@@ -129,7 +129,11 @@ Some prose after the code.`;
 
   it('prefers markdown over formattedText over plain text', () => {
     const a = chunkTurn(
-      baseInput({ markdown: '# Heading\n\nFrom markdown.', formattedText: 'From formatted', text: 'From text' }),
+      baseInput({
+        markdown: '# Heading\n\nFrom markdown.',
+        formattedText: 'From formatted',
+        text: 'From text',
+      }),
     );
     expect(a[0]?.text).toContain('From markdown');
     const b = chunkTurn(baseInput({ formattedText: 'From formatted', text: 'From text' }));

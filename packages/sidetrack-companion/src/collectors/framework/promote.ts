@@ -34,17 +34,12 @@ import {
 export interface PromoteContext {
   readonly registry: MaterializerRegistry;
   readonly isManifestLoaded: (collectorId: string) => boolean;
-  readonly capabilitiesForCollector: (
-    collectorId: string,
-  ) => ReadonlyArray<CollectorCapability>;
+  readonly capabilitiesForCollector: (collectorId: string) => readonly CollectorCapability[];
   // Lock 4 — read gate state for any collector capability.
   // Receives the union of granted/revoked permission events; returns
   // 'granted' | 'revoked' | 'pending' for the (collector, capability)
   // pair.
-  readonly gateStateFor: (
-    collectorId: string,
-    capability: CollectorCapability,
-  ) => GateState;
+  readonly gateStateFor: (collectorId: string, capability: CollectorCapability) => GateState;
   // (collector_id, source_record_id) presence check for idempotency.
   readonly isAlreadyPromoted: (
     collectorId: string,
@@ -81,8 +76,7 @@ const isCollectorEventEnvelope = (value: unknown): value is CollectorEvent => {
     typeof obj['collector_version'] === 'string' &&
     typeof obj['collector_run_id'] === 'string' &&
     'payload' in obj &&
-    (obj['source_record_id'] === undefined ||
-      typeof obj['source_record_id'] === 'string') &&
+    (obj['source_record_id'] === undefined || typeof obj['source_record_id'] === 'string') &&
     (obj['dimensions'] === undefined ||
       (typeof obj['dimensions'] === 'object' && obj['dimensions'] !== null))
   );
@@ -105,7 +99,7 @@ const findDeniedCapability = (
 
 const runUpcasters = (
   payload: unknown,
-  chain: ReadonlyArray<(x: unknown) => unknown>,
+  chain: readonly ((x: unknown) => unknown)[],
 ): { ok: true; upcasted: unknown } | { ok: false; reason: 'upcaster-threw' } => {
   let current = payload;
   for (const step of chain) {
@@ -121,9 +115,7 @@ const runUpcasters = (
 const runValidate = (
   reg: MaterializerRegistration<unknown>,
   upcasted: unknown,
-):
-  | { ok: true; validated: unknown }
-  | { ok: false; reason: 'materializer-validation-failed' } => {
+): { ok: true; validated: unknown } | { ok: false; reason: 'materializer-validation-failed' } => {
   try {
     return { ok: true, validated: reg.validate(upcasted) };
   } catch {

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { resetTimelineMaterializerStateForTests, setTimelineDrainHook } from '../../../src/timeline/materializer';
+import {
+  resetTimelineMaterializerStateForTests,
+  setTimelineDrainHook,
+} from '../../../src/timeline/materializer';
 import {
   initializeTimelineWiring,
   resetTimelineWiringForTests,
@@ -67,24 +70,52 @@ const stubChrome = (): {
       },
     },
     tabs: {
-      onCreated: { addListener: vi.fn((cb: ListenerStore['onCreated']) => { listeners.onCreated = cb; }) },
-      onActivated: { addListener: vi.fn((cb: ListenerStore['onActivated']) => { listeners.onActivated = cb; }) },
-      onUpdated: { addListener: vi.fn((cb: ListenerStore['onUpdated']) => { listeners.onUpdated = cb; }) },
-      onRemoved: { addListener: vi.fn((cb: ListenerStore['onRemoved']) => { listeners.onRemoved = cb; }) },
+      onCreated: {
+        addListener: vi.fn((cb: ListenerStore['onCreated']) => {
+          listeners.onCreated = cb;
+        }),
+      },
+      onActivated: {
+        addListener: vi.fn((cb: ListenerStore['onActivated']) => {
+          listeners.onActivated = cb;
+        }),
+      },
+      onUpdated: {
+        addListener: vi.fn((cb: ListenerStore['onUpdated']) => {
+          listeners.onUpdated = cb;
+        }),
+      },
+      onRemoved: {
+        addListener: vi.fn((cb: ListenerStore['onRemoved']) => {
+          listeners.onRemoved = cb;
+        }),
+      },
       get: vi.fn((tabId: number) => Promise.resolve(tabState.get(tabId) ?? { id: tabId })),
       __setTab: (tabId: number, data: { url?: string; title?: string; windowId?: number }) => {
         tabState.set(tabId, data);
       },
     },
     windows: {
-      onRemoved: { addListener: vi.fn((cb: ListenerStore['onWindowRemoved']) => { listeners.onWindowRemoved = cb; }) },
+      onRemoved: {
+        addListener: vi.fn((cb: ListenerStore['onWindowRemoved']) => {
+          listeners.onWindowRemoved = cb;
+        }),
+      },
     },
     idle: {
-      onStateChanged: { addListener: vi.fn((cb: ListenerStore['onIdleStateChanged']) => { listeners.onIdleStateChanged = cb; }) },
+      onStateChanged: {
+        addListener: vi.fn((cb: ListenerStore['onIdleStateChanged']) => {
+          listeners.onIdleStateChanged = cb;
+        }),
+      },
     },
     alarms: {
       create: vi.fn(() => Promise.resolve()),
-      onAlarm: { addListener: vi.fn((cb: ListenerStore['onAlarm']) => { listeners.onAlarm = cb; }) },
+      onAlarm: {
+        addListener: vi.fn((cb: ListenerStore['onAlarm']) => {
+          listeners.onAlarm = cb;
+        }),
+      },
     },
   };
   return {
@@ -118,17 +149,19 @@ describe('timeline wiring', () => {
     await initializeTimelineWiring({
       readCompanion: async () => null, // companion offline; drain disabled
     });
-    const c = (globalThis as unknown as {
-      chrome: {
-        tabs: {
-          onCreated: { addListener: { mock: { calls: unknown[] } } };
-          onActivated: { addListener: { mock: { calls: unknown[] } } };
+    const c = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            onCreated: { addListener: { mock: { calls: unknown[] } } };
+            onActivated: { addListener: { mock: { calls: unknown[] } } };
+          };
+          windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
+          idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
+          alarms: { create: { mock: { calls: unknown[] } } };
         };
-        windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
-        idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
-        alarms: { create: { mock: { calls: unknown[] } } };
-      };
-    }).chrome;
+      }
+    ).chrome;
     expect(c.tabs.onCreated.addListener.mock.calls.length).toBe(1);
     expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(1);
     expect(c.windows.onRemoved.addListener.mock.calls.length).toBe(1);
@@ -139,18 +172,29 @@ describe('timeline wiring', () => {
   it('initialize is idempotent across repeated calls', async () => {
     await initializeTimelineWiring({ readCompanion: async () => null });
     await initializeTimelineWiring({ readCompanion: async () => null });
-    const c = (globalThis as unknown as {
-      chrome: { tabs: { onActivated: { addListener: { mock: { calls: unknown[] } } } } };
-    }).chrome;
+    const c = (
+      globalThis as unknown as {
+        chrome: { tabs: { onActivated: { addListener: { mock: { calls: unknown[] } } } } };
+      }
+    ).chrome;
     expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(1);
   });
 
   it('chrome.tabs.onActivated → observer.observe → materializer.admitLocal', async () => {
     await initializeTimelineWiring({ readCompanion: async () => null });
     // Pre-populate the tab with a URL.
-    const c = (globalThis as unknown as {
-      chrome: { tabs: { __setTab: (id: number, data: { url?: string; title?: string; windowId?: number }) => void } };
-    }).chrome;
+    const c = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            __setTab: (
+              id: number,
+              data: { url?: string; title?: string; windowId?: number },
+            ) => void;
+          };
+        };
+      }
+    ).chrome;
     c.tabs.__setTab(42, {
       url: 'https://chatgpt.com/c/abc123',
       title: 'My chat',
@@ -162,11 +206,13 @@ describe('timeline wiring', () => {
     env.listeners.onActivated({ tabId: 42, windowId: 1 });
     await new Promise((r) => setTimeout(r, 10));
     // The materializer admitted; spool has one entry.
-    const spool = (await (globalThis as unknown as {
-      chrome: { storage: { local: { get: (k: string) => Promise<Record<string, unknown>> } } };
-    }).chrome.storage.local.get('sidetrack.sync.spool.timeline'))[
-      'sidetrack.sync.spool.timeline'
-    ];
+    const spool = (
+      await (
+        globalThis as unknown as {
+          chrome: { storage: { local: { get: (k: string) => Promise<Record<string, unknown>> } } };
+        }
+      ).chrome.storage.local.get('sidetrack.sync.spool.timeline')
+    )['sidetrack.sync.spool.timeline'];
     expect(Array.isArray(spool)).toBe(true);
     expect((spool as unknown[]).length).toBeGreaterThanOrEqual(1);
   });
@@ -178,9 +224,18 @@ describe('timeline wiring', () => {
     // still be `'https://www.google.com/'` (pre-nav). The observer must
     // use the changeInfo (authoritative new URL), not the stale tab.url.
     await initializeTimelineWiring({ readCompanion: async () => null });
-    const c = (globalThis as unknown as {
-      chrome: { tabs: { __setTab: (id: number, data: { url?: string; title?: string; windowId?: number }) => void } };
-    }).chrome;
+    const c = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            __setTab: (
+              id: number,
+              data: { url?: string; title?: string; windowId?: number },
+            ) => void;
+          };
+        };
+      }
+    ).chrome;
     // Tab snapshot is the pre-navigation homepage URL — what Chrome
     // hands us as `tab.url` in the race-condition window.
     c.tabs.__setTab(99, {
@@ -194,11 +249,15 @@ describe('timeline wiring', () => {
       { id: 99, url: 'https://www.google.com/', windowId: 1 },
     );
     await new Promise((r) => setTimeout(r, 10));
-    const spool = (await (globalThis as unknown as {
-      chrome: { storage: { local: { get: (k: string) => Promise<Record<string, unknown>> } } };
-    }).chrome.storage.local.get('sidetrack.sync.spool.timeline'))[
-      'sidetrack.sync.spool.timeline'
-    ] as readonly { readonly payload?: { readonly url?: string } }[];
+    const spool = (
+      await (
+        globalThis as unknown as {
+          chrome: { storage: { local: { get: (k: string) => Promise<Record<string, unknown>> } } };
+        }
+      ).chrome.storage.local.get('sidetrack.sync.spool.timeline')
+    )['sidetrack.sync.spool.timeline'] as readonly {
+      readonly payload?: { readonly url?: string };
+    }[];
     expect(Array.isArray(spool)).toBe(true);
     const urls = spool.map((entry) => entry.payload?.url).filter(Boolean);
     expect(urls).toContain('https://www.google.com/search?q=warp+exchange');
@@ -218,17 +277,19 @@ describe('timeline wiring', () => {
     await setTimelineEnabled(false);
 
     await initializeTimelineWiring({ readCompanion: async () => null });
-    const c = (globalThis as unknown as {
-      chrome: {
-        tabs: {
-          onCreated: { addListener: { mock: { calls: unknown[] } } };
-          onActivated: { addListener: { mock: { calls: unknown[] } } };
+    const c = (
+      globalThis as unknown as {
+        chrome: {
+          tabs: {
+            onCreated: { addListener: { mock: { calls: unknown[] } } };
+            onActivated: { addListener: { mock: { calls: unknown[] } } };
+          };
+          windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
+          idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
+          alarms: { create: { mock: { calls: unknown[] } } };
         };
-        windows: { onRemoved: { addListener: { mock: { calls: unknown[] } } } };
-        idle: { onStateChanged: { addListener: { mock: { calls: unknown[] } } } };
-        alarms: { create: { mock: { calls: unknown[] } } };
-      };
-    }).chrome;
+      }
+    ).chrome;
     expect(c.tabs.onCreated.addListener.mock.calls.length).toBe(0);
     expect(c.tabs.onActivated.addListener.mock.calls.length).toBe(0);
     expect(c.windows.onRemoved.addListener.mock.calls.length).toBe(0);

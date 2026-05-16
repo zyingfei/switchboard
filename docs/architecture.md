@@ -489,11 +489,11 @@ block:
 
 ```bash
 # Terminal A (already running, keep it):
-npm --prefix packages/sidetrack-extension run e2e:chrome-debug
+bun run --cwd packages/sidetrack-extension e2e:chrome-debug
 
 # Terminal B:
 SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
-  npm --prefix packages/sidetrack-extension run e2e:attach-diag
+  bun run --cwd packages/sidetrack-extension e2e:attach-diag
 ```
 
 The harness connects over CDP, wakes the MV3 service worker, reads

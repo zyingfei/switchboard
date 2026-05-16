@@ -1,10 +1,10 @@
 // Non-interactive title-pipeline diagnostic.
 //
 // Run with:
-//   npm run build && npm --prefix ../sidetrack-companion run build
+//   bun run build && bun run --cwd ../sidetrack-companion build
 //   SIDETRACK_MANUAL_BROWSER_MODE=persistent-playwright-stealth-experiment \
 //     SIDETRACK_E2E_STEALTH_EXPERIMENT=1 SIDETRACK_E2E_HEADLESS=0 \
-//     npx playwright test tests/e2e/diag-title-pipeline.spec.ts \
+//     bunx --bun --no-install playwright test tests/e2e/diag-title-pipeline.spec.ts \
 //       --project=manual --grep diag --headed --timeout 0
 //
 // Captures all console output from the SW, the panel, and a page tab,
@@ -125,9 +125,11 @@ test.describe('manual title pipeline diagnostic', () => {
       // Diag from the panel.
       const diag = (await runtime.sendRuntimeMessage(panel, {
         type: 'sidetrack.dev.diag',
-      })) as
-        | { readonly ok?: boolean; readonly diagnostics?: unknown; readonly error?: string }
-        | null;
+      })) as {
+        readonly ok?: boolean;
+        readonly diagnostics?: unknown;
+        readonly error?: string;
+      } | null;
       print('DIAG', diag);
 
       // Pull the URL projection directly from companion.
@@ -146,13 +148,19 @@ test.describe('manual title pipeline diagnostic', () => {
       // Pull the panel's view of the same URL via its own injected DOM.
       // (Panel's loadTabSessions already logs activeTabUrl + urlRecord;
       // the console capture above will have it.)
-      print('SW WORKERS', sw.map((w) => w.url()));
+      print(
+        'SW WORKERS',
+        sw.map((w) => w.url()),
+      );
 
       // One more wait to capture late title-watcher pushes.
       await sleep(5_000);
-      print('SECOND DIAG (after 5 s)', await runtime.sendRuntimeMessage(panel, {
-        type: 'sidetrack.dev.diag',
-      }));
+      print(
+        'SECOND DIAG (after 5 s)',
+        await runtime.sendRuntimeMessage(panel, {
+          type: 'sidetrack.dev.diag',
+        }),
+      );
 
       // Final companion projection.
       const projection2 = await fetch(

@@ -27,7 +27,8 @@ const main = async () => {
   console.log(`\nCDP /json/list — ${all.length} targets total:`);
   for (const t of all) {
     console.log(`  [${t.type}] ${t.url?.slice(0, 130) ?? ''}`);
-    if (t.title !== undefined && t.title.length > 0) console.log(`    title: ${t.title.slice(0, 60)}`);
+    if (t.title !== undefined && t.title.length > 0)
+      console.log(`    title: ${t.title.slice(0, 60)}`);
   }
   await browser.close();
 };

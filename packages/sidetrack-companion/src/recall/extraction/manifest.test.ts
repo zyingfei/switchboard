@@ -10,23 +10,49 @@ describe('selectActiveRevision', () => {
   it('returns undefined when all candidates are tombstoned', () => {
     expect(
       selectActiveRevision([
-        { extractionRevisionId: 'a', extractorId: 'legacy', extractorVersion: '0.0.0', extractionSchemaVersion: 1, tombstoned: true },
+        {
+          extractionRevisionId: 'a',
+          extractorId: 'legacy',
+          extractorVersion: '0.0.0',
+          extractionSchemaVersion: 1,
+          tombstoned: true,
+        },
       ]),
     ).toBeUndefined();
   });
 
   it('prefers higher extractionSchemaVersion over higher semver', () => {
     const winner = selectActiveRevision([
-      { extractionRevisionId: 'a', extractorId: 'legacy', extractorVersion: '99.0.0', extractionSchemaVersion: 1 },
-      { extractionRevisionId: 'b', extractorId: 'legacy', extractorVersion: '0.0.0', extractionSchemaVersion: 2 },
+      {
+        extractionRevisionId: 'a',
+        extractorId: 'legacy',
+        extractorVersion: '99.0.0',
+        extractionSchemaVersion: 1,
+      },
+      {
+        extractionRevisionId: 'b',
+        extractorId: 'legacy',
+        extractorVersion: '0.0.0',
+        extractionSchemaVersion: 2,
+      },
     ]);
     expect(winner?.extractionRevisionId).toBe('b');
   });
 
   it('prefers higher semver when extractorId matches; uses proper compare not lex', () => {
     const winner = selectActiveRevision([
-      { extractionRevisionId: 'a', extractorId: 'legacy', extractorVersion: '1.10.0', extractionSchemaVersion: 1 },
-      { extractionRevisionId: 'b', extractorId: 'legacy', extractorVersion: '1.2.0', extractionSchemaVersion: 1 },
+      {
+        extractionRevisionId: 'a',
+        extractorId: 'legacy',
+        extractorVersion: '1.10.0',
+        extractionSchemaVersion: 1,
+      },
+      {
+        extractionRevisionId: 'b',
+        extractorId: 'legacy',
+        extractorVersion: '1.2.0',
+        extractionSchemaVersion: 1,
+      },
     ]);
     // 1.10.0 > 1.2.0 in semver (NOT lex, where '1.2.0' > '1.10.0').
     expect(winner?.extractionRevisionId).toBe('a');

@@ -61,7 +61,10 @@ describe('runCli', () => {
 
   it('models status reports the manifest revision + cache dir without touching the network', async () => {
     const streams = createStreams();
-    const exitCode = await runCli(['models', 'status', '--models-dir', '/tmp/sb-models-test', '--offline-models'], streams);
+    const exitCode = await runCli(
+      ['models', 'status', '--models-dir', '/tmp/sb-models-test', '--offline-models'],
+      streams,
+    );
     expect(exitCode).toBe(0);
     const out = streams.stdout.text();
     expect(out).toContain('model id');

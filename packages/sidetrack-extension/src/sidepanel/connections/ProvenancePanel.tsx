@@ -1,10 +1,7 @@
 import { useMemo, type ReactElement } from 'react';
 
 import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
-import {
-  formatNodeIdDisplay,
-  type EntityDisplayCtx,
-} from '../entityDisplay/format';
+import { formatNodeIdDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import { feedbackRelationKindForEdgeKind } from './client';
 import { EDGE_KINDS, FAMILIES, type EdgeFamily } from './edgeKinds';
 import { CloseIcon } from './icons';
@@ -56,12 +53,7 @@ export const ProvenanceCard = ({
         <span className="cx-prov-kind">{edge.kind}</span>
         <span className="cx-stamp">{edge.confidence}</span>
         <span className="cx-grow" />
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close"
-          className="cx-prov-close"
-        >
+        <button type="button" onClick={onClose} aria-label="Close" className="cx-prov-close">
           {CloseIcon}
         </button>
       </header>
@@ -166,9 +158,7 @@ export const ProvenanceEmpty = ({
   readonly ctx: EntityDisplayCtx;
 }): ReactElement => (
   <div className="cx-prov-empty">
-    <div className="cx-prov-empty-head">
-      {anchor !== null ? 'Anchor summary' : 'No anchor'}
-    </div>
+    <div className="cx-prov-empty-head">{anchor !== null ? 'Anchor summary' : 'No anchor'}</div>
     {anchor !== null ? <NodeChip node={anchor} state="anchor" size="lg" ctx={ctx} /> : null}
     <div className="cx-prov-empty-body">
       {anchor !== null

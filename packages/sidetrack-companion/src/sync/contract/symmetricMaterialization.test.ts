@@ -46,10 +46,18 @@ describe('Lane 1 contract — symmetric local/peer materialization (L1-G8 + L1-G
     const runnerA = createSyncContractRunner();
     const runnerB = createSyncContractRunner();
     runnerA.register(
-      createProjectionMaterializer({ vaultRoot: vaultA, eventLog: eventLogA, projectionChanges: changesA }),
+      createProjectionMaterializer({
+        vaultRoot: vaultA,
+        eventLog: eventLogA,
+        projectionChanges: changesA,
+      }),
     );
     runnerB.register(
-      createProjectionMaterializer({ vaultRoot: vaultB, eventLog: eventLogB, projectionChanges: changesB }),
+      createProjectionMaterializer({
+        vaultRoot: vaultB,
+        eventLog: eventLogB,
+        projectionChanges: changesB,
+      }),
     );
 
     // A locally accepts the event (we use appendServerObserved to
@@ -119,10 +127,18 @@ describe('Lane 1 contract — symmetric local/peer materialization (L1-G8 + L1-G
     const runnerA = createSyncContractRunner();
     const runnerB = createSyncContractRunner();
     runnerA.register(
-      createProjectionMaterializer({ vaultRoot: vaultA, eventLog: eventLogA, projectionChanges: changesA }),
+      createProjectionMaterializer({
+        vaultRoot: vaultA,
+        eventLog: eventLogA,
+        projectionChanges: changesA,
+      }),
     );
     runnerB.register(
-      createProjectionMaterializer({ vaultRoot: vaultB, eventLog: eventLogB, projectionChanges: changesB }),
+      createProjectionMaterializer({
+        vaultRoot: vaultB,
+        eventLog: eventLogB,
+        projectionChanges: changesB,
+      }),
     );
 
     const accepted: AcceptedEvent = await eventLogA.appendServerObserved({

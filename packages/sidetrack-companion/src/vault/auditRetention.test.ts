@@ -25,9 +25,7 @@ describe('audit retention', () => {
     await expect(
       enforceRetention(vaultRoot, { maxBytes: 8 }, new Date('2026-05-04T00:00:00.000Z')),
     ).resolves.toEqual({ removed: 0 });
-    expect(await readdir(auditRoot)).toContain(
-      '2026-05-03.2026-05-04T00-00-00-000Z.jsonl.gz',
-    );
+    expect(await readdir(auditRoot)).toContain('2026-05-03.2026-05-04T00-00-00-000Z.jsonl.gz');
   });
 
   it('rotates logs older than the max age', async () => {
@@ -42,10 +40,16 @@ describe('audit retention', () => {
 
   it('keeps only the newest twelve rotations', async () => {
     for (let index = 0; index < 13; index += 1) {
-      await writeFile(join(auditRoot, `old-${String(index).padStart(2, '0')}.jsonl.gz`), 'gz', 'utf8');
+      await writeFile(
+        join(auditRoot, `old-${String(index).padStart(2, '0')}.jsonl.gz`),
+        'gz',
+        'utf8',
+      );
     }
 
     await expect(enforceRetention(vaultRoot)).resolves.toEqual({ removed: 1 });
-    expect((await readdir(auditRoot)).filter((name) => name.endsWith('.jsonl.gz'))).toHaveLength(12);
+    expect((await readdir(auditRoot)).filter((name) => name.endsWith('.jsonl.gz'))).toHaveLength(
+      12,
+    );
   });
 });

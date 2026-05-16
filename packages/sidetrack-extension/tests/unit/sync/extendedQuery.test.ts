@@ -13,7 +13,10 @@ describe('runExtendedQuery', () => {
         { id: 'b', label: 'remote-b' },
         { id: 'c', label: 'remote-c' },
       ],
-      readActive: async () => [{ id: 'a', label: 'active-a' }, { id: 'b', label: 'active-b' }],
+      readActive: async () => [
+        { id: 'a', label: 'active-a' },
+        { id: 'b', label: 'active-b' },
+      ],
       idOf: (it) => it.id,
     });
     expect(result.scope).toBe('companion-extended');

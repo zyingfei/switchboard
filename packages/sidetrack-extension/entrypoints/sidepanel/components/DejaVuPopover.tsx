@@ -31,13 +31,7 @@ interface DejaVuPopoverProps {
   readonly onMute?: () => void;
 }
 
-export function DejaVuPopover({
-  items,
-  anchor,
-  onJump,
-  onDismiss,
-  onMute,
-}: DejaVuPopoverProps) {
+export function DejaVuPopover({ items, anchor, onJump, onDismiss, onMute }: DejaVuPopoverProps) {
   if (items.length === 0) {
     return null;
   }

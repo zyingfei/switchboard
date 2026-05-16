@@ -32,7 +32,7 @@ This POC validates vault-backed semantic recall for Browser AI Companion with th
 
 ## Benchmarks
 
-Benchmarks were run locally on April 25, 2026 with `npm run benchmark`.
+Benchmarks were run locally on April 25, 2026 with `bun run benchmark`.
 
 Model/runtime:
 
@@ -90,17 +90,17 @@ That points toward:
 
 ## Known Caveat
 
-`npm run build` succeeds, but bundling `@huggingface/transformers` into the MV3 background worker currently emits an `import.meta` warning and produces a large worker bundle. The Node benchmark path is verified; the browser extension model-loading path still needs manual runtime validation in Chrome before treating this as production-ready.
+`bun run build` succeeds, but bundling `@huggingface/transformers` into the MV3 background worker currently emits an `import.meta` warning and produces a large worker bundle. The Bun benchmark path is verified; the browser extension model-loading path still needs manual runtime validation in Chrome before treating this as production-ready.
 
 ## Run
 
 ```sh
 cd poc/recall-vector
-npm install
-npm run compile
-npm test
-npm run build
-npm run benchmark
+bun install
+bun run compile
+bun run test
+bun run build
+bun run benchmark
 ```
 
 To try the sidepanel manually:

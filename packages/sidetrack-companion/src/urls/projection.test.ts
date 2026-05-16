@@ -173,7 +173,9 @@ describe('url projection', () => {
       observed({ seq: 2, canonicalUrl: 'https://x/b', observedAt: '2026-05-07T10:10:00.000Z' }),
       observed({ seq: 3, canonicalUrl: 'https://x/c', observedAt: '2026-05-07T10:20:00.000Z' }),
     ];
-    const before = urlInbox(projectUrls(events), { limit: 10, offset: 0 }).map((r) => r.canonicalUrl);
+    const before = urlInbox(projectUrls(events), { limit: 10, offset: 0 }).map(
+      (r) => r.canonicalUrl,
+    );
     // Revisit `a` — under lastSeenAt sort this would jump `a` to the
     // top of the list. Under firstSeenAt sort it stays put.
     const withRevisit: AcceptedEvent[] = [
@@ -227,9 +229,7 @@ describe('url projection', () => {
           },
         ],
       });
-      const inboxUrls = urlInbox(projection, { limit: 10, offset: 0 }).map(
-        (r) => r.canonicalUrl,
-      );
+      const inboxUrls = urlInbox(projection, { limit: 10, offset: 0 }).map((r) => r.canonicalUrl);
       // Thread URL is excluded (attributed via thread propagation),
       // HN URL is still in the Inbox (no matching thread).
       expect(inboxUrls).toEqual(['https://news.ycombinator.com/item?id=42']);
@@ -270,7 +270,11 @@ describe('url projection', () => {
     it('explicit URL move still wins over thread-derived attribution on tie-break', () => {
       const events = [
         observed({ seq: 1, canonicalUrl: 'https://chatgpt.com/c/abc' }),
-        userMove({ seq: 2, canonicalUrl: 'https://chatgpt.com/c/abc', workstreamId: 'WS-EXPLICIT' }),
+        userMove({
+          seq: 2,
+          canonicalUrl: 'https://chatgpt.com/c/abc',
+          workstreamId: 'WS-EXPLICIT',
+        }),
       ];
       const projection = projectUrls(events, {
         threads: [

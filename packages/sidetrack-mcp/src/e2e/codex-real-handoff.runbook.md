@@ -22,19 +22,19 @@ test browser  ──CDP──▶ extension ──HTTP──▶ companion (vault)
 Tested on macOS 14+, Apple Silicon. Linux/Windows should work the
 same way; replace paths as needed.
 
-| Dep | Version |
-|---|---|
-| Node.js | ≥ 22 (the runtime everything else assumes) |
-| Chrome / Chromium | recent stable; needs to support `--remote-debugging-port` |
-| `git` | for cloning |
+| Dep                | Version                                                                   |
+| ------------------ | ------------------------------------------------------------------------- |
+| Bun                | >= 1.3.14 (the runtime everything else assumes)                           |
+| Chrome / Chromium  | recent stable; needs to support `--remote-debugging-port`                 |
+| `git`              | for cloning                                                               |
 | Two free TCP ports | the script uses `17373` for companion, picks a random `8730–8830` for MCP |
-| ChatGPT account | the script logs into chat.openai.com via your existing browser session |
+| ChatGPT account    | the script logs into chat.openai.com via your existing browser session    |
 
 You should also have:
 
-* A working bridge key (auto-created on first companion run; lives at
+- A working bridge key (auto-created on first companion run; lives at
   `<vault>/_BAC/.config/bridge.key`).
-* A vault directory (e.g. `~/Documents/Sidetrack-vault`); created on
+- A vault directory (e.g. `~/Documents/Sidetrack-vault`); created on
   first companion start.
 
 ## 1. Build the workspace
@@ -42,30 +42,27 @@ You should also have:
 ```bash
 git clone <repo>
 cd <repo-root>
+bun install
+
 # Build companion (needed: dist/cli.js)
-cd packages/sidetrack-companion
-npm install
-npm run build
+bun run --cwd packages/sidetrack-companion build
 
 # Build MCP (needed: dist/cli.js)
-cd ../sidetrack-mcp
-npm install
-npm run build
+bun run --cwd packages/sidetrack-mcp build
 
 # Build extension (needed: .output/chrome-mv3 for loading into Chrome)
-cd ../sidetrack-extension
-npm install
-npm run build
+bun run --cwd packages/sidetrack-extension build
 ```
 
 ## 2. Start the companion
 
 ```bash
 cd packages/sidetrack-companion
-node dist/cli.js --vault ~/Documents/Sidetrack-vault
+bun dist/cli.js --vault ~/Documents/Sidetrack-vault
 ```
 
 Companion will:
+
 - create the vault if missing,
 - mint a bridge key on first run (printed once; thereafter at
   `~/Documents/Sidetrack-vault/_BAC/.config/bridge.key`),
@@ -86,6 +83,7 @@ You should see `"status": "ok"` (eventually — recall may report
 ## 3. Start the test browser (definitive)
 
 The e2e expects a Chrome-for-Testing (CfT) window with:
+
 - the remote-debug port open at `http://localhost:9222`,
 - the unpacked Sidetrack extension loaded,
 - a persistent user-data dir (so provider sign-ins survive between
@@ -100,7 +98,7 @@ the extension ID to `.output/cdp-extension-id` for the spec runner.
 
 ```bash
 cd packages/sidetrack-extension
-npm run e2e:install-cft
+bun run e2e:install-cft
 ```
 
 Installs to the **shared OS cache** at
@@ -111,26 +109,26 @@ every worktree; see `scripts/install-cft.mjs`). Override with
 You can prune stale per-worktree copies any time with:
 
 ```bash
-npm run e2e:gc-cft           # dry-run
-npm run e2e:gc-cft -- --apply
+bun run e2e:gc-cft           # dry-run
+bun run e2e:gc-cft -- --apply
 ```
 
 ### 3.2 Launch
 
 ```bash
 cd packages/sidetrack-extension
-npm run e2e:chrome-debug
+bun run e2e:chrome-debug
 ```
 
-This runs `npm run build` then `scripts/chrome-debug.mjs`, which:
+This runs `bun run build` then `scripts/chrome-debug.mjs`, which:
 
-| Setting | Value | Override |
-|---|---|---|
-| Binary | shared CfT install | `SIDETRACK_E2E_CHROME_BIN` |
-| Extension | `./.output/chrome-mv3` | `SIDETRACK_EXTENSION_PATH` |
-| User-data-dir | `~/.sidetrack-test-profile` | `SIDETRACK_USER_DATA_DIR` |
-| CDP port | 9222 | `SIDETRACK_E2E_CDP_PORT` |
-| Initial tabs | chatgpt.com, claude.ai, gemini.google.com | (script-internal) |
+| Setting       | Value                                     | Override                   |
+| ------------- | ----------------------------------------- | -------------------------- |
+| Binary        | shared CfT install                        | `SIDETRACK_E2E_CHROME_BIN` |
+| Extension     | `./.output/chrome-mv3`                    | `SIDETRACK_EXTENSION_PATH` |
+| User-data-dir | `~/.sidetrack-test-profile`               | `SIDETRACK_USER_DATA_DIR`  |
+| CDP port      | 9222                                      | `SIDETRACK_E2E_CDP_PORT`   |
+| Initial tabs  | chatgpt.com, claude.ai, gemini.google.com | (script-internal)          |
 
 The script also opens CDP, watches for the extension service worker,
 and writes its ID to `.output/cdp-extension-id`. **Leave this script
@@ -143,7 +141,7 @@ and session tokens. Sign in once with a human at the keyboard and
 all later runs — including agent-driven ones — reuse the session.
 
 ```bash
-npm run e2e:chrome-debug
+bun run e2e:chrome-debug
 # In the launched window, sign in to chatgpt.com / claude.ai /
 # gemini.google.com (Touch ID / passkey at the prompt). Cmd-Q when
 # done. The next run skips the login.
@@ -154,7 +152,7 @@ profile — useful when you're hand-completing a passkey and don't
 want a CDP-attached run fighting the login UI:
 
 ```bash
-node scripts/login-test-profile.mjs
+bun scripts/login-test-profile.mjs
 ```
 
 **Setting up an agent on a second machine.** Two practical options:
@@ -169,7 +167,7 @@ node scripts/login-test-profile.mjs
    tar czf sidetrack-test-profile.tar.gz -C ~ .sidetrack-test-profile
    # target machine:
    tar xzf sidetrack-test-profile.tar.gz -C ~
-   npm run e2e:chrome-debug
+   bun run e2e:chrome-debug
    ```
    Google's session-binding (DBSC) sometimes invalidates moved
    cookies and re-prompts for the passkey on first navigation —
@@ -181,7 +179,7 @@ magic links, no hardware key needed):
 
 ```bash
 SIDETRACK_TARGET_URL=https://claude.ai/chat/<id> \
-  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
+  bun packages/sidetrack-extension/scripts/codex-real-e2e.mjs
 ```
 
 ### 3.4 Verify the extension is loaded
@@ -195,8 +193,8 @@ A correctly-launched browser should show:
 - `curl http://localhost:9222/json/list | grep -c chrome-extension`
   returns ≥ 1 service-worker target.
 
-If the extension is missing: re-run `npm run build` then
-`npm run e2e:chrome-debug`, and confirm `.output/chrome-mv3/manifest.json`
+If the extension is missing: re-run `bun run build` then
+`bun run e2e:chrome-debug`, and confirm `.output/chrome-mv3/manifest.json`
 exists.
 
 ### 3.5 Wire the bridge key (extension ↔ companion auth)
@@ -222,7 +220,7 @@ extension stores at chrome.storage.local["sidetrack.settings"]
 **Headless flow (recommended for agents):**
 
 ```bash
-npm run e2e:pair
+bun run e2e:pair
 # Reads <vault>/_BAC/.config/bridge.key, writes it to
 # chrome.storage.local["sidetrack.settings"].companion.bridgeKey,
 # and flips sidetrack:setupCompleted=true so the wizard skips.
@@ -242,12 +240,12 @@ already-open provider thread:
 
 ```bash
 cd packages/sidetrack-extension
-SIDETRACK_E2E_CDP_URL=http://127.0.0.1:9223 npm run e2e:pair
+SIDETRACK_E2E_CDP_URL=http://127.0.0.1:9223 bun run e2e:pair
 
 cd ../..
 SIDETRACK_E2E_CDP_URL=http://127.0.0.1:9223 \
 SIDETRACK_TARGET_URL='https://chatgpt.com/.../c/<thread-id>' \
-  node packages/sidetrack-extension/scripts/codex-real-e2e.mjs
+  bun packages/sidetrack-extension/scripts/codex-real-e2e.mjs
 ```
 
 This path also handles an idle MV3 service worker: the scripts can
@@ -288,7 +286,7 @@ curl -s -H "x-bac-bridge-key: $KEY" \
   `chrome.storage.local` (nested at `companion.bridgeKey`). To clear
   it without touching the file, open DevTools on the side panel:
   ```js
-  chrome.storage.local.remove('sidetrack.settings')
+  chrome.storage.local.remove('sidetrack.settings');
   ```
   Reload the side panel; the wizard re-prompts. (This also clears
   vault path + per-host overrides, so re-paste both if customised.)
@@ -316,53 +314,53 @@ different thread.
 The driver script lives at
 `packages/sidetrack-extension/scripts/codex-real-e2e.mjs`. It
 imports playwright + the MCP SDK via absolute paths (no separate
-`npm install` in the extension dir for this purpose).
+package install in the extension dir for this purpose).
 
 ```bash
-node packages/sidetrack-extension/scripts/codex-real-e2e.mjs 2>&1 \
+bun packages/sidetrack-extension/scripts/codex-real-e2e.mjs 2>&1 \
   | tee /tmp/codex-e2e.log
 ```
 
 What happens, narrated:
 
-| Phase | What the script does |
-|---|---|
-| `[1.nav]` | Connects to the test browser via CDP. Picks (or navigates) a chatgpt.com tab to the target URL. Waits for `[data-message-author-role]` to appear. |
-| `[2.capture]` | Activates the target tab + window so the SW's `chrome.tabs.query({active, currentWindow})` returns it; sends `messageTypes.captureCurrentTab` from the side-panel context. Polls `chrome.storage.local` until the thread appears with a `bac_id`. |
-| `[3.mcp]` | Spawns `node packages/sidetrack-mcp/dist/cli.js --transport websocket …`. Waits for the `websocket listening on …` line on stderr. |
-| `[4.prompt]` | Builds the **compact handoff prompt** (now ~225 chars after the trim review). Logs the length + asserts it doesn't contain leaked URLs. |
-| `[5.parse / 5.connect]` | Parses `sidetrack_thread_id` + `sidetrack_mcp` out of the prompt; opens an MCP SDK client over the WebSocket transport. |
-| `[6.tools/list]` | Calls `tools/list` and logs the advertised count. |
-| `[6.read_thread_md]` | Fetches the vault header markdown for the bac_id. |
-| `[6.turns]` | Fetches all captured turns (the actual conversation body lives here). |
-| `[6.list_dispatches]` | Fetches recent dispatches across the vault. |
-| `[6.recall]` | Runs a vector recall using a snippet from the first turn. |
-| `[6.list_annotations]` | Fetches user-pinned annotations. |
-| `[6.queue_item]` | Writes a follow-up note back to the thread's queue. |
-| `[DONE]` | Emits the queue-item bac_id; you can find the file at `<vault>/_BAC/queue/<bac_id>.json`. |
+| Phase                   | What the script does                                                                                                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[1.nav]`               | Connects to the test browser via CDP. Picks (or navigates) a chatgpt.com tab to the target URL. Waits for `[data-message-author-role]` to appear.                                                                                                 |
+| `[2.capture]`           | Activates the target tab + window so the SW's `chrome.tabs.query({active, currentWindow})` returns it; sends `messageTypes.captureCurrentTab` from the side-panel context. Polls `chrome.storage.local` until the thread appears with a `bac_id`. |
+| `[3.mcp]`               | Spawns `bun packages/sidetrack-mcp/dist/cli.js --transport websocket ...`. Waits for the `websocket listening on ...` line on stderr.                                                                                                             |
+| `[4.prompt]`            | Builds the **compact handoff prompt** (now ~225 chars after the trim review). Logs the length + asserts it doesn't contain leaked URLs.                                                                                                           |
+| `[5.parse / 5.connect]` | Parses `sidetrack_thread_id` + `sidetrack_mcp` out of the prompt; opens an MCP SDK client over the WebSocket transport.                                                                                                                           |
+| `[6.tools/list]`        | Calls `tools/list` and logs the advertised count.                                                                                                                                                                                                 |
+| `[6.read_thread_md]`    | Fetches the vault header markdown for the bac_id.                                                                                                                                                                                                 |
+| `[6.turns]`             | Fetches all captured turns (the actual conversation body lives here).                                                                                                                                                                             |
+| `[6.list_dispatches]`   | Fetches recent dispatches across the vault.                                                                                                                                                                                                       |
+| `[6.recall]`            | Runs a vector recall using a snippet from the first turn.                                                                                                                                                                                         |
+| `[6.list_annotations]`  | Fetches user-pinned annotations.                                                                                                                                                                                                                  |
+| `[6.queue_item]`        | Writes a follow-up note back to the thread's queue.                                                                                                                                                                                               |
+| `[DONE]`                | Emits the queue-item bac_id; you can find the file at `<vault>/_BAC/queue/<bac_id>.json`.                                                                                                                                                         |
 
 ## 6. Verify evidence
 
 After the run, four artifacts confirm correctness:
 
-| Artifact | Where | What to check |
-|---|---|---|
-| Stdout log | `/tmp/codex-e2e.log` | Every step labelled `[N.subphase]`; final line `[DONE] ✓ all steps green; queue item bac_id: …`. |
-| Vault header | `<vault>/_BAC/threads/<bac_id>.md` | Title resolved (`# Heap rank algorithm`), no turn body — that's expected. |
-| Captured event | `<vault>/_BAC/events/YYYY-MM-DD.jsonl` (latest line for the bac_id) | `turns` array length matches the message count visible in the chat tab. |
-| Queue write-back | `<vault>/_BAC/queue/<queue-bac_id>.json` | `text` field starts with `Codex e2e probe:`; `targetId` matches the thread's bac_id. |
+| Artifact         | Where                                                               | What to check                                                                                    |
+| ---------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Stdout log       | `/tmp/codex-e2e.log`                                                | Every step labelled `[N.subphase]`; final line `[DONE] ✓ all steps green; queue item bac_id: …`. |
+| Vault header     | `<vault>/_BAC/threads/<bac_id>.md`                                  | Title resolved (`# Heap rank algorithm`), no turn body — that's expected.                        |
+| Captured event   | `<vault>/_BAC/events/YYYY-MM-DD.jsonl` (latest line for the bac_id) | `turns` array length matches the message count visible in the chat tab.                          |
+| Queue write-back | `<vault>/_BAC/queue/<queue-bac_id>.json`                            | `text` field starts with `Codex e2e probe:`; `targetId` matches the thread's bac_id.             |
 
 ## 7. Common failure modes
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `[1.nav] no chatgpt tab to navigate; user must have one logged in` | Test browser has no chatgpt.com tab open or you're not logged in | Open chatgpt.com manually + sign in. |
-| `[2.capture] capture response keys: ok: undefined` | Side panel was closed when the message went out | Reopen the side panel; it must be live for the `chrome.runtime` fan-out. |
-| `[2.capture] thread did not appear in local cache after 10s` | autoTrack=false + URL pattern doesn't match a thread | Check `tab.url()` ends in `/c/<id>`. The "+" capture path skips landing pages. |
-| `[3.mcp] MCP server did not log listening within 8s` | Build artifact missing | `cd packages/sidetrack-mcp && npm run build` then retry. |
-| `[5.connect] timed out` | MCP token didn't match `--mcp-auth-key` | The script reuses the bridge key for both; if you customised, update both flags. |
-| `[6.recall] related-thread count: 0` | Recall index empty for this content | Wait for the rebuild to finish (Health panel → recall pill = ready). |
-| `[6.queue_item]` throws | Companion HTTP unreachable or bridge key mismatch | Re-check companion logs + bridge.key contents. |
+| Symptom                                                            | Likely cause                                                     | Fix                                                                              |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `[1.nav] no chatgpt tab to navigate; user must have one logged in` | Test browser has no chatgpt.com tab open or you're not logged in | Open chatgpt.com manually + sign in.                                             |
+| `[2.capture] capture response keys: ok: undefined`                 | Side panel was closed when the message went out                  | Reopen the side panel; it must be live for the `chrome.runtime` fan-out.         |
+| `[2.capture] thread did not appear in local cache after 10s`       | autoTrack=false + URL pattern doesn't match a thread             | Check `tab.url()` ends in `/c/<id>`. The "+" capture path skips landing pages.   |
+| `[3.mcp] MCP server did not log listening within 8s`               | Build artifact missing                                           | `cd packages/sidetrack-mcp && bun run build` then retry.                         |
+| `[5.connect] timed out`                                            | MCP token didn't match `--mcp-auth-key`                          | The script reuses the bridge key for both; if you customised, update both flags. |
+| `[6.recall] related-thread count: 0`                               | Recall index empty for this content                              | Wait for the rebuild to finish (Health panel → recall pill = ready).             |
+| `[6.queue_item]` throws                                            | Companion HTTP unreachable or bridge key mismatch                | Re-check companion logs + bridge.key contents.                                   |
 
 ## 8. Adapting the script
 
@@ -370,11 +368,11 @@ If you want to test a different scenario, the levers are at the
 top of `codex-real-e2e.mjs`:
 
 ```js
-const TARGET_URL  = 'https://chatgpt.com/c/<your-thread>';
-const VAULT       = '/Users/yingfei/Documents/Sidetrack-vault';
+const TARGET_URL = 'https://chatgpt.com/c/<your-thread>';
+const VAULT = '/Users/yingfei/Documents/Sidetrack-vault';
 const COMPANION_PORT = 17373;
-const BRIDGE_KEY  = '<paste from bridge.key file>';
-const MCP_PORT    = 8730 + Math.floor(Math.random() * 100);
+const BRIDGE_KEY = '<paste from bridge.key file>';
+const MCP_PORT = 8730 + Math.floor(Math.random() * 100);
 ```
 
 The MCP tool calls in `[6.*]` are also the canonical sequence a

@@ -50,9 +50,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0;
 
-const isPolicyMode = (
-  value: unknown,
-): value is UrlAttributionInferredPayload['policyMode'] =>
+const isPolicyMode = (value: unknown): value is UrlAttributionInferredPayload['policyMode'] =>
   value === 'conservative' || value === 'balanced' || value === 'aggressive';
 
 const isDominantSource = (
@@ -64,10 +62,7 @@ const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
 const isIgnoreReason = (value: unknown): value is UrlIgnoredPayload['reason'] =>
-  value === undefined ||
-  value === 'noise' ||
-  value === 'duplicate' ||
-  value === 'private';
+  value === undefined || value === 'noise' || value === 'duplicate' || value === 'private';
 
 export const isUrlIgnoredPayload = (value: unknown): value is UrlIgnoredPayload => {
   if (!isRecord(value)) return false;

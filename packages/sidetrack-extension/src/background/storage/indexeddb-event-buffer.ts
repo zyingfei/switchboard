@@ -97,7 +97,9 @@ export class IndexedDbEventBuffer implements EventBuffer {
     return this.driver.peek(limit);
   }
 
-  async deleteMany(keys: readonly Pick<BufferedEvent, 'streamName' | 'lamport' | 'replicaId'>[]): Promise<number> {
+  async deleteMany(
+    keys: readonly Pick<BufferedEvent, 'streamName' | 'lamport' | 'replicaId'>[],
+  ): Promise<number> {
     let deleted = 0;
     for (const key of keys) if (await this.driver.deleteByKey(keyOf(key))) deleted += 1;
     return deleted;

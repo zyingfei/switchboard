@@ -34,13 +34,9 @@ const NOTE_BY_SCOPE: Record<ResultScope, string | undefined> = {
     'Older history is in exported archive packs that the companion has not imported yet.',
 };
 
-export const noteForScope = (scope: ResultScope): string | undefined =>
-  NOTE_BY_SCOPE[scope];
+export const noteForScope = (scope: ResultScope): string | undefined => NOTE_BY_SCOPE[scope];
 
-export const buildScopedResult = <T>(
-  scope: ResultScope,
-  items: readonly T[],
-): ScopedResult<T> => {
+export const buildScopedResult = <T>(scope: ResultScope, items: readonly T[]): ScopedResult<T> => {
   const note = noteForScope(scope);
   return note === undefined ? { scope, items } : { scope, items, note };
 };

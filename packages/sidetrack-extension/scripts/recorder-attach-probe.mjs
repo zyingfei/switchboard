@@ -3,7 +3,7 @@
 // Non-destructive: never closes existing tabs, only opens new ones.
 //
 // Requires the recorder to have been launched with:
-//   SIDETRACK_E2E_CDP_DEBUG_PORT=9223 npm --prefix packages/sidetrack-extension run e2e:recorder
+//   SIDETRACK_E2E_CDP_DEBUG_PORT=9223 bun run --cwd packages/sidetrack-extension e2e:recorder
 
 import { chromium } from 'playwright';
 
@@ -26,7 +26,10 @@ const main = async () => {
 
   // Find the existing side panel page (don't open a duplicate).
   const allPages = ctx.pages();
-  log('open pages', allPages.map((p) => p.url().slice(0, 100)));
+  log(
+    'open pages',
+    allPages.map((p) => p.url().slice(0, 100)),
+  );
 
   let panel = allPages.find((p) => p.url().includes(`${extensionId}/sidepanel.html`));
   if (panel === undefined) {
@@ -44,16 +47,12 @@ const main = async () => {
     const diag = await chrome.runtime
       .sendMessage({ type: 'sidetrack.dev.diag' })
       .catch((e) => ({ error: e?.message ?? String(e) }));
-    const session = await chrome.storage.session
-      .get('sidetrack.engagement.diag')
-      .catch(() => ({}));
+    const session = await chrome.storage.session.get('sidetrack.engagement.diag').catch(() => ({}));
     const regs = await chrome.scripting
       .getRegisteredContentScripts({ ids: ['sidetrack-engagement'] })
       .catch(() => []);
     const perm = await new Promise((r) => {
-      chrome.permissions.contains({ origins: ['https://*/*', 'http://*/*'] }, (g) =>
-        r(Boolean(g)),
-      );
+      chrome.permissions.contains({ origins: ['https://*/*', 'http://*/*'] }, (g) => r(Boolean(g)));
     });
     const httpTabs = await chrome.tabs.query({ url: ['https://*/*', 'http://*/*'] });
     return {
@@ -76,7 +75,9 @@ const main = async () => {
   // Open HN in a NEW tab so we don't disturb the user's open tabs.
   const hn = await ctx.newPage();
   log('opening HN slowly...', 'navigating');
-  await hn.goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await hn
+    .goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' })
+    .catch(() => undefined);
   log('HN loaded', hn.url());
 
   // Slow browse — keep focused so the engagement aggregator can accumulate
@@ -96,9 +97,7 @@ const main = async () => {
     const diag = await chrome.runtime
       .sendMessage({ type: 'sidetrack.dev.diag' })
       .catch((e) => ({ error: e?.message ?? String(e) }));
-    const session = await chrome.storage.session
-      .get('sidetrack.engagement.diag')
-      .catch(() => ({}));
+    const session = await chrome.storage.session.get('sidetrack.engagement.diag').catch(() => ({}));
     return {
       engagementJournal: diag?.diagnostics?.engagement ?? null,
       engagementJournalFromSession: session['sidetrack.engagement.diag'] ?? null,

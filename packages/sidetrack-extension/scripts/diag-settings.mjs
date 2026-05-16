@@ -29,7 +29,8 @@ const out = await sw.evaluate(async () => {
     companion: desc(settings?.companion),
     portType: typeof settings?.companion?.port,
     bridgeKeyType: typeof settings?.companion?.bridgeKey,
-    bridgeKeyLen: typeof settings?.companion?.bridgeKey === 'string' ? settings.companion.bridgeKey.length : 0,
+    bridgeKeyLen:
+      typeof settings?.companion?.bridgeKey === 'string' ? settings.companion.bridgeKey.length : 0,
   };
 });
 console.log(JSON.stringify(out, null, 2));

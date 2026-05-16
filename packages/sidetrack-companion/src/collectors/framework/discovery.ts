@@ -227,8 +227,7 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
 
           // Detect a meaningful state change: status or rejection reason changed.
           const changed =
-            previous_entry === undefined ||
-            previous_entry.status !== result.entry.status ||
+            previous_entry?.status !== result.entry.status ||
             previous_entry.rejectedReason !== result.entry.rejectedReason;
 
           registry.set(result.id, result.entry);
@@ -240,8 +239,7 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
           // appearance OR transition from load-failed → loaded. The
           // runtime starts a tail loop in response.
           const becameLoaded =
-            result.entry.status === 'loaded' &&
-            (previous_entry === undefined || previous_entry.status !== 'loaded');
+            result.entry.status === 'loaded' && previous_entry?.status !== 'loaded';
           if (becameLoaded) {
             await fireOnLoaded(result.entry);
           }

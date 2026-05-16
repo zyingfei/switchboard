@@ -253,8 +253,7 @@ export interface EngagementClassRevision {
   readonly producedAt: number;
 }
 
-const sha256Hex = (value: string): string =>
-  createHash('sha256').update(value).digest('hex');
+const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex');
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -292,10 +291,7 @@ export const engagementRuleTableHash = (
 export const engagementRevisionIdForRuleTable = (
   ruleTable: readonly EngagementRuleDefinition[] = DEFAULT_ENGAGEMENT_RULE_TABLE,
 ): string =>
-  sha256Hex(`${ENGAGEMENT_CLASS_PRODUCER_KEY}${engagementRuleTableHash(ruleTable)}`).slice(
-    0,
-    16,
-  );
+  sha256Hex(`${ENGAGEMENT_CLASS_PRODUCER_KEY}${engagementRuleTableHash(ruleTable)}`).slice(0, 16);
 
 const isParkedBackground = (
   input: EngagementClassifierInput,

@@ -66,11 +66,7 @@ const REDUCER_TS_BLOCK =
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const url = `http://127.0.0.1:${String(comp.port)}${path}`;
   const response = await fetch(url, {
     method: 'POST',
@@ -351,9 +347,7 @@ const seedAllFlows = async (comp: TestCompanion): Promise<SeedResult> => {
     provider: 'chatgpt',
     title: 'ChatGPT — review CVE repro',
     capturedAt: '2026-05-07T09:30:00.000Z',
-    turns: [
-      { role: 'user', text: `please audit this:\n${PYTHON_REPRO_BLOCK}\nis it sound?` },
-    ],
+    turns: [{ role: 'user', text: `please audit this:\n${PYTHON_REPRO_BLOCK}\nis it sound?` }],
   });
   await seedCapture(comp, {
     threadId: T_PG_CLAUDE,
@@ -493,16 +487,41 @@ const seedAllFlows = async (comp: TestCompanion): Promise<SeedResult> => {
   // through the live HTTP path. Ambient cross-flow URLs left
   // untagged so the per-anchor separation assertions still hold.
   await seedTimelineVisits(comp, [
-    { url: URL_HN_COPYFAIL, observedAt: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros', workstreamId: wsSecurityId },
+    {
+      url: URL_HN_COPYFAIL,
+      observedAt: '2026-05-07T09:00:00.000Z',
+      title: 'HN: copy-fail breaks distros',
+      workstreamId: wsSecurityId,
+    },
     { url: URL_GH_PR, observedAt: '2026-05-07T09:05:00.000Z', title: 'sidetrack/sidetrack PR #98' },
-    { url: URL_XINT_BLOG, observedAt: '2026-05-07T09:05:30.000Z', title: 'copy-fail across linux distros' },
-    { url: URL_GOOGLE_CVE, observedAt: '2026-05-07T09:08:00.000Z', title: 'Google: linux copy_file_range CVE' },
-    { url: URL_KERNEL_DOC, observedAt: '2026-05-07T09:10:00.000Z', title: 'man copy_file_range(2)' },
+    {
+      url: URL_XINT_BLOG,
+      observedAt: '2026-05-07T09:05:30.000Z',
+      title: 'copy-fail across linux distros',
+    },
+    {
+      url: URL_GOOGLE_CVE,
+      observedAt: '2026-05-07T09:08:00.000Z',
+      title: 'Google: linux copy_file_range CVE',
+    },
+    {
+      url: URL_KERNEL_DOC,
+      observedAt: '2026-05-07T09:10:00.000Z',
+      title: 'man copy_file_range(2)',
+    },
     { url: URL_GH_BRAINSTORM, observedAt: '2026-05-07T09:11:00.000Z', title: 'BRAINSTORM.md' },
-    { url: URL_HN_PGMERGE, observedAt: '2026-05-07T09:12:00.000Z', title: 'HN: postgres MERGE pitfalls' },
+    {
+      url: URL_HN_PGMERGE,
+      observedAt: '2026-05-07T09:12:00.000Z',
+      title: 'HN: postgres MERGE pitfalls',
+    },
     { url: URL_NVD_CVE, observedAt: '2026-05-07T09:14:00.000Z', title: 'NVD CVE-2024-12345' },
     { url: URL_PG_BLOG, observedAt: '2026-05-07T09:15:00.000Z', title: 'MERGE pitfalls (blog)' },
-    { url: URL_HN_PGMERGE, observedAt: '2026-05-07T09:16:00.000Z', title: 'HN: postgres MERGE pitfalls' },
+    {
+      url: URL_HN_PGMERGE,
+      observedAt: '2026-05-07T09:16:00.000Z',
+      title: 'HN: postgres MERGE pitfalls',
+    },
     { url: URL_CLAUDE_CVE, observedAt: '2026-05-07T09:18:00.000Z', title: 'Claude — CVE chat' },
     { url: URL_CLAUDE_SB, observedAt: '2026-05-07T09:18:30.000Z', title: 'Claude — sb chat' },
     { url: URL_PG_DOCS, observedAt: '2026-05-07T09:20:00.000Z', title: 'PostgreSQL: MERGE' },

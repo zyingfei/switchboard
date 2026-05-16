@@ -108,9 +108,7 @@ export const quiesceUntilConverged = async (
   }
   throw new Error(
     `quiesceUntilConverged: replicas did not converge within ${String(timeoutMs)}ms.\n` +
-      lastSnapshots
-        .map((s, i) => `  replica[${String(i)}].dots=${s.slice(0, 200)}`)
-        .join('\n'),
+      lastSnapshots.map((s, i) => `  replica[${String(i)}].dots=${s.slice(0, 200)}`).join('\n'),
   );
 };
 
@@ -205,7 +203,9 @@ export const assertRecallQueryExcludesTombstoned = async (
       `recall query against replica on :${String(replica.port)} failed: ${String(response.status)}`,
     );
   }
-  const body = (await response.json()) as { readonly data?: readonly { readonly threadId?: string }[] };
+  const body = (await response.json()) as {
+    readonly data?: readonly { readonly threadId?: string }[];
+  };
   const matchedTombstoned = (body.data ?? []).filter(
     (row) => row.threadId !== undefined && tombstonedThreadIds.includes(row.threadId),
   );

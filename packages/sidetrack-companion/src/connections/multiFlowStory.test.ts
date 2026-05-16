@@ -153,11 +153,7 @@ describe('connections — multi-flow user-story integration', () => {
         scope: 'companion-extended',
         snapshot: sub,
       };
-      writeFileSync(
-        resolve(dumpDir, a.file),
-        `${JSON.stringify(envelope, null, 2)}\n`,
-        'utf8',
-      );
+      writeFileSync(resolve(dumpDir, a.file), `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
     }
     expect(true).toBe(true);
   });

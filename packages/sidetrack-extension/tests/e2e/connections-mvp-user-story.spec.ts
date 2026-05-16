@@ -74,11 +74,7 @@ const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   return await res.json();
 };
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     method: 'POST',
     headers: {
@@ -121,9 +117,15 @@ const waitForNodes = async (
   }
   if (last !== null) {
     // eslint-disable-next-line no-console
-    console.error('[mvp-user-story] FINAL nodes:', JSON.stringify(last.data.snapshot.nodes.map((n) => n.id)));
+    console.error(
+      '[mvp-user-story] FINAL nodes:',
+      JSON.stringify(last.data.snapshot.nodes.map((n) => n.id)),
+    );
     // eslint-disable-next-line no-console
-    console.error('[mvp-user-story] FINAL edge kinds:', JSON.stringify([...new Set(last.data.snapshot.edges.map((e) => e.kind))]));
+    console.error(
+      '[mvp-user-story] FINAL edge kinds:',
+      JSON.stringify([...new Set(last.data.snapshot.edges.map((e) => e.kind))]),
+    );
   }
   throw new Error(`waitForNodes timed out after ${String(timeoutMs)}ms`);
 };
@@ -157,18 +159,17 @@ test.describe('Stage 1 MVP user story', () => {
     await runtime.context.route(/^https?:\/\//u, async (route) => {
       const url = route.request().url();
       if (ALL_URLS.some((target) => url.startsWith(target.split('?')[0]))) {
-        const title =
-          url.includes('postgres/merge-pitfalls')
-            ? 'Postgres MERGE Pitfalls — A 10-minute guide'
-            : url.includes('postgres/upsert-semantics')
-              ? 'Postgres UPSERT semantics: ON CONFLICT in depth'
-              : url.includes('postgres/merge-vs-upsert')
-                ? 'Postgres MERGE vs UPSERT — Which to use?'
-                : url.includes('news.ycombinator.com')
-                  ? 'HN: Postgres MERGE statement landed in 15'
-                  : url.includes('copy.fail')
-                    ? 'copy.fail home page'
-                    : 'YouTube — Postgres MERGE deep dive';
+        const title = url.includes('postgres/merge-pitfalls')
+          ? 'Postgres MERGE Pitfalls — A 10-minute guide'
+          : url.includes('postgres/upsert-semantics')
+            ? 'Postgres UPSERT semantics: ON CONFLICT in depth'
+            : url.includes('postgres/merge-vs-upsert')
+              ? 'Postgres MERGE vs UPSERT — Which to use?'
+              : url.includes('news.ycombinator.com')
+                ? 'HN: Postgres MERGE statement landed in 15'
+                : url.includes('copy.fail')
+                  ? 'copy.fail home page'
+                  : 'YouTube — Postgres MERGE deep dive';
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
@@ -237,7 +238,9 @@ test.describe('Stage 1 MVP user story', () => {
     // HN article: foreground, lots of focus + scroll → engaged_read.
     const hnTab = await runtime.context.newPage();
     await hnTab.goto(URL_HN, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
-    await hnTab.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => undefined);
+    await hnTab
+      .evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+      .catch(() => undefined);
     await new Promise((r) => setTimeout(r, 1000));
 
     // Postgres similar pages: foreground, scrolled → topic-formation candidates.

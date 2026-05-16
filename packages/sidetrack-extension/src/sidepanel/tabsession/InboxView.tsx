@@ -21,10 +21,7 @@ export interface InboxViewProps {
   readonly onAttribute: (tabSessionId: string, workstreamId: string | null) => void;
   readonly onOpenTab?: (record: TabSessionRecord) => void;
   readonly onPickAnother?: (tabSessionId: string) => void;
-  readonly onIgnore?: (
-    tabSessionId: string,
-    reason: 'noise' | 'duplicate' | 'private',
-  ) => void;
+  readonly onIgnore?: (tabSessionId: string, reason: 'noise' | 'duplicate' | 'private') => void;
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
   readonly onOpenInConnections?: (canonicalUrl: string) => void;
@@ -90,7 +87,8 @@ export function InboxView({
   }, [initialQuery, onQueryConsumed]);
   const trimmed = query.trim();
   const filtered = useMemo(
-    () => (trimmed.length === 0 ? inbox.items : inbox.items.filter((r) => matchesQuery(r, trimmed))),
+    () =>
+      trimmed.length === 0 ? inbox.items : inbox.items.filter((r) => matchesQuery(r, trimmed)),
     [inbox.items, trimmed],
   );
   const slice = sliceInboxForPanel(filtered, inbox.total);
@@ -137,9 +135,7 @@ export function InboxView({
       {loading ? <div className="thread-empty subtle">Loading tab sessions…</div> : null}
       {!loading && slice.visible.length === 0 ? (
         <div className="thread-empty subtle">
-          {trimmed.length === 0
-            ? 'No unattributed tab sessions.'
-            : `No matches for "${trimmed}".`}
+          {trimmed.length === 0 ? 'No unattributed tab sessions.' : `No matches for "${trimmed}".`}
         </div>
       ) : null}
       <div className="tab-session-list">

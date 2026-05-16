@@ -9,10 +9,8 @@ import { describe, expect, it } from 'vitest';
 import { sidetrackToolNames } from '../capabilities.js';
 
 const packageRoot = fileURLToPath(new URL('../..', import.meta.url));
-const tsxImportPath = fileURLToPath(
-  new URL('../../node_modules/tsx/dist/esm/index.mjs', import.meta.url),
-);
 const serverCliPath = fileURLToPath(new URL('../cli.ts', import.meta.url));
+const bunCommand = process.env['BUN_EXECUTABLE'] ?? 'bun';
 
 const createVaultFixture = async (): Promise<string> => {
   const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-stdio-'));
@@ -69,8 +67,8 @@ describe('sidetrack MCP stdio server', () => {
   it('serves the M1 read-only tools over stdio', async () => {
     const vaultPath = await createVaultFixture();
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ['--import', tsxImportPath, serverCliPath, '--vault', vaultPath],
+      command: bunCommand,
+      args: [serverCliPath, '--vault', vaultPath],
       cwd: packageRoot,
       stderr: 'pipe',
     });

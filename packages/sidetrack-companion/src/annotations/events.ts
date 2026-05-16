@@ -70,9 +70,7 @@ const isAnchor = (value: unknown): value is SerializedAnchor => {
   );
 };
 
-export const isAnnotationCreatedPayload = (
-  value: unknown,
-): value is AnnotationCreatedPayload =>
+export const isAnnotationCreatedPayload = (value: unknown): value is AnnotationCreatedPayload =>
   isRecord(value) &&
   typeof value['bac_id'] === 'string' &&
   typeof value['url'] === 'string' &&
@@ -80,12 +78,11 @@ export const isAnnotationCreatedPayload = (
   isAnchor(value['anchor']) &&
   hasValidPayloadExtensionFields(value);
 
-export const isAnnotationNoteSetPayload = (
-  value: unknown,
-): value is AnnotationNoteSetPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['note'] === 'string' && hasValidPayloadExtensionFields(value);
+export const isAnnotationNoteSetPayload = (value: unknown): value is AnnotationNoteSetPayload =>
+  isRecord(value) &&
+  typeof value['bac_id'] === 'string' &&
+  typeof value['note'] === 'string' &&
+  hasValidPayloadExtensionFields(value);
 
-export const isAnnotationDeletedPayload = (
-  value: unknown,
-): value is AnnotationDeletedPayload =>
+export const isAnnotationDeletedPayload = (value: unknown): value is AnnotationDeletedPayload =>
   isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);

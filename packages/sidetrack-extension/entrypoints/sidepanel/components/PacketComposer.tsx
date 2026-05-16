@@ -325,10 +325,7 @@ ${ctx}
 // "offline fallback" snapshot, but if the companion is unreachable
 // the agent can't act on the thread either way — the fallback was
 // reassuring noise, not useful context.
-const buildCodingAgentPacket = (
-  title: string,
-  scope: PacketComposerScope,
-): string =>
+const buildCodingAgentPacket = (title: string, scope: PacketComposerScope): string =>
   // Even leaner than the previous lean version: drops the 274-char
   // explanatory paragraph in favor of a one-line breadcrumb. Modern
   // coding agents (Codex, Claude Code, Cursor) auto-discover MCP
@@ -662,7 +659,9 @@ export function PacketComposer({
             {hasReviewDraft ? (
               <button
                 type="button"
-                className={'btn-link mono review-include-toggle' + (includeReviewDraft ? ' on' : '')}
+                className={
+                  'btn-link mono review-include-toggle' + (includeReviewDraft ? ' on' : '')
+                }
                 aria-pressed={includeReviewDraft}
                 title={
                   includeReviewDraft

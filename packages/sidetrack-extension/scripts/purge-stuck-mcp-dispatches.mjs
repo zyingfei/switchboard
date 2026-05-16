@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Walk every .jsonl in <vault>/_BAC/dispatches and rewrite each file
 // with the auto-approved MCP records removed. Backs up the original
 // to <name>.bak.<timestamp> alongside the rewrite. Defaults to a
@@ -64,7 +64,9 @@ for (const name of files) {
   totalKept += kept.length;
   totalRemoved += removed.length;
   if (removed.length > 0) {
-    console.log(`${name}: ${removed.length} auto-approved MCP record(s) flagged, ${kept.length} kept`);
+    console.log(
+      `${name}: ${removed.length} auto-approved MCP record(s) flagged, ${kept.length} kept`,
+    );
     for (const r of removed.slice(0, 3)) {
       removedSamples.push({
         bac_id: r.bac_id,
@@ -87,9 +89,13 @@ console.log(`\nSummary: ${totalKept} record(s) kept, ${totalRemoved} flagged for
 if (removedSamples.length > 0) {
   console.log('\nFlagged (first few):');
   for (const s of removedSamples) {
-    console.log(`  - ${s.bac_id} | ${s.target?.provider}/${s.target?.mode} | ${s.createdAt} | ${(s.title ?? '').slice(0, 60)}`);
+    console.log(
+      `  - ${s.bac_id} | ${s.target?.provider}/${s.target?.mode} | ${s.createdAt} | ${(s.title ?? '').slice(0, 60)}`,
+    );
   }
 }
 if (!apply && totalRemoved > 0) {
-  console.log('\nRe-run with --apply to actually rewrite the files. Backups (.bak.<timestamp>) are kept alongside.');
+  console.log(
+    '\nRe-run with --apply to actually rewrite the files. Backups (.bak.<timestamp>) are kept alongside.',
+  );
 }

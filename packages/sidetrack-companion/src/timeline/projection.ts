@@ -8,10 +8,7 @@ import type {
   TimelineProvider,
   TimelineTransition,
 } from './events.js';
-import {
-  BROWSER_TIMELINE_OBSERVED,
-  isBrowserTimelineObservedPayload,
-} from './events.js';
+import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from './events.js';
 
 // Sync Contract v1 — timeline projection.
 //
@@ -62,10 +59,8 @@ export interface TimelineDayProjection {
   readonly entryCount: number;
 }
 
-const TRANSITIONS_INCREMENTING_VISIT_COUNT: ReadonlySet<TimelineTransition> = new Set<TimelineTransition>([
-  'activated',
-  'updated',
-]);
+const TRANSITIONS_INCREMENTING_VISIT_COUNT: ReadonlySet<TimelineTransition> =
+  new Set<TimelineTransition>(['activated', 'updated']);
 
 // Day bucket for a payload. UTC; format YYYY-MM-DD. Anchors the
 // projection file path AND the aggregateId for the registry entry.
@@ -106,22 +101,25 @@ export const entryIdFor = (input: { canonicalUrl?: string; url: string }): strin
 export const reduceTimelineEvents = (
   events: readonly BrowserTimelineObservedPayload[],
 ): readonly TimelineEntry[] => {
-  const byEntry = new Map<string, {
-    firstSeenAt: string;
-    lastSeenAt: string;
-    url: string;
-    canonicalUrl?: string;
-    title?: string;
-    provider?: TimelineProvider;
-    visitCount: number;
-    titleObservedAt?: string;
-    providerObservedAt?: string;
-    tabSessionId?: string;
-    openerTabSessionId?: string;
-    tabSessionObservedAt?: string;
-    workstreamId?: string;
-    workstreamObservedAt?: string;
-  }>();
+  const byEntry = new Map<
+    string,
+    {
+      firstSeenAt: string;
+      lastSeenAt: string;
+      url: string;
+      canonicalUrl?: string;
+      title?: string;
+      provider?: TimelineProvider;
+      visitCount: number;
+      titleObservedAt?: string;
+      providerObservedAt?: string;
+      tabSessionId?: string;
+      openerTabSessionId?: string;
+      tabSessionObservedAt?: string;
+      workstreamId?: string;
+      workstreamObservedAt?: string;
+    }
+  >();
   for (const event of events) {
     const id = entryIdFor(event);
     const incrementsVisit = TRANSITIONS_INCREMENTING_VISIT_COUNT.has(event.transition);
@@ -164,7 +162,10 @@ export const reduceTimelineEvents = (
       }
     }
     if (event.provider !== undefined) {
-      if (existing.providerObservedAt === undefined || event.observedAt >= existing.providerObservedAt) {
+      if (
+        existing.providerObservedAt === undefined ||
+        event.observedAt >= existing.providerObservedAt
+      ) {
         existing.provider = event.provider;
         existing.providerObservedAt = event.observedAt;
       }

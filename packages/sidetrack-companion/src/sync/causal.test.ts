@@ -41,11 +41,7 @@ describe('causal vector helpers', () => {
   });
 
   it('vectorFromEvents collects highest seq per replica', () => {
-    const events = [
-      accepted('A', 1),
-      accepted('A', 2),
-      accepted('B', 7),
-    ];
+    const events = [accepted('A', 1), accepted('A', 2), accepted('B', 7)];
     expect(vectorFromEvents(events)).toEqual({ A: 2, B: 7 });
   });
 });

@@ -1,15 +1,21 @@
 import { chromium } from 'playwright';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const ctx = browser.contexts()[0];
-const sp = ctx.pages().find(p => p.url().includes('sidepanel.html'));
-const sw = ctx.serviceWorkers().find(w => w.url().includes('background.js'));
-if (!sp || !sw) { console.log('missing pages'); process.exit(1); }
+const sp = ctx.pages().find((p) => p.url().includes('sidepanel.html'));
+const sw = ctx.serviceWorkers().find((w) => w.url().includes('background.js'));
+if (!sp || !sw) {
+  console.log('missing pages');
+  process.exit(1);
+}
 
 // 1. Check what bundle the side panel actually loaded.
 const loadedScripts = await sp.evaluate(() => {
-  return Array.from(document.scripts).map(s => s.src);
+  return Array.from(document.scripts).map((s) => s.src);
 });
-console.log('side panel scripts:', loadedScripts.filter(s => s.includes('sidepanel-')).map(s => s.split('/').pop()));
+console.log(
+  'side panel scripts:',
+  loadedScripts.filter((s) => s.includes('sidepanel-')).map((s) => s.split('/').pop()),
+);
 
 // 2. Check that the page loaded the same chunk hash that's on disk.
 const html = await sp.content();
@@ -53,12 +59,15 @@ await sp.evaluate(() => {
 
 // 5. Send the focus message.
 const t0 = Date.now();
-await sw.evaluate(async ({ url }) => {
-  await chrome.runtime.sendMessage({ type: 'sidetrack.sidepanel.focusThread', threadUrl: url });
-}, { url: target.threadUrl });
+await sw.evaluate(
+  async ({ url }) => {
+    await chrome.runtime.sendMessage({ type: 'sidetrack.sidepanel.focusThread', threadUrl: url });
+  },
+  { url: target.threadUrl },
+);
 
 // 6. Wait + collect.
-await new Promise(r => setTimeout(r, 800));
+await new Promise((r) => setTimeout(r, 800));
 const result = await sp.evaluate(() => ({
   msgs: window.__msgs,
   hits: window.__hits,

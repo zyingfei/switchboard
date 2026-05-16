@@ -68,9 +68,7 @@ export const setWorkerScriptOverride = (path: string | undefined): void => {
  * The seq token round-trips so the caller can ignore stale responses
  * if a newer drain finished first.
  */
-export const runReconcileInWorker = (
-  job: ReconcileWorkerJob,
-): Promise<ReconcileWorkerResult> =>
+export const runReconcileInWorker = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> =>
   new Promise<ReconcileWorkerResult>((resolve) => {
     const worker = new Worker(workerScriptPath, {
       workerData: job,

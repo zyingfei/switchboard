@@ -95,7 +95,12 @@ describe('connections — cross-replica unification', () => {
     const connectionsStore = createConnectionsStore(vaultRoot);
     const runner = createSyncContractRunner();
     runner.register(
-      createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store: connectionsStore }),
+      createConnectionsMaterializer({
+        vaultRoot,
+        eventLog,
+        timelineStore,
+        store: connectionsStore,
+      }),
     );
     await runner.catchUpAll(eventLog);
     await runner.awaitIdle();

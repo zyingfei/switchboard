@@ -55,7 +55,15 @@ const SENSITIVE_PARAM_NAMES: ReadonlySet<string> = new Set<string>([
   'oauth2_token',
 ]);
 
-const SENSITIVE_SUFFIXES: readonly string[] = ['_token', '_key', '_secret', '_password', '_auth', '_session', '_code'];
+const SENSITIVE_SUFFIXES: readonly string[] = [
+  '_token',
+  '_key',
+  '_secret',
+  '_password',
+  '_auth',
+  '_session',
+  '_code',
+];
 
 const isSensitiveParam = (name: string): boolean => {
   const lower = name.toLowerCase();
@@ -128,12 +136,7 @@ const MARKETING_PARAM_NAMES: ReadonlySet<string> = new Set<string>([
 // tracking — every campaign produces hsa_acc/hsa_cam/hsa_grp/hsa_ad
 // (etc). Prefix-strip is safer than enumerating each leaf since the
 // network can introduce new sub-params at any time.
-const MARKETING_PARAM_PREFIXES: readonly string[] = [
-  'utm_',
-  'hsa_',
-  'gad_',
-  'mc_',
-];
+const MARKETING_PARAM_PREFIXES: readonly string[] = ['utm_', 'hsa_', 'gad_', 'mc_'];
 
 const STRIP_MARKETING_PARAMS_ENV = 'SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS';
 

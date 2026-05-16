@@ -41,9 +41,7 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
     (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
-export const isPrivacyGateFlippedPayload = (
-  value: unknown,
-): value is PrivacyGateFlippedPayload =>
+export const isPrivacyGateFlippedPayload = (value: unknown): value is PrivacyGateFlippedPayload =>
   isRecord(value) &&
   typeof value['gate'] === 'string' &&
   value['gate'].length > 0 &&

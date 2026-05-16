@@ -9,10 +9,7 @@ import type {
 import type { UrlAttribution, UrlProjection, UrlVisitRecord } from '../urls/projection.js';
 
 import { buildTopicRevision } from './topicClusterer.js';
-import {
-  deriveUserAssertedRelations,
-  knownCanonicalUrlsFor,
-} from './userAssertedRelations.js';
+import { deriveUserAssertedRelations, knownCanonicalUrlsFor } from './userAssertedRelations.js';
 import type { TopicVisit } from './topicClusterer.js';
 
 const TIMESTAMP = '2026-05-10T10:00:00.000Z';
@@ -57,9 +54,7 @@ const urlProjection = (records: readonly UrlVisitRecord[]): UrlProjection => ({
   byCanonicalUrl: new Map(records.map((r) => [r.canonicalUrl, r])),
 });
 
-const tabSessionUserAssertion = (
-  workstreamId: string | null,
-): TabSessionAttribution => ({
+const tabSessionUserAssertion = (workstreamId: string | null): TabSessionAttribution => ({
   workstreamId,
   source: 'user_asserted',
   observedAt: TIMESTAMP,
@@ -79,9 +74,7 @@ const tabSessionRecord = (
   ...overrides,
 });
 
-const tabSessionProjection = (
-  records: readonly TabSessionRecord[],
-): TabSessionProjection => ({
+const tabSessionProjection = (records: readonly TabSessionRecord[]): TabSessionProjection => ({
   schemaVersion: 1,
   bySessionId: new Map(records.map((r) => [r.tabSessionId, r])),
   openSessionsByTabId: new Map(),
@@ -154,10 +147,7 @@ describe('deriveUserAssertedRelations', () => {
     const relations = deriveUserAssertedRelations({
       urlProjection: projection,
       tabSessionProjection: createEmptyTabSessionProjection(),
-      knownCanonicalUrls: new Set([
-        'https://example.test/a',
-        'https://example.test/b',
-      ]),
+      knownCanonicalUrls: new Set(['https://example.test/a', 'https://example.test/b']),
     });
     // Only one user-asserted URL in ws-1 → no pairs.
     expect(relations).toEqual([]);
@@ -228,10 +218,7 @@ describe('deriveUserAssertedRelations', () => {
     const relations = deriveUserAssertedRelations({
       urlProjection: projection,
       tabSessionProjection: tabSessions,
-      knownCanonicalUrls: new Set([
-        'https://example.test/x',
-        'https://example.test/y',
-      ]),
+      knownCanonicalUrls: new Set(['https://example.test/x', 'https://example.test/y']),
     });
     expect(relations).toEqual([]);
   });

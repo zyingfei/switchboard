@@ -10,11 +10,11 @@ export interface TestTickManifestOpts {
   readonly manifestSchema?: number; // default 1
   readonly requiresCompanion?: string; // default '>=1.0.0 <2.0.0'
   readonly requiresVault?: number; // default 1 (integer per manifest schema)
-  readonly emits?: ReadonlyArray<{
+  readonly emits?: readonly {
     readonly event_type: string;
     readonly payload_version: number;
     readonly stability?: 'alpha' | 'beta' | 'stable' | 'deprecated';
-  }>;
+  }[];
   readonly readsPaths?: readonly string[];
   readonly readsEnv?: readonly string[];
   readonly readsNetwork?: boolean;

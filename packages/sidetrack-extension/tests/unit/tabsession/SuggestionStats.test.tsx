@@ -44,14 +44,18 @@ const suggestion = (overrides: {
 
 describe('SuggestionStats', () => {
   it('renders highly-likely bucket for logit ≥ 1.4', () => {
-    render(<SuggestionStats suggestion={suggestion({ topLogit: 2.0 })} workstreams={workstreams} />);
+    render(
+      <SuggestionStats suggestion={suggestion({ topLogit: 2.0 })} workstreams={workstreams} />,
+    );
     // sigmoid(2.0) ≈ 0.881 → >80% → "Highly likely"
     expect(screen.getByText(/Highly likely/)).toBeInTheDocument();
     expect(screen.getByText(/88%/)).toBeInTheDocument();
   });
 
   it('renders not-likely bucket for negative logit', () => {
-    render(<SuggestionStats suggestion={suggestion({ topLogit: -2.0 })} workstreams={workstreams} />);
+    render(
+      <SuggestionStats suggestion={suggestion({ topLogit: -2.0 })} workstreams={workstreams} />,
+    );
     expect(screen.getByText(/Not likely/)).toBeInTheDocument();
   });
 
@@ -100,9 +104,7 @@ describe('SuggestionStats', () => {
     render(<SuggestionStats workstreams={workstreams} showEmptyPlaceholder />);
     expect(screen.getByText('Checking signals…')).toBeInTheDocument();
     expect(
-      screen.getByText(
-        /Asking the companion for related visits, similarity, and topic membership/,
-      ),
+      screen.getByText(/Asking the companion for related visits, similarity, and topic membership/),
     ).toBeInTheDocument();
   });
 
@@ -113,13 +115,7 @@ describe('SuggestionStats', () => {
       decision: { action: 'inbox', margin: 0 },
       fusedCandidates: [],
     };
-    render(
-      <SuggestionStats
-        suggestion={empty}
-        workstreams={workstreams}
-        showEmptyPlaceholder
-      />,
-    );
+    render(<SuggestionStats suggestion={empty} workstreams={workstreams} showEmptyPlaceholder />);
     expect(screen.getByText('No signal yet')).toBeInTheDocument();
   });
 

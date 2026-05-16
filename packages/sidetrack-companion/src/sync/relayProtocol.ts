@@ -119,29 +119,29 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
   switch (obj['kind']) {
     case 'HELLO':
       return typeof obj['protocol_version'] === 'number'
-        ? ({ kind: 'HELLO', protocol_version: obj['protocol_version'] })
+        ? { kind: 'HELLO', protocol_version: obj['protocol_version'] }
         : null;
     case 'WELCOME':
       return isString(obj['server_version']) &&
         typeof obj['max_event_size'] === 'number' &&
         typeof obj['max_buffer_seconds'] === 'number'
-        ? ({
+        ? {
             kind: 'WELCOME',
             server_version: obj['server_version'],
             max_event_size: obj['max_event_size'],
             max_buffer_seconds: obj['max_buffer_seconds'],
-          })
+          }
         : null;
     case 'SUBSCRIBE':
       return isString(obj['rendezvous_id']) &&
         isString(obj['replica_id']) &&
         isString(obj['sender_public_key'])
-        ? ({
+        ? {
             kind: 'SUBSCRIBE',
             rendezvous_id: obj['rendezvous_id'],
             replica_id: obj['replica_id'],
             sender_public_key: obj['sender_public_key'],
-          })
+          }
         : null;
     case 'PUBLISH':
       return isString(obj['rendezvous_id']) &&
@@ -150,7 +150,7 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
         isString(obj['nonce']) &&
         isString(obj['signature']) &&
         isString(obj['sender_public_key'])
-        ? ({
+        ? {
             kind: 'PUBLISH',
             rendezvous_id: obj['rendezvous_id'],
             replica_id: obj['replica_id'],
@@ -159,7 +159,7 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
             signature: obj['signature'],
             sender_public_key: obj['sender_public_key'],
             ...(typeof obj['ttl_seconds'] === 'number' ? { ttl_seconds: obj['ttl_seconds'] } : {}),
-          })
+          }
         : null;
     case 'EVENT':
       return isString(obj['rendezvous_id']) &&
@@ -169,7 +169,7 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
         isString(obj['signature']) &&
         isString(obj['sender_public_key']) &&
         typeof obj['received_at'] === 'number'
-        ? ({
+        ? {
             kind: 'EVENT',
             rendezvous_id: obj['rendezvous_id'],
             sender_replica_id: obj['sender_replica_id'],
@@ -178,7 +178,7 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
             signature: obj['signature'],
             sender_public_key: obj['sender_public_key'],
             received_at: obj['received_at'],
-          })
+          }
         : null;
     case 'PING':
       return { kind: 'PING' };
@@ -186,7 +186,7 @@ export const decodeFrame = (data: Buffer | string): RelayFrame | null => {
       return { kind: 'PONG' };
     case 'ERROR':
       return isString(obj['code']) && isString(obj['message'])
-        ? ({ kind: 'ERROR', code: obj['code'], message: obj['message'] })
+        ? { kind: 'ERROR', code: obj['code'], message: obj['message'] }
         : null;
   }
 };

@@ -197,7 +197,9 @@ const labelsForOrganizedItem = (
       positive: [],
       negative: [
         ...label(payload.itemId, payload.fromContainer ?? payload.itemId),
-        ...(payload.details?.splitInto ?? []).flatMap((targetId) => label(payload.itemId, targetId)),
+        ...(payload.details?.splitInto ?? []).flatMap((targetId) =>
+          label(payload.itemId, targetId),
+        ),
       ],
     };
   }

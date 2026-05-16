@@ -221,21 +221,17 @@ test.describe('Tier 6.5 — conflict resolution propagates', () => {
       // requires a full local emit + companion projection rebuild
       // + SSE → mirror cycle even on the same machine.
       await expect(
-        pageA
-          .locator('.review-draft-conflict')
-          .filter({
-            has: pageA.locator('.review-draft-conflict-label', { hasText: 'Verdict' }),
-          }),
+        pageA.locator('.review-draft-conflict').filter({
+          has: pageA.locator('.review-draft-conflict-label', { hasText: 'Verdict' }),
+        }),
       ).toHaveCount(0, { timeout: 30_000 });
 
       // B's banner clears via the relay-propagated resolution
       // event. Slightly more wait than A because of round-trip.
       await expect(
-        pageB
-          .locator('.review-draft-conflict')
-          .filter({
-            has: pageB.locator('.review-draft-conflict-label', { hasText: 'Verdict' }),
-          }),
+        pageB.locator('.review-draft-conflict').filter({
+          has: pageB.locator('.review-draft-conflict-label', { hasText: 'Verdict' }),
+        }),
       ).toHaveCount(0, { timeout: 30_000 });
 
       // chrome.storage on both sides must reflect the resolved

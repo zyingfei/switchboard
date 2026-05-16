@@ -107,10 +107,7 @@ export const replayQuarantine = async (opts: ReplayOpts): Promise<ReplayResult> 
     for (const fname of collectorFiles) {
       if (!fname.endsWith('.jsonl')) continue;
       const collectorIdFromFile = fname.replace(/\.jsonl$/u, '');
-      if (
-        opts.collectorIdFilter !== undefined &&
-        collectorIdFromFile !== opts.collectorIdFilter
-      ) {
+      if (opts.collectorIdFilter !== undefined && collectorIdFromFile !== opts.collectorIdFilter) {
         continue;
       }
       const path = join(dateDir, fname);

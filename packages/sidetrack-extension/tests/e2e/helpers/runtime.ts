@@ -61,8 +61,7 @@ const getExtensionServiceWorker = async (
       .serviceWorkers()
       .find(
         (w) =>
-          isSidetrackExtensionWorker(w) &&
-          w.url().includes(`chrome-extension://${extensionId}/`),
+          isSidetrackExtensionWorker(w) && w.url().includes(`chrome-extension://${extensionId}/`),
       );
     if (worker !== undefined) return worker;
     await wakeServiceWorker(context, extensionId).catch(() => undefined);
@@ -201,7 +200,7 @@ const resolveExtensionId = async (cdpUrl: string): Promise<string> => {
   }
   throw new Error(
     `Could not resolve the Sidetrack extension id. Make sure ` +
-      `\`npm run e2e:chrome-debug\` is running, then re-run. ` +
+      `\`bun run e2e:chrome-debug\` is running, then re-run. ` +
       `Looked at .output/cdp-extension-id and ${listUrl}.`,
   );
 };
@@ -365,8 +364,7 @@ const attachOverCdp = async (cdpUrl: string): Promise<ExtensionRuntime> => {
             (c as { runtime?: object }).runtime === undefined
               ? []
               : Object.keys((c as { runtime: object }).runtime).sort();
-          const runtimeIdGetter =
-            (c as { runtime?: { id?: string } }).runtime?.id ?? '<undefined>';
+          const runtimeIdGetter = (c as { runtime?: { id?: string } }).runtime?.id ?? '<undefined>';
           return {
             ok: false,
             url: location.href,
@@ -529,9 +527,10 @@ export const launchExtensionRuntime = async (
   // Under stealth/manual recording, use a stable cache dir for the
   // host-permission-widened extension copy. Same path → same extension
   // ID → chrome.storage (workstreams) survives across runs.
-  const stableExtensionCacheDir = modeConfig.stealthExperiment && options.userDataDir === undefined
-    ? expandHomeDir('~/.sidetrack-stealth-extension')
-    : undefined;
+  const stableExtensionCacheDir =
+    modeConfig.stealthExperiment && options.userDataDir === undefined
+      ? expandHomeDir('~/.sidetrack-stealth-extension')
+      : undefined;
   const extensionForLaunch = await extensionPathWithExtraHostPermissions(
     readExtensionPath(),
     options.extraHostPermissions,
@@ -565,9 +564,7 @@ export const launchExtensionRuntime = async (
     (persistentDir === undefined || persistentDir.length === 0);
   const headless = process.env.SIDETRACK_E2E_HEADLESS !== '0';
   if (modeConfig.stealthExperiment && headless) {
-    throw new Error(
-      'Stealth experiment mode is headed/manual only; set SIDETRACK_E2E_HEADLESS=0.',
-    );
+    throw new Error('Stealth experiment mode is headed/manual only; set SIDETRACK_E2E_HEADLESS=0.');
   }
   // Use Chrome stable when a persistent profile is requested (the
   // login-test-profile script uses Chrome to bypass Google's OAuth
@@ -635,7 +632,7 @@ export const launchExtensionRuntime = async (
       throw new Error(
         `Could not lock the user-data dir at ${userDataDir}. ` +
           `Another Chrome process (likely the one started by ` +
-          `\`npm run e2e:login\`) still holds it. Close that window ` +
+          `\`bun run e2e:login\`) still holds it. Close that window ` +
           `(Cmd-Q on the login window) and re-run.`,
       );
     }

@@ -12,8 +12,7 @@ export const fnv1a32 = (input: string): number => {
   return hash >>> 0;
 };
 
-export const fnv1a32Hex = (input: string): string =>
-  fnv1a32(input).toString(16).padStart(8, '0');
+export const fnv1a32Hex = (input: string): string => fnv1a32(input).toString(16).padStart(8, '0');
 
 export const saltedFnv1a32Hex = (salt: string, input: string): string =>
   fnv1a32Hex(`${salt}|${input}`);

@@ -98,9 +98,7 @@ export interface RecallLifecycle {
   // recall.tombstone.target events into the V3 index. Holding the
   // single-writer mutex for the whole run prevents a concurrent
   // rebuild or appendEntry from corrupting the index file.
-  readonly ingestIncremental: (
-    eventLog: import('../sync/eventLog.js').EventLog,
-  ) => Promise<{
+  readonly ingestIncremental: (eventLog: import('../sync/eventLog.js').EventLog) => Promise<{
     readonly indexedChunks: number;
     readonly tombstonedChunks: number;
     readonly tombstonedEntries: number;
@@ -122,7 +120,10 @@ export interface CreateRecallLifecycleOptions {
   readonly warn?: (message: string) => void;
   readonly activity?: Pick<
     RecallActivityTracker,
-    'recordRebuildStarted' | 'recordRebuildFinished' | 'recordRebuildFailed' | 'recordIncrementalIndex'
+    | 'recordRebuildStarted'
+    | 'recordRebuildFinished'
+    | 'recordRebuildFailed'
+    | 'recordIncrementalIndex'
   >;
   // Drift tolerance: when entryCount < eventTurnCount * (1 - tolerance)
   // the report flips to `stale` and a rebuild is scheduled. 0.05 (5%)
@@ -302,9 +303,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     // user's mental model is "deleted." Drift compares the live
     // entry count against the event log so a tombstoned row doesn't
     // mask missing index coverage.
-    const liveEntryCount = (index?.items ?? []).filter(
-      (item) => item.tombstoned !== true,
-    ).length;
+    const liveEntryCount = (index?.items ?? []).filter((item) => item.tombstoned !== true).length;
     const entryCount = index?.items.length ?? 0;
     const modelId = index?.modelId ?? null;
     const driftPct =
@@ -451,9 +450,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       await appendEntryRaw(indexPath(), entry, currentModelId);
     });
 
-  const gcEntries = (
-    validIds: ReadonlySet<string>,
-  ): Promise<{ readonly removed: number }> =>
+  const gcEntries = (validIds: ReadonlySet<string>): Promise<{ readonly removed: number }> =>
     enqueueWrite(async () => await gcEntriesRaw(indexPath(), validIds));
 
   const ingestIncremental = (
@@ -471,9 +468,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       return await ingest(opts.vaultRoot, eventLog);
     });
 
-  const tombstoneByThread = (
-    threadId: string,
-  ): Promise<{ readonly tombstoned: number }> =>
+  const tombstoneByThread = (threadId: string): Promise<{ readonly tombstoned: number }> =>
     enqueueWrite(async () => {
       // Emit a log event so peers learn about the tombstone via
       // sync. clientEventId is deterministic per (threadId,

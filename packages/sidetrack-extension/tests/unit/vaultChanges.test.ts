@@ -81,9 +81,11 @@ describe('createVaultChangesClient', () => {
       'data: {"type":"created","relPath":"_BAC/review-drafts/abc.json","at":"2026-05-05T12:00:00.000Z"}\n\n',
       'data: {"type":"modified","relPath":"_BAC/threads/xyz.json","at":"2026-05-05T12:00:01.000Z"}\n\n',
     ]);
-    const fetchImpl = vi.fn().mockResolvedValue(
-      new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
-    );
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+      );
     const client = createVaultChangesClient({
       resolveCompanion: () => config,
       fetchImpl: fetchImpl,

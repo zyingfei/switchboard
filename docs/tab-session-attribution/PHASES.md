@@ -50,7 +50,7 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 >    - Unit test `projection.ts` to assert `tabSessionId` threads correctly into `TimelineEntry`.
 >    - Snapshot test `snapshot.ts`: confirm new node/edge kinds appear and `visit_in_workstream` no longer appears for active-pointer-only attribution. (Use a synthetic `EventLog` fixture.)
 >    - Re-run T1 manual replay if available locally; expected behavior is **no `visit_in_workstream` edges in the rebuilt graph** (visits are unattributed). This is the intended regression — Phase 2 restores edges from a different source.
-> 5. **Type & test gates:** `npx tsc --noEmit -p tsconfig.json` clean across both packages; `npm run test` (companion + extension) green.
+> 5. **Type & test gates:** `bun run typecheck` clean across both packages; `bun run test` (companion + extension) green.
 > 6. **Commit message:** `feat(tabsession): phase 1 — tabSessionId on browser.timeline.observed + boundary state machine` with the standard `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` trailer.
 > 7. Push the branch and announce `READY` in the PR description.
 
@@ -59,7 +59,7 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 - All new observed visits carry `tabSessionId` in their payload; no observation includes `workstreamId`.
 - `Connections` snapshot rebuilds emit zero `visit_in_workstream` edges sourced from the active-pointer stamp.
 - `tab-session` node + `visit_in_tab_session` + `tab_session_opener_chain` edges appear in the rebuilt graph.
-- `npx tsc --noEmit` and `npm run test` clean.
+- `bun run typecheck` and `bun run test` clean.
 - T1 replay shows visits as unattributed (the intended regression). Document the diff vs baseline in the PR description.
 - No `tabGroups` permission, no new HTTP routes, no new event types.
 
@@ -156,8 +156,8 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 **Acceptance criteria.**
 
-- `npx tsc --noEmit` clean across both packages.
-- `npm run test` green: companion + extension.
+- `bun run typecheck` clean across both packages.
+- `bun run test` green: companion + extension.
 - Storage concurrency test (a) passes; the underlying fix is one of the three approved patterns above.
 - Multi-session URL test (b) passes and demonstrates per-session attribution isolation.
 - Both items in **one PR**.
@@ -332,7 +332,7 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 >    - `case-5-autoapply-policy-mode.json`: drives T1-D auto-apply at policy=balanced; asserts Class E event landed, AND a parallel run with auto-apply disabled (`SIDETRACK_T1_AUTO_APPLY_DISABLED=1`) emits no Class E events.
 >    - `case-6-active-pointer-not-truth.json`: replay with `activeWorkstreamId` set in storage but no explicit attribution; assert no `visit_in_workstream` edge materializes from the active pointer.
 >
-> 3. **Update the T1 acceptance contract.** Each PR landing on `main` from this point forward must declare which T1 mode(s) it exercises in the PR description. The default replay command (`npx playwright test record-replay-one-browser`) runs T1-A; CI smoke for the other modes is gated by env knobs to keep the default fast.
+> 3. **Update the T1 acceptance contract.** Each PR landing on `main` from this point forward must declare which T1 mode(s) it exercises in the PR description. The default replay command (`bunx --bun --no-install playwright test record-replay-one-browser`) runs T1-A; CI smoke for the other modes is gated by env knobs to keep the default fast.
 >
 > 4. **Update the report layers in `report.md`/`report.json`.** New layer ordering: `page-replay → extension-observation → companion-projection → graph-materialization → product-behavior (T1-C/T1-D) → evaluation-expectations`. Document the layer in `tests/e2e/helpers/recordReplay.ts`.
 >
@@ -345,7 +345,7 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 - T1-C passes the three-card scenario (assigned / unassigned / dismissed) using the real side panel — no synthetic POST helper.
 - T1-D passes resolver dry-run (no writes), tab-group pull-in/pull-out (with pull-out overriding pull-in), and auto-apply at policy=balanced.
 - All six cases (`case-1` through `case-6`) pass; `case-1` specifically demonstrates same-URL multi-session correctness in the real reducer path (not just the unit test from PR #131).
-- `npx tsc --noEmit` clean both packages; vitest green both packages.
+- `bun run typecheck` clean both packages; vitest green both packages.
 - `report.md` shows the new product-behavior layer alongside the existing five.
 
 ---
@@ -520,16 +520,16 @@ These rules apply to every phase. The reviewer's blockers — they exist because
 
 ```bash
 cd packages/sidetrack-companion
-npm run typecheck
-npm run test -- \
+bun run typecheck
+bun run test -- \
   src/tabsession/resolver.test.ts \
   src/tabsession/projection.test.ts \
   src/http/tabsessionRoutes.test.ts \
   src/connections/snapshot.test.ts
 
 cd ../sidetrack-extension
-npm run typecheck
-npm run test -- \
+bun run typecheck
+bun run test -- \
   tests/unit/tabsession/InboxCard.test.tsx \
   tests/unit/tabsession/boundary.test.ts \
   tests/unit/tabgroups/wiring.test.ts \
@@ -538,14 +538,14 @@ npm run test -- \
 SIDETRACK_CAPTURE_LEVEL=html \
 SIDETRACK_REPLAY_STRICT_OFFLINE=1 \
 SIDETRACK_T1_FULL_PRODUCT_E2E=1 \
-npx playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
+bunx --bun --no-install playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
   --headed --timeout 0 --grep manual
 
 # Replay-from-pack must also pass:
 SIDETRACK_REPLAY_PACK=<pack-from-first-run>/pack.json \
 SIDETRACK_REPLAY_STRICT_OFFLINE=1 \
 SIDETRACK_T1_FULL_PRODUCT_E2E=1 \
-npx playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
+bunx --bun --no-install playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
   --headed --timeout 0 --grep manual
 ```
 

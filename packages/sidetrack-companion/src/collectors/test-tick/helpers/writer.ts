@@ -53,10 +53,7 @@ const inboxFilePath = (vaultRoot: string, dateStamp: string): string =>
   join(vaultRoot, '_BAC', 'inbox', TEST_TICK_COLLECTOR_ID, `${dateStamp}.jsonl`);
 
 const tempPathFor = (finalPath: string): string =>
-  join(
-    dirname(finalPath),
-    `.${finalPath.split('/').pop()}.${randomBytes(4).toString('hex')}.tmp`,
-  );
+  join(dirname(finalPath), `.${finalPath.split('/').pop()}.${randomBytes(4).toString('hex')}.tmp`);
 
 const fileExists = async (path: string): Promise<boolean> => {
   try {
@@ -105,13 +102,7 @@ export const writeTickBatch = async (
   const base = opts.emittedAtBase ?? new Date();
   const payloadVersion = opts.payloadVersion ?? 1;
   const dateStamp = opts.dateStamp ?? dateStampUtc(base);
-  const finalPath = join(
-    opts.vaultRoot,
-    '_BAC',
-    'inbox',
-    collectorId,
-    `${dateStamp}.jsonl`,
-  );
+  const finalPath = join(opts.vaultRoot, '_BAC', 'inbox', collectorId, `${dateStamp}.jsonl`);
 
   await mkdir(dirname(finalPath), { recursive: true });
 

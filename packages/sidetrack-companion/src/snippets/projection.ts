@@ -65,7 +65,9 @@ export const hammingDistanceSimhash64 = (left: string, right: string): number =>
 
 const snippetIdFor = (selectionHash: string): string => `snippet_${selectionHash.slice(0, 24)}`;
 
-const sortByTimeThenDot = <T extends { readonly event: AcceptedEvent }>(events: readonly T[]): T[] =>
+const sortByTimeThenDot = <T extends { readonly event: AcceptedEvent }>(
+  events: readonly T[],
+): T[] =>
   [...events].sort((a, b) => {
     if (a.event.acceptedAtMs !== b.event.acceptedAtMs) {
       return a.event.acceptedAtMs - b.event.acceptedAtMs;
@@ -81,9 +83,15 @@ export const projectSnippetLineage = (events: readonly AcceptedEvent[]): Snippet
   const pastes: PasteEvent[] = [];
   for (const event of events) {
     if (event.type === SELECTION_COPIED && isSelectionCopiedPayload(event.payload)) {
-      copies.push({ event: event as AcceptedEvent<SelectionCopiedPayload>, payload: event.payload });
+      copies.push({
+        event: event as AcceptedEvent<SelectionCopiedPayload>,
+        payload: event.payload,
+      });
     } else if (event.type === SELECTION_PASTED && isSelectionPastedPayload(event.payload)) {
-      pastes.push({ event: event as AcceptedEvent<SelectionPastedPayload>, payload: event.payload });
+      pastes.push({
+        event: event as AcceptedEvent<SelectionPastedPayload>,
+        payload: event.payload,
+      });
     }
   }
   const orderedCopies = sortByTimeThenDot(copies);
@@ -100,8 +108,7 @@ export const projectSnippetLineage = (events: readonly AcceptedEvent[]): Snippet
     const fuzzy =
       exact ??
       candidates.find(
-        (copy) =>
-          hammingDistanceSimhash64(copy.payload.simhash64, paste.payload.simhash64) <= 3,
+        (copy) => hammingDistanceSimhash64(copy.payload.simhash64, paste.payload.simhash64) <= 3,
       );
     if (fuzzy === undefined) continue;
     lineages.push({

@@ -115,9 +115,9 @@ describe('rebuildFromEventLog', () => {
     expect(result.indexed).toBe(2);
     // chunkIds carry the source bac_id + turnOrdinal + paragraph
     // index + a content hash so they're deterministic across rebuilds.
-    expect(index?.items.map((item) => item.id).every((id) => id.startsWith('chunk:thread_a:'))).toBe(
-      true,
-    );
+    expect(
+      index?.items.map((item) => item.id).every((id) => id.startsWith('chunk:thread_a:')),
+    ).toBe(true);
     // Per-replica stamp survives the chunk projection — a multi-
     // replica reader can still merge by (chunkId, replicaId).
     expect(index?.items.every((item) => item.replicaId === replica.replicaId)).toBe(true);

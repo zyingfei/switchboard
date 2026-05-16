@@ -7,7 +7,10 @@ import type {
   TabSessionStorage,
 } from '../../../src/tabsession/storage';
 
-const memoryStorage = (): { readonly records: TabSessionByTabIdHash; readonly storage: TabSessionStorage } => {
+const memoryStorage = (): {
+  readonly records: TabSessionByTabIdHash;
+  readonly storage: TabSessionStorage;
+} => {
   const records: TabSessionByTabIdHash = {};
   return {
     records,

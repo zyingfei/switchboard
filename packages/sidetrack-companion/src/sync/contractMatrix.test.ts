@@ -35,14 +35,10 @@ interface MatrixCase {
   readonly name: string;
   readonly relDir: string;
   readonly aggregateId: string;
-  readonly first: () => Pick<
-    AcceptedEvent,
-    'type' | 'payload' | 'aggregateId' | 'target'
-  >;
-  readonly second: (priorVector: VersionVector) => Pick<
-    AcceptedEvent,
-    'type' | 'payload' | 'aggregateId' | 'target'
-  > | null;
+  readonly first: () => Pick<AcceptedEvent, 'type' | 'payload' | 'aggregateId' | 'target'>;
+  readonly second: (
+    priorVector: VersionVector,
+  ) => Pick<AcceptedEvent, 'type' | 'payload' | 'aggregateId' | 'target'> | null;
 }
 
 const cases: readonly MatrixCase[] = [

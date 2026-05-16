@@ -218,7 +218,10 @@ export const updateAnnotation = async (
     updatedAt,
     revisions: [{ at: updatedAt, note: current.note }, ...current.revisions],
   };
-  await writeAtomic(join(vaultRoot, '_BAC', 'annotations', `${bac_id}.md`), renderAnnotation(updated));
+  await writeAtomic(
+    join(vaultRoot, '_BAC', 'annotations', `${bac_id}.md`),
+    renderAnnotation(updated),
+  );
   return updated;
 };
 
@@ -232,6 +235,9 @@ export const softDeleteAnnotation = async (
   }
   const deletedAt = new Date().toISOString();
   const updated: Annotation = { ...current, deletedAt, updatedAt: deletedAt };
-  await writeAtomic(join(vaultRoot, '_BAC', 'annotations', `${bac_id}.md`), renderAnnotation(updated));
+  await writeAtomic(
+    join(vaultRoot, '_BAC', 'annotations', `${bac_id}.md`),
+    renderAnnotation(updated),
+  );
   return updated;
 };

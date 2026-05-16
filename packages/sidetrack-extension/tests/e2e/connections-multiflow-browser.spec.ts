@@ -10,7 +10,7 @@ import { SETTINGS_KEY } from './helpers/sidepanel';
 // Layer 4 — multi-flow user-story end-to-end against a REAL browser.
 //
 // Attaches to a Chrome for Testing instance started outside playwright
-// (via `npm run e2e:chrome-debug`, which keeps cookies for chatgpt.com /
+// (via `bun run e2e:chrome-debug`, which keeps cookies for chatgpt.com /
 // claude.ai / gemini.google.com so live providers stay logged in).
 // Set `SIDETRACK_E2E_CDP_URL=http://localhost:9222` to enable.
 //
@@ -68,11 +68,7 @@ const REDUCER_TS_BLOCK =
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const url = `http://127.0.0.1:${String(comp.port)}${path}`;
   const response = await fetch(url, {
     method: 'POST',
@@ -109,10 +105,7 @@ interface SeedResult {
   readonly wsSidetrackId: string;
 }
 
-const seedWorkstream = async (
-  comp: TestCompanion,
-  title: string,
-): Promise<string> => {
+const seedWorkstream = async (comp: TestCompanion, title: string): Promise<string> => {
   const result = (await apiPost(comp, '/v1/workstreams', { title })) as {
     data: { bac_id: string };
   };
@@ -431,10 +424,7 @@ interface PreservedSettings {
   readonly hadPreviousSettings: boolean;
 }
 
-const replaceSettings = async (
-  panel: Page,
-  newSettings: unknown,
-): Promise<PreservedSettings> => {
+const replaceSettings = async (panel: Page, newSettings: unknown): Promise<PreservedSettings> => {
   const result = (await panel.evaluate(
     async ({ key, next }) => {
       const before = await chrome.storage.local.get(key);
@@ -447,10 +437,7 @@ const replaceSettings = async (
   return result;
 };
 
-const restoreSettings = async (
-  panel: Page,
-  preserved: PreservedSettings,
-): Promise<void> => {
+const restoreSettings = async (panel: Page, preserved: PreservedSettings): Promise<void> => {
   if (preserved.hadPreviousSettings) {
     await panel.evaluate(
       async ({ key, value }) => {

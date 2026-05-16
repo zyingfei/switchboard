@@ -269,7 +269,7 @@ const compactMetadata = (m: Record<string, unknown>): ConnectionNodeMetadata => 
   // Sort keys for deterministic JSON.stringify output.
   const sorted: Record<string, unknown> = {};
   for (const k of Object.keys(out).sort()) sorted[k] = out[k];
-  return sorted as ConnectionNodeMetadata;
+  return sorted;
 };
 
 const upsertNode = (
@@ -1969,9 +1969,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     // case future code paths add timeline-visit nodes elsewhere.
     const canonicalUrl =
       (typeof node.metadata['canonicalUrl'] === 'string'
-        ? (node.metadata['canonicalUrl'] as string)
+        ? node.metadata['canonicalUrl']
         : undefined) ??
-      (typeof node.metadata['url'] === 'string' ? (node.metadata['url'] as string) : undefined);
+      (typeof node.metadata['url'] === 'string' ? node.metadata['url'] : undefined);
     const key =
       canonicalUrl !== undefined
         ? stripFragmentAndTrailingSlash(canonicalUrl)

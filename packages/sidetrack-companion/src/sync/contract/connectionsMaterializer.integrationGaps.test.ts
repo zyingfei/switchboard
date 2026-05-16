@@ -15,9 +15,7 @@ import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 
-const buildEvent = (
-  input: { seq: number; type: string; payload: unknown },
-): AcceptedEvent => ({
+const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
   dot: { replicaId: 'replica-A', seq: input.seq },
   deps: {},

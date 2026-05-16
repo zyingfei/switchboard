@@ -134,7 +134,9 @@ describe('WorkstreamDetailPanel — rename + move', () => {
     );
     fireEvent.click(screen.getByText('Delete group'));
     expect(screen.getByText(/3 threads will be detached/i)).toBeTruthy();
-    fireEvent.click(screen.getByText(/^Delete group$/i, { selector: '.ws-detail-delete-confirm-btn' }));
+    fireEvent.click(
+      screen.getByText(/^Delete group$/i, { selector: '.ws-detail-delete-confirm-btn' }),
+    );
     await new Promise((r) => setTimeout(r, 0));
     expect(onDelete).toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();

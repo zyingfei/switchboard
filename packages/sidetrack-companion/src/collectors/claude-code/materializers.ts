@@ -61,7 +61,10 @@ type SessionTurnV1 = z.infer<typeof sessionTurnV1Schema>;
 
 // ─── registrations ─────────────────────────────────────────────────
 
-const provenanceFor = (eventType: string, env: { collector_version: string; collector_run_id: string }) => ({
+const provenanceFor = (
+  eventType: string,
+  env: { collector_version: string; collector_run_id: string },
+) => ({
   kind: 'collector' as const,
   ruleId: `${CLAUDE_CODE_COLLECTOR_ID}:${eventType}`,
   ruleVersion: env.collector_version,
@@ -90,7 +93,12 @@ export const claudeCodeSessionStartedRegistration: MaterializerRegistration<
       cwd: latest.cwd,
       producedBy: provenanceFor('session_started', env),
       ...(env.dimensions === undefined
-        ? { dimensions: { project_encoded_path: latest.project_encoded_path, ...(latest.git_branch === undefined ? {} : { git_branch: latest.git_branch }) } }
+        ? {
+            dimensions: {
+              project_encoded_path: latest.project_encoded_path,
+              ...(latest.git_branch === undefined ? {} : { git_branch: latest.git_branch }),
+            },
+          }
         : {
             dimensions: {
               ...env.dimensions,

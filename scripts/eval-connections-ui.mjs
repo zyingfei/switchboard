@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Stage 5 polish — Connections UI evaluation. Reads the persistent
 // vault snapshot (`~/.sidetrack-vault/_BAC/connections/current.json`),
 // pulls 5 representative examples per node kind + edge kind, and
@@ -6,7 +6,7 @@
 // is the dry-run before the recorder pass so we know which surfaces
 // are useful vs which still leak raw ids or have empty metadata.
 //
-// Run: node scripts/eval-connections-ui.mjs
+// Run: bun scripts/eval-connections-ui.mjs
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';

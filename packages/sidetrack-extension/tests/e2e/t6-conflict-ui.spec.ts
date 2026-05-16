@@ -134,9 +134,7 @@ test.describe('Tier 6.4 — conflict UI for register slot', () => {
 
       // Wait for B's side to mirror the draft (so we know the relay
       // is delivering before we partition).
-      await expect
-        .poll(async () => readDraft(pageB), { timeout: 30_000 })
-        .not.toBeNull();
+      await expect.poll(async () => readDraft(pageB), { timeout: 30_000 }).not.toBeNull();
 
       // PARTITION. Both companions still up; only the relay is
       // gone. Outbound events buffer in each replica's transport
@@ -215,15 +213,15 @@ test.describe('Tier 6.4 — conflict UI for register slot', () => {
       // where label comes from VERDICT_LABELS in
       // ReviewDraftFooter.tsx ("Agree", "Partial", etc.) — NOT the
       // raw verdict id. Match the user-visible label.
-      await expect(
-        conflictForSlot(pageA, 'verdict').locator('button[title="Agree"]'),
-      ).toHaveCount(1);
+      await expect(conflictForSlot(pageA, 'verdict').locator('button[title="Agree"]')).toHaveCount(
+        1,
+      );
       await expect(
         conflictForSlot(pageA, 'verdict').locator('button[title="Partial"]'),
       ).toHaveCount(1);
-      await expect(
-        conflictForSlot(pageB, 'verdict').locator('button[title="Agree"]'),
-      ).toHaveCount(1);
+      await expect(conflictForSlot(pageB, 'verdict').locator('button[title="Agree"]')).toHaveCount(
+        1,
+      );
       await expect(
         conflictForSlot(pageB, 'verdict').locator('button[title="Partial"]'),
       ).toHaveCount(1);

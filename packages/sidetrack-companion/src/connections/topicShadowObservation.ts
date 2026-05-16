@@ -168,7 +168,10 @@ export const buildTopicShadowObservationDiagnostics = ({
     previousBaselineRevision === null
       ? undefined
       : isCollapsedRevision(previousBaselineRevision, undefined);
-  const shadowCollapsed = isCollapsedRevision(shadowRevision, previousShadowRevision?.topics.length);
+  const shadowCollapsed = isCollapsedRevision(
+    shadowRevision,
+    previousShadowRevision?.topics.length,
+  );
   const previousShadowCollapsed =
     previousShadowRevision === null
       ? undefined

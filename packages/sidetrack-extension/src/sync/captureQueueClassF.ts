@@ -34,11 +34,7 @@ export const captureQueueHealth = async (): Promise<PluginMaterializerHealth> =>
   // pending merged. Report the merged count as activeSetSize and
   // expose dropped+failed as the terminal-state indicators.
   const status: PluginMaterializerHealth['status'] =
-    failedExplicit.length > 0
-      ? 'failed'
-      : activeCount > QUEUE_LIMIT * 0.8
-        ? 'degraded'
-        : 'healthy';
+    failedExplicit.length > 0 ? 'failed' : activeCount > QUEUE_LIMIT * 0.8 ? 'degraded' : 'healthy';
   return {
     status,
     activeSetSize: activeCount,
@@ -49,9 +45,10 @@ export const captureQueueHealth = async (): Promise<PluginMaterializerHealth> =>
     // status check); the queue itself is companion-agnostic.
     companionReachable: true,
     lastReconcileAt: null,
-    lastError: failedExplicit.length > 0
-      ? `${String(failedExplicit.length)} explicit captures rejected; queue full while companion offline`
-      : null,
+    lastError:
+      failedExplicit.length > 0
+        ? `${String(failedExplicit.length)} explicit captures rejected; queue full while companion offline`
+        : null,
     failedExplicitCount: failedExplicit.length,
     droppedPassiveCount: dropped,
   };

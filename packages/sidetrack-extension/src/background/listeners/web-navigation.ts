@@ -133,10 +133,7 @@ const sessionHash = (
   id: number,
   browserSessionStartMs: number,
 ): string =>
-  saltedFnv1a32Hex(
-    edgeReplicaId,
-    `${kind}|${String(id)}|${String(browserSessionStartMs)}`,
-  );
+  saltedFnv1a32Hex(edgeReplicaId, `${kind}|${String(id)}|${String(browserSessionStartMs)}`);
 
 export const buildVisitId = (
   edgeReplicaId: string,
@@ -159,7 +156,9 @@ const fallbackDocumentId = (
     `${tabSessionIdHash}|${canonicalUrl}|${String(Math.trunc(commitTimestamp))}`,
   )}`;
 
-export const createWebNavigationListener = (deps: NavigationListenerDeps): {
+export const createWebNavigationListener = (
+  deps: NavigationListenerDeps,
+): {
   readonly handleCommitted: (details: WebNavigationCommittedDetails) => Promise<void>;
   readonly hydrate: () => Promise<void>;
 } => {
@@ -237,9 +236,7 @@ export const createWebNavigationListener = (deps: NavigationListenerDeps): {
     const previousVisitId = previous?.lastVisitId ?? null;
     const navigationSequence = (previous?.navigationSequence ?? 0) + 1;
     const visitId = buildVisitId(deps.edgeReplicaId, canonicalUrl, commitTimestamp);
-    const openerVisitId = await resolveOpenerVisitId(
-      deps.tabOpenerStore.openerFor(details.tabId),
-    );
+    const openerVisitId = await resolveOpenerVisitId(deps.tabOpenerStore.openerFor(details.tabId));
 
     const payload: NavigationCommittedPayload = {
       payloadVersion: 1,
@@ -259,9 +256,7 @@ export const createWebNavigationListener = (deps: NavigationListenerDeps): {
       openerVisitId,
       previousVisitId,
       navigationSequence,
-      transitionType: isTransitionType(details.transitionType)
-        ? details.transitionType
-        : 'link',
+      transitionType: isTransitionType(details.transitionType) ? details.transitionType : 'link',
       transitionQualifiers: (details.transitionQualifiers ?? []).filter(isTransitionQualifier),
       commitTimestamp,
       dimensions: {
@@ -313,13 +308,9 @@ export const loadOrCreateBrowserSessionStartMs = async (): Promise<number> => {
   return fresh;
 };
 
-export const registerDefaultWebNavigationListeners = (
-  tabOpenerStore: TabOpenerStore,
-): void => {
+export const registerDefaultWebNavigationListeners = (tabOpenerStore: TabOpenerStore): void => {
   const webNavigation = chrome.webNavigation as WebNavigationApi;
-  let listenerPromise:
-    | Promise<ReturnType<typeof createWebNavigationListener>>
-    | null = null;
+  let listenerPromise: Promise<ReturnType<typeof createWebNavigationListener>> | null = null;
   const listener = async (): Promise<ReturnType<typeof createWebNavigationListener>> => {
     if (listenerPromise !== null) return listenerPromise;
     listenerPromise = (async () => {
@@ -342,6 +333,8 @@ export const registerDefaultWebNavigationListeners = (
   };
 
   webNavigation.onCommitted.addListener((details) => {
-    void listener().then((resolved) => resolved.handleCommitted(details)).catch(() => undefined);
+    void listener()
+      .then((resolved) => resolved.handleCommitted(details))
+      .catch(() => undefined);
   });
 };

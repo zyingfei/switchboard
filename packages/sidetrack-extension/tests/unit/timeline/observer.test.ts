@@ -68,7 +68,12 @@ describe('TimelineObserver — coalesce + debounce', () => {
 
   it('same (tabIdHash, canonicalUrl) within window does NOT emit', () => {
     const { emitted, observer, advance } = setup();
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a?token=1', transition: 'activated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a?token=1',
+      transition: 'activated',
+    });
     advance(5_000);
     observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a?token=2', transition: 'updated' });
     expect(emitted).toHaveLength(1);
@@ -104,9 +109,21 @@ describe('TimelineObserver — coalesce + debounce', () => {
 
   it('repeat of the same URL+title within the coalesce window does NOT emit', () => {
     const { emitted, observer, advance } = setup();
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'activated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A',
+      transition: 'activated',
+    });
     advance(2_000);
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'updated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A',
+      transition: 'updated',
+    });
     expect(emitted).toHaveLength(1);
   });
 
@@ -117,23 +134,47 @@ describe('TimelineObserver — coalesce + debounce', () => {
     const { emitted, observer, advance } = setup();
     observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', transition: 'activated' });
     advance(2_000);
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A real title', transition: 'updated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A real title',
+      transition: 'updated',
+    });
     expect(emitted).toHaveLength(2);
     expect(emitted[1]?.title).toBe('A real title');
   });
 
   it('title rename within the coalesce window emits the new title', () => {
     const { emitted, observer, advance } = setup();
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'activated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A',
+      transition: 'activated',
+    });
     advance(2_000);
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A renamed', transition: 'updated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A renamed',
+      transition: 'updated',
+    });
     expect(emitted).toHaveLength(2);
     expect(emitted[1]?.title).toBe('A renamed');
   });
 
   it('close emits a closed transition with the last observed URL', () => {
     const { emitted, observer, advance } = setup();
-    observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', title: 'A', transition: 'activated' });
+    observer.observe({
+      tabId: 1,
+      windowId: 1,
+      url: 'https://x/a',
+      title: 'A',
+      transition: 'activated',
+    });
     advance(60_000);
     observer.close({ tabId: 1, windowId: 1 });
     expect(emitted).toHaveLength(2);
@@ -150,9 +191,7 @@ describe('TimelineObserver — coalesce + debounce', () => {
   it('mintEventId determines the emitted eventId', () => {
     const { emitted, observer } = setup();
     observer.observe({ tabId: 1, windowId: 1, url: 'https://x/a', transition: 'activated' });
-    expect(emitted[0]?.eventId).toBe(
-      'tab_1_1|https://x/a|2026-05-07T10:00:00.000Z',
-    );
+    expect(emitted[0]?.eventId).toBe('tab_1_1|https://x/a|2026-05-07T10:00:00.000Z');
   });
 
   it('sanitizes raw URL — strips fragment and sensitive query params', () => {

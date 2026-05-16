@@ -20,10 +20,7 @@ import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
-import type {
-  ReconcileWorkerJob,
-  ReconcileWorkerResult,
-} from './connectionsReconcileWorker.js';
+import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 
 const post = (result: ReconcileWorkerResult): void => {
   parentPort?.postMessage(result);

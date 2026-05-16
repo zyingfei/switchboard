@@ -20,8 +20,7 @@ export const inboxArchiveDirFor = (vaultRoot: string, collectorId: string): stri
 export const bookmarkPathFor = (vaultRoot: string, collectorId: string): string =>
   join(inboxDirFor(vaultRoot, collectorId), '.bookmark.json');
 
-export const manifestRootFor = (vaultRoot: string): string =>
-  join(vaultRoot, '_BAC', 'collectors');
+export const manifestRootFor = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'collectors');
 
 export const manifestDirFor = (vaultRoot: string, collectorId: string): string =>
   join(manifestRootFor(vaultRoot), collectorId);

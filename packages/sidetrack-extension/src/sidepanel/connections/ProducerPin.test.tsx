@@ -12,7 +12,10 @@ interface ChromeStorageStub {
   };
 }
 
-const installChromeStub = (): { storage: Record<string, unknown>; chrome: { storage: ChromeStorageStub } } => {
+const installChromeStub = (): {
+  storage: Record<string, unknown>;
+  chrome: { storage: ChromeStorageStub };
+} => {
   const backing: Record<string, unknown> = {};
   const stub: { storage: ChromeStorageStub } = {
     storage: {
@@ -61,7 +64,9 @@ describe('ProducerPin', () => {
     render(<ProducerPin producedBy={producedBy} />);
     expect(await screen.findByTestId('producer-pin-ranker')).toBeTruthy();
     expect(screen.getByTestId('producer-pin-ranker-pin').textContent).toBe('Pin this version');
-    expect(screen.getByTestId('producer-pin-ranker-label').textContent).toContain('Closest-visit ranker');
+    expect(screen.getByTestId('producer-pin-ranker-label').textContent).toContain(
+      'Closest-visit ranker',
+    );
     expect(screen.getByTestId('producer-pin-ranker-label').textContent).toContain('rev abc123de');
   });
 

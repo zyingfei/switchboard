@@ -1,8 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  PluginBudgetGuard,
-} from '../../../src/sync/pluginMaterializer';
+import { PluginBudgetGuard } from '../../../src/sync/pluginMaterializer';
 import { DEFAULT_PLUGIN_BUDGETS } from '../../../src/sync/budgetConfig';
 import { runExtendedQuery } from '../../../src/sync/extendedQuery';
 import { drainSpoolToCompanion } from '../../../src/sync/spoolDrainer';
@@ -130,7 +128,12 @@ describe('Lane 3 / L3-G1 — Mode P functional', () => {
           id: 'cap-1',
           queuedAt: '2026-05-07T00:00:00.000Z',
           failedAt: '2026-05-07T00:01:00.000Z',
-          event: { provider: 'chatgpt', threadUrl: 'https://x', capturedAt: '2026-05-07T00:00:00.000Z', turns: [] },
+          event: {
+            provider: 'chatgpt',
+            threadUrl: 'https://x',
+            capturedAt: '2026-05-07T00:00:00.000Z',
+            turns: [],
+          },
         },
       ],
     });

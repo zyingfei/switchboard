@@ -1,10 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 
-import {
-  SettingsPanel,
-  Wizard,
-} from '../../entrypoints/sidepanel/components';
+import { SettingsPanel, Wizard } from '../../entrypoints/sidepanel/components';
 
 const STUB_PROPS = {
   settings: null,

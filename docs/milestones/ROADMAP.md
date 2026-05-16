@@ -91,7 +91,7 @@ M3 lands and we have a clearer signal. Listed in rough priority order:
   (`launchd` / `systemd` / Task Scheduler integration)
 - **First-run wizard polish v2** (M2 already polishes, but cross-OS
   install flows often surface real friction; iterate)
-- **Auto-update path** for the companion (currently `npm update -g`)
+- **Auto-update path** for the companion (currently `bun update --global`)
 - **Telemetry-free local diagnostics** (capture-health UI, error
   exports for support)
 - **Distribution surfaces**: Chrome Web Store submission, Obsidian

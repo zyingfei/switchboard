@@ -1,16 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  createMaterializerRegistry,
-  type MaterializerRegistration,
-} from './materializer.js';
+import { createMaterializerRegistry, type MaterializerRegistration } from './materializer.js';
 
-type VersionInfo = MaterializerRegistration<CurrentPayload>['versions'] extends ReadonlyMap<
-  number,
-  infer V
->
-  ? V
-  : never;
+type VersionInfo =
+  MaterializerRegistration<CurrentPayload>['versions'] extends ReadonlyMap<number, infer V>
+    ? V
+    : never;
 
 interface CurrentPayload {
   readonly value: string;
@@ -33,9 +28,7 @@ const registration = (
   toClassA: () => [],
 });
 
-const expectFound = (
-  result: ReturnType<ReturnType<typeof createMaterializerRegistry>['get']>,
-) => {
+const expectFound = (result: ReturnType<ReturnType<typeof createMaterializerRegistry>['get']>) => {
   if (result.kind !== 'found') {
     throw new Error(`expected found, received ${result.kind}`);
   }
@@ -75,10 +68,9 @@ describe('materializer registry', () => {
     );
 
     const result = expectFound(registry.get('test-collector', 'test.event', 1));
-    const latest = result.upcasterChain.reduce<unknown>(
-      (payload, upcast) => upcast(payload),
-      { value: 'alpha' },
-    );
+    const latest = result.upcasterChain.reduce<unknown>((payload, upcast) => upcast(payload), {
+      value: 'alpha',
+    });
 
     expect(result.status).toBe('accepted');
     expect(result.upcasterChain).toHaveLength(1);
@@ -117,10 +109,9 @@ describe('materializer registry', () => {
     );
 
     const result = expectFound(registry.get('test-collector', 'test.event', 1));
-    const latest = result.upcasterChain.reduce<unknown>(
-      (payload, upcast) => upcast(payload),
-      { value: 'alpha' },
-    );
+    const latest = result.upcasterChain.reduce<unknown>((payload, upcast) => upcast(payload), {
+      value: 'alpha',
+    });
 
     expect(result.upcasterChain).toHaveLength(2);
     expect(latest).toEqual({ value: 'alpha', version: 3 });
@@ -148,9 +139,9 @@ describe('materializer registry', () => {
     const registry = createMaterializerRegistry();
     registry.register(registration(versionMap([[1, { status: 'current' }]]), 1));
 
-    expect(() =>
-      registry.register(registration(versionMap([[1, { status: 'current' }]]), 1)),
-    ).toThrow('duplicate materializer registration: test-collector:test.event:1');
+    expect(() => {
+      registry.register(registration(versionMap([[1, { status: 'current' }]]), 1));
+    }).toThrow('duplicate materializer registration: test-collector:test.event:1');
   });
 
   it('returns the maximum known payload version across registered versions', () => {
@@ -166,9 +157,7 @@ describe('materializer registry', () => {
       ),
     );
 
-    expect(
-      registry.maxKnownPayloadVersionFor('test-collector', 'test.event'),
-    ).toBe(3);
+    expect(registry.maxKnownPayloadVersionFor('test-collector', 'test.event')).toBe(3);
     expect(
       registry.maxKnownPayloadVersionFor('missing-collector', 'missing.event'),
     ).toBeUndefined();

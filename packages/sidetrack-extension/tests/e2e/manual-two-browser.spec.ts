@@ -1,7 +1,7 @@
 // Interactive two-browser harness — NOT a CI test.
 //
 // Run with:
-//   npx playwright test tests/e2e/manual-two-browser.spec.ts --headed --grep manual --timeout 0
+//   bunx --bun --no-install playwright test tests/e2e/manual-two-browser.spec.ts --headed --grep manual --timeout 0
 //
 // Spawns:
 //   - 1 standalone test relay

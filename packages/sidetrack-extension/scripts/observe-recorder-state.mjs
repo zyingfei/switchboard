@@ -77,8 +77,7 @@ const main = async () => {
         },
         observer: diag?.diagnostics?.observer ?? null,
         materializer: diag?.diagnostics?.materializer ?? null,
-        engagementJournalTail: (diag?.diagnostics?.engagement?.journal ?? [])
-          .slice(-6),
+        engagementJournalTail: (diag?.diagnostics?.engagement?.journal ?? []).slice(-6),
         engagementJournalLength: diag?.diagnostics?.engagement?.journalLength ?? 0,
       },
       httpTabCount: httpTabs.length,

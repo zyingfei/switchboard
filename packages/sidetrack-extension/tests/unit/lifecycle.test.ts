@@ -34,11 +34,7 @@ describe('deriveLifecycle', () => {
   });
 
   it('lights signal pill when there is a non-dismissed reminder for the thread', () => {
-    const result = deriveLifecycle(
-      thread(),
-      [{ threadId: 'bac_thread_1', status: 'new' }],
-      NOW_MS,
-    );
+    const result = deriveLifecycle(thread(), [{ threadId: 'bac_thread_1', status: 'new' }], NOW_MS);
     expect(result.kind).toBe('unread-reply');
     expect(result.dotClass).toBe('signal');
     expect(result.lifecyclePill?.label).toBe('Unread reply');

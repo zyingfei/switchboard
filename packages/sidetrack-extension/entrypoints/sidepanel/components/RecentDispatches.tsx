@@ -75,7 +75,9 @@ export function RecentDispatches({
         onClick={onToggleShowArchived}
         title={showArchived ? 'Hide archived dispatches' : 'Show archived dispatches'}
       >
-        {showArchived ? `Hide archived (${String(archivedCount)})` : `Show archived (${String(archivedCount)})`}
+        {showArchived
+          ? `Hide archived (${String(archivedCount)})`
+          : `Show archived (${String(archivedCount)})`}
       </button>
     ) : null;
   if (visible.length === 0) {

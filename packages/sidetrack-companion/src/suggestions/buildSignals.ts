@@ -100,9 +100,7 @@ export const buildSignals = async (
   }
 
   for (const workstream of workstreams) {
-    const wsTokens = normalizeTokens(
-      `${workstream.title} ${workstream.description ?? ''}`,
-    );
+    const wsTokens = normalizeTokens(`${workstream.title} ${workstream.description ?? ''}`);
     // Lexical = max(jaccard, ws→thread containment). Jaccard
     // captures bidirectional overlap; the containment term rescues
     // the common case where the workstream name is concentrated
@@ -120,9 +118,8 @@ export const buildSignals = async (
         .filter((id): id is string => typeof id === 'string'),
     );
     const memberCentroid = meanNormalized(
-      index?.items
-        .filter((item) => memberIds.has(item.threadId))
-        .map((item) => item.embedding) ?? [],
+      index?.items.filter((item) => memberIds.has(item.threadId)).map((item) => item.embedding) ??
+        [],
     );
     const workstreamCentroid = memberCentroid ?? coldStartCentroids.get(workstream.id) ?? null;
     vector[workstream.id] =

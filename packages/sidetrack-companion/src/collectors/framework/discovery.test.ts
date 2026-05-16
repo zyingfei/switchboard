@@ -45,10 +45,7 @@ const REQUIRES_COMPANION_FUTURE_TOML = VALID_TOML.replace(
   'requires-companion = ">=999.0.0"',
 );
 
-const REQUIRES_LAUNCHD_TOML = VALID_TOML.replace(
-  'managed-by = "user"',
-  'managed-by = "launchd"',
-);
+const REQUIRES_LAUNCHD_TOML = VALID_TOML.replace('managed-by = "user"', 'managed-by = "launchd"');
 
 // A second valid TOML with a slightly different compatibility range (used to
 // trigger a reloaded audit event when we overwrite the file).
@@ -67,9 +64,7 @@ const makeRegistry = () => {
     collector_id: 'sidetrack.test',
     event_type: 'tick',
     current_payload_version: 1,
-    versions: new Map([
-      [1, { status: 'current' as const }],
-    ]),
+    versions: new Map([[1, { status: 'current' as const }]]),
     validate: (x: unknown) => x,
     toClassA: () => [],
   });
@@ -89,8 +84,7 @@ const makeOpts = (
   auditRoute,
 });
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // Test state
@@ -113,11 +107,7 @@ afterEach(async () => {
 });
 
 // Helper to write a collector.toml into the vault root under _BAC/collectors/<id>/
-const writeCollectorToml = async (
-  vaultRoot: string,
-  id: string,
-  toml: string,
-): Promise<void> => {
+const writeCollectorToml = async (vaultRoot: string, id: string, toml: string): Promise<void> => {
   const dir = join(vaultRoot, '_BAC', 'collectors', id);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, 'collector.toml'), toml, 'utf8');
@@ -132,7 +122,9 @@ it('empty _BAC/collectors directory → loadedCollectors() returns []', async ()
   await mkdir(join(tmpDir, '_BAC', 'collectors'), { recursive: true });
   const audits: string[] = [];
   handle = await startDiscovery(
-    makeOpts(tmpDir, async (route) => { audits.push(route); }),
+    makeOpts(tmpDir, async (route) => {
+      audits.push(route);
+    }),
   );
   expect(handle.loadedCollectors()).toEqual([]);
   expect(audits).toEqual([]);
@@ -141,9 +133,11 @@ it('empty _BAC/collectors directory → loadedCollectors() returns []', async ()
 it('one valid manifest → status=loaded, audit collector:manifest-loaded fired', async () => {
   await writeCollectorToml(tmpDir, 'sidetrack.test', VALID_TOML);
 
-  const audits: Array<{ route: string; subject: string }> = [];
+  const audits: { route: string; subject: string }[] = [];
   handle = await startDiscovery(
-    makeOpts(tmpDir, async (route, subject) => { audits.push({ route, subject }); }),
+    makeOpts(tmpDir, async (route, subject) => {
+      audits.push({ route, subject });
+    }),
   );
 
   const collectors = handle.loadedCollectors();
@@ -157,9 +151,11 @@ it('one valid manifest → status=loaded, audit collector:manifest-loaded fired'
 it('manifest with requires-companion >=999.0.0 → load-failed + correct rejection + audit', async () => {
   await writeCollectorToml(tmpDir, 'sidetrack.test', REQUIRES_COMPANION_FUTURE_TOML);
 
-  const audits: Array<{ route: string; subject: string }> = [];
+  const audits: { route: string; subject: string }[] = [];
   handle = await startDiscovery(
-    makeOpts(tmpDir, async (route, subject) => { audits.push({ route, subject }); }),
+    makeOpts(tmpDir, async (route, subject) => {
+      audits.push({ route, subject });
+    }),
   );
 
   const collectors = handle.loadedCollectors();
@@ -183,9 +179,11 @@ it('manifest with process.managed-by = launchd → load-failed, manifest-spawn-p
   // This is the correct behaviour: the schema enforces managed-by = 'user'.
   await writeCollectorToml(tmpDir, 'sidetrack.test', REQUIRES_LAUNCHD_TOML);
 
-  const audits: Array<{ route: string; subject: string }> = [];
+  const audits: { route: string; subject: string }[] = [];
   handle = await startDiscovery(
-    makeOpts(tmpDir, async (route, subject) => { audits.push({ route, subject }); }),
+    makeOpts(tmpDir, async (route, subject) => {
+      audits.push({ route, subject });
+    }),
   );
 
   const collectors = handle.loadedCollectors();
@@ -201,9 +199,11 @@ it('manifest with process.managed-by = launchd → load-failed, manifest-spawn-p
 it('mid-run manifest change → re-evaluation fires collector:manifest-reloaded', async () => {
   await writeCollectorToml(tmpDir, 'sidetrack.test', VALID_TOML);
 
-  const audits: Array<{ route: string; subject: string }> = [];
+  const audits: { route: string; subject: string }[] = [];
   handle = await startDiscovery(
-    makeOpts(tmpDir, async (route, subject) => { audits.push({ route, subject }); }),
+    makeOpts(tmpDir, async (route, subject) => {
+      audits.push({ route, subject });
+    }),
   );
 
   // Verify initial load.

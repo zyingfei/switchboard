@@ -312,8 +312,7 @@ export const startRelayServer = async (
   });
 
   const address = httpServer.address();
-  const resolvedPort =
-    typeof address === 'object' && address !== null ? address.port : port;
+  const resolvedPort = typeof address === 'object' && address !== null ? address.port : port;
 
   return {
     port: resolvedPort,

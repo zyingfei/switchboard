@@ -43,7 +43,7 @@ describe('page-content store', () => {
       headingSignatureHash: 'abc',
     },
     content: {
-      text: `${'Oracle cloud adoption framework architecture guardrails '.repeat(70)}`,
+      text: 'Oracle cloud adoption framework architecture guardrails '.repeat(70),
       contentHash: 'hash-oracle-cloud',
       charCount: 3200,
     },
@@ -126,7 +126,7 @@ describe('page-content store', () => {
           extractionStrategy: 'visible-dom',
         },
         content: {
-          text: `${'low quality filler words '.repeat(50)}`,
+          text: 'low quality filler words '.repeat(50),
           contentHash: 'hash-low',
           charCount: 1250,
         },

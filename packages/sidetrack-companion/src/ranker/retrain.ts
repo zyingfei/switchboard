@@ -161,10 +161,7 @@ const containerMembersFromSnapshot = (
       if (url.length > 0 && url !== edge.fromNodeId) addMember(topicMembers, edge.toNodeId, url);
       continue;
     }
-    if (
-      edge.kind === 'visit_in_workstream' &&
-      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
-    ) {
+    if (edge.kind === 'visit_in_workstream' && edge.toNodeId.startsWith(WORKSTREAM_PREFIX)) {
       const url = stripTimelineVisitPrefix(edge.fromNodeId);
       if (url.length > 0 && url !== edge.fromNodeId) {
         addMember(workstreamMembers, edge.toNodeId, url);
@@ -255,9 +252,7 @@ export const deriveNegativeVisitPairLabelsFromSnapshot = (
 
     if (toIsContainer && !fromIsContainer) {
       const visitUrl = stripTimelineVisitPrefix(label.fromId);
-      for (const memberUrl of [
-        ...(membersByContainer.get(label.toId) ?? []),
-      ].sort(compareText)) {
+      for (const memberUrl of [...(membersByContainer.get(label.toId) ?? [])].sort(compareText)) {
         emit(visitUrl, memberUrl, label.weight);
       }
       continue;
@@ -265,9 +260,7 @@ export const deriveNegativeVisitPairLabelsFromSnapshot = (
 
     if (fromIsContainer && !toIsContainer) {
       const visitUrl = stripTimelineVisitPrefix(label.toId);
-      for (const memberUrl of [
-        ...(membersByContainer.get(label.fromId) ?? []),
-      ].sort(compareText)) {
+      for (const memberUrl of [...(membersByContainer.get(label.fromId) ?? [])].sort(compareText)) {
         emit(memberUrl, visitUrl, label.weight);
       }
       continue;
@@ -825,8 +818,7 @@ export const maybeRetrainClosestVisitRanker = async ({
   const feedback = augmentFeedbackWithVisitPairLabels(baseFeedback, snapshot);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
-  const resolvedThreshold =
-    threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
+  const resolvedThreshold = threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
   const cooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
   const forceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];
   const force = forceInput === true || forceEnv === '1' || forceEnv === 'true';

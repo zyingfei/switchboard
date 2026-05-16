@@ -655,10 +655,8 @@ describe('buildTopicRevision', () => {
       expect(revision.topics).toHaveLength(1);
       expect(revision.topics[0]?.memberCanonicalUrls).toEqual([a, b]);
     } finally {
-      /* eslint-disable @typescript-eslint/no-dynamic-delete */
       if (original === undefined) delete process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'];
       else process.env['SIDETRACK_TOPIC_ENGAGEMENT_GATE_MS'] = original;
-      /* eslint-enable @typescript-eslint/no-dynamic-delete */
     }
   });
 });

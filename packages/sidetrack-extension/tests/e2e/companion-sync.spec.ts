@@ -26,12 +26,15 @@ test.describe('companion sync (synthetic)', () => {
       await expect(page.locator('.ws-status')).toHaveText('local-only');
       await expect(page.locator('.sys-banner')).toHaveCount(0);
 
-      await page.evaluate(async ({ settingsKey, settings }) => {
-        await chrome.storage.local.set({ [settingsKey]: settings });
-      }, {
-        settingsKey: SETTINGS_KEY,
-        settings: configuredSettings,
-      });
+      await page.evaluate(
+        async ({ settingsKey, settings }) => {
+          await chrome.storage.local.set({ [settingsKey]: settings });
+        },
+        {
+          settingsKey: SETTINGS_KEY,
+          settings: configuredSettings,
+        },
+      );
       await page.reload({ waitUntil: 'domcontentloaded' });
 
       // After re-mount the panel starts in the 'unknown' state ("vault:
@@ -47,20 +50,23 @@ test.describe('companion sync (synthetic)', () => {
       await expect(disconnectedBanner).toContainText('Companion: disconnected');
       await expect(disconnectedBanner.getByRole('button', { name: 'Open setup' })).toBeVisible();
 
-      await page.evaluate(async ({ settingsKey, settings }) => {
-        await chrome.storage.local.set({
-          [settingsKey]: {
-            ...settings,
-            companion: {
-              ...settings.companion,
-              bridgeKey: '',
+      await page.evaluate(
+        async ({ settingsKey, settings }) => {
+          await chrome.storage.local.set({
+            [settingsKey]: {
+              ...settings,
+              companion: {
+                ...settings.companion,
+                bridgeKey: '',
+              },
             },
-          },
-        });
-      }, {
-        settingsKey: SETTINGS_KEY,
-        settings: configuredSettings,
-      });
+          });
+        },
+        {
+          settingsKey: SETTINGS_KEY,
+          settings: configuredSettings,
+        },
+      );
       await page.reload({ waitUntil: 'domcontentloaded' });
 
       await expect(page.locator('.ws-status')).toHaveText('local-only');

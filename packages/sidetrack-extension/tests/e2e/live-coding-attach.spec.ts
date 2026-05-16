@@ -1,10 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
 import { isRuntimeResponse, messageTypes } from '../../src/messages';
-import {
-  createMockVaultCompanion,
-  type MockVaultCompanion,
-} from './helpers/mockVaultCompanion';
+import { createMockVaultCompanion, type MockVaultCompanion } from './helpers/mockVaultCompanion';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 import { SETTINGS_KEY, SETUP_KEY } from './helpers/sidepanel';
 import { startInProcessMcp, type InProcessMcp } from './helpers/inProcessMcp';
@@ -12,9 +9,7 @@ import { startInProcessMcp, type InProcessMcp } from './helpers/inProcessMcp';
 const snapshotSidetrackStorage = async (page: Page): Promise<Record<string, unknown>> => {
   return await page.evaluate(async () => {
     const all = await chrome.storage.local.get(null);
-    return Object.fromEntries(
-      Object.entries(all).filter(([key]) => key.startsWith('sidetrack')),
-    );
+    return Object.fromEntries(Object.entries(all).filter(([key]) => key.startsWith('sidetrack')));
   });
 };
 

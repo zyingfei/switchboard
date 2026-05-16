@@ -48,9 +48,7 @@ export interface LlmNetworkMock {
 
 const installState = new WeakMap<BrowserContext, InstalledMock>();
 
-export const installLlmNetworkMock = async (
-  context: BrowserContext,
-): Promise<LlmNetworkMock> => {
+export const installLlmNetworkMock = async (context: BrowserContext): Promise<LlmNetworkMock> => {
   const recorded: { readonly url: string; readonly at: number }[] = [];
 
   await context.route(/.*/u, (route: Route) => {

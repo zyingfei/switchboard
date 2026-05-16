@@ -4,15 +4,13 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from './events.js';
 import { projectQueueItem } from './projection.js';
 
-const event = (
-  partial: {
-    readonly type: string;
-    readonly replicaId: string;
-    readonly seq: number;
-    readonly payload: Record<string, unknown>;
-    readonly deps?: Record<string, number>;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  readonly type: string;
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly payload: Record<string, unknown>;
+  readonly deps?: Record<string, number>;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: partial.deps ?? {},

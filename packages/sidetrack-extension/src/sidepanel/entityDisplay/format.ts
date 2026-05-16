@@ -162,10 +162,7 @@ const formatRelOrUndef = (iso: string | undefined): string | undefined => {
 
 // Per-kind formatter dispatch. Every branch must produce a `primary` that
 // is NEVER an opaque id and NEVER a raw URL; URLs surface as host only.
-export const formatEntityDisplay = (
-  node: ConnectionNode,
-  ctx: EntityDisplayCtx,
-): EntityDisplay => {
+export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx): EntityDisplay => {
   const metadata = node.metadata;
   const kindBadge = kindBadgeFor(node.kind);
 
@@ -184,7 +181,9 @@ export const formatEntityDisplay = (
       const provider = metaStr(metadata, ['provider']);
       const url = metaStr(metadata, ['url', 'canonicalUrl']);
       const primary =
-        title ?? labelClean ?? (provider !== undefined ? `${provider} thread` : '(untitled thread)');
+        title ??
+        labelClean ??
+        (provider !== undefined ? `${provider} thread` : '(untitled thread)');
       const secondary = composeSecondary([provider, formatRelOrUndef(node.lastSeenAt)]);
       return { primary, secondary, kindBadge, tooltip: url ?? trimPrefix(node.id, 'thread:') };
     }
@@ -253,10 +252,16 @@ export const formatEntityDisplay = (
       const sourcePath = metaStr(metadata, ['sourcePath']);
       const provider = metaStr(metadata, ['provider']);
       const labelClean = cleanLabel(node.label);
-      const basename = sourcePath !== undefined ? sourcePath.split('/').filter(Boolean).pop() : undefined;
+      const basename =
+        sourcePath !== undefined ? sourcePath.split('/').filter(Boolean).pop() : undefined;
       const primary = title ?? labelClean ?? basename ?? '(coding session)';
       const secondary = composeSecondary([provider, formatRelOrUndef(node.lastSeenAt)]);
-      return { primary, secondary, kindBadge, tooltip: sourcePath ?? trimPrefix(node.id, 'coding-session:') };
+      return {
+        primary,
+        secondary,
+        kindBadge,
+        tooltip: sourcePath ?? trimPrefix(node.id, 'coding-session:'),
+      };
     }
     case 'topic': {
       let primary: string = '(topic cluster)';
@@ -270,8 +275,7 @@ export const formatEntityDisplay = (
         if (labelClean !== undefined) primary = labelClean;
       }
       const memberCount = metadata['memberCount'];
-      const secondary =
-        typeof memberCount === 'number' ? `${memberCount} members` : undefined;
+      const secondary = typeof memberCount === 'number' ? `${memberCount} members` : undefined;
       return { primary, secondary, kindBadge, tooltip: trimPrefix(node.id, 'topic:') };
     }
     case 'replica': {
@@ -292,7 +296,7 @@ export const formatEntityDisplay = (
       const threadNode =
         threadId === undefined
           ? undefined
-          : ctx.nodeById?.get(threadId) ?? ctx.nodeById?.get(`thread:${threadId}`);
+          : (ctx.nodeById?.get(threadId) ?? ctx.nodeById?.get(`thread:${threadId}`));
       if (threadNode !== undefined) {
         const threadTitle = formatEntityDisplay(threadNode, ctx).primary;
         primary = `Reminder: ${threadTitle}`;
@@ -319,18 +323,15 @@ export const formatEntityDisplay = (
           ? undefined
           : ctx.snippetPreview(metaStr(metadata, ['selectionHash', 'charHashPrefix']));
       if (localPreview !== undefined && localPreview.length > 0) {
-        const truncated = localPreview.length > 80
-          ? `${localPreview.slice(0, 80).trimEnd()}…`
-          : localPreview;
+        const truncated =
+          localPreview.length > 80 ? `${localPreview.slice(0, 80).trimEnd()}…` : localPreview;
         const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
         return { primary: truncated, kindBadge, tooltip };
       }
-      const charCount = typeof metadata['charCount'] === 'number'
-        ? (metadata['charCount'] as number)
-        : undefined;
-      const lineCount = typeof metadata['lineCount'] === 'number'
-        ? (metadata['lineCount'] as number)
-        : undefined;
+      const charCount =
+        typeof metadata['charCount'] === 'number' ? (metadata['charCount'] as number) : undefined;
+      const lineCount =
+        typeof metadata['lineCount'] === 'number' ? (metadata['lineCount'] as number) : undefined;
       const contentKindHint = metaStr(metadata, ['contentKindHint']);
       const kindLabel = (() => {
         if (contentKindHint === 'code-block') return 'Code';
@@ -346,8 +347,7 @@ export const formatEntityDisplay = (
       }
       if (charCount !== undefined) parts.push(`${String(charCount)} chars`);
       const labelClean = cleanLabel(node.label);
-      const primary =
-        parts.length > 0 ? parts.join(' · ') : labelClean ?? '(snippet)';
+      const primary = parts.length > 0 ? parts.join(' · ') : (labelClean ?? '(snippet)');
       const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
       return { primary, kindBadge, tooltip };
     }
@@ -415,7 +415,8 @@ export const formatNodeIdDisplay = (
   if (kind === 'dispatch') return { primary: '(dispatch)', kindBadge, tooltip: undefined };
   if (kind === 'topic') return { primary: '(topic)', kindBadge, tooltip: undefined };
   if (kind === 'snippet') return { primary: '(snippet)', kindBadge, tooltip: undefined };
-  if (kind === 'coding-session') return { primary: '(coding session)', kindBadge, tooltip: undefined };
+  if (kind === 'coding-session')
+    return { primary: '(coding session)', kindBadge, tooltip: undefined };
   if (kind === 'annotation') return { primary: '(note)', kindBadge, tooltip: undefined };
   if (kind === 'queue-item') return { primary: '(queue item)', kindBadge, tooltip: undefined };
   if (kind === 'inbound-reminder') return { primary: '(reminder)', kindBadge, tooltip: undefined };
@@ -458,9 +459,7 @@ export const formatAnchorDisplay = (
 // Promote any old-shape string anchor to the enriched form so the rest
 // of the codebase can rely on { id, kind, label } regardless of which
 // resolver version produced it.
-export const upgradeAnchor = (
-  anchor: string | AttributionAnchorLike,
-): AttributionAnchorLike => {
+export const upgradeAnchor = (anchor: string | AttributionAnchorLike): AttributionAnchorLike => {
   if (typeof anchor !== 'string') return anchor;
   const kind = kindFromNodeId(anchor);
   return { id: anchor, ...(kind === undefined ? {} : { kind }) };

@@ -4,16 +4,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.3.14"
   },
   "scripts": {
-    "compile": "tsc --noEmit",
-    "start": "tsx cli.ts"
+    "compile": "bunx --bun --no-install tsc --noEmit",
+    "start": "bun cli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
-    "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }
 }

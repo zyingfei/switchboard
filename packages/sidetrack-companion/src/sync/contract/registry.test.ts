@@ -3,11 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
-import {
-  CONTRACT_REGISTRY,
-  KNOWN_MATERIALIZERS,
-  REGISTERED_EVENT_TYPES,
-} from './registry.js';
+import { CONTRACT_REGISTRY, KNOWN_MATERIALIZERS, REGISTERED_EVENT_TYPES } from './registry.js';
 
 // Coverage assertions for the sync contract registry.
 //
@@ -46,15 +42,11 @@ const enumerateSourceEventTypes = async (): Promise<readonly string[]> => {
   for (const file of eventFiles) {
     const text = await readFile(file, 'utf8');
     // Match: export const FOO = 'foo.bar' as const;
-    for (const match of text.matchAll(
-      /export const \w+\s*=\s*['"]([\w.\-]+)['"]\s+as const/g,
-    )) {
+    for (const match of text.matchAll(/export const \w+\s*=\s*['"]([\w.\-]+)['"]\s+as const/g)) {
       types.push(match[1] ?? '');
     }
     // Match REVIEW_DRAFT_EVENT_TYPES = [ 'review-draft.x', ... ] as const;
-    const rdMatch = text.match(
-      /REVIEW_DRAFT_EVENT_TYPES\s*=\s*\[([\s\S]*?)\]\s*as const/,
-    );
+    const rdMatch = /REVIEW_DRAFT_EVENT_TYPES\s*=\s*\[([\s\S]*?)\]\s*as const/.exec(text);
     if (rdMatch !== null) {
       for (const lit of (rdMatch[1] ?? '').matchAll(/'([\w.\-]+)'/g)) {
         types.push(lit[1] ?? '');
@@ -155,15 +147,13 @@ describe('sync contract registry', () => {
     expect(wrong, `local-only without reason: ${JSON.stringify(wrong)}`).toEqual([]);
   });
 
-
   it('every registry entry stamps currentPayloadVersion >= 1', () => {
     const invalid = CONTRACT_REGISTRY.filter(
-      (entry) =>
-        typeof entry.currentPayloadVersion !== 'number' || entry.currentPayloadVersion < 1,
-    ).map(
-      (entry) => entry.eventType,
+      (entry) => typeof entry.currentPayloadVersion !== 'number' || entry.currentPayloadVersion < 1,
+    ).map((entry) => entry.eventType);
+    expect(invalid, `entries with invalid currentPayloadVersion: ${invalid.join(', ')}`).toEqual(
+      [],
     );
-    expect(invalid, `entries with invalid currentPayloadVersion: ${invalid.join(', ')}`).toEqual([]);
   });
   it('no entry has an empty surfaces[]', () => {
     const empty = CONTRACT_REGISTRY.filter((entry) => entry.surfaces.length === 0).map(

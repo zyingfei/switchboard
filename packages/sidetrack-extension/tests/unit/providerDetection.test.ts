@@ -92,9 +92,9 @@ describe('provider detection', () => {
       expect(
         isProviderThreadUrl('chatgpt', 'http://127.0.0.1:4321/chatgpt.html?provider=chatgpt'),
       ).toBe(true);
-      expect(isProviderThreadUrl('claude', 'http://localhost:4321/claude.html?provider=claude')).toBe(
-        true,
-      );
+      expect(
+        isProviderThreadUrl('claude', 'http://localhost:4321/claude.html?provider=claude'),
+      ).toBe(true);
       // Mismatched param doesn't qualify.
       expect(
         isProviderThreadUrl('claude', 'http://127.0.0.1:4321/anything.html?provider=chatgpt'),

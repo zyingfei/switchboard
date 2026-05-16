@@ -118,11 +118,7 @@ export const autoApplyUrlAttribution = async (
   // semantically identical. That feedback loop ran 344 inferred events
   // for 15 visits in the cross-replica e2e and starved the peer event
   // budget. Skip when the decision matches the current inferred state.
-  if (
-    existing !== undefined &&
-    existing.source === 'inferred' &&
-    existing.workstreamId === payload.workstreamId
-  ) {
+  if (existing?.source === 'inferred' && existing.workstreamId === payload.workstreamId) {
     return {
       status: 'skipped-existing-attribution',
       resolution,

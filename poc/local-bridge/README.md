@@ -32,8 +32,8 @@ HTTP is the runbook default because it has the smallest v1 install story:
 
 ```sh
 cd poc/local-bridge/companion
-npm install
-npm start -- --vault /tmp/bac-local-bridge-live --port 17875
+bun install
+bun run start -- --vault /tmp/bac-local-bridge-live --port 17875
 ```
 
 Then load `poc/local-bridge/extension/.output/chrome-mv3` in
@@ -45,15 +45,15 @@ For a mostly hands-off verification run:
 
 ```sh
 cd poc/local-bridge
-npm run verify
+bun run verify
 ```
 
 Useful variants:
 
 ```sh
-npm run verify -- --tick-seconds 60
-npm run verify -- --vault "/Users/$USER/Library/Mobile Documents/com~apple~CloudDocs/tmp" --tick-seconds 60
-npm run verify -- --no-browser --tick-seconds 10
+bun run verify -- --tick-seconds 60
+bun run verify -- --vault "/Users/$USER/Library/Mobile Documents/com~apple~CloudDocs/tmp" --tick-seconds 60
+bun run verify -- --no-browser --tick-seconds 10
 ```
 
 The default verifier starts a companion, checks auth, writes events, runs a
@@ -132,8 +132,8 @@ Validated on macOS 26.2 and Chrome 147.0.7727.102.
 Build/test checks:
 
 ```sh
-cd poc/local-bridge/companion && npm run compile && npm test
-cd poc/local-bridge/extension && npm run compile && npm test && npm run build
+cd poc/local-bridge/companion && bun run compile && bun run test
+cd poc/local-bridge/extension && bun run compile && bun run test && bun run build
 ```
 
 End-to-end checks:

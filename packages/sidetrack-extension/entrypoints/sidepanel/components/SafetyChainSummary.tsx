@@ -38,14 +38,9 @@ export function SafetyChainSummary({ checks, defaultOpen = false }: SafetyChainS
         }}
         aria-expanded={open}
       >
-        <span className="sc-glyph">
-          {hasIssue ? Icons.alert : Icons.check}
-        </span>
+        <span className="sc-glyph">{hasIssue ? Icons.alert : Icons.check}</span>
         <span className="sc-title">
-          Safety chain ·{' '}
-          <b>
-            {hasIssue ? 'needs review' : `${String(checks.length)} checks ok`}
-          </b>
+          Safety chain · <b>{hasIssue ? 'needs review' : `${String(checks.length)} checks ok`}</b>
         </span>
         <div className="sc-list">
           {checks.map((c) => (
@@ -75,7 +70,11 @@ export function SafetyChainSummary({ checks, defaultOpen = false }: SafetyChainS
         <div className="sc-detail">
           {checks.map((c) => (
             <div key={c.key} className="sc-row">
-              <span className={'sc-pip' + (c.status === 'bad' ? ' bad' : c.status === 'ok' ? ' ok' : '')}>
+              <span
+                className={
+                  'sc-pip' + (c.status === 'bad' ? ' bad' : c.status === 'ok' ? ' ok' : '')
+                }
+              >
                 {c.status === 'ok' ? '✓' : c.status === 'warn' ? '⚠' : '✗'}
               </span>
               <b>{c.label}</b>

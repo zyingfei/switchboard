@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Pair the loaded Sidetrack extension with the running companion by
 // injecting the bridge key directly into the extension's storage —
 // no UI paste required. Designed for headless / agent-driven setups
@@ -14,9 +14,9 @@
 //   4. (optional) calls /v1/system/health to confirm the link.
 //
 // Usage:
-//   npm run e2e:pair                       # uses defaults
-//   SIDETRACK_VAULT=~/path npm run e2e:pair
-//   SIDETRACK_E2E_CDP_URL=http://localhost:9222 npm run e2e:pair
+//   bun run e2e:pair                       # uses defaults
+//   SIDETRACK_VAULT=~/path bun run e2e:pair
+//   SIDETRACK_E2E_CDP_URL=http://localhost:9222 bun run e2e:pair
 //
 // Required state:
 //   - test browser running with the extension loaded (e2e:chrome-debug)
@@ -42,7 +42,7 @@ try {
 } catch (err) {
   console.error(`[pair-extension] cannot read ${bridgeKeyPath}`);
   console.error('  Start the companion first:');
-  console.error(`    node packages/sidetrack-companion/dist/cli.js --vault ${vault}`);
+  console.error(`    bun packages/sidetrack-companion/dist/cli.js --vault ${vault}`);
   console.error(`  (then re-run this script)`);
   console.error('  Underlying error:', err.message ?? err);
   process.exit(1);
@@ -52,7 +52,7 @@ if (bridgeKey.length === 0) {
   process.exit(1);
 }
 
-const { chromium } = await import(path.join(packageRoot, 'node_modules/playwright/index.mjs'));
+const { chromium } = await import('@playwright/test');
 
 let browser;
 try {
@@ -60,7 +60,7 @@ try {
 } catch (err) {
   console.error(`[pair-extension] cannot connect to ${cdpUrl}`);
   console.error('  Start the test browser first:');
-  console.error('    npm run e2e:chrome-debug');
+  console.error('    bun run e2e:chrome-debug');
   console.error('  Underlying error:', err.message ?? err);
   process.exit(1);
 }
@@ -111,7 +111,7 @@ if (extensionId === null) {
   console.error('[pair-extension] cannot find Sidetrack extension.');
   console.error('  Confirm chrome://extensions/ shows Sidetrack as enabled,');
   console.error('  or relaunch the test browser:');
-  console.error('    npm run e2e:chrome-debug');
+  console.error('    bun run e2e:chrome-debug');
   process.exit(1);
 }
 

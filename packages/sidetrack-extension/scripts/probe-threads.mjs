@@ -9,9 +9,16 @@ const state = await sw.evaluate(async () => {
   const diag = (await get('sidetrack.dispatchDiagnostic')) ?? null;
   return {
     threadCount: Array.isArray(threads) ? threads.length : 'not-array',
-    chatgptThreads: Array.isArray(threads) ? threads
-      .filter((t) => t.provider === 'chatgpt')
-      .map((t) => ({ bac_id: t.bac_id, url: t.threadUrl, title: t.title, lastSeenAt: t.lastSeenAt })) : [],
+    chatgptThreads: Array.isArray(threads)
+      ? threads
+          .filter((t) => t.provider === 'chatgpt')
+          .map((t) => ({
+            bac_id: t.bac_id,
+            url: t.threadUrl,
+            title: t.title,
+            lastSeenAt: t.lastSeenAt,
+          }))
+      : [],
     queueCount: Array.isArray(queue) ? queue.length : 'not-array',
     dispatchDiagnostic: diag,
   };

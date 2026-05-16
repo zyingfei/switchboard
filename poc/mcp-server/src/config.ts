@@ -26,8 +26,8 @@ const rawConfigSchema = z.object({
 const usageText = `BAC MCP server POC
 
 Usage:
-  npm start -- --config ./fixtures/demo-config.json
-  node ./dist/cli.js --config /absolute/path/to/config.json
+  bun run start -- --config ./fixtures/demo-config.json
+  bun ./dist/cli.js --config /absolute/path/to/config.json
 
 Environment overrides:
   BAC_VAULT_PATH

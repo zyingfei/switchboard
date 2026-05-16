@@ -147,10 +147,7 @@ describe('POST /v1/edge/events', () => {
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  const post = async (
-    path: string,
-    body: unknown,
-  ): Promise<{ status: number; data: unknown }> => {
+  const post = async (path: string, body: unknown): Promise<{ status: number; data: unknown }> => {
     const res = await fetch(`${serverUrl}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': BRIDGE },
@@ -194,7 +191,7 @@ describe('POST /v1/edge/events', () => {
     const stray: AcceptedEvent = {
       ...interval(3),
       type: 'browser.timeline.observed', // wrong route for this type
-    } as AcceptedEvent;
+    };
     const r = await post('/v1/edge/events', { events: [stray] });
     expect(r.status).toBe(200);
     const body = r.data as { data: { imported: unknown[]; skipped: { reason: string }[] } };
@@ -206,7 +203,7 @@ describe('POST /v1/edge/events', () => {
   it('rejects malformed engagement payloads with invalid-payload', async () => {
     const malformed: AcceptedEvent = {
       ...interval(4),
-      payload: { not: 'an-engagement-payload' } as unknown as AcceptedEvent['payload'],
+      payload: { not: 'an-engagement-payload' },
     };
     const r = await post('/v1/edge/events', { events: [malformed] });
     expect(r.status).toBe(200);
@@ -260,22 +257,19 @@ describe('POST /v1/edge/events', () => {
     expect(r.status).toBe(400);
   });
 
-  it.skip(
-    'rejects visual.fingerprint.observed when the payload has no required fields — pinning the surface even though no real producer triggers this branch today',
-    async () => {
-      const malformed: AcceptedEvent = {
-        clientEventId: 'vf:1',
-        dot: { replicaId: 'edge_vf', seq: 1 },
-        deps: {},
-        aggregateId: 'visual.fingerprint:hash:zzz',
-        type: VISUAL_FINGERPRINT_OBSERVED,
-        payload: {} as unknown as AcceptedEvent['payload'],
-        acceptedAtMs: Date.now(),
-      };
-      const r = await post('/v1/edge/events', { events: [malformed] });
-      expect(r.status).toBe(200);
-      const body = r.data as { data: { skipped: { reason: string }[] } };
-      expect(body.data.skipped[0]?.reason).toBe('invalid-payload');
-    },
-  );
+  it.skip('rejects visual.fingerprint.observed when the payload has no required fields — pinning the surface even though no real producer triggers this branch today', async () => {
+    const malformed: AcceptedEvent = {
+      clientEventId: 'vf:1',
+      dot: { replicaId: 'edge_vf', seq: 1 },
+      deps: {},
+      aggregateId: 'visual.fingerprint:hash:zzz',
+      type: VISUAL_FINGERPRINT_OBSERVED,
+      payload: {},
+      acceptedAtMs: Date.now(),
+    };
+    const r = await post('/v1/edge/events', { events: [malformed] });
+    expect(r.status).toBe(200);
+    const body = r.data as { data: { skipped: { reason: string }[] } };
+    expect(body.data.skipped[0]?.reason).toBe('invalid-payload');
+  });
 });

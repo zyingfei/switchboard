@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ActiveTimelineObservation, BrowserTimelineObservedPayload } from '../../../src/timeline/events';
+import type {
+  ActiveTimelineObservation,
+  BrowserTimelineObservedPayload,
+} from '../../../src/timeline/events';
 import {
   observationFromPayload,
   resetTimelineMaterializerStateForTests,
@@ -105,14 +108,19 @@ describe('timeline plugin materializer (Class F)', () => {
       edgeDot: { replicaId: 'edge_test', seq: i + 1 },
       clientEventId: `pre-${String(i)}`,
       surface: 'timeline',
-      payload: buildPayload({ eventId: `pre-${String(i)}`, observedAt: `2026-05-07T${String(i % 24).padStart(2, '0')}:00:00.000Z` }),
+      payload: buildPayload({
+        eventId: `pre-${String(i)}`,
+        observedAt: `2026-05-07T${String(i % 24).padStart(2, '0')}:00:00.000Z`,
+      }),
       state: i < cap ? 'active' : 'spooled',
       createdAt: '2026-05-07T00:00:00.000Z',
       lastTransitionAt: '2026-05-07T00:00:00.000Z',
     }));
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({ [SPOOL_KEY]: fullEntries });
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({ [SPOOL_KEY]: fullEntries });
 
     const result = await timelinePluginMaterializer.admitLocal(
       observationFromPayload(buildPayload({ eventId: 'overflow' })),
@@ -126,9 +134,11 @@ describe('timeline plugin materializer (Class F)', () => {
 
   it('drain pushes spooled entries through the hook and removes them after ack', async () => {
     // Seed an edge replica id so allocateNextSeq doesn't generate one.
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     // Admit two observations.
@@ -154,9 +164,11 @@ describe('timeline plugin materializer (Class F)', () => {
   });
 
   it('drain failure rolls remaining entries back to spooled for retry', async () => {
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     await timelinePluginMaterializer.admitLocal(
@@ -176,9 +188,11 @@ describe('timeline plugin materializer (Class F)', () => {
   });
 
   it('drain partial-success rolls un-acked entries back to spooled (self-review fix)', async () => {
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     await timelinePluginMaterializer.admitLocal(
@@ -210,9 +224,11 @@ describe('timeline plugin materializer (Class F)', () => {
     // filter only included 'active' | 'spooled', so every subsequent
     // drain reported drainableCount=0 even though pending-send
     // entries existed — they were orphaned forever.
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     await timelinePluginMaterializer.admitLocal(
@@ -240,9 +256,11 @@ describe('timeline plugin materializer (Class F)', () => {
   });
 
   it('drain idempotency: second drain over the same entries is a no-op once acked', async () => {
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     await timelinePluginMaterializer.admitLocal(
@@ -260,9 +278,11 @@ describe('timeline plugin materializer (Class F)', () => {
   });
 
   it('healthSnapshot reflects active + spool sizes', async () => {
-    await (globalThis as unknown as {
-      chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
-    }).chrome.storage.local.set({
+    await (
+      globalThis as unknown as {
+        chrome: { storage: { local: { set: (e: Record<string, unknown>) => Promise<void> } } };
+      }
+    ).chrome.storage.local.set({
       [EDGE_KEY]: { edgeReplicaId: 'edge_test', nextSeq: 1 },
     });
     await timelinePluginMaterializer.admitLocal(

@@ -76,7 +76,9 @@ export class ClientEventIdReuseError extends Error {
 // The internal `appendClient` accepts a `baseVector?` and is the
 // shared implementation. New code must call one of the named APIs.
 
-export interface AppendInputObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+export interface AppendInputObserved<
+  TPayload extends Record<string, unknown> = Record<string, unknown>,
+> {
   readonly clientEventId: string;
   readonly aggregateId: string;
   readonly type: string;
@@ -92,7 +94,9 @@ export interface AppendInputObserved<TPayload extends Record<string, unknown> = 
   readonly hlc?: Hlc;
 }
 
-export interface AppendInputServerObserved<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+export interface AppendInputServerObserved<
+  TPayload extends Record<string, unknown> = Record<string, unknown>,
+> {
   readonly clientEventId: string;
   readonly aggregateId: string;
   readonly type: string;
@@ -154,9 +158,7 @@ export interface EventLog {
   ) => Promise<AcceptedEvent<TPayload>>;
   readonly readMerged: () => Promise<readonly AcceptedEvent[]>;
   readonly readReplica: (replicaId: string) => Promise<readonly AcceptedEvent[]>;
-  readonly readByAggregate: (
-    aggregateId: string,
-  ) => Promise<readonly AcceptedEvent[]>;
+  readonly readByAggregate: (aggregateId: string) => Promise<readonly AcceptedEvent[]>;
   readonly findByClientEventId: (clientEventId: string) => Promise<AcceptedEvent | null>;
   readonly findByDot: (dot: Dot) => Promise<AcceptedEvent | null>;
   readonly listReplicaIds: () => Promise<readonly string[]>;
@@ -202,7 +204,7 @@ const replicaLogDir = (vaultPath: string, replicaId: string): string =>
 const replicaLogPath = (vaultPath: string, replicaId: string, date: Date): string =>
   join(replicaLogDir(vaultPath, replicaId), `${dateStamp(date)}.jsonl`);
 
-const isAcceptedEvent = (value: unknown): value is AcceptedEvent => {
+export const isAcceptedEvent = (value: unknown): value is AcceptedEvent => {
   if (typeof value !== 'object' || value === null) return false;
   const entry = value as Record<string, unknown>;
   if (typeof entry['clientEventId'] !== 'string') return false;
@@ -335,16 +337,12 @@ export const createEventLog = (
     return sortAcceptedEvents(all);
   };
 
-  const readByAggregate = async (
-    aggregateId: string,
-  ): Promise<readonly AcceptedEvent[]> => {
+  const readByAggregate = async (aggregateId: string): Promise<readonly AcceptedEvent[]> => {
     const merged = await readMerged();
     return merged.filter((event) => event.aggregateId === aggregateId);
   };
 
-  const findByClientEventId = async (
-    clientEventId: string,
-  ): Promise<AcceptedEvent | null> => {
+  const findByClientEventId = async (clientEventId: string): Promise<AcceptedEvent | null> => {
     const merged = await readMerged();
     return merged.find((event) => event.clientEventId === clientEventId) ?? null;
   };
@@ -352,9 +350,8 @@ export const createEventLog = (
   const findByDot = async (dot: Dot): Promise<AcceptedEvent | null> => {
     const merged = await readMerged();
     return (
-      merged.find(
-        (event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq,
-      ) ?? null
+      merged.find((event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq) ??
+      null
     );
   };
 
@@ -396,9 +393,7 @@ export const createEventLog = (
       return event;
     });
 
-  const importPeerEvent = (
-    event: AcceptedEvent,
-  ): Promise<{ readonly imported: boolean }> =>
+  const importPeerEvent = (event: AcceptedEvent): Promise<{ readonly imported: boolean }> =>
     enqueueAppend(async () => {
       // Refusing imports under our own replica id keeps the local
       // shard truthful — only `appendClient` writes there.
@@ -525,9 +520,7 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   if (explicit !== undefined) {
     deps = explicit;
   } else {
-    deps = vectorFromEvents(
-      merged.filter((event) => event.aggregateId === input.aggregateId),
-    );
+    deps = vectorFromEvents(merged.filter((event) => event.aggregateId === input.aggregateId));
   }
   if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
     const byClientId = new Map<string, AcceptedEvent>();
@@ -542,5 +535,4 @@ const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
   return deps;
 };
 
-const maybeAttachHlc = (hlc: Hlc | undefined): { hlc?: Hlc } =>
-  hlc === undefined ? {} : { hlc };
+const maybeAttachHlc = (hlc: Hlc | undefined): { hlc?: Hlc } => (hlc === undefined ? {} : { hlc });

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { mkdir, readdir, readFile } from 'node:fs/promises';
@@ -76,12 +76,12 @@ const parseArgs = (argv) => {
 const usage = `BAC local-bridge automated verification
 
 Usage:
-  npm run verify -- [--vault /path/to/vault] [--port 17875] [--tick-seconds 8]
+  bun run verify -- [--vault /path/to/vault] [--port 17875] [--tick-seconds 8]
 
 Examples:
-  npm run verify
-  npm run verify -- --vault "/Users/$USER/Library/Mobile Documents/com~apple~CloudDocs/tmp" --tick-seconds 60
-  npm run verify -- --browser --tick-seconds 10
+  bun run verify
+  bun run verify -- --vault "/Users/$USER/Library/Mobile Documents/com~apple~CloudDocs/tmp" --tick-seconds 60
+  bun run verify -- --browser --tick-seconds 10
 
 Notes:
   - Uses HTTP localhost transport.
@@ -156,13 +156,13 @@ const readKey = async (vaultPath) => {
 };
 
 const startCompanion = async ({ vault, port }) => {
-  const tsxPath = path.join(companionDir, 'node_modules', '.bin', 'tsx');
-  if (!existsSync(tsxPath)) {
-    throw new Error(`Missing companion dependencies. Run: npm --prefix ${companionDir} install`);
+  const companionCli = path.join(companionDir, 'src', 'cli.ts');
+  if (!existsSync(companionCli)) {
+    throw new Error(`Missing companion CLI at ${companionCli}`);
   }
 
   await mkdir(vault, { recursive: true });
-  const child = spawn('npm', ['start', '--', '--vault', vault, '--port', String(port)], {
+  const child = spawn('bun', [companionCli, '--vault', vault, '--port', String(port)], {
     cwd: companionDir,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -526,7 +526,7 @@ const main = async () => {
 
   try {
     if (args.build) {
-      await run('build extension', 'npm', ['run', 'build'], { cwd: extensionDir });
+      await run('build extension', 'bun', ['run', 'build'], { cwd: extensionDir });
     }
 
     await start();

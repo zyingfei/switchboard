@@ -66,7 +66,7 @@ describe('connections — realistic two-flow narration (CVE + Switchboard)', () 
     // Now anchor on each "ambient browsing" visit the user
     // mentioned. These are the visits most at risk of NOT linking
     // because the user didn't necessarily paste them into a chat.
-    const ambient: ReadonlyArray<readonly [string, string]> = [
+    const ambient: readonly (readonly [string, string])[] = [
       ['Flow A — Google search', REALISTIC_FLOW_A_NODES.visits.googleSearch],
       ['Flow A — HN thread visit', REALISTIC_FLOW_A_NODES.visits.hn],
       ['Flow A — copy.fail homepage', REALISTIC_FLOW_A_NODES.visits.copyFail],

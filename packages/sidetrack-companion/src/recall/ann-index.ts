@@ -92,7 +92,6 @@ const HNSW_FILTER_BUFFER = 8;
 
 const defaultLogger: AnnLogger = {
   warn: (message) => {
-    // eslint-disable-next-line no-console
     console.warn(message);
   },
 };
@@ -186,10 +185,7 @@ export const queryFlatTopK = (
     .slice(0, limit);
 };
 
-const createFlatAnnIndex = (
-  revisionId: string,
-  items: readonly IndexEntry[],
-): AnnVectorIndex => ({
+const createFlatAnnIndex = (revisionId: string, items: readonly IndexEntry[]): AnnVectorIndex => ({
   revisionId,
   backend: 'flat',
   itemCount: items.filter((item) => item.tombstoned !== true).length,
@@ -275,7 +271,11 @@ export const buildAnnIndex = async ({
         if (requestedLimit === 0) return [];
         const nativeLimit = hnswSearchLimit(requestedLimit, searchable.length, options);
         try {
-          const matches = index.search(vectorForDimension(queryEmbedding, dimensions), nativeLimit, 0);
+          const matches = index.search(
+            vectorForDimension(queryEmbedding, dimensions),
+            nativeLimit,
+            0,
+          );
           const results: AnnSearchResult[] = [];
           for (let cursor = 0; cursor < matches.keys.length; cursor += 1) {
             const key = matches.keys[cursor];
@@ -314,7 +314,9 @@ export const createAnnIndexCache = (): AnnIndexCache => {
       byRevision.set(input.revisionId, built);
       return built;
     },
-    clear: () => byRevision.clear(),
+    clear: () => {
+      byRevision.clear();
+    },
   };
 };
 

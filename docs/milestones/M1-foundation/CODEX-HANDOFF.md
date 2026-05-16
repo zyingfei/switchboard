@@ -69,7 +69,7 @@ The preview entry stays as-is — it's useful for design iteration.
 
 ## Mission 2 — E2E acceptance pass
 
-Run `cd packages/sidetrack-extension && npm run e2e` first. This
+Run `cd packages/sidetrack-extension && bun run e2e` first. This
 launches the MV3 extension in a persistent Playwright-bundled Chromium
 profile, captures the ChatGPT, Claude, and Gemini PoC fixtures, and
 writes to a temp companion vault under `/tmp`.
@@ -89,10 +89,12 @@ For each condition:
 
 Setup steps before the walk:
 ```sh
-cd packages/sidetrack-companion && npm install && npm run build
-node dist/cli.js --vault /tmp/sidetrack-m1-validation --port 17373 &
+bun install
+cd packages/sidetrack-companion
+bun run build
+bun dist/cli.js --vault /tmp/sidetrack-m1-validation --port 17373 &
 cat /tmp/sidetrack-m1-validation/_BAC/.config/bridge.key
-cd ../sidetrack-extension && npm install && npm run build
+cd ../sidetrack-extension && bun run build
 ```
 
 Use Computer Use to:

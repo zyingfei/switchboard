@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Probe two things against the running CfT instance (CDP @ 9222):
 //   (1) https://chatgpt.com/?temporary-chat=true bypasses the
 //       redirect-to-last-chat behavior of the bare URL.
@@ -42,9 +42,7 @@ const main = async () => {
     // uses; mirror it so we exercise the same code path ChatGPT's
     // ProseMirror editor expects.
     await page.evaluate(() => {
-      const el = document.querySelector(
-        '#prompt-textarea[role="textbox"], #prompt-textarea',
-      );
+      const el = document.querySelector('#prompt-textarea[role="textbox"], #prompt-textarea');
       if (el instanceof HTMLElement) el.focus();
       // eslint-disable-next-line @typescript-eslint/no-deprecated
       document.execCommand('insertText', false, 'Reply with one word: hi');
@@ -56,7 +54,8 @@ const main = async () => {
     try {
       await page.waitForFunction(
         () =>
-          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
+          document
+            .querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
             ?.checkVisibility?.() ?? false,
         null,
         { timeout: 12_000 },
@@ -70,7 +69,8 @@ const main = async () => {
     try {
       await page.waitForFunction(
         () =>
-          document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
+          document
+            .querySelector('button[data-testid="stop-button"], button[aria-label*="Stop" i]')
             ?.checkVisibility?.() === false ||
           document.querySelector('button[data-testid="stop-button"]') === null,
         null,
@@ -82,9 +82,7 @@ const main = async () => {
     const finalUrl = page.url();
     console.log(`  final URL:           ${finalUrl}`);
     console.log(`  contains /c/<id>:    ${finalUrl.includes('/c/')}`);
-    console.log(
-      `  contains ?temporary-chat=true: ${finalUrl.includes('temporary-chat=true')}`,
-    );
+    console.log(`  contains ?temporary-chat=true: ${finalUrl.includes('temporary-chat=true')}`);
     const articleCount = await page.evaluate(
       () => document.querySelectorAll('article[data-message-author-role]').length,
     );

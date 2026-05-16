@@ -45,7 +45,8 @@ const sha256Hex = async (value: string): Promise<string> =>
 const contentKindFor = (value: string): ContentKindHint => {
   const trimmed = value.trim();
   const looksUrl = /^https?:\/\/\S+$/u.test(trimmed);
-  const hasCodeSignals = /(?:^|\n)\s*(?:const|let|function|class|import|export|\{|\}|<\/?[a-z])/u.test(value);
+  const hasCodeSignals =
+    /(?:^|\n)\s*(?:const|let|function|class|import|export|\{|\}|<\/?[a-z])/u.test(value);
   const hasSentence = /[.!?]\s/u.test(value);
   if (looksUrl) return 'url';
   if (hasCodeSignals && hasSentence) return 'mixed';
@@ -73,7 +74,9 @@ const destinationKindForLocation = (
   return 'note';
 };
 
-const digestSelection = async (value: string): Promise<{
+const digestSelection = async (
+  value: string,
+): Promise<{
   readonly normalized: string;
   readonly selectionHash: string;
   readonly simhash64: string;
@@ -98,8 +101,9 @@ const SNIPPET_PREVIEW_CHARS = 120;
 const cacheSnippetPreview = async (selectionHash: string, text: string): Promise<void> => {
   const preview = text.slice(0, SNIPPET_PREVIEW_CHARS);
   try {
-    const storage = (globalThis as { chrome?: { storage?: { local?: chrome.storage.LocalStorageArea } } })
-      .chrome?.storage?.local;
+    const storage = (
+      globalThis as { chrome?: { storage?: { local?: chrome.storage.LocalStorageArea } } }
+    ).chrome?.storage?.local;
     if (storage === undefined) return;
     const existing = await storage.get(SNIPPET_PREVIEW_KEY);
     const map: Record<string, string> =
@@ -171,9 +175,7 @@ export const attachCopyPasteLineage = (input: {
   });
 };
 
-export const isSelectionLineageMessage = (
-  value: unknown,
-): value is SelectionLineageMessage => {
+export const isSelectionLineageMessage = (value: unknown): value is SelectionLineageMessage => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (

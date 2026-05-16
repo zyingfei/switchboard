@@ -181,7 +181,9 @@ const withTrackedBudget = async <T>(
 ): Promise<{ readonly value: T; readonly timedOut: boolean }> => {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<{ value: T; timedOut: true }>((resolve) => {
-    timer = setTimeout(() => resolve({ value: fallback, timedOut: true }), budgetMs);
+    timer = setTimeout(() => {
+      resolve({ value: fallback, timedOut: true });
+    }, budgetMs);
   });
   try {
     return await Promise.race([

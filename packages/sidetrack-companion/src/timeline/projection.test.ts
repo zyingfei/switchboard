@@ -12,8 +12,9 @@ import {
 import { BROWSER_TIMELINE_OBSERVED } from './events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 
-const observe = (input: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string }):
-  BrowserTimelineObservedPayload => ({
+const observe = (
+  input: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string },
+): BrowserTimelineObservedPayload => ({
   eventId: input.eventId ?? `evt-${input.observedAt}-${input.url}`,
   observedAt: input.observedAt,
   url: input.url,
@@ -32,9 +33,25 @@ const observe = (input: Partial<BrowserTimelineObservedPayload> & { observedAt: 
 describe('timeline projection reducer (Class B)', () => {
   it('groups multiple observations of one canonicalUrl into one entry', () => {
     const events = [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://chatgpt.com/c/abc?token=1', canonicalUrl: 'https://chatgpt.com/c/abc', title: 'A' }),
-      observe({ observedAt: '2026-05-07T10:01:00.000Z', url: 'https://chatgpt.com/c/abc?token=2', canonicalUrl: 'https://chatgpt.com/c/abc', title: 'A — updated' }),
-      observe({ observedAt: '2026-05-07T10:05:00.000Z', url: 'https://chatgpt.com/c/abc', canonicalUrl: 'https://chatgpt.com/c/abc', title: 'A — updated', transition: 'updated' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://chatgpt.com/c/abc?token=1',
+        canonicalUrl: 'https://chatgpt.com/c/abc',
+        title: 'A',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:01:00.000Z',
+        url: 'https://chatgpt.com/c/abc?token=2',
+        canonicalUrl: 'https://chatgpt.com/c/abc',
+        title: 'A — updated',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:05:00.000Z',
+        url: 'https://chatgpt.com/c/abc',
+        canonicalUrl: 'https://chatgpt.com/c/abc',
+        title: 'A — updated',
+        transition: 'updated',
+      }),
     ];
     const entries = reduceTimelineEvents(events);
     expect(entries).toHaveLength(1);
@@ -47,8 +64,16 @@ describe('timeline projection reducer (Class B)', () => {
 
   it('keeps distinct canonicalUrls separate within a day', () => {
     const events = [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://chatgpt.com/c/abc', canonicalUrl: 'https://chatgpt.com/c/abc' }),
-      observe({ observedAt: '2026-05-07T10:01:00.000Z', url: 'https://chatgpt.com/c/xyz', canonicalUrl: 'https://chatgpt.com/c/xyz' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://chatgpt.com/c/abc',
+        canonicalUrl: 'https://chatgpt.com/c/abc',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:01:00.000Z',
+        url: 'https://chatgpt.com/c/xyz',
+        canonicalUrl: 'https://chatgpt.com/c/xyz',
+      }),
     ];
     const entries = reduceTimelineEvents(events);
     expect(entries).toHaveLength(2);
@@ -56,10 +81,28 @@ describe('timeline projection reducer (Class B)', () => {
 
   it('is order-independent (deterministic regardless of input order)', () => {
     const events = [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
-      observe({ observedAt: '2026-05-07T10:01:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b', transition: 'updated' }),
-      observe({ observedAt: '2026-05-07T10:02:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', title: 'A v2' }),
-      observe({ observedAt: '2026-05-07T10:03:00.000Z', url: 'https://x/c', canonicalUrl: 'https://x/c' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:01:00.000Z',
+        url: 'https://x/b',
+        canonicalUrl: 'https://x/b',
+        transition: 'updated',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:02:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        title: 'A v2',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:03:00.000Z',
+        url: 'https://x/c',
+        canonicalUrl: 'https://x/c',
+      }),
     ];
     const fwd = reduceTimelineEvents(events);
     const rev = reduceTimelineEvents([...events].reverse());
@@ -70,8 +113,17 @@ describe('timeline projection reducer (Class B)', () => {
 
   it('closed/completed transitions update lastSeenAt but not visitCount', () => {
     const events = [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
-      observe({ observedAt: '2026-05-07T10:01:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', transition: 'closed' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:01:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        transition: 'closed',
+      }),
     ];
     const entries = reduceTimelineEvents(events);
     expect(entries[0]?.visitCount).toBe(1);
@@ -80,16 +132,24 @@ describe('timeline projection reducer (Class B)', () => {
 
   it('sorts entries by lastSeenAt desc, id asc tie-break', () => {
     const events = [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
-      observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
-      observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/c', canonicalUrl: 'https://x/c' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
+      observe({
+        observedAt: '2026-05-07T11:00:00.000Z',
+        url: 'https://x/b',
+        canonicalUrl: 'https://x/b',
+      }),
+      observe({
+        observedAt: '2026-05-07T11:00:00.000Z',
+        url: 'https://x/c',
+        canonicalUrl: 'https://x/c',
+      }),
     ];
     const entries = reduceTimelineEvents(events);
-    expect(entries.map((e) => e.id)).toEqual([
-      'https://x/b',
-      'https://x/c',
-      'https://x/a',
-    ]);
+    expect(entries.map((e) => e.id)).toEqual(['https://x/b', 'https://x/c', 'https://x/a']);
   });
 
   it('falls back to raw url when canonicalUrl is missing', () => {

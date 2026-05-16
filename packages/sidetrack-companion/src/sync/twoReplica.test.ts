@@ -121,7 +121,10 @@ describe('two-replica review-draft simulation', () => {
     expect(projA.overall.status).toBe('conflict');
     expect(projB.overall.status).toBe('conflict');
     if (projA.overall.status === 'conflict') {
-      expect(projA.overall.candidates.map((c) => c.value).sort()).toEqual(['A summary', 'B summary']);
+      expect(projA.overall.candidates.map((c) => c.value).sort()).toEqual([
+        'A summary',
+        'B summary',
+      ]);
     }
     expect(projA.vector).toEqual(projB.vector);
   });
@@ -274,18 +277,10 @@ describe('two-replica review-draft simulation', () => {
 
     // Both replicas' merged logs contain both events keyed by
     // their original dots (no re-stamping).
-    const mergedFromA = (await A.log.readMerged()).filter(
-      (e) => e.type === 'capture.recorded',
-    );
-    const mergedFromB = (await B.log.readMerged()).filter(
-      (e) => e.type === 'capture.recorded',
-    );
-    const dotsA = mergedFromA
-      .map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`)
-      .sort();
-    const dotsB = mergedFromB
-      .map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`)
-      .sort();
+    const mergedFromA = (await A.log.readMerged()).filter((e) => e.type === 'capture.recorded');
+    const mergedFromB = (await B.log.readMerged()).filter((e) => e.type === 'capture.recorded');
+    const dotsA = mergedFromA.map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`).sort();
+    const dotsB = mergedFromB.map((e) => `${e.dot.replicaId}:${String(e.dot.seq)}`).sort();
     expect(dotsA).toEqual(dotsB);
     expect(dotsA.length).toBe(2);
     // Neither dominates the other — concurrent append-only.

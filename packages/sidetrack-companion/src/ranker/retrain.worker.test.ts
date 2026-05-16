@@ -9,7 +9,7 @@ import { runMaybeRetrainInWorker } from './retrain.js';
 
 // Worker integration test. Vitest runs off src/ which does not have
 // the compiled `retrain.worker.js` next to retrain.js, so the test
-// gracefully skips unless `npm run build` produced the dist bundle
+// gracefully skips unless `bun run build` produced the dist bundle
 // AND the test environment was configured to load the worker from
 // there. The post-build path is exercised by the production runtime;
 // this test pins the contract.

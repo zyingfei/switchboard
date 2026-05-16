@@ -59,16 +59,10 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
 const isProvider = (value: unknown): value is TimelineProvider =>
-  value === 'chatgpt' ||
-  value === 'claude' ||
-  value === 'gemini' ||
-  value === 'generic';
+  value === 'chatgpt' || value === 'claude' || value === 'gemini' || value === 'generic';
 
 const isTransition = (value: unknown): value is TimelineTransition =>
-  value === 'activated' ||
-  value === 'updated' ||
-  value === 'completed' ||
-  value === 'closed';
+  value === 'activated' || value === 'updated' || value === 'completed' || value === 'closed';
 
 // Reviewer-flagged DoS bound: cap URL / title fields so a malformed
 // or malicious payload can't bloat the projection file. Real URLs
@@ -89,38 +83,38 @@ export const isBrowserTimelineObservedPayload = (
   value: unknown,
 ): value is BrowserTimelineObservedPayload => {
   if (!isRecord(value)) return false;
-  if (typeof value['eventId'] !== 'string' || (value['eventId'] as string).length > TIMELINE_EVENT_ID_MAX_LENGTH) {
+  if (
+    typeof value['eventId'] !== 'string' ||
+    value['eventId'].length > TIMELINE_EVENT_ID_MAX_LENGTH
+  ) {
     return false;
   }
-  if (typeof value['observedAt'] !== 'string' || (value['observedAt'] as string).length > 64) {
+  if (typeof value['observedAt'] !== 'string' || value['observedAt'].length > 64) {
     return false;
   }
-  if (typeof value['url'] !== 'string' || (value['url'] as string).length > TIMELINE_URL_MAX_LENGTH) {
+  if (typeof value['url'] !== 'string' || value['url'].length > TIMELINE_URL_MAX_LENGTH) {
     return false;
   }
   if (!isTransition(value['transition'])) return false;
   if (value['canonicalUrl'] !== undefined) {
     if (typeof value['canonicalUrl'] !== 'string') return false;
-    if ((value['canonicalUrl'] as string).length > TIMELINE_URL_MAX_LENGTH) return false;
+    if (value['canonicalUrl'].length > TIMELINE_URL_MAX_LENGTH) return false;
   }
   if (value['title'] !== undefined) {
     if (typeof value['title'] !== 'string') return false;
-    if ((value['title'] as string).length > TIMELINE_TITLE_MAX_LENGTH) return false;
+    if (value['title'].length > TIMELINE_TITLE_MAX_LENGTH) return false;
   }
   if (value['provider'] !== undefined && !isProvider(value['provider'])) return false;
   if (value['tabIdHash'] !== undefined) {
     if (typeof value['tabIdHash'] !== 'string') return false;
-    if ((value['tabIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
+    if (value['tabIdHash'].length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
   if (value['windowIdHash'] !== undefined) {
     if (typeof value['windowIdHash'] !== 'string') return false;
-    if ((value['windowIdHash'] as string).length > TIMELINE_HASH_MAX_LENGTH) return false;
+    if (value['windowIdHash'].length > TIMELINE_HASH_MAX_LENGTH) return false;
   }
   if (value['tabSessionId'] !== undefined && !isStableId(value['tabSessionId'])) return false;
-  if (
-    value['openerTabSessionId'] !== undefined &&
-    !isStableId(value['openerTabSessionId'])
-  ) {
+  if (value['openerTabSessionId'] !== undefined && !isStableId(value['openerTabSessionId'])) {
     return false;
   }
   if (!hasValidPayloadExtensionFields(value)) return false;

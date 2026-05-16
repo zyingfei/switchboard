@@ -103,7 +103,8 @@ const targetVisitNodes = (snapshot: ConnectionsSnapshot, tabSessionId: string): 
     }
     if (
       edge.toNodeId === target &&
-      (edge.fromNodeId.startsWith(VISIT_PREFIX) || edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX))
+      (edge.fromNodeId.startsWith(VISIT_PREFIX) ||
+        edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX))
     ) {
       visits.add(edge.fromNodeId);
     }
@@ -290,19 +291,17 @@ const collectUrlAnchors = (
   for (const node of snapshot.nodes) {
     if (node.kind !== 'visit-instance') continue;
     const nodeCanonical =
-      typeof node.metadata['canonicalUrl'] === 'string'
-        ? (node.metadata['canonicalUrl'] as string)
-        : typeof node.metadata['url'] === 'string'
-          ? (node.metadata['url'] as string)
+      typeof node.metadata.canonicalUrl === 'string'
+        ? node.metadata.canonicalUrl
+        : typeof node.metadata.url === 'string'
+          ? node.metadata.url
           : undefined;
     if (nodeCanonical === canonicalUrl) out.push(node.id);
   }
   return out.sort(compareString);
 };
 
-export const resolveUrlAttribution = (
-  input: ResolveUrlAttributionInput,
-): UrlResolutionResult => {
+export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlResolutionResult => {
   const mode = input.policyMode ?? 'balanced';
   const evidence = buildEvidenceGraph(input.snapshot);
   const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl).filter((anchor) =>

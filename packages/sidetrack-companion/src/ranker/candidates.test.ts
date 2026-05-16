@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ConnectionEdge, ConnectionEdgeKind, ConnectionEdgeProducedBy } from '../connections/types.js';
+import type {
+  ConnectionEdge,
+  ConnectionEdgeKind,
+  ConnectionEdgeProducedBy,
+} from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
@@ -85,7 +89,10 @@ const timelinePayload = (input: {
   payloadVersion: 1,
 });
 
-const snippetPayload = (input: { readonly visitId: string; readonly selectionHash: string }): unknown => ({
+const snippetPayload = (input: {
+  readonly visitId: string;
+  readonly selectionHash: string;
+}): unknown => ({
   payloadVersion: 1,
   visitId: input.visitId,
   selectionHash: input.selectionHash,
@@ -391,13 +398,19 @@ describe('ranker candidate generation', () => {
         seq: 1,
         replicaId: 'replica-a',
         type: NAVIGATION_COMMITTED,
-        payload: navigationPayload({ visitId: 'visit-a', canonicalUrl: 'https://shared.test/page' }),
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://shared.test/page',
+        }),
       }),
       event({
         seq: 3,
         replicaId: 'replica-b',
         type: NAVIGATION_COMMITTED,
-        payload: navigationPayload({ visitId: 'visit-b', canonicalUrl: 'https://shared.test/page' }),
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://shared.test/page',
+        }),
       }),
     ]);
 

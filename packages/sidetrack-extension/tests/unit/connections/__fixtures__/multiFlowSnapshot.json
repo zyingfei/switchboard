@@ -7,9 +7,7 @@
       "label": "the unsafe path is here. cross-ref https://nvd.nist.gov/vuln/detail/CVE-2024-123",
       "firstSeenAt": "2026-05-07T09:35:30.000Z",
       "lastSeenAt": "2026-05-07T09:35:30.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "man copy_file_range",
         "url": "https://kernel.org/doc/man-pages/online/copy_file_range.2.html"
@@ -21,9 +19,7 @@
       "label": "check assistant assumed AF_UNIX abstract namespace",
       "firstSeenAt": "2026-05-07T09:35:45.000Z",
       "lastSeenAt": "2026-05-07T09:35:45.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "Claude — CVE chat",
         "url": "https://claude.ai/chat/cve_thread"
@@ -35,9 +31,7 @@
       "label": "note: see https://blog.example.com/merge-pitfalls for the failure mode.",
       "firstSeenAt": "2026-05-07T09:36:00.000Z",
       "lastSeenAt": "2026-05-07T09:36:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "PostgreSQL: MERGE",
         "url": "https://www.postgresql.org/docs/current/sql-merge.html"
@@ -49,9 +43,7 @@
       "label": "needs §27 cross-ref to BRAINSTORM",
       "firstSeenAt": "2026-05-07T09:35:00.000Z",
       "lastSeenAt": "2026-05-07T09:35:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "BRAINSTORM.md",
         "url": "https://github.com/sidetrack-co/sidetrack/blob/main/BRAINSTORM.md"
@@ -91,9 +83,7 @@
       "label": "Codex — Python repro for CVE-2024-12345",
       "firstSeenAt": "2026-05-07T09:22:00.000Z",
       "lastSeenAt": "2026-05-07T09:33:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "provider": "codex",
         "status": "sent",
@@ -145,9 +135,7 @@
       "label": "test repro on Ubuntu 22 + 24",
       "firstSeenAt": "2026-05-07T09:38:00.000Z",
       "lastSeenAt": "2026-05-07T09:38:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "status": "pending",
         "title": "test repro on Ubuntu 22 + 24"
@@ -159,9 +147,7 @@
       "label": "document MERGE isolation pitfall",
       "firstSeenAt": "2026-05-07T09:35:00.000Z",
       "lastSeenAt": "2026-05-07T09:35:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "status": "pending",
         "title": "document MERGE isolation pitfall"
@@ -173,9 +159,7 @@
       "label": "ChatGPT — review CVE repro",
       "firstSeenAt": "2026-05-07T09:30:00.000Z",
       "lastSeenAt": "2026-05-07T09:33:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://chatgpt.com/c/cve_review",
         "provider": "chatgpt",
@@ -190,9 +174,7 @@
       "label": "Claude — copy_file_range CVE",
       "firstSeenAt": "2026-05-07T09:18:00.000Z",
       "lastSeenAt": "2026-05-07T09:18:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://claude.ai/chat/cve_thread",
         "provider": "claude",
@@ -207,9 +189,7 @@
       "label": "ChatGPT — review SQL plan",
       "firstSeenAt": "2026-05-07T09:28:00.000Z",
       "lastSeenAt": "2026-05-07T09:28:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://chatgpt.com/c/pg_review",
         "provider": "chatgpt",
@@ -224,9 +204,7 @@
       "label": "Claude — MERGE vs UPSERT",
       "firstSeenAt": "2026-05-07T09:24:00.000Z",
       "lastSeenAt": "2026-05-07T09:35:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://claude.ai/chat/pg_thread",
         "provider": "claude",
@@ -241,9 +219,7 @@
       "label": "ChatGPT — review reducer code",
       "firstSeenAt": "2026-05-07T09:31:00.000Z",
       "lastSeenAt": "2026-05-07T09:31:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://chatgpt.com/c/sb_review",
         "provider": "chatgpt",
@@ -258,9 +234,7 @@
       "label": "Claude — m2 dispatch design review",
       "firstSeenAt": "2026-05-07T09:19:00.000Z",
       "lastSeenAt": "2026-05-07T09:19:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "canonicalUrl": "https://claude.ai/chat/sb_thread",
         "provider": "claude",
@@ -502,9 +476,7 @@
       "label": "Postgres · MERGE semantics",
       "firstSeenAt": "2026-05-07T08:57:00.000Z",
       "lastSeenAt": "2026-05-07T09:28:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "Postgres · MERGE semantics"
       }
@@ -515,9 +487,7 @@
       "label": "ws_research",
       "firstSeenAt": "2026-05-07T08:55:00.000Z",
       "lastSeenAt": "2026-05-07T08:56:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "Research"
       }
@@ -528,9 +498,7 @@
       "label": "Security · Linux CVE",
       "firstSeenAt": "2026-05-07T08:56:00.000Z",
       "lastSeenAt": "2026-05-07T09:38:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "Security · Linux CVE"
       }
@@ -541,9 +509,7 @@
       "label": "Sidetrack · project review",
       "firstSeenAt": "2026-05-07T08:58:00.000Z",
       "lastSeenAt": "2026-05-07T09:31:00.000Z",
-      "originReplicaIds": [
-        "replica-mac"
-      ],
+      "originReplicaIds": ["replica-mac"],
       "metadata": {
         "title": "Sidetrack · project review"
       }

@@ -2,7 +2,10 @@ import { chromium } from '@playwright/test';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const [context] = browser.contexts();
 const sw = context.serviceWorkers().find((w) => w.url().includes('background.js'));
-if (!sw) { console.log('SW dormant'); process.exit(1); }
+if (!sw) {
+  console.log('SW dormant');
+  process.exit(1);
+}
 const result = await sw.evaluate(async () => {
   const tabs = await chrome.tabs.query({});
   const target = tabs.find((t) => t.url?.includes('69fa8f0f'));

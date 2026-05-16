@@ -100,9 +100,7 @@ const isGradeHistogram = (value: unknown): value is RankerTrainQuality['gradeHis
   if (!isRecord(value)) return false;
   return (['0', '1', '2', '3', '4'] as const).every(
     (grade) =>
-      typeof value[grade] === 'number' &&
-      Number.isInteger(value[grade]) &&
-      value[grade] >= 0,
+      typeof value[grade] === 'number' && Number.isInteger(value[grade]) && value[grade] >= 0,
   );
 };
 

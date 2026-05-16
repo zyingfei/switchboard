@@ -60,11 +60,7 @@ const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   return await res.json();
 };
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     method: 'POST',
     headers: {
@@ -106,20 +102,19 @@ test.describe('connections — real chrome.tabs navigation drives the timeline o
     await runtime.context.route(/^https?:\/\//u, async (route) => {
       const url = route.request().url();
       if (ALL_URLS.some((target) => url.startsWith(target.split('?')[0]))) {
-        const title =
-          url.startsWith('https://news.ycombinator.com')
-            ? 'HN thread'
-            : url.startsWith('https://xint.io')
-              ? 'xint blog'
-              : url.startsWith('https://www.google.com')
-                ? 'google search'
-                : url.startsWith('https://chatgpt.com')
-                  ? 'chat'
-                  : url.startsWith('https://copy.fail')
-                    ? 'copy.fail'
-                    : url.startsWith('https://github.com')
-                      ? 'pr'
-                      : 'video';
+        const title = url.startsWith('https://news.ycombinator.com')
+          ? 'HN thread'
+          : url.startsWith('https://xint.io')
+            ? 'xint blog'
+            : url.startsWith('https://www.google.com')
+              ? 'google search'
+              : url.startsWith('https://chatgpt.com')
+                ? 'chat'
+                : url.startsWith('https://copy.fail')
+                  ? 'copy.fail'
+                  : url.startsWith('https://github.com')
+                    ? 'pr'
+                    : 'video';
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
@@ -178,16 +173,18 @@ test.describe('connections — real chrome.tabs navigation drives the timeline o
     // Force-drain via the new runtime message so the test doesn't
     // wait on the 60 s alarm cadence.
     const drainSender = await runtime.context.newPage();
-    await drainSender.goto(
-      `chrome-extension://${runtime.extensionId}/sidepanel.html`,
-      { waitUntil: 'domcontentloaded' },
-    );
+    await drainSender.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+    });
     let drainResult: unknown = null;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       drainResult = await runtime.sendRuntimeMessage(drainSender, {
         type: 'sidetrack.timeline.force-drain',
       });
-      const r = drainResult as { ok?: boolean; drain?: { uploaded?: number; remaining?: number } } | null;
+      const r = drainResult as {
+        ok?: boolean;
+        drain?: { uploaded?: number; remaining?: number };
+      } | null;
       if (r !== null && r.ok === true && (r.drain?.uploaded ?? 0) >= ALL_URLS.length) {
         break;
       }

@@ -597,9 +597,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       ...(tabSession.openerTabSessionId === undefined
         ? {}
         : { openerTabSessionId: tabSession.openerTabSessionId }),
-      ...(cachedActiveWorkstreamId === undefined
-        ? {}
-        : { workstreamId: cachedActiveWorkstreamId }),
+      ...(cachedActiveWorkstreamId === undefined ? {} : { workstreamId: cachedActiveWorkstreamId }),
     });
   };
 
@@ -765,8 +763,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       // the observer so the tab-session projection picks up `latestTitle`
       // and the Inbox / current-tab card show a human-readable string
       // instead of the canonical URL.
-      const hasTitleChange =
-        typeof changeInfo.title === 'string' && changeInfo.title.length > 0;
+      const hasTitleChange = typeof changeInfo.title === 'string' && changeInfo.title.length > 0;
       if (changeInfo.url === undefined && changeInfo.status !== 'complete' && !hasTitleChange) {
         updateLastOnUpdated(sequence, { skippedReason: 'no-url-and-not-complete-and-no-title' });
         return;

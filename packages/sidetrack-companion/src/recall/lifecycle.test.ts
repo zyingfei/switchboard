@@ -398,9 +398,9 @@ describe('recall lifecycle', () => {
       expect(result.tombstoned).toBe(1);
       const merged = await eventLog.readMerged();
       expect(
-        merged.filter((event) => event.type === 'recall.tombstone.target').map((event) =>
-          (event.payload as { readonly threadId?: string }).threadId,
-        ),
+        merged
+          .filter((event) => event.type === 'recall.tombstone.target')
+          .map((event) => (event.payload as { readonly threadId?: string }).threadId),
       ).toEqual(['t']);
     } finally {
       await rm(root, { recursive: true, force: true });

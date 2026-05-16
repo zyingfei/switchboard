@@ -69,7 +69,10 @@ interface CacheState {
 
 const readCacheFile = async (
   state: CacheState,
-): Promise<{ readonly header: CacheHeader; readonly entries: Map<string, Float32Array> } | null> => {
+): Promise<{
+  readonly header: CacheHeader;
+  readonly entries: Map<string, Float32Array>;
+} | null> => {
   let buffer: Buffer;
   try {
     buffer = await readFile(state.path);
@@ -80,7 +83,9 @@ const readCacheFile = async (
     const cursor = { offset: 0 };
     const headerLength = buffer.readUInt32LE(cursor.offset);
     cursor.offset += 4;
-    const headerJson = buffer.subarray(cursor.offset, cursor.offset + headerLength).toString('utf8');
+    const headerJson = buffer
+      .subarray(cursor.offset, cursor.offset + headerLength)
+      .toString('utf8');
     cursor.offset += headerLength;
     const header = JSON.parse(headerJson) as CacheHeader;
     if (header.magic !== MAGIC || header.version !== VERSION) return null;

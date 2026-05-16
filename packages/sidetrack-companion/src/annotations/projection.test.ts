@@ -1,11 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  ANNOTATION_CREATED,
-  ANNOTATION_DELETED,
-  ANNOTATION_NOTE_SET,
-} from './events.js';
+import { ANNOTATION_CREATED, ANNOTATION_DELETED, ANNOTATION_NOTE_SET } from './events.js';
 import { projectAnnotations } from './projection.js';
 
 const anchor = (exact: string) => ({
@@ -14,15 +10,13 @@ const anchor = (exact: string) => ({
   cssSelector: 'main',
 });
 
-const event = (
-  partial: {
-    readonly type: string;
-    readonly replicaId: string;
-    readonly seq: number;
-    readonly payload: Record<string, unknown>;
-    readonly deps?: Record<string, number>;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  readonly type: string;
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly payload: Record<string, unknown>;
+  readonly deps?: Record<string, number>;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: partial.deps ?? {},

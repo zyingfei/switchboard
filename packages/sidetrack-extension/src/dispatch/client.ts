@@ -85,10 +85,7 @@ export interface DispatchClient {
     readonly limit?: number;
     readonly since?: string;
   }) => Promise<readonly DispatchEventRecord[]>;
-  readonly linkDispatchToThread: (
-    dispatchId: string,
-    threadId: string,
-  ) => Promise<void>;
+  readonly linkDispatchToThread: (dispatchId: string, threadId: string) => Promise<void>;
 }
 
 export class HttpDispatchClient implements DispatchClient {

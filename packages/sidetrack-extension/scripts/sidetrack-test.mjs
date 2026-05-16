@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -176,8 +176,8 @@ const spawnPlaywright = async (specPath, env, mode) => {
     console.log(
       JSON.stringify(
         {
-          command: 'npx',
-          args,
+          command: 'bunx',
+          args: ['--bun', '--no-install', ...args],
           cwd: PACKAGE_DIR,
           env: selectedEnv(env),
         },
@@ -191,7 +191,7 @@ const spawnPlaywright = async (specPath, env, mode) => {
   let lastPackPath = null;
   let lastReportPath = null;
   let interrupted = false;
-  const child = spawn('npx', args, {
+  const child = spawn('bunx', ['--bun', '--no-install', ...args], {
     cwd: PACKAGE_DIR,
     env,
     stdio: ['inherit', 'pipe', 'pipe'],

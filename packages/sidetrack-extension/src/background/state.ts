@@ -737,9 +737,7 @@ export interface RemoteThreadProjection {
   readonly deleted: boolean;
 }
 
-export const mirrorRemoteThread = async (
-  projection: RemoteThreadProjection,
-): Promise<void> => {
+export const mirrorRemoteThread = async (projection: RemoteThreadProjection): Promise<void> => {
   const current = await readThreads();
   // Tombstone path — a peer's delete event whose deps cover every
   // local upsert collapses the record register to undefined AND
@@ -911,9 +909,7 @@ export interface RemoteDispatchProjection {
   };
 }
 
-export const mirrorRemoteDispatch = async (
-  projection: RemoteDispatchProjection,
-): Promise<void> => {
+export const mirrorRemoteDispatch = async (projection: RemoteDispatchProjection): Promise<void> => {
   const entry = projection.entry;
   if (entry !== undefined) {
     const current = await readCachedDispatches();
@@ -930,7 +926,9 @@ export const mirrorRemoteDispatch = async (
       tokenEstimate: existing?.tokenEstimate ?? 0,
       status: existing?.status ?? 'sent',
       ...(entry.workstreamId === undefined ? {} : { workstreamId: entry.workstreamId }),
-      ...(existing?.sourceThreadId === undefined ? {} : { sourceThreadId: existing.sourceThreadId }),
+      ...(existing?.sourceThreadId === undefined
+        ? {}
+        : { sourceThreadId: existing.sourceThreadId }),
       ...(existing?.mcpRequest === undefined ? {} : { mcpRequest: existing.mcpRequest }),
     };
     const merged =
@@ -1296,7 +1294,7 @@ export const updateLocalWorkstream = async (
   const nextParentId: string | undefined = wantsDetach
     ? undefined
     : wantsReparent
-      ? update.parentId ?? undefined
+      ? (update.parentId ?? undefined)
       : previousParentId;
   const next = current.map((candidate) => {
     if (candidate.bac_id !== workstreamId) {

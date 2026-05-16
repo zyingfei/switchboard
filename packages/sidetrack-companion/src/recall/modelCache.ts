@@ -120,7 +120,7 @@ const findCachedRevision = async (root: string): Promise<string | null> => {
       // '<sha>.json' / '<sha>'. Also pick up any small text file
       // whose CONTENT is a 40-char hex string.
       if (/^[0-9a-f]{40}$/i.test(name)) return name.toLowerCase();
-      if (name === 'main' || /^refs?$/.test(name) === false) {
+      if (name === 'main' || !/^refs?$/.test(name)) {
         // Cheap probe: read short files only.
         try {
           const buf = await readFile(full, { encoding: 'utf8' });
@@ -182,8 +182,7 @@ export const getModelCacheStatus = async (
   // knows whether a re-fetch is needed after a manifest bump.
   const cachedRevision = present ? await findCachedRevision(dir) : null;
   const verified =
-    cachedRevision !== null &&
-    cachedRevision.toLowerCase() === RECALL_MODEL.revision.toLowerCase();
+    cachedRevision !== null && cachedRevision.toLowerCase() === RECALL_MODEL.revision.toLowerCase();
   return {
     modelId: RECALL_MODEL.modelId,
     revision: RECALL_MODEL.revision,

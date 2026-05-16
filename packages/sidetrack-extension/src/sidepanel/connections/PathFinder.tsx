@@ -96,9 +96,7 @@ export const PathFinder = ({
         aria-expanded={open}
         data-testid="connections-pathfinder-toggle"
         title={
-          open
-            ? 'Hide path finder'
-            : `Find a path from ${anchorLabel ?? 'anchor'} to another node`
+          open ? 'Hide path finder' : `Find a path from ${anchorLabel ?? 'anchor'} to another node`
         }
       >
         {open ? '▾' : '▸'} Path from{' '}
@@ -118,9 +116,7 @@ export const PathFinder = ({
             />
           </div>
           {pathState.kind === 'loading' ? (
-            <div className="cx-pathfinder-status mono cx-dim">
-              Searching for a path…
-            </div>
+            <div className="cx-pathfinder-status mono cx-dim">Searching for a path…</div>
           ) : null}
           {pathState.kind === 'error' ? (
             <div className="cx-pathfinder-status warn" data-testid="connections-pathfinder-error">
@@ -128,10 +124,7 @@ export const PathFinder = ({
             </div>
           ) : null}
           {pathState.kind === 'not-found' ? (
-            <div
-              className="cx-pathfinder-status cx-dim"
-              data-testid="connections-pathfinder-empty"
-            >
+            <div className="cx-pathfinder-status cx-dim" data-testid="connections-pathfinder-empty">
               No path within {`${4} hops`}. Increase hop count or pick a closer node.
             </div>
           ) : null}

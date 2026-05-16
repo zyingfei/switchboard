@@ -15,7 +15,7 @@ const readVaultArg = (): string => {
     },
   });
   if (values.help || !values.vault) {
-    process.stderr.write('Usage: npm start -- --vault /path/to/vault\n');
+    process.stderr.write('Usage: bun run start -- --vault /path/to/vault\n');
     process.exit(values.help ? 0 : 1);
   }
   return path.resolve(values.vault);

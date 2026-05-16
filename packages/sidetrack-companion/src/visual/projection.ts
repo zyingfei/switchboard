@@ -1,8 +1,5 @@
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  VISUAL_FINGERPRINT_OBSERVED,
-  isVisualFingerprintObservedPayload,
-} from './events.js';
+import { VISUAL_FINGERPRINT_OBSERVED, isVisualFingerprintObservedPayload } from './events.js';
 
 export interface VisualFingerprintProjectionEntry {
   readonly visitId: string;

@@ -57,9 +57,7 @@ describe('review-draft pending clientDeps', () => {
     });
     expect(await state.readReviewDraftPending('thread-1')).toEqual(['evt-1', 'evt-2']);
 
-    const queue = await (
-      await import('../../src/review/outbox')
-    ).readReviewDraftQueue();
+    const queue = await (await import('../../src/review/outbox')).readReviewDraftQueue();
     const events = queue.map((item) => item.payload.event);
     expect(events[0]?.clientDeps).toBeUndefined();
     expect(events[1]?.clientDeps).toEqual(['evt-1']);

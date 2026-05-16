@@ -447,7 +447,11 @@ describe('codex handoff over MCP', () => {
     expect(ask).toContain('queue a follow-up');
 
     const client = new Client({ name: 'codex-handoff-e2e', version: '0.0.0' });
-    await client.connect(new StreamableHTTPClientTransport(new URL(mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(mcpEndpoint)) as unknown as Parameters<
+        typeof client.connect
+      >[0],
+    );
     try {
       // Step 2 — discover available tools (the prompt says to do this).
       const tools = await client.listTools();
@@ -555,7 +559,11 @@ describe('codex handoff over MCP', () => {
 
     const parsed = parseAttachPrompt(prompt);
     const client = new Client({ name: 'codex-inbound-e2e', version: '0.0.0' });
-    await client.connect(new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint)) as unknown as Parameters<typeof client.connect>[0]);
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint)) as unknown as Parameters<
+        typeof client.connect
+      >[0],
+    );
     try {
       const tools = await client.listTools();
       expect(tools.tools.map((tool) => tool.name)).toEqual(

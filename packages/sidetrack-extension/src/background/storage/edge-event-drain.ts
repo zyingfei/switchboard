@@ -53,8 +53,7 @@ export const createEdgeEventDrainSingleFlight = <T>(
 const keyOf = (event: Pick<BufferedEvent, 'replicaId' | 'lamport'>): string =>
   `${event.replicaId}:${String(event.lamport)}`;
 
-const ackKeyOf = (event: EdgeEventImportAck): string =>
-  `${event.replicaId}:${String(event.seq)}`;
+const ackKeyOf = (event: EdgeEventImportAck): string => `${event.replicaId}:${String(event.seq)}`;
 
 const PERMANENT_SKIP_REASONS = new Set([
   'already-imported',

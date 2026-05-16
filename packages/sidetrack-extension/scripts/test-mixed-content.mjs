@@ -14,9 +14,12 @@ const out = await sw.evaluate(async () => {
       const port = settings.companion.port;
       const bridgeKey = settings.companion.bridgeKey;
       try {
-        const resp = await fetch(`http://127.0.0.1:${port}/v1/annotations?url=${encodeURIComponent(window.location.href)}`, {
-          headers: { 'x-bac-bridge-key': bridgeKey },
-        });
+        const resp = await fetch(
+          `http://127.0.0.1:${port}/v1/annotations?url=${encodeURIComponent(window.location.href)}`,
+          {
+            headers: { 'x-bac-bridge-key': bridgeKey },
+          },
+        );
         const body = await resp.json();
         return { ok: true, status: resp.status, count: body?.data?.length ?? 0 };
       } catch (e) {

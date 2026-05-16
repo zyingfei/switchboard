@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Drive a real autoSend cycle against chatgpt.com using the SAME
 // selectors the content-script driver uses (PROVIDER_DRIVERS.chatgpt
 // in entrypoints/content.ts). Verifies whether the composer +
@@ -14,10 +14,7 @@ import { chromium } from '@playwright/test';
 const cdpUrl = process.env.SIDETRACK_E2E_CDP_URL ?? 'http://localhost:9222';
 
 const COMPOSER_SELECTORS = ['div#prompt-textarea[role="textbox"]', '#prompt-textarea'];
-const STOP_BUTTON_SELECTORS = [
-  'button[data-testid="stop-button"]',
-  'button[aria-label*="Stop" i]',
-];
+const STOP_BUTTON_SELECTORS = ['button[data-testid="stop-button"]', 'button[aria-label*="Stop" i]'];
 
 const main = async () => {
   const browser = await chromium.connectOverCDP(cdpUrl);

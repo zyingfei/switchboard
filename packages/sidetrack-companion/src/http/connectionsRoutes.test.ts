@@ -19,11 +19,7 @@ import { createIdempotencyStore } from './idempotency.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 
-const buildEvent = (input: {
-  seq: number;
-  type: string;
-  payload: unknown;
-}): AcceptedEvent => ({
+const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
   dot: { replicaId: 'replica-A', seq: input.seq },
   deps: {},
@@ -47,7 +43,12 @@ describe('connections HTTP routes', () => {
     const connectionsStore = createConnectionsStore(vaultRoot);
     const runner = createSyncContractRunner();
     runner.register(
-      createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store: connectionsStore }),
+      createConnectionsMaterializer({
+        vaultRoot,
+        eventLog,
+        timelineStore,
+        store: connectionsStore,
+      }),
     );
 
     // Seed some data via the event log so the materializer has
@@ -196,8 +197,8 @@ describe('connections HTTP routes', () => {
   it('GET /v1/connections/edges/<id> returns provenance', async () => {
     // First fetch the snapshot to find an actual edge id.
     const snap = await get('/v1/connections');
-    const edgeId = (snap.data as { data: { snapshot: { edges: { id: string }[] } } }).data
-      .snapshot.edges[0]?.id;
+    const edgeId = (snap.data as { data: { snapshot: { edges: { id: string }[] } } }).data.snapshot
+      .edges[0]?.id;
     expect(edgeId).toBeDefined();
     const r = await get(`/v1/connections/edges/${encodeURIComponent(edgeId!)}`);
     expect(r.status).toBe(200);

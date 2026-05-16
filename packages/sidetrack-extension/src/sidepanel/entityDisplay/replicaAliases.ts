@@ -23,9 +23,7 @@ interface StorageBackend {
 }
 
 const getStorage = (): StorageBackend | null => {
-  const c = (
-    globalThis as unknown as { chrome?: { storage?: { local?: StorageBackend } } }
-  ).chrome;
+  const c = (globalThis as unknown as { chrome?: { storage?: { local?: StorageBackend } } }).chrome;
   return c?.storage?.local ?? null;
 };
 

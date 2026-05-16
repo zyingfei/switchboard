@@ -78,9 +78,7 @@ export const readHealthHistory = async (
     return [];
   }
   if (!Array.isArray(parsed)) return [];
-  const samples = parsed
-    .filter(isHealthHistorySample)
-    .map(normalizeSample);
+  const samples = parsed.filter(isHealthHistorySample).map(normalizeSample);
   if (limit !== undefined && limit >= 0 && samples.length > limit) {
     return samples.slice(samples.length - limit);
   }
@@ -99,8 +97,6 @@ export const appendHealthHistory = async (
   const existing = await readHealthHistory(vaultRoot);
   const next = [...existing, normalizeSample(sample)];
   const trimmed =
-    next.length > HEALTH_HISTORY_MAX
-      ? next.slice(next.length - HEALTH_HISTORY_MAX)
-      : next;
+    next.length > HEALTH_HISTORY_MAX ? next.slice(next.length - HEALTH_HISTORY_MAX) : next;
   await atomicWriteJson(historyPath(vaultRoot), trimmed);
 };

@@ -58,9 +58,7 @@ const buildAgentPrompt = (
     `sidetrack_mcp: ${mcpEndpoint}`,
     ...(mcpAuthBearer === undefined ? [] : [`sidetrack_mcp_auth: Bearer ${mcpAuthBearer}`]),
     `sidetrack_attach_token: ${token}`,
-    ...(workstreamId === undefined
-      ? []
-      : [`sidetrack_workstream_id: ${workstreamId}`]),
+    ...(workstreamId === undefined ? [] : [`sidetrack_workstream_id: ${workstreamId}`]),
     '',
     'Use the Sidetrack MCP server above. Call sidetrack.session.attach with the attach token, then continue with my task using Sidetrack tools when useful.',
   ].join('\n');
@@ -99,10 +97,7 @@ const buildCodexStdioConfigSnippet = (
   ].join('\n');
 };
 
-const buildCodexCliCommand = (
-  vaultRoot: string | undefined,
-  companionPort: number,
-): string =>
+const buildCodexCliCommand = (vaultRoot: string | undefined, companionPort: number): string =>
   [
     'codex mcp add sidetrack \\',
     '  --env SIDETRACK_BRIDGE_KEY="$SIDETRACK_BRIDGE_KEY" \\',
@@ -321,9 +316,9 @@ export function CodingAttach({
         <div className="banner warning">
           MCP server is listening but is rejecting our auth key (last checked{' '}
           {new Date(mcpHealth.checkedAt).toLocaleTimeString()}). The persisted{' '}
-          <code>SIDETRACK_MCP_AUTH_KEY</code> in <code>_BAC/.config/mcp-auth.key</code>{' '}
-          and the value the side panel reads from <code>/v1/status</code> have drifted.
-          Restart the companion to regenerate.
+          <code>SIDETRACK_MCP_AUTH_KEY</code> in <code>_BAC/.config/mcp-auth.key</code> and the
+          value the side panel reads from <code>/v1/status</code> have drifted. Restart the
+          companion to regenerate.
         </div>
       ) : null}
 
@@ -331,9 +326,9 @@ export function CodingAttach({
         <summary className="mono">1. Configure Sidetrack MCP in your coding agent</summary>
         <div className="coding-handoff-config-body">
           <p className="muted">
-            One-time setup. Streamable HTTP is recommended when the companion manages the MCP
-            child (this side panel reads its auth key from <code>/v1/status</code>). Stdio is
-            the fallback when you start <code>sidetrack-mcp</code> by hand.
+            One-time setup. Streamable HTTP is recommended when the companion manages the MCP child
+            (this side panel reads its auth key from <code>/v1/status</code>). Stdio is the fallback
+            when you start <code>sidetrack-mcp</code> by hand.
           </p>
           <div className="coding-handoff-snippet">
             <div className="coding-handoff-snippet-head mono">
@@ -411,8 +406,8 @@ export function CodingAttach({
           </div>
 
           <p className="muted">
-            Restart Codex if you changed config. After that, generating a token below gives
-            you the one-line attach instruction to paste into the agent — no more boilerplate.
+            Restart Codex if you changed config. After that, generating a token below gives you the
+            one-line attach instruction to paste into the agent — no more boilerplate.
           </p>
         </div>
       </details>

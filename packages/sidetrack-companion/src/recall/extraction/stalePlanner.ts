@@ -42,9 +42,7 @@ const classify = (state: ExtractionSourceState): SourceUpgradeStatus => {
   return 'live-provider';
 };
 
-export const planExtractionUpgrade = async (
-  store: ExtractionStore,
-): Promise<UpgradePlan> => {
+export const planExtractionUpgrade = async (store: ExtractionStore): Promise<UpgradePlan> => {
   const all = await store.listAllSources();
   const bySource = new Map<string, SourceUpgradeStatus>();
   let current = 0;

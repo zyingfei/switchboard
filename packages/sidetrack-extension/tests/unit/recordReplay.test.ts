@@ -651,9 +651,9 @@ describe('T1 record/replay session pack helpers', () => {
     }
     // But the same title on a generic URL (or a URL that carries the
     // cf challenge token in its query) DOES still fire.
-    expect(classifyDetour({ url: 'https://example.test/page', title: realProviderTitle })?.kind).toBe(
-      'cloudflare-challenge',
-    );
+    expect(
+      classifyDetour({ url: 'https://example.test/page', title: realProviderTitle })?.kind,
+    ).toBe('cloudflare-challenge');
     expect(
       classifyDetour({
         url: 'https://chatgpt.com/c/abc?__cf_chl_rt_tk=opaque',
@@ -987,11 +987,7 @@ describe('T1 record/replay session pack helpers', () => {
     const browser = pack.browsers[0];
     const cases: readonly (readonly [string, string, RegExp])[] = [
       ['Authorization: Bearer abc.def-123', 'authorization header', /authorization header/u],
-      [
-        'Bearer abcdefghijklmnop',
-        'bearer token',
-        /bearer token|authorization header/u,
-      ],
+      ['Bearer abcdefghijklmnop', 'bearer token', /bearer token|authorization header/u],
       ['Set-Cookie: sid=abc', 'set-cookie header', /set-cookie header/u],
       ['cookie: sid=abc', 'cookie header', /cookie header/u],
       ['ghp_AAAAAAAAAAAAAAAAAAAAAAAAAA', 'GitHub token', /GitHub token/u],
@@ -1015,12 +1011,9 @@ describe('T1 record/replay session pack helpers', () => {
           },
         ],
       };
-      expect(
-        () => {
-          assertPackPrivacy(tainted);
-        },
-        `expected ${label} to trip the deny-list`,
-      ).toThrow(expected);
+      expect(() => {
+        assertPackPrivacy(tainted);
+      }, `expected ${label} to trip the deny-list`).toThrow(expected);
     }
   });
 

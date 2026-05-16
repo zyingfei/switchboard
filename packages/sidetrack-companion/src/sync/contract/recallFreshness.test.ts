@@ -75,9 +75,7 @@ describe('Lane 1 recall freshness — capture-then-recall, tombstone, crash reco
     await recallLifecycle.ensureFresh();
     await recallLifecycle.waitForRebuild();
     const runner = createSyncContractRunner();
-    runner.register(
-      createRecallMaterializer({ recallLifecycle, recallActivity, eventLog }),
-    );
+    runner.register(createRecallMaterializer({ recallLifecycle, recallActivity, eventLog }));
     return { eventLog, runner, recallLifecycle };
   };
 

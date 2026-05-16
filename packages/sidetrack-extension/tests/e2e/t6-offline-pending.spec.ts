@@ -80,7 +80,10 @@ test.describe('Tier 6.2 — offline pending visibility', () => {
       await expect
         .poll(
           async () =>
-            (await page.locator('.sys-banner').filter({ hasText: 'Companion: disconnected' }).count()) > 0,
+            (await page
+              .locator('.sys-banner')
+              .filter({ hasText: 'Companion: disconnected' })
+              .count()) > 0,
           { timeout: 5_000, intervals: [200, 500] },
         )
         .toBe(false);
@@ -151,7 +154,10 @@ test.describe('Tier 6.2 — offline pending visibility', () => {
       const queuedCount = await readBannerCount(page, 'captures-queued');
       const failedCount = await readBannerCount(page, 'captures-failed');
       const total = (queuedCount ?? 0) + (failedCount ?? 0);
-      expect(total, 'expected captures-queued OR captures-failed banner with count ≥ 1').toBeGreaterThan(0);
+      expect(
+        total,
+        'expected captures-queued OR captures-failed banner with count ≥ 1',
+      ).toBeGreaterThan(0);
     } finally {
       await runtime?.close();
       await companion?.close();

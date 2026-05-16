@@ -131,9 +131,7 @@ const urlsByTabSessionId = (projection: UrlProjection): Map<string, string[]> =>
 // Build the set of canonical URLs the topic builder will see this run.
 // Mirrors `topicVisitFromEntry` in the materializer so we filter
 // userAssertedRelations against the same key set.
-export const knownCanonicalUrlsFor = (
-  visits: readonly TopicVisit[],
-): ReadonlySet<string> => {
+export const knownCanonicalUrlsFor = (visits: readonly TopicVisit[]): ReadonlySet<string> => {
   const out = new Set<string>();
   for (const visit of visits) {
     if (visit.canonicalUrl.length === 0) continue;

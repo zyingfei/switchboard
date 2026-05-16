@@ -18,17 +18,36 @@ describe('bridge key rotation', () => {
 
   it('accepts the previous key during the fixed grace window only', async () => {
     const previous = (await ensureBridgeKey(vaultRoot)).key;
-    const rotated = await rotateBridgeKey(vaultRoot, previous, new Date('2026-05-03T00:00:00.000Z'));
+    const rotated = await rotateBridgeKey(
+      vaultRoot,
+      previous,
+      new Date('2026-05-03T00:00:00.000Z'),
+    );
 
     expect(rotated.current).not.toBe(previous);
     await expect(
-      isBridgeKeyAccepted(vaultRoot, rotated.current, previous, new Date('2026-05-03T00:00:30.000Z')),
+      isBridgeKeyAccepted(
+        vaultRoot,
+        rotated.current,
+        previous,
+        new Date('2026-05-03T00:00:30.000Z'),
+      ),
     ).resolves.toBe(true);
     await expect(
-      isBridgeKeyAccepted(vaultRoot, rotated.current, previous, new Date('2026-05-03T00:01:01.000Z')),
+      isBridgeKeyAccepted(
+        vaultRoot,
+        rotated.current,
+        previous,
+        new Date('2026-05-03T00:01:01.000Z'),
+      ),
     ).resolves.toBe(false);
     await expect(
-      isBridgeKeyAccepted(vaultRoot, rotated.current, rotated.current, new Date('2026-05-03T00:01:01.000Z')),
+      isBridgeKeyAccepted(
+        vaultRoot,
+        rotated.current,
+        rotated.current,
+        new Date('2026-05-03T00:01:01.000Z'),
+      ),
     ).resolves.toBe(true);
   });
 });

@@ -59,10 +59,7 @@ describe('plugin active extraction window', () => {
   });
 
   it('upsert + read round-trips full content (Mode P self-sufficient — text is on-device)', async () => {
-    await upsertActiveExtractionRevision(
-      revisionInput('src:A', 'hello mode P'),
-      100,
-    );
+    await upsertActiveExtractionRevision(revisionInput('src:A', 'hello mode P'), 100);
     const got = await readActiveRevisionForSource('src:A');
     expect(got).not.toBeNull();
     expect(got!.content.turns[0]?.text).toBe('hello mode P');

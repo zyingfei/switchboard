@@ -1,9 +1,6 @@
 import { WebSocket as WsWebSocket } from 'ws';
 
-import {
-  type AcceptedEvent,
-  canonicalEventBytes,
-} from './causal.js';
+import { type AcceptedEvent, canonicalEventBytes } from './causal.js';
 import type { KnownReplicasStore } from './knownReplicas.js';
 import {
   decodeBytes,
@@ -106,18 +103,22 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   let lastOutboundAtMs: number | null = null;
   const byReplicaCounts = new Map<
     string,
-    { eventsIn: number; eventsOut: number; lastInboundAtMs: number | null; lastOutboundAtMs: number | null }
+    {
+      eventsIn: number;
+      eventsOut: number;
+      lastInboundAtMs: number | null;
+      lastOutboundAtMs: number | null;
+    }
   >();
   const bumpInbound = (replicaId: string): void => {
     totalEventsIn += 1;
     lastInboundAtMs = Date.now();
-    const entry =
-      byReplicaCounts.get(replicaId) ?? {
-        eventsIn: 0,
-        eventsOut: 0,
-        lastInboundAtMs: null,
-        lastOutboundAtMs: null,
-      };
+    const entry = byReplicaCounts.get(replicaId) ?? {
+      eventsIn: 0,
+      eventsOut: 0,
+      lastInboundAtMs: null,
+      lastOutboundAtMs: null,
+    };
     entry.eventsIn += 1;
     entry.lastInboundAtMs = lastInboundAtMs;
     byReplicaCounts.set(replicaId, entry);
@@ -125,13 +126,12 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
   const bumpOutbound = (replicaId: string): void => {
     totalEventsOut += 1;
     lastOutboundAtMs = Date.now();
-    const entry =
-      byReplicaCounts.get(replicaId) ?? {
-        eventsIn: 0,
-        eventsOut: 0,
-        lastInboundAtMs: null,
-        lastOutboundAtMs: null,
-      };
+    const entry = byReplicaCounts.get(replicaId) ?? {
+      eventsIn: 0,
+      eventsOut: 0,
+      lastInboundAtMs: null,
+      lastOutboundAtMs: null,
+    };
     entry.eventsOut += 1;
     entry.lastOutboundAtMs = lastOutboundAtMs;
     byReplicaCounts.set(replicaId, entry);
@@ -213,10 +213,7 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
         return;
       }
       if (decision.kind === 'reject-revoked') {
-        log(
-          'warn',
-          `relay frame from revoked replica ${parsed.dot.replicaId}; dropping`,
-        );
+        log('warn', `relay frame from revoked replica ${parsed.dot.replicaId}; dropping`);
         return;
       }
       // Verify against the TRUSTED key (= what the store has on
@@ -388,12 +385,8 @@ export const createRelayTransport = (options: RelayTransportOptions): LogTranspo
         replicaId,
         eventsIn: counts.eventsIn,
         eventsOut: counts.eventsOut,
-        ...(counts.lastInboundAtMs === null
-          ? {}
-          : { lastInboundAtMs: counts.lastInboundAtMs }),
-        ...(counts.lastOutboundAtMs === null
-          ? {}
-          : { lastOutboundAtMs: counts.lastOutboundAtMs }),
+        ...(counts.lastInboundAtMs === null ? {} : { lastInboundAtMs: counts.lastInboundAtMs }),
+        ...(counts.lastOutboundAtMs === null ? {} : { lastOutboundAtMs: counts.lastOutboundAtMs }),
       }));
     return {
       connected: socket?.readyState === WsWebSocket.OPEN,
@@ -439,9 +432,7 @@ export interface RelayTransportStatus {
   readonly byReplica: readonly RelayTransportPerReplicaStatus[];
 }
 
-export const getRelayTransportStatus = (
-  transport: LogTransport,
-): RelayTransportStatus | null => {
+export const getRelayTransportStatus = (transport: LogTransport): RelayTransportStatus | null => {
   const get = (transport.publishEvent as unknown as { getStatus?: () => RelayTransportStatus })
     .getStatus;
   return typeof get === 'function' ? get() : null;

@@ -61,7 +61,7 @@ What's preserved:
 - Vault as canonical state. The companion writes plain Markdown / JSONL /
   `.canvas` / `.base` via Node `fs`. Substrate principle (BRAINSTORM
   §23.0) is unaffected; the writer just moves out of the browser.
-- MCP read side. `npx bac-mcp --vault <path>` is unchanged. `poc/mcp-server`
+- MCP read side. `bunx bac-mcp --vault <path>` is unchanged. `poc/mcp-server`
   on `main` already validated this against fixtures.
 - §27 sync semantics. Connection / sync-in / sync-out remain three
   separate concepts; both directions are owned by the companion.
@@ -152,22 +152,22 @@ Extension:
 
 ```sh
 cd poc/vault-bridge/extension
-npm install
-npm run compile
-npm test
-npm run build
+bun install
+bun run compile
+bun run test
+bun run build
 ```
 
 Reader:
 
 ```sh
 cd poc/vault-bridge/reader
-npm install
-npm run compile
-npm start -- --vault /path/to/test-vault
+bun install
+bun run compile
+bun run start -- --vault /path/to/test-vault
 ```
 
-Use the Node reader or `tail -F` for manual tailing. Plain `tail -f` can miss File System Access-style replacement writes because it may continue following the old file descriptor; I reproduced that locally with a temp-file-then-rename simulation.
+Use the Bun reader or `tail -F` for manual tailing. Plain `tail -f` can miss File System Access-style replacement writes because it may continue following the old file descriptor; I reproduced that locally with a temp-file-then-rename simulation.
 
 Load the extension from:
 
@@ -181,12 +181,12 @@ Then follow [observations/RUNBOOK.md](observations/RUNBOOK.md).
 
 Run locally on 2026-04-26:
 
-- `extension`: `npm run compile`
-- `extension`: `npm test`
-- `extension`: `npm run build`
-- `reader`: `npm run compile`
-- `reader`: `npm start -- --help`
-- `reader`: disposable `/tmp` tail smoke with a normal Node append
+- `extension`: `bun run compile`
+- `extension`: `bun run test`
+- `extension`: `bun run build`
+- `reader`: `bun run compile`
+- `reader`: `bun run start -- --help`
+- `reader`: disposable `/tmp` tail smoke with a normal Bun append
 - local simulation showing `tail -f` misses atomic replacement while `tail -F` sees it
 - live Chrome/iCloud manual write from side panel to Node reader
 - live Chrome/iCloud short `Start tick` run to Node reader

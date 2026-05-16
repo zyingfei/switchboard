@@ -9,9 +9,7 @@ import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
 } from '../../timeline/events.js';
-import {
-  createTimelineStore,
-} from '../../timeline/projection.js';
+import { createTimelineStore } from '../../timeline/projection.js';
 import { createVaultWriter } from '../../vault/writer.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
@@ -50,8 +48,9 @@ const buildEdgeEvent = (input: {
   acceptedAtMs: Date.parse(input.payload.observedAt),
 });
 
-const observe = (overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string }):
-  BrowserTimelineObservedPayload => ({
+const observe = (
+  overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string },
+): BrowserTimelineObservedPayload => ({
   eventId: overrides.eventId ?? `evt-${overrides.observedAt}-${overrides.url}`,
   observedAt: overrides.observedAt,
   url: overrides.url,
@@ -109,20 +108,26 @@ describe('timeline Mode P → Mode P+C integration', () => {
     edgeReplicaId: string,
     payloads: readonly BrowserTimelineObservedPayload[],
   ): readonly AcceptedEvent[] =>
-    payloads.map((payload, index) =>
-      buildEdgeEvent({ edgeReplicaId, seq: index + 1, payload }),
-    );
+    payloads.map((payload, index) => buildEdgeEvent({ edgeReplicaId, seq: index + 1, payload }));
 
   const drainToCompanion = async (
     events: readonly AcceptedEvent[],
-  ): Promise<{ imported: { replicaId: string; seq: number }[]; skipped: { replicaId: string; seq: number; reason: string }[] }> => {
+  ): Promise<{
+    imported: { replicaId: string; seq: number }[];
+    skipped: { replicaId: string; seq: number; reason: string }[];
+  }> => {
     const res = await fetch(`${serverUrl}/v1/timeline/events`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': BRIDGE },
       body: JSON.stringify({ events }),
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { data: { imported: { replicaId: string; seq: number }[]; skipped: { replicaId: string; seq: number; reason: string }[] } };
+    const body = (await res.json()) as {
+      data: {
+        imported: { replicaId: string; seq: number }[];
+        skipped: { replicaId: string; seq: number; reason: string }[];
+      };
+    };
     return body.data;
   };
 
@@ -142,9 +147,25 @@ describe('timeline Mode P → Mode P+C integration', () => {
   it('Mode P offline → Mode P+C drain → GET /v1/timeline reflects the entries', async () => {
     // Mode P: plugin observes 3 events while companion is offline.
     const offlineSpool = buildSpool('edge_modeP_test', [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', title: 'A' }),
-      observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b', title: 'B' }),
-      observe({ observedAt: '2026-05-07T11:30:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', title: 'A revisited', transition: 'updated' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        title: 'A',
+      }),
+      observe({
+        observedAt: '2026-05-07T11:00:00.000Z',
+        url: 'https://x/b',
+        canonicalUrl: 'https://x/b',
+        title: 'B',
+      }),
+      observe({
+        observedAt: '2026-05-07T11:30:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+        title: 'A revisited',
+        transition: 'updated',
+      }),
     ]);
     expect(offlineSpool).toHaveLength(3);
 
@@ -165,15 +186,17 @@ describe('timeline Mode P → Mode P+C integration', () => {
     expect(ids).toContain('https://x/b');
     // The two activated/updated transitions on /a get folded into
     // one entry with visitCount 2.
-    const a = view.items.find((e) => e.id === 'https://x/a') as
-      | { visitCount?: number }
-      | undefined;
+    const a = view.items.find((e) => e.id === 'https://x/a') as { visitCount?: number } | undefined;
     expect(a?.visitCount).toBe(2);
   });
 
   it('archive identity — re-drain of same edge dots is a no-op (idempotent at the companion)', async () => {
     const spool = buildSpool('edge_archive_test', [
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
     ]);
     const drain1 = await drainToCompanion(spool);
     expect(drain1.imported).toHaveLength(1);
@@ -193,9 +216,21 @@ describe('timeline Mode P → Mode P+C integration', () => {
 
   it('range filter honors `since` and `until` against the day projections', async () => {
     const spool = buildSpool('edge_range_test', [
-      observe({ observedAt: '2026-05-05T10:00:00.000Z', url: 'https://x/may5', canonicalUrl: 'https://x/may5' }),
-      observe({ observedAt: '2026-05-06T10:00:00.000Z', url: 'https://x/may6', canonicalUrl: 'https://x/may6' }),
-      observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/may7', canonicalUrl: 'https://x/may7' }),
+      observe({
+        observedAt: '2026-05-05T10:00:00.000Z',
+        url: 'https://x/may5',
+        canonicalUrl: 'https://x/may5',
+      }),
+      observe({
+        observedAt: '2026-05-06T10:00:00.000Z',
+        url: 'https://x/may6',
+        canonicalUrl: 'https://x/may6',
+      }),
+      observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/may7',
+        canonicalUrl: 'https://x/may7',
+      }),
     ]);
     await drainToCompanion(spool);
     await new Promise((r) => setTimeout(r, 50));

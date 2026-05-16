@@ -47,9 +47,7 @@ export interface CreateTimelineMaterializerDeps {
 // later catchUp / alarm / event after the cooldown will retry).
 const FAILURE_COOLDOWN_MS = 5_000;
 
-export const createTimelineMaterializer = (
-  deps: CreateTimelineMaterializerDeps,
-): Materializer => {
+export const createTimelineMaterializer = (deps: CreateTimelineMaterializerDeps): Materializer => {
   const handles = eventTypesForMaterializer('timeline');
   let pending = false;
   let running = false;
@@ -58,7 +56,7 @@ export const createTimelineMaterializer = (
   // Wall-clock ms of the most recent drain failure; used by
   // requestDrain to skip retries within FAILURE_COOLDOWN_MS so a
   // persistent failure doesn't tight-loop with the event stream.
-  let lastFailureAtMs: number = 0;
+  let lastFailureAtMs = 0;
   // Days touched since the last drain. Set semantics — rebuild
   // each one once. catchUp clears this and rebuilds everything
   // observed in the merged log.

@@ -13,10 +13,8 @@ export interface ManifestForGateCheck {
   };
 }
 
-export const permissionKeyFor = (
-  collectorId: string,
-  capability: CollectorCapability,
-): string => `collector.${collectorId}.${capability}`;
+export const permissionKeyFor = (collectorId: string, capability: CollectorCapability): string =>
+  `collector.${collectorId}.${capability}`;
 
 export const parsePermissionKey = (
   key: string,
@@ -35,7 +33,7 @@ export const parsePermissionKey = (
 };
 
 const hasPermission = (
-  permissions: PrivacyProjection['grantedPermissions'] | PrivacyProjection['retroactiveMasks'],
+  permissions: PrivacyProjection['grantedPermissions'],
   permission: string,
 ): boolean => permissions.some((entry) => entry.permission === permission);
 
@@ -77,5 +75,4 @@ export const allCapabilitiesGranted = (
   );
 };
 
-export const quarantineReasonForGateDenial = (): 'privacy-gate-denied' =>
-  'privacy-gate-denied';
+export const quarantineReasonForGateDenial = (): 'privacy-gate-denied' => 'privacy-gate-denied';

@@ -83,9 +83,7 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
     (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
-export const isThreadUpsertedPayload = (
-  value: unknown,
-): value is ThreadUpsertedPayload => {
+export const isThreadUpsertedPayload = (value: unknown): value is ThreadUpsertedPayload => {
   if (!isRecord(value)) return false;
   return (
     typeof value['bac_id'] === 'string' &&
@@ -97,7 +95,5 @@ export const isThreadUpsertedPayload = (
   );
 };
 
-export const isThreadStatusPayload = (
-  value: unknown,
-): value is ThreadArchivedPayload =>
+export const isThreadStatusPayload = (value: unknown): value is ThreadArchivedPayload =>
   isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);

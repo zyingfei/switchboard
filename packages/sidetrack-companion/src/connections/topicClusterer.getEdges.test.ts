@@ -4,10 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  IncrementalTopicClusterAccumulator,
-  type TopicVisit,
-} from './topicClusterer.js';
+import { IncrementalTopicClusterAccumulator, type TopicVisit } from './topicClusterer.js';
 
 const visit = (canonicalUrl: string): TopicVisit => ({
   canonicalUrl,

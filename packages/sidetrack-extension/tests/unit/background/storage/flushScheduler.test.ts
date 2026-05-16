@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createFlushScheduler, FLUSH_ALARM, MAX_BATCH_SIZE } from '../../../../src/background/storage/flush-scheduler';
-import { InMemoryEventBuffer, type BufferedEvent } from '../../../../src/background/storage/in-memory-event-buffer';
+import {
+  createFlushScheduler,
+  FLUSH_ALARM,
+  MAX_BATCH_SIZE,
+} from '../../../../src/background/storage/flush-scheduler';
+import {
+  InMemoryEventBuffer,
+  type BufferedEvent,
+} from '../../../../src/background/storage/in-memory-event-buffer';
 
 const e = (n: number): BufferedEvent => ({
   streamName: 'navigation.committed',
@@ -33,7 +40,9 @@ describe('flush scheduler', () => {
   it('registers a 60s chrome alarm', async () => {
     const create = vi.fn(async () => undefined);
     const addListener = vi.fn();
-    (globalThis as unknown as { chrome: unknown }).chrome = { alarms: { create, onAlarm: { addListener } } };
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      alarms: { create, onAlarm: { addListener } },
+    };
     const scheduler = createFlushScheduler(new InMemoryEventBuffer());
     await scheduler.start();
     expect(create).toHaveBeenCalledWith(FLUSH_ALARM, { periodInMinutes: 1 });

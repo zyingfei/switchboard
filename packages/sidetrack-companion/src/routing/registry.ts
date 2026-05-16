@@ -138,8 +138,9 @@ export const createBucketRegistry = (primaryVaultRoot: string): BucketRegistry =
     async pickBucket(input) {
       const buckets = await readStored();
       return (
-        buckets.find((bucket) => bucket.matchers.some((matcher) => matcherMatches(matcher, input))) ??
-        defaultBucket(primaryVaultRoot)
+        buckets.find((bucket) =>
+          bucket.matchers.some((matcher) => matcherMatches(matcher, input)),
+        ) ?? defaultBucket(primaryVaultRoot)
       );
     },
   };

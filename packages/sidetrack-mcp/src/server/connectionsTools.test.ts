@@ -166,12 +166,10 @@ describe('connections MCP tools', () => {
         r.structuredContent as {
           snapshot: { nodes: { id: string }[] };
         }
-      ).snapshot.nodes.map((n) => n.id).sort();
-      expect(ids).toEqual([
-        'dispatch:disp_1',
-        'thread:thread_a',
-        'workstream:ws_x',
-      ]);
+      ).snapshot.nodes
+        .map((n) => n.id)
+        .sort();
+      expect(ids).toEqual(['dispatch:disp_1', 'thread:thread_a', 'workstream:ws_x']);
     } finally {
       await client.close();
     }

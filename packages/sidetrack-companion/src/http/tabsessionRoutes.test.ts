@@ -497,7 +497,9 @@ describe('tab-session HTTP routes', () => {
       source: 'user_asserted',
     });
     expect(
-      (await eventLog.readMerged()).filter((event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED),
+      (await eventLog.readMerged()).filter(
+        (event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED,
+      ),
     ).toHaveLength(0);
   });
 

@@ -1,10 +1,6 @@
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
-import type {
-  AcceptedEventContext,
-  Materializer,
-  MaterializerHealth,
-} from './materializer.js';
+import type { AcceptedEventContext, Materializer, MaterializerHealth } from './materializer.js';
 
 // Sync Contract v1 — runner.
 //
@@ -46,9 +42,7 @@ export const createSyncContractRunner = (): SyncContractRunner => {
 
   const register = (m: Materializer): void => {
     if (materializers.has(m.name)) {
-      throw new Error(
-        `SyncContractRunner: materializer '${m.name}' already registered`,
-      );
+      throw new Error(`SyncContractRunner: materializer '${m.name}' already registered`);
     }
     materializers.set(m.name, m);
   };
@@ -110,8 +104,7 @@ export const createSyncContractRunner = (): SyncContractRunner => {
         out[name] = {
           status: 'failed',
           lastSuccessAt: null,
-          lastError:
-            err instanceof Error ? err.message : `health() threw: ${String(err)}`,
+          lastError: err instanceof Error ? err.message : `health() threw: ${String(err)}`,
           pending: false,
         };
       }

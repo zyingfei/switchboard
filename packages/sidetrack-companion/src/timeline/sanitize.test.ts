@@ -86,9 +86,7 @@ describe('companion detectSearchUrl + search-URL canonicalization', () => {
       'https://www.google.com/search?q=Linux+crypto+subsystem&newwindow=1&sca_esv=9700858d11d87a5f&sxsrf=ANbL-n7otDb8AtUZOxbzZ4JQi1ezOpsbrw',
     );
     expect(info).not.toBeNull();
-    expect(info!.canonicalUrl).toBe(
-      'https://www.google.com/search?q=Linux+crypto+subsystem',
-    );
+    expect(info!.canonicalUrl).toBe('https://www.google.com/search?q=Linux+crypto+subsystem');
     expect(info!.query).toBe('Linux crypto subsystem');
   });
 

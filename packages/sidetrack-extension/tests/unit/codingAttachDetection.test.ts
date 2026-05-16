@@ -9,7 +9,9 @@ const doc = (text: string): Document => {
 
 describe('coding attach detection', () => {
   it('detects Codex URL and DOM hints with high confidence', () => {
-    expect(detectCodingSurface('https://chatgpt.com/codex/project', doc('Codex diff branch'))).toEqual({
+    expect(
+      detectCodingSurface('https://chatgpt.com/codex/project', doc('Codex diff branch')),
+    ).toEqual({
       id: 'codex',
       signals: { urlMatch: true, domHint: true },
       confidence: 'high',
@@ -17,11 +19,15 @@ describe('coding attach detection', () => {
   });
 
   it('uses medium confidence for URL-only matches and low for DOM-only matches', () => {
-    expect(detectCodingSurface('https://claude.ai/code/session', doc('ordinary page'))).toMatchObject({
+    expect(
+      detectCodingSurface('https://claude.ai/code/session', doc('ordinary page')),
+    ).toMatchObject({
       id: 'claude_code',
       confidence: 'medium',
     });
-    expect(detectCodingSurface('https://example.test/page', doc('Cursor agent cloud'))).toMatchObject({
+    expect(
+      detectCodingSurface('https://example.test/page', doc('Cursor agent cloud')),
+    ).toMatchObject({
       id: 'cursor',
       confidence: 'low',
     });

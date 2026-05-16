@@ -18,9 +18,7 @@ import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 
-const buildEvent = (
-  input: { seq: number; type: string; payload: unknown },
-): AcceptedEvent => ({
+const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
   dot: { replicaId: 'replica-A', seq: input.seq },
   deps: {},
@@ -55,7 +53,7 @@ describe('Stage 5.2 W6 — connectionsMaterializer invalidation accumulation', (
     expect(mat.getInvalidationsSinceLastBuild()).toEqual([]);
   });
 
-  it('catchUp surfaces the accumulated dedupe\'d keys from prior onAccepted events', async () => {
+  it("catchUp surfaces the accumulated dedupe'd keys from prior onAccepted events", async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
@@ -137,10 +135,9 @@ describe('Stage 5.2 W6 — connectionsMaterializer invalidation accumulation', (
       store,
     });
 
-    mat.onAccepted(
-      buildEvent({ seq: 1, type: ANNOTATION_CREATED, payload: {} }),
-      { origin: 'local' },
-    );
+    mat.onAccepted(buildEvent({ seq: 1, type: ANNOTATION_CREATED, payload: {} }), {
+      origin: 'local',
+    });
     await mat.catchUp(eventLog);
     expect(mat.getInvalidationsSinceLastBuild()).toEqual([]);
   });

@@ -31,10 +31,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { bootCollectorFramework } from './runtime.js';
-import {
-  TEST_TICK_COLLECTOR_ID,
-  writeTickBatch,
-} from '../test-tick/helpers/writer.js';
+import { TEST_TICK_COLLECTOR_ID, writeTickBatch } from '../test-tick/helpers/writer.js';
 import { renderTestTickManifest } from '../test-tick/helpers/manifest-fixture.js';
 import type { MaterializerRegistry } from './materializer.js';
 import type { CollectorEvent } from './types.js';
@@ -159,9 +156,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
   });
 
   it('#2: 100 lines from one test-tick collector → 100 promoted + 0 quarantined', async () => {
-    const fixture = await setupFixtureVault(
-      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
-    );
+    const fixture = await setupFixtureVault(new Map([[TEST_TICK_COLLECTOR_ID, {}]]));
     cleanup = fixture.cleanup;
     const harness = await bootHarness(fixture.vaultRoot);
     try {
@@ -183,9 +178,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
       const quarantine = await readQuarantineFiles(fixture.vaultRoot);
       expect(quarantine).toHaveLength(0);
       // Audit log captured the line-promoted route 100 times.
-      const promoteAudits = harness.audits.filter(
-        (a) => a.route === 'collector:line-promoted',
-      );
+      const promoteAudits = harness.audits.filter((a) => a.route === 'collector:line-promoted');
       expect(promoteAudits.length).toBeGreaterThanOrEqual(100);
     } finally {
       await harness.close();
@@ -344,9 +337,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
   });
 
   it('malformed line → deterministically quarantined with materializer-validation-failed', async () => {
-    const fixture = await setupFixtureVault(
-      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
-    );
+    const fixture = await setupFixtureVault(new Map([[TEST_TICK_COLLECTOR_ID, {}]]));
     cleanup = fixture.cleanup;
     const harness = await bootHarness(fixture.vaultRoot);
     try {
@@ -382,9 +373,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
       // Malformed line quarantined with the canonical reason.
       const quarantine = await readQuarantineFiles(fixture.vaultRoot);
       expect(quarantine.length).toBeGreaterThanOrEqual(1);
-      expect(
-        quarantine.some((q) => q.reason === 'materializer-validation-failed'),
-      ).toBe(true);
+      expect(quarantine.some((q) => q.reason === 'materializer-validation-failed')).toBe(true);
     } finally {
       await harness.close();
     }
@@ -398,9 +387,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
     // to derive a clientEventId — those collide here. The new
     // (event, ruleId, line) signature uses line.source_record_id as
     // the primary key.
-    const fixture = await setupFixtureVault(
-      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
-    );
+    const fixture = await setupFixtureVault(new Map([[TEST_TICK_COLLECTOR_ID, {}]]));
     cleanup = fixture.cleanup;
     const harness = await bootHarness(fixture.vaultRoot);
     try {
@@ -468,9 +455,7 @@ describe('Stage 4 spine — compass §2.G structural tests', () => {
     // bootHarness here uses the capture adapter (not production
     // eventLog) — so we register a custom appendClassA that mirrors
     // the production formula and asserts the fallback ids differ.
-    const fixture = await setupFixtureVault(
-      new Map([[TEST_TICK_COLLECTOR_ID, {}]]),
-    );
+    const fixture = await setupFixtureVault(new Map([[TEST_TICK_COLLECTOR_ID, {}]]));
     cleanup = fixture.cleanup;
     const { createHash } = await import('node:crypto');
     const fallbackClientEventId = (ruleId: string, line: CollectorEvent): string => {

@@ -71,8 +71,7 @@ const dateLabel = (ms: number): string =>
 const timeLabel = (ms: number): string =>
   new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 
-const compactDateTimeLabel = (ms: number): string =>
-  `${dateLabel(ms)}, ${timeLabel(ms)}`;
+const compactDateTimeLabel = (ms: number): string => `${dateLabel(ms)}, ${timeLabel(ms)}`;
 
 const labelForNode = (node: ConnectionsSnapshot['nodes'][number]): string => {
   if (node.label.length > 0) return node.label;
@@ -115,7 +114,10 @@ const buildTicks = (startMs: number, endMs: number): readonly TimelineTick[] => 
   return out;
 };
 
-const normalizeRange = (window: TimeRangeWindow | null, timestamps: readonly number[]): TimeRangeWindow => {
+const normalizeRange = (
+  window: TimeRangeWindow | null,
+  timestamps: readonly number[],
+): TimeRangeWindow => {
   if (window !== null) return window;
   const sorted = [...timestamps].sort((a, b) => a - b);
   const first = sorted[0] ?? Date.now();
@@ -167,8 +169,7 @@ const collectNodeFallbackTimestamps = (snapshot: ConnectionsSnapshot): Timestamp
   for (const node of snapshot.nodes) {
     const ms = parseTimestamp(node.lastSeenAt) ?? parseTimestamp(node.firstSeenAt);
     if (ms === null) continue;
-    const replicaIds =
-      node.originReplicaIds.length > 0 ? node.originReplicaIds : ['unknown'];
+    const replicaIds = node.originReplicaIds.length > 0 ? node.originReplicaIds : ['unknown'];
     for (const replicaId of replicaIds) {
       const list = timestampsByReplica.get(replicaId);
       if (list === undefined) timestampsByReplica.set(replicaId, [ms]);
@@ -271,7 +272,10 @@ export const computeTimelineRail = (
   const neighborTimes = [...neighborSet].sort((a, b) => a - b);
 
   return {
-    date: isoDayLocal(startMs) === isoDayLocal(endMs) ? isoDayLocal(startMs) : `${isoDayLocal(startMs)}-${isoDayLocal(endMs)}`,
+    date:
+      isoDayLocal(startMs) === isoDayLocal(endMs)
+        ? isoDayLocal(startMs)
+        : `${isoDayLocal(startMs)}-${isoDayLocal(endMs)}`,
     rangeLabel: rangeLabel(startMs, endMs),
     scaleLabel: scaleLabelForSpan(spanMs),
     startMs,

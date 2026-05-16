@@ -99,7 +99,9 @@ export function TurnText({ text, maxChars = 200 }: TurnTextProps) {
         i += 1;
         continue;
       }
-      nodes.push(<Fragment key={i}>{trimmed.length > 280 ? trimmed.slice(0, 280) + '…' : trimmed}</Fragment>);
+      nodes.push(
+        <Fragment key={i}>{trimmed.length > 280 ? trimmed.slice(0, 280) + '…' : trimmed}</Fragment>,
+      );
     } else {
       nodes.push(
         <img

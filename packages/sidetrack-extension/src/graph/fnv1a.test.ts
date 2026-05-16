@@ -12,9 +12,7 @@ describe('fnv1a32Hex', () => {
   });
 
   it('salts hashes at the call site', () => {
-    expect(saltedFnv1a32Hex('edge_a', 'tab|1|100')).toBe(
-      fnv1a32Hex('edge_a|tab|1|100'),
-    );
+    expect(saltedFnv1a32Hex('edge_a', 'tab|1|100')).toBe(fnv1a32Hex('edge_a|tab|1|100'));
     expect(saltedFnv1a32Hex('edge_a', 'tab|1|100')).not.toBe(
       saltedFnv1a32Hex('edge_b', 'tab|1|100'),
     );

@@ -31,11 +31,11 @@ describe('runAutoUpdate', () => {
     expect(result).toEqual({ ok: false, from: '1.0.0', to: '1.0.0', durationMs: 0 });
   });
 
-  it('runs npm update on success and reports duration', async () => {
+  it('runs bun update on success and reports duration', async () => {
     const exec: AutoUpdateExecPort = {
       execFile: (file, args) => {
-        expect(file).toBe('npm');
-        expect(args).toEqual(['update', '-g', '@sidetrack/companion']);
+        expect(file).toBe('bun');
+        expect(args).toEqual(['update', '--global', '@sidetrack/companion']);
         return Promise.resolve({ stdout: 'ok', stderr: '' });
       },
     };
@@ -56,7 +56,7 @@ describe('runAutoUpdate', () => {
     const result = await runAutoUpdate({
       confirm: '1.0.2',
       currentVersion: '1.0.0',
-      exec: { execFile: () => Promise.reject(new Error('npm exploded')) },
+      exec: { execFile: () => Promise.reject(new Error('bun exploded')) },
       checkLatest: () => Promise.resolve(advisory('1.0.2', true)),
     });
 
@@ -64,7 +64,7 @@ describe('runAutoUpdate', () => {
       ok: false,
       from: '1.0.0',
       to: '1.0.2',
-      stderr: 'npm exploded',
+      stderr: 'bun exploded',
     });
   });
 });

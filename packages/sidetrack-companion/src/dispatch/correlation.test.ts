@@ -1,11 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { DispatchEventRecord } from '../http/schemas.js';
-import {
-  normaliseForMatch,
-  tryLinkCapturedThread,
-  type DispatchLinkInput,
-} from './correlation.js';
+import { normaliseForMatch, tryLinkCapturedThread, type DispatchLinkInput } from './correlation.js';
 
 const NOW_MS = Date.parse('2026-04-30T12:00:00.000Z');
 

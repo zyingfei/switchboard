@@ -72,16 +72,11 @@ export const registerPrompts = (server: McpServer): void => {
           .enum(['chatgpt', 'claude', 'gemini'])
           .describe('Where to send the dispatch.'),
         taskBody: z.string().min(1).describe('The packet body the provider will receive.'),
-        annotationCount: z
-          .string()
-          .optional()
-          .describe('How many annotations to pin (default 4).'),
+        annotationCount: z.string().optional().describe('How many annotations to pin (default 4).'),
         audience: z
           .string()
           .optional()
-          .describe(
-            'Who the annotations are for. Defaults to "10+ year software architects".',
-          ),
+          .describe('Who the annotations are for. Defaults to "10+ year software architects".'),
       },
     },
     ({ targetProvider, taskBody, annotationCount, audience }) => {

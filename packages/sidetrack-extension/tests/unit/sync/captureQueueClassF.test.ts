@@ -82,7 +82,12 @@ describe('captureQueueHealth', () => {
           id: 'cap-1',
           queuedAt: '2026-05-07T00:00:00.000Z',
           failedAt: '2026-05-07T00:01:00.000Z',
-          event: { provider: 'chatgpt', threadUrl: 'https://x', capturedAt: '2026-05-07T00:00:00.000Z', turns: [] },
+          event: {
+            provider: 'chatgpt',
+            threadUrl: 'https://x',
+            capturedAt: '2026-05-07T00:00:00.000Z',
+            turns: [],
+          },
         },
       ],
     });

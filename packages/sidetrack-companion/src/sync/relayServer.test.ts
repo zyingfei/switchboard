@@ -202,8 +202,8 @@ describe('relay server', () => {
         }),
       );
       await new Promise((resolve) => setTimeout(resolve, 20));
-      const send = (idx: number) =>
-        { a.socket.send(
+      const send = (idx: number) => {
+        a.socket.send(
           encodeFrame({
             kind: 'PUBLISH',
             rendezvous_id: 'rzv-rate',
@@ -213,7 +213,8 @@ describe('relay server', () => {
             signature: 'sig',
             sender_public_key: 'pkA',
           }),
-        ); };
+        );
+      };
       send(0);
       send(1);
       send(2);

@@ -81,8 +81,7 @@ export function ReviewComposer({
   // when there's any comment to send. Dispatch-out is the escape hatch
   // for fan-out reviews.
   const hasAnyComment =
-    reviewerNote.trim().length > 0 ||
-    Object.values(perSpan).some((c) => c.trim().length > 0);
+    reviewerNote.trim().length > 0 || Object.values(perSpan).some((c) => c.trim().length > 0);
 
   return (
     <div className="review-composer">
@@ -122,9 +121,7 @@ export function ReviewComposer({
         <div className="review-comments-col">
           {spans.map((span, index) => (
             <div key={span.id} className="review-comment-card">
-              <label className="mono review-comment-label">
-                comment on #{index + 1}
-              </label>
+              <label className="mono review-comment-label">comment on #{index + 1}</label>
               <textarea
                 className="review-comment-text"
                 placeholder="What's right, what's wrong, what needs more…"

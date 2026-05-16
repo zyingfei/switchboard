@@ -102,7 +102,11 @@ describe('Lane 1 contract — burst resilience + stale outbox + materializer hea
     const runner = createSyncContractRunner();
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
-    const m = createRecallMaterializer({ recallLifecycle: lifecycle, recallActivity: activity, eventLog });
+    const m = createRecallMaterializer({
+      recallLifecycle: lifecycle,
+      recallActivity: activity,
+      eventLog,
+    });
     runner.register(m);
 
     // The dirty-bit scheduler kicks off one worker; subsequent
@@ -126,7 +130,11 @@ describe('Lane 1 contract — burst resilience + stale outbox + materializer hea
     const runner = createSyncContractRunner();
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
-    const m = createRecallMaterializer({ recallLifecycle: lifecycle, recallActivity: activity, eventLog });
+    const m = createRecallMaterializer({
+      recallLifecycle: lifecycle,
+      recallActivity: activity,
+      eventLog,
+    });
     runner.register(m);
     runner.onAcceptedEvent(captureEvent(1), { origin: 'peer' });
     await runner.awaitIdle();

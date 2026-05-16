@@ -83,12 +83,16 @@ export const createVaultWatcher = (
     );
   };
 
-  const watcher: FSWatcher = watch(join(vaultRoot, '_BAC'), { recursive: true }, (_event, filename) => {
-    if (filename === null) {
-      return;
-    }
-    emitLater(relative(vaultRoot, join(vaultRoot, '_BAC', filename)));
-  });
+  const watcher: FSWatcher = watch(
+    join(vaultRoot, '_BAC'),
+    { recursive: true },
+    (_event, filename) => {
+      if (filename === null) {
+        return;
+      }
+      emitLater(relative(vaultRoot, join(vaultRoot, '_BAC', filename)));
+    },
+  );
 
   return {
     close() {

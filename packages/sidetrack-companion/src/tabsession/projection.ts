@@ -92,7 +92,7 @@ const upsertObservedSession = (
   },
 ): void => {
   const existing = records.get(input.tabSessionId);
-  if (existing !== undefined && existing.closedAt !== undefined && input.transition !== 'closed') {
+  if (existing?.closedAt !== undefined && input.transition !== 'closed') {
     return;
   }
 
@@ -304,7 +304,7 @@ export const seedTabSessionProjectionAccumulatorAsync = async (
   const acc = createEmptyTabSessionProjectionAccumulator();
   const sorted = [...events].sort(compareEventOrder);
   for (let i = 0; i < sorted.length; i += 1) {
-    foldEventIntoTabSessionProjectionAccumulator(acc, sorted[i] as AcceptedEvent);
+    foldEventIntoTabSessionProjectionAccumulator(acc, sorted[i]!);
     if ((i + 1) % yieldEvery === 0) {
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
@@ -348,9 +348,7 @@ export const deserializeTabSessionProjection = (
 ): TabSessionProjection => ({
   schemaVersion: serialized.schemaVersion,
   bySessionId: new Map(
-    Object.entries(serialized.bySessionId).sort(([left], [right]) =>
-      compareString(left, right),
-    ),
+    Object.entries(serialized.bySessionId).sort(([left], [right]) => compareString(left, right)),
   ),
   openSessionsByTabId: new Map(
     Object.entries(serialized.openSessionsByTabId).sort(([left], [right]) =>

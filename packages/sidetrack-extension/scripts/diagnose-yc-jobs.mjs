@@ -17,13 +17,18 @@ const log = (label, value) => {
 const main = async () => {
   const browser = await chromium.connectOverCDP(cdpUrl);
   const ctx = browser.contexts()[0];
-  const extensionId = ctx.serviceWorkers()[0]?.url().match(/chrome-extension:\/\/([^/]+)/)?.[1];
+  const extensionId = ctx
+    .serviceWorkers()[0]
+    ?.url()
+    .match(/chrome-extension:\/\/([^/]+)/)?.[1];
   const panel = ctx.pages().find((p) => p.url().includes(`${extensionId}/sidepanel.html`));
   if (panel === undefined) throw new Error('no side panel');
 
   // Open /jobs in a fresh tab and dwell briefly.
   const jobs = await ctx.newPage();
-  await jobs.goto('https://news.ycombinator.com/jobs', { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await jobs
+    .goto('https://news.ycombinator.com/jobs', { waitUntil: 'domcontentloaded' })
+    .catch(() => undefined);
   await jobs.bringToFront();
   await jobs.waitForTimeout(2500);
 
@@ -48,7 +53,8 @@ const main = async () => {
 
   // Companion-side: pull the URL projection and grep for HN URLs.
   const projection = await panel.evaluate(async () => {
-    const settings = (await chrome.storage.local.get('sidetrack.settings'))['sidetrack.settings'] ?? {};
+    const settings =
+      (await chrome.storage.local.get('sidetrack.settings'))['sidetrack.settings'] ?? {};
     const port = settings.companion?.port ?? null;
     const bridgeKey = settings.companion?.bridgeKey ?? null;
     if (port === null || bridgeKey === null) return { error: 'no companion config' };

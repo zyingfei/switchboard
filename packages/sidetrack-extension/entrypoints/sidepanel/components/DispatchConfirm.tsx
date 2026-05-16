@@ -75,9 +75,7 @@ export function DispatchConfirm({
   onEdit,
   onConfirm,
 }: DispatchConfirmProps) {
-  const [mode, setMode] = useState<'paste' | 'auto_send'>(
-    autoSendOptedIn ? 'auto_send' : 'paste',
-  );
+  const [mode, setMode] = useState<'paste' | 'auto_send'>(autoSendOptedIn ? 'auto_send' : 'paste');
   const tokenPct = Math.round((tokenEstimate / tokenLimit) * 100);
   const tokenLevel: 'green' | 'amber' | 'over' =
     tokenPct < 80 ? 'green' : tokenPct < 100 ? 'amber' : 'over';

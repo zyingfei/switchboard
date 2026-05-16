@@ -505,9 +505,7 @@ const clusterAnchorsByRow = (
   for (const list of buckets.values()) {
     list.sort((left, right) => left.rect.left - right.rect.left);
   }
-  return [...buckets.entries()]
-    .sort(([a], [b]) => a - b)
-    .map(([, list]) => list);
+  return [...buckets.entries()].sort(([a], [b]) => a - b).map(([, list]) => list);
 };
 
 // Mount per-anchor highlights + per-row margin markers + a single
@@ -679,10 +677,7 @@ export const mountAnnotationNotePopover = (
     <div class="quote"></div>
     <div class="note"></div>
   `;
-  let cursor = Math.min(
-    Math.max(opts.initialCursor ?? 0, 0),
-    opts.anchors.length - 1,
-  );
+  let cursor = Math.min(Math.max(opts.initialCursor ?? 0, 0), opts.anchors.length - 1);
   const quoteEl = pop.querySelector<HTMLElement>('.quote');
   const noteEl = pop.querySelector<HTMLElement>('.note');
   const metaEl = pop.querySelector<HTMLElement>('.meta');
@@ -693,9 +688,7 @@ export const mountAnnotationNotePopover = (
     const current = opts.anchors[cursor];
     if (current === undefined) return;
     if (metaEl !== null) {
-      metaEl.textContent = multi
-        ? `${String(cursor + 1)} / ${String(opts.anchors.length)}`
-        : '';
+      metaEl.textContent = multi ? `${String(cursor + 1)} / ${String(opts.anchors.length)}` : '';
     }
     if (quoteEl !== null) {
       if (current.quote !== undefined && current.quote.length > 0) {
@@ -711,9 +704,7 @@ export const mountAnnotationNotePopover = (
     }
     if (noteEl !== null) {
       noteEl.textContent =
-        current.note !== undefined && current.note.length > 0
-          ? current.note
-          : '(no note attached)';
+        current.note !== undefined && current.note.length > 0 ? current.note : '(no note attached)';
     }
     if (prevBtn !== null) prevBtn.disabled = cursor === 0;
     if (nextBtn !== null) nextBtn.disabled = cursor === opts.anchors.length - 1;

@@ -12,7 +12,11 @@ const readStored = async (): Promise<readonly McpServerConfig[]> => {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) {
       return false;
     }
-    const record = item as { readonly id?: unknown; readonly url?: unknown; readonly transport?: unknown };
+    const record = item as {
+      readonly id?: unknown;
+      readonly url?: unknown;
+      readonly transport?: unknown;
+    };
     return (
       typeof record.id === 'string' &&
       typeof record.url === 'string' &&

@@ -38,14 +38,21 @@ while (Date.now() - start < timeoutMs) {
       const chatgptThreads = Array.isArray(threads)
         ? threads
             .filter((t) => t.provider === 'chatgpt')
-            .map((t) => ({ bac_id: t.bac_id, url: t.threadUrl, title: t.title, lastSeenAt: t.lastSeenAt }))
+            .map((t) => ({
+              bac_id: t.bac_id,
+              url: t.threadUrl,
+              title: t.title,
+              lastSeenAt: t.lastSeenAt,
+            }))
         : [];
       const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
       const chatgptTabs = tabs.map((t) => ({ url: t.url, status: t.status, active: t.active }));
       return { autoApproved, links, dispatchTabs, lastOpenedAt, chatgptThreads, chatgptTabs };
     });
   } catch (error) {
-    console.log(`[${ts()} +${elapsed()}] SW probe failed (likely evicted mid-eval): ${error.message?.slice(0, 80)}`);
+    console.log(
+      `[${ts()} +${elapsed()}] SW probe failed (likely evicted mid-eval): ${error.message?.slice(0, 80)}`,
+    );
     await new Promise((r) => setTimeout(r, 15_000));
     continue;
   }

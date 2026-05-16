@@ -58,11 +58,7 @@ const engagementEvent = (overrides: {
     },
   });
 
-const navigationEvent = (overrides: {
-  seq: number;
-  visitId: string;
-  canonicalUrl: string;
-}) =>
+const navigationEvent = (overrides: { seq: number; visitId: string; canonicalUrl: string }) =>
   buildEvent({
     seq: overrides.seq,
     type: NAVIGATION_COMMITTED,
@@ -133,10 +129,7 @@ describe('Stage 5.2 W2a — engagement accumulator', () => {
     const acc = seedEngagementAccumulator(initial, emptyTimelineDays);
     for (const event of extra) foldEventIntoEngagementAccumulator(acc, event);
     const streamed = engagementClassifierInputsFromAccumulator(acc);
-    const oneShot = buildEngagementClassifierInputs(
-      [...initial, ...extra],
-      emptyTimelineDays,
-    );
+    const oneShot = buildEngagementClassifierInputs([...initial, ...extra], emptyTimelineDays);
     expect(streamed).toEqual(oneShot);
   });
 
@@ -188,7 +181,10 @@ describe('Stage 5.2 W2a — engagement accumulator', () => {
 
   it('non-engagement, non-navigation events are no-ops in fold', () => {
     const acc = createEmptyEngagementAccumulator();
-    foldEventIntoEngagementAccumulator(acc, buildEvent({ seq: 1, type: 'unrelated.event', payload: {} }));
+    foldEventIntoEngagementAccumulator(
+      acc,
+      buildEvent({ seq: 1, type: 'unrelated.event', payload: {} }),
+    );
     expect(acc.latestByVisitSession.size).toBe(0);
     expect(acc.canonicalUrlByVisitId.size).toBe(0);
   });

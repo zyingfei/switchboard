@@ -61,7 +61,10 @@ export const projectPrivacy = (events: readonly AcceptedEvent[]): PrivacyProject
       continue;
     }
 
-    if (event.type === PRIVACY_PERMISSION_GRANTED && isPrivacyPermissionGrantedPayload(event.payload)) {
+    if (
+      event.type === PRIVACY_PERMISSION_GRANTED &&
+      isPrivacyPermissionGrantedPayload(event.payload)
+    ) {
       const entry = { permission: event.payload.permission, scope: event.payload.scope };
       const key = permissionKey(entry.permission, entry.scope);
       granted.set(key, entry);
@@ -70,7 +73,10 @@ export const projectPrivacy = (events: readonly AcceptedEvent[]): PrivacyProject
       continue;
     }
 
-    if (event.type === PRIVACY_PERMISSION_REVOKED && isPrivacyPermissionRevokedPayload(event.payload)) {
+    if (
+      event.type === PRIVACY_PERMISSION_REVOKED &&
+      isPrivacyPermissionRevokedPayload(event.payload)
+    ) {
       const entry = { permission: event.payload.permission, scope: event.payload.scope };
       const key = permissionKey(entry.permission, entry.scope);
       granted.delete(key);

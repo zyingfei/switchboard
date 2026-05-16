@@ -394,9 +394,7 @@ const setLightGbmGroupField = async (
 
 const RANKER_GRADES = ['0', '1', '2', '3', '4'] as const satisfies readonly RankerGrade[];
 
-const gradeHistogramForRows = (
-  rows: readonly RankerTrainingRow[],
-): Record<RankerGrade, number> => {
+const gradeHistogramForRows = (rows: readonly RankerTrainingRow[]): Record<RankerGrade, number> => {
   const histogram: Record<RankerGrade, number> = { '0': 0, '1': 0, '2': 0, '3': 0, '4': 0 };
   for (const row of rows) {
     const grade = Math.min(4, Math.max(0, Math.round(row.label)));
@@ -417,14 +415,11 @@ const percentile = (sorted: readonly number[], fraction: number): number => {
   return lower + (upper - lower) * (rank - lowerIndex);
 };
 
-const scoreSpread = (
-  scores: readonly number[],
-): RankerTrainQuality['scoreSpread'] => {
+const scoreSpread = (scores: readonly number[]): RankerTrainQuality['scoreSpread'] => {
   if (scores.length === 0) return undefined;
   const sorted = [...scores].sort((left, right) => left - right);
   const mean = scores.reduce((sum, score) => sum + score, 0) / scores.length;
-  const variance =
-    scores.reduce((sum, score) => sum + (score - mean) ** 2, 0) / scores.length;
+  const variance = scores.reduce((sum, score) => sum + (score - mean) ** 2, 0) / scores.length;
   // Round to a stable precision so a "distinct" count isn't inflated by
   // float noise from an effectively-constant model.
   const distinct = new Set(scores.map((score) => score.toFixed(9))).size;

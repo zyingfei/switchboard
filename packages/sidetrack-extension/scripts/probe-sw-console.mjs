@@ -17,15 +17,17 @@ const state = await sw.evaluate(async () => {
   const settings = await get('sidetrack.settings');
   const alarms = await chrome.alarms.getAll();
   return {
-    dispatches: Array.isArray(dispatches) ? dispatches.map((d) => ({
-      bac_id: d.bac_id,
-      kind: d.kind,
-      target: d.target,
-      title: d.title,
-      status: d.status,
-      mcpRequest: d.mcpRequest,
-      createdAt: d.createdAt,
-    })) : dispatches,
+    dispatches: Array.isArray(dispatches)
+      ? dispatches.map((d) => ({
+          bac_id: d.bac_id,
+          kind: d.kind,
+          target: d.target,
+          title: d.title,
+          status: d.status,
+          mcpRequest: d.mcpRequest,
+          createdAt: d.createdAt,
+        }))
+      : dispatches,
     mcpStarted,
     links,
     hasSettings: !!settings,

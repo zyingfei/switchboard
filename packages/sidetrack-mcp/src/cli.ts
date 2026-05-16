@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import type { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
@@ -345,9 +345,7 @@ const createCompanionWriteClient = (
         ...(input.pageTitle === undefined ? {} : { pageTitle: input.pageTitle }),
         term: input.term,
         note: input.note,
-        ...(input.selectionHint === undefined
-          ? {}
-          : { selectionHint: input.selectionHint }),
+        ...(input.selectionHint === undefined ? {} : { selectionHint: input.selectionHint }),
         ...(input.sourceTurn === undefined ? {} : { sourceTurn: input.sourceTurn }),
         ...(input.anchorPolicy === undefined ? {} : { anchorPolicy: input.anchorPolicy }),
       };
@@ -429,9 +427,7 @@ const createCompanionWriteClient = (
           reason: reasonValue,
           message: typeof data['message'] === 'string' ? (data['message'] as string) : '',
           occurrenceCount:
-            typeof data['occurrenceCount'] === 'number'
-              ? (data['occurrenceCount'] as number)
-              : 0,
+            typeof data['occurrenceCount'] === 'number' ? (data['occurrenceCount'] as number) : 0,
           ...(Array.isArray(suggestedRaw) &&
           suggestedRaw.every((entry) => typeof entry === 'string')
             ? { suggestedSelectionHints: suggestedRaw as readonly string[] }
@@ -609,9 +605,7 @@ const createCompanionWriteClient = (
         });
         if (!response.ok) {
           const detail = await response.text().catch(() => '');
-          throw new Error(
-            `Companion await-capture failed (${String(response.status)}): ${detail}`,
-          );
+          throw new Error(`Companion await-capture failed (${String(response.status)}): ${detail}`);
         }
         const body = (await response.json()) as { readonly data?: unknown };
         if (typeof body.data !== 'object' || body.data === null || Array.isArray(body.data)) {

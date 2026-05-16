@@ -27,15 +27,21 @@ already-running test browser via CDP (`localhost:9222`), find an
 existing logged-in chatgpt.com tab, and navigate it to the target.
 
 **Operation**:
+
 ```js
 const browser = await chromium.connectOverCDP('http://localhost:9222');
-const tab = browser.contexts()[0].pages().find(p => p.url().startsWith('https://chatgpt.com/'));
-await tab.goto('https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0',
-                { waitUntil: 'domcontentloaded' });
+const tab = browser
+  .contexts()[0]
+  .pages()
+  .find((p) => p.url().startsWith('https://chatgpt.com/'));
+await tab.goto('https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0', {
+  waitUntil: 'domcontentloaded',
+});
 await tab.waitForSelector('[data-message-author-role]');
 ```
 
 **Log evidence**:
+
 ```
 [1.nav] no existing tab; opening target URL
 [1.nav] tab url: https://chatgpt.com/c/69fa10f8-ae00-8330-a104-ee21469af0e0
@@ -55,11 +61,13 @@ exactly. We focus the target tab + its window (so the SW's
 dispatch `messageTypes.captureCurrentTab` from the side-panel page.
 
 **Operation**:
+
 ```js
 // From the SW: focus the right tab + window.
 await sw.evaluate(async () => {
-  const t = (await chrome.tabs.query({ url: 'https://chatgpt.com/c/*' }))
-    .find(x => x.url?.includes('69fa10f8-ae00'));
+  const t = (await chrome.tabs.query({ url: 'https://chatgpt.com/c/*' })).find((x) =>
+    x.url?.includes('69fa10f8-ae00'),
+  );
   await chrome.tabs.update(t.id, { active: true });
   await chrome.windows.update(t.windowId, { focused: true });
 });
@@ -72,6 +80,7 @@ const captureRes = await sidepanel.evaluate(async () =>
 ```
 
 **Log evidence**:
+
 ```
 [2.capture] focusing target tab + window, then sending captureCurrentTab from side panel context
 [2.capture] capture response keys: ok,state ok: true
@@ -92,6 +101,7 @@ The MCP server is what the agent will talk to. Started as a
 subprocess pointed at the user's vault + the running companion.
 
 **Operation**:
+
 ```bash
 node packages/sidetrack-mcp/dist/cli.js \
      --vault /Users/yingfei/Documents/Sidetrack-vault \
@@ -103,6 +113,7 @@ node packages/sidetrack-mcp/dist/cli.js \
 ```
 
 **Log evidence**:
+
 ```
 [3.mcp] starting sidetrack-mcp on ws://127.0.0.1:8786/mcp
   [mcp.err] sidetrack-mcp websocket listening on ws://127.0.0.1:8786/mcp
@@ -117,6 +128,7 @@ The prompt the agent receives. This is the entirety of what gets
 copied to clipboard / pasted into a coding agent — nothing else.
 
 **Operation**:
+
 ```
 # Coding handoff: chat thread
 
@@ -133,6 +145,7 @@ Summarise this conversation and identify the single biggest open question.
 ```
 
 **Log evidence**:
+
 ```
 [4.prompt] lean prompt length: 512 chars (no chat URL, no provider, no turn snapshot)
 ```
@@ -151,6 +164,7 @@ The agent extracts only `thread_id` + `endpoint` + `ask` from the
 prompt. Anything else it needs comes over the MCP tool channel.
 
 **Operation**:
+
 ```js
 const parsed = {
   threadId: /sidetrack_thread_id:\s*(\S+)/.exec(prompt)?.[1],
@@ -162,6 +176,7 @@ await client.connect(new WebSocketClientTransport(new URL(parsed.endpoint)));
 ```
 
 **Log evidence**:
+
 ```
 [5.parse] agent parsed: thread_id=2ZRHJ5ZHV9TDTT3A endpoint=ws://127.0.0.1:8786/mcp?token=Xnr-n2HC2Q…
 [5.connect] MCP client connected
@@ -177,6 +192,7 @@ The prompt instructs the agent to call this first. The MCP server
 advertises 30 tools.
 
 **Log evidence**:
+
 ```
 [6.tools/list] advertised: 30 tools
   sample: bac.recent_threads, bac.workstream, bac.context_pack, bac.search,
@@ -192,6 +208,7 @@ metadata: title, provider, URL, status). 407 bytes for this thread —
 the full turn body lives in the event log, fetched via `bac.turns`.
 
 **Log evidence**:
+
 ```
 [6.read_thread_md] bac.read_thread_md(2ZRHJ5ZHV9TDTT3A)
   vault path: /Users/yingfei/Documents/Sidetrack-vault/_BAC/threads/2ZRHJ5ZHV9TDTT3A.md
@@ -213,6 +230,7 @@ Pulls the actual turns from the event log. 6 captured turns, first
 user message + last assistant response.
 
 **Log evidence**:
+
 ```
 [6.turns] bac.turns — captured-turn payload for the thread
   turn count: 6
@@ -231,6 +249,7 @@ Returns the 5 most-recent dispatch packets the user has shipped, so
 the agent doesn't repeat already-completed work.
 
 **Log evidence**:
+
 ```
 [6.list_dispatches] bac.list_dispatches(limit=5)
   count: 5
@@ -247,6 +266,7 @@ are this same thread (self-match score 1.0 + 0.918 + 0.865) plus
 two other threads.
 
 **Log evidence**:
+
 ```
 [6.recall] query: "what's the b* algorithm to do heap rank"
   related-thread count: 5
@@ -260,6 +280,7 @@ two other threads.
 Empty for this thread — user hasn't annotated it. Agent moves on.
 
 **Log evidence**:
+
 ```
 [6.list_annotations] annotation count: 0
 ```
@@ -270,6 +291,7 @@ Final step: agent writes a follow-up confirmation back into the
 thread's queue. Demonstrates the write surface works end-to-end too.
 
 **Log evidence**:
+
 ```
 [6.queue_item] agent writes back: bac.queue_item with a follow-up note
   queue item bac_id: WKRYAJM01KM6FPJF
@@ -277,6 +299,7 @@ thread's queue. Demonstrates the write surface works end-to-end too.
 ```
 
 **On-disk evidence** — companion persisted the queue item:
+
 ```json
 {
   "text": "Codex e2e probe: read thread markdown via MCP, identified user ask, queued this confirmation.",
@@ -289,19 +312,20 @@ thread's queue. Demonstrates the write surface works end-to-end too.
   "updatedAt": "2026-05-05T15:57:37.801Z"
 }
 ```
+
 Full file in `evidence-queue-item.json`.
 
 ---
 
 ## Wiring evidence — the actual contract
 
-| Surface | Configured by | Used by |
-|---|---|---|
-| Test browser (CDP `localhost:9222`) | user's running Chrome | Step 1 navigate, Step 2 capture trigger |
-| Sidetrack extension SW + side panel | user's loaded extension | Step 2 capture (focus tab + dispatch message) |
-| Companion HTTP `127.0.0.1:17373` | user's running `sidetrack-companion` | Step 2 vault writes, Step 6 MCP→companion proxy |
-| **MCP WebSocket `127.0.0.1:8786`** | spawned by this script | **the only surface the agent talks to** |
-| Lean prompt | built in Step 4 | hands the agent `thread_id` + endpoint |
+| Surface                             | Configured by                        | Used by                                         |
+| ----------------------------------- | ------------------------------------ | ----------------------------------------------- |
+| Test browser (CDP `localhost:9222`) | user's running Chrome                | Step 1 navigate, Step 2 capture trigger         |
+| Sidetrack extension SW + side panel | user's loaded extension              | Step 2 capture (focus tab + dispatch message)   |
+| Companion HTTP `127.0.0.1:17373`    | user's running `sidetrack-companion` | Step 2 vault writes, Step 6 MCP→companion proxy |
+| **MCP WebSocket `127.0.0.1:8786`**  | spawned by this script               | **the only surface the agent talks to**         |
+| Lean prompt                         | built in Step 4                      | hands the agent `thread_id` + endpoint          |
 
 The agent never hits the companion HTTP API directly — only via
 `bac.*` tools over MCP. The chat URL (`https://chatgpt.com/c/…`) is
@@ -313,24 +337,25 @@ header (and the agent could choose to ignore it).
 
 ## Summary
 
-| Step | Status | Evidence |
-|------|--------|----------|
-| 1. Navigate test browser | ✅ | 7 message turns rendered |
-| 2. Capture via extension | ✅ | bac_id `2ZRHJ5ZHV9TDTT3A` |
-| 3. Start MCP server | ✅ | `ws://127.0.0.1:8786/mcp` listening |
-| 4. Build lean prompt | ✅ | 512 chars, no URL leak |
-| 5. Agent parses + connects | ✅ | MCP client connected |
-| 6a. tools/list | ✅ | 30 tools advertised |
-| 6b. read_thread_md | ✅ | 407 bytes, title resolved |
-| 6c. turns | ✅ | 6 turns, full content |
-| 6d. list_dispatches | ✅ | 5 prior shipments |
-| 6e. recall | ✅ | 5 hits, top score 1.0 |
-| 6f. list_annotations | ✅ | 0 (none pinned) |
-| 6g. queue_item write-back | ✅ | persisted as `WKRYAJM01KM6FPJF` |
+| Step                       | Status | Evidence                            |
+| -------------------------- | ------ | ----------------------------------- |
+| 1. Navigate test browser   | ✅     | 7 message turns rendered            |
+| 2. Capture via extension   | ✅     | bac_id `2ZRHJ5ZHV9TDTT3A`           |
+| 3. Start MCP server        | ✅     | `ws://127.0.0.1:8786/mcp` listening |
+| 4. Build lean prompt       | ✅     | 512 chars, no URL leak              |
+| 5. Agent parses + connects | ✅     | MCP client connected                |
+| 6a. tools/list             | ✅     | 30 tools advertised                 |
+| 6b. read_thread_md         | ✅     | 407 bytes, title resolved           |
+| 6c. turns                  | ✅     | 6 turns, full content               |
+| 6d. list_dispatches        | ✅     | 5 prior shipments                   |
+| 6e. recall                 | ✅     | 5 hits, top score 1.0               |
+| 6f. list_annotations       | ✅     | 0 (none pinned)                     |
+| 6g. queue_item write-back  | ✅     | persisted as `WKRYAJM01KM6FPJF`     |
 
 End-to-end automated, MCP-only, no manual intervention.
 
 **Files in this directory**:
+
 - `codex-real-handoff.report.md` — this writeup
 - `codex-real-handoff.run.log` — raw stdout from the test run
 - `evidence-thread-md.txt` — vault thread header the agent received

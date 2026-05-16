@@ -38,9 +38,7 @@ const hasHashFields = (value: Record<string, unknown>): boolean =>
   value['charCount'] >= 0 &&
   value['dimensions'] === undefined;
 
-export const isSelectionCopiedPayload = (
-  value: unknown,
-): value is SelectionCopiedPayload =>
+export const isSelectionCopiedPayload = (value: unknown): value is SelectionCopiedPayload =>
   isRecord(value) &&
   hasHashFields(value) &&
   typeof value['visitId'] === 'string' &&
@@ -52,9 +50,7 @@ export const isSelectionCopiedPayload = (
     value['contentKindHint'] === 'url' ||
     value['contentKindHint'] === 'mixed');
 
-export const isSelectionPastedPayload = (
-  value: unknown,
-): value is SelectionPastedPayload =>
+export const isSelectionPastedPayload = (value: unknown): value is SelectionPastedPayload =>
   isRecord(value) &&
   hasHashFields(value) &&
   typeof value['destinationId'] === 'string' &&

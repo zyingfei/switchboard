@@ -39,9 +39,7 @@
         "label": "ChatGPT — review reducer code",
         "firstSeenAt": "2026-05-07T09:31:00.000Z",
         "lastSeenAt": "2026-05-07T09:31:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "canonicalUrl": "https://chatgpt.com/c/sb_review",
           "provider": "chatgpt",
@@ -56,9 +54,7 @@
         "label": "Claude — m2 dispatch design review",
         "firstSeenAt": "2026-05-07T09:19:00.000Z",
         "lastSeenAt": "2026-05-07T09:19:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "canonicalUrl": "https://claude.ai/chat/sb_thread",
           "provider": "claude",
@@ -144,9 +140,7 @@
         "label": "Sidetrack · project review",
         "firstSeenAt": "2026-05-07T08:58:00.000Z",
         "lastSeenAt": "2026-05-07T09:31:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "title": "Sidetrack · project review"
         }

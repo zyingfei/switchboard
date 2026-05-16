@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Find and (with --apply) delete legacy per-worktree Chrome-for-Testing
 // installs. The shared cache at ~/Library/Caches/sidetrack/chrome-for-testing
 // is what chrome-debug.mjs reads from now; the per-worktree copies are
@@ -6,9 +6,9 @@
 //
 // Defaults to dry-run. Pass --apply to actually delete.
 //
-//   node scripts/gc-cft.mjs            # list candidates only
-//   node scripts/gc-cft.mjs --apply    # delete them
-//   SIDETRACK_GC_ROOTS="$HOME/Documents,$HOME/.codex" node scripts/gc-cft.mjs
+//   bun scripts/gc-cft.mjs            # list candidates only
+//   bun scripts/gc-cft.mjs --apply    # delete them
+//   SIDETRACK_GC_ROOTS="$HOME/Documents,$HOME/.codex" bun scripts/gc-cft.mjs
 
 import { rm, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -25,7 +25,8 @@ const roots = (process.env.SIDETRACK_GC_ROOTS ?? `${homedir()}/Documents,${homed
   .filter((s) => s.length > 0);
 
 const sharedRoot =
-  process.env.SIDETRACK_CFT_ROOT ?? path.join(homedir(), 'Library/Caches/sidetrack/chrome-for-testing');
+  process.env.SIDETRACK_CFT_ROOT ??
+  path.join(homedir(), 'Library/Caches/sidetrack/chrome-for-testing');
 
 const findCftDirs = (root) => {
   const result = spawnSync(

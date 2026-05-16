@@ -54,11 +54,11 @@ const visitNodeId = (visitKey: string): string => `${VISIT_PREFIX}${visitKey}`;
 const canonicalVisitForNode = (snapshot: ConnectionsSnapshot, nodeId: string): string => {
   if (nodeId.startsWith(VISIT_PREFIX)) return nodeId;
   const node = snapshot.nodes.find((candidate) => candidate.id === nodeId);
-  const timelineVisitId = node?.metadata?.['timelineVisitId'];
+  const timelineVisitId = node?.metadata?.timelineVisitId;
   if (typeof timelineVisitId === 'string' && timelineVisitId.startsWith(VISIT_PREFIX)) {
     return timelineVisitId;
   }
-  const canonicalUrl = node?.metadata?.['canonicalUrl'];
+  const canonicalUrl = node?.metadata?.canonicalUrl;
   if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) return visitNodeId(canonicalUrl);
   return nodeId;
 };

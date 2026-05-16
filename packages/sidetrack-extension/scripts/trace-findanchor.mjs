@@ -20,7 +20,11 @@ const out = await sw.evaluate(async () => {
       const body = await resp.json();
       const annotations = body?.data ?? [];
       // Re-implement findAnchor + stripMarkdownFormatting locally
-      const stripMd = (s) => s.replace(/[*_`~#>]/g, '').replace(/\\([*_`~#>])/g, '$1').replace(/\s+/g, ' ');
+      const stripMd = (s) =>
+        s
+          .replace(/[*_`~#>]/g, '')
+          .replace(/\\([*_`~#>])/g, '$1')
+          .replace(/\s+/g, ' ');
       const CONTEXT_CHARS = 32;
       const findAnchor = (root, anchor) => {
         const fullText = root.textContent ?? '';
@@ -36,8 +40,14 @@ const out = await sw.evaluate(async () => {
           if (index < 0) break;
           const prefix = fullText.slice(Math.max(0, index - CONTEXT_CHARS), index);
           const suffix = fullText.slice(index + exact.length, index + exact.length + CONTEXT_CHARS);
-          const prefixOk = expectedPrefixRaw.length === 0 || prefix.endsWith(expectedPrefixRaw) || stripMd(prefix).endsWith(expectedPrefixNorm);
-          const suffixOk = expectedSuffixRaw.length === 0 || suffix.startsWith(expectedSuffixRaw) || stripMd(suffix).startsWith(expectedSuffixNorm);
+          const prefixOk =
+            expectedPrefixRaw.length === 0 ||
+            prefix.endsWith(expectedPrefixRaw) ||
+            stripMd(prefix).endsWith(expectedPrefixNorm);
+          const suffixOk =
+            expectedSuffixRaw.length === 0 ||
+            suffix.startsWith(expectedSuffixRaw) ||
+            stripMd(suffix).startsWith(expectedSuffixNorm);
           if (prefixOk && suffixOk) return { matchIndex: index };
           from = index + 1;
         }

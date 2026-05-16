@@ -10,15 +10,15 @@ import {
   type EntityDisplayCtx,
 } from '../../src/sidepanel/entityDisplay/format';
 
-const makeCtx = (
-  overrides: Partial<EntityDisplayCtx> = {},
-): EntityDisplayCtx => ({
+const makeCtx = (overrides: Partial<EntityDisplayCtx> = {}): EntityDisplayCtx => ({
   resolveWorkstreamPath: () => null,
   replicaAlias: (id) => (id === 'this-replica' ? 'This browser' : 'Browser 2'),
   ...overrides,
 });
 
-const makeNode = (overrides: Partial<ConnectionNode> & Pick<ConnectionNode, 'id' | 'kind'>): ConnectionNode => ({
+const makeNode = (
+  overrides: Partial<ConnectionNode> & Pick<ConnectionNode, 'id' | 'kind'>,
+): ConnectionNode => ({
   label: '',
   originReplicaIds: [],
   metadata: {},
@@ -180,9 +180,9 @@ describe('entityDisplay/format', () => {
   describe('formatNodeIdDisplay — missing node fallbacks', () => {
     const empty: ReadonlyMap<string, ConnectionNode> = new Map();
     it('workstream falls back to ctx path or Unknown workstream', () => {
-      expect(
-        formatNodeIdDisplay('workstream:ABC', empty, makeCtx()).primary,
-      ).toBe('Unknown workstream');
+      expect(formatNodeIdDisplay('workstream:ABC', empty, makeCtx()).primary).toBe(
+        'Unknown workstream',
+      );
       expect(
         formatNodeIdDisplay(
           'workstream:ABC',
@@ -207,11 +207,7 @@ describe('entityDisplay/format', () => {
       expect(display.primary).not.toContain('visit-instance');
     });
     it('timeline-visit URL host', () => {
-      const display = formatNodeIdDisplay(
-        'timeline-visit:https://example.com/x',
-        empty,
-        makeCtx(),
-      );
+      const display = formatNodeIdDisplay('timeline-visit:https://example.com/x', empty, makeCtx());
       expect(display.primary).toBe('example.com');
     });
     it('completely unknown node still returns safe placeholder', () => {

@@ -1,6 +1,10 @@
 import { useMemo, type ReactElement } from 'react';
 
-import { formatEntityDisplay, formatNodeIdDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
+import {
+  formatEntityDisplay,
+  formatNodeIdDisplay,
+  type EntityDisplayCtx,
+} from '../entityDisplay/format';
 import { EDGE_KINDS, contentDerivedHint, type EdgeFamily } from './edgeKinds';
 import { NodeChip } from './NodeChip';
 import { computeOrbitalLayout, type OrbitalLayoutResult } from './orbitalLayout';
@@ -92,10 +96,7 @@ export const OrbitalCenter = ({
       <div className="cx-orbit" style={{ minHeight: ORBIT_H }}>
         <div className="cx-orbit-ring" style={{ width: layout.r1 * 2, height: layout.r1 * 2 }} />
         {hops >= 2 ? (
-          <div
-            className="cx-orbit-ring"
-            style={{ width: layout.r2 * 2, height: layout.r2 * 2 }}
-          />
+          <div className="cx-orbit-ring" style={{ width: layout.r2 * 2, height: layout.r2 * 2 }} />
         ) : null}
         <div className="cx-orbit-sector-label cx-orbit-sector-top">↑ Containment</div>
         <div className="cx-orbit-sector-label cx-orbit-sector-right">Flow →</div>
@@ -185,9 +186,7 @@ export const OrbitalCenter = ({
               >
                 <span className="cx-edge-line" />
               </span>
-              <span className="cx-edge-summary-main">
-                {edgeEndpointLabel(edge, nodeById, ctx)}
-              </span>
+              <span className="cx-edge-summary-main">{edgeEndpointLabel(edge, nodeById, ctx)}</span>
               <span className="bac-connections-edge-hint">{meta?.label ?? edge.kind}</span>
               {hint !== null ? (
                 <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>

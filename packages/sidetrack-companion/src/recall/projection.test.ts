@@ -4,15 +4,13 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from './events.js';
 import { collectLogBacIds, projectRecallFromLog } from './projection.js';
 
-const event = (
-  partial: {
-    readonly type: string;
-    readonly replicaId: string;
-    readonly seq: number;
-    readonly payload: Record<string, unknown>;
-    readonly aggregateId?: string;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  readonly type: string;
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly payload: Record<string, unknown>;
+  readonly aggregateId?: string;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: {},

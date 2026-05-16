@@ -48,10 +48,7 @@ const importRecords = async (
   return { applied, conflicts };
 };
 
-export const importSettings = async (
-  vaultRoot: string,
-  input: unknown,
-): Promise<ImportResult> => {
+export const importSettings = async (vaultRoot: string, input: unknown): Promise<ImportResult> => {
   const bundle: SettingsBundle = settingsBundleSchema.parse(input);
   let applied = 0;
   const conflicts: ConflictRecord[] = [];

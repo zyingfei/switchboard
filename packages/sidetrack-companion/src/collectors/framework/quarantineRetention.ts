@@ -31,9 +31,7 @@ const logRetentionError = (message: string, error: unknown): void => {
   console.warn(`[quarantine-retention] ${message}`, error);
 };
 
-const listQuarantineFiles = async (
-  quarantineRoot: string,
-): Promise<ReadonlyArray<QuarantineFile>> => {
+const listQuarantineFiles = async (quarantineRoot: string): Promise<readonly QuarantineFile[]> => {
   const dateDirs = await readdir(quarantineRoot, { withFileTypes: true }).catch(
     (error: unknown) => {
       if (!isNotFoundError(error)) {

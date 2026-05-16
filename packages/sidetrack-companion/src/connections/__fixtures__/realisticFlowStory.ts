@@ -191,21 +191,91 @@ const codingSessions: readonly CodingSessionVaultRecord[] = [
 // during Switchboard project review — pick up the workstream of
 // the user's then-active flow even though they're never pasted
 // into a chat. That's what closes the ambient-browsing gap.
-const visits: ReadonlyArray<{ url: string; time: string; title: string; workstreamId?: string }> = [
-  { url: URL_A_HN, time: '2026-05-07T10:00:00.000Z', title: 'HN: copy-fail Linux CVE', workstreamId: WS_A_CVE },
-  { url: URL_B_GH_REPO, time: '2026-05-07T10:02:00.000Z', title: 'switchboard GitHub', workstreamId: WS_B_SWITCHBOARD },
-  { url: URL_A_BLOG, time: '2026-05-07T10:05:00.000Z', title: 'copy-fail across linux distros', workstreamId: WS_A_CVE },
-  { url: URL_B_GH_PRS, time: '2026-05-07T10:07:00.000Z', title: 'switchboard PRs', workstreamId: WS_B_SWITCHBOARD },
-  { url: URL_A_GOOGLE_SEARCH, time: '2026-05-07T10:08:00.000Z', title: 'Google: Linux crypto subsystem', workstreamId: WS_A_CVE },
-  { url: URL_A_CHATGPT, time: '2026-05-07T10:10:00.000Z', title: 'ChatGPT — CVE chat', workstreamId: WS_A_CVE },
-  { url: URL_B_CHATGPT_1, time: '2026-05-07T10:20:00.000Z', title: 'ChatGPT — Switchboard sync', workstreamId: WS_B_SWITCHBOARD },
-  { url: URL_A_BLOG, time: '2026-05-07T10:22:00.000Z', title: 'copy-fail (re-read)', workstreamId: WS_A_CVE },
-  { url: URL_A_COPY_FAIL, time: '2026-05-07T10:25:00.000Z', title: 'copy.fail home', workstreamId: WS_A_CVE },
-  { url: URL_A_GITHUB_POC, time: '2026-05-07T10:28:00.000Z', title: 'copy_fail_exp.py', workstreamId: WS_A_CVE },
-  { url: URL_B_YOUTUBE, time: '2026-05-07T10:30:00.000Z', title: 'YouTube — bg', workstreamId: WS_B_SWITCHBOARD },
-  { url: URL_B_CHATGPT_2, time: '2026-05-07T10:35:00.000Z', title: 'ChatGPT — Switchboard PRs', workstreamId: WS_B_SWITCHBOARD },
-  { url: URL_A_CODING_THREAD, time: '2026-05-07T10:42:00.000Z', title: 'Claude — coding agent', workstreamId: WS_A_CVE },
-  { url: URL_B_GEMINI, time: '2026-05-07T10:50:00.000Z', title: 'Gemini — analysis', workstreamId: WS_B_SWITCHBOARD },
+const visits: readonly { url: string; time: string; title: string; workstreamId?: string }[] = [
+  {
+    url: URL_A_HN,
+    time: '2026-05-07T10:00:00.000Z',
+    title: 'HN: copy-fail Linux CVE',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_B_GH_REPO,
+    time: '2026-05-07T10:02:00.000Z',
+    title: 'switchboard GitHub',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
+  {
+    url: URL_A_BLOG,
+    time: '2026-05-07T10:05:00.000Z',
+    title: 'copy-fail across linux distros',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_B_GH_PRS,
+    time: '2026-05-07T10:07:00.000Z',
+    title: 'switchboard PRs',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
+  {
+    url: URL_A_GOOGLE_SEARCH,
+    time: '2026-05-07T10:08:00.000Z',
+    title: 'Google: Linux crypto subsystem',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_A_CHATGPT,
+    time: '2026-05-07T10:10:00.000Z',
+    title: 'ChatGPT — CVE chat',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_B_CHATGPT_1,
+    time: '2026-05-07T10:20:00.000Z',
+    title: 'ChatGPT — Switchboard sync',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
+  {
+    url: URL_A_BLOG,
+    time: '2026-05-07T10:22:00.000Z',
+    title: 'copy-fail (re-read)',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_A_COPY_FAIL,
+    time: '2026-05-07T10:25:00.000Z',
+    title: 'copy.fail home',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_A_GITHUB_POC,
+    time: '2026-05-07T10:28:00.000Z',
+    title: 'copy_fail_exp.py',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_B_YOUTUBE,
+    time: '2026-05-07T10:30:00.000Z',
+    title: 'YouTube — bg',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
+  {
+    url: URL_B_CHATGPT_2,
+    time: '2026-05-07T10:35:00.000Z',
+    title: 'ChatGPT — Switchboard PRs',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
+  {
+    url: URL_A_CODING_THREAD,
+    time: '2026-05-07T10:42:00.000Z',
+    title: 'Claude — coding agent',
+    workstreamId: WS_A_CVE,
+  },
+  {
+    url: URL_B_GEMINI,
+    time: '2026-05-07T10:50:00.000Z',
+    title: 'Gemini — analysis',
+    workstreamId: WS_B_SWITCHBOARD,
+  },
 ];
 
 const buildDay = (): TimelineDayProjection => {
@@ -279,7 +349,13 @@ interface RawEvent {
 
 const toAcceptedEvents = (raw: readonly RawEvent[]): AcceptedEvent[] => {
   const sorted = [...raw].sort((a, b) =>
-    a.timeIso !== b.timeIso ? (a.timeIso < b.timeIso ? -1 : 1) : a.aggregateId < b.aggregateId ? -1 : 1,
+    a.timeIso !== b.timeIso
+      ? a.timeIso < b.timeIso
+        ? -1
+        : 1
+      : a.aggregateId < b.aggregateId
+        ? -1
+        : 1,
   );
   return sorted.map((r, i) => ({
     clientEventId: `evt-${String(i + 1).padStart(3, '0')}`,

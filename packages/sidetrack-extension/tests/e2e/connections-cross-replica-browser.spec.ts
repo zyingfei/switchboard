@@ -40,11 +40,7 @@ const URL_PR = 'https://github.com/zyingfei/switchboard/pull/42';
 const T_XR = 't_cross_replica';
 const D_XR = 'd_cross_replica';
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     method: 'POST',
     headers: {
@@ -66,9 +62,7 @@ const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   return await res.json();
 };
 
-const seedFlowOnA = async (
-  compA: TestCompanion,
-): Promise<{ wsId: string }> => {
+const seedFlowOnA = async (compA: TestCompanion): Promise<{ wsId: string }> => {
   const ws = (await apiPost(compA, '/v1/workstreams', {
     title: 'Cross-replica research',
   })) as { data: { bac_id: string } };
@@ -228,10 +222,7 @@ test.describe('connections — two-browser cross-replica sync', () => {
     );
 
     // Configure each browser to talk to its own companion.
-    const openPanel = async (
-      runtime: ExtensionRuntime,
-      comp: TestCompanion,
-    ): Promise<Page> => {
+    const openPanel = async (runtime: ExtensionRuntime, comp: TestCompanion): Promise<Page> => {
       const p = await runtime.context.newPage();
       await p.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
         waitUntil: 'domcontentloaded',

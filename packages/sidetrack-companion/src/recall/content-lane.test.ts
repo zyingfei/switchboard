@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  createDirtySourceQueue,
-  foldGroupBEventIntoQueue,
-} from './content-lane.js';
+import { createDirtySourceQueue, foldGroupBEventIntoQueue } from './content-lane.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from './events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from './extraction/events.js';
 
@@ -132,7 +129,9 @@ describe('Stage 5.2 W7 — foldGroupBEventIntoQueue', () => {
     const queue = createDirtySourceQueue();
     expect(foldGroupBEventIntoQueue(queue, makeEvent(1, CAPTURE_RECORDED, {}))).toBe(true);
     expect(foldGroupBEventIntoQueue(queue, makeEvent(2, RECALL_TOMBSTONE_TARGET, {}))).toBe(true);
-    expect(foldGroupBEventIntoQueue(queue, makeEvent(3, CAPTURE_EXTRACTION_PRODUCED, {}))).toBe(true);
+    expect(foldGroupBEventIntoQueue(queue, makeEvent(3, CAPTURE_EXTRACTION_PRODUCED, {}))).toBe(
+      true,
+    );
     const snap = queue.snapshot();
     expect(snap.dirtySourceUnitIds).toEqual([]);
     expect(snap.tombstonedSourceUnitIds).toEqual([]);
@@ -151,10 +150,7 @@ describe('Stage 5.2 W7 — foldGroupBEventIntoQueue', () => {
 
   it('stream of mixed Group B events accumulates the right state', () => {
     const queue = createDirtySourceQueue();
-    foldGroupBEventIntoQueue(
-      queue,
-      makeEvent(1, CAPTURE_RECORDED, { sourceUnitId: 's1' }),
-    );
+    foldGroupBEventIntoQueue(queue, makeEvent(1, CAPTURE_RECORDED, { sourceUnitId: 's1' }));
     foldGroupBEventIntoQueue(
       queue,
       makeEvent(2, CAPTURE_EXTRACTION_PRODUCED, {
@@ -169,14 +165,8 @@ describe('Stage 5.2 W7 — foldGroupBEventIntoQueue', () => {
         extractionRevisionId: 'rev-b', // newer revision wins
       }),
     );
-    foldGroupBEventIntoQueue(
-      queue,
-      makeEvent(4, CAPTURE_RECORDED, { sourceUnitId: 's2' }),
-    );
-    foldGroupBEventIntoQueue(
-      queue,
-      makeEvent(5, RECALL_TOMBSTONE_TARGET, { sourceUnitId: 's2' }),
-    );
+    foldGroupBEventIntoQueue(queue, makeEvent(4, CAPTURE_RECORDED, { sourceUnitId: 's2' }));
+    foldGroupBEventIntoQueue(queue, makeEvent(5, RECALL_TOMBSTONE_TARGET, { sourceUnitId: 's2' }));
     const snap = queue.snapshot();
     expect(snap.dirtySourceUnitIds).toEqual(['s1', 's2']);
     expect(snap.tombstonedSourceUnitIds).toEqual(['s2']);

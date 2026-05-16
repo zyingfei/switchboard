@@ -6,15 +6,15 @@ import {
 } from '../../../src/sidepanel/entityDisplay/format';
 import type { ConnectionNode } from '../../../src/sidepanel/connections/types';
 
-const ctx = (
-  overrides: Partial<EntityDisplayCtx> = {},
-): EntityDisplayCtx => ({
+const ctx = (overrides: Partial<EntityDisplayCtx> = {}): EntityDisplayCtx => ({
   resolveWorkstreamPath: () => null,
   replicaAlias: () => 'Browser',
   ...overrides,
 });
 
-const makeNode = (input: Partial<ConnectionNode> & { kind: ConnectionNode['kind']; id: string }) => ({
+const makeNode = (
+  input: Partial<ConnectionNode> & { kind: ConnectionNode['kind']; id: string },
+) => ({
   label: '',
   originReplicaIds: [],
   metadata: {},

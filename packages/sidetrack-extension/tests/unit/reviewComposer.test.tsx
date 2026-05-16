@@ -129,8 +129,6 @@ describe('ReviewComposer — live state passes through to handlers', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Disagree' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save only' }));
     expect(onSave).toHaveBeenCalledTimes(1);
-    expect(onSave).toHaveBeenCalledWith(
-      expect.objectContaining({ verdict: 'disagree' }),
-    );
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ verdict: 'disagree' }));
   });
 });

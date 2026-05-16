@@ -6,7 +6,7 @@
 //                       <path>.backup-<iso>, start fresh
 //
 // One-liner from repo root:
-//   git pull && npm --prefix packages/sidetrack-extension run e2e:recorder \
+//   git pull && bun run --cwd packages/sidetrack-extension e2e:recorder \
 //     2>&1 | tee /tmp/sidetrack-recorder.log
 //
 // The browser stays open until stdin advances the prompts:
@@ -169,7 +169,7 @@ const vaultHasData = async (vaultRoot: string): Promise<boolean> => {
   }
 };
 
-// Vault resolution is non-interactive. Two npm entry points:
+// Vault resolution is non-interactive. Two Bun entry points:
 //   e2e:recorder        — reuse the existing vault as-is (companion
 //                         starts with all prior workstreams + history).
 //   e2e:recorder:fresh  — sets SIDETRACK_VAULT_FRESH=1, which archives
@@ -294,8 +294,10 @@ interface VersionInfo {
 const readVersionInfo = (): VersionInfo => {
   const gitTrim = (args: string): string => {
     try {
-      return execSync(`git ${args}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-        .trim();
+      return execSync(`git ${args}`, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
     } catch {
       return '';
     }
@@ -495,7 +497,9 @@ const dumpSwDiagOnce = async (
           engagementRegistrations: registrations,
           hostPermission,
           httpTabCount: tabs.length,
-          sampleTabs: tabs.slice(0, 3).map((t) => ({ id: t.id ?? null, url: t.url?.slice(0, 80) ?? null })),
+          sampleTabs: tabs
+            .slice(0, 3)
+            .map((t) => ({ id: t.id ?? null, url: t.url?.slice(0, 80) ?? null })),
         };
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) };
@@ -514,7 +518,11 @@ const dumpSwDiagOnce = async (
 };
 
 const startPeriodicSwDiagDump = (
-  runtimes: readonly { readonly label: string; readonly runtime: ExtensionRuntime; readonly panel: Page }[],
+  runtimes: readonly {
+    readonly label: string;
+    readonly runtime: ExtensionRuntime;
+    readonly panel: Page;
+  }[],
   outDir: string,
   intervalMs: number,
 ): { readonly stop: () => Promise<void> } => {
@@ -737,7 +745,9 @@ interface CompanionWorkstream {
   readonly title: string;
 }
 
-const listUserWorkstreams = async (comp: TestCompanion): Promise<readonly CompanionWorkstream[]> => {
+const listUserWorkstreams = async (
+  comp: TestCompanion,
+): Promise<readonly CompanionWorkstream[]> => {
   const url = `http://127.0.0.1:${String(comp.port)}/v1/workstreams/projections`;
   const response = await fetch(url, { headers: { 'x-bac-bridge-key': comp.bridgeKey } });
   if (!response.ok) return [];
@@ -745,7 +755,10 @@ const listUserWorkstreams = async (comp: TestCompanion): Promise<readonly Compan
     readonly data?: readonly {
       readonly bac_id?: unknown;
       readonly deleted?: unknown;
-      readonly record?: { readonly status?: unknown; readonly value?: { readonly title?: unknown } };
+      readonly record?: {
+        readonly status?: unknown;
+        readonly value?: { readonly title?: unknown };
+      };
     }[];
   };
   const data = body.data ?? [];
@@ -753,7 +766,9 @@ const listUserWorkstreams = async (comp: TestCompanion): Promise<readonly Compan
     if (item.deleted === true) return [];
     if (typeof item.bac_id !== 'string') return [];
     const value =
-      item.record?.status === 'resolved' ? (item.record as { value?: { title?: unknown } }).value : undefined;
+      item.record?.status === 'resolved'
+        ? (item.record as { value?: { title?: unknown } }).value
+        : undefined;
     const title = typeof value?.title === 'string' ? value.title : item.bac_id;
     return [{ bac_id: item.bac_id, title }];
   });
@@ -827,9 +842,7 @@ test.describe('manual full-browser recorder', () => {
       // load the unpacked MV3 extension; mixing stealth Chromium with
       // the user's pinned Chrome login profile leaves chrome.storage
       // unreachable on the sidepanel page.
-      const runtimeAOptions = modeConfig.stealthExperiment
-        ? {}
-        : { userDataDir: profileDir };
+      const runtimeAOptions = modeConfig.stealthExperiment ? {} : { userDataDir: profileDir };
       runtimeA = await launchExtensionRuntime({
         ...runtimeAOptions,
         extraHostPermissions: RECORDER_HOST_PERMISSIONS,
@@ -998,7 +1011,10 @@ dumps, visible screenshots, and companion/plugin result JSON.
           panelB,
           ws.bac_id,
           artifactsDir,
-          ws.title.replaceAll(/[^a-z0-9]+/giu, '-').toLowerCase().slice(0, 32) || ws.bac_id,
+          ws.title
+            .replaceAll(/[^a-z0-9]+/giu, '-')
+            .toLowerCase()
+            .slice(0, 32) || ws.bac_id,
         ).catch(() => undefined);
       }
       await recorder.snapshotPage(panelA, 'panel-a-final');

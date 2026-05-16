@@ -32,7 +32,11 @@ const mkSnap = (overrides: Partial<ConnectionsSnapshot> = {}): ConnectionsSnapsh
 describe('connections — computeOrbitalLayout', () => {
   it('places the anchor at the center', () => {
     const layout = computeOrbitalLayout({
-      snapshot: mkSnap({ nodes: [{ id: 'thread:t1', kind: 'thread', label: 'A', originReplicaIds: [], metadata: {} }] }),
+      snapshot: mkSnap({
+        nodes: [
+          { id: 'thread:t1', kind: 'thread', label: 'A', originReplicaIds: [], metadata: {} },
+        ],
+      }),
       anchorId: 'thread:t1',
       width: 760,
       height: 600,
@@ -47,8 +51,18 @@ describe('connections — computeOrbitalLayout', () => {
   it('routes contain edges to the top sector and flow edges to the right sector', () => {
     const snap = mkSnap({
       edges: [
-        mkEdge({ id: 'e1', kind: 'thread_in_workstream', fromNodeId: 'thread:t1', toNodeId: 'workstream:w1' }),
-        mkEdge({ id: 'e2', kind: 'dispatch_from_thread', fromNodeId: 'dispatch:d1', toNodeId: 'thread:t1' }),
+        mkEdge({
+          id: 'e1',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+        }),
+        mkEdge({
+          id: 'e2',
+          kind: 'dispatch_from_thread',
+          fromNodeId: 'dispatch:d1',
+          toNodeId: 'thread:t1',
+        }),
       ],
     });
     const layout = computeOrbitalLayout({
@@ -70,8 +84,18 @@ describe('connections — computeOrbitalLayout', () => {
   it('routes urlmatch edges to the left sector and defer edges to the bottom sector', () => {
     const snap = mkSnap({
       edges: [
-        mkEdge({ id: 'eu', kind: 'thread_references_url', fromNodeId: 'thread:t1', toNodeId: 'timeline-visit:https://x' }),
-        mkEdge({ id: 'ed', kind: 'queue_targets_thread', fromNodeId: 'queue-item:q1', toNodeId: 'thread:t1' }),
+        mkEdge({
+          id: 'eu',
+          kind: 'thread_references_url',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'timeline-visit:https://x',
+        }),
+        mkEdge({
+          id: 'ed',
+          kind: 'queue_targets_thread',
+          fromNodeId: 'queue-item:q1',
+          toNodeId: 'thread:t1',
+        }),
       ],
     });
     const layout = computeOrbitalLayout({
@@ -90,9 +114,24 @@ describe('connections — computeOrbitalLayout', () => {
 
   it('is deterministic: same input → byte-identical positions across edge orders', () => {
     const edges = [
-      mkEdge({ id: 'e1', kind: 'thread_in_workstream', fromNodeId: 'thread:t1', toNodeId: 'workstream:w1' }),
-      mkEdge({ id: 'e2', kind: 'dispatch_from_thread', fromNodeId: 'dispatch:d1', toNodeId: 'thread:t1' }),
-      mkEdge({ id: 'e3', kind: 'queue_targets_thread', fromNodeId: 'queue-item:q1', toNodeId: 'thread:t1' }),
+      mkEdge({
+        id: 'e1',
+        kind: 'thread_in_workstream',
+        fromNodeId: 'thread:t1',
+        toNodeId: 'workstream:w1',
+      }),
+      mkEdge({
+        id: 'e2',
+        kind: 'dispatch_from_thread',
+        fromNodeId: 'dispatch:d1',
+        toNodeId: 'thread:t1',
+      }),
+      mkEdge({
+        id: 'e3',
+        kind: 'queue_targets_thread',
+        fromNodeId: 'queue-item:q1',
+        toNodeId: 'thread:t1',
+      }),
     ];
     const fwd = computeOrbitalLayout({
       snapshot: mkSnap({ edges }),
@@ -114,7 +153,12 @@ describe('connections — computeOrbitalLayout', () => {
   it('places second-hop neighbors on the outer ring when hops=2', () => {
     const snap = mkSnap({
       edges: [
-        mkEdge({ id: 'e1', kind: 'thread_in_workstream', fromNodeId: 'thread:t1', toNodeId: 'workstream:w1' }),
+        mkEdge({
+          id: 'e1',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+        }),
         // workstream → child workstream (no anchor endpoint)
         mkEdge({
           id: 'e2',
@@ -138,7 +182,12 @@ describe('connections — computeOrbitalLayout', () => {
   it('hops=1 (default) excludes second-hop neighbors and their edges', () => {
     const snap = mkSnap({
       edges: [
-        mkEdge({ id: 'e1', kind: 'thread_in_workstream', fromNodeId: 'thread:t1', toNodeId: 'workstream:w1' }),
+        mkEdge({
+          id: 'e1',
+          kind: 'thread_in_workstream',
+          fromNodeId: 'thread:t1',
+          toNodeId: 'workstream:w1',
+        }),
         mkEdge({
           id: 'e2',
           kind: 'workstream_parent_of',

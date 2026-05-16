@@ -10,8 +10,8 @@ import { NativeMessagingTransportServer } from './transport/nm';
 const usage = `BAC local bridge companion
 
 Usage:
-  npm start -- --vault /path/to/vault [--port 17875]
-  npm start -- --vault /path/to/vault --nm
+  bun run start -- --vault /path/to/vault [--port 17875]
+  bun run start -- --vault /path/to/vault --nm
 
 Options:
   --vault <path>             Vault root folder

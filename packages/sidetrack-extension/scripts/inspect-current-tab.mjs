@@ -26,7 +26,8 @@ const main = async () => {
     );
 
     // Read companion settings.
-    const settings = (await chrome.storage.local.get('sidetrack.settings'))['sidetrack.settings'] ?? {};
+    const settings =
+      (await chrome.storage.local.get('sidetrack.settings'))['sidetrack.settings'] ?? {};
     const port = settings.companion?.port ?? null;
     const bridgeKey = settings.companion?.bridgeKey ?? null;
 
@@ -54,7 +55,11 @@ const main = async () => {
       const direct = projectionByCanonical[url];
       // Find any projection key that contains the same hostname
       const host = (() => {
-        try { return new URL(url).hostname; } catch { return ''; }
+        try {
+          return new URL(url).hostname;
+        } catch {
+          return '';
+        }
       })();
       const hostMatches = Object.keys(projectionByCanonical).filter((k) => k.includes(host));
       return {
@@ -94,9 +99,11 @@ const main = async () => {
     if (card === null) return null;
     return {
       classList: card.className,
-      titleText: card.querySelector('.tab-attribution-card-title')?.textContent?.slice(0, 200) ?? null,
+      titleText:
+        card.querySelector('.tab-attribution-card-title')?.textContent?.slice(0, 200) ?? null,
       pendingText: card.querySelector('.tab-attribution-card-pending')?.textContent ?? null,
-      titleTooltip: card.querySelector('.tab-attribution-card-title')?.getAttribute('title') ?? null,
+      titleTooltip:
+        card.querySelector('.tab-attribution-card-title')?.getAttribute('title') ?? null,
     };
   });
   log('Current tab card DOM state (what the user sees)', cardState);

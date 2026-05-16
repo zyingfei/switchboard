@@ -53,7 +53,10 @@ export interface CodingTickObservedEvent {
 
 // ─── registration ──────────────────────────────────────────────────
 
-export const testTickRegistration: MaterializerRegistration<TickPayloadV1, CodingTickObservedEvent> = {
+export const testTickRegistration: MaterializerRegistration<
+  TickPayloadV1,
+  CodingTickObservedEvent
+> = {
   collector_id: TEST_TICK_COLLECTOR_ID,
   event_type: 'tick',
   current_payload_version: 1,

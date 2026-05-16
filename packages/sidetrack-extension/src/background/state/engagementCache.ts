@@ -43,12 +43,10 @@ export interface EngagementCache {
   readonly finalizeTab: (
     tabId: number,
     endedAt: number,
-  ) =>
-    | {
-        readonly interval: EngagementIntervalObservedPayload;
-        readonly aggregate: EngagementSessionAggregatedPayload;
-      }
-    | null;
+  ) => {
+    readonly interval: EngagementIntervalObservedPayload;
+    readonly aggregate: EngagementSessionAggregatedPayload;
+  } | null;
 }
 
 const toIntervalPayload = (
@@ -72,9 +70,7 @@ const toAggregatePayload = (
   },
 });
 
-export const createEngagementCache = (input: {
-  readonly sessionId: string;
-}): EngagementCache => {
+export const createEngagementCache = (input: { readonly sessionId: string }): EngagementCache => {
   const byTab = new Map<number, CachedEngagementSession>();
 
   return {
@@ -89,7 +85,10 @@ export const createEngagementCache = (input: {
         sessionId:
           existing?.sessionId ??
           `${input.sessionId}:tab:${String(tabId)}:start:${String(message.intervalStart)}`,
-        intervalStart: Math.min(existing?.intervalStart ?? message.intervalStart, message.intervalStart),
+        intervalStart: Math.min(
+          existing?.intervalStart ?? message.intervalStart,
+          message.intervalStart,
+        ),
         intervalEnd: Math.max(existing?.intervalEnd ?? message.intervalEnd, message.intervalEnd),
         totals,
       };
@@ -125,9 +124,7 @@ export const createEngagementCache = (input: {
   };
 };
 
-export const isEngagementIntervalMessage = (
-  value: unknown,
-): value is EngagementIntervalMessage => {
+export const isEngagementIntervalMessage = (value: unknown): value is EngagementIntervalMessage => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   if (record.type !== 'sidetrack.engagement.interval' || record.version !== 1) {

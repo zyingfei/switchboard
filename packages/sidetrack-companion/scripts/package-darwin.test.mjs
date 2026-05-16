@@ -20,14 +20,14 @@ let outDir;
 let packageDir;
 
 // Heavy: runs a real tsc build + copies node_modules. Default-
-// skipped to keep `npm test` fast. Opt in with
+// skipped to keep `bun run test` fast. Opt in with
 // SIDETRACK_RUN_PACKAGE_TEST=1.
 const RUN = process.env['SIDETRACK_RUN_PACKAGE_TEST'] === '1';
 
 describe.skipIf(!RUN)('package-darwin smoke', () => {
   beforeAll(async () => {
     outDir = await mkdtemp(join(tmpdir(), 'sidetrack-pkg-test-'));
-    execSync(`node ${join(companionRoot, 'scripts', 'package-darwin.mjs')} --out ${outDir}`, {
+    execSync(`bun ${join(companionRoot, 'scripts', 'package-darwin.mjs')} --out ${outDir}`, {
       stdio: ['ignore', 'inherit', 'inherit'],
       cwd: companionRoot,
     });

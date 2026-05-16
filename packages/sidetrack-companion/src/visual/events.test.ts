@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CONTRACT_REGISTRY } from '../sync/contract/registry.js';
-import {
-  VISUAL_FINGERPRINT_OBSERVED,
-  isVisualFingerprintObservedPayload,
-} from './events.js';
+import { VISUAL_FINGERPRINT_OBSERVED, isVisualFingerprintObservedPayload } from './events.js';
 
 const validPayload = {
   payloadVersion: 1,

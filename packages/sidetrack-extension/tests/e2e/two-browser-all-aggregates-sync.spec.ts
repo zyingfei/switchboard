@@ -34,8 +34,7 @@ import {
 //     `sidetrack.annotation.refresh` content message wiring.
 //   - The capture path — already covered by t6-real-time-propagation.
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -165,9 +164,9 @@ test.describe('two-browser headless sync — all aggregates', () => {
       // Companion B's vault grows a _BAC/threads/projections/<id>.json
       // (Lane 1 path-decoupling).
       const threadFiles = async (): Promise<readonly string[]> =>
-        await readdir(
-          path.join(companionB.vaultPath, '_BAC', 'threads', 'projections'),
-        ).catch(() => [] as readonly string[]);
+        await readdir(path.join(companionB.vaultPath, '_BAC', 'threads', 'projections')).catch(
+          () => [] as readonly string[],
+        );
       await expect
         .poll(async () => (await threadFiles()).length, {
           timeout: 30_000,
@@ -369,7 +368,11 @@ test.describe('two-browser headless sync — all aggregates', () => {
       const dispatchId = dispatchResponse.data?.bac_id;
       expect(typeof dispatchId).toBe('string');
 
-      await waitForVaultFile(companionB.vaultPath, '_BAC/dispatches/projections', `${dispatchId!}.json`);
+      await waitForVaultFile(
+        companionB.vaultPath,
+        '_BAC/dispatches/projections',
+        `${dispatchId!}.json`,
+      );
 
       // Sanity: companion B's per-id projection endpoint returns the
       // entry. If this fails, the SSE subscriber's fetchDispatchProjection

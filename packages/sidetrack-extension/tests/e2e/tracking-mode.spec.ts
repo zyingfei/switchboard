@@ -65,9 +65,7 @@ test.describe('tracking mode toggle (synthetic)', () => {
       await expect(row).toBeVisible();
       // v2 design pass: Stop / Resume now live behind the ⋯ overflow menu.
       await row.getByRole('button', { name: 'More actions', exact: true }).click();
-      await page
-        .getByRole('menuitem', { name: 'Stop tracking', exact: true })
-        .click();
+      await page.getByRole('menuitem', { name: 'Stop tracking', exact: true }).click();
       await expandStaleBucket(page);
 
       // After flip: stamp shows "Tracking stopped".

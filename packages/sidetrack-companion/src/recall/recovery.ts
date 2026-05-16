@@ -42,9 +42,7 @@ export interface RecallProcessLock {
   readonly release: () => Promise<void>;
 }
 
-export const acquireRecallProcessLock = async (
-  vaultRoot: string,
-): Promise<RecallProcessLock> => {
+export const acquireRecallProcessLock = async (vaultRoot: string): Promise<RecallProcessLock> => {
   await mkdir(recallDir(vaultRoot), { recursive: true });
   const path = lockPath(vaultRoot);
   let existingPid: number | null = null;
