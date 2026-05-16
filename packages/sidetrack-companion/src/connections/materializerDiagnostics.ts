@@ -40,6 +40,7 @@ import {
 import { createDriftStateStore, type DriftStateStore } from './drift/driftStateStore.js';
 import type { SilhouetteSimilarityEdge, SilhouetteTopic } from './drift/temporalSilhouette.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
 
@@ -70,6 +71,13 @@ export interface MaterializerSimilarityCounters {
   // forwarded to `buildVisitSimilarity`, captured here so dogfood can
   // confirm env overrides actually took effect. Optional because the
   // collector accepts legacy input shapes that didn't carry it.
+  readonly contentEnrichedEdges: number;
+  readonly metadataOnlyEdges: number;
+  readonly mixedTierEdges: number;
+  readonly avgEvidenceConfidence: number;
+  readonly vectorSkippedMissingCount: number;
+  readonly vectorSkippedModelMismatchCount: number;
+  readonly topMatchedTerms: readonly string[];
   readonly effectiveConfig?: {
     readonly threshold: number;
     readonly topK: number;
@@ -179,6 +187,52 @@ export interface MaterializerSnapshotCounters {
   readonly edgeCountByKind: Readonly<Record<string, number>>;
 }
 
+export interface MaterializerPageEvidenceCounters {
+  readonly metadataOnlyCount: number;
+  readonly featuresOnlyCount: number;
+  readonly indexedChunkCount: number;
+  readonly contentVectorReadyCount: number;
+  readonly contentVectorMissingCount: number;
+  readonly contentVectorDisabledCount: number;
+  readonly contentVectorFailedCount: number;
+  readonly avgTopTermCount: number;
+  readonly featureOnlyPages: number;
+}
+
+export interface MaterializerPhaseDuration {
+  readonly label: string;
+  readonly durationMs: number;
+  readonly totalMs: number;
+}
+
+export interface MaterializerLatencyCounters {
+  readonly pageEvidence: {
+    readonly evidenceReadP95Ms: number;
+    readonly vectorMapReadP95Ms: number;
+    readonly chunkReadP95Ms: number;
+  };
+  readonly contentSimilarity: {
+    readonly pairScoringP95Ms: number;
+    readonly buildP95Ms: number;
+  };
+  readonly snapshot: {
+    readonly rebuildP95Ms: number;
+    readonly baseRebuildP95Ms: number;
+    readonly rankerAugmentedRebuildP95Ms: number;
+  };
+  readonly phases: {
+    readonly readMergedP95Ms: number;
+    readonly readVaultStoresP95Ms: number;
+    readonly buildTimelineDaysP95Ms: number;
+    readonly engagementClassifierP95Ms: number;
+    readonly topicRevisionP95Ms: number;
+    readonly topicShadowP95Ms: number;
+    readonly rankerRetrainerP95Ms: number;
+    readonly rankerLoadP95Ms: number;
+    readonly putCurrentP95Ms: number;
+  };
+}
+
 export interface MaterializerDiagnostics {
   readonly schemaVersion: typeof MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION;
   readonly producedAt: string;
@@ -193,6 +247,8 @@ export interface MaterializerDiagnostics {
   readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
+  readonly pageEvidence?: MaterializerPageEvidenceCounters;
+  readonly latency?: MaterializerLatencyCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
   readonly shadowObservation?: TopicShadowObservationDiagnostics;
   // Statistical drift/evaluation layer. Optional: present once the
@@ -221,6 +277,8 @@ export interface MaterializerDiagnosticsInput {
   readonly events: readonly AcceptedEvent[];
   readonly urlProjection: UrlProjection;
   readonly snapshot: ConnectionsSnapshot;
+  readonly pageEvidenceRecords?: readonly PageEvidenceRecord[];
+  readonly phaseDurations?: readonly MaterializerPhaseDuration[];
   readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
 }
@@ -237,6 +295,120 @@ const focusedWindowMsOf = (dimensions: unknown): number | undefined => {
     return undefined;
   }
   return focused;
+};
+
+const collectPageEvidenceCounters = (
+  records: readonly PageEvidenceRecord[],
+): MaterializerPageEvidenceCounters => {
+  const metadataOnlyCount = records.filter(
+    (record) => record.evidenceTier === 'metadata_only',
+  ).length;
+  const featuresOnlyCount = records.filter(
+    (record) => record.evidenceTier === 'content_features_only',
+  ).length;
+  const indexedChunkCount = records.filter(
+    (record) => record.evidenceTier === 'indexed_chunks',
+  ).length;
+  const contentRecords = records.filter((record) => record.content !== undefined);
+  const contentVectorDisabledCount = contentRecords.filter(
+    (record) => record.content?.embeddingState === 'disabled',
+  ).length;
+  const contentVectorFailedCount = contentRecords.filter(
+    (record) => record.content?.embeddingState === 'failed',
+  ).length;
+  return {
+    metadataOnlyCount,
+    featuresOnlyCount,
+    indexedChunkCount,
+    contentVectorReadyCount: contentRecords.filter(
+      (record) => record.content?.docEmbeddingRef !== undefined,
+    ).length,
+    contentVectorMissingCount: contentRecords.filter(
+      (record) =>
+        record.content?.docEmbeddingRef === undefined &&
+        record.content?.embeddingState !== 'disabled' &&
+        record.content?.embeddingState !== 'failed',
+    ).length,
+    contentVectorDisabledCount,
+    contentVectorFailedCount,
+    avgTopTermCount:
+      records.length === 0
+        ? 0
+        : Number(
+            (
+              records.reduce((sum, record) => sum + (record.content?.terms.length ?? 0), 0) /
+              records.length
+            ).toFixed(2),
+          ),
+    featureOnlyPages: featuresOnlyCount,
+  };
+};
+
+const p95 = (values: readonly number[]): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+  return Number((sorted[index] ?? 0).toFixed(3));
+};
+
+const collectLatencyCounters = (
+  phaseDurations: readonly MaterializerPhaseDuration[] | undefined,
+): MaterializerLatencyCounters | undefined => {
+  if (phaseDurations === undefined || phaseDurations.length === 0) return undefined;
+  const labelNumber = (label: string, key: string): number | undefined => {
+    const match = new RegExp(`(?:^| )${key}=([0-9]+(?:\\.[0-9]+)?)`, 'u').exec(label);
+    if (match?.[1] === undefined) return undefined;
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  };
+  const durationsFor = (prefixes: readonly string[]): readonly number[] =>
+    phaseDurations
+      .filter((phase) => prefixes.some((prefix) => phase.label.startsWith(prefix)))
+      .map((phase) => phase.durationMs);
+  const phaseP95 = (prefixes: readonly string[]): number => p95(durationsFor(prefixes));
+  const perRecordDurationsFor = (
+    prefixes: readonly string[],
+    countKey: string,
+  ): readonly number[] =>
+    phaseDurations
+      .filter((phase) => prefixes.some((prefix) => phase.label.startsWith(prefix)))
+      .map((phase) => phase.durationMs / (labelNumber(phase.label, countKey) ?? 1));
+  return {
+    pageEvidence: {
+      evidenceReadP95Ms: p95(perRecordDurationsFor(['pageEvidence.ensure'], 'records')),
+      vectorMapReadP95Ms: phaseP95(['pageEvidence.vectorMapRead']),
+      chunkReadP95Ms: phaseP95(['pageEvidence.chunkRead']),
+    },
+    contentSimilarity: {
+      pairScoringP95Ms: p95(
+        perRecordDurationsFor(['buildVisitSimilarity', 'buildVisitSimilarityIncremental'], 'pairs'),
+      ),
+      buildP95Ms: phaseP95(['buildVisitSimilarity', 'buildVisitSimilarityIncremental']),
+    },
+    snapshot: {
+      rebuildP95Ms: p95(durationsFor(['buildConnectionsSnapshot'])),
+      baseRebuildP95Ms: phaseP95(['buildConnectionsSnapshot base']),
+      rankerAugmentedRebuildP95Ms: phaseP95([
+        'buildConnectionsSnapshot ranker-augmented',
+        'augmentConnectionsSnapshot ranker-augmented',
+      ]),
+    },
+    phases: {
+      readMergedP95Ms: phaseP95(['readMerged']),
+      readVaultStoresP95Ms: phaseP95(['readVaultStores']),
+      buildTimelineDaysP95Ms: phaseP95(['buildTimelineDays']),
+      engagementClassifierP95Ms: phaseP95(['engagementClassifier']),
+      topicRevisionP95Ms: phaseP95([
+        'topicRevision',
+        'buildTopicRevisionFromAccumulator',
+        'putActiveTopicRevision',
+      ]),
+      topicShadowP95Ms: phaseP95(['topicShadowCandidate']),
+      rankerRetrainerP95Ms: phaseP95(['rankerRetrainer']),
+      rankerLoadP95Ms: phaseP95(['loadClosestVisitRanker']),
+      putCurrentP95Ms: phaseP95(['putCurrent']),
+    },
+  };
 };
 
 const emptyUserAssertionsByKind = (): Record<UserOrganizedItemKind, number> => {
@@ -276,24 +448,75 @@ const collectTimelineCounters = (
 const collectSimilarityCounters = (
   revision: VisitSimilarityRevision,
   effectiveConfig: EffectiveVisitSimilarityConfig | undefined,
-): MaterializerSimilarityCounters => ({
-  revisionId: revision.revisionId,
-  modelRevision: revision.modelRevision,
-  threshold: revision.threshold,
-  edgeCount: revision.edges.length,
-  producer: revision.producer ?? 'unknown',
-  ...(effectiveConfig === undefined
-    ? {}
-    : {
-        effectiveConfig: {
-          threshold: effectiveConfig.threshold,
-          topK: effectiveConfig.topK,
-          engagementGateMs: effectiveConfig.engagementGateMs,
-          lexicalThreshold: effectiveConfig.lexicalThreshold,
-          lexicalFallbackEnabled: effectiveConfig.lexicalFallbackEnabled,
-        },
-      }),
-});
+): MaterializerSimilarityCounters => {
+  const contentEnriched = revision.edges.filter(
+    (edge) => edge.metadata?.producer === 'content-enriched',
+  );
+  const metadataOnly = revision.edges.filter((edge) => edge.metadata?.producer === 'metadata-only');
+  const confidences = revision.edges.flatMap((edge) =>
+    typeof edge.metadata?.confidence === 'number' ? [edge.metadata.confidence] : [],
+  );
+  const matchedTermCounts = new Map<string, number>();
+  let vectorSkippedMissingCount = 0;
+  let vectorSkippedModelMismatchCount = 0;
+  for (const edge of revision.edges) {
+    const metadata = edge.metadata;
+    if (metadata === undefined) continue;
+    if (
+      metadata.evidenceTierFrom !== metadata.evidenceTierTo &&
+      (metadata.evidenceTierFrom === 'metadata_only' || metadata.evidenceTierTo === 'metadata_only')
+    ) {
+      vectorSkippedMissingCount += 1;
+    }
+    if (
+      metadata.evidenceTierFrom !== 'metadata_only' &&
+      metadata.evidenceTierTo !== 'metadata_only' &&
+      metadata.channels.contentVector === undefined
+    ) {
+      vectorSkippedModelMismatchCount += 1;
+    }
+    for (const term of metadata.matchedTerms ?? []) {
+      matchedTermCounts.set(term, (matchedTermCounts.get(term) ?? 0) + 1);
+    }
+  }
+  return {
+    revisionId: revision.revisionId,
+    modelRevision: revision.modelRevision,
+    threshold: revision.threshold,
+    edgeCount: revision.edges.length,
+    producer: revision.producer ?? 'unknown',
+    contentEnrichedEdges: contentEnriched.length,
+    metadataOnlyEdges: metadataOnly.length,
+    mixedTierEdges: revision.edges.filter(
+      (edge) =>
+        edge.metadata !== undefined &&
+        edge.metadata.evidenceTierFrom !== edge.metadata.evidenceTierTo,
+    ).length,
+    avgEvidenceConfidence:
+      confidences.length === 0
+        ? 0
+        : Number(
+            (confidences.reduce((sum, value) => sum + value, 0) / confidences.length).toFixed(4),
+          ),
+    vectorSkippedMissingCount,
+    vectorSkippedModelMismatchCount,
+    topMatchedTerms: [...matchedTermCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 20)
+      .map(([term]) => term),
+    ...(effectiveConfig === undefined
+      ? {}
+      : {
+          effectiveConfig: {
+            threshold: effectiveConfig.threshold,
+            topK: effectiveConfig.topK,
+            engagementGateMs: effectiveConfig.engagementGateMs,
+            lexicalThreshold: effectiveConfig.lexicalThreshold,
+            lexicalFallbackEnabled: effectiveConfig.lexicalFallbackEnabled,
+          },
+        }),
+  };
+};
 
 const collectTopicCounters = (revision: TopicRevision): MaterializerTopicCounters => {
   const componentSizes = revision.topics
@@ -497,6 +720,7 @@ export const collectMaterializerDiagnostics = (
   input: MaterializerDiagnosticsInput,
 ): MaterializerDiagnostics => {
   const eventCounters = collectEventCounters(input.events);
+  const latency = collectLatencyCounters(input.phaseDurations);
   return {
     schemaVersion: MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION,
     producedAt: input.producedAt,
@@ -512,6 +736,10 @@ export const collectMaterializerDiagnostics = (
     engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
+    ...(input.pageEvidenceRecords === undefined
+      ? {}
+      : { pageEvidence: collectPageEvidenceCounters(input.pageEvidenceRecords) }),
+    ...(latency === undefined ? {} : { latency }),
     ...(input.topicShadowDiagnostics === undefined
       ? {}
       : { shadowVsBaseline: input.topicShadowDiagnostics }),

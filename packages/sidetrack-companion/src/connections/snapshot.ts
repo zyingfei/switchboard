@@ -33,11 +33,12 @@ import {
   type TopicSecondaryAffiliation,
 } from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { extractFeatures } from '../ranker/features.js';
-import type { Candidate } from '../ranker/types.js';
+import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
@@ -218,6 +219,8 @@ export interface ConnectionsInput {
   readonly urlProjection?: UrlProjection;
   readonly visitSimilarity?: VisitSimilarityRevision;
   readonly topicRevision?: TopicRevision;
+  readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
   readonly topicWorkstreamShareThreshold?: number;
   readonly crossReplica?: CrossReplicaMaterialization;
   readonly engagementClassRevision?: EngagementClassRevision;
@@ -227,7 +230,7 @@ export interface ConnectionsInput {
 
 export interface ClosestVisitRankerPrediction {
   readonly score: number;
-  readonly contributions: Readonly<Record<keyof CandidatePairFeatures, number>>;
+  readonly contributions: Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>;
 }
 
 export interface ClosestVisitRanker {
@@ -239,6 +242,36 @@ export interface ClosestVisitRanker {
     candidate: Candidate,
   ) => ClosestVisitRankerPrediction;
 }
+
+const RANKER_SERVING_SOURCE_PRIORITY = new Map<CandidateSource, number>(
+  (
+    [
+      'user_confirmed',
+      'content_embedding_neighborhood',
+      'content_term_overlap',
+      'embedding_neighborhood',
+      'opener_chain',
+      'navigation_chain',
+      'same_canonical_url',
+      'same_copied_snippet',
+      'same_search_query',
+      'same_title_path_tokens',
+      'same_repo_or_domain',
+      'cross_replica_continuation',
+      'same_workstream',
+      'recently_skipped',
+      'random_unrelated',
+    ] satisfies readonly CandidateSource[]
+  ).map((source, index) => [source, index] as const),
+);
+
+const rankerServingPriority = (candidate: Candidate): number =>
+  Math.min(...candidate.sources.map((source) => RANKER_SERVING_SOURCE_PRIORITY.get(source) ?? 999));
+
+const compareRankerServingCandidate = (left: Candidate, right: Candidate): number =>
+  rankerServingPriority(left) - rankerServingPriority(right) ||
+  right.generatedAt - left.generatedAt ||
+  compareString(left.toVisitId, right.toVisitId);
 
 // Internal accumulator for nodes — allows merging origin replica
 // ids and merging metadata from multiple sources.
@@ -257,6 +290,32 @@ const sortAlphaById = <T extends { id: string }>(rows: readonly T[]): T[] =>
 
 const compareString = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
+
+const evidenceMetadataForNode = (
+  input: ConnectionsInput,
+  canonicalUrl: string,
+): Record<string, unknown> | undefined => {
+  const evidence = input.pageEvidenceByCanonicalUrl?.get(canonicalUrl);
+  if (evidence === undefined) return undefined;
+  return {
+    tier: evidence.evidenceTier,
+    evidenceRevision: evidence.evidenceRevision,
+    updatedAt: evidence.updatedAt,
+    termCount: evidence.content?.terms.length ?? 0,
+    keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+    entityCount: evidence.content?.entities.length ?? 0,
+    ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+    ...(evidence.content?.docEmbeddingRef === undefined
+      ? {}
+      : {
+          vector: {
+            modelId: evidence.content.docEmbeddingRef.modelId,
+            modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+            dimensions: evidence.content.docEmbeddingRef.dimensions,
+          },
+        }),
+  };
+};
 
 const compactMetadata = (m: Record<string, unknown>): ConnectionNodeMetadata => {
   // Drop undefined entries so the same logical metadata produces
@@ -943,7 +1002,7 @@ const collectVisitInstances = (input: {
 const roundRankerMetric = (value: number): number => Number(value.toFixed(6));
 
 const topClosestVisitContributions = (
-  contributions: Readonly<Record<keyof CandidatePairFeatures, number>>,
+  contributions: Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>,
   limit: number,
 ): readonly { readonly feature: string; readonly weight: number }[] =>
   (Object.entries(contributions) as readonly [keyof CandidatePairFeatures, number][])
@@ -955,6 +1014,110 @@ const topClosestVisitContributions = (
     )
     .slice(0, Math.max(0, Math.floor(limit)))
     .map(([feature, weight]) => ({ feature, weight: roundRankerMetric(weight) }));
+
+const closestVisitRankerEdgesForSnapshot = (
+  input: ConnectionsInput,
+  baseSnapshot: ConnectionsSnapshot,
+  ranker: ClosestVisitRanker,
+): readonly ConnectionEdge[] => {
+  const threshold = ranker.threshold ?? 0.3;
+  const topK = Math.max(0, Math.floor(ranker.topK ?? 5));
+  if (topK === 0) return [];
+  const maxServingCandidatesPerVisit = Math.max(topK * 2, 10);
+  const baseNodeById = new Map(baseSnapshot.nodes.map((node) => [node.id, node] as const));
+  const visitKeys = [
+    ...new Set(
+      baseSnapshot.nodes
+        .filter((node) => node.kind === 'timeline-visit')
+        .map((node) => visitKeyFromNodeOrRaw(node.id))
+        .filter((visitKey) => visitKey.length > 0),
+    ),
+  ].sort();
+  const merged = [...input.events];
+  const rankerCandidateContext = {
+    merged,
+    existingEdges: [...baseSnapshot.edges],
+    ...(input.pageEvidenceByCanonicalUrl === undefined
+      ? {}
+      : { pageEvidenceByCanonicalUrl: input.pageEvidenceByCanonicalUrl }),
+    ...(input.evidenceVectorsByVectorId === undefined
+      ? {}
+      : { evidenceVectorsByVectorId: input.evidenceVectorsByVectorId }),
+  };
+  const rankerFeatureContext = { merged, snapshot: baseSnapshot };
+  const rankerEdges = new Map<string, ConnectionEdge>();
+
+  const observedAtForVisit = (visitKey: string): string => {
+    const node = baseNodeById.get(nodeIdFor('timeline-visit', visitKey));
+    return node?.lastSeenAt ?? node?.firstSeenAt ?? '';
+  };
+
+  for (const fromVisitKey of visitKeys) {
+    const scoredCandidates = [...generateCandidates(fromVisitKey, rankerCandidateContext)]
+      .sort(compareRankerServingCandidate)
+      .slice(0, maxServingCandidatesPerVisit)
+      .map((candidate) => {
+        const toVisitKey = visitKeyFromNodeOrRaw(candidate.toVisitId);
+        if (!baseNodeById.has(nodeIdFor('timeline-visit', toVisitKey))) return null;
+        const features = extractFeatures(candidate, rankerFeatureContext);
+        const prediction = ranker.predict(features, candidate);
+        if (!Number.isFinite(prediction.score) || prediction.score < threshold) {
+          return null;
+        }
+        return {
+          candidate,
+          toVisitKey,
+          score: roundRankerMetric(prediction.score),
+          topContributions: topClosestVisitContributions(prediction.contributions, 3),
+        };
+      })
+      .filter(
+        (
+          candidate,
+        ): candidate is {
+          readonly candidate: Candidate;
+          readonly toVisitKey: string;
+          readonly score: number;
+          readonly topContributions: readonly {
+            readonly feature: string;
+            readonly weight: number;
+          }[];
+        } => candidate !== null,
+      )
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          left.toVisitKey.localeCompare(right.toVisitKey) ||
+          left.candidate.generatedAt - right.candidate.generatedAt,
+      )
+      .slice(0, topK);
+
+    for (const scored of scoredCandidates) {
+      const fromObservedAt = observedAtForVisit(fromVisitKey);
+      const toObservedAt = observedAtForVisit(scored.toVisitKey);
+      const observedAt = fromObservedAt > toObservedAt ? fromObservedAt : toObservedAt;
+      upsertEdge(rankerEdges, {
+        kind: 'closest_visit',
+        fromNodeId: nodeIdFor('timeline-visit', fromVisitKey),
+        toNodeId: nodeIdFor('timeline-visit', scored.toVisitKey),
+        observedAt,
+        producedBy: {
+          source: 'ranker',
+          revisionId: ranker.revisionId,
+        },
+        confidence: 'inferred',
+        family: 'urlmatch',
+        metadata: {
+          score: scored.score,
+          featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          topContributions: scored.topContributions,
+        },
+      });
+    }
+  }
+
+  return sortAlphaById([...rankerEdges.values()]);
+};
 
 // ---------------------------------------------------------------------------
 // Pass 1: walk events, populate nodes + emit event-derived edges.
@@ -1495,6 +1658,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
                   scrollEvents: engagementClass.scrollEvents,
                 },
               }),
+          ...(evidenceMetadataForNode(input, visitKey) === undefined
+            ? {}
+            : { pageEvidence: evidenceMetadataForNode(input, visitKey) }),
         },
       });
       // 2026-05 fix: emit the `visit_in_workstream` edge that the
@@ -1646,6 +1812,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         canonicalUrl: instance.canonicalUrl,
         title: instance.title,
         provider: instance.provider,
+        ...(evidenceMetadataForNode(input, instance.visitKey) === undefined
+          ? {}
+          : { pageEvidence: evidenceMetadataForNode(input, instance.visitKey) }),
       },
     });
     // Hydrate the tab-session node from the projection so frontend
@@ -2408,6 +2577,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         metadata: {
           cosine: Number(similarityEdge.cosine.toFixed(4)),
           threshold: Number(input.visitSimilarity.threshold.toFixed(4)),
+          ...(similarityEdge.metadata === undefined ? {} : similarityEdge.metadata),
         },
       });
     }
@@ -2462,6 +2632,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           metadata: {
             canonicalUrl: memberCanonicalUrl,
+            ...(evidenceMetadataForNode(input, memberCanonicalUrl) === undefined
+              ? {}
+              : { pageEvidence: evidenceMetadataForNode(input, memberCanonicalUrl) }),
           },
         });
         upsertEdge(edges, {
@@ -2485,6 +2658,9 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           metadata: {
             canonicalUrl: affiliation.canonicalUrl,
+            ...(evidenceMetadataForNode(input, affiliation.canonicalUrl) === undefined
+              ? {}
+              : { pageEvidence: evidenceMetadataForNode(input, affiliation.canonicalUrl) }),
           },
         });
         upsertEdge(edges, {
@@ -2787,94 +2963,16 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // Class E revision.
   // -------------------------------------------------------------------
   if (input.closestVisitRanker !== undefined) {
-    const ranker = input.closestVisitRanker;
-    const threshold = ranker.threshold ?? 0.3;
-    const topK = Math.max(0, Math.floor(ranker.topK ?? 5));
     const baseSnapshot = snapshotFromAccumulators(input.scope, nodes, edges, maxObservedAt);
-    const baseNodeById = new Map(baseSnapshot.nodes.map((node) => [node.id, node] as const));
-    const visitKeys = [
-      ...new Set(
-        baseSnapshot.nodes
-          .filter((node) => node.kind === 'timeline-visit')
-          .map((node) => visitKeyFromNodeOrRaw(node.id))
-          .filter((visitKey) => visitKey.length > 0),
-      ),
-    ].sort();
-    const merged = [...input.events];
-
-    const observedAtForVisit = (visitKey: string): string => {
-      const node = baseNodeById.get(nodeIdFor('timeline-visit', visitKey));
-      return node?.lastSeenAt ?? node?.firstSeenAt ?? visitObservedAtByKey.get(visitKey) ?? '';
-    };
-
-    for (const fromVisitKey of visitKeys) {
-      if (topK === 0) break;
-      const scoredCandidates = generateCandidates(fromVisitKey, {
-        merged,
-        existingEdges: [...baseSnapshot.edges],
-      })
-        .map((candidate) => {
-          const toVisitKey = visitKeyFromNodeOrRaw(candidate.toVisitId);
-          if (!baseNodeById.has(nodeIdFor('timeline-visit', toVisitKey))) return null;
-          const features = extractFeatures(candidate, {
-            merged,
-            snapshot: baseSnapshot,
-          });
-          const prediction = ranker.predict(features, candidate);
-          if (!Number.isFinite(prediction.score) || prediction.score < threshold) {
-            return null;
-          }
-          return {
-            candidate,
-            toVisitKey,
-            score: roundRankerMetric(prediction.score),
-            topContributions: topClosestVisitContributions(prediction.contributions, 3),
-          };
-        })
-        .filter(
-          (
-            candidate,
-          ): candidate is {
-            readonly candidate: Candidate;
-            readonly toVisitKey: string;
-            readonly score: number;
-            readonly topContributions: readonly {
-              readonly feature: string;
-              readonly weight: number;
-            }[];
-          } => candidate !== null,
-        )
-        .sort(
-          (left, right) =>
-            right.score - left.score ||
-            left.toVisitKey.localeCompare(right.toVisitKey) ||
-            left.candidate.generatedAt - right.candidate.generatedAt,
-        )
-        .slice(0, topK);
-
-      for (const scored of scoredCandidates) {
-        const fromObservedAt = observedAtForVisit(fromVisitKey);
-        const toObservedAt = observedAtForVisit(scored.toVisitKey);
-        const observedAt = fromObservedAt > toObservedAt ? fromObservedAt : toObservedAt;
-        trackObservedAt(observedAt);
-        upsertEdge(edges, {
-          kind: 'closest_visit',
-          fromNodeId: nodeIdFor('timeline-visit', fromVisitKey),
-          toNodeId: nodeIdFor('timeline-visit', scored.toVisitKey),
-          observedAt,
-          producedBy: {
-            source: 'ranker',
-            revisionId: ranker.revisionId,
-          },
-          confidence: 'inferred',
-          family: 'urlmatch',
-          metadata: {
-            score: scored.score,
-            featureSchemaVersion: FEATURE_SCHEMA_VERSION,
-            topContributions: scored.topContributions,
-          },
-        });
-      }
+    for (const edge of closestVisitRankerEdgesForSnapshot(
+      input,
+      baseSnapshot,
+      input.closestVisitRanker,
+    )) {
+      trackObservedAt(edge.observedAt);
+      const { id: _id, ...edgeInput } = edge;
+      void _id;
+      upsertEdge(edges, edgeInput);
     }
   }
 
@@ -2970,6 +3068,54 @@ const computeSnapshotRevision = (parts: {
   hasher.update('|');
   hasher.update(String(parts.tabSessionProjectionKeyCount));
   return hasher.digest('hex').slice(0, 16);
+};
+
+export const augmentConnectionsSnapshotWithClosestVisitRanker = (
+  input: ConnectionsInput & { readonly closestVisitRanker: ClosestVisitRanker },
+  baseSnapshot: ConnectionsSnapshot,
+): ConnectionsSnapshot => {
+  const edges = new Map<string, ConnectionEdge>(
+    baseSnapshot.edges
+      .filter((edge) => edge.kind !== 'closest_visit')
+      .map((edge) => [edge.id, edge] as const),
+  );
+  const baseWithoutClosestVisit = {
+    ...baseSnapshot,
+    edges: [...edges.values()],
+    edgeCount: edges.size,
+  };
+  let maxObservedAt = baseWithoutClosestVisit.updatedAt;
+  for (const edge of closestVisitRankerEdgesForSnapshot(
+    input,
+    baseWithoutClosestVisit,
+    input.closestVisitRanker,
+  )) {
+    if (edge.observedAt > maxObservedAt) maxObservedAt = edge.observedAt;
+    const { id: _id, ...edgeInput } = edge;
+    void _id;
+    upsertEdge(edges, edgeInput);
+  }
+  const sortedEdges = sortAlphaById([...edges.values()]);
+  const updatedAt = maxObservedAt.length > 0 ? maxObservedAt : baseSnapshot.updatedAt;
+  return {
+    ...baseSnapshot,
+    edges: sortedEdges,
+    updatedAt,
+    edgeCount: sortedEdges.length,
+    snapshotRevision: computeSnapshotRevision({
+      updatedAt,
+      nodeCount: baseSnapshot.nodeCount,
+      edgeCount: sortedEdges.length,
+      urlProjectionKeyCount:
+        baseSnapshot.urlProjection === undefined
+          ? 0
+          : Object.keys(baseSnapshot.urlProjection.byCanonicalUrl).length,
+      tabSessionProjectionKeyCount:
+        baseSnapshot.tabSessionProjection === undefined
+          ? 0
+          : Object.keys(baseSnapshot.tabSessionProjection.bySessionId).length,
+    }),
+  };
 };
 
 // ---------------------------------------------------------------------------

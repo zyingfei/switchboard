@@ -8,11 +8,15 @@ import type {
 import { nodeIdFor } from '../connections/types.js';
 import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import { buildExtractedPageEvidence } from '../page-evidence/extract.js';
+import type { PageEvidenceExtractedRequest, VectorRef } from '../page-evidence/types.js';
 import { SELECTION_COPIED } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import {
   CANDIDATE_SOURCES,
+  generateContentEmbeddingNeighborhoodCandidates,
+  generateContentTermOverlapCandidates,
   generateCandidates,
   generateCrossReplicaContinuationCandidates,
   generateEmbeddingNeighborhoodCandidates,
@@ -108,9 +112,11 @@ const snippetPayload = (input: {
 const context = (
   merged: readonly AcceptedEvent[] = [],
   existingEdges: readonly ConnectionEdge[] = [],
+  extra: Omit<CandidateContext, 'merged' | 'existingEdges'> = {},
 ): CandidateContext => ({
   merged: [...merged],
   existingEdges: [...existingEdges],
+  ...extra,
 });
 
 const edge = (input: {
@@ -119,6 +125,7 @@ const edge = (input: {
   readonly toNodeId: string;
   readonly observedAt?: string;
   readonly producedBy?: ConnectionEdgeProducedBy;
+  readonly metadata?: Record<string, unknown>;
 }): ConnectionEdge => ({
   id: `edge:${input.kind}:${input.fromNodeId}:${input.toNodeId}`,
   kind: input.kind,
@@ -127,6 +134,42 @@ const edge = (input: {
   observedAt: input.observedAt ?? '2026-05-07T10:00:03.000Z',
   producedBy: input.producedBy ?? { source: 'timeline-projection' },
   confidence: 'inferred',
+  ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+});
+
+const evidencePayload = (input: {
+  readonly canonicalUrl: string;
+  readonly title: string;
+  readonly text: string;
+}): PageEvidenceExtractedRequest => ({
+  payloadVersion: 1,
+  canonicalUrl: input.canonicalUrl,
+  url: input.canonicalUrl,
+  title: input.title,
+  extractedAt: '2026-05-16T10:00:00.000Z',
+  extractionSource: 'reader-mode',
+  extractionPolicy: { trigger: 'attention-gate' },
+  quality: 'high',
+  qualitySignals: {
+    extractedWordCount: 320,
+    contentToDomRatio: 0.7,
+    boilerplateFraction: 0.05,
+    extractionStrategy: 'reader-mode',
+  },
+  content: {
+    text: input.text,
+    contentHash: `hash-${input.title.toLowerCase()}`,
+    charCount: input.text.length,
+  },
+  storageMode: 'features_only',
+});
+
+const vectorRef = (vectorId: string, overrides: Partial<VectorRef> = {}): VectorRef => ({
+  vectorId,
+  modelId: 'test-e5',
+  modelVersion: 'rev-a',
+  dimensions: 2,
+  ...overrides,
 });
 
 const expectSingleSourceCandidate = (
@@ -159,6 +202,8 @@ describe('ranker candidate generation', () => {
       'same_copied_snippet',
       'same_title_path_tokens',
       'embedding_neighborhood',
+      'content_term_overlap',
+      'content_embedding_neighborhood',
       'cross_replica_continuation',
       'random_unrelated',
       'recently_skipped',
@@ -414,6 +459,121 @@ describe('ranker candidate generation', () => {
       'visit-b',
       ctx,
     );
+  });
+
+  it('generates content_term_overlap candidates from PageEvidence when available', () => {
+    const alpha = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://alpha.test/f16',
+        title: 'F16 Minipack',
+        text: 'F16 Minipack data center fabric network switch 100G '.repeat(20),
+      }),
+    );
+    const bravo = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://bravo.test/fabric',
+        title: 'Fabric switch',
+        text: 'Minipack F16 network fabric data center architecture '.repeat(20),
+      }),
+    );
+    const charlie = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://charlie.test/database',
+        title: 'Database backup',
+        text: 'transaction log backup recovery point objective '.repeat(20),
+      }),
+    );
+    const ctx = context(
+      [event({ seq: 3, type: 'noop', payload: {} })],
+      [
+        edge({
+          kind: 'visit_resembles_visit',
+          fromNodeId: alpha.canonicalUrl,
+          toNodeId: bravo.canonicalUrl,
+          producedBy: { source: 'visit-similarity', revisionId: 'visit-sim:v1' },
+          metadata: { channels: { contentVector: 1 } },
+        }),
+      ],
+      {
+        pageEvidenceByCanonicalUrl: new Map([
+          [alpha.canonicalUrl, alpha],
+          [bravo.canonicalUrl, bravo],
+          [charlie.canonicalUrl, charlie],
+        ]),
+      },
+    );
+
+    expect(generateContentTermOverlapCandidates(alpha.canonicalUrl, ctx)).toEqual([
+      {
+        fromVisitId: alpha.canonicalUrl,
+        toVisitId: bravo.canonicalUrl,
+        sources: ['content_term_overlap'],
+        generatedAt: GENERATED_AT,
+      },
+    ]);
+  });
+
+  it('generates content_embedding_neighborhood candidates from compatible doc vectors', () => {
+    const alpha = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://alpha.test/f16',
+        title: 'F16 Minipack',
+        text: 'F16 Minipack data center fabric network switch 100G '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-alpha') },
+    );
+    const bravo = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://bravo.test/fabric',
+        title: 'Fabric switch',
+        text: 'Minipack F16 network fabric data center architecture '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-bravo') },
+    );
+    const incompatible = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: 'https://charlie.test/fabric',
+        title: 'Other fabric',
+        text: 'Minipack F16 network fabric data center architecture '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-charlie', { modelVersion: 'rev-b' }) },
+    );
+    const ctx = context(
+      [event({ seq: 3, type: 'noop', payload: {} })],
+      [
+        edge({
+          kind: 'visit_resembles_visit',
+          fromNodeId: alpha.canonicalUrl,
+          toNodeId: bravo.canonicalUrl,
+          producedBy: { source: 'visit-similarity', revisionId: 'visit-sim:v1' },
+          metadata: { channels: { contentVector: 1 } },
+        }),
+      ],
+      {
+        pageEvidenceByCanonicalUrl: new Map([
+          [alpha.canonicalUrl, alpha],
+          [bravo.canonicalUrl, bravo],
+          [incompatible.canonicalUrl, incompatible],
+        ]),
+        evidenceVectorsByVectorId: new Map([
+          ['vec-alpha', Float32Array.from([1, 0])],
+          ['vec-bravo', Float32Array.from([1, 0])],
+          ['vec-charlie', Float32Array.from([1, 0])],
+        ]),
+      },
+    );
+
+    expect(generateContentEmbeddingNeighborhoodCandidates(alpha.canonicalUrl, ctx)).toEqual([
+      {
+        fromVisitId: alpha.canonicalUrl,
+        toVisitId: bravo.canonicalUrl,
+        sources: ['content_embedding_neighborhood'],
+        generatedAt: GENERATED_AT,
+      },
+    ]);
   });
 
   it('generates cross_replica_continuation candidates', () => {

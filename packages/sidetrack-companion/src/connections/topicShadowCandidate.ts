@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
+import { evidenceTokensForRecord } from '../page-evidence/extract.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   type TopicSecondaryAffiliation,
@@ -33,6 +35,8 @@ const SECONDARY_AFFILIATION_MIN_COSINE = 0.85;
 
 interface WeightedEdge extends VisitSimilarityEdge {
   readonly lexicalScore: number;
+  readonly confidence: number;
+  readonly qualityPairWeight: number;
   readonly weight: number;
 }
 
@@ -72,6 +76,11 @@ export interface TopicShadowDiagnostics {
   readonly splitParentCount: number;
   readonly splitAcceptedCount: number;
   readonly secondaryAffiliationCount: number;
+  readonly contentEnrichedEdges?: number;
+  readonly metadataOnlyEdges?: number;
+  readonly mixedTierEdges?: number;
+  readonly contentDrivenTopicCount?: number;
+  readonly metadataOnlyTopicCount?: number;
   readonly perVisitChurn: number;
   readonly runtimeMs: number;
 }
@@ -88,6 +97,7 @@ export interface BuildTopicShadowCandidateInput {
   readonly baselineRevision: TopicRevision;
   readonly previousRevision?: TopicRevision;
   readonly cosineThreshold: number;
+  readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
 }
 
 const compareString = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
@@ -139,17 +149,32 @@ const titleTokens = (title: string | undefined): readonly string[] =>
     .map((part) => part.trim())
     .filter((part) => part.length > 1);
 
-const visitTokens = (visit: TopicVisit): readonly string[] =>
-  [
+const visitTokens = (
+  visit: TopicVisit,
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
+): readonly string[] => {
+  const evidence = evidenceByCanonicalUrl?.get(visit.canonicalUrl);
+  if (evidence !== undefined) {
+    return [
+      ...new Set([
+        ...evidenceTokensForRecord(evidence).map((term) => term.normalized),
+        ...evidence.metadata.titleTokens,
+        ...evidence.metadata.pathTokens,
+      ]),
+    ].sort(compareString);
+  }
+  return [
     ...new Set([
       ...titleTokens(visit.title),
       ...hostTokensForUrl(visit.canonicalUrl),
       ...pathTokensForUrl(visit.canonicalUrl),
     ]),
   ].sort(compareString);
+};
 
 const buildTokenStats = (
   visits: readonly TopicVisit[],
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
 ): {
   readonly tokensByVisit: ReadonlyMap<string, readonly string[]>;
   readonly terms: readonly TermFrequency[];
@@ -159,7 +184,7 @@ const buildTokenStats = (
   const df = new Map<string, number>();
   for (const visit of visits) {
     if (visit.canonicalUrl.length === 0) continue;
-    const tokens = visitTokens(visit);
+    const tokens = visitTokens(visit, evidenceByCanonicalUrl);
     tokensByVisit.set(visit.canonicalUrl, tokens);
     for (const token of tokens) df.set(token, (df.get(token) ?? 0) + 1);
   }
@@ -195,6 +220,25 @@ const idfCosine = (
   return dot / Math.sqrt(leftNorm * rightNorm);
 };
 
+const qualityWeightFor = (quality: string | undefined): number => {
+  if (quality === 'high') return 1;
+  if (quality === 'medium') return 0.75;
+  if (quality === 'low') return 0.25;
+  return 1;
+};
+
+const qualityPairWeightFor = (
+  edge: VisitSimilarityEdge,
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
+): number => {
+  const left = evidenceByCanonicalUrl?.get(edge.fromVisitKey);
+  const right = evidenceByCanonicalUrl?.get(edge.toVisitKey);
+  return Math.min(
+    qualityWeightFor(left?.content?.quality),
+    qualityWeightFor(right?.content?.quality),
+  );
+};
+
 const rankLookupFor = (edges: readonly VisitSimilarityEdge[]): ReadonlyMap<string, number> => {
   const adjacency = new Map<string, { readonly other: string; readonly score: number }[]>();
   for (const edge of edges) {
@@ -220,13 +264,14 @@ const rankLookupFor = (edges: readonly VisitSimilarityEdge[]): ReadonlyMap<strin
 const prunedSimilarityFor = (
   visits: readonly TopicVisit[],
   visitSimilarity: VisitSimilarityRevision,
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
 ): {
   readonly revisionId: string;
   readonly edges: readonly WeightedEdge[];
   readonly highDfTerms: readonly TermFrequency[];
 } => {
   const visitByCanonical = new Map(visits.map((visit) => [visit.canonicalUrl, visit] as const));
-  const { tokensByVisit, terms, idfFor } = buildTokenStats(visits);
+  const { tokensByVisit, terms, idfFor } = buildTokenStats(visits, evidenceByCanonicalUrl);
   const ranks = rankLookupFor(visitSimilarity.edges);
   const edges: WeightedEdge[] = [];
   for (const edge of visitSimilarity.edges) {
@@ -249,12 +294,20 @@ const prunedSimilarityFor = (
       idfFor,
     );
     if (lexicalScore < MIN_LEXICAL_SCORE) continue;
+    const confidence =
+      typeof edge.metadata?.confidence === 'number' && Number.isFinite(edge.metadata.confidence)
+        ? Math.max(0, Math.min(1, edge.metadata.confidence))
+        : 1;
+    const qualityPairWeight = qualityPairWeightFor(edge, evidenceByCanonicalUrl);
     edges.push({
       fromVisitKey: edge.fromVisitKey,
       toVisitKey: edge.toVisitKey,
       cosine: edge.cosine,
+      ...(edge.metadata === undefined ? {} : { metadata: edge.metadata }),
       lexicalScore: roundMetric(lexicalScore),
-      weight: roundMetric(edge.cosine * lexicalScore),
+      confidence: roundMetric(confidence),
+      qualityPairWeight: roundMetric(qualityPairWeight),
+      weight: roundMetric(edge.cosine * lexicalScore * confidence),
     });
   }
   edges.sort((left, right) => {
@@ -459,6 +512,7 @@ const secondaryAffiliationsFor = (
   topics: readonly TopicRevisionTopic[],
   visits: readonly TopicVisit[],
   visitSimilarity: VisitSimilarityRevision,
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
 ): readonly TopicRevisionTopic[] => {
   if (topics.length === 0) return topics;
   const uniqueVisits = uniqueVisitsByCanonical(visits);
@@ -471,7 +525,7 @@ const secondaryAffiliationsFor = (
   }
   const edgeByPair = edgeLookupFor(visitSimilarity.edges);
   const ranks = rankLookupFor(visitSimilarity.edges);
-  const { tokensByVisit, idfFor } = buildTokenStats(uniqueVisits);
+  const { tokensByVisit, idfFor } = buildTokenStats(uniqueVisits, evidenceByCanonicalUrl);
   const secondaryByTopic = new Map<string, TopicSecondaryAffiliation[]>();
 
   for (const visit of uniqueVisits) {
@@ -663,7 +717,11 @@ export const buildTopicShadowCandidate = async (
   input: BuildTopicShadowCandidateInput,
 ): Promise<TopicShadowCandidateResult> => {
   const startedAt = performance.now();
-  const pruned = prunedSimilarityFor(input.visits, input.visitSimilarity);
+  const pruned = prunedSimilarityFor(
+    input.visits,
+    input.visitSimilarity,
+    input.evidenceByCanonicalUrl,
+  );
   const retainedRelations = input.userAssertedRelations.filter(
     (relation) => relation.kind !== 'in_workstream',
   );
@@ -698,11 +756,32 @@ export const buildTopicShadowCandidate = async (
     }
   }
   topics.sort((left, right) => compareString(left.topicId, right.topicId));
-  const topicsWithSecondary = secondaryAffiliationsFor(topics, input.visits, input.visitSimilarity);
+  const topicsWithSecondary = secondaryAffiliationsFor(
+    topics,
+    input.visits,
+    input.visitSimilarity,
+    input.evidenceByCanonicalUrl,
+  );
   const secondaryAffiliationCount = topicsWithSecondary.reduce(
     (sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0),
     0,
   );
+  const contentEnrichedEdges = input.visitSimilarity.edges.filter(
+    (edge) => edge.metadata?.producer === 'content-enriched',
+  ).length;
+  const metadataOnlyEdges = input.visitSimilarity.edges.filter(
+    (edge) => edge.metadata?.producer === 'metadata-only',
+  ).length;
+  const mixedTierEdges = input.visitSimilarity.edges.filter((edge) => {
+    const from = edge.metadata?.evidenceTierFrom;
+    const to = edge.metadata?.evidenceTierTo;
+    return typeof from === 'string' && typeof to === 'string' && from !== to;
+  }).length;
+  const contentDrivenTopicCount = topicsWithSecondary.filter((topic) =>
+    topic.memberCanonicalUrls.some(
+      (canonicalUrl) => input.evidenceByCanonicalUrl?.get(canonicalUrl)?.content !== undefined,
+    ),
+  ).length;
   const revision: TopicRevision = {
     ...base,
     topics: topicsWithSecondary,
@@ -744,6 +823,11 @@ export const buildTopicShadowCandidate = async (
     splitParentCount,
     splitAcceptedCount,
     secondaryAffiliationCount,
+    contentEnrichedEdges,
+    metadataOnlyEdges,
+    mixedTierEdges,
+    contentDrivenTopicCount,
+    metadataOnlyTopicCount: Math.max(0, topicsWithSecondary.length - contentDrivenTopicCount),
     perVisitChurn: roundMetric(perVisitChurn(input.baselineRevision, revision)),
     runtimeMs: roundMetric(performance.now() - startedAt),
   };

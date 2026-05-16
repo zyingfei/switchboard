@@ -474,6 +474,17 @@ const topicVisitFromEdge = (
     pageContent !== undefined && typeof pageContent['quality'] === 'string'
       ? pageContent['quality']
       : undefined;
+  const pageEvidence = isRecord(visit.metadata['pageEvidence'])
+    ? visit.metadata['pageEvidence']
+    : undefined;
+  const pageEvidenceTier =
+    pageEvidence !== undefined && typeof pageEvidence['tier'] === 'string'
+      ? pageEvidence['tier']
+      : undefined;
+  const pageEvidenceTermCount =
+    pageEvidence !== undefined && typeof pageEvidence['termCount'] === 'number'
+      ? pageEvidence['termCount']
+      : undefined;
   return {
     id: visit.id,
     label: formatEntityDisplay(visit, ctx).primary,
@@ -487,6 +498,8 @@ const topicVisitFromEdge = (
       : {}),
     ...(pageContentState === undefined ? {} : { pageContentState }),
     ...(pageContentQuality === undefined ? {} : { pageContentQuality }),
+    ...(pageEvidenceTier === undefined ? {} : { pageEvidenceTier }),
+    ...(pageEvidenceTermCount === undefined ? {} : { pageEvidenceTermCount }),
   };
 };
 

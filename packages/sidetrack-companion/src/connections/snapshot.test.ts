@@ -113,7 +113,7 @@ const navigationCommittedPayload = (input: {
 
 const rankerContributionsFor = (
   score: number,
-): Readonly<Record<keyof CandidatePairFeatures, number>> => ({
+): Readonly<Partial<Record<keyof CandidatePairFeatures, number>>> => ({
   schemaVersion: 0,
   same_workstream: 0,
   opener_chain_depth: 0,

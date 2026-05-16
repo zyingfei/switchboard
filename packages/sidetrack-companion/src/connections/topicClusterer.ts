@@ -11,6 +11,7 @@ import {
   type TopicRevision,
   type TopicRevisionTopic,
 } from '../producers/topic-revision.js';
+import type { PageEvidenceSimilarityMetadata } from '../page-evidence/types.js';
 import { topicId } from './topicId.js';
 import { UnionFind } from './unionFind.js';
 
@@ -27,6 +28,7 @@ export interface VisitSimilarityEdge {
   readonly fromVisitKey: string;
   readonly toVisitKey: string;
   readonly cosine: number;
+  readonly metadata?: PageEvidenceSimilarityMetadata;
 }
 
 export interface VisitSimilarityRevisionInput {

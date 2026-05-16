@@ -629,6 +629,10 @@ export const pageContentExtractedSchema = z.object({
   dimensions: z.record(z.string(), z.unknown()).optional(),
 });
 
+export const pageEvidenceExtractedSchema = pageContentExtractedSchema.extend({
+  storageMode: z.enum(['features_only', 'indexed_chunks']),
+});
+
 export const pageContentTombstonedSchema = z.object({
   payloadVersion: z.literal(1),
   canonicalUrl: z.url(),

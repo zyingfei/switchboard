@@ -58,6 +58,8 @@ export interface TopicVisit {
   readonly secondaryReasons?: readonly string[];
   readonly pageContentState?: string;
   readonly pageContentQuality?: string;
+  readonly pageEvidenceTier?: string;
+  readonly pageEvidenceTermCount?: number;
 }
 
 export interface FocusWorkstreamOption {
@@ -171,6 +173,12 @@ const secondaryVisitTitle = (visit: TopicVisit): string => {
 };
 
 const pageContentBadge = (visit: TopicVisit): string => {
+  if (visit.pageEvidenceTier === 'content_features_only') return 'Features';
+  if (visit.pageEvidenceTier === 'indexed_chunks') {
+    return visit.pageContentQuality === undefined
+      ? 'Indexed'
+      : `Indexed · ${visit.pageContentQuality}`;
+  }
   if (visit.pageContentState === 'indexed') {
     return visit.pageContentQuality === undefined
       ? 'Indexed'
@@ -831,7 +839,11 @@ export const FocusView = ({
                           <span className="cx-focus-visit-title">{visit.label}</span>
                           <span
                             className="cx-focus-chip cx-focus-chip-coverage"
-                            title="Page-content coverage"
+                            title={
+                              visit.pageEvidenceTermCount === undefined
+                                ? 'Page evidence coverage'
+                                : `${String(visit.pageEvidenceTermCount)} extracted evidence terms`
+                            }
                           >
                             {pageContentBadge(visit)}
                           </span>

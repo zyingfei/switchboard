@@ -12,7 +12,7 @@
 //     (worker A finished after worker B with a higher seq) are
 //     discarded by the caller — the in-memory snapshot store always
 //     has the latest revision and the worker's putCurrent atomic
-//     swap is the durability oracle.
+//     swap is the durability reference.
 //
 // This module is the harness only — wiring into the materializer's
 // drain loop is gated behind `SIDETRACK_CONNECTIONS_WORKER=1` in a

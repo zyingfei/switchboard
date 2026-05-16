@@ -1,0 +1,7 @@
+{
+  "module": "content-enriched-similarity",
+  "defaultMode": "shadow",
+  "enablementMetric": "content_enriched_edge_count > 0 plus Recall@10/MRR/NoiseRate gate",
+  "graduationCriterion": "Recall@10 >= baseline + 15pp, MRR >= baseline + 10pp, NoiseRate regression <= 5pp, latency budgets green",
+  "sunsetDate": "2026-07-01"
+}

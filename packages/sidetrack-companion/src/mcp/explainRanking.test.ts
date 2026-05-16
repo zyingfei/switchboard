@@ -127,7 +127,7 @@ const contributions = (overrides: Partial<Record<keyof CandidatePairFeatures, nu
     page_quality_tier_from: 0,
     page_quality_tier_to: 0,
     ...overrides,
-  }) satisfies Readonly<Record<keyof CandidatePairFeatures, number>>;
+  }) satisfies Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>;
 
 const deps = (): ExplainRankingDeps => ({
   readMergedEvents: () => Promise.resolve(emptyEvents),
@@ -149,7 +149,7 @@ describe('sidetrack.debug.explainRanking', () => {
   it('returns exact stable debug JSON for a fixture visit pair', async () => {
     await expect(explainRanking({ from: fromVisit, to: toVisit }, deps())).resolves.toEqual({
       features: {
-        schemaVersion: 3,
+        schemaVersion: 4,
         same_workstream: 1,
         opener_chain_depth: 0,
         in_navigation_chain: 0,
@@ -172,6 +172,17 @@ describe('sidetrack.debug.explainRanking', () => {
         topic_lineage_merge_split_related: 0,
         page_quality_tier_from: 0,
         page_quality_tier_to: 0,
+        shared_content_terms: 0,
+        shared_content_keyphrases: 0,
+        content_weighted_jaccard: 0,
+        content_vector_cosine: 0,
+        content_entity_overlap: 0,
+        content_evidence_tier_from: 0,
+        content_evidence_tier_to: 0,
+        content_both_available: 0,
+        content_quality_pair_min: 0,
+        chunk_support_count: 0,
+        max_chunk_pair_score: 0,
       },
       modelVersion: 'lightgbm-lambdamart-v1',
       revisionId: 'ranker-rev-fixture',
@@ -199,6 +210,17 @@ describe('sidetrack.debug.explainRanking', () => {
         { feature: 'topic_lineage_merge_split_related', weight: 0 },
         { feature: 'page_quality_tier_from', weight: 0 },
         { feature: 'page_quality_tier_to', weight: 0 },
+        { feature: 'shared_content_terms', weight: 0 },
+        { feature: 'shared_content_keyphrases', weight: 0 },
+        { feature: 'content_weighted_jaccard', weight: 0 },
+        { feature: 'content_vector_cosine', weight: 0 },
+        { feature: 'content_entity_overlap', weight: 0 },
+        { feature: 'content_evidence_tier_from', weight: 0 },
+        { feature: 'content_evidence_tier_to', weight: 0 },
+        { feature: 'content_both_available', weight: 0 },
+        { feature: 'content_quality_pair_min', weight: 0 },
+        { feature: 'chunk_support_count', weight: 0 },
+        { feature: 'max_chunk_pair_score', weight: 0 },
       ],
       sortedReasonCodes: [
         {

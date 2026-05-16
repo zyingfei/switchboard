@@ -45,6 +45,13 @@ import {
   type PageContentExtractedPayload,
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
+import { writeExtractedPageEvidence } from '../page-evidence/store.js';
+import {
+  type PageEvidenceExtractedEventPayload,
+  type PageEvidenceExtractedRequest,
+  type PageEvidenceRecord,
+} from '../page-evidence/types.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../page-evidence/events.js';
 import {
   canonicalizePageUrl,
   pageContentCoverageCounts,
@@ -311,6 +318,7 @@ import {
   contentQuerySchema,
   pageContentCoverageQuerySchema,
   pageContentExtractedSchema,
+  pageEvidenceExtractedSchema,
   pageContentTombstonedSchema,
   reviewDraftEventBatchSchema,
   reviewDraftListQuerySchema,
@@ -955,6 +963,47 @@ const compactPageContentExtractedPayload = (
         },
       }),
   ...(payload.dimensions === undefined ? {} : { dimensions: payload.dimensions }),
+});
+
+const compactPageEvidenceExtractedPayload = (
+  payload: ReturnType<typeof pageEvidenceExtractedSchema.parse>,
+): PageEvidenceExtractedRequest => ({
+  ...compactPageContentExtractedPayload(payload),
+  storageMode: payload.storageMode,
+});
+
+const pageEvidenceExtractedEventPayload = (
+  evidence: PageEvidenceRecord,
+  request: PageEvidenceExtractedRequest,
+): PageEvidenceExtractedEventPayload => ({
+  payloadVersion: 1,
+  canonicalUrl: evidence.canonicalUrl,
+  evidenceRevision: evidence.evidenceRevision,
+  semanticFeatureRevision: evidence.semanticFeatureRevision,
+  behaviorMetadataRevision: evidence.behaviorMetadataRevision,
+  evidenceTier: evidence.evidenceTier,
+  ...(evidence.content?.contentHash === undefined
+    ? {}
+    : { contentHash: evidence.content.contentHash }),
+  storageMode: request.storageMode,
+  versions: evidence.versions,
+  ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+  termCount: evidence.content?.terms.length ?? 0,
+  keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+  entityCount: evidence.content?.entities.length ?? 0,
+  ...(evidence.content?.docEmbeddingRef === undefined
+    ? {}
+    : {
+        vectorRef: {
+          modelId: evidence.content.docEmbeddingRef.modelId,
+          modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+          dimensions: evidence.content.docEmbeddingRef.dimensions,
+        },
+      }),
+  ...(evidence.content?.embeddingState === undefined
+    ? {}
+    : { embeddingState: evidence.content.embeddingState }),
+  trigger: request.extractionPolicy.trigger,
 });
 
 const compactPageContentTombstonedPayload = (
@@ -4132,6 +4181,10 @@ const routes: readonly RouteDefinition[] = [
       );
       return await runIdempotent(context, 'pageContentExtracted', idempotencyKey, async () => {
         const coverage = await writePageContentExtracted(vaultRoot, payload);
+        const evidence = await writeExtractedPageEvidence(vaultRoot, {
+          ...payload,
+          storageMode: 'indexed_chunks',
+        });
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({
             clientEventId: idempotencyKey,
@@ -4139,8 +4192,56 @@ const routes: readonly RouteDefinition[] = [
             type: PAGE_CONTENT_EXTRACTED,
             payload: { ...payload },
           });
+          await context.eventLog.appendServerObserved({
+            clientEventId: `${idempotencyKey}:page-evidence`,
+            aggregateId: `page-evidence:${evidence.canonicalUrl}`,
+            type: PAGE_EVIDENCE_EXTRACTED,
+            payload: {
+              ...pageEvidenceExtractedEventPayload(evidence, {
+                ...payload,
+                storageMode: 'indexed_chunks',
+              }),
+            },
+          });
         }
         return [202, { data: { coverage } }];
+      });
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/page-evidence\/extracted$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const idempotencyKey = requireIdempotencyKey(request);
+      const payload = compactPageEvidenceExtractedPayload(
+        pageEvidenceExtractedSchema.parse(await readBody(request)),
+      );
+      return await runIdempotent(context, 'pageEvidenceExtracted', idempotencyKey, async () => {
+        const pageContentPayload = compactPageContentExtractedPayload(payload);
+        const coverage =
+          payload.storageMode === 'indexed_chunks'
+            ? await writePageContentExtracted(vaultRoot, pageContentPayload)
+            : null;
+        const evidence = await writeExtractedPageEvidence(vaultRoot, payload);
+        if (context.eventLog !== undefined) {
+          if (coverage !== null) {
+            await context.eventLog.appendServerObserved({
+              clientEventId: `${idempotencyKey}:page-content`,
+              aggregateId: `page-content:${coverage.canonicalUrl}`,
+              type: PAGE_CONTENT_EXTRACTED,
+              payload: { ...pageContentPayload },
+            });
+          }
+          await context.eventLog.appendServerObserved({
+            clientEventId: `${idempotencyKey}:page-evidence`,
+            aggregateId: `page-evidence:${evidence.canonicalUrl}`,
+            type: PAGE_EVIDENCE_EXTRACTED,
+            payload: { ...pageEvidenceExtractedEventPayload(evidence, payload) },
+          });
+        }
+        return [202, { data: { evidence, ...(coverage === null ? {} : { coverage }) } }];
       });
     },
   },

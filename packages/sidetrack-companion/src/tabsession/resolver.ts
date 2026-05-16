@@ -210,9 +210,13 @@ const evidenceReasons = (
     });
   }
   if (candidate.simTopScore > 0) {
+    const matched =
+      candidate.simMatchedTerms === undefined || candidate.simMatchedTerms.length === 0
+        ? ''
+        : ` via ${candidate.simMatchedTerms.slice(0, 3).join(', ')}`;
     reasons.push({
       source: 'similarity',
-      summary: `Similarity top ${candidate.simTopScore.toFixed(3)}, margin ${candidate.simMargin.toFixed(3)}`,
+      summary: `Similarity top ${candidate.simTopScore.toFixed(3)}, margin ${candidate.simMargin.toFixed(3)}${matched}`,
       anchors,
     });
   }
@@ -356,6 +360,7 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
         simMeanScore: sim?.simMeanScore ?? 0,
         simAgreement: sim?.simAgreement ?? 0,
         simMargin: sim?.simMargin ?? 0,
+        ...(sim?.simMatchedTerms === undefined ? {} : { simMatchedTerms: sim.simMatchedTerms }),
         clusterPosterior: clusterEvidence?.posterior ?? 0,
         corroborationCount,
       };
@@ -449,6 +454,7 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
         simMeanScore: sim?.simMeanScore ?? 0,
         simAgreement: sim?.simAgreement ?? 0,
         simMargin: sim?.simMargin ?? 0,
+        ...(sim?.simMatchedTerms === undefined ? {} : { simMatchedTerms: sim.simMatchedTerms }),
         clusterPosterior: clusterEvidence?.posterior ?? 0,
         corroborationCount,
       };

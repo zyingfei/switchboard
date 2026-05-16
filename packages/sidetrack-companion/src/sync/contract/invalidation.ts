@@ -35,6 +35,7 @@ import {
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
@@ -72,6 +73,7 @@ export type InvalidationKey =
   | { readonly kind: 'extractionRevision'; readonly extractionRevisionId: string }
   | { readonly kind: 'recallIndex'; readonly sourceUnitId: string }
   | { readonly kind: 'contentSimilarity'; readonly sourceUnitId: string }
+  | { readonly kind: 'pageEvidence'; readonly canonicalUrl: string }
   | { readonly kind: 'contentEvidence'; readonly sourceUnitId: string }
   | { readonly kind: 'resolverAnchors'; readonly nodeIds: readonly string[] }
   // Batch-level content keys (model / chunker version flips).
@@ -246,6 +248,16 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
       keys.push({ kind: 'extractionRevision', extractionRevisionId });
     }
     return keys;
+  },
+  [PAGE_EVIDENCE_EXTRACTED]: (event) => {
+    const canonicalUrl = str(asRecord(event.payload)['canonicalUrl']);
+    if (canonicalUrl === undefined) return [{ kind: 'rankerLabels' }];
+    return [
+      { kind: 'url', canonicalUrl },
+      { kind: 'topicMember', visitId: canonicalUrl },
+      { kind: 'pageEvidence', canonicalUrl },
+      { kind: 'rankerLabels' },
+    ];
   },
   [RECALL_TOMBSTONE_TARGET]: (event) => {
     const p = asRecord(event.payload);

@@ -16,6 +16,11 @@ import {
   type FeedbackTrainingLabel,
   projectFeedback,
 } from '../feedback/projection.js';
+import {
+  readPageEvidenceMap,
+  readPageEvidenceVectorMap,
+} from '../page-evidence/store.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
@@ -198,7 +203,7 @@ export const deriveNegativeVisitPairLabelsFromSnapshot = (
   const emit = (fromId: string, toId: string, weight: number): void => {
     if (fromId.length === 0 || toId.length === 0) return;
     if (fromId === toId) return;
-    const key = `${fromId} ${toId} ${String(weight)}`;
+    const key = `${fromId}\u0000${toId}\u0000${String(weight)}`;
     if (seen.has(key)) return;
     seen.add(key);
     labels.push({ fromId, toId, weight });
@@ -325,6 +330,8 @@ export type RankerRetrainResult =
 export interface RankerRetrainContext {
   readonly merged: readonly AcceptedEvent[];
   readonly snapshot: ConnectionsSnapshot;
+  readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
 }
 
 export type RankerRetrainer = (context: RankerRetrainContext) => Promise<RankerRetrainResult>;
@@ -351,6 +358,8 @@ export interface BuildRankerTrainingCandidatesInput {
   readonly feedback: FeedbackProjection;
   readonly merged: readonly AcceptedEvent[];
   readonly snapshot: ConnectionsSnapshot;
+  readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
   readonly randomNegativeCandidatesPerPositive?: number | undefined;
 }
 
@@ -874,6 +883,8 @@ export const buildRankerTrainingCandidates = ({
   feedback,
   merged,
   snapshot,
+  pageEvidenceByCanonicalUrl,
+  evidenceVectorsByVectorId,
   randomNegativeCandidatesPerPositive,
 }: BuildRankerTrainingCandidatesInput): readonly RankerTrainingCandidate[] => {
   const visitKeysList = timelineVisitKeys(snapshot);
@@ -883,7 +894,12 @@ export const buildRankerTrainingCandidates = ({
   const candidates = new Map<string, Candidate>();
   const generatedAt = maxObservedAt(merged, snapshot);
   const timestampContext = buildTrainingTimestampContext(merged, snapshot, generatedAt);
-  const context = { merged: [...merged], existingEdges: [...snapshot.edges] };
+  const context = {
+    merged: [...merged],
+    existingEdges: [...snapshot.edges],
+    ...(pageEvidenceByCanonicalUrl === undefined ? {} : { pageEvidenceByCanonicalUrl }),
+    ...(evidenceVectorsByVectorId === undefined ? {} : { evidenceVectorsByVectorId }),
+  };
 
   for (const fromVisitId of visitKeysList) {
     for (const candidate of generateCandidates(fromVisitId, context)) {
@@ -922,6 +938,7 @@ export const buildRankerTrainingCandidates = ({
     generatedAt,
   );
 
+  const featureContext = { merged: [...merged], snapshot };
   return [...candidates.values()]
     .map((candidate) => restampTrainingCandidate(candidate, timestampContext))
     .sort(
@@ -931,7 +948,7 @@ export const buildRankerTrainingCandidates = ({
     )
     .map((candidate) => ({
       candidate,
-      features: extractFeatures(candidate, { merged: [...merged], snapshot }),
+      features: extractFeatures(candidate, featureContext),
     }));
 };
 
@@ -952,10 +969,31 @@ const stateFromRevision = (
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
+const readRankerPageEvidenceContext = async (
+  vaultRoot: string,
+  snapshot: ConnectionsSnapshot,
+  suppliedEvidence: ReadonlyMap<string, PageEvidenceRecord> | undefined,
+  suppliedVectors: ReadonlyMap<string, Float32Array> | undefined,
+): Promise<{
+  readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
+}> => {
+  const pageEvidenceByCanonicalUrl =
+    suppliedEvidence ?? (await readPageEvidenceMap(vaultRoot, timelineVisitKeys(snapshot)));
+  const evidenceVectorsByVectorId =
+    suppliedVectors ?? (await readPageEvidenceVectorMap(vaultRoot, pageEvidenceByCanonicalUrl.values()));
+  return {
+    ...(pageEvidenceByCanonicalUrl.size === 0 ? {} : { pageEvidenceByCanonicalUrl }),
+    ...(evidenceVectorsByVectorId.size === 0 ? {} : { evidenceVectorsByVectorId }),
+  };
+};
+
 export const maybeRetrainClosestVisitRanker = async ({
   vaultRoot,
   merged,
   snapshot,
+  pageEvidenceByCanonicalUrl,
+  evidenceVectorsByVectorId,
   threshold,
   force: forceInput,
   randomNegativeCandidatesPerPositive,
@@ -1001,10 +1039,17 @@ export const maybeRetrainClosestVisitRanker = async ({
     };
   }
 
+  const evidenceContext = await readRankerPageEvidenceContext(
+    vaultRoot,
+    snapshot,
+    pageEvidenceByCanonicalUrl,
+    evidenceVectorsByVectorId,
+  );
   const candidates = buildRankerTrainingCandidates({
     feedback,
     merged,
     snapshot,
+    ...evidenceContext,
     ...(randomNegativeCandidatesPerPositive === undefined
       ? {}
       : { randomNegativeCandidatesPerPositive }),

@@ -2,11 +2,15 @@ import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { Candidate } from './types.js';
 
+// Bumped 3 → 4 when PageEvidence content terms/vectors became ranker
+// features. Persisted v3 models are rejected so the scorer cannot
+// silently ignore the new content-evidence columns during validation.
+//
 // Bumped 2 → 3 when the closest_visit scorer stopped consuming
 // workstream-identity leakage features. Persisted v2 models are
 // rejected so the scorer cannot keep emitting edges from a model whose
 // input vector was trained on leaked workstream closure.
-export const FEATURE_SCHEMA_VERSION = 3;
+export const FEATURE_SCHEMA_VERSION = 4;
 
 export interface CandidatePairFeatures {
   schemaVersion: typeof FEATURE_SCHEMA_VERSION;
@@ -39,6 +43,17 @@ export interface CandidatePairFeatures {
   // 3 = high) of the from / to pages.
   page_quality_tier_from: number;
   page_quality_tier_to: number;
+  shared_content_terms?: number;
+  shared_content_keyphrases?: number;
+  content_weighted_jaccard?: number;
+  content_vector_cosine?: number;
+  content_entity_overlap?: number;
+  content_evidence_tier_from?: number;
+  content_evidence_tier_to?: number;
+  content_both_available?: 0 | 1;
+  content_quality_pair_min?: number;
+  chunk_support_count?: number;
+  max_chunk_pair_score?: number;
 }
 
 export const CANDIDATE_PAIR_FEATURE_KEYS = [
@@ -65,6 +80,17 @@ export const CANDIDATE_PAIR_FEATURE_KEYS = [
   'topic_lineage_merge_split_related',
   'page_quality_tier_from',
   'page_quality_tier_to',
+  'shared_content_terms',
+  'shared_content_keyphrases',
+  'content_weighted_jaccard',
+  'content_vector_cosine',
+  'content_entity_overlap',
+  'content_evidence_tier_from',
+  'content_evidence_tier_to',
+  'content_both_available',
+  'content_quality_pair_min',
+  'chunk_support_count',
+  'max_chunk_pair_score',
 ] as const satisfies readonly (keyof CandidatePairFeatures)[];
 
 export type ExtractFeatures = (

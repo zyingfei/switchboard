@@ -39,6 +39,7 @@ import {
   ENGAGEMENT_SESSION_AGGREGATED,
 } from '../../engagement/events.js';
 import { FEEDBACK_EVENT_TYPES } from '../../feedback/events.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
 import {
   PRIVACY_GATE_FLIPPED,
   PRIVACY_PERMISSION_GRANTED,
@@ -328,6 +329,29 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         surface: 'recall-index',
         class: 'derived-cache',
         materializer: 'recall',
+        peerFreshnessMs: 30_000,
+        recovery: 'source-scoped-reextract',
+      },
+    ],
+  },
+  {
+    eventType: PAGE_EVIDENCE_EXTRACTED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'page-evidence-store',
+        class: 'derived-cache',
+        materializer: 'connections',
+        peerFreshnessMs: 30_000,
+        // features_only events are intentionally no-raw and do not carry
+        // terms/keyphrases/entities, so replay can invalidate but cannot
+        // reconstruct the feature store without revisiting/reextracting.
+        recovery: 'source-scoped-reextract',
+      },
+      {
+        surface: 'content-similarity',
+        class: 'derived-cache',
+        materializer: 'connections',
         peerFreshnessMs: 30_000,
         recovery: 'source-scoped-reextract',
       },

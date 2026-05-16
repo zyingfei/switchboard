@@ -16,11 +16,13 @@ import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerDiagnostics,
   type MaterializerDiagnosticsStore,
+  type MaterializerPhaseDuration,
   type MaterializerRankerAugmentationCounters,
   type MaterializerRankerMethodologySpineDiagnostics,
   type MaterializerRankerModelFreshness,
 } from '../../connections/materializerDiagnostics.js';
 import {
+  augmentConnectionsSnapshotWithClosestVisitRanker,
   buildConnectionsSnapshot,
   type ClosestVisitRanker,
   type ConnectionsInput,
@@ -131,7 +133,13 @@ import {
 } from '../../recall/content-lane.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
+import {
+  ensurePageEvidenceForTimelineEntries,
+  readPageEvidenceVectorMap,
+} from '../../page-evidence/store.js';
+import { readPageContentChunksForCanonicalUrls } from '../../page-content/store.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
   THREAD_ARCHIVED,
@@ -251,6 +259,7 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   ANNOTATION_DELETED,
   CAPTURE_RECORDED,
   CAPTURE_EXTRACTION_PRODUCED,
+  PAGE_EVIDENCE_EXTRACTED,
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
   USER_ENGAGEMENT_RELABELED,
@@ -792,12 +801,17 @@ export const createConnectionsMaterializer = (
     const phaseLogs = process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1';
     const phaseStart = Date.now();
     let phaseLast = phaseStart;
+    const phaseDurations: MaterializerPhaseDuration[] = [];
     const mark = (label: string): void => {
-      if (!phaseLogs) return;
       const now = Date.now();
-      console.warn(
-        `[connections-phase] ${label} dt=${String(now - phaseLast)}ms total=${String(now - phaseStart)}ms`,
-      );
+      const durationMs = now - phaseLast;
+      const totalMs = now - phaseStart;
+      phaseDurations.push({ label, durationMs, totalMs });
+      if (phaseLogs) {
+        console.warn(
+          `[connections-phase] ${label} dt=${String(durationMs)}ms total=${String(totalMs)}ms`,
+        );
+      }
       phaseLast = now;
     };
     // Stage 5.2 W6 — snapshot the invalidation keys accumulated since
@@ -871,10 +885,36 @@ export const createConnectionsMaterializer = (
     // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
     // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
     const similarityConfig: EffectiveVisitSimilarityConfig = resolveVisitSimilarityConfig();
-    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(
-      similarityEntries,
-      similarityConfig,
+    const similarityEligibleCount = similarityEntries.filter(
+      (entry) => focusedWindowMsFromEntry(entry) >= similarityConfig.engagementGateMs,
+    ).length;
+    const similarityPairBudget = Math.max(
+      0,
+      (similarityEligibleCount * (similarityEligibleCount - 1)) / 2,
     );
+    const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
+      deps.vaultRoot,
+      similarityEntries,
+    );
+    mark(`pageEvidence.ensure records=${String(pageEvidenceByCanonicalUrl.size)}`);
+    const pageEvidenceVectorsByVectorId = await readPageEvidenceVectorMap(
+      deps.vaultRoot,
+      pageEvidenceByCanonicalUrl.values(),
+    );
+    mark(`pageEvidence.vectorMapRead vectors=${String(pageEvidenceVectorsByVectorId.size)}`);
+    const pageContentChunksByCanonicalUrl = await readPageContentChunksForCanonicalUrls(
+      deps.vaultRoot,
+      [...pageEvidenceByCanonicalUrl.keys()],
+    );
+    mark(
+      `pageEvidence.chunkRead indexedChunkPages=${String(pageContentChunksByCanonicalUrl.size)}`,
+    );
+    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(similarityEntries, {
+      ...similarityConfig,
+      evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+      pageContentChunksByCanonicalUrl,
+    });
     const cachedSimilarityRevision = await readVisitSimilarityRevision(
       deps.vaultRoot,
       expectedSimilarityRevisionId,
@@ -904,7 +944,9 @@ export const createConnectionsMaterializer = (
       );
       const embeddingsByVisitKey = new Map<string, Float32Array>();
       if (newEntries.length > 0) {
-        const texts = newEntries.map((e) => `passage: ${corpusForVisitEntry(e)}`);
+        const texts = newEntries.map(
+          (e) => `passage: ${corpusForVisitEntry(e, pageEvidenceByCanonicalUrl)}`,
+        );
         try {
           const embedded = await (deps.embed ?? defaultEmbed)(texts);
           for (let i = 0; i < newEntries.length; i += 1) {
@@ -924,7 +966,12 @@ export const createConnectionsMaterializer = (
           visitSimilarity = await buildVisitSimilarity(
             similarityEntries,
             deps.embed ?? defaultEmbed,
-            similarityConfig,
+            {
+              ...similarityConfig,
+              evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+              evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+              pageContentChunksByCanonicalUrl,
+            },
           );
         }
       }
@@ -935,20 +982,24 @@ export const createConnectionsMaterializer = (
         options: {
           threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
           topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+          pageContentChunksByCanonicalUrl,
         },
       });
       mark(
-        `buildVisitSimilarityIncremental newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
+        `buildVisitSimilarityIncremental pairs=${String(similarityPairBudget)} newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
       );
     } else {
       // Legacy path with PR #141's resolved similarityConfig
       // (threshold / topK / engagementGateMs / lexical fallback).
-      visitSimilarity = await buildVisitSimilarity(
-        similarityEntries,
-        deps.embed ?? defaultEmbed,
-        similarityConfig,
-      );
-      mark('buildVisitSimilarity');
+      visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
+        ...similarityConfig,
+        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+        evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+        pageContentChunksByCanonicalUrl,
+      });
+      mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
     if (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
@@ -980,13 +1031,13 @@ export const createConnectionsMaterializer = (
       const newSimilarityPairs = new Set<string>(
         visitSimilarity.edges.map((e) =>
           e.fromVisitKey < e.toVisitKey
-            ? `${e.fromVisitKey} ${e.toVisitKey}`
-            : `${e.toVisitKey} ${e.fromVisitKey}`,
+            ? `${e.fromVisitKey}\u0000${e.toVisitKey}`
+            : `${e.toVisitKey}\u0000${e.fromVisitKey}`,
         ),
       );
       let removedCount = 0;
       for (const edge of prevSimilarityEdges) {
-        const sig = edge.a < edge.b ? `${edge.a} ${edge.b}` : `${edge.b} ${edge.a}`;
+        const sig = edge.a < edge.b ? `${edge.a}\u0000${edge.b}` : `${edge.b}\u0000${edge.a}`;
         if (!newSimilarityPairs.has(sig)) {
           topicAccumulator.removeEdge(edge.a, edge.b);
           removedCount += 1;
@@ -1098,6 +1149,7 @@ export const createConnectionsMaterializer = (
         visitSimilarity,
         userAssertedRelations,
         baselineRevision: topicRevision,
+        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
         cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
       });
@@ -1128,6 +1180,8 @@ export const createConnectionsMaterializer = (
       urlProjection,
       visitSimilarity,
       topicRevision: servedTopicRevision,
+      pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
       engagementClassRevision,
     };
     mark('projectionAccumulators.derive');
@@ -1144,7 +1198,12 @@ export const createConnectionsMaterializer = (
     await deps.store.putCurrent(baseSnapshot);
     mark('putCurrent baseSnapshot');
     await yieldToEventLoop();
-    const rankerRetrainResult = await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    const rankerRetrainResult = await rankerRetrainer({
+      merged,
+      snapshot: baseSnapshot,
+      pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+    });
     mark('rankerRetrainer');
     // Track the snapshot we ultimately wrote so diagnostics see the
     // ranker-augmented form when it was produced, the base form when
@@ -1171,12 +1230,15 @@ export const createConnectionsMaterializer = (
         );
         if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
-          finalSnapshot = buildConnectionsSnapshot({
-            ...input,
-            closestVisitRanker: closestVisitRanker.ranker,
-          });
+          finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
+            {
+              ...input,
+              closestVisitRanker: closestVisitRanker.ranker,
+            },
+            baseSnapshot,
+          );
           mark(
-            `buildConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
+            `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
           );
           await deps.store.putCurrent(finalSnapshot);
           mark('putCurrent ranker-augmented');
@@ -1235,6 +1297,8 @@ export const createConnectionsMaterializer = (
       urlProjection,
       snapshot: finalSnapshot,
       rankerAugmentation,
+      pageEvidenceRecords: [...pageEvidenceByCanonicalUrl.values()],
+      phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
     });
@@ -1417,7 +1481,7 @@ export const createConnectionsMaterializer = (
     // and don't touch the queue; Group B events mark their sourceUnitId
     // dirty (or tombstoned) and optionally record the latest extraction
     // revisionId. No I/O, no chunk/embed work — that's the reconciler's
-    // job. The buildAndWrite drain remains the byte-determinism oracle;
+    // job. The buildAndWrite drain remains the byte-determinism reference;
     // this queue is purely for the off-path content reconciler.
     foldGroupBEventIntoQueue(dirtySourceQueue, event);
     // Stage 5.2 W6 — accumulate invalidation keys for this event so the

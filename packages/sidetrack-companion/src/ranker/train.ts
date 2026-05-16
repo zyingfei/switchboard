@@ -18,13 +18,14 @@ import type { Candidate } from './types.js';
 // features. The manifest validator pins this exact string, so a model
 // persisted under v2 fails to load and the retrain loop produces a
 // fresh non-leaky model instead of reusing leaked weights.
-export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v3' as const;
+export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v4' as const;
 export const DEFAULT_RANKER_NUM_ROUND = 40;
 export const DEFAULT_RANKER_SEED = 20260508;
 // k for the in-sample NDCG@k offline metric captured at train time.
 export const RANKER_IN_SAMPLE_NDCG_K = 5;
 export const RANKER_HELD_OUT_NDCG_K = 5;
-export const DETERMINISTIC_BASELINE_VERSION = 'deterministic-feature-baseline-v1' as const;
+export const DETERMINISTIC_BASELINE_VERSION =
+  'deterministic-feature-baseline-v2-no-content-priors' as const;
 export const REGULARIZED_LOGISTIC_REGRESSION_VERSION =
   'regularized-logistic-regression-v1' as const;
 const RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA = 0.005;
@@ -271,6 +272,17 @@ export const RANKER_FEATURE_KEYS = [
   'topic_lineage_merge_split_related',
   'page_quality_tier_from',
   'page_quality_tier_to',
+  'shared_content_terms',
+  'shared_content_keyphrases',
+  'content_weighted_jaccard',
+  'content_vector_cosine',
+  'content_entity_overlap',
+  'content_evidence_tier_from',
+  'content_evidence_tier_to',
+  'content_both_available',
+  'content_quality_pair_min',
+  'chunk_support_count',
+  'max_chunk_pair_score',
 ] as const satisfies readonly RankerFeatureKey[];
 
 const PREDICT_CONTRIB_BIAS_SLOT_COUNT = 1;
@@ -518,7 +530,7 @@ const stableFeatureObject = (
 ): Record<keyof CandidatePairFeatures, number> => {
   const out = {} as Record<keyof CandidatePairFeatures, number>;
   for (const key of CANDIDATE_PAIR_FEATURE_KEYS) {
-    out[key] = features[key];
+    out[key] = features[key] ?? 0;
   }
   return out;
 };
@@ -547,7 +559,7 @@ export const createRankerRevisionId = (trainingDatasetHash: string): string =>
   ).slice(0, 16);
 
 const featureValue = (features: CandidatePairFeatures, key: RankerFeatureKey): number => {
-  const value = features[key];
+  const value = features[key] ?? 0;
   return Number.isFinite(value) ? value : 0;
 };
 
@@ -852,8 +864,21 @@ const logisticFeatureValue = (features: CandidatePairFeatures, key: RankerFeatur
       return cappedPositive(value, 5);
     case 'page_quality_tier_from':
     case 'page_quality_tier_to':
+    case 'content_evidence_tier_from':
+    case 'content_evidence_tier_to':
+    case 'content_quality_pair_min':
       return cappedPositive(value, 3);
+    case 'shared_content_terms':
+      return cappedPositive(value, 6);
+    case 'shared_content_keyphrases':
+    case 'content_entity_overlap':
+      return cappedPositive(value, 4);
+    case 'chunk_support_count':
+      return cappedPositive(value, 5);
     case 'cosine_similarity':
+    case 'content_weighted_jaccard':
+    case 'content_vector_cosine':
+    case 'max_chunk_pair_score':
     case 'recency_score_from':
     case 'recency_score_to':
       return clamp01(value);
@@ -868,6 +893,7 @@ const logisticFeatureValue = (features: CandidatePairFeatures, key: RankerFeatur
     case 'user_asserted_in_workstream':
     case 'same_active_topic':
     case 'topic_lineage_merge_split_related':
+    case 'content_both_available':
       return value;
   }
 };

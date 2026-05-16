@@ -11,6 +11,7 @@ export interface SimilarityEvidence {
   readonly simMeanScore: number;
   readonly simAgreement: number;
   readonly simMargin: number;
+  readonly simMatchedTerms?: readonly string[];
 }
 
 export interface BuildSimilarityEvidenceInput {
@@ -25,10 +26,17 @@ const VISIT_PREFIX = 'timeline-visit:';
 const VISIT_INSTANCE_PREFIX = 'visit-instance:';
 const WORKSTREAM_PREFIX = 'workstream:';
 
-const scoreForEdge = (kind: string): number => {
+const scoreForEdge = (kind: string, metadata?: Readonly<Record<string, unknown>>): number => {
   if (kind === 'closest_visit') return 1;
   if (kind === 'visit_continues_visit') return 0.85;
-  if (kind === 'visit_resembles_visit') return 0.7;
+  if (kind === 'visit_resembles_visit') {
+    const score = metadata?.['score'] ?? metadata?.['cosine'] ?? metadata?.['similarity'];
+    const confidence = metadata?.['confidence'];
+    const normalizedScore = typeof score === 'number' && Number.isFinite(score) ? score : 0.7;
+    const normalizedConfidence =
+      typeof confidence === 'number' && Number.isFinite(confidence) ? confidence : 1;
+    return Math.max(0, Math.min(1, normalizedScore * normalizedConfidence));
+  }
   return 0;
 };
 
@@ -97,11 +105,21 @@ export const buildSimilarityEvidence = ({
   }
 
   const byWorkstream = new Map<string, number[]>();
-  const addScore = (workstreamId: string | undefined, score: number): void => {
+  const matchedTermsByWorkstream = new Map<string, Set<string>>();
+  const addScore = (
+    workstreamId: string | undefined,
+    score: number,
+    matchedTerms: readonly string[] = [],
+  ): void => {
     if (workstreamId === undefined || !Number.isFinite(score) || score <= 0) return;
     const list = byWorkstream.get(workstreamId) ?? [];
     list.push(Math.max(0, Math.min(1, score)));
     byWorkstream.set(workstreamId, list);
+    if (matchedTerms.length > 0) {
+      const terms = matchedTermsByWorkstream.get(workstreamId) ?? new Set<string>();
+      for (const term of matchedTerms) terms.add(term);
+      matchedTermsByWorkstream.set(workstreamId, terms);
+    }
   };
 
   const context = { merged: [...events], existingEdges: [...snapshot.edges] };
@@ -144,7 +162,7 @@ export const buildSimilarityEvidence = ({
   }
 
   for (const edge of snapshot.edges) {
-    const score = scoreForEdge(edge.kind);
+    const score = scoreForEdge(edge.kind, edge.metadata);
     if (score === 0) continue;
     const other =
       canonicalTargetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(VISIT_PREFIX)
@@ -159,7 +177,22 @@ export const buildSimilarityEvidence = ({
               ? canonicalVisitForNode(snapshot, edge.fromNodeId)
               : null;
     if (other === null) continue;
-    addScore(visitWorkstream.get(other), score);
+    const matchedTerms = [
+      ...(Array.isArray(edge.metadata?.['matchedTerms'])
+        ? edge.metadata['matchedTerms'].filter((term): term is string => typeof term === 'string')
+        : []),
+      ...(Array.isArray(edge.metadata?.['matchedKeyphrases'])
+        ? edge.metadata['matchedKeyphrases'].filter(
+            (term): term is string => typeof term === 'string',
+          )
+        : []),
+      ...(Array.isArray(edge.metadata?.['matchedEntities'])
+        ? edge.metadata['matchedEntities'].filter(
+            (term): term is string => typeof term === 'string',
+          )
+        : []),
+    ];
+    addScore(visitWorkstream.get(other), score, matchedTerms);
   }
 
   const topScores = [...byWorkstream.values()]
@@ -176,6 +209,13 @@ export const buildSimilarityEvidence = ({
         simMeanScore: scores.reduce((sum, value) => sum + value, 0) / scores.length,
         simAgreement: Math.min(1, scores.length / 10),
         simMargin: Math.max(0, top - second),
+        ...((matchedTermsByWorkstream.get(workstreamId)?.size ?? 0) === 0
+          ? {}
+          : {
+              simMatchedTerms: [...(matchedTermsByWorkstream.get(workstreamId) ?? [])]
+                .sort()
+                .slice(0, 5),
+            }),
       };
     });
 };

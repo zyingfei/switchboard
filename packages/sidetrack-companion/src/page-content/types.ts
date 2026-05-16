@@ -1,3 +1,5 @@
+import type { VectorRef, WeightedTerm } from '../page-evidence/types.js';
+
 export const PAGE_CONTENT_EXTRACTED = 'page.content.extracted' as const;
 export const PAGE_CONTENT_TOMBSTONED = 'page.content.tombstoned' as const;
 
@@ -109,6 +111,10 @@ export interface PageContentChunk {
   readonly extractedAt: string;
   readonly quality: PageContentQuality;
   readonly extractionStrategy: PageContentExtractionStrategy;
+  readonly headingPath?: readonly string[];
+  readonly terms?: readonly WeightedTerm[];
+  readonly embeddingRef?: VectorRef;
+  readonly qualityWeight?: number;
 }
 
 export interface ContentSearchHit {

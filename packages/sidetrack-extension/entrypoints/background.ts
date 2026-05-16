@@ -74,6 +74,7 @@ import {
   type SelectionCopiedPayload,
   type SelectionPastedPayload,
 } from '../src/content/engagement/copy-paste';
+import type { EngagementIntervalMessage } from '../src/content/engagement/aggregator';
 import {
   VISUAL_FINGERPRINT_OBSERVED,
   VISUAL_FINGERPRINT_PRIVACY_GET,
@@ -86,6 +87,7 @@ import { createRecallClient } from '../src/companion/recallClient';
 import {
   createPageContentClient,
   type PageContentCoverage,
+  type PageEvidenceRecord,
 } from '../src/companion/pageContentClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
@@ -973,6 +975,99 @@ const extractPageContentFromTab = async (
     throw new Error('Companion not configured.');
   }
   return await createPageContentClient(settings.companion).index(result.data.payload);
+};
+
+type PageEvidenceTrigger =
+  | 'manual'
+  | 'workstream-policy'
+  | 'save-suggestion'
+  | 'allowlist'
+  | 'attention-gate'
+  | 'bulk-open-tabs';
+
+const extractPageEvidenceFromTab = async (
+  tab: chrome.tabs.Tab,
+  trigger: PageEvidenceTrigger,
+): Promise<PageEvidenceRecord> => {
+  if (typeof tab.id !== 'number') {
+    throw new Error('Current tab has no tab id.');
+  }
+  if (tab.incognito === true) {
+    throw new Error('Page-evidence extraction is disabled in incognito tabs.');
+  }
+  const tabUrl = tab.url ?? '';
+  if (!/^https?:\/\//u.test(tabUrl)) {
+    throw new Error('Page-evidence extraction only supports HTTP(S) pages.');
+  }
+  const request = {
+    type: messageTypes.pageContentExtract,
+    mode: 'page',
+    trigger,
+  } as const;
+  let result = await sendToContentScriptWithRecovery(tab.id, request);
+  if (result.ok && !isPageContentExtractContentResponse(result.data)) {
+    const inject = await ensureContentScriptInTab(tab.id);
+    if (!inject.ok) {
+      throw new Error(
+        `Content script returned an invalid page-evidence response. Tried to recover but: ${inject.error ?? 'inject failed'}.`,
+      );
+    }
+    result = await sendToContentScriptWithRecovery(tab.id, request);
+  }
+  if (!result.ok) {
+    throw new Error(result.error ?? 'Content script is not reachable.');
+  }
+  if (!isPageContentExtractContentResponse(result.data)) {
+    throw new Error('Content script returned an invalid page-evidence response.');
+  }
+  if (!result.data.ok) {
+    throw new Error(result.data.error);
+  }
+  const settings = await readSettings();
+  if (settings.companion.bridgeKey.trim().length === 0) {
+    throw new Error('Companion not configured.');
+  }
+  return await createPageContentClient(settings.companion).evidence(
+    result.data.payload,
+    'features_only',
+  );
+};
+
+const PAGE_EVIDENCE_ATTENTION_GATE_MS = 5_000;
+const PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+const pageEvidenceAttentionExtractedAtByCanonical = new Map<string, number>();
+
+const maybeExtractAttentionGatePageEvidence = async (
+  tabId: number,
+  message: EngagementIntervalMessage,
+): Promise<void> => {
+  const settings = await readSettings();
+  if (settings.pageEvidenceAutoExtractEnabled !== true) return;
+  const focusedWindowMs = message.dimensions.engagement.focusedWindowMs;
+  if (focusedWindowMs < PAGE_EVIDENCE_ATTENTION_GATE_MS) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab === null || typeof tab.url !== 'string' || !/^https?:\/\//u.test(tab.url)) return;
+  if (tab.incognito === true) return;
+  const canonicalUrl = canonicalThreadUrl(tab.url);
+  const now = Date.now();
+  const previous = pageEvidenceAttentionExtractedAtByCanonical.get(canonicalUrl);
+  if (previous !== undefined && now - previous < PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS) return;
+  pageEvidenceAttentionExtractedAtByCanonical.set(canonicalUrl, now);
+  try {
+    await extractPageEvidenceFromTab(tab, 'attention-gate');
+    await recordEngagementSyncDiag('pageEvidence.extracted', {
+      tabId,
+      focusedWindowMs,
+      canonicalUrl,
+    });
+  } catch (error) {
+    await recordEngagementSyncDiag('pageEvidence.failed', {
+      tabId,
+      focusedWindowMs,
+      canonicalUrl,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 };
 
 const openTabPreviewForPageContent = (tab: chrome.tabs.Tab): PageContentOpenTabPreview => {
@@ -3378,6 +3473,7 @@ export default defineBackground(() => {
       final: message.final,
       payloadCount: payloads.length,
     });
+    void maybeExtractAttentionGatePageEvidence(tabId, message);
   };
 
   const finalizeEngagementForTab = async (tabId: number): Promise<void> => {

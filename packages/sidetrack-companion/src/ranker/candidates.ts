@@ -1,6 +1,8 @@
 import { type ConnectionEdge } from '../connections/types.js';
 import { USER_FLOW_CONFIRMED } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
+import { type WeightedItem } from '../page-evidence/idf.js';
+import type { PageEvidenceRecord, WeightedEntity } from '../page-evidence/types.js';
 import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
@@ -38,6 +40,8 @@ export const CANDIDATE_SOURCES = [
   'same_copied_snippet',
   'same_title_path_tokens',
   'embedding_neighborhood',
+  'content_term_overlap',
+  'content_embedding_neighborhood',
   'cross_replica_continuation',
   'random_unrelated',
   'recently_skipped',
@@ -268,6 +272,42 @@ const collectVisitRecords = (events: readonly AcceptedEvent[]): readonly VisitRe
 const recordsById = (records: readonly VisitRecord[]): ReadonlyMap<string, VisitRecord> =>
   new Map(records.map((record) => [record.id, record] as const));
 
+interface GroupedRecordIndex {
+  readonly byKey: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly keysByRecordId: ReadonlyMap<string, readonly string[]>;
+}
+
+interface CandidateContextIndexes {
+  readonly generatedAt: number;
+  readonly records: readonly VisitRecord[];
+  readonly recordsById: ReadonlyMap<string, VisitRecord>;
+  readonly groupedRecordIndexes: Map<CandidateSource, GroupedRecordIndex>;
+  readonly chainGraphs: Map<CandidateSource, ReadonlyMap<string, ReadonlySet<string>>>;
+  workstreamGroups?: ReadonlyMap<string, ReadonlySet<string>>;
+  snippetGroups?: ReadonlyMap<string, ReadonlySet<string>>;
+  embeddingNeighbors?: ReadonlyMap<string, ReadonlySet<string>>;
+  contentTermEdgeNeighbors?: ReadonlyMap<string, ReadonlySet<string>>;
+  contentVectorEdgeNeighbors?: ReadonlyMap<string, ReadonlySet<string>>;
+  contentTermEvidenceNeighbors?: ReadonlyMap<string, readonly string[]>;
+}
+
+const indexesByContext = new WeakMap<object, CandidateContextIndexes>();
+
+const indexesFor = (context: CandidateContext): CandidateContextIndexes => {
+  const cached = indexesByContext.get(context);
+  if (cached !== undefined) return cached;
+  const records = collectVisitRecords(context.merged);
+  const indexes: CandidateContextIndexes = {
+    generatedAt: stableGeneratedAt(context),
+    records,
+    recordsById: recordsById(records),
+    groupedRecordIndexes: new Map(),
+    chainGraphs: new Map(),
+  };
+  indexesByContext.set(context, indexes);
+  return indexes;
+};
+
 const addToSetMap = (map: Map<string, Set<string>>, key: string, value: string): void => {
   if (key.length === 0 || value.length === 0) return;
   let set = map.get(key);
@@ -331,7 +371,7 @@ const pairSourceGenerator =
 const sourceWrapper =
   (source: CandidateSource, generator: SourceGenerator): GenerateCandidates =>
   (fromVisitId, context) =>
-    generator(fromVisitId, context, stableGeneratedAt(context));
+    generator(fromVisitId, context, indexesFor(context).generatedAt);
 
 const groupedRecordCandidates = (
   fromVisitId: string,
@@ -340,21 +380,27 @@ const groupedRecordCandidates = (
   generatedAt: number,
   keyForRecord: (record: VisitRecord) => readonly string[],
 ): readonly Candidate[] => {
-  const records = collectVisitRecords(context.merged);
-  const byId = recordsById(records);
-  const fromRecord = byId.get(fromKeyFor(fromVisitId));
+  const indexes = indexesFor(context);
+  const fromRecord = indexes.recordsById.get(fromKeyFor(fromVisitId));
   if (fromRecord === undefined) return [];
-
-  const byKey = new Map<string, Set<string>>();
-  for (const record of records) {
-    for (const key of keyForRecord(record)) {
-      addToSetMap(byKey, key, record.id);
+  let grouped = indexes.groupedRecordIndexes.get(source);
+  if (grouped === undefined) {
+    const byKey = new Map<string, Set<string>>();
+    const keysByRecordId = new Map<string, readonly string[]>();
+    for (const record of indexes.records) {
+      const keys = keyForRecord(record);
+      keysByRecordId.set(record.id, keys);
+      for (const key of keys) {
+        addToSetMap(byKey, key, record.id);
+      }
     }
+    grouped = { byKey, keysByRecordId };
+    indexes.groupedRecordIndexes.set(source, grouped);
   }
 
   const toVisitIds = new Set<string>();
-  for (const key of keyForRecord(fromRecord)) {
-    for (const toVisitId of toSortedIds(byKey.get(key))) {
+  for (const key of grouped.keysByRecordId.get(fromRecord.id) ?? []) {
+    for (const toVisitId of toSortedIds(grouped.byKey.get(key))) {
       toVisitIds.add(toVisitId);
     }
   }
@@ -384,24 +430,28 @@ const workstreamGroupsFromEdges = (
 };
 
 const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const groups = new Map<string, Set<string>>();
-  const edgeGroups = workstreamGroupsFromEdges(context.existingEdges);
-  const visitsWithEdgeWorkstream = new Set<string>();
-  for (const visitIds of edgeGroups.values()) {
-    for (const visitId of visitIds) visitsWithEdgeWorkstream.add(visitId);
-  }
-  for (const record of collectVisitRecords(context.merged)) {
-    if (record.workstreamId !== undefined && !visitsWithEdgeWorkstream.has(record.id)) {
-      addToSetMap(groups, record.workstreamId, record.id);
+  const indexes = indexesFor(context);
+  if (indexes.workstreamGroups === undefined) {
+    const groups = new Map<string, Set<string>>();
+    const edgeGroups = workstreamGroupsFromEdges(context.existingEdges);
+    const visitsWithEdgeWorkstream = new Set<string>();
+    for (const visitIds of edgeGroups.values()) {
+      for (const visitId of visitIds) visitsWithEdgeWorkstream.add(visitId);
     }
-  }
-  for (const [workstreamId, visitIds] of edgeGroups) {
-    for (const visitId of visitIds) addToSetMap(groups, workstreamId, visitId);
+    for (const record of indexes.records) {
+      if (record.workstreamId !== undefined && !visitsWithEdgeWorkstream.has(record.id)) {
+        addToSetMap(groups, record.workstreamId, record.id);
+      }
+    }
+    for (const [workstreamId, visitIds] of edgeGroups) {
+      for (const visitId of visitIds) addToSetMap(groups, workstreamId, visitId);
+    }
+    indexes.workstreamGroups = groups;
   }
 
   const fromKey = fromKeyFor(fromVisitId);
   const toVisitIds = new Set<string>();
-  for (const visitIds of groups.values()) {
+  for (const visitIds of indexes.workstreamGroups.values()) {
     if (!visitIds.has(fromKey)) continue;
     for (const visitId of visitIds) toVisitIds.add(visitId);
   }
@@ -415,10 +465,16 @@ const chainGenerator =
     linkForRecord: (record: VisitRecord) => string | undefined,
   ): SourceGenerator =>
   (fromVisitId, context, generatedAt) => {
-    const graph = new Map<string, Set<string>>();
-    for (const record of collectVisitRecords(context.merged)) {
-      const linked = linkForRecord(record);
-      if (linked !== undefined) addUndirected(graph, record.id, linked);
+    const indexes = indexesFor(context);
+    let graph = indexes.chainGraphs.get(source);
+    if (graph === undefined) {
+      const nextGraph = new Map<string, Set<string>>();
+      for (const record of indexes.records) {
+        const linked = linkForRecord(record);
+        if (linked !== undefined) addUndirected(nextGraph, record.id, linked);
+      }
+      graph = nextGraph;
+      indexes.chainGraphs.set(source, graph);
     }
     return candidatesFromIds(
       fromVisitId,
@@ -538,17 +594,21 @@ const snippetGroupsFromEdges = (
 };
 
 const sameCopiedSnippetGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const groups = new Map<string, Set<string>>();
-  for (const [snippetId, visitIds] of snippetGroupsFromEvents(context.merged)) {
-    for (const visitId of visitIds) addToSetMap(groups, snippetId, visitId);
-  }
-  for (const [snippetId, visitIds] of snippetGroupsFromEdges(context.existingEdges)) {
-    for (const visitId of visitIds) addToSetMap(groups, snippetId, visitId);
+  const indexes = indexesFor(context);
+  if (indexes.snippetGroups === undefined) {
+    const groups = new Map<string, Set<string>>();
+    for (const [snippetId, visitIds] of snippetGroupsFromEvents(context.merged)) {
+      for (const visitId of visitIds) addToSetMap(groups, snippetId, visitId);
+    }
+    for (const [snippetId, visitIds] of snippetGroupsFromEdges(context.existingEdges)) {
+      for (const visitId of visitIds) addToSetMap(groups, snippetId, visitId);
+    }
+    indexes.snippetGroups = groups;
   }
 
   const fromKey = fromKeyFor(fromVisitId);
   const toVisitIds = new Set<string>();
-  for (const visitIds of groups.values()) {
+  for (const visitIds of indexes.snippetGroups.values()) {
     if (!visitIds.has(fromKey)) continue;
     for (const visitId of visitIds) toVisitIds.add(visitId);
   }
@@ -556,25 +616,193 @@ const sameCopiedSnippetGenerator: SourceGenerator = (fromVisitId, context, gener
 };
 
 const embeddingNeighborhoodGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const fromKey = fromKeyFor(fromVisitId);
-  const toVisitIds = new Set<string>();
-  for (const edge of context.existingEdges) {
-    if (edge.kind !== 'visit_resembles_visit') continue;
-    const fromEdgeVisit = visitIdFromNodeOrRaw(edge.fromNodeId);
-    const toEdgeVisit = visitIdFromNodeOrRaw(edge.toNodeId);
-    if (fromEdgeVisit === fromKey) toVisitIds.add(toEdgeVisit);
-    if (toEdgeVisit === fromKey) toVisitIds.add(fromEdgeVisit);
+  const indexes = indexesFor(context);
+  if (indexes.embeddingNeighbors === undefined) {
+    const neighbors = new Map<string, Set<string>>();
+    for (const edge of context.existingEdges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const fromEdgeVisit = visitIdFromNodeOrRaw(edge.fromNodeId);
+      const toEdgeVisit = visitIdFromNodeOrRaw(edge.toNodeId);
+      addToSetMap(neighbors, fromEdgeVisit, toEdgeVisit);
+      addToSetMap(neighbors, toEdgeVisit, fromEdgeVisit);
+    }
+    indexes.embeddingNeighbors = neighbors;
   }
-  return candidatesFromIds(fromVisitId, toVisitIds, 'embedding_neighborhood', generatedAt);
+  const fromKey = fromKeyFor(fromVisitId);
+  return candidatesFromIds(
+    fromVisitId,
+    toSortedIds(indexes.embeddingNeighbors.get(fromKey)),
+    'embedding_neighborhood',
+    generatedAt,
+  );
+};
+
+const weightedEntityItems = (entities: readonly WeightedEntity[]): readonly WeightedItem[] =>
+  entities.map((entity) => ({ normalized: entity.normalized, weight: entity.weight }));
+
+const contentItemsFor = (evidence: PageEvidenceRecord): readonly WeightedItem[] => [
+  ...(evidence.content?.terms ?? []),
+  ...(evidence.content?.keyphrases ?? []),
+  ...weightedEntityItems(evidence.content?.entities ?? []),
+];
+
+const CONTENT_TERM_SOURCE_LIMIT = 80;
+const CONTENT_TERM_POSTING_LIMIT = 200;
+const CONTENT_TERM_CANDIDATE_LIMIT = 80;
+
+interface ContentPosting {
+  readonly canonicalUrl: string;
+  readonly weight: number;
+}
+
+const sortedContentItems = (evidence: PageEvidenceRecord): readonly WeightedItem[] =>
+  [...contentItemsFor(evidence)]
+    .filter((item) => item.normalized.length > 0 && item.weight > 0)
+    .sort(
+      (left, right) => right.weight - left.weight || compareText(left.normalized, right.normalized),
+    )
+    .slice(0, CONTENT_TERM_SOURCE_LIMIT);
+
+const contentTermOverlapFromEvidence = (
+  fromVisitId: string,
+  context: CandidateContext,
+  generatedAt: number,
+): readonly Candidate[] | null => {
+  const indexes = indexesFor(context);
+  const evidenceByCanonicalUrl = context.pageEvidenceByCanonicalUrl;
+  if (evidenceByCanonicalUrl === undefined) return null;
+  const fromKey = fromKeyFor(fromVisitId);
+  const fromEvidence = evidenceByCanonicalUrl.get(fromKey);
+  if (fromEvidence?.content === undefined) return [];
+  if (indexes.contentTermEvidenceNeighbors === undefined) {
+    const records = [...evidenceByCanonicalUrl.values()].filter((record) => {
+      if (record.content === undefined) return false;
+      return sortedContentItems(record).length > 0;
+    });
+    const itemsByUrl = new Map(
+      records.map((record) => [record.canonicalUrl, sortedContentItems(record)] as const),
+    );
+    const postingsByTerm = new Map<string, ContentPosting[]>();
+    for (const record of records) {
+      for (const item of itemsByUrl.get(record.canonicalUrl) ?? []) {
+        const postings = postingsByTerm.get(item.normalized) ?? [];
+        postings.push({ canonicalUrl: record.canonicalUrl, weight: item.weight });
+        postingsByTerm.set(item.normalized, postings);
+      }
+    }
+    for (const [term, postings] of postingsByTerm) {
+      postingsByTerm.set(
+        term,
+        postings
+          .sort(
+            (left, right) =>
+              right.weight - left.weight || compareText(left.canonicalUrl, right.canonicalUrl),
+          )
+          .slice(0, CONTENT_TERM_POSTING_LIMIT),
+      );
+    }
+    const neighbors = new Map<string, readonly string[]>();
+    for (const record of records) {
+      const scores = new Map<string, number>();
+      for (const item of itemsByUrl.get(record.canonicalUrl) ?? []) {
+        for (const posting of postingsByTerm.get(item.normalized) ?? []) {
+          if (posting.canonicalUrl === record.canonicalUrl) continue;
+          scores.set(
+            posting.canonicalUrl,
+            (scores.get(posting.canonicalUrl) ?? 0) + Math.min(item.weight, posting.weight),
+          );
+        }
+      }
+      const ranked = [...scores.entries()]
+        .map(([canonicalUrl, score]) => ({ canonicalUrl, score }))
+        .sort(
+          (left, right) =>
+            right.score - left.score || compareText(left.canonicalUrl, right.canonicalUrl),
+        )
+        .slice(0, CONTENT_TERM_CANDIDATE_LIMIT)
+        .map((row) => row.canonicalUrl);
+      neighbors.set(record.canonicalUrl, ranked);
+    }
+    indexes.contentTermEvidenceNeighbors = neighbors;
+  }
+  return candidatesFromIds(
+    fromVisitId,
+    indexes.contentTermEvidenceNeighbors.get(fromEvidence.canonicalUrl) ?? [],
+    'content_term_overlap',
+    generatedAt,
+  );
+};
+
+const contentTermOverlapGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
+  const evidenceCandidates = contentTermOverlapFromEvidence(fromVisitId, context, generatedAt);
+  if (evidenceCandidates !== null) return evidenceCandidates;
+  const indexes = indexesFor(context);
+  if (indexes.contentTermEdgeNeighbors === undefined) {
+    const neighbors = new Map<string, Set<string>>();
+    for (const edge of context.existingEdges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const matchedTerms = edge.metadata?.['matchedTerms'];
+      const matchedKeyphrases = edge.metadata?.['matchedKeyphrases'];
+      const matchedEntities = edge.metadata?.['matchedEntities'];
+      const hasContentTerms =
+        (Array.isArray(matchedTerms) && matchedTerms.length > 0) ||
+        (Array.isArray(matchedKeyphrases) && matchedKeyphrases.length > 0) ||
+        (Array.isArray(matchedEntities) && matchedEntities.length > 0);
+      if (!hasContentTerms) continue;
+      const fromEdgeVisit = visitIdFromNodeOrRaw(edge.fromNodeId);
+      const toEdgeVisit = visitIdFromNodeOrRaw(edge.toNodeId);
+      addToSetMap(neighbors, fromEdgeVisit, toEdgeVisit);
+      addToSetMap(neighbors, toEdgeVisit, fromEdgeVisit);
+    }
+    indexes.contentTermEdgeNeighbors = neighbors;
+  }
+  const fromKey = fromKeyFor(fromVisitId);
+  return candidatesFromIds(
+    fromVisitId,
+    toSortedIds(indexes.contentTermEdgeNeighbors.get(fromKey)),
+    'content_term_overlap',
+    generatedAt,
+  );
+};
+
+const contentEmbeddingNeighborhoodGenerator: SourceGenerator = (
+  fromVisitId,
+  context,
+  generatedAt,
+) => {
+  const indexes = indexesFor(context);
+  if (indexes.contentVectorEdgeNeighbors === undefined) {
+    const neighbors = new Map<string, Set<string>>();
+    for (const edge of context.existingEdges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const channels = edge.metadata?.['channels'];
+      const contentVector =
+        isRecord(channels) && typeof channels['contentVector'] === 'number'
+          ? channels['contentVector']
+          : undefined;
+      if (contentVector === undefined || contentVector <= 0) continue;
+      const fromEdgeVisit = visitIdFromNodeOrRaw(edge.fromNodeId);
+      const toEdgeVisit = visitIdFromNodeOrRaw(edge.toNodeId);
+      addToSetMap(neighbors, fromEdgeVisit, toEdgeVisit);
+      addToSetMap(neighbors, toEdgeVisit, fromEdgeVisit);
+    }
+    indexes.contentVectorEdgeNeighbors = neighbors;
+  }
+  const fromKey = fromKeyFor(fromVisitId);
+  return candidatesFromIds(
+    fromVisitId,
+    toSortedIds(indexes.contentVectorEdgeNeighbors.get(fromKey)),
+    'content_embedding_neighborhood',
+    generatedAt,
+  );
 };
 
 const crossReplicaContinuationGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const records = collectVisitRecords(context.merged);
-  const byId = recordsById(records);
-  const fromRecord = byId.get(fromKeyFor(fromVisitId));
+  const indexes = indexesFor(context);
+  const fromRecord = indexes.recordsById.get(fromKeyFor(fromVisitId));
   if (fromRecord?.replicaId === undefined) return [];
 
-  const toVisitIds = records
+  const toVisitIds = indexes.records
     .filter(
       (record) =>
         record.canonicalUrl === fromRecord.canonicalUrl &&
@@ -695,6 +923,16 @@ export const generateEmbeddingNeighborhoodCandidates: GenerateCandidates = sourc
   embeddingNeighborhoodGenerator,
 );
 
+export const generateContentTermOverlapCandidates: GenerateCandidates = sourceWrapper(
+  'content_term_overlap',
+  contentTermOverlapGenerator,
+);
+
+export const generateContentEmbeddingNeighborhoodCandidates: GenerateCandidates = sourceWrapper(
+  'content_embedding_neighborhood',
+  contentEmbeddingNeighborhoodGenerator,
+);
+
 export const generateCrossReplicaContinuationCandidates: GenerateCandidates = sourceWrapper(
   'cross_replica_continuation',
   crossReplicaContinuationGenerator,
@@ -721,6 +959,8 @@ export const CANDIDATE_GENERATORS: Readonly<Record<CandidateSource, GenerateCand
   same_copied_snippet: generateSameCopiedSnippetCandidates,
   same_title_path_tokens: generateSameTitlePathTokensCandidates,
   embedding_neighborhood: generateEmbeddingNeighborhoodCandidates,
+  content_term_overlap: generateContentTermOverlapCandidates,
+  content_embedding_neighborhood: generateContentEmbeddingNeighborhoodCandidates,
   cross_replica_continuation: generateCrossReplicaContinuationCandidates,
   random_unrelated: generateRandomUnrelatedCandidates,
   recently_skipped: generateRecentlySkippedCandidates,

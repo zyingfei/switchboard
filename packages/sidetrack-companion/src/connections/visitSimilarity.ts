@@ -1,6 +1,26 @@
 import { createHash } from 'node:crypto';
 
 import { buildAnnIndex } from '../recall/ann-index.js';
+import { evidenceCorpusForRecord } from '../page-evidence/extract.js';
+import {
+  DEFAULT_UNKNOWN_IDF,
+  userIdf,
+  weightedContainment,
+  weightedJaccard,
+} from '../page-evidence/idf.js';
+import {
+  PAGE_EVIDENCE_COLD_START_SCORING_POLICY,
+  confidenceForPageEvidencePair,
+  extractionReliabilityForQuality,
+  fusePageEvidenceChannelScores,
+} from '../page-evidence/scoringPolicy.js';
+import { compatibleVectorRefs } from '../page-evidence/vectorRef.js';
+import type {
+  PageEvidenceRecord,
+  PageEvidenceSimilarityMetadata,
+  WeightedEntity,
+  WeightedTerm,
+} from '../page-evidence/types.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { buildLexicalIndex, rankHybrid, type IndexEntry } from '../recall/ranker.js';
 import type { TimelineEntry } from '../timeline/projection.js';
@@ -30,6 +50,12 @@ export interface BuildVisitSimilarityOptions {
   // that simulate "embedder is unavailable, no edges expected." Default
   // honors the env var (enabled unless explicitly disabled).
   readonly lexicalFallbackEnabled?: boolean;
+  readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
+  readonly pageContentChunksByCanonicalUrl?: ReadonlyMap<
+    string,
+    readonly VisitSimilarityChunkEvidence[]
+  >;
 }
 
 export const VISIT_SIMILARITY_MODEL_ID = 'Xenova/multilingual-e5-small' as const;
@@ -67,12 +93,19 @@ const lexicalFallbackEnabled = (): boolean => {
 
 const PASSAGE_PREFIX = 'passage: ';
 const QUERY_PREFIX = 'query: ';
+const CHUNK_SUPPORT_THRESHOLD = 0.2;
 
 interface NormalizedVisit {
   readonly visitKey: string;
   readonly lastSeenAt: string;
   readonly corpus: string;
   readonly focusedWindowMs: number;
+  readonly evidence?: PageEvidenceRecord;
+}
+
+export interface VisitSimilarityChunkEvidence {
+  readonly terms?: readonly WeightedTerm[];
+  readonly qualityWeight?: number;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -127,7 +160,21 @@ const hostnameForUrl = (url: string): string => {
 // Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
 // from outside this module. They're stateless + cheap; expose as named
 // exports so the materializer can compute pre-embedding inputs.
-export const corpusForVisitEntry = (entry: VisitSimilarityEntry): string => {
+const evidenceForEntry = (
+  entry: VisitSimilarityEntry,
+  evidenceByCanonicalUrl: ReadonlyMap<string, PageEvidenceRecord> | undefined,
+): PageEvidenceRecord | undefined => {
+  if (evidenceByCanonicalUrl === undefined) return undefined;
+  const visitKey = visitKeyForVisitEntry(entry);
+  return evidenceByCanonicalUrl.get(visitKey);
+};
+
+export const corpusForVisitEntry = (
+  entry: VisitSimilarityEntry,
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
+): string => {
+  const evidence = evidenceForEntry(entry, evidenceByCanonicalUrl);
+  if (evidence !== undefined) return evidenceCorpusForRecord(evidence);
   const url = entry.canonicalUrl ?? entry.url;
   return normalizeSpaces(
     [entry.title ?? '', hostnameForUrl(url), ...pathTokensForUrl(url)].join(' '),
@@ -161,23 +208,79 @@ const preferNewEntry = (existing: NormalizedVisit, candidate: NormalizedVisit): 
     : { ...existing, focusedWindowMs };
 };
 
-const normalizeEntries = (entries: readonly VisitSimilarityEntry[]): readonly NormalizedVisit[] => {
+const roundWeight = (value: number): number => Number(value.toFixed(6));
+
+const corpusAdjustedTerms = (
+  terms: readonly WeightedTerm[],
+  dfByTerm: ReadonlyMap<string, number>,
+  documentCount: number,
+): readonly WeightedTerm[] =>
+  terms.map((term) => {
+    const df = dfByTerm.get(term.normalized) ?? 0;
+    const idf = userIdf({ documentCount, documentFrequency: df });
+    const previousIdf =
+      typeof term.idf === 'number' && Number.isFinite(term.idf) && term.idf > 0
+        ? term.idf
+        : DEFAULT_UNKNOWN_IDF;
+    return {
+      ...term,
+      df,
+      idf: roundWeight(idf),
+      weight: roundWeight(term.weight * (idf / Math.max(previousIdf, 0.000001))),
+    };
+  });
+
+const applyCorpusIdfToVisits = (visits: readonly NormalizedVisit[]): readonly NormalizedVisit[] => {
+  const contentVisits = visits.filter((visit) => visit.evidence?.content !== undefined);
+  if (contentVisits.length === 0) return visits;
+  const dfByTerm = new Map<string, number>();
+  for (const visit of contentVisits) {
+    const terms = new Set<string>();
+    for (const term of visit.evidence?.content?.terms ?? []) terms.add(term.normalized);
+    for (const term of visit.evidence?.content?.keyphrases ?? []) terms.add(term.normalized);
+    for (const term of terms) dfByTerm.set(term, (dfByTerm.get(term) ?? 0) + 1);
+  }
+  const documentCount = contentVisits.length;
+  return visits.map((visit) => {
+    const evidence = visit.evidence;
+    if (evidence?.content === undefined) return visit;
+    return {
+      ...visit,
+      evidence: {
+        ...evidence,
+        content: {
+          ...evidence.content,
+          terms: corpusAdjustedTerms(evidence.content.terms, dfByTerm, documentCount),
+          keyphrases: corpusAdjustedTerms(evidence.content.keyphrases, dfByTerm, documentCount),
+        },
+      },
+    };
+  });
+};
+
+const normalizeEntries = (
+  entries: readonly VisitSimilarityEntry[],
+  evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
+): readonly NormalizedVisit[] => {
   const byKey = new Map<string, NormalizedVisit>();
   for (const entry of entries) {
     const visitKey = visitKeyForEntry(entry);
     if (visitKey.length === 0) continue;
+    const evidence = evidenceForEntry(entry, evidenceByCanonicalUrl);
     const candidate: NormalizedVisit = {
       visitKey,
       lastSeenAt: entry.lastSeenAt,
-      corpus: corpusForEntry(entry),
+      corpus: corpusForEntry(entry, evidenceByCanonicalUrl),
       focusedWindowMs: readFocusedWindowMs(entry),
+      ...(evidence === undefined ? {} : { evidence }),
     };
     const existing = byKey.get(visitKey);
     byKey.set(visitKey, existing === undefined ? candidate : preferNewEntry(existing, candidate));
   }
-  return [...byKey.values()].sort((left, right) =>
+  const visits = [...byKey.values()].sort((left, right) =>
     left.visitKey < right.visitKey ? -1 : left.visitKey > right.visitKey ? 1 : 0,
   );
+  return applyCorpusIdfToVisits(visits);
 };
 
 const clampUnit = (value: number): number => Math.min(Math.max(value, 0), 1);
@@ -258,7 +361,22 @@ const revisionIdFor = (input: {
   readonly lexicalThreshold: number;
   readonly lexicalFallbackEnabled: boolean;
   readonly visits: readonly NormalizedVisit[];
+  readonly pageContentChunksByCanonicalUrl?:
+    | ReadonlyMap<string, readonly VisitSimilarityChunkEvidence[]>
+    | undefined;
 }): string => {
+  const chunkSignatureFor = (visitKey: string): string | undefined => {
+    const chunks = input.pageContentChunksByCanonicalUrl?.get(visitKey);
+    if (chunks === undefined || chunks.length === 0) return undefined;
+    return chunks
+      .map((chunk) =>
+        (chunk.terms ?? [])
+          .slice(0, 12)
+          .map((term) => `${term.normalized}:${term.weight.toFixed(4)}`)
+          .join(','),
+      )
+      .join('|');
+  };
   const hash = createHash('sha256');
   hash.update(
     JSON.stringify({
@@ -275,6 +393,9 @@ const revisionIdFor = (input: {
         visitKey: visit.visitKey,
         corpus: visit.corpus,
         focusedWindowMs: visit.focusedWindowMs,
+        evidenceRevision:
+          visit.evidence?.semanticFeatureRevision ?? visit.evidence?.evidenceRevision,
+        indexedChunkSignature: chunkSignatureFor(visit.visitKey),
       })),
     }),
   );
@@ -325,10 +446,325 @@ const jaccard = (left: ReadonlySet<string>, right: ReadonlySet<string>): number 
   return union === 0 ? 0 : intersection / union;
 };
 
+const cosine = (
+  left: Float32Array | undefined,
+  right: Float32Array | undefined,
+): number | undefined => {
+  if (
+    left === undefined ||
+    right === undefined ||
+    left.length !== right.length ||
+    left.length === 0
+  ) {
+    return undefined;
+  }
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const l = left[index] ?? 0;
+    const r = right[index] ?? 0;
+    dot += l * r;
+    leftNorm += l * l;
+    rightNorm += r * r;
+  }
+  if (leftNorm <= 0 || rightNorm <= 0) return undefined;
+  return dot / Math.sqrt(leftNorm * rightNorm);
+};
+
+const sortedOverlap = (
+  left: readonly { readonly normalized: string; readonly weight: number; readonly term?: string }[],
+  right: readonly {
+    readonly normalized: string;
+    readonly weight: number;
+    readonly term?: string;
+  }[],
+): readonly string[] => {
+  const rightByTerm = new Map(right.map((item) => [item.normalized, item] as const));
+  return left
+    .flatMap((item): readonly { readonly label: string; readonly weight: number }[] => {
+      const match = rightByTerm.get(item.normalized);
+      if (match === undefined) return [];
+      return [{ label: item.term ?? item.normalized, weight: Math.min(item.weight, match.weight) }];
+    })
+    .sort((a, b) => b.weight - a.weight || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0))
+    .map((item) => item.label)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 8);
+};
+
+const entityOverlap = (
+  left: readonly WeightedEntity[],
+  right: readonly WeightedEntity[],
+): number => {
+  if (left.length === 0 || right.length === 0) return 0;
+  const rightSet = new Set(right.map((entity) => entity.normalized));
+  const overlap = left.filter((entity) => rightSet.has(entity.normalized)).length;
+  return overlap / Math.min(left.length, right.length);
+};
+
+const chunkSupportFor = (
+  leftChunks: readonly VisitSimilarityChunkEvidence[] | undefined,
+  rightChunks: readonly VisitSimilarityChunkEvidence[] | undefined,
+):
+  | {
+      readonly score: number;
+      readonly supportCount: number;
+      readonly maxPairScore: number;
+      readonly meanTop3Score: number;
+    }
+  | undefined => {
+  if (leftChunks === undefined || rightChunks === undefined) return undefined;
+  if (leftChunks.length === 0 || rightChunks.length === 0) return undefined;
+  const scores: number[] = [];
+  for (const left of leftChunks) {
+    const leftTerms = left.terms ?? [];
+    if (leftTerms.length === 0) continue;
+    for (const right of rightChunks) {
+      const rightTerms = right.terms ?? [];
+      if (rightTerms.length === 0) continue;
+      const lexical = Math.max(
+        weightedJaccard(leftTerms, rightTerms),
+        weightedContainment(leftTerms, rightTerms),
+      );
+      if (lexical <= 0) continue;
+      scores.push(lexical);
+    }
+  }
+  if (scores.length === 0) return undefined;
+  scores.sort((left, right) => right - left);
+  const top3 = scores.slice(0, 3);
+  const meanTop3Score = top3.reduce((sum, value) => sum + value, 0) / top3.length;
+  const maxPairScore = scores[0] ?? 0;
+  const supportCount = scores.filter((score) => score >= CHUNK_SUPPORT_THRESHOLD).length;
+  return {
+    score: Math.min(1, meanTop3Score),
+    supportCount,
+    maxPairScore,
+    meanTop3Score,
+  };
+};
+
+const metadataTermsForEvidence = (evidence: PageEvidenceRecord): readonly WeightedTerm[] => [
+  ...evidence.metadata.titleTokens.map((term) => ({
+    term,
+    normalized: term,
+    weight: 1,
+    source: 'title' as const,
+  })),
+  ...evidence.metadata.pathTokens.map((term) => ({
+    term,
+    normalized: term,
+    weight: 1,
+    source: 'url_path' as const,
+  })),
+  ...(evidence.metadata.host.length === 0
+    ? []
+    : evidence.metadata.host.split('.').map((term) => ({
+        term,
+        normalized: term,
+        weight: 1,
+        source: 'host' as const,
+      }))),
+];
+
+const evidenceMetadataForPair = (
+  left: NormalizedVisit,
+  right: NormalizedVisit,
+  vectorSimilarity: number | undefined,
+  evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>,
+  pageContentChunksByCanonicalUrl?: ReadonlyMap<string, readonly VisitSimilarityChunkEvidence[]>,
+): { readonly score: number; readonly metadata: PageEvidenceSimilarityMetadata } => {
+  const leftEvidence = left.evidence;
+  const rightEvidence = right.evidence;
+  if (leftEvidence === undefined || rightEvidence === undefined) {
+    const metadataScore = jaccard(tokenize(left.corpus), tokenize(right.corpus));
+    const channels = {
+      ...(vectorSimilarity === undefined ? {} : { behavior: roundedCosine(vectorSimilarity) }),
+      metadata: roundedCosine(metadataScore),
+    };
+    const score = fusePageEvidenceChannelScores(channels);
+    const confidenceSignals = confidenceForPageEvidencePair({
+      channels,
+      extractionReliability: 1,
+    });
+    return {
+      score,
+      metadata: {
+        producer: 'metadata-only',
+        policyId: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyId,
+        policyMode: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyMode,
+        defaultEligible: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.defaultEligible,
+        score: roundedCosine(score),
+        semanticScore: roundedCosine(score),
+        confidence: roundedCosine(confidenceSignals.confidence),
+        confidenceSignals: {
+          evidenceCoverage: roundedCosine(confidenceSignals.evidenceCoverage),
+          extractionReliability: roundedCosine(confidenceSignals.extractionReliability),
+          vectorCompatible: false,
+        },
+        evidenceTierFrom: 'metadata_only',
+        evidenceTierTo: 'metadata_only',
+        channels,
+        featureSchemaVersion: 2,
+      },
+    };
+  }
+
+  const leftContentTerms = leftEvidence.content?.terms ?? [];
+  const rightContentTerms = rightEvidence.content?.terms ?? [];
+  if (leftEvidence.content === undefined && rightEvidence.content === undefined) {
+    const metadataScore = weightedJaccard(
+      metadataTermsForEvidence(leftEvidence),
+      metadataTermsForEvidence(rightEvidence),
+    );
+    const channels = {
+      ...(vectorSimilarity === undefined ? {} : { behavior: roundedCosine(vectorSimilarity) }),
+      metadata: roundedCosine(metadataScore),
+    };
+    const score = fusePageEvidenceChannelScores(channels);
+    const confidenceSignals = confidenceForPageEvidencePair({
+      channels,
+      extractionReliability: 1,
+    });
+    return {
+      score,
+      metadata: {
+        producer: 'metadata-only',
+        policyId: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyId,
+        policyMode: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyMode,
+        defaultEligible: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.defaultEligible,
+        score: roundedCosine(score),
+        semanticScore: roundedCosine(score),
+        confidence: roundedCosine(confidenceSignals.confidence),
+        confidenceSignals: {
+          evidenceCoverage: roundedCosine(confidenceSignals.evidenceCoverage),
+          extractionReliability: roundedCosine(confidenceSignals.extractionReliability),
+          vectorCompatible: false,
+        },
+        evidenceTierFrom: leftEvidence.evidenceTier,
+        evidenceTierTo: rightEvidence.evidenceTier,
+        channels,
+        featureSchemaVersion: 2,
+      },
+    };
+  }
+  const leftKeyphrases = leftEvidence.content?.keyphrases ?? [];
+  const rightKeyphrases = rightEvidence.content?.keyphrases ?? [];
+  const leftEntities = leftEvidence.content?.entities ?? [];
+  const rightEntities = rightEvidence.content?.entities ?? [];
+  const metadataScore = weightedJaccard(
+    metadataTermsForEvidence(leftEvidence),
+    metadataTermsForEvidence(rightEvidence),
+  );
+  const pairExtractionReliability = Math.min(
+    extractionReliabilityForQuality(leftEvidence.content?.quality),
+    extractionReliabilityForQuality(rightEvidence.content?.quality),
+  );
+  const contentTermsRaw = Math.max(
+    weightedJaccard(leftContentTerms, rightContentTerms),
+    weightedContainment(leftContentTerms, rightContentTerms),
+  );
+  const keyphraseRaw = Math.max(
+    weightedJaccard(leftKeyphrases, rightKeyphrases),
+    weightedContainment(leftKeyphrases, rightKeyphrases),
+  );
+  const contentTerms = contentTermsRaw;
+  const keyphrases = keyphraseRaw;
+  const entities = entityOverlap(leftEntities, rightEntities);
+  const leftVectorRef = leftEvidence.content?.docEmbeddingRef;
+  const rightVectorRef = rightEvidence.content?.docEmbeddingRef;
+  const contentVector =
+    leftVectorRef !== undefined &&
+    rightVectorRef !== undefined &&
+    compatibleVectorRefs(leftVectorRef, rightVectorRef)
+      ? cosine(
+          evidenceVectorsByVectorId?.get(leftVectorRef.vectorId),
+          evidenceVectorsByVectorId?.get(rightVectorRef.vectorId),
+        )
+      : undefined;
+  const chunkSupport =
+    leftEvidence.evidenceTier === 'indexed_chunks' &&
+    rightEvidence.evidenceTier === 'indexed_chunks'
+      ? chunkSupportFor(
+          pageContentChunksByCanonicalUrl?.get(leftEvidence.canonicalUrl),
+          pageContentChunksByCanonicalUrl?.get(rightEvidence.canonicalUrl),
+        )
+      : undefined;
+  const channels = {
+    ...(contentVector === undefined ? {} : { contentVector: roundedCosine(contentVector) }),
+    ...(leftContentTerms.length === 0 || rightContentTerms.length === 0
+      ? {}
+      : { contentTerms: roundedCosine(contentTerms) }),
+    ...(leftKeyphrases.length === 0 || rightKeyphrases.length === 0
+      ? {}
+      : { keyphrases: roundedCosine(keyphrases) }),
+    ...(leftEntities.length === 0 || rightEntities.length === 0
+      ? {}
+      : { entities: roundedCosine(entities) }),
+    ...(chunkSupport === undefined ? {} : { chunkSupport: roundedCosine(chunkSupport.score) }),
+    metadata: roundedCosine(metadataScore),
+  };
+  const score = fusePageEvidenceChannelScores(channels);
+  const confidenceSignals = confidenceForPageEvidencePair({
+    channels,
+    extractionReliability: pairExtractionReliability,
+  });
+  const matchedTerms = sortedOverlap(leftContentTerms, rightContentTerms);
+  const matchedKeyphrases = sortedOverlap(leftKeyphrases, rightKeyphrases);
+  const matchedEntities = sortedOverlap(
+    leftEntities.map((entity) => ({
+      normalized: entity.normalized,
+      weight: entity.weight,
+      term: entity.text,
+    })),
+    rightEntities.map((entity) => ({
+      normalized: entity.normalized,
+      weight: entity.weight,
+      term: entity.text,
+    })),
+  );
+  return {
+    score,
+    metadata: {
+      producer: 'content-enriched',
+      policyId: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyId,
+      policyMode: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.policyMode,
+      defaultEligible: PAGE_EVIDENCE_COLD_START_SCORING_POLICY.defaultEligible,
+      score: roundedCosine(score),
+      semanticScore: roundedCosine(score),
+      confidence: roundedCosine(confidenceSignals.confidence),
+      confidenceSignals: {
+        evidenceCoverage: roundedCosine(confidenceSignals.evidenceCoverage),
+        extractionReliability: roundedCosine(confidenceSignals.extractionReliability),
+        vectorCompatible:
+          leftVectorRef !== undefined &&
+          rightVectorRef !== undefined &&
+          compatibleVectorRefs(leftVectorRef, rightVectorRef),
+      },
+      evidenceTierFrom: leftEvidence.evidenceTier,
+      evidenceTierTo: rightEvidence.evidenceTier,
+      channels,
+      ...(matchedTerms.length === 0 ? {} : { matchedTerms }),
+      ...(matchedKeyphrases.length === 0 ? {} : { matchedKeyphrases }),
+      ...(matchedEntities.length === 0 ? {} : { matchedEntities }),
+      ...(chunkSupport === undefined
+        ? {}
+        : {
+            chunkSupportCount: chunkSupport.supportCount,
+            maxChunkPairScore: roundedCosine(chunkSupport.maxPairScore),
+          }),
+      featureSchemaVersion: 2,
+    },
+  };
+};
+
 const buildLexicalEdges = (
   visits: readonly NormalizedVisit[],
   threshold: number,
   topK: number,
+  evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>,
+  pageContentChunksByCanonicalUrl?: ReadonlyMap<string, readonly VisitSimilarityChunkEvidence[]>,
 ): readonly VisitSimilarityEdge[] => {
   if (visits.length < 2) return [];
   const tokensByVisit = new Map<string, ReadonlySet<string>>();
@@ -344,7 +780,18 @@ const buildLexicalEdges = (
       if (candidate.visitKey === source.visitKey) continue;
       const candTokens = tokensByVisit.get(candidate.visitKey);
       if (candTokens === undefined || candTokens.size === 0) continue;
-      const similarity = jaccard(sourceTokens, candTokens);
+      const baseSimilarity = jaccard(sourceTokens, candTokens);
+      const hasEvidence = source.evidence !== undefined || candidate.evidence !== undefined;
+      const evidenceScore = hasEvidence
+        ? evidenceMetadataForPair(
+            source,
+            candidate,
+            undefined,
+            evidenceVectorsByVectorId,
+            pageContentChunksByCanonicalUrl,
+          )
+        : undefined;
+      const similarity = evidenceScore?.score ?? baseSimilarity;
       if (similarity < threshold) continue;
       ranked.push({ id: candidate.visitKey, similarity });
     }
@@ -355,10 +802,22 @@ const buildLexicalEdges = (
     for (const candidate of ranked.slice(0, topK)) {
       // Deduplicate the undirected edge by emitting only when source<candidate.
       if (candidate.id <= source.visitKey) continue;
+      const target = visits.find((visit) => visit.visitKey === candidate.id) ?? source;
+      const emittedEvidence =
+        source.evidence !== undefined || target.evidence !== undefined
+          ? evidenceMetadataForPair(
+              source,
+              target,
+              undefined,
+              evidenceVectorsByVectorId,
+              pageContentChunksByCanonicalUrl,
+            )
+          : undefined;
       edges.push({
         fromVisitKey: source.visitKey,
         toVisitKey: candidate.id,
         cosine: roundedCosine(candidate.similarity),
+        ...(emittedEvidence === undefined ? {} : { metadata: emittedEvidence.metadata }),
       });
     }
   }
@@ -428,7 +887,7 @@ export const computeVisitSimilarityRevisionId = (
   // matches buildVisitSimilarity's embedding-path id.
   const config = resolveVisitSimilarityConfig(options);
   const modelRevision = RECALL_MODEL.revision;
-  const visits = normalizeEntries(entries);
+  const visits = normalizeEntries(entries, options.evidenceByCanonicalUrl);
   return revisionIdFor({
     modelRevision,
     producer: 'embedding',
@@ -438,6 +897,7 @@ export const computeVisitSimilarityRevisionId = (
     lexicalThreshold: config.lexicalThreshold,
     lexicalFallbackEnabled: config.lexicalFallbackEnabled,
     visits,
+    pageContentChunksByCanonicalUrl: options.pageContentChunksByCanonicalUrl,
   });
 };
 
@@ -458,7 +918,7 @@ export const computeVisitSimilarityRevisionId = (
 // The materializer's hot path consults `decideHotPathEmbed(budget)`
 // to pick this path on warm + small-corpus drains. Worker
 // reconciliation always uses buildVisitSimilarity (the byte-equality
-// oracle).
+// reference path).
 
 import type { IncrementalVisitSimilarityIndex } from './visitSimilarity.incremental.js';
 
@@ -478,7 +938,7 @@ export const buildVisitSimilarityIncremental = (
   const config = resolveVisitSimilarityConfig(input.options ?? {});
   const { threshold, topK, engagementGateMs } = config;
   const modelRevision = `${RECALL_MODEL.revision}:incremental`;
-  const visits = normalizeEntries(input.entries);
+  const visits = normalizeEntries(input.entries, input.options?.evidenceByCanonicalUrl);
   // PR #141 enriched revisionIdFor with producer + lexical params.
   // The incremental path is cosine-only so producer='embedding'
   // matches; lexical params still need to flow through for the id
@@ -492,6 +952,7 @@ export const buildVisitSimilarityIncremental = (
     lexicalThreshold: config.lexicalThreshold,
     lexicalFallbackEnabled: config.lexicalFallbackEnabled,
     visits,
+    pageContentChunksByCanonicalUrl: input.options?.pageContentChunksByCanonicalUrl,
   });
   const eligible = visits.filter((visit) => visit.focusedWindowMs >= engagementGateMs);
   // Insert each eligible visit into the index. Existing visits no-op.
@@ -512,13 +973,31 @@ export const buildVisitSimilarityIncremental = (
       },
     });
   }
+  const visitByKey = new Map(visits.map((visit) => [visit.visitKey, visit] as const));
+  const edges = input.index.edges().map((edge): VisitSimilarityEdge => {
+    const left = visitByKey.get(edge.fromVisitKey);
+    const right = visitByKey.get(edge.toVisitKey);
+    if (left === undefined || right === undefined) return edge;
+    if (left.evidence === undefined && right.evidence === undefined) return edge;
+    const evidenceScore = evidenceMetadataForPair(
+      left,
+      right,
+      edge.cosine,
+      input.options?.evidenceVectorsByVectorId,
+      input.options?.pageContentChunksByCanonicalUrl,
+    );
+    return {
+      ...edge,
+      metadata: evidenceScore.metadata,
+    };
+  });
   return {
     revisionId,
     modelId: VISIT_SIMILARITY_MODEL_ID,
     modelRevision,
     featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
     threshold,
-    edges: input.index.edges(),
+    edges,
     producedAt: Date.now(),
   };
 };
@@ -532,7 +1011,7 @@ export const buildVisitSimilarity = async (
   const { threshold, topK, engagementGateMs, lexicalThreshold } = config;
   const fallbackAllowed = config.lexicalFallbackEnabled;
   const modelRevision = RECALL_MODEL.revision;
-  const visits = normalizeEntries(entries);
+  const visits = normalizeEntries(entries, options.evidenceByCanonicalUrl);
   // Stage 5.0 follow-up — embedding-path id is computed up front and
   // ALSO includes lexicalThreshold/lexicalFallbackEnabled in its
   // hash. That keeps it sensitive to changes the operator made to the
@@ -547,6 +1026,7 @@ export const buildVisitSimilarity = async (
     lexicalThreshold,
     lexicalFallbackEnabled: fallbackAllowed,
     visits,
+    pageContentChunksByCanonicalUrl: options.pageContentChunksByCanonicalUrl,
   });
   const embeddingBase = {
     revisionId: embeddingRevisionId,
@@ -576,6 +1056,7 @@ export const buildVisitSimilarity = async (
       lexicalThreshold,
       lexicalFallbackEnabled: fallbackAllowed,
       visits,
+      pageContentChunksByCanonicalUrl: options.pageContentChunksByCanonicalUrl,
     });
     return {
       revisionId: lexicalRevisionId,
@@ -585,7 +1066,15 @@ export const buildVisitSimilarity = async (
       threshold: lexicalThreshold,
       producedAt: Date.now(),
       producer: 'lexical',
-      edges: fallbackAllowed ? buildLexicalEdges(eligibleForLexical, lexicalThreshold, topK) : [],
+      edges: fallbackAllowed
+        ? buildLexicalEdges(
+            eligibleForLexical,
+            lexicalThreshold,
+            topK,
+            options.evidenceVectorsByVectorId,
+            options.pageContentChunksByCanonicalUrl,
+          )
+        : [],
     };
   };
 
@@ -652,11 +1141,28 @@ export const buildVisitSimilarity = async (
 
     for (const candidate of ranked) {
       if (candidate.id <= source.visitKey) continue;
-      if (candidate.similarity < threshold) continue;
+      const target = eligible.find((visit) => visit.visitKey === candidate.id);
+      if (target === undefined) continue;
+      const hasEvidence = source.evidence !== undefined || target.evidence !== undefined;
+      const evidenceScore = hasEvidence
+        ? evidenceMetadataForPair(
+            source,
+            target,
+            candidate.similarity,
+            options.evidenceVectorsByVectorId,
+            options.pageContentChunksByCanonicalUrl,
+          )
+        : undefined;
+      const score =
+        candidate.similarity >= threshold
+          ? candidate.similarity
+          : (evidenceScore?.score ?? candidate.similarity);
+      if (score < threshold) continue;
       edges.push({
         fromVisitKey: source.visitKey,
         toVisitKey: candidate.id,
-        cosine: roundedCosine(candidate.similarity),
+        cosine: roundedCosine(score),
+        ...(evidenceScore === undefined ? {} : { metadata: evidenceScore.metadata }),
       });
     }
   }
