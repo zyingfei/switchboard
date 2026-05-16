@@ -9,6 +9,10 @@ export interface CaptureProviderHealth {
   readonly warn24h: number;
   readonly fail24h: number;
   readonly warning?: string;
+  // Plan TODO-H7: content hint so a heartbeat timestamp says *what*
+  // was captured, not just that something was.
+  readonly lastCaptureTitle?: string;
+  readonly lastCaptureThreadId?: string;
 }
 
 export interface CaptureWarningHealth {
@@ -17,6 +21,27 @@ export interface CaptureWarningHealth {
   readonly code: string;
   readonly message: string;
   readonly severity: 'info' | 'warning';
+}
+
+// Honesty contract (plan TODO-H1/H2/X1): a section is `unavailable`
+// when its summary timed out and we fell back to an empty value — that
+// is NOT the same as a real zero, and the UI must not render it as
+// "no data". `stale` is when the section returned a real value that
+// itself reports it is behind. `ok` is a fresh real value.
+export type SectionAvailability = 'ok' | 'stale' | 'unavailable';
+export type HealthStatus = 'ok' | 'degraded' | 'failed';
+
+export interface HealthObservability {
+  // ISO timestamp this report was collected (all sections share it
+  // since they are gathered together).
+  readonly asOf: string;
+  // Server-side derived worst-of so the board renders one light
+  // without re-deriving it ad hoc in the component.
+  readonly status: HealthStatus;
+  // Per-section reachability/freshness. Keys mirror HealthReport
+  // sections that were collected: vault, capture, recall, service,
+  // workGraph (if wired), sync (if wired).
+  readonly sections: Readonly<Record<string, SectionAvailability>>;
 }
 
 export interface HealthReport {
@@ -32,6 +57,16 @@ export interface HealthReport {
     readonly droppedHint: number | null;
     readonly providers?: readonly CaptureProviderHealth[];
     readonly recentWarnings?: readonly CaptureWarningHealth[];
+    // Plan TODO-H6: a real 1h activity window. Deliberately NOT
+    // queue/process-time percentiles — that data does not exist in the
+    // capture event log, and fabricating it would be the exact
+    // misleading-metric failure this work targets. This is the honest
+    // signal that IS computable here: capture volume over the last hour.
+    readonly window1h?: {
+      readonly captures: number;
+      readonly warnings: number;
+      readonly fails: number;
+    };
   };
   readonly recall: {
     readonly indexExists: boolean;
@@ -50,6 +85,11 @@ export interface HealthReport {
     readonly lastError?: string | null;
     readonly rebuildEmbedded?: number;
     readonly rebuildTotal?: number;
+    // Follow-up #17: current rebuild stage, shown inline at the
+    // Embedding pipeline node. Passthrough string (display only);
+    // null/absent at rest or when a child-indexer rebuild can't
+    // report phases.
+    readonly rebuildPhase?: string | null;
     readonly embedderDevice?: 'cpu' | 'wasm' | 'webgpu' | 'unknown';
     readonly embedderAccelerator?: 'accelerate' | 'mkl' | 'cpu' | 'unknown';
     readonly activity?: RecallActivityReport;
@@ -76,6 +116,9 @@ export interface HealthReport {
     };
   };
   readonly service: { readonly installed: boolean; readonly running: boolean };
+  // Optional so the many call-sites/tests that construct HealthReport
+  // literals stay valid; collectHealth always populates it.
+  readonly observability?: HealthObservability;
   readonly workGraph?: WorkGraphHealthReport;
   // Identity of the local replica + its Lamport high-water mark.
   // Optional so legacy / test call-sites that don't wire a replica
@@ -126,47 +169,115 @@ export interface HealthDeps {
 const FAST_OP_BUDGET_MS = 1_000;
 const HEAVY_OP_BUDGET_MS = 5_000;
 
-const withBudget = async <T>(
+// Tracked variant: reports whether the operation timed out and we
+// served the fallback. This is the load-bearing honesty signal — the
+// previous withBudget could not tell a real empty value from a
+// budget-fallback, which is exactly how "capture timed out" rendered
+// as "no events yet".
+const withTrackedBudget = async <T>(
   operation: () => Promise<T>,
   fallback: T,
   budgetMs: number = FAST_OP_BUDGET_MS,
-): Promise<T> =>
-  await Promise.race([
-    operation(),
-    new Promise<T>((resolve) => {
-      setTimeout(() => {
-        resolve(fallback);
-      }, budgetMs);
-    }),
-  ]);
+): Promise<{ readonly value: T; readonly timedOut: boolean }> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ value: T; timedOut: true }>((resolve) => {
+    timer = setTimeout(() => resolve({ value: fallback, timedOut: true }), budgetMs);
+  });
+  try {
+    return await Promise.race([
+      operation().then((value) => ({ value, timedOut: false as const })),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
+const worst = (a: HealthStatus, b: HealthStatus): HealthStatus => {
+  if (a === 'failed' || b === 'failed') return 'failed';
+  if (a === 'degraded' || b === 'degraded') return 'degraded';
+  return 'ok';
+};
 
 export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => {
   const now = deps.now?.() ?? new Date();
-  const [writable, sizeBytes, capture, recall, service, workGraph] = await Promise.all([
-    withBudget(deps.vaultWritable, false),
-    withBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
-    withBudget(
+  const [writableR, sizeBytesR, captureR, recallR, serviceR, workGraphR] = await Promise.all([
+    withTrackedBudget(deps.vaultWritable, false),
+    withTrackedBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
+    withTrackedBudget(
       deps.captureSummary,
       { lastByProvider: {}, queueDepthHint: null, droppedHint: null },
       HEAVY_OP_BUDGET_MS,
     ),
-    withBudget(
+    withTrackedBudget(
       deps.recallSummary,
       { indexExists: false, entryCount: null, modelId: null, sizeBytes: null },
       HEAVY_OP_BUDGET_MS,
     ),
-    withBudget(deps.serviceStatus, { installed: false, running: false }),
+    withTrackedBudget(deps.serviceStatus, { installed: false, running: false }),
     deps.workGraphSummary === undefined
-      ? Promise.resolve(undefined)
-      : withBudget(deps.workGraphSummary, undefined, HEAVY_OP_BUDGET_MS),
+      ? Promise.resolve<{ value: WorkGraphHealthReport | undefined; timedOut: boolean }>({
+          value: undefined,
+          timedOut: false,
+        })
+      : withTrackedBudget<WorkGraphHealthReport | undefined>(
+          deps.workGraphSummary,
+          undefined,
+          HEAVY_OP_BUDGET_MS,
+        ),
   ]);
+  const writable = writableR.value;
+  const sizeBytes = sizeBytesR.value;
+  const capture = captureR.value;
+  const recall = recallR.value;
+  const service = serviceR.value;
+  const workGraph = workGraphR.value;
   const sync = deps.syncSummary?.();
+
+  // Per-section availability: timed-out summaries are `unavailable`
+  // (served the empty fallback), not a real zero. A vault size that
+  // timed out is `stale` rather than `unavailable` because writability
+  // is the real liveness signal there.
+  const sections: Record<string, SectionAvailability> = {
+    vault: writableR.timedOut ? 'unavailable' : sizeBytesR.timedOut ? 'stale' : 'ok',
+    capture: captureR.timedOut ? 'unavailable' : 'ok',
+    recall: recallR.timedOut
+      ? 'unavailable'
+      : recall.status === 'missing' || recall.status === 'stale'
+        ? 'stale'
+        : 'ok',
+    service: serviceR.timedOut ? 'unavailable' : 'ok',
+  };
+  if (workGraph !== undefined || deps.workGraphSummary !== undefined) {
+    sections['workGraph'] = workGraphR.timedOut ? 'unavailable' : 'ok';
+  }
+  if (sync !== undefined) sections['sync'] = 'ok';
+
+  // Derived worst-of. A real outage (vault not writable, a materializer
+  // failed) is `failed`; missing/stale data or a degraded materializer
+  // is `degraded`; everything fresh is `ok`.
+  let status: HealthStatus = 'ok';
+  if (!writable && !writableR.timedOut) status = worst(status, 'failed');
+  for (const availability of Object.values(sections)) {
+    if (availability === 'unavailable' || availability === 'stale') {
+      status = worst(status, 'degraded');
+    }
+  }
+  if (recall.status === 'missing' || recall.status === 'stale' || recall.status === 'rebuilding') {
+    status = worst(status, 'degraded');
+  }
+  for (const materializer of Object.values(sync?.materializers ?? {})) {
+    if (materializer.status === 'failed') status = worst(status, 'failed');
+    else if (materializer.status === 'degraded') status = worst(status, 'degraded');
+  }
+
   return {
     uptimeSec: Math.max(0, Math.floor((now.getTime() - deps.startedAt.getTime()) / 1000)),
     vault: { root: deps.vaultRoot, writable, sizeBytes },
     capture,
     recall,
     service,
+    observability: { asOf: now.toISOString(), status, sections },
     ...(workGraph === undefined ? {} : { workGraph }),
     ...(sync === undefined ? {} : { sync }),
   };

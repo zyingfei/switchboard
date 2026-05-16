@@ -3,7 +3,11 @@ import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
-import { RANKER_MODEL_VERSION, type RankerRevision } from '../ranker/train.js';
+import {
+  RANKER_MODEL_VERSION,
+  type RankerRevision,
+  type RankerTrainQuality,
+} from '../ranker/train.js';
 
 const CLOSEST_VISIT_REVISION_DIR = '_BAC/connections/closest-visit';
 
@@ -15,6 +19,13 @@ export interface ClosestVisitRankerRevisionManifest {
   readonly trainedAt: number;
   readonly modelByteLength: number;
   readonly modelSha256: string;
+  /**
+   * Optional train-time observability. Absent on manifests written
+   * before this field existed; readers must treat it as best-effort.
+   * Its presence/absence never gates scoring (featureSchemaVersion is
+   * unchanged) so the refuse-to-score invariant is preserved.
+   */
+  readonly trainQuality?: RankerTrainQuality;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -52,6 +63,7 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     trainedAt: revision.trainedAt,
     modelByteLength: modelBytes.byteLength,
     modelSha256: sha256Hex(modelBytes),
+    ...(revision.trainQuality === undefined ? {} : { trainQuality: revision.trainQuality }),
   };
 };
 
@@ -60,6 +72,55 @@ const writeAtomic = async (path: string, body: string): Promise<void> => {
   const tmp = `${path}.${String(process.pid)}.tmp`;
   await writeFile(tmp, body, 'utf8');
   await rename(tmp, path);
+};
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+const isGradeHistogram = (value: unknown): value is RankerTrainQuality['gradeHistogram'] => {
+  if (!isRecord(value)) return false;
+  return (['0', '1', '2', '3', '4'] as const).every(
+    (grade) =>
+      typeof value[grade] === 'number' &&
+      Number.isInteger(value[grade]) &&
+      (value[grade] as number) >= 0,
+  );
+};
+
+// Lenient: a malformed `trainQuality` is pure observability, so it is
+// dropped rather than failing the whole manifest. A manifest without
+// `trainQuality` (older writers) is also valid — returns undefined.
+const normalizeTrainQuality = (value: unknown): RankerTrainQuality | undefined => {
+  if (!isRecord(value)) return undefined;
+  if (!isGradeHistogram(value['gradeHistogram'])) return undefined;
+  const spreadRaw = value['scoreSpread'];
+  const spread =
+    isRecord(spreadRaw) &&
+    isFiniteNumber(spreadRaw['p05']) &&
+    isFiniteNumber(spreadRaw['p50']) &&
+    isFiniteNumber(spreadRaw['p95']) &&
+    isFiniteNumber(spreadRaw['stdDev']) &&
+    isFiniteNumber(spreadRaw['distinctRatio'])
+      ? {
+          p05: spreadRaw['p05'],
+          p50: spreadRaw['p50'],
+          p95: spreadRaw['p95'],
+          stdDev: spreadRaw['stdDev'],
+          distinctRatio: spreadRaw['distinctRatio'],
+        }
+      : undefined;
+  const metricRaw = value['inSampleMetric'];
+  const metric =
+    isRecord(metricRaw) &&
+    typeof metricRaw['kind'] === 'string' &&
+    isFiniteNumber(metricRaw['value'])
+      ? { kind: metricRaw['kind'], value: metricRaw['value'] }
+      : undefined;
+  return {
+    gradeHistogram: value['gradeHistogram'],
+    ...(spread === undefined ? {} : { scoreSpread: spread }),
+    ...(metric === undefined ? {} : { inSampleMetric: metric }),
+  };
 };
 
 // Pinned to the *current* ranker constants (not inline literals): a
@@ -89,6 +150,21 @@ const isManifest = (value: unknown): value is ClosestVisitRankerRevisionManifest
   );
 };
 
+// Coerce a validated manifest record into the typed shape, normalizing
+// the optional `trainQuality` (drop if malformed/absent).
+const finalizeManifest = (
+  value: ClosestVisitRankerRevisionManifest,
+): ClosestVisitRankerRevisionManifest => {
+  const trainQuality = normalizeTrainQuality(
+    (value as { readonly trainQuality?: unknown }).trainQuality,
+  );
+  if (trainQuality === undefined) {
+    const { trainQuality: _drop, ...rest } = value;
+    return rest;
+  }
+  return { ...value, trainQuality };
+};
+
 export const readClosestVisitRankerRevisionManifest = async (
   vaultRoot: string,
   revisionId: string,
@@ -97,7 +173,7 @@ export const readClosestVisitRankerRevisionManifest = async (
     const parsed = JSON.parse(
       await readFile(closestVisitRevisionManifestPath(vaultRoot, revisionId), 'utf8'),
     ) as unknown;
-    return isManifest(parsed) ? parsed : null;
+    return isManifest(parsed) ? finalizeManifest(parsed) : null;
   } catch {
     return null;
   }
@@ -110,7 +186,7 @@ export const readActiveClosestVisitRankerRevisionManifest = async (
     const parsed = JSON.parse(
       await readFile(activeClosestVisitRevisionManifestPath(vaultRoot), 'utf8'),
     ) as unknown;
-    return isManifest(parsed) ? parsed : null;
+    return isManifest(parsed) ? finalizeManifest(parsed) : null;
   } catch {
     return null;
   }
@@ -168,6 +244,7 @@ export const readClosestVisitRankerRevision = async (
       trainingDatasetHash: manifest.trainingDatasetHash,
       trainedAt: manifest.trainedAt,
       modelBytes: toOwnedArrayBuffer(bytes),
+      ...(manifest.trainQuality === undefined ? {} : { trainQuality: manifest.trainQuality }),
     };
   } catch {
     return null;

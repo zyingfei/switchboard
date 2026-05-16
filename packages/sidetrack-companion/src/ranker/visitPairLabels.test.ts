@@ -14,8 +14,12 @@ import type {
   ConnectionsSnapshot,
 } from '../connections/types.js';
 
+import type { FeedbackProjection } from '../feedback/projection.js';
+
 import {
   augmentFeedbackWithVisitPairLabels,
+  buildRankerTrainingCandidates,
+  deriveNegativeVisitPairLabelsFromSnapshot,
   deriveVisitPairLabelsFromSnapshot,
 } from './retrain.js';
 
@@ -228,5 +232,155 @@ describe('augmentFeedbackWithVisitPairLabels', () => {
     expect(sortLabels(result.positiveLabels)).toContain('https://example.test/a|https://example.test/b');
     expect(sortLabels(result.positiveLabels)).toContain('https://example.test/b|https://example.test/a');
     expect(sortLabels(result.positiveLabels)).toContain('pre-existing-from|pre-existing-to');
+  });
+});
+
+const timelineVisitNode = (canonicalUrl: string): ConnectionNode => ({
+  id: `timeline-visit:${canonicalUrl}`,
+  kind: 'timeline-visit',
+  label: canonicalUrl,
+  firstSeenAt: TIMESTAMP,
+  lastSeenAt: TIMESTAMP,
+  originReplicaIds: ['rep-1'],
+  metadata: { canonicalUrl },
+});
+
+const topicNode = (topicId: string): ConnectionNode => ({
+  id: `topic:${topicId}`,
+  kind: 'topic',
+  label: topicId,
+  originReplicaIds: ['rep-1'],
+  metadata: {},
+});
+
+const visitInTopicEdge = (canonicalUrl: string, topicId: string): ConnectionEdge => ({
+  id: `edge:visit_in_topic:timeline-visit:${canonicalUrl}:topic:${topicId}`,
+  kind: 'visit_in_topic',
+  fromNodeId: `timeline-visit:${canonicalUrl}`,
+  toNodeId: `topic:${topicId}`,
+  observedAt: TIMESTAMP,
+  producedBy: { source: 'topic-clusterer', revisionId: 'rev-1' },
+  confidence: 'inferred',
+});
+
+const feedbackWith = (
+  negativeLabels: readonly { fromId: string; toId: string; weight: number }[],
+): FeedbackProjection => ({
+  schemaVersion: 1,
+  perItem: {},
+  containerByItem: {},
+  organizedItemsByContainer: {},
+  positiveLabels: [],
+  negativeLabels,
+});
+
+describe('deriveNegativeVisitPairLabelsFromSnapshot', () => {
+  it('expands a (timeline-visit:A, topic:T) negative into A↔member pairs that survive the resolution gate', () => {
+    const a = 'https://example.test/a';
+    const b = 'https://example.test/b';
+    const c = 'https://example.test/c';
+    const snap = snapshot(
+      [timelineVisitNode(a), timelineVisitNode(b), timelineVisitNode(c), topicNode('T')],
+      [visitInTopicEdge(b, 'T'), visitInTopicEdge(c, 'T')],
+    );
+    const feedback = feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 }]);
+
+    const derived = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snap);
+    expect(sortLabels(derived)).toEqual([`${a}|${b}`, `${a}|${c}`]);
+
+    // The derived negatives must reach training: every one must survive
+    // `candidateResolvesToTimelineVisits` inside buildRankerTrainingCandidates.
+    // augment appends the 2 derived pairs alongside the 1 original
+    // container-shaped negative (the original is gate-dropped; the
+    // derived pairs are not).
+    const augmented = augmentFeedbackWithVisitPairLabels(feedback, snap);
+    expect(augmented.negativeLabels).toHaveLength(3);
+    expect(sortLabels(augmented.negativeLabels)).toEqual(
+      [`${a}|${b}`, `${a}|${c}`, `timeline-visit:${a}|topic:T`].sort(),
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback: augmented,
+      merged: [],
+      snapshot: snap,
+      randomNegativeCandidatesPerPositive: 0,
+    });
+    const skippedPairs = candidates
+      .filter((entry) => entry.candidate.sources.includes('recently_skipped'))
+      .map((entry) => `${entry.candidate.fromVisitId}|${entry.candidate.toVisitId}`)
+      .sort();
+    expect(skippedPairs).toEqual([`${a}|${b}`, `${a}|${c}`]);
+  });
+
+  it('passes already-(visit, visit) negatives through unchanged', () => {
+    const feedback = feedbackWith([
+      { fromId: 'https://example.test/a', toId: 'https://example.test/b', weight: 1 },
+    ]);
+    expect(deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot([], []))).toEqual([
+      { fromId: 'https://example.test/a', toId: 'https://example.test/b', weight: 1 },
+    ]);
+  });
+
+  it('yields nothing for a container with no snapshot members (no crash)', () => {
+    const feedback = feedbackWith([
+      { fromId: 'timeline-visit:https://example.test/a', toId: 'topic:empty', weight: 1 },
+    ]);
+    expect(
+      deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot([topicNode('empty')], [])),
+    ).toEqual([]);
+  });
+
+  it('does not create self-pairs and dedupes repeated expansions', () => {
+    const a = 'https://example.test/a';
+    const snap = snapshot(
+      [timelineVisitNode(a), topicNode('T')],
+      [visitInTopicEdge(a, 'T')],
+    );
+    // The visit endpoint is itself a member of the container → the only
+    // candidate pair would be A↔A, which must be dropped.
+    const selfOnly = deriveNegativeVisitPairLabelsFromSnapshot(
+      feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 }]),
+      snap,
+    );
+    expect(selfOnly).toEqual([]);
+
+    // Two identical negatives against the same container collapse to one.
+    const b = 'https://example.test/b';
+    const dupSnap = snapshot(
+      [timelineVisitNode(a), timelineVisitNode(b), topicNode('T')],
+      [visitInTopicEdge(b, 'T')],
+    );
+    const deduped = deriveNegativeVisitPairLabelsFromSnapshot(
+      feedbackWith([
+        { fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 },
+        { fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 },
+      ]),
+      dupSnap,
+    );
+    expect(deduped).toEqual([{ fromId: a, toId: b, weight: 1 }]);
+  });
+
+  it('resolves a workstream container transitively through topic_in_workstream', () => {
+    const a = 'https://example.test/a';
+    const b = 'https://example.test/b';
+    const snap = snapshot(
+      [timelineVisitNode(a), timelineVisitNode(b), topicNode('T'), workstreamNode('ws-1')],
+      [
+        visitInTopicEdge(b, 'T'),
+        {
+          id: 'edge:topic_in_workstream:topic:T:workstream:ws-1',
+          kind: 'topic_in_workstream',
+          fromNodeId: 'topic:T',
+          toNodeId: 'workstream:ws-1',
+          observedAt: TIMESTAMP,
+          producedBy: { source: 'topic-clusterer', revisionId: 'rev-1' },
+          confidence: 'inferred',
+        },
+      ],
+    );
+    const derived = deriveNegativeVisitPairLabelsFromSnapshot(
+      feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'workstream:ws-1', weight: 1 }]),
+      snap,
+    );
+    expect(sortLabels(derived)).toEqual([`${a}|${b}`]);
   });
 });

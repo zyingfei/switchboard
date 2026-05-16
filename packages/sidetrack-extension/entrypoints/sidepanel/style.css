@@ -5838,6 +5838,14 @@ button.btn-link.thread-dispatched-name:hover {
 .hp-pipeline-stage.is-idle {
   opacity: 0.6;
 }
+/* Honest unavailable-vs-zero: a section whose metrics could not be
+   collected. Visually distinct from is-idle (collected, empty) via a
+   dashed border so a glance reads "didn't load", not "nothing yet". */
+.hp-pipeline-stage.is-unavailable {
+  border-style: dashed;
+  border-color: var(--ink-4, #a39a8c);
+  opacity: 0.7;
+}
 .hp-pipeline-name {
   font-size: 11px;
   font-weight: 500;
@@ -6111,9 +6119,28 @@ button.btn-link.thread-dispatched-name:hover {
   font-size: 10px;
   line-height: 1.35;
 }
+.hp-activity-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+.hp-link-btn {
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #6aa1ff);
+  font-size: 10.5px;
+  cursor: pointer;
+  text-decoration: underline;
+}
 .hp-activity-list {
   display: grid;
   gap: 6px;
+  margin-top: 6px;
 }
 .hp-activity {
   display: grid;
@@ -10299,4 +10326,806 @@ pre.diff {
 .cx-col-r.is-collapsed > :not(.cx-rightpanel-toggle),
 .cx-page-content-card.is-collapsed > :not(.cx-summary-toggle) {
   display: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   SwitchBoard design language — HEALTH VIEW ONLY.
+
+   Scoping contract (BRAINSTORM honesty + zero-bleed rule):
+   - The design ships its palette/font tokens on :root. We deliberately
+     do NOT do that here — putting --paper/--ink/--display/… on :root
+     would restyle the entire side panel. Instead the token block lives
+     on the single `.sx-health` root the HealthPanel wraps itself in.
+   - Every component rule is `.sx-* ` prefixed (no clash with .hp-/.cx-)
+     AND further nested under `.sx-health ` so it can only ever paint
+     inside the health view.
+   - Fonts: NO remote @import (MV3 CSP + offline). Fallback stacks are
+     used verbatim from final-tokens.css; graceful degradation expected.
+   Source: /tmp/sb-design/switchboard/project/final-tokens.css
+   ══════════════════════════════════════════════════════════════════════ */
+.sx-health {
+  /* Locked tokens from BAC paper/ink — scoped, not on :root */
+  --paper: #f5efe2;
+  --paper-light: #fbf7ee;
+  --paper-tinted: #ede5d2;
+  --paper-deep: #e8dfc8;
+  --ink: #1b1916;
+  --ink-2: #4a453d;
+  --ink-3: #7a7269;
+  --ink-4: #a39a8c;
+  --rule: #d4cdb8;
+  --rule-soft: #e5ddc9;
+
+  --signal: #c2410c;
+  --signal-2: #ea580c;
+  --signal-tint: #fed7aa;
+  --signal-bg: #fff7ed;
+
+  --amber: #9a6e2c;
+  --amber-bg: #fbf1dc;
+  --amber-tint: rgba(154, 110, 44, 0.3);
+  --sage: #3f7a3a;
+  --sage-bg: #ecf1e1;
+  --sage-tint: rgba(63, 122, 58, 0.28);
+  --rose: #8e2e2e;
+  --rose-bg: #f6e3df;
+  --rose-tint: rgba(142, 46, 46, 0.28);
+
+  --display: 'Fraunces', 'EB Garamond', Georgia, serif;
+  --body: 'Source Serif 4', 'Source Serif Pro', Georgia, serif;
+  --mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+
+  --rad-s: 4px;
+  --rad-m: 6px;
+  --rad-l: 10px;
+  --hair: 1px solid var(--rule);
+  --hair-soft: 1px solid var(--rule-soft);
+
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--paper-light);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 14px;
+  line-height: 1.55;
+  z-index: 25;
+  animation: health-in 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.sx-health * {
+  box-sizing: border-box;
+}
+
+/* Op-bar — board controls */
+.sx-health .sx-opbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--paper);
+  border-bottom: var(--hair-soft);
+  flex: none;
+}
+.sx-health .sx-opbar .label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.sx-health .sx-opbar .grow {
+  flex: 1;
+}
+.sx-health .sx-opbar .reason {
+  font-family: var(--body);
+  font-size: 13px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Buttons */
+.sx-health .sx-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 6px 11px;
+  border-radius: var(--rad-s);
+  border: 1px solid var(--rule);
+  background: var(--paper-light);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+  white-space: nowrap;
+}
+.sx-health .sx-btn:hover {
+  background: var(--paper-tinted);
+  color: var(--ink);
+}
+.sx-health .sx-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.sx-health .sx-btn:disabled:hover {
+  background: var(--paper-light);
+  color: var(--ink-2);
+}
+.sx-health .sx-btn.signal {
+  background: var(--signal);
+  color: var(--paper-light);
+  border-color: var(--signal);
+}
+.sx-health .sx-btn.signal:hover {
+  background: var(--signal-2);
+  border-color: var(--signal-2);
+}
+.sx-health .sx-btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  padding: 6px 8px;
+}
+.sx-health .sx-btn.ghost:hover {
+  background: var(--paper-tinted);
+  border-color: var(--rule-soft);
+}
+.sx-health .sx-btn .icon {
+  width: 13px;
+  height: 13px;
+  display: grid;
+  place-items: center;
+}
+.sx-health .sx-btn .icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* Status pill (tri-state honesty) */
+.sx-health .sx-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid;
+}
+.sx-health .sx-status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.sx-health .sx-status.ok {
+  color: var(--sage);
+  background: var(--sage-bg);
+  border-color: var(--sage-tint);
+}
+.sx-health .sx-status.ok .dot {
+  background: var(--sage);
+}
+.sx-health .sx-status.stale {
+  color: var(--amber);
+  background: var(--amber-bg);
+  border-color: var(--amber-tint);
+}
+.sx-health .sx-status.stale .dot {
+  background: var(--amber);
+}
+.sx-health .sx-status.unavail {
+  color: var(--ink-3);
+  background: var(--paper-tinted);
+  border-color: var(--rule);
+}
+.sx-health .sx-status.unavail .dot {
+  background: var(--ink-4);
+}
+.sx-health .sx-status.warn {
+  color: var(--rose);
+  background: var(--rose-bg);
+  border-color: var(--rose-tint);
+}
+.sx-health .sx-status.warn .dot {
+  background: var(--rose);
+}
+.sx-health .sx-asof {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+}
+
+/* Board layout */
+.sx-health .sx-board {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.sx-health .sx-board-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.sx-health .sx-board-main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sx-health .sx-board-side {
+  width: 300px;
+  border-left: var(--hair);
+  background: var(--paper);
+  overflow: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: none;
+}
+
+/* Pipeline strip — the spine */
+.sx-health .sx-pipeline {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+  padding: 14px;
+  background: var(--paper-light);
+  border-bottom: var(--hair);
+  flex: none;
+}
+.sx-health .sx-pipenode {
+  position: relative;
+  padding: 10px 12px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-m);
+  cursor: pointer;
+  transition:
+    border-color 120ms,
+    background 120ms;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 104px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.sx-health .sx-pipenode:hover {
+  background: var(--paper-tinted);
+}
+.sx-health .sx-pipenode.selected {
+  border-color: var(--ink);
+  box-shadow: 0 0 0 1px var(--ink);
+}
+.sx-health .sx-pipenode.warn {
+  border-color: var(--amber);
+  background: var(--amber-bg);
+}
+.sx-health .sx-pipenode.warn.selected {
+  box-shadow: 0 0 0 1px var(--amber);
+}
+.sx-health .sx-pipenode.alarm {
+  border-color: var(--signal);
+  background: var(--signal-bg);
+}
+.sx-health .sx-pipenode.alarm.selected {
+  box-shadow: 0 0 0 1px var(--signal);
+}
+.sx-health .sx-pipenode.unavail {
+  border-style: dashed;
+  border-color: var(--ink-4);
+}
+.sx-health .sx-pipenode .stage {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.sx-health .sx-pipenode .head {
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+}
+.sx-health .sx-pipenode.alarm .head {
+  color: var(--signal);
+}
+.sx-health .sx-pipenode .sub {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--ink-2);
+  line-height: 1.4;
+}
+.sx-health .sx-pipenode .grow {
+  flex: 1;
+}
+.sx-health .sx-pipenode .footrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+.sx-health .sx-pipenode .arrow {
+  position: absolute;
+  right: -7px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 12px;
+  height: 12px;
+  color: var(--ink-4);
+  z-index: 1;
+  background: var(--paper-light);
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+}
+.sx-health .sx-pipenode:last-child .arrow {
+  display: none;
+}
+
+/* Sparkline */
+.sx-health .sx-spark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  height: 14px;
+}
+.sx-health .sx-spark span {
+  width: 3px;
+  background: var(--ink-3);
+  opacity: 0.55;
+  border-radius: 1px;
+}
+.sx-health .sx-spark.warn span {
+  background: var(--amber);
+  opacity: 0.7;
+}
+.sx-health .sx-spark.alarm span {
+  background: var(--signal);
+  opacity: 0.7;
+}
+.sx-health .sx-mini {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+}
+.sx-health .sx-mini b {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* Alarm row */
+.sx-health .sx-alarm {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--rad-m);
+  border: 1px solid var(--rule-soft);
+  background: var(--paper);
+  margin-bottom: 6px;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.sx-health .sx-alarm.signal {
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+}
+.sx-health .sx-alarm.amber {
+  border-color: var(--amber-tint);
+  background: var(--amber-bg);
+}
+.sx-health .sx-alarm .body {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--body);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.sx-health .sx-alarm .stage {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 2px;
+}
+.sx-health .sx-alarm .head {
+  font-family: var(--display);
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+  margin-bottom: 2px;
+}
+.sx-health .sx-alarm .meta {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+}
+
+/* Section heading */
+.sx-health .sx-h {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+  font-weight: 500;
+}
+.sx-health h2.sx-drill-title {
+  margin: 0;
+  font-family: var(--display);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.012em;
+  color: var(--ink);
+}
+
+/* Big-stat tile */
+.sx-health .sx-tilegrid {
+  display: grid;
+  gap: 10px;
+}
+.sx-health .sx-tile {
+  padding: 12px 14px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--rad-m);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sx-health .sx-tile .num {
+  font-family: var(--display);
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+  color: var(--ink);
+}
+.sx-health .sx-tile .num small {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink-2);
+}
+.sx-health .sx-tile .lbl {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.sx-health .sx-tile .foot {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  margin-top: 2px;
+}
+.sx-health .sx-tile.warn {
+  background: var(--amber-bg);
+  border-color: var(--amber-tint);
+}
+.sx-health .sx-tile.alarm {
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
+}
+.sx-health .sx-tile.alarm .num {
+  color: var(--signal);
+}
+.sx-health .sx-tile.unavail {
+  border-style: dashed;
+  border-color: var(--ink-4);
+}
+.sx-health .sx-tile.unavail .num {
+  color: var(--ink-3);
+  font-size: 15px;
+}
+
+/* Callout block */
+.sx-health .sx-callout {
+  padding: 12px 14px;
+  border-radius: var(--rad-m);
+  background: var(--paper-tinted);
+  border-left: 2px solid var(--ink-3);
+  font-family: var(--body);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+.sx-health .sx-callout.alarm {
+  background: var(--signal-bg);
+  border-left-color: var(--signal);
+}
+.sx-health .sx-callout.warn {
+  background: var(--amber-bg);
+  border-left-color: var(--amber);
+}
+.sx-health .sx-callout code {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--paper-light);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--rule-soft);
+}
+
+/* Receipt card */
+.sx-health .sx-receipt {
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-m);
+  padding: 14px;
+}
+.sx-health .sx-receipt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  border-bottom: var(--hair-soft);
+  margin-bottom: 10px;
+}
+.sx-health .sx-stamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 3px;
+}
+.sx-health .sx-stamp.deterministic {
+  color: var(--sage);
+  background: var(--sage-bg);
+  border: 1px solid var(--sage-tint);
+}
+.sx-health .sx-stamp.partial {
+  color: var(--amber);
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-tint);
+}
+.sx-health .sx-stamp.signal {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border: 1px solid var(--signal-tint);
+}
+.sx-health .sx-receipt dl {
+  margin: 0;
+}
+.sx-health .sx-receipt-row {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 12px;
+}
+.sx-health .sx-receipt-row dt {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0;
+}
+.sx-health .sx-receipt-row dd {
+  margin: 0;
+  color: var(--ink);
+}
+.sx-health .sx-receipt-row dd.mono {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.sx-health .sx-receipt-reason {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--paper-tinted);
+  border-left: 2px solid var(--ink-3);
+  border-radius: 0 var(--rad-s) var(--rad-s) 0;
+  font-family: var(--body);
+  font-size: 12.5px;
+  font-style: italic;
+  color: var(--ink);
+}
+.sx-health .sx-receipt-reason code {
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--ink);
+  border-bottom: 1px dotted var(--ink-3);
+}
+
+/* Inventory table */
+.sx-health .sx-inv {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--body);
+  font-size: 12.5px;
+}
+.sx-health .sx-inv th,
+.sx-health .sx-inv td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: var(--hair-soft);
+}
+.sx-health .sx-inv th {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 500;
+  background: var(--paper-tinted);
+}
+.sx-health .sx-inv td.mono {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.sx-health .sx-inv td .reclaim {
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* Compact mono table */
+.sx-health .sx-monotbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.sx-health .sx-monotbl td,
+.sx-health .sx-monotbl th {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: var(--hair-soft);
+  color: var(--ink-2);
+}
+.sx-health .sx-monotbl th {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 500;
+}
+.sx-health .sx-monotbl td.right {
+  text-align: right;
+}
+.sx-health .sx-monotbl tr.warn td {
+  background: var(--amber-bg);
+  color: var(--amber);
+}
+
+/* Proportional bar */
+.sx-health .sx-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--paper-tinted);
+  overflow: hidden;
+  display: flex;
+}
+.sx-health .sx-bar span {
+  display: block;
+  height: 100%;
+}
+.sx-health .sx-bar .live {
+  background: var(--ink);
+}
+.sx-health .sx-bar .reclaim {
+  background: var(--rule);
+}
+
+/* Key/value */
+.sx-health .sx-kv {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 12px;
+}
+.sx-health .sx-kv dt {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0;
+}
+.sx-health .sx-kv dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--body);
+}
+.sx-health .sx-kv dd.mono {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* Utilities */
+.sx-health .sx-mono {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}
+.sx-health .sx-dim {
+  color: var(--ink-3);
+}
+
+/* Empty / unavailable view */
+.sx-health .sx-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 32px 20px;
+  align-items: flex-start;
+}
+.sx-health .sx-empty-title {
+  font-family: var(--display);
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.sx-health .sx-empty-copy {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1.5;
+}
+
+/* Floating toast */
+.sx-health .sx-toast {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--paper-light);
+  font-family: var(--mono);
+  font-size: 11px;
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+  box-shadow: 0 8px 28px -8px rgba(0, 0, 0, 0.4);
+  z-index: 30;
+}
+.sx-health .sx-toast button {
+  background: transparent;
+  border: 0;
+  color: var(--signal);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
 }

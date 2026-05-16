@@ -682,7 +682,7 @@ describe('attachDriftReport (drift layer wiring)', () => {
       shadowVsBaseline: {
         enabled: true,
         candidate: 'idf-rkn-split',
-        activeAlgorithmVersion: 'topic-revision:v1:union-find',
+        baselineAlgorithmVersion: 'topic-revision:v1:union-find',
         shadowAlgorithmVersion: 'topic-revision:shadow:idf-rkn-split',
         baselineRevisionId: 'b',
         shadowRevisionId: 's',

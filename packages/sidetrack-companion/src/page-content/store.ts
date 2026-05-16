@@ -4,11 +4,13 @@ import { basename, dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
 import {
+  PAGE_CONTENT_COVERAGE_STATES,
   PAGE_CONTENT_EXTRACTED,
   PAGE_CONTENT_TOMBSTONED,
   type ContentSearchHit,
   type PageContentChunk,
   type PageContentCoverage,
+  type PageContentCoverageState,
   type PageContentExtractedPayload,
   type PageContentRecord,
   type PageContentTombstonedPayload,
@@ -410,5 +412,35 @@ export const pageContentStorageStats = async (
     bytes: await walk(root),
     records: records.length,
     indexed: records.filter((record) => record.coverage.state === 'indexed').length,
+  };
+};
+
+export interface PageContentCoverageCounts {
+  readonly producedAt: string; // ISO
+  readonly byState: Record<string /*PageContentCoverageState*/, number>;
+  readonly total: number;
+  readonly indexed: number; // indexed + indexed_low_quality
+  readonly bytes: number; // reuse pageContentStorageStats bytes if cheap
+}
+
+export const pageContentCoverageCounts = async (
+  vaultRoot: string,
+): Promise<PageContentCoverageCounts> => {
+  // Explicit zero for every known state: absent states read as 0, not missing.
+  const byState: Record<PageContentCoverageState, number> = Object.fromEntries(
+    PAGE_CONTENT_COVERAGE_STATES.map((state) => [state, 0]),
+  ) as Record<PageContentCoverageState, number>;
+  const records = await readAllRecords(vaultRoot);
+  for (const record of records) {
+    const state = record.coverage.state;
+    byState[state] = (byState[state] ?? 0) + 1;
+  }
+  const stats = await pageContentStorageStats(vaultRoot);
+  return {
+    producedAt: new Date().toISOString(),
+    byState,
+    total: records.length,
+    indexed: byState.indexed + byState.indexed_low_quality,
+    bytes: stats.bytes,
   };
 };

@@ -24,7 +24,16 @@ import {
   type TrainRankerRevisionFn,
   type WriteActiveRankerRevisionFn,
 } from './retrain.js';
-import { RANKER_MODEL_VERSION, type RankerRevision, type TrainRankerInput } from './train.js';
+import {
+  RANKER_MODEL_VERSION,
+  trainRankerRevision,
+  type RankerRevision,
+  type TrainRankerInput,
+} from './train.js';
+import {
+  readActiveClosestVisitRankerRevisionManifest,
+  writeActiveClosestVisitRankerRevision,
+} from '../producers/closest-visit-revision.js';
 
 const observedAt = '2026-05-08T12:00:00.000Z';
 const observedAtMs = Date.parse(observedAt);
@@ -298,6 +307,57 @@ describe('ranker retraining loop', () => {
       activeRevisionId: 'revision-s25',
       rankerTrainingDatasetHash: '1'.repeat(64),
     });
+  });
+
+  it('captures trainQuality (gradeHistogram + spread + in-sample metric) into the persisted manifest', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-trainquality-'));
+    tempRoots.push(vaultRoot);
+
+    // Small synthetic dataset: two from-visits, each with one positive
+    // (graded >=1) and one negative (graded 0) destination so each query
+    // group has the >=2 rows / >=2 distinct labels the trainer needs.
+    const fromA = 'https://example.test/from-a';
+    const fromB = 'https://example.test/from-b';
+    const posA = 'https://example.test/pos-a';
+    const negA = 'https://example.test/neg-a';
+    const posB = 'https://example.test/pos-b';
+    const negB = 'https://example.test/neg-b';
+    const feedback = projection(
+      [label(fromA, posA), label(fromB, posB)],
+      [label(fromA, negA), label(fromB, negB)],
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback,
+      merged: [],
+      snapshot: snapshotWithVisits([fromA, fromB, posA, negA, posB, negB]),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    const revision = await trainRankerRevision({
+      feedback,
+      candidates,
+      options: { numRound: 5, trainedAt: observedAtMs },
+    });
+
+    expect(revision.trainQuality).toBeDefined();
+    const histogram = revision.trainQuality?.gradeHistogram;
+    expect(histogram).toMatchObject({ '0': 2, '1': 2 });
+    // Every graded row is accounted for exactly once across grades 0..4.
+    const totalGraded = Object.values(histogram ?? {}).reduce((sum, n) => sum + n, 0);
+    expect(totalGraded).toBe(4);
+    if (revision.trainQuality?.scoreSpread !== undefined) {
+      expect(revision.trainQuality.scoreSpread.distinctRatio).toBeGreaterThan(0);
+      expect(Number.isFinite(revision.trainQuality.scoreSpread.stdDev)).toBe(true);
+    }
+    if (revision.trainQuality?.inSampleMetric !== undefined) {
+      expect(revision.trainQuality.inSampleMetric.kind).toContain('ndcg');
+      expect(revision.trainQuality.inSampleMetric.value).toBeGreaterThanOrEqual(0);
+      expect(revision.trainQuality.inSampleMetric.value).toBeLessThanOrEqual(1);
+    }
+
+    await writeActiveClosestVisitRankerRevision(vaultRoot, revision);
+    const manifest = await readActiveClosestVisitRankerRevisionManifest(vaultRoot);
+    expect(manifest?.trainQuality?.gradeHistogram).toMatchObject({ '0': 2, '1': 2 });
   });
 
   it('connections materializer schedules retrain checks for feedback events', async () => {

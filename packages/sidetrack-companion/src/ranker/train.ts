@@ -22,6 +22,47 @@ import type { Candidate } from './types.js';
 export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v2' as const;
 export const DEFAULT_RANKER_NUM_ROUND = 40;
 export const DEFAULT_RANKER_SEED = 20260508;
+// k for the in-sample NDCG@k offline metric captured at train time.
+export const RANKER_IN_SAMPLE_NDCG_K = 5;
+
+export type RankerGrade = '0' | '1' | '2' | '3' | '4';
+
+/**
+ * Additive, optional train-time observability captured straight after
+ * the booster finishes. NONE of these fields feed back into ranking —
+ * they exist purely so a health board can spot a degenerate model
+ * (e.g. every score identical) without re-loading the model. All
+ * sub-objects are optional so older manifests/readers stay valid; the
+ * presence of `trainQuality` itself never affects the refuse-to-score
+ * schema invariant (featureSchemaVersion is unchanged).
+ */
+export interface RankerTrainQuality {
+  /** Count of training rows per relevance grade 0..4. Always present. */
+  readonly gradeHistogram: Record<RankerGrade, number>;
+  /**
+   * Spread of the freshly trained model's scores over the SAME training
+   * rows. Computed by reusing the in-process booster (a single extra
+   * `predict` over the already-encoded feature matrix — no second model
+   * load). A near-zero `stdDev` / tiny `distinctRatio` means the model
+   * collapsed to a constant.
+   */
+  readonly scoreSpread?: {
+    readonly p05: number;
+    readonly p50: number;
+    readonly p95: number;
+    readonly stdDev: number;
+    readonly distinctRatio: number;
+  };
+  /**
+   * In-sample (NOT held-out) ranking quality of the trained model's
+   * ordering vs. the graded labels, averaged over query groups.
+   * In-sample is acceptable here and explicitly labeled as such.
+   */
+  readonly inSampleMetric?: {
+    readonly kind: string;
+    readonly value: number;
+  };
+}
 
 export interface RankerRevision {
   readonly revisionId: string;
@@ -30,6 +71,7 @@ export interface RankerRevision {
   readonly trainingDatasetHash: string;
   readonly trainedAt: number;
   readonly modelBytes: ArrayBuffer;
+  readonly trainQuality?: RankerTrainQuality;
 }
 
 export interface RankerTrainingCandidate {
@@ -350,6 +392,95 @@ const setLightGbmGroupField = async (
   }
 };
 
+const RANKER_GRADES = ['0', '1', '2', '3', '4'] as const satisfies readonly RankerGrade[];
+
+const gradeHistogramForRows = (
+  rows: readonly RankerTrainingRow[],
+): Record<RankerGrade, number> => {
+  const histogram: Record<RankerGrade, number> = { '0': 0, '1': 0, '2': 0, '3': 0, '4': 0 };
+  for (const row of rows) {
+    const grade = Math.min(4, Math.max(0, Math.round(row.label)));
+    const key = String(grade) as RankerGrade;
+    histogram[key] += 1;
+  }
+  return histogram;
+};
+
+const percentile = (sorted: readonly number[], fraction: number): number => {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0] ?? 0;
+  const rank = fraction * (sorted.length - 1);
+  const lowerIndex = Math.floor(rank);
+  const upperIndex = Math.ceil(rank);
+  const lower = sorted[lowerIndex] ?? 0;
+  const upper = sorted[upperIndex] ?? lower;
+  return lower + (upper - lower) * (rank - lowerIndex);
+};
+
+const scoreSpread = (
+  scores: readonly number[],
+): RankerTrainQuality['scoreSpread'] => {
+  if (scores.length === 0) return undefined;
+  const sorted = [...scores].sort((left, right) => left - right);
+  const mean = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+  const variance =
+    scores.reduce((sum, score) => sum + (score - mean) ** 2, 0) / scores.length;
+  // Round to a stable precision so a "distinct" count isn't inflated by
+  // float noise from an effectively-constant model.
+  const distinct = new Set(scores.map((score) => score.toFixed(9))).size;
+  return {
+    p05: percentile(sorted, 0.05),
+    p50: percentile(sorted, 0.5),
+    p95: percentile(sorted, 0.95),
+    stdDev: Math.sqrt(variance),
+    distinctRatio: distinct / scores.length,
+  };
+};
+
+const dcgAtK = (gains: readonly number[], k: number): number => {
+  let dcg = 0;
+  const limit = Math.min(k, gains.length);
+  for (let i = 0; i < limit; i += 1) {
+    dcg += (gains[i] ?? 0) / Math.log2(i + 2);
+  }
+  return dcg;
+};
+
+/**
+ * Mean in-sample NDCG@k over query groups. Each group is ordered by the
+ * trained model's score (desc) and scored against its graded labels. A
+ * group whose ideal DCG is 0 (no positive grades) is skipped — it
+ * carries no ranking signal. In-sample by construction.
+ */
+const inSampleNdcg = (
+  rows: readonly RankerTrainingRow[],
+  groupSizes: readonly number[],
+  scores: readonly number[],
+  k: number,
+): number | undefined => {
+  let offset = 0;
+  let sum = 0;
+  let counted = 0;
+  for (const size of groupSizes) {
+    const indices = Array.from({ length: size }, (_, i) => offset + i);
+    const ideal = [...indices]
+      .map((index) => rows[index]?.label ?? 0)
+      .sort((left, right) => right - left);
+    const idealDcg = dcgAtK(ideal, k);
+    if (idealDcg > 0) {
+      const predictedOrder = [...indices].sort(
+        (left, right) => (scores[right] ?? 0) - (scores[left] ?? 0),
+      );
+      const predictedGains = predictedOrder.map((index) => rows[index]?.label ?? 0);
+      sum += dcgAtK(predictedGains, k) / idealDcg;
+      counted += 1;
+    }
+    offset += size;
+  }
+  if (counted === 0) return undefined;
+  return sum / counted;
+};
+
 export const trainRankerRevisionFromRows = async (
   rowsInput: readonly RankerTrainingRow[],
   options: TrainRankerOptions = {},
@@ -378,6 +509,31 @@ export const trainRankerRevisionFromRows = async (
       for (let iteration = 0; iteration < numRound; iteration += 1) {
         booster.update();
       }
+      // Reuse the in-process booster + the already-encoded `matrix` for
+      // a single extra prediction pass. This is the SAME model that was
+      // just trained — no second load, no behavior change to ranking.
+      const rawScores = booster.predict(matrix, rows.length, RANKER_FEATURE_KEYS.length, {});
+      const scores: number[] = [];
+      for (const score of rawScores) {
+        if (Number.isFinite(score)) scores.push(score);
+      }
+      const spread = scores.length === rows.length ? scoreSpread(scores) : undefined;
+      const ndcg =
+        scores.length === rows.length
+          ? inSampleNdcg(rows, groupSizes, scores, RANKER_IN_SAMPLE_NDCG_K)
+          : undefined;
+      const trainQuality: RankerTrainQuality = {
+        gradeHistogram: gradeHistogramForRows(rows),
+        ...(spread === undefined ? {} : { scoreSpread: spread }),
+        ...(ndcg === undefined
+          ? {}
+          : {
+              inSampleMetric: {
+                kind: `in-sample ndcg@${String(RANKER_IN_SAMPLE_NDCG_K)}`,
+                value: ndcg,
+              },
+            }),
+      };
       return {
         revisionId,
         modelVersion: RANKER_MODEL_VERSION,
@@ -385,6 +541,7 @@ export const trainRankerRevisionFromRows = async (
         trainingDatasetHash,
         trainedAt: options.trainedAt ?? maxGeneratedAt(rows),
         modelBytes: toOwnedArrayBuffer(booster.saveModel()),
+        trainQuality,
       };
     } finally {
       booster.dispose();

@@ -22,6 +22,24 @@ export interface WorkGraphHealthReport {
     readonly trainingDatasetHash: string | null;
     readonly retrainSkipReason: RankerRetrainSkipReason | null;
     readonly retrainNewLabelCount: number;
+    // Honest training mix (plan TODO-R5/X1). `negativeLabelCount`
+    // alone is the misleading-metric trap: it counts only explicit
+    // user-feedback negatives at last train (historically 0, and even
+    // those were dropped pre-fix). The model actually trains on
+    // grade-0 rows — synthetic random_unrelated/recently_skipped plus
+    // the now-derived visit-pair negatives. Surface all three so a
+    // reader cannot mistake "0 user negatives" for "no negatives".
+    readonly trainingMix: {
+      readonly positivesAtTrain: number;
+      readonly userFeedbackNegativesAtTrain: number;
+      // grade-0 training rows from the model manifest (synthetic +
+      // derived). null when the active manifest predates trainQuality
+      // capture — rendered as "unknown", never as 0.
+      readonly trainingNegatives: number | null;
+    } | null;
+    // True when the current feedback fingerprint differs from what the
+    // active model was trained on — "data changed, model is behind".
+    readonly datasetChangedSinceTrain: boolean;
   };
   readonly ann: {
     readonly backend: 'hnsw' | 'flat';
@@ -81,6 +99,23 @@ export const collectWorkGraphHealth = async ({
       ? null
       : await readClosestVisitRankerRevision(vaultRoot, activeManifest.revisionId);
   const retrainPlan = planRankerRetrain({ fingerprint, state: retrainState });
+  const gradeHistogram = (
+    activeRevision as { trainQuality?: { gradeHistogram?: Record<string, number> } } | null
+  )?.trainQuality?.gradeHistogram;
+  const trainingNegatives =
+    gradeHistogram !== undefined && typeof gradeHistogram['0'] === 'number'
+      ? gradeHistogram['0']
+      : null;
+  const trainingMix =
+    retrainState === null
+      ? null
+      : {
+          positivesAtTrain: retrainState.lastTrainedPositiveLabelCount,
+          userFeedbackNegativesAtTrain: retrainState.lastTrainedNegativeLabelCount,
+          trainingNegatives,
+        };
+  const datasetChangedSinceTrain =
+    retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
   return {
     ranker: {
       activeRevisionId: activeManifest?.revisionId ?? null,
@@ -90,6 +125,8 @@ export const collectWorkGraphHealth = async ({
       trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
       retrainSkipReason: retrainPlan.action === 'skip' ? retrainPlan.reason : null,
       retrainNewLabelCount: retrainPlan.newLabelCount,
+      trainingMix,
+      datasetChangedSinceTrain,
     },
     ann,
     feedback: {

@@ -26,6 +26,7 @@ import type { TrainRankerOptions } from './train.js';
 export interface RetrainWorkerJob {
   readonly vaultRoot: string;
   readonly threshold?: number;
+  readonly force?: boolean;
   readonly randomNegativeCandidatesPerPositive?: number;
   readonly trainOptions?: TrainRankerOptions;
 }
@@ -72,6 +73,7 @@ const run = async (): Promise<void> => {
       merged,
       snapshot,
       ...(job.threshold === undefined ? {} : { threshold: job.threshold }),
+      ...(job.force === undefined ? {} : { force: job.force }),
       ...(job.randomNegativeCandidatesPerPositive === undefined
         ? {}
         : { randomNegativeCandidatesPerPositive: job.randomNegativeCandidatesPerPositive }),

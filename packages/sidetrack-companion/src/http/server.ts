@@ -47,12 +47,15 @@ import {
 } from '../page-content/types.js';
 import {
   canonicalizePageUrl,
+  pageContentCoverageCounts,
   queryPageContent,
   readPageContentCoverage,
   readPageContentCoverageMap,
   writePageContentExtracted,
   writePageContentTombstoned,
 } from '../page-content/store.js';
+import { gcInventoryCached } from '../gc/plan.js';
+import { readHealthHistory } from '../connections/healthHistory.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
@@ -1061,10 +1064,17 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
       warn24h: number;
       fail24h: number;
       warning?: string;
+      lastCaptureTitle?: string;
+      lastCaptureThreadId?: string;
     }
   >();
   const recentWarnings: CaptureWarningHealth[] = [];
-  const since24h = Date.now() - 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const since24h = now - 24 * 60 * 60 * 1000;
+  const since1h = now - 60 * 60 * 1000;
+  let window1hCaptures = 0;
+  let window1hWarnings = 0;
+  let window1hFails = 0;
   for (const name of names
     .filter((candidate) => candidate.endsWith('.jsonl'))
     .sort()
@@ -1078,6 +1088,8 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
           readonly capturedAt?: unknown;
           readonly selectorCanary?: unknown;
           readonly warnings?: unknown;
+          readonly title?: unknown;
+          readonly threadId?: unknown;
         };
         if (typeof event.provider === 'string' && typeof event.capturedAt === 'string') {
           const existing = last[event.provider];
@@ -1105,9 +1117,24 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
             if (selectorCanary === 'warning') current.warn24h += 1;
             if (selectorCanary === 'failed') current.fail24h += 1;
           }
+          if (!Number.isNaN(capturedMillis) && capturedMillis >= since1h) {
+            window1hCaptures += 1;
+            if (selectorCanary === 'warning') window1hWarnings += 1;
+            if (selectorCanary === 'failed') window1hFails += 1;
+          }
           if (current.lastCaptureAt === null || current.lastCaptureAt < event.capturedAt) {
             current.lastCaptureAt = event.capturedAt;
             current.lastStatus = selectorCanary;
+            if (typeof event.title === 'string' && event.title.length > 0) {
+              current.lastCaptureTitle = event.title;
+            } else {
+              delete current.lastCaptureTitle;
+            }
+            if (typeof event.threadId === 'string' && event.threadId.length > 0) {
+              current.lastCaptureThreadId = event.threadId;
+            } else {
+              delete current.lastCaptureThreadId;
+            }
             const warning = firstCaptureWarningMessage(event.warnings);
             if (warning !== undefined) {
               current.warning = warning;
@@ -1171,6 +1198,11 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
     recentWarnings: recentWarnings
       .sort((left, right) => right.capturedAt.localeCompare(left.capturedAt))
       .slice(0, 10),
+    window1h: {
+      captures: window1hCaptures,
+      warnings: window1hWarnings,
+      fails: window1hFails,
+    },
   };
 };
 
@@ -2562,6 +2594,7 @@ const routes: readonly RouteDefinition[] = [
                       lastError: lifecycleReport.lastError,
                       rebuildEmbedded: lifecycleReport.rebuildEmbedded,
                       rebuildTotal: lifecycleReport.rebuildTotal,
+                      rebuildPhase: lifecycleReport.rebuildPhase,
                       embedderDevice: lifecycleReport.embedderDevice,
                       embedderAccelerator: lifecycleReport.embedderAccelerator,
                       drift: lifecycleReport.drift,
@@ -2602,8 +2635,98 @@ const routes: readonly RouteDefinition[] = [
     method: 'GET',
     pattern: /^\/v1\/system\/hygiene-status$/,
     authRequired: true,
-    handle: (_request, _requestId, _match, context) =>
-      Promise.resolve([200, { data: context.hygieneStatus ?? {} }]),
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      // GC inventory walks thousands of derived files — too slow for a
+      // synchronous request on a real vault. Served from a TTL'd
+      // background-refreshed cache (follow-up #15): O(1) here, the walk
+      // happens off the request. Honest tri-state: unavailable until the
+      // first compute lands, stale while refreshing an expired entry, ok
+      // when fresh. pageContent counts are cheap → keep the inline
+      // budget guard so a slow disk still degrades honestly (plan X1).
+      const budget = async <T>(
+        op: () => Promise<T>,
+        ms: number,
+      ): Promise<{ value: T | null; availability: 'ok' | 'unavailable' }> => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
+            op().then((value) => ({ value, availability: 'ok' as const })),
+            new Promise<{ value: null; availability: 'unavailable' }>((resolve) => {
+              timer = setTimeout(
+                () => resolve({ value: null, availability: 'unavailable' }),
+                ms,
+              );
+            }),
+          ]);
+        } catch {
+          return { value: null, availability: 'unavailable' };
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      };
+      const [gc, pageContent] = await Promise.all([
+        gcInventoryCached(vaultRoot),
+        budget(() => pageContentCoverageCounts(vaultRoot), 4_000),
+      ]);
+      return [
+        200,
+        {
+          data: {
+            ...(context.hygieneStatus ?? {}),
+            asOf: new Date().toISOString(),
+            availability: { gc: gc.availability, pageContent: pageContent.availability },
+            gcAsOf: gc.asOf,
+            gc: gc.value,
+            pageContent: pageContent.value,
+          },
+        },
+      ];
+    },
+  },
+  {
+    // Plan TODO-H4: Focus surface. Serves the pre-digested
+    // diagnostics/latest.json (O(1) file read — the materializer
+    // already writes it every drain) plus an optional ?history=N
+    // window from the dumb ring buffer. Never scans diagnostics/history.
+    method: 'GET',
+    pattern: /^\/v1\/system\/focus-health$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/v1/system/focus-health', 'http://internal');
+      const historyRaw = url.searchParams.get('history');
+      const historyN =
+        historyRaw === null ? 0 : Math.max(0, Math.min(96, Number.parseInt(historyRaw, 10) || 0));
+      const latestPath = join(vaultRoot, '_BAC/connections/diagnostics/latest.json');
+      let digest: unknown = null;
+      let availability: 'ok' | 'unavailable' = 'unavailable';
+      let asOf: string | null = null;
+      try {
+        const parsed = JSON.parse(await readFile(latestPath, 'utf8')) as {
+          readonly producedAt?: unknown;
+        };
+        digest = parsed;
+        availability = 'ok';
+        asOf = typeof parsed.producedAt === 'string' ? parsed.producedAt : null;
+      } catch {
+        // Missing/corrupt digest → honest "unavailable", not a faked
+        // healthy empty (plan X1).
+        availability = 'unavailable';
+      }
+      const history = historyN > 0 ? await readHealthHistory(vaultRoot, historyN) : [];
+      return [
+        200,
+        {
+          data: {
+            availability,
+            asOf,
+            digest,
+            history,
+          },
+        },
+      ];
+    },
   },
   {
     method: 'POST',
@@ -5182,6 +5305,7 @@ const routes: readonly RouteDefinition[] = [
           merged: await context.eventLog.readMerged(),
           snapshot,
           ...(threshold === undefined ? {} : { threshold }),
+          ...(force ? { force: true } : {}),
           ...(randomNegativeCandidatesPerPositive === undefined
             ? {}
             : { randomNegativeCandidatesPerPositive }),
@@ -5191,6 +5315,7 @@ const routes: readonly RouteDefinition[] = [
         result = await runMaybeRetrainInWorker({
           vaultRoot,
           ...(threshold === undefined ? {} : { threshold }),
+          ...(force ? { force: true } : {}),
           ...(randomNegativeCandidatesPerPositive === undefined
             ? {}
             : { randomNegativeCandidatesPerPositive }),
