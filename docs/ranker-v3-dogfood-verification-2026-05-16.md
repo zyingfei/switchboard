@@ -211,6 +211,56 @@ lacks trainable positive visit-pair supervision, but the companion no
 longer spends tens of minutes generating and featurizing candidates
 before discovering that fact.
 
+## Post-#190 Latest-Main Readiness Check
+
+After #189 added the explicit Focus `Keep` path for
+`USER_FLOW_CONFIRMED` / `closest_visit` feedback and #190 updated the
+follow-up tracker, the companion was restarted from latest
+`origin/main` `9d715d6c`:
+
+```bash
+cd /Users/yingfei/playground/playground/browser-ai-companion-main-dogfood/packages/sidetrack-companion
+env SIDETRACK_TOPIC_SHADOW_CANDIDATE=idf-rkn-split \
+  SIDETRACK_CONNECTIONS_CHILD=1 \
+  npx --yes bun@1.3.14 dist/cli.js \
+  --vault /Users/yingfei/.sidetrack-vault \
+  --port 17373
+```
+
+The startup materializer log showed the same safe-block shape:
+
+```text
+nodes=2805 edges=9915 visits=837 engagementEligible=449
+ranker=skipped:below-threshold
+rankerAug=absent:stale-model-schema
+rankerNeedsRetrain=true
+closestVisit=0 rankerSource=0
+labels=790(+218/-572)
+shadow=idf-rkn-split shadowTopics=44 shadowMax=35 shadowNoise=0.416667
+```
+
+A forced retrain against latest `main` returned immediately:
+
+```json
+{
+  "status": "skipped",
+  "reason": "no-usable-query-groups",
+  "fingerprint": {
+    "hash": "2bcc5fbfe3c7f874358825a61348548ee16ca7452eab8e05ed1844fed7234f84",
+    "labelCount": 790,
+    "positiveLabelCount": 218,
+    "negativeLabelCount": 572
+  },
+  "newLabelCount": 0,
+  "candidateCount": 0
+}
+```
+
+The response was saved at
+`_BAC/debug-dumps/ranker-post-190-retrain-response.json`. A pre-dogfood
+vault count still showed `0` `user.flow.confirmed` events, so #189
+supplies the missing UI path but does not by itself satisfy CV-3.
+
 ## Conclusion
 
 The verification confirms the core safety improvement over the v2
@@ -230,9 +280,12 @@ blocker:
 | distinct labeled-row timestamps | not evaluated | 136 in the post-#186 retry |
 | usable query groups | tautologically separable | 0 |
 | post-#187 forced retrain | n/a | `skipped:no-usable-query-groups`, `candidateCount: 0` |
+| post-#190 latest-main retrain | n/a | `skipped:no-usable-query-groups`, `candidateCount: 0` |
+| explicit positive-feedback UI path | absent | present via #189 `Keep` action; no real dogfood clicks yet |
 | v3 replacement model written | n/a | no |
 
 This should be treated as a safe-block result, not a quality win for
-emitted ranking. The cheap preflight is now landed via #187. The next
-product/data requirement is more genuine visit-to-visit positive
-supervision if `closest_visit` is expected to emit learned edges again.
+emitted ranking. The cheap preflight is now landed via #187, and the
+explicit positive-feedback UI path is landed via #189. The next
+product/data requirement is real dogfood use of that path so
+`user.flow.confirmed` visit-pair positives exist before retraining.
