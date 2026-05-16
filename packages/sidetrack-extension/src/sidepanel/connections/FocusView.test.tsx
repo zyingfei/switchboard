@@ -431,4 +431,63 @@ describe('FocusView', () => {
     });
     expect(screen.getByTestId('focus-visit-timeline-visit:https://example.test/b')).toBeDefined();
   });
+
+  it('confirms a related visit against the scoped anchor visit', async () => {
+    const onVisitConfirmRelated = vi.fn(() => Promise.resolve());
+    const { rerender } = render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 3, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+            { id: 'timeline-visit:https://example.test/c', label: 'C', focusedWindowMs: 4_000 },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        anchorVisitId="timeline-visit:https://example.test/a"
+        onVisitConfirmRelated={onVisitConfirmRelated}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Alpha'));
+    expect(screen.getAllByText('Keep')).toHaveLength(2);
+    fireEvent.click(
+      screen.getByTestId(
+        'focus-visit-confirm-related-topic:a-timeline-visit:https://example.test/b',
+      ),
+    );
+
+    await waitFor(() => {
+      expect(onVisitConfirmRelated).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        fromVisitId: 'timeline-visit:https://example.test/a',
+        toVisitId: 'timeline-visit:https://example.test/b',
+      });
+    });
+    expect(screen.getByText('Kept')).toBeDefined();
+
+    rerender(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 3, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            { id: 'timeline-visit:https://example.test/b', label: 'B', focusedWindowMs: 5_000 },
+            { id: 'timeline-visit:https://example.test/c', label: 'C', focusedWindowMs: 4_000 },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        anchorVisitId="timeline-visit:https://example.test/c"
+        onVisitConfirmRelated={onVisitConfirmRelated}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    expect(screen.queryByText('Kept')).toBeNull();
+    expect(screen.getAllByText('Keep')).toHaveLength(2);
+  });
 });
