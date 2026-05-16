@@ -25,7 +25,7 @@ import {
 import type { TopicRevision } from '../producers/topic-revision.js';
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import type { RankerRetrainResult } from '../ranker/retrain.js';
-import { RANKER_MODEL_VERSION } from '../ranker/train.js';
+import { RANKER_MODEL_VERSION, type RankerTrainQuality } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
@@ -109,6 +109,14 @@ export type MaterializerRankerAugmentationStatus =
 
 export type MaterializerRankerModelFreshness = 'fresh' | 'stale' | 'unknown' | null;
 
+type RankerMethodologySpine = NonNullable<RankerTrainQuality['methodologySpine']>;
+
+export interface MaterializerRankerMethodologySpineDiagnostics {
+  readonly servingGateEnforced: boolean;
+  readonly split: RankerMethodologySpine['split'];
+  readonly shipGate: RankerMethodologySpine['shipGate'];
+}
+
 export interface MaterializerRankerAugmentationCounters {
   readonly status: MaterializerRankerAugmentationStatus;
   readonly reason: string | null;
@@ -119,6 +127,7 @@ export interface MaterializerRankerAugmentationCounters {
   readonly expectedFeatureSchemaVersion: number;
   readonly needsRetrain: boolean;
   readonly modelFreshness: MaterializerRankerModelFreshness;
+  readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
   readonly baseEdgeCount: number;
   readonly finalEdgeCount: number;
   readonly closestVisitEdgeCount: number;
@@ -367,6 +376,7 @@ const collectDefaultRankerAugmentationCounters = (
   expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
   needsRetrain: false,
   modelFreshness: 'unknown',
+  methodologySpine: null,
   baseEdgeCount: snapshot.edges.length,
   finalEdgeCount: snapshot.edges.length,
   closestVisitEdgeCount: snapshot.edges.filter((edge) => edge.kind === 'closest_visit').length,
@@ -511,6 +521,18 @@ export const collectMaterializerDiagnostics = (
   };
 };
 
+export const rankerMethodologySpineDiagnosticsFromTrainQuality = (
+  trainQuality: RankerTrainQuality | undefined,
+): MaterializerRankerMethodologySpineDiagnostics | null => {
+  const methodologySpine = trainQuality?.methodologySpine;
+  if (methodologySpine === undefined) return null;
+  return {
+    servingGateEnforced: false,
+    split: methodologySpine.split,
+    shipGate: methodologySpine.shipGate,
+  };
+};
+
 export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagnostics): string => {
   const parts: string[] = [
     `nodes=${String(diagnostics.snapshot.nodeCount)}`,
@@ -542,6 +564,17 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
     `urlsAttributed=${String(diagnostics.urls.attributedCanonicalUrlCount)}/${String(diagnostics.urls.canonicalUrlCount)}`,
     `visitInstancesAttributed=${String(diagnostics.snapshot.attributedVisitInstanceCount)}/${String(diagnostics.snapshot.visitInstanceCount)}`,
   ];
+  const methodologySpine = diagnostics.rankerAugmentation.methodologySpine;
+  if (methodologySpine !== null) {
+    const split = methodologySpine.split;
+    parts.push(
+      `shipGate=${methodologySpine.shipGate.status}:${methodologySpine.shipGate.reason}`,
+      `servingGateEnforced=${String(methodologySpine.servingGateEnforced)}`,
+      split.status === 'available'
+        ? `split=available:${String(split.trainGroupCount)}/${String(split.validationGroupCount)}/${String(split.testGroupCount)}`
+        : `split=unavailable:${split.reason}`,
+    );
+  }
   if (diagnostics.shadowVsBaseline !== undefined) {
     parts.push(
       `shadow=${diagnostics.shadowVsBaseline.candidate}`,

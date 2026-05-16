@@ -13,9 +13,11 @@ import {
   collectMaterializerDiagnostics,
   createMaterializerDiagnosticsStore,
   logMaterializerDiagnostics,
+  rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerDiagnostics,
   type MaterializerDiagnosticsStore,
   type MaterializerRankerAugmentationCounters,
+  type MaterializerRankerMethodologySpineDiagnostics,
   type MaterializerRankerModelFreshness,
 } from '../../connections/materializerDiagnostics.js';
 import {
@@ -298,6 +300,7 @@ type ClosestVisitRankerLoadResult =
       readonly activeFeatureSchemaVersion?: number | null;
       readonly expectedFeatureSchemaVersion?: number;
       readonly needsRetrain?: boolean;
+      readonly methodologySpine?: MaterializerRankerMethodologySpineDiagnostics | null;
     }
   | {
       readonly status: 'missing';
@@ -308,6 +311,7 @@ type ClosestVisitRankerLoadResult =
       readonly activeFeatureSchemaVersion?: number | null;
       readonly expectedFeatureSchemaVersion?: number;
       readonly needsRetrain?: boolean;
+      readonly methodologySpine?: MaterializerRankerMethodologySpineDiagnostics | null;
     }
   | {
       readonly status: 'invalid';
@@ -323,6 +327,7 @@ type ClosestVisitRankerLoadResult =
       readonly activeFeatureSchemaVersion?: number | null;
       readonly expectedFeatureSchemaVersion?: number;
       readonly needsRetrain?: boolean;
+      readonly methodologySpine?: MaterializerRankerMethodologySpineDiagnostics | null;
     };
 
 type ClosestVisitRankerLoader = () => Promise<ClosestVisitRankerLoadResult>;
@@ -647,6 +652,7 @@ export const createConnectionsMaterializer = (
     readonly expectedFeatureSchemaVersion: number;
     readonly needsRetrain: boolean;
     readonly modelFreshness: MaterializerRankerModelFreshness;
+    readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
     readonly baseSnapshot: ConnectionsSnapshot;
     readonly finalSnapshot: ConnectionsSnapshot;
   }): MaterializerRankerAugmentationCounters => ({
@@ -659,6 +665,7 @@ export const createConnectionsMaterializer = (
     expectedFeatureSchemaVersion: input.expectedFeatureSchemaVersion,
     needsRetrain: input.needsRetrain,
     modelFreshness: input.modelFreshness,
+    methodologySpine: input.methodologySpine,
     baseEdgeCount: input.baseSnapshot.edges.length,
     finalEdgeCount: input.finalSnapshot.edges.length,
     closestVisitEdgeCount: countClosestVisitEdges(input.finalSnapshot),
@@ -674,6 +681,7 @@ export const createConnectionsMaterializer = (
     | 'activeFeatureSchemaVersion'
     | 'expectedFeatureSchemaVersion'
     | 'needsRetrain'
+    | 'methodologySpine'
   > => ({
     activeModelVersion:
       result?.activeModelVersion ??
@@ -686,6 +694,7 @@ export const createConnectionsMaterializer = (
     expectedFeatureSchemaVersion:
       result?.expectedFeatureSchemaVersion ?? expectedClosestVisitRankerSchema.featureSchemaVersion,
     needsRetrain: result?.needsRetrain ?? false,
+    methodologySpine: result?.methodologySpine ?? null,
   });
 
   const loadClosestVisitRanker = async (): Promise<ClosestVisitRankerLoadResult> => {
@@ -703,6 +712,7 @@ export const createConnectionsMaterializer = (
           activeFeatureSchemaVersion: probe.activeFeatureSchemaVersion,
           expectedFeatureSchemaVersion: probe.expectedFeatureSchemaVersion,
           needsRetrain: probe.staleModelSchema,
+          methodologySpine: null,
         };
       }
       return {
@@ -710,8 +720,12 @@ export const createConnectionsMaterializer = (
         activeRevisionId: null,
         reason: 'no-active-manifest',
         needsRetrain: false,
+        methodologySpine: null,
       };
     }
+    const methodologySpine = rankerMethodologySpineDiagnosticsFromTrainQuality(
+      manifest.trainQuality,
+    );
     const revision = await readClosestVisitRankerRevision(deps.vaultRoot, manifest.revisionId);
     if (revision === null) {
       return {
@@ -724,6 +738,7 @@ export const createConnectionsMaterializer = (
         activeFeatureSchemaVersion: manifest.featureSchemaVersion,
         expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
         needsRetrain: false,
+        methodologySpine,
       };
     }
     try {
@@ -737,6 +752,7 @@ export const createConnectionsMaterializer = (
         activeFeatureSchemaVersion: manifest.featureSchemaVersion,
         expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
         needsRetrain: false,
+        methodologySpine,
         ranker: {
           revisionId: model.revisionId,
           predict: (features) => predictRanker(features, model),
@@ -753,6 +769,7 @@ export const createConnectionsMaterializer = (
         activeFeatureSchemaVersion: manifest.featureSchemaVersion,
         expectedFeatureSchemaVersion: expectedClosestVisitRankerSchema.featureSchemaVersion,
         needsRetrain: false,
+        methodologySpine,
       };
     }
   };
