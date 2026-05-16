@@ -32,6 +32,27 @@ import type {
 
 const TIMESTAMP = '2026-05-10T00:00:00.000Z';
 const ACCEPTED_AT_MS = Date.parse(TIMESTAMP);
+const METHODOLOGY_SPINE_DIAGNOSTICS = {
+  servingGateEnforced: false,
+  split: {
+    status: 'available' as const,
+    strategy: 'forward-chaining-time' as const,
+    timestampSource: 'supervision-event-or-visit-observed-at' as const,
+    trainGroupCount: 12,
+    validationGroupCount: 4,
+    testGroupCount: 3,
+    validationCutoffGeneratedAt: Date.parse('2026-05-09T00:00:00.000Z'),
+    testCutoffGeneratedAt: Date.parse('2026-05-10T00:00:00.000Z'),
+  },
+  shipGate: {
+    status: 'fail' as const,
+    candidate: RANKER_MODEL_VERSION,
+    minValidationDeltaVsBaseline: 0.005,
+    minReservedTestNdcg: 0.5,
+    reservedTestUsedExactlyOnce: true as const,
+    reason: 'reserved-test-below-floor' as const,
+  },
+};
 
 const event = (
   overrides: Partial<AcceptedEvent> & {
@@ -349,6 +370,7 @@ describe('collectMaterializerDiagnostics', () => {
           expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
           needsRetrain: false,
           modelFreshness: 'fresh',
+          methodologySpine: METHODOLOGY_SPINE_DIAGNOSTICS,
           baseEdgeCount: 0,
           finalEdgeCount: 1,
           closestVisitEdgeCount: 1,
@@ -366,6 +388,7 @@ describe('collectMaterializerDiagnostics', () => {
       expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
       needsRetrain: false,
       modelFreshness: 'fresh',
+      methodologySpine: METHODOLOGY_SPINE_DIAGNOSTICS,
       baseEdgeCount: 0,
       finalEdgeCount: 1,
       closestVisitEdgeCount: 1,
@@ -553,6 +576,34 @@ describe('summarizeMaterializerDiagnostics', () => {
     expect(summary).toContain('ranker=not-run');
     expect(summary).toContain('rankerAug=not-run:unknown');
     expect(summary).toContain('newLabels=n/a');
+  });
+
+  it('includes ranker ship-gate and split diagnostics when present', () => {
+    const diag = collectMaterializerDiagnostics(
+      baseInput({
+        rankerAugmentation: {
+          status: 'emitted',
+          reason: null,
+          activeRevisionId: 'ranker-rev-1',
+          activeModelVersion: RANKER_MODEL_VERSION,
+          expectedModelVersion: RANKER_MODEL_VERSION,
+          activeFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          needsRetrain: false,
+          modelFreshness: 'fresh',
+          methodologySpine: METHODOLOGY_SPINE_DIAGNOSTICS,
+          baseEdgeCount: 0,
+          finalEdgeCount: 0,
+          closestVisitEdgeCount: 0,
+          rankerSourceEdgeCount: 0,
+        },
+      }),
+    );
+
+    const summary = summarizeMaterializerDiagnostics(diag);
+    expect(summary).toContain('shipGate=fail:reserved-test-below-floor');
+    expect(summary).toContain('servingGateEnforced=false');
+    expect(summary).toContain('split=available:12/4/3');
   });
 
   it('flags the similarity producer when the lexical fallback runs', () => {

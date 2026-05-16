@@ -2,6 +2,10 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  rankerMethodologySpineDiagnosticsFromTrainQuality,
+  type MaterializerRankerMethodologySpineDiagnostics,
+} from '../connections/materializerDiagnostics.js';
+import {
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
   readActiveClosestVisitRankerRevisionManifestProbe,
@@ -32,6 +36,7 @@ export interface WorkGraphHealthReport {
     readonly trainingDatasetHash: string | null;
     readonly retrainSkipReason: RankerRetrainSkipReason | null;
     readonly retrainNewLabelCount: number;
+    readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
     // Honest training mix (plan TODO-R5/X1). `negativeLabelCount`
     // alone is the misleading-metric trap: it counts only explicit
     // user-feedback negatives at last train (historically 0, and even
@@ -60,6 +65,7 @@ export interface WorkGraphHealthReport {
       readonly expectedFeatureSchemaVersion: number;
       readonly needsRetrain: boolean;
       readonly modelFreshness: string | null;
+      readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
       readonly closestVisitEdgeCount: number;
       readonly rankerSourceEdgeCount: number;
       readonly asOf: string | null;
@@ -118,6 +124,70 @@ const numberOrNull = (value: unknown): number | null =>
 
 const booleanOrFalse = (value: unknown): boolean => (typeof value === 'boolean' ? value : false);
 
+const parseMethodologySpineDiagnostics = (
+  value: unknown,
+): MaterializerRankerMethodologySpineDiagnostics | null => {
+  if (!isRecord(value)) return null;
+  const splitRaw = value['split'];
+  const shipGateRaw = value['shipGate'];
+  if (!isRecord(splitRaw) || !isRecord(shipGateRaw)) return null;
+  const split =
+    splitRaw['status'] === 'available' &&
+    splitRaw['strategy'] === 'forward-chaining-time' &&
+    splitRaw['timestampSource'] === 'supervision-event-or-visit-observed-at' &&
+    numberOrNull(splitRaw['trainGroupCount']) !== null &&
+    numberOrNull(splitRaw['validationGroupCount']) !== null &&
+    numberOrNull(splitRaw['testGroupCount']) !== null &&
+    numberOrNull(splitRaw['validationCutoffGeneratedAt']) !== null &&
+    numberOrNull(splitRaw['testCutoffGeneratedAt']) !== null
+      ? {
+          status: 'available' as const,
+          strategy: 'forward-chaining-time' as const,
+          timestampSource: 'supervision-event-or-visit-observed-at' as const,
+          trainGroupCount: numberOrZero(splitRaw['trainGroupCount']),
+          validationGroupCount: numberOrZero(splitRaw['validationGroupCount']),
+          testGroupCount: numberOrZero(splitRaw['testGroupCount']),
+          validationCutoffGeneratedAt: numberOrZero(splitRaw['validationCutoffGeneratedAt']),
+          testCutoffGeneratedAt: numberOrZero(splitRaw['testCutoffGeneratedAt']),
+        }
+      : splitRaw['status'] === 'unavailable' &&
+          splitRaw['reason'] === 'insufficient-time-separated-groups'
+        ? {
+            status: 'unavailable' as const,
+            reason: 'insufficient-time-separated-groups' as const,
+          }
+        : null;
+  if (split === null) return null;
+  const shipGateStatus = shipGateRaw['status'];
+  const shipGateReason = shipGateRaw['reason'];
+  if (
+    (shipGateStatus !== 'pass' && shipGateStatus !== 'fail' && shipGateStatus !== 'unavailable') ||
+    shipGateRaw['candidate'] !== expectedClosestVisitRankerSchema.modelVersion ||
+    numberOrNull(shipGateRaw['minValidationDeltaVsBaseline']) === null ||
+    numberOrNull(shipGateRaw['minReservedTestNdcg']) === null ||
+    shipGateRaw['reservedTestUsedExactlyOnce'] !== true ||
+    (shipGateReason !== 'active-model-cleared-validation-and-reserved-test' &&
+      shipGateReason !== 'active-model-does-not-beat-comparison-baseline' &&
+      shipGateReason !== 'reserved-test-below-floor' &&
+      shipGateReason !== 'novel-pair-supervision-unavailable' &&
+      shipGateReason !== 'validation-or-test-metric-unavailable')
+  ) {
+    return null;
+  }
+  return {
+    servingGateEnforced: booleanOrFalse(value['servingGateEnforced']),
+    split,
+    shipGate: {
+      status: shipGateStatus,
+      candidate: expectedClosestVisitRankerSchema.modelVersion,
+      minValidationDeltaVsBaseline: numberOrZero(shipGateRaw['minValidationDeltaVsBaseline']),
+      minReservedTestNdcg: numberOrZero(shipGateRaw['minReservedTestNdcg']),
+      reservedTestUsedExactlyOnce: true,
+      reason: shipGateReason,
+    },
+  };
+};
+
 const readRankerAugmentationStatus = async (
   vaultRoot: string,
 ): Promise<WorkGraphHealthReport['ranker']['augmentation']> => {
@@ -144,6 +214,7 @@ const readRankerAugmentationStatus = async (
         expectedClosestVisitRankerSchema.featureSchemaVersion,
       needsRetrain: booleanOrFalse(rankerAugmentation['needsRetrain']),
       modelFreshness: stringOrNull(rankerAugmentation['modelFreshness']),
+      methodologySpine: parseMethodologySpineDiagnostics(rankerAugmentation['methodologySpine']),
       closestVisitEdgeCount: numberOrZero(rankerAugmentation['closestVisitEdgeCount']),
       rankerSourceEdgeCount: numberOrZero(rankerAugmentation['rankerSourceEdgeCount']),
       asOf: stringOrNull(parsed['producedAt']),
@@ -218,6 +289,9 @@ export const collectWorkGraphHealth = async ({
       trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
       retrainSkipReason: retrainPlan.action === 'skip' ? retrainPlan.reason : null,
       retrainNewLabelCount: retrainPlan.newLabelCount,
+      methodologySpine: rankerMethodologySpineDiagnosticsFromTrainQuality(
+        activeManifest?.trainQuality,
+      ),
       trainingMix,
       datasetChangedSinceTrain,
       augmentation,

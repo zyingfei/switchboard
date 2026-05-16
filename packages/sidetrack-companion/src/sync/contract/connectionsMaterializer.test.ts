@@ -8,7 +8,12 @@ import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.
 import { activeClosestVisitRevisionManifestPath } from '../../producers/closest-visit-revision.js';
 import { FEATURE_SCHEMA_VERSION } from '../../ranker/feature-schema.js';
 import type { LightGBMModel, RankerContributions } from '../../ranker/predict.js';
-import { RANKER_MODEL_VERSION } from '../../ranker/train.js';
+import {
+  DETERMINISTIC_BASELINE_VERSION,
+  RANKER_MODEL_VERSION,
+  REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+  type RankerTrainQuality,
+} from '../../ranker/train.js';
 import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
@@ -153,6 +158,115 @@ const writeStaleV1RankerManifest = async (root: string): Promise<void> => {
         trainedAt: Date.parse('2026-05-01T00:00:00.000Z'),
         modelByteLength: 0,
         modelSha256: 'b'.repeat(64),
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+};
+
+const failingShipGateTrainQuality = (): RankerTrainQuality => ({
+  gradeHistogram: { '0': 3, '1': 0, '2': 0, '3': 0, '4': 2 },
+  candidateLabeling: {
+    totalCandidates: 5,
+    labeledRows: 5,
+    positiveRows: 2,
+    negativeRows: 3,
+    implicitNegativeRows: 3,
+    unlabeledCandidateCount: 0,
+  },
+  methodologySpine: {
+    split: {
+      status: 'available',
+      strategy: 'forward-chaining-time',
+      timestampSource: 'supervision-event-or-visit-observed-at',
+      trainGroupCount: 12,
+      validationGroupCount: 4,
+      testGroupCount: 3,
+      validationCutoffGeneratedAt: Date.parse('2026-05-09T00:00:00.000Z'),
+      testCutoffGeneratedAt: Date.parse('2026-05-10T00:00:00.000Z'),
+    },
+    novelPairSlice: {
+      rowCount: 5,
+      groupCount: 2,
+      positiveRows: 2,
+      negativeRows: 3,
+      sourceKinds: ['feedback'],
+    },
+    labelPermutation: {
+      seed: 20260516,
+      rowCount: 5,
+      groupCount: 2,
+    },
+    workstreamFeatureAblation: {
+      droppedFeatures: [],
+      status: 'not-in-feature-vector',
+    },
+    reservedTestMetric: {
+      kind: 'reserved test ndcg@5',
+      value: 0.42,
+      rowCount: 3,
+      groupCount: 1,
+    },
+    tuning: {
+      status: 'available',
+      strategy: 'validation-num-round-grid',
+      requestedNumRound: 40,
+      selectedNumRound: 20,
+      validationCandidateCount: 2,
+      candidates: [{ numRound: 20, metric: { kind: 'validation ndcg@5', value: 0.6 } }],
+    },
+    modelChoice: {
+      deterministicBaseline: {
+        candidate: DETERMINISTIC_BASELINE_VERSION,
+        validationMetric: { kind: 'validation ndcg@5', value: 0.61 },
+        reservedTestMetric: { kind: 'reserved test ndcg@5', value: 0.51 },
+      },
+      activeModel: {
+        candidate: RANKER_MODEL_VERSION,
+        validationMetric: { kind: 'validation ndcg@5', value: 0.6 },
+        reservedTestMetric: { kind: 'reserved test ndcg@5', value: 0.42 },
+      },
+      regularizedLogisticRegression: {
+        candidate: REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+        validationMetric: { kind: 'validation ndcg@5', value: 0.55 },
+        reservedTestMetric: { kind: 'reserved test ndcg@5', value: 0.4 },
+      },
+      graduation: {
+        status: 'not-earned',
+        minValidationDelta: 0.005,
+        validationDelta: -0.01,
+        comparisonCandidate: DETERMINISTIC_BASELINE_VERSION,
+        reason: 'active-model-does-not-beat-comparison-baseline',
+      },
+    },
+    shipGate: {
+      status: 'fail',
+      candidate: RANKER_MODEL_VERSION,
+      minValidationDeltaVsBaseline: 0.005,
+      minReservedTestNdcg: 0.5,
+      reservedTestUsedExactlyOnce: true,
+      reason: 'reserved-test-below-floor',
+    },
+  },
+});
+
+const writeV3RankerManifestWithFailingShipGate = async (root: string): Promise<void> => {
+  const manifestPath = activeClosestVisitRevisionManifestPath(root);
+  await mkdir(dirname(manifestPath), { recursive: true });
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        revisionId: 'ranker-rev-v3-methodology',
+        modelVersion: RANKER_MODEL_VERSION,
+        featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        trainingDatasetHash: 'c'.repeat(64),
+        trainedAt: Date.parse('2026-05-01T00:00:00.000Z'),
+        modelByteLength: 0,
+        modelSha256: 'd'.repeat(64),
+        trainQuality: failingShipGateTrainQuality(),
       },
       null,
       2,
@@ -382,6 +496,11 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
     const { store, writes } = createRecordingStore(vaultRoot);
+    const trainQuality = failingShipGateTrainQuality();
+    const methodologySpine = trainQuality.methodologySpine;
+    if (methodologySpine === undefined) {
+      throw new Error('expected test train quality to include methodology spine');
+    }
     const embed = embedFromVectors(
       new Map<string, Float32Array>([
         ['ranker', unit([1, 0])],
@@ -405,6 +524,11 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
               disposeCalls += 1;
             },
           } as LightGBMModel,
+          methodologySpine: {
+            servingGateEnforced: false,
+            split: methodologySpine.split,
+            shipGate: methodologySpine.shipGate,
+          },
           ranker: {
             revisionId: 'ranker-rev-test',
             threshold: 0.1,
@@ -458,6 +582,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         readonly expectedFeatureSchemaVersion?: number;
         readonly needsRetrain?: boolean;
         readonly modelFreshness?: string;
+        readonly methodologySpine?: unknown;
         readonly closestVisitEdgeCount?: number;
         readonly rankerSourceEdgeCount?: number;
       };
@@ -471,8 +596,45 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
       expectedFeatureSchemaVersion: FEATURE_SCHEMA_VERSION,
       needsRetrain: false,
       modelFreshness: 'fresh',
+      methodologySpine: {
+        servingGateEnforced: false,
+        shipGate: {
+          status: 'fail',
+          reason: 'reserved-test-below-floor',
+        },
+        split: {
+          status: 'available',
+          trainGroupCount: 12,
+          validationGroupCount: 4,
+          testGroupCount: 3,
+        },
+      },
       closestVisitEdgeCount: closestVisitEdges.length,
       rankerSourceEdgeCount: closestVisitEdges.length,
+    });
+  });
+
+  it('surfaces active manifest ship gate and split state in work graph health', async () => {
+    await writeV3RankerManifestWithFailingShipGate(vaultRoot);
+
+    const health = await collectWorkGraphHealth({ vaultRoot });
+
+    expect(health.ranker).toMatchObject({
+      activeRevisionId: 'ranker-rev-v3-methodology',
+      loadStatus: 'invalid-model',
+      methodologySpine: {
+        servingGateEnforced: false,
+        shipGate: {
+          status: 'fail',
+          reason: 'reserved-test-below-floor',
+        },
+        split: {
+          status: 'available',
+          trainGroupCount: 12,
+          validationGroupCount: 4,
+          testGroupCount: 3,
+        },
+      },
     });
   });
 
