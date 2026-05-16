@@ -483,6 +483,163 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.queryByTestId(`flow-visit-${flowAnchorId}`)).not.toBeNull();
   });
 
+  it('expands Flow Path through tab-session opener chains', async () => {
+    const articleTimelineId = 'timeline-visit:https://engineering.example/article';
+    const articleVisitId =
+      'visit-instance:tab-article:2026-05-16T17:55:18.515Z:https://engineering.example/article';
+    const googleVisitId =
+      'visit-instance:tab-google:2026-05-16T17:54:40.312Z:https://www.google.com/search?q=network';
+    const articleTabId = 'tab-session:tab-article';
+    const googleTabId = 'tab-session:tab-google';
+    const scopedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: articleTimelineId, hops: 1 },
+        nodes: [
+          {
+            id: articleTimelineId,
+            kind: 'timeline-visit',
+            label: 'Data center network article',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://engineering.example/article',
+              title: 'Data center network article',
+              url: 'https://engineering.example/article',
+            },
+            firstSeenAt: '2026-05-16T17:55:18.515Z',
+            lastSeenAt: '2026-05-16T17:55:18.515Z',
+          },
+        ],
+        edges: [],
+        updatedAt: '2026-05-16T17:55:18.515Z',
+        nodeCount: 1,
+        edgeCount: 0,
+      },
+    };
+    const fullSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: {},
+        nodes: [
+          ...scopedSnapshot.snapshot.nodes,
+          {
+            id: articleVisitId,
+            kind: 'visit-instance',
+            label: 'Data center network article',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://engineering.example/article',
+              tabSessionId: 'tab-article',
+              title: 'Data center network article',
+              url: 'https://engineering.example/article',
+            },
+            firstSeenAt: '2026-05-16T17:55:18.515Z',
+            lastSeenAt: '2026-05-16T17:55:18.515Z',
+          },
+          {
+            id: googleVisitId,
+            kind: 'visit-instance',
+            label: 'network - Google Search',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://www.google.com/search?q=network',
+              tabSessionId: 'tab-google',
+              title: 'network - Google Search',
+              url: 'https://www.google.com/search?q=network',
+            },
+            firstSeenAt: '2026-05-16T17:54:40.312Z',
+            lastSeenAt: '2026-05-16T17:54:40.312Z',
+          },
+          {
+            id: articleTabId,
+            kind: 'tab-session',
+            label: 'Data center network article',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              latestTitle: 'Data center network article',
+              latestUrl: 'https://engineering.example/article',
+            },
+          },
+          {
+            id: googleTabId,
+            kind: 'tab-session',
+            label: 'network - Google Search',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              latestTitle: 'network - Google Search',
+              latestUrl: 'https://www.google.com/search?q=network',
+            },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:same-url',
+            kind: 'visit_instance_same_url_as_timeline_visit',
+            fromNodeId: articleVisitId,
+            toNodeId: articleTimelineId,
+            observedAt: '2026-05-16T17:55:18.515Z',
+            producedBy: { source: 'timeline' },
+            confidence: 'observed',
+          },
+          {
+            id: 'edge:article-tab',
+            kind: 'visit_instance_in_tab_session',
+            fromNodeId: articleVisitId,
+            toNodeId: articleTabId,
+            observedAt: '2026-05-16T17:55:18.515Z',
+            producedBy: { source: 'timeline' },
+            confidence: 'observed',
+          },
+          {
+            id: 'edge:google-tab',
+            kind: 'visit_instance_in_tab_session',
+            fromNodeId: googleVisitId,
+            toNodeId: googleTabId,
+            observedAt: '2026-05-16T17:54:40.312Z',
+            producedBy: { source: 'timeline' },
+            confidence: 'observed',
+          },
+          {
+            id: 'edge:opened-from-google',
+            kind: 'tab_session_opener_chain',
+            fromNodeId: articleTabId,
+            toNodeId: googleTabId,
+            observedAt: '2026-05-16T17:55:18.515Z',
+            producedBy: { source: 'timeline-projection' },
+            confidence: 'observed',
+          },
+        ],
+        updatedAt: '2026-05-16T17:55:18.515Z',
+        nodeCount: 5,
+        edgeCount: 4,
+      },
+    };
+
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: scopedSnapshot });
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return Promise.resolve({ ok: true, data: fullSnapshot });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    render(<ConnectionsView initialAnchor={articleTimelineId} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-flow')).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-mode-flow'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(`flow-visit-${googleVisitId}`)).not.toBeNull();
+    });
+    expect(screen.getByText(/opened from network - Google Search/u)).toBeDefined();
+    expect(screen.queryByText('Direct visit — no prior page in this tab')).toBeNull();
+  });
+
   it('scopes shadow focus suggestions to the selected workstream', async () => {
     const collapsedSnapshot = {
       scope: 'companion-extended',

@@ -624,15 +624,29 @@ const deriveFlowVisits = (
     );
   })();
 
+  const visitInstanceUrls = new Set<string>();
+  for (const node of nodes) {
+    if (node.kind !== 'visit-instance') continue;
+    const canonicalUrl =
+      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
+    if (canonicalUrl !== undefined) visitInstanceUrls.add(canonicalUrl);
+  }
+
   const out: TimelineVisit[] = [];
   for (const node of nodes) {
     if (node.kind !== 'visit-instance' && node.kind !== 'timeline-visit') continue;
+    const canonicalUrl =
+      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
+    // Flow Path should show concrete tab visits when available; the
+    // timeline aggregate would otherwise duplicate the same page in
+    // an artificial all-tabs row.
+    if (node.kind === 'timeline-visit' && visitInstanceUrls.has(canonicalUrl ?? '')) {
+      continue;
+    }
     const tabSessionIdHash =
       metadataString(node.metadata, ['tabSessionId', 'tabSessionIdHash', 'tabIdHash']) ??
       (node.kind === 'timeline-visit' ? 'all-tabs' : 'unknown-tab');
     const engagementClass = engagementClassForNode(node);
-    const canonicalUrl =
-      metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
     const host = hostOf(canonicalUrl);
     // Prefer the nested engagement.focusedWindowMs (companion writes it
     // alongside engagement.class); fall back to a flat key for
@@ -772,8 +786,10 @@ const deriveFlowSummary = (
 const NAV_EDGE_KINDS = new Set<string>([
   'previous_visit_in_tab_session',
   'opener_visit',
+  'tab_session_opener_chain',
   'visit_in_tab_session',
   'visit_instance_in_tab_session',
+  'visit_instance_same_url_as_timeline_visit',
 ]);
 
 const expandFlowSubgraph = (
