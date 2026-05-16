@@ -2,11 +2,7 @@ import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { createRevision } from '../../domain/ids.js';
-import type {
-  ExtractionRevision,
-  ExtractionSourceState,
-  SourceUnitId,
-} from './types.js';
+import type { ExtractionRevision, ExtractionSourceState, SourceUnitId } from './types.js';
 
 // Sync Contract v1 / Class E — extraction store layout.
 //
@@ -36,15 +32,10 @@ export interface ExtractionStore {
   readonly putRevision: (revision: ExtractionRevision) => Promise<void>;
   readonly readRevision: (extractionRevisionId: string) => Promise<ExtractionRevision | null>;
   readonly putSourceState: (state: ExtractionSourceState) => Promise<void>;
-  readonly readSourceState: (
-    sourceUnitId: SourceUnitId,
-  ) => Promise<ExtractionSourceState | null>;
+  readonly readSourceState: (sourceUnitId: SourceUnitId) => Promise<ExtractionSourceState | null>;
   readonly listStaleSources: () => Promise<readonly ExtractionSourceState[]>;
   readonly listAllSources: () => Promise<readonly ExtractionSourceState[]>;
-  readonly markIndexed: (
-    sourceUnitId: SourceUnitId,
-    extractionRevisionId: string,
-  ) => Promise<void>;
+  readonly markIndexed: (sourceUnitId: SourceUnitId, extractionRevisionId: string) => Promise<void>;
 }
 
 export const createExtractionStore = (vaultRoot: string): ExtractionStore => {
@@ -74,7 +65,10 @@ export const createExtractionStore = (vaultRoot: string): ExtractionStore => {
   };
 
   const putRevision = async (revision: ExtractionRevision): Promise<void> => {
-    await writeAtomic(revisionPath(revision.extractionRevisionId), JSON.stringify(revision, null, 2));
+    await writeAtomic(
+      revisionPath(revision.extractionRevisionId),
+      JSON.stringify(revision, null, 2),
+    );
   };
 
   const readRevision = async (id: string): Promise<ExtractionRevision | null> =>
@@ -84,9 +78,7 @@ export const createExtractionStore = (vaultRoot: string): ExtractionStore => {
     await writeAtomic(sourcePath(state.sourceUnitId), JSON.stringify(state, null, 2));
   };
 
-  const readSourceState = async (
-    id: SourceUnitId,
-  ): Promise<ExtractionSourceState | null> =>
+  const readSourceState = async (id: SourceUnitId): Promise<ExtractionSourceState | null> =>
     readJsonOrNull<ExtractionSourceState>(sourcePath(id));
 
   const listAllSources = async (): Promise<readonly ExtractionSourceState[]> => {
@@ -105,10 +97,7 @@ export const createExtractionStore = (vaultRoot: string): ExtractionStore => {
     return all.filter((s) => s.status === 'stale');
   };
 
-  const markIndexed = async (
-    id: SourceUnitId,
-    extractionRevisionId: string,
-  ): Promise<void> => {
+  const markIndexed = async (id: SourceUnitId, extractionRevisionId: string): Promise<void> => {
     const state = await readSourceState(id);
     if (state === null) return;
     if (state.latestExtractionRevision !== extractionRevisionId) {

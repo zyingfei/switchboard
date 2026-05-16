@@ -53,9 +53,7 @@ const recordedFromPayload = (
   seq: event.dot.seq,
 });
 
-export const projectDispatches = (
-  events: readonly AcceptedEvent[],
-): DispatchesProjection => {
+export const projectDispatches = (events: readonly AcceptedEvent[]): DispatchesProjection => {
   const entries: DispatchProjectionEntry[] = [];
   const linksByDispatch = new Map<string, RegisterValue<DispatchLinkedPayload>[]>();
   for (const event of events) {
@@ -104,9 +102,9 @@ export const projectDispatches = (
   return {
     entries,
     links,
-    vector: vectorFromEvents(events.filter((event) =>
-      event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
-    )),
+    vector: vectorFromEvents(
+      events.filter((event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED),
+    ),
     updatedAtMs: events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0),
   };
 };

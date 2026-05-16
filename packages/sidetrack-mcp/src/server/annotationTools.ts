@@ -56,12 +56,7 @@ const anchorFailureReasonEnum = z.enum([
   'no_assistant_turns',
 ]);
 
-const annotationStatusEnum = z.enum([
-  'created',
-  'anchor_failed',
-  'validation_failed',
-  'failed',
-]);
+const annotationStatusEnum = z.enum(['created', 'anchor_failed', 'validation_failed', 'failed']);
 
 const batchOutputShape = {
   threadId: z.string().optional(),
@@ -138,9 +133,7 @@ export const registerAnnotationTools = (
         );
       }
       if (threadId === undefined && url === undefined) {
-        throw new Error(
-          'sidetrack.annotations.create_batch requires either threadId or url.',
-        );
+        throw new Error('sidetrack.annotations.create_batch requires either threadId or url.');
       }
       const createAnnotation = companionClient.createAnnotation;
       const results: z.infer<typeof batchOutputShape.items>[number][] = [];
@@ -188,9 +181,7 @@ export const registerAnnotationTools = (
         }
       }
       const createdCount = results.filter((entry) => entry.status === 'created').length;
-      const anchorFailedCount = results.filter(
-        (entry) => entry.status === 'anchor_failed',
-      ).length;
+      const anchorFailedCount = results.filter((entry) => entry.status === 'anchor_failed').length;
       const failedCount = results.filter(
         (entry) => entry.status === 'failed' || entry.status === 'validation_failed',
       ).length;

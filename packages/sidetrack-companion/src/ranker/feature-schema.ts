@@ -9,7 +9,7 @@ import type { Candidate } from './types.js';
 // rejected (graceful fall back to retrain) instead of mis-scoring.
 export const FEATURE_SCHEMA_VERSION = 2;
 
-export type CandidatePairFeatures = {
+export interface CandidatePairFeatures {
   schemaVersion: typeof FEATURE_SCHEMA_VERSION;
   same_workstream: 0 | 1;
   opener_chain_depth: number;
@@ -40,7 +40,7 @@ export type CandidatePairFeatures = {
   // 3 = high) of the from / to pages.
   page_quality_tier_from: number;
   page_quality_tier_to: number;
-};
+}
 
 export const CANDIDATE_PAIR_FEATURE_KEYS = [
   'schemaVersion',

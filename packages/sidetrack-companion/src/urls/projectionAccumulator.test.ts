@@ -6,10 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  USER_ORGANIZED_ITEM,
-  type UserOrganizedItemPayload,
-} from '../feedback/events.js';
+import { USER_ORGANIZED_ITEM, type UserOrganizedItemPayload } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { URL_ATTRIBUTION_INFERRED } from './events.js';
@@ -181,9 +178,7 @@ describe('Stage 5.2 W2b — URL projection accumulator', () => {
     // because compareAttribution prefers user_asserted regardless of order.
     foldEventIntoUrlProjectionAccumulator(acc, organizeEvt);
     foldEventIntoUrlProjectionAccumulator(acc, inferEvt);
-    const record = urlProjectionFromAccumulator(acc).byCanonicalUrl.get(
-      'https://example.com/a',
-    );
+    const record = urlProjectionFromAccumulator(acc).byCanonicalUrl.get('https://example.com/a');
     expect(record?.currentAttribution?.source).toBe('user_asserted');
     expect(record?.currentAttribution?.workstreamId).toBe('ws_user');
   });

@@ -17,10 +17,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { createConnectionsStore } from '../connections/snapshot.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
-import {
-  maybeRetrainClosestVisitRanker,
-  type RankerRetrainResult,
-} from './retrain.js';
+import { maybeRetrainClosestVisitRanker, type RankerRetrainResult } from './retrain.js';
 import type { TrainRankerOptions } from './train.js';
 
 export interface RetrainWorkerJob {

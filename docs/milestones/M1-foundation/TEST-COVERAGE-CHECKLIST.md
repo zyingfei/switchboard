@@ -206,6 +206,6 @@ Original scope:
 4. **If live surfaces a bug**, add a unit test in `tests/unit/` that
    reproduces it from synthetic DOM, then fix the bug in `src/`.
 5. **Verify before declaring done:**
-   `cd packages/sidetrack-extension && npm test && npm run lint && npm run typecheck && SIDETRACK_E2E_CDP_URL=http://localhost:9222 npx playwright test <new-spec-name>`
+   `cd packages/sidetrack-extension && bun run test && bun run lint && bun run typecheck && SIDETRACK_E2E_CDP_URL=http://localhost:9222 bunx --bun --no-install playwright test <new-spec-name>`
 6. **Don't commit.** Write the files; the parent agent commits
    per-feature after review.

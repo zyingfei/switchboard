@@ -101,14 +101,15 @@ const renderBlock = (node: Node, depth: number): string => {
     const ordered = tag === 'ol';
     const startAttr = attr(node, 'start');
     const startN = startAttr.length > 0 ? Number(startAttr) : 1;
-    const items = Array.from(node.children).filter(
-      (child) => child.tagName.toLowerCase() === 'li',
-    );
+    const items = Array.from(node.children).filter((child) => child.tagName.toLowerCase() === 'li');
     const lines = items.map((li, index) => {
       const marker = ordered ? `${String(startN + index)}.` : '-';
       const inner = Array.from(li.childNodes)
         .map((child) => {
-          if (isElement(child) && (child.tagName.toLowerCase() === 'ul' || child.tagName.toLowerCase() === 'ol')) {
+          if (
+            isElement(child) &&
+            (child.tagName.toLowerCase() === 'ul' || child.tagName.toLowerCase() === 'ol')
+          ) {
             return `\n${renderBlock(child, depth + 1).trimEnd()}`;
           }
           return renderInline(child);
@@ -145,6 +146,8 @@ const renderBlock = (node: Node, depth: number): string => {
 // has no rendered content. Trims trailing whitespace.
 export const domToMarkdown = (root: Node | null): string => {
   if (root === null) return '';
-  const md = renderBlock(root, 0).replace(/\n{3,}/g, '\n\n').trim();
+  const md = renderBlock(root, 0)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   return md;
 };

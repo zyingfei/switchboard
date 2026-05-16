@@ -154,7 +154,11 @@ test.describe('Tier 6.1 — cross-browser real-time propagation', () => {
       const fs3 = await import('node:fs/promises');
       await fs3.writeFile(
         '/tmp/t61-vaults.json',
-        JSON.stringify({ aThreads, bThreads, aVault: companionA!.vaultPath, bVault: companionB!.vaultPath }, null, 2),
+        JSON.stringify(
+          { aThreads, bThreads, aVault: companionA!.vaultPath, bVault: companionB!.vaultPath },
+          null,
+          2,
+        ),
       );
 
       // The load-bearing T6.1 assertion: B's chrome.storage gets
@@ -168,8 +172,7 @@ test.describe('Tier 6.1 — cross-browser real-time propagation', () => {
               const all = await chrome.storage.local.get('sidetrack.threads');
               const list = all['sidetrack.threads'];
               return (
-                Array.isArray(list) &&
-                list.some((t: { threadUrl?: string }) => t.threadUrl === url)
+                Array.isArray(list) && list.some((t: { threadUrl?: string }) => t.threadUrl === url)
               );
             }, threadUrl),
           { timeout: 30_000, intervals: [500, 1_000] },

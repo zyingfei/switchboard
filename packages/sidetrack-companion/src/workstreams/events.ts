@@ -10,9 +10,7 @@
 export const WORKSTREAM_UPSERTED = 'workstream.upserted' as const;
 export const WORKSTREAM_DELETED = 'workstream.deleted' as const;
 
-export type WorkstreamEventType =
-  | typeof WORKSTREAM_UPSERTED
-  | typeof WORKSTREAM_DELETED;
+export type WorkstreamEventType = typeof WORKSTREAM_UPSERTED | typeof WORKSTREAM_DELETED;
 
 export type WorkstreamPrivacy = 'private' | 'shared' | 'public';
 
@@ -50,12 +48,11 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
     (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
-export const isWorkstreamUpsertedPayload = (
-  value: unknown,
-): value is WorkstreamUpsertedPayload =>
-  isRecord(value) && typeof value['bac_id'] === 'string' && typeof value['title'] === 'string' && hasValidPayloadExtensionFields(value);
+export const isWorkstreamUpsertedPayload = (value: unknown): value is WorkstreamUpsertedPayload =>
+  isRecord(value) &&
+  typeof value['bac_id'] === 'string' &&
+  typeof value['title'] === 'string' &&
+  hasValidPayloadExtensionFields(value);
 
-export const isWorkstreamDeletedPayload = (
-  value: unknown,
-): value is WorkstreamDeletedPayload =>
+export const isWorkstreamDeletedPayload = (value: unknown): value is WorkstreamDeletedPayload =>
   isRecord(value) && typeof value['bac_id'] === 'string' && hasValidPayloadExtensionFields(value);

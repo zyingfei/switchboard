@@ -32,10 +32,7 @@
 
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, stat, watch, writeFile } from 'node:fs';
-import {
-  promises as fsp,
-  type FSWatcher,
-} from 'node:fs';
+import { promises as fsp, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 
 import { writeJsonAtomic } from '../../vault/atomic.js';
@@ -92,7 +89,9 @@ const fileSize = async (path: string): Promise<number> => {
   }
 };
 
-const splitLinesPreservingTrailing = (chunk: string): { readonly complete: readonly string[]; readonly trailing: string } => {
+const splitLinesPreservingTrailing = (
+  chunk: string,
+): { readonly complete: readonly string[]; readonly trailing: string } => {
   const parts = chunk.split('\n');
   const trailing = parts.pop() ?? '';
   return { complete: parts, trailing };
@@ -117,7 +116,7 @@ export const startTail = async (opts: TailOpts): Promise<TailHandle> => {
   let watcher: FSWatcher | null = null;
   let rescanTimer: ReturnType<typeof setInterval> | null = null;
 
-  const idleResolvers: Array<() => void> = [];
+  const idleResolvers: (() => void)[] = [];
   const flushIdle = (): void => {
     while (idleResolvers.length > 0) {
       const resolve = idleResolvers.shift();
@@ -211,9 +210,12 @@ export const startTail = async (opts: TailOpts): Promise<TailHandle> => {
 
   const enqueueProcess = (): void => {
     if (closed) return;
-    processing = processing.then(processNewBytes).then(flushIdle).catch(() => {
-      flushIdle();
-    });
+    processing = processing
+      .then(processNewBytes)
+      .then(flushIdle)
+      .catch(() => {
+        flushIdle();
+      });
   };
 
   const scheduleProcess = (): void => {

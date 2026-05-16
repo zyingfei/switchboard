@@ -11,7 +11,10 @@ const log = (label, value) => {
 const main = async () => {
   const browser = await chromium.connectOverCDP(cdpUrl);
   const ctx = browser.contexts()[0];
-  const extensionId = ctx.serviceWorkers()[0]?.url().match(/chrome-extension:\/\/([^/]+)/)?.[1];
+  const extensionId = ctx
+    .serviceWorkers()[0]
+    ?.url()
+    .match(/chrome-extension:\/\/([^/]+)/)?.[1];
   const panel = ctx.pages().find((p) => p.url().includes(`${extensionId}/sidepanel.html`));
   if (panel === undefined) throw new Error('no side panel');
 

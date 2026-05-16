@@ -6,9 +6,9 @@ every run.
 
 ## What's already wired
 
-- **Vitest** (`npm test` in `packages/sidetrack-extension/`) — unit tests
+- **Vitest** (`bun run test` in `packages/sidetrack-extension/`) — unit tests
   for the side panel and content extractors.
-- **Playwright e2e** (`npm run e2e` in `packages/sidetrack-extension/`) —
+- **Playwright e2e** (`bun run e2e` in `packages/sidetrack-extension/`) —
   loads the built MV3 bundle into a Chromium persistent profile, mounts
   the side panel, and drives the runtime via
   `chrome.runtime.sendMessage`. Spec files live in `tests/e2e/`; helpers
@@ -24,17 +24,17 @@ every run.
 
 ```bash
 cd packages/sidetrack-extension
-npm install
-npm run build                     # produces .output/chrome-mv3
-SIDETRACK_E2E_HEADLESS=1 npm run e2e
+bun install
+bun run build                     # produces .output/chrome-mv3
+SIDETRACK_E2E_HEADLESS=1 bun run e2e
 ```
 
-`npm run e2e` does, in order:
+`bun run e2e` does, in order:
 
 1. `wxt build` — produce the MV3 bundle.
-2. `npm --prefix ../sidetrack-companion run build` — produce the
+2. `bun run --cwd ../sidetrack-companion build` — produce the
    companion's compiled JS so e2e specs can boot it.
-3. `node scripts/verify-extension-build.mjs` — manifest sanity check.
+3. `bun scripts/verify-extension-build.mjs` — manifest sanity check.
 4. `playwright test` — run every spec under `tests/e2e/`.
 
 Set `SIDETRACK_E2E_HEADLESS=0` to watch the runs in a real Chromium
@@ -50,8 +50,8 @@ Build both artifacts first. The spec launches the compiled companion
 CLI and the built MV3 extension from `.output/chrome-mv3`.
 
 ```bash
-npm --prefix packages/sidetrack-companion run build
-npm --prefix packages/sidetrack-extension run build
+bun run --cwd packages/sidetrack-companion build
+bun run --cwd packages/sidetrack-extension build
 ```
 
 Run the headed story from the repo root:
@@ -60,8 +60,9 @@ Run the headed story from the repo root:
 SIDETRACK_E2E_HOLD_OPEN=1 \
 SIDETRACK_E2E_HEADLESS=0 \
 SIDETRACK_E2E_BROWSER=chromium \
-npm --prefix packages/sidetrack-extension exec -- \
-  playwright test connections-full-browser-sync-user-story --headed --workers=1
+cd packages/sidetrack-extension
+bunx --bun --no-install playwright test \
+  connections-full-browser-sync-user-story --headed --workers=1
 ```
 
 Important details:
@@ -193,7 +194,7 @@ chat — use a long-lived Chromium profile so you only log in once.
 
 ```bash
 cd packages/sidetrack-extension
-npm run e2e:login
+bun run e2e:login
 ```
 
 That builds the extension, opens a **headed Chrome stable window**
@@ -207,7 +208,7 @@ your cookies stay in the profile dir.
 > Playwright's Chromium build with _"This browser or app may not be
 > secure"_. Real Chrome is accepted. The login script defaults to
 > `channel: 'chrome'`. If you don't have Chrome installed,
-> `SIDETRACK_E2E_BROWSER=chromium npm run e2e:login` falls back —
+> `SIDETRACK_E2E_BROWSER=chromium bun run e2e:login` falls back —
 > but Gemini login won't work and ChatGPT-via-Google-SSO won't
 > either. ChatGPT email/password and Claude email/password still
 > work in Chromium.
@@ -215,7 +216,7 @@ your cookies stay in the profile dir.
 Override the profile path:
 
 ```bash
-SIDETRACK_USER_DATA_DIR=~/.my-test-profile npm run e2e:login
+SIDETRACK_USER_DATA_DIR=~/.my-test-profile bun run e2e:login
 ```
 
 ### Running a spec against the logged-in profile (CDP-attach flow)
@@ -231,7 +232,7 @@ doesn't have either restriction.
 
 ```bash
 cd packages/sidetrack-extension
-npm run e2e:install-cft
+bun run e2e:install-cft
 ```
 
 That downloads CfT into `./.chrome-for-testing/` (~200MB; gitignored).
@@ -240,7 +241,7 @@ That downloads CfT into `./.chrome-for-testing/` (~200MB; gitignored).
 
 ```bash
 cd packages/sidetrack-extension
-npm run e2e:chrome-debug
+bun run e2e:chrome-debug
 ```
 
 This launches CfT with the extension loaded, the dedicated profile
@@ -254,7 +255,7 @@ navigate to whichever chats you want specs to capture against.
 
 ```bash
 SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
-  npx playwright test tests/e2e/live-providers-smoke.spec.ts
+  bunx --bun --no-install playwright test tests/e2e/live-providers-smoke.spec.ts
 ```
 
 Specs detect `SIDETRACK_E2E_CDP_URL` and skip launching a new browser
@@ -277,7 +278,7 @@ stable profile? Two reasons:
 ### Older tmpdir flow (still supported, no login required)
 
 ```bash
-npx playwright test tests/e2e/queue-lifecycle.spec.ts
+bunx --bun --no-install playwright test tests/e2e/queue-lifecycle.spec.ts
 ```
 
 When neither `SIDETRACK_E2E_CDP_URL` nor `SIDETRACK_USER_DATA_DIR` is

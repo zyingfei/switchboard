@@ -72,11 +72,7 @@ describe('recovery helpers', () => {
       return;
     }
     await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
-    await writeFile(
-      join(vaultRoot, '_BAC', 'recall', '.lock'),
-      `${String(parentPid)}\n`,
-      'utf8',
-    );
+    await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
     await expect(acquireRecallProcessLock(vaultRoot)).rejects.toBeInstanceOf(RecallLockHeldError);
   });
 });

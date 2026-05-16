@@ -47,7 +47,9 @@ describe('createDefaultTimelineFetchHook', () => {
   });
 
   it('builds the right URL with q + limit query params', async () => {
-    const stub = stubFetch([{ status: 200, body: { data: { scope: 'companion-extended', items: [] } } }]);
+    const stub = stubFetch([
+      { status: 200, body: { data: { scope: 'companion-extended', items: [] } } },
+    ]);
     restore = stub.restore;
     const hook = createDefaultTimelineFetchHook({
       companionUrl: 'http://127.0.0.1:9999',

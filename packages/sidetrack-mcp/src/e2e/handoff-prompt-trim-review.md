@@ -17,27 +17,30 @@ available; `bac.read_thread_md` returns the conversation body.
 …
 ```
 
-| Region | Chars | Function |
-|---|---|---|
-| Title heading | 41 | Human signal — what this task is about |
-| Two key/value lines | 105 | **Load-bearing** — agent needs both |
-| Body paragraph | 274 | Explains the contract to a first-time reader |
-| `## User's ask` + filler | 27 | Where the user types |
+| Region                   | Chars | Function                                     |
+| ------------------------ | ----- | -------------------------------------------- |
+| Title heading            | 41    | Human signal — what this task is about       |
+| Two key/value lines      | 105   | **Load-bearing** — agent needs both          |
+| Body paragraph           | 274   | Explains the contract to a first-time reader |
+| `## User's ask` + filler | 27    | Where the user types                         |
 
 ## Cuts considered
 
 The body paragraph is ~60% of the prompt. Three plausible trims:
 
 ### Draft A — minimal (no instructions)
+
 ```
 sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=<key>
 sidetrack_thread_id: 2ZRHJ5ZHV9TDTT3A
 
 <user's ask>
 ```
+
 **~140 chars (-69%).** Drops title + paragraph entirely.
 
 ### Draft B — keep title, drop paragraph
+
 ```
 # Coding handoff: Heap rank algorithm
 sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=<key>
@@ -45,9 +48,11 @@ sidetrack_thread_id: 2ZRHJ5ZHV9TDTT3A
 
 <user's ask>
 ```
+
 **~190 chars (-58%).** Title remains for human readability.
 
 ### Draft C — title + one-line hint + ask
+
 ```
 # Coding handoff: Heap rank algorithm
 sidetrack_mcp: ws://127.0.0.1:8721/mcp?token=<key>
@@ -56,17 +61,18 @@ sidetrack_thread_id: 2ZRHJ5ZHV9TDTT3A
 
 <user's ask>
 ```
+
 **~225 chars (-50%).** Title + parenthetical breadcrumb that fits on one line.
 
 ## Review — which to pick
 
-| Concern | Draft A (140) | Draft B (190) | Draft C (225) | Today (447) |
-|---|---|---|---|---|
-| Agent that already knows MCP | ✓ ✓ ✓ | ✓ ✓ ✓ | ✓ ✓ ✓ | ✓ ✓ ✓ |
-| Cold-call agent: "what's this?" | ✗ | ◔ (title) | ✓ (breadcrumb) | ✓ ✓ |
-| User reading the prompt later | ✗ (looks cryptic) | ◔ | ✓ | ✓ ✓ |
-| Token cost | great | great | good | wasteful |
-| Avoids leaking chat URL | ✓ | ✓ | ✓ | ✓ |
+| Concern                         | Draft A (140)     | Draft B (190) | Draft C (225)  | Today (447) |
+| ------------------------------- | ----------------- | ------------- | -------------- | ----------- |
+| Agent that already knows MCP    | ✓ ✓ ✓             | ✓ ✓ ✓         | ✓ ✓ ✓          | ✓ ✓ ✓       |
+| Cold-call agent: "what's this?" | ✗                 | ◔ (title)     | ✓ (breadcrumb) | ✓ ✓         |
+| User reading the prompt later   | ✗ (looks cryptic) | ◔             | ✓              | ✓ ✓         |
+| Token cost                      | great             | great         | good           | wasteful    |
+| Avoids leaking chat URL         | ✓                 | ✓             | ✓              | ✓           |
 
 **Recommend Draft C (225 chars).** Title + breadcrumb keep the
 prompt human-readable when the user re-reads it later, and gives a

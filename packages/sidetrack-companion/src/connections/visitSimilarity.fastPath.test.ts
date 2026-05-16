@@ -22,7 +22,7 @@ const entry = (id: string, focusedWindowMs = 60_000): VisitSimilarityEntry => ({
   visitCount: 1,
   firstSeenAt: '2026-05-12T10:00:00.000Z',
   lastSeenAt: '2026-05-12T10:30:00.000Z',
-  dimensions: { engagement: { focusedWindowMs } } as unknown as VisitSimilarityEntry['dimensions'],
+  dimensions: { engagement: { focusedWindowMs } },
 });
 
 describe('Stage 5.2 W3 — buildVisitSimilarityIncremental', () => {

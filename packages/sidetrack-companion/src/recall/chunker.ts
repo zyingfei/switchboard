@@ -99,10 +99,10 @@ const splitIntoBlocks = (source: string): readonly Block[] => {
   while (i < lines.length) {
     const line = lines[i] ?? '';
     // Code fence — slurp until the closing fence (or EOF).
-    if (/^```/.test(line)) {
+    if (line.startsWith('```')) {
       const start = i;
       i += 1;
-      while (i < lines.length && !/^```/.test(lines[i] ?? '')) {
+      while (i < lines.length && !(lines[i] ?? '').startsWith('```')) {
         i += 1;
       }
       // Include the closing fence if present.
@@ -131,7 +131,7 @@ const splitIntoBlocks = (source: string): readonly Block[] => {
     while (i < lines.length) {
       const next = lines[i] ?? '';
       if (next.trim().length === 0) break;
-      if (/^```/.test(next)) break;
+      if (next.startsWith('```')) break;
       if (/^#{1,4}\s+/.test(next)) break;
       i += 1;
     }
@@ -191,7 +191,7 @@ const splitLongFence = (text: string): readonly string[] => {
   // chunk. If there's no trailing fence (malformed input) we still
   // close every chunk so downstream readers don't see open fences.
   const lastIdx = lines.length - 1;
-  const hasClosing = /^```/.test(lines[lastIdx] ?? '');
+  const hasClosing = (lines[lastIdx] ?? '').startsWith('```');
   const bodyLines = lines.slice(1, hasClosing ? lastIdx : lines.length);
 
   const out: string[] = [];

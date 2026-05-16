@@ -1,5 +1,5 @@
-import { Client } from '../../../../sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js';
-import { InMemoryTransport } from '../../../../sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   createSidetrackMcpServer,
   type CompanionWriteClient,

@@ -378,11 +378,23 @@ interface PipelineStage {
 // design's `alarm`, 'warn' is `warn`, 'unavailable' gets the dashed
 // `unavail` border so a glance reads "didn't load", not "nothing yet".
 const nodeVariant = (status: PipelineStatus): string =>
-  status === 'err' ? 'alarm' : status === 'warn' ? 'warn' : status === 'unavailable' ? 'unavail' : '';
+  status === 'err'
+    ? 'alarm'
+    : status === 'warn'
+      ? 'warn'
+      : status === 'unavailable'
+        ? 'unavail'
+        : '';
 
 // StatusPill — tri-state honesty. ok→ok, degraded→warn, failed→warn,
 // unavailable→unavail. Never a fabricated "healthy".
-function StatusPill({ value, label }: { value: 'ok' | 'warn' | 'stale' | 'unavail'; label: string }) {
+function StatusPill({
+  value,
+  label,
+}: {
+  value: 'ok' | 'warn' | 'stale' | 'unavail';
+  label: string;
+}) {
   return (
     <span className={`sx-status ${value}`} data-testid="hp-overall-status">
       <span className="dot" />
@@ -684,9 +696,7 @@ export function HealthPanel({
           ? `${formatCount(report.recall.entryCount)} vectors`
           : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
     const recallHead =
-      recallStatus === 'rebuilding'
-        ? 'Rebuilding'
-        : `${formatCount(report.recall.entryCount)} vec`;
+      recallStatus === 'rebuilding' ? 'Rebuilding' : `${formatCount(report.recall.entryCount)} vec`;
 
     // Ranker — driven by workGraph.ranker. Honest training mix: never
     // the raw negative count alone; the labeled triple + dataset-
@@ -711,9 +721,7 @@ export function HealthPanel({
     const staleLine =
       rankerHealth?.datasetChangedSinceTrain === true
         ? ` · data changed since train${
-            rankerHealth.retrainSkipReason === null
-              ? ''
-              : ` (${rankerHealth.retrainSkipReason})`
+            rankerHealth.retrainSkipReason === null ? '' : ` (${rankerHealth.retrainSkipReason})`
           }`
         : '';
     const rankerDetail = workGraphUnavailable
@@ -921,7 +929,9 @@ export function HealthPanel({
   const renderTopicsDrill = () => {
     const tp = report?.workGraph?.topicProducer;
     const fhUnavailable =
-      focusHealth === null || focusHealth.availability === 'unavailable' || focusHealth.digest === null;
+      focusHealth === null ||
+      focusHealth.availability === 'unavailable' ||
+      focusHealth.digest === null;
     const svb = focusHealth?.digest?.shadowVsBaseline;
     const obs = focusHealth?.digest?.shadowObservation;
     const history = focusHealth?.history ?? [];
@@ -955,7 +965,9 @@ export function HealthPanel({
                 : svb?.shadowTopicCount === undefined
                   ? 'no signal yet'
                   : String(svb.shadowTopicCount)}
-              {!fhUnavailable && svb?.shadowTopicCount !== undefined ? <small> topics</small> : null}
+              {!fhUnavailable && svb?.shadowTopicCount !== undefined ? (
+                <small> topics</small>
+              ) : null}
             </div>
             <div className="foot">
               {fhUnavailable
@@ -986,16 +998,8 @@ export function HealthPanel({
             </span>
           </div>
           <dl>
-            <ReceiptRow
-              dt="Active revision"
-              dd={tp?.activeRevisionId ?? 'no signal yet'}
-              mono
-            />
-            <ReceiptRow
-              dt="Active algorithm"
-              dd={tp?.algorithmVersion ?? 'no signal yet'}
-              mono
-            />
+            <ReceiptRow dt="Active revision" dd={tp?.activeRevisionId ?? 'no signal yet'} mono />
+            <ReceiptRow dt="Active algorithm" dd={tp?.algorithmVersion ?? 'no signal yet'} mono />
             <ReceiptRow
               dt="Active topics"
               dd={tp === undefined ? 'no signal yet' : String(tp.topicCount)}
@@ -1080,13 +1084,13 @@ export function HealthPanel({
         {r?.datasetChangedSinceTrain === true ? (
           <div className="sx-callout warn">
             <strong>Data changed · the active model is behind.</strong>{' '}
-            {r.retrainSkipReason === null
-              ? 'No retrain decision recorded.'
-              : (
-                  <>
-                    Reason: <code>{r.retrainSkipReason}</code>.
-                  </>
-                )}{' '}
+            {r.retrainSkipReason === null ? (
+              'No retrain decision recorded.'
+            ) : (
+              <>
+                Reason: <code>{r.retrainSkipReason}</code>.
+              </>
+            )}{' '}
             Retrain cadence is feedback-only — a model can silently freeze whenever positive
             feedback stalls.
           </div>
@@ -1096,9 +1100,7 @@ export function HealthPanel({
           <div className={`sx-tile${mix === undefined || mix === null ? ' unavail' : ''}`}>
             <div className="lbl">Positives</div>
             <div className="num">
-              {mix === undefined || mix === null
-                ? 'no signal yet'
-                : String(mix.positivesAtTrain)}
+              {mix === undefined || mix === null ? 'no signal yet' : String(mix.positivesAtTrain)}
             </div>
             <div className="foot">user-asserted, at train</div>
           </div>
@@ -1128,11 +1130,7 @@ export function HealthPanel({
           <div className="sx-receipt-head">
             <span
               className={`sx-stamp ${
-                r === undefined
-                  ? 'partial'
-                  : r.loadStatus === 'ready'
-                    ? 'deterministic'
-                    : 'partial'
+                r === undefined ? 'partial' : r.loadStatus === 'ready' ? 'deterministic' : 'partial'
               }`}
             >
               <span />
@@ -1159,11 +1157,7 @@ export function HealthPanel({
             </button>
           </div>
           <dl>
-            <ReceiptRow
-              dt="Active revision"
-              dd={r?.activeRevisionId ?? 'no signal yet'}
-              mono
-            />
+            <ReceiptRow dt="Active revision" dd={r?.activeRevisionId ?? 'no signal yet'} mono />
             <ReceiptRow
               dt="Load status"
               dd={<span className="sx-mono">{r?.loadStatus ?? 'no signal yet'}</span>}
@@ -1190,17 +1184,11 @@ export function HealthPanel({
             />
             <ReceiptRow
               dt="Skip reason"
-              dd={
-                <span className="sx-mono">
-                  {r?.retrainSkipReason ?? 'no signal yet'}
-                </span>
-              }
+              dd={<span className="sx-mono">{r?.retrainSkipReason ?? 'no signal yet'}</span>}
             />
             <ReceiptRow
               dt="New labels since"
-              dd={
-                r === undefined ? 'no signal yet' : String(r.retrainNewLabelCount)
-              }
+              dd={r === undefined ? 'no signal yet' : String(r.retrainNewLabelCount)}
             />
           </dl>
           <div className="sx-receipt-reason">
@@ -1304,7 +1292,9 @@ export function HealthPanel({
                       : '—'}
                   </td>
                   <td>
-                    <span className={`sx-status ${statusState(row.lastStatus) === 'ok' ? 'ok' : 'warn'}`}>
+                    <span
+                      className={`sx-status ${statusState(row.lastStatus) === 'ok' ? 'ok' : 'warn'}`}
+                    >
                       <span className="dot" />
                       {row.lastStatus ?? 'seen'}
                     </span>
@@ -1494,9 +1484,7 @@ export function HealthPanel({
             <div className="num" style={{ fontSize: 18 }}>
               {rec?.status ?? 'no signal yet'}
             </div>
-            <div className="foot">
-              {rec?.modelId?.split('/').pop() ?? 'no model'}
-            </div>
+            <div className="foot">{rec?.modelId?.split('/').pop() ?? 'no model'}</div>
           </div>
           <div className="sx-tile">
             <div className="lbl">Last indexed</div>
@@ -1685,12 +1673,7 @@ export function HealthPanel({
     <div className="sx-health" role="dialog" aria-label="Capture health">
       {/* Op-bar — board controls */}
       <div className="sx-opbar">
-        <button
-          type="button"
-          className="sx-btn ghost"
-          onClick={onClose}
-          aria-label="Close"
-        >
+        <button type="button" className="sx-btn ghost" onClick={onClose} aria-label="Close">
           <span className="icon">{Icons.back}</span>
         </button>
         <span className="label">Health</span>
@@ -1700,9 +1683,7 @@ export function HealthPanel({
         {report?.observability?.asOf !== undefined ? (
           <span className="sx-asof">as of {formatWhen(report.observability.asOf)}</span>
         ) : (
-          <span className="sx-asof">
-            snapshot · {loadState === 'live' ? 'live' : loadState}
-          </span>
+          <span className="sx-asof">snapshot · {loadState === 'live' ? 'live' : loadState}</span>
         )}
         <button
           type="button"
@@ -1749,9 +1730,7 @@ export function HealthPanel({
                       {s.spark !== undefined ? (
                         <Spark data={s.spark} variant={nodeVariant(s.status)} />
                       ) : null}
-                      {s.mini !== undefined ? (
-                        <span className="sx-mini">{s.mini}</span>
-                      ) : null}
+                      {s.mini !== undefined ? <span className="sx-mini">{s.mini}</span> : null}
                     </div>
                   ) : null}
                   <div className="arrow">›</div>
@@ -1801,8 +1780,8 @@ export function HealthPanel({
                 <h4 className="sx-h">Honesty rule</h4>
                 <div className="sx-callout warn">
                   A number whose name implies more than it measures (a bare negative-label count,
-                  budget-fallback zeros, churn during a collapse) is relabeled with what it
-                  actually measures or rendered as <em>&quot;no signal yet&quot;</em>.
+                  budget-fallback zeros, churn during a collapse) is relabeled with what it actually
+                  measures or rendered as <em>&quot;no signal yet&quot;</em>.
                 </div>
               </div>
 
@@ -1812,8 +1791,7 @@ export function HealthPanel({
                   type="button"
                   className="sx-btn"
                   disabled={
-                    rebuildState.kind === 'accepted' ||
-                    report.recall.status === 'rebuilding'
+                    rebuildState.kind === 'accepted' || report.recall.status === 'rebuilding'
                   }
                   onClick={() => {
                     void triggerRebuild();
@@ -1824,8 +1802,7 @@ export function HealthPanel({
                     ? `Re-indexing… (${String(
                         report.recall.rebuildEmbedded ?? report.recall.entryCount ?? 0,
                       )}${
-                        report.recall.rebuildTotal !== undefined &&
-                        report.recall.rebuildTotal > 0
+                        report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
                           ? `/${String(report.recall.rebuildTotal)}`
                           : report.recall.eventTurnCount !== undefined
                             ? `/${String(report.recall.eventTurnCount)}`

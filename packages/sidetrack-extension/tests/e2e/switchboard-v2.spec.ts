@@ -174,26 +174,37 @@ test.describe('SwitchBoard v2 e2e gap coverage', () => {
       const root = workstream('bac_ws_v2_root', 'Sidetrack');
       const mvp = workstream('bac_ws_v2_mvp', 'MVP PRD', { parentId: root.bac_id });
       const dispatch = workstream('bac_ws_v2_dispatch', 'Dispatch', { parentId: root.bac_id });
-      const sourceThread = thread('bac_thread_v2_suggestions', 'Composer suggestions thread', mvp.bac_id);
+      const sourceThread = thread(
+        'bac_thread_v2_suggestions',
+        'Composer suggestions thread',
+        mvp.bac_id,
+      );
       const page = await seedAndOpenSidepanel(runtime, {
         [SETTINGS_KEY]: connectedSettings,
         [WORKSTREAMS_KEY]: [root, mvp, dispatch],
         [THREADS_KEY]: [sourceThread],
       });
 
-      await page.route(`http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/**`, async (route) => {
-        await fulfillJson(route, 200, {
-          data: [
-            { workstreamId: mvp.bac_id, score: 0.92, breakdown: { lexical: 0.55, vector: 0.22 } },
-            {
-              workstreamId: dispatch.bac_id,
-              score: 0.77,
-              breakdown: { lexical: 0.31, vector: 0.38 },
-            },
-            { workstreamId: root.bac_id, score: 0.61, breakdown: { lexical: 0.21, vector: 0.19 } },
-          ],
-        });
-      });
+      await page.route(
+        `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/**`,
+        async (route) => {
+          await fulfillJson(route, 200, {
+            data: [
+              { workstreamId: mvp.bac_id, score: 0.92, breakdown: { lexical: 0.55, vector: 0.22 } },
+              {
+                workstreamId: dispatch.bac_id,
+                score: 0.77,
+                breakdown: { lexical: 0.31, vector: 0.38 },
+              },
+              {
+                workstreamId: root.bac_id,
+                score: 0.61,
+                breakdown: { lexical: 0.21, vector: 0.19 },
+              },
+            ],
+          });
+        },
+      );
 
       await test.step('When the composer opens, it renders all companion suggestions', async () => {
         await openComposerForThread(page, sourceThread.title);
@@ -349,15 +360,18 @@ test.describe('SwitchBoard v2 e2e gap coverage', () => {
       await row.evaluate((element) => {
         element.scrollIntoView = () => undefined;
       });
-      await page.evaluate(async ({ threadUrl, type }) => {
-        await chrome.runtime.sendMessage({
-          type,
-          threadUrl,
-        });
-      }, {
-        threadUrl: seeded.threadUrl,
-        type: messageTypes.focusThreadInSidePanel,
-      });
+      await page.evaluate(
+        async ({ threadUrl, type }) => {
+          await chrome.runtime.sendMessage({
+            type,
+            threadUrl,
+          });
+        },
+        {
+          threadUrl: seeded.threadUrl,
+          type: messageTypes.focusThreadInSidePanel,
+        },
+      );
       await expect(row).toHaveClass(/focusing/u);
     } finally {
       await runtime?.close();

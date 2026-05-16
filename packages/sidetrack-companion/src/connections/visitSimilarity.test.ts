@@ -376,10 +376,7 @@ describe('buildVisitSimilarity — Stage 5 / T2 env-driven gates', () => {
     process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '500';
     try {
       const revision = await buildVisitSimilarity(
-        [
-          visit('alpha', { focusedWindowMs: 600 }),
-          visit('bravo', { focusedWindowMs: 700 }),
-        ],
+        [visit('alpha', { focusedWindowMs: 600 }), visit('bravo', { focusedWindowMs: 700 })],
         embedFromVectors(
           new Map<string, Float32Array>([
             ['visit-alpha', unit([1, 0])],
@@ -591,13 +588,12 @@ describe('resolveVisitSimilarityConfig — Stage 5.0 follow-up', () => {
       // Restore each env var separately — keeps the names visible to a
       // future reader, and the static keys pacify the no-dynamic-delete
       // lint rule.
-      /* eslint-disable @typescript-eslint/no-dynamic-delete */
+
       if (previous.threshold === undefined) delete process.env['SIDETRACK_SIMILARITY_THRESHOLD'];
       else process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = previous.threshold;
       if (previous.topK === undefined) delete process.env['SIDETRACK_SIMILARITY_TOP_K'];
       else process.env['SIDETRACK_SIMILARITY_TOP_K'] = previous.topK;
-      if (previous.gate === undefined)
-        delete process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'];
+      if (previous.gate === undefined) delete process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'];
       else process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = previous.gate;
       if (previous.lexical === undefined)
         delete process.env['SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD'];
@@ -605,7 +601,6 @@ describe('resolveVisitSimilarityConfig — Stage 5.0 follow-up', () => {
       if (previous.fallback === undefined)
         delete process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'];
       else process.env['SIDETRACK_SIMILARITY_LEXICAL_FALLBACK'] = previous.fallback;
-      /* eslint-enable @typescript-eslint/no-dynamic-delete */
     }
   });
 });

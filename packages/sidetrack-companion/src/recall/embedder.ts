@@ -190,9 +190,7 @@ export const getEmbedder = async (): Promise<FeatureExtractor> => {
           cacheDirAtLoad,
         );
       }
-      throw new Error(
-        `[recall] could not load ${MODEL_ID} on any dtype. Tried: ${joined}`,
-      );
+      throw new Error(`[recall] could not load ${MODEL_ID} on any dtype. Tried: ${joined}`);
     })();
   }
   try {
@@ -330,7 +328,7 @@ export const embed = async (texts: readonly string[]): Promise<readonly Float32A
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
   for (let i = 0; i < texts.length; i += 1) {
-    const text = texts[i] as string;
+    const text = texts[i]!;
     const output = await extractor(`${E5_PREFIX}${text}`, {
       pooling: 'mean',
       normalize: true,

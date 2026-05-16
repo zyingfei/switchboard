@@ -14,18 +14,15 @@ run_if_exists() {
 }
 
 if [ -f package.json ]; then
-  if command -v pnpm >/dev/null 2>&1; then
-    pnpm run typecheck
-    pnpm run lint
-    pnpm run format:check
-    pnpm run test
-    pnpm run build
-  elif command -v npm >/dev/null 2>&1; then
-    npm run typecheck
-    npm run lint
-    npm run format:check
-    npm test
-    npm run build
+  if command -v bun >/dev/null 2>&1; then
+    bun run typecheck
+    bun run lint
+    bun run format:check
+    bun run test
+    bun run build
+  else
+    echo "Missing bun; install Bun 1.3.14 or newer."
+    exit 1
   fi
 fi
 

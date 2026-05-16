@@ -21,7 +21,11 @@ const isUntriageableForInbox = (record: TabSessionRecord): boolean => {
 const dedupeKey = (record: TabSessionRecord): string => record.latestUrl ?? record.tabSessionId;
 
 const compareLastActivityDesc = (left: TabSessionRecord, right: TabSessionRecord): number =>
-  left.lastActivityAt < right.lastActivityAt ? 1 : left.lastActivityAt > right.lastActivityAt ? -1 : 0;
+  left.lastActivityAt < right.lastActivityAt
+    ? 1
+    : left.lastActivityAt > right.lastActivityAt
+      ? -1
+      : 0;
 
 // Multiple tab sessions can share the same URL (the user opened the
 // same page in two tabs, or the boundary state machine re-minted a
@@ -29,9 +33,7 @@ const compareLastActivityDesc = (left: TabSessionRecord, right: TabSessionRecord
 // the Inbox we only want the most-recent session per URL — attributing
 // one stamps an explicit signal that benefits the next resolver run on
 // any same-URL sibling.
-const dedupeByUrl = (
-  records: readonly TabSessionRecord[],
-): readonly TabSessionRecord[] => {
+const dedupeByUrl = (records: readonly TabSessionRecord[]): readonly TabSessionRecord[] => {
   const sorted = [...records].sort(compareLastActivityDesc);
   const seen = new Set<string>();
   const out: TabSessionRecord[] = [];
@@ -60,9 +62,6 @@ export const sliceInboxForPanel = (
   const collapsedDuplicates = filtered.length - deduped.length;
   return {
     visible,
-    hiddenCount: Math.max(
-      0,
-      total - droppedUntriageable - collapsedDuplicates - visible.length,
-    ),
+    hiddenCount: Math.max(0, total - droppedUntriageable - collapsedDuplicates - visible.length),
   };
 };

@@ -106,7 +106,7 @@ describe('relay transport (integration)', () => {
     stopRelayTransport(b);
   });
 
-  it("rejects events from a known replica that suddenly publishes a different public key (no silent key swap)", async () => {
+  it('rejects events from a known replica that suddenly publishes a different public key (no silent key swap)', async () => {
     const secret = generateRendezvousSecret();
     const keysA1 = generateReplicaKeyPair();
     const keysA2 = generateReplicaKeyPair(); // attacker

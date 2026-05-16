@@ -57,8 +57,7 @@ const compareText = (left: string, right: string): number =>
 const visitKeyForUrl = (url: string): string =>
   url.trim().replace(/#.*$/u, '').replace(/\/+$/u, '');
 
-const maybeTimestamp = (value: number): number | null =>
-  Number.isFinite(value) ? value : null;
+const maybeTimestamp = (value: number): number | null => (Number.isFinite(value) ? value : null);
 
 const parseTimestamp = (value: string): number | null => {
   const parsed = Date.parse(value);
@@ -154,7 +153,10 @@ const pickOptionalLatestText = (
   return pickLatestText(left, leftObservedAtMs, right, rightObservedAtMs);
 };
 
-const pickRicherTitle = (left: string | undefined, right: string | undefined): string | undefined => {
+const pickRicherTitle = (
+  left: string | undefined,
+  right: string | undefined,
+): string | undefined => {
   if (left === undefined || left.length === 0) return right;
   if (right === undefined || right.length === 0) return left;
   if (right.length > left.length) return right;
@@ -225,7 +227,9 @@ const collectVisitRecords = (events: readonly AcceptedEvent[]): readonly VisitRe
         url: event.payload.url,
         canonicalUrl,
         observedAtMs,
-        ...(event.payload.openerVisitId === null ? {} : { openerVisitId: event.payload.openerVisitId }),
+        ...(event.payload.openerVisitId === null
+          ? {}
+          : { openerVisitId: event.payload.openerVisitId }),
         ...(event.payload.previousVisitId === null
           ? {}
           : { previousVisitId: event.payload.previousVisitId }),
@@ -281,7 +285,10 @@ const addUndirected = (graph: Map<string, Set<string>>, left: string, right: str
   addToSetMap(graph, right, left);
 };
 
-const walkGraph = (graph: ReadonlyMap<string, ReadonlySet<string>>, start: string): readonly string[] => {
+const walkGraph = (
+  graph: ReadonlyMap<string, ReadonlySet<string>>,
+  start: string,
+): readonly string[] => {
   const seen = new Set<string>([start]);
   const queue: string[] = [...toSortedIds(graph.get(start))];
 
@@ -298,25 +305,29 @@ const walkGraph = (graph: ReadonlyMap<string, ReadonlySet<string>>, start: strin
   return [...seen].sort(compareText);
 };
 
-const pairSourceGenerator = (
-  source: CandidateSource,
-  readPairs: (context: CandidateContext) => readonly { readonly from: string; readonly to: string }[],
-): SourceGenerator => (fromVisitId, context, generatedAt) => {
-  const fromKey = fromKeyFor(fromVisitId);
-  return candidatesFromIds(
-    fromVisitId,
-    readPairs(context)
-      .filter((pair) => pair.from === fromKey)
-      .map((pair) => pair.to),
-    source,
-    generatedAt,
-  );
-};
+const pairSourceGenerator =
+  (
+    source: CandidateSource,
+    readPairs: (
+      context: CandidateContext,
+    ) => readonly { readonly from: string; readonly to: string }[],
+  ): SourceGenerator =>
+  (fromVisitId, context, generatedAt) => {
+    const fromKey = fromKeyFor(fromVisitId);
+    return candidatesFromIds(
+      fromVisitId,
+      readPairs(context)
+        .filter((pair) => pair.from === fromKey)
+        .map((pair) => pair.to),
+      source,
+      generatedAt,
+    );
+  };
 
-const sourceWrapper = (source: CandidateSource, generator: SourceGenerator): GenerateCandidates => (
-  fromVisitId,
-  context,
-) => generator(fromVisitId, context, stableGeneratedAt(context));
+const sourceWrapper =
+  (source: CandidateSource, generator: SourceGenerator): GenerateCandidates =>
+  (fromVisitId, context) =>
+    generator(fromVisitId, context, stableGeneratedAt(context));
 
 const groupedRecordCandidates = (
   fromVisitId: string,
@@ -347,7 +358,9 @@ const groupedRecordCandidates = (
   return candidatesFromIds(fromVisitId, toVisitIds, source, generatedAt);
 };
 
-const workstreamGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMap<string, Set<string>> => {
+const workstreamGroupsFromEdges = (
+  edges: readonly ConnectionEdge[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const edge of edges) {
     if (edge.kind !== 'visit_in_workstream') continue;
@@ -392,17 +405,24 @@ const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generate
   return candidatesFromIds(fromVisitId, toVisitIds, 'same_workstream', generatedAt);
 };
 
-const chainGenerator = (
-  source: CandidateSource,
-  linkForRecord: (record: VisitRecord) => string | undefined,
-): SourceGenerator => (fromVisitId, context, generatedAt) => {
-  const graph = new Map<string, Set<string>>();
-  for (const record of collectVisitRecords(context.merged)) {
-    const linked = linkForRecord(record);
-    if (linked !== undefined) addUndirected(graph, record.id, linked);
-  }
-  return candidatesFromIds(fromVisitId, walkGraph(graph, fromKeyFor(fromVisitId)), source, generatedAt);
-};
+const chainGenerator =
+  (
+    source: CandidateSource,
+    linkForRecord: (record: VisitRecord) => string | undefined,
+  ): SourceGenerator =>
+  (fromVisitId, context, generatedAt) => {
+    const graph = new Map<string, Set<string>>();
+    for (const record of collectVisitRecords(context.merged)) {
+      const linked = linkForRecord(record);
+      if (linked !== undefined) addUndirected(graph, record.id, linked);
+    }
+    return candidatesFromIds(
+      fromVisitId,
+      walkGraph(graph, fromKeyFor(fromVisitId)),
+      source,
+      generatedAt,
+    );
+  };
 
 const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
   try {
@@ -472,10 +492,7 @@ const tokenizeTitlePathText = (value: string): readonly string[] =>
     .split(/[^A-Za-z0-9]+/u)
     .map((token) => token.trim().toLowerCase())
     .filter(
-      (token) =>
-        token.length >= 3 &&
-        !/^\d+$/u.test(token) &&
-        !TITLE_PATH_STOP_TOKENS.has(token),
+      (token) => token.length >= 3 && !/^\d+$/u.test(token) && !TITLE_PATH_STOP_TOKENS.has(token),
     );
 
 const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
@@ -492,7 +509,9 @@ const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
   return [...new Set(tokenizeTitlePathText(pieces.join(' ')))].map((token) => `token:${token}`);
 };
 
-const snippetGroupsFromEvents = (events: readonly AcceptedEvent[]): ReadonlyMap<string, Set<string>> => {
+const snippetGroupsFromEvents = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const event of events) {
     if (event.type !== SELECTION_COPIED || !isSelectionCopiedPayload(event.payload)) continue;
@@ -501,7 +520,9 @@ const snippetGroupsFromEvents = (events: readonly AcceptedEvent[]): ReadonlyMap<
   return groups;
 };
 
-const snippetGroupsFromEdges = (edges: readonly ConnectionEdge[]): ReadonlyMap<string, Set<string>> => {
+const snippetGroupsFromEdges = (
+  edges: readonly ConnectionEdge[],
+): ReadonlyMap<string, Set<string>> => {
   const groups = new Map<string, Set<string>>();
   for (const edge of edges) {
     if (edge.kind !== 'snippet_copied_from_visit') continue;
@@ -547,7 +568,7 @@ const crossReplicaContinuationGenerator: SourceGenerator = (fromVisitId, context
   const records = collectVisitRecords(context.merged);
   const byId = recordsById(records);
   const fromRecord = byId.get(fromKeyFor(fromVisitId));
-  if (fromRecord === undefined || fromRecord.replicaId === undefined) return [];
+  if (fromRecord?.replicaId === undefined) return [];
 
   const toVisitIds = records
     .filter(
@@ -563,7 +584,9 @@ const crossReplicaContinuationGenerator: SourceGenerator = (fromVisitId, context
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const pairFromPayload = (payload: unknown): { readonly from: string; readonly to: string } | null => {
+const pairFromPayload = (
+  payload: unknown,
+): { readonly from: string; readonly to: string } | null => {
   if (!isRecord(payload)) return null;
   const from =
     typeof payload['fromVisitId'] === 'string'
@@ -593,13 +616,9 @@ const explicitPairGenerator = (eventType: string, source: CandidateSource): Sour
   );
 
 const sameCanonicalUrlGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
-  groupedRecordCandidates(
-    fromVisitId,
-    context,
-    'same_canonical_url',
-    generatedAt,
-    (record) => [`canonical:${record.canonicalUrl}`],
-  );
+  groupedRecordCandidates(fromVisitId, context, 'same_canonical_url', generatedAt, (record) => [
+    `canonical:${record.canonicalUrl}`,
+  ]);
 
 const sameRepoOrDomainGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
   groupedRecordCandidates(
@@ -611,13 +630,7 @@ const sameRepoOrDomainGenerator: SourceGenerator = (fromVisitId, context, genera
   );
 
 const sameSearchQueryGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
-  groupedRecordCandidates(
-    fromVisitId,
-    context,
-    'same_search_query',
-    generatedAt,
-    searchQueryKeys,
-  );
+  groupedRecordCandidates(fromVisitId, context, 'same_search_query', generatedAt, searchQueryKeys);
 
 const sameTitlePathTokensGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
   groupedRecordCandidates(

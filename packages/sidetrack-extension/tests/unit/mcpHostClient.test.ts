@@ -49,7 +49,9 @@ describe('MCP host client', () => {
     });
 
     await expect(listTools('local')).resolves.toEqual([{ name: 'search' }]);
-    await expect(callTool({ serverId: 'local', tool: 'search', input: { q: 'x' } })).resolves.toEqual({
+    await expect(
+      callTool({ serverId: 'local', tool: 'search', input: { q: 'x' } }),
+    ).resolves.toEqual({
       ok: true,
       content: [{ type: 'text', text: 'ok' }],
       structuredContent: { ok: true },

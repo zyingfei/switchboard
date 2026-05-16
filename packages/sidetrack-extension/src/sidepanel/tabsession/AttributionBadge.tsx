@@ -11,10 +11,7 @@ const workstreamLabel = (
   if (workstreamId === null || workstreamId === undefined) return '?';
   // If the referenced workstream is gone (user deleted it after attribution
   // landed) fall back to a human marker instead of leaking the raw bac_id.
-  return (
-    workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ??
-    '(removed)'
-  );
+  return workstreams.find((workstream) => workstream.bac_id === workstreamId)?.path ?? '(removed)';
 };
 
 // Visual state distinguishes how a URL ended up attributed:
@@ -24,13 +21,7 @@ const workstreamLabel = (
 //   suggested: not yet applied, resolver has a guess (dashed)
 //   ignored: user said "don't bother me about this URL" (struck-through)
 //   empty: no attribution, no suggestion (placeholder)
-type BadgeVariant =
-  | 'user-asserted'
-  | 'inferred'
-  | 'thread'
-  | 'suggested'
-  | 'ignored'
-  | 'empty';
+type BadgeVariant = 'user-asserted' | 'inferred' | 'thread' | 'suggested' | 'ignored' | 'empty';
 
 const variantFor = (
   attribution: TabSessionRecord['currentAttribution'] | undefined,
@@ -94,9 +85,10 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
   const attribution = record?.currentAttribution;
   const ignored = record?.currentIgnored;
   const suggestedWorkstreamId = suggestion?.decision.workstreamId;
-  const label = ignored !== undefined
-    ? 'ignored'
-    : workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
+  const label =
+    ignored !== undefined
+      ? 'ignored'
+      : workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
   const variant = variantFor(attribution, ignored, suggestedWorkstreamId !== undefined);
   const marker = markerFor(variant);
   return (
@@ -105,7 +97,11 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
       title={titleFor(variant, label)}
       data-attribution-variant={variant}
     >
-      {marker !== null ? <span className="tab-session-badge-marker" aria-hidden>{marker}</span> : null}
+      {marker !== null ? (
+        <span className="tab-session-badge-marker" aria-hidden>
+          {marker}
+        </span>
+      ) : null}
       <span className="tab-session-badge-label">{label}</span>
     </span>
   );

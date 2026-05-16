@@ -52,7 +52,12 @@ describe('RecallClient', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const client = createRecallClient(settings);
-    await client.indexTurn({ id: 't:0', threadId: 't', capturedAt: '2026-05-05T00:00:00Z', text: 'one' });
+    await client.indexTurn({
+      id: 't:0',
+      threadId: 't',
+      capturedAt: '2026-05-05T00:00:00Z',
+      text: 'one',
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const calls = (fetchMock as unknown as { mock: { calls: [string, RequestInit][] } }).mock.calls;
     const init = calls[0][1];

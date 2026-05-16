@@ -803,9 +803,7 @@ const snapshotsFromManualFiles = (
     if (!isReplayScopedUrl(snapshot.url)) continue;
     // Same canonicalization the navigation events use, so pack
     // snapshots and pack events agree on the canonical key.
-    const canonicalUrl = stripTrailingSlash(
-      sanitizeTimelineUrl(canonicalThreadUrl(snapshot.url)),
-    );
+    const canonicalUrl = stripTrailingSlash(sanitizeTimelineUrl(canonicalThreadUrl(snapshot.url)));
     const redacted =
       snapshot.redactionCounts === undefined
         ? redactHtmlForSessionPack(snapshot.html)
@@ -1092,9 +1090,7 @@ const installRouteStubs = async (
   });
   return {
     expectedCanonicalUrls: [
-      ...new Set(
-        [...canonicalsByRouteKey.values()].flatMap((set) => [...set]),
-      ),
+      ...new Set([...canonicalsByRouteKey.values()].flatMap((set) => [...set])),
     ].sort(),
     hitCounts: () => new Map(hits),
     fulfilledBodies: () => new Map(fulfilledBodies),

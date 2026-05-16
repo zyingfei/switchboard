@@ -47,10 +47,7 @@ describe('embedding cache', () => {
 
   it('drops the cache when modelId changes', async () => {
     const cache = createEmbeddingCache(vault);
-    await cache.put(
-      { modelId: 'A', modelRevision: 'r1', embedTextHash: 'h1' },
-      makeVector(1),
-    );
+    await cache.put({ modelId: 'A', modelRevision: 'r1', embedTextHash: 'h1' }, makeVector(1));
     // Different modelId — older entries are no longer addressable.
     const got = await cache.get({
       modelId: 'B',
@@ -62,10 +59,7 @@ describe('embedding cache', () => {
 
   it('drops the cache when modelRevision changes', async () => {
     const cache = createEmbeddingCache(vault);
-    await cache.put(
-      { modelId: 'A', modelRevision: 'r1', embedTextHash: 'h1' },
-      makeVector(1),
-    );
+    await cache.put({ modelId: 'A', modelRevision: 'r1', embedTextHash: 'h1' }, makeVector(1));
     const got = await cache.get({
       modelId: 'A',
       modelRevision: 'r2',

@@ -6,8 +6,12 @@ const out = await sw.evaluate(async () => {
   // Multiple ways of reading the same key
   const a = await new Promise((r) => chrome.storage.local.get('sidetrack.settings', (v) => r(v)));
   const b = await new Promise((r) => chrome.storage.local.get(['sidetrack.settings'], (v) => r(v)));
-  const c = await new Promise((r) => chrome.storage.local.get({ 'sidetrack.settings': undefined }, (v) => r(v)));
-  const d = await new Promise((r) => chrome.storage.local.get({ 'sidetrack.settings': 'DEFAULT' }, (v) => r(v)));
+  const c = await new Promise((r) =>
+    chrome.storage.local.get({ 'sidetrack.settings': undefined }, (v) => r(v)),
+  );
+  const d = await new Promise((r) =>
+    chrome.storage.local.get({ 'sidetrack.settings': 'DEFAULT' }, (v) => r(v)),
+  );
   // Also dump all keys
   const all = await new Promise((r) => chrome.storage.local.get(null, (v) => r(Object.keys(v))));
   return { a, b, c, d, allKeys: all };

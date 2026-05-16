@@ -121,9 +121,7 @@ describe('PathFinder', () => {
     });
     expect(screen.getByTestId('connections-pathfinder-pill-workstream:A')).toBeInTheDocument();
     expect(screen.getByTestId('connections-pathfinder-pill-thread:T1')).toBeInTheDocument();
-    expect(
-      screen.getByTestId('connections-pathfinder-pill-visit-instance:V1'),
-    ).toBeInTheDocument();
+    expect(screen.getByTestId('connections-pathfinder-pill-visit-instance:V1')).toBeInTheDocument();
     expect(screen.getByText(/2 edges/)).toBeInTheDocument();
   });
 

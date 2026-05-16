@@ -262,7 +262,10 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      const result = await client.callTool({ name: 'sidetrack.system.update_check', arguments: {} });
+      const result = await client.callTool({
+        name: 'sidetrack.system.update_check',
+        arguments: {},
+      });
       expect(companionClient.systemUpdateCheck).toHaveBeenCalled();
       expect(result.structuredContent).toMatchObject({ latest: '0.1.0', behind: true });
     } finally {
@@ -286,7 +289,10 @@ describe('companion-backed read tools', () => {
       await expect(
         client.callTool({ name: 'sidetrack.annotations.delete', arguments: { bac_id: 'ann_1' } }),
       ).resolves.toMatchObject({ structuredContent: { bac_id: 'ann_1', deletedAt: 'now' } });
-      expect(companionClient.updateAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1', note: 'new' });
+      expect(companionClient.updateAnnotation).toHaveBeenCalledWith({
+        bac_id: 'ann_1',
+        note: 'new',
+      });
       expect(companionClient.deleteAnnotation).toHaveBeenCalledWith({ bac_id: 'ann_1' });
     } finally {
       await client.close();
@@ -308,8 +314,14 @@ describe('companion-backed read tools', () => {
     const client = await startInProcessServer(companionClient);
     try {
       await client.callTool({ name: 'sidetrack.workstreams.bump', arguments: { bac_id: 'ws_1' } });
-      await client.callTool({ name: 'sidetrack.threads.archive', arguments: { bac_id: 'thread_1' } });
-      await client.callTool({ name: 'sidetrack.threads.unarchive', arguments: { bac_id: 'thread_1' } });
+      await client.callTool({
+        name: 'sidetrack.threads.archive',
+        arguments: { bac_id: 'thread_1' },
+      });
+      await client.callTool({
+        name: 'sidetrack.threads.unarchive',
+        arguments: { bac_id: 'thread_1' },
+      });
       expect(companionClient.bumpWorkstream).toHaveBeenCalledWith({ bac_id: 'ws_1' });
       expect(companionClient.archiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
       expect(companionClient.unarchiveThread).toHaveBeenCalledWith({ bac_id: 'thread_1' });
@@ -325,10 +337,14 @@ describe('companion-backed read tools', () => {
     });
     const client = await startInProcessServer(companionClient);
     try {
-      await expect(client.callTool({ name: 'sidetrack.buckets.list', arguments: {} })).resolves.toMatchObject({
+      await expect(
+        client.callTool({ name: 'sidetrack.buckets.list', arguments: {} }),
+      ).resolves.toMatchObject({
         structuredContent: { items: [{ id: 'default' }] },
       });
-      await expect(client.callTool({ name: 'sidetrack.system.health', arguments: {} })).resolves.toMatchObject({
+      await expect(
+        client.callTool({ name: 'sidetrack.system.health', arguments: {} }),
+      ).resolves.toMatchObject({
         structuredContent: { uptimeSec: 1 },
       });
     } finally {

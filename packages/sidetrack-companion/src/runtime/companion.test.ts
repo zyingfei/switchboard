@@ -29,7 +29,9 @@ describe('startCompanion bind-failure rollback', () => {
     busyServer = createServer();
     await new Promise<void>((resolve, reject) => {
       busyServer.once('error', reject);
-      busyServer.listen(0, '127.0.0.1', () => resolve());
+      busyServer.listen(0, '127.0.0.1', () => {
+        resolve();
+      });
     });
     const address = busyServer.address();
     if (typeof address !== 'object' || address === null) {
@@ -39,7 +41,11 @@ describe('startCompanion bind-failure rollback', () => {
   });
 
   afterEach(async () => {
-    await new Promise<void>((resolve) => busyServer.close(() => resolve()));
+    await new Promise<void>((resolve) =>
+      busyServer.close(() => {
+        resolve();
+      }),
+    );
     await rm(vaultRoot, { recursive: true, force: true });
   });
 

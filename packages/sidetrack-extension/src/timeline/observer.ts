@@ -254,8 +254,7 @@ export const createTimelineObserver = (deps: TimelineObserverDeps): TimelineObse
       // otherwise the companion's tab-session projection never gets a
       // useful `latestTitle` and the Inbox / current-tab card stays stuck
       // displaying raw URLs.
-      const titleChanged =
-        boundedTitle !== undefined && existing.title !== boundedTitle;
+      const titleChanged = boundedTitle !== undefined && existing.title !== boundedTitle;
       const elapsed = now.getTime() - existing.lastEmittedAt;
       if (elapsed < coalesceWindowMs && !titleChanged) {
         coalescedCalls += 1;

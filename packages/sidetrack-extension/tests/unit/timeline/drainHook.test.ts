@@ -26,9 +26,10 @@ const buildEntry = (seq: number): SpoolEntry<BrowserTimelineObservedPayload> => 
   lastTransitionAt: '2026-05-07T10:00:00.000Z',
 });
 
-const stubFetch = (
-  response: { status: number; body: unknown },
-): { mock: ReturnType<typeof vi.fn>; restore: () => void } => {
+const stubFetch = (response: {
+  status: number;
+  body: unknown;
+}): { mock: ReturnType<typeof vi.fn>; restore: () => void } => {
   const original = globalThis.fetch;
   const mock = vi.fn(async () => {
     return new Response(JSON.stringify(response.body), {

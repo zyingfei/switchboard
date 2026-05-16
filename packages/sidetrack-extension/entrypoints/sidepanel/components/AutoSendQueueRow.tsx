@@ -88,11 +88,7 @@ export function AutoSendQueueRow({
   return (
     <li className={className} {...dndProps}>
       {dnd?.draggable ? (
-        <span
-          className="queue-row-grip mono"
-          aria-hidden
-          title="Drag to reorder"
-        >
+        <span className="queue-row-grip mono" aria-hidden title="Drag to reorder">
           ⋮⋮
         </span>
       ) : null}
@@ -102,7 +98,9 @@ export function AutoSendQueueRow({
       <div className="queue-row-main">
         <div className="queue-row-head mono">
           <span>{label}</span>
-          <span>· {String(index + 1)} of {String(total)}</span>
+          <span>
+            · {String(index + 1)} of {String(total)}
+          </span>
         </div>
         <div className="queue-row-text" title={item.text}>
           “{item.text}”

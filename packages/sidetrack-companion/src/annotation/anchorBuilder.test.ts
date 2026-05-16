@@ -131,8 +131,7 @@ describe('buildAnchorFromTerm', () => {
   it('accepts short terms when a preceding-fragment hint is provided', () => {
     const result = requireOk(
       buildAnchorFromTerm({
-        turnText:
-          'AI in research and AI in production diverge. The topic is AI safety today.',
+        turnText: 'AI in research and AI in production diverge. The topic is AI safety today.',
         term: 'AI',
         selectionHint: 'topic is',
       }),
@@ -141,8 +140,7 @@ describe('buildAnchorFromTerm', () => {
   });
 
   it('preserves multibyte characters in the windows', () => {
-    const turnText =
-      'café architecture stack: WebGPU shines for résumé-fast operations.';
+    const turnText = 'café architecture stack: WebGPU shines for résumé-fast operations.';
     const result = requireOk(buildAnchorFromTerm({ turnText, term: 'WebGPU' }));
     expect(result.anchor.textQuote.prefix).toContain('café');
     expect(result.anchor.textQuote.suffix).toContain('résumé');

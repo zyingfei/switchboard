@@ -35,7 +35,9 @@ const makeEntry = (input: {
     textHash: 'h',
     text: 't',
     ...(input.sourceUnitId === undefined ? {} : { sourceUnitId: input.sourceUnitId }),
-    ...(input.extractionRevisionId === undefined ? {} : { extractionRevisionId: input.extractionRevisionId }),
+    ...(input.extractionRevisionId === undefined
+      ? {}
+      : { extractionRevisionId: input.extractionRevisionId }),
   },
 });
 
@@ -55,9 +57,24 @@ describe('replaceEntriesForSourceUnit', () => {
     await writeIndex(
       path,
       [
-        makeEntry({ id: 'a:0', threadId: 't-A', sourceUnitId: 'src:A', extractionRevisionId: 'rev-A-v1' }),
-        makeEntry({ id: 'a:1', threadId: 't-A', sourceUnitId: 'src:A', extractionRevisionId: 'rev-A-v1' }),
-        makeEntry({ id: 'b:0', threadId: 't-B', sourceUnitId: 'src:B', extractionRevisionId: 'rev-B-v1' }),
+        makeEntry({
+          id: 'a:0',
+          threadId: 't-A',
+          sourceUnitId: 'src:A',
+          extractionRevisionId: 'rev-A-v1',
+        }),
+        makeEntry({
+          id: 'a:1',
+          threadId: 't-A',
+          sourceUnitId: 'src:A',
+          extractionRevisionId: 'rev-A-v1',
+        }),
+        makeEntry({
+          id: 'b:0',
+          threadId: 't-B',
+          sourceUnitId: 'src:B',
+          extractionRevisionId: 'rev-B-v1',
+        }),
       ],
       'Xenova/multilingual-e5-small',
     );
@@ -117,7 +134,14 @@ describe('replaceEntriesForSourceUnit', () => {
     const path = join(vault, 'index.bin');
     await writeIndex(
       path,
-      [makeEntry({ id: 'a:0', threadId: 't-A', sourceUnitId: 'src:A', extractionRevisionId: 'rev-A-v1' })],
+      [
+        makeEntry({
+          id: 'a:0',
+          threadId: 't-A',
+          sourceUnitId: 'src:A',
+          extractionRevisionId: 'rev-A-v1',
+        }),
+      ],
       'Xenova/multilingual-e5-small',
       { modelRevision: 'commit-sha-123' },
     );

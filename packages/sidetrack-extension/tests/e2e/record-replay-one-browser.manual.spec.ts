@@ -4,7 +4,7 @@
 //
 // Run from packages/sidetrack-extension:
 //   SIDETRACK_TEST_SESSIONS_DIR=/tmp/t1-smoke \
-//     npx playwright test tests/e2e/record-replay-one-browser.manual.spec.ts \
+//     bunx --bun --no-install playwright test tests/e2e/record-replay-one-browser.manual.spec.ts \
 //     --headed --timeout 0 --grep manual
 //
 // This spec records a minimal local session pack, writes it under
@@ -275,13 +275,33 @@ const evaluateIdentityReplay = async (input: {
     urlScopedWorkstreamEdges.length > 0
   ) {
     return [
-      fail('T1-A identity replay', 'case-1-same-url-two-sessions', 'identity replay failed', details),
-      fail('T1-A identity replay', 'case-6-active-pointer-not-truth', 'active pointer leaked', details),
+      fail(
+        'T1-A identity replay',
+        'case-1-same-url-two-sessions',
+        'identity replay failed',
+        details,
+      ),
+      fail(
+        'T1-A identity replay',
+        'case-6-active-pointer-not-truth',
+        'active pointer leaked',
+        details,
+      ),
     ];
   }
   return [
-    pass('T1-A identity replay', 'case-1-same-url-two-sessions', 'session-scoped visit identity held', details),
-    pass('T1-A identity replay', 'case-6-active-pointer-not-truth', 'active pointer did not create URL-scoped graph truth', details),
+    pass(
+      'T1-A identity replay',
+      'case-1-same-url-two-sessions',
+      'session-scoped visit identity held',
+      details,
+    ),
+    pass(
+      'T1-A identity replay',
+      'case-6-active-pointer-not-truth',
+      'active pointer did not create URL-scoped graph truth',
+      details,
+    ),
   ];
 };
 
@@ -301,9 +321,13 @@ const applyExplicitAttributionFixture = async (
   for (const record of records) {
     const tabSessionId = record.tabSessionId;
     if (attributed.has(tabSessionId)) continue;
-    await companionPost(companion, `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/attribute`, {
-      workstreamId,
-    });
+    await companionPost(
+      companion,
+      `/v1/tabsessions/${encodeURIComponent(tabSessionId)}/attribute`,
+      {
+        workstreamId,
+      },
+    );
     attributed.add(tabSessionId);
   }
   const after = await readTabSessionProjection(companion);
@@ -391,9 +415,12 @@ const runInboxUxReplay = async (input: {
   const [assigned, dismissed, unassigned] = records;
   if (assigned === undefined || dismissed === undefined || unassigned === undefined) {
     return [
-      fail('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'not enough tab sessions for three-card UX case', [
-        `records: ${records.map((record) => record.tabSessionId).join(', ')}`,
-      ]),
+      fail(
+        'T1-C inbox UX replay',
+        'case-2-real-inbox-assignment',
+        'not enough tab sessions for three-card UX case',
+        [`records: ${records.map((record) => record.tabSessionId).join(', ')}`],
+      ),
     ];
   }
 
@@ -435,8 +462,22 @@ const runInboxUxReplay = async (input: {
     `unassigned=${unassigned.tabSessionId}:${String(unassignedOk)}`,
   ];
   return assignedOk && dismissedOk && unassignedOk
-    ? [pass('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'real Inbox UI assigned/dismissed/left cards correctly', details)]
-    : [fail('T1-C inbox UX replay', 'case-2-real-inbox-assignment', 'Inbox UI state did not match expected assignments', details)];
+    ? [
+        pass(
+          'T1-C inbox UX replay',
+          'case-2-real-inbox-assignment',
+          'real Inbox UI assigned/dismissed/left cards correctly',
+          details,
+        ),
+      ]
+    : [
+        fail(
+          'T1-C inbox UX replay',
+          'case-2-real-inbox-assignment',
+          'Inbox UI state did not match expected assignments',
+          details,
+        ),
+      ];
 };
 
 const firstSameUrlPair = (
@@ -470,14 +511,26 @@ const runResolverTabGroupReplay = async (input: {
   const pair = firstSameUrlPair(tabSessionRecordsForCanonicals(before, input.expectedUrls));
   if (pair === null) {
     return [
-      fail('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'no same-URL tab-session pair was available', []),
+      fail(
+        'T1-D resolver/tab-group replay',
+        'case-3-resolver-dryrun-no-write',
+        'no same-URL tab-session pair was available',
+        [],
+      ),
     ];
   }
   const [anchor, target] = pair;
-  await companionPost(input.companion, `/v1/tabsessions/${encodeURIComponent(anchor.tabSessionId)}/attribute`, {
-    workstreamId: ACTIVE_WORKSTREAM_ID,
+  await companionPost(
+    input.companion,
+    `/v1/tabsessions/${encodeURIComponent(anchor.tabSessionId)}/attribute`,
+    {
+      workstreamId: ACTIVE_WORKSTREAM_ID,
+    },
+  );
+  await waitForReplaySurfaces({
+    companion: input.companion,
+    expectedCanonicalUrls: input.expectedUrls,
   });
-  await waitForReplaySurfaces({ companion: input.companion, expectedCanonicalUrls: input.expectedUrls });
 
   const dryRunBody = (await companionGet(
     input.companion,
@@ -504,13 +557,18 @@ const runResolverTabGroupReplay = async (input: {
     'inferred';
   checks.push(
     dryRunOk && !dryRunWrote
-      ? pass('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'resolver dry-run returned explainable candidates without inferred writes', [
-          `top=${top.workstreamId}:${top.dominantSource}`,
-        ])
-      : fail('T1-D resolver/tab-group replay', 'case-3-resolver-dryrun-no-write', 'resolver dry-run failed or wrote inferred attribution', [
-          `top=${JSON.stringify(top)}`,
-          `dryRunWrote=${String(dryRunWrote)}`,
-        ]),
+      ? pass(
+          'T1-D resolver/tab-group replay',
+          'case-3-resolver-dryrun-no-write',
+          'resolver dry-run returned explainable candidates without inferred writes',
+          [`top=${top.workstreamId}:${top.dominantSource}`],
+        )
+      : fail(
+          'T1-D resolver/tab-group replay',
+          'case-3-resolver-dryrun-no-write',
+          'resolver dry-run failed or wrote inferred attribution',
+          [`top=${JSON.stringify(top)}`, `dryRunWrote=${String(dryRunWrote)}`],
+        ),
   );
 
   if (AUTO_APPLY_DISABLED) {
@@ -548,23 +606,34 @@ const runResolverTabGroupReplay = async (input: {
       autoBody.data?.status === 'applied' &&
       autoBody.data.projection?.bySessionId[target.tabSessionId]?.currentAttribution?.source ===
         'inferred' &&
-      autoBody.data.projection.bySessionId[target.tabSessionId]?.currentAttribution?.workstreamId ===
-        ACTIVE_WORKSTREAM_ID;
+      autoBody.data.projection.bySessionId[target.tabSessionId]?.currentAttribution
+        ?.workstreamId === ACTIVE_WORKSTREAM_ID;
     checks.push(
       applied
-        ? pass('T1-D resolver/tab-group replay', 'case-5-autoapply-policy-mode', 'balanced policy wrote Class E inferred attribution', [
-            `target=${target.tabSessionId}`,
-          ])
-        : fail('T1-D resolver/tab-group replay', 'case-5-autoapply-policy-mode', 'balanced policy did not auto-apply strong evidence', [
-            JSON.stringify(autoBody.data),
-          ]),
+        ? pass(
+            'T1-D resolver/tab-group replay',
+            'case-5-autoapply-policy-mode',
+            'balanced policy wrote Class E inferred attribution',
+            [`target=${target.tabSessionId}`],
+          )
+        : fail(
+            'T1-D resolver/tab-group replay',
+            'case-5-autoapply-policy-mode',
+            'balanced policy did not auto-apply strong evidence',
+            [JSON.stringify(autoBody.data)],
+          ),
     );
   }
 
   const [seedUrl, targetUrl] = input.expectedUrls;
   if (seedUrl === undefined || targetUrl === undefined) {
     checks.push(
-      fail('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'missing URLs for tab-group replay', []),
+      fail(
+        'T1-D resolver/tab-group replay',
+        'case-4-tabgroup-pull-in-out',
+        'missing URLs for tab-group replay',
+        [],
+      ),
     );
     return checks;
   }
@@ -599,15 +668,25 @@ const runResolverTabGroupReplay = async (input: {
       pullOutRecord.currentAttribution?.workstreamId === null;
     checks.push(
       tabGroupOk
-        ? pass('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'tab-group pull-in and pull-out events materialized', [
-            `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
-            `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
-          ])
-        : fail('T1-D resolver/tab-group replay', 'case-4-tabgroup-pull-in-out', 'tab-group hook did not produce pull-in/pull-out attribution', [
-            `hook=${JSON.stringify(result)}`,
-            `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
-            `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
-          ]),
+        ? pass(
+            'T1-D resolver/tab-group replay',
+            'case-4-tabgroup-pull-in-out',
+            'tab-group pull-in and pull-out events materialized',
+            [
+              `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
+              `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
+            ],
+          )
+        : fail(
+            'T1-D resolver/tab-group replay',
+            'case-4-tabgroup-pull-in-out',
+            'tab-group hook did not produce pull-in/pull-out attribution',
+            [
+              `hook=${JSON.stringify(result)}`,
+              `pullIn=${pullInRecord?.tabSessionId ?? '<none>'}`,
+              `pullOut=${pullOutRecord?.tabSessionId ?? '<none>'}`,
+            ],
+          ),
     );
   } finally {
     await seedPage.close().catch(() => undefined);

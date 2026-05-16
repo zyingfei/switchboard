@@ -16,11 +16,7 @@ import {
   quarantineFileFor,
   quarantineRootFor,
 } from '../../vault/inbox.js';
-import {
-  MAX_QUARANTINE_RAW_BYTES,
-  type CollectorEvent,
-  type QuarantineReason,
-} from './types.js';
+import { MAX_QUARANTINE_RAW_BYTES, type CollectorEvent, type QuarantineReason } from './types.js';
 
 export interface QuarantineEntry {
   readonly line: CollectorEvent;

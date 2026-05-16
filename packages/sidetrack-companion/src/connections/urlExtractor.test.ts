@@ -10,9 +10,7 @@ describe('connections — urlExtractor', () => {
   });
 
   it('strips fragments and auth-token query params', () => {
-    const out = extractUrlsFromText(
-      'try https://example.com/page?token=abc&keep=1#section-2 here',
-    );
+    const out = extractUrlsFromText('try https://example.com/page?token=abc&keep=1#section-2 here');
     expect(out).toEqual(['https://example.com/page?keep=1']);
   });
 

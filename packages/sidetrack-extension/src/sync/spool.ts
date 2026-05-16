@@ -65,7 +65,8 @@ interface ChromeStorageLike {
 const getChromeStorage = (): ChromeStorageLike => {
   // chrome.storage.local in production; tests inject a stub via
   // globalThis.chrome before importing this module.
-  const c = (globalThis as unknown as { chrome?: { storage?: { local?: ChromeStorageLike } } }).chrome;
+  const c = (globalThis as unknown as { chrome?: { storage?: { local?: ChromeStorageLike } } })
+    .chrome;
   const local = c?.storage?.local;
   if (local === undefined) {
     throw new Error('chrome.storage.local is unavailable');
@@ -96,10 +97,8 @@ export const writeSpool = async (
   await getChromeStorage().set({ [storageKey(surface)]: [...entries] });
 };
 
-const dotEquals = (
-  a: SpoolEntry['edgeDot'],
-  b: SpoolEntry['edgeDot'],
-): boolean => a.replicaId === b.replicaId && a.seq === b.seq;
+const dotEquals = (a: SpoolEntry['edgeDot'], b: SpoolEntry['edgeDot']): boolean =>
+  a.replicaId === b.replicaId && a.seq === b.seq;
 
 // Append an entry to the spool. Idempotent on edgeDot — re-spooling
 // the same dot is a no-op.

@@ -233,13 +233,7 @@ test.describe('dispatch packet (synthetic)', () => {
       // by unit tests in components.test.tsx instead.)
       await expect(body).toHaveValue(/Find the gaps, weak claims/u);
       // All five framing buttons should at least be present + clickable.
-      for (const buttonName of [
-        'Critique',
-        'Compare',
-        'Drill deeper',
-        'Continue',
-        'Custom',
-      ]) {
+      for (const buttonName of ['Critique', 'Compare', 'Drill deeper', 'Continue', 'Custom']) {
         await expect(modal.getByRole('button', { name: buttonName })).toBeVisible();
       }
 

@@ -48,8 +48,7 @@ const SECTORS: Record<EdgeFamily, SectorSpec> = {
   urlmatch: { center: 180, span: 80 },
 };
 
-const familyForEdge = (kind: string): EdgeFamily =>
-  EDGE_KINDS[kind]?.family ?? 'urlmatch';
+const familyForEdge = (kind: string): EdgeFamily => EDGE_KINDS[kind]?.family ?? 'urlmatch';
 
 const cmpOtherEnd = (
   a: { kind: string; otherEnd: string },
@@ -125,7 +124,11 @@ export const computeOrbitalLayout = (input: {
   // Optional second-hop placement: edges between two non-anchor
   // nodes where one endpoint is already on the inner ring.
   if (hops >= 2) {
-    const secondHopCandidates: Array<{ edge: ConnectionEdge; otherEnd: string; family: EdgeFamily }> = [];
+    const secondHopCandidates: Array<{
+      edge: ConnectionEdge;
+      otherEnd: string;
+      family: EdgeFamily;
+    }> = [];
     for (const edge of snapshot.edges) {
       if (edge.fromNodeId === anchorId || edge.toNodeId === anchorId) continue;
       const fromOnRing = positions.has(edge.fromNodeId);

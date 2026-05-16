@@ -77,7 +77,9 @@ export const loadOrCreateEdgeReplica = async (): Promise<EdgeReplica> => {
 // caller emits the event so a kill mid-flight can never re-use the
 // same dot. Idempotent on re-call within the same caller batch:
 // callers should `allocate(N)` for batch emits.
-export const allocateNextSeq = async (count = 1): Promise<{
+export const allocateNextSeq = async (
+  count = 1,
+): Promise<{
   readonly edgeReplicaId: string;
   readonly fromSeq: number;
   readonly toSeq: number;

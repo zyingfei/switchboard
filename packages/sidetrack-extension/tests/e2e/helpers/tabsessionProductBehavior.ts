@@ -76,9 +76,7 @@ export const buildFailT1FCheck = (
   details,
 });
 
-export const computeT1FStatus = (
-  productBehavior: readonly T1ProductBehaviorCheck[],
-): T1FStatus => {
+export const computeT1FStatus = (productBehavior: readonly T1ProductBehaviorCheck[]): T1FStatus => {
   const t1f = productBehavior.filter((c) => c.mode === T1F_MODE);
   const seen = new Set(t1f.map((c) => c.caseId));
   const missing = T1F_REQUIRED_CASE_IDS.filter((id) => !seen.has(id));
@@ -104,7 +102,11 @@ interface TabSessionRecord {
 interface ConnectionsSnapshot {
   readonly data: {
     readonly snapshot: {
-      readonly nodes: readonly { readonly id: string; readonly kind: string; readonly key: string }[];
+      readonly nodes: readonly {
+        readonly id: string;
+        readonly kind: string;
+        readonly key: string;
+      }[];
       readonly edges: readonly {
         readonly kind: string;
         readonly fromNodeId: string;
@@ -200,10 +202,7 @@ const runActivePointerNotTruthCheck = async (
   harness: T1FHarness,
 ): Promise<T1ProductBehaviorCheck> => {
   try {
-    const snap = (await companionGet(
-      harness.companionA,
-      '/v1/connections',
-    )) as ConnectionsSnapshot;
+    const snap = (await companionGet(harness.companionA, '/v1/connections')) as ConnectionsSnapshot;
     const visitInWorkstream = snap.data.snapshot.edges.filter(
       (edge) => edge.kind === 'visit_in_workstream',
     );
@@ -412,8 +411,7 @@ const runSameUrlVisitInstanceNoLeakCheck = async (
           '/v1/connections',
         )) as ConnectionsSnapshot;
         const urlAgg = snap.data.snapshot.edges.find(
-          (e) =>
-            e.kind === 'visit_in_workstream' && e.fromNodeId === `timeline-visit:${url}`,
+          (e) => e.kind === 'visit_in_workstream' && e.fromNodeId === `timeline-visit:${url}`,
         );
         if (urlAgg !== undefined) {
           violations.push(
@@ -573,15 +571,21 @@ const runTabGroupPullInOutCheck = async (harness: T1FHarness): Promise<T1Product
       const violations: string[] = [];
       for (const [sid, rec] of Object.entries(proj.data.bySessionId)) {
         const history = rec.attributionHistory ?? [];
-        const lastPullOut = [...history].reverse().findIndex((h) => h.source === 'tab-group-pull-out');
-        const lastPullIn = [...history].reverse().findIndex((h) => h.source === 'tab-group-pull-in');
+        const lastPullOut = [...history]
+          .reverse()
+          .findIndex((h) => h.source === 'tab-group-pull-out');
+        const lastPullIn = [...history]
+          .reverse()
+          .findIndex((h) => h.source === 'tab-group-pull-in');
         if (
           lastPullOut !== -1 &&
           (lastPullIn === -1 || lastPullOut < lastPullIn) &&
           rec.currentAttribution?.workstreamId !== null &&
           rec.currentAttribution?.workstreamId !== undefined
         ) {
-          violations.push(`session ${sid} has pull-out latest but currentAttribution still points to a workstream`);
+          violations.push(
+            `session ${sid} has pull-out latest but currentAttribution still points to a workstream`,
+          );
         }
       }
       if (violations.length === 0) {
@@ -590,11 +594,15 @@ const runTabGroupPullInOutCheck = async (harness: T1FHarness): Promise<T1Product
           'observed tab-group-pull-in/out history; pull-out-after-pull-in precedence held in projection',
         );
       }
-      return buildFailT1FCheck('full-tabgroup-pull-in-out', 'tab-group precedence violated', violations.slice(0, 3));
+      return buildFailT1FCheck(
+        'full-tabgroup-pull-in-out',
+        'tab-group precedence violated',
+        violations.slice(0, 3),
+      );
     }
     return buildPassT1FCheck(
       'full-tabgroup-pull-in-out',
-      "no opportunity to violate: current pack contains no tab-group-pull-in/out history; invariant vacuously held",
+      'no opportunity to violate: current pack contains no tab-group-pull-in/out history; invariant vacuously held',
       [
         'Driving real chrome.tabs.group/ungroup from Playwright requires extension-context APIs not yet wired in this harness; reachable behavior is exercised in the unit suite (tabgroups/wiring.test.ts).',
       ],
@@ -673,14 +681,9 @@ const runInboxAssertionCheck = async (harness: T1FHarness): Promise<T1ProductBeh
   }
 };
 
-const runNonAiNotAllThreadsCheck = async (
-  harness: T1FHarness,
-): Promise<T1ProductBehaviorCheck> => {
+const runNonAiNotAllThreadsCheck = async (harness: T1FHarness): Promise<T1ProductBehaviorCheck> => {
   try {
-    const snap = (await companionGet(
-      harness.companionB,
-      '/v1/connections',
-    )) as ConnectionsSnapshot;
+    const snap = (await companionGet(harness.companionB, '/v1/connections')) as ConnectionsSnapshot;
     const proj = (await companionGet(
       harness.companionB,
       '/v1/tabsessions/projection',
@@ -731,9 +734,7 @@ export const runT1FullProductE2ECases = async (
   checks.push(await runInboxAssertionCheck(harness));
   checks.push(await runSameUrlVisitInstanceNoLeakCheck(harness));
   checks.push(await runResolverDryRunNoWriteCheck(harness));
-  checks.push(
-    await runResolverEvidenceCheck(harness, 'full-ppr-causal-beats-similarity', 'ppr'),
-  );
+  checks.push(await runResolverEvidenceCheck(harness, 'full-ppr-causal-beats-similarity', 'ppr'));
   checks.push(
     await runResolverEvidenceCheck(harness, 'full-cluster-target-local-or-absent', 'cluster'),
   );

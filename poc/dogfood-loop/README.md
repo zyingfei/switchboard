@@ -50,25 +50,25 @@ Run from this folder:
 
 ```sh
 cd poc/dogfood-loop
-npm install
-npm run compile
-npm test
-npm run build
+bun install
+bun run compile
+bun run test
+bun run build
 ```
 
 Install Chrome for Testing once before running e2e:
 
 ```sh
-npm run e2e:install
-npm run test:e2e
+bun run e2e:install
+bun run test:e2e
 ```
 
 Useful e2e environment variables:
 
 ```sh
-BAC_E2E_CHROME_PATH=/path/to/chrome npm run test:e2e
-BAC_E2E_HEADLESS=1 npm run test:e2e
-BAC_EXTENSION_PATH=/path/to/chrome-mv3 npm run test:e2e
+BAC_E2E_CHROME_PATH=/path/to/chrome bun run test:e2e
+BAC_E2E_HEADLESS=1 bun run test:e2e
+BAC_EXTENSION_PATH=/path/to/chrome-mv3 bun run test:e2e
 ```
 
 The e2e runner follows the TechPulse-style extension harness: build the WXT extension, launch Chrome with the unpacked MV3 output, open `chrome-extension://<extension-id>/sidepanel.html`, and exercise the workflow in browser tabs.
@@ -79,8 +79,8 @@ Build the extension:
 
 ```sh
 cd poc/dogfood-loop
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Load `.output/chrome-mv3` in Chrome:
@@ -184,8 +184,8 @@ Use these as the quick "is this POC still healthy?" check:
 
 ```sh
 cd poc/dogfood-loop
-npm run compile
-npm test
-npm run build
-npm run test:e2e
+bun run compile
+bun run test
+bun run build
+bun run test:e2e
 ```

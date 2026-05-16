@@ -3,9 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { computeTimelineRail } from '../../../src/sidepanel/connections/timelineWindows';
 import type { ConnectionsSnapshot } from '../../../src/sidepanel/connections/types';
 
-const baseSnap = (
-  overrides: Partial<ConnectionsSnapshot> = {},
-): ConnectionsSnapshot => ({
+const baseSnap = (overrides: Partial<ConnectionsSnapshot> = {}): ConnectionsSnapshot => ({
   scope: {},
   nodes: [],
   edges: [],

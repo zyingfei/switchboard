@@ -25,12 +25,7 @@ export interface VaultChangesSubscription {
   readonly onReconcile?: (since: string | null) => Promise<void> | void;
 }
 
-export type VaultChangesStatus =
-  | 'idle'
-  | 'connecting'
-  | 'connected'
-  | 'reconnecting'
-  | 'error';
+export type VaultChangesStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 export interface VaultChangesClient {
   readonly subscribe: (sub: VaultChangesSubscription) => () => void;
@@ -216,10 +211,7 @@ export const createVaultChangesClient = (options: VaultChangesOptions): VaultCha
         consecutiveFailures += 1;
         setStatus(consecutiveFailures > 1 ? 'reconnecting' : 'error');
         await sleep(computeBackoff());
-        if (
-          error instanceof Error &&
-          error.message === 'Companion is not configured.'
-        ) {
+        if (error instanceof Error && error.message === 'Companion is not configured.') {
           // Keep retrying — settings may arrive at any time. The
           // backoff already applied so the loop doesn't busy-spin.
           continue;

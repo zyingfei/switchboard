@@ -177,7 +177,7 @@ export const scoreCrossReplicaContinuationCandidates = (
   const observationsByCanonical = new Map<string, NavigationObservation[]>();
   for (const observation of collectNavigationObservations(input.merged)) {
     const eligibleReplicas = eligibleReplicasByCanonical.get(observation.canonicalUrl);
-    if (eligibleReplicas === undefined || !eligibleReplicas.has(observation.replicaId)) {
+    if (!eligibleReplicas?.has(observation.replicaId)) {
       continue;
     }
     const existing = observationsByCanonical.get(observation.canonicalUrl) ?? [];

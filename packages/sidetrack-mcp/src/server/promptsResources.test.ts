@@ -2,10 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  sidetrackPromptNames,
-  sidetrackResourceTemplates,
-} from '../capabilities.js';
+import { sidetrackPromptNames, sidetrackResourceTemplates } from '../capabilities.js';
 import type { LiveVaultSnapshot } from '../vault/liveVaultReader.js';
 import {
   createSidetrackMcpServer,
@@ -85,7 +82,9 @@ const reader: SidetrackMcpReader = {
 const fakeCompanion: CompanionWriteClient = {
   registerCodingSession: vi.fn(() => Promise.resolve({ bac_id: 'bac_session_test' })),
   listAnnotations: vi.fn(() =>
-    Promise.resolve([{ bac_id: 'bac_ann_1', note: 'Hot path', url: 'https://chatgpt.com/c/target' }]),
+    Promise.resolve([
+      { bac_id: 'bac_ann_1', note: 'Hot path', url: 'https://chatgpt.com/c/target' },
+    ]),
   ),
   readThreadMarkdown: vi.fn(() =>
     Promise.resolve({ markdown: '# Recall index lifecycle\n\nAssistant body.' }),
@@ -130,8 +129,7 @@ describe('Sidetrack MCP prompts', () => {
       expect(message?.role).toBe('user');
       const content = message?.content;
       expect(content?.type).toBe('text');
-      const text =
-        content !== undefined && 'text' in content ? (content.text as string) : '';
+      const text = content !== undefined && 'text' in content ? (content.text as string) : '';
       expect(text).toContain('sidetrack.session.attach');
       expect(text).toContain('tok_phase5_demo');
       expect(text).toContain('sidetrack://workstream/bac_ws_recall/context');
@@ -184,9 +182,7 @@ describe('Sidetrack MCP resources', () => {
     const client = await startServer();
     try {
       const list = await client.listResourceTemplates();
-      const templates = list.resourceTemplates.map(
-        (entry) => entry.uriTemplate,
-      );
+      const templates = list.resourceTemplates.map((entry) => entry.uriTemplate);
       for (const expected of sidetrackResourceTemplates) {
         expect(templates).toContain(expected);
       }

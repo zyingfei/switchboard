@@ -115,9 +115,7 @@ export function WorkstreamDetailPanel({
   const moveCandidates = useMemo(() => {
     if (workstream === undefined) return [] as readonly WorkstreamDetailNode[];
     const banned = collectDescendantIds(workstream.bac_id, workstreams);
-    return workstreams.filter(
-      (w) => !banned.has(w.bac_id) && w.bac_id !== workstream.parentId,
-    );
+    return workstreams.filter((w) => !banned.has(w.bac_id) && w.bac_id !== workstream.parentId);
   }, [workstream, workstreams]);
 
   const commitRename = (): void => {
@@ -168,7 +166,11 @@ export function WorkstreamDetailPanel({
             title={renameEnabled ? 'Rename workstream' : undefined}
           >
             <span className="title">{workstreamLabel}</span>
-            {renameEnabled ? <span className="ws-detail-rename-hint" aria-hidden>✎</span> : null}
+            {renameEnabled ? (
+              <span className="ws-detail-rename-hint" aria-hidden>
+                ✎
+              </span>
+            ) : null}
           </button>
         )}
         <span className="muted">workstream</span>
@@ -202,9 +204,7 @@ export function WorkstreamDetailPanel({
       ) : null}
 
       <div className="detail-sec">
-        <div className="detail-sec-head">
-          Linked notes · from your vault ({linkedNotes.length})
-        </div>
+        <div className="detail-sec-head">Linked notes · from your vault ({linkedNotes.length})</div>
         <LinkedNotes notes={linkedNotes} onAddLink={onAddLink} />
       </div>
 
@@ -224,9 +224,7 @@ export function WorkstreamDetailPanel({
                   {childCount === 1 ? '' : 's'} before deleting.
                 </em>
               ) : (
-                <em className="subtle">
-                  Delete this group; threads inside fall back to Inbox.
-                </em>
+                <em className="subtle">Delete this group; threads inside fall back to Inbox.</em>
               )}
             </span>
             <button
@@ -304,9 +302,7 @@ export function WorkstreamDetailPanel({
                       onClose();
                     })
                     .catch((error: unknown) => {
-                      setDeleteError(
-                        error instanceof Error ? error.message : 'Delete failed.',
-                      );
+                      setDeleteError(error instanceof Error ? error.message : 'Delete failed.');
                     })
                     .finally(() => {
                       setDeleting(false);
@@ -341,9 +337,7 @@ export function WorkstreamDetailPanel({
             <div className="ws-picker-list">
               <button
                 type="button"
-                className={
-                  'ws-picker-row' + (workstream.parentId === undefined ? ' on' : '')
-                }
+                className={'ws-picker-row' + (workstream.parentId === undefined ? ' on' : '')}
                 onClick={() => {
                   if (workstream.parentId !== undefined) {
                     onMove(null);

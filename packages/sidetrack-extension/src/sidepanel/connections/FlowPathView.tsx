@@ -67,8 +67,7 @@ const tabTimeDescription = (
 ): string => {
   const sorted = [...tabVisits].sort(compareVisit);
   const firstIso = tabInfo?.firstSeenAt ?? sorted[0]?.firstSeenAt ?? sorted[0]?.commitTimestamp;
-  const lastIso =
-    tabInfo?.lastActivityAt ?? sorted[sorted.length - 1]?.commitTimestamp ?? firstIso;
+  const lastIso = tabInfo?.lastActivityAt ?? sorted[sorted.length - 1]?.commitTimestamp ?? firstIso;
   const firstMs = firstIso === undefined ? Number.NaN : Date.parse(firstIso);
   const lastMs = lastIso === undefined ? Number.NaN : Date.parse(lastIso);
   const span =
@@ -385,10 +384,7 @@ export const FlowPathView = ({
   return (
     <section className="cx-flow" data-testid="flow-path-view">
       {summaryParts.length > 0 ? (
-        <header
-          className="cx-flow-summary cx-dim cx-mono"
-          data-testid="flow-path-summary"
-        >
+        <header className="cx-flow-summary cx-dim cx-mono" data-testid="flow-path-summary">
           {summaryParts.join(' · ')}
         </header>
       ) : null}
@@ -421,15 +417,9 @@ export const FlowPathView = ({
                   {String(tabGroup.entries.length)} tabs aggregated
                 </div>
               ) : null}
-              {tabTime.length > 0 ? (
-                <div className="cx-flow-tab-life cx-dim">
-                  {tabTime}
-                </div>
-              ) : null}
+              {tabTime.length > 0 ? <div className="cx-flow-tab-life cx-dim">{tabTime}</div> : null}
               {openedFrom !== undefined ? (
-                <div className="cx-flow-tab-opener">
-                  ← opened from {tabHeaderLabel(openedFrom)}
-                </div>
+                <div className="cx-flow-tab-opener">← opened from {tabHeaderLabel(openedFrom)}</div>
               ) : null}
             </div>
             <div className="cx-flow-visits">
@@ -458,12 +448,9 @@ export const FlowPathView = ({
                     : ENGAGEMENT_LABELS[visit.engagementClass];
                 // Before / After segment label inserted between cells
                 // when both sides of the anchor are populated.
-                const showBeforeLabel =
-                  idx === 0 && anchorIdx > 0 && tabVisits.length > 1;
+                const showBeforeLabel = idx === 0 && anchorIdx > 0 && tabVisits.length > 1;
                 const showAfterLabel =
-                  anchorIdx >= 0 &&
-                  anchorIdx < tabVisits.length - 1 &&
-                  idx === anchorIdx + 1;
+                  anchorIdx >= 0 && anchorIdx < tabVisits.length - 1 && idx === anchorIdx + 1;
                 const previousVisit = tabVisits[idx - 1];
                 const showArrow =
                   idx > 0 &&
@@ -471,12 +458,8 @@ export const FlowPathView = ({
                   previousVisit?.tabSessionIdHash === visit.tabSessionIdHash;
                 return (
                   <div key={visit.id} className="cx-flow-visit-cell">
-                    {showBeforeLabel ? (
-                      <span className="cx-flow-segment-label">Before</span>
-                    ) : null}
-                    {showAfterLabel ? (
-                      <span className="cx-flow-segment-label">After</span>
-                    ) : null}
+                    {showBeforeLabel ? <span className="cx-flow-segment-label">Before</span> : null}
+                    {showAfterLabel ? <span className="cx-flow-segment-label">After</span> : null}
                     {showArrow ? (
                       <span className="cx-flow-arrow" aria-hidden="true">
                         →
@@ -496,10 +479,7 @@ export const FlowPathView = ({
                           </span>
                         ) : null}
                         {visit.searchQuery !== undefined && visit.searchQuery.length > 0 ? (
-                          <span
-                            className="cx-flow-visit-search-query"
-                            title={visit.searchQuery}
-                          >
+                          <span className="cx-flow-visit-search-query" title={visit.searchQuery}>
                             q: {truncateQuery(visit.searchQuery)}
                           </span>
                         ) : null}

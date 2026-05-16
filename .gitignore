@@ -9,6 +9,7 @@
 # Local environment
 .env
 .env.local
+node_modules/
 
 # Local-only T1 record/replay packs (also protects repo-relative
 # SIDETRACK_TEST_SESSIONS_DIR overrides).

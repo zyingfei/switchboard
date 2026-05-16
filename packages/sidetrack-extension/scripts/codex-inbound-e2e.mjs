@@ -42,19 +42,9 @@ if (!['chatgpt', 'claude', 'gemini'].includes(TARGET_PROVIDER)) {
   throw new Error('SIDETRACK_INBOUND_TARGET_PROVIDER must be chatgpt, claude, or gemini.');
 }
 
-const { chromium } = await import(path.join(packageRoot, 'node_modules/playwright/index.mjs'));
-const { Client } = await import(
-  path.join(
-    repoRoot,
-    'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js',
-  )
-);
-const { WebSocketClientTransport } = await import(
-  path.join(
-    repoRoot,
-    'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/websocket.js',
-  )
-);
+const { chromium } = await import('@playwright/test');
+const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+const { WebSocketClientTransport } = await import('@modelcontextprotocol/sdk/client/websocket.js');
 
 const log = (step, ...args) => console.log(`\n[${step}]`, ...args);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,7 +108,7 @@ log('1.attach', 'token minted; workstream:', workstreamId ?? '(none)');
 
 log('2.mcp', `starting sidetrack-mcp on ws://127.0.0.1:${MCP_PORT}/mcp`);
 const mcpProc = spawn(
-  'node',
+  process.execPath,
   [
     path.join(repoRoot, 'packages/sidetrack-mcp/dist/cli.js'),
     '--vault',

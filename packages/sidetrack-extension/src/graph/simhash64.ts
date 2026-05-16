@@ -42,7 +42,8 @@ export const uint64ToBase64 = (value: bigint): string => {
 };
 
 export const base64ToUint64 = (value: string): bigint => {
-  if (typeof Buffer !== 'undefined') return bytesToBigint(new Uint8Array(Buffer.from(value, 'base64')));
+  if (typeof Buffer !== 'undefined')
+    return bytesToBigint(new Uint8Array(Buffer.from(value, 'base64')));
   const binary = atob(value);
   return bytesToBigint(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
 };

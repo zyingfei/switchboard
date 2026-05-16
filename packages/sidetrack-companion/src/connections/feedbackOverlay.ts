@@ -38,17 +38,17 @@ const timelineVisitNodeIdFor = (value: string): string =>
 
 const visitIdsForNode = (node: ConnectionNode): readonly string[] => {
   const ids = new Set<string>([node.id]);
-  const canonicalUrl = node.metadata['canonicalUrl'];
+  const canonicalUrl = node.metadata.canonicalUrl;
   if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
     ids.add(canonicalUrl);
     ids.add(timelineVisitNodeIdFor(canonicalUrl));
   }
-  const url = node.metadata['url'];
+  const url = node.metadata.url;
   if (typeof url === 'string' && url.length > 0) {
     ids.add(url);
     ids.add(timelineVisitNodeIdFor(url));
   }
-  const timelineVisitId = node.metadata['timelineVisitId'];
+  const timelineVisitId = node.metadata.timelineVisitId;
   if (typeof timelineVisitId === 'string' && timelineVisitId.length > 0) ids.add(timelineVisitId);
   return [...ids];
 };

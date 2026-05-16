@@ -27,7 +27,11 @@ import {
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
 } from '../../feedback/events.js';
-import { ANNOTATION_CREATED, ANNOTATION_DELETED, ANNOTATION_NOTE_SET } from '../../annotations/events.js';
+import {
+  ANNOTATION_CREATED,
+  ANNOTATION_DELETED,
+  ANNOTATION_NOTE_SET,
+} from '../../annotations/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
@@ -99,10 +103,7 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
   [USER_ENGAGEMENT_RELABELED]: (event) => {
     const visitId = str(asRecord(event.payload)['visitId']);
     if (visitId === undefined) return [{ kind: 'rankerLabels' }];
-    return [
-      { kind: 'engagementVisit', visitId },
-      { kind: 'rankerLabels' },
-    ];
+    return [{ kind: 'engagementVisit', visitId }, { kind: 'rankerLabels' }];
   },
   [USER_FLOW_CONFIRMED]: (event) => {
     const ids = strs(asRecord(event.payload)['visitIds']) ?? [];
@@ -145,28 +146,19 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
     const bacId = str(asRecord(event.payload)['bac_id']);
     return bacId === undefined
       ? [{ kind: 'inboxFilter' }]
-      : [
-          { kind: 'thread', bacId },
-          { kind: 'inboxFilter' },
-        ];
+      : [{ kind: 'thread', bacId }, { kind: 'inboxFilter' }];
   },
   [THREAD_UNARCHIVED]: (event) => {
     const bacId = str(asRecord(event.payload)['bac_id']);
     return bacId === undefined
       ? [{ kind: 'inboxFilter' }]
-      : [
-          { kind: 'thread', bacId },
-          { kind: 'inboxFilter' },
-        ];
+      : [{ kind: 'thread', bacId }, { kind: 'inboxFilter' }];
   },
   [THREAD_DELETED]: (event) => {
     const bacId = str(asRecord(event.payload)['bac_id']);
     return bacId === undefined
       ? [{ kind: 'inboxFilter' }]
-      : [
-          { kind: 'thread', bacId },
-          { kind: 'inboxFilter' },
-        ];
+      : [{ kind: 'thread', bacId }, { kind: 'inboxFilter' }];
   },
   [URL_ATTRIBUTION_INFERRED]: (event) => {
     const canonicalUrl = str(asRecord(event.payload)['canonicalUrl']);
@@ -226,10 +218,7 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
   [ENGAGEMENT_SESSION_AGGREGATED]: (event) => {
     const visitId = str(asRecord(event.payload)['visitId']);
     if (visitId === undefined) return [{ kind: 'rankerLabels' }];
-    return [
-      { kind: 'engagementVisit', visitId },
-      { kind: 'rankerLabels' },
-    ];
+    return [{ kind: 'engagementVisit', visitId }, { kind: 'rankerLabels' }];
   },
   // Group B (W7 content / recall index lane).
   [CAPTURE_RECORDED]: (event) => {
@@ -283,9 +272,7 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
  * decides whether unknown types trigger a full rebuild or are silently
  * ignored.
  */
-export const invalidationsForEvent = (
-  event: AcceptedEvent,
-): readonly InvalidationKey[] => {
+export const invalidationsForEvent = (event: AcceptedEvent): readonly InvalidationKey[] => {
   const rule = INVALIDATION_RULES[event.type];
   return rule === undefined ? [] : rule(event);
 };

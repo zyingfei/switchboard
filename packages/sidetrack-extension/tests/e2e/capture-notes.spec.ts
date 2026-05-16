@@ -68,14 +68,11 @@ test.describe('capture-note edit / delete (synthetic)', () => {
       await expect(page.getByText(original)).toHaveCount(0);
 
       // Storage reflects the update.
-      const storedText = await page.evaluate(
-        async (storageKey) => {
-          const all = await chrome.storage.local.get([storageKey]);
-          const notes = (all[storageKey] ?? []) as { text: string }[];
-          return notes[0]?.text ?? null;
-        },
-        CAPTURE_NOTES_KEY,
-      );
+      const storedText = await page.evaluate(async (storageKey) => {
+        const all = await chrome.storage.local.get([storageKey]);
+        const notes = (all[storageKey] ?? []) as { text: string }[];
+        return notes[0]?.text ?? null;
+      }, CAPTURE_NOTES_KEY);
       expect(storedText).toBe(updated);
     } finally {
       await runtime?.close();
@@ -108,14 +105,11 @@ test.describe('capture-note edit / delete (synthetic)', () => {
       await expect(page.getByText('Drop this note')).toHaveCount(0);
       await expect(page.getByText('Keep this note')).toBeVisible();
 
-      const storedIds = await page.evaluate(
-        async (storageKey) => {
-          const all = await chrome.storage.local.get([storageKey]);
-          const notes = (all[storageKey] ?? []) as { bac_id: string }[];
-          return notes.map((n) => n.bac_id);
-        },
-        CAPTURE_NOTES_KEY,
-      );
+      const storedIds = await page.evaluate(async (storageKey) => {
+        const all = await chrome.storage.local.get([storageKey]);
+        const notes = (all[storageKey] ?? []) as { bac_id: string }[];
+        return notes.map((n) => n.bac_id);
+      }, CAPTURE_NOTES_KEY);
       expect(storedIds).toEqual([keepId]);
     } finally {
       await runtime?.close();

@@ -60,9 +60,7 @@ export interface CreateRecallMaterializerDeps {
   readonly embeddingCache?: EmbeddingCache;
 }
 
-export const createRecallMaterializer = (
-  deps: CreateRecallMaterializerDeps,
-): Materializer => {
+export const createRecallMaterializer = (deps: CreateRecallMaterializerDeps): Materializer => {
   const handles = eventTypesForMaterializer('recall');
 
   let dirty = false;
@@ -79,9 +77,7 @@ export const createRecallMaterializer = (
         lastError = null;
       } catch (err) {
         const code =
-          err !== null && typeof err === 'object' && 'code' in err
-            ? String((err as { code: unknown }).code)
-            : 'unknown';
+          err !== null && typeof err === 'object' && 'code' in err ? String(err.code) : 'unknown';
         const message = err instanceof Error ? err.message : String(err);
         lastError = `${code}: ${message.slice(0, 200)}`;
         deps.recallActivity.recordIngestFailed(lastError);

@@ -64,10 +64,10 @@ describe('connectionsStore — Stage 5.2 W5 store-level skip-write', () => {
     const { snapshotRevision: _drop2, ...snap2 } = buildSnapshot('ignored');
     void _drop1;
     void _drop2;
-    await store.putCurrent(snap1 as ConnectionsSnapshot);
+    await store.putCurrent(snap1);
     const t1 = await mtimeMs();
     await new Promise((r) => setTimeout(r, 30));
-    await store.putCurrent(snap2 as ConnectionsSnapshot);
+    await store.putCurrent(snap2);
     const t2 = await mtimeMs();
     // Without a revision, we can't dedupe, so each call writes.
     expect(t2).toBeGreaterThan(t1);

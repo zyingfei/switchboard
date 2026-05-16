@@ -245,7 +245,6 @@ test.describe('vault mixed modes (synthetic)', () => {
       expect(offlineState.threadTitles).toContain('Queued during outage');
       expect(offlineState.queueLength).toBeGreaterThanOrEqual(1);
       expect(offlineState.queueTitles).toContain('Queued during outage');
-
     } finally {
       await runtime?.close();
     }

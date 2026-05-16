@@ -22,9 +22,7 @@ interface OnDiskKeyPair {
   readonly privateKey: string;
 }
 
-export const loadOrCreateReplicaKeyPair = async (
-  vaultPath: string,
-): Promise<ReplicaKeyPair> => {
+export const loadOrCreateReplicaKeyPair = async (vaultPath: string): Promise<ReplicaKeyPair> => {
   const path = keyPairPath(vaultPath);
   try {
     const raw = await readFile(path, 'utf8');

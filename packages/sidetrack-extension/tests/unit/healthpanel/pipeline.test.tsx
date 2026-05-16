@@ -56,7 +56,12 @@ const stubFetch = (
           ok: true,
           status: 200,
           json: async () => ({
-            data: opts.focus ?? { availability: 'unavailable', asOf: null, digest: null, history: [] },
+            data: opts.focus ?? {
+              availability: 'unavailable',
+              asOf: null,
+              digest: null,
+              history: [],
+            },
           }),
         };
       }
@@ -65,13 +70,12 @@ const stubFetch = (
           ok: true,
           status: 200,
           json: async () => ({
-            data:
-              opts.hygiene ?? {
-                asOf: null,
-                availability: { gc: 'unavailable', pageContent: 'unavailable' },
-                gc: null,
-                pageContent: null,
-              },
+            data: opts.hygiene ?? {
+              asOf: null,
+              availability: { gc: 'unavailable', pageContent: 'unavailable' },
+              gc: null,
+              pageContent: null,
+            },
           }),
         };
       }
@@ -402,8 +406,18 @@ describe('HealthPanel pipeline strip', () => {
             lastSuggestionAt: null,
             lastSuggestionThreadId: null,
             recent: [
-              { kind: 'query' as const, at: '2026-05-12T20:00:00.000Z', resultCount: 0, queryLength: 12 },
-              { kind: 'query' as const, at: '2026-05-12T19:00:00.000Z', resultCount: 2, queryLength: 8 },
+              {
+                kind: 'query' as const,
+                at: '2026-05-12T20:00:00.000Z',
+                resultCount: 0,
+                queryLength: 12,
+              },
+              {
+                kind: 'query' as const,
+                at: '2026-05-12T19:00:00.000Z',
+                resultCount: 2,
+                queryLength: 8,
+              },
             ],
           },
         },

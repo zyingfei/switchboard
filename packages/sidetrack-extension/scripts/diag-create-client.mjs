@@ -5,7 +5,8 @@ const sw = context.serviceWorkers().find((w) => w.url().includes('background.js'
 // Reproduce createAnnotationClient inline to see exactly which path fails
 const result = await sw.evaluate(async () => {
   const SETTINGS_KEY = 'sidetrack.settings';
-  const get = (k) => new Promise((r) => chrome.storage.local.get({ [k]: undefined }, (v) => r(v[k])));
+  const get = (k) =>
+    new Promise((r) => chrome.storage.local.get({ [k]: undefined }, (v) => r(v[k])));
   const settings = await get(SETTINGS_KEY);
   const isRecord = (v) => typeof v === 'object' && v !== null;
   const trace = {
@@ -17,7 +18,10 @@ const result = await sw.evaluate(async () => {
     portType: typeof settings?.companion?.port,
     portValue: settings?.companion?.port,
     bridgeKeyType: typeof settings?.companion?.bridgeKey,
-    bridgeKeyTrim: typeof settings?.companion?.bridgeKey === 'string' ? settings.companion.bridgeKey.trim().length : 0,
+    bridgeKeyTrim:
+      typeof settings?.companion?.bridgeKey === 'string'
+        ? settings.companion.bridgeKey.trim().length
+        : 0,
   };
   return trace;
 });

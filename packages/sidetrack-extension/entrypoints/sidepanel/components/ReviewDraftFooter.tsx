@@ -51,12 +51,7 @@ interface ConflictBannerProps<T> {
   readonly onPick: (value: T) => void;
 }
 
-function ConflictBanner<T>({
-  label,
-  candidates,
-  renderValue,
-  onPick,
-}: ConflictBannerProps<T>) {
+function ConflictBanner<T>({ label, candidates, renderValue, onPick }: ConflictBannerProps<T>) {
   return (
     <div className="review-draft-conflict mono">
       <span className="review-draft-conflict-label">

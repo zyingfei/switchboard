@@ -1,24 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AcceptedEvent } from '../sync/causal.js';
-import {
-  THREAD_ARCHIVED,
-  THREAD_DELETED,
-  THREAD_UNARCHIVED,
-  THREAD_UPSERTED,
-} from './events.js';
+import { THREAD_ARCHIVED, THREAD_DELETED, THREAD_UNARCHIVED, THREAD_UPSERTED } from './events.js';
 import { projectThread } from './projection.js';
 
-const event = (
-  partial: {
-    readonly type: string;
-    readonly replicaId: string;
-    readonly seq: number;
-    readonly payload: Record<string, unknown>;
-    readonly deps?: Record<string, number>;
-    readonly acceptedAtMs?: number;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  readonly type: string;
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly payload: Record<string, unknown>;
+  readonly deps?: Record<string, number>;
+  readonly acceptedAtMs?: number;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: partial.deps ?? {},
@@ -51,10 +44,7 @@ const upsert = (
 
 describe('projectThread', () => {
   it('resolves to the most recent causally-newer upsert', () => {
-    const events = [
-      upsert('A', 1, { title: 'old' }),
-      upsert('A', 2, { title: 'new' }, { A: 1 }),
-    ];
+    const events = [upsert('A', 1, { title: 'old' }), upsert('A', 2, { title: 'new' }, { A: 1 })];
     const projection = projectThread('thread-1', events);
     expect(projection.record).toMatchObject({ status: 'resolved' });
     if (projection.record.status === 'resolved') {
@@ -63,10 +53,7 @@ describe('projectThread', () => {
   });
 
   it('concurrent upserts surface as a record-level conflict', () => {
-    const events = [
-      upsert('A', 1, { title: 'A version' }),
-      upsert('B', 1, { title: 'B version' }),
-    ];
+    const events = [upsert('A', 1, { title: 'A version' }), upsert('B', 1, { title: 'B version' })];
     const projection = projectThread('thread-1', events);
     expect(projection.record.status).toBe('conflict');
   });

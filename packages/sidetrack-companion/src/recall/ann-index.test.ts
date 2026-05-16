@@ -27,8 +27,7 @@ const loader = (): UsearchLoader => async () => {
     constructor(_config: unknown) {}
 
     add(keys: bigint | readonly bigint[] | BigUint64Array, vectors: Float32Array): void {
-      const keyRows =
-        typeof keys === 'bigint' ? [keys] : Array.from(keys as readonly bigint[]);
+      const keyRows = typeof keys === 'bigint' ? [keys] : Array.from(keys as readonly bigint[]);
       const dimensions = vectors.length / keyRows.length;
       keyRows.forEach((key, index) => {
         this.rows.push({

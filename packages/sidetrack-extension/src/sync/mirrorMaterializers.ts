@@ -48,11 +48,7 @@ const noOpExport = async (): Promise<{ exported: number; archivePath: string }> 
   archivePath: '',
 });
 
-const baseHealth = (
-  count: number,
-  budget: number,
-  surface: string,
-): PluginMaterializerHealth => ({
+const baseHealth = (count: number, budget: number, surface: string): PluginMaterializerHealth => ({
   status: count > budget * 0.9 ? 'degraded' : 'healthy',
   activeSetSize: count,
   activeSetBudget: budget,
@@ -144,17 +140,12 @@ export const queueItemsPluginMaterializer: PluginMaterializer<RemoteQueueItemPro
   ) => Promise<ExtendedResult<RemoteQueueItemProjection>>,
   drainSpoolToCompanion: noOpDrain,
   exportSpoolToArchive: noOpExport,
-  health: () =>
-    baseHealth(0, DEFAULT_PLUGIN_BUDGETS.activeSetCount['queue'] ?? 100, 'queue'),
+  health: () => baseHealth(0, DEFAULT_PLUGIN_BUDGETS.activeSetCount['queue'] ?? 100, 'queue'),
 };
 
 export const queueItemsHealthSnapshot = async (): Promise<PluginMaterializerHealth> => {
   const items: readonly QueueItem[] = await readQueueItems();
-  return baseHealth(
-    items.length,
-    DEFAULT_PLUGIN_BUDGETS.activeSetCount['queue'] ?? 100,
-    'queue',
-  );
+  return baseHealth(items.length, DEFAULT_PLUGIN_BUDGETS.activeSetCount['queue'] ?? 100, 'queue');
 };
 
 // -----------------------------------------------------------------
@@ -164,9 +155,7 @@ export const dispatchesPluginMaterializer: PluginMaterializer<RemoteDispatchProj
   name: 'dispatches',
   admitLocal: noOpAdmit,
   mirrorFromCompanion: (projection) => mirrorRemoteDispatch(projection),
-  fetchExtended: noFetch as (
-    q: ExtendedQuery,
-  ) => Promise<ExtendedResult<RemoteDispatchProjection>>,
+  fetchExtended: noFetch as (q: ExtendedQuery) => Promise<ExtendedResult<RemoteDispatchProjection>>,
   drainSpoolToCompanion: noOpDrain,
   exportSpoolToArchive: noOpExport,
   health: () =>

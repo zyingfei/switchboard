@@ -70,10 +70,7 @@ describe('Stage 5.2 W4 — IncrementalTopicClusterAccumulator', () => {
   it('edges with unknown endpoints are ignored (no implicit visit creation)', async () => {
     const acc = new IncrementalTopicClusterAccumulator();
     acc.addVisit(visit('a'));
-    acc.addSimilarityEdge(
-      { fromVisitKey: 'a', toVisitKey: 'unknown', cosine: 0.99 },
-      0.85,
-    );
+    acc.addSimilarityEdge({ fromVisitKey: 'a', toVisitKey: 'unknown', cosine: 0.99 }, 0.85);
     expect(await acc.getComponents()).toEqual([]);
   });
 

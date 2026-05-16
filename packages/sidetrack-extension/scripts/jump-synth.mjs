@@ -1,12 +1,18 @@
 import { chromium } from 'playwright';
 const b = await chromium.connectOverCDP('http://localhost:9222');
-const sp = b.contexts()[0].pages().find(p => p.url().includes('sidepanel.html'));
-const sw = b.contexts()[0].serviceWorkers().find(w => w.url().includes('background.js'));
+const sp = b
+  .contexts()[0]
+  .pages()
+  .find((p) => p.url().includes('sidepanel.html'));
+const sw = b
+  .contexts()[0]
+  .serviceWorkers()
+  .find((w) => w.url().includes('background.js'));
 
 // Reload the side panel to load the new bundle.
 await sp.reload();
 await sp.waitForLoadState('networkidle');
-await new Promise(r => setTimeout(r, 1500));
+await new Promise((r) => setTimeout(r, 1500));
 
 await sp.evaluate(() => {
   window.__hits = [];
@@ -32,7 +38,7 @@ await sw.evaluate(async () => {
   });
 });
 
-await new Promise(r => setTimeout(r, 1500));
+await new Promise((r) => setTimeout(r, 1500));
 const result = await sp.evaluate(() => ({
   hits: window.__hits,
   rowCount: document.querySelectorAll('.thread').length,

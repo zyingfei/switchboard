@@ -73,8 +73,10 @@ const formatModelSlug = (slug: string): string => {
     // gpt-<number>[suffix] (gpt-4o, gpt-5, gpt-4-turbo) — keep the
     // suffix attached to the version (no extra hyphen), since
     // "GPT-4o" is the canonical spelling.
-    .replace(/^gpt-(\d+)([a-z]+)?\b/i, (_m, n, suffix) =>
-      `GPT${HYPHEN_PLACEHOLDER}${String(n)}${typeof suffix === 'string' ? suffix : ''}`,
+    .replace(
+      /^gpt-(\d+)([a-z]+)?\b/i,
+      (_m, n, suffix) =>
+        `GPT${HYPHEN_PLACEHOLDER}${String(n)}${typeof suffix === 'string' ? suffix : ''}`,
     );
   out = out
     .split('-')
@@ -307,9 +309,7 @@ const enrichGemini = (ctx: EnrichmentContext): TurnEnrichment => {
   const isResearchReport =
     /Research|Deep dive|Sources/i.test(markdown.slice(0, 200)) && markdown.length > 2000;
   const researchReport: CapturedResearchReport | undefined =
-    ctx.role === 'assistant' && isResearchReport
-      ? { mode: 'gemini-deep-research' }
-      : undefined;
+    ctx.role === 'assistant' && isResearchReport ? { mode: 'gemini-deep-research' } : undefined;
   return {
     ...(modelName === undefined ? {} : { modelName }),
     ...(markdown.length === 0 ? {} : { markdown }),

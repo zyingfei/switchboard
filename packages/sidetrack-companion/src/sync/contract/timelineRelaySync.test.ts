@@ -125,13 +125,7 @@ describe('browser.timeline.observed relay sync (probe for L5 gap)', () => {
     const tlRes = await post(`${companionA.url}/v1/timeline/events`, companionA.bridgeKey, {
       events: [
         buildTimelineEvent('replica-tlrs-edge-A', 1, URL_HN, '2026-05-08T10:00:00.000Z', wsId),
-        buildTimelineEvent(
-          'replica-tlrs-edge-A',
-          2,
-          URL_AMBIENT,
-          '2026-05-08T10:01:00.000Z',
-          wsId,
-        ),
+        buildTimelineEvent('replica-tlrs-edge-A', 2, URL_AMBIENT, '2026-05-08T10:01:00.000Z', wsId),
       ],
     });
     expect(tlRes.ok).toBe(true);
@@ -170,9 +164,9 @@ describe('browser.timeline.observed relay sync (probe for L5 gap)', () => {
       } catch {
         // ignore
       }
-      // eslint-disable-next-line no-console
+
       console.error('[probe] FINAL A nodes:', JSON.stringify(lastANodeIds));
-      // eslint-disable-next-line no-console
+
       console.error('[probe] FINAL B nodes:', JSON.stringify(lastBNodeIds));
     }
     expect(seen).toBe(true);

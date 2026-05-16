@@ -7,13 +7,7 @@ const noop = () => undefined;
 
 const renderComposer = (overrides: Partial<Parameters<typeof PacketComposer>[0]> = {}) =>
   render(
-    <PacketComposer
-      onCancel={noop}
-      onCopy={noop}
-      onSave={noop}
-      onDispatch={noop}
-      {...overrides}
-    />,
+    <PacketComposer onCancel={noop} onCopy={noop} onSave={noop} onDispatch={noop} {...overrides} />,
   );
 
 describe('PacketComposer — title is owned by Scope', () => {

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
@@ -689,7 +689,7 @@ const runIngestSubcommand = async (
   }
   // Lazy imports — keeps CLI startup fast for unrelated verbs.
   const { readFile } = await import('node:fs/promises');
-  const { createEventLog } = await import('./sync/eventLog.js');
+  const { createEventLog, isAcceptedEvent } = await import('./sync/eventLog.js');
   const { loadOrCreateReplica } = await import('./sync/replicaId.js');
   const replica = await loadOrCreateReplica(vaultPath);
   const eventLog = createEventLog(vaultPath, replica);
@@ -700,7 +700,10 @@ const runIngestSubcommand = async (
   let errors = 0;
   for (const line of lines) {
     try {
-      const event = JSON.parse(line);
+      const event: unknown = JSON.parse(line);
+      if (!isAcceptedEvent(event)) {
+        throw new Error('archive line is not a valid accepted event');
+      }
       const result = await eventLog.importPeerEvent(event);
       if (result.imported) imported += 1;
       else skipped += 1;
@@ -961,7 +964,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     if (!existsSync(mcpBin)) {
       writeLine(
         streams.stderr,
-        `--mcp-port set but sidetrack-mcp CLI not found at ${mcpBin}. Build it (npm --prefix packages/sidetrack-mcp run build) or pass --mcp-bin <path>.`,
+        `--mcp-port set but sidetrack-mcp CLI not found at ${mcpBin}. Build it (bun run --cwd packages/sidetrack-mcp build) or pass --mcp-bin <path>.`,
       );
       await closeAll();
       return 1;
@@ -1021,8 +1024,8 @@ const entrypointPath = process.argv[1];
 
 // Determine whether this module is the process entry point. The naive
 // `import.meta.url === pathToFileURL(argv[1]).href` check fails when
-// the CLI is invoked through a symlink (e.g. an `npm link`-ed bin or a
-// global Homebrew shim): Node resolves the symlink for `import.meta
+// the CLI is invoked through a symlink (e.g. a globally linked bin or a
+// Homebrew shim): Bun resolves the symlink for `import.meta
 // .url` but leaves `argv[1]` pointing at the symlink, so the URLs
 // differ even though the same script is the entry. Compare realpaths
 // instead, falling back to the symlink path if realpath fails (paths

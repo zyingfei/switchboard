@@ -13,7 +13,7 @@
 //
 // The bridge key is read from <vault>/_BAC/.config/bridge.key, which
 // the companion writes on first start. To pre-pair the extension on
-// a fresh machine: `npm run e2e:pair`.
+// a fresh machine: `bun run e2e:pair`.
 
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -45,26 +45,16 @@ try {
 } catch (err) {
   console.error(`[setup] cannot read bridge key from ${BRIDGE_KEY_PATH}`);
   console.error('  Start the companion first:');
-  console.error(`    node packages/sidetrack-companion/dist/cli.js --vault ${VAULT}`);
+  console.error(`    bun packages/sidetrack-companion/dist/cli.js --vault ${VAULT}`);
   console.error('  Then pair the extension:');
-  console.error('    npm run e2e:pair');
+  console.error('    bun run e2e:pair');
   console.error('  Underlying error:', err.message ?? err);
   process.exit(1);
 }
 
-const { chromium } = await import(path.join(packageRoot, 'node_modules/playwright/index.mjs'));
-const { Client } = await import(
-  path.join(
-    repoRoot,
-    'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js',
-  )
-);
-const { WebSocketClientTransport } = await import(
-  path.join(
-    repoRoot,
-    'packages/sidetrack-mcp/node_modules/@modelcontextprotocol/sdk/dist/esm/client/websocket.js',
-  )
-);
+const { chromium } = await import('@playwright/test');
+const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+const { WebSocketClientTransport } = await import('@modelcontextprotocol/sdk/client/websocket.js');
 
 const log = (step, ...args) => console.log(`\n[${step}]`, ...args);
 
@@ -158,7 +148,7 @@ log('2.capture', 'thread bac_id:', bacId);
 // ───────── Step 3 — start MCP server (websocket) pointing at vault + companion
 log('3.mcp', `starting sidetrack-mcp on ws://127.0.0.1:${MCP_PORT}/mcp`);
 const mcpProc = spawn(
-  'node',
+  process.execPath,
   [
     path.join(repoRoot, 'packages/sidetrack-mcp/dist/cli.js'),
     '--vault',

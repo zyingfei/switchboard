@@ -21,19 +21,12 @@
 // log read. `capabilitiesForCollector` is auto-derived from
 // discovery's loaded manifests — the caller does NOT pass it in.
 
-import {
-  startDiscovery,
-  type DiscoveryHandle,
-  type LoadedCollector,
-} from './discovery.js';
+import { startDiscovery, type DiscoveryHandle, type LoadedCollector } from './discovery.js';
 import { startTail, type TailHandle } from './tail.js';
 import { replayQuarantine } from './replay.js';
 import { materializeCollectorLine, type PromoteContext } from './promote.js';
 import { createQuarantineWriter, type QuarantineWriter } from './quarantine.js';
-import {
-  createMaterializerRegistry,
-  type MaterializerRegistry,
-} from './materializer.js';
+import { createMaterializerRegistry, type MaterializerRegistry } from './materializer.js';
 import { registerTestTick } from '../test-tick/materializers.js';
 import { registerCodexCli } from '../codex-cli/materializers.js';
 import { registerClaudeCode } from '../claude-code/materializers.js';
@@ -73,11 +66,7 @@ interface BootOpts {
   // `source_record_id` to derive an idempotent clientEventId so a
   // re-promotion of the same source line short-circuits at the
   // event log's clientEventId dedupe.
-  readonly appendClassA?: (
-    event: unknown,
-    ruleId: string,
-    line: CollectorEvent,
-  ) => Promise<void>;
+  readonly appendClassA?: (event: unknown, ruleId: string, line: CollectorEvent) => Promise<void>;
   // Audit log adapter (decoupled from vault/writer for testability).
   readonly auditRoute?: (route: string, subject: string) => Promise<void>;
   // Privacy gate read — synchronous. The caller maintains a cached
@@ -103,7 +92,7 @@ interface BootOpts {
     sourceRecordId: string,
   ) => Promise<{ original_class_a_id: string } | null>;
   // Additional materializer registrations beyond the built-ins.
-  readonly extraMaterializers?: ReadonlyArray<(registry: MaterializerRegistry) => void>;
+  readonly extraMaterializers?: readonly ((registry: MaterializerRegistry) => void)[];
 }
 
 const noopAudit = async (_route: string, _subject: string): Promise<void> => {};
@@ -116,28 +105,32 @@ const noopReadPromoted = async (): Promise<null> => null;
 const defaultResolveGate = (): GateState => 'granted';
 
 const declaredCapabilities = (m: LoadedCollector | undefined): readonly CollectorCapability[] => {
-  if (m === undefined || m.status !== 'loaded') return [];
+  if (m?.status !== 'loaded') return [];
   const out: CollectorCapability[] = [];
-  if (m.manifest.capabilities['reads-paths'] !== undefined && m.manifest.capabilities['reads-paths'].length > 0) {
+  if (
+    m.manifest.capabilities['reads-paths'] !== undefined &&
+    m.manifest.capabilities['reads-paths'].length > 0
+  ) {
     out.push('reads-paths');
   }
-  if (m.manifest.capabilities['reads-env'] !== undefined && m.manifest.capabilities['reads-env'].length > 0) {
+  if (
+    m.manifest.capabilities['reads-env'] !== undefined &&
+    m.manifest.capabilities['reads-env'].length > 0
+  ) {
     out.push('reads-env');
   }
-  if (m.manifest.capabilities['reads-network'] === true) {
+  if (m.manifest.capabilities['reads-network']) {
     out.push('reads-network');
   }
   return out;
 };
 
 const defaultEnabledFor = (m: LoadedCollector | undefined): boolean => {
-  if (m === undefined || m.status !== 'loaded') return false;
-  return m.manifest.capabilities['default-enabled'] !== false;
+  if (m?.status !== 'loaded') return false;
+  return m.manifest.capabilities['default-enabled'];
 };
 
-export const bootCollectorFramework = async (
-  opts: BootOpts,
-): Promise<CollectorFrameworkHandle> => {
+export const bootCollectorFramework = async (opts: BootOpts): Promise<CollectorFrameworkHandle> => {
   const auditRoute = opts.auditRoute ?? noopAudit;
   const appendClassA = opts.appendClassA ?? noopAppendClassA;
   const resolveGate = opts.resolveGate ?? defaultResolveGate;
@@ -170,7 +163,7 @@ export const bootCollectorFramework = async (
     registry,
     isManifestLoaded: (id) => {
       const m = findLoaded(id);
-      return m !== undefined && m.status === 'loaded';
+      return m?.status === 'loaded';
     },
     capabilitiesForCollector: (id) => declaredCapabilities(findLoaded(id)),
     gateStateFor: (id, cap) => {
@@ -183,10 +176,7 @@ export const bootCollectorFramework = async (
         await appendClassA(event, ruleId, line);
       }
       lastPromotedAt.set(line.collector_id, new Date().toISOString());
-      await auditRoute(
-        'collector:line-promoted',
-        `${line.collector_id}:${line.event_type}`,
-      );
+      await auditRoute('collector:line-promoted', `${line.collector_id}:${line.event_type}`);
     },
   };
 
@@ -197,7 +187,7 @@ export const bootCollectorFramework = async (
   const lastPromotedAt = new Map<string, string>();
 
   // 4. Per-collector tail loops, started lazily as manifests load.
-  const tails: Map<string, TailHandle> = new Map();
+  const tails = new Map<string, TailHandle>();
   const startTailFor = async (collectorId: string): Promise<void> => {
     if (tails.has(collectorId)) return;
     const handle = await startTail({
@@ -206,16 +196,8 @@ export const bootCollectorFramework = async (
       onLine: async (raw) => {
         const result = await materializeCollectorLine(raw, ctx);
         if (result.kind === 'quarantined') {
-          await quarantineWriter.write(
-            collectorId,
-            raw,
-            result.line,
-            result.reason,
-          );
-          await auditRoute(
-            'collector:line-quarantined',
-            `${collectorId}:${result.reason}`,
-          );
+          await quarantineWriter.write(collectorId, raw, result.line, result.reason);
+          await auditRoute('collector:line-quarantined', `${collectorId}:${result.reason}`);
         } else if (result.kind === 'deduped') {
           await auditRoute(
             'collector:line-deduped',

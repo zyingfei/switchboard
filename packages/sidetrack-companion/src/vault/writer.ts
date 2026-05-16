@@ -316,9 +316,7 @@ const readDispatchLinkFile = async (path: string): Promise<readonly DispatchLink
 // Walk every dispatch-links/<date>.jsonl file, newest first. Used by
 // the link readers — the table is small (one entry per dispatch) and
 // pruning happens out-of-band, so a simple linear scan is fine.
-const readAllDispatchLinks = async (
-  bacRoot: string,
-): Promise<readonly DispatchLinkRecord[]> => {
+const readAllDispatchLinks = async (bacRoot: string): Promise<readonly DispatchLinkRecord[]> => {
   const linkRoot = join(bacRoot, 'dispatch-links');
   let names: string[];
   try {
@@ -771,10 +769,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         existingThread?.['lastResearchMode'] === 'deep-research' ||
         existingThread?.['lastResearchMode'] === 'gemini-deep-research' ||
         existingThread?.['lastResearchMode'] === 'unknown'
-          ? (existingThread['lastResearchMode'] as
-              | 'deep-research'
-              | 'gemini-deep-research'
-              | 'unknown')
+          ? existingThread['lastResearchMode']
           : undefined;
       const carriedResearchMode = input.lastResearchMode ?? previousResearchMode;
       const thread = {
@@ -923,7 +918,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
           );
         }
         if (wantsReparent) {
-          const nextParentId = input.parentId as string;
+          const nextParentId = input.parentId!;
           const nextParentPath = join(bacRoot, 'workstreams', `${nextParentId}.json`);
           const nextParent = await readJsonRecord(nextParentPath);
           const updatedNext = {
@@ -1016,10 +1011,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
           await writeJson(threadPath, detached);
           const threadMd = join(threadsRoot, `${threadBacId}.md`);
           if (!(await readMarkdownLockSentinel(threadMd))) {
-            await writeMarkdownProjection(
-              threadMd,
-              renderThreadMarkdown(detached as ThreadProjectionInput),
-            );
+            await writeMarkdownProjection(threadMd, renderThreadMarkdown(detached));
           }
           detachedThreadIds.push(threadBacId);
         }
@@ -1297,7 +1289,13 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       const existing = await readJsonRecord(path);
       const revision = createRevision();
       const timestamp = new Date().toISOString();
-      const updated = { ...existing, bac_id, revision, lastBumpedAt: timestamp, updatedAt: timestamp };
+      const updated = {
+        ...existing,
+        bac_id,
+        revision,
+        lastBumpedAt: timestamp,
+        updatedAt: timestamp,
+      };
       await writeJson(path, updated);
       await audit({ requestId, route: 'bumpWorkstream', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };

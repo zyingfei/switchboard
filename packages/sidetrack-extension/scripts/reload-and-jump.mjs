@@ -1,16 +1,22 @@
 import { chromium } from 'playwright';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const ctx = browser.contexts()[0];
-const sp = ctx.pages().find(p => p.url().includes('sidepanel.html'));
-if (!sp) { console.error('no side panel'); process.exit(1); }
+const sp = ctx.pages().find((p) => p.url().includes('sidepanel.html'));
+if (!sp) {
+  console.error('no side panel');
+  process.exit(1);
+}
 console.log('reloading side panel...');
 await sp.reload();
 await sp.waitForLoadState('networkidle');
 await sp.waitForTimeout(800);
 
 const swList = ctx.serviceWorkers();
-const sw = swList.find(w => w.url().includes('background.js'));
-if (!sw) { console.error('no SW'); process.exit(2); }
+const sw = swList.find((w) => w.url().includes('background.js'));
+if (!sw) {
+  console.error('no SW');
+  process.exit(2);
+}
 
 // Snapshot a target URL
 const target = await sp.evaluate(async () => {
@@ -33,9 +39,12 @@ await sp.evaluate(() => {
 });
 
 // Send the focus message via SW
-await sw.evaluate(async ({ url }) => {
-  await chrome.runtime.sendMessage({ type: 'sidetrack.sidepanel.focusThread', threadUrl: url });
-}, { url: target.threadUrl });
+await sw.evaluate(
+  async ({ url }) => {
+    await chrome.runtime.sendMessage({ type: 'sidetrack.sidepanel.focusThread', threadUrl: url });
+  },
+  { url: target.threadUrl },
+);
 
 await sp.waitForTimeout(500);
 const hits = await sp.evaluate(() => window.__hits);

@@ -41,9 +41,11 @@ export const useSnippetPreviewMap = (): PreviewLookup => {
   const [state, setState] = useState<PreviewLookup>(EMPTY_LOOKUP);
 
   useEffect(() => {
-    const storage = (globalThis as {
-      chrome?: { storage?: { local?: chrome.storage.LocalStorageArea } };
-    }).chrome?.storage?.local;
+    const storage = (
+      globalThis as {
+        chrome?: { storage?: { local?: chrome.storage.LocalStorageArea } };
+      }
+    ).chrome?.storage?.local;
     if (storage === undefined) return;
 
     let cancelled = false;

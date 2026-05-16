@@ -6,12 +6,12 @@ for (const page of context.pages()) {
   if (!targetIds.some((id) => page.url().includes(id))) continue;
   console.log(`\n=== ${page.url()} ===`);
   const state = await page.evaluate(() => {
-    const turns = Array.from(
-      document.querySelectorAll('main [data-message-author-role]'),
-    ).map((el) => ({
-      role: el.getAttribute('data-message-author-role'),
-      head: (el.textContent ?? '').replace(/\s+/g, ' ').slice(0, 120),
-    }));
+    const turns = Array.from(document.querySelectorAll('main [data-message-author-role]')).map(
+      (el) => ({
+        role: el.getAttribute('data-message-author-role'),
+        head: (el.textContent ?? '').replace(/\s+/g, ' ').slice(0, 120),
+      }),
+    );
     return {
       pathname: location.pathname,
       title: document.title,

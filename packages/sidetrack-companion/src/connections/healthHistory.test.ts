@@ -29,8 +29,7 @@ describe('healthHistory ring buffer', () => {
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  const diagnosticsDir = (): string =>
-    join(vaultRoot, '_BAC', 'connections', 'diagnostics');
+  const diagnosticsDir = (): string => join(vaultRoot, '_BAC', 'connections', 'diagnostics');
   const historyFile = (): string => join(diagnosticsDir(), 'health-history.json');
 
   it('returns [] when the history file is missing', async () => {

@@ -67,7 +67,9 @@ const isCaptureIntent = (value: unknown): value is CaptureIntent =>
 // writes always wrap with { intent, event }.
 const unwrap = (raw: Record<string, unknown>): { intent: CaptureIntent; event: CaptureEvent } => {
   const intent = isCaptureIntent(raw['intent']) ? raw['intent'] : 'passive';
-  const event = isRecord(raw['event']) ? (raw['event'] as unknown as CaptureEvent) : (raw as unknown as CaptureEvent);
+  const event = isRecord(raw['event'])
+    ? (raw['event'] as unknown as CaptureEvent)
+    : (raw as unknown as CaptureEvent);
   return { intent, event };
 };
 
@@ -108,9 +110,8 @@ export const readQueue = async (
   return items.map(toQueuedCapture);
 };
 
-export const readDroppedCount = async (
-  storage: StoragePort = chromeStoragePort,
-): Promise<number> => await captureOutbox.readDropped(storage);
+export const readDroppedCount = async (storage: StoragePort = chromeStoragePort): Promise<number> =>
+  await captureOutbox.readDropped(storage);
 
 export const clearQueue = async (storage: StoragePort = chromeStoragePort): Promise<void> => {
   await captureOutbox.clear(storage);
@@ -154,9 +155,7 @@ export const enqueueCapture = async (
   // Queue is at capacity. Try to evict the oldest passive item to
   // make room. If everyone is explicit, reject the new arrival so
   // the side panel can surface a banner.
-  const oldestPassiveIndex = current.findIndex(
-    (item) => item.payload.intent === 'passive',
-  );
+  const oldestPassiveIndex = current.findIndex((item) => item.payload.intent === 'passive');
   if (oldestPassiveIndex === -1) {
     return {
       accepted: false,

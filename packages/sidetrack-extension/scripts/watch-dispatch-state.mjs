@@ -5,7 +5,10 @@ import { chromium } from '@playwright/test';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const [context] = browser.contexts();
 const sw = context.serviceWorkers().find((w) => w.url().includes('background.js'));
-if (!sw) { console.error('SW not attached'); process.exit(1); }
+if (!sw) {
+  console.error('SW not attached');
+  process.exit(1);
+}
 const start = Date.now();
 const timeoutMs = 3 * 60 * 1000;
 let lastSnap = '';
@@ -18,10 +21,13 @@ while (Date.now() - start < timeoutMs) {
     const linkedThreadInfo = {};
     for (const [dispatchId, threadBacId] of Object.entries(links)) {
       const t = Array.isArray(threads) ? threads.find((x) => x.bac_id === threadBacId) : undefined;
-      linkedThreadInfo[dispatchId] = t ? { bac_id: t.bac_id, url: t.threadUrl, lastSeenAt: t.lastSeenAt, title: t.title } : { bac_id: threadBacId };
+      linkedThreadInfo[dispatchId] = t
+        ? { bac_id: t.bac_id, url: t.threadUrl, lastSeenAt: t.lastSeenAt, title: t.title }
+        : { bac_id: threadBacId };
     }
     const tabs = await chrome.tabs.query({});
-    const chatgptTabs = tabs.filter((t) => t.url?.includes('chatgpt.com'))
+    const chatgptTabs = tabs
+      .filter((t) => t.url?.includes('chatgpt.com'))
       .map((t) => ({ id: t.id, url: t.url, active: t.active }));
     return { started, links, linkedThreadInfo, chatgptTabs };
   });

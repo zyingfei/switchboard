@@ -59,7 +59,14 @@ describe('recall index file', () => {
     await expect(
       upsertEntries(
         path,
-        [{ id: 'turn_1', threadId: 'thread_1', capturedAt: '2026-05-03T00:00:00.000Z', embedding: first }],
+        [
+          {
+            id: 'turn_1',
+            threadId: 'thread_1',
+            capturedAt: '2026-05-03T00:00:00.000Z',
+            embedding: first,
+          },
+        ],
         'model',
       ),
     ).resolves.toEqual({ added: 1, replaced: 0 });
@@ -225,7 +232,14 @@ describe('recall index file', () => {
     e1[0] = 1;
     await upsertEntries(
       path,
-      [{ id: 'turn_a', threadId: 'thread_a', capturedAt: '2026-05-03T00:00:00.000Z', embedding: e1 }],
+      [
+        {
+          id: 'turn_a',
+          threadId: 'thread_a',
+          capturedAt: '2026-05-03T00:00:00.000Z',
+          embedding: e1,
+        },
+      ],
       'model',
     );
     const first = (await readIndex(path))?.items[0];
@@ -237,7 +251,14 @@ describe('recall index file', () => {
     e2[1] = 1;
     await upsertEntries(
       path,
-      [{ id: 'turn_b', threadId: 'thread_a', capturedAt: '2026-05-03T00:00:00.000Z', embedding: e2 }],
+      [
+        {
+          id: 'turn_b',
+          threadId: 'thread_a',
+          capturedAt: '2026-05-03T00:00:00.000Z',
+          embedding: e2,
+        },
+      ],
       'model',
     );
     const items = (await readIndex(path))?.items ?? [];
@@ -251,8 +272,18 @@ describe('recall index file', () => {
     await writeIndex(
       path,
       [
-        { id: 'a:1', threadId: 'thread_archived', capturedAt: '2026-05-03T00:00:00.000Z', embedding },
-        { id: 'a:2', threadId: 'thread_archived', capturedAt: '2026-05-03T00:00:00.000Z', embedding },
+        {
+          id: 'a:1',
+          threadId: 'thread_archived',
+          capturedAt: '2026-05-03T00:00:00.000Z',
+          embedding,
+        },
+        {
+          id: 'a:2',
+          threadId: 'thread_archived',
+          capturedAt: '2026-05-03T00:00:00.000Z',
+          embedding,
+        },
         { id: 'b:1', threadId: 'thread_kept', capturedAt: '2026-05-03T00:00:00.000Z', embedding },
       ],
       'model',
@@ -298,7 +329,17 @@ describe('recall index file', () => {
     }
     await writeFile(
       path,
-      Buffer.concat([headerLen, headerBytes, idLen, idBytes, tidLen, tidBytes, tsLen, tsBytes, embedBuf]),
+      Buffer.concat([
+        headerLen,
+        headerBytes,
+        idLen,
+        idBytes,
+        tidLen,
+        tidBytes,
+        tsLen,
+        tsBytes,
+        embedBuf,
+      ]),
     );
     await expect(readIndex(path)).resolves.toBeNull();
   });

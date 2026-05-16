@@ -1,7 +1,4 @@
-import {
-  canonicalizeDomSkeleton,
-  type DomSkeletonNode,
-} from '../../graph/dom-skeleton';
+import { canonicalizeDomSkeleton, type DomSkeletonNode } from '../../graph/dom-skeleton';
 
 export const VISUAL_FINGERPRINT_OBSERVED = 'visual.fingerprint.observed' as const;
 export const VISUAL_FINGERPRINT_MESSAGE = 'sidetrack.visualFingerprint.observed' as const;
@@ -108,9 +105,7 @@ export const readVisualFingerprintPrivacyGate = async (): Promise<boolean> => {
   }
 };
 
-export const emitVisualFingerprintOnce = async (
-  deps: VisualFingerprintDeps,
-): Promise<boolean> => {
+export const emitVisualFingerprintOnce = async (deps: VisualFingerprintDeps): Promise<boolean> => {
   if (!(await deps.isPrivacyGateOpen())) return false;
   const domHash = await domSkeletonHash(deps.root);
   if (!(await deps.isPrivacyGateOpen())) return false;
@@ -140,4 +135,3 @@ export const startVisualFingerprinting = (): void => {
     },
   }).catch(() => undefined);
 };
-

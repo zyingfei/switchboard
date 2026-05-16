@@ -27,7 +27,11 @@ type ParentMessage =
 
 type ChildMessage =
   | { readonly kind: 'ready' }
-  | { readonly kind: 'state'; readonly state: 'cold' | 'warming' | 'ready' | 'failed'; readonly detail?: string }
+  | {
+      readonly kind: 'state';
+      readonly state: 'cold' | 'warming' | 'ready' | 'failed';
+      readonly detail?: string;
+    }
   | { readonly kind: 'embed-ok'; readonly id: number; readonly vectors: readonly number[][] }
   | { readonly kind: 'embed-err'; readonly id: number; readonly error: string };
 

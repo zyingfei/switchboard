@@ -2,7 +2,10 @@ import { chromium } from '@playwright/test';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const [context] = browser.contexts();
 const sw = context.serviceWorkers().find((w) => w.url().includes('background.js'));
-if (!sw) { console.log('SW dormant - open side panel briefly'); process.exit(1); }
+if (!sw) {
+  console.log('SW dormant - open side panel briefly');
+  process.exit(1);
+}
 // Use SW to fetch annotations directly via companion API.
 const result = await sw.evaluate(async () => {
   const get = (k) => new Promise((r) => chrome.storage.local.get(k, (v) => r(v[k])));

@@ -21,12 +21,7 @@ describe('TimelineRail', () => {
     rows: [
       {
         replicaId: 'replica:a',
-        windows: [
-          [
-            Date.parse('2026-05-15T16:00:00.000Z'),
-            Date.parse('2026-05-15T16:30:00.000Z'),
-          ],
-        ],
+        windows: [[Date.parse('2026-05-15T16:00:00.000Z'), Date.parse('2026-05-15T16:30:00.000Z')]],
       },
     ],
     anchorTime: Date.parse('2026-05-15T16:20:00.000Z'),
@@ -96,7 +91,9 @@ describe('TimelineRail', () => {
       />,
     );
 
-    const marker = screen.getByTestId('timeline-marker-related-timeline-visit:https://example.test');
+    const marker = screen.getByTestId(
+      'timeline-marker-related-timeline-visit:https://example.test',
+    );
     fireEvent.mouseEnter(marker);
     expect(onHoverNode).toHaveBeenCalledWith('timeline-visit:https://example.test');
     fireEvent.mouseLeave(marker);

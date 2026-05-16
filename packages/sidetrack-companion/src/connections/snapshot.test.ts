@@ -1369,7 +1369,7 @@ describe('connections — content-derived edges', () => {
     const taggedVisit = snap.nodes.find(
       (n) => n.id === nodeIdFor('timeline-visit', 'https://copy.fail'),
     );
-    expect(taggedVisit?.metadata['tabSessionId']).toBeUndefined();
+    expect(taggedVisit?.metadata.tabSessionId).toBeUndefined();
     // 2026-05 fix: timeline-visit metadata now carries the active
     // workstreamId the observer stamped on the event, matching the
     // e2e suite's expectation at `connections-real-tabs.spec.ts:228`.
@@ -1377,7 +1377,7 @@ describe('connections — content-derived edges', () => {
     // attribution link; this is the redundant breadcrumb that lets
     // the side panel render the active-workstream chip without
     // resolving the edge.
-    expect(taggedVisit?.metadata['workstreamId']).toBe('ws_security');
+    expect(taggedVisit?.metadata.workstreamId).toBe('ws_security');
     expect(
       snap.edges.some(
         (edge) =>
@@ -1430,7 +1430,7 @@ describe('connections — content-derived edges', () => {
     expect(tabNode?.label).toBe('Codex collector — design notes');
     expect(tabNode?.metadata['latestTitle']).toBe('Codex collector — design notes');
     expect(tabNode?.metadata['latestUrl']).toBe('https://chatgpt.com/g/g-p-x/c/y');
-    expect(tabNode?.metadata['provider']).toBe('chatgpt');
+    expect(tabNode?.metadata.provider).toBe('chatgpt');
   });
 
   it('URL attribution drives visit_instance_in_workstream edges (URL beats tab-session)', () => {
@@ -1513,7 +1513,7 @@ describe('connections — content-derived edges', () => {
     const timelineVisit = snap.nodes.find(
       (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
     );
-    expect(timelineVisit?.metadata['workstreamId']).toBe('ws_urlPrimary');
+    expect(timelineVisit?.metadata.workstreamId).toBe('ws_urlPrimary');
     expect(timelineVisit?.metadata['workstreamAttributionOrigin']).toBe('canonical-url');
     expect(
       snap.edges.filter(
@@ -1584,7 +1584,7 @@ describe('connections — content-derived edges', () => {
     const timelineVisit = snap.nodes.find(
       (node) => node.id === nodeIdFor('timeline-visit', 'https://example.test/article'),
     );
-    expect(timelineVisit?.metadata['workstreamId']).toBeUndefined();
+    expect(timelineVisit?.metadata.workstreamId).toBeUndefined();
     expect(
       snap.edges.some(
         (edge) =>
@@ -1995,7 +1995,7 @@ describe('connections — content-derived edges', () => {
     const lineage = snap.edges.find((edge) => edge.kind === 'topic.lineage');
     expect(lineage?.fromNodeId).toBe(nodeIdFor('topic', 'topic:old'));
     expect(lineage?.toNodeId).toBe(topicNodeId);
-    expect(lineage?.metadata?.['lineageKind']).toBe('merge');
+    expect(lineage?.metadata?.lineageKind).toBe('merge');
     expect(lineage?.producedBy).toEqual({
       source: 'topic-clusterer',
       revisionId: 'topic-rev-1',

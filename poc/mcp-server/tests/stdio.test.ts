@@ -8,15 +8,15 @@ import { loadConfig } from '../src/config';
 
 const fixtureConfigPath = fileURLToPath(new URL('../fixtures/demo-config.json', import.meta.url));
 const packageRoot = fileURLToPath(new URL('..', import.meta.url));
-const tsxCliPath = fileURLToPath(new URL('../node_modules/tsx/dist/cli.mjs', import.meta.url));
 const serverCliPath = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
+const bunCommand = process.env['BUN_EXECUTABLE'] ?? 'bun';
 
 describe('BAC MCP stdio server', () => {
   it('serves the BAC tools over stdio', async () => {
     const config = await loadConfig(fixtureConfigPath);
     const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [tsxCliPath, serverCliPath, '--config', config.configPath],
+      command: bunCommand,
+      args: [serverCliPath, '--config', config.configPath],
       cwd: packageRoot,
       stderr: 'inherit',
     });

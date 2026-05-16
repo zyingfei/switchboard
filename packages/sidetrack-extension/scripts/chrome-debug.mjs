@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Spawn Chrome for Testing (CfT) directly, with the Sidetrack extension
 // loaded and a remote debugging port open. CfT is Google's automation
 // distribution — it accepts --load-extension and avoids Playwright's
@@ -8,10 +8,10 @@
 // Two-terminal usage:
 //
 //   Terminal A:
-//     npm run e2e:chrome-debug
+//     bun run e2e:chrome-debug
 //   Terminal B:
 //     SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
-//       npx playwright test live-providers-smoke
+//       bunx --bun --no-install playwright test live-providers-smoke
 //
 // One-time login:
 //   First run, navigate to chatgpt.com / claude.ai / gemini.google.com
@@ -38,7 +38,7 @@ const userDataDir = expandTilde(process.env.SIDETRACK_USER_DATA_DIR ?? '~/.sidet
 const port = process.env.SIDETRACK_E2E_CDP_PORT ?? '9222';
 
 // Shared CfT install root, in the OS user-cache. One copy serves all
-// worktrees / PoCs / clones, instead of each `npm run e2e:install-cft`
+// worktrees / PoCs / clones, instead of each `bun run e2e:install-cft`
 // dropping a 340 MB tree under `.chrome-for-testing/` per worktree.
 // Override with SIDETRACK_CFT_ROOT.
 const SHARED_CFT_ROOT =
@@ -81,7 +81,7 @@ const findChromeForTesting = async () => {
     console.warn(
       '\n[chrome-debug] NOTE: using legacy per-worktree CfT install at .chrome-for-testing/.\n' +
         '  Consider migrating to the shared cache to save disk:\n' +
-        '    npm run e2e:install-cft   (now installs to ~/Library/Caches/sidetrack/chrome-for-testing)\n' +
+        '    bun run e2e:install-cft   (now installs to ~/Library/Caches/sidetrack/chrome-for-testing)\n' +
         '    rm -rf ./.chrome-for-testing\n',
     );
     return { binary: localHit, channel: 'CfT (legacy local install)' };
@@ -97,7 +97,7 @@ const findChromeForTesting = async () => {
       '\n[chrome-debug] WARNING: Chrome for Testing not found. Falling back to ' +
         'regular Chrome stable, but extension loading may fail silently and ' +
         'Google login may be blocked. Install CfT with:\n' +
-        '  npm run e2e:install-cft\n',
+        '  bun run e2e:install-cft\n',
     );
     return { binary: stableChrome, channel: 'Chrome stable (fallback)' };
   }
@@ -119,7 +119,7 @@ console.log('[chrome-debug] launching Chrome for Testing with the extension load
 console.log('');
 console.log('[chrome-debug] In another terminal, run:');
 console.log(`[chrome-debug]   SIDETRACK_E2E_CDP_URL=http://localhost:${port} \\`);
-console.log('[chrome-debug]     npx playwright test live-providers-smoke');
+console.log('[chrome-debug]     bunx --bun --no-install playwright test live-providers-smoke');
 console.log('');
 console.log('[chrome-debug] First-time setup:');
 console.log(

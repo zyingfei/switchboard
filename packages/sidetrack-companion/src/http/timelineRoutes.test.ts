@@ -34,8 +34,9 @@ const buildEvent = (input: {
   acceptedAtMs: Date.parse(input.payload.observedAt),
 });
 
-const observe = (overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string }):
-  BrowserTimelineObservedPayload => ({
+const observe = (
+  overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string },
+): BrowserTimelineObservedPayload => ({
   eventId: overrides.eventId ?? `evt-${overrides.observedAt}-${overrides.url}`,
   observedAt: overrides.observedAt,
   url: overrides.url,
@@ -110,12 +111,22 @@ describe('timeline HTTP routes', () => {
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 1,
-        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', title: 'A' }),
+        payload: observe({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+          title: 'A',
+        }),
       }),
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 2,
-        payload: observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b', title: 'B' }),
+        payload: observe({
+          observedAt: '2026-05-07T11:00:00.000Z',
+          url: 'https://x/b',
+          canonicalUrl: 'https://x/b',
+          title: 'B',
+        }),
       }),
     ];
     const post1 = await post('/v1/timeline/events', { events });
@@ -128,7 +139,9 @@ describe('timeline HTTP routes', () => {
 
     const got = await get('/v1/timeline');
     expect(got.status).toBe(200);
-    const body = got.data as { data: { scope: string; items: { id: string }[]; entryCount: number } };
+    const body = got.data as {
+      data: { scope: string; items: { id: string }[]; entryCount: number };
+    };
     expect(body.data.scope).toBe('companion-extended');
     expect(body.data.entryCount).toBeGreaterThanOrEqual(2);
     const ids = body.data.items.map((e) => e.id);
@@ -140,7 +153,11 @@ describe('timeline HTTP routes', () => {
     const event = buildEvent({
       edgeReplicaId: 'edge_test',
       seq: 1,
-      payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+      payload: observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
     });
     const r1 = await post('/v1/timeline/events', { events: [event] });
     expect(r1.status).toBe(200);
@@ -159,12 +176,22 @@ describe('timeline HTTP routes', () => {
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 1,
-        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://chat.example.com/abc', canonicalUrl: 'https://chat.example.com/abc', title: 'Recipe planning' }),
+        payload: observe({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://chat.example.com/abc',
+          canonicalUrl: 'https://chat.example.com/abc',
+          title: 'Recipe planning',
+        }),
       }),
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 2,
-        payload: observe({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://github.com/repo', canonicalUrl: 'https://github.com/repo', title: 'GitHub' }),
+        payload: observe({
+          observedAt: '2026-05-07T11:00:00.000Z',
+          url: 'https://github.com/repo',
+          canonicalUrl: 'https://github.com/repo',
+          title: 'GitHub',
+        }),
       }),
     ];
     await post('/v1/timeline/events', { events });
@@ -178,7 +205,11 @@ describe('timeline HTTP routes', () => {
     const goodEvent = buildEvent({
       edgeReplicaId: 'edge_test',
       seq: 1,
-      payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+      payload: observe({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
     });
     const wrongType = {
       clientEventId: 'wrong-type',
@@ -237,7 +268,8 @@ describe('timeline HTTP routes', () => {
 
     await new Promise((res) => setTimeout(res, 50));
     const view = await get('/v1/timeline');
-    const items = (view.data as { data: { items: { url: string; canonicalUrl?: string }[] } }).data.items;
+    const items = (view.data as { data: { items: { url: string; canonicalUrl?: string }[] } }).data
+      .items;
     expect(items).toHaveLength(1);
     // Auth tokens MUST NOT be present in the projection.
     const serialized = JSON.stringify(items);
@@ -259,12 +291,20 @@ describe('timeline HTTP routes', () => {
       buildEvent({
         edgeReplicaId: 'edge_partial',
         seq: 1,
-        payload: observe({ observedAt: '2026-05-07T09:00:00.000Z', url: 'https://x/morning', canonicalUrl: 'https://x/morning' }),
+        payload: observe({
+          observedAt: '2026-05-07T09:00:00.000Z',
+          url: 'https://x/morning',
+          canonicalUrl: 'https://x/morning',
+        }),
       }),
       buildEvent({
         edgeReplicaId: 'edge_partial',
         seq: 2,
-        payload: observe({ observedAt: '2026-05-07T15:00:00.000Z', url: 'https://x/afternoon', canonicalUrl: 'https://x/afternoon' }),
+        payload: observe({
+          observedAt: '2026-05-07T15:00:00.000Z',
+          url: 'https://x/afternoon',
+          canonicalUrl: 'https://x/afternoon',
+        }),
       }),
     ];
     await post('/v1/timeline/events', { events });
@@ -279,17 +319,29 @@ describe('timeline HTTP routes', () => {
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 1,
-        payload: observe({ observedAt: '2026-05-06T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+        payload: observe({
+          observedAt: '2026-05-06T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
       }),
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 2,
-        payload: observe({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
+        payload: observe({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/b',
+          canonicalUrl: 'https://x/b',
+        }),
       }),
       buildEvent({
         edgeReplicaId: 'edge_test',
         seq: 3,
-        payload: observe({ observedAt: '2026-05-08T10:00:00.000Z', url: 'https://x/c', canonicalUrl: 'https://x/c' }),
+        payload: observe({
+          observedAt: '2026-05-08T10:00:00.000Z',
+          url: 'https://x/c',
+          canonicalUrl: 'https://x/c',
+        }),
       }),
     ];
     await post('/v1/timeline/events', { events });

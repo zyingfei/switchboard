@@ -8,7 +8,9 @@ describe('normalizeSelectionText', () => {
   });
 
   it('strips markdown setext headers and prefixed chrome lines', () => {
-    expect(normalizeSelectionText('Title Here\n====\n# nav\n> quote\n// chrome\nbody')).toBe('body');
+    expect(normalizeSelectionText('Title Here\n====\n# nav\n> quote\n// chrome\nbody')).toBe(
+      'body',
+    );
   });
 
   it('drops pure timestamp lines', () => {

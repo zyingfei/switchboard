@@ -15,10 +15,7 @@ import { QUEUE_CREATED } from '../../queue/events.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
-import {
-  THREAD_ARCHIVED,
-  THREAD_UPSERTED,
-} from '../../threads/events.js';
+import { THREAD_ARCHIVED, THREAD_UPSERTED } from '../../threads/events.js';
 import { URL_ATTRIBUTION_INFERRED } from '../../urls/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import type { AcceptedEvent } from '../causal.js';
@@ -86,9 +83,7 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   });
 
   it('user.flow.confirmed produces a topicMember per visit', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(USER_FLOW_CONFIRMED, { visitIds: ['v1', 'v2'] }),
-    );
+    const keys = invalidationsForEvent(makeEvent(USER_FLOW_CONFIRMED, { visitIds: ['v1', 'v2'] }));
     expect(keys).toEqual([
       { kind: 'topicMember', visitId: 'v1' },
       { kind: 'topicMember', visitId: 'v2' },
@@ -96,9 +91,7 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   });
 
   it('user.flow.rejected produces a topicMember per visit', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(USER_FLOW_REJECTED, { visitIds: ['v1'] }),
-    );
+    const keys = invalidationsForEvent(makeEvent(USER_FLOW_REJECTED, { visitIds: ['v1'] }));
     expect(keys).toEqual([{ kind: 'topicMember', visitId: 'v1' }]);
   });
 
@@ -114,9 +107,7 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   });
 
   it('workstream.deleted produces workstream + tree + pathMemo', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(WORKSTREAM_DELETED, { bac_id: 'ws_x' }),
-    );
+    const keys = invalidationsForEvent(makeEvent(WORKSTREAM_DELETED, { bac_id: 'ws_x' }));
     expect(keys).toEqual([
       { kind: 'workstream', bacId: 'ws_x' },
       { kind: 'workstreamTree' },
@@ -142,13 +133,8 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   });
 
   it('thread.archived produces thread + inboxFilter', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(THREAD_ARCHIVED, { bac_id: 'bac_thread' }),
-    );
-    expect(keys).toEqual([
-      { kind: 'thread', bacId: 'bac_thread' },
-      { kind: 'inboxFilter' },
-    ]);
+    const keys = invalidationsForEvent(makeEvent(THREAD_ARCHIVED, { bac_id: 'bac_thread' }));
+    expect(keys).toEqual([{ kind: 'thread', bacId: 'bac_thread' }, { kind: 'inboxFilter' }]);
   });
 
   it('urls.attribution.inferred → url slice', () => {
@@ -166,16 +152,12 @@ describe('Stage 5.2 W6 — invalidation rules', () => {
   });
 
   it('queue.created → queue slice', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(QUEUE_CREATED, { itemId: 'q-1' }),
-    );
+    const keys = invalidationsForEvent(makeEvent(QUEUE_CREATED, { itemId: 'q-1' }));
     expect(keys).toEqual([{ kind: 'queue', itemId: 'q-1' }]);
   });
 
   it('Group B — capture.recorded invalidates sourceUnit + recallIndex + contentSimilarity', () => {
-    const keys = invalidationsForEvent(
-      makeEvent(CAPTURE_RECORDED, { sourceUnitId: 'source-1' }),
-    );
+    const keys = invalidationsForEvent(makeEvent(CAPTURE_RECORDED, { sourceUnitId: 'source-1' }));
     expect(keys).toEqual([
       { kind: 'sourceUnit', sourceUnitId: 'source-1' },
       { kind: 'recallIndex', sourceUnitId: 'source-1' },

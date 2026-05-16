@@ -77,18 +77,18 @@ Current automated coverage includes:
 
 ```sh
 cd poc/provider-capture
-npm install
-npm run compile
-npm test
-npm run build
-npm run e2e:install
-npm run test:e2e
+bun install
+bun run compile
+bun run test
+bun run build
+bun run e2e:install
+bun run test:e2e
 ```
 
 Notes:
 
-- `npm test` runs the unit suite.
-- `npm run test:e2e` builds the extension and runs the Playwright extension harness.
+- `bun run test` runs the unit suite.
+- `bun run test:e2e` builds the extension and runs the Playwright extension harness.
 - The e2e runner uses Chrome for Testing when available and can be pointed at another Chrome binary with `BAC_E2E_CHROME_PATH`.
 
 ## Live Validation Summary
@@ -196,8 +196,8 @@ The intended v1 path is to keep `getTrackedThreads(filter?)` stable, then change
 
 ```sh
 cd poc/provider-capture
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 2. In Chrome, open `chrome://extensions`, enable Developer mode, and load unpacked:

@@ -68,7 +68,7 @@ export const useConnectionsSnapshot = (
       setError(null);
     }
     let cancelled = false;
-    fetchConnectionsNeighbors({ nodeId: anchor, hops }).then((r) => {
+    void fetchConnectionsNeighbors({ nodeId: anchor, hops }).then((r) => {
       if (cancelled) return;
       setLoading(false);
       if (!r.ok || r.data === undefined) {
@@ -116,9 +116,7 @@ export const useConnectionsSnapshot = (
 // (e.g. ranker contribution weights). Same cancellation pattern
 // as the snapshot hook; no cache needed because the user only
 // inspects one edge at a time.
-export const useConnectionsEdge = (
-  selectedEdge: ConnectionEdge | null,
-): ConnectionEdge | null => {
+export const useConnectionsEdge = (selectedEdge: ConnectionEdge | null): ConnectionEdge | null => {
   const [edgeDetail, setEdgeDetail] = useState<ConnectionEdge | null>(null);
   useEffect(() => {
     if (selectedEdge === null) {
@@ -127,7 +125,7 @@ export const useConnectionsEdge = (
     }
     setEdgeDetail(null);
     let cancelled = false;
-    fetchConnectionsEdge(selectedEdge.id).then((r) => {
+    void fetchConnectionsEdge(selectedEdge.id).then((r) => {
       if (cancelled) return;
       if (r.ok && r.data !== undefined) setEdgeDetail(r.data);
     });

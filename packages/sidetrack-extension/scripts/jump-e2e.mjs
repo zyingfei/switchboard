@@ -5,8 +5,17 @@ import { chromium } from 'playwright';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const ctx = browser.contexts()[0];
 const sidepanel = ctx.pages().find((p) => p.url().includes('sidepanel.html'));
-const chat = ctx.pages().find((p) => p.url().startsWith('https://gemini.google.com/') || p.url().startsWith('https://chatgpt.com/'));
-if (!sidepanel || !chat) { console.error('missing pages'); process.exit(1); }
+const chat = ctx
+  .pages()
+  .find(
+    (p) =>
+      p.url().startsWith('https://gemini.google.com/') ||
+      p.url().startsWith('https://chatgpt.com/'),
+  );
+if (!sidepanel || !chat) {
+  console.error('missing pages');
+  process.exit(1);
+}
 console.log('side panel:', sidepanel.url());
 console.log('chat page:', chat.url());
 
@@ -28,11 +37,18 @@ await sidepanel.evaluate(() => {
         if (r.type !== 'attributes' || r.attributeName !== 'class') continue;
         const target = r.target;
         if (target instanceof HTMLElement && target.classList.contains('focusing')) {
-          console.log('[jump-e2e] focusing class APPLIED to', (target.textContent || '').slice(0, 60));
+          console.log(
+            '[jump-e2e] focusing class APPLIED to',
+            (target.textContent || '').slice(0, 60),
+          );
         }
       }
     });
-    observer.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: true });
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['class'],
+      subtree: true,
+    });
     window.__focusObserver = observer;
   }
 });
@@ -52,7 +68,10 @@ console.log('sample:', stateInfo.sampleUrls);
 // Pick a target URL we know is in storage — use the first thread's URL.
 const targetUrl = stateInfo.sampleUrls[0]?.threadUrl;
 const targetBacId = stateInfo.sampleUrls[0]?.bac_id;
-if (!targetUrl) { console.error('no thread to target'); process.exit(2); }
+if (!targetUrl) {
+  console.error('no thread to target');
+  process.exit(2);
+}
 console.log('\ntargeting:', targetUrl, '(bac_id:', targetBacId + ')');
 
 // Send a focusThreadInSidePanel message directly via the background
@@ -61,11 +80,20 @@ console.log('\ntargeting:', targetUrl, '(bac_id:', targetBacId + ')');
 // broadcasts to all other extension pages (including the side panel)
 // without triggering the SW itself.
 const messageTypeKey = 'sidetrack.sidepanel.focusThread';
-const swTarget = browser.contexts()[0].serviceWorkers().find((w) => w.url().includes(`/background.js`));
-if (!swTarget) { console.error('no background SW available'); process.exit(2); }
-await swTarget.evaluate(async ({ msg, target }) => {
-  await chrome.runtime.sendMessage({ type: msg, threadUrl: target });
-}, { msg: messageTypeKey, target: targetUrl });
+const swTarget = browser
+  .contexts()[0]
+  .serviceWorkers()
+  .find((w) => w.url().includes(`/background.js`));
+if (!swTarget) {
+  console.error('no background SW available');
+  process.exit(2);
+}
+await swTarget.evaluate(
+  async ({ msg, target }) => {
+    await chrome.runtime.sendMessage({ type: msg, threadUrl: target });
+  },
+  { msg: messageTypeKey, target: targetUrl },
+);
 
 // Focus class is set then cleared after 1500ms. Check at 400ms so
 // we catch it while still applied.
@@ -80,7 +108,9 @@ const focusState = await sidepanel.evaluate(() => {
     focusingExists: !!focusing,
     focusingTitle: focusing?.querySelector('.title, h3, h4')?.textContent?.slice(0, 60),
     rowCount: allRows.length,
-    sampleTitles: Array.from(allRows).slice(0, 4).map((r) => r.querySelector('.title, h3, h4')?.textContent?.slice(0, 50)),
+    sampleTitles: Array.from(allRows)
+      .slice(0, 4)
+      .map((r) => r.querySelector('.title, h3, h4')?.textContent?.slice(0, 50)),
   };
 });
 console.log('\nfocus state after message:', focusState);
@@ -93,9 +123,12 @@ for (const l of spLogs.slice(-10)) console.log('  ', l.slice(0, 200));
 const mangledUrl = targetUrl + '?utm=test';
 console.log('\ntesting non-canonical URL:', mangledUrl);
 spLogs.length = 0;
-await swTarget.evaluate(async ({ msg, target }) => {
-  await chrome.runtime.sendMessage({ type: msg, threadUrl: target });
-}, { msg: messageTypeKey, target: mangledUrl });
+await swTarget.evaluate(
+  async ({ msg, target }) => {
+    await chrome.runtime.sendMessage({ type: msg, threadUrl: target });
+  },
+  { msg: messageTypeKey, target: mangledUrl },
+);
 await sidepanel.waitForTimeout(800);
 const mangledFocus = await sidepanel.evaluate((targetBac) => {
   const focusing = document.querySelector('.focusing, [data-focusing="true"]');

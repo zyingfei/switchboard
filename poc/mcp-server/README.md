@@ -115,21 +115,21 @@ The point here is interoperability first.
 
 ```sh
 cd poc/mcp-server
-npm install
-npm run compile
-npm test
-npm run build
-npm run smoke -- --config ./fixtures/demo-config.json
+bun install
+bun run compile
+bun run test
+bun run build
+bun run smoke -- --config ./fixtures/demo-config.json
 ```
 
 ## What Passed Locally
 
 Validated on April 26, 2026:
 
-- `npm run compile`
-- `npm test`
-- `npm run build`
-- `npm run smoke -- --config ./fixtures/demo-config.json`
+- `bun run compile`
+- `bun run test`
+- `bun run build`
+- `bun run smoke -- --config ./fixtures/demo-config.json`
 - real `codex exec` run against the MCP server over stdio
 
 The smoke client verified:
@@ -167,7 +167,7 @@ From the repo root:
 ```sh
 export BAC_MCP_ROOT="$(pwd)/poc/mcp-server"
 claude mcp add --transport stdio --scope project bac-mcp -- \
-  node "$BAC_MCP_ROOT/dist/cli.js" \
+  bun "$BAC_MCP_ROOT/dist/cli.js" \
   --config "$BAC_MCP_ROOT/fixtures/demo-config.json"
 ```
 
@@ -192,7 +192,7 @@ From the repo root:
 ```sh
 export BAC_MCP_ROOT="$(pwd)/poc/mcp-server"
 codex mcp add bac-mcp -- \
-  node "$BAC_MCP_ROOT/dist/cli.js" \
+  bun "$BAC_MCP_ROOT/dist/cli.js" \
   --config "$BAC_MCP_ROOT/fixtures/demo-config.json"
 ```
 
@@ -212,7 +212,7 @@ override so Codex auto-approves calls from this MCP server:
 
 ```sh
 codex exec \
-  -c 'mcp_servers.bac-mcp.command="node"' \
+  -c 'mcp_servers.bac-mcp.command="bun"' \
   -c 'mcp_servers.bac-mcp.args=["'"$BAC_MCP_ROOT"'/dist/cli.js","--config","'"$BAC_MCP_ROOT"'/fixtures/demo-config.json"]' \
   -c 'mcp_servers.bac-mcp.default_tools_approval_mode="approve"' \
   -C "$(pwd)" \

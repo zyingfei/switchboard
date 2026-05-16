@@ -267,9 +267,7 @@ export const startTestCompanion = async (
         // companion's /v1/version reports the actual build identity.
         // Lets the attach-diag detect "extension rebuilt but the
         // companion is still running the prior build."
-        ...(process.env['SIDETRACK_COMPANION_GIT_SHA'] === undefined
-          ? readGitShaForEnv()
-          : {}),
+        ...(process.env['SIDETRACK_COMPANION_GIT_SHA'] === undefined ? readGitShaForEnv() : {}),
       },
     });
     try {
@@ -295,7 +293,6 @@ export const startTestCompanion = async (
     next.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trimEnd();
       if (text.length > 0) {
-         
         console.warn(`[comp:${String(port)}] ${text}`);
       }
     });
@@ -305,15 +302,12 @@ export const startTestCompanion = async (
   // When the caller supplied vaultDir, the vault is THEIRS and must
   // survive across runs (workstreams, connections, etc.). Auto-mkdtemp
   // vaults are owned by us and cleaned up on close.
-  const cleanupOnClose =
-    options.vaultDir === undefined || options.vaultDir.length === 0;
+  const cleanupOnClose = options.vaultDir === undefined || options.vaultDir.length === 0;
 
   await spawnNow();
   let bridgeKey: string;
   try {
-    bridgeKey = (
-      await readFile(path.join(vaultPath, '_BAC/.config/bridge.key'), 'utf8')
-    ).trim();
+    bridgeKey = (await readFile(path.join(vaultPath, '_BAC/.config/bridge.key'), 'utf8')).trim();
   } catch (error) {
     // spawnNow() mutates `child` via closure capture, but TS narrows
     // the local back to `null` because the mutation isn't visible in

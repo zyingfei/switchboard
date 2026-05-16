@@ -65,9 +65,7 @@ export const overlayTopicRevisionOnSnapshot = (
   } as const;
 
   const visitWorkstreamIdFor = (canonicalUrl: string): string | undefined => {
-    const value = nodesById.get(nodeIdFor('timeline-visit', canonicalUrl))?.metadata[
-      'workstreamId'
-    ];
+    const value = nodesById.get(nodeIdFor('timeline-visit', canonicalUrl))?.metadata.workstreamId;
     return typeof value === 'string' && value.length > 0 ? value : undefined;
   };
 

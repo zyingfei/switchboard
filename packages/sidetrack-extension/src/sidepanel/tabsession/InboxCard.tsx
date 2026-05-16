@@ -35,10 +35,7 @@ export interface InboxCardProps {
   // onPickAnother (parent owns the modal); ignore writes a
   // urls.ignored event. When omitted, the affordance renders disabled.
   readonly onPickAnother?: (tabSessionId: string) => void;
-  readonly onIgnore?: (
-    tabSessionId: string,
-    reason: 'noise' | 'duplicate' | 'private',
-  ) => void;
+  readonly onIgnore?: (tabSessionId: string, reason: 'noise' | 'duplicate' | 'private') => void;
   // Optional; when present, anchor labels in the provenance row use
   // the live connections snapshot to render human-friendly text.
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;

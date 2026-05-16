@@ -15,15 +15,15 @@ describe('sanitizeTimelineUrl', () => {
   });
 
   it('drops common OAuth / token / code params', () => {
-    expect(
-      sanitizeTimelineUrl('https://example.com/callback?code=abc&state=xyz'),
-    ).toBe('https://example.com/callback');
-    expect(
-      sanitizeTimelineUrl('https://app.com/?access_token=secret&id_token=more'),
-    ).toBe('https://app.com/');
-    expect(
-      sanitizeTimelineUrl('https://x.com/?refresh_token=z&q=stay'),
-    ).toBe('https://x.com/?q=stay');
+    expect(sanitizeTimelineUrl('https://example.com/callback?code=abc&state=xyz')).toBe(
+      'https://example.com/callback',
+    );
+    expect(sanitizeTimelineUrl('https://app.com/?access_token=secret&id_token=more')).toBe(
+      'https://app.com/',
+    );
+    expect(sanitizeTimelineUrl('https://x.com/?refresh_token=z&q=stay')).toBe(
+      'https://x.com/?q=stay',
+    );
   });
 
   it('drops session / key / secret / password / auth params', () => {
@@ -47,14 +47,14 @@ describe('sanitizeTimelineUrl', () => {
   });
 
   it('preserves non-sensitive, non-marketing query params', () => {
-    expect(
-      sanitizeTimelineUrl('https://x.com/search?q=hello&page=2'),
-    ).toBe('https://x.com/search?q=hello&page=2');
+    expect(sanitizeTimelineUrl('https://x.com/search?q=hello&page=2')).toBe(
+      'https://x.com/search?q=hello&page=2',
+    );
     // utm_source is now stripped by default (Stage 5 follow-up). The
     // content-bearing `model` param stays.
-    expect(
-      sanitizeTimelineUrl('https://x.com/?utm_source=email&model=gpt-4'),
-    ).toBe('https://x.com/?model=gpt-4');
+    expect(sanitizeTimelineUrl('https://x.com/?utm_source=email&model=gpt-4')).toBe(
+      'https://x.com/?model=gpt-4',
+    );
   });
 
   it('parameter name match is case-insensitive', () => {
@@ -125,9 +125,7 @@ describe('sanitizeTimelineUrl', () => {
       const previous = process.env['SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS'];
       process.env['SIDETRACK_TIMELINE_STRIP_MARKETING_PARAMS'] = '0';
       try {
-        const out = sanitizeTimelineUrl(
-          'https://example.test/p?utm_source=adwords&keep=me',
-        );
+        const out = sanitizeTimelineUrl('https://example.test/p?utm_source=adwords&keep=me');
         // utm_source preserved when strip is disabled.
         expect(out).toBe('https://example.test/p?utm_source=adwords&keep=me');
       } finally {

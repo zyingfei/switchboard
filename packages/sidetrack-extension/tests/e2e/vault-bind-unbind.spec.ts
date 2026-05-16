@@ -1,12 +1,12 @@
 // Live e2e for the bind/unbind round-trip against a REAL companion
-// process (spawned via startTestCompanion → real Node CLI, real
+// process (spawned via startTestCompanion -> real Bun CLI, real
 // HTTP server, real bridge key file). No mocks. Uses
 // forceLocalProfile so it spawns a fresh Playwright Chromium —
 // run with SIDETRACK_E2E_HEADLESS=0 to watch the flow:
 //
 //   cd packages/sidetrack-extension
 //   SIDETRACK_E2E_HEADLESS=0 SIDETRACK_E2E_DEMO_PAUSE_MS=5000 \
-//     npx playwright test vault-bind-unbind --reporter=list
+//     bunx --bun --no-install playwright test vault-bind-unbind --reporter=list
 //
 // The "sync" half of vault behaviour (capture writes events to the
 // vault filesystem) is covered by extension-runtime.spec.ts.

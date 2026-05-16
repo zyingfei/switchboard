@@ -3,10 +3,7 @@ import {
   USER_FLOW_REJECTED,
   type UserFlowRelationKind,
 } from '../../feedback/events.js';
-import {
-  NAVIGATION_COMMITTED,
-  type NavigationTransitionType,
-} from '../../navigation/events.js';
+import { NAVIGATION_COMMITTED, type NavigationTransitionType } from '../../navigation/events.js';
 import { SELECTION_COPIED } from '../../snippets/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';

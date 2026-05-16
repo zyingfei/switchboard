@@ -4,7 +4,11 @@
 **Decider**: User + Claude
 **Related**: PRD §5 (architecture), PRD §11 Q4, BRAINSTORM §27.6
 (vault-bridge empirical pivot), `poc/local-bridge` planning artifact
-(on `poc-planning` branch).
+(on `poc-planning` branch), ADR-0004.
+
+> Note: ADR-0004 supersedes this ADR's Node/npm/npx command details.
+> The HTTP loopback architecture and Native Messaging rejection remain
+> accepted.
 
 ## Context
 

@@ -64,10 +64,7 @@ const readDispatchJsonlDirectory = async (
   let entries: string[];
   try {
     entries = (await readdir(dir, { withFileTypes: true }))
-      .filter(
-        (entry) =>
-          entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name),
-      )
+      .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(entry.name))
       .map((entry) => entry.name);
   } catch {
     return [];

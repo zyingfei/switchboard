@@ -29,17 +29,14 @@ export const LEGACY_EXTRACTOR_VERSION = '0.0.0';
 export const LEGACY_EXTRACTION_SCHEMA_VERSION = 1;
 export const LEGACY_CHUNKER_VERSION = 'legacy';
 
-const sha256 = (input: string): string =>
-  createHash('sha256').update(input).digest('hex');
+const sha256 = (input: string): string => createHash('sha256').update(input).digest('hex');
 
 const stableJson = (value: unknown): string => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const keys = Object.keys(value).sort();
   return `{${keys
-    .map(
-      (k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`,
-    )
+    .map((k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`)
     .join(',')}}`;
 };
 

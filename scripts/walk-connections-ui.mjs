@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Stage 5 polish — First-principles UX walkthrough. Simulates the
 // Connections UI rendering against the persistent recorder vault.
 // For each canonical anchor kind (workstream, thread, tab-session,

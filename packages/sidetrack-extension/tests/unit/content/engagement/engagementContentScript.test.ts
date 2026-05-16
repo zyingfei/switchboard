@@ -58,7 +58,9 @@ describe('engagement content script wiring', () => {
     const emitted = sent.at(-1) as {
       readonly type?: string;
       readonly final?: boolean;
-      readonly dimensions?: { readonly engagement?: { readonly copyCount?: number; readonly scrollEvents?: number } };
+      readonly dimensions?: {
+        readonly engagement?: { readonly copyCount?: number; readonly scrollEvents?: number };
+      };
     };
     expect(emitted.type).toBe('sidetrack.engagement.interval');
     expect(emitted.final).toBe(true);

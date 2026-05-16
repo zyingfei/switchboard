@@ -220,7 +220,7 @@ These come from `CHARTER.md §3` and are non-negotiable:
 
 ```
 SIDETRACK_TEST_SESSIONS_DIR=/tmp/t1-smoke \
-  npx playwright test \
+  bunx --bun --no-install playwright test \
   packages/sidetrack-extension/tests/e2e/<your-record-spec> \
   --headed --timeout 0 --grep manual
 ```

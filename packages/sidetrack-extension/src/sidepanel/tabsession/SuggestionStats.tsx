@@ -1,7 +1,4 @@
-import type {
-  TabSessionResolutionResult,
-  TabSessionWorkstreamOption,
-} from './types';
+import type { TabSessionResolutionResult, TabSessionWorkstreamOption } from './types';
 
 // Stage 5 polish — surface the resolver's confidence in human-readable
 // terms while keeping the raw numbers available on hover. The
@@ -62,7 +59,7 @@ const workstreamLabel = (
 ): string =>
   workstreamId === undefined
     ? '?'
-    : workstreams.find((w) => w.bac_id === workstreamId)?.path ?? '(removed)';
+    : (workstreams.find((w) => w.bac_id === workstreamId)?.path ?? '(removed)');
 
 export interface SuggestionStatsProps {
   readonly suggestion?: TabSessionResolutionResult;

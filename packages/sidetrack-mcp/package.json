@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "bin": {
     "sidetrack-mcp": "./dist/cli.js"
   },
@@ -11,16 +12,16 @@
     "dist"
   ],
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.3.14"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "eslint .",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "build": "bunx --bun --no-install tsc -p tsconfig.build.json",
+    "typecheck": "bunx --bun --no-install tsc --noEmit -p tsconfig.json",
+    "lint": "bunx --bun --no-install eslint \"**/*.{ts,tsx}\"",
+    "format": "bunx --bun --no-install prettier --write .",
+    "format:check": "bunx --bun --no-install prettier --check .",
+    "test": "bunx --no-install vitest run",
+    "test:watch": "bunx --no-install vitest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -32,9 +33,8 @@
     "@types/node": "^24.10.1",
     "eslint": "^9.39.1",
     "prettier": "^3.7.4",
-    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.46.4",
-    "vitest": "^4.1.5"
+    "vitest": "4.1.5"
   }
 }

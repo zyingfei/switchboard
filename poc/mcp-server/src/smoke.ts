@@ -7,16 +7,13 @@ import { loadConfig, parseCliArgs } from './config';
 const serverCommand = (): { command: string; args: string[] } => {
   if (import.meta.url.endsWith('.ts')) {
     return {
-      command: process.execPath,
-      args: [
-        fileURLToPath(new URL('../node_modules/tsx/dist/cli.mjs', import.meta.url)),
-        fileURLToPath(new URL('./cli.ts', import.meta.url)),
-      ],
+      command: process.env['BUN_EXECUTABLE'] ?? 'bun',
+      args: [fileURLToPath(new URL('./cli.ts', import.meta.url))],
     };
   }
 
   return {
-    command: process.execPath,
+    command: process.env['BUN_EXECUTABLE'] ?? 'bun',
     args: [fileURLToPath(new URL('./cli.js', import.meta.url))],
   };
 };

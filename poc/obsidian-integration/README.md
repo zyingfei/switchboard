@@ -54,25 +54,25 @@ Manual validation against real Obsidian is still required for the UI-rendering q
 
 ```sh
 cd poc/obsidian-integration
-npm install
-npm run compile
-npm test
-npm run build
+bun install
+bun run compile
+bun run test
+bun run build
 ```
 
 Install Chrome for Testing once before e2e:
 
 ```sh
-npm run e2e:install
-npm run test:e2e
+bun run e2e:install
+bun run test:e2e
 ```
 
 Useful e2e environment variables:
 
 ```sh
-BAC_E2E_CHROME_PATH=/path/to/chrome npm run test:e2e
-BAC_E2E_HEADLESS=1 npm run test:e2e
-BAC_EXTENSION_PATH=/path/to/chrome-mv3 npm run test:e2e
+BAC_E2E_CHROME_PATH=/path/to/chrome bun run test:e2e
+BAC_E2E_HEADLESS=1 bun run test:e2e
+BAC_EXTENSION_PATH=/path/to/chrome-mv3 bun run test:e2e
 ```
 
 ## Try It Manually
@@ -81,8 +81,8 @@ Build the extension:
 
 ```sh
 cd poc/obsidian-integration
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Load `.output/chrome-mv3` in Chrome:

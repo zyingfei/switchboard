@@ -157,12 +157,9 @@ const recordTimelinePermissionEvent = async (type: string): Promise<void> => {
 const readChromePermissionsContains = async (): Promise<boolean> => {
   try {
     return await new Promise<boolean>((resolve) => {
-      chrome.permissions.contains(
-        { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
-        (granted) => {
-          resolve(Boolean(granted));
-        },
-      );
+      chrome.permissions.contains({ origins: [...TIMELINE_OPTIONAL_ORIGINS] }, (granted) => {
+        resolve(Boolean(granted));
+      });
     });
   } catch {
     return false;
@@ -220,16 +217,15 @@ export function TimelineSection() {
     setNotice(null);
     try {
       const granted = await new Promise<boolean>((resolve) => {
-        chrome.permissions.request(
-          { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
-          (g) => {
-            resolve(Boolean(g));
-          },
-        );
+        chrome.permissions.request({ origins: [...TIMELINE_OPTIONAL_ORIGINS] }, (g) => {
+          resolve(Boolean(g));
+        });
       });
       setHasPermission(granted);
       if (granted) {
-        await recordTimelinePermissionEvent('sidetrack.timeline.permission.granted').catch(() => undefined);
+        await recordTimelinePermissionEvent('sidetrack.timeline.permission.granted').catch(
+          () => undefined,
+        );
       }
       setNotice(
         granted
@@ -250,16 +246,15 @@ export function TimelineSection() {
     setNotice(null);
     try {
       const removed = await new Promise<boolean>((resolve) => {
-        chrome.permissions.remove(
-          { origins: [...TIMELINE_OPTIONAL_ORIGINS] },
-          (r) => {
-            resolve(Boolean(r));
-          },
-        );
+        chrome.permissions.remove({ origins: [...TIMELINE_OPTIONAL_ORIGINS] }, (r) => {
+          resolve(Boolean(r));
+        });
       });
       if (removed) setHasPermission(false);
       if (removed) {
-        await recordTimelinePermissionEvent('sidetrack.timeline.permission.revoked').catch(() => undefined);
+        await recordTimelinePermissionEvent('sidetrack.timeline.permission.revoked').catch(
+          () => undefined,
+        );
       }
       setNotice(
         removed
@@ -279,9 +274,8 @@ export function TimelineSection() {
     <div className="settings-sec-v2" id="sec-timeline" data-testid="settings-timeline-section">
       <div className="sec-h">Timeline observation</div>
       <p className="settings-section-lede ai-italic">
-        When enabled, Sidetrack observes URL + title for every browser tab
-        navigation and attributes each one to the active workstream — no
-        page contents are captured. Default OFF, opt-in.
+        When enabled, Sidetrack observes URL + title for every browser tab navigation and attributes
+        each one to the active workstream — no page contents are captured. Default OFF, opt-in.
       </p>
       <label className={'switch ' + (enabled ? 'on' : '')}>
         <input
@@ -305,7 +299,9 @@ export function TimelineSection() {
       </label>
       <div className="settings-cta-row" style={{ marginTop: 8 }}>
         <span className="mono" data-testid="settings-timeline-permission-status">
-          {hasPermission ? '✓ deeper page access granted' : 'deeper page access not granted (optional)'}
+          {hasPermission
+            ? '✓ deeper page access granted'
+            : 'deeper page access not granted (optional)'}
         </span>
         {hasPermission ? (
           <button
@@ -339,13 +335,11 @@ export function TimelineSection() {
         </div>
       ) : null}
       <p className="settings-hint mono">
-        URL + title observation works as soon as the toggle is on (the
-        manifest's <code>tabs</code> permission covers it). Deeper access
-        is optional — it lets future Sidetrack features (content
-        extraction, in-page actions) work on ambient pages too. Active
-        workstream is set by selecting one in the workboard; observed
-        visits attach via <code>visit_in_workstream</code> in the
-        Connections graph.
+        URL + title observation works as soon as the toggle is on (the manifest's <code>tabs</code>{' '}
+        permission covers it). Deeper access is optional — it lets future Sidetrack features
+        (content extraction, in-page actions) work on ambient pages too. Active workstream is set by
+        selecting one in the workboard; observed visits attach via <code>visit_in_workstream</code>{' '}
+        in the Connections graph.
       </p>
     </div>
   );

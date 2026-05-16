@@ -8,7 +8,7 @@ import {
 
 export type WizardStep = 'welcome' | 'vault' | 'companion' | 'providers' | 'done';
 
-// Vault before Companion — the companion's npx command needs the
+// Vault before Companion — the companion's bunx command needs the
 // vault path the user just picked, so we collect it first and
 // interpolate the chosen path into the command shown to the user.
 const STEP_ORDER: readonly WizardStep[] = ['welcome', 'vault', 'companion', 'providers', 'done'];
@@ -286,7 +286,7 @@ function CompanionStep({
         <div className="wizard-card primary">
           <div className="wizard-card-title">HTTP loopback</div>
           <code className="wizard-card-cmd mono">
-            npx @sidetrack/companion --vault {commandPath}
+            bunx @sidetrack/companion --vault {commandPath}
           </code>
           <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
         </div>
@@ -296,12 +296,13 @@ function CompanionStep({
           <div className="wizard-card">
             <div className="wizard-card-title">Dev build — run from local worktree</div>
             <code className="wizard-card-cmd mono">
-              node ~/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-companion/dist/cli.js
+              bun
+              ~/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-companion/dist/cli.js
               --vault {commandPath}
             </code>
             <div className="wizard-card-meta mono">
-              The npm package isn&apos;t published yet, so the npx command above won&apos;t resolve.
-              Run this directly against the built CLI.
+              The Bun package isn&apos;t published yet, so the bunx command above won&apos;t
+              resolve. Run this directly against the built CLI.
             </div>
           </div>
         </div>

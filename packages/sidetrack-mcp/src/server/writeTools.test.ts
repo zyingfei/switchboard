@@ -570,8 +570,8 @@ describe('sidetrack.dispatch.create', () => {
         },
       });
       expect(writeClient.requestDispatch).toHaveBeenCalledTimes(1);
-      const call = (writeClient.requestDispatch as unknown as { mock: { calls: unknown[][] } })
-        .mock.calls[0]?.[0] as { readonly body: string };
+      const call = (writeClient.requestDispatch as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0]?.[0] as { readonly body: string };
       // Profile-derived formatting prefix is at the top; the
       // user's intent stays verbatim below it.
       expect(call.body).toMatch(/respond in plain text/i);

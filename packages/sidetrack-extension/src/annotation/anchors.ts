@@ -58,9 +58,7 @@ const cssPath = (element: Element | null): string => {
       (child): child is Element => child.tagName === currentElement.tagName,
     );
     const suffix =
-      siblings.length <= 1
-        ? ''
-        : `:nth-of-type(${String(siblings.indexOf(currentElement) + 1)})`;
+      siblings.length <= 1 ? '' : `:nth-of-type(${String(siblings.indexOf(currentElement) + 1)})`;
     parts.unshift(`${tag}${suffix}`);
     currentElement = parent;
   }

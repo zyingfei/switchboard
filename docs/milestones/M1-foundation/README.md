@@ -158,7 +158,7 @@ Promote `poc/local-bridge/companion/` to production-grade per
 - Integration test: in-process HTTP client → companion → vault →
   filesystem inspection
 - `package.json` `bin: { "sidetrack-companion": "./dist/cli.js" }` for
-  `npx @sidetrack/companion`
+  `bunx @sidetrack/companion`
 - **Vault writer** writes:
   - `_BAC/events/<date>.jsonl` — append-only capture event log
   - `_BAC/threads/<bac_id>.json` — per-thread state index (provider,
@@ -310,7 +310,7 @@ The existing `poc/mcp-server/` is the read side. For M1:
   - `bac.coding_sessions()` — returns empty in M1 (no attach UI yet)
 - All tools return empty / sensible defaults if data is absent.
 - One-line install via standard MCP client config:
-  `npx @sidetrack/mcp --vault <path>`.
+  `bunx @sidetrack/mcp --vault <path>`.
 
 ### 4. End-to-end demo script
 
@@ -335,7 +335,7 @@ The milestone is done when **all** of the following pass:
 
 ### Capture & tracking
 
-1. **Companion starts cleanly**: `npx @sidetrack/companion --vault /tmp/sidetrack-m1` boots, binds 127.0.0.1, writes `bridge.key`. Health endpoint responds within 1s.
+1. **Companion starts cleanly**: `bunx @sidetrack/companion --vault /tmp/sidetrack-m1` boots, binds 127.0.0.1, writes `bridge.key`. Health endpoint responds within 1s.
 2. **Extension installs and connects**: load unpacked from `packages/sidetrack-extension/.output/chrome-mv3`. First-run paste of `bridge.key` connects to companion. Side-panel header shows "vault: connected · companion: running".
 3. **Multi-provider capture**: open ChatGPT, Claude, Gemini tabs. Send messages, get assistant turns. Within 30 seconds of each turn, an event lands in `_BAC/events/<date>.jsonl` with the right `provider`, `threadId`, `threadUrl`, `capturedAt`. Side-panel Recent section shows all three threads. Plus: open one arbitrary URL (e.g. a GitHub PR) and "Track current tab" — generic-fallback capture works (URL + title + favicon land in `_BAC/threads/<bac_id>.json`).
 4. **Selector canary**: simulate a broken selector for one provider — yellow banner appears in side panel, clipboard fallback offered, capture still functional.
@@ -362,7 +362,7 @@ The milestone is done when **all** of the following pass:
 
 ### MCP read-side
 
-13. **bac-mcp returns rich data**: `npx @sidetrack/mcp --vault /tmp/sidetrack-m1` boots; from an in-process stdio harness (or real Claude Code with MCP config):
+13. **bac-mcp returns rich data**: `bunx @sidetrack/mcp --vault /tmp/sidetrack-m1` boots; from an in-process stdio harness (or real Claude Code with MCP config):
     - `bac.recent_threads` → returns 4 captured threads
     - `bac.workstream({ id: "<sidetrack id>" })` → returns nested tree + items + queued + checklist
     - `bac.context_pack({ workstreamId })` → returns Markdown context pack
@@ -378,10 +378,10 @@ The milestone is done when **all** of the following pass:
 
 ### Standards gates
 
-17. `cd packages/sidetrack-companion && npm run lint && npm run typecheck && npm test`
-18. `cd packages/sidetrack-extension && npm run lint && npm run typecheck && npm test && npm run build`
-19. `cd packages/sidetrack-extension && npm run e2e` (Playwright)
-20. `cd packages/sidetrack-mcp && npm run lint && npm run typecheck && npm test`
+17. `cd packages/sidetrack-companion && bun run lint && bun run typecheck && bun run test`
+18. `cd packages/sidetrack-extension && bun run lint && bun run typecheck && bun run test && bun run build`
+19. `cd packages/sidetrack-extension && bun run e2e` (Playwright)
+20. `cd packages/sidetrack-mcp && bun run lint && bun run typecheck && bun run test`
 21. **No `any` across boundaries.** Spot-check via `grep -nr ": any" packages/` returns nothing in production code.
 22. **No hidden global state.** Spot-check via the standards' rubric — composition root wires dependencies; no service locators.
 
@@ -472,10 +472,10 @@ Total: ~3.5 hours of reading before code.
 
 Suggested order — each step is independently reviewable:
 
-1. **Scaffold packages/sidetrack-companion/** — TS strict, lint, vitest, package.json + bin. Smoke: `npm test` passes.
-2. **Scaffold packages/sidetrack-extension/** — WXT + React + TS strict, lint, vitest. Side panel renders "Hello Sidetrack" + companion-status badge. Smoke: `npm run build` produces a loadable extension.
-3. **Scaffold packages/sidetrack-mcp/** — lift `poc/mcp-server` to standards. Smoke: `npm test` passes; stdio harness returns empty arrays for all tools.
-4. **Companion API design** — write `packages/sidetrack-companion/docs/api/m1-endpoints.md` from `templates/api-endpoint-rfc.md` covering health, events, threads, workstreams, queue, reminders. Author `packages/sidetrack-companion/openapi.yaml` extending `configs/openapi/openapi.base.yaml`. Wire Spectral (or equivalent) lint via `configs/openapi/api-style-rules.yaml`. Run `checklists/api-design-review.md`. **Land before any route is implemented.** Smoke: `npm run lint:openapi` green.
+1. **Scaffold packages/sidetrack-companion/** — TS strict, lint, vitest, package.json + bin. Smoke: `bun run test` passes.
+2. **Scaffold packages/sidetrack-extension/** — WXT + React + TS strict, lint, vitest. Side panel renders "Hello Sidetrack" + companion-status badge. Smoke: `bun run build` produces a loadable extension.
+3. **Scaffold packages/sidetrack-mcp/** — lift `poc/mcp-server` to standards. Smoke: `bun run test` passes; stdio harness returns empty arrays for all tools.
+4. **Companion API design** — write `packages/sidetrack-companion/docs/api/m1-endpoints.md` from `templates/api-endpoint-rfc.md` covering health, events, threads, workstreams, queue, reminders. Author `packages/sidetrack-companion/openapi.yaml` extending `configs/openapi/openapi.base.yaml`. Wire Spectral (or equivalent) lint via `configs/openapi/api-style-rules.yaml`. Run `checklists/api-design-review.md`. **Land before any route is implemented.** Smoke: `bun run lint:openapi` green.
 5. **Companion: HTTP server + auth + bridge.key** (lift from `poc/local-bridge/companion`, refactor to the route registry pattern). Zod schemas match the RFC. Smoke: `curl` hits `/v1/health`.
 6. **Companion: vault writer + audit log + capture-event endpoint** (`POST /v1/events`). Smoke: HTTP write → JSONL line in vault.
 7. **Companion: workstream/queue/reminder endpoints** (full vault writer per Deliverable 1). Smoke: each endpoint writes the expected vault file.

@@ -22,9 +22,7 @@ describe('RecentDispatches — mode-aware actions', () => {
     const onOpenTarget = vi.fn();
     render(
       <RecentDispatches
-        dispatches={[
-          buildEvent({ targetThreadTitle: 'destination chat' }),
-        ]}
+        dispatches={[buildEvent({ targetThreadTitle: 'destination chat' })]}
         onOpenTarget={onOpenTarget}
       />,
     );
@@ -75,9 +73,7 @@ describe('RecentDispatches — mode-aware actions', () => {
 
   it('view button is always present and fires onView', () => {
     const onView = vi.fn();
-    render(
-      <RecentDispatches dispatches={[buildEvent()]} onView={onView} />,
-    );
+    render(<RecentDispatches dispatches={[buildEvent()]} onView={onView} />);
     const view = screen.getByRole('button', { name: 'View dispatch body' });
     fireEvent.click(view);
     expect(onView).toHaveBeenCalledWith('d1');
@@ -85,12 +81,7 @@ describe('RecentDispatches — mode-aware actions', () => {
 
   it('source side fires onFocusSource', () => {
     const onFocusSource = vi.fn();
-    render(
-      <RecentDispatches
-        dispatches={[buildEvent()]}
-        onFocusSource={onFocusSource}
-      />,
-    );
+    render(<RecentDispatches dispatches={[buildEvent()]} onFocusSource={onFocusSource} />);
     fireEvent.click(screen.getByRole('button', { name: /Source thread/ }));
     expect(onFocusSource).toHaveBeenCalledWith('d1');
   });
@@ -108,11 +99,7 @@ describe('RecentDispatches — mode-aware actions', () => {
   });
 
   it('linked row chip shows the destination thread title (not the placeholder)', () => {
-    render(
-      <RecentDispatches
-        dispatches={[buildEvent({ targetThreadTitle: 'my new chat' })]}
-      />,
-    );
+    render(<RecentDispatches dispatches={[buildEvent({ targetThreadTitle: 'my new chat' })]} />);
     expect(screen.getByText('my new chat')).toBeInTheDocument();
     expect(screen.queryByText('open new thread')).toBeNull();
     expect(screen.queryByText('send to new thread')).toBeNull();

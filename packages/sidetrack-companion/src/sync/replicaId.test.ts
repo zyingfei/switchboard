@@ -4,11 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  loadOrCreateReplica,
-  replicaIdPath,
-  replicaSeqPath,
-} from './replicaId.js';
+import { loadOrCreateReplica, replicaIdPath, replicaSeqPath } from './replicaId.js';
 
 describe('replica context', () => {
   let vaultRoot: string;
@@ -64,9 +60,7 @@ describe('replica context', () => {
 
   it('serializes concurrent nextSeq callers so values are unique and contiguous', async () => {
     const ctx = await loadOrCreateReplica(vaultRoot);
-    const results = await Promise.all(
-      Array.from({ length: 32 }, () => ctx.nextSeq()),
-    );
+    const results = await Promise.all(Array.from({ length: 32 }, () => ctx.nextSeq()));
     const sorted = [...results].sort((a, b) => a - b);
     expect(sorted).toEqual(Array.from({ length: 32 }, (_, i) => i + 1));
     expect(ctx.peekSeq()).toBe(32);

@@ -22,11 +22,7 @@ interface AnnotationOverlayProps {
   readonly onMarkerClick?: (id: string) => void;
 }
 
-export function AnnotationOverlay({
-  markers,
-  hint,
-  onMarkerClick,
-}: AnnotationOverlayProps) {
+export function AnnotationOverlay({ markers, hint, onMarkerClick }: AnnotationOverlayProps) {
   if (markers.length === 0 && hint === undefined) {
     return null;
   }

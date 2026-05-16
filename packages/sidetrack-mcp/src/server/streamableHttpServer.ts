@@ -162,8 +162,7 @@ export const startStreamableHttpMcpServer = async (
         jsonrpc: '2.0',
         error: {
           code: mcpAuthenticationRequiredCode,
-          message:
-            'Authentication required. Connect with Authorization: Bearer <bridge-key>.',
+          message: 'Authentication required. Connect with Authorization: Bearer <bridge-key>.',
         },
         id: null,
       });

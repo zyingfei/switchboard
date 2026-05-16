@@ -6,23 +6,23 @@ Status: implementation smoke runbook for the PR #13 M1 packages.
 
 ```sh
 cd packages/sidetrack-companion
-npm run lint && npm run typecheck && npm test && npm run build && npm run lint:openapi
+bun run lint && bun run typecheck && bun run test && bun run build && bun run lint:openapi
 
 cd ../sidetrack-extension
-npm run lint && npm run typecheck && npm test && npm run build && npm run e2e
+bun run lint && bun run typecheck && bun run test && bun run build && bun run e2e
 
 cd ../sidetrack-mcp
-npm run lint && npm run typecheck && npm test && npm run build
+bun run lint && bun run typecheck && bun run test && bun run build
 ```
 
-`npm run e2e` for the extension builds the MV3 bundle, verifies the loadable manifest, builds the companion, then launches the extension in Playwright's bundled Chromium with a persistent temp profile. The automated pass uses the `poc/provider-capture` provider fixtures against a temp companion vault under `/tmp`; branded Google Chrome is reserved for the manual Developer Mode path below.
+`bun run e2e` for the extension builds the MV3 bundle, verifies the loadable manifest, builds the companion, then launches the extension in Playwright's bundled Chromium with a persistent temp profile. The automated pass uses the `poc/provider-capture` provider fixtures against a temp companion vault under `/tmp`; branded Google Chrome is reserved for the manual Developer Mode path below.
 
 ## Companion
 
 ```sh
 cd packages/sidetrack-companion
-npm run build
-node dist/cli.js --vault /tmp/sidetrack-m1 --port 17373
+bun run build
+bun dist/cli.js --vault /tmp/sidetrack-m1 --port 17373
 ```
 
 The companion binds `127.0.0.1`, writes `/tmp/sidetrack-m1/_BAC/.config/bridge.key`, and serves:
@@ -42,12 +42,12 @@ Use the bridge key value as the `x-bac-bridge-key` header. `POST /v1/events` and
 
 ```sh
 cd packages/sidetrack-extension
-npm run build
+bun run build
 ```
 
 Load unpacked from `packages/sidetrack-extension/.output/chrome-mv3`.
 
-Automated MV3 validation does not side-load into a main Chrome profile. Use `npm run e2e` for Playwright-bundled Chromium coverage, and use Chrome Developer Mode → Load unpacked only for a human acceptance pass.
+Automated MV3 validation does not side-load into a main Chrome profile. Use `bun run e2e` for Playwright-bundled Chromium coverage, and use Chrome Developer Mode → Load unpacked only for a human acceptance pass.
 
 1. Open the side panel.
 2. Paste the bridge key from `/tmp/sidetrack-m1/_BAC/.config/bridge.key`.
@@ -62,9 +62,9 @@ If the companion is down, captures are queued in `chrome.storage.local` and repl
 
 ```sh
 cd packages/sidetrack-mcp
-npm run build
-node dist/cli.js --vault /tmp/sidetrack-m1 --list-tools
-node dist/cli.js --vault /tmp/sidetrack-m1
+bun run build
+bun dist/cli.js --vault /tmp/sidetrack-m1 --list-tools
+bun dist/cli.js --vault /tmp/sidetrack-m1
 ```
 
 The M1 read-only tools are:
@@ -90,7 +90,7 @@ The stdio integration test covers a populated `_BAC` vault fixture and verifies 
 
 ### Capture & tracking
 
-- [ ] Companion starts cleanly. Verify `node dist/cli.js --vault /tmp/sidetrack-m1 --port 17373` binds `127.0.0.1`, writes `_BAC/.config/bridge.key`, and `GET /v1/health` responds within 1s.
+- [ ] Companion starts cleanly. Verify `bun dist/cli.js --vault /tmp/sidetrack-m1 --port 17373` binds `127.0.0.1`, writes `_BAC/.config/bridge.key`, and `GET /v1/health` responds within 1s.
 - [ ] Extension installs and connects. Verify the unpacked MV3 build loads, the bridge key paste succeeds, and the side panel header reports the vault as connected with the companion running.
 - [ ] Multi-provider capture works. Verify ChatGPT, Claude, and Gemini each produce captured events in `_BAC/events/<date>.jsonl`, then use Track current tab on an arbitrary URL and confirm the generic fallback thread lands in `_BAC/threads/<bac_id>.json`.
 - [ ] Selector canary degrades safely. Verify a broken provider selector raises the yellow warning banner, offers fallback, and capture still works.
@@ -127,9 +127,9 @@ The stdio integration test covers a populated `_BAC` vault fixture and verifies 
 
 ### Standards
 
-- [ ] Companion standards commands pass. Verify `cd packages/sidetrack-companion && npm run lint && npm run typecheck && npm test`.
-- [ ] Extension standards commands pass. Verify `cd packages/sidetrack-extension && npm run lint && npm run typecheck && npm test && npm run build`.
-- [ ] Extension Playwright e2e passes. Verify `cd packages/sidetrack-extension && npm run e2e`; this uses bundled Chromium, a persistent temp profile, and a temp companion vault.
-- [ ] MCP standards commands pass. Verify `cd packages/sidetrack-mcp && npm run lint && npm run typecheck && npm test`.
+- [ ] Companion standards commands pass. Verify `cd packages/sidetrack-companion && bun run lint && bun run typecheck && bun run test`.
+- [ ] Extension standards commands pass. Verify `cd packages/sidetrack-extension && bun run lint && bun run typecheck && bun run test && bun run build`.
+- [ ] Extension Playwright e2e passes. Verify `cd packages/sidetrack-extension && bun run e2e`; this uses bundled Chromium, a persistent temp profile, and a temp companion vault.
+- [ ] MCP standards commands pass. Verify `cd packages/sidetrack-mcp && bun run lint && bun run typecheck && bun run test`.
 - [ ] No `any` across production boundaries. Verify `grep -nr ": any" packages/` returns nothing in production code.
 - [ ] No hidden global state. Verify composition roots still own dependency wiring and no service-locator style globals were introduced.

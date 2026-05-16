@@ -5,7 +5,7 @@
 // Run from packages/sidetrack-extension:
 //   SIDETRACK_TEST_SESSIONS_DIR=/tmp/t1-smoke \
 //   SIDETRACK_CAPTURE_LEVEL=html \
-//     npx playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
+//     bunx --bun --no-install playwright test tests/e2e/record-replay-two-browser.manual.spec.ts \
 //     --headed --timeout 0 --grep manual
 //
 // Set SIDETRACK_REPLAY_HOLD=1 to leave Browser A and Browser B open

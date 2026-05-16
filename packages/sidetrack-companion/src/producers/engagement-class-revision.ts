@@ -16,22 +16,14 @@ import {
   isEngagementSessionAggregatedPayload,
   type EngagementDimensions,
 } from '../engagement/events.js';
-import {
-  NAVIGATION_COMMITTED,
-  isNavigationCommittedPayload,
-} from '../navigation/events.js';
+import { NAVIGATION_COMMITTED, isNavigationCommittedPayload } from '../navigation/events.js';
 import type { SelectionPastedPayload } from '../snippets/events.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
 
 const DOWNSTREAM_PASTE_DESTINATIONS: ReadonlySet<SelectionPastedPayload['destinationKind']> =
-  new Set<SelectionPastedPayload['destinationKind']>([
-    'thread',
-    'dispatch',
-    'note',
-    'capture',
-  ]);
+  new Set<SelectionPastedPayload['destinationKind']>(['thread', 'dispatch', 'note', 'capture']);
 
 interface LatestSessionAggregate {
   readonly visitId: string;
@@ -174,10 +166,7 @@ const recordCanonical = (
   for (const alias of canonicalVisitAliases(canonical)) byVisitId.set(alias, canonical);
 };
 
-const recordTimelineDay = (
-  byVisitId: Map<string, string>,
-  day: TimelineDayProjection,
-): void => {
+const recordTimelineDay = (byVisitId: Map<string, string>, day: TimelineDayProjection): void => {
   for (const entry of day.entries) {
     const canonical = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
     recordCanonical(byVisitId, entry.id, canonical);
@@ -204,22 +193,16 @@ const foldEngagementAggregateIntoAccumulator = (
     replicaId: event.dot.replicaId,
     seq: event.dot.seq,
   };
-  const key = [
-    payload.visitId,
-    payload.sessionId,
-    event.dot.replicaId,
-    String(event.dot.seq),
-  ].join('\u0000');
+  const key = [payload.visitId, payload.sessionId, event.dot.replicaId, String(event.dot.seq)].join(
+    '\u0000',
+  );
   const existing = acc.latestByVisitSession.get(key);
   if (existing === undefined || compareEventOrder(existing, next) < 0) {
     acc.latestByVisitSession.set(key, next);
   }
 };
 
-const foldNavigationIntoAccumulator = (
-  acc: EngagementAccumulator,
-  event: AcceptedEvent,
-): void => {
+const foldNavigationIntoAccumulator = (acc: EngagementAccumulator, event: AcceptedEvent): void => {
   if (event.type !== NAVIGATION_COMMITTED) return;
   if (!isNavigationCommittedPayload(event.payload)) return;
   recordCanonical(acc.canonicalUrlByVisitId, event.payload.visitId, event.payload.canonicalUrl);
@@ -318,7 +301,6 @@ export const buildEngagementClassifierInputs = (
 ): readonly EngagementClassifierInput[] =>
   engagementClassifierInputsFromAccumulator(seedEngagementAccumulator(events, timelineDays));
 
-
 export const buildEngagementClassRevisionFromEvents = (
   events: readonly AcceptedEvent[],
   timelineDays: readonly TimelineDayProjection[],
@@ -328,10 +310,7 @@ export const buildEngagementClassRevisionFromEvents = (
   } = {},
 ): EngagementClassRevision => {
   const inputs = buildEngagementClassifierInputs(events, timelineDays);
-  const maxAcceptedAtMs = events.reduce(
-    (max, event) => Math.max(max, event.acceptedAtMs),
-    0,
-  );
+  const maxAcceptedAtMs = events.reduce((max, event) => Math.max(max, event.acceptedAtMs), 0);
   return buildEngagementClassRevision(inputs, {
     ...(options.thresholds === undefined ? {} : { thresholds: options.thresholds }),
     producedAt: options.producedAt ?? maxAcceptedAtMs,
@@ -347,8 +326,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const isEngagementClass = (value: unknown): value is EngagementClass =>
-  typeof value === 'string' &&
-  ENGAGEMENT_CLASSES.some((candidate) => candidate === value);
+  typeof value === 'string' && ENGAGEMENT_CLASSES.some((candidate) => candidate === value);
 
 const isClassification = (
   value: unknown,
@@ -360,9 +338,7 @@ const isClassification = (
   value['canonicalUrl'].length > 0 &&
   isEngagementClass(value['class']);
 
-export const isEngagementClassRevision = (
-  value: unknown,
-): value is EngagementClassRevision =>
+export const isEngagementClassRevision = (value: unknown): value is EngagementClassRevision =>
   isRecord(value) &&
   typeof value['revisionId'] === 'string' &&
   value['revisionId'].length > 0 &&
@@ -389,15 +365,10 @@ export const createEngagementClassRevisionStore = (
   };
 
   const putRevision = async (revision: EngagementClassRevision): Promise<void> => {
-    await writeAtomic(
-      revisionPath(revision.revisionId),
-      JSON.stringify(revision, null, 2),
-    );
+    await writeAtomic(revisionPath(revision.revisionId), JSON.stringify(revision, null, 2));
   };
 
-  const readRevision = async (
-    revisionId: string,
-  ): Promise<EngagementClassRevision | null> => {
+  const readRevision = async (revisionId: string): Promise<EngagementClassRevision | null> => {
     try {
       const parsed: unknown = JSON.parse(await readFile(revisionPath(revisionId), 'utf8'));
       return isEngagementClassRevision(parsed) ? parsed : null;

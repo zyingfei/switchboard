@@ -220,10 +220,7 @@ describe('ingestor', () => {
     const replicaA = await mkdtemp(join(tmpdir(), 'sidetrack-det-A-'));
     const replicaB = await mkdtemp(join(tmpdir(), 'sidetrack-det-B-'));
     try {
-      const [bytesA, bytesB] = await Promise.all([
-        seedReplica(replicaA),
-        seedReplica(replicaB),
-      ]);
+      const [bytesA, bytesB] = await Promise.all([seedReplica(replicaA), seedReplica(replicaB)]);
       expect(bytesA.equals(bytesB)).toBe(true);
     } finally {
       await rm(replicaA, { recursive: true, force: true });
@@ -267,9 +264,7 @@ describe('ingestor', () => {
       payload: {
         bac_id: 'thread_concurrent',
         capturedAt: '2026-05-07T07:00:00.000Z',
-        turns: [
-          { ordinal: 0, role: 'user', text: 'concurrent peer-A turn' },
-        ],
+        turns: [{ ordinal: 0, role: 'user', text: 'concurrent peer-A turn' }],
       },
       acceptedAtMs: 1_780_000_000_000,
     });
@@ -303,9 +298,7 @@ describe('ingestor', () => {
     // Layer-2: chunks for thread_concurrent are present AND
     // tombstoned. Target-level semantics: NOT add-wins.
     const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
-    const concurrent = (index?.items ?? []).filter(
-      (item) => item.threadId === 'thread_concurrent',
-    );
+    const concurrent = (index?.items ?? []).filter((item) => item.threadId === 'thread_concurrent');
     expect(concurrent.length).toBeGreaterThan(0);
     expect(concurrent.every((item) => item.tombstoned === true)).toBe(true);
   });
@@ -400,8 +393,7 @@ describe('ingestor', () => {
     const second = await ingestIncremental(vaultRoot, eventLog);
     expect(second.indexedChunks).toBeGreaterThan(0);
     const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
-    const peerChunks =
-      index?.items.filter((item) => item.threadId === 'thread_delayed') ?? [];
+    const peerChunks = index?.items.filter((item) => item.threadId === 'thread_delayed') ?? [];
     expect(peerChunks.length).toBeGreaterThan(0);
     expect(
       peerChunks.every((item) => item.tombstoned === true),

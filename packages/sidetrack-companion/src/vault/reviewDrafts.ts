@@ -3,8 +3,7 @@ import { basename, dirname, join } from 'node:path';
 
 import type { ReviewDraftProjection } from '../review/projection.js';
 
-const reviewDraftsDir = (vaultRoot: string): string =>
-  join(vaultRoot, '_BAC', 'review-drafts');
+const reviewDraftsDir = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'review-drafts');
 
 const reviewDraftPath = (vaultRoot: string, threadId: string): string =>
   join(reviewDraftsDir(vaultRoot), `${threadId}.json`);
@@ -15,7 +14,10 @@ const isMissingError = (error: unknown): boolean =>
 const writeJsonAtomic = async (path: string, value: unknown): Promise<void> => {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true });
-  const tempPath = join(directory, `.${basename(path)}.${String(process.pid)}.${String(Date.now())}.tmp`);
+  const tempPath = join(
+    directory,
+    `.${basename(path)}.${String(process.pid)}.${String(Date.now())}.tmp`,
+  );
   await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
   await rename(tempPath, path);
 };
@@ -41,10 +43,7 @@ export const readReviewDraft = async (
   }
 };
 
-export const deleteReviewDraft = async (
-  vaultRoot: string,
-  threadId: string,
-): Promise<void> => {
+export const deleteReviewDraft = async (vaultRoot: string, threadId: string): Promise<void> => {
   try {
     await unlink(reviewDraftPath(vaultRoot, threadId));
   } catch (error) {

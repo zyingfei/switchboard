@@ -575,7 +575,7 @@ or PR per step):
 1. **Pre-flight**: read M1 final deliverables; map M1's API contracts;
    sketch M2's additive endpoints in `docs/api/m2-additions.md`.
 2. **packages/sidetrack-shared/**: scaffold (if M1 didn't already
-   create it). Strict TS, vitest. Smoke: `npm test`.
+   create it). Strict TS, vitest. Smoke: `bun run test`.
 3. **RedactionPipeline** in shared. Default deny-list + user-rule
    registry types + streaming match-and-replace + tests.
 4. **Token-budget adapter** in shared. tiktoken-js wrap + per-model

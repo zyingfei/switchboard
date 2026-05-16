@@ -53,12 +53,9 @@ describe('/v1/status availability contract', () => {
   // `await embed(...)` to /v1/status.
   it('source of /v1/status handler does not reference any forbidden recall/embedder/ONNX module', async () => {
     const fs = await import('node:fs/promises');
-    const serverSrc = await fs.readFile(
-      resolve(packageRoot, 'src', 'http', 'server.ts'),
-      'utf8',
-    );
+    const serverSrc = await fs.readFile(resolve(packageRoot, 'src', 'http', 'server.ts'), 'utf8');
     // Slice out the /v1/status handler block.
-    const start = serverSrc.indexOf("pattern: /^\\/v1\\/status$/");
+    const start = serverSrc.indexOf('pattern: /^\\/v1\\/status$/');
     expect(start, '/v1/status handler not found in server.ts').toBeGreaterThan(0);
     // Find the closing of the route object — the next `},` at the
     // same indentation level. Approximate by reading 6000 chars; the
@@ -73,7 +70,7 @@ describe('/v1/status availability contract', () => {
   });
 
   it('compiled CLI does not bundle onnxruntime-node into the /v1/status path', () => {
-    // Smoke test using a one-off Node process: import the http
+    // Smoke test using a one-off Bun process: import the http
     // server module, then check require.cache for forbidden native
     // modules. If the route truly stays hot-path, ONNX hasn't been
     // loaded yet at this point.

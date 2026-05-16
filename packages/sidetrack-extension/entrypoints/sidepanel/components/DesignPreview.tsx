@@ -28,8 +28,7 @@ const FIXTURE_DEJA: readonly DejaVuItem[] = [
     providerLabel: 'Claude',
     providerKey: 'claude',
     title: 'Threat model — replay defense',
-    snippet:
-      '…use HMAC-SHA256 and keep tolerance under ±2 minutes for production replay defense…',
+    snippet: '…use HMAC-SHA256 and keep tolerance under ±2 minutes for production replay defense…',
     relativeWhen: '14 days ago',
     score: 0.92,
   },
@@ -158,8 +157,8 @@ export function DesignPreview({ onClose }: DesignPreviewProps) {
               marginBottom: 16,
             }}
           >
-            Déjà-vu popover anchored to a hypothetical text selection. In production it
-            mounts into the host page&apos;s document via portal.
+            Déjà-vu popover anchored to a hypothetical text selection. In production it mounts into
+            the host page&apos;s document via portal.
           </p>
           {dejaOpen ? (
             <DejaVuPopover
@@ -264,8 +263,7 @@ export function DesignPreview({ onClose }: DesignPreviewProps) {
               marginBottom: 8,
             }}
           >
-            Per-row workstream suggestion — renders inline below an ungrouped
-            thread row.
+            Per-row workstream suggestion — renders inline below an ungrouped thread row.
           </p>
           <NeedsOrganizeSuggestion
             suggestedLabel="Sidetrack / MVP PRD"

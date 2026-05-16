@@ -4,16 +4,14 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from './events.js';
 import { projectDispatches } from './projection.js';
 
-const event = (
-  partial: {
-    readonly type: string;
-    readonly replicaId: string;
-    readonly seq: number;
-    readonly payload: Record<string, unknown>;
-    readonly deps?: Record<string, number>;
-    readonly acceptedAtMs?: number;
-  },
-): AcceptedEvent => ({
+const event = (partial: {
+  readonly type: string;
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly payload: Record<string, unknown>;
+  readonly deps?: Record<string, number>;
+  readonly acceptedAtMs?: number;
+}): AcceptedEvent => ({
   clientEventId: `${partial.replicaId}.${String(partial.seq)}`,
   dot: { replicaId: partial.replicaId, seq: partial.seq },
   deps: partial.deps ?? {},

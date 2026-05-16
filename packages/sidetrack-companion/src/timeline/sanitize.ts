@@ -93,9 +93,7 @@ export const detectSearchUrl = (input: string): SearchUrlInfo | null => {
     return null;
   }
   const rawPath = parsed.pathname.toLowerCase();
-  const path = rawPath.length > 1 && rawPath.endsWith('/')
-    ? rawPath.replace(/\/+$/u, '')
-    : rawPath;
+  const path = rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.replace(/\/+$/u, '') : rawPath;
   const normalized = path.length === 0 ? '/' : path;
   if (!SEARCH_PATHS.has(normalized)) return null;
   const q = parsed.searchParams.get('q');
@@ -145,13 +143,8 @@ export const sanitizeTimelinePayload = <
 ): T => {
   const sanitizedUrl = sanitizeTimelineUrl(payload.url);
   const sanitizedCanonical =
-    payload.canonicalUrl === undefined
-      ? undefined
-      : sanitizeTimelineUrl(payload.canonicalUrl);
-  if (
-    sanitizedUrl === payload.url &&
-    sanitizedCanonical === payload.canonicalUrl
-  ) {
+    payload.canonicalUrl === undefined ? undefined : sanitizeTimelineUrl(payload.canonicalUrl);
+  if (sanitizedUrl === payload.url && sanitizedCanonical === payload.canonicalUrl) {
     return payload;
   }
   return {

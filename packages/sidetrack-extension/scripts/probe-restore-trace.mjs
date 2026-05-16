@@ -2,7 +2,10 @@ import { chromium } from '@playwright/test';
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const [context] = browser.contexts();
 const chat = context.pages().find((p) => p.url().includes('69fa8f0f'));
-if (!chat) { console.log('chat tab not found'); process.exit(1); }
+if (!chat) {
+  console.log('chat tab not found');
+  process.exit(1);
+}
 
 // Read the live DOM textContent and try to manually replicate the
 // findAnchor normalized-match for each annotation. This bypasses the
@@ -31,7 +34,12 @@ const out = await chat.evaluate(() => {
       const matched = (rawPrefixOk || normPrefixOk) && (rawSuffixOk || normSuffixOk);
       if (matched || occurrences <= 3) {
         tries.push({
-          idx, matched, rawPrefixOk, rawSuffixOk, normPrefixOk, normSuffixOk,
+          idx,
+          matched,
+          rawPrefixOk,
+          rawSuffixOk,
+          normPrefixOk,
+          normSuffixOk,
           prefixSeen: JSON.stringify(prefix.slice(-32)),
           suffixSeen: JSON.stringify(suffix.slice(0, 32)),
         });
@@ -42,10 +50,26 @@ const out = await chat.evaluate(() => {
     return { occurrences, matched: false, tries };
   };
   const cases = [
-    { term: 'Chrome', prefix: "e.\n\nI’ve got the candidate: the ", suffix: '/Gemini Nano story is far ahead ' },
-    { term: 'V8',     prefix: 'parable in spirit to shipping **',    suffix: '**, **SQLite**, **PDFium**, or m' },
-    { term: 'WebGPU', prefix: 'l than N websites each bundling ',   suffix: '/WASM inference stacks, ONNX Run' },
-    { term: 'GPU',    prefix: 'han N websites each bundling Web',   suffix: '/WASM inference stacks, ONNX Run' },
+    {
+      term: 'Chrome',
+      prefix: 'e.\n\nI’ve got the candidate: the ',
+      suffix: '/Gemini Nano story is far ahead ',
+    },
+    {
+      term: 'V8',
+      prefix: 'parable in spirit to shipping **',
+      suffix: '**, **SQLite**, **PDFium**, or m',
+    },
+    {
+      term: 'WebGPU',
+      prefix: 'l than N websites each bundling ',
+      suffix: '/WASM inference stacks, ONNX Run',
+    },
+    {
+      term: 'GPU',
+      prefix: 'han N websites each bundling Web',
+      suffix: '/WASM inference stacks, ONNX Run',
+    },
   ];
   return {
     fullTextLen: fullText.length,

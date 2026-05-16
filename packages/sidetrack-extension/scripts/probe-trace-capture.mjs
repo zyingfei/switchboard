@@ -10,11 +10,19 @@ const state = await sw.evaluate(async () => {
   const dispatchDiagnostic = (await get('sidetrack.dispatchDiagnostic')) ?? null;
   return {
     dispatchCount: cachedDispatches.length,
-    autoApprovedCount: cachedDispatches.filter((d) => d.mcpRequest?.approval === 'auto-approved').length,
+    autoApprovedCount: cachedDispatches.filter((d) => d.mcpRequest?.approval === 'auto-approved')
+      .length,
     threadCount: Array.isArray(cachedThreads) ? cachedThreads.length : 'not-array',
-    chatgptThreads: Array.isArray(cachedThreads) ? cachedThreads
-      .filter((t) => t.provider === 'chatgpt')
-      .map((t) => ({ bac_id: t.bac_id, url: t.threadUrl, title: t.title, lastSeenAt: t.lastSeenAt })) : [],
+    chatgptThreads: Array.isArray(cachedThreads)
+      ? cachedThreads
+          .filter((t) => t.provider === 'chatgpt')
+          .map((t) => ({
+            bac_id: t.bac_id,
+            url: t.threadUrl,
+            title: t.title,
+            lastSeenAt: t.lastSeenAt,
+          }))
+      : [],
     queuedCaptureCount: Array.isArray(queuedCaptures) ? queuedCaptures.length : 'not-array',
     dispatchDiagnostic,
   };

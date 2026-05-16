@@ -319,10 +319,12 @@ describe('per-URL HTTP routes', () => {
       };
     };
     expect(body.data?.status).toBe('applied');
-    expect(body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution).toMatchObject({
-      workstreamId: 'ws_security',
-      source: 'inferred',
-    });
+    expect(body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution).toMatchObject(
+      {
+        workstreamId: 'ws_security',
+        source: 'inferred',
+      },
+    );
     await expect(eventLog.readMerged()).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({

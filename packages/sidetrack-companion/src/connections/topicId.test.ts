@@ -4,11 +4,7 @@ import { topicId } from './topicId.js';
 
 describe('topicId', () => {
   it('produces the same id regardless of input order', async () => {
-    const members = [
-      'https://example.test/b',
-      'https://example.test/a',
-      'https://example.test/c',
-    ];
+    const members = ['https://example.test/b', 'https://example.test/a', 'https://example.test/c'];
 
     await expect(topicId(members)).resolves.toBe(
       await topicId([members[2]!, members[0]!, members[1]!]),
@@ -21,10 +17,7 @@ describe('topicId', () => {
       'https://example.test/b',
       'https://example.test/c',
     ]);
-    const missingOne = await topicId([
-      'https://example.test/a',
-      'https://example.test/b',
-    ]);
+    const missingOne = await topicId(['https://example.test/a', 'https://example.test/b']);
 
     expect(full).not.toBe(missingOne);
   });

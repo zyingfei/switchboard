@@ -235,7 +235,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
     // Vault step is now first after Welcome (vaultPath defaults to
-    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // '~/Documents/Sidetrack-vault' so the bunx command can render
     // it). Next twice → companion step.
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
@@ -259,7 +259,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />,
     );
     // Vault step is now first after Welcome (vaultPath defaults to
-    // '~/Documents/Sidetrack-vault' so the npx command can render
+    // '~/Documents/Sidetrack-vault' so the bunx command can render
     // it). Next twice → companion step.
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));

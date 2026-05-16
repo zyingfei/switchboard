@@ -354,13 +354,13 @@ export interface CompanionHttpConfig {
       readonly eventsOut?: number;
       readonly lastInboundAtMs?: number;
       readonly lastOutboundAtMs?: number;
-      readonly byReplica?: ReadonlyArray<{
+      readonly byReplica?: readonly {
         readonly replicaId: string;
         readonly eventsIn: number;
         readonly eventsOut: number;
         readonly lastInboundAtMs?: number;
         readonly lastOutboundAtMs?: number;
-      }>;
+      }[];
     } | null;
   };
   readonly updateChecker?: () => Promise<UpdateAdvisory>;
@@ -786,8 +786,8 @@ const applyPageContentCoverageToSnapshot = async (
   const timelineUrls = snapshot.nodes
     .filter((node) => node.kind === 'timeline-visit')
     .map((node) =>
-      typeof node.metadata['canonicalUrl'] === 'string'
-        ? node.metadata['canonicalUrl']
+      typeof node.metadata.canonicalUrl === 'string'
+        ? node.metadata.canonicalUrl
         : node.id.startsWith('timeline-visit:')
           ? node.id.slice('timeline-visit:'.length)
           : '',
@@ -800,8 +800,8 @@ const applyPageContentCoverageToSnapshot = async (
     nodes: snapshot.nodes.map((node) => {
       if (node.kind !== 'timeline-visit') return node;
       const canonicalUrl =
-        typeof node.metadata['canonicalUrl'] === 'string'
-          ? node.metadata['canonicalUrl']
+        typeof node.metadata.canonicalUrl === 'string'
+          ? node.metadata.canonicalUrl
           : node.id.startsWith('timeline-visit:')
             ? node.id.slice('timeline-visit:'.length)
             : undefined;
@@ -844,16 +844,10 @@ const queryRecallContent = async (
   const indexMtime = indexStat?.mtimeMs ?? 0;
   const cached = lexicalIndexCache.get(indexFilePath);
   const lexical: HybridLexicalIndex =
-    cached !== undefined &&
-    cached.mtimeMs === indexMtime &&
-    cached.entryCount === index.items.length
+    cached?.mtimeMs === indexMtime && cached.entryCount === index.items.length
       ? cached.index
       : buildLexicalIndex(index.items);
-  if (
-    cached === undefined ||
-    cached.mtimeMs !== indexMtime ||
-    cached.entryCount !== index.items.length
-  ) {
+  if (cached?.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
     lexicalIndexCache.set(indexFilePath, {
       mtimeMs: indexMtime,
       entryCount: index.items.length,
@@ -1508,7 +1502,7 @@ const routes: readonly RouteDefinition[] = [
               : { startedAt: context.startedAt.toISOString() }),
             // gitSha is best-effort: it's set when the CLI is invoked
             // with --git-sha or with the SIDETRACK_COMPANION_GIT_SHA
-            // env var. Absent in normal `node dist/cli.js` runs.
+            // env var. Absent in normal `bun dist/cli.js` runs.
             ...(typeof process.env['SIDETRACK_COMPANION_GIT_SHA'] === 'string' &&
             process.env['SIDETRACK_COMPANION_GIT_SHA'].length > 0
               ? { gitSha: process.env['SIDETRACK_COMPANION_GIT_SHA'] }
@@ -2653,10 +2647,9 @@ const routes: readonly RouteDefinition[] = [
           return await Promise.race([
             op().then((value) => ({ value, availability: 'ok' as const })),
             new Promise<{ value: null; availability: 'unavailable' }>((resolve) => {
-              timer = setTimeout(
-                () => resolve({ value: null, availability: 'unavailable' }),
-                ms,
-              );
+              timer = setTimeout(() => {
+                resolve({ value: null, availability: 'unavailable' });
+              }, ms);
             }),
           ]);
         } catch {
@@ -2767,11 +2760,11 @@ const routes: readonly RouteDefinition[] = [
               name: string;
               version: string;
               manifest_schema: number;
-              emits: ReadonlyArray<{
+              emits: readonly {
                 event_type: string;
                 payload_version: number;
                 stability?: 'alpha' | 'beta' | 'stable' | 'deprecated';
-              }>;
+              }[];
               capabilities: {
                 'reads-paths'?: readonly string[];
                 'reads-env'?: readonly string[];
@@ -4022,16 +4015,10 @@ const routes: readonly RouteDefinition[] = [
       const indexMtime = indexStat?.mtimeMs ?? 0;
       const cached = lexicalIndexCache.get(indexFilePath);
       const lexical: HybridLexicalIndex =
-        cached !== undefined &&
-        cached.mtimeMs === indexMtime &&
-        cached.entryCount === index.items.length
+        cached?.mtimeMs === indexMtime && cached.entryCount === index.items.length
           ? cached.index
           : buildLexicalIndex(index.items);
-      if (
-        cached === undefined ||
-        cached.mtimeMs !== indexMtime ||
-        cached.entryCount !== index.items.length
-      ) {
+      if (cached?.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
         lexicalIndexCache.set(indexFilePath, {
           mtimeMs: indexMtime,
           entryCount: index.items.length,
@@ -5200,7 +5187,7 @@ const routes: readonly RouteDefinition[] = [
         if (until !== undefined && d > until.slice(0, 10)) return false;
         return true;
       });
-      const items: Array<{
+      const items: {
         readonly date: string;
         readonly id: string;
         readonly firstSeenAt: string;
@@ -5210,7 +5197,7 @@ const routes: readonly RouteDefinition[] = [
         readonly title?: string;
         readonly provider?: string;
         readonly visitCount: number;
-      }> = [];
+      }[] = [];
       // Reviewer F6: also apply EXACT timestamp filtering. The
       // day-bucket filter above is only a coarse pass that picks
       // which files to open. An entry on the boundary day might
@@ -5429,7 +5416,7 @@ const routes: readonly RouteDefinition[] = [
         const wsNodeId = `workstream:${workstreamId}`;
         const keepNodeIds = new Set<string>([wsNodeId]);
         for (const n of nodes) {
-          if (n.metadata['workstreamId'] === workstreamId) keepNodeIds.add(n.id);
+          if (n.metadata.workstreamId === workstreamId) keepNodeIds.add(n.id);
         }
         // Pull in edge endpoints reachable from the kept set in one
         // hop so the projection is comprehensible.
@@ -5449,7 +5436,7 @@ const routes: readonly RouteDefinition[] = [
         edges = edges.filter((e) => e.kind === edgeKind);
       }
       if (provider !== undefined) {
-        nodes = nodes.filter((n) => n.metadata['provider'] === provider);
+        nodes = nodes.filter((n) => n.metadata.provider === provider);
         const kept = new Set(nodes.map((n) => n.id));
         edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
       }

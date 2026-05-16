@@ -11,10 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  runReconcileInWorker,
-  setWorkerScriptOverride,
-} from './connectionsReconcileWorker.js';
+import { runReconcileInWorker, setWorkerScriptOverride } from './connectionsReconcileWorker.js';
 
 describe('Stage 5.2 W1 — runReconcileInWorker harness', () => {
   let tmpDir: string;

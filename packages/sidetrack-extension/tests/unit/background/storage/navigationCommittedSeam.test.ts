@@ -88,10 +88,7 @@ describe('navigation.committed end-to-end seam', () => {
     // uploaded. If a future commit reintroduces a local whitelist
     // that doesn't include navigation.committed, this assertion fails
     // — same protection as before, simpler mechanism.
-    const partition = partitionEdgeEventDrainBatch(
-      buffered as readonly BufferedEvent[],
-      10,
-    );
+    const partition = partitionEdgeEventDrainBatch(buffered as readonly BufferedEvent[], 10);
     expect(partition.routeBatch.map((e) => e.streamName)).toEqual([NAVIGATION_COMMITTED]);
     expect(partition.locallyRejectedBatch).toEqual([]);
   });
@@ -118,5 +115,4 @@ describe('navigation.committed end-to-end seam', () => {
     // skip every navigation, just like before.
     expect(isNavigationCommittedPayload(payload)).toBe(true);
   });
-
 });

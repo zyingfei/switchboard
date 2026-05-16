@@ -3,10 +3,7 @@ import { TextEncoder } from 'node:util';
 
 const encoder = new TextEncoder();
 
-export const sha256Base64UrlPrefix = async (
-  value: string,
-  length = 16,
-): Promise<string> => {
+export const sha256Base64UrlPrefix = async (value: string, length = 16): Promise<string> => {
   const digest = await webcrypto.subtle.digest('SHA-256', encoder.encode(value));
   return Buffer.from(new Uint8Array(digest))
     .toString('base64')

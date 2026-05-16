@@ -4,8 +4,14 @@
 import { chromium } from 'playwright';
 import { readFileSync } from 'node:fs';
 
-const TURN_ENRICHER = readFileSync('/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-extension/src/capture/turnEnricher.ts', 'utf8');
-const DOM_TO_MD = readFileSync('/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-extension/src/capture/domToMarkdown.ts', 'utf8');
+const TURN_ENRICHER = readFileSync(
+  '/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-extension/src/capture/turnEnricher.ts',
+  'utf8',
+);
+const DOM_TO_MD = readFileSync(
+  '/Users/yingfei/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-extension/src/capture/domToMarkdown.ts',
+  'utf8',
+);
 
 // Strip TS imports + types so the file is runnable in a browser
 // context. Each module re-defines types inline so we just need the
@@ -187,19 +193,30 @@ const probe = async (page, provider) => {
     const E = window.__sidetrackEnrich;
     let turnSelector = '';
     if (provider === 'chatgpt') turnSelector = '[data-message-author-role]';
-    else if (provider === 'claude') turnSelector = 'div[class*="font-claude-response"], .font-user-message, [data-test-render-count]';
+    else if (provider === 'claude')
+      turnSelector =
+        'div[class*="font-claude-response"], .font-user-message, [data-test-render-count]';
     else if (provider === 'gemini') turnSelector = 'user-query, model-response, .conversation-turn';
     const candidates = Array.from(document.querySelectorAll(turnSelector));
     if (candidates.length === 0) return { error: 'no turns', selector: turnSelector };
-    const lastAssistant = candidates.reverse().find(el => {
-      if (provider === 'chatgpt') return el.getAttribute('data-message-author-role') === 'assistant';
-      if (provider === 'claude') return /font-claude-response/.test(el.className || '');
-      if (provider === 'gemini') return el.tagName.toLowerCase() === 'model-response' || /response/i.test(el.className || '');
-      return false;
-    }) || candidates[0];
-    const role = (provider === 'chatgpt' && lastAssistant.getAttribute('data-message-author-role') === 'assistant') ||
-                 (provider === 'claude' && /font-claude-response/.test(lastAssistant.className || '')) ||
-                 (provider === 'gemini') ? 'assistant' : 'unknown';
+    const lastAssistant =
+      candidates.reverse().find((el) => {
+        if (provider === 'chatgpt')
+          return el.getAttribute('data-message-author-role') === 'assistant';
+        if (provider === 'claude') return /font-claude-response/.test(el.className || '');
+        if (provider === 'gemini')
+          return (
+            el.tagName.toLowerCase() === 'model-response' || /response/i.test(el.className || '')
+          );
+        return false;
+      }) || candidates[0];
+    const role =
+      (provider === 'chatgpt' &&
+        lastAssistant.getAttribute('data-message-author-role') === 'assistant') ||
+      (provider === 'claude' && /font-claude-response/.test(lastAssistant.className || '')) ||
+      provider === 'gemini'
+        ? 'assistant'
+        : 'unknown';
     const plain = (lastAssistant.textContent || '').trim();
     let enriched;
     if (provider === 'chatgpt') enriched = E.enrichChatgpt(lastAssistant, document, role);
@@ -225,10 +242,12 @@ const probe = async (page, provider) => {
 const browser = await chromium.connectOverCDP('http://localhost:9222');
 const ctx = browser.contexts()[0];
 const pages = ctx.pages();
-const cgp = pages.find(p => /chatgpt\.com\/c\//.test(p.url()));
-const cgpDeep = pages.find(p => /chatgpt\.com\/g\/.*\/c\//.test(p.url()));
-const cla = pages.find(p => /claude\.ai\/chat\//.test(p.url()));
-const gem = pages.find(p => /gemini\.google\.com\/app\/[^/]+$/.test(p.url()) && p.url().split('/').pop().length > 8);
+const cgp = pages.find((p) => /chatgpt\.com\/c\//.test(p.url()));
+const cgpDeep = pages.find((p) => /chatgpt\.com\/g\/.*\/c\//.test(p.url()));
+const cla = pages.find((p) => /claude\.ai\/chat\//.test(p.url()));
+const gem = pages.find(
+  (p) => /gemini\.google\.com\/app\/[^/]+$/.test(p.url()) && p.url().split('/').pop().length > 8,
+);
 
 const targets = [
   ['ChatGPT (regular)', cgp, 'chatgpt'],
@@ -237,7 +256,10 @@ const targets = [
   ['Gemini', gem, 'gemini'],
 ];
 for (const [label, page, provider] of targets) {
-  if (!page) { console.log(`\n=== ${label}: SKIPPED (no tab) ===`); continue; }
+  if (!page) {
+    console.log(`\n=== ${label}: SKIPPED (no tab) ===`);
+    continue;
+  }
   console.log(`\n=== ${label} ===\n  url: ${page.url().slice(0, 80)}`);
   try {
     const r = await probe(page, provider);

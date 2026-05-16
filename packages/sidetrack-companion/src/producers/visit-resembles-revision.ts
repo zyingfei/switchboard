@@ -8,10 +8,8 @@ const VISIT_SIMILARITY_REVISION_DIR = '_BAC/connections/visit-similarity';
 export const visitSimilarityRevisionDir = (vaultRoot: string): string =>
   join(vaultRoot, VISIT_SIMILARITY_REVISION_DIR);
 
-export const visitSimilarityRevisionPath = (
-  vaultRoot: string,
-  revisionId: string,
-): string => join(visitSimilarityRevisionDir(vaultRoot), `${revisionId}.json`);
+export const visitSimilarityRevisionPath = (vaultRoot: string, revisionId: string): string =>
+  join(visitSimilarityRevisionDir(vaultRoot), `${revisionId}.json`);
 
 export const writeVisitSimilarityRevision = async (
   vaultRoot: string,

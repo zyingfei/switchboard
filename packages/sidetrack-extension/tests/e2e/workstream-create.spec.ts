@@ -35,7 +35,7 @@ test.describe('workstream creation (synthetic)', () => {
       // because we entered via the "+" path (createMode=true).
       await expect(picker.getByText('Existing workstream')).toBeVisible();
       // The picker now renders 2 create-input slots (top + nested
-       // sub-workstream). Pick the first; both submit the same way.
+      // sub-workstream). Pick the first; both submit the same way.
       const createInput = picker.locator('.ws-picker-create-input').first();
       await expect(createInput).toBeVisible();
 
@@ -48,14 +48,11 @@ test.describe('workstream creation (synthetic)', () => {
       await expect(picker).toBeVisible();
       await expect(picker.getByText('Brand new workstream')).toBeVisible();
 
-      const persisted = await page.evaluate(
-        async (storageKey) => {
-          const all = await chrome.storage.local.get([storageKey]);
-          const ws = (all[storageKey] ?? []) as { title: string; privacy: string }[];
-          return ws.map((w) => ({ title: w.title, privacy: w.privacy }));
-        },
-        WORKSTREAMS_KEY,
-      );
+      const persisted = await page.evaluate(async (storageKey) => {
+        const all = await chrome.storage.local.get([storageKey]);
+        const ws = (all[storageKey] ?? []) as { title: string; privacy: string }[];
+        return ws.map((w) => ({ title: w.title, privacy: w.privacy }));
+      }, WORKSTREAMS_KEY);
       expect(persisted).toContainEqual({
         title: 'Brand new workstream',
         privacy: 'shared',

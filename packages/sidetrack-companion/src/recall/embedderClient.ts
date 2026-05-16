@@ -34,10 +34,10 @@ export interface EmbedderClient {
   readonly stop: () => Promise<void>;
 }
 
-type Pending = {
+interface Pending {
   readonly resolve: (vectors: readonly Float32Array[]) => void;
   readonly reject: (err: Error) => void;
-};
+}
 
 type ChildMessage =
   | { readonly kind: 'ready' }
@@ -58,9 +58,7 @@ const defaultEntryPath = (): string => {
   return join(dirname(here), 'embedderChild.entry.js');
 };
 
-export const createEmbedderClient = (
-  options: EmbedderClientOptions = {},
-): EmbedderClient => {
+export const createEmbedderClient = (options: EmbedderClientOptions = {}): EmbedderClient => {
   const entryPath = options.entryPath ?? defaultEntryPath();
   const fork_ = options.forker ?? fork;
 
@@ -168,14 +166,11 @@ export const createEmbedderClient = (
       nextId += 1;
       return new Promise<readonly Float32Array[]>((resolve, reject) => {
         pending.set(id, { resolve, reject });
-        c.send(
-          { kind: 'embed', id, texts },
-          (err) => {
-            if (err === null || err === undefined) return;
-            pending.delete(id);
-            reject(err);
-          },
-        );
+        c.send({ kind: 'embed', id, texts }, (err) => {
+          if (err === null || err === undefined) return;
+          pending.delete(id);
+          reject(err);
+        });
       });
     },
     async stop(): Promise<void> {

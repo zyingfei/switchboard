@@ -15,9 +15,7 @@ import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 
-const buildEvent = (
-  input: { seq: number; type: string; payload: unknown },
-): AcceptedEvent => ({
+const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
   dot: { replicaId: 'replica-A', seq: input.seq },
   deps: {},
@@ -53,7 +51,6 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
         append: () => {
           throw new Error('unused');
         },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any,
       timelineStore: createTimelineStore(vaultRoot),
       store: createConnectionsStore(vaultRoot),
@@ -155,10 +152,9 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
 
   it('non-Group-B events do not touch the queue', () => {
     const mat = createMat();
-    mat.onAccepted(
-      buildEvent({ seq: 1, type: 'unrelated.event', payload: {} }),
-      { origin: 'local' },
-    );
+    mat.onAccepted(buildEvent({ seq: 1, type: 'unrelated.event', payload: {} }), {
+      origin: 'local',
+    });
     const snap = mat.getDirtySources();
     expect(snap.dirtySourceUnitIds).toEqual([]);
     expect(snap.tombstonedSourceUnitIds).toEqual([]);

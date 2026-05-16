@@ -311,7 +311,7 @@ every event type in `*/events.ts` has exactly one entry.
 
 ### 5. Test it
 
-- `npx vitest run` against the materializer's test file.
+- `bunx --no-install vitest run` against the materializer's test file.
 - Manually: drop the manifest at `_BAC/collectors/myorg.ticker/`, run the
   collector binary, restart the companion, observe ticks promoted to
   Class A in the audit log + side-panel Collectors section.

@@ -10,10 +10,7 @@ import type { ConnectionEdge, ConnectionNode } from '../../../src/sidepanel/conn
 
 const NOW = Date.parse('2026-05-12T20:00:00.000Z');
 
-const node = (input: {
-  readonly id: string;
-  readonly lastSeenAt?: string;
-}): ConnectionNode => ({
+const node = (input: { readonly id: string; readonly lastSeenAt?: string }): ConnectionNode => ({
   id: input.id,
   kind: 'visit-instance',
   label: '',
@@ -205,7 +202,13 @@ describe('TimeRangePicker', () => {
 
   it('Quick Select "All time" fires onChange with kind=all', () => {
     const onChange = vi.fn();
-    render(<TimeRangePicker value={{ kind: 'custom', startMs: 0, endMs: NOW }} onChange={onChange} nowMs={NOW} />);
+    render(
+      <TimeRangePicker
+        value={{ kind: 'custom', startMs: 0, endMs: NOW }}
+        onChange={onChange}
+        nowMs={NOW}
+      />,
+    );
     fireEvent.click(screen.getByTestId('connections-timerange-custom'));
     fireEvent.click(screen.getByText('All time'));
     expect(onChange).toHaveBeenCalledWith({ kind: 'all' });

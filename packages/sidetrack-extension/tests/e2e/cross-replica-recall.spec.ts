@@ -24,8 +24,7 @@ import { startTestRelay, type TestRelay } from './helpers/relay';
 // matching on the unique query term is what the assertions rely
 // on; vectors are sane but not semantically meaningful.
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const callCompanion = async (
   companion: TestCompanion,
@@ -215,10 +214,9 @@ test.describe('Sync Contract v1 / Lane 1 — cross-replica recall (real two-comp
         'POST',
         `/v1/threads/${encodeURIComponent(bacId!)}/archive`,
       );
-      expect(
-        archiveResult.status,
-        `archive returned status=${String(archiveResult.status)}`,
-      ).toBe(200);
+      expect(archiveResult.status, `archive returned status=${String(archiveResult.status)}`).toBe(
+        200,
+      );
 
       // B's recall query must stop returning the chunk within 30 s.
       await expect

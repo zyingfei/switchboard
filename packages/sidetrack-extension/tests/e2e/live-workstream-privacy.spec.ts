@@ -96,7 +96,9 @@ test.describe('live workstream privacy (logged-in profile)', () => {
       await expect(sharedRow.getByText('Shared capture title')).toBeVisible();
 
       await expect(page.locator('.capture').filter({ hasText: '[private]' }).first()).toBeVisible();
-      await expect(page.locator('.capture').filter({ hasText: 'Shared capture title' }).first()).toBeVisible();
+      await expect(
+        page.locator('.capture').filter({ hasText: 'Shared capture title' }).first(),
+      ).toBeVisible();
     } finally {
       await runtime?.close();
     }

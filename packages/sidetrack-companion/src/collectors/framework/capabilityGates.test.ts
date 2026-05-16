@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  PRIVACY_PERMISSION_GRANTED,
-  PRIVACY_PERMISSION_REVOKED,
-} from '../../privacy/events.js';
+import { PRIVACY_PERMISSION_GRANTED, PRIVACY_PERMISSION_REVOKED } from '../../privacy/events.js';
 import { projectPrivacy } from '../../privacy/projection.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
 import {
@@ -13,7 +10,10 @@ import {
   permissionKeyFor,
 } from './capabilityGates.js';
 
-const grantEvent = (input: { readonly permission: string; readonly seq: number }): AcceptedEvent => ({
+const grantEvent = (input: {
+  readonly permission: string;
+  readonly seq: number;
+}): AcceptedEvent => ({
   clientEventId: `privacy.${String(input.seq)}`,
   dot: { replicaId: 'test', seq: input.seq },
   deps: {},
@@ -60,24 +60,22 @@ describe('parsePermissionKey', () => {
 
 describe('gateStateForCollector', () => {
   it('returns granted for an empty projection when the capability is default-enabled', () => {
-    expect(
-      gateStateForCollector(projectPrivacy([]), 'my-collector', 'reads-paths', true),
-    ).toBe('granted');
+    expect(gateStateForCollector(projectPrivacy([]), 'my-collector', 'reads-paths', true)).toBe(
+      'granted',
+    );
   });
 
   it('returns pending for an empty projection when the capability is default-disabled', () => {
-    expect(
-      gateStateForCollector(projectPrivacy([]), 'my-collector', 'reads-paths', false),
-    ).toBe('pending');
+    expect(gateStateForCollector(projectPrivacy([]), 'my-collector', 'reads-paths', false)).toBe(
+      'pending',
+    );
   });
 
   it('returns granted when the privacy projection contains a grant event for the key', () => {
     const permission = permissionKeyFor('my-collector', 'reads-paths');
     const projection = projectPrivacy([grantEvent({ permission, seq: 1 })]);
 
-    expect(gateStateForCollector(projection, 'my-collector', 'reads-paths', false)).toBe(
-      'granted',
-    );
+    expect(gateStateForCollector(projection, 'my-collector', 'reads-paths', false)).toBe('granted');
   });
 
   it('returns revoked when a revoke follows a grant for the key', () => {
@@ -87,9 +85,7 @@ describe('gateStateForCollector', () => {
       revokeEvent({ permission, seq: 2 }),
     ]);
 
-    expect(gateStateForCollector(projection, 'my-collector', 'reads-paths', true)).toBe(
-      'revoked',
-    );
+    expect(gateStateForCollector(projection, 'my-collector', 'reads-paths', true)).toBe('revoked');
   });
 });
 

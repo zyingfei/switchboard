@@ -36,8 +36,7 @@ import {
 // drive the scenario live. Default headless run validates every
 // step in CI.
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const settingsFor = (companion: TestCompanion) => ({
   companion: { port: companion.port, bridgeKey: companion.bridgeKey },
@@ -187,7 +186,8 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
         async () =>
           (await pageB.evaluate(async (id: string) => {
             const all = await chrome.storage.local.get('sidetrack.workstreams');
-            const list = (all['sidetrack.workstreams'] as { bac_id?: string; title?: string }[]) ?? [];
+            const list =
+              (all['sidetrack.workstreams'] as { bac_id?: string; title?: string }[]) ?? [];
             return list.find((w) => w.bac_id === id)?.title;
           }, wsId!)) ?? null,
         'Research-Q2',
@@ -235,13 +235,18 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
         pageB,
         'thread.primaryWorkstreamId visible on B',
         async () =>
-          await pageB.evaluate(async (input: { url: string }) => {
-            const all = await chrome.storage.local.get('sidetrack.threads');
-            const list =
-              (all['sidetrack.threads'] as { threadUrl?: string; primaryWorkstreamId?: string }[]) ??
-              [];
-            return list.find((t) => t.threadUrl === input.url)?.primaryWorkstreamId;
-          }, { url: threadUrl }),
+          await pageB.evaluate(
+            async (input: { url: string }) => {
+              const all = await chrome.storage.local.get('sidetrack.threads');
+              const list =
+                (all['sidetrack.threads'] as {
+                  threadUrl?: string;
+                  primaryWorkstreamId?: string;
+                }[]) ?? [];
+              return list.find((t) => t.threadUrl === input.url)?.primaryWorkstreamId;
+            },
+            { url: threadUrl },
+          ),
         wsId!,
       );
       await stepPause();
@@ -262,7 +267,8 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
         async () =>
           (await pageB.evaluate(async (id: string) => {
             const all = await chrome.storage.local.get('sidetrack.workstreams');
-            const list = (all['sidetrack.workstreams'] as { bac_id?: string; title?: string }[]) ?? [];
+            const list =
+              (all['sidetrack.workstreams'] as { bac_id?: string; title?: string }[]) ?? [];
             return list.find((w) => w.bac_id === id)?.title;
           }, wsId!)) ?? null,
         'Research-Q3',
@@ -312,7 +318,11 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       );
 
       // A's vault gets the dispatch projection.
-      await waitForVaultFile(companionA.vaultPath, '_BAC/dispatches/projections', `${dispatchId!}.json`);
+      await waitForVaultFile(
+        companionA.vaultPath,
+        '_BAC/dispatches/projections',
+        `${dispatchId!}.json`,
+      );
       // A's chrome.storage gets the dispatch entry.
       await waitForStorage(
         pageA,
@@ -396,11 +406,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
 
       // ── Step 9 ─────────────────────────────────────────────────
       log('step 9', 'B deletes the workstream');
-      await callCompanion(
-        companionB,
-        'DELETE',
-        `/v1/workstreams/${encodeURIComponent(wsId!)}`,
-      );
+      await callCompanion(companionB, 'DELETE', `/v1/workstreams/${encodeURIComponent(wsId!)}`);
       // A no longer has the workstream row.
       await waitForStorage(
         pageA,
@@ -435,9 +441,7 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
             () => [] as readonly string[],
           );
           for (const day of days) {
-            const text = await readFile(path.join(logRoot, replicaId, day), 'utf8').catch(
-              () => '',
-            );
+            const text = await readFile(path.join(logRoot, replicaId, day), 'utf8').catch(() => '');
             for (const line of text.split('\n')) {
               if (line.length === 0) continue;
               const event = JSON.parse(line) as {
@@ -457,10 +461,11 @@ test.describe('two-browser feature-breadth — every aggregate, bidirectional', 
       await sleep(2_500);
       const dotsA = await dumpDots(companionA.vaultPath);
       const dotsB = await dumpDots(companionB.vaultPath);
-      log('convergence', `A has ${dotsA.split('|').length} events, B has ${dotsB.split('|').length}`);
-      expect(dotsA, 'event-log convergence: A and B should observe identical dots').toEqual(
-        dotsB,
+      log(
+        'convergence',
+        `A has ${dotsA.split('|').length} events, B has ${dotsB.split('|').length}`,
       );
+      expect(dotsA, 'event-log convergence: A and B should observe identical dots').toEqual(dotsB);
       log('done', 'all 10 steps passed; event logs converged');
     } finally {
       await runtimeB?.close();

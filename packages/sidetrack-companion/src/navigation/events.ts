@@ -84,7 +84,7 @@ export const isNavigationCommittedPayload = (
     'tabSessionIdHash',
     'windowSessionIdHash',
   ]) {
-    if (typeof value[key] !== 'string' || (value[key] as string).length === 0) return false;
+    if (typeof value[key] !== 'string' || value[key].length === 0) return false;
   }
   if (value['parentDocumentId'] !== null && typeof value['parentDocumentId'] !== 'string') {
     return false;

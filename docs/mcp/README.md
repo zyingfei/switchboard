@@ -11,8 +11,8 @@ Start the WebSocket server:
 
 ```sh
 cd packages/sidetrack-mcp
-npm run build
-node dist/cli.js --transport websocket --vault /path/to/vault \
+bun run build
+bun dist/cli.js --transport websocket --vault /path/to/vault \
   --companion-url http://127.0.0.1:17373 --bridge-key "$SIDETRACK_BRIDGE_KEY"
 ```
 

@@ -54,10 +54,7 @@ interface StubObserver {
   readonly events: AcceptedEvent[];
 }
 
-const createStubMaterializer = (
-  name: string,
-  observer: StubObserver,
-): Materializer => {
+const createStubMaterializer = (name: string, observer: StubObserver): Materializer => {
   let lastSuccessAt: string | null = null;
   return {
     name,

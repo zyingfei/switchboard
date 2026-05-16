@@ -199,10 +199,9 @@ test.describe('connections — fully user-path e2e (no setup-state seeding)', ()
 
     // Force-drain the spool — production cadence is 60 s.
     const drainSender = await runtime.context.newPage();
-    await drainSender.goto(
-      `chrome-extension://${runtime.extensionId}/sidepanel.html`,
-      { waitUntil: 'domcontentloaded' },
-    );
+    await drainSender.goto(`chrome-extension://${runtime.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+    });
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const r = (await runtime.sendRuntimeMessage(drainSender, {
         type: 'sidetrack.timeline.force-drain',

@@ -144,8 +144,7 @@ export const registerResources = (
       );
     }
     const result = await companionClient.readThreadMarkdown({ bac_id: threadId });
-    const markdown =
-      typeof result['markdown'] === 'string' ? (result['markdown'] as string) : '';
+    const markdown = typeof result['markdown'] === 'string' ? (result['markdown'] as string) : '';
     return markdownContents(uri, markdown);
   };
   server.registerResource(
@@ -190,10 +189,7 @@ export const registerResources = (
   // sidetrack.workstreams.context_pack tool returns, surfaced as
   // a markdown resource.
   const workstreamContextRead: ReadResourceTemplateCallback = async (uri, variables) => {
-    const workstreamId = requireVariable(
-      variables as Record<string, unknown>,
-      'workstreamId',
-    );
+    const workstreamId = requireVariable(variables as Record<string, unknown>, 'workstreamId');
     const snapshot = await reader.readSnapshot();
     const workstream = snapshot.workstreams.find((entry) => entry.bac_id === workstreamId);
     if (workstream === undefined) {
@@ -210,9 +206,7 @@ export const registerResources = (
       `- ${workstream.title ?? workstream.bac_id}`,
       '',
       '## Threads',
-      ...threads.map(
-        (thread) => `- ${thread.title ?? thread.threadUrl ?? thread.bac_id}`,
-      ),
+      ...threads.map((thread) => `- ${thread.title ?? thread.threadUrl ?? thread.bac_id}`),
       '',
       '## Queue items',
       ...queueItems.map((item) => `- ${item.text ?? item.bac_id}`),

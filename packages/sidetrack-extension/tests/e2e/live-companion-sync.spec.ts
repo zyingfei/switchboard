@@ -10,9 +10,7 @@ type SidetrackStorage = Record<string, unknown>;
 const readSidetrackStorage = async (page: Page): Promise<SidetrackStorage> => {
   return await page.evaluate(async () => {
     const all = await chrome.storage.local.get(null);
-    return Object.fromEntries(
-      Object.entries(all).filter(([key]) => key.startsWith('sidetrack')),
-    );
+    return Object.fromEntries(Object.entries(all).filter(([key]) => key.startsWith('sidetrack')));
   });
 };
 
@@ -96,7 +94,9 @@ test.describe('live companion sync (logged-in profile)', () => {
       await expect(page.locator('.sys-banner')).toHaveCount(0);
 
       await page.evaluate(async (settingsKey) => {
-        const current = (await chrome.storage.local.get(settingsKey))[settingsKey] as SettingsRecord;
+        const current = (await chrome.storage.local.get(settingsKey))[
+          settingsKey
+        ] as SettingsRecord;
         await chrome.storage.local.set({
           [settingsKey]: {
             ...current,

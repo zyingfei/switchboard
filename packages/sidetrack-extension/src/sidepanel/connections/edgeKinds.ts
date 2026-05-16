@@ -213,12 +213,14 @@ export const EDGE_KINDS: Record<string, EdgeKindMetadata> = {
   visit_instance_in_tab_session: {
     family: 'contain',
     label: 'in tab session',
-    description: 'Per-visit-instance variant of visit_in_tab_session (Phase 7 visit-instance identity).',
+    description:
+      'Per-visit-instance variant of visit_in_tab_session (Phase 7 visit-instance identity).',
   },
   visit_instance_in_workstream: {
     family: 'contain',
     label: 'in workstream',
-    description: 'Per-visit-instance attribution edge (Phase 7) — replaces URL-aggregate visit_in_workstream so same-URL sessions stay isolated.',
+    description:
+      'Per-visit-instance attribution edge (Phase 7) — replaces URL-aggregate visit_in_workstream so same-URL sessions stay isolated.',
   },
   visit_instance_same_url_as_timeline_visit: {
     family: 'urlmatch',

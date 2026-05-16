@@ -15,12 +15,12 @@ export type CandidateSource =
   | 'random_unrelated'
   | 'recently_skipped';
 
-export type Candidate = {
+export interface Candidate {
   fromVisitId: string;
   toVisitId: string;
   sources: readonly CandidateSource[];
   generatedAt: number;
-};
+}
 
 export type GenerateCandidates = (
   fromVisitId: string,

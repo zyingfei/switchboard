@@ -116,9 +116,7 @@ describe('Stage 5.2 W2c — tab-session projection accumulator', () => {
       infer({ seq: 5, tabSessionId: 'tses_b', workstreamId: 'ws_y' }),
     ];
     const oneShot = projectTabSessions(events);
-    const viaAcc = tabSessionProjectionFromAccumulator(
-      seedTabSessionProjectionAccumulator(events),
-    );
+    const viaAcc = tabSessionProjectionFromAccumulator(seedTabSessionProjectionAccumulator(events));
     expect(serializeProjection(viaAcc)).toBe(serializeProjection(oneShot));
   });
 

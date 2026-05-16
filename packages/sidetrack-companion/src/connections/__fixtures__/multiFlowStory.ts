@@ -312,16 +312,30 @@ const reminders: readonly ReminderVaultRecord[] = [
 // multi-flow integration test exercises visit_in_workstream alongside
 // the other 17 emitted edge kinds; the rest stay untagged so the
 // fixture remains representative of mixed ambient + focused browsing.
-const timelineEntries: ReadonlyArray<{
+const timelineEntries: readonly {
   url: string;
   time: string;
   title: string;
   workstreamId?: string;
-}> = [
-  { url: URL_HN_COPYFAIL, time: '2026-05-07T09:00:00.000Z', title: 'HN: copy-fail breaks distros', workstreamId: WS_SECURITY },
-  { url: URL_GH_PR, time: '2026-05-07T09:05:00.000Z', title: 'sidetrack/sidetrack PR #98', workstreamId: WS_SIDETRACK },
+}[] = [
+  {
+    url: URL_HN_COPYFAIL,
+    time: '2026-05-07T09:00:00.000Z',
+    title: 'HN: copy-fail breaks distros',
+    workstreamId: WS_SECURITY,
+  },
+  {
+    url: URL_GH_PR,
+    time: '2026-05-07T09:05:00.000Z',
+    title: 'sidetrack/sidetrack PR #98',
+    workstreamId: WS_SIDETRACK,
+  },
   { url: URL_XINT_BLOG, time: '2026-05-07T09:05:30.000Z', title: 'copy-fail across linux distros' },
-  { url: URL_GOOGLE_CVE, time: '2026-05-07T09:08:00.000Z', title: 'Google: linux copy_file_range CVE' },
+  {
+    url: URL_GOOGLE_CVE,
+    time: '2026-05-07T09:08:00.000Z',
+    title: 'Google: linux copy_file_range CVE',
+  },
   { url: URL_KERNEL_DOC, time: '2026-05-07T09:10:00.000Z', title: 'man copy_file_range(2)' },
   { url: URL_GH_BRAINSTORM, time: '2026-05-07T09:11:00.000Z', title: 'BRAINSTORM.md' },
   // HN_PGMERGE is the intentional cross-flow URL coincidence (both

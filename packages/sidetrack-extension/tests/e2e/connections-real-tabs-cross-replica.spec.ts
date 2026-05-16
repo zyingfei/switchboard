@@ -44,11 +44,7 @@ const apiGet = async (comp: TestCompanion, path: string): Promise<unknown> => {
   return await res.json();
 };
 
-const apiPost = async (
-  comp: TestCompanion,
-  path: string,
-  body: unknown,
-): Promise<unknown> => {
+const apiPost = async (comp: TestCompanion, path: string, body: unknown): Promise<unknown> => {
   const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
     method: 'POST',
     headers: {
@@ -155,10 +151,9 @@ test.describe('connections — real chrome.tabs on Browser A syncs through relay
 
     // Force-drain A's spool so its companion ingests every observation.
     const drainSenderA = await runtimeA.context.newPage();
-    await drainSenderA.goto(
-      `chrome-extension://${runtimeA.extensionId}/sidepanel.html`,
-      { waitUntil: 'domcontentloaded' },
-    );
+    await drainSenderA.goto(`chrome-extension://${runtimeA.extensionId}/sidepanel.html`, {
+      waitUntil: 'domcontentloaded',
+    });
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const r = (await runtimeA.sendRuntimeMessage(drainSenderA, {
         type: 'sidetrack.timeline.force-drain',
@@ -191,10 +186,7 @@ test.describe('connections — real chrome.tabs on Browser A syncs through relay
     }
     if (!allSeenOnB) {
       // eslint-disable-next-line no-console
-      console.error(
-        '[real-tabs-xrep] FINAL B nodes:',
-        JSON.stringify(lastBNodes.map((n) => n.id)),
-      );
+      console.error('[real-tabs-xrep] FINAL B nodes:', JSON.stringify(lastBNodes.map((n) => n.id)));
     }
     expect(allSeenOnB).toBe(true);
 

@@ -279,12 +279,7 @@ test.describe('M1/M2 requirements BDD (user experience)', () => {
             workstream('bac_ws_private', 'Sensitive partner review', { privacy: 'private' }),
           ],
           [THREADS_KEY]: [
-            thread(
-              'bac_thread_chatgpt_reply',
-              'chatgpt',
-              'switchboard MVP scope',
-              'bac_ws_active',
-            ),
+            thread('bac_thread_chatgpt_reply', 'chatgpt', 'switchboard MVP scope', 'bac_ws_active'),
             thread(
               'bac_thread_claude_waiting',
               'claude',
@@ -346,12 +341,7 @@ test.describe('M1/M2 requirements BDD (user experience)', () => {
         page = await seedAndOpenSidepanel(activeRuntime, {
           [WORKSTREAMS_KEY]: [workstream('bac_ws_active', 'Active Workstreams')],
           [THREADS_KEY]: [
-            thread(
-              'bac_thread_queue_host',
-              'claude',
-              'MVP architecture thread',
-              'bac_ws_active',
-            ),
+            thread('bac_thread_queue_host', 'claude', 'MVP architecture thread', 'bac_ws_active'),
           ],
         });
         await page.getByRole('tab', { name: 'All threads' }).click();

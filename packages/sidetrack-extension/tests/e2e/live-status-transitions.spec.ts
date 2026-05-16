@@ -12,7 +12,7 @@
 //
 // Opt-in only — drives real chats and consumes provider credits. To run:
 //   SIDETRACK_E2E_LIVE_TRANSITIONS=1 SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
-//     npx playwright test live-status-transitions
+//     bunx --bun --no-install playwright test live-status-transitions
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 import { isRuntimeResponse, messageTypes } from '../../src/messages';

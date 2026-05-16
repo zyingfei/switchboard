@@ -42,9 +42,7 @@ afterEach(async () => {
   await Promise.all(startedServers.splice(0).map((server) => server.close()));
 });
 
-const startServer = async (
-  authKey?: string,
-): Promise<StartedStreamableHttpMcpServer> => {
+const startServer = async (authKey?: string): Promise<StartedStreamableHttpMcpServer> => {
   const started = await startStreamableHttpMcpServer({
     port: 0,
     ...(authKey === undefined ? {} : { authKey }),
@@ -94,9 +92,7 @@ describe('Streamable HTTP MCP server transport', () => {
   it('rejects unauthenticated requests when an auth key is configured', async () => {
     const started = await startServer('bridge_secret');
     const client = new Client({ name: 'sidetrack-mcp-http-noauth', version: '0.0.0' });
-    await expect(
-      client.connect(buildBearerTransport(started.url, 'wrong')),
-    ).rejects.toThrow();
+    await expect(client.connect(buildBearerTransport(started.url, 'wrong'))).rejects.toThrow();
     await client.close().catch(() => undefined);
   });
 

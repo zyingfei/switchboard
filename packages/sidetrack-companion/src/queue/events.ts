@@ -42,19 +42,17 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
     (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
-export const isQueueCreatedPayload = (
-  value: unknown,
-): value is QueueCreatedPayload =>
+export const isQueueCreatedPayload = (value: unknown): value is QueueCreatedPayload =>
   isRecord(value) &&
   typeof value['bac_id'] === 'string' &&
   typeof value['text'] === 'string' &&
   typeof value['scope'] === 'string' &&
   hasValidPayloadExtensionFields(value);
 
-export const isQueueStatusSetPayload = (
-  value: unknown,
-): value is QueueStatusSetPayload =>
+export const isQueueStatusSetPayload = (value: unknown): value is QueueStatusSetPayload =>
   isRecord(value) &&
   typeof value['bac_id'] === 'string' &&
-  (value['status'] === 'pending' || value['status'] === 'done' || value['status'] === 'dismissed') &&
+  (value['status'] === 'pending' ||
+    value['status'] === 'done' ||
+    value['status'] === 'dismissed') &&
   hasValidPayloadExtensionFields(value);

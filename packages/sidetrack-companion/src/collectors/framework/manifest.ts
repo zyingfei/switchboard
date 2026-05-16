@@ -128,10 +128,7 @@ export const parseManifestTOML = (raw: string): ParseManifestResult => {
   return { ok: true, manifest: result.data };
 };
 
-const rejected = (
-  reason: ManifestRejectionReason,
-  details?: string,
-): ManifestLoadDecision => {
+const rejected = (reason: ManifestRejectionReason, details?: string): ManifestLoadDecision => {
   if (details === undefined) return { rejected: { reason } };
   return { rejected: { reason, details } };
 };
@@ -189,10 +186,7 @@ export const decideLoad = (
 
   const warnings: string[] = [];
   for (const emitted of manifest.emits) {
-    const maxKnownPayloadVersion = ctx.maxKnownPayloadVersionFor(
-      manifest.id,
-      emitted.event_type,
-    );
+    const maxKnownPayloadVersion = ctx.maxKnownPayloadVersionFor(manifest.id, emitted.event_type);
     if (maxKnownPayloadVersion === undefined) {
       return rejected(
         'no-emits-registered',

@@ -1,8 +1,5 @@
 import type { ExtractionStore } from '../../recall/extraction/store.js';
-import type {
-  ExtractionRevision,
-  ExtractionSourceState,
-} from '../../recall/extraction/types.js';
+import type { ExtractionRevision, ExtractionSourceState } from '../../recall/extraction/types.js';
 import type { AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -207,9 +204,7 @@ export const createExtractionMaterializer = (
       // after the queue is drained — same AWAIT-drain rule as the
       // runner's catchUpAll. Different sourceUnitIds run in
       // parallel; same-source events serialize via the queue.
-      await Promise.all(
-        merged.filter((e) => handles.has(e.type)).map((e) => handleEvent(e)),
-      );
+      await Promise.all(merged.filter((e) => handles.has(e.type)).map((e) => handleEvent(e)));
       lastSuccessAt = new Date().toISOString();
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);

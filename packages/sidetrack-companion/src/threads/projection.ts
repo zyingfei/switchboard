@@ -128,10 +128,7 @@ export const projectThread = (
     status.status === 'resolved' &&
     status.value === undefined;
 
-  const lastEventMs = relevant.reduce(
-    (latest, event) => Math.max(latest, event.acceptedAtMs),
-    0,
-  );
+  const lastEventMs = relevant.reduce((latest, event) => Math.max(latest, event.acceptedAtMs), 0);
 
   return {
     bac_id: bacId,

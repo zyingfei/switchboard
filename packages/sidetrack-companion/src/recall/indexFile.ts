@@ -147,9 +147,7 @@ export const readIndex = async (path: string): Promise<IndexFile | null> => {
       : SCHEMA_CAPABILITIES;
     return {
       modelId: header.modelId,
-      ...(typeof header.modelRevision === 'string'
-        ? { modelRevision: header.modelRevision }
-        : {}),
+      ...(typeof header.modelRevision === 'string' ? { modelRevision: header.modelRevision } : {}),
       ...(typeof header.chunkSchemaVersion === 'number'
         ? { chunkSchemaVersion: header.chunkSchemaVersion }
         : {}),
@@ -193,9 +191,11 @@ export interface WriteIndexOptions {
 const stableJsonStringify = (value: unknown): string => {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(',')}]`;
-  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const keys = Object.keys(value).sort();
   return `{${keys
-    .map((k) => `${JSON.stringify(k)}:${stableJsonStringify((value as Record<string, unknown>)[k])}`)
+    .map(
+      (k) => `${JSON.stringify(k)}:${stableJsonStringify((value as Record<string, unknown>)[k])}`,
+    )
     .join(',')}}`;
 };
 
@@ -282,8 +282,7 @@ export const upsertEntries = async (
   const existing = await readIndex(path);
   // Bucket by (id, replicaId) so a write from another replica with
   // the same id doesn't clobber the local replica's entry on merge.
-  const keyOf = (entry: IndexEntry): string =>
-    `${entry.id} ${entry.replicaId ?? DEFAULT_REPLICA}`;
+  const keyOf = (entry: IndexEntry): string => `${entry.id} ${entry.replicaId ?? DEFAULT_REPLICA}`;
   const byKey = new Map((existing?.items ?? []).map((item) => [keyOf(item), item]));
   let added = 0;
   let replaced = 0;
@@ -317,8 +316,7 @@ export const upsertEntries = async (
   // Preserve the existing modelRevision unless the caller overrides
   // it, so an incremental upsert doesn't accidentally clear the
   // revision pin from the header.
-  const revision =
-    options.modelRevision ?? existing?.modelRevision ?? undefined;
+  const revision = options.modelRevision ?? existing?.modelRevision ?? undefined;
   await writeIndex(
     path,
     [...byKey.values()],
@@ -364,9 +362,7 @@ export const replaceEntriesForSourceUnit = async (
   // of the prior extraction revision. That's the contract: the caller
   // declares "this revision is now active for this source unit" and
   // the index converges to that statement.
-  const survived = priorItems.filter(
-    (item) => item.metadata?.sourceUnitId !== input.sourceUnitId,
-  );
+  const survived = priorItems.filter((item) => item.metadata?.sourceUnitId !== input.sourceUnitId);
   const removed = priorItems.length - survived.length;
   // Tag the incoming entries with the revision id so a future replace
   // can identify them. Caller can populate the rest of the metadata
@@ -384,12 +380,7 @@ export const replaceEntriesForSourceUnit = async (
   })) as IndexEntry[];
   const next = [...survived, ...tagged];
   const revision = options.modelRevision ?? existing?.modelRevision ?? undefined;
-  await writeIndex(
-    path,
-    next,
-    modelId,
-    revision === undefined ? {} : { modelRevision: revision },
-  );
+  await writeIndex(path, next, modelId, revision === undefined ? {} : { modelRevision: revision });
   return { removed, inserted: tagged.length };
 };
 

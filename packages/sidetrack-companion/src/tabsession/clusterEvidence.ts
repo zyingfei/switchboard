@@ -20,10 +20,16 @@ export const buildClusterEvidence = (
   const targetVisits = new Set(targetVisitNodeIds);
   for (const edge of snapshot.edges) {
     if (edge.kind !== 'visit_instance_same_url_as_timeline_visit') continue;
-    if (targetVisitNodeIds.has(edge.fromNodeId) && edge.toNodeId.startsWith(TIMELINE_VISIT_PREFIX)) {
+    if (
+      targetVisitNodeIds.has(edge.fromNodeId) &&
+      edge.toNodeId.startsWith(TIMELINE_VISIT_PREFIX)
+    ) {
       targetVisits.add(edge.toNodeId);
     }
-    if (targetVisitNodeIds.has(edge.toNodeId) && edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)) {
+    if (
+      targetVisitNodeIds.has(edge.toNodeId) &&
+      edge.fromNodeId.startsWith(VISIT_INSTANCE_PREFIX)
+    ) {
       targetVisits.add(edge.fromNodeId);
     }
   }

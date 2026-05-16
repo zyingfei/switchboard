@@ -99,20 +99,24 @@ const localTimezoneLabel = (): string => {
     const sign = offset >= 0 ? '+' : '−';
     const hours = Math.floor(Math.abs(offset) / 60);
     const mins = Math.abs(offset) % 60;
-    const offsetStr = mins === 0 ? `${sign}${String(hours)}` : `${sign}${String(hours)}:${pad2(mins)}`;
+    const offsetStr =
+      mins === 0 ? `${sign}${String(hours)}` : `${sign}${String(hours)}:${pad2(mins)}`;
     return `Local · ${tz} (UTC${offsetStr})`;
   } catch {
     return 'Local time';
   }
 };
 
-const isSameLocalDay = (a: number, b: number): boolean =>
-  startOfLocalDay(a) === startOfLocalDay(b);
+const isSameLocalDay = (a: number, b: number): boolean => startOfLocalDay(a) === startOfLocalDay(b);
 
 interface CalendarMonth {
   readonly year: number;
   readonly month: number; // 0-11
-  readonly weeks: readonly (readonly { readonly ms: number; readonly day: number; readonly otherMonth: boolean }[])[];
+  readonly weeks: readonly (readonly {
+    readonly ms: number;
+    readonly day: number;
+    readonly otherMonth: boolean;
+  }[])[];
 }
 
 const buildCalendarMonth = (year: number, month: number): CalendarMonth => {
@@ -146,8 +150,18 @@ export interface TimeRangePickerProps {
 
 const WEEKDAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'] as const;
 const MONTH_LABELS = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
 ] as const;
 
 export const TimeRangePicker = ({
@@ -249,7 +263,16 @@ export const TimeRangePicker = ({
     setDraftError(null);
   };
 
-  const applyQuickSelect = (kind: 'last-15-min' | 'last-hour' | 'today' | 'yesterday' | 'last-7-days' | 'last-30-days' | 'all-time'): void => {
+  const applyQuickSelect = (
+    kind:
+      | 'last-15-min'
+      | 'last-hour'
+      | 'today'
+      | 'yesterday'
+      | 'last-7-days'
+      | 'last-30-days'
+      | 'all-time',
+  ): void => {
     if (kind === 'all-time') {
       onChange(ALL_RANGE);
       setPopoverOpen(false);
@@ -337,7 +360,8 @@ export const TimeRangePicker = ({
       </button>
       {value.kind === 'custom' ? (
         <span className="cx-timerange-active mono" data-testid="connections-timerange-custom-label">
-          {localDateLabel(value.startMs)} {localTimeLabel(value.startMs)} – {localDateLabel(value.endMs)} {localTimeLabel(value.endMs)}
+          {localDateLabel(value.startMs)} {localTimeLabel(value.startMs)} –{' '}
+          {localDateLabel(value.endMs)} {localTimeLabel(value.endMs)}
         </span>
       ) : null}
       {!isAll && hiddenNodeCount !== undefined && hiddenNodeCount > 0 ? (
@@ -398,8 +422,7 @@ export const TimeRangePicker = ({
                 const isStart = isSameLocalDay(cell.ms, draftStart);
                 const isEnd = isSameLocalDay(cell.ms, draftEnd);
                 const isInRange =
-                  cell.ms >= startOfLocalDay(draftStart) &&
-                  cell.ms <= startOfLocalDay(draftEnd);
+                  cell.ms >= startOfLocalDay(draftStart) && cell.ms <= startOfLocalDay(draftEnd);
                 const isToday = isSameLocalDay(cell.ms, referenceMs);
                 const cls = [
                   'cx-cal-cell',

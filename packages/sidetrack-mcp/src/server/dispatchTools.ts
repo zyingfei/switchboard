@@ -57,10 +57,7 @@ const buildFormattingPrefix = (
   if (responseProfile?.avoidLatex === true && captureProfile === undefined) {
     lines.push('Format: avoid LaTeX; use ASCII or plain text formulas.');
   }
-  if (
-    responseProfile?.preferSectionHeadings === true &&
-    captureProfile === undefined
-  ) {
+  if (responseProfile?.preferSectionHeadings === true && captureProfile === undefined) {
     lines.push('Format: organise the answer into labelled section headings.');
   }
   if (responseProfile?.preferStableTerminology === true && captureProfile === undefined) {
@@ -139,23 +136,15 @@ export const registerDispatchTools = (
       description:
         "Send a natural-language task to a target AI provider through Sidetrack. Use this when the user asks Sidetrack to ask ChatGPT, Claude, or Gemini something. Put the user's actual request in body — write it like a normal user message; do not add Sidetrack workflow instructions. If the captured answer will be annotated later, set captureProfile='annotation_friendly' instead of expanding body with formatting boilerplate. Returns a dispatchId; call sidetrack.dispatch.await_capture next to get thread + latestAssistantTurn.",
       inputSchema: {
-        codingSessionId: z
-          .string()
-          .min(1)
-          .describe('bac_id returned by sidetrack.session.attach.'),
-        targetProvider: targetProviderSchema.describe(
-          'Which provider should receive the packet.',
-        ),
-        title: z
-          .string()
-          .min(1)
-          .describe('Short title shown in Sidetrack Recent Dispatches.'),
+        codingSessionId: z.string().min(1).describe('bac_id returned by sidetrack.session.attach.'),
+        targetProvider: targetProviderSchema.describe('Which provider should receive the packet.'),
+        title: z.string().min(1).describe('Short title shown in Sidetrack Recent Dispatches.'),
         body: z
           .string()
           .min(1)
           .max(20000)
           .describe(
-            "Natural-language request to send to the target provider. Should read like a normal user message; let captureProfile / responseProfile carry formatting constraints instead of inline instructions.",
+            'Natural-language request to send to the target provider. Should read like a normal user message; let captureProfile / responseProfile carry formatting constraints instead of inline instructions.',
           ),
         captureProfile: captureProfileSchema
           .optional()
@@ -172,9 +161,7 @@ export const registerDispatchTools = (
           .optional()
           .describe('Workstream bac_id. Defaults to the registered session workstream.'),
         sourceThreadId: z.string().optional().describe('Optional source thread bac_id.'),
-        mode: dispatchModeSchema
-          .optional()
-          .describe("Dispatch mode. Defaults to 'auto-send'."),
+        mode: dispatchModeSchema.optional().describe("Dispatch mode. Defaults to 'auto-send'."),
       },
       outputSchema: dispatchCreateOutputShape,
     },
@@ -255,10 +242,7 @@ export const registerDispatchTools = (
       description:
         "Wait for a dispatch to be linked to a captured thread. Use this immediately after sidetrack.dispatch.create when the user expects the target AI's response to be read or annotated. Returns thread identity, resource URIs the agent can readResource, and the latest assistant turn so no follow-up turn fetch is needed.",
       inputSchema: {
-        dispatchId: z
-          .string()
-          .min(1)
-          .describe('dispatchId returned by sidetrack.dispatch.create.'),
+        dispatchId: z.string().min(1).describe('dispatchId returned by sidetrack.dispatch.create.'),
         timeoutMs: z
           .number()
           .int()
@@ -284,9 +268,7 @@ export const registerDispatchTools = (
       const result = await companionClient.awaitCaptureForDispatch({
         dispatchId,
         ...(timeoutMs === undefined ? {} : { timeoutMs }),
-        ...(includeLatestAssistantTurn === undefined
-          ? {}
-          : { includeLatestAssistantTurn }),
+        ...(includeLatestAssistantTurn === undefined ? {} : { includeLatestAssistantTurn }),
       });
       const structured: z.infer<z.ZodObject<typeof awaitCaptureOutputShape>> = {
         dispatchId: result.dispatchId,

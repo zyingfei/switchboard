@@ -36,10 +36,9 @@ export const runAutoUpdate = async (opts: {
   readonly nowFn?: () => Date;
 }): Promise<UpdateResult> => {
   const started = opts.nowFn?.() ?? new Date();
-  const advisory = await (opts.checkLatest ?? ((current, now) => checkLatestVersion(current, globalThis.fetch, now)))(
-    opts.currentVersion,
-    started,
-  );
+  const advisory = await (
+    opts.checkLatest ?? ((current, now) => checkLatestVersion(current, globalThis.fetch, now))
+  )(opts.currentVersion, started);
   if (!advisory.behind || advisory.latest === null) {
     return { ok: false, from: opts.currentVersion, to: advisory.latest, durationMs: 0 };
   }
@@ -47,9 +46,9 @@ export const runAutoUpdate = async (opts: {
     return { ok: false, from: opts.currentVersion, to: advisory.latest, durationMs: 0 };
   }
   try {
-    const result = await (opts.exec ?? nodeAutoUpdateExecPort).execFile('npm', [
+    const result = await (opts.exec ?? nodeAutoUpdateExecPort).execFile('bun', [
       'update',
-      '-g',
+      '--global',
       '@sidetrack/companion',
     ]);
     const ended = opts.nowFn?.() ?? new Date();
@@ -67,7 +66,7 @@ export const runAutoUpdate = async (opts: {
       from: opts.currentVersion,
       to: advisory.latest,
       durationMs: Math.max(0, ended.getTime() - started.getTime()),
-      stderr: error instanceof Error ? error.message : 'npm update failed',
+      stderr: error instanceof Error ? error.message : 'bun update failed',
     };
   }
 };

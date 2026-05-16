@@ -18,7 +18,7 @@ Mid-build. The architecture and product surface are settled (see [`PRD.md`](PRD.
 
 ## Try it
 
-Prerequisites: Node 22+ and Chrome 147+. The most useful runnable entry point today is [`poc/local-bridge/README.md`](poc/local-bridge/README.md) — it walks the current companion + extension flow end to end. Production packages under `packages/*` are coming online with M1.
+Prerequisites: Bun 1.3.14+ and Chrome 147+. The most useful runnable entry point today is [`poc/local-bridge/README.md`](poc/local-bridge/README.md) — it walks the current companion + extension flow end to end. Production packages under `packages/*` are coming online with M1.
 
 ## Contributing
 

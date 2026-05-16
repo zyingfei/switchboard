@@ -96,8 +96,9 @@ test.describe('fork lineage (synthetic)', () => {
         const threads = state['sidetrack.threads'] as
           | readonly { readonly threadUrl: string; readonly parentThreadId?: string }[]
           | undefined;
-        return threads?.find((thread) => thread.threadUrl === 'https://claude.ai/chat/child-synthetic')
-          ?.parentThreadId;
+        return threads?.find(
+          (thread) => thread.threadUrl === 'https://claude.ai/chat/child-synthetic',
+        )?.parentThreadId;
       });
       expect(childParentId).toBe('thread_parent');
     } finally {

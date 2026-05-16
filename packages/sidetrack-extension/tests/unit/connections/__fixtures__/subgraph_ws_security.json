@@ -12,9 +12,7 @@
         "label": "check assistant assumed AF_UNIX abstract namespace",
         "firstSeenAt": "2026-05-07T09:35:45.000Z",
         "lastSeenAt": "2026-05-07T09:35:45.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "title": "Claude — CVE chat",
           "url": "https://claude.ai/chat/cve_thread"
@@ -40,9 +38,7 @@
         "label": "Codex — Python repro for CVE-2024-12345",
         "firstSeenAt": "2026-05-07T09:22:00.000Z",
         "lastSeenAt": "2026-05-07T09:33:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "provider": "codex",
           "status": "sent",
@@ -68,9 +64,7 @@
         "label": "test repro on Ubuntu 22 + 24",
         "firstSeenAt": "2026-05-07T09:38:00.000Z",
         "lastSeenAt": "2026-05-07T09:38:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "status": "pending",
           "title": "test repro on Ubuntu 22 + 24"
@@ -82,9 +76,7 @@
         "label": "ChatGPT — review CVE repro",
         "firstSeenAt": "2026-05-07T09:30:00.000Z",
         "lastSeenAt": "2026-05-07T09:33:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "canonicalUrl": "https://chatgpt.com/c/cve_review",
           "provider": "chatgpt",
@@ -99,9 +91,7 @@
         "label": "Claude — copy_file_range CVE",
         "firstSeenAt": "2026-05-07T09:18:00.000Z",
         "lastSeenAt": "2026-05-07T09:18:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "canonicalUrl": "https://claude.ai/chat/cve_thread",
           "provider": "claude",
@@ -202,9 +192,7 @@
         "label": "ws_research",
         "firstSeenAt": "2026-05-07T08:55:00.000Z",
         "lastSeenAt": "2026-05-07T08:56:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "title": "Research"
         }
@@ -215,9 +203,7 @@
         "label": "Security · Linux CVE",
         "firstSeenAt": "2026-05-07T08:56:00.000Z",
         "lastSeenAt": "2026-05-07T09:38:00.000Z",
-        "originReplicaIds": [
-          "replica-mac"
-        ],
+        "originReplicaIds": ["replica-mac"],
         "metadata": {
           "title": "Security · Linux CVE"
         }

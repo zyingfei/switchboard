@@ -61,7 +61,7 @@ describe('service installers', () => {
     expect(files.removed).toContain(result.path);
   });
 
-  it('launchd installs the local node checkout command with managed MCP when requested', async () => {
+  it('launchd installs the local Bun checkout command with managed MCP when requested', async () => {
     const files = fakeFiles();
     const exec = fakeExec();
     const installer = pickInstaller('darwin', { homeDir: '/home/test', files, exec });
@@ -69,13 +69,13 @@ describe('service installers', () => {
     const result = await installer.install({
       vaultPath: '/Users/test/Sidetrack vault',
       port: 17373,
-      companionCommand: ['/usr/local/bin/node', '/repo/packages/sidetrack-companion/dist/cli.js'],
+      companionCommand: ['/usr/local/bin/bun', '/repo/packages/sidetrack-companion/dist/cli.js'],
       mcpPort: 8721,
       syncRelayLocalPort: 18443,
     });
 
     const body = files.writes.get(result.path) ?? '';
-    expect(body).toContain('<string>/usr/local/bin/node</string>');
+    expect(body).toContain('<string>/usr/local/bin/bun</string>');
     expect(body).toContain('<string>/repo/packages/sidetrack-companion/dist/cli.js</string>');
     expect(body).toContain('<string>--vault</string>');
     expect(body).toContain('<string>/Users/test/Sidetrack vault</string>');

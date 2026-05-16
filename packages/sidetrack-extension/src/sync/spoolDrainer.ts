@@ -14,12 +14,7 @@
 // On other errors: leave the entry as `spooled` with an error
 // message recorded for the side panel banner (gate L3-G3).
 
-import {
-  readSpool,
-  spoolRemove,
-  spoolTransition,
-  type SpoolEntry,
-} from './spool';
+import { readSpool, spoolRemove, spoolTransition, type SpoolEntry } from './spool';
 
 export interface CompanionImportPort {
   // Send an edge-origin event to the companion. Implementations

@@ -22,8 +22,7 @@ export type AutoApplyTabSessionAttributionStatus =
 // Auto-apply is reversible: the user's manual `user_asserted` move
 // always beats the synthesized `inferred` attribution on precedence
 // tie-break. Mirrors the URL-level gate in `urls/autoApply.ts`.
-export const TABSESSION_RESOLVER_AUTO_APPLY_ENV =
-  'SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY';
+export const TABSESSION_RESOLVER_AUTO_APPLY_ENV = 'SIDETRACK_TABSESSION_RESOLVER_AUTO_APPLY';
 
 const autoApplyEnabled = (): boolean => {
   const raw = process.env[TABSESSION_RESOLVER_AUTO_APPLY_ENV];
@@ -105,11 +104,7 @@ export const autoApplyTabSessionAttribution = async (
   // to the same workstream, re-emitting only varies the dependencyKey
   // in clientEventId and produces a byte-different but semantically
   // identical event. Same feedback loop as `urls/autoApply.ts`.
-  if (
-    existing !== undefined &&
-    existing.source === 'inferred' &&
-    existing.workstreamId === payload.workstreamId
-  ) {
+  if (existing?.source === 'inferred' && existing.workstreamId === payload.workstreamId) {
     return {
       status: 'skipped-existing-attribution',
       resolution,

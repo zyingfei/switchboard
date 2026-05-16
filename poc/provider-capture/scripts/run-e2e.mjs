@@ -26,4 +26,4 @@ const run = (command, args, env = process.env) =>
     });
   });
 
-await run('npx', ['playwright', 'test', ...process.argv.slice(2)]);
+await run('bunx', ['--bun', '--no-install', 'playwright', 'test', ...process.argv.slice(2)]);

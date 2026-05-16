@@ -82,12 +82,8 @@ export const projectWorkstream = (
     deletes.some((tombstone) => eventDominates(tombstone, event));
   const live = upsertCandidates.filter((candidate) => !isErased(candidate.event));
   const record = mergeRegister(live);
-  const deleted =
-    deletes.length > 0 && record.status === 'resolved' && record.value === undefined;
-  const lastEventMs = relevant.reduce(
-    (latest, event) => Math.max(latest, event.acceptedAtMs),
-    0,
-  );
+  const deleted = deletes.length > 0 && record.status === 'resolved' && record.value === undefined;
+  const lastEventMs = relevant.reduce((latest, event) => Math.max(latest, event.acceptedAtMs), 0);
   return {
     bac_id: bacId,
     record,

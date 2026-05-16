@@ -195,8 +195,7 @@ export const BATCH_RECONCILE_TRIGGERS = {
   embeddingModelRevisionFlipped: 'embedding-model-revision-flipped',
   chunkerVersionFlipped: 'chunker-version-flipped',
   extractionSchemaFlipped: 'extraction-schema-flipped',
-  contentSimilarityProducerVersionFlipped:
-    'content-similarity-producer-version-flipped',
+  contentSimilarityProducerVersionFlipped: 'content-similarity-producer-version-flipped',
 } as const;
 
 export type BatchReconcileTrigger =

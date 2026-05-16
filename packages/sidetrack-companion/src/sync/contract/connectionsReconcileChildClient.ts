@@ -18,10 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 
-import type {
-  ReconcileWorkerJob,
-  ReconcileWorkerResult,
-} from './connectionsReconcileWorker.js';
+import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 
 let childScriptPath: string | undefined;
 
@@ -46,9 +43,7 @@ interface ReconcileChildMessage {
  * with the child's result; the seq token round-trips so the caller can
  * ignore stale responses if a newer drain finished first.
  */
-export const runReconcileInChild = (
-  job: ReconcileWorkerJob,
-): Promise<ReconcileWorkerResult> =>
+export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> =>
   new Promise<ReconcileWorkerResult>((resolve) => {
     const entry = childScriptPath ?? defaultEntryPath();
     if (!existsSync(entry)) {

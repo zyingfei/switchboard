@@ -83,9 +83,7 @@ const main = async () => {
   // 3. Try SW round-trip with a short timeout
   try {
     const workboard = await withTimeout(
-      panel.evaluate(async () =>
-        chrome.runtime.sendMessage({ type: 'sidetrack.workboard.state' }),
-      ),
+      panel.evaluate(async () => chrome.runtime.sendMessage({ type: 'sidetrack.workboard.state' })),
       8000,
       'SW workboard.state',
     );

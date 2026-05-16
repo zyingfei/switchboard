@@ -54,9 +54,7 @@ export interface EventLoopMonitorOptions {
   readonly logger?: (line: string) => void;
 }
 
-export const startEventLoopMonitor = (
-  options: EventLoopMonitorOptions = {},
-): EventLoopMonitor => {
+export const startEventLoopMonitor = (options: EventLoopMonitorOptions = {}): EventLoopMonitor => {
   const resolutionMs = options.resolutionMs ?? 20;
   const warnThresholdMs = options.warnThresholdMs ?? 250;
   // Sustained-high utilization is the other failure mode: many sub-

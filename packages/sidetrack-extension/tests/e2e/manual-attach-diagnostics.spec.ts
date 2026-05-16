@@ -8,11 +8,11 @@
 // Two-terminal flow:
 //
 //   Terminal A — keep this running for the duration of the diag:
-//     npm --prefix packages/sidetrack-extension run e2e:chrome-debug
+//     bun run --cwd packages/sidetrack-extension e2e:chrome-debug
 //
 //   Terminal B — runs in ~30 s, writes attach-diag.json + a summary:
 //     SIDETRACK_E2E_CDP_URL=http://localhost:9222 \
-//       npm --prefix packages/sidetrack-extension run e2e:attach-diag
+//       bun run --cwd packages/sidetrack-extension e2e:attach-diag
 //
 // How this differs from `e2e:recorder`:
 //
@@ -62,10 +62,7 @@ import { fileURLToPath } from 'node:url';
 
 import { expect, test } from '@playwright/test';
 
-import {
-  startTestCompanion,
-  type TestCompanion,
-} from './helpers/companion';
+import { startTestCompanion, type TestCompanion } from './helpers/companion';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../../../../', import.meta.url)));
@@ -244,19 +241,18 @@ const probeSidepanel = async (
         : null;
     const httpHostAccess = await new Promise<boolean | null>((resolve) => {
       try {
-        c.permissions.contains(
-          { origins: ['https://*/*', 'http://*/*'] },
-          (granted) => {
-            resolve(granted);
-          },
-        );
+        c.permissions.contains({ origins: ['https://*/*', 'http://*/*'] }, (granted) => {
+          resolve(granted);
+        });
       } catch {
         resolve(null);
       }
     });
     const fetchScripts = async (
       id: string,
-    ): Promise<{ id: string; matches?: readonly string[]; js?: readonly string[]; runAt?: string }[]> => {
+    ): Promise<
+      { id: string; matches?: readonly string[]; js?: readonly string[]; runAt?: string }[]
+    > => {
       try {
         const list = await c.scripting.getRegisteredContentScripts({ ids: [id] });
         return list.map((entry) => ({
@@ -285,8 +281,7 @@ const probeSidepanel = async (
     });
     let devDiag: unknown = null;
     try {
-      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local })
-        .session;
+      const sessionStorage = (c.storage as { readonly session?: typeof c.storage.local }).session;
       if (sessionStorage !== undefined) {
         const stash = await sessionStorage.get('sidetrack.dev.diag');
         devDiag = stash['sidetrack.dev.diag'] ?? null;
@@ -344,27 +339,26 @@ const exerciseEngagementPage = async (
 const classifyEngagementFailure = (
   report: Pick<
     AttachDiagReport,
-    | 'privacy'
-    | 'permissions'
-    | 'contentScripts'
-    | 'engagement'
-    | 'materializer'
+    'privacy' | 'permissions' | 'contentScripts' | 'engagement' | 'materializer'
   >,
 ): string => {
   if (report.privacy.engagementGate !== 'open') return 'closed gate';
   if (report.permissions.httpHostAccess !== true) return 'missing permission';
   if (!report.contentScripts.engagementBuiltFileExists) return 'wrong built script path';
   if (!report.contentScripts.engagementRegistered) return 'registration not called';
-  if (report.engagement.lastIntervalSeen === null || report.engagement.lastIntervalSeen === undefined) {
+  if (
+    report.engagement.lastIntervalSeen === null ||
+    report.engagement.lastIntervalSeen === undefined
+  ) {
     return 'script registered but not injected';
   }
-  if (report.engagement.lastAggregatePosted === null || report.engagement.lastAggregatePosted === undefined) {
+  if (
+    report.engagement.lastAggregatePosted === null ||
+    report.engagement.lastAggregatePosted === undefined
+  ) {
     return 'SW did not receive interval';
   }
-  if (
-    report.engagement.postError !== null &&
-    report.engagement.postError !== undefined
-  ) {
+  if (report.engagement.postError !== null && report.engagement.postError !== undefined) {
     return 'companion post failed';
   }
   if (
@@ -386,9 +380,7 @@ const classifyThreadPropagationFailure = (
     return 'thread URLs are not in the URL projection';
   }
   const threadCount =
-    'thread' in propagation.urlAttributionBySource
-      ? propagation.urlAttributionBySource.thread
-      : 0;
+    'thread' in propagation.urlAttributionBySource ? propagation.urlAttributionBySource.thread : 0;
   if (threadCount === 0) {
     if (propagation.missReasons.lostToPrecedence > 0) {
       return `propagation ran but lost to direct user_asserted on ${String(propagation.missReasons.lostToPrecedence)} URLs`;
@@ -405,27 +397,24 @@ const openPrivacyGateViaCompanion = async (
   gate: string,
 ): Promise<void> => {
   const idempotencyKey = `attach-diag-gate-${gate}-${String(Date.now())}`;
-  const response = await fetch(
-    `http://127.0.0.1:${String(companion.port)}/v1/privacy/events`,
-    {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-bac-bridge-key': companion.bridgeKey,
-        'idempotency-key': idempotencyKey,
-      },
-      body: JSON.stringify({
-        type: 'privacy.gate.flipped',
-        payload: {
-          payloadVersion: 1,
-          gate,
-          state: 'open',
-          actor: 'user',
-          reason: 'attach-diag',
-        },
-      }),
+  const response = await fetch(`http://127.0.0.1:${String(companion.port)}/v1/privacy/events`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-bac-bridge-key': companion.bridgeKey,
+      'idempotency-key': idempotencyKey,
     },
-  );
+    body: JSON.stringify({
+      type: 'privacy.gate.flipped',
+      payload: {
+        payloadVersion: 1,
+        gate,
+        state: 'open',
+        actor: 'user',
+        reason: 'attach-diag',
+      },
+    }),
+  });
   if (!response.ok) {
     throw new Error(`openPrivacyGate(${gate}) failed: HTTP ${String(response.status)}`);
   }
@@ -498,18 +487,16 @@ const bootstrapCompanionAndGates = async (runtime: ExtensionRuntime): Promise<Te
   return companion;
 };
 
-const exerciseGoogleSearchPage = async (
-  runtime: ExtensionRuntime,
-): Promise<void> => {
+const exerciseGoogleSearchPage = async (runtime: ExtensionRuntime): Promise<void> => {
   const exerc = await runtime.context.newPage();
   try {
     // Repro for the Google-search URL bug. Navigate directly to a
     // search URL so we don't depend on the user typing in a search
     // box (which would require a form-submit + new-window dance).
-    await exerc.goto(
-      'https://www.google.com/search?q=sidetrack+attach+diag+probe',
-      { waitUntil: 'domcontentloaded', timeout: 20_000 },
-    );
+    await exerc.goto('https://www.google.com/search?q=sidetrack+attach+diag+probe', {
+      waitUntil: 'domcontentloaded',
+      timeout: 20_000,
+    });
     await exerc.bringToFront();
     await exerc.waitForTimeout(3_000);
   } catch {
@@ -535,7 +522,7 @@ const preflightCdpReachable = async (cdpUrl: string): Promise<string | null> => 
     return null;
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    return `Could not reach CDP at ${cdpUrl} (${detail}). Run this first in another terminal:\n  npm --prefix packages/sidetrack-extension run e2e:chrome-debug\nThen re-run e2e:attach-diag.`;
+    return `Could not reach CDP at ${cdpUrl} (${detail}). Run this first in another terminal:\n  bun run --cwd packages/sidetrack-extension e2e:chrome-debug\nThen re-run e2e:attach-diag.`;
   }
 };
 
@@ -581,7 +568,9 @@ test.describe('manual attach diagnostics', () => {
           ? null
           : await fetchCompanionJson(companionEndpoint, '/v1/privacy/projection');
       const versionProjection =
-        companionEndpoint === null ? null : await fetchCompanionJson(companionEndpoint, '/v1/version');
+        companionEndpoint === null
+          ? null
+          : await fetchCompanionJson(companionEndpoint, '/v1/version');
       const threadsProjection =
         companionEndpoint === null
           ? null
@@ -662,7 +651,10 @@ test.describe('manual attach diagnostics', () => {
       let propagatedCount = 0;
       let lostToPrecedence = 0;
       for (const thread of threads) {
-        if (typeof thread.primaryWorkstreamId !== 'string' || thread.primaryWorkstreamId.length === 0) {
+        if (
+          typeof thread.primaryWorkstreamId !== 'string' ||
+          thread.primaryWorkstreamId.length === 0
+        ) {
           continue;
         }
         threadsWithPrimary += 1;
@@ -671,7 +663,12 @@ test.describe('manual attach diagnostics', () => {
         threadsWithUrl += 1;
         const canonical = stripFragmentAndSlash(candidate);
         const record = urlMap.get(canonical) as
-          | { readonly currentAttribution?: { readonly source?: string; readonly workstreamId?: string } }
+          | {
+              readonly currentAttribution?: {
+                readonly source?: string;
+                readonly workstreamId?: string;
+              };
+            }
           | undefined;
         if (record === undefined) continue;
         threadsMatched += 1;
@@ -719,12 +716,15 @@ test.describe('manual attach diagnostics', () => {
           ? (versionProjection as { data: { gitSha: string } }).data.gitSha
           : null;
       const stalenessWarning =
-        companionBuildSha !== null && headSha !== 'unknown' && !companionBuildSha.startsWith(headSha)
+        companionBuildSha !== null &&
+        headSha !== 'unknown' &&
+        !companionBuildSha.startsWith(headSha)
           ? `STALE_PROCESS: extension build sha (${headSha}) and companion build sha (${companionBuildSha}) differ; restart the recorder/companion to interpret companion-side diagnostics`
           : null;
 
-      const privacyData = (privacyProjection as { data?: { gateStates?: Record<string, string> } } | null)
-        ?.data?.gateStates ?? {};
+      const privacyData =
+        (privacyProjection as { data?: { gateStates?: Record<string, string> } } | null)?.data
+          ?.gateStates ?? {};
 
       const report: AttachDiagReport = {
         producedAt: new Date().toISOString(),
@@ -769,28 +769,28 @@ test.describe('manual attach diagnostics', () => {
             (after.result.devDiag as { engagement?: { lastInterval?: unknown } } | null)?.engagement
               ?.lastInterval ?? null,
           lastAggregatePosted:
-            (after.result.devDiag as { engagement?: { lastAggregate?: unknown } } | null)?.engagement
-              ?.lastAggregate ?? null,
+            (after.result.devDiag as { engagement?: { lastAggregate?: unknown } } | null)
+              ?.engagement?.lastAggregate ?? null,
           postError:
-            (after.result.devDiag as { engagement?: { lastPostError?: unknown } } | null)?.engagement
-              ?.lastPostError ?? null,
+            (after.result.devDiag as { engagement?: { lastPostError?: unknown } } | null)
+              ?.engagement?.lastPostError ?? null,
           eventCountBefore:
             (matDiag as { engagement?: { sessionAggregatedCount?: number } } | null)?.engagement
               ?.sessionAggregatedCount ?? null,
           eventCountAfter:
-            (matDiagAfter as { engagement?: { sessionAggregatedCount?: number } } | null)?.engagement
-              ?.sessionAggregatedCount ?? null,
+            (matDiagAfter as { engagement?: { sessionAggregatedCount?: number } } | null)
+              ?.engagement?.sessionAggregatedCount ?? null,
         },
         materializer: {
           engagementEligibleEntryCount:
             (matDiagAfter as { timeline?: { engagementEligibleEntryCount?: number } } | null)
               ?.timeline?.engagementEligibleEntryCount ?? null,
           entriesWithFocusedWindowMs:
-            (matDiagAfter as { timeline?: { entriesWithFocusedWindowMs?: number } } | null)?.timeline
-              ?.entriesWithFocusedWindowMs ?? null,
+            (matDiagAfter as { timeline?: { entriesWithFocusedWindowMs?: number } } | null)
+              ?.timeline?.entriesWithFocusedWindowMs ?? null,
           similarityEdgeCount:
-            (matDiagAfter as { similarity?: { edgeCount?: number } } | null)?.similarity?.edgeCount ??
-            null,
+            (matDiagAfter as { similarity?: { edgeCount?: number } } | null)?.similarity
+              ?.edgeCount ?? null,
           rankerStatus:
             (matDiagAfter as { ranker?: { status?: string } } | null)?.ranker?.status ?? null,
           closestVisitEdgeCount:
@@ -822,7 +822,9 @@ test.describe('manual attach diagnostics', () => {
       const finalReport: AttachDiagReport = {
         ...report,
         engagementFailureClass: classifyEngagementFailure(report),
-        threadPropagationFailureClass: classifyThreadPropagationFailure(report.threadUrlPropagation),
+        threadPropagationFailureClass: classifyThreadPropagationFailure(
+          report.threadUrlPropagation,
+        ),
       };
 
       // 11: write the report.

@@ -74,7 +74,7 @@ export const checkLatestVersion = async (
   }
   try {
     const controller = new AbortController();
-    // Five seconds keeps the status endpoint responsive when npm or the
+    // Five seconds keeps the status endpoint responsive when the registry or the
     // network is unavailable; failure returns a warning instead of throwing.
     const timeout = setTimeout(() => {
       controller.abort();

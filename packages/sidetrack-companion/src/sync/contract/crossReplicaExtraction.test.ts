@@ -72,9 +72,7 @@ describe('Lane 2 cross-replica extraction', () => {
     const store = createExtractionStore(vaultRoot);
     const indexPath = join(vaultRoot, '_BAC', 'recall', 'index.bin');
     const runner = createSyncContractRunner();
-    runner.register(
-      createExtractionMaterializer({ store, eventLog }),
-    );
+    runner.register(createExtractionMaterializer({ store, eventLog }));
     runner.register(
       createRecallMaterializer({
         recallLifecycle,
@@ -144,8 +142,12 @@ describe('Lane 2 cross-replica extraction', () => {
     await b.runner.catchUpAll(b.eventLog);
 
     // Both replicas have v1 active.
-    expect((await a.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision).toBe('rev-v1');
-    expect((await b.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision).toBe('rev-v1');
+    expect(
+      (await a.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision,
+    ).toBe('rev-v1');
+    expect(
+      (await b.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision,
+    ).toBe('rev-v1');
 
     // B re-captures with v1.1 (newer extractorVersion + schema).
     const eventV2 = extractionProducedEvent({
@@ -168,8 +170,12 @@ describe('Lane 2 cross-replica extraction', () => {
 
     // Both replicas now have v2 active. Active-revision policy is
     // deterministic (higher schema version wins).
-    expect((await a.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision).toBe('rev-v2');
-    expect((await b.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision).toBe('rev-v2');
+    expect(
+      (await a.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision,
+    ).toBe('rev-v2');
+    expect(
+      (await b.store.readSourceState('src:chatgpt:thread-x:turn-0'))?.latestExtractionRevision,
+    ).toBe('rev-v2');
     // Recall index on both replicas reflects v2.
     const indexA = await readIndex(a.indexPath);
     const indexB = await readIndex(b.indexPath);
@@ -207,9 +213,7 @@ describe('Lane 2 cross-replica extraction', () => {
     // into chatgpt.
     const index = await readIndex(b.indexPath);
     expect(index, 'recall index exists on B').not.toBeNull();
-    const chunks = index!.items.filter(
-      (e) => e.metadata?.extractionRevisionId === 'rev-v1.1',
-    );
+    const chunks = index!.items.filter((e) => e.metadata?.extractionRevisionId === 'rev-v1.1');
     expect(chunks.length).toBeGreaterThan(0);
     // Confirm B's eventLog has zero capture.recorded events for
     // thread-x — the no-login claim.

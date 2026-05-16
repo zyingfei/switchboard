@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Find a reliable selector for ChatGPT's "New chat" sidebar button
 // (or equivalent affordance) so the dispatch driver can click it
 // when chatgpt.com/ redirects to /c/<existing-id>. Probes the live
@@ -55,7 +55,9 @@ const main = async () => {
         record('by-label', el);
       }
       // (b) Sidebar link to "/".
-      for (const el of document.querySelectorAll('a[href="/"], a[href="/?"], a[href="/?model=auto"]')) {
+      for (const el of document.querySelectorAll(
+        'a[href="/"], a[href="/?"], a[href="/?model=auto"]',
+      )) {
         record('href-root', el);
       }
       // (c) Buttons / links containing the literal text "New chat".
@@ -65,7 +67,9 @@ const main = async () => {
         }
       }
       // (d) Plus icons on the sidebar (often unlabeled).
-      for (const el of document.querySelectorAll('button[aria-label*="plus" i], button:has(svg.lucide-plus)')) {
+      for (const el of document.querySelectorAll(
+        'button[aria-label*="plus" i], button:has(svg.lucide-plus)',
+      )) {
         record('plus-icon', el);
       }
       const out = {};
@@ -80,16 +84,12 @@ const main = async () => {
       // Prefer aria-label, then data-testid, then sidebar a[href="/"].
       const isVisible = (el) =>
         el instanceof HTMLElement && el.offsetParent !== null && el.checkVisibility?.() !== false;
-      const tries = [
-        '[aria-label*="new chat" i]',
-        '[data-testid*="new-chat" i]',
-        'a[href="/"]',
-      ];
+      const tries = ['[aria-label*="new chat" i]', '[data-testid*="new-chat" i]', 'a[href="/"]'];
       for (const sel of tries) {
         for (const el of document.querySelectorAll(sel)) {
           if (isVisible(el)) {
             const id = `__sidetrack_probe_${Math.random().toString(36).slice(2)}`;
-            (el).setAttribute('data-sidetrack-probe-target', id);
+            el.setAttribute('data-sidetrack-probe-target', id);
             return { selector: `[data-sidetrack-probe-target="${id}"]`, used: sel };
           }
         }
@@ -108,7 +108,7 @@ const main = async () => {
     const composerEmpty = await page.evaluate(() => {
       const el = document.querySelector('#prompt-textarea[role="textbox"], #prompt-textarea');
       if (!el) return null;
-      return ((el).innerText ?? '').trim().length === 0;
+      return (el.innerText ?? '').trim().length === 0;
     });
     console.log(`  composer present + empty: ${String(composerEmpty)}`);
     console.log(

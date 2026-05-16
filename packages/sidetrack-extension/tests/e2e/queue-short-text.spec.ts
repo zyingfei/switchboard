@@ -6,12 +6,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 import { messageTypes } from '../../src/messages';
 import { launchExtensionRuntime, type ExtensionRuntime } from './helpers/runtime';
-import {
-  THREADS_KEY,
-  WORKSTREAMS_KEY,
-  assertOk,
-  seedAndOpenSidepanel,
-} from './helpers/sidepanel';
+import { THREADS_KEY, WORKSTREAMS_KEY, assertOk, seedAndOpenSidepanel } from './helpers/sidepanel';
 
 const QUEUE_ITEMS_KEY = 'sidetrack.queueItems';
 

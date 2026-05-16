@@ -2,11 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { buildAnnIndex } from '../recall/ann-index.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
-import {
-  buildLexicalIndex,
-  rankHybrid,
-  type IndexEntry,
-} from '../recall/ranker.js';
+import { buildLexicalIndex, rankHybrid, type IndexEntry } from '../recall/ranker.js';
 import type { TimelineEntry } from '../timeline/projection.js';
 import type {
   VisitSimilarityEdge,
@@ -52,12 +48,9 @@ export const VISIT_SIMILARITY_DEFAULT_LEXICAL_THRESHOLD = 0.3;
 
 export const VISIT_SIMILARITY_THRESHOLD_ENV = 'SIDETRACK_SIMILARITY_THRESHOLD';
 export const VISIT_SIMILARITY_TOP_K_ENV = 'SIDETRACK_SIMILARITY_TOP_K';
-export const VISIT_SIMILARITY_ENGAGEMENT_GATE_MS_ENV =
-  'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS';
-export const VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV =
-  'SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD';
-export const VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV =
-  'SIDETRACK_SIMILARITY_LEXICAL_FALLBACK';
+export const VISIT_SIMILARITY_ENGAGEMENT_GATE_MS_ENV = 'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS';
+export const VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV = 'SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD';
+export const VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV = 'SIDETRACK_SIMILARITY_LEXICAL_FALLBACK';
 
 const readEnvNumber = (name: string): number | undefined => {
   const raw = process.env[name];
@@ -137,11 +130,7 @@ const hostnameForUrl = (url: string): string => {
 export const corpusForVisitEntry = (entry: VisitSimilarityEntry): string => {
   const url = entry.canonicalUrl ?? entry.url;
   return normalizeSpaces(
-    [
-      entry.title ?? '',
-      hostnameForUrl(url),
-      ...pathTokensForUrl(url),
-    ].join(' '),
+    [entry.title ?? '', hostnameForUrl(url), ...pathTokensForUrl(url)].join(' '),
   );
 };
 
@@ -153,10 +142,7 @@ export const visitKeyForVisitEntry = (entry: VisitSimilarityEntry): string =>
 const corpusForEntry = corpusForVisitEntry;
 const visitKeyForEntry = visitKeyForVisitEntry;
 
-const preferNewEntry = (
-  existing: NormalizedVisit,
-  candidate: NormalizedVisit,
-): NormalizedVisit => {
+const preferNewEntry = (existing: NormalizedVisit, candidate: NormalizedVisit): NormalizedVisit => {
   const focusedWindowMs = Math.max(existing.focusedWindowMs, candidate.focusedWindowMs);
   if (candidate.lastSeenAt > existing.lastSeenAt) {
     return { ...candidate, focusedWindowMs };
@@ -175,9 +161,7 @@ const preferNewEntry = (
     : { ...existing, focusedWindowMs };
 };
 
-const normalizeEntries = (
-  entries: readonly VisitSimilarityEntry[],
-): readonly NormalizedVisit[] => {
+const normalizeEntries = (entries: readonly VisitSimilarityEntry[]): readonly NormalizedVisit[] => {
   const byKey = new Map<string, NormalizedVisit>();
   for (const entry of entries) {
     const visitKey = visitKeyForEntry(entry);
@@ -392,7 +376,7 @@ const buildLexicalEdges = (
 
 const logMaterializerError = (error: unknown): void => {
   const message = error instanceof Error ? error.message : String(error);
-  // eslint-disable-next-line no-console
+
   console.warn(`[materializer-error] visit-similarity embed failed: ${message}`);
 };
 
@@ -476,7 +460,7 @@ export const computeVisitSimilarityRevisionId = (
 // reconciliation always uses buildVisitSimilarity (the byte-equality
 // oracle).
 
-import { IncrementalVisitSimilarityIndex } from './visitSimilarity.incremental.js';
+import type { IncrementalVisitSimilarityIndex } from './visitSimilarity.incremental.js';
 
 export interface BuildVisitSimilarityIncrementalInput {
   /** Persistent in-memory index maintained by the materializer across drains. */
@@ -601,9 +585,7 @@ export const buildVisitSimilarity = async (
       threshold: lexicalThreshold,
       producedAt: Date.now(),
       producer: 'lexical',
-      edges: fallbackAllowed
-        ? buildLexicalEdges(eligibleForLexical, lexicalThreshold, topK)
-        : [],
+      edges: fallbackAllowed ? buildLexicalEdges(eligibleForLexical, lexicalThreshold, topK) : [],
     };
   };
 
@@ -657,18 +639,12 @@ export const buildVisitSimilarity = async (
     if (queryVector === undefined) continue;
     const candidateEntries = indexEntries.filter((entry) => entry.id !== source.visitKey);
     const ranked = [
-      ...rankHybrid(
-        source.corpus,
-        queryVector,
-        candidateEntries,
-        new Date(source.lastSeenAt),
-        {
-          limit: topK,
-          lexical: buildLexicalIndex(candidateEntries),
-          vectorIndex,
-          excludeIds: new Set<string>([source.visitKey]),
-        },
-      ),
+      ...rankHybrid(source.corpus, queryVector, candidateEntries, new Date(source.lastSeenAt), {
+        limit: topK,
+        lexical: buildLexicalIndex(candidateEntries),
+        vectorIndex,
+        excludeIds: new Set<string>([source.visitKey]),
+      }),
     ].sort((left, right) => {
       if (right.similarity !== left.similarity) return right.similarity - left.similarity;
       return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;

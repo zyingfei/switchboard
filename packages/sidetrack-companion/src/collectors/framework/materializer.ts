@@ -1,7 +1,4 @@
-import type {
-  CollectorEvent,
-  PayloadVersionStatus,
-} from './types.js';
+import type { CollectorEvent, PayloadVersionStatus } from './types.js';
 
 export interface MaterializerRegistration<P_current, EmittedEvent = unknown> {
   readonly collector_id: string;
@@ -15,10 +12,7 @@ export interface MaterializerRegistration<P_current, EmittedEvent = unknown> {
     }
   >;
   readonly validate: (latest: unknown) => P_current;
-  readonly toClassA: (
-    latest: P_current,
-    env: CollectorEvent,
-  ) => readonly EmittedEvent[];
+  readonly toClassA: (latest: P_current, env: CollectorEvent) => readonly EmittedEvent[];
 }
 
 export interface MaterializerRegistry {
@@ -38,17 +32,11 @@ export interface MaterializerRegistry {
     | { kind: 'version-too-new'; max_known: number };
   allRegistrations(): readonly MaterializerRegistration<unknown>[];
   allTuples(): ReadonlySet<string>;
-  maxKnownPayloadVersionFor(
-    collector_id: string,
-    event_type: string,
-  ): number | undefined;
+  maxKnownPayloadVersionFor(collector_id: string, event_type: string): number | undefined;
 }
 
-const tupleKey = (
-  collector_id: string,
-  event_type: string,
-  payload_version: number,
-): string => `${collector_id}:${event_type}:${payload_version}`;
+const tupleKey = (collector_id: string, event_type: string, payload_version: number): string =>
+  `${collector_id}:${event_type}:${payload_version}`;
 
 const registrationKey = (collector_id: string, event_type: string): string =>
   `${collector_id}:${event_type}`;
@@ -74,10 +62,7 @@ export const createMaterializerRegistry = (): MaterializerRegistry => {
       registrations.set(baseKey, stored);
       registrationsInOrder.push(stored);
       for (const version of reg.versions.keys()) {
-        tupleToRegistration.set(
-          tupleKey(reg.collector_id, reg.event_type, version),
-          stored,
-        );
+        tupleToRegistration.set(tupleKey(reg.collector_id, reg.event_type, version), stored);
         maxVersions.set(
           baseKey,
           Math.max(maxVersions.get(baseKey) ?? Number.NEGATIVE_INFINITY, version),
@@ -117,11 +102,7 @@ export const createMaterializerRegistry = (): MaterializerRegistry => {
       }
 
       const upcasterChain: ((x: unknown) => unknown)[] = [];
-      for (
-        let version = payload_version;
-        version < reg.current_payload_version;
-        version += 1
-      ) {
+      for (let version = payload_version; version < reg.current_payload_version; version += 1) {
         const next = reg.versions.get(version)?.upcastTo;
         if (next === undefined) {
           return { kind: 'not-registered' };
@@ -145,10 +126,7 @@ export const createMaterializerRegistry = (): MaterializerRegistry => {
       return new Set(tupleToRegistration.keys());
     },
 
-    maxKnownPayloadVersionFor(
-      collector_id: string,
-      event_type: string,
-    ): number | undefined {
+    maxKnownPayloadVersionFor(collector_id: string, event_type: string): number | undefined {
       return maxVersions.get(registrationKey(collector_id, event_type));
     },
   };

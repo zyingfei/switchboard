@@ -48,7 +48,7 @@ const assertOk = (response: unknown): void => {
 
 // Read-only smoke against real provider pages. Requires the profile
 // at ~/.sidetrack-test-profile to be already logged in (run
-// `npm run e2e:login` once and sign in to each provider). Will be
+// `bun run e2e:login` once and sign in to each provider). Will be
 // SKIPPED automatically when SIDETRACK_USER_DATA_DIR is unset, so the
 // throwaway-profile CI path stays green.
 test.describe('live providers (logged-in profile)', () => {

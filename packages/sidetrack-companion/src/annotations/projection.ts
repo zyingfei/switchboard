@@ -50,9 +50,7 @@ const ensure = (map: Map<string, PerAnnotation>, bacId: string): PerAnnotation =
   return entry;
 };
 
-export const projectAnnotations = (
-  events: readonly AcceptedEvent[],
-): AnnotationsProjection => {
+export const projectAnnotations = (events: readonly AcceptedEvent[]): AnnotationsProjection => {
   const byId = new Map<string, PerAnnotation>();
   const relevantEvents: AcceptedEvent[] = [];
   for (const event of events) {
@@ -78,7 +76,10 @@ export const projectAnnotations = (
 
   const projected: AnnotationProjectionEntry[] = [];
   for (const entry of byId.values()) {
-    if (entry.createdEvent === undefined || !isAnnotationCreatedPayload(entry.createdEvent.payload)) {
+    if (
+      entry.createdEvent === undefined ||
+      !isAnnotationCreatedPayload(entry.createdEvent.payload)
+    ) {
       continue;
     }
     const created = entry.createdEvent.payload;

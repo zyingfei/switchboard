@@ -143,7 +143,7 @@ The milestone ships when ALL of these pass (full criteria in
 docs/milestones/M1-foundation/README.md §"E2E acceptance criteria"):
 
 Capture & tracking:
-1. `npx @sidetrack/companion --vault /tmp/sidetrack-m1` boots
+1. `bunx @sidetrack/companion --vault /tmp/sidetrack-m1` boots
    cleanly, binds 127.0.0.1, writes `_BAC/.config/bridge.key`.
 2. Extension installs from packages/sidetrack-extension/.output/
    chrome-mv3, paste-key first-run flow connects.
@@ -176,7 +176,7 @@ Recovery:
     session / reopen URL).
 
 MCP read-side:
-13. `npx @sidetrack/mcp --vault /tmp/sidetrack-m1`; bac.recent_threads
+13. `bunx @sidetrack/mcp --vault /tmp/sidetrack-m1`; bac.recent_threads
     returns 4 captured threads; bac.workstream returns nested tree;
     bac.context_pack returns Markdown; bac.search lexical works;
     bac.queued_items + bac.inbound_reminders return populated.

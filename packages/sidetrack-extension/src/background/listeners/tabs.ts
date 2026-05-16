@@ -7,7 +7,9 @@ export interface TabOpenerStore {
 
 export interface TabsListenerApi {
   readonly onCreated: {
-    addListener(listener: (tab: { readonly id?: number; readonly openerTabId?: number }) => void): void;
+    addListener(
+      listener: (tab: { readonly id?: number; readonly openerTabId?: number }) => void,
+    ): void;
   };
   readonly onRemoved: {
     addListener(listener: (tabId: number) => void): void;

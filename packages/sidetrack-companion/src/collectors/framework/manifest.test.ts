@@ -35,12 +35,8 @@ const stringArray = (values: readonly string[]): string =>
   `[${values.map((value) => quoted(value)).join(', ')}]`;
 
 const manifestToml = (options: ManifestFixtureOptions = {}): string => {
-  const emits = options.emits ?? [
-    { event_type: 'tick', payload_version: 1, stability: 'alpha' },
-  ];
-  const lines: string[] = [
-    `id = ${quoted(options.id ?? 'sidetrack.test')}`,
-  ];
+  const emits = options.emits ?? [{ event_type: 'tick', payload_version: 1, stability: 'alpha' }];
+  const lines: string[] = [`id = ${quoted(options.id ?? 'sidetrack.test')}`];
 
   if (options.includeName !== false) {
     lines.push(`name = ${quoted(options.name ?? 'Sidetrack Test Collector')}`);
@@ -106,10 +102,7 @@ const context = (overrides: Partial<ManifestLoadContext> = {}): ManifestLoadCont
   ...overrides,
 });
 
-const expectRejected = (
-  decision: ManifestLoadDecision,
-  reason: ManifestRejectionReason,
-): void => {
+const expectRejected = (decision: ManifestLoadDecision, reason: ManifestRejectionReason): void => {
   expect('rejected' in decision).toBe(true);
   if (!('rejected' in decision)) throw new Error('expected manifest rejection');
   expect(decision.rejected.reason).toBe(reason);
@@ -159,9 +152,7 @@ describe('collector manifest parsing and load decision', () => {
   });
 
   it('covers Compass 2.G #5 requires-companion-not-satisfied', () => {
-    const manifest = parseValidManifest(
-      manifestToml({ requiresCompanion: '>=999.0.0' }),
-    );
+    const manifest = parseValidManifest(manifestToml({ requiresCompanion: '>=999.0.0' }));
     expectRejected(decideLoad(manifest, context()), 'requires-companion-not-satisfied');
   });
 

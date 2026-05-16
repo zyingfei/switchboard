@@ -99,13 +99,19 @@ export const callTool = async (call: McpToolCall): Promise<McpResult> => {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new ProtocolError('MCP tools/call response was not an object.');
   }
-  const record = body as { readonly content?: unknown; readonly structuredContent?: unknown; readonly error?: unknown };
+  const record = body as {
+    readonly content?: unknown;
+    readonly structuredContent?: unknown;
+    readonly error?: unknown;
+  };
   if (typeof record.error === 'string') {
     return { ok: false, error: record.error };
   }
   return {
     ok: true,
     content: record.content,
-    ...(record.structuredContent === undefined ? {} : { structuredContent: record.structuredContent }),
+    ...(record.structuredContent === undefined
+      ? {}
+      : { structuredContent: record.structuredContent }),
   };
 };

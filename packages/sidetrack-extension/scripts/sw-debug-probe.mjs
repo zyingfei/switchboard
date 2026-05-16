@@ -15,7 +15,7 @@
 //   7. Prints a structured summary.
 //
 // Requires chrome-debug to be running:
-//   npm --prefix packages/sidetrack-extension run e2e:chrome-debug
+//   bun run --cwd packages/sidetrack-extension e2e:chrome-debug
 
 import { chromium } from 'playwright';
 
@@ -91,7 +91,9 @@ const main = async () => {
 
   // Probe 4: open Hacker News and wait so the timeline observer admits.
   const hn = await ctx.newPage();
-  await hn.goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+  await hn
+    .goto('https://news.ycombinator.com/', { waitUntil: 'domcontentloaded' })
+    .catch(() => undefined);
   log('opened HN', hn.url());
   // Slow browse: 25 s focused. If engagement DID inject (it won't
   // without host permission in CfT), the 30 s aggregator interval

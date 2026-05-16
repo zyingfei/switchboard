@@ -17,8 +17,7 @@ export interface Trust {
 }
 
 const isWorkstreamWriteTool = (value: unknown): value is WorkstreamWriteTool =>
-  typeof value === 'string' &&
-  workstreamWriteTools.some((candidate) => candidate === value);
+  typeof value === 'string' && workstreamWriteTools.some((candidate) => candidate === value);
 
 const trustPath = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'trust.json');
 

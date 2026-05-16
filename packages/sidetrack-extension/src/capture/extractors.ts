@@ -534,13 +534,7 @@ export const captureVisibleConversation = (
   const config = providerConfigs[provider];
 
   let usedFallback = false;
-  let turns = finalizeTurns(
-    extractConfiguredTurns(doc, config),
-    maxChars,
-    config,
-    capturedAt,
-    doc,
-  );
+  let turns = finalizeTurns(extractConfiguredTurns(doc, config), maxChars, config, capturedAt, doc);
   if (turns.length === 0) {
     // Fallback grabs visible text from <main>/<body>. On real provider
     // pages (Gemini's Angular shell wraps sidebar + conversation in a

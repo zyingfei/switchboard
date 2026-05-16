@@ -42,7 +42,7 @@ const fileInfo = async (
   path: string,
 ): Promise<{ readonly path: string; readonly mtimeMs: number; readonly bytes: number } | null> => {
   const info = await stat(path).catch(() => null);
-  if (info === null || !info.isFile()) return null;
+  if (!info?.isFile()) return null;
   return { path, mtimeMs: info.mtimeMs, bytes: info.size };
 };
 

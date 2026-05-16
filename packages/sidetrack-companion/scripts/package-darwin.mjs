@@ -1,10 +1,10 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Sidetrack-companion macOS-first package builder.
 //
 // Produces a versioned STAGED DISTRIBUTION BUNDLE under
 // dist-packages/sidetrack-darwin-<arch>-<version>/. Not a one-click
 // installer:
-//   * Wrapper scripts shell out to system `node` — embedding Node
+//   * Wrapper scripts shell out to system `bun` — embedding Bun
 //     would require platform-specific bundling and bumps the
 //     bundle from ~150MB to ~250MB+.
 //   * install.sh copies the bundle into Application Support and
@@ -13,14 +13,15 @@
 // "Staged" because every artifact the runtime needs is in the
 // bundle (companion + mcp dist, node_modules with native ONNX
 // bindings, optional model cache) — what's NOT in the bundle is a
-// system-Node-free runtime + automated launchd registration. Both
+// system-Bun-free runtime + automated launchd registration. Both
 // are deliberate scope boundaries; mention them in the README.
 // Layout:
 //
-//   bin/sidetrack-companion        wrapper script (calls system Node)
+//   bin/sidetrack-companion        wrapper script (calls system Bun)
 //   bin/sidetrack-mcp              wrapper script
-//   companion/dist/, companion/package.json, companion/node_modules/
-//   mcp/dist/, mcp/package.json, mcp/node_modules/
+//   companion/dist/, companion/package.json
+//   mcp/dist/, mcp/package.json
+//   node_modules/                  root Bun workspace dependencies
 //   models/                        optional, when --include-model
 //   install.sh                     copies the bundle under
 //                                  ~/Library/Application Support/
@@ -34,9 +35,9 @@
 // signing and notarization land in a separate pass.
 //
 // Usage:
-//   node scripts/package-darwin.mjs
-//   node scripts/package-darwin.mjs --include-model
-//   node scripts/package-darwin.mjs --out dist-packages
+//   bun scripts/package-darwin.mjs
+//   bun scripts/package-darwin.mjs --include-model
+//   bun scripts/package-darwin.mjs --out dist-packages
 
 import { execSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
@@ -91,13 +92,13 @@ const run = (cmd, opts = {}) => {
 
 const main = async () => {
   if (process.platform !== 'darwin') {
-    log(`WARNING: running on non-darwin platform (${process.platform}). Output is still macOS-shaped.`);
+    log(
+      `WARNING: running on non-darwin platform (${process.platform}). Output is still macOS-shaped.`,
+    );
   }
 
   // 1. Read versions.
-  const companionPkg = JSON.parse(
-    await readFile(join(companionRoot, 'package.json'), 'utf8'),
-  );
+  const companionPkg = JSON.parse(await readFile(join(companionRoot, 'package.json'), 'utf8'));
   const mcpRoot = resolve(repoRoot, 'packages', 'sidetrack-mcp');
   let mcpPkg = null;
   if (existsSync(join(mcpRoot, 'package.json'))) {
@@ -113,30 +114,26 @@ const main = async () => {
 
   // 2. Build companion (and mcp if present).
   log('building companion …');
-  run('npx tsc -p tsconfig.build.json', { cwd: companionRoot });
+  run('bunx --bun --no-install tsc -p tsconfig.build.json', { cwd: companionRoot });
   if (mcpPkg !== null) {
     log('building mcp …');
-    run('npx tsc -p tsconfig.build.json', { cwd: mcpRoot });
+    run('bunx --bun --no-install tsc -p tsconfig.build.json', { cwd: mcpRoot });
   }
 
   // 3. Stage companion files.
   await mkdir(join(stage, 'companion'), { recursive: true });
   await cp(join(companionRoot, 'dist'), join(stage, 'companion', 'dist'), { recursive: true });
-  await cp(
-    join(companionRoot, 'package.json'),
-    join(stage, 'companion', 'package.json'),
-  );
-  // Use the companion's installed node_modules — it carries the ONNX
-  // native bindings + transformers.js. We copy rather than reinstall
-  // to keep the package builder offline-friendly.
-  if (existsSync(join(companionRoot, 'node_modules'))) {
-    await cp(
-      join(companionRoot, 'node_modules'),
-      join(stage, 'companion', 'node_modules'),
-      { recursive: true, dereference: true },
-    );
+  await cp(join(companionRoot, 'package.json'), join(stage, 'companion', 'package.json'));
+  // Use the root Bun workspace node_modules. It carries companion +
+  // MCP runtime deps, including native ONNX bindings. We copy rather
+  // than reinstall to keep the package builder offline-friendly.
+  if (existsSync(join(repoRoot, 'node_modules'))) {
+    await cp(join(repoRoot, 'node_modules'), join(stage, 'node_modules'), {
+      recursive: true,
+      dereference: true,
+    });
   } else {
-    log('WARN: companion/node_modules missing — run `npm install` first.');
+    log('WARN: root node_modules missing — run `bun install` first.');
   }
 
   // 4. Stage mcp files when present.
@@ -144,21 +141,14 @@ const main = async () => {
     await mkdir(join(stage, 'mcp'), { recursive: true });
     await cp(join(mcpRoot, 'dist'), join(stage, 'mcp', 'dist'), { recursive: true });
     await cp(join(mcpRoot, 'package.json'), join(stage, 'mcp', 'package.json'));
-    if (existsSync(join(mcpRoot, 'node_modules'))) {
-      await cp(
-        join(mcpRoot, 'node_modules'),
-        join(stage, 'mcp', 'node_modules'),
-        { recursive: true, dereference: true },
-      );
-    }
   }
 
-  // 5. Bin wrappers — call the dist entrypoints with system Node.
+  // 5. Bin wrappers — call the dist entrypoints with system Bun.
   await mkdir(join(stage, 'bin'), { recursive: true });
   const companionWrapper = `#!/usr/bin/env bash
 set -euo pipefail
 DIR="$( cd "$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
-exec node "$DIR/../companion/dist/cli.js" "$@"
+exec bun "$DIR/../companion/dist/cli.js" "$@"
 `;
   await writeFile(join(stage, 'bin', 'sidetrack-companion'), companionWrapper, 'utf8');
   await chmod(join(stage, 'bin', 'sidetrack-companion'), 0o755);
@@ -166,7 +156,7 @@ exec node "$DIR/../companion/dist/cli.js" "$@"
     const mcpWrapper = `#!/usr/bin/env bash
 set -euo pipefail
 DIR="$( cd "$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
-exec node "$DIR/../mcp/dist/cli.js" "$@"
+exec bun "$DIR/../mcp/dist/cli.js" "$@"
 `;
     await writeFile(join(stage, 'bin', 'sidetrack-mcp'), mcpWrapper, 'utf8');
     await chmod(join(stage, 'bin', 'sidetrack-mcp'), 0o755);
@@ -210,10 +200,10 @@ Staged companion + MCP server for Sidetrack ${version}.
 
 This is a **staged distribution bundle**, not a fully self-contained one-click installer:
 
-- The bin wrappers shell out to **system Node**. The bundle does not embed Node — that would balloon the artifact and require platform-specific bundling. \`node\` ≥ 20 must be on \`PATH\` (or installed via Homebrew / nvm) for the wrappers to launch.
+- The bin wrappers shell out to **system Bun**. The bundle does not embed Bun — that would balloon the artifact and require platform-specific bundling. \`bun\` ≥ 1.3.14 must be on \`PATH\` for the wrappers to launch.
 - \`install.sh\` copies the bundle into \`~/Library/Application Support/Sidetrack/companion/${version}/\` and **prints** (does not run) the launchd registration command. You pick the vault path explicitly, then run that command yourself.
 
-What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), companion + MCP dist + node_modules including the ONNX native bindings, optionally a prewarmed embedding-model cache, and install.sh / uninstall.sh helpers.
+What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), companion + MCP dist + root Bun workspace node_modules including the ONNX native bindings, optionally a prewarmed embedding-model cache, and install.sh / uninstall.sh helpers.
 
 ## Install
 
@@ -231,10 +221,11 @@ What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), comp
 
 ## Layout
 
-- \`bin/sidetrack-companion\` — wrapper that runs \`companion/dist/cli.js\` with system Node.
+- \`bin/sidetrack-companion\` — wrapper that runs \`companion/dist/cli.js\` with system Bun.
 - \`bin/sidetrack-mcp\` — sibling MCP server (optional).
-- \`companion/\` — companion dist + node_modules (includes the ONNX native bindings).
-- \`mcp/\` — MCP dist + node_modules.
+- \`companion/\` — companion dist.
+- \`mcp/\` — MCP dist.
+- \`node_modules/\` — root Bun workspace dependencies.
 - \`models/\` — embedding-model cache (only present when built with --include-model).
 
 ## Notes
@@ -305,18 +296,16 @@ What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), comp
     const appleId = process.env['SIDETRACK_NOTARIZE_APPLE_ID'];
     const teamId = process.env['SIDETRACK_NOTARIZE_TEAM_ID'];
     const password = process.env['SIDETRACK_NOTARIZE_PASSWORD'];
-    if (
-      typeof appleId !== 'string' ||
-      typeof teamId !== 'string' ||
-      typeof password !== 'string'
-    ) {
+    if (typeof appleId !== 'string' || typeof teamId !== 'string' || typeof password !== 'string') {
       throw new Error(
         '--notarize needs SIDETRACK_NOTARIZE_APPLE_ID, SIDETRACK_NOTARIZE_TEAM_ID, and SIDETRACK_NOTARIZE_PASSWORD env vars.',
       );
     }
     const zipPath = `${stage}.zip`;
     log(`zipping for notarization: ${zipPath}`);
-    run(`/usr/bin/ditto -c -k --sequesterRsrc --keepParent ${JSON.stringify(stage)} ${JSON.stringify(zipPath)}`);
+    run(
+      `/usr/bin/ditto -c -k --sequesterRsrc --keepParent ${JSON.stringify(stage)} ${JSON.stringify(zipPath)}`,
+    );
     log('submitting to notarytool…');
     run(
       `xcrun notarytool submit ${JSON.stringify(zipPath)} --apple-id ${JSON.stringify(appleId)} --team-id ${JSON.stringify(teamId)} --password ${JSON.stringify(password)} --wait`,
@@ -334,7 +323,7 @@ What IS in the bundle: signed wrapper scripts (when built with \`--sign\`), comp
     log('prewarming model cache (this may take a few minutes)…');
     await mkdir(join(stage, 'models'), { recursive: true });
     run(
-      `node "${join(stage, 'companion', 'dist', 'cli.js')}" models ensure --models-dir "${join(stage, 'models')}"`,
+      `bun "${join(stage, 'companion', 'dist', 'cli.js')}" models ensure --models-dir "${join(stage, 'models')}"`,
       { cwd: stage, env: { ...process.env, SIDETRACK_MODELS_DIR: join(stage, 'models') } },
     );
   }

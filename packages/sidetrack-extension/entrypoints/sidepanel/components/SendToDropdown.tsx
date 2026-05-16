@@ -87,11 +87,7 @@ export function SendToDropdown({
     };
   }, [onClose]);
 
-  const renderRow = (
-    target: SendToTarget,
-    label: string,
-    extra?: string,
-  ): React.JSX.Element => (
+  const renderRow = (target: SendToTarget, label: string, extra?: string): React.JSX.Element => (
     <button
       key={target}
       type="button"

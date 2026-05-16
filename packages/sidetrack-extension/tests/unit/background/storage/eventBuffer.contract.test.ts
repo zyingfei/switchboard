@@ -12,12 +12,20 @@ class MemoryDriver {
   private keyOf(e: Pick<BufferedEvent, 'streamName' | 'lamport' | 'replicaId'>): string {
     return `${e.streamName}|${e.lamport}|${e.replicaId}`;
   }
-  async put(event: BufferedEvent): Promise<void> { this.map.set(this.keyOf(event), event); }
-  async peek(limit: number): Promise<BufferedEvent[]> {
-    return [...this.map.values()].sort((a,b)=>a.lamport-b.lamport || a.replicaId.localeCompare(b.replicaId)).slice(0, limit);
+  async put(event: BufferedEvent): Promise<void> {
+    this.map.set(this.keyOf(event), event);
   }
-  async deleteByKey(key: string): Promise<boolean> { return this.map.delete(key); }
-  async count(): Promise<number> { return this.map.size; }
+  async peek(limit: number): Promise<BufferedEvent[]> {
+    return [...this.map.values()]
+      .sort((a, b) => a.lamport - b.lamport || a.replicaId.localeCompare(b.replicaId))
+      .slice(0, limit);
+  }
+  async deleteByKey(key: string): Promise<boolean> {
+    return this.map.delete(key);
+  }
+  async count(): Promise<number> {
+    return this.map.size;
+  }
 }
 
 const event = (lamport: number, replicaId = 'r1'): BufferedEvent => ({
@@ -41,7 +49,9 @@ const runContract = (name: string, create: () => EventBuffer): void => {
     it('deleteMany removes matching keys only', async () => {
       const b = create();
       await b.appendMany([event(1), event(2)]);
-      const removed = await b.deleteMany([{ streamName: 'selection.copied', lamport: 1, replicaId: 'r1' }]);
+      const removed = await b.deleteMany([
+        { streamName: 'selection.copied', lamport: 1, replicaId: 'r1' },
+      ]);
       expect(removed).toBe(1);
       expect(await b.count()).toBe(1);
     });

@@ -48,9 +48,7 @@ const hasValidPayloadExtensionFields = (value: Record<string, unknown>): boolean
     (typeof value['payloadVersion'] === 'number' && value['payloadVersion'] >= 1)) &&
   (value['dimensions'] === undefined || isRecord(value['dimensions']));
 
-export const isDispatchRecordedPayload = (
-  value: unknown,
-): value is DispatchRecordedPayload => {
+export const isDispatchRecordedPayload = (value: unknown): value is DispatchRecordedPayload => {
   if (!isRecord(value)) return false;
   const target = value['target'];
   return (
@@ -63,9 +61,8 @@ export const isDispatchRecordedPayload = (
   );
 };
 
-export const isDispatchLinkedPayload = (
-  value: unknown,
-): value is DispatchLinkedPayload =>
+export const isDispatchLinkedPayload = (value: unknown): value is DispatchLinkedPayload =>
   isRecord(value) &&
   typeof value['dispatchId'] === 'string' &&
-  typeof value['threadId'] === 'string' && hasValidPayloadExtensionFields(value);
+  typeof value['threadId'] === 'string' &&
+  hasValidPayloadExtensionFields(value);

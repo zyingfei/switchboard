@@ -106,10 +106,7 @@ export interface CompanionWriteClient {
     readonly url?: string;
     readonly pageTitle?: string;
     readonly selectionHint?: string;
-    readonly sourceTurn?:
-      | 'assistant_latest'
-      | 'assistant_all'
-      | { readonly ordinal: number };
+    readonly sourceTurn?: 'assistant_latest' | 'assistant_all' | { readonly ordinal: number };
     readonly anchorPolicy?: {
       readonly repeatedTerm?: 'first' | 'require_hint';
       readonly shortTermMinLength?: number;
@@ -944,7 +941,14 @@ export const createSidetrackMcpServer = (
       if (snap === null) {
         return asStructuredContent({
           scope: 'companion-extended',
-          snapshot: { nodes: [], edges: [], nodeCount: 0, edgeCount: 0, updatedAt: '1970-01-01T00:00:00.000Z', scope: {} },
+          snapshot: {
+            nodes: [],
+            edges: [],
+            nodeCount: 0,
+            edgeCount: 0,
+            updatedAt: '1970-01-01T00:00:00.000Z',
+            scope: {},
+          },
           note: 'No connections snapshot yet — the materializer has not run.',
         });
       }
@@ -999,7 +1003,14 @@ export const createSidetrackMcpServer = (
       if (snap === null) {
         return asStructuredContent({
           scope: 'companion-extended',
-          snapshot: { nodes: [], edges: [], nodeCount: 0, edgeCount: 0, updatedAt: '1970-01-01T00:00:00.000Z', scope: { nodeId, hops: hops ?? 1 } },
+          snapshot: {
+            nodes: [],
+            edges: [],
+            nodeCount: 0,
+            edgeCount: 0,
+            updatedAt: '1970-01-01T00:00:00.000Z',
+            scope: { nodeId, hops: hops ?? 1 },
+          },
           note: 'No connections snapshot yet.',
         });
       }
@@ -1031,7 +1042,9 @@ export const createSidetrackMcpServer = (
         .map((id) => nodeMap.get(id))
         .filter((n): n is NonNullable<typeof n> => n !== undefined)
         .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-      const subEdges = [...keptEdges.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const subEdges = [...keptEdges.values()].sort((a, b) =>
+        a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+      );
       return asStructuredContent({
         scope: 'companion-extended',
         snapshot: {
@@ -1068,7 +1081,8 @@ export const createSidetrackMcpServer = (
   server.registerTool(
     'sidetrack.connections.find_path',
     {
-      description: 'BFS over undirected edges; returns the first path between two nodes or {found:false}.',
+      description:
+        'BFS over undirected edges; returns the first path between two nodes or {found:false}.',
       inputSchema: {
         fromNodeId: z.string().min(1),
         toNodeId: z.string().min(1),
@@ -1081,7 +1095,8 @@ export const createSidetrackMcpServer = (
       const limit = Math.min(Math.max(maxHops ?? 4, 1), 8);
       if (fromNodeId === toNodeId) {
         const node = snap.nodes.find((n) => n.id === fromNodeId);
-        if (node !== undefined) return asStructuredContent({ found: true, nodes: [node], edges: [] });
+        if (node !== undefined)
+          return asStructuredContent({ found: true, nodes: [node], edges: [] });
         return asStructuredContent({ found: false });
       }
       const adjacency = new Map<string, (typeof snap.edges)[number][]>();

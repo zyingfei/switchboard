@@ -146,7 +146,10 @@ export type ConnectionEdgeSource =
   | 'annotation-store'
   | 'reminder-store';
 
-type ConnectionEdgeDot = { readonly replicaId: string; readonly seq: number };
+interface ConnectionEdgeDot {
+  readonly replicaId: string;
+  readonly seq: number;
+}
 
 type RevisionProducedBySource =
   | 'visit-similarity'

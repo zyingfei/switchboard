@@ -153,8 +153,7 @@ const upsertAttribution = (
     (attribution.source === 'user_asserted' ||
       attribution.source === 'tab-group-pull-in' ||
       attribution.source === 'tab-group-pull-out');
-  const preserveIgnored =
-    existing?.currentIgnored !== undefined && !userAssertedReorganize;
+  const preserveIgnored = existing?.currentIgnored !== undefined && !userAssertedReorganize;
   records.set(attribution.canonicalUrl, {
     canonicalUrl: attribution.canonicalUrl,
     firstSeenAt: existing?.firstSeenAt ?? fallbackObservedAt,
@@ -166,8 +165,8 @@ const upsertAttribution = (
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
     ...(currentAttribution === undefined ? {} : { currentAttribution }),
-    ...(preserveIgnored && existing!.currentIgnored !== undefined
-      ? { currentIgnored: existing!.currentIgnored }
+    ...(preserveIgnored && existing.currentIgnored !== undefined
+      ? { currentIgnored: existing.currentIgnored }
       : {}),
     attributionHistory: history,
   });
@@ -192,15 +191,16 @@ const upsertIgnored = (
     (existingCursor.observedAt > incomingCursor.observedAt ||
       (existingCursor.observedAt === incomingCursor.observedAt &&
         existingCursor.seq > incomingCursor.seq));
-  const nextIgnored: UrlIgnoredState = keepExisting && existingCursor !== undefined
-    ? existingCursor
-    : {
-        reason: input.reason,
-        observedAt: input.observedAt,
-        clientEventId: input.clientEventId,
-        replicaId: input.replicaId,
-        seq: input.seq,
-      };
+  const nextIgnored: UrlIgnoredState =
+    keepExisting && existingCursor !== undefined
+      ? existingCursor
+      : {
+          reason: input.reason,
+          observedAt: input.observedAt,
+          clientEventId: input.clientEventId,
+          replicaId: input.replicaId,
+          seq: input.seq,
+        };
   const fallbackObservedAt = input.observedAt;
   records.set(input.canonicalUrl, {
     canonicalUrl: input.canonicalUrl,
@@ -449,7 +449,7 @@ export const seedUrlProjectionAccumulatorAsync = async (
 ): Promise<UrlProjectionAccumulator> => {
   const acc = createEmptyUrlProjectionAccumulator();
   for (let i = 0; i < events.length; i += 1) {
-    foldEventIntoUrlProjectionAccumulator(acc, events[i] as AcceptedEvent);
+    foldEventIntoUrlProjectionAccumulator(acc, events[i]!);
     if ((i + 1) % yieldEvery === 0) {
       await new Promise<void>((resolve) => {
         setImmediate(resolve);
@@ -459,9 +459,7 @@ export const seedUrlProjectionAccumulatorAsync = async (
   return acc;
 };
 
-export const urlProjectionFromAccumulator = (
-  acc: UrlProjectionAccumulator,
-): UrlProjection => ({
+export const urlProjectionFromAccumulator = (acc: UrlProjectionAccumulator): UrlProjection => ({
   schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
   byCanonicalUrl: new Map(
     [...acc.records.entries()].sort(([left], [right]) => compareString(left, right)),
@@ -523,14 +521,10 @@ export const serializeUrlProjection = (projection: UrlProjection): SerializedUrl
   byCanonicalUrl: Object.fromEntries(projection.byCanonicalUrl),
 });
 
-export const deserializeUrlProjection = (
-  serialized: SerializedUrlProjection,
-): UrlProjection => ({
+export const deserializeUrlProjection = (serialized: SerializedUrlProjection): UrlProjection => ({
   schemaVersion: serialized.schemaVersion,
   byCanonicalUrl: new Map(
-    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
-      compareString(left, right),
-    ),
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) => compareString(left, right)),
   ),
 });
 
@@ -542,8 +536,7 @@ export const urlInbox = (
     // Hide attributed URLs (they live in their workstream view) AND
     // hide ignored URLs (user explicitly said "noise, don't bother").
     .filter(
-      (record) =>
-        record.currentAttribution === undefined && record.currentIgnored === undefined,
+      (record) => record.currentAttribution === undefined && record.currentIgnored === undefined,
     )
     // Sort by FIRST seen (descending — newest URL on top), not last
     // seen. Sorting by lastSeenAt makes existing items jump around the

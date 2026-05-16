@@ -28,13 +28,10 @@ export const COLLECTOR_AUDIT_ROUTES = {
   MANIFEST_RELOADED: 'collector:manifest-reloaded',
   MANIFEST_TOO_NEW: 'collector:manifest-too-new',
   MANIFEST_TOO_OLD: 'collector:manifest-too-old',
-  MANIFEST_REQUIRES_COMPANION_NOT_SATISFIED:
-    'collector:manifest-requires-companion-not-satisfied',
-  MANIFEST_REQUIRES_VAULT_NOT_SATISFIED:
-    'collector:manifest-requires-vault-not-satisfied',
+  MANIFEST_REQUIRES_COMPANION_NOT_SATISFIED: 'collector:manifest-requires-companion-not-satisfied',
+  MANIFEST_REQUIRES_VAULT_NOT_SATISFIED: 'collector:manifest-requires-vault-not-satisfied',
   MANIFEST_NO_EMITS_REGISTERED: 'collector:manifest-no-emits-registered',
-  MANIFEST_SPAWN_POLICY_UNSUPPORTED:
-    'collector:manifest-spawn-policy-unsupported',
+  MANIFEST_SPAWN_POLICY_UNSUPPORTED: 'collector:manifest-spawn-policy-unsupported',
   MANIFEST_PARSE_FAILED: 'collector:manifest-parse-failed',
   MANIFEST_SCHEMA_FAILED: 'collector:manifest-schema-failed',
   // Replay-on-startup.

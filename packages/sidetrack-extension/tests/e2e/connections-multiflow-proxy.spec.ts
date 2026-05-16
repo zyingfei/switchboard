@@ -36,9 +36,7 @@ const URL_SEARCH =
 
 const T_PROXY = 't_proxy_chatgpt';
 
-const seedThroughHttp = async (
-  comp: TestCompanion,
-): Promise<{ wsId: string }> => {
+const seedThroughHttp = async (comp: TestCompanion): Promise<{ wsId: string }> => {
   const apiPost = async (path: string, body: unknown): Promise<unknown> => {
     const res = await fetch(`http://127.0.0.1:${String(comp.port)}${path}`, {
       method: 'POST',

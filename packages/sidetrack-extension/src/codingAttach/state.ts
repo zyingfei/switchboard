@@ -40,7 +40,9 @@ export const upsertOffer = async (
   return offer;
 };
 
-export const listPendingOffers = async (now: Date = new Date()): Promise<readonly OfferRecord[]> => {
+export const listPendingOffers = async (
+  now: Date = new Date(),
+): Promise<readonly OfferRecord[]> => {
   const offers = expire(await readOffers(), now);
   await writeOffers(offers);
   return offers.filter((offer) => offer.status === 'pending');

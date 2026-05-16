@@ -1,16 +1,16 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // Open a Playwright Chromium window with the Sidetrack extension loaded
 // and a persistent user-data dir, then keep it open while you log in to
 // chatgpt.com / claude.ai / gemini.google.com. Cookies + local storage
-// persist in the user-data dir; subsequent `npx playwright test` runs
+// persist in the user-data dir; subsequent `bunx playwright test` runs
 // using SIDETRACK_USER_DATA_DIR=<same path> reuse them.
 //
 // Usage:
-//   npm run build        # produce .output/chrome-mv3
-//   node scripts/login-test-profile.mjs
+//   bun run build        # produce .output/chrome-mv3
+//   bun scripts/login-test-profile.mjs
 //
 // Or with a custom profile path:
-//   SIDETRACK_USER_DATA_DIR=~/.my-test-profile node scripts/login-test-profile.mjs
+//   SIDETRACK_USER_DATA_DIR=~/.my-test-profile bun scripts/login-test-profile.mjs
 //
 // Close the window in any normal way (Cmd-Q / window-close button) to
 // stop the script. The profile is left in place.
@@ -80,7 +80,7 @@ console.log('');
 console.log('[login] Subsequent test runs reuse this profile:');
 console.log(`[login]   SIDETRACK_USER_DATA_DIR=${userDataDir} \\`);
 console.log('[login]     SIDETRACK_E2E_HEADLESS=0 \\');
-console.log('[login]     npx playwright test <spec>.spec.ts');
+console.log('[login]     bunx --bun --no-install playwright test <spec>.spec.ts');
 console.log('');
 
 await context.waitForEvent('close', { timeout: 0 });

@@ -110,12 +110,20 @@ const PKCS8_ED25519_HEADER = Buffer.from('302e020100300506032b657004220420', 'he
 
 const wrapPublicKey = (raw: Buffer) => {
   if (raw.length !== ED25519_KEY_LEN) throw new Error('bad Ed25519 public length');
-  return createPublicKey({ key: Buffer.concat([SPKI_ED25519_HEADER, raw]), format: 'der', type: 'spki' });
+  return createPublicKey({
+    key: Buffer.concat([SPKI_ED25519_HEADER, raw]),
+    format: 'der',
+    type: 'spki',
+  });
 };
 
 const wrapPrivateKey = (raw: Buffer) => {
   if (raw.length !== ED25519_KEY_LEN) throw new Error('bad Ed25519 private length');
-  return createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_HEADER, raw]), format: 'der', type: 'pkcs8' });
+  return createPrivateKey({
+    key: Buffer.concat([PKCS8_ED25519_HEADER, raw]),
+    format: 'der',
+    type: 'pkcs8',
+  });
 };
 
 // Sign / verify the canonical event bytes. The canonical form (see
@@ -128,10 +136,8 @@ const wrapPrivateKey = (raw: Buffer) => {
 // key (NOT the key embedded in the frame; see runtime
 // known-replicas wiring).
 
-export const signCanonicalEvent = (
-  privateKey: Buffer,
-  canonicalBytes: Buffer,
-): Buffer => nodeSign(null, canonicalBytes, wrapPrivateKey(privateKey));
+export const signCanonicalEvent = (privateKey: Buffer, canonicalBytes: Buffer): Buffer =>
+  nodeSign(null, canonicalBytes, wrapPrivateKey(privateKey));
 
 export const verifyCanonicalEvent = (
   publicKey: Buffer,
@@ -142,11 +148,7 @@ export const verifyCanonicalEvent = (
 // Legacy narrow-scope sign/verify retained ONLY for the existing
 // crypto-unit tests that exercise raw payloads. New callers must
 // use `signCanonicalEvent` / `verifyCanonicalEvent`.
-const signingPayload = (
-  replicaId: string,
-  lamport: number,
-  payloadBytes: Buffer,
-): Buffer => {
+const signingPayload = (replicaId: string, lamport: number, payloadBytes: Buffer): Buffer => {
   const idBytes = Buffer.from(replicaId, 'utf8');
   const lamportBytes = Buffer.alloc(8);
   lamportBytes.writeBigUInt64BE(BigInt(lamport), 0);

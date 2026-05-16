@@ -28,10 +28,7 @@ vi.mock('../../recall/embedder.js', async () => {
 import { createRecallActivityTracker } from '../../recall/activity.js';
 import { createEmbeddingCache } from '../../recall/embeddingCache.js';
 import { createExtractionStore } from '../../recall/extraction/store.js';
-import type {
-  ExtractionRevision,
-  ExtractionSourceState,
-} from '../../recall/extraction/types.js';
+import type { ExtractionRevision, ExtractionSourceState } from '../../recall/extraction/types.js';
 import { createRecallLifecycle } from '../../recall/lifecycle.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
@@ -237,9 +234,6 @@ describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
     });
     await runner.catchUpAll(eventLog);
 
-    expect(
-      embedCalls.length,
-      'embedder is called when text changes',
-    ).toBeGreaterThan(0);
+    expect(embedCalls.length, 'embedder is called when text changes').toBeGreaterThan(0);
   });
 });

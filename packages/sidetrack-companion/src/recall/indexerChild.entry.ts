@@ -39,11 +39,11 @@ import { rebuildFromEventLog } from './rebuild.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 
-type ParentMessage = {
+interface ParentMessage {
   readonly kind: 'rebuild';
   readonly vaultRoot: string;
   readonly reason: string;
-};
+}
 
 type ChildMessage =
   | { readonly kind: 'started'; readonly reason: string }

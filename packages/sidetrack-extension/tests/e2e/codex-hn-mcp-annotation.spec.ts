@@ -565,9 +565,7 @@ test.describe('Codex MCP Hacker News annotation flow (synthetic browser)', () =>
       expect([...highlightTitles].sort()).toEqual(
         [...termAnnotations.map((annotation) => annotation.term)].sort(),
       );
-      await expect(chatPage.locator('.sidetrack-ann-margin')).toHaveCount(
-        termAnnotations.length,
-      );
+      await expect(chatPage.locator('.sidetrack-ann-margin')).toHaveCount(termAnnotations.length);
       await expect(chatPage.locator('.sidetrack-ann-hint')).toContainText(
         `${String(termAnnotations.length)} annotations restored`,
       );

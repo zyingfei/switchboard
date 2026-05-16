@@ -34,8 +34,9 @@ const buildEvent = (input: {
   acceptedAtMs: Date.parse(input.payload.observedAt),
 });
 
-const payload = (overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string }):
-  BrowserTimelineObservedPayload => ({
+const payload = (
+  overrides: Partial<BrowserTimelineObservedPayload> & { observedAt: string; url: string },
+): BrowserTimelineObservedPayload => ({
   eventId: overrides.eventId ?? `evt-${overrides.observedAt}-${overrides.url}`,
   observedAt: overrides.observedAt,
   url: overrides.url,
@@ -62,13 +63,35 @@ describe('timelineMaterializer (Class B)', () => {
 
     // Import three events on 2026-05-07.
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 1, payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }) }),
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
     );
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 2, payload: payload({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }) }),
+      buildEvent({
+        seq: 2,
+        payload: payload({
+          observedAt: '2026-05-07T11:00:00.000Z',
+          url: 'https://x/b',
+          canonicalUrl: 'https://x/b',
+        }),
+      }),
     );
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 3, payload: payload({ observedAt: '2026-05-07T12:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a', transition: 'updated' }) }),
+      buildEvent({
+        seq: 3,
+        payload: payload({
+          observedAt: '2026-05-07T12:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+          transition: 'updated',
+        }),
+      }),
     );
 
     await m.catchUp(eventLog);
@@ -88,7 +111,14 @@ describe('timelineMaterializer (Class B)', () => {
     const m = createTimelineMaterializer({ store, eventLog });
 
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 1, payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }) }),
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
     );
     await m.catchUp(eventLog);
     await m.awaitIdle();
@@ -131,10 +161,24 @@ describe('timelineMaterializer (Class B)', () => {
     const m = createTimelineMaterializer({ store, eventLog });
 
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 1, payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }) }),
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
     );
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 2, payload: payload({ observedAt: '2026-05-08T10:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }) }),
+      buildEvent({
+        seq: 2,
+        payload: payload({
+          observedAt: '2026-05-08T10:00:00.000Z',
+          url: 'https://x/b',
+          canonicalUrl: 'https://x/b',
+        }),
+      }),
     );
     await m.catchUp(eventLog);
     await m.awaitIdle();
@@ -153,10 +197,24 @@ describe('timelineMaterializer (Class B)', () => {
     const store = createTimelineStore(vaultRoot);
     const first = createTimelineMaterializer({ store, eventLog });
     await eventLog.importPeerEvent(
-      buildEvent({ seq: 1, payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }) }),
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
     );
     first.onAccepted(
-      buildEvent({ seq: 1, payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }) }),
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
       { origin: 'peer' },
     );
     await first.awaitIdle();
@@ -194,7 +252,11 @@ describe('timelineMaterializer (Class B)', () => {
 
     const event = buildEvent({
       seq: 1,
-      payload: payload({ observedAt: '2026-05-07T10:00:00.000Z', url: 'https://x/a', canonicalUrl: 'https://x/a' }),
+      payload: payload({
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/a',
+        canonicalUrl: 'https://x/a',
+      }),
     });
     await eventLog.importPeerEvent(event);
     m.onAccepted(event, { origin: 'peer' });
@@ -215,7 +277,11 @@ describe('timelineMaterializer (Class B)', () => {
     // first day still flagged from the recovery path.
     const event2 = buildEvent({
       seq: 2,
-      payload: payload({ observedAt: '2026-05-07T11:00:00.000Z', url: 'https://x/b', canonicalUrl: 'https://x/b' }),
+      payload: payload({
+        observedAt: '2026-05-07T11:00:00.000Z',
+        url: 'https://x/b',
+        canonicalUrl: 'https://x/b',
+      }),
     });
     await eventLog.importPeerEvent(event2);
     await m.catchUp(eventLog);

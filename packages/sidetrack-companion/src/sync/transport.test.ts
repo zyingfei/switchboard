@@ -68,7 +68,9 @@ describe('local-fs transport', () => {
       readReplica: () => Promise.resolve([]),
       listReplicaIds: () => Promise.resolve([]),
     });
-    await expect(transport.publishEvent('self', makeEvent({ replicaId: 'self' }))).resolves.toBeUndefined();
+    await expect(
+      transport.publishEvent('self', makeEvent({ replicaId: 'self' })),
+    ).resolves.toBeUndefined();
   });
 
   it('replays existing peer events on subscribe and dedupes by clientEventId', async () => {
