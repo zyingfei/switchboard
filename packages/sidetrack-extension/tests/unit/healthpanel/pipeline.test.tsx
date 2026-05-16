@@ -100,13 +100,242 @@ describe('HealthPanel pipeline strip', () => {
     vi.unstubAllGlobals();
   });
 
-  it('renders all seven pipeline stages', async () => {
+  it('renders all eight pipeline stages', async () => {
     render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
 
     const pipeline = await screen.findByTestId('hp-pipeline');
-    for (const id of ['capture', 'vault', 'materializers', 'recall', 'topics', 'ranker', 'sync']) {
+    for (const id of [
+      'capture',
+      'vault',
+      'materializers',
+      'recall',
+      'topics',
+      'ranker',
+      'experiments',
+      'sync',
+    ]) {
       expect(pipeline.querySelector(`[data-testid="hp-pipeline-stage-${id}"]`)).not.toBeNull();
     }
+  });
+
+  it('renders candidate lanes in the Experiments drill without A/B wording', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'ranker-rev',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60_000,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-active',
+            algorithmVersion: 'topic-revision:shadow:idf-rkn-split',
+            topicCount: 4,
+            lineageCount: 1,
+          },
+          candidates: [
+            {
+              id: 'topic.active-producer',
+              family: 'topic',
+              lane: 'active',
+              servingImpact: 'serving',
+              status: 'ok',
+              reason: null,
+              revisionId: 'topic-active',
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: { topicCount: 4, lineageCount: 1 },
+            },
+            {
+              id: 'topic.hdbscan-standby',
+              family: 'topic',
+              lane: 'standby',
+              servingImpact: 'not-serving',
+              status: 'off',
+              reason: 'no-production-selector',
+              revisionId: null,
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: { algorithmVersion: 'topic-revision:v2:hdbscan' },
+            },
+            {
+              id: 'topic.shadow-idf-rkn-split',
+              family: 'topic',
+              lane: 'shadow',
+              servingImpact: 'observe-only',
+              status: 'warning',
+              reason: 'shadow-collapse-boundary-changed',
+              revisionId: 'shadow-rev',
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: {
+                shadowTopicCount: 3,
+                shadowMaxTopicShare: 0.42,
+                noiseShare: 0.12,
+                adjacentPerVisitChurn: 0.33,
+              },
+            },
+            {
+              id: 'diagnostic.drift-sidecar',
+              family: 'similarity',
+              lane: 'diagnostic',
+              servingImpact: 'observe-only',
+              status: 'warning',
+              reason: 'drift-warning',
+              revisionId: 'topic-active',
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: { driftStatus: 'warning', trippedSignalCount: 0, warningSignalCount: 1 },
+            },
+            {
+              id: 'content-lane.dirty-source-queue',
+              family: 'content-lane',
+              lane: 'standby',
+              servingImpact: 'not-serving',
+              status: 'pending',
+              reason: 'dirty-source-pending',
+              revisionId: null,
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: {
+                dirtySourceCount: 2,
+                tombstonedSourceCount: 1,
+                oldestDirtySourceAgeMs: null,
+              },
+            },
+          ],
+        },
+      }),
+      {
+        focus: {
+          availability: 'ok',
+          asOf: '2026-05-12T20:00:00.000Z',
+          digest: null,
+          history: [
+            {
+              at: '2026-05-12T20:00:00.000Z',
+              adjacentPerVisitChurn: 0.33,
+              shadowMaxTopicShare: 0.42,
+              noiseShare: 0.12,
+              shadowTopicCount: 3,
+            },
+          ],
+        },
+      },
+    );
+
+    const { container } = render(
+      <HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />,
+    );
+
+    await waitFor(() => {
+      const stage = screen.getByTestId('hp-pipeline-stage-experiments');
+      expect(stage.className).toContain('warn');
+      expect(stage.textContent).toContain('1 shadow');
+      expect(stage.textContent).toContain('2 standby');
+    });
+
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-experiments'));
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-experiments-table')).toBeInTheDocument();
+      expect(screen.getByText('topic.hdbscan-standby')).toBeInTheDocument();
+      expect(screen.getByText('disabled')).toBeInTheDocument();
+      expect(screen.getAllByText('observe-only').length).toBeGreaterThan(0);
+      expect(screen.getByText('dirty-source-pending')).toBeInTheDocument();
+      expect(screen.getByText(/oldest no signal yet/)).toBeInTheDocument();
+    });
+    expect(container.textContent).not.toMatch(/\bA\/B\b|a-b/i);
+  });
+
+  it('routes diagnostic candidate warnings to amber alarms, not red signals', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'ranker-rev',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60_000,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-active',
+            algorithmVersion: 'topic-revision:v1:union-find',
+            topicCount: 2,
+            lineageCount: 0,
+          },
+          candidates: [
+            {
+              id: 'diagnostic.drift-sidecar',
+              family: 'similarity',
+              lane: 'diagnostic',
+              servingImpact: 'observe-only',
+              status: 'warning',
+              reason: 'drift-warning',
+              revisionId: 'topic-active',
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: { driftStatus: 'warning', trippedSignalCount: 0, warningSignalCount: 1 },
+            },
+          ],
+        },
+      }),
+    );
+
+    const { container } = render(
+      <HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-experiments').className).toContain('warn');
+      expect(screen.getByText(/diagnostic\.drift-sidecar/)).toBeInTheDocument();
+    });
+    expect(container.querySelector('.sx-alarm.amber')).not.toBeNull();
+    expect(container.querySelector('.sx-alarm.signal')).toBeNull();
+  });
+
+  it('routes invalid active ranker model alarms to red even when not serving', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'ranker-rev',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60_000,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-active',
+            algorithmVersion: 'topic-revision:v1:union-find',
+            topicCount: 2,
+            lineageCount: 0,
+          },
+          candidates: [
+            {
+              id: 'ranker.active-model',
+              family: 'ranker',
+              lane: 'active',
+              servingImpact: 'not-serving',
+              status: 'alarm',
+              reason: 'invalid-active-model',
+              revisionId: 'ranker-rev',
+              asOf: '2026-05-12T20:00:00.000Z',
+              metrics: { loadStatus: 'invalid-model' },
+            },
+          ],
+        },
+      }),
+    );
+
+    const { container } = render(
+      <HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-experiments').className).toContain('alarm');
+      expect(screen.getByText(/ranker\.active-model/)).toBeInTheDocument();
+    });
+    expect(container.querySelector('.sx-alarm.signal')).not.toBeNull();
   });
 
   it('shows the topic stage detail when workGraph.topicProducer reports clusters', async () => {

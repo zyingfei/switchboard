@@ -11,10 +11,7 @@ import {
   bootCollectorFramework,
   type CollectorFrameworkHandle,
 } from '../collectors/framework/runtime.js';
-import {
-  gateStateForCollector,
-  type CollectorCapability,
-} from '../collectors/framework/capabilityGates.js';
+import { gateStateForCollector } from '../collectors/framework/capabilityGates.js';
 import { COLLECTOR_FRAMEWORK_VERSION } from '../version.js';
 import { projectPrivacy, type PrivacyProjection } from '../privacy/projection.js';
 import {
@@ -659,6 +656,15 @@ export const startCompanion = async (
       eventLog,
       projectionChanges,
       syncMaterializerHealth: () => syncContractRunner.health(),
+      connectionsDiagnostics: () => {
+        const dirty = connectionsMaterializer.getDirtySources();
+        return {
+          dirtySourceCount: dirty.dirtySourceUnitIds.length,
+          tombstonedSourceCount: dirty.tombstonedSourceUnitIds.length,
+          latestExtractionCount: dirty.latestExtractionFor.size,
+          oldestDirtySourceAgeMs: null,
+        };
+      },
       // Class F edge-event import path: plugin-originated events
       // (e.g. browser.timeline.observed) arrive pre-shaped with an
       // edge dot allocated by the plugin. Earlier turns relayed those

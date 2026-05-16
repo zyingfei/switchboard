@@ -11003,7 +11003,7 @@ pre.diff {
 /* Pipeline strip — the spine */
 .sx-health .sx-pipeline {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   gap: 8px;
   padding: 14px;
   background: var(--paper-light);
