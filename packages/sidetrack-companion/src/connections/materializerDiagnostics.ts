@@ -28,6 +28,15 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
+import {
+  DriftMonitor,
+  extractDriftSamples,
+  loadDriftMonitor,
+  persistDriftMonitor,
+  type DriftReport,
+} from './drift/driftMonitor.js';
+import { createDriftStateStore, type DriftStateStore } from './drift/driftStateStore.js';
+import type { SilhouetteSimilarityEdge, SilhouetteTopic } from './drift/temporalSilhouette.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
@@ -149,6 +158,11 @@ export interface MaterializerDiagnostics {
   readonly snapshot: MaterializerSnapshotCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
   readonly shadowObservation?: TopicShadowObservationDiagnostics;
+  // Statistical drift/evaluation layer. Optional: present once the
+  // drift monitor has run for the drain. Absent for legacy fixtures
+  // and for the pure `collectMaterializerDiagnostics` path (which does
+  // no I/O); `attachDriftReport` folds it in after the monitor runs.
+  readonly drift?: DriftReport;
 }
 
 export interface MaterializerDiagnosticsInput {
@@ -495,6 +509,17 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
       }`,
     );
   }
+  if (diagnostics.drift !== undefined) {
+    const drift = diagnostics.drift;
+    parts.push(
+      `drift=${drift.status}`,
+      ...(drift.trippedSignals.length === 0
+        ? []
+        : [`driftTripped=${drift.trippedSignals.join(',')}`]),
+      ...(drift.warningSignals.length === 0 ? [] : [`driftWarn=${drift.warningSignals.join(',')}`]),
+      `silhouette=${drift.silhouette.silhouette === null ? 'n/a' : String(drift.silhouette.silhouette)}`,
+    );
+  }
   return `[materializer-diag] ${parts.join(' ')}`;
 };
 
@@ -539,6 +564,116 @@ export const createMaterializerDiagnosticsStore = (
     }
   };
   return { write };
+};
+
+// --- Statistical drift/evaluation layer wiring -------------------------
+//
+// `collectMaterializerDiagnostics` stays pure (no I/O). The drift
+// monitor is stateful (detector windows persist across drains) so it
+// is driven by a separate async step the materializer invokes after
+// collecting diagnostics. `attachDriftReport` is the single integration
+// seam: feed it the already-collected diagnostics + the topic/edge
+// inputs and it returns the diagnostics with `drift` folded in.
+//
+// Failure contract (matches the existing diagnostics artifact):
+// observability must NEVER fail the drain. Every persistence path is
+// wrapped; on any I/O error the monitor degrades to "fresh state /
+// not persisted" and the in-memory report is still produced.
+
+export interface DriftMonitorRunInput {
+  readonly diagnostics: MaterializerDiagnostics;
+  readonly topics: readonly SilhouetteTopic[];
+  readonly similarityEdges: readonly SilhouetteSimilarityEdge[];
+  readonly stateStore?: DriftStateStore;
+  readonly vaultRoot?: string;
+  readonly updatedAt?: string;
+}
+
+export interface DriftMonitorRunResult {
+  readonly diagnostics: MaterializerDiagnostics;
+  readonly report: DriftReport;
+  readonly statePersisted: boolean;
+  readonly stateError: string | null;
+}
+
+const resolveDriftStateStore = (input: DriftMonitorRunInput): DriftStateStore | null => {
+  if (input.stateStore !== undefined) return input.stateStore;
+  if (input.vaultRoot !== undefined) return createDriftStateStore(input.vaultRoot);
+  return null;
+};
+
+/**
+ * Run the drift monitor for one drain and return the diagnostics with
+ * the `drift` report folded in. The whole body is wrapped: if anything
+ * here throws (it should not — the monitor and its store already
+ * swallow I/O), the original diagnostics are returned unchanged with a
+ * `stable` placeholder so the drain never fails on the drift layer.
+ */
+export const attachDriftReport = async (
+  input: DriftMonitorRunInput,
+): Promise<DriftMonitorRunResult> => {
+  try {
+    const store = resolveDriftStateStore(input);
+    const monitor = store === null ? new DriftMonitor(null) : await loadDriftMonitor(store);
+    const samples = extractDriftSamples({
+      similarityEdgeCount: input.diagnostics.similarity.edgeCount,
+      topicCount: input.diagnostics.topics.topicCount,
+      topicMemberCount: input.diagnostics.topics.memberCount,
+      snapshotEdgeCount: input.diagnostics.snapshot.edgeCount,
+      ...(input.diagnostics.shadowVsBaseline === undefined
+        ? {}
+        : {
+            shadow: {
+              perVisitChurn: input.diagnostics.shadowVsBaseline.perVisitChurn,
+              noiseShare: input.diagnostics.shadowVsBaseline.noiseShare,
+              edgeCountBeforePruning: input.diagnostics.shadowVsBaseline.edgeCountBeforePruning,
+              edgeCountAfterPruning: input.diagnostics.shadowVsBaseline.edgeCountAfterPruning,
+              maxTopicSizeDelta: input.diagnostics.shadowVsBaseline.maxTopicSizeDelta,
+            },
+          }),
+    });
+    const report = monitor.observe({
+      samples,
+      revisionId: input.diagnostics.topics.revisionId,
+      topics: input.topics,
+      similarityEdges: input.similarityEdges,
+    });
+    const updatedAt = input.updatedAt ?? input.diagnostics.producedAt;
+    const persistResult =
+      store === null
+        ? { persisted: false, error: null }
+        : await persistDriftMonitor(store, monitor, updatedAt);
+    return {
+      diagnostics: { ...input.diagnostics, drift: report },
+      report,
+      statePersisted: persistResult.persisted,
+      stateError: persistResult.error,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const fallback: DriftReport = {
+      schemaVersion: 1,
+      status: 'stable',
+      trippedSignals: [],
+      warningSignals: [],
+      signals: [],
+      silhouette: {
+        revisionId: input.diagnostics.topics.revisionId,
+        silhouette: null,
+        previousSilhouette: null,
+        delta: null,
+        meanCohesion: 0,
+        meanSeparation: 0,
+        topicCount: 0,
+      },
+    };
+    return {
+      diagnostics: { ...input.diagnostics, drift: fallback },
+      report: fallback,
+      statePersisted: false,
+      stateError: message,
+    };
+  }
 };
 
 export const logMaterializerDiagnostics = (diagnostics: MaterializerDiagnostics): void => {

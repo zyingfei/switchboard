@@ -25,6 +25,14 @@ export interface RecallChunkInput {
   readonly text: string;
   readonly markdown?: string;
   readonly formattedText?: string;
+  // Optional page-content quality tier (high/medium/low) classified
+  // upstream by `classifyPageContentQuality`. Carried through to
+  // ChunkMetadata so the hybrid ranker can use it as a bounded
+  // tiebreak. Optional + omitted-when-absent: chat-turn captures that
+  // never go through page-content extraction simply don't set it and
+  // the ranker treats them as the neutral tier. NOT part of chunkId
+  // or embedText — the deterministic-build invariant is unaffected.
+  readonly quality?: 'high' | 'medium' | 'low';
 }
 
 export interface RecallChunk {
@@ -49,13 +57,17 @@ export interface RecallChunk {
   // sees the structural context. Stored separately from `text` so
   // the lexical index ranks against the raw user-visible content.
   readonly embedText: string;
+  // Page-content quality tier, passed through verbatim from
+  // RecallChunkInput. Absent for chat-turn captures.
+  readonly quality?: 'high' | 'medium' | 'low';
 }
 
 const TARGET_CHUNK_CHARS = 1200;
 const MIN_CHUNK_CHARS = 200;
 const HARD_CAP_CHARS = 2500;
 
-const sha256Short = (s: string): string => createHash('sha256').update(s).digest('hex').slice(0, 12);
+const sha256Short = (s: string): string =>
+  createHash('sha256').update(s).digest('hex').slice(0, 12);
 
 const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('hex');
 
@@ -275,6 +287,7 @@ export const chunkTurn = (input: RecallChunkInput): readonly RecallChunk[] => {
       text: trimmed,
       textHash: sha256Hex(trimmed),
       embedText,
+      ...(input.quality === undefined ? {} : { quality: input.quality }),
     });
     buffer = [];
     bufferChars = 0;
@@ -302,10 +315,7 @@ export const chunkTurn = (input: RecallChunkInput): readonly RecallChunk[] => {
     // — recall search must not silently drop searchable content.
     if (block.kind === 'fence' && block.text.length >= MIN_CHUNK_CHARS) {
       flush();
-      const parts =
-        block.text.length > HARD_CAP_CHARS
-          ? splitLongFence(block.text)
-          : [block.text];
+      const parts = block.text.length > HARD_CAP_CHARS ? splitLongFence(block.text) : [block.text];
       for (const part of parts) {
         const idx = paragraphIndex;
         paragraphIndex += 1;

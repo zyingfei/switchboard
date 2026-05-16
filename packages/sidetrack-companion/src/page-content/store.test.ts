@@ -107,7 +107,10 @@ describe('page-content store', () => {
     // indexed (high quality)
     await writePageContentExtracted(
       root,
-      extractedPayload({ canonicalUrl: 'https://docs.example.com/a', url: 'https://docs.example.com/a' }),
+      extractedPayload({
+        canonicalUrl: 'https://docs.example.com/a',
+        url: 'https://docs.example.com/a',
+      }),
     );
     // indexed_low_quality (passes floor, below medium thresholds)
     await writePageContentExtracted(
@@ -148,7 +151,10 @@ describe('page-content store', () => {
     // tombstoned
     await writePageContentExtracted(
       root,
-      extractedPayload({ canonicalUrl: 'https://docs.example.com/d', url: 'https://docs.example.com/d' }),
+      extractedPayload({
+        canonicalUrl: 'https://docs.example.com/d',
+        url: 'https://docs.example.com/d',
+      }),
     );
     await writePageContentTombstoned(root, {
       payloadVersion: 1,
@@ -162,17 +168,17 @@ describe('page-content store', () => {
     expect(typeof counts.producedAt).toBe('string');
     expect(Number.isNaN(Date.parse(counts.producedAt))).toBe(false);
     expect(counts.total).toBe(4);
-    expect(counts.byState.indexed).toBe(1);
-    expect(counts.byState.indexed_low_quality).toBe(1);
-    expect(counts.byState.metadata_only_error).toBe(1);
-    expect(counts.byState.tombstoned).toBe(1);
+    expect(counts.byState['indexed']).toBe(1);
+    expect(counts.byState['indexed_low_quality']).toBe(1);
+    expect(counts.byState['metadata_only_error']).toBe(1);
+    expect(counts.byState['tombstoned']).toBe(1);
     expect(counts.indexed).toBe(2); // indexed + indexed_low_quality
     expect(counts.bytes).toBeGreaterThan(0);
     // Every known state present with an explicit zero, never missing.
     for (const state of PAGE_CONTENT_COVERAGE_STATES) {
       expect(counts.byState[state]).toBeTypeOf('number');
     }
-    expect(counts.byState.indexing).toBe(0);
-    expect(counts.byState.stale_index).toBe(0);
+    expect(counts.byState['indexing']).toBe(0);
+    expect(counts.byState['stale_index']).toBe(0);
   });
 });

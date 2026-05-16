@@ -113,6 +113,7 @@ const metadataFromChunk = (chunk: RecallChunk): ChunkMetadata => ({
   charEnd: chunk.charEnd,
   textHash: chunk.textHash,
   text: chunk.text,
+  ...(chunk.quality === undefined ? {} : { quality: chunk.quality }),
 });
 
 export const rebuildFromEventLog = async (
@@ -264,7 +265,9 @@ export const rebuildFromEventLog = async (
   options.onPhase?.('embed');
   for (let offset = 0; offset < total; offset += EMBED_BATCH_SIZE) {
     const batch = chunks.slice(offset, offset + EMBED_BATCH_SIZE);
-    const vectors = await embed(batch.map(({ chunk }) => chunk.embedText.slice(0, EMBED_TEXT_CHARS)));
+    const vectors = await embed(
+      batch.map(({ chunk }) => chunk.embedText.slice(0, EMBED_TEXT_CHARS)),
+    );
     for (let index = 0; index < batch.length; index += 1) {
       const item = batch[index];
       const embedding = vectors[index];

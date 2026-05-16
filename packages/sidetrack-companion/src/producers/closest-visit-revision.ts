@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { RankerRevision, RankerTrainQuality } from '../ranker/train.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
+import {
+  RANKER_MODEL_VERSION,
+  type RankerRevision,
+  type RankerTrainQuality,
+} from '../ranker/train.js';
 
 const CLOSEST_VISIT_REVISION_DIR = '_BAC/connections/closest-visit';
 
@@ -58,9 +63,7 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     trainedAt: revision.trainedAt,
     modelByteLength: modelBytes.byteLength,
     modelSha256: sha256Hex(modelBytes),
-    ...(revision.trainQuality === undefined
-      ? {}
-      : { trainQuality: revision.trainQuality }),
+    ...(revision.trainQuality === undefined ? {} : { trainQuality: revision.trainQuality }),
   };
 };
 
@@ -74,9 +77,7 @@ const writeAtomic = async (path: string, body: string): Promise<void> => {
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
-const isGradeHistogram = (
-  value: unknown,
-): value is RankerTrainQuality['gradeHistogram'] => {
+const isGradeHistogram = (value: unknown): value is RankerTrainQuality['gradeHistogram'] => {
   if (!isRecord(value)) return false;
   return (['0', '1', '2', '3', '4'] as const).every(
     (grade) =>
@@ -122,13 +123,21 @@ const normalizeTrainQuality = (value: unknown): RankerTrainQuality | undefined =
   };
 };
 
+// Pinned to the *current* ranker constants (not inline literals): a
+// manifest persisted under an older model version or feature-schema
+// version fails validation, so `readClosestVisitRankerRevision`
+// returns null and the caller treats it as "no usable model" and
+// retrains. This is the back-compat gate — it prevents handing a
+// stale-feature-count booster a wider feature row (which LightGBM
+// would silently mis-score or the contribution decoder would throw
+// on).
 const isManifest = (value: unknown): value is ClosestVisitRankerRevisionManifest => {
   if (!isRecord(value)) return false;
   return (
     typeof value['revisionId'] === 'string' &&
     value['revisionId'].length > 0 &&
-    value['modelVersion'] === 'lightgbm-lambdamart-v1' &&
-    value['featureSchemaVersion'] === 1 &&
+    value['modelVersion'] === RANKER_MODEL_VERSION &&
+    value['featureSchemaVersion'] === FEATURE_SCHEMA_VERSION &&
     typeof value['trainingDatasetHash'] === 'string' &&
     /^[a-f0-9]{64}$/u.test(value['trainingDatasetHash']) &&
     typeof value['trainedAt'] === 'number' &&
@@ -235,9 +244,7 @@ export const readClosestVisitRankerRevision = async (
       trainingDatasetHash: manifest.trainingDatasetHash,
       trainedAt: manifest.trainedAt,
       modelBytes: toOwnedArrayBuffer(bytes),
-      ...(manifest.trainQuality === undefined
-        ? {}
-        : { trainQuality: manifest.trainQuality }),
+      ...(manifest.trainQuality === undefined ? {} : { trainQuality: manifest.trainQuality }),
     };
   } catch {
     return null;
