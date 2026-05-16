@@ -397,6 +397,11 @@ const candidateRowClass = (status: DiagnosticCandidate['status']): string | unde
 const candidateStatusStamp = (status: DiagnosticCandidate['status']): string =>
   status === 'ok' ? 'deterministic' : status === 'alarm' ? 'signal' : 'partial';
 
+const isCandidateSignal = (candidate: DiagnosticCandidate): boolean =>
+  candidate.status === 'alarm' &&
+  candidate.lane === 'active' &&
+  (candidate.servingImpact === 'serving' || candidate.id === 'ranker.active-model');
+
 const metricSummary = (candidate: DiagnosticCandidate): string =>
   Object.entries(candidate.metrics)
     .slice(0, 4)
@@ -662,17 +667,11 @@ export function HealthPanel({
   const window1h = report?.capture.window1h;
   const activity = report?.recall.activity;
   const candidates = report?.workGraph?.candidates ?? [];
-  const activeServingCandidateAlarm = candidates.some(
-    (candidate) =>
-      candidate.status === 'alarm' &&
-      candidate.lane === 'active' &&
-      candidate.servingImpact === 'serving',
-  );
+  const candidateSignal = candidates.some(isCandidateSignal);
   const candidateWarningCount = candidates.filter(
     (candidate) =>
       candidate.status === 'warning' ||
-      (candidate.status === 'alarm' &&
-        !(candidate.lane === 'active' && candidate.servingImpact === 'serving')),
+      (candidate.status === 'alarm' && !isCandidateSignal(candidate)),
   ).length;
   const disabledCandidateCount = candidates.filter(
     (candidate) => candidate.status === 'off',
@@ -817,7 +816,7 @@ export function HealthPanel({
       ? 'unavailable'
       : candidates.length === 0
         ? 'idle'
-        : activeServingCandidateAlarm
+        : candidateSignal
           ? 'err'
           : candidateWarningCount > 0
             ? 'warn'
@@ -997,13 +996,9 @@ export function HealthPanel({
         (candidate.status === 'unavailable' && candidate.lane === 'active'),
     )
     .map((candidate) => {
-      const signal =
-        candidate.status === 'alarm' &&
-        candidate.lane === 'active' &&
-        candidate.servingImpact === 'serving';
       return {
         stage: 'experiments',
-        sev: signal ? 'signal' : 'amber',
+        sev: isCandidateSignal(candidate) ? 'signal' : 'amber',
         name: `${candidate.family} · ${candidate.lane}`,
         head: formatCandidateStatus(candidate.status),
         meta: `${candidate.id}${candidate.reason === null ? '' : ` · ${candidate.reason}`}`,
@@ -1061,10 +1056,10 @@ export function HealthPanel({
         ) : null}
 
         <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
-          <div className={`sx-tile${activeServingCandidateAlarm ? ' alarm' : ''}`}>
+          <div className={`sx-tile${candidateSignal ? ' alarm' : ''}`}>
             <div className="lbl">Serving rows</div>
             <div className="num">{String(activeServingRows.length)}</div>
-            <div className="foot">red only when an active serving candidate alarms</div>
+            <div className="foot">active alarms that affect serving</div>
           </div>
           <div className={`sx-tile${candidateWarningCount > 0 ? ' warn' : ''}`}>
             <div className="lbl">Warnings</div>
@@ -2017,7 +2012,7 @@ export function HealthPanel({
                   alarms.map((a) => (
                     <button
                       type="button"
-                      key={a.stage}
+                      key={`${a.stage}:${a.name}:${a.head}:${a.meta}`}
                       className={`sx-alarm ${a.sev}`}
                       onClick={() => setStage(a.stage)}
                     >

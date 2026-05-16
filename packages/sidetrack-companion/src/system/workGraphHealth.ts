@@ -120,6 +120,7 @@ export interface WorkGraphHealthDeps {
   readonly vaultRoot: string;
   readonly eventLog?: EventLog;
   readonly connectionsDiagnostics?: () => ConnectionsDiagnosticSnapshot;
+  readonly now?: () => Date;
 }
 
 const emptyEvents: readonly AcceptedEvent[] = [];
@@ -151,6 +152,8 @@ const numberOrNull = (value: unknown): number | null =>
   typeof value === 'number' && Number.isFinite(value) ? value : null;
 
 const booleanOrFalse = (value: unknown): boolean => (typeof value === 'boolean' ? value : false);
+
+const CONTENT_LANE_BACKLOG_WARN_MS = 10 * 60 * 1000;
 
 const metrics = (
   input: Readonly<Record<string, DiagnosticCandidateMetric>>,
@@ -305,6 +308,13 @@ const rankerAugmentationServingImpact = (
 ): DiagnosticCandidate['servingImpact'] =>
   augmentation?.status === 'emitted' ? 'serving' : 'not-serving';
 
+const rankerActiveModelServingImpact = (
+  ranker: WorkGraphHealthReport['ranker'],
+): DiagnosticCandidate['servingImpact'] =>
+  ranker.loadStatus === 'invalid-model'
+    ? 'serving'
+    : rankerAugmentationServingImpact(ranker.augmentation);
+
 const candidateStatusForRankerAugmentation = (
   augmentation: WorkGraphHealthReport['ranker']['augmentation'],
 ): DiagnosticCandidate['status'] => {
@@ -338,13 +348,22 @@ const candidateStatusForDrift = (
 const countStringArray = (value: unknown): number | null =>
   Array.isArray(value) && value.every((item) => typeof item === 'string') ? value.length : null;
 
+const millisToIso = (value: number | null): string | null =>
+  value === null ? null : new Date(value).toISOString();
+
 const buildDiagnosticCandidates = (input: {
   readonly ranker: WorkGraphHealthReport['ranker'];
   readonly topicProducer: WorkGraphHealthReport['topicProducer'];
   readonly diagnostics: LatestConnectionsDiagnostics;
   readonly connectionsDiagnostics: ConnectionsDiagnosticSnapshot | null;
+  readonly collectedAt: string;
+  readonly topicProducedAt: string | null;
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
+  const diagnosticsObservedAt = producedAt;
+  const liveObservedAt = input.collectedAt;
+  const topicObservedAt = input.topicProducedAt ?? liveObservedAt;
+  const rankerObservedAt = millisToIso(input.ranker.trainedAt) ?? liveObservedAt;
   const raw = input.diagnostics.raw;
   const shadow = raw !== null && isRecord(raw['shadowVsBaseline']) ? raw['shadowVsBaseline'] : null;
   const observation =
@@ -358,10 +377,19 @@ const buildDiagnosticCandidates = (input: {
   const dirtySourceCount = connectionsDiagnostics?.dirtySourceCount ?? null;
   const tombstonedSourceCount = connectionsDiagnostics?.tombstonedSourceCount ?? null;
   const latestExtractionCount = connectionsDiagnostics?.latestExtractionCount ?? null;
-  const hasDirtySourceBacklog =
+  const oldestDirtySourceAgeMs = connectionsDiagnostics?.oldestDirtySourceAgeMs ?? null;
+  const hasDirtySourceWork =
     connectionsDiagnostics !== null && connectionsDiagnostics.dirtySourceCount > 0;
+  const hasDirtySourceBacklog =
+    oldestDirtySourceAgeMs !== null && oldestDirtySourceAgeMs > CONTENT_LANE_BACKLOG_WARN_MS;
   const contentLaneStatus: DiagnosticCandidate['status'] =
-    connectionsDiagnostics === null ? 'unavailable' : hasDirtySourceBacklog ? 'warning' : 'ok';
+    connectionsDiagnostics === null
+      ? 'unavailable'
+      : hasDirtySourceBacklog
+        ? 'warning'
+        : hasDirtySourceWork
+          ? 'pending'
+          : 'ok';
   const hotSimilarityEnabled = envEnabled('SIDETRACK_CONNECTIONS_HOT_SIMILARITY');
   const hotTopicsEnabled = envEnabled('SIDETRACK_CONNECTIONS_HOT_TOPICS');
   const runnerMode = reconcileRunnerMode();
@@ -375,7 +403,7 @@ const buildDiagnosticCandidates = (input: {
       status: candidateStatusForTopic(input.topicProducer),
       reason: reasonForTopic(input.topicProducer),
       revisionId: input.topicProducer.activeRevisionId,
-      asOf: producedAt,
+      asOf: topicObservedAt,
       metrics: metrics({
         algorithmVersion: input.topicProducer.algorithmVersion,
         topicCount: input.topicProducer.topicCount,
@@ -390,7 +418,7 @@ const buildDiagnosticCandidates = (input: {
       status: 'off',
       reason: 'no-production-selector',
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({
         algorithmVersion: TOPIC_HDBSCAN_REVISION_KEY,
         defaultAlgorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
@@ -404,7 +432,7 @@ const buildDiagnosticCandidates = (input: {
       status: 'off',
       reason: 'no-runtime-route',
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({ comparisonCandidatesWritten: true }),
     },
     {
@@ -434,7 +462,7 @@ const buildDiagnosticCandidates = (input: {
       revisionId:
         stringOrNull(observation?.['shadowRevisionId']) ??
         stringOrNull(shadow?.['shadowRevisionId']),
-      asOf: producedAt,
+      asOf: diagnosticsObservedAt,
       metrics: metrics({
         algorithmVersion:
           stringOrNull(shadow?.['shadowAlgorithmVersion']) ??
@@ -461,7 +489,7 @@ const buildDiagnosticCandidates = (input: {
               ? 'drift-warning'
               : null,
       revisionId: stringOrNull(silhouette?.['revisionId']),
-      asOf: producedAt,
+      asOf: diagnosticsObservedAt,
       metrics: metrics({
         driftStatus: stringOrNull(driftReport?.['status']),
         trippedSignalCount: countStringArray(driftReport?.['trippedSignals']),
@@ -474,7 +502,7 @@ const buildDiagnosticCandidates = (input: {
       id: 'ranker.active-model',
       family: 'ranker',
       lane: 'active',
-      servingImpact: rankerAugmentationServingImpact(input.ranker.augmentation),
+      servingImpact: rankerActiveModelServingImpact(input.ranker),
       status: candidateStatusForRankerLoad(input.ranker.loadStatus),
       reason:
         input.ranker.loadStatus === 'ready'
@@ -483,7 +511,7 @@ const buildDiagnosticCandidates = (input: {
             ? 'no-active-manifest'
             : 'invalid-active-model',
       revisionId: input.ranker.activeRevisionId,
-      asOf: producedAt,
+      asOf: rankerObservedAt,
       metrics: metrics({
         loadStatus: input.ranker.loadStatus,
         activeModelVersion: input.ranker.activeModelVersion,
@@ -504,7 +532,7 @@ const buildDiagnosticCandidates = (input: {
         input.ranker.augmentation?.reason ??
         (input.ranker.augmentation === null ? 'no-diagnostics' : null),
       revisionId: input.ranker.augmentation?.activeRevisionId ?? null,
-      asOf: input.ranker.augmentation?.asOf ?? producedAt,
+      asOf: input.ranker.augmentation?.asOf ?? diagnosticsObservedAt,
       metrics: metrics({
         status: input.ranker.augmentation?.status ?? null,
         modelFreshness: input.ranker.augmentation?.modelFreshness ?? null,
@@ -520,7 +548,7 @@ const buildDiagnosticCandidates = (input: {
       status: candidateStatusForMethodology(methodologySpine),
       reason: methodologySpine?.shipGate.reason ?? 'methodology-spine-unavailable',
       revisionId: input.ranker.activeRevisionId,
-      asOf: producedAt,
+      asOf: input.ranker.augmentation?.asOf ?? rankerObservedAt ?? diagnosticsObservedAt,
       metrics: metrics({
         servingGateEnforced: methodologySpine?.servingGateEnforced ?? null,
         splitStatus: methodologySpine?.split.status ?? null,
@@ -536,7 +564,7 @@ const buildDiagnosticCandidates = (input: {
       status: input.ranker.trainingMix === null ? 'unavailable' : 'ok',
       reason: input.ranker.trainingMix === null ? 'training-mix-unavailable' : null,
       revisionId: input.ranker.activeRevisionId,
-      asOf: producedAt,
+      asOf: rankerObservedAt,
       metrics: metrics({
         positivesAtTrain: input.ranker.trainingMix?.positivesAtTrain ?? null,
         userFeedbackNegativesAtTrain:
@@ -553,7 +581,7 @@ const buildDiagnosticCandidates = (input: {
       status: hotSimilarityEnabled ? 'pending' : 'off',
       reason: hotSimilarityEnabled ? 'last-fast-path-decision-unavailable' : 'env-off',
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({
         envEnabled: hotSimilarityEnabled,
         envName: 'SIDETRACK_CONNECTIONS_HOT_SIMILARITY',
@@ -568,7 +596,7 @@ const buildDiagnosticCandidates = (input: {
       status: hotTopicsEnabled ? 'pending' : 'off',
       reason: hotTopicsEnabled ? 'last-fast-path-decision-unavailable' : 'env-off',
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({
         envEnabled: hotTopicsEnabled,
         envName: 'SIDETRACK_CONNECTIONS_HOT_TOPICS',
@@ -586,14 +614,17 @@ const buildDiagnosticCandidates = (input: {
           ? 'content-lane-snapshot-unavailable'
           : hasDirtySourceBacklog
             ? 'dirty-source-backlog'
-            : null,
+            : hasDirtySourceWork
+              ? 'dirty-source-pending'
+              : null,
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({
         dirtySourceCount,
         tombstonedSourceCount,
         latestExtractionCount,
-        oldestDirtySourceAgeMs: connectionsDiagnostics?.oldestDirtySourceAgeMs ?? null,
+        oldestDirtySourceAgeMs,
+        backlogWarnMs: CONTENT_LANE_BACKLOG_WARN_MS,
       }),
     },
     {
@@ -604,7 +635,7 @@ const buildDiagnosticCandidates = (input: {
       status: 'ok',
       reason: runnerMode,
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({
         mode: runnerMode,
         inProcessEnv: envEnabled('SIDETRACK_CONNECTIONS_INPROCESS'),
@@ -620,7 +651,7 @@ const buildDiagnosticCandidates = (input: {
       status: 'off',
       reason: 'no-runtime-model-injection',
       revisionId: null,
-      asOf: producedAt,
+      asOf: liveObservedAt,
       metrics: metrics({ learnedModelLoaded: false }),
     },
   ];
@@ -630,7 +661,9 @@ export const collectWorkGraphHealth = async ({
   vaultRoot,
   eventLog,
   connectionsDiagnostics: readConnectionsDiagnostics,
+  now = () => new Date(),
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
+  const collectedAt = now().toISOString();
   const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
   const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
@@ -706,6 +739,8 @@ export const collectWorkGraphHealth = async ({
     lineageCount: topicRevision?.lineage.length ?? 0,
   };
   const connectionsDiagnosticSnapshot = readConnectionsDiagnostics?.() ?? null;
+  const topicProducedAt =
+    topicRevision === null ? null : new Date(topicRevision.producedAt).toISOString();
   return {
     ranker,
     ann,
@@ -720,6 +755,8 @@ export const collectWorkGraphHealth = async ({
       topicProducer,
       diagnostics,
       connectionsDiagnostics: connectionsDiagnosticSnapshot,
+      collectedAt,
+      topicProducedAt,
     }),
   };
 };

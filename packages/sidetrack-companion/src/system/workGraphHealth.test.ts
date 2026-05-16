@@ -154,6 +154,7 @@ describe('work graph diagnostic candidates', () => {
 
     const health = await collectWorkGraphHealth({
       vaultRoot,
+      now: () => new Date('2026-05-16T12:45:00.000Z'),
       connectionsDiagnostics: () => ({
         dirtySourceCount: 2,
         tombstonedSourceCount: 1,
@@ -170,6 +171,7 @@ describe('work graph diagnostic candidates', () => {
           servingImpact: 'serving',
           status: 'ok',
           revisionId: 'topic-rev-active',
+          asOf: '2026-05-16T12:00:00.000Z',
         }),
         expect.objectContaining({
           id: 'topic.hdbscan-standby',
@@ -213,13 +215,15 @@ describe('work graph diagnostic candidates', () => {
         expect.objectContaining({
           id: 'content-lane.dirty-source-queue',
           lane: 'standby',
-          status: 'warning',
-          reason: 'dirty-source-backlog',
+          status: 'pending',
+          reason: 'dirty-source-pending',
+          asOf: '2026-05-16T12:45:00.000Z',
           metrics: expect.objectContaining({
             dirtySourceCount: 2,
             tombstonedSourceCount: 1,
             latestExtractionCount: 1,
             oldestDirtySourceAgeMs: null,
+            backlogWarnMs: 600_000,
           }),
         }),
         expect.objectContaining({
@@ -234,6 +238,35 @@ describe('work graph diagnostic candidates', () => {
           family: 'quality',
           status: 'off',
           reason: 'no-runtime-model-injection',
+        }),
+      ]),
+    );
+  });
+
+  it('warns on content-lane backlog only when an age threshold is tripped', async () => {
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T13:00:00.000Z'),
+      connectionsDiagnostics: () => ({
+        dirtySourceCount: 1,
+        tombstonedSourceCount: 0,
+        latestExtractionCount: 0,
+        oldestDirtySourceAgeMs: 600_001,
+      }),
+    });
+
+    expect(health.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'content-lane.dirty-source-queue',
+          status: 'warning',
+          reason: 'dirty-source-backlog',
+          asOf: '2026-05-16T13:00:00.000Z',
+          metrics: expect.objectContaining({
+            dirtySourceCount: 1,
+            oldestDirtySourceAgeMs: 600_001,
+            backlogWarnMs: 600_000,
+          }),
         }),
       ]),
     );

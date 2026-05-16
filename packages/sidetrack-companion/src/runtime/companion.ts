@@ -11,10 +11,7 @@ import {
   bootCollectorFramework,
   type CollectorFrameworkHandle,
 } from '../collectors/framework/runtime.js';
-import {
-  gateStateForCollector,
-  type CollectorCapability,
-} from '../collectors/framework/capabilityGates.js';
+import { gateStateForCollector } from '../collectors/framework/capabilityGates.js';
 import { COLLECTOR_FRAMEWORK_VERSION } from '../version.js';
 import { projectPrivacy, type PrivacyProjection } from '../privacy/projection.js';
 import {
