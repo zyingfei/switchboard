@@ -173,3 +173,39 @@ export const TrashIcon = (
     <path d="M9 7V4h6v3" />
   </svg>
 );
+
+export const ExternalLinkIcon = (
+  <svg {...baseProps}>
+    <path d="M14 3h7v7" />
+    <path d="m10 14 11-11" />
+    <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
+  </svg>
+);
+
+export const FilterIcon = (
+  <svg {...baseProps}>
+    <path d="M4 5h16" />
+    <path d="M7 12h10" />
+    <path d="M10 19h4" />
+  </svg>
+);
+
+export const ListIcon = (
+  <svg {...baseProps}>
+    <path d="M8 6h13" />
+    <path d="M8 12h13" />
+    <path d="M8 18h13" />
+    <path d="M3 6h.01" />
+    <path d="M3 12h.01" />
+    <path d="M3 18h.01" />
+  </svg>
+);
+
+export const RefreshIcon = (
+  <svg {...baseProps}>
+    <path d="M21 12a9 9 0 0 1-15.2 6.5" />
+    <path d="M3 12A9 9 0 0 1 18.2 5.5" />
+    <path d="M18 2v4h4" />
+    <path d="M6 22v-4H2" />
+  </svg>
+);

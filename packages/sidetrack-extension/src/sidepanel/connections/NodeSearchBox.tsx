@@ -2,7 +2,7 @@ import { useMemo, useState, type ReactElement } from 'react';
 
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import { NODE_KIND_DISPLAY } from './edgeKinds';
-import { KindIcons } from './icons';
+import { ExternalLinkIcon, KindIcons } from './icons';
 import type { ConnectionNode } from './types';
 
 // Stage 5 polish — find-by-title search. The advanced-anchor input
@@ -56,6 +56,7 @@ export interface NodeSearchBoxProps {
   readonly recallHits?: readonly RecallSearchHit[];
   readonly recallLoading?: boolean;
   readonly recallError?: string | null;
+  readonly onOpenFullSearch?: (query: string) => void;
 }
 
 interface SearchHit {
@@ -92,6 +93,7 @@ export const NodeSearchBox = ({
   recallHits = [],
   recallLoading = false,
   recallError = null,
+  onOpenFullSearch,
 }: NodeSearchBoxProps): ReactElement => {
   const [query, setQuery] = useState<string>('');
   const [open, setOpen] = useState<boolean>(false);
@@ -154,10 +156,12 @@ export const NodeSearchBox = ({
             if (event.key === 'Escape') {
               setQuery('');
               setOpen(false);
+              onQueryChange?.('');
             } else if (event.key === 'Enter' && hits[0] !== undefined) {
               onPick(hits[0].id);
               setQuery('');
               setOpen(false);
+              onQueryChange?.('');
             }
           }}
           data-testid="connections-search-input"
@@ -168,12 +172,27 @@ export const NodeSearchBox = ({
             className="cx-search-clear"
             onClick={() => {
               setQuery('');
+              onQueryChange?.('');
             }}
             aria-label="Clear search"
           >
             ×
           </button>
         ) : null}
+        {onOpenFullSearch === undefined ? null : (
+          <button
+            type="button"
+            className="cx-search-open-tab"
+            onClick={() => {
+              onOpenFullSearch(query);
+            }}
+            aria-label="Open full Search"
+            title="Open full Search"
+            data-testid="connections-search-open-tab"
+          >
+            {ExternalLinkIcon}
+          </button>
+        )}
       </label>
       {open && trimmed.length > 0 ? (
         <div className="cx-search-results" data-testid="connections-search-results">

@@ -88,9 +88,7 @@ describe('NodeSearchBox', () => {
   it('shows a "no matches" placeholder when nothing hits', () => {
     render(
       <NodeSearchBox
-        nodes={[
-          node({ id: 'thread:T1', kind: 'thread', metadata: { title: 'Chicago' } }),
-        ]}
+        nodes={[node({ id: 'thread:T1', kind: 'thread', metadata: { title: 'Chicago' } })]}
         extras={[]}
         ctx={ctx}
         onPick={vi.fn()}
@@ -99,22 +97,12 @@ describe('NodeSearchBox', () => {
     fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
       target: { value: 'zzzz-no-match' },
     });
-    expect(
-      screen.getByText(/No matches across the full snapshot/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/No matches across the full snapshot/)).toBeInTheDocument();
   });
 
   it('primes the full-snapshot fetch on focus when onPrime is provided', () => {
     const onPrime = vi.fn();
-    render(
-      <NodeSearchBox
-        nodes={[]}
-        extras={[]}
-        ctx={ctx}
-        onPick={vi.fn()}
-        onPrime={onPrime}
-      />,
-    );
+    render(<NodeSearchBox nodes={[]} extras={[]} ctx={ctx} onPick={vi.fn()} onPrime={onPrime} />);
     fireEvent.focus(screen.getByLabelText('Find an anchor by title'));
     expect(onPrime).toHaveBeenCalled();
   });
@@ -165,15 +153,7 @@ describe('NodeSearchBox', () => {
   });
 
   it('shows a "searching the whole vault" hint while loading', () => {
-    render(
-      <NodeSearchBox
-        nodes={[]}
-        extras={[]}
-        ctx={ctx}
-        onPick={vi.fn()}
-        loading
-      />,
-    );
+    render(<NodeSearchBox nodes={[]} extras={[]} ctx={ctx} onPick={vi.fn()} loading />);
     fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
       target: { value: 'anything' },
     });
@@ -197,5 +177,23 @@ describe('NodeSearchBox', () => {
     expect(screen.getAllByTestId(/connections-search-hit-/u).length).toBeGreaterThan(0);
     fireEvent.keyDown(input, { key: 'Escape' });
     expect(screen.queryByTestId('connections-search-results')).toBeNull();
+  });
+
+  it('opens the full Search surface with the current query', () => {
+    const onOpenFullSearch = vi.fn();
+    render(
+      <NodeSearchBox
+        nodes={[node({ id: 'thread:T1', kind: 'thread', metadata: { title: 'Chicago' } })]}
+        extras={[]}
+        ctx={ctx}
+        onPick={vi.fn()}
+        onOpenFullSearch={onOpenFullSearch}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
+      target: { value: 'chic' },
+    });
+    fireEvent.click(screen.getByTestId('connections-search-open-tab'));
+    expect(onOpenFullSearch).toHaveBeenCalledWith('chic');
   });
 });

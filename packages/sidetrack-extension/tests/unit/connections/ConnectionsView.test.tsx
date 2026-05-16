@@ -50,6 +50,58 @@ const buildSnapshot = () => ({
   },
 });
 
+const flowAnchorId = 'timeline-visit:https://example.test/start';
+const flowNextId = 'timeline-visit:https://example.test/next';
+
+const buildFlowSnapshot = () => ({
+  scope: 'companion-extended',
+  snapshot: {
+    scope: { nodeId: flowAnchorId, hops: 1 },
+    nodes: [
+      {
+        id: flowAnchorId,
+        kind: 'timeline-visit',
+        label: 'Start page',
+        originReplicaIds: ['replica-A'],
+        metadata: {
+          canonicalUrl: 'https://example.test/start',
+          focusedWindowMs: 8_000,
+          tabSessionId: 'tab-a',
+        },
+        firstSeenAt: '2026-05-07T10:00:00.000Z',
+        lastSeenAt: '2026-05-07T10:00:00.000Z',
+      },
+      {
+        id: flowNextId,
+        kind: 'timeline-visit',
+        label: 'Next page',
+        originReplicaIds: ['replica-A'],
+        metadata: {
+          canonicalUrl: 'https://example.test/next',
+          focusedWindowMs: 4_000,
+          tabSessionId: 'tab-a',
+        },
+        firstSeenAt: '2026-05-07T10:01:00.000Z',
+        lastSeenAt: '2026-05-07T10:01:00.000Z',
+      },
+    ],
+    edges: [
+      {
+        id: 'edge:previous_visit_in_tab_session:next:start',
+        kind: 'previous_visit_in_tab_session',
+        fromNodeId: flowNextId,
+        toNodeId: flowAnchorId,
+        observedAt: '2026-05-07T10:01:00.000Z',
+        producedBy: { source: 'timeline' },
+        confidence: 'observed',
+      },
+    ],
+    updatedAt: '2026-05-07T10:01:00.000Z',
+    nodeCount: 2,
+    edgeCount: 1,
+  },
+});
+
 const deferred = <T,>(): {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
@@ -174,6 +226,160 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(requestedNodeIds).toContain('workstream:ws_x');
     });
     expect(selector.value).toBe('workstream:ws_x');
+  });
+
+  it('opens a full Search mode and anchors picked results', async () => {
+    const requestedNodeIds: string[] = [];
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        requestedNodeIds.push(m.nodeId ?? '');
+        return { ok: true, data: buildSnapshot() };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: {},
+              nodes: [
+                ...buildSnapshot().snapshot.nodes,
+                {
+                  id: 'thread:oracle',
+                  kind: 'thread',
+                  label: 'Oracle Cloud Infrastructure Cloud Adoption Framework',
+                  originReplicaIds: ['replica-A'],
+                  metadata: { title: 'Oracle Cloud Infrastructure Cloud Adoption Framework' },
+                },
+              ],
+              edges: buildSnapshot().snapshot.edges,
+              updatedAt: '2026-05-07T10:00:00.000Z',
+              nodeCount: 3,
+              edgeCount: 1,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-search')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-search'));
+    expect(screen.getByTestId('connections-search-tab')).toBeDefined();
+    expect(screen.queryByTestId('connections-rail-toggle')).toBeNull();
+    expect(screen.queryByTestId('connections-rightpanel-toggle')).toBeNull();
+    expect(screen.queryByTestId('connections-filterbar')).toBeNull();
+    expect(screen.queryByTestId('connections-advanced-anchor')).toBeNull();
+    fireEvent.change(screen.getByTestId('connections-search-tab-input'), {
+      target: { value: 'or' },
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-search-tab-hit-thread:oracle')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-search-tab-hit-thread:oracle'));
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain('thread:oracle');
+    });
+    expect(screen.getByTestId('connections-mode-linked')).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('filters Linked results by object kind', async () => {
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildSnapshot() });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('group-workstream')).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-object-filter-workstream'));
+
+    expect(screen.queryByTestId('group-workstream')).toBeNull();
+    expect(
+      screen.queryByTestId('edge-edge:thread_in_workstream:thread:thread_a:workstream:ws_x'),
+    ).toBeNull();
+  });
+
+  it('filters Linked results by edge family', async () => {
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildSnapshot() });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId('edge-edge:thread_in_workstream:thread:thread_a:workstream:ws_x'),
+      ).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-family-filter-contain'));
+
+    expect(screen.queryByTestId('group-workstream')).toBeNull();
+    expect(
+      screen.queryByTestId('edge-edge:thread_in_workstream:thread:thread_a:workstream:ws_x'),
+    ).toBeNull();
+  });
+
+  it('filters Orbital results by object kind', async () => {
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildSnapshot() });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-orbital')).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-mode-orbital'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('orbit-node-workstream:ws_x')).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-object-filter-workstream'));
+
+    expect(screen.queryByTestId('orbit-node-workstream:ws_x')).toBeNull();
+  });
+
+  it('filters Flow Path results by edge family', async () => {
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildFlowSnapshot() });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    render(<ConnectionsView initialAnchor={flowAnchorId} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-flow')).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-mode-flow'));
+    await waitFor(() => {
+      expect(screen.queryByTestId(`flow-visit-${flowNextId}`)).not.toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('connections-family-filter-flow'));
+
+    expect(screen.queryByTestId(`flow-visit-${flowNextId}`)).toBeNull();
+    expect(screen.queryByTestId(`flow-visit-${flowAnchorId}`)).not.toBeNull();
   });
 
   it('scopes shadow focus suggestions to the selected workstream', async () => {
