@@ -132,4 +132,38 @@ describe('SearchTab', () => {
     expect(screen.queryByTestId('connections-search-tab-recall-thread:oracle')).toBeNull();
     expect(screen.queryByTestId(`connections-search-tab-recall-${visitId}`)).not.toBeNull();
   });
+
+  it('browses topics on an empty query after kind filtering', () => {
+    render(
+      <SearchTab
+        nodes={[
+          ...Array.from({ length: 8 }, (_, index) =>
+            node({
+              id: `thread:thread_${String(index)}`,
+              kind: 'thread' as const,
+              metadata: { title: `Thread ${String(index)}` },
+            }),
+          ),
+          node({
+            id: 'topic:transformers',
+            kind: 'topic',
+            metadata: {
+              representativeTitles: ['huggingface/transformers'],
+              memberCount: 12,
+            },
+          }),
+        ]}
+        extras={[]}
+        ctx={ctx}
+        query=""
+        onQueryChange={vi.fn()}
+        onPick={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('connections-search-kind-filter-thread'));
+
+    expect(screen.queryByTestId('connections-search-tab-hit-topic:transformers')).not.toBeNull();
+    expect(screen.getByText('huggingface/transformers')).toBeDefined();
+  });
 });

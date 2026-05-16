@@ -287,6 +287,107 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByTestId('connections-mode-linked')).toHaveAttribute('aria-selected', 'true');
   });
 
+  it('finds shadow topics in Search and renders their linked members', async () => {
+    const topicId = 'topic:transformers';
+    const visitId = 'timeline-visit:https://github.com/huggingface/transformers';
+    const activeTopicSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: topicId, hops: 1 },
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      },
+    };
+    const shadowSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { topicVariant: 'shadow' },
+        nodes: [
+          {
+            id: visitId,
+            kind: 'timeline-visit',
+            label: 'huggingface/transformers',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              title: 'huggingface/transformers: Transformers',
+              canonicalUrl: 'https://github.com/huggingface/transformers',
+              focusedWindowMs: 8_000,
+            },
+          },
+          {
+            id: topicId,
+            kind: 'topic',
+            label: 'huggingface/transformers',
+            originReplicaIds: [],
+            metadata: {
+              representativeTitles: ['huggingface/transformers'],
+              memberCount: 1,
+              cohesion: 0.93,
+            },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:shadow-transformers',
+            kind: 'visit_in_topic',
+            fromNodeId: visitId,
+            toNodeId: topicId,
+            observedAt: '2026-05-14T10:00:00.000Z',
+            producedBy: { source: 'topic-shadow' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-14T10:00:00.000Z',
+        nodeCount: 2,
+        edgeCount: 1,
+      },
+    };
+    const requestedNodeIds: string[] = [];
+
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        if (m.nodeId !== undefined) requestedNodeIds.push(m.nodeId);
+        return { ok: true, data: m.nodeId === topicId ? activeTopicSnapshot : buildSnapshot() };
+      }
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? shadowSnapshot : buildSnapshot(),
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView initialAnchor="thread:thread_a" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-search')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-search'));
+    fireEvent.change(screen.getByTestId('connections-search-tab-input'), {
+      target: { value: 'transformers' },
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(`connections-search-tab-hit-${topicId}`)).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId(`connections-search-tab-hit-${topicId}`));
+
+    await waitFor(() => {
+      expect(requestedNodeIds).toContain(topicId);
+      expect(screen.queryByTestId(`node-${visitId}`)).not.toBeNull();
+    });
+    expect(screen.queryByTestId('connections-empty')).toBeNull();
+    expect(screen.queryByTestId('group-timeline-visit')).not.toBeNull();
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+    await waitFor(() => {
+      expect(screen.queryByTestId(`focus-topic-${topicId}`)).not.toBeNull();
+    });
+  });
+
   it('filters Linked results by object kind', async () => {
     setConnectionsClientTransportForTests((msg) => {
       const m = msg as { type: string };
@@ -794,7 +895,11 @@ describe('ConnectionsView — engineering scaffold', () => {
     });
     expect(screen.queryByTestId('focus-empty')).toBeNull();
     expect(screen.getByText('2 pages')).toBeDefined();
-    fireEvent.click(screen.getByText('The US Is Winning the AI Race'));
+    fireEvent.click(
+      within(screen.getByTestId('focus-topic-topic:ai_race')).getByRole('button', {
+        name: 'The US Is Winning the AI Race',
+      }),
+    );
     expect(
       screen.getByTestId('focus-visit-timeline-visit:https://example.test/ai-race-a'),
     ).toBeDefined();

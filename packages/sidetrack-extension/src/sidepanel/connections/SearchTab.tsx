@@ -48,6 +48,25 @@ const kindFromAnchorId = (id: string): ConnectionNodeKind => {
   return isConnectionNodeKind(prefix) ? prefix : 'timeline-visit';
 };
 
+const KIND_BROWSE_RANK: ReadonlyMap<ConnectionNodeKind, number> = new Map(
+  [
+    'topic',
+    'workstream',
+    'thread',
+    'timeline-visit',
+    'visit-instance',
+    'tab-session',
+    'snippet',
+    'annotation',
+    'inbound-reminder',
+    'queue-item',
+    'dispatch',
+    'coding-session',
+    'replica',
+    'template',
+  ].map((kind, index) => [kind as ConnectionNodeKind, index] as const),
+);
+
 const urlFromNodeId = (nodeId: string): string | undefined => {
   if (nodeId.startsWith('timeline-visit:')) {
     const value = nodeId.slice('timeline-visit:'.length);
@@ -145,6 +164,41 @@ export const SearchTab = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const browseHits = useMemo<readonly SearchHit[]>(() => {
+    const byId = new Map<string, SearchHit>();
+    for (const node of nodes) {
+      const display = formatEntityDisplay(node, ctx);
+      byId.set(node.id, {
+        id: node.id,
+        primary: display.primary,
+        ...(display.secondary === undefined ? {} : { secondary: display.secondary }),
+        kind: node.kind,
+        score: 0,
+        ...(urlForNode(node) === undefined ? {} : { url: urlForNode(node) }),
+      });
+    }
+    for (const extra of extras) {
+      if (byId.has(extra.id)) continue;
+      const kind = isConnectionNodeKind(extra.kind) ? extra.kind : kindFromAnchorId(extra.id);
+      byId.set(extra.id, {
+        id: extra.id,
+        primary: extra.label,
+        ...(extra.meta === undefined ? {} : { secondary: extra.meta }),
+        kind,
+        score: 0,
+        ...(urlFromNodeId(extra.id) === undefined ? {} : { url: urlFromNodeId(extra.id) }),
+      });
+    }
+    return [...byId.values()]
+      .sort(
+        (left, right) =>
+          (KIND_BROWSE_RANK.get(left.kind) ?? 99) -
+            (KIND_BROWSE_RANK.get(right.kind) ?? 99) ||
+          left.primary.localeCompare(right.primary),
+      )
+      .slice(0, 200);
+  }, [ctx, extras, nodes]);
+
   const titleHits = useMemo<readonly SearchHit[]>(() => {
     if (trimmed.length === 0) return [];
     const byId = new Map<string, SearchHit>();
@@ -180,34 +234,6 @@ export const SearchTab = ({
       .slice(0, 24);
   }, [ctx, extras, nodes, trimmed]);
 
-  const quickPicks = useMemo<readonly SearchHit[]>(() => {
-    const byId = new Map<string, SearchHit>();
-    for (const extra of extras.slice(0, 6)) {
-      const kind = isConnectionNodeKind(extra.kind) ? extra.kind : kindFromAnchorId(extra.id);
-      byId.set(extra.id, {
-        id: extra.id,
-        primary: extra.label,
-        ...(extra.meta === undefined ? {} : { secondary: extra.meta }),
-        kind,
-        score: 0,
-        ...(urlFromNodeId(extra.id) === undefined ? {} : { url: urlFromNodeId(extra.id) }),
-      });
-    }
-    for (const node of nodes.slice(0, 8)) {
-      if (byId.has(node.id)) continue;
-      const display = formatEntityDisplay(node, ctx);
-      byId.set(node.id, {
-        id: node.id,
-        primary: display.primary,
-        ...(display.secondary === undefined ? {} : { secondary: display.secondary }),
-        kind: node.kind,
-        score: 0,
-        ...(urlForNode(node) === undefined ? {} : { url: urlForNode(node) }),
-      });
-    }
-    return [...byId.values()].slice(0, 8);
-  }, [ctx, extras, nodes]);
-
   const kindCounts = useMemo(() => {
     const counts = new Map<ConnectionNodeKind, number>();
     for (const node of nodes) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1);
@@ -233,9 +259,9 @@ export const SearchTab = ({
     [hiddenKinds, titleHits],
   );
 
-  const filteredQuickPicks = useMemo(
-    () => quickPicks.filter((hit) => !hiddenKinds.has(hit.kind)),
-    [hiddenKinds, quickPicks],
+  const filteredBrowseHits = useMemo(
+    () => browseHits.filter((hit) => !hiddenKinds.has(hit.kind)).slice(0, 80),
+    [browseHits, hiddenKinds],
   );
 
   const filteredRecallHits = useMemo(
@@ -244,7 +270,9 @@ export const SearchTab = ({
   );
 
   const titleCountLabel =
-    trimmed.length === 0 ? 'Quick picks' : `Title matches · ${String(filteredTitleHits.length)}`;
+    trimmed.length === 0
+      ? `Browse objects · ${String(filteredBrowseHits.length)}`
+      : `Title matches · ${String(filteredTitleHits.length)}`;
   const recallCountLabel = recallLoading
     ? 'Content matches · searching…'
     : `Content matches · ${String(filteredRecallHits.length)}`;
@@ -409,7 +437,14 @@ export const SearchTab = ({
               ) : null}
             </div>
             <div className="cx-search-tab-list">
-              {(trimmed.length === 0 ? filteredQuickPicks : filteredTitleHits).map(renderTitleHit)}
+              {(trimmed.length === 0 ? filteredBrowseHits : filteredTitleHits).map(
+                renderTitleHit,
+              )}
+              {trimmed.length === 0 && filteredBrowseHits.length === 0 ? (
+                <div className="cx-search-tab-empty" data-testid="connections-search-tab-empty">
+                  No objects match the selected kind filters.
+                </div>
+              ) : null}
               {trimmed.length > 0 && filteredTitleHits.length === 0 ? (
                 <div
                   className="cx-search-tab-empty"

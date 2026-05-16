@@ -249,6 +249,68 @@ const filterGraphPartsForConnectionModes = (
   return { nodes: filteredNodes, edges: filteredEdges };
 };
 
+const scopedResultFromLoadedGraph = ({
+  nodes,
+  edges,
+  anchorId,
+  hops,
+  updatedAt,
+  scope,
+}: {
+  readonly nodes: readonly ConnectionNode[];
+  readonly edges: readonly ConnectionEdge[];
+  readonly anchorId: string;
+  readonly hops: number;
+  readonly updatedAt: string;
+  readonly scope: Record<string, unknown>;
+}): ConnectionsScopedResult | null => {
+  if (!nodes.some((node) => node.id === anchorId)) return null;
+  const normalizedHops = Math.max(0, Math.min(4, Math.floor(hops)));
+  const visited = new Set<string>([anchorId]);
+  let frontier = new Set<string>([anchorId]);
+  const keptEdges = new Map<string, ConnectionEdge>();
+
+  for (let hop = 0; hop < normalizedHops; hop += 1) {
+    const next = new Set<string>();
+    for (const edge of edges) {
+      if (frontier.has(edge.fromNodeId) && !visited.has(edge.toNodeId)) {
+        keptEdges.set(edge.id, edge);
+        next.add(edge.toNodeId);
+      }
+      if (frontier.has(edge.toNodeId) && !visited.has(edge.fromNodeId)) {
+        keptEdges.set(edge.id, edge);
+        next.add(edge.fromNodeId);
+      }
+      if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
+        keptEdges.set(edge.id, edge);
+      }
+    }
+    for (const id of next) visited.add(id);
+    frontier = next;
+    if (frontier.size === 0) break;
+  }
+
+  for (const edge of edges) {
+    if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
+      keptEdges.set(edge.id, edge);
+    }
+  }
+
+  const scopedNodes = nodes.filter((node) => visited.has(node.id));
+  const scopedEdges = [...keptEdges.values()];
+  return {
+    scope: 'companion-extended',
+    snapshot: {
+      scope: { ...scope, nodeId: anchorId, hops: normalizedHops },
+      nodes: scopedNodes,
+      edges: scopedEdges,
+      updatedAt,
+      nodeCount: scopedNodes.length,
+      edgeCount: scopedEdges.length,
+    },
+  };
+};
+
 const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
@@ -1319,11 +1381,20 @@ export const ConnectionsView = ({
     const node = result.snapshot.nodes.find((n) => n.id === anchor) ?? null;
     return node === null ? null : applyAnchorLabel(node, anchorLabelOverrides[anchor]);
   }, [anchor, anchorLabelOverrides, result]);
+  const shadowSnapshotNodeById = useMemo(
+    () => new Map(shadowFullSnapshot.nodes.map((node) => [node.id, node] as const)),
+    [shadowFullSnapshot.nodes],
+  );
+  const shadowAnchorNode = useMemo<ConnectionNode | null>(() => {
+    if (!anchor.startsWith('topic:')) return null;
+    const node = shadowSnapshotNodeById.get(anchor) ?? null;
+    return node === null ? null : applyAnchorLabel(node, anchorLabelOverrides[anchor]);
+  }, [anchor, anchorLabelOverrides, shadowSnapshotNodeById]);
   const fallbackAnchorNode = useMemo<ConnectionNode | null>(() => {
-    if (anchor.length === 0 || anchorNode !== null) return null;
+    if (anchor.length === 0 || anchorNode !== null || shadowAnchorNode !== null) return null;
     return displayOnlyAnchorNode(anchor, anchorLabelOverrides[anchor]);
-  }, [anchor, anchorLabelOverrides, anchorNode]);
-  const anchorDisplayNode = anchorNode ?? fallbackAnchorNode;
+  }, [anchor, anchorLabelOverrides, anchorNode, shadowAnchorNode]);
+  const anchorDisplayNode = anchorNode ?? shadowAnchorNode ?? fallbackAnchorNode;
   const snapshotNodeById = useMemo(() => {
     const byId =
       result === null
@@ -1337,10 +1408,6 @@ export const ConnectionsView = ({
   const ctx: EntityDisplayCtx = useMemo(
     () => ({ ...baseCtx, nodeById: snapshotNodeById }),
     [baseCtx, snapshotNodeById],
-  );
-  const shadowSnapshotNodeById = useMemo(
-    () => new Map(shadowFullSnapshot.nodes.map((node) => [node.id, node] as const)),
-    [shadowFullSnapshot.nodes],
   );
   const shadowCtx: EntityDisplayCtx = useMemo(
     () => ({ ...baseCtx, nodeById: shadowSnapshotNodeById }),
@@ -1455,9 +1522,18 @@ export const ConnectionsView = ({
   const searchNodes = useMemo<readonly ConnectionNode[]>(() => {
     const byId = new Map<string, ConnectionNode>();
     for (const n of fullSnapshot.nodes) byId.set(n.id, n);
+    for (const n of shadowFullSnapshot.nodes) byId.set(n.id, n);
     for (const n of result?.snapshot.nodes ?? []) byId.set(n.id, n);
     return [...byId.values()];
-  }, [fullSnapshot.nodes, result]);
+  }, [fullSnapshot.nodes, result, shadowFullSnapshot.nodes]);
+  const searchNodeById = useMemo(
+    () => new Map(searchNodes.map((node) => [node.id, node] as const)),
+    [searchNodes],
+  );
+  const searchCtx: EntityDisplayCtx = useMemo(
+    () => ({ ...baseCtx, nodeById: searchNodeById }),
+    [baseCtx, searchNodeById],
+  );
 
   // Search pool — combines the user's named workstreams + recent
   // anchors so the search box catches things even when they aren't
@@ -1949,8 +2025,11 @@ export const ConnectionsView = ({
     if (subMode === 'focus') {
       fullSnapshot.prime();
       shadowFullSnapshot.prime();
-    } else if (subMode === 'flow' || subMode === 'search') {
+    } else if (subMode === 'flow') {
       fullSnapshot.prime();
+    } else if (subMode === 'search') {
+      fullSnapshot.prime();
+      shadowFullSnapshot.prime();
     }
     // Intentionally not depending on fullSnapshot itself — prime()
     // is internally idempotent and the no-op guard handles repeats.
@@ -1995,6 +2074,44 @@ export const ConnectionsView = ({
     );
     return { nodes: filtered.nodes, edges: filtered.edges } as const;
   }, [anchor, shadowFullSnapshot.edges, shadowFullSnapshot.nodes, timeRange]);
+  const anchorIsTopic = anchor.startsWith('topic:');
+  const shadowTopicScopedResult = useMemo<ConnectionsScopedResult | null>(() => {
+    if (!anchorIsTopic || !shadowFullSnapshot.ready) return null;
+    return scopedResultFromLoadedGraph({
+      nodes: filteredShadowSnapshot.nodes,
+      edges: filteredShadowSnapshot.edges,
+      anchorId: anchor,
+      hops,
+      updatedAt: result?.snapshot.updatedAt ?? '1970-01-01T00:00:00.000Z',
+      scope: { topicVariant: 'shadow' },
+    });
+  }, [
+    anchor,
+    anchorIsTopic,
+    filteredShadowSnapshot.edges,
+    filteredShadowSnapshot.nodes,
+    hops,
+    result,
+    shadowFullSnapshot.ready,
+  ]);
+  const renderedConnectionResult = shadowTopicScopedResult ?? result;
+  const filteredRenderedConnectionResult = useMemo(() => {
+    if (shadowTopicScopedResult === null) return filteredPanelResult;
+    if (!panelFilterActive) return shadowTopicScopedResult;
+    return filterSnapshotForConnectionModes(
+      shadowTopicScopedResult,
+      anchor,
+      hiddenNodeKinds,
+      hiddenEdgeFamilies,
+    );
+  }, [
+    anchor,
+    filteredPanelResult,
+    hiddenEdgeFamilies,
+    hiddenNodeKinds,
+    panelFilterActive,
+    shadowTopicScopedResult,
+  ]);
   const focusData = useMemo(
     () =>
       result === null
@@ -2035,7 +2152,6 @@ export const ConnectionsView = ({
     focusData.previousTopicCount,
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
-  const anchorIsTopic = anchor.startsWith('topic:');
   const shadowSnapshotReady = shadowFullSnapshot.ready;
   const topicAnchorShadowResolving =
     anchorIsTopic && !shadowSnapshotReady && shadowFullSnapshot.error === null;
@@ -2123,11 +2239,14 @@ export const ConnectionsView = ({
     <SearchTab
       nodes={searchNodes}
       extras={searchExtras}
-      ctx={ctx}
+      ctx={searchCtx}
       query={searchQuery}
       onQueryChange={setSearchQuery}
-      onPrime={fullSnapshot.prime}
-      loading={fullSnapshot.loading}
+      onPrime={() => {
+        fullSnapshot.prime();
+        shadowFullSnapshot.prime();
+      }}
+      loading={fullSnapshot.loading || shadowFullSnapshot.loading}
       recallHits={recallResults.items.map((item) => ({
         ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
         ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
@@ -2432,6 +2551,7 @@ export const ConnectionsView = ({
           onClick={() => {
             setSubMode('search');
             fullSnapshot.prime();
+            shadowFullSnapshot.prime();
           }}
           data-testid="connections-mode-search"
         >
@@ -2446,7 +2566,7 @@ export const ConnectionsView = ({
           }
           nodes={searchNodes}
           extras={searchExtras}
-          ctx={ctx}
+          ctx={searchCtx}
           onNodeClick={(nodeId) => {
             useNodeAsAnchor(nodeId);
           }}
@@ -2491,13 +2611,16 @@ export const ConnectionsView = ({
               <NodeSearchBox
                 nodes={searchNodes}
                 extras={searchExtras}
-                ctx={ctx}
+                ctx={searchCtx}
                 onPick={(id) => {
                   navigateToAnchor(id);
                 }}
                 onQueryChange={setSearchQuery}
-                onPrime={fullSnapshot.prime}
-                loading={fullSnapshot.loading}
+                onPrime={() => {
+                  fullSnapshot.prime();
+                  shadowFullSnapshot.prime();
+                }}
+                loading={fullSnapshot.loading || shadowFullSnapshot.loading}
                 recallHits={recallResults.items.map((item) => ({
                   ...(item.sourceKind === undefined ? {} : { sourceKind: item.sourceKind }),
                   ...(item.anchorNodeId === undefined ? {} : { anchorNodeId: item.anchorNodeId }),
@@ -2755,10 +2878,10 @@ export const ConnectionsView = ({
           ) : null}
           {subMode === 'search' ? (
             searchTab
-          ) : result !== null ? (
+          ) : renderedConnectionResult !== null ? (
             subMode === 'linked' ? (
               <LinkedCenter
-                result={filteredPanelResult ?? result}
+                result={filteredRenderedConnectionResult ?? renderedConnectionResult}
                 anchorId={anchor}
                 selectedEdge={selectedEdge}
                 highlightedNodeId={timelineHoverNodeId}
@@ -2770,7 +2893,7 @@ export const ConnectionsView = ({
               />
             ) : subMode === 'orbital' ? (
               <OrbitalCenter
-                result={filteredPanelResult ?? result}
+                result={filteredRenderedConnectionResult ?? renderedConnectionResult}
                 anchorId={anchor}
                 hops={hops}
                 selectedEdge={selectedEdge}
@@ -2783,11 +2906,11 @@ export const ConnectionsView = ({
                 const flowNodes =
                   filteredFlowSubgraph.nodes.length > 0
                     ? filteredFlowSubgraph.nodes
-                    : (filteredPanelResult ?? result).snapshot.nodes;
+                    : (filteredRenderedConnectionResult ?? renderedConnectionResult).snapshot.nodes;
                 const flowEdges =
                   filteredFlowSubgraph.edges.length > 0
                     ? filteredFlowSubgraph.edges
-                    : (filteredPanelResult ?? result).snapshot.edges;
+                    : (filteredRenderedConnectionResult ?? renderedConnectionResult).snapshot.edges;
                 const flowVisits = deriveFlowVisits(flowNodes, ctx, anchor);
                 const crossReplica = deriveCrossReplicaEdges(flowEdges);
                 return (
