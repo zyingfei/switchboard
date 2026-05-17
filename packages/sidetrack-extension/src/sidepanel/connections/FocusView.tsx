@@ -1,4 +1,4 @@
-import { useState, type ReactElement } from 'react';
+import { useEffect, useState, type ReactElement } from 'react';
 
 import {
   CheckIcon,
@@ -9,6 +9,7 @@ import {
   SaveIcon,
   TrashIcon,
 } from './icons';
+import { messageTypes, type ContentQueryResponse } from '../../messages';
 
 export const ENGAGEMENT_CLASSES = [
   'parked_background',
@@ -38,6 +39,8 @@ const isEngagementClass = (value: string): value is EngagementClass =>
 export interface TopicNode {
   readonly id: string;
   readonly label: string;
+  readonly suggestedLabels?: readonly string[];
+  readonly source?: 'topic' | 'related-neighborhood';
   readonly memberCount: number;
   readonly totalMemberCount?: number;
   readonly secondaryCount?: number;
@@ -62,9 +65,30 @@ export interface TopicVisit {
   readonly pageEvidenceTermCount?: number;
 }
 
+export interface FocusCandidate {
+  readonly id: string;
+  readonly label: string;
+  readonly url?: string;
+  readonly canonicalUrl?: string;
+  readonly source: 'suggested' | 'search' | 'recent' | 'current';
+  readonly reasons: readonly string[];
+  readonly score?: number;
+  readonly snippet?: string;
+  readonly pageEvidenceTier?: string;
+}
+
 export interface FocusWorkstreamOption {
   readonly id: string;
   readonly label: string;
+}
+
+export interface FocusGroupSaveInput {
+  readonly topicId: string;
+  readonly title: string;
+  readonly mode: 'create' | 'move-existing' | 'split-new' | 'current-page';
+  readonly canonicalUrls: readonly string[];
+  readonly memberVisitIds: readonly string[];
+  readonly targetWorkstreamId?: string;
 }
 
 export interface FocusViewProps {
@@ -76,6 +100,8 @@ export interface FocusViewProps {
   readonly previousTopicCount?: number;
   readonly emptyDetail?: string;
   readonly workstreamOptions?: readonly FocusWorkstreamOption[];
+  readonly suggestedCandidatesByTopic?: Record<string, readonly FocusCandidate[]>;
+  readonly recentCandidates?: readonly FocusCandidate[];
   readonly onTopicClick: (topicId: string) => void;
   readonly onTopicAnchor?: (input: { readonly topicId: string; readonly label: string }) => void;
   readonly onTopicPromote?: (input: {
@@ -92,6 +118,7 @@ export interface FocusViewProps {
     readonly topicId: string;
     readonly memberVisitIds: readonly string[];
   }) => Promise<void> | void;
+  readonly onFocusGroupSave?: (input: FocusGroupSaveInput) => Promise<void> | void;
   readonly onVisitMarkNotRelated?: (input: {
     readonly topicId: string;
     readonly visitId: string;
@@ -229,6 +256,116 @@ const iconSlot = (icon: ReactElement): ReactElement => (
   </span>
 );
 
+const canonicalUrlFromVisitId = (visitId: string): string | undefined => {
+  if (visitId.startsWith('timeline-visit:')) {
+    const url = visitId.slice('timeline-visit:'.length);
+    return url.length > 0 ? url : undefined;
+  }
+  if (visitId.startsWith('visit-instance:')) {
+    const tail = visitId.slice('visit-instance:'.length);
+    const httpIdx = tail.indexOf(':http');
+    if (httpIdx >= 0) {
+      const url = tail.slice(httpIdx + 1);
+      return url.length > 0 ? url : undefined;
+    }
+  }
+  return undefined;
+};
+
+const canonicalUrlForVisit = (visit: TopicVisit): string | undefined =>
+  visit.url ?? canonicalUrlFromVisitId(visit.id);
+
+const focusCandidateFromVisit = (
+  visit: TopicVisit,
+  source: FocusCandidate['source'],
+): FocusCandidate => {
+  const canonicalUrl = canonicalUrlForVisit(visit);
+  return {
+    id: visit.id,
+    label: visit.label,
+    ...(visit.url === undefined ? {} : { url: visit.url }),
+    ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+    source,
+    reasons:
+      visit.affiliation === 'secondary'
+        ? ['Also related']
+        : source === 'current'
+          ? ['Current suggestion']
+          : ['Recently viewed'],
+    ...(visit.secondaryScore === undefined ? {} : { score: visit.secondaryScore }),
+    ...(visit.pageEvidenceTier === undefined ? {} : { pageEvidenceTier: visit.pageEvidenceTier }),
+  };
+};
+
+const dedupeCandidates = (candidates: readonly FocusCandidate[]): readonly FocusCandidate[] => {
+  const seen = new Set<string>();
+  const out: FocusCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = candidate.canonicalUrl ?? candidate.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(candidate);
+  }
+  return out;
+};
+
+const candidateKey = (candidate: FocusCandidate): string => candidate.canonicalUrl ?? candidate.id;
+
+const uniqueStrings = (values: readonly (string | undefined)[]): readonly string[] => {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed === undefined || trimmed.length === 0 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+};
+
+const nameSuggestionsForTopic = (
+  topic: TopicNode,
+  visits: readonly TopicVisit[],
+  workstreamOptions: readonly FocusWorkstreamOption[],
+): readonly string[] => {
+  const dominantWorkstream = workstreamOptions.find(
+    (option) => option.id === topic.dominantWorkstreamId,
+  )?.label;
+  const attentiveVisits = [...visits]
+    .sort(
+      (left, right) =>
+        right.focusedWindowMs - left.focusedWindowMs || left.label.localeCompare(right.label),
+    )
+    .slice(0, 4)
+    .map((visit) => visit.label);
+  return uniqueStrings([
+    dominantWorkstream,
+    topic.label,
+    ...(topic.suggestedLabels ?? []),
+    ...attentiveVisits,
+  ]).slice(0, 8);
+};
+
+const contentSearchHitToCandidate = (
+  hit: ContentQueryResponse['items'][number],
+): FocusCandidate | null => {
+  const canonicalUrl = hit.canonicalUrl;
+  if (canonicalUrl === undefined || canonicalUrl.length === 0) return null;
+  return {
+    id: hit.anchorNodeId,
+    label: hit.title ?? canonicalUrl,
+    url: canonicalUrl,
+    canonicalUrl,
+    source: 'search',
+    reasons: [hit.sourceKind === 'page-content' ? 'Page content' : 'Chat turn'],
+    score: hit.score,
+    ...(hit.snippet === undefined ? {} : { snippet: hit.snippet }),
+    ...(hit.coverageState === undefined ? {} : { pageEvidenceTier: hit.coverageState }),
+  };
+};
+
+const EMPTY_SEARCH_ITEMS: readonly FocusCandidate[] = [];
+
 export const isCollapsedSuggestionSet = (
   topics: readonly TopicNode[],
   eligibleVisitCount: number | undefined,
@@ -256,11 +393,14 @@ export const FocusView = ({
   previousTopicCount,
   emptyDetail,
   workstreamOptions = [],
+  suggestedCandidatesByTopic = {},
+  recentCandidates = [],
   onTopicClick,
   onTopicAnchor,
   onTopicPromote,
   onTopicRename,
   onTopicDismiss,
+  onFocusGroupSave,
   onVisitMarkNotRelated,
   onVisitRestoreToTopic,
   onVisitConfirmRelated,
@@ -283,6 +423,27 @@ export const FocusView = ({
   const [renamingTopicId, setRenamingTopicId] = useState<string | null>(null);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameErrorTopicId, setRenameErrorTopicId] = useState<string | null>(null);
+  const [composingTopicIds, setComposingTopicIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const [selectedVisitIdsByTopic, setSelectedVisitIdsByTopic] = useState<
+    Record<string, ReadonlySet<string>>
+  >({});
+  const [extraSelectionsByTopic, setExtraSelectionsByTopic] = useState<
+    Record<string, readonly FocusCandidate[]>
+  >({});
+  const [addDrawerTopicId, setAddDrawerTopicId] = useState<string | null>(null);
+  const [drawerTabByTopic, setDrawerTabByTopic] = useState<
+    Record<string, 'suggested' | 'search' | 'current' | 'recent'>
+  >({});
+  const [searchQueryByTopic, setSearchQueryByTopic] = useState<Record<string, string>>({});
+  const [searchItems, setSearchItems] = useState<readonly FocusCandidate[]>(EMPTY_SEARCH_ITEMS);
+  const [searchLoading, setSearchLoading] = useState<boolean>(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [saveTargetByTopic, setSaveTargetByTopic] = useState<Record<string, string>>({});
+  const [savingTopicId, setSavingTopicId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveErrorTopicId, setSaveErrorTopicId] = useState<string | null>(null);
   const [dismissedTopicIds, setDismissedTopicIds] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
   );
@@ -330,6 +491,182 @@ export const FocusView = ({
       else next.add(topicId);
       return next;
     });
+  };
+
+  const activeSearchQuery =
+    addDrawerTopicId === null ? '' : (searchQueryByTopic[addDrawerTopicId] ?? '');
+
+  useEffect(() => {
+    const trimmed = activeSearchQuery.trim();
+    if (addDrawerTopicId === null || trimmed.length === 0) {
+      setSearchItems(EMPTY_SEARCH_ITEMS);
+      setSearchLoading(false);
+      setSearchError(null);
+      return undefined;
+    }
+    if (trimmed.length < 3) {
+      setSearchItems(EMPTY_SEARCH_ITEMS);
+      setSearchLoading(false);
+      setSearchError(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setSearchLoading(true);
+    setSearchError(null);
+    const timer = window.setTimeout(() => {
+      chrome.runtime.sendMessage(
+        {
+          type: messageTypes.contentQuery,
+          q: trimmed,
+          limit: 12,
+          sourceKind: ['page-content', 'chat-turn'],
+        },
+        (response: unknown) => {
+          if (cancelled) return;
+          const lastError = chrome.runtime.lastError;
+          if (lastError !== undefined) {
+            setSearchItems(EMPTY_SEARCH_ITEMS);
+            setSearchLoading(false);
+            setSearchError(lastError.message ?? 'Search failed');
+            return;
+          }
+          const parsed = response as Partial<ContentQueryResponse> | null;
+          const items = Array.isArray(parsed?.items)
+            ? parsed.items
+                .map(contentSearchHitToCandidate)
+                .filter((item): item is FocusCandidate => item !== null)
+            : [];
+          setSearchItems(dedupeCandidates(items));
+          setSearchLoading(false);
+          setSearchError(parsed?.ok === false ? (parsed.error ?? 'Search failed') : null);
+        },
+      );
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeSearchQuery, addDrawerTopicId]);
+
+  const ensureSelectionForTopic = (topicId: string, visits: readonly TopicVisit[]): void => {
+    setSelectedVisitIdsByTopic((current) => {
+      if (current[topicId] !== undefined) return current;
+      return { ...current, [topicId]: new Set(visits.map((visit) => visit.id)) };
+    });
+  };
+
+  const openComposition = (topic: TopicNode, visits: readonly TopicVisit[]): void => {
+    ensureSelectionForTopic(topic.id, visits);
+    setComposingTopicIds((current) => {
+      const next = new Set(current);
+      next.add(topic.id);
+      return next;
+    });
+    setExpandedTopicIds((current) => {
+      const next = new Set(current);
+      next.add(topic.id);
+      return next;
+    });
+  };
+
+  const toggleVisitSelection = (topicId: string, visitId: string): void => {
+    setSelectedVisitIdsByTopic((current) => {
+      const nextSet = new Set(current[topicId] ?? []);
+      if (nextSet.has(visitId)) nextSet.delete(visitId);
+      else nextSet.add(visitId);
+      return { ...current, [topicId]: nextSet };
+    });
+  };
+
+  const addCandidateSelection = (topicId: string, candidate: FocusCandidate): void => {
+    setExtraSelectionsByTopic((current) => {
+      const existing = current[topicId] ?? [];
+      const key = candidateKey(candidate);
+      if (existing.some((item) => candidateKey(item) === key)) return current;
+      return { ...current, [topicId]: dedupeCandidates([...existing, candidate]) };
+    });
+  };
+
+  const removeExtraSelection = (topicId: string, candidate: FocusCandidate): void => {
+    const key = candidateKey(candidate);
+    setExtraSelectionsByTopic((current) => ({
+      ...current,
+      [topicId]: (current[topicId] ?? []).filter((item) => candidateKey(item) !== key),
+    }));
+  };
+
+  const selectedCandidatesForTopic = (
+    topicId: string,
+    visits: readonly TopicVisit[],
+  ): readonly FocusCandidate[] => {
+    const selectedIds = selectedVisitIdsByTopic[topicId];
+    const visitSelections =
+      selectedIds === undefined
+        ? visits.map((visit) => focusCandidateFromVisit(visit, 'current'))
+        : visits
+            .filter((visit) => selectedIds.has(visit.id))
+            .map((visit) => focusCandidateFromVisit(visit, 'current'));
+    return dedupeCandidates([...visitSelections, ...(extraSelectionsByTopic[topicId] ?? [])]);
+  };
+
+  const selectedCanonicalUrlsForTopic = (
+    topicId: string,
+    visits: readonly TopicVisit[],
+  ): readonly string[] =>
+    uniqueStrings(
+      selectedCandidatesForTopic(topicId, visits).map((candidate) => candidate.canonicalUrl),
+    );
+
+  const submitFocusGroupSave = (
+    topic: TopicNode,
+    visits: readonly TopicVisit[],
+    mode: FocusGroupSaveInput['mode'],
+  ): void => {
+    if (onFocusGroupSave === undefined) {
+      submitTopicPromote(
+        topic,
+        visits.map((visit) => visit.id),
+      );
+      return;
+    }
+    const title = renameDraftFor(topic).trim() || displayLabelFor(topic);
+    const canonicalUrls = selectedCanonicalUrlsForTopic(topic.id, visits);
+    if (canonicalUrls.length === 0) {
+      setSaveError('No selected pages have canonical URLs to save.');
+      setSaveErrorTopicId(topic.id);
+      return;
+    }
+    const target = saveTargetByTopic[topic.id] ?? 'new';
+    setSavingTopicId(topic.id);
+    setSaveError(null);
+    setSaveErrorTopicId(null);
+    void Promise.resolve(
+      onFocusGroupSave({
+        topicId: topic.id,
+        title,
+        mode: target === 'new' ? mode : 'move-existing',
+        canonicalUrls,
+        memberVisitIds: selectedCandidatesForTopic(topic.id, visits).map(
+          (candidate) => candidate.id,
+        ),
+        ...(target === 'new' ? {} : { targetWorkstreamId: target }),
+      }),
+    )
+      .then(() => {
+        setComposingTopicIds((current) => {
+          const next = new Set(current);
+          next.delete(topic.id);
+          return next;
+        });
+        setAddDrawerTopicId((current) => (current === topic.id ? null : current));
+      })
+      .catch((error: unknown) => {
+        setSaveError(error instanceof Error ? error.message : String(error));
+        setSaveErrorTopicId(topic.id);
+      })
+      .finally(() => {
+        setSavingTopicId(null);
+      });
   };
 
   const submitEngagementRelabel = (
@@ -596,6 +933,51 @@ export const FocusView = ({
                 ? 'Loading the candidate topic graph for this suggestion.'
                 : 'This page is not in the current candidate topic output.')}
           </p>
+          {anchorVisitId !== undefined && onFocusGroupSave !== undefined ? (
+            <div className="cx-focus-triage-actions">
+              <button
+                type="button"
+                className="cx-focus-expand cx-focus-inline-action"
+                disabled={savingTopicId === anchorVisitId}
+                onClick={() => {
+                  const canonicalUrl = canonicalUrlFromVisitId(anchorVisitId);
+                  if (canonicalUrl === undefined) {
+                    setSaveError('This page does not have a canonical URL to save.');
+                    setSaveErrorTopicId(anchorVisitId);
+                    return;
+                  }
+                  setSavingTopicId(anchorVisitId);
+                  setSaveError(null);
+                  setSaveErrorTopicId(null);
+                  void Promise.resolve(
+                    onFocusGroupSave({
+                      topicId: `focus:current-page:${anchorVisitId}`,
+                      title: 'New focus group',
+                      mode: 'current-page',
+                      canonicalUrls: [canonicalUrl],
+                      memberVisitIds: [anchorVisitId],
+                    }),
+                  )
+                    .catch((error: unknown) => {
+                      setSaveError(error instanceof Error ? error.message : String(error));
+                      setSaveErrorTopicId(anchorVisitId);
+                    })
+                    .finally(() => {
+                      setSavingTopicId(null);
+                    });
+                }}
+                data-testid="focus-create-current-page"
+              >
+                {iconSlot(SaveIcon)}
+                Create group around this page
+              </button>
+            </div>
+          ) : null}
+          {saveError !== null && saveErrorTopicId === anchorVisitId ? (
+            <div className="cx-mono cx-dim" role="alert" data-testid="focus-save-error">
+              {saveError}
+            </div>
+          ) : null}
         </article>
       </section>
     );
@@ -621,7 +1003,28 @@ export const FocusView = ({
         const displayLabel = displayLabelFor(topic);
         const renameDraft = renameDraftFor(topic);
         const visibleVisitIds = visibleVisits.map((visit) => visit.id);
-        const canPromote = onTopicPromote !== undefined && workstreamOptions.length > 0;
+        const canPromote =
+          onFocusGroupSave !== undefined ||
+          (onTopicPromote !== undefined && workstreamOptions.length > 0);
+        const canAnchorTopic =
+          onTopicAnchor !== undefined && topic.source !== 'related-neighborhood';
+        const composing = composingTopicIds.has(topic.id);
+        const selectedCandidates = selectedCandidatesForTopic(topic.id, visibleVisits);
+        const selectedCanonicalUrls = selectedCanonicalUrlsForTopic(topic.id, visibleVisits);
+        const nameSuggestions = nameSuggestionsForTopic(topic, visibleVisits, workstreamOptions);
+        const activeDrawerTab = drawerTabByTopic[topic.id] ?? 'suggested';
+        const suggestedCandidates = dedupeCandidates(suggestedCandidatesByTopic[topic.id] ?? []);
+        const currentCandidates = visibleVisits.map((visit) =>
+          focusCandidateFromVisit(visit, 'current'),
+        );
+        const drawerCandidates =
+          activeDrawerTab === 'suggested'
+            ? suggestedCandidates
+            : activeDrawerTab === 'search'
+              ? searchItems
+              : activeDrawerTab === 'recent'
+                ? recentCandidates
+                : currentCandidates;
         return (
           <article
             className={`cx-focus-card${needsTriage ? ' is-triage' : ''}`}
@@ -653,7 +1056,8 @@ export const FocusView = ({
                     className="cx-focus-head-action"
                     disabled={promotingTopicId === topic.id || visibleVisits.length === 0}
                     onClick={() => {
-                      submitTopicPromote(topic, visibleVisitIds);
+                      if (onFocusGroupSave !== undefined) openComposition(topic, visibleVisits);
+                      else submitTopicPromote(topic, visibleVisitIds);
                     }}
                     data-testid={`focus-promote-${topic.id}`}
                     title="Save this suggestion"
@@ -662,7 +1066,7 @@ export const FocusView = ({
                     {iconSlot(SaveIcon)}
                   </button>
                 ) : null}
-                {onTopicAnchor === undefined ? null : (
+                {canAnchorTopic ? (
                   <button
                     type="button"
                     className="cx-focus-head-action cx-focus-head-action-text"
@@ -675,7 +1079,7 @@ export const FocusView = ({
                     {iconSlot(KindIcons.topic)}
                     Anchor
                   </button>
-                )}
+                ) : null}
                 {needsTriage && onTopicDismiss !== undefined ? (
                   <button
                     type="button"
@@ -716,7 +1120,7 @@ export const FocusView = ({
               <div className="cx-focus-detail" data-testid={`focus-detail-${topic.id}`}>
                 <div className="cx-focus-rename">
                   <label className="cx-focus-rename-label" htmlFor={`focus-rename-${topic.id}`}>
-                    Rename
+                    Group name
                   </label>
                   <input
                     id={`focus-rename-${topic.id}`}
@@ -752,6 +1156,88 @@ export const FocusView = ({
                     {renamingTopicId === topic.id ? 'Saving' : 'Save name'}
                   </button>
                 </div>
+                {nameSuggestions.length === 0 ? null : (
+                  <div className="cx-focus-name-suggestions">
+                    <span className="cx-focus-rename-label">Name suggestions</span>
+                    <div className="cx-focus-chip-row">
+                      {nameSuggestions.map((label) => (
+                        <button
+                          type="button"
+                          className="cx-focus-name-chip"
+                          key={label}
+                          onClick={() => {
+                            setRenameDraftsByTopic((current) => ({
+                              ...current,
+                              [topic.id]: label,
+                            }));
+                          }}
+                          data-testid={`focus-name-chip-${topic.id}-${label}`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {onFocusGroupSave === undefined ? null : (
+                  <div className="cx-focus-compose-actions">
+                    <select
+                      className="cx-focus-target-select"
+                      value={saveTargetByTopic[topic.id] ?? 'new'}
+                      onChange={(event) => {
+                        setSaveTargetByTopic((current) => ({
+                          ...current,
+                          [topic.id]: event.currentTarget.value,
+                        }));
+                      }}
+                      data-testid={`focus-save-target-${topic.id}`}
+                      aria-label="Save target"
+                    >
+                      <option value="new">New group</option>
+                      {workstreamOptions.map((option) => (
+                        <option key={option.id} value={option.id}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="cx-focus-expand cx-focus-inline-action"
+                      disabled={savingTopicId === topic.id || selectedCanonicalUrls.length === 0}
+                      onClick={() => {
+                        if (!composing) openComposition(topic, visibleVisits);
+                        submitFocusGroupSave(topic, visibleVisits, 'create');
+                      }}
+                      data-testid={`focus-save-group-${topic.id}`}
+                    >
+                      {iconSlot(SaveIcon)}
+                      {savingTopicId === topic.id ? 'Saving' : 'Save group'}
+                    </button>
+                    <button
+                      type="button"
+                      className="cx-focus-expand cx-focus-inline-action"
+                      onClick={() => {
+                        openComposition(topic, visibleVisits);
+                      }}
+                      data-testid={`focus-refine-${topic.id}`}
+                    >
+                      {iconSlot(EditIcon)}
+                      Refine
+                    </button>
+                    <button
+                      type="button"
+                      className="cx-focus-expand cx-focus-inline-action"
+                      onClick={() => {
+                        openComposition(topic, visibleVisits);
+                        setAddDrawerTopicId(topic.id);
+                      }}
+                      data-testid={`focus-add-pages-${topic.id}`}
+                    >
+                      {iconSlot(CheckIcon)}
+                      Add pages
+                    </button>
+                  </div>
+                )}
                 {renameError !== null && renameErrorTopicId === topic.id ? (
                   <div className="cx-mono cx-dim" role="alert" data-testid="focus-rename-error">
                     {renameError}
@@ -765,6 +1251,163 @@ export const FocusView = ({
                 {dismissError !== null && dismissErrorTopicId === topic.id ? (
                   <div className="cx-mono cx-dim" role="alert" data-testid="focus-dismiss-error">
                     {dismissError}
+                  </div>
+                ) : null}
+                {saveError !== null && saveErrorTopicId === topic.id ? (
+                  <div className="cx-mono cx-dim" role="alert" data-testid="focus-save-error">
+                    {saveError}
+                  </div>
+                ) : null}
+                {composing ? (
+                  <div
+                    className="cx-focus-selected-tray"
+                    data-testid={`focus-selection-${topic.id}`}
+                  >
+                    <div className="cx-focus-detail-head">
+                      <span>Selected</span>
+                      <span className="cx-mono cx-dim">
+                        {pageCountLabel(selectedCandidates.length)}
+                      </span>
+                    </div>
+                    <div className="cx-focus-selected-items">
+                      {selectedCandidates.map((candidate) => (
+                        <span className="cx-focus-selected-item" key={candidateKey(candidate)}>
+                          {candidate.label}
+                          {candidate.source === 'current' ? null : (
+                            <button
+                              type="button"
+                              className="cx-focus-selected-remove"
+                              onClick={() => {
+                                removeExtraSelection(topic.id, candidate);
+                              }}
+                              aria-label={`Remove ${candidate.label}`}
+                            >
+                              x
+                            </button>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="cx-focus-compose-actions">
+                      <button
+                        type="button"
+                        className="cx-focus-expand cx-focus-inline-action"
+                        disabled={savingTopicId === topic.id || selectedCanonicalUrls.length === 0}
+                        onClick={() => {
+                          submitFocusGroupSave(topic, visibleVisits, 'split-new');
+                        }}
+                        data-testid={`focus-split-save-${topic.id}`}
+                      >
+                        Split selected to new group
+                      </button>
+                      <button
+                        type="button"
+                        className="cx-focus-expand cx-focus-inline-action"
+                        onClick={() => {
+                          setAddDrawerTopicId((current) =>
+                            current === topic.id ? null : topic.id,
+                          );
+                        }}
+                      >
+                        {addDrawerTopicId === topic.id ? 'Close add pages' : 'Add pages'}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {addDrawerTopicId === topic.id ? (
+                  <div className="cx-focus-add-drawer" data-testid={`focus-add-drawer-${topic.id}`}>
+                    <div className="cx-focus-tabs">
+                      {(['suggested', 'search', 'current', 'recent'] as const).map((tab) => (
+                        <button
+                          type="button"
+                          className={`cx-focus-tab${activeDrawerTab === tab ? ' is-active' : ''}`}
+                          key={tab}
+                          onClick={() => {
+                            setDrawerTabByTopic((current) => ({ ...current, [topic.id]: tab }));
+                          }}
+                        >
+                          {tab === 'suggested'
+                            ? 'Suggested'
+                            : tab === 'search'
+                              ? 'Search'
+                              : tab === 'current'
+                                ? 'Current group'
+                                : 'Recently viewed'}
+                        </button>
+                      ))}
+                    </div>
+                    {activeDrawerTab === 'search' ? (
+                      <input
+                        className="cx-focus-search-input"
+                        value={searchQueryByTopic[topic.id] ?? ''}
+                        placeholder="Search pages"
+                        onChange={(event) => {
+                          setSearchQueryByTopic((current) => ({
+                            ...current,
+                            [topic.id]: event.currentTarget.value,
+                          }));
+                        }}
+                        data-testid={`focus-search-${topic.id}`}
+                      />
+                    ) : null}
+                    {searchLoading && activeDrawerTab === 'search' ? (
+                      <div className="cx-mono cx-dim">Searching...</div>
+                    ) : null}
+                    {searchError !== null && activeDrawerTab === 'search' ? (
+                      <div className="cx-mono cx-dim" role="alert">
+                        {searchError}
+                      </div>
+                    ) : null}
+                    <div className="cx-focus-candidates">
+                      {drawerCandidates.length === 0 ? (
+                        <div className="cx-mono cx-dim">No pages here yet.</div>
+                      ) : (
+                        drawerCandidates.map((candidate) => {
+                          const selected = selectedCandidates.some(
+                            (item) => candidateKey(item) === candidateKey(candidate),
+                          );
+                          return (
+                            <div className="cx-focus-candidate" key={candidateKey(candidate)}>
+                              <div className="cx-focus-candidate-body">
+                                <span className="cx-focus-candidate-title">{candidate.label}</span>
+                                {candidate.url === undefined ? null : (
+                                  <span className="cx-mono cx-dim">{candidate.url}</span>
+                                )}
+                                {candidate.snippet === undefined ? null : (
+                                  <span className="cx-focus-candidate-snippet">
+                                    {candidate.snippet}
+                                  </span>
+                                )}
+                                <span className="cx-focus-chip-row">
+                                  {candidate.reasons.map((reason) => (
+                                    <span
+                                      className="cx-focus-chip cx-focus-chip-coverage"
+                                      key={reason}
+                                    >
+                                      {reason}
+                                    </span>
+                                  ))}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="cx-focus-expand cx-focus-inline-action"
+                                disabled={selected || candidate.canonicalUrl === undefined}
+                                onClick={() => {
+                                  if (candidate.source === 'current') {
+                                    toggleVisitSelection(topic.id, candidate.id);
+                                  } else {
+                                    addCandidateSelection(topic.id, candidate);
+                                  }
+                                }}
+                              >
+                                {selected ? 'Added' : 'Add'}
+                              </button>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
                   </div>
                 ) : null}
                 <div className="cx-focus-detail-head">
@@ -812,8 +1455,23 @@ export const FocusView = ({
                       confirmScopeKey === undefined
                         ? false
                         : confirmedVisitIdsByScope[confirmScopeKey]?.has(visit.id);
+                    const selectedVisitIds = selectedVisitIdsByTopic[topic.id];
+                    const selectedForComposition =
+                      selectedVisitIds === undefined ? true : selectedVisitIds.has(visit.id);
                     return (
                       <div className="cx-focus-visit" key={visit.id}>
+                        {composing ? (
+                          <input
+                            type="checkbox"
+                            className="cx-focus-visit-check"
+                            checked={selectedForComposition}
+                            onChange={() => {
+                              toggleVisitSelection(topic.id, visit.id);
+                            }}
+                            aria-label={`Select ${visit.label}`}
+                            data-testid={`focus-select-${topic.id}-${visit.id}`}
+                          />
+                        ) : null}
                         <button
                           type="button"
                           className="cx-focus-visit-main"

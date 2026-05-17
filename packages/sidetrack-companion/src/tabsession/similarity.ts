@@ -41,10 +41,11 @@ const scoreForEdge = (kind: string, metadata?: Readonly<Record<string, unknown>>
 };
 
 const scoreForCandidateSources = (candidate: Candidate): number => {
-  if (candidate.sources.includes('same_workstream')) return 0.95;
   if (candidate.sources.includes('same_canonical_url')) return 0.9;
   if (candidate.sources.includes('opener_chain')) return 0.85;
   if (candidate.sources.includes('navigation_chain')) return 0.8;
+  if (candidate.sources.includes('content_embedding_neighborhood')) return 0.75;
+  if (candidate.sources.includes('content_term_overlap')) return 0.7;
   if (candidate.sources.includes('same_repo_or_domain')) return 0.65;
   if (candidate.sources.includes('same_search_query')) return 0.6;
   if (candidate.sources.includes('same_copied_snippet')) return 0.55;

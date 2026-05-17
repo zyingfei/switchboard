@@ -1307,6 +1307,110 @@ describe('connections — content-derived edges', () => {
     );
   });
 
+  it('Pass 12 does not emit closest_visit from shared workstream membership alone', () => {
+    const urls = ['https://alpha.test/reference', 'https://bravo.invalid/handbook'] as const;
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: urls.map((url, index) => ({
+        id: url,
+        firstSeenAt: `2026-05-07T09:0${String(index)}:00.000Z`,
+        lastSeenAt: `2026-05-07T09:0${String(index)}:30.000Z`,
+        url,
+        canonicalUrl: url,
+        title: index === 0 ? 'Alpha reference' : 'Bravo handbook',
+        provider: 'generic',
+        visitCount: 1,
+        workstreamId: 'ws_scope',
+      })),
+      updatedAt: '2026-05-07T09:01:30.000Z',
+      entryCount: urls.length,
+    };
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        closestVisitRanker: {
+          revisionId: 'ranker-rev-1',
+          threshold: 0.1,
+          topK: 5,
+          predict: () => ({ score: 1, contributions: rankerContributionsFor(1) }),
+        },
+      }),
+    );
+
+    expect(
+      snap.edges.filter(
+        (edge) =>
+          edge.kind === 'visit_in_workstream' &&
+          edge.toNodeId === nodeIdFor('workstream', 'ws_scope'),
+      ),
+    ).toHaveLength(2);
+    expect(
+      snap.edges.some(
+        (edge) =>
+          edge.kind === 'closest_visit' &&
+          ((edge.fromNodeId === nodeIdFor('timeline-visit', urls[0]) &&
+            edge.toNodeId === nodeIdFor('timeline-visit', urls[1])) ||
+            (edge.fromNodeId === nodeIdFor('timeline-visit', urls[1]) &&
+              edge.toNodeId === nodeIdFor('timeline-visit', urls[0]))),
+      ),
+    ).toBe(false);
+  });
+
+  it('Pass 12 can still emit closest_visit from independent similarity inside a workstream', () => {
+    const urls = ['https://alpha.test/reference', 'https://bravo.invalid/handbook'] as const;
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: urls.map((url, index) => ({
+        id: url,
+        firstSeenAt: `2026-05-07T09:0${String(index)}:00.000Z`,
+        lastSeenAt: `2026-05-07T09:0${String(index)}:30.000Z`,
+        url,
+        canonicalUrl: url,
+        title: index === 0 ? 'Alpha reference' : 'Bravo handbook',
+        provider: 'generic',
+        visitCount: 1,
+        workstreamId: 'ws_scope',
+      })),
+      updatedAt: '2026-05-07T09:01:30.000Z',
+      entryCount: urls.length,
+    };
+
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-1',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'test-model',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [{ fromVisitKey: urls[0], toVisitKey: urls[1], cosine: 0.91 }],
+          producedAt: Date.parse('2026-05-07T09:02:00.000Z'),
+          producer: 'embedding',
+        },
+        closestVisitRanker: {
+          revisionId: 'ranker-rev-1',
+          threshold: 0.1,
+          topK: 1,
+          predict: () => ({ score: 1, contributions: rankerContributionsFor(1) }),
+        },
+      }),
+    );
+
+    const edge = snap.edges.find(
+      (candidate) =>
+        candidate.kind === 'closest_visit' &&
+        candidate.fromNodeId === nodeIdFor('timeline-visit', urls[0]) &&
+        candidate.toNodeId === nodeIdFor('timeline-visit', urls[1]),
+    );
+    expect(edge).toBeDefined();
+    expect(edge?.metadata).toMatchObject({
+      candidateSources: ['embedding_neighborhood'],
+      primaryCandidateSource: 'embedding_neighborhood',
+    });
+  });
+
   it('tab-session nodes and visit edges replace active-pointer visit_in_workstream edges', () => {
     const day: TimelineDayProjection = {
       date: '2026-05-07',

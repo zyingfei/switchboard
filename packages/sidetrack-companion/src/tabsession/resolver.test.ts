@@ -342,9 +342,9 @@ describe('tab-session resolver', () => {
   });
 
   it('treats current visit_in_workstream edges as authoritative over stale event stamps', () => {
-    const currentUrl = 'https://current.example.test/page';
-    const newAnchorUrl = 'https://new-anchor.example.test/page';
-    const oldAnchorUrl = 'https://old-anchor.example.test/page';
+    const currentUrl = 'https://current.example.test/start';
+    const newAnchorUrl = 'https://new-anchor.example.test/relevant';
+    const oldAnchorUrl = 'https://old-anchor.example.test/archive';
     const snap = snapshot(
       [
         `timeline-visit:${currentUrl}`,
@@ -368,6 +368,11 @@ describe('tab-session resolver', () => {
           kind: 'visit_in_workstream',
           from: `timeline-visit:${oldAnchorUrl}`,
           to: 'workstream:ws_old',
+        },
+        {
+          kind: 'visit_resembles_visit',
+          from: `timeline-visit:${currentUrl}`,
+          to: `timeline-visit:${newAnchorUrl}`,
         },
       ],
     );

@@ -849,6 +849,53 @@ const applyPageContentCoverageToSnapshot = async (
   };
 };
 
+const trimTrailingUrlSlash = (value: string): string =>
+  value.length > 0 ? value.replace(/\/+$/u, '') : value;
+
+const metadataString = (
+  metadata: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): string | undefined => {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+const addNodeAnchorAlias = (
+  aliases: Map<string, string>,
+  alias: string | undefined,
+  targetNodeId: string,
+): void => {
+  if (alias === undefined || alias.length === 0) return;
+  if (!aliases.has(alias)) aliases.set(alias, targetNodeId);
+  const trimmed = trimTrailingUrlSlash(alias);
+  if (trimmed.length > 0 && !aliases.has(trimmed)) aliases.set(trimmed, targetNodeId);
+};
+
+const resolveConnectionsNodeId = (
+  snapshot: import('../connections/snapshot.js').ConnectionsSnapshot,
+  nodeId: string,
+): string => {
+  if (snapshot.nodes.some((node) => node.id === nodeId)) return nodeId;
+
+  const aliases = new Map<string, string>();
+  for (const node of snapshot.nodes) {
+    addNodeAnchorAlias(aliases, node.id, node.id);
+    const canonicalUrl = metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']);
+    if (canonicalUrl !== undefined) {
+      if (node.kind === 'timeline-visit') {
+        addNodeAnchorAlias(aliases, `timeline-visit:${canonicalUrl}`, node.id);
+        addNodeAnchorAlias(aliases, canonicalUrl, node.id);
+      }
+    }
+    addNodeAnchorAlias(aliases, metadataString(node.metadata, ['timelineVisitId']), node.id);
+  }
+
+  return aliases.get(nodeId) ?? aliases.get(trimTrailingUrlSlash(nodeId)) ?? nodeId;
+};
+
 const queryRecallContent = async (
   vaultRoot: string,
   query: { readonly q: string; readonly limit: number; readonly workstreamId?: string },
@@ -5622,7 +5669,8 @@ const routes: readonly RouteDefinition[] = [
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
       const { subgraphForNode } = await import('../connections/snapshot.js');
-      const sub = subgraphForNode(snap, nodeId, hops);
+      const resolvedNodeId = resolveConnectionsNodeId(snap, nodeId);
+      const sub = subgraphForNode(snap, resolvedNodeId, hops);
       return [200, { data: { scope: 'companion-extended', snapshot: sub } }];
     },
   },

@@ -31,6 +31,8 @@ import {
   FocusView,
   isCollapsedSuggestionSet,
   type EngagementClass,
+  type FocusCandidate,
+  type FocusGroupSaveInput,
   type TopicNode,
   type TopicVisit,
   type TopicVisitAffiliation,
@@ -81,6 +83,8 @@ import {
 import type { FeedbackChoice } from '../feedback/FeedbackButtons';
 import { WhyRelatedPanel } from './WhyRelatedPanel';
 import type { Reason } from './why-related/reasons';
+
+export type { FocusGroupSaveInput } from './FocusView';
 
 // Connections side-panel view — anchor + 3-col shell (left rail,
 // center subMode, right provenance). All subcomponents
@@ -156,6 +160,7 @@ type Props = {
   // Receives the canonical URL; the parent decides whether to
   // switch viewMode + pre-fill the Inbox search.
   readonly onOpenInInbox?: (canonicalUrl: string) => void;
+  readonly onSaveFocusGroup?: (input: FocusGroupSaveInput) => Promise<void> | void;
 };
 
 const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
@@ -253,6 +258,9 @@ const normalizeWorkstreamAnchorId = (id: string): string =>
   id.startsWith('workstream:') ? id : `workstream:${id}`;
 
 const DEFAULT_TOPIC_ENGAGEMENT_GATE_MS = 5_000;
+
+const trimTrailingUrlSlash = (value: string): string =>
+  value.length > 0 ? value.replace(/\/+$/u, '') : value;
 
 const pageContentCanonicalUrl = (raw: string): string => {
   try {
@@ -807,6 +815,7 @@ const deriveFocusData = (
       return {
         id: node.id,
         label: formatEntityDisplay(node, ctx).primary,
+        suggestedLabels: metadataStringList(node.metadata, 'representativeTitles') ?? [],
         memberCount,
         ...(totalMemberCount > memberCount ? { totalMemberCount } : {}),
         ...(metadataNumber(node.metadata, 'secondaryCount', 0) > 0
@@ -894,28 +903,36 @@ const addVisitAliasesForNode = (node: ConnectionNode | undefined, out: Set<strin
   if (node === undefined) return;
   if (node.kind === 'timeline-visit' || node.kind === 'visit-instance' || node.kind === 'thread') {
     out.add(node.id);
+    out.add(trimTrailingUrlSlash(node.id));
   }
   const timelineVisitId = metadataString(node.metadata, ['timelineVisitId']);
   if (timelineVisitId !== undefined) {
     out.add(timelineVisitId);
+    out.add(trimTrailingUrlSlash(timelineVisitId));
   }
   const canonicalUrl =
     metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
   if (canonicalUrl !== undefined) {
-    out.add(`timeline-visit:${canonicalUrl}`);
+    const timelineVisitId = `timeline-visit:${canonicalUrl}`;
+    out.add(timelineVisitId);
+    out.add(trimTrailingUrlSlash(timelineVisitId));
   }
 };
 
 const addVisitAliasesForAnchorId = (anchorId: string, out: Set<string>): void => {
   if (anchorId.startsWith('timeline-visit:')) {
     out.add(anchorId);
+    out.add(trimTrailingUrlSlash(anchorId));
     return;
   }
   if (anchorId.startsWith('visit-instance:')) {
     out.add(anchorId);
+    out.add(trimTrailingUrlSlash(anchorId));
     const canonicalUrl = urlFromAnchorNodeId(anchorId);
     if (canonicalUrl !== undefined) {
-      out.add(`timeline-visit:${canonicalUrl}`);
+      const timelineVisitId = `timeline-visit:${canonicalUrl}`;
+      out.add(timelineVisitId);
+      out.add(trimTrailingUrlSlash(timelineVisitId));
     }
   }
 };
@@ -965,6 +982,244 @@ const addAnchorScopedVisitAliases = (
     }
   }
 };
+
+const RELATED_FOCUS_EDGE_KINDS = new Set<string>([
+  'closest_visit',
+  'visit_resembles_visit',
+  'visit_continues_visit',
+]);
+
+const RELATED_FOCUS_MEMBER_LIMIT = 12;
+
+const relatedFocusScore = (edge: ConnectionEdge): number => {
+  const score = metadataNumber(edge.metadata ?? {}, 'score', Number.NaN);
+  if (Number.isFinite(score)) return score;
+  if (edge.kind === 'closest_visit') return 0.8;
+  if (edge.kind === 'visit_continues_visit') return 0.7;
+  return 0.5;
+};
+
+const isVisitNode = (node: ConnectionNode | undefined): node is ConnectionNode =>
+  node !== undefined && (node.kind === 'timeline-visit' || node.kind === 'visit-instance');
+
+const deriveRelatedFocusData = (
+  anchorId: string,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  ctx: EntityDisplayCtx,
+): FocusData => {
+  const aliases = new Set<string>();
+  addAnchorScopedVisitAliases(nodes, edges, anchorId, aliases);
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const byVisitId = new Map<string, { readonly node: ConnectionNode; readonly score: number }>();
+
+  for (const alias of aliases) {
+    const anchorNode = nodeById.get(alias);
+    if (isVisitNode(anchorNode)) byVisitId.set(anchorNode.id, { node: anchorNode, score: 1 });
+  }
+
+  for (const edge of edges) {
+    if (!RELATED_FOCUS_EDGE_KINDS.has(edge.kind)) continue;
+    const fromIsAnchor = aliases.has(edge.fromNodeId);
+    const toIsAnchor = aliases.has(edge.toNodeId);
+    if (!fromIsAnchor && !toIsAnchor) continue;
+    const relatedNode = nodeById.get(fromIsAnchor ? edge.toNodeId : edge.fromNodeId);
+    if (!isVisitNode(relatedNode)) continue;
+    const score = relatedFocusScore(edge);
+    const existing = byVisitId.get(relatedNode.id);
+    if (existing === undefined || score > existing.score) {
+      byVisitId.set(relatedNode.id, { node: relatedNode, score });
+    }
+  }
+
+  const topicId = `topic:related:${anchorId}`;
+  const visits = [...byVisitId.values()]
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        focusedWindowMsForNode(right.node) - focusedWindowMsForNode(left.node) ||
+        left.node.id.localeCompare(right.node.id),
+    )
+    .slice(0, RELATED_FOCUS_MEMBER_LIMIT)
+    .map((entry) =>
+      topicVisitFromEdge(
+        {
+          id: `related-focus:${anchorId}:${entry.node.id}`,
+          kind: 'visit_in_topic',
+          fromNodeId: entry.node.id,
+          toNodeId: topicId,
+          observedAt: entry.node.lastSeenAt ?? new Date(0).toISOString(),
+          producedBy: { source: 'topic-clusterer', revisionId: 'related-neighborhood' },
+          confidence: 'inferred',
+          metadata: entry.score < 1 ? { affiliation: 'secondary', score: entry.score } : {},
+        },
+        entry.node,
+        ctx,
+      ),
+    );
+  if (visits.length < 2) return emptyFocusData();
+
+  const anchorLabel =
+    visits.find((visit) => aliases.has(visit.id))?.label ?? visits[0]?.label ?? 'this page';
+  const finiteScores = [...byVisitId.values()]
+    .map((entry) => entry.score)
+    .filter((score) => Number.isFinite(score) && score < 1);
+  const cohesion =
+    finiteScores.length === 0
+      ? 0
+      : finiteScores.reduce((sum, score) => sum + score, 0) / finiteScores.length;
+  const engagementClassesByVisit: Record<string, EngagementClass> = {};
+  for (const node of nodes) {
+    const engagementClass = engagementClassForNode(node);
+    if (isVisitNode(node) && engagementClass !== undefined) {
+      engagementClassesByVisit[node.id] = engagementClass;
+    }
+  }
+  return {
+    topics: [
+      {
+        id: topicId,
+        label: `Related pages around ${anchorLabel}`,
+        suggestedLabels: visits.map((visit) => visit.label),
+        source: 'related-neighborhood',
+        memberCount: visits.length,
+        cohesion,
+      },
+    ],
+    visitsByTopic: { [topicId]: visits },
+    engagementClassesByVisit,
+    previousTopicCount: undefined,
+  };
+};
+
+const focusCandidateReasonForEdge = (edge: ConnectionEdge): string => {
+  if (edge.kind === 'closest_visit') {
+    const score = metadataNumber(edge.metadata ?? {}, 'score', Number.NaN);
+    return Number.isFinite(score) ? `Closest visit ${score.toFixed(2)}` : 'Closest visit';
+  }
+  if (edge.kind === 'visit_resembles_visit') {
+    const metadata = edge.metadata ?? {};
+    const matchedTerms = metadataStringList(metadata, 'matchedTerms') ?? [];
+    if (matchedTerms.length > 0) return `Similar content: ${matchedTerms.slice(0, 3).join(', ')}`;
+    const score = metadataNumber(metadata, 'score', metadataNumber(metadata, 'cosine', Number.NaN));
+    return Number.isFinite(score) ? `Similar content ${score.toFixed(2)}` : 'Similar content';
+  }
+  if (edge.kind === 'visit_continues_visit') return 'Visited in sequence';
+  if (edge.kind === 'timeline_same_url_as_thread') return 'Same canonical URL';
+  if (edge.kind === 'snippet_copied_from_visit') return 'Copied snippet lineage';
+  if (edge.kind.startsWith('snippet_pasted_into_')) return 'Pasted snippet lineage';
+  return edge.kind;
+};
+
+const focusCandidateFromNode = (
+  node: ConnectionNode,
+  ctx: EntityDisplayCtx,
+  input: {
+    readonly source: FocusCandidate['source'];
+    readonly reasons: readonly string[];
+    readonly score?: number;
+  },
+): FocusCandidate | null => {
+  const canonicalUrl =
+    metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']) ?? urlFromNodeId(node);
+  if (canonicalUrl === undefined) return null;
+  const pageEvidence = isRecord(node.metadata['pageEvidence']) ? node.metadata['pageEvidence'] : {};
+  const pageEvidenceTier =
+    typeof pageEvidence['tier'] === 'string' ? pageEvidence['tier'] : undefined;
+  return {
+    id: node.id,
+    label: formatEntityDisplay(node, ctx).primary,
+    url: canonicalUrl,
+    canonicalUrl,
+    source: input.source,
+    reasons: input.reasons,
+    ...(input.score === undefined ? {} : { score: input.score }),
+    ...(pageEvidenceTier === undefined ? {} : { pageEvidenceTier }),
+  };
+};
+
+const deriveFocusSuggestedCandidates = (
+  focusData: FocusData,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  ctx: EntityDisplayCtx,
+): Record<string, readonly FocusCandidate[]> => {
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const byTopic: Record<string, FocusCandidate[]> = {};
+  for (const topic of focusData.topics) {
+    const currentIds = new Set((focusData.visitsByTopic[topic.id] ?? []).map((visit) => visit.id));
+    const candidates = new Map<
+      string,
+      { readonly node: ConnectionNode; readonly score: number; readonly reasons: readonly string[] }
+    >();
+    for (const edge of edges) {
+      if (
+        !RELATED_FOCUS_EDGE_KINDS.has(edge.kind) &&
+        edge.kind !== 'timeline_same_url_as_thread' &&
+        edge.kind !== 'snippet_copied_from_visit' &&
+        !edge.kind.startsWith('snippet_pasted_into_')
+      ) {
+        continue;
+      }
+      const fromIsMember = currentIds.has(edge.fromNodeId);
+      const toIsMember = currentIds.has(edge.toNodeId);
+      if (!fromIsMember && !toIsMember) continue;
+      const candidateId = fromIsMember ? edge.toNodeId : edge.fromNodeId;
+      if (currentIds.has(candidateId)) continue;
+      const node = nodeById.get(candidateId);
+      if (!isVisitNode(node)) continue;
+      const score = relatedFocusScore(edge);
+      const reason = focusCandidateReasonForEdge(edge);
+      const existing = candidates.get(node.id);
+      if (existing === undefined) {
+        candidates.set(node.id, { node, score, reasons: [reason] });
+      } else {
+        candidates.set(node.id, {
+          node,
+          score: Math.max(existing.score, score),
+          reasons: [...new Set([...existing.reasons, reason])],
+        });
+      }
+    }
+    byTopic[topic.id] = [...candidates.values()]
+      .sort(
+        (left, right) =>
+          right.score - left.score ||
+          focusedWindowMsForNode(right.node) - focusedWindowMsForNode(left.node) ||
+          left.node.id.localeCompare(right.node.id),
+      )
+      .slice(0, RELATED_FOCUS_MEMBER_LIMIT)
+      .map((candidate) =>
+        focusCandidateFromNode(candidate.node, ctx, {
+          source: 'suggested',
+          reasons: candidate.reasons,
+          score: candidate.score,
+        }),
+      )
+      .filter((candidate): candidate is FocusCandidate => candidate !== null);
+  }
+  return byTopic;
+};
+
+const deriveRecentFocusCandidates = (
+  nodes: readonly ConnectionNode[],
+  ctx: EntityDisplayCtx,
+): readonly FocusCandidate[] =>
+  nodes
+    .filter(isVisitNode)
+    .sort((left, right) => {
+      const leftTime = left.lastSeenAt === undefined ? 0 : Date.parse(left.lastSeenAt);
+      const rightTime = right.lastSeenAt === undefined ? 0 : Date.parse(right.lastSeenAt);
+      return rightTime - leftTime || focusedWindowMsForNode(right) - focusedWindowMsForNode(left);
+    })
+    .slice(0, 24)
+    .map((node) =>
+      focusCandidateFromNode(node, ctx, {
+        source: 'recent',
+        reasons: ['Recently viewed'],
+      }),
+    )
+    .filter((candidate): candidate is FocusCandidate => candidate !== null);
 
 const maxFocusedWindowMsForAnchor = (
   anchorId: string,
@@ -1217,6 +1472,7 @@ export const ConnectionsView = ({
   requestAnchor,
   onRequestConsumed,
   onOpenInInbox,
+  onSaveFocusGroup,
 }: Props): ReactElement => {
   const baseCtx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
   // Anchor history — back/forward stack so drilling into a neighbor
@@ -1314,6 +1570,11 @@ export const ConnectionsView = ({
       },
     };
   }, [anchor, engagementOverrides, rawSnapshot, timeRange]);
+
+  const resolvedAnchorId = useMemo(() => {
+    const scopedNodeId = result?.snapshot.scope['nodeId'];
+    return typeof scopedNodeId === 'string' && scopedNodeId.length > 0 ? scopedNodeId : anchor;
+  }, [anchor, result]);
 
   // For the time-range pill bar — how many nodes are hidden by the
   // current filter. Computed cheaply from the difference between
@@ -1815,6 +2076,14 @@ export const ConnectionsView = ({
     }
   };
 
+  const submitFocusGroupSave = async (input: FocusGroupSaveInput): Promise<void> => {
+    if (onSaveFocusGroup === undefined) {
+      throw new Error('Focus group saving is not available.');
+    }
+    await Promise.resolve(onSaveFocusGroup(input));
+    refresh();
+  };
+
   const submitTopicRename = async (input: {
     readonly topicId: string;
     readonly previousName: string;
@@ -1977,10 +2246,10 @@ export const ConnectionsView = ({
       return { nodes: fullSnapshot.nodes, edges: fullSnapshot.edges } as const;
     }
     const filtered = filterByTimeRange(fullSnapshot.nodes, fullSnapshot.edges, timeRange, {
-      anchorId: anchor,
+      anchorId: resolvedAnchorId,
     });
     return { nodes: filtered.nodes, edges: filtered.edges } as const;
-  }, [anchor, fullSnapshot.edges, fullSnapshot.nodes, timeRange]);
+  }, [fullSnapshot.edges, fullSnapshot.nodes, resolvedAnchorId, timeRange]);
   const filteredShadowSnapshot = useMemo(() => {
     if (timeRange.kind === 'all') {
       return { nodes: shadowFullSnapshot.nodes, edges: shadowFullSnapshot.edges } as const;
@@ -1990,11 +2259,11 @@ export const ConnectionsView = ({
       shadowFullSnapshot.edges,
       timeRange,
       {
-        anchorId: anchor,
+        anchorId: resolvedAnchorId,
       },
     );
     return { nodes: filtered.nodes, edges: filtered.edges } as const;
-  }, [anchor, shadowFullSnapshot.edges, shadowFullSnapshot.nodes, timeRange]);
+  }, [resolvedAnchorId, shadowFullSnapshot.edges, shadowFullSnapshot.nodes, timeRange]);
   const focusData = useMemo(
     () =>
       result === null
@@ -2013,7 +2282,7 @@ export const ConnectionsView = ({
       return emptyFocusData();
     }
     const shadowScope = deriveShadowFocusScope(
-      anchor,
+      resolvedAnchorId,
       result.snapshot.nodes,
       result.snapshot.edges,
       filteredShadowSnapshot.nodes,
@@ -2026,7 +2295,13 @@ export const ConnectionsView = ({
       shadowScope.edges,
       shadowCtx,
     );
-  }, [anchor, filteredShadowSnapshot.edges, filteredShadowSnapshot.nodes, result, shadowCtx]);
+  }, [
+    filteredShadowSnapshot.edges,
+    filteredShadowSnapshot.nodes,
+    resolvedAnchorId,
+    result,
+    shadowCtx,
+  ]);
   const focusEligibleVisitCount = eligibleVisitCountForFocusData(focusData);
   const shadowEligibleVisitCount = eligibleVisitCountForFocusData(shadowFocusData);
   const activeFocusCollapsed = isCollapsedSuggestionSet(
@@ -2035,7 +2310,7 @@ export const ConnectionsView = ({
     focusData.previousTopicCount,
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
-  const anchorIsTopic = anchor.startsWith('topic:');
+  const anchorIsTopic = resolvedAnchorId.startsWith('topic:');
   const shadowSnapshotReady = shadowFullSnapshot.ready;
   const topicAnchorShadowResolving =
     anchorIsTopic && !shadowSnapshotReady && shadowFullSnapshot.error === null;
@@ -2048,14 +2323,63 @@ export const ConnectionsView = ({
       : activeFocusCollapsed && shadowSnapshotReady
         ? scopedEmptyFocusData
         : focusData;
+  const relatedFocusData = useMemo(() => {
+    if (result === null || anchorIsTopic) return emptyFocusData();
+    return deriveRelatedFocusData(
+      resolvedAnchorId,
+      result.snapshot.nodes,
+      result.snapshot.edges,
+      ctx,
+    );
+  }, [anchorIsTopic, ctx, resolvedAnchorId, result]);
+  const displayedFocusData =
+    renderedFocusData.topics.length === 0 && relatedFocusData.topics.length > 0
+      ? relatedFocusData
+      : renderedFocusData;
+  const focusCandidateNodes =
+    displayedFocusData === shadowFocusData
+      ? filteredShadowSnapshot.nodes
+      : filteredFullSnapshot.nodes;
+  const focusCandidateEdges =
+    displayedFocusData === shadowFocusData
+      ? filteredShadowSnapshot.edges
+      : filteredFullSnapshot.edges;
+  const focusCandidateCtx = displayedFocusData === shadowFocusData ? shadowCtx : ctx;
+  const suggestedFocusCandidatesByTopic = useMemo(
+    () =>
+      deriveFocusSuggestedCandidates(
+        displayedFocusData,
+        focusCandidateNodes.length > 0 ? focusCandidateNodes : (result?.snapshot.nodes ?? []),
+        focusCandidateEdges.length > 0 ? focusCandidateEdges : (result?.snapshot.edges ?? []),
+        focusCandidateCtx,
+      ),
+    [
+      displayedFocusData,
+      focusCandidateCtx,
+      focusCandidateEdges,
+      focusCandidateNodes,
+      result?.snapshot.edges,
+      result?.snapshot.nodes,
+    ],
+  );
+  const recentFocusCandidates = useMemo(
+    () =>
+      deriveRecentFocusCandidates(
+        focusCandidateNodes.length > 0 ? focusCandidateNodes : (result?.snapshot.nodes ?? []),
+        focusCandidateCtx,
+      ),
+    [focusCandidateCtx, focusCandidateNodes, result?.snapshot.nodes],
+  );
   const renderedFocusEligibleVisitCount =
-    renderedFocusData === shadowFocusData
-      ? shadowEligibleVisitCount
-      : renderedFocusData === scopedEmptyFocusData
-        ? 0
-        : focusEligibleVisitCount;
+    displayedFocusData === relatedFocusData
+      ? eligibleVisitCountForFocusData(relatedFocusData)
+      : renderedFocusData === shadowFocusData
+        ? shadowEligibleVisitCount
+        : renderedFocusData === scopedEmptyFocusData
+          ? 0
+          : focusEligibleVisitCount;
   const renderedFocusEmptyDetail = useMemo(() => {
-    if (renderedFocusData !== scopedEmptyFocusData || result === null) return undefined;
+    if (displayedFocusData !== scopedEmptyFocusData || result === null) return undefined;
     if (topicAnchorShadowResolving) {
       return 'Loading the candidate topic graph for this suggestion.';
     }
@@ -2063,16 +2387,16 @@ export const ConnectionsView = ({
       return `Could not load the candidate topic graph: ${shadowFullSnapshot.error}`;
     }
     return focusEmptyDetailForAnchor(
-      anchor,
+      resolvedAnchorId,
       [...result.snapshot.nodes, ...filteredShadowSnapshot.nodes],
       [...result.snapshot.edges, ...filteredShadowSnapshot.edges],
     );
   }, [
-    anchor,
     anchorIsTopic,
+    displayedFocusData,
     filteredShadowSnapshot.edges,
     filteredShadowSnapshot.nodes,
-    renderedFocusData,
+    resolvedAnchorId,
     result,
     scopedEmptyFocusData,
     shadowFullSnapshot.error,
@@ -2809,19 +3133,24 @@ export const ConnectionsView = ({
               })()
             ) : subMode === 'focus' ? (
               <FocusView
-                topics={renderedFocusData.topics}
-                visitsByTopic={renderedFocusData.visitsByTopic}
-                engagementClassesByVisit={renderedFocusData.engagementClassesByVisit}
+                topics={displayedFocusData.topics}
+                visitsByTopic={displayedFocusData.visitsByTopic}
+                engagementClassesByVisit={displayedFocusData.engagementClassesByVisit}
                 eligibleVisitCount={renderedFocusEligibleVisitCount}
-                previousTopicCount={renderedFocusData.previousTopicCount}
+                previousTopicCount={displayedFocusData.previousTopicCount}
                 emptyDetail={renderedFocusEmptyDetail}
                 workstreamOptions={workstreamOptions}
-                allowTriageTopicCards={anchor.startsWith('topic:')}
+                suggestedCandidatesByTopic={suggestedFocusCandidatesByTopic}
+                recentCandidates={recentFocusCandidates}
+                allowTriageTopicCards={resolvedAnchorId.startsWith('topic:')}
                 resolving={topicAnchorShadowResolving}
                 onTopicPromote={submitTopicPromote}
                 onTopicRename={submitTopicRename}
                 onTopicDismiss={submitTopicDismiss}
-                {...(anchor.startsWith('timeline-visit:') ? { anchorVisitId: anchor } : {})}
+                onFocusGroupSave={onSaveFocusGroup === undefined ? undefined : submitFocusGroupSave}
+                {...(resolvedAnchorId.startsWith('timeline-visit:')
+                  ? { anchorVisitId: resolvedAnchorId }
+                  : {})}
                 onVisitMarkNotRelated={submitVisitMarkNotRelated}
                 onVisitRestoreToTopic={submitVisitRestoreToTopic}
                 onVisitConfirmRelated={submitVisitConfirmRelated}

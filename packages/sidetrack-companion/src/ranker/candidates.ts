@@ -31,7 +31,6 @@ interface VisitRecord {
 
 export const CANDIDATE_SOURCES = [
   'user_confirmed',
-  'same_workstream',
   'opener_chain',
   'navigation_chain',
   'same_canonical_url',
@@ -52,7 +51,6 @@ const SOURCE_ORDER = new Map<CandidateSource, number>(
 );
 
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
-const WORKSTREAM_PREFIX = 'workstream:';
 const SNIPPET_PREFIX = 'snippet:';
 const EXPLICIT_RANDOM_UNRELATED = 'ranker.random_unrelated';
 const USER_FLOW_REJECTED = 'user.flow.rejected';
@@ -283,7 +281,6 @@ interface CandidateContextIndexes {
   readonly recordsById: ReadonlyMap<string, VisitRecord>;
   readonly groupedRecordIndexes: Map<CandidateSource, GroupedRecordIndex>;
   readonly chainGraphs: Map<CandidateSource, ReadonlyMap<string, ReadonlySet<string>>>;
-  workstreamGroups?: ReadonlyMap<string, ReadonlySet<string>>;
   snippetGroups?: ReadonlyMap<string, ReadonlySet<string>>;
   embeddingNeighbors?: ReadonlyMap<string, ReadonlySet<string>>;
   contentTermEdgeNeighbors?: ReadonlyMap<string, ReadonlySet<string>>;
@@ -406,57 +403,6 @@ const groupedRecordCandidates = (
   }
 
   return candidatesFromIds(fromVisitId, toVisitIds, source, generatedAt);
-};
-
-const workstreamGroupsFromEdges = (
-  edges: readonly ConnectionEdge[],
-): ReadonlyMap<string, Set<string>> => {
-  const groups = new Map<string, Set<string>>();
-  for (const edge of edges) {
-    if (edge.kind !== 'visit_in_workstream') continue;
-    const fromVisit = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
-    const toWorkstream = parsePrefixedId(edge.toNodeId, WORKSTREAM_PREFIX);
-    if (fromVisit !== null && toWorkstream !== null) {
-      addToSetMap(groups, toWorkstream, fromVisit);
-      continue;
-    }
-    const toVisit = parsePrefixedId(edge.toNodeId, TIMELINE_VISIT_PREFIX);
-    const fromWorkstream = parsePrefixedId(edge.fromNodeId, WORKSTREAM_PREFIX);
-    if (toVisit !== null && fromWorkstream !== null) {
-      addToSetMap(groups, fromWorkstream, toVisit);
-    }
-  }
-  return groups;
-};
-
-const sameWorkstreamGenerator: SourceGenerator = (fromVisitId, context, generatedAt) => {
-  const indexes = indexesFor(context);
-  if (indexes.workstreamGroups === undefined) {
-    const groups = new Map<string, Set<string>>();
-    const edgeGroups = workstreamGroupsFromEdges(context.existingEdges);
-    const visitsWithEdgeWorkstream = new Set<string>();
-    for (const visitIds of edgeGroups.values()) {
-      for (const visitId of visitIds) visitsWithEdgeWorkstream.add(visitId);
-    }
-    for (const record of indexes.records) {
-      if (record.workstreamId !== undefined && !visitsWithEdgeWorkstream.has(record.id)) {
-        addToSetMap(groups, record.workstreamId, record.id);
-      }
-    }
-    for (const [workstreamId, visitIds] of edgeGroups) {
-      for (const visitId of visitIds) addToSetMap(groups, workstreamId, visitId);
-    }
-    indexes.workstreamGroups = groups;
-  }
-
-  const fromKey = fromKeyFor(fromVisitId);
-  const toVisitIds = new Set<string>();
-  for (const visitIds of indexes.workstreamGroups.values()) {
-    if (!visitIds.has(fromKey)) continue;
-    for (const visitId of visitIds) toVisitIds.add(visitId);
-  }
-
-  return candidatesFromIds(fromVisitId, toVisitIds, 'same_workstream', generatedAt);
 };
 
 const chainGenerator =
@@ -873,11 +819,6 @@ const sameTitlePathTokensGenerator: SourceGenerator = (fromVisitId, context, gen
     titlePathTokenKeys,
   );
 
-export const generateSameWorkstreamCandidates: GenerateCandidates = sourceWrapper(
-  'same_workstream',
-  sameWorkstreamGenerator,
-);
-
 export const generateUserConfirmedCandidates: GenerateCandidates = sourceWrapper(
   'user_confirmed',
   explicitPairGenerator(USER_FLOW_CONFIRMED, 'user_confirmed'),
@@ -950,7 +891,6 @@ export const generateRecentlySkippedCandidates: GenerateCandidates = sourceWrapp
 
 export const CANDIDATE_GENERATORS: Readonly<Record<CandidateSource, GenerateCandidates>> = {
   user_confirmed: generateUserConfirmedCandidates,
-  same_workstream: generateSameWorkstreamCandidates,
   opener_chain: generateOpenerChainCandidates,
   navigation_chain: generateNavigationChainCandidates,
   same_canonical_url: generateSameCanonicalUrlCandidates,

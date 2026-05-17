@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../connections/snapshot.js';
+import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
 import {
   createTopicRevisionStore,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
@@ -192,6 +193,88 @@ describe('connections HTTP routes', () => {
     const ids = body.data.snapshot.nodes.map((n) => n.id).sort();
     expect(ids).toContain('thread:thread_a');
     expect(ids).toContain('workstream:ws_x');
+  });
+
+  it('resolves URL-form timeline anchors whose stored node id omits a trailing slash', async () => {
+    const canonicalWithSlash = 'https://example.test/fabric/';
+    const canonicalWithoutSlash = 'https://example.test/fabric';
+    const neighborId = 'timeline-visit:https://example.test/minipack';
+    const anchorId = `timeline-visit:${canonicalWithoutSlash}`;
+    const snapshot: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        {
+          id: 'tab-session:tses_same_url',
+          kind: 'tab-session',
+          label: 'Fabric tab session',
+          firstSeenAt: '2026-05-07T09:59:00.000Z',
+          lastSeenAt: '2026-05-07T10:01:00.000Z',
+          originReplicaIds: [],
+          metadata: {
+            canonicalUrl: canonicalWithSlash,
+            latestUrl: canonicalWithSlash,
+          },
+        },
+        {
+          id: anchorId,
+          kind: 'timeline-visit',
+          label: 'Fabric',
+          firstSeenAt: '2026-05-07T10:00:00.000Z',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          originReplicaIds: [],
+          metadata: {
+            canonicalUrl: canonicalWithSlash,
+            url: canonicalWithSlash,
+          },
+        },
+        {
+          id: neighborId,
+          kind: 'timeline-visit',
+          label: 'Minipack',
+          originReplicaIds: [],
+          metadata: {
+            canonicalUrl: 'https://example.test/minipack',
+          },
+        },
+      ],
+      edges: [
+        {
+          id: edgeIdFor('visit_resembles_visit', anchorId, neighborId),
+          kind: 'visit_resembles_visit',
+          fromNodeId: anchorId,
+          toNodeId: neighborId,
+          observedAt: '2026-05-07T10:00:00.000Z',
+          producedBy: { source: 'visit-similarity', revisionId: 'sim-test' },
+          confidence: 'inferred',
+        },
+      ],
+      updatedAt: '2026-05-07T10:00:00.000Z',
+      nodeCount: 3,
+      edgeCount: 1,
+      snapshotRevision: 'slash-alias-fixture',
+    };
+    await createConnectionsStore(vaultRoot).putCurrent(snapshot);
+
+    const requested = encodeURIComponent(`timeline-visit:${canonicalWithSlash}`);
+    const r = await get(`/v1/connections/nodes/${requested}/neighbors?hops=1`);
+
+    expect(r.status).toBe(200);
+    const body = r.data as {
+      data: {
+        snapshot: {
+          scope: { nodeId?: string };
+          nodes: { id: string }[];
+          edges: { kind: string }[];
+        };
+      };
+    };
+    const ids = body.data.snapshot.nodes.map((n) => n.id);
+    expect(body.data.snapshot.scope.nodeId).toBe(anchorId);
+    expect(ids).toContain(anchorId);
+    expect(ids).toContain(neighborId);
+    expect(body.data.snapshot.edges).toContainEqual(
+      expect.objectContaining({ kind: 'visit_resembles_visit' }),
+    );
   });
 
   it('GET /v1/connections/edges/<id> returns provenance', async () => {

@@ -258,7 +258,6 @@ const RANKER_SERVING_SOURCE_PRIORITY = new Map<CandidateSource, number>(
       'same_title_path_tokens',
       'same_repo_or_domain',
       'cross_replica_continuation',
-      'same_workstream',
       'recently_skipped',
       'random_unrelated',
     ] satisfies readonly CandidateSource[]
@@ -267,6 +266,13 @@ const RANKER_SERVING_SOURCE_PRIORITY = new Map<CandidateSource, number>(
 
 const rankerServingPriority = (candidate: Candidate): number =>
   Math.min(...candidate.sources.map((source) => RANKER_SERVING_SOURCE_PRIORITY.get(source) ?? 999));
+
+const primaryRankerCandidateSource = (candidate: Candidate): CandidateSource | null =>
+  [...candidate.sources].sort(
+    (left, right) =>
+      (RANKER_SERVING_SOURCE_PRIORITY.get(left) ?? 999) -
+        (RANKER_SERVING_SOURCE_PRIORITY.get(right) ?? 999) || left.localeCompare(right),
+  )[0] ?? null;
 
 const compareRankerServingCandidate = (left: Candidate, right: Candidate): number =>
   rankerServingPriority(left) - rankerServingPriority(right) ||
@@ -1110,6 +1116,8 @@ const closestVisitRankerEdgesForSnapshot = (
         metadata: {
           score: scored.score,
           featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+          candidateSources: [...scored.candidate.sources],
+          primaryCandidateSource: primaryRankerCandidateSource(scored.candidate),
           topContributions: scored.topContributions,
         },
       });

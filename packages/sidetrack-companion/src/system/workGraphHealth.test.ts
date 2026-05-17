@@ -3,12 +3,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createConnectionsStore } from '../connections/snapshot.js';
+import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { projectFeedback } from '../feedback/projection.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
 } from '../producers/topic-revision.js';
+import {
+  augmentFeedbackWithVisitPairLabels,
+  fingerprintFeedbackTrainingLabels,
+} from '../ranker/retrain.js';
 import { RANKER_MODEL_VERSION } from '../ranker/train.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { createEventLog } from '../sync/eventLog.js';
 import { collectWorkGraphHealth } from './workGraphHealth.js';
 
 describe('work graph diagnostic candidates', () => {
@@ -298,5 +308,103 @@ describe('work graph diagnostic candidates', () => {
         }),
       ]),
     );
+  });
+
+  it('compares retrain freshness against the same augmented label dataset used by retrain', async () => {
+    const replicaId = '11111111-1111-4111-8111-111111111111';
+    const peerReplicaId = '22222222-2222-4222-8222-222222222222';
+    let seq = 0;
+    const eventLog = createEventLog(vaultRoot, {
+      replicaId,
+      created: true,
+      nextSeq: async () => {
+        seq += 1;
+        return seq;
+      },
+      peekSeq: () => seq,
+      observeSeq: async (incoming: number) => {
+        seq = Math.max(seq, incoming);
+      },
+    });
+    const rejectedAgainstWorkstream: AcceptedEvent = {
+      clientEventId: 'client-reject-a-from-w1',
+      dot: { replicaId: peerReplicaId, seq: 1 },
+      deps: {},
+      aggregateId: 'feedback:reject-a-from-w1',
+      type: USER_ORGANIZED_ITEM,
+      payload: {
+        payloadVersion: 1,
+        itemKind: 'canonical-url',
+        itemId: 'https://example.test/a',
+        action: 'ignore',
+        fromContainer: 'workstream:w1',
+      },
+      acceptedAtMs: Date.parse('2026-05-16T14:00:00.000Z'),
+    };
+    await eventLog.importPeerEvent(rejectedAgainstWorkstream);
+
+    const snapshot: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [],
+      edges: [
+        {
+          id: edgeIdFor(
+            'visit_in_workstream',
+            'timeline-visit:https://example.test/b',
+            'workstream:w1',
+          ),
+          kind: 'visit_in_workstream',
+          fromNodeId: 'timeline-visit:https://example.test/b',
+          toNodeId: 'workstream:w1',
+          observedAt: '2026-05-16T14:00:00.000Z',
+          producedBy: {
+            source: 'event-log',
+            eventType: USER_ORGANIZED_ITEM,
+            dot: { replicaId: peerReplicaId, seq: 2 },
+          },
+          confidence: 'asserted',
+        },
+      ],
+      updatedAt: '2026-05-16T14:00:00.000Z',
+      nodeCount: 0,
+      edgeCount: 1,
+      snapshotRevision: 'snapshot-with-workstream-member',
+    };
+    await createConnectionsStore(vaultRoot).putCurrent(snapshot);
+
+    const feedback = augmentFeedbackWithVisitPairLabels(
+      projectFeedback([rejectedAgainstWorkstream]),
+      snapshot,
+    );
+    const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
+    await mkdir(join(vaultRoot, '_BAC', 'connections', 'closest-visit'), { recursive: true });
+    await writeFile(
+      join(vaultRoot, '_BAC', 'connections', 'closest-visit', 'retrain-state.json'),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        lastTrainedLabelDatasetHash: fingerprint.hash,
+        lastTrainedLabelCount: fingerprint.labelCount,
+        lastTrainedPositiveLabelCount: fingerprint.positiveLabelCount,
+        lastTrainedNegativeLabelCount: fingerprint.negativeLabelCount,
+        activeRevisionId: 'ranker-rev',
+        rankerTrainingDatasetHash:
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        updatedAt: Date.parse('2026-05-16T14:01:00.000Z'),
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      eventLog,
+      now: () => new Date('2026-05-16T14:02:00.000Z'),
+    });
+
+    expect(health.ranker.datasetChangedSinceTrain).toBe(false);
+    expect(health.ranker.retrainSkipReason).toBe('unchanged');
+    expect(health.ranker.trainingMix).toMatchObject({
+      positivesAtTrain: 0,
+      userFeedbackNegativesAtTrain: 2,
+    });
   });
 });

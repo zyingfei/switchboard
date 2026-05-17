@@ -4,7 +4,6 @@ import type { AcceptedEvent } from '../sync/causal.js';
 
 export type CandidateSource =
   | 'user_confirmed'
-  | 'same_workstream'
   | 'opener_chain'
   | 'navigation_chain'
   | 'same_canonical_url'

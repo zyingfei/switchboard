@@ -354,6 +354,10 @@ describe('collectMaterializerDiagnostics', () => {
           ),
           producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
           confidence: 'inferred',
+          metadata: {
+            candidateSources: ['content_term_overlap', 'same_title_path_tokens'],
+            primaryCandidateSource: 'content_term_overlap',
+          },
         },
       ],
     );
@@ -393,6 +397,41 @@ describe('collectMaterializerDiagnostics', () => {
       finalEdgeCount: 1,
       closestVisitEdgeCount: 1,
       rankerSourceEdgeCount: 1,
+    });
+    expect(diag.pairEvidence).toEqual({
+      candidatesBySource: {
+        content_term_overlap: 1,
+        same_title_path_tokens: 1,
+      },
+      closestVisitEdgesByPrimarySource: {
+        content_term_overlap: 1,
+      },
+      sameWorkstreamCandidateSourceCount: 0,
+      membershipOnlyClosestVisitEdgeCount: 0,
+      membershipOnlyPairEdgesBlocked: 0,
+    });
+  });
+
+  it('counts workstream-only visit pairs as blocked pair-evidence expansions', () => {
+    const snap = snapshot(
+      [
+        visitNode('timeline-visit:https://example.test/a'),
+        visitNode('timeline-visit:https://example.test/b'),
+        workstreamNode('workstream:ws-1'),
+      ],
+      [
+        edgeOf('visit_in_workstream', 'timeline-visit:https://example.test/a', 'workstream:ws-1'),
+        edgeOf('visit_in_workstream', 'timeline-visit:https://example.test/b', 'workstream:ws-1'),
+      ],
+    );
+    const diag = collectMaterializerDiagnostics(baseInput({ snapshot: snap }));
+
+    expect(diag.pairEvidence).toMatchObject({
+      candidatesBySource: {},
+      closestVisitEdgesByPrimarySource: {},
+      sameWorkstreamCandidateSourceCount: 0,
+      membershipOnlyClosestVisitEdgeCount: 0,
+      membershipOnlyPairEdgesBlocked: 1,
     });
   });
 
@@ -575,6 +614,7 @@ describe('summarizeMaterializerDiagnostics', () => {
     expect(summary).toContain('engagementEligible=1');
     expect(summary).toContain('ranker=not-run');
     expect(summary).toContain('rankerAug=not-run:unknown');
+    expect(summary).toContain('sameWorkstreamPairSources=0');
     expect(summary).toContain('newLabels=n/a');
   });
 

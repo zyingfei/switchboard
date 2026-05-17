@@ -385,6 +385,87 @@ describe('FocusView', () => {
     expect(screen.getByText('Oracle research')).toBeDefined();
   });
 
+  it('fills the group name from ranked name suggestion chips', () => {
+    render(
+      <FocusView
+        topics={[
+          {
+            id: 'topic:a',
+            label: 'The LMAX Architecture',
+            suggestedLabels: [
+              'The LMAX Architecture',
+              'Facebook data center fabric',
+              'Reinventing our data center network with F16, Minipack',
+            ],
+            memberCount: 3,
+            cohesion: 0.91,
+          },
+        ]}
+        visitsByTopic={{}}
+        engagementClassesByVisit={{}}
+        onTopicRename={() => undefined}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('The LMAX Architecture'));
+    fireEvent.click(screen.getByText('Facebook data center fabric'));
+
+    expect(screen.getByTestId('focus-rename-input-topic:a')).toHaveValue(
+      'Facebook data center fabric',
+    );
+  });
+
+  it('saves selected pages through Focus group save with canonical URLs', async () => {
+    const onFocusGroupSave = vi.fn(() => Promise.resolve());
+    render(
+      <FocusView
+        topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 2, cohesion: 0.91 }]}
+        visitsByTopic={{
+          'topic:a': [
+            {
+              id: 'timeline-visit:https://example.test/a',
+              label: 'A',
+              url: 'https://example.test/a',
+              focusedWindowMs: 10_000,
+            },
+            {
+              id: 'timeline-visit:https://example.test/b',
+              label: 'B',
+              url: 'https://example.test/b',
+              focusedWindowMs: 5_000,
+            },
+          ],
+        }}
+        engagementClassesByVisit={{}}
+        onFocusGroupSave={onFocusGroupSave}
+        onTopicClick={() => undefined}
+        onVisitClick={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Alpha'));
+    fireEvent.click(screen.getByTestId('focus-refine-topic:a'));
+    fireEvent.click(
+      screen.getByTestId('focus-select-topic:a-timeline-visit:https://example.test/b'),
+    );
+    fireEvent.change(screen.getByTestId('focus-rename-input-topic:a'), {
+      target: { value: 'Fabric research' },
+    });
+    fireEvent.click(screen.getByTestId('focus-save-group-topic:a'));
+
+    await waitFor(() => {
+      expect(onFocusGroupSave).toHaveBeenCalledWith({
+        topicId: 'topic:a',
+        title: 'Fabric research',
+        mode: 'create',
+        canonicalUrls: ['https://example.test/a'],
+        memberVisitIds: ['timeline-visit:https://example.test/a'],
+      });
+    });
+  });
+
   it('removes a visit from the visible suggestion and can restore it', async () => {
     const onVisitMarkNotRelated = vi.fn(() => Promise.resolve());
     const onVisitRestoreToTopic = vi.fn(() => Promise.resolve());

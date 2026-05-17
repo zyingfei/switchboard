@@ -24,6 +24,8 @@ const hostFor = (record: TabSessionRecord): string => {
   }
 };
 
+const isHttpUrl = (value: string): boolean => /^https?:\/\//iu.test(value);
+
 export interface InboxCardProps {
   readonly record: TabSessionRecord;
   readonly suggestion?: TabSessionResolutionResult;
@@ -79,6 +81,10 @@ export function InboxCard({
     record.currentAttribution === undefined &&
     record.currentIgnored === undefined;
   const canOpenTab = onOpenTab !== undefined && record.latestUrl !== undefined;
+  const connectionsUrl =
+    isHttpUrl(record.tabSessionId) || record.latestUrl === undefined
+      ? record.tabSessionId
+      : record.latestUrl;
   const faviconLetter = useMemo(() => host.slice(0, 1).toUpperCase() || '?', [host]);
 
   return (
@@ -118,15 +124,15 @@ export function InboxCard({
               <span>Go to</span>
             </button>
           ) : null}
-          {onOpenInConnections !== undefined && record.latestUrl !== undefined ? (
+          {onOpenInConnections !== undefined && isHttpUrl(connectionsUrl) ? (
             <button
               type="button"
               className="tab-session-go-to"
               onClick={() => {
-                // Use the URL-keyed canonical id (record.tabSessionId
-                // in the URL-projection adapter), surfacing the
-                // timeline-visit node in the Connections graph.
-                onOpenInConnections(record.tabSessionId);
+                // URL Inbox records use the canonical URL as
+                // `tabSessionId`; real tab-session records keep a
+                // session id there, so fall back to latestUrl.
+                onOpenInConnections(connectionsUrl);
               }}
               title="Open this URL in the Connections graph"
               aria-label="Open in Connections"

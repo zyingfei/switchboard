@@ -83,7 +83,10 @@ import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
 import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
-import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
+import {
+  ConnectionsView,
+  type FocusGroupSaveInput,
+} from '../../src/sidepanel/connections/ConnectionsView';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
@@ -2460,6 +2463,7 @@ const App = () => {
   const attributeUrlToWorkstream = async (
     canonicalUrl: string,
     workstreamId: string | null,
+    idempotencyKey?: string,
   ): Promise<WorkboardState> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       throw new Error('Companion is not configured.');
@@ -2470,7 +2474,9 @@ const App = () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'idempotency-key': `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
+          'idempotency-key':
+            idempotencyKey ??
+            `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
           'x-bac-bridge-key': bridgeKey,
         },
         body: JSON.stringify({ workstreamId }),
@@ -2547,6 +2553,60 @@ const App = () => {
   // per-URL attribution endpoint.
   const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
     void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
+  };
+
+  const handleFocusGroupSave = async (input: FocusGroupSaveInput): Promise<void> => {
+    const canonicalUrls = [
+      ...new Set(input.canonicalUrls.map((url) => url.trim()).filter(Boolean)),
+    ];
+    if (canonicalUrls.length === 0) {
+      throw new Error('No pages were selected for this group.');
+    }
+    setBusy(true);
+    setError(null);
+    const operationId = `focus-group-${String(Date.now())}-${Math.random().toString(36).slice(2)}`;
+    try {
+      let targetWorkstreamId = input.targetWorkstreamId?.replace(/^workstream:/u, '').trim() ?? '';
+      let nextState = state;
+      if (targetWorkstreamId.length === 0) {
+        const beforeIds = new Set(state.workstreams.map((workstream) => workstream.bac_id));
+        nextState = await sendRequest({
+          type: messageTypes.createWorkstream,
+          workstream: {
+            title: input.title,
+            privacy: 'shared',
+            description: `Created from Focus ${input.mode}.`,
+          },
+        });
+        const created =
+          nextState.workstreams.find((workstream) => !beforeIds.has(workstream.bac_id)) ??
+          [...nextState.workstreams]
+            .reverse()
+            .find((workstream) => workstream.title === input.title);
+        if (created === undefined) {
+          throw new Error('Created group could not be found in the refreshed workboard state.');
+        }
+        targetWorkstreamId = created.bac_id;
+      }
+      for (const canonicalUrl of canonicalUrls) {
+        nextState = await attributeUrlToWorkstream(
+          canonicalUrl,
+          targetWorkstreamId,
+          `${operationId}:${targetWorkstreamId}:${canonicalUrl}`,
+        );
+      }
+      setState(nextState);
+      setError(nextState.lastError ?? null);
+      setBridgeKey(nextState.settings.companion.bridgeKey);
+      setPort(String(nextState.settings.companion.port));
+    } catch (actionError) {
+      const message =
+        actionError instanceof Error ? actionError.message : 'Could not save Focus group.';
+      setError(message);
+      throw actionError;
+    } finally {
+      setBusy(false);
+    }
   };
 
   // Stage 5 polish — explicit "ignore this URL" action. Distinct from
@@ -6072,6 +6132,7 @@ const App = () => {
             setConnectionsAnchorRequest('');
           }}
           onOpenInInbox={requestSwitchToInbox}
+          onSaveFocusGroup={handleFocusGroupSave}
           workstreamAnchors={state.workstreams.map((w) => ({
             id: `workstream:${w.bac_id}`,
             label: workstreamPath(w.bac_id, state.workstreams),

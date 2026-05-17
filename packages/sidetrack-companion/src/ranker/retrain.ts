@@ -16,10 +16,7 @@ import {
   type FeedbackTrainingLabel,
   projectFeedback,
 } from '../feedback/projection.js';
-import {
-  readPageEvidenceMap,
-  readPageEvidenceVectorMap,
-} from '../page-evidence/store.js';
+import { readPageEvidenceMap, readPageEvidenceVectorMap } from '../page-evidence/store.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -68,7 +65,8 @@ const readEnvNumber = (name: string): number | undefined => {
 // made `closest_visit` learn "same workstream" instead of topical /
 // navigational closeness. Keep the exported seam for callers/tests, but
 // never mint positives from workstream closure again. Same-workstream
-// evidence remains available as a candidate source only.
+// membership remains graph scope/debug context, not ranker candidate
+// evidence.
 export const deriveVisitPairLabelsFromSnapshot = (
   snapshot: ConnectionsSnapshot,
 ): readonly FeedbackTrainingLabel[] => {
@@ -367,10 +365,12 @@ export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContex
   readonly vaultRoot: string;
   readonly threshold?: number | undefined;
   // Plan Part 8 / TODO-R7: a forced retrigger bypasses the *policy*
-  // gates (threshold + cooldown). planRankerRetrain still returns skip
-  // for the *substance* gates (no-labels / unchanged /
-  // no-training-candidates) — a manual retrigger may not manufacture a
-  // healthier model than the data supports.
+  // gates (unchanged label fingerprint, threshold, and cooldown).
+  // It still respects substance gates that prove there is nothing
+  // trainable (no-labels / no-usable-query-groups /
+  // no-training-candidates). This lets operators rebuild after model,
+  // feature, or candidate-generation changes even when feedback labels
+  // did not move.
   readonly force?: boolean | undefined;
   readonly randomNegativeCandidatesPerPositive?: number | undefined;
   readonly trainOptions?: TrainRankerOptions | undefined;
@@ -494,18 +494,17 @@ export const planRankerRetrain = ({
     return { action: 'skip', reason: 'no-labels', fingerprint, newLabelCount: 0 };
   }
 
-  if (state?.lastTrainedLabelDatasetHash === fingerprint.hash) {
-    return { action: 'skip', reason: 'unchanged', fingerprint, newLabelCount: 0 };
-  }
-
   const previousLabelCount = state?.lastTrainedLabelCount ?? 0;
   const newLabelCount = Math.max(0, fingerprint.labelCount - previousLabelCount);
 
-  // Force flag bypasses the next two checks entirely but still respects
-  // 'no-labels' + 'unchanged' (which mean there's literally nothing
-  // new to learn).
+  // Force flag bypasses the policy checks entirely. It still respects
+  // 'no-labels' above plus the later structural candidate gates.
   if (force === true) {
     return { action: 'train', fingerprint, newLabelCount };
+  }
+
+  if (state?.lastTrainedLabelDatasetHash === fingerprint.hash) {
+    return { action: 'skip', reason: 'unchanged', fingerprint, newLabelCount: 0 };
   }
 
   if (newLabelCount < normalizedThreshold(threshold)) {
@@ -981,7 +980,8 @@ const readRankerPageEvidenceContext = async (
   const pageEvidenceByCanonicalUrl =
     suppliedEvidence ?? (await readPageEvidenceMap(vaultRoot, timelineVisitKeys(snapshot)));
   const evidenceVectorsByVectorId =
-    suppliedVectors ?? (await readPageEvidenceVectorMap(vaultRoot, pageEvidenceByCanonicalUrl.values()));
+    suppliedVectors ??
+    (await readPageEvidenceVectorMap(vaultRoot, pageEvidenceByCanonicalUrl.values()));
   return {
     ...(pageEvidenceByCanonicalUrl.size === 0 ? {} : { pageEvidenceByCanonicalUrl }),
     ...(evidenceVectorsByVectorId.size === 0 ? {} : { evidenceVectorsByVectorId }),

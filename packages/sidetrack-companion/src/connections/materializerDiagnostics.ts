@@ -38,6 +38,7 @@ import {
   type DriftReport,
 } from './drift/driftMonitor.js';
 import { createDriftStateStore, type DriftStateStore } from './drift/driftStateStore.js';
+import { edgeKindIsPairwiseRelatedness } from './edgeSemantics.js';
 import type { SilhouetteSimilarityEdge, SilhouetteTopic } from './drift/temporalSilhouette.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
@@ -49,6 +50,8 @@ export const MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION = 1;
 const DIAGNOSTICS_RELATIVE_DIR = '_BAC/connections/diagnostics';
 const DIAGNOSTICS_LATEST_FILENAME = 'latest.json';
 const DIAGNOSTICS_HISTORY_DIRNAME = 'history';
+const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
+const WORKSTREAM_PREFIX = 'workstream:';
 
 export interface MaterializerTimelineCounters {
   readonly entryCount: number;
@@ -187,6 +190,17 @@ export interface MaterializerSnapshotCounters {
   readonly edgeCountByKind: Readonly<Record<string, number>>;
 }
 
+export interface MaterializerPairEvidenceCounters {
+  // Counts candidate-source metadata on emitted closest_visit edges.
+  // `same_workstream` must stay zero/absent; workstream membership is
+  // graph scope, not pairwise evidence.
+  readonly candidatesBySource: Readonly<Record<string, number>>;
+  readonly closestVisitEdgesByPrimarySource: Readonly<Record<string, number>>;
+  readonly sameWorkstreamCandidateSourceCount: number;
+  readonly membershipOnlyClosestVisitEdgeCount: number;
+  readonly membershipOnlyPairEdgesBlocked: number;
+}
+
 export interface MaterializerPageEvidenceCounters {
   readonly metadataOnlyCount: number;
   readonly featuresOnlyCount: number;
@@ -247,6 +261,7 @@ export interface MaterializerDiagnostics {
   readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
+  readonly pairEvidence: MaterializerPairEvidenceCounters;
   readonly pageEvidence?: MaterializerPageEvidenceCounters;
   readonly latency?: MaterializerLatencyCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
@@ -607,6 +622,129 @@ const collectDefaultRankerAugmentationCounters = (
     .length,
 });
 
+const metadataString = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): string | null => {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+};
+
+const metadataStringList = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): readonly string[] => {
+  const value = metadata?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+};
+
+const incrementCounter = (record: Record<string, number>, key: string): void => {
+  record[key] = (record[key] ?? 0) + 1;
+};
+
+const parsePrefixedId = (value: string, prefix: string): string | null => {
+  if (!value.startsWith(prefix)) return null;
+  const id = value.slice(prefix.length);
+  return id.length > 0 ? id : null;
+};
+
+const addToSetMap = (map: Map<string, Set<string>>, key: string, value: string): void => {
+  let set = map.get(key);
+  if (set === undefined) {
+    set = new Set<string>();
+    map.set(key, set);
+  }
+  set.add(value);
+};
+
+const pairKey = (left: string, right: string): string =>
+  left < right ? `${left}\u0000${right}` : `${right}\u0000${left}`;
+
+const collectVisitWorkstreamMemberships = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const groups = new Map<string, Set<string>>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_in_workstream') continue;
+    const visitId = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
+    const workstreamId = parsePrefixedId(edge.toNodeId, WORKSTREAM_PREFIX);
+    if (visitId === null || workstreamId === null) continue;
+    addToSetMap(groups, workstreamId, visitId);
+  }
+  return groups;
+};
+
+const collectPairwiseRelatednessKeys = (snapshot: ConnectionsSnapshot): ReadonlySet<string> => {
+  const keys = new Set<string>();
+  for (const edge of snapshot.edges) {
+    if (!edgeKindIsPairwiseRelatedness(edge.kind)) continue;
+    const fromVisitId = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
+    const toVisitId = parsePrefixedId(edge.toNodeId, TIMELINE_VISIT_PREFIX);
+    if (fromVisitId === null || toVisitId === null || fromVisitId === toVisitId) continue;
+    keys.add(pairKey(fromVisitId, toVisitId));
+  }
+  return keys;
+};
+
+const countMembershipOnlyPairsBlocked = (snapshot: ConnectionsSnapshot): number => {
+  const groups = collectVisitWorkstreamMemberships(snapshot);
+  if (groups.size === 0) return 0;
+  const pairwiseRelatedness = collectPairwiseRelatednessKeys(snapshot);
+  let blocked = 0;
+  for (const visitIds of groups.values()) {
+    const n = visitIds.size;
+    if (n < 2) continue;
+    blocked += (n * (n - 1)) / 2;
+    const visits = [...visitIds];
+    for (let left = 0; left < visits.length; left += 1) {
+      for (let right = left + 1; right < visits.length; right += 1) {
+        const leftVisit = visits[left];
+        const rightVisit = visits[right];
+        if (
+          leftVisit !== undefined &&
+          rightVisit !== undefined &&
+          pairwiseRelatedness.has(pairKey(leftVisit, rightVisit))
+        ) {
+          blocked -= 1;
+        }
+      }
+    }
+  }
+  return Math.max(0, blocked);
+};
+
+const collectPairEvidenceCounters = (
+  snapshot: ConnectionsSnapshot,
+): MaterializerPairEvidenceCounters => {
+  const candidatesBySource: Record<string, number> = {};
+  const closestVisitEdgesByPrimarySource: Record<string, number> = {};
+  let sameWorkstreamCandidateSourceCount = 0;
+  let membershipOnlyClosestVisitEdgeCount = 0;
+
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'closest_visit') continue;
+    const candidateSources = metadataStringList(edge.metadata, 'candidateSources');
+    for (const source of candidateSources) {
+      incrementCounter(candidatesBySource, source);
+      if (source === 'same_workstream') sameWorkstreamCandidateSourceCount += 1;
+    }
+    const primarySource = metadataString(edge.metadata, 'primaryCandidateSource');
+    if (primarySource !== null) incrementCounter(closestVisitEdgesByPrimarySource, primarySource);
+    if (candidateSources.length === 1 && candidateSources[0] === 'same_workstream') {
+      membershipOnlyClosestVisitEdgeCount += 1;
+    }
+  }
+
+  return {
+    candidatesBySource,
+    closestVisitEdgesByPrimarySource,
+    sameWorkstreamCandidateSourceCount,
+    membershipOnlyClosestVisitEdgeCount,
+    membershipOnlyPairEdgesBlocked: countMembershipOnlyPairsBlocked(snapshot),
+  };
+};
+
 const isRecordLite = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -736,6 +874,7 @@ export const collectMaterializerDiagnostics = (
     engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
+    pairEvidence: collectPairEvidenceCounters(input.snapshot),
     ...(input.pageEvidenceRecords === undefined
       ? {}
       : { pageEvidence: collectPageEvidenceCounters(input.pageEvidenceRecords) }),
@@ -784,6 +923,9 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
     `rankerNeedsRetrain=${String(diagnostics.rankerAugmentation.needsRetrain)}`,
     `closestVisit=${String(diagnostics.rankerAugmentation.closestVisitEdgeCount)}`,
     `rankerSource=${String(diagnostics.rankerAugmentation.rankerSourceEdgeCount)}`,
+    `sameWorkstreamPairSources=${String(
+      diagnostics.pairEvidence.sameWorkstreamCandidateSourceCount,
+    )}`,
     `labels=${String(diagnostics.ranker.labelCount)}(+${String(diagnostics.ranker.positiveLabelCount)}/-${String(diagnostics.ranker.negativeLabelCount)})`,
     `newLabels=${diagnostics.ranker.newLabelCount === null ? 'n/a' : String(diagnostics.ranker.newLabelCount)}`,
     `userAssertions=${String(diagnostics.userAssertions.total)}`,

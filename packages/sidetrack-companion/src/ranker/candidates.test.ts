@@ -29,7 +29,6 @@ import {
   generateSameRepoOrDomainCandidates,
   generateSameSearchQueryCandidates,
   generateSameTitlePathTokensCandidates,
-  generateSameWorkstreamCandidates,
   generateUserConfirmedCandidates,
 } from './candidates.js';
 import type { CandidateSource, GenerateCandidates } from './types.js';
@@ -193,7 +192,6 @@ describe('ranker candidate generation', () => {
   it('keeps the CandidateSource registry in schema order', () => {
     expect(CANDIDATE_SOURCES).toEqual([
       'user_confirmed',
-      'same_workstream',
       'opener_chain',
       'navigation_chain',
       'same_canonical_url',
@@ -235,23 +233,64 @@ describe('ranker candidate generation', () => {
     );
   });
 
-  it('generates same_workstream candidates', () => {
+  it('does not generate pair candidates from shared workstream membership alone', () => {
     const ctx = context([
       event({
         seq: 1,
         type: BROWSER_TIMELINE_OBSERVED,
-        payload: timelinePayload({ url: 'https://alpha.test/a', workstreamId: 'ws-a' }),
+        payload: timelinePayload({
+          url: 'https://alpha.test/a',
+          title: 'Alpha reference',
+          workstreamId: 'ws-a',
+        }),
       }),
       event({
         seq: 3,
         type: BROWSER_TIMELINE_OBSERVED,
-        payload: timelinePayload({ url: 'https://bravo.test/b', workstreamId: 'ws-a' }),
+        payload: timelinePayload({
+          url: 'https://bravo.test/b',
+          title: 'Bravo handbook',
+          workstreamId: 'ws-a',
+        }),
+      }),
+    ]);
+
+    expect(generateCandidates('https://alpha.test/a', ctx)).toEqual([]);
+  });
+
+  it('still generates user_confirmed candidates for explicit pairs in a shared workstream', () => {
+    const ctx = context([
+      event({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({
+          url: 'https://alpha.test/a',
+          title: 'Alpha reference',
+          workstreamId: 'ws-a',
+        }),
+      }),
+      event({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({
+          url: 'https://bravo.test/b',
+          title: 'Bravo handbook',
+          workstreamId: 'ws-a',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: USER_FLOW_CONFIRMED,
+        payload: {
+          fromVisitId: 'https://alpha.test/a',
+          toVisitId: 'https://bravo.test/b',
+        },
       }),
     ]);
 
     expectSingleSourceCandidate(
-      generateSameWorkstreamCandidates,
-      'same_workstream',
+      generateCandidates,
+      'user_confirmed',
       'https://alpha.test/a',
       'https://bravo.test/b',
       ctx,
@@ -669,7 +708,7 @@ describe('ranker candidate generation', () => {
       {
         fromVisitId: 'https://alpha.test/a',
         toVisitId: 'https://bravo.test/b',
-        sources: ['same_workstream', 'same_title_path_tokens'],
+        sources: ['same_title_path_tokens'],
         generatedAt: GENERATED_AT,
       },
     ]);

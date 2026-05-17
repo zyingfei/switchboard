@@ -5,6 +5,7 @@ import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerRankerMethodologySpineDiagnostics,
 } from '../connections/materializerDiagnostics.js';
+import { createConnectionsStore } from '../connections/snapshot.js';
 import {
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
@@ -20,6 +21,7 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
+  augmentFeedbackWithVisitPairLabels,
   fingerprintFeedbackTrainingLabels,
   planRankerRetrain,
   readRankerRetrainState,
@@ -667,7 +669,12 @@ export const collectWorkGraphHealth = async ({
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
   const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
-  const feedback = projectFeedback(merged);
+  const baseFeedback = projectFeedback(merged);
+  const currentSnapshot = await createConnectionsStore(vaultRoot).readCurrent();
+  const feedback =
+    currentSnapshot === null
+      ? baseFeedback
+      : augmentFeedbackWithVisitPairLabels(baseFeedback, currentSnapshot);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [activeManifest, activeManifestProbe, retrainState, ann, topicRevision, diagnostics] =
     await Promise.all([
