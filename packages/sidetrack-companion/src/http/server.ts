@@ -1167,6 +1167,59 @@ const directorySize = async (path: string): Promise<number> => {
   return sizes.reduce((sum, size) => sum + size, 0);
 };
 
+// `/v1/system/health` is polled by the extension (App.tsx every
+// ~15-30s, HealthPanel ~30s) with NO in-flight dedupe across its
+// (observed: 6) stacked sockets. Each call is ~0.85s and fully
+// UNCACHED: directorySize() recurses the entire multi-GB _BAC tree,
+// collectWorkGraphHealth re-reads the 15MB connections snapshot +
+// re-merges the event log + fingerprints every training label.
+// Concurrent/rapid polls pile up into N overlapping full-tree walks
+// ⇒ a pinned core (the second, non-connections CPU runaway). Mirror
+// the /v1/system/hygiene-status fix (gcInventoryCached): a short TTL
+// + in-flight dedupe so rapid/overlapping polls coalesce to ~1
+// compute. Health is a status indicator; ≤TTL staleness is fine (the
+// hygiene sibling uses a 5-MIN TTL — this is far more conservative).
+// Env-tunable; resolved once (process-lifetime constant is fine).
+const SYSTEM_HEALTH_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_SYSTEM_HEALTH_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 10_000;
+})();
+interface SystemHealthCacheEntry {
+  readonly value: HealthReport;
+  readonly computedAtMs: number;
+}
+const systemHealthCache = new Map<string, SystemHealthCacheEntry>();
+const systemHealthInFlight = new Map<string, Promise<HealthReport>>();
+const cachedCollectHealth = async (
+  vaultRoot: string,
+  build: () => Promise<HealthReport>,
+): Promise<HealthReport> => {
+  const cached = systemHealthCache.get(vaultRoot);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < SYSTEM_HEALTH_TTL_MS) {
+    return cached.value;
+  }
+  const existing = systemHealthInFlight.get(vaultRoot);
+  if (existing !== undefined) return existing;
+  const compute = (async (): Promise<HealthReport> => {
+    try {
+      const value = await build();
+      systemHealthCache.set(vaultRoot, { value, computedAtMs: Date.now() });
+      return value;
+    } catch (err) {
+      // A failed refresh must not poison: serve the last good value
+      // if we have one (mirrors gcInventoryCached).
+      const prev = systemHealthCache.get(vaultRoot);
+      if (prev !== undefined) return prev.value;
+      throw err;
+    } finally {
+      systemHealthInFlight.delete(vaultRoot);
+    }
+  })();
+  systemHealthInFlight.set(vaultRoot, compute);
+  return compute;
+};
+
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
   value === 'ok' || value === 'warning' || value === 'failed';
 
@@ -2684,82 +2737,84 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
-          data: await collectHealth({
-            startedAt: context.startedAt ?? new Date(),
-            vaultRoot,
-            vaultWritable: async () => {
-              try {
-                await access(vaultRoot);
-                return true;
-              } catch {
-                return false;
-              }
-            },
-            vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
-            captureSummary: () => captureHealthSummary(vaultRoot),
-            recallSummary: async () => {
-              const [index, info, lifecycleReport, modelStatus] = await Promise.all([
-                readIndex(indexPath),
-                stat(indexPath).catch(() => undefined),
-                context.recallLifecycle?.report() ?? Promise.resolve(undefined),
-                getModelCacheStatus().catch(() => undefined),
-              ]);
-              const indexExists = index !== null;
-              return {
-                indexExists,
-                entryCount: index?.items.length ?? null,
-                modelId: index?.modelId ?? null,
-                sizeBytes: info?.size ?? null,
-                // Lifecycle fields are optional so legacy callers
-                // (no recallLifecycle injected) keep the old shape.
-                ...(lifecycleReport === undefined
-                  ? {}
-                  : {
-                      status: lifecycleReport.status,
-                      eventTurnCount: lifecycleReport.eventTurnCount,
-                      currentModelId: lifecycleReport.currentModelId,
-                      companionVersion: lifecycleReport.companionVersion,
-                      lastRebuildAt: lifecycleReport.lastRebuildAt,
-                      lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
-                      lastError: lifecycleReport.lastError,
-                      rebuildEmbedded: lifecycleReport.rebuildEmbedded,
-                      rebuildTotal: lifecycleReport.rebuildTotal,
-                      rebuildPhase: lifecycleReport.rebuildPhase,
-                      embedderDevice: lifecycleReport.embedderDevice,
-                      embedderAccelerator: lifecycleReport.embedderAccelerator,
-                      drift: lifecycleReport.drift,
-                    }),
-                ...(context.recallActivity === undefined
-                  ? {}
-                  : { activity: context.recallActivity.report() }),
-                ...(modelStatus === undefined
-                  ? {}
-                  : {
-                      model: {
-                        id: modelStatus.modelId,
-                        revision: modelStatus.revision,
-                        cacheDir: modelStatus.cacheDir,
-                        present: modelStatus.present,
-                        verified: modelStatus.verified,
-                        offline: modelStatus.offline,
-                      },
-                    }),
-              };
-            },
-            serviceStatus: async () => {
-              const status = await (context.serviceInstaller ?? pickInstaller()).status();
-              return { installed: status.installed, running: status.running };
-            },
-            workGraphSummary: () =>
-              collectWorkGraphHealth({
-                vaultRoot,
-                ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
-                ...(context.connectionsDiagnostics === undefined
-                  ? {}
-                  : { connectionsDiagnostics: context.connectionsDiagnostics }),
-              }),
-            ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
-          }),
+          data: await cachedCollectHealth(vaultRoot, () =>
+            collectHealth({
+              startedAt: context.startedAt ?? new Date(),
+              vaultRoot,
+              vaultWritable: async () => {
+                try {
+                  await access(vaultRoot);
+                  return true;
+                } catch {
+                  return false;
+                }
+              },
+              vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
+              captureSummary: () => captureHealthSummary(vaultRoot),
+              recallSummary: async () => {
+                const [index, info, lifecycleReport, modelStatus] = await Promise.all([
+                  readIndex(indexPath),
+                  stat(indexPath).catch(() => undefined),
+                  context.recallLifecycle?.report() ?? Promise.resolve(undefined),
+                  getModelCacheStatus().catch(() => undefined),
+                ]);
+                const indexExists = index !== null;
+                return {
+                  indexExists,
+                  entryCount: index?.items.length ?? null,
+                  modelId: index?.modelId ?? null,
+                  sizeBytes: info?.size ?? null,
+                  // Lifecycle fields are optional so legacy callers
+                  // (no recallLifecycle injected) keep the old shape.
+                  ...(lifecycleReport === undefined
+                    ? {}
+                    : {
+                        status: lifecycleReport.status,
+                        eventTurnCount: lifecycleReport.eventTurnCount,
+                        currentModelId: lifecycleReport.currentModelId,
+                        companionVersion: lifecycleReport.companionVersion,
+                        lastRebuildAt: lifecycleReport.lastRebuildAt,
+                        lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
+                        lastError: lifecycleReport.lastError,
+                        rebuildEmbedded: lifecycleReport.rebuildEmbedded,
+                        rebuildTotal: lifecycleReport.rebuildTotal,
+                        rebuildPhase: lifecycleReport.rebuildPhase,
+                        embedderDevice: lifecycleReport.embedderDevice,
+                        embedderAccelerator: lifecycleReport.embedderAccelerator,
+                        drift: lifecycleReport.drift,
+                      }),
+                  ...(context.recallActivity === undefined
+                    ? {}
+                    : { activity: context.recallActivity.report() }),
+                  ...(modelStatus === undefined
+                    ? {}
+                    : {
+                        model: {
+                          id: modelStatus.modelId,
+                          revision: modelStatus.revision,
+                          cacheDir: modelStatus.cacheDir,
+                          present: modelStatus.present,
+                          verified: modelStatus.verified,
+                          offline: modelStatus.offline,
+                        },
+                      }),
+                };
+              },
+              serviceStatus: async () => {
+                const status = await (context.serviceInstaller ?? pickInstaller()).status();
+                return { installed: status.installed, running: status.running };
+              },
+              workGraphSummary: () =>
+                collectWorkGraphHealth({
+                  vaultRoot,
+                  ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+                  ...(context.connectionsDiagnostics === undefined
+                    ? {}
+                    : { connectionsDiagnostics: context.connectionsDiagnostics }),
+                }),
+              ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
+            }),
+          ),
         },
       ];
     },
