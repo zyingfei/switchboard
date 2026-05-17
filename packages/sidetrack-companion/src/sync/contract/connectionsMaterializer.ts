@@ -56,6 +56,11 @@ import {
   type TopicCandidateAbDiagnostics,
 } from '../../connections/topicCandidateAb.js';
 import {
+  hotSimilarityModeEnabled,
+  hotTopicsModeEnabled,
+  type HotPathDiagnostics,
+} from '../../connections/hotPathMode.js';
+import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
   resolveVisitSimilarityConfig,
@@ -979,12 +984,30 @@ export const createConnectionsMaterializer = (
     // IncrementalVisitSimilarityIndex for cosine-only top-K. The
     // resulting revisionId carries a `:incremental` suffix so on-disk
     // cached revisions stay distinct from the legacy hybrid path.
-    const hotSimilarityMode = process.env['SIDETRACK_CONNECTIONS_HOT_SIMILARITY'] === '1';
+    const hotSimilarityMode = hotSimilarityModeEnabled();
+    const hotSimCorpusSize = incrementalSimilarityIndex.size();
     const hotSimilarityDecision = hotSimilarityMode
-      ? decideHotPathEmbed(embedderWarmthTracker.snapshot(incrementalSimilarityIndex.size()))
+      ? decideHotPathEmbed(embedderWarmthTracker.snapshot(hotSimCorpusSize))
       : { shouldEmbedOnHotPath: false as const };
+    // U2 — captured for HotPathDiagnostics (no extra compute; locals
+    // the drain already produces).
+    let usedHotSimilarityPath = false;
+    let hotSimNewEmbedded: number | null = null;
     let visitSimilarity;
-    if (cachedSimilarityRevision !== null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
+    if (cachedSimilarityRevision !== null) {
+      // U2 — a valid cached revision means the W3 skip-gate id (a pure
+      // function of inputs+config) matched: the inputs are unchanged,
+      // so the cached revision IS the correct output. Reuse it
+      // unconditionally — even when the hot decision says "embed".
+      // The pre-U2 `&& !shouldEmbedOnHotPath` qualifier let default-on
+      // hot mode bypass the cache and re-embed on UNCHANGED inputs
+      // (the legacy drain never populates the in-memory incremental
+      // index, which also does not survive child-per-drain), flipping
+      // the revisionId (`:incremental` suffix) every drain and
+      // cascading to defeat the topic + shadow skip-gates — i.e. the
+      // exact per-drain re-embed/rebuild the connections CPU work
+      // removed. The hot path still engages on a genuine cache miss
+      // (new/changed inputs) where amortised embedding is the win.
       visitSimilarity = cachedSimilarityRevision;
     } else if (hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Embed only entries not yet in the index. The legacy path embeds
@@ -992,6 +1015,8 @@ export const createConnectionsMaterializer = (
       const newEntries = similarityEntries.filter(
         (entry) => !incrementalSimilarityIndex.has(visitKeyForVisitEntry(entry)),
       );
+      usedHotSimilarityPath = true;
+      hotSimNewEmbedded = newEntries.length;
       const embeddingsByVisitKey = new Map<string, Float32Array>();
       if (newEntries.length > 0) {
         const texts = newEntries.map(
@@ -1051,6 +1076,9 @@ export const createConnectionsMaterializer = (
       });
       mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
+    // U2 — similarity-stage wall time for HotPathDiagnostics (the
+    // visitSimilarity revision is finalized here).
+    const hotSimRuntimeMs = Date.now() - similarityStartedAtMs;
     if (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
       // (cache hits don't exercise the embedder). Divide by entry count
@@ -1149,9 +1177,19 @@ export const createConnectionsMaterializer = (
     // above via the revision-flip diff + per-drain addSimilarityEdge.
     // PR #141's userAssertedRelations are still passed when falling
     // through to the legacy builder.
-    const hotTopicsMode = process.env['SIDETRACK_CONNECTIONS_HOT_TOPICS'] === '1';
+    const hotTopicsMode = hotTopicsModeEnabled();
+    const topicComponentCount = (await topicAccumulator.getComponents()).length;
+    // U2 — the accumulator fast path is test-asserted byte-equal to
+    // the UNION-FIND builder only. When a different topic algorithm is
+    // explicitly selected (HDBSCAN / idf-rkn via deps), it must NOT be
+    // silently overridden by the accumulator, so gate the fast path on
+    // the selected algorithm being the union-find baseline (the
+    // default — so default-on still engages it for the normal case).
     const useTopicAccumulatorFastPath =
-      hotTopicsMode && (await topicAccumulator.getComponents()).length > 0;
+      hotTopicsMode &&
+      topicRevisionAlgorithm === TOPIC_UNION_FIND_REVISION_KEY &&
+      topicComponentCount > 0;
+    const topicBuildStartedAtMs = Date.now();
     let topicRevision;
     if (
       previousTopicRevision !== null &&
@@ -1178,6 +1216,33 @@ export const createConnectionsMaterializer = (
     mark(
       `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,
     );
+    // U2 — decision + cheap counters for the (now default-on)
+    // incremental hot paths. No baseline re-run: every field is a
+    // local the drain already produced. Surfaced via workGraphHealth
+    // similarity.hot-incremental / topic.hot-incremental.
+    const hotPathDiagnostics: HotPathDiagnostics = {
+      similarity: {
+        enabled: hotSimilarityMode,
+        shouldEmbedOnHotPath: hotSimilarityDecision.shouldEmbedOnHotPath,
+        reason:
+          'reason' in hotSimilarityDecision && hotSimilarityDecision.reason !== undefined
+            ? hotSimilarityDecision.reason
+            : null,
+        usedHotPath: usedHotSimilarityPath,
+        corpusSize: hotSimCorpusSize,
+        newEmbedded: hotSimNewEmbedded,
+        edgeCount: visitSimilarity.edges.length,
+        runtimeMs: hotSimRuntimeMs,
+      },
+      topics: {
+        enabled: hotTopicsMode,
+        usedFastPath: useTopicAccumulatorFastPath,
+        cacheHit: topicRevision === previousTopicRevision,
+        componentCount: topicComponentCount,
+        topicCount: topicRevision.topics.length,
+        runtimeMs: Date.now() - topicBuildStartedAtMs,
+      },
+    };
     // G1 — RETIRE union-find from serving. The baseline union-find
     // revision starves on raw e5 cosine (~1 giant topic / all members
     // in one component) — it must NEVER be the active/served producer
@@ -1470,6 +1535,7 @@ export const createConnectionsMaterializer = (
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
       ...(topicHdbscanDiagnostics === null ? {} : { topicHdbscanDiagnostics }),
+      hotPathDiagnostics,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
     // through the change detectors and fold the status into the

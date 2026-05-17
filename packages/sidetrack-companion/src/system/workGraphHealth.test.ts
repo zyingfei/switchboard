@@ -231,17 +231,20 @@ describe('work graph diagnostic candidates', () => {
           status: 'warning',
           reason: 'reserved-test-below-floor',
         }),
+        // U2 — hot paths default ON (topics unset ⇒ now enabled, was
+        // 'off'/'env-off'); no hotPath diagnostics in this fixture ⇒
+        // honest 'pending'/'fast-path-decision-pending'.
         expect.objectContaining({
           id: 'similarity.hot-incremental',
           lane: 'standby',
           status: 'pending',
-          reason: 'last-fast-path-decision-unavailable',
+          reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'topic.hot-incremental',
           lane: 'standby',
-          status: 'off',
-          reason: 'env-off',
+          status: 'pending',
+          reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'content-lane.dirty-source-queue',

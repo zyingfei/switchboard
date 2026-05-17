@@ -18,6 +18,12 @@ import {
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
 } from '../producers/topic-revision.js';
+import {
+  HOT_SIMILARITY_ENV,
+  HOT_TOPICS_ENV,
+  hotSimilarityModeEnabled,
+  hotTopicsModeEnabled,
+} from '../connections/hotPathMode.js';
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
@@ -396,8 +402,13 @@ const buildDiagnosticCandidates = (input: {
         : hasDirtySourceWork
           ? 'pending'
           : 'ok';
-  const hotSimilarityEnabled = envEnabled('SIDETRACK_CONNECTIONS_HOT_SIMILARITY');
-  const hotTopicsEnabled = envEnabled('SIDETRACK_CONNECTIONS_HOT_TOPICS');
+  // U2 — default-ON resolvers (was strict env==='1' opt-in).
+  const hotSimilarityEnabled = hotSimilarityModeEnabled();
+  const hotTopicsEnabled = hotTopicsModeEnabled();
+  const hotPath = raw !== null && isRecord(raw['hotPath']) ? raw['hotPath'] : null;
+  const hotSim =
+    hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
+  const hotTop = hotPath !== null && isRecord(hotPath['topics']) ? hotPath['topics'] : null;
   const runnerMode = reconcileRunnerMode();
 
   return [
@@ -595,31 +606,71 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'similarity.hot-incremental',
       family: 'similarity',
+      // U2 — now ON by default + the actual decision is surfaced (was
+      // a perpetual 'last-fast-path-decision-unavailable' standby).
+      // servingImpact reflects whether the incremental path actually
+      // ran this drain.
       lane: 'standby',
-      servingImpact: 'not-serving',
-      status: hotSimilarityEnabled ? 'pending' : 'off',
-      reason: hotSimilarityEnabled ? 'last-fast-path-decision-unavailable' : 'env-off',
+      servingImpact: booleanOrFalse(hotSim?.['usedHotPath']) ? 'serving' : 'not-serving',
+      status: !hotSimilarityEnabled
+        ? 'off'
+        : hotSim === null
+          ? 'pending'
+          : booleanOrFalse(hotSim['usedHotPath'])
+            ? 'ok'
+            : 'pending',
+      reason: !hotSimilarityEnabled
+        ? 'env-off'
+        : hotSim === null
+          ? 'fast-path-decision-pending'
+          : booleanOrFalse(hotSim['usedHotPath'])
+            ? null
+            : (stringOrNull(hotSim['reason']) ?? 'fast-path-fallback'),
       revisionId: null,
-      asOf: liveObservedAt,
+      asOf: hotSim === null ? liveObservedAt : diagnosticsObservedAt,
       metrics: metrics({
         envEnabled: hotSimilarityEnabled,
-        envName: 'SIDETRACK_CONNECTIONS_HOT_SIMILARITY',
-        lastFastPathDecision: null,
+        envName: HOT_SIMILARITY_ENV,
+        shouldEmbedOnHotPath: hotSim === null ? null : booleanOrFalse(hotSim['shouldEmbedOnHotPath']),
+        usedHotPath: hotSim === null ? null : booleanOrFalse(hotSim['usedHotPath']),
+        decisionReason: stringOrNull(hotSim?.['reason']),
+        corpusSize: numberOrNull(hotSim?.['corpusSize']),
+        newEmbedded: numberOrNull(hotSim?.['newEmbedded']),
+        edgeCount: numberOrNull(hotSim?.['edgeCount']),
+        runtimeMs: numberOrNull(hotSim?.['runtimeMs']),
       }),
     },
     {
       id: 'topic.hot-incremental',
       family: 'topic',
       lane: 'standby',
-      servingImpact: 'not-serving',
-      status: hotTopicsEnabled ? 'pending' : 'off',
-      reason: hotTopicsEnabled ? 'last-fast-path-decision-unavailable' : 'env-off',
+      servingImpact: booleanOrFalse(hotTop?.['usedFastPath']) ? 'serving' : 'not-serving',
+      status: !hotTopicsEnabled
+        ? 'off'
+        : hotTop === null
+          ? 'pending'
+          : booleanOrFalse(hotTop['usedFastPath']) || booleanOrFalse(hotTop['cacheHit'])
+            ? 'ok'
+            : 'pending',
+      reason: !hotTopicsEnabled
+        ? 'env-off'
+        : hotTop === null
+          ? 'fast-path-decision-pending'
+          : booleanOrFalse(hotTop['usedFastPath'])
+            ? null
+            : booleanOrFalse(hotTop['cacheHit'])
+              ? 'cache-hit'
+              : 'no-accumulator-components',
       revisionId: null,
-      asOf: liveObservedAt,
+      asOf: hotTop === null ? liveObservedAt : diagnosticsObservedAt,
       metrics: metrics({
         envEnabled: hotTopicsEnabled,
-        envName: 'SIDETRACK_CONNECTIONS_HOT_TOPICS',
-        lastFastPathDecision: null,
+        envName: HOT_TOPICS_ENV,
+        usedFastPath: hotTop === null ? null : booleanOrFalse(hotTop['usedFastPath']),
+        cacheHit: hotTop === null ? null : booleanOrFalse(hotTop['cacheHit']),
+        componentCount: numberOrNull(hotTop?.['componentCount']),
+        topicCount: numberOrNull(hotTop?.['topicCount']),
+        runtimeMs: numberOrNull(hotTop?.['runtimeMs']),
       }),
     },
     {
