@@ -469,6 +469,12 @@ export interface CompanionHttpConfig {
   readonly importEdgeEvent?: (
     event: import('../sync/causal.js').AcceptedEvent,
   ) => Promise<{ imported: boolean }>;
+  // P2 — batched edge-event ingest: ONE readMerged + dedupe + shard
+  // write for the whole flush instead of ~3 whole-log scans/event.
+  // Returns per-clientEventId imported flags (false ⇒ duplicate).
+  readonly importEdgeEvents?: (
+    events: readonly import('../sync/causal.js').AcceptedEvent[],
+  ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
   // Optional timeline projection store, exposing read access for
   // the GET /v1/timeline route. When unset that route returns 503.
   readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
@@ -1180,11 +1186,15 @@ const directorySize = async (path: string): Promise<number> => {
 // + in-flight dedupe so rapid/overlapping polls coalesce to ~1
 // compute. Health is a status indicator; ≤TTL staleness is fine (the
 // hygiene sibling uses a 5-MIN TTL — this is far more conservative).
-// Env-tunable; resolved once (process-lifetime constant is fine).
+// P3 — default raised 10s→60s. The extension polls /v1/system/health
+// ~every 30s, so a 10s TTL guaranteed a cache MISS on every poll
+// (~441ms recompute each). Health is a status indicator; ≤60s
+// staleness is fine (the sibling /v1/system/hygiene-status uses a
+// 5-min TTL). Env-tunable; resolved once (process-lifetime const).
 const SYSTEM_HEALTH_TTL_MS = ((): number => {
   const raw = process.env['SIDETRACK_SYSTEM_HEALTH_TTL_MS'];
   const n = raw === undefined ? Number.NaN : Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 10_000;
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
 })();
 interface SystemHealthCacheEntry {
   readonly value: HealthReport;
@@ -5661,6 +5671,7 @@ const routes: readonly RouteDefinition[] = [
         EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      const valid: import('../sync/causal.js').AcceptedEvent[] = [];
       for (const candidate of body.events) {
         if (
           candidate === null ||
@@ -5688,26 +5699,57 @@ const routes: readonly RouteDefinition[] = [
           });
           continue;
         }
-        try {
-          const result = await context.importEdgeEvent(event);
-          if (result.imported) {
-            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
-          } else {
-            skipped.push({
-              replicaId: event.dot.replicaId,
-              seq: event.dot.seq,
-              reason: 'already-imported',
-            });
-          }
-        } catch (err) {
+        valid.push(event);
+      }
+      void requestId;
+      // P2 — batch the whole flush: ONE readMerged + dedupe + shard
+      // write, vs ~3 whole-log scans PER event (the 39s-on-backlog
+      // quadratic). Fallback to the per-event path when the batch
+      // dep isn't wired (tests / programmatic startCompanion users).
+      const recordResult = (
+        event: import('../sync/causal.js').AcceptedEvent,
+        wasImported: boolean,
+      ): void => {
+        if (wasImported) {
+          imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+        } else {
           skipped.push({
             replicaId: event.dot.replicaId,
             seq: event.dot.seq,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: 'already-imported',
           });
         }
+      };
+      const recordError = (
+        event: import('../sync/causal.js').AcceptedEvent,
+        err: unknown,
+      ): void => {
+        skipped.push({
+          replicaId: event.dot.replicaId,
+          seq: event.dot.seq,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      };
+      if (context.importEdgeEvents !== undefined) {
+        try {
+          const res = await context.importEdgeEvents(valid);
+          const importedById = new Map(res.map((r) => [r.clientEventId, r.imported]));
+          for (const event of valid) {
+            recordResult(event, importedById.get(event.clientEventId) === true);
+          }
+        } catch (err) {
+          for (const event of valid) recordError(event, err);
+        }
+      } else {
+        for (const event of valid) {
+          try {
+            const result = await context.importEdgeEvent!(event);
+            recordResult(event, result.imported);
+          } catch (err) {
+            recordError(event, err);
+          }
+        }
       }
-      void requestId;
       return [200, { data: { imported, skipped } }];
     },
   },

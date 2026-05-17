@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -140,6 +140,21 @@ export interface EventLog {
   readonly appendClientObserved: <TPayload extends Record<string, unknown>>(
     input: AppendInputObserved<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
+  /**
+   * P2 — batched browser-observed append. ONE readMerged + dedupe +
+   * shard write for the whole batch, instead of ~3 whole-log scans
+   * PER event (findByClientEventId ×2 + deps readMerged). Correct
+   * for edge events specifically: they pass `baseVector: {}` and no
+   * `clientDeps`, so `computeDepsFromInput` returns `{}` independent
+   * of `merged` — a single-snapshot batch is exactly equivalent to N
+   * sequential appendClientObserved calls. Used by POST
+   * /v1/edge/events (the ~1-min plugin flush; 39 s on backlog).
+   * Returns per-input {clientEventId, imported} (false ⇒ duplicate,
+   * already present or earlier in this batch).
+   */
+  readonly appendClientObservedBatch: <TPayload extends Record<string, unknown>>(
+    inputs: readonly AppendInputObserved<TPayload>[],
+  ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
   /**
    * Server-driven event append. System stamps deps from the
    * aggregate's prior events. See `AppendInputServerObserved`.
@@ -328,13 +343,71 @@ export const createEventLog = (
       .sort();
   };
 
-  const readMerged = async (): Promise<readonly AcceptedEvent[]> => {
+  // P1 — readMerged() memoization. Re-reading + parsing the entire
+  // multi-day, multi-shard event log on EVERY call (every hot HTTP
+  // endpoint's cache-miss, findByClientEventId ×3 per edge-event,
+  // every projector) was the deepest systemic CPU root behind the
+  // dogfood runaway. Memoize on a CHEAP filesystem signature — the
+  // set of shard files with their (mtimeMs,size). Any write by any
+  // writer (local appendClient, peer importPeerEvent, relay sync,
+  // log rotation, compaction) changes a file's mtime/size or the
+  // file set, so the signature flips and the memo is correctly
+  // invalidated; unchanged ⇒ O(#shardfiles) stats instead of
+  // O(bytes) read+parse+sort. In-flight dedupe collapses the many
+  // concurrent readMerged callers into one re-read on a miss.
+  // (AcceptedEvent[] is readonly by contract everywhere; the memo
+  // shares the array — callers must not mutate, which they don't.)
+  let mergedMemo: { signature: string; value: readonly AcceptedEvent[] } | null = null;
+  let mergedInFlight: { signature: string; promise: Promise<readonly AcceptedEvent[]> } | null =
+    null;
+
+  const computeLogSignature = async (): Promise<string> => {
+    const ids = await listReplicaIds();
+    const parts: string[] = [];
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort();
+      for (const file of files) {
+        try {
+          const s = await stat(file);
+          parts.push(`${file}:${String(s.mtimeMs)}:${String(s.size)}`);
+        } catch {
+          parts.push(`${file}:absent`);
+        }
+      }
+    }
+    return parts.join('|');
+  };
+
+  const readMergedUncached = async (): Promise<readonly AcceptedEvent[]> => {
     const ids = await listReplicaIds();
     const all: AcceptedEvent[] = [];
     for (const id of ids) {
       for (const event of await readReplica(id)) all.push(event);
     }
     return sortAcceptedEvents(all);
+  };
+
+  const readMerged = async (): Promise<readonly AcceptedEvent[]> => {
+    const signature = await computeLogSignature();
+    if (mergedMemo !== null && mergedMemo.signature === signature) {
+      return mergedMemo.value;
+    }
+    if (mergedInFlight !== null && mergedInFlight.signature === signature) {
+      return mergedInFlight.promise;
+    }
+    const promise = (async (): Promise<readonly AcceptedEvent[]> => {
+      try {
+        const value = await readMergedUncached();
+        mergedMemo = { signature, value };
+        return value;
+      } finally {
+        if (mergedInFlight !== null && mergedInFlight.signature === signature) {
+          mergedInFlight = null;
+        }
+      }
+    })();
+    mergedInFlight = { signature, promise };
+    return promise;
   };
 
   const readByAggregate = async (aggregateId: string): Promise<readonly AcceptedEvent[]> => {
@@ -391,6 +464,61 @@ export const createEventLog = (
         { encoding: 'utf8', flag: 'a' },
       );
       return event;
+    });
+
+  const appendClientObservedBatch = <TPayload extends Record<string, unknown>>(
+    inputs: readonly AppendInputObserved<TPayload>[],
+  ): Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]> =>
+    enqueueAppend(async () => {
+      if (inputs.length === 0) return [];
+      // ONE readMerged for the whole batch (vs findByClientEventId +
+      // deps readMerged PER event). Edge-event deps are `{}` (explicit
+      // baseVector, no clientDeps) so this single snapshot is exact.
+      const merged = await readMerged();
+      const present = new Set(merged.map((event) => event.clientEventId));
+      const events: AcceptedEvent<TPayload>[] = [];
+      const results: { clientEventId: string; imported: boolean }[] = [];
+      const at = now();
+      for (const input of inputs) {
+        if (present.has(input.clientEventId)) {
+          // Already in the log OR earlier in this batch — dedupe,
+          // exactly like appendClient's findByClientEventId guard.
+          results.push({ clientEventId: input.clientEventId, imported: false });
+          continue;
+        }
+        const deps = computeDepsFromInput(input, merged);
+        // eslint-disable-next-line no-await-in-loop -- nextSeq is a cheap monotonic counter
+        const seq = await replica.nextSeq();
+        const event: AcceptedEvent<TPayload> = {
+          clientEventId: input.clientEventId,
+          dot: { replicaId: replica.replicaId, seq },
+          deps,
+          aggregateId: input.aggregateId,
+          type: input.type,
+          payload: input.payload,
+          acceptedAtMs: at.getTime(),
+          ...(input.target === undefined ? {} : { target: input.target }),
+          ...(input.hlc === undefined
+            ? options.hlcStamper !== undefined
+              ? maybeAttachHlc(options.hlcStamper())
+              : {}
+            : { hlc: input.hlc }),
+        };
+        present.add(input.clientEventId);
+        events.push(event);
+        results.push({ clientEventId: input.clientEventId, imported: true });
+      }
+      if (events.length > 0) {
+        const dir = replicaLogDir(vaultPath, replica.replicaId);
+        await mkdir(dir, { recursive: true });
+        // Single append of all new events (vs one writeFile/event).
+        await writeFile(
+          replicaLogPath(vaultPath, replica.replicaId, at),
+          `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+          { encoding: 'utf8', flag: 'a' },
+        );
+      }
+      return results;
     });
 
   const importPeerEvent = (event: AcceptedEvent): Promise<{ readonly imported: boolean }> =>
@@ -460,6 +588,7 @@ export const createEventLog = (
   return {
     appendClient,
     appendClientObserved,
+    appendClientObservedBatch,
     appendServerObserved,
     readMerged,
     readReplica,
