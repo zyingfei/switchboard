@@ -792,55 +792,95 @@ export const buildTopicShadowCandidate = async (
     input.visitSimilarity,
     input.evidenceByCanonicalUrl,
   );
-  const secondaryAffiliationCount = topicsWithSecondary.reduce(
-    (sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0),
-    0,
-  );
-  const contentEnrichedEdges = input.visitSimilarity.edges.filter(
-    (edge) => edge.metadata?.producer === 'content-enriched',
-  ).length;
-  const metadataOnlyEdges = input.visitSimilarity.edges.filter(
-    (edge) => edge.metadata?.producer === 'metadata-only',
-  ).length;
-  const mixedTierEdges = input.visitSimilarity.edges.filter((edge) => {
-    const from = edge.metadata?.evidenceTierFrom;
-    const to = edge.metadata?.evidenceTierTo;
-    return typeof from === 'string' && typeof to === 'string' && from !== to;
-  }).length;
-  const contentDrivenTopicCount = topicsWithSecondary.filter((topic) =>
-    topic.memberCanonicalUrls.some(
-      (canonicalUrl) => input.evidenceByCanonicalUrl?.get(canonicalUrl)?.content !== undefined,
-    ),
-  ).length;
   const revision: TopicRevision = {
     ...base,
     topics: topicsWithSecondary,
   };
+  const diagnostics = buildShadowDiagnostics({
+    baselineRevision: input.baselineRevision,
+    revision,
+    pruned,
+    visitSimilarityEdges: input.visitSimilarity.edges,
+    ...(input.evidenceByCanonicalUrl === undefined
+      ? {}
+      : { evidenceByCanonicalUrl: input.evidenceByCanonicalUrl }),
+    inThreadRelationsRetained: retainedRelations.length,
+    workstreamHardUnionEdgesRemoved: removedWorkstreamRelations,
+    splitParentCount,
+    splitAcceptedCount,
+    startedAtMs: startedAt,
+  });
+  return { revision, diagnostics };
+};
 
-  const baselineMembers = Math.max(1, memberCountFor(input.baselineRevision));
+interface ShadowDiagnosticsParams {
+  readonly baselineRevision: TopicRevision;
+  readonly revision: TopicRevision;
+  readonly pruned: {
+    readonly edges: readonly WeightedEdge[];
+    readonly highDfTerms: readonly TermFrequency[];
+  };
+  readonly visitSimilarityEdges: readonly VisitSimilarityEdge[];
+  readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly inThreadRelationsRetained: number;
+  readonly workstreamHardUnionEdgesRemoved: number;
+  readonly splitParentCount: number;
+  readonly splitAcceptedCount: number;
+  readonly startedAtMs: number;
+}
+
+// The single source of truth for the shadow-vs-baseline A/B
+// diagnostics. Everything here is derived from the baseline + the
+// final shadow `revision` + the (cheap) pruned similarity + the raw
+// edges — i.e. it does NOT need the expensive idf-rkn-split clustering
+// process, only its already-materialized result. Shared by the full
+// build path and the skip-path reuse below so the two can never drift.
+const buildShadowDiagnostics = (p: ShadowDiagnosticsParams): TopicShadowDiagnostics => {
+  const { baselineRevision, revision, pruned, visitSimilarityEdges } = p;
+  const secondaryAffiliationCount = revision.topics.reduce(
+    (sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0),
+    0,
+  );
+  const contentEnrichedEdges = visitSimilarityEdges.filter(
+    (edge) => edge.metadata?.producer === 'content-enriched',
+  ).length;
+  const metadataOnlyEdges = visitSimilarityEdges.filter(
+    (edge) => edge.metadata?.producer === 'metadata-only',
+  ).length;
+  const mixedTierEdges = visitSimilarityEdges.filter((edge) => {
+    const from = edge.metadata?.evidenceTierFrom;
+    const to = edge.metadata?.evidenceTierTo;
+    return typeof from === 'string' && typeof to === 'string' && from !== to;
+  }).length;
+  const contentDrivenTopicCount = revision.topics.filter((topic) =>
+    topic.memberCanonicalUrls.some(
+      (canonicalUrl) => p.evidenceByCanonicalUrl?.get(canonicalUrl)?.content !== undefined,
+    ),
+  ).length;
+  const baselineMembers = Math.max(1, memberCountFor(baselineRevision));
   const shadowMembers = memberCountFor(revision);
-  const baselineMax = maxTopicSizeFor(input.baselineRevision);
+  const baselineMax = maxTopicSizeFor(baselineRevision);
   const shadowMax = maxTopicSizeFor(revision);
   const baselineShare = baselineMax / baselineMembers;
   const shadowShare = shadowMax / baselineMembers;
-  const diagnostics: TopicShadowDiagnostics = {
+  return {
     enabled: true,
     candidate: TOPIC_SHADOW_IDF_RKN_SPLIT_CANDIDATE,
-    baselineAlgorithmVersion: input.baselineRevision.algorithmVersion,
+    baselineAlgorithmVersion: baselineRevision.algorithmVersion,
     shadowAlgorithmVersion: TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
-    baselineRevisionId: input.baselineRevision.revisionId,
+    baselineRevisionId: baselineRevision.revisionId,
     shadowRevisionId: revision.revisionId,
-    edgeCountBeforePruning: input.visitSimilarity.edges.length,
+    edgeCountBeforePruning: visitSimilarityEdges.length,
     edgeCountAfterPruning: pruned.edges.length,
     reciprocalK: RECIPROCAL_K,
     minLexicalScore: MIN_LEXICAL_SCORE,
-    workstreamHardUnionEdgesRemoved: removedWorkstreamRelations,
-    inThreadRelationsRetained: retainedRelations.length,
+    workstreamHardUnionEdgesRemoved: p.workstreamHardUnionEdgesRemoved,
+    inThreadRelationsRetained: p.inThreadRelationsRetained,
     highDfTermsSuppressed: pruned.highDfTerms.length,
     highDfTerms: pruned.highDfTerms,
-    baselineTopicCount: topicCountFor(input.baselineRevision),
+    baselineTopicCount: topicCountFor(baselineRevision),
     shadowTopicCount: topicCountFor(revision),
-    topicCountDelta: topicCountFor(revision) - topicCountFor(input.baselineRevision),
+    topicCountDelta: topicCountFor(revision) - topicCountFor(baselineRevision),
     baselineMaxTopicSize: baselineMax,
     shadowMaxTopicSize: shadowMax,
     maxTopicSizeDelta: shadowMax - baselineMax,
@@ -850,16 +890,59 @@ export const buildTopicShadowCandidate = async (
     eligibleVisitCount: baselineMembers,
     shadowAssignedVisitCount: shadowMembers,
     noiseShare: roundMetric((baselineMembers - shadowMembers) / baselineMembers),
-    splitParentCount,
-    splitAcceptedCount,
+    splitParentCount: p.splitParentCount,
+    splitAcceptedCount: p.splitAcceptedCount,
     secondaryAffiliationCount,
     contentEnrichedEdges,
     metadataOnlyEdges,
     mixedTierEdges,
     contentDrivenTopicCount,
-    metadataOnlyTopicCount: Math.max(0, topicsWithSecondary.length - contentDrivenTopicCount),
-    perVisitChurn: roundMetric(perVisitChurn(input.baselineRevision, revision)),
-    runtimeMs: roundMetric(performance.now() - startedAt),
+    metadataOnlyTopicCount: Math.max(0, revision.topics.length - contentDrivenTopicCount),
+    perVisitChurn: roundMetric(perVisitChurn(baselineRevision, revision)),
+    runtimeMs: roundMetric(performance.now() - p.startedAtMs),
   };
-  return { revision, diagnostics };
+};
+
+// G2 — skip-path A/B diagnostics. When the materializer reuses an
+// unchanged persisted shadow revision (the W4 skip-gate / CPU win) it
+// still needs the shadow-vs-baseline comparison so the HealthPanel
+// experiments lane and workGraphHealth `topic.shadow-idf-rkn-split`
+// candidate are not perpetually "unavailable". The expensive part —
+// the idf-rkn-split clustering — is NOT redone (the reused revision
+// already holds its result); only the cheap pruned-similarity pass
+// runs. splitParentCount/splitAcceptedCount are 0 and runtimeMs is
+// near-0 because no split was performed THIS drain — an honest signal
+// that the row reflects a reused revision, not a fresh build.
+export const buildReusedShadowDiagnostics = (input: {
+  readonly visits: readonly TopicVisit[];
+  readonly visitSimilarity: VisitSimilarityRevision;
+  readonly userAssertedRelations: readonly UserAssertedVisitRelation[];
+  readonly baselineRevision: TopicRevision;
+  readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly reusedRevision: TopicRevision;
+}): TopicShadowDiagnostics => {
+  const startedAt = performance.now();
+  const pruned = prunedSimilarityFor(
+    input.visits,
+    input.visitSimilarity,
+    input.evidenceByCanonicalUrl,
+  );
+  const retainedRelations = input.userAssertedRelations.filter(
+    (relation) => relation.kind !== 'in_workstream',
+  );
+  return buildShadowDiagnostics({
+    baselineRevision: input.baselineRevision,
+    revision: input.reusedRevision,
+    pruned,
+    visitSimilarityEdges: input.visitSimilarity.edges,
+    ...(input.evidenceByCanonicalUrl === undefined
+      ? {}
+      : { evidenceByCanonicalUrl: input.evidenceByCanonicalUrl }),
+    inThreadRelationsRetained: retainedRelations.length,
+    workstreamHardUnionEdgesRemoved:
+      input.userAssertedRelations.length - retainedRelations.length,
+    splitParentCount: 0,
+    splitAcceptedCount: 0,
+    startedAtMs: startedAt,
+  });
 };

@@ -39,6 +39,7 @@ import {
   knownCanonicalUrlsFor,
 } from '../../connections/userAssertedRelations.js';
 import {
+  buildReusedShadowDiagnostics,
   buildTopicShadowCandidate,
   expectedShadowRevisionId,
   shouldBuildTopicShadowCandidate,
@@ -1214,22 +1215,39 @@ export const createConnectionsMaterializer = (
         previousShadowRevision !== null &&
         previousShadowRevision.revisionId === expectedShadowId
       ) {
-        // Unchanged — reuse. Mirrors the baseline guard (no re-put
-        // when topicRevision === previousTopicRevision): the prior
-        // shadow is already the active/served revision on disk, so
-        // there is nothing to write. No fresh shadow diagnostics this
-        // drain (topicShadowDiagnostics/Observation stay null — the
-        // same nullable path used when the candidate is disabled), so
-        // a no-op drain also stops emitting a redundant history
-        // sample.
+        // Unchanged — reuse. Mirrors the baseline guard: the prior
+        // shadow is already the active/served revision on disk so the
+        // expensive buildTopicShadowCandidate is skipped (the CPU
+        // win). G2 — but we DO recompute the shadow-vs-baseline A/B
+        // diagnostics from the reused revision (cheap: prune only, no
+        // clustering) so the HealthPanel experiments lane and the
+        // workGraphHealth `topic.shadow-idf-rkn-split` candidate are
+        // populated every drain instead of being perpetually
+        // "unavailable" on skip drains.
         servedTopicRevision = previousShadowRevision;
         // G1 — keep idf-rkn-split the ACTIVE revision even on the
-        // skip path. The expensive buildTopicShadowCandidate is still
-        // skipped (the CPU win); putActiveRevision is a tiny write.
-        // Without this, skip drains left the starved union-find
-        // baseline as the persisted active revision (the regression).
+        // skip path. Without this, skip drains left the starved
+        // union-find baseline as the persisted active revision.
         await topicRevisionStore.putActiveRevision(previousShadowRevision);
-        mark('topicShadowCandidate cacheHit=true (skip rebuild, kept active)');
+        topicShadowDiagnostics = buildReusedShadowDiagnostics({
+          visits: topicVisits,
+          visitSimilarity,
+          userAssertedRelations,
+          baselineRevision: topicRevision,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          reusedRevision: previousShadowRevision,
+        });
+        topicShadowObservation = buildTopicShadowObservationDiagnostics({
+          baselineRevision: topicRevision,
+          previousBaselineRevision: previousTopicRevision,
+          // Shadow is unchanged this drain, so shadow-vs-prior-shadow
+          // churn is 0 by construction (reused === previous).
+          shadowRevision: previousShadowRevision,
+          previousShadowRevision,
+        });
+        mark(
+          `topicShadowCandidate cacheHit=true (skip rebuild, kept active, A/B emitted topics=${String(topicShadowDiagnostics.shadowTopicCount)})`,
+        );
       } else {
         const shadow = await buildTopicShadowCandidate({
           visits: topicVisits,

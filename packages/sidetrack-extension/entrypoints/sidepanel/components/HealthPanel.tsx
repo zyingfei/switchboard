@@ -821,16 +821,34 @@ export function HealthPanel({
           : candidateWarningCount > 0
             ? 'warn'
             : 'ok';
+    // The shadow-vs-baseline A/B digest is now emitted every drain
+    // (including skip drains — companion G2), so surface it inline in
+    // the always-visible stage row instead of only in the drill. The
+    // headline IS the idf-rkn-split clustering (the served producer
+    // post-G1); the baseline union-find is retained only as the A/B
+    // comparison input. Falls back to the candidate-lane summary when
+    // the focus digest hasn't loaded (older companion / cold start).
+    const svb = focusHealth?.digest?.shadowVsBaseline;
+    const obs = focusHealth?.digest?.shadowObservation;
+    const abAvailable = svb?.shadowTopicCount !== undefined;
+    const warnSuffix = candidateWarningCount > 0 ? ` · ${String(candidateWarningCount)}w` : '';
     const experimentsHead = workGraphUnavailable
       ? 'Unavailable'
-      : candidates.length === 0
-        ? 'No signal yet'
-        : `${String(shadowCandidateCount)} shadow · ${String(standbyCandidateCount)} standby`;
+      : abAvailable
+        ? `idf-rkn ${String(svb?.shadowTopicCount)} topics`
+        : candidates.length === 0
+          ? 'No signal yet'
+          : `${String(shadowCandidateCount)} shadow · ${String(standbyCandidateCount)} standby`;
     const experimentsDetail = workGraphUnavailable
       ? 'unavailable — metrics didn’t load'
-      : candidates.length === 0
-        ? 'candidate lanes not reported'
-        : `${String(candidateWarningCount)} warning${candidateWarningCount === 1 ? '' : 's'} · ${String(disabledCandidateCount)} disabled`;
+      : abAvailable
+        ? `A/B vs union-find · noise ${fmtNum(svb?.noiseShare, 2)} · churn ${fmtNum(
+            obs?.adjacentPerVisitChurn,
+            2,
+          )} · max share ${fmtNum(svb?.shadowMaxTopicShare, 3)}${warnSuffix}`
+        : candidates.length === 0
+          ? 'candidate lanes not reported'
+          : `${String(candidateWarningCount)} warning${candidateWarningCount === 1 ? '' : 's'} · ${String(disabledCandidateCount)} disabled`;
 
     const relay = report.sync?.relay;
     const syncStatus: PipelineStatus =
