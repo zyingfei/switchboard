@@ -67,4 +67,24 @@ describe('engagement content script wiring', () => {
     expect(emitted.dimensions?.engagement?.copyCount).toBe(1);
     expect(emitted.dimensions?.engagement?.scrollEvents).toBe(1);
   });
+
+  it('emits an early non-final snapshot once the attention gate has focused time', () => {
+    startEngagementTracking();
+
+    vi.advanceTimersByTime(4_999);
+    expect(sent).toHaveLength(0);
+
+    vi.advanceTimersByTime(1);
+
+    const emitted = sent.at(-1) as {
+      readonly type?: string;
+      readonly final?: boolean;
+      readonly dimensions?: {
+        readonly engagement?: { readonly focusedWindowMs?: number };
+      };
+    };
+    expect(emitted.type).toBe('sidetrack.engagement.interval');
+    expect(emitted.final).toBe(false);
+    expect(emitted.dimensions?.engagement?.focusedWindowMs).toBeGreaterThanOrEqual(5_000);
+  });
 });
