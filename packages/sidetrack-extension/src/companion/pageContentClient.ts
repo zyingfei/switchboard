@@ -50,6 +50,7 @@ export interface PageContentExtractedPayload {
       | 'workstream-policy'
       | 'save-suggestion'
       | 'allowlist'
+      | 'auto-observed'
       | 'attention-gate'
       | 'bulk-open-tabs';
     readonly workstreamId?: string;

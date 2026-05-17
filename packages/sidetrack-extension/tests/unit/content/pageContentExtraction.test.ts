@@ -120,6 +120,16 @@ describe('settleAndExtractPageContent — ensemble selection', () => {
     expect(second.payload.content.contentHash).toBe(first.payload.content.contentHash);
     expect(second.payload.qualitySignals).toEqual(first.payload.qualitySignals);
   });
+
+  it('preserves the auto-observed trigger for immediate features-only capture', async () => {
+    document.body.innerHTML = `<article><h1>Immediate Evidence</h1>${articleBody(8)}</article>`;
+
+    const result = await settleAndExtract({ mode: 'page', trigger: 'auto-observed' });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.extractionPolicy.trigger).toBe('auto-observed');
+  });
 });
 
 describe('settleAndExtractPageContent — zero-regression fallback', () => {

@@ -26,6 +26,7 @@ export type PageContentPolicyTrigger =
   | 'workstream-policy'
   | 'save-suggestion'
   | 'allowlist'
+  | 'auto-observed'
   | 'attention-gate'
   | 'bulk-open-tabs';
 
