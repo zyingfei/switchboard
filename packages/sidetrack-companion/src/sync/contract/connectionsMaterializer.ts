@@ -1172,17 +1172,26 @@ export const createConnectionsMaterializer = (
     mark(
       `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,
     );
-    if (topicRevision !== previousTopicRevision) {
+    // G1 — RETIRE union-find from serving. The baseline union-find
+    // revision starves on raw e5 cosine (~1 giant topic / all members
+    // in one component) — it must NEVER be the active/served producer
+    // when idf-rkn-split is enabled. It is still COMPUTED above purely
+    // as (a) the input `splitMembers` splits to produce idf-rkn-split
+    // and (b) the A/B comparison baseline for diagnostics. Only
+    // promote it to active in the genuine fallback where shadow is
+    // disabled. (Pre-G1 this unconditionally put union-find active,
+    // then the shadow block re-promoted shadow over it; the C
+    // skip-gate then stopped re-promoting on skip drains, leaving the
+    // starved union-find served — the bug this fixes.)
+    if (!shouldBuildTopicShadowCandidate() && topicRevision !== previousTopicRevision) {
       await topicRevisionStore.putActiveRevision(topicRevision);
       mark('putActiveTopicRevision');
     }
-    // FLIP (shadow->active): when the idf-rkn-split shadow clustering is
-    // enabled it is the intended production clustering. The baseline
-    // union-find revision starves on raw e5 cosine (~0 topics on real
-    // embeddings). `topicRevision` stays the BASELINE so the diagnostics
-    // artifact and shadow-vs-baseline observation remain meaningful;
-    // `servedTopicRevision` is what we persist active + feed into the
-    // served snapshot. When shadow is disabled this is a no-op.
+    // FLIP (shadow->active): idf-rkn-split is the production clustering.
+    // `topicRevision` stays the BASELINE input so the shadow-vs-baseline
+    // A/B observation remains meaningful; `servedTopicRevision` is what
+    // we persist active + feed into the served snapshot. When shadow is
+    // disabled this is a no-op (the fallback putActive above ran).
     let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
@@ -1214,7 +1223,13 @@ export const createConnectionsMaterializer = (
         // a no-op drain also stops emitting a redundant history
         // sample.
         servedTopicRevision = previousShadowRevision;
-        mark('topicShadowCandidate cacheHit=true (skip rebuild)');
+        // G1 — keep idf-rkn-split the ACTIVE revision even on the
+        // skip path. The expensive buildTopicShadowCandidate is still
+        // skipped (the CPU win); putActiveRevision is a tiny write.
+        // Without this, skip drains left the starved union-find
+        // baseline as the persisted active revision (the regression).
+        await topicRevisionStore.putActiveRevision(previousShadowRevision);
+        mark('topicShadowCandidate cacheHit=true (skip rebuild, kept active)');
       } else {
         const shadow = await buildTopicShadowCandidate({
           visits: topicVisits,
