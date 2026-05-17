@@ -7671,6 +7671,21 @@ function NeedsOrganizeSuggestionRow({
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
 
+  // Latest-ref pattern. onCache / resolveLabel are recreated by the
+  // parent every render; the effect calls onCache() on success →
+  // parent setState → re-render → new callback identities → effect
+  // re-fires → fetch → onCache → … an unbounded fetch-on-render
+  // loop. It was masked only by the ~600ms server latency + the
+  // global fetch slot; server-side caching of /v1/suggestions/thread
+  // made the response instant and exposed it as ~500 req/s/thread
+  // (~93k req/90s). Keep these OUT of the effect deps and call the
+  // latest via refs so the effect re-runs only on real input changes
+  // (matches the existing latest-ref usage elsewhere in this file).
+  const onCacheRef = useRef(onCache);
+  onCacheRef.current = onCache;
+  const resolveLabelRef = useRef(resolveLabel);
+  resolveLabelRef.current = resolveLabel;
+
   useEffect(() => {
     if (companionPort === null || bridgeKey === null) return undefined;
     // Suppress fetches while the recall index is rebuilding —
@@ -7720,10 +7735,10 @@ function NeedsOrganizeSuggestionRow({
           setSuggestion(null);
           return;
         }
-        const label = resolveLabel(top.workstreamId);
+        const label = resolveLabelRef.current(top.workstreamId);
         const next = { workstreamId: top.workstreamId, label, confidence: top.score };
         setSuggestion(next);
-        onCache(next);
+        onCacheRef.current(next);
       } catch {
         // Silent — empty render
       } finally {
@@ -7735,12 +7750,12 @@ function NeedsOrganizeSuggestionRow({
     return () => {
       cancelled = true;
     };
+    // onCache / resolveLabel intentionally excluded — called via
+    // refs above to break the fetch-on-render loop.
   }, [
     companionPort,
     bridgeKey,
     threadId,
-    onCache,
-    resolveLabel,
     workstreamFingerprint,
     indexRebuilding,
     refreshTick,
