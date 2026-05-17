@@ -40,6 +40,7 @@ import {
 } from '../../connections/userAssertedRelations.js';
 import {
   buildTopicShadowCandidate,
+  expectedShadowRevisionId,
   shouldBuildTopicShadowCandidate,
   type TopicShadowDiagnostics,
 } from '../../connections/topicShadowCandidate.js';
@@ -213,6 +214,25 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // drain. Side-panel views poll their own state and don't observe a
 // per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
 const DRAIN_DEBOUNCE_MS = 1500;
+
+// Stage 5.2 W1b — minimum wall-clock interval between successive
+// in-flight drain passes. DRAIN_DEBOUNCE_MS only gates the
+// idle->drain ENTRY; once a drain is running, requestDrain just sets
+// dirty=true and returns, so a steady HANDLES-event trickle (open
+// tabs / observation events) made drain()'s `while (dirty)` loop run
+// full O(graph) rebuilds back-to-back and pinned a core. This floor
+// coalesces everything that arrives during a rebuild + the gap into
+// the next single pass; no starvation (dirty stays set, the loop
+// always resumes), awaitIdle stays correct (running=true through the
+// wait). Env-overridable so tests can disable it (set 0). Resolved
+// per pass (not a frozen module const) so a test can set the env
+// before constructing the materializer.
+const DEFAULT_DRAIN_MIN_INTERVAL_MS = 15_000;
+const resolveDrainMinIntervalMs = (): number => {
+  const raw = process.env['SIDETRACK_CONNECTIONS_DRAIN_MIN_INTERVAL_MS'];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DRAIN_MIN_INTERVAL_MS;
+};
 
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
@@ -1156,32 +1176,62 @@ export const createConnectionsMaterializer = (
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
     if (shouldBuildTopicShadowCandidate()) {
       const previousShadowRevision = await topicRevisionStore.readShadowRevision();
-      const shadow = await buildTopicShadowCandidate({
+      // Stage 5.2 W4 (shadow) — skip-gate, mirroring the baseline
+      // topic-revision reuse above. The shadow revision id is a
+      // deterministic function of its inputs, so when nothing relevant
+      // changed we reuse the persisted shadow instead of recomputing
+      // the expensive idf-rkn-split clustering. Recomputing it every
+      // drain (unconditionally, even on baseline cache-hit) was the
+      // dominant per-drain CPU cost behind the constant-CPU runaway.
+      const expectedShadowId = await expectedShadowRevisionId({
         visits: topicVisits,
         visitSimilarity,
-        userAssertedRelations,
-        baselineRevision: topicRevision,
         evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-        ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
         cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
       });
-      await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
-      topicShadowDiagnostics = shadow.diagnostics;
-      topicShadowObservation = buildTopicShadowObservationDiagnostics({
-        baselineRevision: topicRevision,
-        previousBaselineRevision: previousTopicRevision,
-        shadowRevision: shadow.revision,
-        previousShadowRevision,
-      });
-      mark(
-        `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
-      );
-      // Promote the shadow clustering to the active/served revision so
-      // GET /v1/connections (no topicVariant) and the materialized
-      // snapshot serve it, and current.json mirrors current.shadow.json.
-      servedTopicRevision = shadow.revision;
-      await topicRevisionStore.putActiveRevision(shadow.revision);
-      mark('topicShadowCandidate->active (flip)');
+      if (
+        previousShadowRevision !== null &&
+        previousShadowRevision.revisionId === expectedShadowId
+      ) {
+        // Unchanged — reuse. Mirrors the baseline guard (no re-put
+        // when topicRevision === previousTopicRevision): the prior
+        // shadow is already the active/served revision on disk, so
+        // there is nothing to write. No fresh shadow diagnostics this
+        // drain (topicShadowDiagnostics/Observation stay null — the
+        // same nullable path used when the candidate is disabled), so
+        // a no-op drain also stops emitting a redundant history
+        // sample.
+        servedTopicRevision = previousShadowRevision;
+        mark('topicShadowCandidate cacheHit=true (skip rebuild)');
+      } else {
+        const shadow = await buildTopicShadowCandidate({
+          visits: topicVisits,
+          visitSimilarity,
+          userAssertedRelations,
+          baselineRevision: topicRevision,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+          cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+        });
+        await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
+        topicShadowDiagnostics = shadow.diagnostics;
+        topicShadowObservation = buildTopicShadowObservationDiagnostics({
+          baselineRevision: topicRevision,
+          previousBaselineRevision: previousTopicRevision,
+          shadowRevision: shadow.revision,
+          previousShadowRevision,
+        });
+        mark(
+          `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
+        );
+        // Promote the shadow clustering to the active/served revision
+        // so GET /v1/connections (no topicVariant) and the
+        // materialized snapshot serve it, and current.json mirrors
+        // current.shadow.json.
+        servedTopicRevision = shadow.revision;
+        await topicRevisionStore.putActiveRevision(shadow.revision);
+        mark('topicShadowCandidate->active (flip)');
+      }
     }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
@@ -1432,6 +1482,7 @@ export const createConnectionsMaterializer = (
 
   const drain = async (): Promise<void> => {
     while (dirty) {
+      const passStartedAtMs = Date.now();
       dirty = false;
       try {
         if (shouldUseWorker()) {
@@ -1448,6 +1499,19 @@ export const createConnectionsMaterializer = (
         // avoid tight-retry on persistent failures.
         dirty = true;
         return;
+      }
+      // Stage 5.2 W1b — coalesce at the DRAIN level. Only relevant when
+      // `dirty` was re-set DURING the rebuild (a HANDLES event arrived
+      // mid-pass): without this the loop would immediately run another
+      // full O(graph) rebuild with zero gap. Wait out the remainder of
+      // DRAIN_MIN_INTERVAL_MS so events that arrived during the rebuild
+      // + this gap collapse into the next single pass. Fire-then-
+      // awaitIdle callers never hit this (dirty is false post-pass).
+      if (dirty) {
+        const remainingMs = resolveDrainMinIntervalMs() - (Date.now() - passStartedAtMs);
+        if (remainingMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, remainingMs));
+        }
       }
     }
   };

@@ -5,6 +5,7 @@ import { evidenceTokensForRecord } from '../page-evidence/extract.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+  createTopicRevisionId,
   type TopicSecondaryAffiliation,
   type TopicNodeMetadata,
   type TopicRevision,
@@ -711,6 +712,35 @@ export const shouldBuildTopicShadowCandidate = (): boolean => {
   const raw = process.env[TOPIC_SHADOW_CANDIDATE_ENV];
   if (raw === undefined) return true;
   return !TOPIC_SHADOW_DISABLED_VALUES.has(raw.trim().toLowerCase());
+};
+
+// Stage 5.2 W4 (shadow) — the shadow revision id is a deterministic
+// function of its inputs (the pruned-similarity revision id + cosine
+// threshold + algorithm), exactly like the baseline topic-revision
+// skip-gate in connectionsMaterializer. `prunedSimilarityFor` is the
+// cheap part (token/df + reciprocal-rank pruning + a content hash);
+// the expensive part is the union-find + recursive split clustering
+// below. Computing just the expected id lets the materializer reuse a
+// persisted, unchanged shadow instead of recomputing the full
+// idf-rkn-split clustering on every drain (the dominant per-drain CPU
+// cost — the runaway). Must stay byte-consistent with the id
+// `buildTopicShadowCandidate` ultimately produces (asserted by test).
+export const expectedShadowRevisionId = async (input: {
+  readonly visits: readonly TopicVisit[];
+  readonly visitSimilarity: VisitSimilarityRevision;
+  readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
+  readonly cosineThreshold: number;
+}): Promise<string> => {
+  const pruned = prunedSimilarityFor(
+    input.visits,
+    input.visitSimilarity,
+    input.evidenceByCanonicalUrl,
+  );
+  return createTopicRevisionId({
+    visitSimilarityRevisionId: pruned.revisionId,
+    cosineThreshold: input.cosineThreshold,
+    algorithmVersion: TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+  });
 };
 
 export const buildTopicShadowCandidate = async (
