@@ -1375,6 +1375,57 @@ const cachedThreadSuggestions = async (
   return compute;
 };
 
+// Generic stat-fingerprint + TTL + in-flight-dedupe cache for the
+// remaining uncached GET resolver/projection endpoints the extension
+// polls (tabsessions/visits resolve — ~4x/min PER visible card ×
+// many cards, each readCurrent 14MB + readMerged + resolve ~1s;
+// workstreams/projections — readMerged + project, polled by
+// refreshCachedWorkstreams). Same rationale + tradeoff as the
+// connections/suggestions caches: graph-exact via current.json stat,
+// event-log-derived parts ≤TTL stale (W2b "contextual" stance).
+const ROUTE_CACHE_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_ROUTE_CACHE_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface RouteCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly computedAtMs: number;
+}
+const routeCache = new Map<string, RouteCacheEntry>();
+const routeInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const cachedRoute = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> => {
+  const cached = routeCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return cached.result;
+  }
+  const inFlight = routeInFlight.get(key);
+  if (inFlight !== undefined) return inFlight;
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      if (result[0] === 200) {
+        routeCache.set(key, { result, computedAtMs: Date.now() });
+        if (routeCache.size > 256) {
+          const now = Date.now();
+          for (const [k, v] of routeCache) {
+            if (now - v.computedAtMs >= ttlMs) routeCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      routeInFlight.delete(key);
+    }
+  })();
+  routeInFlight.set(key, compute);
+  return compute;
+};
+
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
   value === 'ok' || value === 'warning' || value === 'failed';
 
@@ -2298,35 +2349,44 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
-      const merged = await context.eventLog.readMerged();
-      // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
-      const { projection } = await loadTabSessionProjection(context, context.eventLog);
-      if (!projection.bySessionId.has(tabSessionId)) {
-        throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
-      }
-      return [
-        200,
-        {
-          data: resolveAttribution({
-            tabSessionId,
-            snapshot,
-            projection,
-            events: merged,
-          }),
-          ...(snapshot.snapshotRevision === undefined
-            ? {}
-            : { snapshotRevision: snapshot.snapshotRevision }),
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await statSig(
+        join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+      )}|${url.search}`;
+      return cachedRoute(
+        tabResKey,
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const merged = await context.eventLog!.readMerged();
+          // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
+          const { projection } = await loadTabSessionProjection(context, context.eventLog!);
+          if (!projection.bySessionId.has(tabSessionId)) {
+            throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
+          }
+          return [
+            200,
+            {
+              data: resolveAttribution({
+                tabSessionId,
+                snapshot,
+                projection,
+                events: merged,
+              }),
+              ...(snapshot.snapshotRevision === undefined
+                ? {}
+                : { snapshotRevision: snapshot.snapshotRevision }),
+            },
+          ];
         },
-      ];
+      );
     },
   },
   {
@@ -2591,29 +2651,38 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
-      if (canonicalUrl.length === 0) {
-        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
-      }
-      const merged = await context.eventLog.readMerged();
-      return [
-        200,
-        {
-          data: resolveUrlAttribution({
-            canonicalUrl,
-            snapshot,
-            events: merged,
-          }),
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await statSig(
+        join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+      )}|${url.search}`;
+      return cachedRoute(
+        visResKey,
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+          if (canonicalUrl.length === 0) {
+            throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+          }
+          const merged = await context.eventLog!.readMerged();
+          return [
+            200,
+            {
+              data: resolveUrlAttribution({
+                canonicalUrl,
+                snapshot,
+                events: merged,
+              }),
+            },
+          ];
         },
-      ];
+      );
     },
   },
   {
@@ -5092,15 +5161,23 @@ const routes: readonly RouteDefinition[] = [
       // from the companion's relay-replicated event log to the extension's
       // chrome.storage cache, so workstreams created on Browser A reach
       // Browser B's side panel via the standard sync path.
-      const events = await context.eventLog.readMerged();
-      const aggregateIds = new Set<string>();
-      for (const event of events) {
-        if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
-          aggregateIds.add(event.aggregateId);
-        }
-      }
-      const projections = [...aggregateIds].sort().map((bacId) => projectWorkstream(bacId, events));
-      return [200, { data: projections }];
+      return cachedRoute(
+        'wsproj',
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const events = await context.eventLog!.readMerged();
+          const aggregateIds = new Set<string>();
+          for (const event of events) {
+            if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
+              aggregateIds.add(event.aggregateId);
+            }
+          }
+          const projections = [...aggregateIds]
+            .sort()
+            .map((bacId) => projectWorkstream(bacId, events));
+          return [200, { data: projections }];
+        },
+      );
     },
   },
   {
