@@ -51,6 +51,11 @@ import {
 } from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
+  compareTopicRevisions,
+  shouldBuildTopicHdbscanCandidate,
+  type TopicCandidateAbDiagnostics,
+} from '../../connections/topicCandidateAb.js';
+import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
   resolveVisitSimilarityConfig,
@@ -1278,6 +1283,62 @@ export const createConnectionsMaterializer = (
         mark('topicShadowCandidate->active (flip)');
       }
     }
+    // U1 — HDBSCAN observational A/B candidate. Density clustering of
+    // the same visits, compared against the SAME union-find baseline
+    // (`topicRevision`) the idf-rkn-split shadow A/B uses, so the
+    // HealthPanel experiments table shows union-find vs
+    // idf-rkn-split(served) vs HDBSCAN side by side. Skip-gated like
+    // the baseline W4 / shadow: the HDBSCAN revision id is a pure
+    // function of (visitSimilarity.revisionId, cosineThreshold, algo)
+    // — unchanged ⇒ reuse the persisted candidate + emit the cheap
+    // reused A/B (NO re-clustering this drain; the CPU-safe property
+    // promised when activating these dormant lanes). Default ON;
+    // SIDETRACK_TOPIC_HDBSCAN_CANDIDATE=off disables.
+    let topicHdbscanDiagnostics: TopicCandidateAbDiagnostics | null = null;
+    if (shouldBuildTopicHdbscanCandidate()) {
+      const previousHdbscan =
+        await topicRevisionStore.readCandidateShadowRevision(TOPIC_HDBSCAN_REVISION_KEY);
+      const expectedHdbscanId = await createTopicRevisionId({
+        visitSimilarityRevisionId: visitSimilarity.revisionId,
+        cosineThreshold: topicCosineThreshold,
+        algorithmVersion: TOPIC_HDBSCAN_REVISION_KEY,
+      });
+      if (previousHdbscan !== null && previousHdbscan.revisionId === expectedHdbscanId) {
+        topicHdbscanDiagnostics = compareTopicRevisions({
+          baselineRevision: topicRevision,
+          candidateRevision: previousHdbscan,
+          candidate: 'topic.hdbscan',
+          runtimeMs: 0,
+          reused: true,
+        });
+        mark(
+          `topicHdbscanCandidate cacheHit=true topics=${String(topicHdbscanDiagnostics.candidateTopicCount)}`,
+        );
+      } else {
+        const hdbscanStartedAt = performance.now();
+        const hdbscanRevision = await buildHdbscanTopicRevision({
+          visits: topicVisits,
+          visitSimilarity,
+          options: { cosineThreshold: topicCosineThreshold },
+          ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
+          ...(previousHdbscan === null ? {} : { previousRevision: previousHdbscan }),
+        });
+        await topicRevisionStore.putCandidateShadowRevision(
+          TOPIC_HDBSCAN_REVISION_KEY,
+          hdbscanRevision,
+        );
+        topicHdbscanDiagnostics = compareTopicRevisions({
+          baselineRevision: topicRevision,
+          candidateRevision: hdbscanRevision,
+          candidate: 'topic.hdbscan',
+          runtimeMs: performance.now() - hdbscanStartedAt,
+          reused: false,
+        });
+        mark(
+          `topicHdbscanCandidate build topics=${String(topicHdbscanDiagnostics.candidateTopicCount)} runtimeMs=${String(topicHdbscanDiagnostics.runtimeMs)}`,
+        );
+      }
+    }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -1408,6 +1469,7 @@ export const createConnectionsMaterializer = (
       phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
+      ...(topicHdbscanDiagnostics === null ? {} : { topicHdbscanDiagnostics }),
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
     // through the change detectors and fold the status into the

@@ -370,6 +370,8 @@ const buildDiagnosticCandidates = (input: {
   const shadow = raw !== null && isRecord(raw['shadowVsBaseline']) ? raw['shadowVsBaseline'] : null;
   const observation =
     raw !== null && isRecord(raw['shadowObservation']) ? raw['shadowObservation'] : null;
+  const hdbscan =
+    raw !== null && isRecord(raw['hdbscanVsBaseline']) ? raw['hdbscanVsBaseline'] : null;
   const driftReport = raw !== null && isRecord(raw['drift']) ? raw['drift'] : null;
   const silhouette =
     driftReport !== null && isRecord(driftReport['silhouette']) ? driftReport['silhouette'] : null;
@@ -417,15 +419,28 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'topic.hdbscan-standby',
       family: 'topic',
-      lane: 'standby',
-      servingImpact: 'not-serving',
-      status: 'off',
-      reason: 'no-production-selector',
-      revisionId: null,
-      asOf: liveObservedAt,
+      // U1 — now an active observational A/B lane (was a structurally
+      // 'off' standby with no runtime route). Density-clustered every
+      // drain alongside the served idf-rkn-split, compared against the
+      // same union-find baseline; skip-gated so it is CPU-safe.
+      lane: 'shadow',
+      servingImpact: 'observe-only',
+      status: hdbscan === null ? 'unavailable' : 'ok',
+      reason: hdbscan === null ? 'hdbscan-diagnostics-unavailable' : null,
+      revisionId: stringOrNull(hdbscan?.['candidateRevisionId']),
+      asOf: hdbscan === null ? liveObservedAt : diagnosticsObservedAt,
       metrics: metrics({
-        algorithmVersion: TOPIC_HDBSCAN_REVISION_KEY,
-        defaultAlgorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+        algorithmVersion:
+          stringOrNull(hdbscan?.['algorithmVersion']) ?? TOPIC_HDBSCAN_REVISION_KEY,
+        baselineAlgorithmVersion:
+          stringOrNull(hdbscan?.['baselineAlgorithmVersion']) ?? TOPIC_UNION_FIND_REVISION_KEY,
+        candidateTopicCount: numberOrNull(hdbscan?.['candidateTopicCount']),
+        baselineTopicCount: numberOrNull(hdbscan?.['baselineTopicCount']),
+        candidateMaxTopicShare: numberOrNull(hdbscan?.['candidateMaxTopicShare']),
+        noiseShare: numberOrNull(hdbscan?.['noiseShare']),
+        perVisitChurn: numberOrNull(hdbscan?.['perVisitChurn']),
+        runtimeMs: numberOrNull(hdbscan?.['runtimeMs']),
+        reused: booleanOrFalse(hdbscan?.['reused']),
       }),
     },
     {
