@@ -133,7 +133,6 @@ import {
 } from '../../recall/content-lane.js';
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
-import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import {
   ensurePageEvidenceForTimelineEntries,
@@ -238,6 +237,20 @@ const DRAIN_DEBOUNCE_MS = 1500;
 //     `browser.timeline.observed` event for the same nav, so its
 //     arrival never triggers a structurally-new rebuild — the paired
 //     timeline observation does.
+//   - `page.evidence.extracted` is emitted per page-evidence
+//     auto-capture (page observation / live current-tab / early
+//     engagement snapshot — high frequency, multiple per nav and
+//     re-emitted on engagement ticks). It is reconstructed from the
+//     page-evidence store inside every drain via
+//     `ensurePageEvidenceForTimelineEntries`, so leaving it OUT of
+//     HANDLES keeps the snapshot's evidence-derived edges correct —
+//     they just refresh on the next structural event (the paired
+//     `browser.timeline.observed` nav already triggered a drain).
+//     Routing it through HANDLES re-created the W2b per-event rebuild
+//     storm: a steady auto-capture stream keeps `dirty` set so the
+//     `drain()` while-loop rebuilds the full connections snapshot
+//     back-to-back with the debounce bypassed (debounce only gates
+//     the idle→drain entry, not the in-flight loop), pinning a core.
 // If a session never produces a HOT event for an extended period
 // (passive read of one page), the engagement classification stays
 // stale until the next navigation or mutation. That is acceptable
@@ -259,7 +272,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   ANNOTATION_DELETED,
   CAPTURE_RECORDED,
   CAPTURE_EXTRACTION_PRODUCED,
-  PAGE_EVIDENCE_EXTRACTED,
   RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
   USER_ENGAGEMENT_RELABELED,

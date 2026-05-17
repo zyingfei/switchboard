@@ -1372,8 +1372,14 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   });
 
   // Stage 5.2 W2b — high-frequency events that fold into the next
-  // natural drain (engagement aggregates, visual fingerprints) MUST NOT
-  // be in HANDLES, so they don't trigger their own per-event rebuild.
+  // natural drain (engagement aggregates, visual fingerprints,
+  // page-evidence auto-capture) MUST NOT be in HANDLES, so they don't
+  // trigger their own per-event rebuild. page.evidence.extracted was
+  // regressed into HANDLES by the page-evidence auto-capture work and
+  // re-created the dogfood rebuild storm (one core pinned by
+  // back-to-back full connections rebuilds); it is reconstructed from
+  // the page-evidence store inside every drain, so omitting it keeps
+  // the snapshot correct.
   it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
@@ -1383,6 +1389,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
 
     expect(m.handles.has('engagement.session.aggregated')).toBe(false);
     expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
+    expect(m.handles.has('page.evidence.extracted')).toBe(false);
   });
 
   it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {
