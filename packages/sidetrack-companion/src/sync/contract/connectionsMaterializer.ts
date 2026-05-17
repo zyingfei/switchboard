@@ -215,19 +215,25 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
 const DRAIN_DEBOUNCE_MS = 1500;
 
-// Stage 5.2 W1b — minimum wall-clock interval between successive
-// in-flight drain passes. DRAIN_DEBOUNCE_MS only gates the
-// idle->drain ENTRY; once a drain is running, requestDrain just sets
-// dirty=true and returns, so a steady HANDLES-event trickle (open
-// tabs / observation events) made drain()'s `while (dirty)` loop run
-// full O(graph) rebuilds back-to-back and pinned a core. This floor
-// coalesces everything that arrives during a rebuild + the gap into
-// the next single pass; no starvation (dirty stays set, the loop
-// always resumes), awaitIdle stays correct (running=true through the
-// wait). Env-overridable so tests can disable it (set 0). Resolved
-// per pass (not a frozen module const) so a test can set the env
-// before constructing the materializer.
-const DEFAULT_DRAIN_MIN_INTERVAL_MS = 15_000;
+// Stage 5.2 W1b/W1c — minimum wall-clock interval between drain
+// STARTS. DRAIN_DEBOUNCE_MS only coalesces a burst into ONE start;
+// it does NOT bound the cadence of successive starts. Measured:
+// buildConnectionsSnapshot ≈4-5s/pass, and with a steady
+// extension-flush trigger stream each post-debounce start fired
+// every ~DRAIN_DEBOUNCE_MS → a ~5s rebuild every ~6.5s ≈ a pinned
+// core (the dogfood runaway). This floor governs BOTH the in-flight
+// `while (dirty)` continuation (W1b) AND the gap between separate
+// debounced starts (W1c, see startDrainWhenIntervalElapsed): a drain
+// starts at most once per interval; intervening triggers coalesce
+// into the next one (dirty stays set — no starvation; awaitIdle
+// stays correct: dirty&&!error keeps it waiting through the defer).
+// Connections is contextual ("not user-immediate-feedback" per the
+// W2b note), so an interval of staleness is acceptable. Default
+// raised 15s→30s so the default is sane WITHOUT the dogfood
+// suppression env. Env-overridable (`SIDETRACK_CONNECTIONS_DRAIN_MIN_INTERVAL_MS`,
+// set 0 to disable); resolved per call (not a frozen module const)
+// so a test can set the env before constructing the materializer.
+const DEFAULT_DRAIN_MIN_INTERVAL_MS = 30_000;
 const resolveDrainMinIntervalMs = (): number => {
   const raw = process.env['SIDETRACK_CONNECTIONS_DRAIN_MIN_INTERVAL_MS'];
   const parsed = raw === undefined ? Number.NaN : Number(raw);
@@ -521,6 +527,12 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+  // W1c — wall-clock of the last drain pass START. Reference for the
+  // minimum interval between drain STARTS (not just the within-drain
+  // while-loop continuation), so a steady trigger stream can't pace
+  // full rebuilds at the weak DRAIN_DEBOUNCE_MS cadence. 0 ⇒ the
+  // first drain is never deferred.
+  let lastDrainStartedAtMs = 0;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
   // (e.g. multiple tabs activating in sequence, peer-event imports)
   // into one drain. Cleared when a fresh requestDrain arrives within
@@ -1483,6 +1495,7 @@ export const createConnectionsMaterializer = (
   const drain = async (): Promise<void> => {
     while (dirty) {
       const passStartedAtMs = Date.now();
+      lastDrainStartedAtMs = passStartedAtMs;
       dirty = false;
       try {
         if (shouldUseWorker()) {
@@ -1529,6 +1542,31 @@ export const createConnectionsMaterializer = (
     })();
   };
 
+  // Stage 5.2 W1c — enforce a true minimum interval between drain
+  // STARTS. DRAIN_DEBOUNCE_MS only coalesces a burst into one start;
+  // with a steady trigger stream each post-debounce start still fired
+  // every ~DRAIN_DEBOUNCE_MS, so a ~5s buildConnectionsSnapshot ran
+  // ~every 6.5s (the runaway). Defer the start until
+  // DRAIN_MIN_INTERVAL_MS has elapsed since the last drain START;
+  // intervening triggers coalesce into it (dirty stays set ⇒ no
+  // starvation). Re-arms itself via the same unref'd debounce slot.
+  // The first drain (lastDrainStartedAtMs===0) is never deferred.
+  const startDrainWhenIntervalElapsed = (): void => {
+    if (!dirty || running) return;
+    const minIntervalMs = resolveDrainMinIntervalMs();
+    const sinceLastStartMs = Date.now() - lastDrainStartedAtMs;
+    if (sinceLastStartMs < minIntervalMs) {
+      if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
+      drainDebounceTimer = setTimeout(() => {
+        drainDebounceTimer = null;
+        startDrainWhenIntervalElapsed();
+      }, minIntervalMs - sinceLastStartMs);
+      drainDebounceTimer.unref();
+      return;
+    }
+    startDrain();
+  };
+
   const requestDrain = (): void => {
     dirty = true;
     pending = true;
@@ -1544,8 +1582,7 @@ export const createConnectionsMaterializer = (
     if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
     drainDebounceTimer = setTimeout(() => {
       drainDebounceTimer = null;
-      if (!dirty || running) return;
-      startDrain();
+      startDrainWhenIntervalElapsed();
     }, DRAIN_DEBOUNCE_MS);
     drainDebounceTimer.unref();
   };
