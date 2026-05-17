@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
@@ -1217,6 +1218,160 @@ const cachedCollectHealth = async (
     }
   })();
   systemHealthInFlight.set(vaultRoot, compute);
+  return compute;
+};
+
+// GET /v1/connections rebuilds a ~14MB response per call: readCurrent
+// (14MB) + readMerged (whole event log → feedback overlay) +
+// applyPageContentCoverage + JSON-serialize ~14MB — UNCACHED,
+// measured ~1.5-2.7s/call. The extension's connections view polls it
+// across (observed) 6+ stacked sockets ⇒ a pinned core (the second,
+// non-connections CPU runaway, "consumer #2"). current.json is
+// stable under the W1c drain floor and the event log only advances
+// on the extension's ~1/min flush, so a CHEAP fingerprint —
+// current.json + shadow file stat (mtime+size) + replica.peekSeq()
+// (cheap in-memory event-log version, the only thing the feedback
+// overlay depends on) + the query string — hits constantly between
+// flushes. A TTL ceiling bounds any fingerprint miss; in-flight
+// dedupe collapses the concurrent polls into one compute.
+const CONNECTIONS_RESPONSE_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_CONNECTIONS_RESPONSE_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface ConnectionsResponseCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly etag: string;
+  readonly computedAtMs: number;
+}
+const connectionsResponseCache = new Map<string, ConnectionsResponseCacheEntry>();
+const connectionsResponseInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const statSig = async (path: string): Promise<string> => {
+  try {
+    const s = await stat(path);
+    return `${String(s.mtimeMs)}:${String(s.size)}`;
+  } catch {
+    return 'absent';
+  }
+};
+// NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
+// position. The feedback + page-content overlays do depend on the
+// event log, but it advances on EVERY extension event flush (~1/min
+// of edge events, many per flush), so a seq-keyed cache never hits
+// under the real workload (validated: 0 hits, CPU unchanged). Key
+// only on what makes the GRAPH change — current.json (W1c-floored,
+// so stable between drains) + the shadow revision file + the query.
+// The overlays' freshness is bounded by CONNECTIONS_RESPONSE_TTL_MS
+// instead: graph structure is exact, contextual overlays are
+// ≤TTL stale. Consistent with the W2b "connections is contextual,
+// not user-immediate-feedback; staleness is acceptable" stance.
+const connectionsResponseCacheKey = async (
+  vaultRoot: string,
+  querySearch: string,
+): Promise<string> => {
+  const root = join(vaultRoot, '_BAC', 'connections');
+  const [cur, shadow] = await Promise.all([
+    statSig(join(root, 'current.json')),
+    statSig(join(root, 'topics', 'current.shadow.json')),
+  ]);
+  return `cur=${cur}|shadow=${shadow}|q=${querySearch}`;
+};
+// Stable short ETag derived from the (already collision-resistant)
+// cache key. Exposed for HTTP If-None-Match → 304 (staged separately).
+const connectionsResponseEtag = (key: string): string =>
+  `"c-${createHash('sha256').update(key).digest('hex').slice(0, 16)}"`;
+const cachedConnectionsResponse = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<{ result: readonly [number, unknown]; etag: string }> => {
+  const cached = connectionsResponseCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return { result: cached.result, etag: cached.etag };
+  }
+  const inFlight = connectionsResponseInFlight.get(key);
+  if (inFlight !== undefined) {
+    return { result: await inFlight, etag: connectionsResponseEtag(key) };
+  }
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      // Only pin successful full-snapshot responses; errors/empties
+      // are cheap and must not be cached.
+      if (result[0] === 200) {
+        connectionsResponseCache.set(key, {
+          result,
+          etag: connectionsResponseEtag(key),
+          computedAtMs: Date.now(),
+        });
+        // Bound memory: the key changes every flush, so prune expired
+        // entries when the map grows (each entry can be ~14MB).
+        if (connectionsResponseCache.size > 16) {
+          const now = Date.now();
+          for (const [k, v] of connectionsResponseCache) {
+            if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      connectionsResponseInFlight.delete(key);
+    }
+  })();
+  connectionsResponseInFlight.set(key, compute);
+  return { result: await compute, etag: connectionsResponseEtag(key) };
+};
+
+// GET /v1/suggestions/thread/<id> is the dominant "consumer #2"
+// (ground-truth request log: the sidepanel fires one fetch PER
+// visible thread row on every render — observed ~1.3 req/s per
+// thread, ~600ms each: readCurrent 14MB + readMerged whole log +
+// resolveThreadAttribution graph PPR/sim/cluster, UNCACHED). Same
+// fix: cache per (threadId, current.json stat, query). TTL bounds
+// the event-log-derived attribution freshness (deliberately NOT
+// keyed on event seq — that floods, see connections cache note);
+// in-flight dedupe collapses the concurrent duplicate fetches the
+// extension fires on re-render.
+const THREAD_SUGGESTIONS_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_THREAD_SUGGESTIONS_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface ThreadSuggestionsCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly computedAtMs: number;
+}
+const threadSuggestionsCache = new Map<string, ThreadSuggestionsCacheEntry>();
+const threadSuggestionsInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const cachedThreadSuggestions = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> => {
+  const cached = threadSuggestionsCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return cached.result;
+  }
+  const inFlight = threadSuggestionsInFlight.get(key);
+  if (inFlight !== undefined) return inFlight;
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      if (result[0] === 200) {
+        threadSuggestionsCache.set(key, { result, computedAtMs: Date.now() });
+        if (threadSuggestionsCache.size > 64) {
+          const now = Date.now();
+          for (const [k, v] of threadSuggestionsCache) {
+            if (now - v.computedAtMs >= ttlMs) threadSuggestionsCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      threadSuggestionsInFlight.delete(key);
+    }
+  })();
+  threadSuggestionsInFlight.set(key, compute);
   return compute;
 };
 
@@ -4585,64 +4740,77 @@ const routes: readonly RouteDefinition[] = [
       if (match.threadId === undefined) {
         throw new Error('Missing threadId path parameter.');
       }
+      // Capture the guard-narrowed values: TS narrowing from the
+      // throws above does not carry into the cached builder closure.
+      const threadId = match.threadId;
+      const eventLog = context.eventLog;
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const query = suggestionQuerySchema.parse({
         limit: url.searchParams.get('limit') ?? undefined,
         threshold: url.searchParams.get('threshold') ?? undefined,
       });
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      const target = await readThreadSuggestionTarget(vaultRoot, match.threadId);
-      const merged = await context.eventLog.readMerged();
-      const resolution = resolveThreadAttribution({
-        threadId: target.threadId,
-        ...(target.providerThreadId === undefined
-          ? {}
-          : { providerThreadId: target.providerThreadId }),
-        ...(target.threadUrl === undefined ? {} : { threadUrl: target.threadUrl }),
-        snapshot,
-        events: merged,
-      });
-      // Compatibility route: callers still receive a ranked
-      // Suggestion[] array, but the score now comes from the same
-      // graph resolver used by URL/current-tab suggestions.
-      const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
-      const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
-      const threshold = query.threshold ?? defaultThreshold;
-      const suggestions = resolution.fusedCandidates
-        .map((candidate) => {
-          const score = 1 / (1 + Math.exp(-candidate.rawFusionLogit));
-          return {
-            workstreamId: candidate.workstreamId,
-            score,
-            breakdown: {
-              ppr: candidate.pprScore,
-              similarity: candidate.simTopScore,
-              cluster: candidate.clusterPosterior,
-              corroboration: candidate.corroborationCount,
-              margin: resolution.decision.margin,
-            },
-            resolver: {
-              modelRevision: resolution.reasons.modelRevision,
-              graphRevision: resolution.reasons.graphRevision,
-              dominantSource: candidate.dominantSource,
-              action: resolution.decision.action,
-            },
-          };
-        })
-        .filter((suggestion) => suggestion.score >= threshold)
-        .slice(0, query.limit);
-      context.recallActivity?.recordSuggestion({
-        threadId: match.threadId,
-        resultCount: suggestions.length,
-      });
-      return [200, { data: suggestions }];
+      const suggestionsCacheKey = `thread:${threadId}|${await statSig(
+        join(vaultRoot, '_BAC', 'connections', 'current.json'),
+      )}|l=${String(query.limit)}|th=${String(query.threshold ?? '')}`;
+      return cachedThreadSuggestions(
+        suggestionsCacheKey,
+        THREAD_SUGGESTIONS_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const target = await readThreadSuggestionTarget(vaultRoot, threadId);
+          const merged = await eventLog.readMerged();
+          const resolution = resolveThreadAttribution({
+            threadId: target.threadId,
+            ...(target.providerThreadId === undefined
+              ? {}
+              : { providerThreadId: target.providerThreadId }),
+            ...(target.threadUrl === undefined ? {} : { threadUrl: target.threadUrl }),
+            snapshot,
+            events: merged,
+          });
+          // Compatibility route: callers still receive a ranked
+          // Suggestion[] array, but the score now comes from the same
+          // graph resolver used by URL/current-tab suggestions.
+          const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
+          const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
+          const threshold = query.threshold ?? defaultThreshold;
+          const suggestions = resolution.fusedCandidates
+            .map((candidate) => {
+              const score = 1 / (1 + Math.exp(-candidate.rawFusionLogit));
+              return {
+                workstreamId: candidate.workstreamId,
+                score,
+                breakdown: {
+                  ppr: candidate.pprScore,
+                  similarity: candidate.simTopScore,
+                  cluster: candidate.clusterPosterior,
+                  corroboration: candidate.corroborationCount,
+                  margin: resolution.decision.margin,
+                },
+                resolver: {
+                  modelRevision: resolution.reasons.modelRevision,
+                  graphRevision: resolution.reasons.graphRevision,
+                  dominantSource: candidate.dominantSource,
+                  action: resolution.decision.action,
+                },
+              };
+            })
+            .filter((suggestion) => suggestion.score >= threshold)
+            .slice(0, query.limit);
+          context.recallActivity?.recordSuggestion({
+            threadId,
+            resultCount: suggestions.length,
+          });
+          return [200, { data: suggestions }];
+        },
+      );
     },
   },
   {
@@ -5675,122 +5843,133 @@ const routes: readonly RouteDefinition[] = [
       }
       const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
-      let snap = await context.connectionsStore.readCurrent();
-      if (snap === null) {
-        // Materializer hasn't run yet — return an empty scoped
-        // envelope so callers don't have to special-case 404.
-        return [
-          200,
-          {
-            data: {
-              scope: 'companion-extended',
-              snapshot: {
-                scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
-                nodes: [],
-                edges: [],
-                updatedAt: '1970-01-01T00:00:00.000Z',
-                nodeCount: 0,
-                edgeCount: 0,
+      const cacheVaultRoot = requireVaultRoot(context);
+      const cacheKey = await connectionsResponseCacheKey(cacheVaultRoot, url.search);
+      const { result: connectionsResult } = await cachedConnectionsResponse(
+        cacheKey,
+        CONNECTIONS_RESPONSE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          let snap = await context.connectionsStore!.readCurrent();
+          if (snap === null) {
+            // Materializer hasn't run yet — return an empty scoped
+            // envelope so callers don't have to special-case 404.
+            return [
+              200,
+              {
+                data: {
+                  scope: 'companion-extended',
+                  snapshot: {
+                    scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
+                    nodes: [],
+                    edges: [],
+                    updatedAt: '1970-01-01T00:00:00.000Z',
+                    nodeCount: 0,
+                    edgeCount: 0,
+                  },
+                },
               },
-            },
-          },
-        ];
-      }
-      if (topicVariant === 'shadow') {
-        const shadowRevision = await createTopicRevisionStore(
-          requireVaultRoot(context),
-        ).readShadowRevision();
-        if (shadowRevision === null) {
+            ];
+          }
+          if (topicVariant === 'shadow') {
+            const shadowRevision = await createTopicRevisionStore(
+              requireVaultRoot(context),
+            ).readShadowRevision();
+            if (shadowRevision === null) {
+              return [
+                200,
+                {
+                  data: {
+                    scope: 'companion-extended',
+                    snapshot: {
+                      scope: { topicVariant },
+                      nodes: [],
+                      edges: [],
+                      updatedAt: snap.updatedAt,
+                      nodeCount: 0,
+                      edgeCount: 0,
+                      ...(snap.snapshotRevision === undefined
+                        ? {}
+                        : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                    },
+                  },
+                },
+              ];
+            }
+            snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
+          }
+          if (context.eventLog !== undefined) {
+            snap = applyFeedbackOverlayToSnapshot(
+              snap,
+              projectFeedback(await context.eventLog.readMerged()),
+            );
+          }
+          snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
+          // Coarse filters — honoured by simple matchers. workstreamId
+          // narrows to nodes either matching the ws id directly or
+          // having metadata.workstreamId pointing to it; edges between
+          // selected nodes survive.
+          let nodes = snap.nodes;
+          let edges = snap.edges;
+          if (workstreamId !== undefined) {
+            const wsNodeId = `workstream:${workstreamId}`;
+            const keepNodeIds = new Set<string>([wsNodeId]);
+            for (const n of nodes) {
+              if (n.metadata.workstreamId === workstreamId) keepNodeIds.add(n.id);
+            }
+            // Pull in edge endpoints reachable from the kept set in one
+            // hop so the projection is comprehensible.
+            for (const e of edges) {
+              if (keepNodeIds.has(e.fromNodeId)) keepNodeIds.add(e.toNodeId);
+              if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
+            }
+            nodes = nodes.filter((n) => keepNodeIds.has(n.id));
+            edges = edges.filter(
+              (e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId),
+            );
+          }
+          if (nodeKind !== undefined) {
+            nodes = nodes.filter((n) => n.kind === nodeKind);
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
+          if (edgeKind !== undefined) {
+            edges = edges.filter((e) => e.kind === edgeKind);
+          }
+          if (provider !== undefined) {
+            nodes = nodes.filter((n) => n.metadata.provider === provider);
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
+          if (originReplicaId !== undefined) {
+            nodes = nodes.filter((n) => n.originReplicaIds.includes(originReplicaId));
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
           return [
             200,
             {
               data: {
                 scope: 'companion-extended',
                 snapshot: {
-                  scope: { topicVariant },
-                  nodes: [],
-                  edges: [],
+                  scope: {
+                    ...(workstreamId === undefined ? {} : { workstreamId }),
+                    ...(topicVariant === undefined ? {} : { topicVariant }),
+                  },
+                  nodes,
+                  edges,
                   updatedAt: snap.updatedAt,
-                  nodeCount: 0,
-                  edgeCount: 0,
+                  nodeCount: nodes.length,
+                  edgeCount: edges.length,
                   ...(snap.snapshotRevision === undefined
                     ? {}
-                    : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                    : { snapshotRevision: snap.snapshotRevision }),
                 },
               },
             },
           ];
-        }
-        snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
-      }
-      if (context.eventLog !== undefined) {
-        snap = applyFeedbackOverlayToSnapshot(
-          snap,
-          projectFeedback(await context.eventLog.readMerged()),
-        );
-      }
-      snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
-      // Coarse filters — honoured by simple matchers. workstreamId
-      // narrows to nodes either matching the ws id directly or
-      // having metadata.workstreamId pointing to it; edges between
-      // selected nodes survive.
-      let nodes = snap.nodes;
-      let edges = snap.edges;
-      if (workstreamId !== undefined) {
-        const wsNodeId = `workstream:${workstreamId}`;
-        const keepNodeIds = new Set<string>([wsNodeId]);
-        for (const n of nodes) {
-          if (n.metadata.workstreamId === workstreamId) keepNodeIds.add(n.id);
-        }
-        // Pull in edge endpoints reachable from the kept set in one
-        // hop so the projection is comprehensible.
-        for (const e of edges) {
-          if (keepNodeIds.has(e.fromNodeId)) keepNodeIds.add(e.toNodeId);
-          if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
-        }
-        nodes = nodes.filter((n) => keepNodeIds.has(n.id));
-        edges = edges.filter((e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId));
-      }
-      if (nodeKind !== undefined) {
-        nodes = nodes.filter((n) => n.kind === nodeKind);
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      if (edgeKind !== undefined) {
-        edges = edges.filter((e) => e.kind === edgeKind);
-      }
-      if (provider !== undefined) {
-        nodes = nodes.filter((n) => n.metadata.provider === provider);
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      if (originReplicaId !== undefined) {
-        nodes = nodes.filter((n) => n.originReplicaIds.includes(originReplicaId));
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      return [
-        200,
-        {
-          data: {
-            scope: 'companion-extended',
-            snapshot: {
-              scope: {
-                ...(workstreamId === undefined ? {} : { workstreamId }),
-                ...(topicVariant === undefined ? {} : { topicVariant }),
-              },
-              nodes,
-              edges,
-              updatedAt: snap.updatedAt,
-              nodeCount: nodes.length,
-              edgeCount: edges.length,
-              ...(snap.snapshotRevision === undefined
-                ? {}
-                : { snapshotRevision: snap.snapshotRevision }),
-            },
-          },
         },
-      ];
+      );
+      return connectionsResult;
     },
   },
   {
@@ -6029,7 +6208,19 @@ export const handleRequest = async (
 
   try {
     const match = route.pattern.exec(url.pathname);
+    // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
+    // what the extension actually polls + per-request latency. Written
+    // to a file because the screen-session pty isn't capturable.
+    // Fire-and-forget; zero overhead when the env is unset.
+    const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
+    const httpLogStartedMs = httpLog ? Date.now() : 0;
     const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
+    if (httpLog) {
+      void appendFile(
+        '/tmp/sidetrack-http-debug.log',
+        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(status)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+      ).catch(() => undefined);
+    }
     sendJson(response, status, body);
   } catch (error) {
     const issues = getValidationIssues(error);
