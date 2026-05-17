@@ -72,4 +72,31 @@ describe('InboxCard — cross-surface "Graph" jump', () => {
     );
     expect(screen.queryByLabelText('Open in Connections')).toBeNull();
   });
+
+  it('renders the PageEvidence capture tier when present', () => {
+    render(
+      <InboxCard
+        record={record({
+          pageEvidence: {
+            tier: 'content_features_only',
+            evidenceRevision: 'evidence-rev',
+            semanticFeatureRevision: 'semantic-rev',
+            updatedAt: '2026-05-10T10:06:00.000Z',
+            termCount: 64,
+            keyphraseCount: 32,
+            entityCount: 7,
+            quality: 'high',
+          },
+        })}
+        workstreams={workstreams}
+        onAttribute={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('Capture type: Features only')).toBeInTheDocument();
+    expect(screen.getByText('Features only')).toHaveAttribute(
+      'title',
+      expect.stringContaining('64 terms'),
+    );
+  });
 });

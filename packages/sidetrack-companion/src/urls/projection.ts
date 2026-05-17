@@ -55,6 +55,24 @@ export interface UrlIgnoredState {
   readonly seq: number;
 }
 
+export interface UrlPageEvidenceVectorSummary {
+  readonly modelId: string;
+  readonly modelVersion: string;
+  readonly dimensions: number;
+}
+
+export interface UrlPageEvidenceSummary {
+  readonly tier: 'metadata_only' | 'content_features_only' | 'indexed_chunks';
+  readonly evidenceRevision: string;
+  readonly semanticFeatureRevision: string;
+  readonly updatedAt: string;
+  readonly termCount: number;
+  readonly keyphraseCount: number;
+  readonly entityCount: number;
+  readonly quality?: 'high' | 'medium' | 'low';
+  readonly vector?: UrlPageEvidenceVectorSummary;
+}
+
 export interface UrlVisitRecord {
   readonly canonicalUrl: string;
   readonly firstSeenAt: string;
@@ -68,6 +86,7 @@ export interface UrlVisitRecord {
   readonly currentAttribution?: UrlAttribution;
   readonly currentIgnored?: UrlIgnoredState;
   readonly attributionHistory: readonly UrlAttribution[];
+  readonly pageEvidence?: UrlPageEvidenceSummary;
 }
 
 export interface UrlProjection {

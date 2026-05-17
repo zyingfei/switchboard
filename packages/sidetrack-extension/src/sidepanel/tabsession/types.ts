@@ -29,6 +29,24 @@ export interface TabSessionIgnoredState {
   readonly clientEventId: string;
 }
 
+export interface TabSessionPageEvidenceVectorSummary {
+  readonly modelId: string;
+  readonly modelVersion: string;
+  readonly dimensions: number;
+}
+
+export interface TabSessionPageEvidenceSummary {
+  readonly tier: string;
+  readonly evidenceRevision?: string;
+  readonly semanticFeatureRevision?: string;
+  readonly updatedAt?: string;
+  readonly termCount?: number;
+  readonly keyphraseCount?: number;
+  readonly entityCount?: number;
+  readonly quality?: string;
+  readonly vector?: TabSessionPageEvidenceVectorSummary;
+}
+
 export interface TabSessionRecord {
   readonly tabSessionId: string;
   readonly openedAt: string;
@@ -42,6 +60,7 @@ export interface TabSessionRecord {
   readonly currentAttribution?: TabSessionAttribution;
   readonly currentIgnored?: TabSessionIgnoredState;
   readonly attributionHistory: readonly TabSessionAttribution[];
+  readonly pageEvidence?: TabSessionPageEvidenceSummary;
 }
 
 export interface TabSessionProjection {
@@ -134,6 +153,7 @@ export interface UrlVisitRecord {
   readonly currentAttribution?: UrlAttribution;
   readonly currentIgnored?: UrlIgnoredState;
   readonly attributionHistory: readonly UrlAttribution[];
+  readonly pageEvidence?: TabSessionPageEvidenceSummary;
 }
 
 export interface UrlProjection {

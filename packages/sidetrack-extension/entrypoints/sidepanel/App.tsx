@@ -95,6 +95,7 @@ import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats'
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
+import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBadge';
 import { SuggestionBanner } from '../../src/sidepanel/tabsession/SuggestionBanner';
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
@@ -162,6 +163,7 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
           clientEventId: url.currentIgnored.clientEventId,
         },
       }),
+  ...(url.pageEvidence === undefined ? {} : { pageEvidence: url.pageEvidence }),
   attributionHistory: url.attributionHistory,
 });
 
@@ -5665,12 +5667,17 @@ const App = () => {
             <div className="tab-attribution-card-head">
               <span className="tab-attribution-card-eyebrow mono">Current tab</span>
               {focusedTabSession !== undefined ? (
-                <span
-                  className="tab-attribution-card-title"
-                  title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
-                >
-                  {tabSessionDisplayTitle(focusedTabSession)}
-                </span>
+                <>
+                  <span
+                    className="tab-attribution-card-title"
+                    title={
+                      focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)
+                    }
+                  >
+                    {tabSessionDisplayTitle(focusedTabSession)}
+                  </span>
+                  <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
+                </>
               ) : liveActiveTabUrl !== undefined ? (
                 // Optimistic render before urlProjection has the entry.
                 // The companion takes a few seconds to materialize the visit

@@ -6,6 +6,7 @@ import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
@@ -45,6 +46,68 @@ const emptyInput = (overrides: Partial<ConnectionsInput> = {}): ConnectionsInput
   codingSessions: [],
   timelineDays: [],
   tabSessionProjection: createEmptyTabSessionProjection(),
+  ...overrides,
+});
+
+const pageEvidenceRecord = (
+  canonicalUrl: string,
+  overrides: Partial<PageEvidenceRecord> = {},
+): PageEvidenceRecord => ({
+  schemaVersion: 1,
+  canonicalUrl,
+  semanticFeatureRevision: `semantic:${canonicalUrl}`,
+  behaviorMetadataRevision: `behavior:${canonicalUrl}`,
+  evidenceRevision: `evidence:${canonicalUrl}`,
+  updatedAt: '2026-05-07T10:05:00.000Z',
+  evidenceTier: 'content_features_only',
+  versions: {
+    extractionCodeVersion: 'page-evidence-extract-v1',
+    tokenizerVersion: 'page-evidence-tokenizer-v5',
+    embeddingModelId: 'e5-small',
+    embeddingModelVersion: 'v1',
+    embeddingDimensions: 384,
+    featureSchemaVersion: 1,
+  },
+  metadata: {
+    title: 'Example page',
+    host: 'example.com',
+    pathTokens: ['a'],
+    titleTokens: ['example', 'page'],
+  },
+  content: {
+    contentHash: 'content-hash',
+    extractionSource: 'reader-mode',
+    quality: 'high',
+    qualitySignals: {
+      extractedWordCount: 600,
+      contentToDomRatio: 0.72,
+      boilerplateFraction: 0.08,
+      extractionStrategy: 'reader-mode',
+    },
+    terms: [{ term: 'fabric', normalized: 'fabric', weight: 2.4, source: 'body' }],
+    keyphrases: [
+      { term: 'data center fabric', normalized: 'data center fabric', weight: 3.1, source: 'body' },
+    ],
+    entities: [
+      {
+        text: 'Minipack',
+        normalized: 'minipack',
+        kind: 'product',
+        weight: 2.8,
+        source: 'body',
+      },
+    ],
+    docEmbeddingRef: {
+      vectorId: 'vec-1',
+      modelId: 'e5-small',
+      modelVersion: 'v1',
+      dimensions: 384,
+    },
+    embeddingState: 'ready',
+  },
+  provenance: {
+    sources: ['timeline', 'page-content'],
+  },
   ...overrides,
 });
 
@@ -2861,6 +2924,36 @@ describe('connections — Stage 5.2 R1/R4 snapshot extension', () => {
     expect(Object.keys(snap.urlProjection?.byCanonicalUrl ?? {})).toContain(
       'https://example.com/a',
     );
+  });
+
+  it('embeds PageEvidence capture summary in urlProjection records when available', () => {
+    const urlProjection = projectUrls([observation]);
+    const tabSessionProjection = projectTabSessions([observation]);
+    const evidence = pageEvidenceRecord('https://example.com/a');
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        events: [observation],
+        tabSessionProjection,
+        urlProjection,
+        pageEvidenceByCanonicalUrl: new Map([[evidence.canonicalUrl, evidence]]),
+      }),
+    );
+
+    expect(snap.urlProjection?.byCanonicalUrl['https://example.com/a']?.pageEvidence).toEqual({
+      tier: 'content_features_only',
+      evidenceRevision: 'evidence:https://example.com/a',
+      semanticFeatureRevision: 'semantic:https://example.com/a',
+      updatedAt: '2026-05-07T10:05:00.000Z',
+      termCount: 1,
+      keyphraseCount: 1,
+      entityCount: 1,
+      quality: 'high',
+      vector: {
+        modelId: 'e5-small',
+        modelVersion: 'v1',
+        dimensions: 384,
+      },
+    });
   });
 
   it('omits urlProjection when ConnectionsInput.urlProjection is undefined (back-compat)', () => {

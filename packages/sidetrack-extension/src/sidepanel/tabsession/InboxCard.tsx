@@ -7,6 +7,7 @@ import type { EntityDisplayCtx } from '../entityDisplay/format';
 import { AttributionBadge } from './AttributionBadge';
 import { AttributionProvenance } from './AttributionProvenance';
 import { tabSessionDisplayTitle } from './displayTitle';
+import { PageEvidenceBadge } from './PageEvidenceBadge';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionRecord,
@@ -107,6 +108,7 @@ export function InboxCard({
             {title}
           </span>
           <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
+          <PageEvidenceBadge pageEvidence={record.pageEvidence} />
           {canOpenTab ? (
             <button
               type="button"

@@ -49,6 +49,7 @@ import {
 import {
   serializeUrlProjection,
   type UrlAttribution,
+  type UrlPageEvidenceSummary,
   type UrlProjection,
 } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
@@ -320,6 +321,52 @@ const evidenceMetadataForNode = (
             dimensions: evidence.content.docEmbeddingRef.dimensions,
           },
         }),
+  };
+};
+
+const pageEvidenceSummaryForUrl = (evidence: PageEvidenceRecord): UrlPageEvidenceSummary => ({
+  tier: evidence.evidenceTier,
+  evidenceRevision: evidence.evidenceRevision,
+  semanticFeatureRevision: evidence.semanticFeatureRevision,
+  updatedAt: evidence.updatedAt,
+  termCount: evidence.content?.terms.length ?? 0,
+  keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+  entityCount: evidence.content?.entities.length ?? 0,
+  ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+  ...(evidence.content?.docEmbeddingRef === undefined
+    ? {}
+    : {
+        vector: {
+          modelId: evidence.content.docEmbeddingRef.modelId,
+          modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+          dimensions: evidence.content.docEmbeddingRef.dimensions,
+        },
+      }),
+});
+
+const urlProjectionWithPageEvidence = (
+  projection: UrlProjection,
+  evidenceByCanonicalUrl: ReadonlyMap<string, PageEvidenceRecord> | undefined,
+): UrlProjection => {
+  if (evidenceByCanonicalUrl === undefined || evidenceByCanonicalUrl.size === 0) {
+    return projection;
+  }
+  return {
+    schemaVersion: projection.schemaVersion,
+    byCanonicalUrl: new Map(
+      [...projection.byCanonicalUrl.entries()].map(([canonicalUrl, record]) => {
+        const evidence = evidenceByCanonicalUrl.get(canonicalUrl);
+        return [
+          canonicalUrl,
+          evidence === undefined
+            ? record
+            : {
+                ...record,
+                pageEvidence: pageEvidenceSummaryForUrl(evidence),
+              },
+        ] as const;
+      }),
+    ),
   };
 };
 
@@ -3038,7 +3085,11 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // ConnectionsInput for back-compat with older callers.
   const tabSessionProjection = serializeTabSessionProjection(input.tabSessionProjection);
   const urlProjection =
-    input.urlProjection === undefined ? undefined : serializeUrlProjection(input.urlProjection);
+    input.urlProjection === undefined
+      ? undefined
+      : serializeUrlProjection(
+          urlProjectionWithPageEvidence(input.urlProjection, input.pageEvidenceByCanonicalUrl),
+        );
   // Stage 5.2 R4 — stable per-snapshot revision id over byte-deterministic
   // contents. Cheap hash so side panel + resolver can detect stale reads
   // without diffing the whole snapshot.
