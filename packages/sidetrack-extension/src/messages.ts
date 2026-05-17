@@ -405,6 +405,7 @@ export type WorkboardRequest =
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
         readonly notifyOnQueueComplete?: boolean;
+        readonly pageEvidenceAutoExtractEnabled?: boolean;
       };
     }
   | {

@@ -5,7 +5,12 @@ import { SettingsPanel, Wizard } from '../../entrypoints/sidepanel/components';
 
 const STUB_PROPS = {
   settings: null,
-  localPreferences: { autoTrack: false, vaultPath: '', notifyOnQueueComplete: false },
+  localPreferences: {
+    autoTrack: false,
+    vaultPath: '',
+    notifyOnQueueComplete: false,
+    pageEvidenceAutoExtractEnabled: false,
+  },
   companionConfigured: true,
   archivedThreads: [] as const,
   workstreams: [] as const,
@@ -75,6 +80,20 @@ describe('SettingsPanel — Companion connection section', () => {
     );
     const save = screen.getByText('Save connection') as HTMLButtonElement;
     expect(save.disabled).toBe(true);
+  });
+
+  it('saves the local page-evidence auto-capture preference', () => {
+    const onSaveLocalPreferences = vi.fn();
+    render(
+      <SettingsPanel {...STUB_PROPS} onSaveLocalPreferences={onSaveLocalPreferences} />,
+    );
+
+    fireEvent.click(screen.getByText('Capture page evidence after focus'));
+    fireEvent.click(screen.getByText('Save'));
+
+    expect(onSaveLocalPreferences).toHaveBeenCalledWith({
+      pageEvidenceAutoExtractEnabled: true,
+    });
   });
 });
 

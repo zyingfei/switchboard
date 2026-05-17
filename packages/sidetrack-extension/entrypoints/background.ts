@@ -148,6 +148,7 @@ import {
   pruneReminders,
   reorderLocalQueueItems,
   saveNotifyOnQueueComplete,
+  savePageEvidenceAutoExtractEnabled,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -3123,6 +3124,11 @@ const handleRequest = async (
       }
       if (typeof request.preferences.notifyOnQueueComplete === 'boolean') {
         await saveNotifyOnQueueComplete(request.preferences.notifyOnQueueComplete);
+      }
+      if (typeof request.preferences.pageEvidenceAutoExtractEnabled === 'boolean') {
+        await savePageEvidenceAutoExtractEnabled(
+          request.preferences.pageEvidenceAutoExtractEnabled,
+        );
       }
     }, 'settings');
   }

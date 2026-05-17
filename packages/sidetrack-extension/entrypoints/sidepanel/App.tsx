@@ -7237,6 +7237,7 @@ const App = () => {
             autoTrack: state.settings.autoTrack,
             vaultPath: state.vaultPath ?? '',
             notifyOnQueueComplete: state.settings.notifyOnQueueComplete,
+            pageEvidenceAutoExtractEnabled: state.settings.pageEvidenceAutoExtractEnabled,
           }}
           companionConfigured={bridgeKey.length > 0}
           workstreams={state.workstreams}
