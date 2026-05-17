@@ -101,6 +101,7 @@ import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionInboxData,
+  type TabSessionPageEvidenceSummary,
   type TabSessionProjection,
   type TabSessionRecord,
   type TabSessionResolutionResult,
@@ -166,6 +167,35 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
   ...(url.pageEvidence === undefined ? {} : { pageEvidence: url.pageEvidence }),
   attributionHistory: url.attributionHistory,
 });
+
+const fallbackHostTitle = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+};
+
+const urlRecordFromLiveTab = (input: {
+  readonly canonicalUrl: string;
+  readonly liveUrl?: string;
+  readonly title?: string;
+  readonly pageEvidence?: TabSessionPageEvidenceSummary;
+}): UrlVisitRecord => {
+  const liveUrl = input.liveUrl ?? input.canonicalUrl;
+  return {
+    canonicalUrl: input.canonicalUrl,
+    firstSeenAt: '',
+    lastSeenAt: '',
+    visitCount: 0,
+    tabSessionIds: [],
+    latestUrl: liveUrl,
+    latestTitle: input.title ?? fallbackHostTitle(liveUrl),
+    provider: detectProviderFromUrl(liveUrl),
+    attributionHistory: [],
+    ...(input.pageEvidence === undefined ? {} : { pageEvidence: input.pageEvidence }),
+  };
+};
 
 // The URL resolver returns a UrlResolutionResult ({ canonicalUrl, … });
 // the existing InboxCard / SuggestionBanner / AttributionBadge expect
@@ -289,6 +319,30 @@ const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
     typeof value['decision']['workstreamId'] === 'string') &&
   typeof value['decision']['margin'] === 'number' &&
   Array.isArray(value['fusedCandidates']);
+
+const isPageEvidenceSummary = (value: unknown): value is TabSessionPageEvidenceSummary =>
+  isPlainRecord(value) &&
+  typeof value['tier'] === 'string' &&
+  (value['evidenceRevision'] === undefined || typeof value['evidenceRevision'] === 'string') &&
+  (value['semanticFeatureRevision'] === undefined ||
+    typeof value['semanticFeatureRevision'] === 'string') &&
+  (value['updatedAt'] === undefined || typeof value['updatedAt'] === 'string') &&
+  (value['termCount'] === undefined || typeof value['termCount'] === 'number') &&
+  (value['keyphraseCount'] === undefined || typeof value['keyphraseCount'] === 'number') &&
+  (value['entityCount'] === undefined || typeof value['entityCount'] === 'number') &&
+  (value['quality'] === undefined || typeof value['quality'] === 'string');
+
+interface PageEvidenceSummaryLookup {
+  readonly canonicalUrl: string;
+  readonly pageEvidence: TabSessionPageEvidenceSummary | null;
+  readonly stale: boolean;
+}
+
+const isPageEvidenceSummaryLookup = (value: unknown): value is PageEvidenceSummaryLookup =>
+  isPlainRecord(value) &&
+  typeof value['canonicalUrl'] === 'string' &&
+  (value['pageEvidence'] === null || isPageEvidenceSummary(value['pageEvidence'])) &&
+  typeof value['stale'] === 'boolean';
 
 const sendRequestRaw = async (
   request: WorkboardRequest,
@@ -789,6 +843,10 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  const [livePageEvidenceByUrl, setLivePageEvidenceByUrl] = useState<
+    Record<string, TabSessionPageEvidenceSummary>
+  >({});
+  const [livePageEvidenceRetryTick, setLivePageEvidenceRetryTick] = useState(0);
   // Stage 5 follow-up — refs let loadTabSessions read the latest
   // suggestion cache without listing it as a dep (which would
   // re-create the callback + tear down the 4s interval on every
@@ -1490,9 +1548,10 @@ const App = () => {
                 state.activeTabUrl ??
                 state.currentTab?.tabSnapshot?.url ??
                 state.currentTab?.threadUrl;
+              const focusedComparable = comparableTabUrl(focusedCanonical);
               const focusedExtras =
-                typeof focusedCanonical === 'string' && focusedCanonical.length > 0
-                  ? [focusedCanonical]
+                typeof focusedComparable === 'string' && focusedComparable.length > 0
+                  ? [focusedComparable]
                   : [];
               void loadUrlSuggestions(
                 urlInboxResp,
@@ -2662,8 +2721,8 @@ const App = () => {
       viewMode,
       companionStatus: state.companionStatus,
       focused: {
-        canonicalUrl: focusedUrlRecord?.canonicalUrl,
-        record: focusedUrlRecord,
+        canonicalUrl: focusedDisplayUrlRecord?.canonicalUrl,
+        record: focusedDisplayUrlRecord,
         suggestion: focusedTabSuggestion,
       },
       urlInbox: {
@@ -3828,6 +3887,48 @@ const App = () => {
       state.currentTab?.tabSnapshot?.url ??
       state.currentTab?.threadUrl,
   );
+  useEffect(() => {
+    if (focusedTabUrl === null || port.length === 0 || bridgeKey.length === 0) return undefined;
+    const cached = livePageEvidenceByUrl[focusedTabUrl];
+    if (cached !== undefined) return undefined;
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    void fetchCompanionJson<unknown>(
+      `/v1/page-evidence/summary?canonicalUrl=${encodeURIComponent(focusedTabUrl)}`,
+    )
+      .then((payload) => {
+        if (cancelled || !isPageEvidenceSummaryLookup(payload)) return;
+        if (payload.pageEvidence === null) {
+          retryTimer = setTimeout(() => {
+            setLivePageEvidenceRetryTick((tick) => tick + 1);
+          }, 3_000);
+        } else {
+          const pageEvidence = payload.pageEvidence;
+          setLivePageEvidenceByUrl((current) => ({
+            ...current,
+            [payload.canonicalUrl]: pageEvidence,
+            [focusedTabUrl]: pageEvidence,
+          }));
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        retryTimer = setTimeout(() => {
+          setLivePageEvidenceRetryTick((tick) => tick + 1);
+        }, 3_000);
+      });
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+    };
+  }, [
+    bridgeKey,
+    fetchCompanionJson,
+    focusedTabUrl,
+    livePageEvidenceByUrl,
+    livePageEvidenceRetryTick,
+    port,
+  ]);
   // Per-URL state: every visible attribution surface (Current tab,
   // Inbox, Pages-in-this-workstream) reads from `urlProjection` instead
   // of the tab-session projection. The synthesized TabSessionRecord
@@ -3851,15 +3952,50 @@ const App = () => {
     // urlRecords is sorted by lastSeenAt desc.
     return urlRecords.find((record) => comparableTabUrl(record.canonicalUrl) === focusedTabUrl);
   }, [focusedTabUrl, urlProjection, urlRecords]);
+  const focusedDisplayUrlRecord = useMemo(() => {
+    if (focusedUrlRecord !== undefined) return focusedUrlRecord;
+    if (focusedTabUrl === null) return undefined;
+    return urlRecordFromLiveTab({
+      canonicalUrl: focusedTabUrl,
+      liveUrl:
+        liveActiveTabUrl ??
+        state.activeTabUrl ??
+        state.currentTab?.tabSnapshot?.url ??
+        state.currentTab?.threadUrl ??
+        focusedTabUrl,
+      title:
+        liveActiveTabTitle ??
+        state.currentTab?.tabSnapshot?.title ??
+        state.currentTab?.title ??
+        undefined,
+      pageEvidence: livePageEvidenceByUrl[focusedTabUrl],
+    });
+  }, [
+    focusedTabUrl,
+    focusedUrlRecord,
+    liveActiveTabTitle,
+    liveActiveTabUrl,
+    livePageEvidenceByUrl,
+    state.activeTabUrl,
+    state.currentTab?.tabSnapshot?.title,
+    state.currentTab?.tabSnapshot?.url,
+    state.currentTab?.threadUrl,
+    state.currentTab?.title,
+  ]);
   const focusedTabSession = useMemo(
-    () => (focusedUrlRecord === undefined ? undefined : tabSessionRecordFromUrl(focusedUrlRecord)),
-    [focusedUrlRecord],
+    () =>
+      focusedDisplayUrlRecord === undefined
+        ? undefined
+        : tabSessionRecordFromUrl(focusedDisplayUrlRecord),
+    [focusedDisplayUrlRecord],
   );
   const focusedTabSuggestion =
-    focusedUrlRecord === undefined ? undefined : urlSuggestions[focusedUrlRecord.canonicalUrl];
+    focusedDisplayUrlRecord === undefined
+      ? undefined
+      : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
   const focusedSuggestionIsActionable =
-    focusedUrlRecord !== undefined &&
-    focusedUrlRecord.currentAttribution === undefined &&
+    focusedDisplayUrlRecord !== undefined &&
+    focusedDisplayUrlRecord.currentAttribution === undefined &&
     focusedTabSuggestion?.decision.action === 'suggest' &&
     focusedTabSuggestion.decision.workstreamId !== undefined;
   const fallbackSuggestedUrl = useMemo(
@@ -3874,7 +4010,9 @@ const App = () => {
       }),
     [urlRecords, urlSuggestions],
   );
-  const suggestedOpenUrl = focusedSuggestionIsActionable ? focusedUrlRecord : fallbackSuggestedUrl;
+  const suggestedOpenUrl = focusedSuggestionIsActionable
+    ? focusedDisplayUrlRecord
+    : fallbackSuggestedUrl;
   const suggestedOpenTabSession = useMemo(
     () => (suggestedOpenUrl === undefined ? undefined : tabSessionRecordFromUrl(suggestedOpenUrl)),
     [suggestedOpenUrl],
@@ -4067,19 +4205,6 @@ const App = () => {
     const expandedDraft =
       reviewDraftExpandFor === thread.bac_id && reviewDraft !== undefined ? reviewDraft : null;
     const reviewDraftExpanded = expandedDraft !== null;
-    const threadUrlAttribution =
-      urlProjection === null
-        ? undefined
-        : (() => {
-            const canonicalUrl = comparableTabUrl(thread.threadUrl);
-            return canonicalUrl === null
-              ? undefined
-              : urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
-          })();
-    const suppressAutoSuggestion =
-      threadUrlAttribution !== undefined &&
-      threadUrlAttribution.workstreamId !== null &&
-      (threadUrlAttribution.source === 'user_asserted' || threadUrlAttribution.source === 'thread');
     return (
       <div
         key={thread.bac_id}
@@ -4229,9 +4354,7 @@ const App = () => {
             </button>
           ) : null}
         </div>
-        {lifecyclePill?.label === 'Needs organize' &&
-        !dismissedSuggestions.has(thread.bac_id) &&
-        !suppressAutoSuggestion ? (
+        {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
           <NeedsOrganizeSuggestionRow
             threadId={thread.bac_id}
             companionPort={port.length > 0 ? Number(port) : null}
@@ -5689,7 +5812,18 @@ const App = () => {
                   >
                     {tabSessionDisplayTitle(focusedTabSession)}
                   </span>
-                  <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
+                  {focusedTabSession.pageEvidence === undefined ? (
+                    <span
+                      className="tab-session-capture-badge is-unknown"
+                      title="Capture status: waiting for PageEvidence metadata from the companion."
+                      aria-label="Capture status: pending"
+                      data-testid="page-evidence-capture-badge"
+                    >
+                      Capturing
+                    </span>
+                  ) : (
+                    <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
+                  )}
                 </>
               ) : liveActiveTabUrl !== undefined ? (
                 // Optimistic render before urlProjection has the entry.
@@ -5759,9 +5893,9 @@ const App = () => {
               Renders for any unattributed/un-ignored focused URL — when
               the resolver has no candidates we still draw the empty
               placeholder so the user sees why the badge is "?". */}
-                  {focusedUrlRecord !== undefined &&
-                  focusedUrlRecord.currentAttribution === undefined &&
-                  focusedUrlRecord.currentIgnored === undefined ? (
+                  {focusedDisplayUrlRecord !== undefined &&
+                  focusedDisplayUrlRecord.currentAttribution === undefined &&
+                  focusedDisplayUrlRecord.currentIgnored === undefined ? (
                     <SuggestionStats
                       suggestion={
                         focusedTabSuggestion === undefined
@@ -5786,19 +5920,19 @@ const App = () => {
             high-enough suggestion exists; the other three always
             render so the user can take the corresponding action even
             when no suggestion is present. */}
-                {focusedUrlRecord !== undefined ? (
+                {focusedDisplayUrlRecord !== undefined ? (
                   <div className="tab-attribution-card-actions">
                     {focusedTabSuggestion !== undefined &&
                     focusedTabSuggestion.decision.workstreamId !== undefined &&
-                    focusedUrlRecord.currentAttribution === undefined &&
-                    focusedUrlRecord.currentIgnored === undefined ? (
+                    focusedDisplayUrlRecord.currentAttribution === undefined &&
+                    focusedDisplayUrlRecord.currentIgnored === undefined ? (
                       <button
                         type="button"
                         className="tab-attribution-card-action primary"
                         onClick={() => {
                           if (focusedTabSuggestion.decision.workstreamId !== undefined) {
                             handleUrlAttribute(
-                              focusedUrlRecord.canonicalUrl,
+                              focusedDisplayUrlRecord.canonicalUrl,
                               focusedTabSuggestion.decision.workstreamId,
                             );
                           }
@@ -5812,7 +5946,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
+                        setTabSessionMoveId(focusedDisplayUrlRecord.canonicalUrl);
                       }}
                       title="Pick a different workstream"
                     >
@@ -5822,7 +5956,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+                        handleUrlAttribute(focusedDisplayUrlRecord.canonicalUrl, null);
                       }}
                       title="This page is meaningful but doesn't belong to any workstream"
                     >
@@ -5832,7 +5966,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+                        handleUrlIgnore(focusedDisplayUrlRecord.canonicalUrl, 'noise');
                       }}
                       title="Mute this URL — don't bother me about it again"
                     >
@@ -5848,7 +5982,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
+                        requestSwitchToConnections(focusedDisplayUrlRecord.canonicalUrl);
                       }}
                       title="Open this URL's neighborhood in the Connections graph"
                       data-testid="focused-tab-open-in-connections"
@@ -6319,8 +6453,8 @@ const App = () => {
               .map(tabSessionRecordFromUrl)
               .filter(
                 (item) =>
-                  focusedUrlRecord === undefined ||
-                  item.tabSessionId !== focusedUrlRecord.canonicalUrl,
+                  focusedDisplayUrlRecord === undefined ||
+                  item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl,
               ),
             total: urlInbox.total,
             limit: urlInbox.limit,

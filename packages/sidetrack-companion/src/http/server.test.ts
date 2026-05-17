@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
+import { writeMetadataOnlyPageEvidence } from '../page-evidence/store.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -192,6 +193,38 @@ describe('companion HTTP server', () => {
 
     expect(result.status).toBe(401);
     expect(result.body).toMatchObject({ code: 'AUTHENTICATION_FAILED' });
+  });
+
+  it('serves compact PageEvidence summaries without raw text', async () => {
+    await writeMetadataOnlyPageEvidence(vaultPath, {
+      canonicalUrl: 'https://example.test/live-current',
+      title: 'Live Current Page',
+      provider: 'other',
+      lastSeenAt: '2026-05-17T09:10:00.000Z',
+      visitCount: 1,
+    });
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/page-evidence/summary?canonicalUrl=${encodeURIComponent('https://example.test/live-current')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({
+      data: {
+        canonicalUrl: 'https://example.test/live-current',
+        pageEvidence: {
+          tier: 'metadata_only',
+          termCount: 0,
+          keyphraseCount: 0,
+          entityCount: 0,
+        },
+        stale: false,
+      },
+    });
+    expect(JSON.stringify(result.body)).not.toContain('rawText');
+    expect(JSON.stringify(result.body)).not.toContain('Live Current Page');
   });
 
   it('reports service status through a stubbed installer', async () => {

@@ -45,7 +45,7 @@ import {
   type PageContentExtractedPayload,
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
-import { writeExtractedPageEvidence } from '../page-evidence/store.js';
+import { readPageEvidence, writeExtractedPageEvidence } from '../page-evidence/store.js';
 import {
   type PageEvidenceExtractedEventPayload,
   type PageEvidenceExtractedRequest,
@@ -1063,6 +1063,26 @@ const pageEvidenceExtractedEventPayload = (
     ? {}
     : { embeddingState: evidence.content.embeddingState }),
   trigger: request.extractionPolicy.trigger,
+});
+
+const pageEvidenceSummaryPayload = (evidence: PageEvidenceRecord): Record<string, unknown> => ({
+  tier: evidence.evidenceTier,
+  evidenceRevision: evidence.evidenceRevision,
+  semanticFeatureRevision: evidence.semanticFeatureRevision,
+  updatedAt: evidence.updatedAt,
+  termCount: evidence.content?.terms.length ?? 0,
+  keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+  entityCount: evidence.content?.entities.length ?? 0,
+  ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+  ...(evidence.content?.docEmbeddingRef === undefined
+    ? {}
+    : {
+        vector: {
+          modelId: evidence.content.docEmbeddingRef.modelId,
+          modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+          dimensions: evidence.content.docEmbeddingRef.dimensions,
+        },
+      }),
 });
 
 const compactPageContentTombstonedPayload = (
@@ -4265,6 +4285,46 @@ const routes: readonly RouteDefinition[] = [
         }
         return [202, { data: { coverage } }];
       });
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/page-evidence\/summary(?:\?.*)?$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const canonicalUrl = url.searchParams.get('canonicalUrl');
+      if (canonicalUrl === null || canonicalUrl.length === 0) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'canonicalUrl query parameter is required.',
+          'GET /v1/page-evidence/summary requires a canonicalUrl query parameter.',
+        );
+      }
+      try {
+        const result = await readPageEvidence(vaultRoot, canonicalUrl);
+        return [
+          200,
+          {
+            data: {
+              canonicalUrl: result.record?.canonicalUrl ?? canonicalUrl,
+              pageEvidence:
+                result.record === null ? null : pageEvidenceSummaryPayload(result.record),
+              stale: result.stale,
+              ...(result.staleReason === undefined ? {} : { staleReason: result.staleReason }),
+            },
+          },
+        ];
+      } catch (error) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          error instanceof Error ? error.message : 'Invalid canonicalUrl.',
+        );
+      }
     },
   },
   {
