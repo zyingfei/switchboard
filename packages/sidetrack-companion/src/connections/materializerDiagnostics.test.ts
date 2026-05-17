@@ -15,6 +15,7 @@ import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection, UrlVisitRecord } from '../urls/projection.js';
 
 import {
+  DIAGNOSTICS_HISTORY_MAX,
   attachDriftReport,
   collectMaterializerDiagnostics,
   createMaterializerDiagnosticsStore,
@@ -736,6 +737,30 @@ describe('createMaterializerDiagnosticsStore', () => {
       '2026-05-10T00-00-00-000Z.json',
       '2026-05-10T00-00-01-000Z.json',
     ]);
+  });
+
+  it('prunes the history dir to the newest DIAGNOSTICS_HISTORY_MAX entries', async () => {
+    const store = createMaterializerDiagnosticsStore(vaultRoot);
+    const base = Date.parse('2026-05-10T00:00:00.000Z');
+    const total = DIAGNOSTICS_HISTORY_MAX + 5;
+    for (let i = 0; i < total; i += 1) {
+      const producedAt = new Date(base + i * 1000).toISOString();
+      // eslint-disable-next-line no-await-in-loop
+      await store.write(collectMaterializerDiagnostics(baseInput({ producedAt })));
+    }
+    const entries = (
+      await readdir(join(vaultRoot, '_BAC/connections/diagnostics/history'))
+    ).sort();
+    // Unbounded before this fix (one file per drain, forever); now
+    // capped at the newest DIAGNOSTICS_HISTORY_MAX.
+    expect(entries).toHaveLength(DIAGNOSTICS_HISTORY_MAX);
+    const fileFor = (offsetMs: number): string =>
+      `${new Date(base + offsetMs).toISOString().replace(/[:.]/gu, '-')}.json`;
+    // Newest kept, oldest 5 pruned.
+    expect(entries[entries.length - 1]).toBe(fileFor((total - 1) * 1000));
+    expect(entries).not.toContain(fileFor(0));
+    expect(entries).not.toContain(fileFor(4 * 1000));
+    expect(entries).toContain(fileFor(5 * 1000));
   });
 });
 

@@ -9,7 +9,7 @@
 // verified against the deltas in these counters, not against "the code
 // runs."
 
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { appendHealthHistory } from './healthHistory.js';
@@ -50,6 +50,12 @@ export const MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION = 1;
 const DIAGNOSTICS_RELATIVE_DIR = '_BAC/connections/diagnostics';
 const DIAGNOSTICS_LATEST_FILENAME = 'latest.json';
 const DIAGNOSTICS_HISTORY_DIRNAME = 'history';
+// Bounded retention for the per-drain history files. This dir had NO
+// pruner — it grew one JSON per drain forever (observed at 4k+ files),
+// and the reconcile path re-walked it, compounding the constant-CPU
+// runaway. The health-history ring (HEALTH_HISTORY_MAX) is the trend
+// source; this dir is ad-hoc forensics, so a few hundred is plenty.
+export const DIAGNOSTICS_HISTORY_MAX = 240;
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
 const WORKSTREAM_PREFIX = 'workstream:';
 
@@ -1008,6 +1014,23 @@ export const createMaterializerDiagnosticsStore = (
     await rename(tmpPath, latestPath);
     const historyPath = join(historyDir, `${safeFilenameTimestamp(diagnostics.producedAt)}.json`);
     await writeFile(historyPath, body, 'utf8');
+    // Bounded retention — prune oldest beyond DIAGNOSTICS_HISTORY_MAX.
+    // safeFilenameTimestamp is ISO-derived (fixed-width, `:`/`.` -> `-`)
+    // so lexicographic sort == chronological. Best-effort: observability
+    // must never fail a drain.
+    try {
+      const historyFiles = (await readdir(historyDir))
+        .filter((name) => name.endsWith('.json'))
+        .sort();
+      if (historyFiles.length > DIAGNOSTICS_HISTORY_MAX) {
+        const stale = historyFiles.slice(0, historyFiles.length - DIAGNOSTICS_HISTORY_MAX);
+        await Promise.all(
+          stale.map((name) => unlink(join(historyDir, name)).catch(() => undefined)),
+        );
+      }
+    } catch {
+      /* prune is best-effort; never fail the drain */
+    }
     // Feed the dumb fixed-window ring (plan TODO-H5). Best-effort:
     // observability must never break a drain, and the ring is the
     // trend source the Focus surface reads instead of scanning the
