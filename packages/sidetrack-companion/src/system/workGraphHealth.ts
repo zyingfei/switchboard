@@ -378,6 +378,18 @@ const buildDiagnosticCandidates = (input: {
     raw !== null && isRecord(raw['shadowObservation']) ? raw['shadowObservation'] : null;
   const hdbscan =
     raw !== null && isRecord(raw['hdbscanVsBaseline']) ? raw['hdbscanVsBaseline'] : null;
+  const algoComparison =
+    raw !== null && isRecord(raw['topicAlgorithmComparison'])
+      ? raw['topicAlgorithmComparison']
+      : null;
+  const algoWinnerMetrics = ((): Record<string, unknown> | null => {
+    if (algoComparison === null || !Array.isArray(algoComparison['byCandidate'])) return null;
+    const winnerId = stringOrNull(algoComparison['winner']);
+    const found = (algoComparison['byCandidate'] as readonly unknown[]).find(
+      (entry) => isRecord(entry) && stringOrNull(entry['candidate']) === winnerId,
+    );
+    return isRecord(found) ? found : null;
+  })();
   const driftReport = raw !== null && isRecord(raw['drift']) ? raw['drift'] : null;
   const silhouette =
     driftReport !== null && isRecord(driftReport['silhouette']) ? driftReport['silhouette'] : null;
@@ -457,13 +469,28 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'topic.algorithm-comparison',
       family: 'topic',
-      lane: 'standby',
-      servingImpact: 'not-serving',
-      status: 'off',
-      reason: 'no-runtime-route',
-      revisionId: null,
-      asOf: liveObservedAt,
-      metrics: metrics({ comparisonCandidatesWritten: true }),
+      // U3 — now an active observe-only benchmark lane (was a
+      // structurally 'off' standby with 'no-runtime-route'). The
+      // 5-algorithm sweep runs once per version against the synthetic
+      // FocusEvalPack; the winner + per-candidate metrics are
+      // surfaced here.
+      lane: 'shadow',
+      servingImpact: 'observe-only',
+      status: algoComparison === null ? 'unavailable' : 'ok',
+      reason: algoComparison === null ? 'algorithm-comparison-unavailable' : null,
+      revisionId: stringOrNull(algoComparison?.['version']),
+      asOf: algoComparison === null ? liveObservedAt : diagnosticsObservedAt,
+      metrics: metrics({
+        winner: stringOrNull(algoComparison?.['winner']),
+        version: stringOrNull(algoComparison?.['version']),
+        candidateCount: Array.isArray(algoComparison?.['byCandidate'])
+          ? (algoComparison['byCandidate'] as readonly unknown[]).length
+          : null,
+        winnerBCubedF1: numberOrNull(algoWinnerMetrics?.['bCubedF1']),
+        winnerOmegaIndex: numberOrNull(algoWinnerMetrics?.['omegaIndex']),
+        winnerLabeledPairAccuracy: numberOrNull(algoWinnerMetrics?.['labeledPairAccuracy']),
+        winnerTopicCount: numberOrNull(algoWinnerMetrics?.['topicCount']),
+      }),
     },
     {
       id: 'topic.shadow-idf-rkn-split',

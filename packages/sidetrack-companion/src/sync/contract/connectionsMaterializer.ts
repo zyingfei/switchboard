@@ -61,6 +61,19 @@ import {
   type HotPathDiagnostics,
 } from '../../connections/hotPathMode.js';
 import {
+  runTopicAlgorithmComparison,
+  writeTopicAlgorithmComparisonShadows,
+} from '../../connections/topicAlgorithmComparison.js';
+import { buildFocusEvalPack } from '../../connections/focusEvalPack.js';
+import {
+  readTopicAlgorithmComparisonSummary,
+  shouldRunTopicAlgorithmComparison,
+  summarizeTopicAlgorithmComparison,
+  TOPIC_ALGORITHM_COMPARISON_VERSION,
+  writeTopicAlgorithmComparisonSummary,
+  type TopicAlgorithmComparisonSummary,
+} from '../../connections/topicAlgorithmComparisonSummary.js';
+import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
   resolveVisitSimilarityConfig,
@@ -1404,6 +1417,32 @@ export const createConnectionsMaterializer = (
         );
       }
     }
+    // U3 — topic.algorithm-comparison. runTopicAlgorithmComparison
+    // scores 5 clustering algorithms against the SYNTHETIC
+    // FocusEvalPack benchmark (not the user's vault), so it is
+    // deterministic + input-invariant: compute ONCE per version, then
+    // every later drain just reuses the persisted summary (tiny read;
+    // the 5-algorithm cost never repeats). Default ON;
+    // SIDETRACK_TOPIC_ALGORITHM_COMPARISON=off disables.
+    let topicAlgorithmComparison: TopicAlgorithmComparisonSummary | null = null;
+    if (shouldRunTopicAlgorithmComparison()) {
+      const persistedComparison = await readTopicAlgorithmComparisonSummary(deps.vaultRoot);
+      if (
+        persistedComparison !== null &&
+        persistedComparison.version === TOPIC_ALGORITHM_COMPARISON_VERSION
+      ) {
+        topicAlgorithmComparison = persistedComparison;
+        mark(`topicAlgorithmComparison reuse winner=${persistedComparison.winner}`);
+      } else {
+        const comparisonResults = await runTopicAlgorithmComparison({
+          pack: buildFocusEvalPack(),
+        });
+        await writeTopicAlgorithmComparisonShadows(topicRevisionStore, comparisonResults);
+        topicAlgorithmComparison = summarizeTopicAlgorithmComparison(comparisonResults);
+        await writeTopicAlgorithmComparisonSummary(deps.vaultRoot, topicAlgorithmComparison);
+        mark(`topicAlgorithmComparison computed winner=${topicAlgorithmComparison.winner}`);
+      }
+    }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -1535,6 +1574,7 @@ export const createConnectionsMaterializer = (
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
       ...(topicHdbscanDiagnostics === null ? {} : { topicHdbscanDiagnostics }),
+      ...(topicAlgorithmComparison === null ? {} : { topicAlgorithmComparison }),
       hotPathDiagnostics,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series

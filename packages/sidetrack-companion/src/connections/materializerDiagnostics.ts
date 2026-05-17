@@ -32,6 +32,7 @@ import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
 import type { TopicCandidateAbDiagnostics } from './topicCandidateAb.js';
 import type { HotPathDiagnostics } from './hotPathMode.js';
+import type { TopicAlgorithmComparisonSummary } from './topicAlgorithmComparisonSummary.js';
 import {
   DriftMonitor,
   extractDriftSamples,
@@ -281,6 +282,9 @@ export interface MaterializerDiagnostics {
   // U2 — incremental hot-path decision + cheap counters (similarity +
   // topics). Always present (the materializer always produces it).
   readonly hotPath?: HotPathDiagnostics;
+  // U3 — the algorithm-comparison benchmark summary (winner +
+  // per-candidate metrics on the synthetic FocusEvalPack).
+  readonly topicAlgorithmComparison?: TopicAlgorithmComparisonSummary;
   // Statistical drift/evaluation layer. Optional: present once the
   // drift monitor has run for the drain. Absent for legacy fixtures
   // and for the pure `collectMaterializerDiagnostics` path (which does
@@ -313,6 +317,7 @@ export interface MaterializerDiagnosticsInput {
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
   readonly topicHdbscanDiagnostics?: TopicCandidateAbDiagnostics;
   readonly hotPathDiagnostics?: HotPathDiagnostics;
+  readonly topicAlgorithmComparison?: TopicAlgorithmComparisonSummary;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -908,6 +913,9 @@ export const collectMaterializerDiagnostics = (
     ...(input.hotPathDiagnostics === undefined
       ? {}
       : { hotPath: input.hotPathDiagnostics }),
+    ...(input.topicAlgorithmComparison === undefined
+      ? {}
+      : { topicAlgorithmComparison: input.topicAlgorithmComparison }),
   };
 };
 
