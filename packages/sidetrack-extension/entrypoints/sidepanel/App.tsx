@@ -996,8 +996,8 @@ const App = () => {
     }
   }, []);
   // Cache of suggested workstream per thread, keyed by thread bac_id.
-  // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
-  // Track F) when the row is rendered. Empty fallback shows nothing.
+  // Populated from companion's unified resolver compatibility route,
+  // GET /v1/suggestions/thread/{id}, when the row is rendered. Empty fallback shows nothing.
   // Stale-while-revalidate semantics: each row renders the cached
   // value immediately AND always kicks a background fetch on mount
   // / on workstream-state change / on explicit refresh. Cache is
@@ -4067,6 +4067,19 @@ const App = () => {
     const expandedDraft =
       reviewDraftExpandFor === thread.bac_id && reviewDraft !== undefined ? reviewDraft : null;
     const reviewDraftExpanded = expandedDraft !== null;
+    const threadUrlAttribution =
+      urlProjection === null
+        ? undefined
+        : (() => {
+            const canonicalUrl = comparableTabUrl(thread.threadUrl);
+            return canonicalUrl === null
+              ? undefined
+              : urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
+          })();
+    const suppressAutoSuggestion =
+      threadUrlAttribution !== undefined &&
+      threadUrlAttribution.workstreamId !== null &&
+      (threadUrlAttribution.source === 'user_asserted' || threadUrlAttribution.source === 'thread');
     return (
       <div
         key={thread.bac_id}
@@ -4216,7 +4229,9 @@ const App = () => {
             </button>
           ) : null}
         </div>
-        {lifecyclePill?.label === 'Needs organize' && !dismissedSuggestions.has(thread.bac_id) ? (
+        {lifecyclePill?.label === 'Needs organize' &&
+        !dismissedSuggestions.has(thread.bac_id) &&
+        !suppressAutoSuggestion ? (
           <NeedsOrganizeSuggestionRow
             threadId={thread.bac_id}
             companionPort={port.length > 0 ? Number(port) : null}
@@ -5670,9 +5685,7 @@ const App = () => {
                 <>
                   <span
                     className="tab-attribution-card-title"
-                    title={
-                      focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)
-                    }
+                    title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
                   >
                     {tabSessionDisplayTitle(focusedTabSession)}
                   </span>
@@ -7455,9 +7468,9 @@ export default App;
 // Spec-aligned UI subcomponents (PR 2 / design rewrite)
 // =====================================================
 
-// Per-row workstream-suggestion fetcher. Calls
-// GET /v1/suggestions/thread/{id} (PR #76 Track F) when companion is
-// configured. Caches the top suggestion via the parent's onCache so
+// Per-row workstream-suggestion fetcher. Calls the unified resolver
+// compatibility route, GET /v1/suggestions/thread/{id}, when companion
+// is configured. Caches the top suggestion via the parent's onCache so
 // repeated row renders don't re-fetch.
 
 interface NeedsOrganizeSuggestionRowProps {

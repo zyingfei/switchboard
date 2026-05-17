@@ -1,5 +1,5 @@
 // Per-row workstream suggestion for the workboard's Needs-Organize
-// section. Backed by `bac.suggest_workstream` (PR #76 Track F).
+// section. Backed by the companion's unified resolver compatibility route.
 // Renders inline below a thread row's existing label/provider line.
 //
 // Two visual modes, decided by whether confidence > 0:

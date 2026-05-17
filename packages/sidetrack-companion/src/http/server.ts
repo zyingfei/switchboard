@@ -110,7 +110,11 @@ import {
 } from '../tabsession/projection.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
-import { resolveAttribution, resolveUrlAttribution } from '../tabsession/resolver.js';
+import {
+  resolveAttribution,
+  resolveThreadAttribution,
+  resolveUrlAttribution,
+} from '../tabsession/resolver.js';
 import {
   deserializeUrlProjection,
   projectUrls,
@@ -135,8 +139,6 @@ import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudg
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
-import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
-import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { vectorFromEvents, type TargetRef, type VersionVector } from '../sync/causal.js';
@@ -770,29 +772,39 @@ const readWorkstreamThreadIds = async (
   return ids;
 };
 
-const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignalsWorkstream[]> => {
-  const root = join(vaultRoot, '_BAC', 'workstreams');
+interface ThreadSuggestionTarget {
+  readonly threadId: string;
+  readonly providerThreadId?: string;
+  readonly threadUrl?: string;
+}
+
+const readThreadSuggestionTarget = async (
+  vaultRoot: string,
+  requestedThreadId: string,
+): Promise<ThreadSuggestionTarget> => {
+  const root = join(vaultRoot, '_BAC', 'threads');
   const names = await readdir(root).catch(() => []);
-  const workstreams: BuildSignalsWorkstream[] = [];
   for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
     try {
       const parsed = JSON.parse(await readFile(join(root, name), 'utf8')) as {
         readonly bac_id?: unknown;
-        readonly title?: unknown;
-        readonly description?: unknown;
+        readonly threadId?: unknown;
+        readonly threadUrl?: unknown;
       };
-      if (typeof parsed.bac_id === 'string' && typeof parsed.title === 'string') {
-        workstreams.push({
-          id: parsed.bac_id,
-          title: parsed.title,
-          ...(typeof parsed.description === 'string' ? { description: parsed.description } : {}),
-        });
+      const bacId = typeof parsed.bac_id === 'string' ? parsed.bac_id : undefined;
+      const providerThreadId = typeof parsed.threadId === 'string' ? parsed.threadId : undefined;
+      if (bacId === requestedThreadId || providerThreadId === requestedThreadId) {
+        return {
+          threadId: bacId ?? requestedThreadId,
+          ...(providerThreadId === undefined ? {} : { providerThreadId }),
+          ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
+        };
       }
     } catch {
-      // Ignore malformed workstream records.
+      // Ignore malformed thread records.
     }
   }
-  return workstreams;
+  return { threadId: requestedThreadId };
 };
 
 const applyPageContentCoverageToSnapshot = async (
@@ -4445,6 +4457,16 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, _requestId, match, context) => {
       const vaultRoot = requireVaultRoot(context);
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
       if (match.threadId === undefined) {
         throw new Error('Missing threadId path parameter.');
       }
@@ -4453,26 +4475,54 @@ const routes: readonly RouteDefinition[] = [
         limit: url.searchParams.get('limit') ?? undefined,
         threshold: url.searchParams.get('threshold') ?? undefined,
       });
-      const workstreams = await readWorkstreams(vaultRoot);
-      const signals = await buildSignals(vaultRoot, match.threadId, workstreams);
-      // Threshold precedence: per-request param wins, then env var,
-      // then a permissive default (0.25). The pre-fix value (0.55)
-      // was calibrated for richly-populated workstreams where the
-      // 0.5*vector term dominated; with the cold-start title-
-      // embedding fallback and the asymmetric ws→thread containment
-      // signal, real positive matches typically score 0.25–0.45,
-      // so 0.25 surfaces them without a flood of noise.
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const target = await readThreadSuggestionTarget(vaultRoot, match.threadId);
+      const merged = await context.eventLog.readMerged();
+      const resolution = resolveThreadAttribution({
+        threadId: target.threadId,
+        ...(target.providerThreadId === undefined
+          ? {}
+          : { providerThreadId: target.providerThreadId }),
+        ...(target.threadUrl === undefined ? {} : { threadUrl: target.threadUrl }),
+        snapshot,
+        events: merged,
+      });
+      // Compatibility route: callers still receive a ranked
+      // Suggestion[] array, but the score now comes from the same
+      // graph resolver used by URL/current-tab suggestions.
       const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
       const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
       const threshold = query.threshold ?? defaultThreshold;
-      const suggestions = scoreSuggestions(
-        {
-          thread: { id: match.threadId },
-          workstreams,
-          signals,
-        },
-        { threshold },
-      ).slice(0, query.limit);
+      const suggestions = resolution.fusedCandidates
+        .map((candidate) => {
+          const score = 1 / (1 + Math.exp(-candidate.rawFusionLogit));
+          return {
+            workstreamId: candidate.workstreamId,
+            score,
+            breakdown: {
+              ppr: candidate.pprScore,
+              similarity: candidate.simTopScore,
+              cluster: candidate.clusterPosterior,
+              corroboration: candidate.corroborationCount,
+              margin: resolution.decision.margin,
+            },
+            resolver: {
+              modelRevision: resolution.reasons.modelRevision,
+              graphRevision: resolution.reasons.graphRevision,
+              dominantSource: candidate.dominantSource,
+              action: resolution.decision.action,
+            },
+          };
+        })
+        .filter((suggestion) => suggestion.score >= threshold)
+        .slice(0, query.limit);
       context.recallActivity?.recordSuggestion({
         threadId: match.threadId,
         resultCount: suggestions.length,

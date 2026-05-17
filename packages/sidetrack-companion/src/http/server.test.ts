@@ -6,6 +6,7 @@ import { Readable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
+import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -2137,8 +2138,81 @@ describe('companion HTTP server', () => {
   });
 
   it('reports group-recommendation activity after workstream suggestions', async () => {
+    const replica = await loadOrCreateReplica(vaultPath);
+    const currentUrl = 'https://chatgpt.com/c/bac-thread-suggest';
+    const anchorUrl = 'https://example.test/alpha-anchor';
+    const currentConnectionsSnapshot: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        {
+          id: 'thread:bac_thread_suggest',
+          kind: 'thread',
+          label: 'Alpha Research Plan',
+          originReplicaIds: [],
+          metadata: {
+            canonicalUrl: currentUrl,
+            threadId: 'provider_thread_suggest',
+            url: currentUrl,
+          },
+        },
+        {
+          id: `timeline-visit:${currentUrl}`,
+          kind: 'timeline-visit',
+          label: 'Alpha Research Plan',
+          originReplicaIds: [],
+          metadata: { canonicalUrl: currentUrl, url: currentUrl },
+        },
+        {
+          id: `timeline-visit:${anchorUrl}`,
+          kind: 'timeline-visit',
+          label: 'Alpha Anchor',
+          originReplicaIds: [],
+          metadata: { canonicalUrl: anchorUrl, url: anchorUrl },
+        },
+        {
+          id: 'workstream:bac_ws_alpha',
+          kind: 'workstream',
+          label: 'Alpha Research',
+          originReplicaIds: [],
+          metadata: {},
+        },
+      ],
+      edges: [
+        {
+          id: 'edge:closest',
+          kind: 'closest_visit',
+          fromNodeId: `timeline-visit:${currentUrl}`,
+          toNodeId: `timeline-visit:${anchorUrl}`,
+          observedAt: '2026-05-05T02:03:00.000Z',
+          producedBy: { source: 'event-log' },
+          confidence: 'inferred',
+        },
+        {
+          id: 'edge:anchor-workstream',
+          kind: 'visit_in_workstream',
+          fromNodeId: `timeline-visit:${anchorUrl}`,
+          toNodeId: 'workstream:bac_ws_alpha',
+          observedAt: '2026-05-05T02:03:00.000Z',
+          producedBy: { source: 'event-log' },
+          confidence: 'asserted',
+        },
+      ],
+      updatedAt: '2026-05-05T02:03:00.000Z',
+      nodeCount: 4,
+      edgeCount: 2,
+    };
+    const connectionsStore: ConnectionsStore = {
+      putCurrent: async () => undefined,
+      readCurrent: async () => currentConnectionsSnapshot,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+    };
     context = {
       ...context,
+      replica,
+      eventLog: createEventLog(vaultPath, replica),
+      connectionsStore,
       recallActivity: createRecallActivityTracker(() => new Date('2026-05-05T02:03:04.000Z')),
     };
     await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
@@ -2148,7 +2222,8 @@ describe('companion HTTP server', () => {
       `${JSON.stringify({
         bac_id: 'bac_thread_suggest',
         title: 'Alpha Research Plan',
-        primaryWorkstreamId: 'bac_ws_alpha',
+        threadId: 'provider_thread_suggest',
+        threadUrl: currentUrl,
       })}\n`,
       'utf8',
     );
