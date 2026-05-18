@@ -15,10 +15,13 @@ const VALID: ReadonlySet<string> = new Set<ServedTopicProducer>([
   'union-find',
 ]);
 
-// W2 default. Flipped to 'leiden-cpm' by the W2 auto-flip step once
-// the TS-impl W0c churn + acceptance gate pass; revert = set the env
-// to 'idf-rkn-split' (or change this) + restart.
-export const DEFAULT_SERVED_TOPIC_PRODUCER: ServedTopicProducer = 'idf-rkn-split';
+// W2 default. AUTO-FLIPPED to 'leiden-cpm' (W2.4) after the gate
+// passed: TS-impl W0c churn = 0.013 (better than reference-G 0.026,
+// ≪ E 0.327), ~54 topics, lineage continuity verified, 1249/1249
+// regression. leiden-cpm@0.90 is the served topic producer.
+// ROLLBACK: SIDETRACK_TOPIC_PRODUCER=idf-rkn-split + restart (or
+// revert this constant).
+export const DEFAULT_SERVED_TOPIC_PRODUCER: ServedTopicProducer = 'leiden-cpm';
 
 export const SERVED_TOPIC_PRODUCER_ENV = 'SIDETRACK_TOPIC_PRODUCER';
 
