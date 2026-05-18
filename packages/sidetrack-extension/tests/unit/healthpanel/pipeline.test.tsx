@@ -118,7 +118,7 @@ describe('HealthPanel pipeline strip', () => {
     }
   });
 
-  it('renders candidate lanes in the Experiments drill + the always-visible A/B banner', async () => {
+  it('renders candidate lanes in the Experiments drill + the served-producer banner', async () => {
     vi.unstubAllGlobals();
     stubFetch(
       mkHealth({
@@ -242,12 +242,13 @@ describe('HealthPanel pipeline strip', () => {
       expect(screen.getByText('dirty-source-pending')).toBeInTheDocument();
       expect(screen.getByText(/oldest no signal yet/)).toBeInTheDocument();
     });
-    // V2 — the topic clustering A/B is now surfaced by default
-    // (always-visible banner, not gated behind the Experiments drill).
-    const abBanner = screen.getByTestId('hp-topic-ab');
-    expect(abBanner).toBeInTheDocument();
-    expect(abBanner.textContent).toMatch(/Topic clustering A\/B/);
-    expect(abBanner.textContent).toMatch(/idf-rkn-split/);
+    // W3 — post-W2 there is ONE served producer (no A/B). The
+    // always-visible banner shows the served clustering truthfully
+    // from workGraph.topicProducer (here the fixture's idf-rkn-split).
+    const served = screen.getByTestId('hp-served-topics');
+    expect(served).toBeInTheDocument();
+    expect(served.textContent).toMatch(/Served topic clustering/);
+    expect(served.textContent).toMatch(/idf-rkn-split/);
   });
 
   it('routes diagnostic candidate warnings to amber alarms, not red signals', async () => {

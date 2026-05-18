@@ -821,34 +821,20 @@ export function HealthPanel({
           : candidateWarningCount > 0
             ? 'warn'
             : 'ok';
-    // The shadow-vs-baseline A/B digest is now emitted every drain
-    // (including skip drains — companion G2), so surface it inline in
-    // the always-visible stage row instead of only in the drill. The
-    // headline IS the idf-rkn-split clustering (the served producer
-    // post-G1); the baseline union-find is retained only as the A/B
-    // comparison input. Falls back to the candidate-lane summary when
-    // the focus digest hasn't loaded (older companion / cold start).
-    const svb = focusHealth?.digest?.shadowVsBaseline;
-    const obs = focusHealth?.digest?.shadowObservation;
-    const abAvailable = svb?.shadowTopicCount !== undefined;
-    const warnSuffix = candidateWarningCount > 0 ? ` · ${String(candidateWarningCount)}w` : '';
+    // W3 — post-W2 there is ONE served producer (its own banner
+    // above). The Experiments stage is now purely the generic
+    // candidate-diagnostics drill summary — no served-producer A/B
+    // wording (that was the retired idf-rkn shadow model).
     const experimentsHead = workGraphUnavailable
       ? 'Unavailable'
-      : abAvailable
-        ? `idf-rkn ${String(svb?.shadowTopicCount)} topics`
-        : candidates.length === 0
-          ? 'No signal yet'
-          : `${String(shadowCandidateCount)} shadow · ${String(standbyCandidateCount)} standby`;
+      : candidates.length === 0
+        ? 'No signal yet'
+        : `${String(shadowCandidateCount)} shadow · ${String(standbyCandidateCount)} standby`;
     const experimentsDetail = workGraphUnavailable
       ? 'unavailable — metrics didn’t load'
-      : abAvailable
-        ? `A/B vs union-find · noise ${fmtNum(svb?.noiseShare, 2)} · churn ${fmtNum(
-            obs?.adjacentPerVisitChurn,
-            2,
-          )} · max share ${fmtNum(svb?.shadowMaxTopicShare, 3)}${warnSuffix}`
-        : candidates.length === 0
-          ? 'candidate lanes not reported'
-          : `${String(candidateWarningCount)} warning${candidateWarningCount === 1 ? '' : 's'} · ${String(disabledCandidateCount)} disabled`;
+      : candidates.length === 0
+        ? 'candidate lanes not reported'
+        : `${String(candidateWarningCount)} warning${candidateWarningCount === 1 ? '' : 's'} · ${String(disabledCandidateCount)} disabled`;
 
     const relay = report.sync?.relay;
     const syncStatus: PipelineStatus =
@@ -1923,95 +1909,45 @@ export function HealthPanel({
     );
   };
 
-  // V2 — always-visible topic-clustering A/B. The per-candidate detail
-  // still lives in the Experiments drill; this surfaces the comparison
-  // (served idf-rkn-split vs the retired union-find baseline vs the
-  // HDBSCAN candidate vs the algorithm sweep) without a drill click,
-  // straight from workGraph.candidates (already in /v1/system/health).
-  // Missing data renders "no signal yet" — never a fabricated value.
-  const renderTopicAbBanner = () => {
-    const byId = (id: string): DiagnosticCandidate | undefined =>
-      candidates.find((c) => c.id === id);
+  // W3 — single served topic producer (post-W2 there is no A/B: one
+  // clustering serves). Truthful summary from workGraph.topicProducer
+  // (the active served revision). Missing data → "no signal yet",
+  // never fabricated. The generic candidate diagnostics still live in
+  // the Experiments drill.
+  const renderServedTopicProducer = () => {
     const tp = report?.workGraph?.topicProducer;
-    const shadow = byId('topic.shadow-idf-rkn-split');
-    const hdb = byId('topic.hdbscan-standby');
-    const algo = byId('topic.algorithm-comparison');
-    const mv = (
-      c: DiagnosticCandidate | undefined,
-      k: string,
-    ): DiagnosticCandidateMetric | undefined => c?.metrics[k];
-    if (tp === undefined && shadow === undefined && hdb === undefined && algo === undefined) {
-      return null;
-    }
-    const tiles: ReadonlyArray<{
-      readonly label: string;
-      readonly num: string;
-      readonly foot: string;
-      readonly status?: DiagnosticCandidate['status'];
-    }> = [
+    if (tp === undefined) return null;
+    const algo = tp.algorithmVersion ?? 'unknown';
+    const producer = algo.includes('leiden-cpm')
+      ? 'leiden-cpm @ 0.90'
+      : algo.includes('idf-rkn')
+        ? 'idf-rkn-split'
+        : algo.includes('union-find')
+          ? 'union-find'
+          : algo;
+    const tiles: ReadonlyArray<{ label: string; num: string; foot: string }> = [
       {
-        label: 'Served · idf-rkn-split',
-        num:
-          tp?.topicCount !== undefined
-            ? `${String(tp.topicCount)} topics`
-            : formatCandidateMetric(mv(shadow, 'shadowTopicCount')),
-        foot: tp?.algorithmVersion ?? 'topic-revision:shadow:idf-rkn-split',
-        status: 'ok',
+        label: 'Producer',
+        num: producer,
+        foot: tp.activeRevisionId ?? 'no revision yet',
       },
       {
-        label: 'Baseline · union-find',
-        num: `${formatCandidateMetric(
-          mv(shadow, 'baselineTopicCount') ?? mv(hdb, 'baselineTopicCount'),
-        )} topics`,
-        foot: 'retired from serving · A/B input only',
+        label: 'Topics',
+        num: tp.topicCount > 0 ? `${String(tp.topicCount)} topics` : 'no clusters yet',
+        foot: 'served to inbox + suggestions',
       },
       {
-        label: 'HDBSCAN',
-        num:
-          hdb === undefined
-            ? 'no signal yet'
-            : `${formatCandidateMetric(mv(hdb, 'candidateTopicCount'))} topics`,
-        foot:
-          hdb === undefined
-            ? '—'
-            : `noise ${formatCandidateMetric(mv(hdb, 'noiseShare'))} · churn ${formatCandidateMetric(
-                mv(hdb, 'perVisitChurn'),
-              )}`,
-        status: hdb?.status,
-      },
-      {
-        label: 'Algorithm sweep',
-        num:
-          algo === undefined
-            ? 'no signal yet'
-            : `winner ${formatCandidateMetric(mv(algo, 'winner'))}`,
-        foot:
-          algo === undefined
-            ? '—'
-            : `${formatCandidateMetric(mv(algo, 'candidateCount'))} algos · bᶜF1 ${formatCandidateMetric(
-                mv(algo, 'winnerBCubedF1'),
-              )}`,
-        status: algo?.status,
+        label: 'Lineage',
+        num: `${String(tp.lineageCount)} edges`,
+        foot: 'topic-id continuity across drains',
       },
     ];
     return (
-      <div className="sx-topic-ab" data-testid="hp-topic-ab">
-        <h4 className="sx-h">
-          Topic clustering A/B
-          {shadow?.status === 'warning' ? (
-            <span className="sx-stamp partial" style={{ marginLeft: 8 }}>
-              {shadow.reason ?? 'shadow warning'}
-            </span>
-          ) : null}
-        </h4>
-        <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+      <div className="sx-topic-ab" data-testid="hp-served-topics">
+        <h4 className="sx-h">Served topic clustering</h4>
+        <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
           {tiles.map((t) => (
-            <div
-              key={t.label}
-              className={`sx-tile${t.status === 'warning' || t.status === 'alarm' ? ' warn' : ''}${
-                t.status === 'unavailable' ? ' unavail' : ''
-              }`}
-            >
+            <div key={t.label} className="sx-tile">
               <div className="lbl">{t.label}</div>
               <div className="num">{t.num}</div>
               <div className="foot">{t.foot}</div>
@@ -2087,7 +2023,7 @@ export function HealthPanel({
       ) : (
         <div className="sx-board">
           {/* V2 — topic clustering A/B, visible without a drill click */}
-          {renderTopicAbBanner()}
+          {renderServedTopicProducer()}
           {/* Pipeline strip — the spine */}
           {pipelineStages.length > 0 ? (
             <div className="sx-pipeline" data-testid="hp-pipeline">
