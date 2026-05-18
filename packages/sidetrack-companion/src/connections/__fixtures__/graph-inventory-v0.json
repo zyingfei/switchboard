@@ -1,0 +1,128 @@
+{
+  "scope": {},
+  "nodes": [
+    {
+      "id": "timeline-visit:https://example.test/a",
+      "kind": "timeline-visit",
+      "label": "Example A",
+      "originReplicaIds": [],
+      "metadata": {
+        "canonicalUrl": "https://example.test/a",
+        "title": "Example A"
+      }
+    },
+    {
+      "id": "thread:thread-a",
+      "kind": "thread",
+      "label": "Thread A",
+      "originReplicaIds": [],
+      "metadata": {
+        "title": "Thread A"
+      }
+    },
+    {
+      "id": "snippet:snippet-a",
+      "kind": "snippet",
+      "label": "snippet-a",
+      "originReplicaIds": [],
+      "metadata": {
+        "charHashPrefix": "abc123"
+      }
+    },
+    {
+      "id": "workstream:ws-a",
+      "kind": "workstream",
+      "label": "Workstream A",
+      "originReplicaIds": [],
+      "metadata": {
+        "title": "Workstream A"
+      }
+    },
+    {
+      "id": "topic:topic-a",
+      "kind": "topic",
+      "label": "Topic A",
+      "originReplicaIds": [],
+      "metadata": {
+        "cohesion": 0.9,
+        "memberCount": 1
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge:visit_resembles_visit:timeline-visit:https://example.test/a:timeline-visit:https://example.test/a",
+      "kind": "visit_resembles_visit",
+      "fromNodeId": "timeline-visit:https://example.test/a",
+      "toNodeId": "timeline-visit:https://example.test/a",
+      "observedAt": "2026-05-17T00:00:00.000Z",
+      "producedBy": {
+        "source": "visit-similarity",
+        "revisionId": "visit-similarity:v1"
+      },
+      "confidence": "inferred",
+      "family": "urlmatch",
+      "metadata": {
+        "cosine": 0.91,
+        "threshold": 0.85
+      }
+    },
+    {
+      "id": "edge:visit_in_workstream:timeline-visit:https://example.test/a:workstream:ws-a",
+      "kind": "visit_in_workstream",
+      "fromNodeId": "timeline-visit:https://example.test/a",
+      "toNodeId": "workstream:ws-a",
+      "observedAt": "2026-05-17T00:01:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "user.organized.item",
+        "dot": {
+          "replicaId": "replica-a",
+          "seq": 1
+        }
+      },
+      "confidence": "asserted",
+      "family": "contain",
+      "metadata": {
+        "attributionSource": "user_asserted"
+      }
+    },
+    {
+      "id": "edge:closest_visit:timeline-visit:https://example.test/a:timeline-visit:https://example.test/a",
+      "kind": "closest_visit",
+      "fromNodeId": "timeline-visit:https://example.test/a",
+      "toNodeId": "timeline-visit:https://example.test/a",
+      "observedAt": "2026-05-17T00:02:00.000Z",
+      "producedBy": {
+        "source": "ranker",
+        "revisionId": "ranker:v1"
+      },
+      "confidence": "inferred",
+      "family": "urlmatch",
+      "metadata": {
+        "score": 0.72
+      }
+    },
+    {
+      "id": "edge:thread_references_url:thread:thread-a:timeline-visit:https://example.test/missing",
+      "kind": "thread_references_url",
+      "fromNodeId": "thread:thread-a",
+      "toNodeId": "timeline-visit:https://example.test/missing",
+      "observedAt": "2026-05-17T00:03:00.000Z",
+      "producedBy": {
+        "source": "event-log",
+        "eventType": "capture.recorded",
+        "dot": {
+          "replicaId": "replica-a",
+          "seq": 2
+        }
+      },
+      "confidence": "observed",
+      "family": "urlmatch"
+    }
+  ],
+  "updatedAt": "2026-05-17T00:03:00.000Z",
+  "nodeCount": 5,
+  "edgeCount": 4,
+  "snapshotRevision": "graph-inventory-v0-fixture"
+}
