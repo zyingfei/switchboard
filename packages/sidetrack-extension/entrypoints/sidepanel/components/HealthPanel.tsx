@@ -1923,6 +1923,105 @@ export function HealthPanel({
     );
   };
 
+  // V2 — always-visible topic-clustering A/B. The per-candidate detail
+  // still lives in the Experiments drill; this surfaces the comparison
+  // (served idf-rkn-split vs the retired union-find baseline vs the
+  // HDBSCAN candidate vs the algorithm sweep) without a drill click,
+  // straight from workGraph.candidates (already in /v1/system/health).
+  // Missing data renders "no signal yet" — never a fabricated value.
+  const renderTopicAbBanner = () => {
+    const byId = (id: string): DiagnosticCandidate | undefined =>
+      candidates.find((c) => c.id === id);
+    const tp = report?.workGraph?.topicProducer;
+    const shadow = byId('topic.shadow-idf-rkn-split');
+    const hdb = byId('topic.hdbscan-standby');
+    const algo = byId('topic.algorithm-comparison');
+    const mv = (
+      c: DiagnosticCandidate | undefined,
+      k: string,
+    ): DiagnosticCandidateMetric | undefined => c?.metrics[k];
+    if (tp === undefined && shadow === undefined && hdb === undefined && algo === undefined) {
+      return null;
+    }
+    const tiles: ReadonlyArray<{
+      readonly label: string;
+      readonly num: string;
+      readonly foot: string;
+      readonly status?: DiagnosticCandidate['status'];
+    }> = [
+      {
+        label: 'Served · idf-rkn-split',
+        num:
+          tp?.topicCount !== undefined
+            ? `${String(tp.topicCount)} topics`
+            : formatCandidateMetric(mv(shadow, 'shadowTopicCount')),
+        foot: tp?.algorithmVersion ?? 'topic-revision:shadow:idf-rkn-split',
+        status: 'ok',
+      },
+      {
+        label: 'Baseline · union-find',
+        num: `${formatCandidateMetric(
+          mv(shadow, 'baselineTopicCount') ?? mv(hdb, 'baselineTopicCount'),
+        )} topics`,
+        foot: 'retired from serving · A/B input only',
+      },
+      {
+        label: 'HDBSCAN',
+        num:
+          hdb === undefined
+            ? 'no signal yet'
+            : `${formatCandidateMetric(mv(hdb, 'candidateTopicCount'))} topics`,
+        foot:
+          hdb === undefined
+            ? '—'
+            : `noise ${formatCandidateMetric(mv(hdb, 'noiseShare'))} · churn ${formatCandidateMetric(
+                mv(hdb, 'perVisitChurn'),
+              )}`,
+        status: hdb?.status,
+      },
+      {
+        label: 'Algorithm sweep',
+        num:
+          algo === undefined
+            ? 'no signal yet'
+            : `winner ${formatCandidateMetric(mv(algo, 'winner'))}`,
+        foot:
+          algo === undefined
+            ? '—'
+            : `${formatCandidateMetric(mv(algo, 'candidateCount'))} algos · bᶜF1 ${formatCandidateMetric(
+                mv(algo, 'winnerBCubedF1'),
+              )}`,
+        status: algo?.status,
+      },
+    ];
+    return (
+      <div className="sx-topic-ab" data-testid="hp-topic-ab">
+        <h4 className="sx-h">
+          Topic clustering A/B
+          {shadow?.status === 'warning' ? (
+            <span className="sx-stamp partial" style={{ marginLeft: 8 }}>
+              {shadow.reason ?? 'shadow warning'}
+            </span>
+          ) : null}
+        </h4>
+        <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+          {tiles.map((t) => (
+            <div
+              key={t.label}
+              className={`sx-tile${t.status === 'warning' || t.status === 'alarm' ? ' warn' : ''}${
+                t.status === 'unavailable' ? ' unavail' : ''
+              }`}
+            >
+              <div className="lbl">{t.label}</div>
+              <div className="num">{t.num}</div>
+              <div className="foot">{t.foot}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
   const renderDrill = () => {
     if (node === undefined) return null;
     switch (node.id) {
@@ -1987,6 +2086,8 @@ export function HealthPanel({
         </div>
       ) : (
         <div className="sx-board">
+          {/* V2 — topic clustering A/B, visible without a drill click */}
+          {renderTopicAbBanner()}
           {/* Pipeline strip — the spine */}
           {pipelineStages.length > 0 ? (
             <div className="sx-pipeline" data-testid="hp-pipeline">

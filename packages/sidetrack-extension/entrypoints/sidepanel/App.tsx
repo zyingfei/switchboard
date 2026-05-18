@@ -1638,10 +1638,24 @@ const App = () => {
 
   // Watch the companion's snapshot revision. When the materializer
   // produces a new snapshot (typically 1-5s after a freshly visited
-  // URL is captured), force a re-fetch of resolver suggestions so
-  // the Current Tab card stops showing "No signal yet" for URLs the
-  // graph now knows about. The cache-fill side of this also skips
-  // caching empty results — together they self-heal the stale state.
+  // URL is captured), refresh resolver suggestions so the Current Tab
+  // card stops showing "No signal yet" for URLs the graph now knows
+  // about.
+  //
+  // This is a NON-forced refresh on purpose. `loadTabSessionSuggestions`
+  // keeps cached non-empty results but never caches empty ("No signal
+  // yet") ones, so a non-forced pass already re-resolves exactly the
+  // stale/empty/new cards the new snapshot can now answer — the
+  // self-heal the comment above wants — WITHOUT re-resolving the
+  // already-known ones. Using forceRefetchSuggestions here re-resolved
+  // *every* unattributed session (observed: 424) on *every* snapshot
+  // revision via /v1/tabsessions/<id>/resolve?dryRun=true; since the
+  // companion bumps the revision every drain and a full sweep
+  // (concurrency 4, ~600ms each) outlasts the drain interval, the
+  // sweeps overlapped and pegged the companion (~146% CPU), which kept
+  // it catching_up → more revisions → a self-sustaining flood. Forced
+  // refetch stays on explicit user Refresh + user-mutation cache
+  // invalidation, where it is correct.
   const lastSnapshotRevisionRef = useRef<string | null>(null);
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -1652,7 +1666,7 @@ const App = () => {
     const previous = lastSnapshotRevisionRef.current;
     lastSnapshotRevisionRef.current = rev;
     if (previous === null) return;
-    void loadTabSessions({ background: true, forceRefetchSuggestions: true });
+    void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.snapshotRevision]);
 
   // 2026-05 cleanup: dropped the 4 s background poll. It was firing

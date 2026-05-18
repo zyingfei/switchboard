@@ -11153,6 +11153,15 @@ pre.diff {
   min-height: 0;
   overflow: hidden;
 }
+/* V2 — always-visible topic A/B banner above the pipeline strip */
+.sx-health .sx-topic-ab {
+  flex: 0 0 auto;
+  padding: 10px 12px 6px;
+  border-bottom: 1px solid var(--sx-border, rgba(255, 255, 255, 0.08));
+}
+.sx-health .sx-topic-ab .sx-h {
+  margin: 0 0 8px;
+}
 .sx-health .sx-board-body {
   flex: 1;
   min-height: 0;
