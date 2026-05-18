@@ -50,6 +50,7 @@ import {
   type TopicShadowObservationDiagnostics,
 } from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
+import { buildLeidenCpmTopicRevision } from '../../connections/leidenCpmTopicRevision.js';
 import {
   hotSimilarityModeEnabled,
   hotTopicsModeEnabled,
@@ -86,6 +87,7 @@ import {
 import {
   DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
@@ -391,6 +393,8 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
       return buildTopicRevision;
     case TOPIC_HDBSCAN_REVISION_KEY:
       return buildHdbscanTopicRevision;
+    case TOPIC_LEIDEN_CPM_REVISION_KEY:
+      return buildLeidenCpmTopicRevision;
     case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
       return buildTopicRevision;
   }

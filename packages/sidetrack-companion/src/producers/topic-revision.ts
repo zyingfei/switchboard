@@ -27,12 +27,16 @@ export const TOPIC_UNION_FIND_REVISION_KEY = 'topic-revision:v1:union-find' as c
 export const TOPIC_HDBSCAN_REVISION_KEY = 'topic-revision:v2:hdbscan' as const;
 export const TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY =
   'topic-revision:shadow:idf-rkn-split' as const;
+// W2 (G) — the leiden-CPM@0.90 producer: 5-blind-round runner-up but
+// W0c-stable (~0.026 churn), beats the retired idf-rkn-split.
+export const TOPIC_LEIDEN_CPM_REVISION_KEY = 'topic-revision:v3:leiden-cpm' as const;
 export const TOPIC_ALGORITHM_VERSION = TOPIC_UNION_FIND_REVISION_KEY;
 
 export const TOPIC_REVISION_KEYS = [
   TOPIC_UNION_FIND_REVISION_KEY,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
 ] as const;
 
 export type TopicAlgorithmVersion = (typeof TOPIC_REVISION_KEYS)[number];
