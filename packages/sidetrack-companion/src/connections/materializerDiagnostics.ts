@@ -30,9 +30,7 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
-import type { TopicCandidateAbDiagnostics } from './topicCandidateAb.js';
 import type { HotPathDiagnostics } from './hotPathMode.js';
-import type { TopicAlgorithmComparisonSummary } from './topicAlgorithmComparisonSummary.js';
 import {
   DriftMonitor,
   extractDriftSamples,
@@ -275,16 +273,9 @@ export interface MaterializerDiagnostics {
   readonly latency?: MaterializerLatencyCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
   readonly shadowObservation?: TopicShadowObservationDiagnostics;
-  // U1+ — observational A/B clustering candidates (HDBSCAN, the
-  // algorithm-comparison sweep) measured against the same baseline as
-  // shadowVsBaseline. Present once the candidate has run for the drain.
-  readonly hdbscanVsBaseline?: TopicCandidateAbDiagnostics;
   // U2 — incremental hot-path decision + cheap counters (similarity +
   // topics). Always present (the materializer always produces it).
   readonly hotPath?: HotPathDiagnostics;
-  // U3 — the algorithm-comparison benchmark summary (winner +
-  // per-candidate metrics on the synthetic FocusEvalPack).
-  readonly topicAlgorithmComparison?: TopicAlgorithmComparisonSummary;
   // Statistical drift/evaluation layer. Optional: present once the
   // drift monitor has run for the drain. Absent for legacy fixtures
   // and for the pure `collectMaterializerDiagnostics` path (which does
@@ -315,9 +306,7 @@ export interface MaterializerDiagnosticsInput {
   readonly phaseDurations?: readonly MaterializerPhaseDuration[];
   readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
-  readonly topicHdbscanDiagnostics?: TopicCandidateAbDiagnostics;
   readonly hotPathDiagnostics?: HotPathDiagnostics;
-  readonly topicAlgorithmComparison?: TopicAlgorithmComparisonSummary;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -907,15 +896,9 @@ export const collectMaterializerDiagnostics = (
     ...(input.topicShadowObservation === undefined
       ? {}
       : { shadowObservation: input.topicShadowObservation }),
-    ...(input.topicHdbscanDiagnostics === undefined
-      ? {}
-      : { hdbscanVsBaseline: input.topicHdbscanDiagnostics }),
     ...(input.hotPathDiagnostics === undefined
       ? {}
       : { hotPath: input.hotPathDiagnostics }),
-    ...(input.topicAlgorithmComparison === undefined
-      ? {}
-      : { topicAlgorithmComparison: input.topicAlgorithmComparison }),
   };
 };
 

@@ -148,22 +148,6 @@ describe('work graph diagnostic candidates', () => {
           adjacentPerVisitChurn: 0.33,
           shadowCollapseBoundaryChanged: true,
         },
-        hdbscanVsBaseline: {
-          candidate: 'topic.hdbscan',
-          enabled: true,
-          algorithmVersion: 'topic-revision:v2:hdbscan',
-          baselineAlgorithmVersion: 'topic-revision:v1:union-find',
-          candidateRevisionId: 'hdbscan-rev',
-          baselineRevisionId: 'baseline-rev',
-          baselineTopicCount: 2,
-          candidateTopicCount: 5,
-          topicCountDelta: 3,
-          candidateMaxTopicShare: 0.3,
-          noiseShare: 0.2,
-          perVisitChurn: 0.25,
-          runtimeMs: 4.2,
-          reused: false,
-        },
         drift: {
           status: 'warning',
           trippedSignals: [],
@@ -201,14 +185,9 @@ describe('work graph diagnostic candidates', () => {
         }),
         expect.objectContaining({
           id: 'topic.hdbscan-standby',
-          // U1 — now an active observational A/B lane (was a
-          // structurally 'off' standby). With hdbscanVsBaseline
-          // present it surfaces 'ok' + the A/B revision/metrics.
-          lane: 'shadow',
-          servingImpact: 'observe-only',
-          status: 'ok',
-          reason: null,
-          revisionId: 'hdbscan-rev',
+          lane: 'standby',
+          servingImpact: 'not-serving',
+          status: 'off',
         }),
         expect.objectContaining({
           id: 'topic.shadow-idf-rkn-split',

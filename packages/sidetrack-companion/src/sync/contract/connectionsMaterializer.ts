@@ -51,28 +51,10 @@ import {
 } from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
 import {
-  compareTopicRevisions,
-  shouldBuildTopicHdbscanCandidate,
-  type TopicCandidateAbDiagnostics,
-} from '../../connections/topicCandidateAb.js';
-import {
   hotSimilarityModeEnabled,
   hotTopicsModeEnabled,
   type HotPathDiagnostics,
 } from '../../connections/hotPathMode.js';
-import {
-  runTopicAlgorithmComparison,
-  writeTopicAlgorithmComparisonShadows,
-} from '../../connections/topicAlgorithmComparison.js';
-import { buildFocusEvalPack } from '../../connections/focusEvalPack.js';
-import {
-  readTopicAlgorithmComparisonSummary,
-  shouldRunTopicAlgorithmComparison,
-  summarizeTopicAlgorithmComparison,
-  TOPIC_ALGORITHM_COMPARISON_VERSION,
-  writeTopicAlgorithmComparisonSummary,
-  type TopicAlgorithmComparisonSummary,
-} from '../../connections/topicAlgorithmComparisonSummary.js';
 import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
@@ -1361,88 +1343,6 @@ export const createConnectionsMaterializer = (
         mark('topicShadowCandidate->active (flip)');
       }
     }
-    // U1 — HDBSCAN observational A/B candidate. Density clustering of
-    // the same visits, compared against the SAME union-find baseline
-    // (`topicRevision`) the idf-rkn-split shadow A/B uses, so the
-    // HealthPanel experiments table shows union-find vs
-    // idf-rkn-split(served) vs HDBSCAN side by side. Skip-gated like
-    // the baseline W4 / shadow: the HDBSCAN revision id is a pure
-    // function of (visitSimilarity.revisionId, cosineThreshold, algo)
-    // — unchanged ⇒ reuse the persisted candidate + emit the cheap
-    // reused A/B (NO re-clustering this drain; the CPU-safe property
-    // promised when activating these dormant lanes). Default ON;
-    // SIDETRACK_TOPIC_HDBSCAN_CANDIDATE=off disables.
-    let topicHdbscanDiagnostics: TopicCandidateAbDiagnostics | null = null;
-    if (shouldBuildTopicHdbscanCandidate()) {
-      const previousHdbscan =
-        await topicRevisionStore.readCandidateShadowRevision(TOPIC_HDBSCAN_REVISION_KEY);
-      const expectedHdbscanId = await createTopicRevisionId({
-        visitSimilarityRevisionId: visitSimilarity.revisionId,
-        cosineThreshold: topicCosineThreshold,
-        algorithmVersion: TOPIC_HDBSCAN_REVISION_KEY,
-      });
-      if (previousHdbscan !== null && previousHdbscan.revisionId === expectedHdbscanId) {
-        topicHdbscanDiagnostics = compareTopicRevisions({
-          baselineRevision: topicRevision,
-          candidateRevision: previousHdbscan,
-          candidate: 'topic.hdbscan',
-          runtimeMs: 0,
-          reused: true,
-        });
-        mark(
-          `topicHdbscanCandidate cacheHit=true topics=${String(topicHdbscanDiagnostics.candidateTopicCount)}`,
-        );
-      } else {
-        const hdbscanStartedAt = performance.now();
-        const hdbscanRevision = await buildHdbscanTopicRevision({
-          visits: topicVisits,
-          visitSimilarity,
-          options: { cosineThreshold: topicCosineThreshold },
-          ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
-          ...(previousHdbscan === null ? {} : { previousRevision: previousHdbscan }),
-        });
-        await topicRevisionStore.putCandidateShadowRevision(
-          TOPIC_HDBSCAN_REVISION_KEY,
-          hdbscanRevision,
-        );
-        topicHdbscanDiagnostics = compareTopicRevisions({
-          baselineRevision: topicRevision,
-          candidateRevision: hdbscanRevision,
-          candidate: 'topic.hdbscan',
-          runtimeMs: performance.now() - hdbscanStartedAt,
-          reused: false,
-        });
-        mark(
-          `topicHdbscanCandidate build topics=${String(topicHdbscanDiagnostics.candidateTopicCount)} runtimeMs=${String(topicHdbscanDiagnostics.runtimeMs)}`,
-        );
-      }
-    }
-    // U3 — topic.algorithm-comparison. runTopicAlgorithmComparison
-    // scores 5 clustering algorithms against the SYNTHETIC
-    // FocusEvalPack benchmark (not the user's vault), so it is
-    // deterministic + input-invariant: compute ONCE per version, then
-    // every later drain just reuses the persisted summary (tiny read;
-    // the 5-algorithm cost never repeats). Default ON;
-    // SIDETRACK_TOPIC_ALGORITHM_COMPARISON=off disables.
-    let topicAlgorithmComparison: TopicAlgorithmComparisonSummary | null = null;
-    if (shouldRunTopicAlgorithmComparison()) {
-      const persistedComparison = await readTopicAlgorithmComparisonSummary(deps.vaultRoot);
-      if (
-        persistedComparison !== null &&
-        persistedComparison.version === TOPIC_ALGORITHM_COMPARISON_VERSION
-      ) {
-        topicAlgorithmComparison = persistedComparison;
-        mark(`topicAlgorithmComparison reuse winner=${persistedComparison.winner}`);
-      } else {
-        const comparisonResults = await runTopicAlgorithmComparison({
-          pack: buildFocusEvalPack(),
-        });
-        await writeTopicAlgorithmComparisonShadows(topicRevisionStore, comparisonResults);
-        topicAlgorithmComparison = summarizeTopicAlgorithmComparison(comparisonResults);
-        await writeTopicAlgorithmComparisonSummary(deps.vaultRoot, topicAlgorithmComparison);
-        mark(`topicAlgorithmComparison computed winner=${topicAlgorithmComparison.winner}`);
-      }
-    }
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -1573,8 +1473,6 @@ export const createConnectionsMaterializer = (
       phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
-      ...(topicHdbscanDiagnostics === null ? {} : { topicHdbscanDiagnostics }),
-      ...(topicAlgorithmComparison === null ? {} : { topicAlgorithmComparison }),
       hotPathDiagnostics,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
