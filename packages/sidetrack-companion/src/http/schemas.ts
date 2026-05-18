@@ -556,13 +556,18 @@ export const contentQuerySchema = z.object({
     .optional()
     .transform((value) =>
       value === undefined
-        ? (['page-content', 'chat-turn'] as const)
+        ? // W4(b-lite): semantic-recall-pool is in the default set so
+          // it expands query candidates by default; the runtime flag
+          // SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL is the one-step off.
+          (['page-content', 'chat-turn', 'semantic-recall-pool'] as const)
         : value
             .split(',')
             .map((entry) => entry.trim())
             .filter(
-              (entry): entry is 'page-content' | 'chat-turn' =>
-                entry === 'page-content' || entry === 'chat-turn',
+              (entry): entry is 'page-content' | 'chat-turn' | 'semantic-recall-pool' =>
+                entry === 'page-content' ||
+                entry === 'chat-turn' ||
+                entry === 'semantic-recall-pool',
             ),
     ),
   limit: z.coerce

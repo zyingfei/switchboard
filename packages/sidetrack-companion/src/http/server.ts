@@ -37,6 +37,12 @@ import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
+import {
+  expandSemanticRecallCandidates,
+  getOrBuildSemanticRecallPool,
+  readSemanticRecallPool,
+  semanticRecallPoolEnabled,
+} from '../recall/semanticRecallPool.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import {
@@ -46,7 +52,12 @@ import {
   type PageContentExtractedPayload,
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
-import { readPageEvidence, writeExtractedPageEvidence } from '../page-evidence/store.js';
+import {
+  listPageEvidenceRecords,
+  readPageEvidence,
+  readPageEvidenceMap,
+  writeExtractedPageEvidence,
+} from '../page-evidence/store.js';
 import {
   type PageEvidenceExtractedEventPayload,
   type PageEvidenceExtractedRequest,
@@ -913,6 +924,80 @@ const resolveConnectionsNodeId = (
   }
 
   return aliases.get(nodeId) ?? aliases.get(trimTrailingUrlSlash(nodeId)) ?? nodeId;
+};
+
+// W4(b-lite) — semantic recall pool: lazy non-blocking refresh +
+// read-only candidate expansion. NEVER runs in the materializer
+// drain; the query path only READS the cached artifact (bounded
+// latency); the build is fire-and-forget off the request path.
+let semanticRecallRefreshInFlight = false;
+const kickSemanticRecallPoolRefresh = (vaultRoot: string): void => {
+  if (semanticRecallRefreshInFlight) return;
+  semanticRecallRefreshInFlight = true;
+  void (async () => {
+    try {
+      const records = await listPageEvidenceRecords(vaultRoot);
+      const items = records
+        .map((r) => ({
+          canonicalUrl: r.canonicalUrl,
+          text: [
+            r.metadata.title ?? '',
+            r.metadata.host ?? '',
+            ...(r.metadata.pathTokens ?? []),
+          ]
+            .join(' ')
+            .trim(),
+        }))
+        .filter((i) => i.text.length > 0);
+      if (items.length >= 2) {
+        await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
+      }
+    } catch {
+      /* offline / embed unavailable — keep last good artifact */
+    } finally {
+      semanticRecallRefreshInFlight = false;
+    }
+  })();
+};
+
+const semanticRecallExpansion = async (
+  vaultRoot: string,
+  anchorHits: readonly ContentSearchHit[],
+  limit: number,
+): Promise<readonly ContentSearchHit[]> => {
+  const pool = await readSemanticRecallPool(vaultRoot);
+  kickSemanticRecallPoolRefresh(vaultRoot); // opportunistic, non-blocking
+  if (pool === null) return [];
+  const anchors = anchorHits
+    .map((h) => h.canonicalUrl)
+    .filter((u): u is string => u !== undefined);
+  if (anchors.length === 0) return [];
+  const expanded = expandSemanticRecallCandidates(pool, anchors, {
+    limit,
+    exclude: new Set(anchors),
+  });
+  if (expanded.length === 0) return [];
+  const evidenceByUrl = await readPageEvidenceMap(
+    vaultRoot,
+    expanded.map((e) => e.canonicalUrl),
+  );
+  const nowIso = new Date().toISOString();
+  return expanded.map((e) => ({
+    id: `semantic-recall-pool:${e.canonicalUrl}`,
+    sourceKind: 'semantic-recall-pool' as const,
+    sourceEvidence: {
+      source: 'semantic_recall_pool' as const,
+      similarity: e.cosine,
+      via: e.via,
+    },
+    anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
+    canonicalUrl: e.canonicalUrl,
+    title: evidenceByUrl.get(e.canonicalUrl)?.metadata.title ?? e.canonicalUrl,
+    // Capped low so semantic-pool hits EXPAND (fill remaining slots)
+    // and never displace primary lexical/vector candidates.
+    score: Math.min(0.49, e.cosine * 0.5),
+    capturedAt: nowIso,
+  }));
 };
 
 const queryRecallContent = async (
@@ -4724,7 +4809,17 @@ const routes: readonly RouteDefinition[] = [
             ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
           })
         : [];
-      const merged = [...pageHits, ...recallHits]
+      // W4(b-lite) — additive, gated, read-only semantic expansion of
+      // the primary hits. One-step off via the runtime flag.
+      const semanticHits =
+        sourceKinds.has('semantic-recall-pool') && semanticRecallPoolEnabled()
+          ? await semanticRecallExpansion(
+              vaultRoot,
+              [...pageHits, ...recallHits],
+              query.limit,
+            )
+          : [];
+      const merged = [...pageHits, ...recallHits, ...semanticHits]
         .sort(
           (left, right) =>
             right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
@@ -4738,6 +4833,7 @@ const routes: readonly RouteDefinition[] = [
             sourceKinds: [...sourceKinds].sort(),
             pageContentCount: pageHits.length,
             chatTurnCount: recallHits.length,
+            semanticRecallPoolCount: semanticHits.length,
           },
         },
       ];

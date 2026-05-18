@@ -120,7 +120,15 @@ export interface PageContentChunk {
 
 export interface ContentSearchHit {
   readonly id: string;
-  readonly sourceKind: 'page-content' | 'chat-turn';
+  readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  // W4(b-lite) — present only on 'semantic-recall-pool' hits: marks
+  // the candidate as a semantic-recall expansion (NOT topic
+  // membership) with its evidence.
+  readonly sourceEvidence?: {
+    readonly source: 'semantic_recall_pool';
+    readonly similarity: number;
+    readonly via: 'cluster' | 'neighbor';
+  };
   readonly anchorNodeId: string;
   readonly canonicalUrl?: string;
   readonly threadId?: string;
