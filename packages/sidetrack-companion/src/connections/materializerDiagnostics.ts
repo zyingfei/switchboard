@@ -31,6 +31,7 @@ import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
 import type { HotPathDiagnostics } from './hotPathMode.js';
+import type { ServedTopicProducerReport } from './servedTopicProducer.js';
 import {
   DriftMonitor,
   extractDriftSamples,
@@ -276,6 +277,9 @@ export interface MaterializerDiagnostics {
   // U2 — incremental hot-path decision + cheap counters (similarity +
   // topics). Always present (the materializer always produces it).
   readonly hotPath?: HotPathDiagnostics;
+  // W2 — which clustering produced the served revision + its
+  // churn/lineage vs the previous served (auto-rollback signal).
+  readonly servedTopicProducer?: ServedTopicProducerReport;
   // Statistical drift/evaluation layer. Optional: present once the
   // drift monitor has run for the drain. Absent for legacy fixtures
   // and for the pure `collectMaterializerDiagnostics` path (which does
@@ -307,6 +311,7 @@ export interface MaterializerDiagnosticsInput {
   readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
   readonly hotPathDiagnostics?: HotPathDiagnostics;
+  readonly servedTopicProducerReport?: ServedTopicProducerReport;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -899,6 +904,9 @@ export const collectMaterializerDiagnostics = (
     ...(input.hotPathDiagnostics === undefined
       ? {}
       : { hotPath: input.hotPathDiagnostics }),
+    ...(input.servedTopicProducerReport === undefined
+      ? {}
+      : { servedTopicProducer: input.servedTopicProducerReport }),
   };
 };
 

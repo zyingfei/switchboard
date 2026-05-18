@@ -50,7 +50,15 @@ import {
   type TopicShadowObservationDiagnostics,
 } from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
-import { buildLeidenCpmTopicRevision } from '../../connections/leidenCpmTopicRevision.js';
+import {
+  buildLeidenCpmTopicRevision,
+  LEIDEN_CPM_COSINE_THRESHOLD,
+} from '../../connections/leidenCpmTopicRevision.js';
+import {
+  buildServedTopicProducerReport,
+  resolveServedTopicProducer,
+  type ServedTopicProducer,
+} from '../../connections/servedTopicProducer.js';
 import {
   hotSimilarityModeEnabled,
   hotTopicsModeEnabled,
@@ -1242,30 +1250,66 @@ export const createConnectionsMaterializer = (
         runtimeMs: Date.now() - topicBuildStartedAtMs,
       },
     };
-    // G1 — RETIRE union-find from serving. The baseline union-find
-    // revision starves on raw e5 cosine (~1 giant topic / all members
-    // in one component) — it must NEVER be the active/served producer
-    // when idf-rkn-split is enabled. It is still COMPUTED above purely
-    // as (a) the input `splitMembers` splits to produce idf-rkn-split
-    // and (b) the A/B comparison baseline for diagnostics. Only
-    // promote it to active in the genuine fallback where shadow is
-    // disabled. (Pre-G1 this unconditionally put union-find active,
-    // then the shadow block re-promoted shadow over it; the C
-    // skip-gate then stopped re-promoting on skip drains, leaving the
-    // starved union-find served — the bug this fixes.)
-    if (!shouldBuildTopicShadowCandidate() && topicRevision !== previousTopicRevision) {
-      await topicRevisionStore.putActiveRevision(topicRevision);
-      mark('putActiveTopicRevision');
-    }
-    // FLIP (shadow->active): idf-rkn-split is the production clustering.
-    // `topicRevision` stays the BASELINE input so the shadow-vs-baseline
-    // A/B observation remains meaningful; `servedTopicRevision` is what
-    // we persist active + feed into the served snapshot. When shadow is
-    // disabled this is a no-op (the fallback putActive above ran).
+    // W2 — SERVED TOPIC PRODUCER selection (feature-flagged, instant
+    // rollback via SIDETRACK_TOPIC_PRODUCER + restart):
+    //  - 'leiden-cpm'    = G: the W0c-stable winner that beats the
+    //                      retired idf-rkn-split (3× blind-judged).
+    //  - 'idf-rkn-split' = pre-W2 path (shadow flip), UNCHANGED.
+    //  - 'union-find'    = conservative baseline fallback.
     let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
-    if (shouldBuildTopicShadowCandidate()) {
+    const servedProducer: ServedTopicProducer = resolveServedTopicProducer();
+    if (servedProducer === 'leiden-cpm') {
+      // Skip-gated like the shadow (revisionId is a pure fn of
+      // visitSimilarity.revisionId + threshold + algo). Lineage via
+      // the dedicated leiden candidate slot ⇒ same-algorithm topic-id
+      // continuity across drains (W2 acceptance, not bespoke).
+      const prevLeiden = await topicRevisionStore.readCandidateShadowRevision(
+        TOPIC_LEIDEN_CPM_REVISION_KEY,
+      );
+      const expectedLeidenId = await createTopicRevisionId({
+        visitSimilarityRevisionId: visitSimilarity.revisionId,
+        cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+        algorithmVersion: TOPIC_LEIDEN_CPM_REVISION_KEY,
+      });
+      let leidenRevision;
+      if (prevLeiden !== null && prevLeiden.revisionId === expectedLeidenId) {
+        leidenRevision = prevLeiden;
+        mark(`servedProducer=leiden-cpm cacheHit topics=${String(leidenRevision.topics.length)}`);
+      } else {
+        leidenRevision = await buildLeidenCpmTopicRevision({
+          visits: topicVisits,
+          visitSimilarity,
+          ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
+          ...(prevLeiden === null ? {} : { previousRevision: prevLeiden }),
+        });
+        await topicRevisionStore.putCandidateShadowRevision(
+          TOPIC_LEIDEN_CPM_REVISION_KEY,
+          leidenRevision,
+        );
+        mark(`servedProducer=leiden-cpm build topics=${String(leidenRevision.topics.length)}`);
+      }
+      servedTopicRevision = leidenRevision;
+      await topicRevisionStore.putActiveRevision(leidenRevision);
+    }
+    // Non-leiden producers ('idf-rkn-split' default, 'union-find')
+    // keep the EXACT pre-W2 path: shadow-off ⇒ the selected baseline
+    // is served (G1 guard); shadow-on ⇒ the idf-rkn flip below. The
+    // only W2 change is excluding the case where leiden already served.
+    if (
+      servedProducer !== 'leiden-cpm' &&
+      !shouldBuildTopicShadowCandidate() &&
+      topicRevision !== previousTopicRevision
+    ) {
+      await topicRevisionStore.putActiveRevision(topicRevision);
+      mark('putActiveTopicRevision');
+    }
+    // FLIP (shadow->active): idf-rkn-split path, unchanged from pre-W2.
+    // `topicRevision` stays the BASELINE input so the shadow-vs-baseline
+    // A/B observation remains meaningful; `servedTopicRevision` is what
+    // we persist active + feed into the served snapshot.
+    if (servedProducer !== 'leiden-cpm' && shouldBuildTopicShadowCandidate()) {
       const previousShadowRevision = await topicRevisionStore.readShadowRevision();
       // Stage 5.2 W4 (shadow) — skip-gate, mirroring the baseline
       // topic-revision reuse above. The shadow revision id is a
@@ -1347,6 +1391,19 @@ export const createConnectionsMaterializer = (
         mark('topicShadowCandidate->active (flip)');
       }
     }
+    // W2 step 5 — served-producer marker + observability (the
+    // post-flip auto-rollback signal). algorithmVersion on the
+    // revision already records the producer; this adds churn/lineage.
+    const servedTopicProducerReport = buildServedTopicProducerReport(
+      servedProducer,
+      servedTopicRevision,
+      previousTopicRevision,
+    );
+    mark(
+      `servedProducer=${servedProducer} topics=${String(
+        servedTopicProducerReport.topicCount,
+      )} churnP90=${String(servedTopicProducerReport.churnP90)}`,
+    );
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -1478,6 +1535,7 @@ export const createConnectionsMaterializer = (
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
       hotPathDiagnostics,
+      servedTopicProducerReport,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
     // through the change detectors and fold the status into the
