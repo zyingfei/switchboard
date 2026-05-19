@@ -131,6 +131,12 @@ import {
   type UrlVisitRecord,
 } from '../../src/sidepanel/tabsession/types';
 import {
+  queryRealChromeTabCount,
+  selectTabSessionCandidates,
+  summarizeResolveCandidates,
+  type ResolveCandidateScope,
+} from '../../src/sidepanel/tabsession/resolveCandidates';
+import {
   USER_ORGANIZED_ITEM,
   feedbackClientEventId,
   type FeedbackEventEnvelope,
@@ -286,6 +292,19 @@ const comparableTabUrl = (input: string | undefined): string | null => {
   if (input === undefined || input.length === 0) return null;
   const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
   return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
+};
+
+// Opt-in resolve-flood diagnostics. Off by default; enable in the
+// side-panel console with localStorage['sidetrack:resolveDiag']='1'.
+const resolveDiagEnabled = (): boolean => {
+  try {
+    return (
+      typeof localStorage !== 'undefined' &&
+      localStorage.getItem('sidetrack:resolveDiag') === '1'
+    );
+  } catch {
+    return false;
+  }
 };
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
@@ -1412,27 +1431,68 @@ const App = () => {
       projection: TabSessionProjection,
       inbox: TabSessionInboxData,
       previous: Readonly<Record<string, TabSessionResolutionResult>>,
-      forceRefetch = false,
+      opts: {
+        readonly forceRefetch?: boolean;
+        // Routine/ambient refresh MUST stay 'bounded' (Inbox page +
+        // focused tab). 'projection-wide' is legacy/explicit-only and
+        // no ambient caller passes it — the structural resolve-flood
+        // fix: a snapshotRevision/view-mode/push refresh no longer
+        // resolves every open+unattributed session in the projection.
+        readonly scope?: ResolveCandidateScope;
+        readonly focusedTabSessionId?: string;
+      } = {},
     ): Promise<Record<string, TabSessionResolutionResult>> => {
-      const recordsById = new Map<string, TabSessionRecord>();
-      for (const record of Object.values(projection.bySessionId)) {
-        if (record.closedAt === undefined && record.currentAttribution === undefined) {
-          recordsById.set(record.tabSessionId, record);
-        }
-      }
-      for (const record of inbox.items) {
-        if (record.currentAttribution === undefined) {
-          recordsById.set(record.tabSessionId, record);
-        }
-      }
-      // Drop cached entries for ids no longer in the inbox.
+      const forceRefetch = opts.forceRefetch === true;
+      const scope: ResolveCandidateScope = opts.scope ?? 'bounded';
+      const recordsById = selectTabSessionCandidates({
+        projection,
+        inbox,
+        scope,
+        ...(opts.focusedTabSessionId === undefined
+          ? {}
+          : { focusedTabSessionId: opts.focusedTabSessionId }),
+      });
+      // Reuse cached results (positive cache); drop entries for ids no
+      // longer in the candidate set.
       const next: Record<string, TabSessionResolutionResult> = {};
       for (const id of recordsById.keys()) {
         if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
       }
-      const idsToFetch = [...recordsById.keys()].filter((id) =>
-        forceRefetch ? true : next[id] === undefined && !recentlyResolvedEmpty(id),
-      );
+      let negativeCacheSkips = 0;
+      const idsToFetch = [...recordsById.keys()].filter((id) => {
+        if (forceRefetch) return true;
+        if (next[id] !== undefined) return false;
+        if (recentlyResolvedEmpty(id)) {
+          negativeCacheSkips += 1;
+          return false;
+        }
+        return true;
+      });
+      // Debug-only: explains a load (real tabs vs unsealed stale vs
+      // projection backlog). Opt in via localStorage
+      // 'sidetrack:resolveDiag'='1' in the side-panel console.
+      if (resolveDiagEnabled()) {
+        const cacheHits = Object.keys(next).length;
+        void queryRealChromeTabCount().then((realChromeTabs) => {
+          // eslint-disable-next-line no-console
+          console.info(
+            '[sidetrack:resolve-diag]',
+            JSON.stringify(
+              summarizeResolveCandidates({
+                projection,
+                inbox,
+                candidates: recordsById,
+                idsToFetch: idsToFetch.length,
+                cacheHits,
+                negativeCacheSkips,
+                scope,
+                forceRefetch,
+                realChromeTabs,
+              }),
+            ),
+          );
+        });
+      }
       const fetched = await mapWithConcurrency(idsToFetch, 4, async (tabSessionId) => {
         try {
           const result = await fetchCompanionJson<unknown>(
@@ -1637,11 +1697,35 @@ const App = () => {
         setTabSessionInbox(tabInbox);
         if (!tabSessionSuggestionLoadInFlightRef.current) {
           tabSessionSuggestionLoadInFlightRef.current = true;
+          // Bounded scope (Inbox page + focused tab) on EVERY caller —
+          // routine refresh never resolves the projection-wide
+          // open+unattributed backlog. Find the focused tab-session by
+          // its comparable URL (a cheap O(projection) scan — the
+          // expensive part was the O(N) resolve fan-out, not this).
+          const focusedComparable = comparableTabUrl(
+            liveActiveTabUrlRef.current ??
+              state.activeTabUrl ??
+              state.currentTab?.tabSnapshot?.url ??
+              state.currentTab?.threadUrl,
+          );
+          const focusedTabSessionId =
+            typeof focusedComparable === 'string' && focusedComparable.length > 0
+              ? Object.values(tabProjection.bySessionId).find(
+                  (r) =>
+                    r.closedAt === undefined &&
+                    r.currentAttribution === undefined &&
+                    comparableTabUrl(r.latestUrl) === focusedComparable,
+                )?.tabSessionId
+              : undefined;
           void loadTabSessionSuggestions(
             tabProjection,
             tabInbox,
             tabSessionSuggestionsRef.current,
-            forceRefetch,
+            {
+              forceRefetch,
+              scope: 'bounded',
+              ...(focusedTabSessionId === undefined ? {} : { focusedTabSessionId }),
+            },
           )
             .then(setTabSessionSuggestions)
             .catch(() => {
