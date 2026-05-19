@@ -35,15 +35,17 @@ const embed = (texts: readonly string[]): Promise<readonly Float32Array[]> =>
 describe('semanticRecallPoolEnabled', () => {
   const ENV = SEMANTIC_RECALL_POOL_ENV;
   afterEach(() => delete process.env[ENV]);
-  it('defaults ON; off only via off/false/0/none', () => {
+  it('defaults ON; opt-OUT only via off/false/0/none (incremental rebuild is cheap)', () => {
     delete process.env[ENV];
     expect(semanticRecallPoolEnabled()).toBe(true);
     for (const v of ['off', 'FALSE', '0', 'None']) {
       process.env[ENV] = v;
       expect(semanticRecallPoolEnabled()).toBe(false);
     }
-    process.env[ENV] = '1';
-    expect(semanticRecallPoolEnabled()).toBe(true);
+    for (const v of ['on', 'TRUE', '1', 'Yes', '', 'maybe']) {
+      process.env[ENV] = v;
+      expect(semanticRecallPoolEnabled()).toBe(true);
+    }
   });
 });
 
@@ -127,5 +129,64 @@ describe('getOrBuildSemanticRecallPool (lazy + cached, offline-safe)', () => {
       modelId: 'e5-test',
     });
     expect(stillGood?.signature).toBe(built?.signature);
+  });
+
+  it('incremental delta: embeds ONLY the new item, neighbours stay EXACT, kept clusters preserved, new item joins a neighbour community', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'srp-'));
+    // a4 ~ the A cluster (not in module VEC; isolated embed below).
+    const embed2 = (texts: readonly string[]): Promise<readonly Float32Array[]> =>
+      Promise.resolve(
+        texts.map((t) => {
+          const u = t.replace(/^query: /, '');
+          return Float32Array.from(
+            u === 'https://x/a4' ? [0.985, 0.05] : (VEC[u] ?? [0, 0]),
+          );
+        }),
+      );
+    const seven = [...items, { canonicalUrl: 'https://x/a4', text: 'https://x/a4' }];
+    // 1) Cold start over the 6 → full build (leiden), persists pool + vectors.
+    await getOrBuildSemanticRecallPool(dir, { items, embed: embed2, modelId: 'e5-test' });
+    const pool6 = await readSemanticRecallPool(dir);
+    // 2) Add ONE item → must take the incremental path (no leiden).
+    const calls: string[][] = [];
+    const spy = (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      calls.push([...texts]);
+      return embed2(texts);
+    };
+    const incr = await getOrBuildSemanticRecallPool(dir, {
+      items: seven,
+      embed: spy,
+      modelId: 'e5-test',
+    });
+    // Incremental ⇒ embed called exactly once, with ONLY the new item.
+    expect(calls).toEqual([['query: https://x/a4']]);
+    expect(incr?.signature).toBe(
+      semanticRecallPoolSignature(seven, 'e5-test'),
+    );
+    expect(incr?.entryCount).toBe(7);
+    type P = NonNullable<typeof incr>;
+    const neigh = (p: P): Record<string, string[]> =>
+      Object.fromEntries(
+        Object.entries(p.byUrl).map(([u, e]) => [
+          u,
+          [...e.neighbors].map((n) => n.canonicalUrl).sort(),
+        ]),
+      );
+    // Neighbours are bit-identical to a from-scratch build of all 7.
+    const full = await buildSemanticRecallPool({
+      items: seven,
+      embed: embed2,
+      modelId: 'e5-test',
+    });
+    expect(neigh(incr as P)).toEqual(neigh(full as P));
+    // Kept urls keep their EXACT prior (leiden) cluster id — no re-partition.
+    for (const u of Object.keys(VEC)) {
+      expect(incr!.byUrl[u]!.clusterId).toBe(pool6!.byUrl[u]!.clusterId);
+    }
+    // The new item joined its best kept neighbour's community (A).
+    expect(incr!.byUrl['https://x/a4']!.clusterId).toBe(
+      incr!.byUrl['https://x/a1']!.clusterId,
+    );
+    expect(incr!.byUrl['https://x/a1']!.clusterId.startsWith('e:singleton:')).toBe(false);
   });
 });

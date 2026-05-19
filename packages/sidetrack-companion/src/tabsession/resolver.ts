@@ -417,6 +417,32 @@ const urlNegativeSeeds = (input: ResolveUrlAttributionInput): Map<string, number
   return seeds;
 };
 
+// "Not in any stream" is a definitive user decision (the latest
+// USER_ORGANIZED_ITEM move for this url with toContainer === null),
+// distinct from "unassigned / never decided". urlNegativeSeeds only
+// down-weights a *prior* container, so a decline on a never-assigned
+// url left no signal and the resolver re-emitted a fresh best-guess
+// every resolve ("ask me again"). Detect the decline and settle.
+const urlUserDeclinedNoWorkstream = (input: ResolveUrlAttributionInput): boolean => {
+  let latest: { readonly at: number; readonly seq: number; readonly declined: boolean } | undefined;
+  for (const event of input.events) {
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) continue;
+    const p = event.payload;
+    if (p.itemKind !== 'canonical-url' || p.itemId !== input.canonicalUrl || p.action !== 'move') {
+      continue;
+    }
+    const cand = { at: event.acceptedAtMs, seq: event.dot.seq, declined: p.toContainer === null };
+    if (
+      latest === undefined ||
+      cand.at > latest.at ||
+      (cand.at === latest.at && cand.seq > latest.seq)
+    ) {
+      latest = cand;
+    }
+  }
+  return latest?.declined === true;
+};
+
 const collectUrlAnchors = (
   snapshot: ConnectionsSnapshot,
   canonicalUrl: string,
@@ -520,6 +546,19 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
       : { closestVisitRanker: input.closestVisitRanker }),
   });
 
+  if (urlUserDeclinedNoWorkstream(input)) {
+    // Respect the user's "Not in any stream": settle as no-suggestion
+    // (the projection already records currentAttribution{ws:null}, so
+    // it's out of the inbox list — this stops the active-tab card from
+    // re-asking with a fresh best-guess).
+    return {
+      canonicalUrl: input.canonicalUrl,
+      dryRun: true,
+      ...resolved,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+  }
   return {
     canonicalUrl: input.canonicalUrl,
     dryRun: true,

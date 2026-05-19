@@ -285,9 +285,13 @@ describe('per-URL HTTP routes', () => {
     expect(body.data?.status).toBe('skipped-disabled');
   });
 
-  it('POST /v1/visits/{url}/resolve auto-applies a strong URL resolver decision', async () => {
+  it('POST /v1/visits/{url}/resolve auto-applies a strong URL resolver decision on revisit', async () => {
     const canonicalUrl = 'https://example.test/strong-url';
+    // Grace window: a freshly-captured URL stays a triageable Inbox row
+    // on its FIRST observation. Auto-apply only assists once revisited
+    // (visitCount >= 2) — so observe it twice here.
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    await appendObservation({ seq: 2, url: canonicalUrl, tabSessionId: 'tses_a' });
     installStrongUrlSnapshot(canonicalUrl);
     // URL auto-apply is ON by default; the env opts OUT (no setup needed
     // for this test, the resolver will commit).
@@ -338,6 +342,45 @@ describe('per-URL HTTP routes', () => {
           }),
         }),
       ]),
+    );
+  });
+
+  it('POST /v1/visits/{url}/resolve keeps a first-observation URL triageable (grace window)', async () => {
+    const canonicalUrl = 'https://example.test/fresh-url';
+    // Observed exactly once (visitCount 1) → even a strong decision must
+    // NOT auto-file it; it stays a normal Inbox row until the user
+    // triages it (or revisits it).
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_a' });
+    installStrongUrlSnapshot(canonicalUrl);
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
+      {
+        method: 'POST',
+        headers: headers('url-grace-window-a'),
+        body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
+      },
+    );
+
+    // Skipped (no event appended) → 200, not 201.
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      readonly data?: {
+        readonly status?: string;
+        readonly projection?: {
+          readonly byCanonicalUrl?: Record<
+            string,
+            { readonly currentAttribution?: unknown }
+          >;
+        };
+      };
+    };
+    expect(body.data?.status).toBe('skipped-grace-window');
+    expect(
+      body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution,
+    ).toBeUndefined();
+    await expect(eventLog.readMerged()).resolves.not.toContainEqual(
+      expect.objectContaining({ type: URL_ATTRIBUTION_INFERRED }),
     );
   });
 

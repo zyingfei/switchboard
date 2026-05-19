@@ -90,6 +90,52 @@ describe('healthHistory ring buffer', () => {
     expect(read.map((s) => s.adjacentPerVisitChurn)).toEqual([1, 2]);
   });
 
+  it('round-trips the F2 served-producer fields', async () => {
+    await appendHealthHistory(vaultRoot, {
+      ...sampleAt(0),
+      servedTopicCount: 87,
+      servedCoveredPages: 410,
+      servedChurnP50: 0,
+      servedChurnP90: 0.25,
+      servedLineageContinue: 82,
+      servedLineageSplit: 4,
+      servedLineageMerge: 4,
+    });
+    const [read] = await readHealthHistory(vaultRoot);
+    expect(read?.servedTopicCount).toBe(87);
+    expect(read?.servedCoveredPages).toBe(410);
+    expect(read?.servedChurnP50).toBe(0);
+    expect(read?.servedChurnP90).toBe(0.25);
+    expect(read?.servedLineageContinue).toBe(82);
+    expect(read?.servedLineageSplit).toBe(4);
+    expect(read?.servedLineageMerge).toBe(4);
+  });
+
+  it('reads pre-F2 samples (no served fields) and normalizes them to null', async () => {
+    await mkdir(diagnosticsDir(), { recursive: true });
+    // Exactly the legacy on-disk shape — six shadow fields, no served*.
+    await writeFile(
+      historyFile(),
+      JSON.stringify([
+        {
+          at: '2026-05-15T00:00:00.000Z',
+          adjacentPerVisitChurn: 0.1,
+          shadowMaxTopicShare: 0.5,
+          noiseShare: null,
+          shadowTopicCount: 3,
+          runtimeMs: 1234,
+          vaultBytes: null,
+        },
+      ]),
+      'utf8',
+    );
+    const [read] = await readHealthHistory(vaultRoot);
+    expect(read?.adjacentPerVisitChurn).toBe(0.1);
+    expect(read?.servedTopicCount).toBeNull();
+    expect(read?.servedChurnP90).toBeNull();
+    expect(read?.servedLineageContinue).toBeNull();
+  });
+
   it('writes atomically leaving no .tmp file behind', async () => {
     await appendHealthHistory(vaultRoot, sampleAt(0));
     await appendHealthHistory(vaultRoot, sampleAt(1));
