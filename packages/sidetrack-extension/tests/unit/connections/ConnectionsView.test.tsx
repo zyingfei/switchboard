@@ -545,6 +545,110 @@ describe('ConnectionsView — engineering scaffold', () => {
     expect(screen.getByTestId('focus-topic-topic:db')).toBeDefined();
   });
 
+  it('scopes a topic anchor against the SERVED snapshot even when the shadow snapshot is empty', async () => {
+    // Post-W2 the served clustering is leiden-cpm; the idf-rkn shadow
+    // snapshot has unrelated ids (or is empty/unavailable). A topic
+    // anchor must resolve in the served graph it was clicked in, not
+    // the shadow — otherwise every topic anchor → "No scoped focus
+    // group".
+    const servedSnapshot = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { nodeId: 'topic:served', hops: 2 },
+        nodes: [
+          {
+            id: 'topic:served',
+            kind: 'topic',
+            label: 'Statistical Learning',
+            originReplicaIds: [],
+            metadata: { memberCount: 2, representativeTitles: ['Statistical Learning'] },
+          },
+          {
+            id: 'timeline-visit:https://hx.example/knn',
+            kind: 'timeline-visit',
+            label: 'kNN chapter',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://hx.example/knn',
+              focusedWindowMs: 9_000,
+              engagement: { class: 'engaged_read' },
+            },
+          },
+          {
+            id: 'timeline-visit:https://hx.example/montecarlo',
+            kind: 'timeline-visit',
+            label: 'Monte Carlo chapter',
+            originReplicaIds: ['replica-A'],
+            metadata: {
+              canonicalUrl: 'https://hx.example/montecarlo',
+              focusedWindowMs: 8_000,
+              engagement: { class: 'engaged_read' },
+            },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:served-knn',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://hx.example/knn',
+            toNodeId: 'topic:served',
+            observedAt: '2026-05-18T10:00:00.000Z',
+            producedBy: { source: 'topic-clusterer' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:served-mc',
+            kind: 'visit_in_topic',
+            fromNodeId: 'timeline-visit:https://hx.example/montecarlo',
+            toNodeId: 'topic:served',
+            observedAt: '2026-05-18T10:00:00.000Z',
+            producedBy: { source: 'topic-clusterer' },
+            confidence: 'inferred',
+          },
+        ],
+        updatedAt: '2026-05-18T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+      },
+    };
+    const emptyShadow = {
+      scope: 'companion-extended',
+      snapshot: {
+        scope: { topicVariant: 'shadow' },
+        nodes: [],
+        edges: [],
+        updatedAt: '2026-05-18T10:00:00.000Z',
+        nodeCount: 0,
+        edgeCount: 0,
+      },
+    };
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string; nodeId?: string; filters?: { topicVariant?: string } };
+      if (m.type === messageTypes.loadConnectionsNeighbors) return { ok: true, data: servedSnapshot };
+      if (m.type === messageTypes.loadConnectionsSnapshot) {
+        return {
+          ok: true,
+          data: m.filters?.topicVariant === 'shadow' ? emptyShadow : servedSnapshot,
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+
+    render(<ConnectionsView requestAnchor="topic:served" />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-mode-focus')).not.toBeNull();
+    });
+    fireEvent.click(screen.getByTestId('connections-mode-focus'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('focus-topic-topic:served')).toBeDefined();
+    });
+    // The scoped focus group resolved from the served snapshot, NOT the
+    // dead "No scoped focus group" empty state.
+    expect(screen.queryByTestId('focus-empty')).toBeNull();
+    expect(screen.queryByText('No scoped focus group')).toBeNull();
+  });
+
   it('does not broaden thread-anchor shadow focus through a collapsed topic scope', async () => {
     const collapsedSnapshot = {
       scope: 'companion-extended',

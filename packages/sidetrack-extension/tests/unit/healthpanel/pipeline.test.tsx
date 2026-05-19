@@ -671,4 +671,155 @@ describe('HealthPanel pipeline strip', () => {
       expect(screen.getByText(/1\/2 zero-result \(expected/)).toBeInTheDocument();
     });
   });
+
+  // F2 — the Topics drill repoints off the retired idf-rkn shadow
+  // (perpetually null post-W2) onto the SERVED producer's per-drain
+  // report + ring series.
+  it('renders the served producer in the Topics drill (stability tile, receipt, drain trend)', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: null,
+            loadStatus: 'missing' as const,
+            trainedAt: null,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: 'bWTFkVzGSOCmyj_1',
+            algorithmVersion: 'topic-revision:v3:leiden-cpm',
+            topicCount: 87,
+            lineageCount: 90,
+          },
+        },
+      }),
+      {
+        focus: {
+          availability: 'ok',
+          asOf: '2026-05-18T04:32:15.210Z',
+          digest: {
+            servedTopicProducer: {
+              producer: 'leiden-cpm',
+              algorithmId: 'topic-revision:v3:leiden-cpm',
+              cosineThreshold: 0.9,
+              topicCount: 87,
+              coveredPages: 410,
+              lineageContinue: 82,
+              lineageSplit: 4,
+              lineageMerge: 4,
+              churnP50: 0,
+              churnP90: 0.25,
+              revisionId: 'bWTFkVzGSOCmyj_1',
+              previousRevisionId: 'bV_prev_rev',
+            },
+          },
+          history: [
+            {
+              at: '2026-05-18T04:12:11.190Z',
+              adjacentPerVisitChurn: null,
+              shadowMaxTopicShare: null,
+              noiseShare: null,
+              shadowTopicCount: null,
+              servedTopicCount: 86,
+              servedChurnP50: 0,
+              servedChurnP90: 0.2,
+              servedLineageContinue: 80,
+              servedLineageSplit: 3,
+              servedLineageMerge: 2,
+            },
+            {
+              at: '2026-05-18T04:32:15.210Z',
+              adjacentPerVisitChurn: null,
+              shadowMaxTopicShare: null,
+              noiseShare: null,
+              shadowTopicCount: null,
+              servedTopicCount: 87,
+              servedChurnP50: 0,
+              servedChurnP90: 0.25,
+              servedLineageContinue: 82,
+              servedLineageSplit: 4,
+              servedLineageMerge: 4,
+            },
+          ],
+        },
+      },
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-topics')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-topics'));
+
+    await waitFor(() => {
+      const tile = screen.getByTestId('hp-topics-served-stability');
+      expect(tile.textContent).not.toMatch(/no signal yet/);
+      expect(tile.textContent).toMatch(/churn p50/);
+      expect(tile.textContent).toMatch(/410 pages/);
+      expect(tile.textContent).toMatch(/82\/4\/4/);
+    });
+    // Receipt is now the served-producer report, not the dead shadow.
+    // (the algorithm id also appears in the active-revision tile foot)
+    expect(screen.getAllByText('topic-revision:v3:leiden-cpm').length).toBeGreaterThan(1);
+    expect(screen.getByText('87 (410 pages covered)')).toBeInTheDocument();
+    expect(screen.getByText('bV_prev_rev')).toBeInTheDocument();
+    expect(screen.queryByText('Shadow comparison')).not.toBeInTheDocument();
+    expect(screen.queryByText('Adjacent churn')).not.toBeInTheDocument();
+    // Drain-trend table carries the served series + columns.
+    const trend = screen.getByTestId('hp-topics-drain-trend');
+    expect(trend.textContent).toMatch(/Churn p50/);
+    expect(trend.textContent).toMatch(/Lineage c\/s\/m/);
+    expect(trend.textContent).not.toMatch(/Shadow topics/);
+    expect(trend.textContent).toMatch(/87/);
+    expect(trend.textContent).toMatch(/0\.250/);
+  });
+
+  it('renders an honest "no signal yet" Topics drill when the served report is absent', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: null,
+            loadStatus: 'missing' as const,
+            trainedAt: null,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+          },
+          topicProducer: {
+            activeRevisionId: 'rev_x',
+            algorithmVersion: 'topic-revision:v3:leiden-cpm',
+            topicCount: 12,
+            lineageCount: 3,
+          },
+        },
+      }),
+      {
+        // Digest loaded, but no servedTopicProducer block yet (e.g. a
+        // drain before the F2 companion writes it) → honest blank.
+        focus: {
+          availability: 'ok',
+          asOf: '2026-05-18T04:32:15.210Z',
+          digest: { schemaVersion: 1 },
+          history: [],
+        },
+      },
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-topics')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-topics'));
+
+    await waitFor(() => {
+      const tile = screen.getByTestId('hp-topics-served-stability');
+      expect(tile.textContent).toMatch(/no signal yet/);
+    });
+    expect(screen.getAllByText('no signal yet').length).toBeGreaterThan(0);
+  });
 });

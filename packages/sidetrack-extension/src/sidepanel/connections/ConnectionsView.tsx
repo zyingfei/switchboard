@@ -64,6 +64,7 @@ import { useAnchorHistory } from './useAnchorHistory';
 import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnapshot';
 import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
 import { useRecallSearch } from './useRecallSearch';
+import { PageTextPanel } from './PageTextPanel';
 import {
   messageTypes,
   type PageContentBulkOperationResponse,
@@ -154,6 +155,11 @@ type Props = {
   // clears the parent's request state so the same target can be
   // re-jumped after the user navigated elsewhere.
   readonly requestAnchor?: string;
+  // Cross-surface "focus the search here" nonce: when this changes to
+  // a new non-zero value the view switches to its own SearchTab. Lets
+  // the global top-bar search button re-use the Connections search
+  // instead of opening a second, separate search panel on this page.
+  readonly requestSearch?: number;
   readonly onRequestConsumed?: () => void;
   // Cross-surface jump from Connections back to the Inbox. Fired
   // when the user clicks "Find in Inbox" on a URL-bearing anchor.
@@ -393,16 +399,6 @@ const pageContentCoverageFromNode = (node: ConnectionNode | null): PageContentCo
       : {}),
     ...(typeof raw['error'] === 'string' ? { error: raw['error'] } : {}),
   };
-};
-
-const pageContentStatusLabel = (coverage: PageContentCoverage | null): string => {
-  if (coverage === null) return 'metadata only';
-  if (coverage.state === 'indexed') return coverage.quality ?? 'indexed';
-  if (coverage.state === 'indexed_low_quality') return 'low quality';
-  if (coverage.state === 'stale_index') return 'stale';
-  if (coverage.state === 'tombstoned') return 'deleted';
-  if (coverage.state === 'metadata_only_error') return 'not indexed';
-  return 'metadata only';
 };
 
 const rankerContributionFromUnknown = (
@@ -1470,6 +1466,7 @@ export const ConnectionsView = ({
   onOpenUrl,
   displayCtx,
   requestAnchor,
+  requestSearch,
   onRequestConsumed,
   onOpenInInbox,
   onSaveFocusGroup,
@@ -1822,6 +1819,16 @@ export const ConnectionsView = ({
     // history; the effect only needs to fire when the request itself changes.
   }, [requestAnchor]);
 
+  // The global top-bar search button, when already on Connections,
+  // focuses THIS view's SearchTab instead of opening a second search
+  // panel over it (the "two search features on one page" complaint).
+  useEffect(() => {
+    if (requestSearch === undefined || requestSearch === 0) return;
+    setSubMode('search');
+    fullSnapshot.prime();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire only when a new request arrives
+  }, [requestSearch]);
+
   // Stage 5 polish — derive a canonical URL from the current anchor
   // so the "Find in Inbox" button can pass it back to App.tsx. Three
   // anchor kinds carry a URL signal: timeline-visit (id is the URL),
@@ -2115,9 +2122,25 @@ export const ConnectionsView = ({
 
   const submitVisitMarkNotRelated = async (input: {
     readonly topicId: string;
+    readonly fromVisitId?: string;
     readonly visitId: string;
     readonly memberVisitIds: readonly string[];
   }): Promise<void> => {
+    // #193 graft — when removed from a scoped (anchored) focus, the
+    // removal is also a rejection of the closest-visit edge that put
+    // the page here, not just an "ignore in this topic".
+    if (input.fromVisitId !== undefined && input.fromVisitId !== input.visitId) {
+      const flowResponse = await postUserFlowRejected({
+        relationKind: 'closest_visit',
+        fromId: input.fromVisitId,
+        toId: input.visitId,
+        reason: 'not-related',
+      });
+      if (!flowResponse.ok) {
+        throw new Error(flowResponse.error ?? 'visit-topic rejection feedback failed');
+      }
+    }
+
     const response = await postUserOrganizedItem({
       itemKind: 'visit',
       itemId: input.visitId,
@@ -2162,38 +2185,10 @@ export const ConnectionsView = ({
   };
 
   const totalEdges = result?.snapshot.edgeCount ?? 0;
-  // Stage 5 polish — sub-mode availability gates. Each gated mode
-  // surfaces a specific node kind, so when that kind isn't in the
-  // current subgraph the user gets a blank panel with no idea why.
-  // Pre-compute availability + a one-line reason so the tabs can
-  // disable themselves (and explain the gating) instead of silently
-  // rendering empty.
-  const modeAvailability = useMemo(() => {
-    const nodes = result?.snapshot.nodes ?? [];
-    const hasVisits = nodes.some((n) => n.kind === 'timeline-visit');
-    const hasTopics = nodes.some((n) => n.kind === 'topic');
-    const isWorkstream = anchor.startsWith('workstream:');
-    return {
-      flow: {
-        enabled: hasVisits,
-        reason: hasVisits
-          ? undefined
-          : 'No timeline-visits in scope. Anchor on a workstream + ↑ Hops to 2, or pick a topic.',
-      },
-      focus: {
-        enabled: hasTopics,
-        reason: hasTopics
-          ? undefined
-          : 'No topic clusters in scope. Topics appear at higher hop counts on workstream anchors.',
-      },
-      context: {
-        enabled: isWorkstream,
-        reason: isWorkstream
-          ? undefined
-          : 'Context Pack composer only works for workstream anchors. Pick a workstream first.',
-      },
-    };
-  }, [anchor, result]);
+  // modeAvailability is computed below, AFTER the filtered/scoped
+  // render sets — gating on the raw neighbor snapshot let a search/
+  // time scope empty the panel while the tab still showed enabled
+  // (the "blank panel with no idea why" bug, E).
 
   // 2026-05 cleanup: the auto-recovery used to bounce the user back
   // to 'linked' the instant they clicked a mode tab whose data
@@ -2310,14 +2305,36 @@ export const ConnectionsView = ({
     focusData.previousTopicCount,
   );
   const scopedEmptyFocusData = useMemo(() => emptyFocusData(), []);
+  // A topic anchor must scope against the SERVED graph the user clicked
+  // the topic in (post-W2 that is leiden-cpm). The legacy path scoped
+  // against the idf-rkn *shadow* snapshot, whose topic ids are a wholly
+  // different clustering — the anchored id never matched there, so every
+  // topic anchor fell through to "No scoped focus group". Reuse the
+  // tested scope derivation but feed it the served snapshot + ctx.
+  const servedTopicFocusData = useMemo(() => {
+    if (result === null || !resolvedAnchorId.startsWith('topic:')) return emptyFocusData();
+    const scope = deriveShadowFocusScope(
+      resolvedAnchorId,
+      result.snapshot.nodes,
+      result.snapshot.edges,
+      result.snapshot.nodes,
+      result.snapshot.edges,
+    );
+    return deriveFocusData(scope.nodes, scope.edges, scope.nodes, scope.edges, ctx);
+  }, [ctx, resolvedAnchorId, result]);
   const anchorIsTopic = resolvedAnchorId.startsWith('topic:');
   const shadowSnapshotReady = shadowFullSnapshot.ready;
   const topicAnchorShadowResolving =
-    anchorIsTopic && !shadowSnapshotReady && shadowFullSnapshot.error === null;
+    anchorIsTopic &&
+    servedTopicFocusData.topics.length === 0 &&
+    !shadowSnapshotReady &&
+    shadowFullSnapshot.error === null;
   const renderedFocusData = anchorIsTopic
-    ? shadowSnapshotReady && shadowFocusData.topics.length > 0
-      ? shadowFocusData
-      : scopedEmptyFocusData
+    ? servedTopicFocusData.topics.length > 0
+      ? servedTopicFocusData
+      : shadowSnapshotReady && shadowFocusData.topics.length > 0
+        ? shadowFocusData
+        : scopedEmptyFocusData
     : activeFocusCollapsed && shadowFocusData.topics.length > 0
       ? shadowFocusData
       : activeFocusCollapsed && shadowSnapshotReady
@@ -2345,6 +2362,37 @@ export const ConnectionsView = ({
       ? filteredShadowSnapshot.edges
       : filteredFullSnapshot.edges;
   const focusCandidateCtx = displayedFocusData === shadowFocusData ? shadowCtx : ctx;
+  // Sub-mode availability gates (E). Gate on what is ACTUALLY rendered
+  // after time/search/scope filtering, not the raw neighbor snapshot —
+  // otherwise a scope that empties the panel still shows the tab as
+  // enabled and the user gets a blank panel with no explanation.
+  const modeAvailability = useMemo(() => {
+    const renderedNodes = filteredFullSnapshot.nodes;
+    const hasVisits = renderedNodes.some((n) => n.kind === 'timeline-visit');
+    const hasTopics =
+      displayedFocusData.topics.length > 0 || renderedNodes.some((n) => n.kind === 'topic');
+    const isWorkstream = anchor.startsWith('workstream:');
+    return {
+      flow: {
+        enabled: hasVisits,
+        reason: hasVisits
+          ? undefined
+          : 'No timeline-visits in this scope. Clear the search/time filter, raise ↑ Hops, or pick a topic.',
+      },
+      focus: {
+        enabled: hasTopics,
+        reason: hasTopics
+          ? undefined
+          : 'No topic clusters in this scope. Clear the search/time filter, or anchor a workstream at higher hops.',
+      },
+      context: {
+        enabled: isWorkstream,
+        reason: isWorkstream
+          ? undefined
+          : 'Context Pack composer only works for workstream anchors. Pick a workstream first.',
+      },
+    };
+  }, [anchor, displayedFocusData, filteredFullSnapshot.nodes]);
   const suggestedFocusCandidatesByTopic = useMemo(
     () =>
       deriveFocusSuggestedCandidates(
@@ -2546,128 +2594,26 @@ export const ConnectionsView = ({
         </button>
         <HopToggle value={hops} onChange={setHops} />
       </div>
-      {anchorCanonicalUrl !== null ? (
-        <div
-          className={'cx-page-content-card' + (anchorSummaryOpen ? '' : ' is-collapsed')}
-          data-testid="connections-page-content-card"
-        >
-          <button
-            type="button"
-            className="cx-summary-toggle cx-mono cx-dim"
-            onClick={() => {
-              setAnchorSummaryOpen((v) => !v);
-            }}
-            aria-expanded={anchorSummaryOpen}
-            data-testid="connections-summary-toggle"
-          >
-            {anchorSummaryOpen ? '▾' : '▸'} Page text
-          </button>
-          <div className="cx-page-content-main">
-            <span className="cx-page-content-label">Page text</span>
-            <span className="cx-page-content-state">
-              {pageContentStatusLabel(anchorPageContentCoverage)}
-            </span>
-            {anchorPageContentCoverage?.chunkCount !== undefined ? (
-              <span className="cx-page-content-meta">
-                {String(anchorPageContentCoverage.chunkCount)} chunks
-              </span>
-            ) : null}
-          </div>
-          <div className="cx-page-content-actions">
-            <button
-              type="button"
-              className="cx-mini-btn"
-              onClick={() => runPageContentAction(messageTypes.pageContentIndexCurrent)}
-              disabled={pageContentBusy !== null}
-              title="Index readable text from the active page"
-            >
-              {pageContentBusy === 'index' ? 'Indexing' : 'Index page'}
-            </button>
-            <button
-              type="button"
-              className="cx-mini-btn"
-              onClick={() => runPageContentAction(messageTypes.pageContentIndexSelection)}
-              disabled={pageContentBusy !== null}
-              title="Index the currently selected text on the active page"
-            >
-              {pageContentBusy === 'selection' ? 'Indexing' : 'Index selection'}
-            </button>
-            <button
-              type="button"
-              className="cx-mini-btn"
-              onClick={loadPageContentBulkPreview}
-              disabled={pageContentBusy !== null || pageContentBulkBusy !== null}
-              title="Preview currently open tabs before indexing their page text"
-            >
-              {pageContentBulkBusy === 'preview' ? 'Checking' : 'Index open tabs'}
-            </button>
-            {anchorPageContentCoverage?.state === 'indexed' ||
-            anchorPageContentCoverage?.state === 'indexed_low_quality' ||
-            anchorPageContentCoverage?.state === 'stale_index' ? (
-              <button
-                type="button"
-                className="cx-mini-btn danger"
-                onClick={() => runPageContentAction(messageTypes.pageContentDelete)}
-                disabled={pageContentBusy !== null}
-                title="Delete indexed text for this page"
-              >
-                Delete text
-              </button>
-            ) : null}
-          </div>
-          {pageContentError !== null ? (
-            <div className="cx-page-content-error">{pageContentError}</div>
-          ) : null}
-          {pageContentBulkPreview !== null ? (
-            <div className="cx-page-content-bulk" data-testid="connections-page-content-bulk">
-              <div className="cx-page-content-bulk-head">
-                <span>
-                  {String(pageContentBulkPreview.filter((tab) => tab.eligible).length)} open tabs
-                  eligible
-                </span>
-                <span className="cx-page-content-meta">
-                  {String(pageContentBulkPreview.length)} checked
-                </span>
-              </div>
-              <div className="cx-page-content-bulk-list">
-                {pageContentBulkPreview.slice(0, 6).map((tab) => (
-                  <div
-                    key={`${String(tab.tabId)}:${tab.url}`}
-                    className={`cx-page-content-bulk-row${tab.eligible ? '' : ' muted'}`}
-                    title={tab.url}
-                  >
-                    <span>{tab.title}</span>
-                    <small>{tab.eligible ? 'Eligible' : (tab.reason ?? 'Skipped')}</small>
-                  </div>
-                ))}
-              </div>
-              <div className="cx-page-content-bulk-actions">
-                <button
-                  type="button"
-                  className="cx-mini-btn"
-                  onClick={runPageContentBulkIndex}
-                  disabled={
-                    pageContentBulkBusy !== null ||
-                    pageContentBulkPreview.filter((tab) => tab.eligible).length === 0
-                  }
-                >
-                  {pageContentBulkBusy === 'index' ? 'Indexing tabs' : 'Confirm'}
-                </button>
-                <button
-                  type="button"
-                  className="cx-mini-btn"
-                  onClick={() => {
-                    setPageContentBulkPreview(null);
-                  }}
-                  disabled={pageContentBulkBusy !== null}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      <PageTextPanel
+        canonicalUrl={anchorCanonicalUrl}
+        open={anchorSummaryOpen}
+        onToggleOpen={() => {
+          setAnchorSummaryOpen((v) => !v);
+        }}
+        coverage={anchorPageContentCoverage}
+        busy={pageContentBusy}
+        bulkBusy={pageContentBulkBusy}
+        error={pageContentError}
+        bulkPreview={pageContentBulkPreview}
+        onIndexPage={() => runPageContentAction(messageTypes.pageContentIndexCurrent)}
+        onIndexSelection={() => runPageContentAction(messageTypes.pageContentIndexSelection)}
+        onDelete={() => runPageContentAction(messageTypes.pageContentDelete)}
+        onBulkPreview={loadPageContentBulkPreview}
+        onBulkIndex={runPageContentBulkIndex}
+        onBulkCancel={() => {
+          setPageContentBulkPreview(null);
+        }}
+      />
       <div className="cx-modes" role="tablist" aria-label="View mode">
         <button
           type="button"
