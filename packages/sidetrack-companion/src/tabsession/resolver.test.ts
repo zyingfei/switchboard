@@ -12,7 +12,12 @@ import { buildClusterEvidence } from './clusterEvidence.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence } from './fusion.js';
 import { projectTabSessions } from './projection.js';
-import { inferredAttributionPayloadFromResolution, resolveAttribution } from './resolver.js';
+import {
+  inferredAttributionPayloadFromResolution,
+  resolveAttribution,
+  resolveThreadAttribution,
+  resolveUrlAttribution,
+} from './resolver.js';
 import { buildSimilarityEvidence } from './similarity.js';
 
 const snapshot = (
@@ -342,9 +347,9 @@ describe('tab-session resolver', () => {
   });
 
   it('treats current visit_in_workstream edges as authoritative over stale event stamps', () => {
-    const currentUrl = 'https://current.example.test/page';
-    const newAnchorUrl = 'https://new-anchor.example.test/page';
-    const oldAnchorUrl = 'https://old-anchor.example.test/page';
+    const currentUrl = 'https://current.example.test/start';
+    const newAnchorUrl = 'https://new-anchor.example.test/relevant';
+    const oldAnchorUrl = 'https://old-anchor.example.test/archive';
     const snap = snapshot(
       [
         `timeline-visit:${currentUrl}`,
@@ -368,6 +373,11 @@ describe('tab-session resolver', () => {
           kind: 'visit_in_workstream',
           from: `timeline-visit:${oldAnchorUrl}`,
           to: 'workstream:ws_old',
+        },
+        {
+          kind: 'visit_resembles_visit',
+          from: `timeline-visit:${currentUrl}`,
+          to: `timeline-visit:${newAnchorUrl}`,
         },
       ],
     );
@@ -445,6 +455,72 @@ describe('tab-session resolver', () => {
       policyMode: 'balanced',
       dominantSource: 'similarity',
     });
+  });
+
+  it('resolves thread suggestions through the same URL graph evidence', () => {
+    const currentUrl = 'https://chatgpt.com/c/thread-a';
+    const anchorUrl = 'https://example.test/anchor';
+    const base = snapshot(
+      [
+        'thread:thread_a',
+        `timeline-visit:${currentUrl}`,
+        `timeline-visit:${anchorUrl}`,
+        'workstream:ws_security',
+      ],
+      [
+        {
+          kind: 'closest_visit',
+          from: `timeline-visit:${currentUrl}`,
+          to: `timeline-visit:${anchorUrl}`,
+        },
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const snap: ConnectionsSnapshot = {
+      ...base,
+      nodes: base.nodes.map((node) =>
+        node.id === 'thread:thread_a'
+          ? {
+              ...node,
+              metadata: {
+                canonicalUrl: currentUrl,
+                threadId: 'provider-thread-a',
+                url: currentUrl,
+              },
+            }
+          : node,
+      ),
+    };
+    const events = [
+      observed(1, 'tses_current', currentUrl, 'Current thread'),
+      observed(2, 'tses_anchor', anchorUrl, 'Anchor'),
+    ];
+
+    const threadResult = resolveThreadAttribution({
+      threadId: 'thread_a',
+      providerThreadId: 'provider-thread-a',
+      threadUrl: currentUrl,
+      snapshot: snap,
+      events,
+      policyMode: 'balanced',
+    });
+    const urlResult = resolveUrlAttribution({
+      canonicalUrl: currentUrl,
+      snapshot: snap,
+      events,
+      policyMode: 'balanced',
+    });
+
+    expect(threadResult.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    expect(threadResult.fusedCandidates[0]?.dominantSource).toBe(
+      urlResult.fusedCandidates[0]?.dominantSource,
+    );
+    expect(threadResult.reasons.targetAnchors).toContain('thread:thread_a');
+    expect(threadResult.reasons.targetAnchors).toContain(`timeline-visit:${currentUrl}`);
   });
 
   it('blocks auto-apply when source regret exceeds the policy budget', () => {

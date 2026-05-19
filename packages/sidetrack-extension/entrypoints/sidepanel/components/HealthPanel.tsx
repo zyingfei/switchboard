@@ -821,6 +821,10 @@ export function HealthPanel({
           : candidateWarningCount > 0
             ? 'warn'
             : 'ok';
+    // W3 — post-W2 there is ONE served producer (its own banner
+    // above). The Experiments stage is now purely the generic
+    // candidate-diagnostics drill summary — no served-producer A/B
+    // wording (that was the retired idf-rkn shadow model).
     const experimentsHead = workGraphUnavailable
       ? 'Unavailable'
       : candidates.length === 0
@@ -1905,6 +1909,55 @@ export function HealthPanel({
     );
   };
 
+  // W3 — single served topic producer (post-W2 there is no A/B: one
+  // clustering serves). Truthful summary from workGraph.topicProducer
+  // (the active served revision). Missing data → "no signal yet",
+  // never fabricated. The generic candidate diagnostics still live in
+  // the Experiments drill.
+  const renderServedTopicProducer = () => {
+    const tp = report?.workGraph?.topicProducer;
+    if (tp === undefined) return null;
+    const algo = tp.algorithmVersion ?? 'unknown';
+    const producer = algo.includes('leiden-cpm')
+      ? 'leiden-cpm @ 0.90'
+      : algo.includes('idf-rkn')
+        ? 'idf-rkn-split'
+        : algo.includes('union-find')
+          ? 'union-find'
+          : algo;
+    const tiles: ReadonlyArray<{ label: string; num: string; foot: string }> = [
+      {
+        label: 'Producer',
+        num: producer,
+        foot: tp.activeRevisionId ?? 'no revision yet',
+      },
+      {
+        label: 'Topics',
+        num: tp.topicCount > 0 ? `${String(tp.topicCount)} topics` : 'no clusters yet',
+        foot: 'served to inbox + suggestions',
+      },
+      {
+        label: 'Lineage',
+        num: `${String(tp.lineageCount)} edges`,
+        foot: 'topic-id continuity across drains',
+      },
+    ];
+    return (
+      <div className="sx-topic-ab" data-testid="hp-served-topics">
+        <h4 className="sx-h">Served topic clustering</h4>
+        <div className="sx-tilegrid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+          {tiles.map((t) => (
+            <div key={t.label} className="sx-tile">
+              <div className="lbl">{t.label}</div>
+              <div className="num">{t.num}</div>
+              <div className="foot">{t.foot}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
   const renderDrill = () => {
     if (node === undefined) return null;
     switch (node.id) {
@@ -1969,6 +2022,8 @@ export function HealthPanel({
         </div>
       ) : (
         <div className="sx-board">
+          {/* V2 — topic clustering A/B, visible without a drill click */}
+          {renderServedTopicProducer()}
           {/* Pipeline strip — the spine */}
           {pipelineStages.length > 0 ? (
             <div className="sx-pipeline" data-testid="hp-pipeline">

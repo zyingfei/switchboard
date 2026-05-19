@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { buildExtractedPageEvidence } from '../page-evidence/extract.js';
+import type { PageEvidenceExtractedRequest, VectorRef } from '../page-evidence/types.js';
 import { createEmptyTabSessionProjection } from '../tabsession/projection.js';
 import { buildConnectionsSnapshot } from './snapshot.js';
 import {
@@ -60,6 +62,41 @@ const embedFromVectors =
       }
       return vector;
     });
+
+const evidencePayload = (input: {
+  readonly canonicalUrl: string;
+  readonly title: string;
+  readonly text: string;
+}): PageEvidenceExtractedRequest => ({
+  payloadVersion: 1,
+  canonicalUrl: input.canonicalUrl,
+  url: input.canonicalUrl,
+  title: input.title,
+  extractedAt: '2026-05-16T10:00:00.000Z',
+  extractionSource: 'reader-mode',
+  extractionPolicy: { trigger: 'attention-gate' },
+  quality: 'high',
+  qualitySignals: {
+    extractedWordCount: 300,
+    contentToDomRatio: 0.7,
+    boilerplateFraction: 0.05,
+    extractionStrategy: 'reader-mode',
+  },
+  content: {
+    text: input.text,
+    contentHash: `hash-${input.title.toLowerCase()}`,
+    charCount: input.text.length,
+  },
+  storageMode: 'features_only',
+});
+
+const vectorRef = (vectorId: string, overrides: Partial<VectorRef> = {}): VectorRef => ({
+  vectorId,
+  modelId: 'test-e5',
+  modelVersion: 'rev-a',
+  dimensions: 2,
+  ...overrides,
+});
 
 const withoutProducedAt = (revision: Awaited<ReturnType<typeof buildVisitSimilarity>>) => {
   const { producedAt: _producedAt, ...rest } = revision;
@@ -219,6 +256,156 @@ describe('buildVisitSimilarity', () => {
     );
     expect(above.edges).toHaveLength(1);
     expect(above.edges[0]?.cosine).toBeCloseTo(0.851, 6);
+  });
+
+  it('emits content-enriched metadata with compatible doc-vector support', async () => {
+    const alpha = visit('alpha');
+    const bravo = visit('bravo');
+    const evidenceAlpha = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: alpha.canonicalUrl!,
+        title: 'alpha',
+        text: 'F16 Minipack data center fabric 100G networking switch design '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-alpha') },
+    );
+    const evidenceBravo = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: bravo.canonicalUrl!,
+        title: 'bravo',
+        text: 'Minipack F16 network fabric data center switch architecture '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-bravo') },
+    );
+
+    const revision = await buildVisitSimilarity(
+      [alpha, bravo],
+      embedFromVectors(
+        new Map<string, Float32Array>([
+          ['alpha', unit([1, 0])],
+          ['bravo', unit([0, 1])],
+        ]),
+      ),
+      {
+        threshold: 0.5,
+        evidenceByCanonicalUrl: new Map([
+          [evidenceAlpha.canonicalUrl, evidenceAlpha],
+          [evidenceBravo.canonicalUrl, evidenceBravo],
+        ]),
+        evidenceVectorsByVectorId: new Map([
+          ['vec-alpha', unit([1, 0])],
+          ['vec-bravo', unit([1, 0])],
+        ]),
+      },
+    );
+
+    expect(revision.edges).toHaveLength(1);
+    expect(revision.edges[0]?.metadata).toMatchObject({
+      producer: 'content-enriched',
+      channels: { contentVector: 1 },
+    });
+    expect(revision.edges[0]?.metadata?.matchedTerms).toContain('Minipack');
+  });
+
+  it('reports indexed chunk support on content-enriched edges', async () => {
+    const alpha = visit('alpha');
+    const bravo = visit('bravo');
+    const evidenceAlpha = buildExtractedPageEvidence({
+      ...evidencePayload({
+        canonicalUrl: alpha.canonicalUrl!,
+        title: 'alpha',
+        text: 'F16 Minipack data center fabric 100G network switch '.repeat(20),
+      }),
+      storageMode: 'indexed_chunks',
+    });
+    const evidenceBravo = buildExtractedPageEvidence({
+      ...evidencePayload({
+        canonicalUrl: bravo.canonicalUrl!,
+        title: 'bravo',
+        text: 'Minipack F16 data center fabric 100G switch architecture '.repeat(20),
+      }),
+      storageMode: 'indexed_chunks',
+    });
+
+    const revision = await buildVisitSimilarity(
+      [alpha, bravo],
+      embedFromVectors(
+        new Map<string, Float32Array>([
+          ['alpha', unit([1, 0])],
+          ['bravo', unit([0, 1])],
+        ]),
+      ),
+      {
+        threshold: 0.3,
+        evidenceByCanonicalUrl: new Map([
+          [evidenceAlpha.canonicalUrl, evidenceAlpha],
+          [evidenceBravo.canonicalUrl, evidenceBravo],
+        ]),
+        pageContentChunksByCanonicalUrl: new Map([
+          [
+            evidenceAlpha.canonicalUrl,
+            [{ terms: evidenceAlpha.content?.terms.slice(0, 8) ?? [], qualityWeight: 1 }],
+          ],
+          [
+            evidenceBravo.canonicalUrl,
+            [{ terms: evidenceBravo.content?.terms.slice(0, 8) ?? [], qualityWeight: 1 }],
+          ],
+        ]),
+      },
+    );
+
+    expect(revision.edges).toHaveLength(1);
+    expect(revision.edges[0]?.metadata?.channels.chunkSupport).toBeGreaterThan(0);
+    expect(revision.edges[0]?.metadata?.chunkSupportCount).toBeGreaterThan(0);
+    expect(revision.edges[0]?.metadata?.maxChunkPairScore).toBeGreaterThan(0);
+  });
+
+  it('skips the content-vector channel for incompatible doc-vector refs', async () => {
+    const alpha = visit('alpha');
+    const bravo = visit('bravo');
+    const evidenceAlpha = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: alpha.canonicalUrl!,
+        title: 'alpha',
+        text: 'F16 Minipack data center fabric 100G networking switch design '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-alpha') },
+    );
+    const evidenceBravo = buildExtractedPageEvidence(
+      evidencePayload({
+        canonicalUrl: bravo.canonicalUrl!,
+        title: 'bravo',
+        text: 'Minipack F16 network fabric data center switch architecture '.repeat(20),
+      }),
+      undefined,
+      { docEmbeddingRef: vectorRef('vec-bravo', { modelVersion: 'rev-b' }) },
+    );
+
+    const revision = await buildVisitSimilarity(
+      [alpha, bravo],
+      embedFromVectors(
+        new Map<string, Float32Array>([
+          ['alpha', unit([1, 0])],
+          ['bravo', unit([1, 0])],
+        ]),
+      ),
+      {
+        evidenceByCanonicalUrl: new Map([
+          [evidenceAlpha.canonicalUrl, evidenceAlpha],
+          [evidenceBravo.canonicalUrl, evidenceBravo],
+        ]),
+        evidenceVectorsByVectorId: new Map([
+          ['vec-alpha', unit([1, 0])],
+          ['vec-bravo', unit([1, 0])],
+        ]),
+      },
+    );
+
+    expect(revision.edges[0]?.metadata?.channels.contentVector).toBeUndefined();
+    expect(revision.edges[0]?.metadata?.channels.contentTerms).toBeGreaterThan(0);
   });
 
   it('requires both endpoints to pass the engagement gate', async () => {

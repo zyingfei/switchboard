@@ -19,6 +19,7 @@ const POLICY_TRIGGERS: ReadonlySet<string> = new Set([
   'workstream-policy',
   'save-suggestion',
   'allowlist',
+  'auto-observed',
   'attention-gate',
   'bulk-open-tabs',
 ]);

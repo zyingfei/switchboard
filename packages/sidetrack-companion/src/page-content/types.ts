@@ -1,3 +1,5 @@
+import type { VectorRef, WeightedTerm } from '../page-evidence/types.js';
+
 export const PAGE_CONTENT_EXTRACTED = 'page.content.extracted' as const;
 export const PAGE_CONTENT_TOMBSTONED = 'page.content.tombstoned' as const;
 
@@ -24,6 +26,7 @@ export type PageContentPolicyTrigger =
   | 'workstream-policy'
   | 'save-suggestion'
   | 'allowlist'
+  | 'auto-observed'
   | 'attention-gate'
   | 'bulk-open-tabs';
 
@@ -109,11 +112,23 @@ export interface PageContentChunk {
   readonly extractedAt: string;
   readonly quality: PageContentQuality;
   readonly extractionStrategy: PageContentExtractionStrategy;
+  readonly headingPath?: readonly string[];
+  readonly terms?: readonly WeightedTerm[];
+  readonly embeddingRef?: VectorRef;
+  readonly qualityWeight?: number;
 }
 
 export interface ContentSearchHit {
   readonly id: string;
-  readonly sourceKind: 'page-content' | 'chat-turn';
+  readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  // W4(b-lite) — present only on 'semantic-recall-pool' hits: marks
+  // the candidate as a semantic-recall expansion (NOT topic
+  // membership) with its evidence.
+  readonly sourceEvidence?: {
+    readonly source: 'semantic_recall_pool';
+    readonly similarity: number;
+    readonly via: 'cluster' | 'neighbor';
+  };
   readonly anchorNodeId: string;
   readonly canonicalUrl?: string;
   readonly threadId?: string;

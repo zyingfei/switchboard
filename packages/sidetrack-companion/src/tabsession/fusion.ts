@@ -5,6 +5,7 @@ export interface CandidateEvidence {
   readonly simMeanScore: number;
   readonly simAgreement: number;
   readonly simMargin: number;
+  readonly simMatchedTerms?: readonly string[];
   readonly clusterPosterior: number;
   readonly corroborationCount: number;
 }

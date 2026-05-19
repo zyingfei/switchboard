@@ -695,6 +695,20 @@ export const startCompanion = async (
         });
         return { imported: true };
       },
+      // P2 — batched edge-event ingest. The plugin's ~1-min flush
+      // imports a whole buffered batch; per-event importEdgeEvent did
+      // ~3 whole-log scans each (~quadratic; 39s on backlog). One
+      // readMerged + dedupe + shard write for the batch.
+      importEdgeEvents: async (events) =>
+        eventLog.appendClientObservedBatch(
+          events.map((event) => ({
+            clientEventId: event.clientEventId,
+            aggregateId: event.aggregateId,
+            type: event.type,
+            payload: event.payload as Record<string, unknown>,
+            baseVector: {},
+          })),
+        ),
       timelineStore,
       connectionsStore,
       refreshConnections: async () => {

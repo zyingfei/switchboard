@@ -83,7 +83,10 @@ import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
 import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
-import { ConnectionsView } from '../../src/sidepanel/connections/ConnectionsView';
+import {
+  ConnectionsView,
+  type FocusGroupSaveInput,
+} from '../../src/sidepanel/connections/ConnectionsView';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
@@ -92,11 +95,13 @@ import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats'
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
+import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBadge';
 import { SuggestionBanner } from '../../src/sidepanel/tabsession/SuggestionBanner';
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionInboxData,
+  type TabSessionPageEvidenceSummary,
   type TabSessionProjection,
   type TabSessionRecord,
   type TabSessionResolutionResult,
@@ -159,8 +164,38 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
           clientEventId: url.currentIgnored.clientEventId,
         },
       }),
+  ...(url.pageEvidence === undefined ? {} : { pageEvidence: url.pageEvidence }),
   attributionHistory: url.attributionHistory,
 });
+
+const fallbackHostTitle = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+};
+
+const urlRecordFromLiveTab = (input: {
+  readonly canonicalUrl: string;
+  readonly liveUrl?: string;
+  readonly title?: string;
+  readonly pageEvidence?: TabSessionPageEvidenceSummary;
+}): UrlVisitRecord => {
+  const liveUrl = input.liveUrl ?? input.canonicalUrl;
+  return {
+    canonicalUrl: input.canonicalUrl,
+    firstSeenAt: '',
+    lastSeenAt: '',
+    visitCount: 0,
+    tabSessionIds: [],
+    latestUrl: liveUrl,
+    latestTitle: input.title ?? fallbackHostTitle(liveUrl),
+    provider: detectProviderFromUrl(liveUrl),
+    attributionHistory: [],
+    ...(input.pageEvidence === undefined ? {} : { pageEvidence: input.pageEvidence }),
+  };
+};
 
 // The URL resolver returns a UrlResolutionResult ({ canonicalUrl, … });
 // the existing InboxCard / SuggestionBanner / AttributionBadge expect
@@ -284,6 +319,30 @@ const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
     typeof value['decision']['workstreamId'] === 'string') &&
   typeof value['decision']['margin'] === 'number' &&
   Array.isArray(value['fusedCandidates']);
+
+const isPageEvidenceSummary = (value: unknown): value is TabSessionPageEvidenceSummary =>
+  isPlainRecord(value) &&
+  typeof value['tier'] === 'string' &&
+  (value['evidenceRevision'] === undefined || typeof value['evidenceRevision'] === 'string') &&
+  (value['semanticFeatureRevision'] === undefined ||
+    typeof value['semanticFeatureRevision'] === 'string') &&
+  (value['updatedAt'] === undefined || typeof value['updatedAt'] === 'string') &&
+  (value['termCount'] === undefined || typeof value['termCount'] === 'number') &&
+  (value['keyphraseCount'] === undefined || typeof value['keyphraseCount'] === 'number') &&
+  (value['entityCount'] === undefined || typeof value['entityCount'] === 'number') &&
+  (value['quality'] === undefined || typeof value['quality'] === 'string');
+
+interface PageEvidenceSummaryLookup {
+  readonly canonicalUrl: string;
+  readonly pageEvidence: TabSessionPageEvidenceSummary | null;
+  readonly stale: boolean;
+}
+
+const isPageEvidenceSummaryLookup = (value: unknown): value is PageEvidenceSummaryLookup =>
+  isPlainRecord(value) &&
+  typeof value['canonicalUrl'] === 'string' &&
+  (value['pageEvidence'] === null || isPageEvidenceSummary(value['pageEvidence'])) &&
+  typeof value['stale'] === 'boolean';
 
 const sendRequestRaw = async (
   request: WorkboardRequest,
@@ -784,6 +843,10 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  const [livePageEvidenceByUrl, setLivePageEvidenceByUrl] = useState<
+    Record<string, TabSessionPageEvidenceSummary>
+  >({});
+  const [livePageEvidenceRetryTick, setLivePageEvidenceRetryTick] = useState(0);
   // Stage 5 follow-up — refs let loadTabSessions read the latest
   // suggestion cache without listing it as a dep (which would
   // re-create the callback + tear down the 4s interval on every
@@ -991,8 +1054,8 @@ const App = () => {
     }
   }, []);
   // Cache of suggested workstream per thread, keyed by thread bac_id.
-  // Populated from companion's GET /v1/suggestions/thread/{id} (PR #76
-  // Track F) when the row is rendered. Empty fallback shows nothing.
+  // Populated from companion's unified resolver compatibility route,
+  // GET /v1/suggestions/thread/{id}, when the row is rendered. Empty fallback shows nothing.
   // Stale-while-revalidate semantics: each row renders the cached
   // value immediately AND always kicks a background fetch on mount
   // / on workstream-state change / on explicit refresh. Cache is
@@ -1485,9 +1548,10 @@ const App = () => {
                 state.activeTabUrl ??
                 state.currentTab?.tabSnapshot?.url ??
                 state.currentTab?.threadUrl;
+              const focusedComparable = comparableTabUrl(focusedCanonical);
               const focusedExtras =
-                typeof focusedCanonical === 'string' && focusedCanonical.length > 0
-                  ? [focusedCanonical]
+                typeof focusedComparable === 'string' && focusedComparable.length > 0
+                  ? [focusedComparable]
                   : [];
               void loadUrlSuggestions(
                 urlInboxResp,
@@ -1574,10 +1638,24 @@ const App = () => {
 
   // Watch the companion's snapshot revision. When the materializer
   // produces a new snapshot (typically 1-5s after a freshly visited
-  // URL is captured), force a re-fetch of resolver suggestions so
-  // the Current Tab card stops showing "No signal yet" for URLs the
-  // graph now knows about. The cache-fill side of this also skips
-  // caching empty results — together they self-heal the stale state.
+  // URL is captured), refresh resolver suggestions so the Current Tab
+  // card stops showing "No signal yet" for URLs the graph now knows
+  // about.
+  //
+  // This is a NON-forced refresh on purpose. `loadTabSessionSuggestions`
+  // keeps cached non-empty results but never caches empty ("No signal
+  // yet") ones, so a non-forced pass already re-resolves exactly the
+  // stale/empty/new cards the new snapshot can now answer — the
+  // self-heal the comment above wants — WITHOUT re-resolving the
+  // already-known ones. Using forceRefetchSuggestions here re-resolved
+  // *every* unattributed session (observed: 424) on *every* snapshot
+  // revision via /v1/tabsessions/<id>/resolve?dryRun=true; since the
+  // companion bumps the revision every drain and a full sweep
+  // (concurrency 4, ~600ms each) outlasts the drain interval, the
+  // sweeps overlapped and pegged the companion (~146% CPU), which kept
+  // it catching_up → more revisions → a self-sustaining flood. Forced
+  // refetch stays on explicit user Refresh + user-mutation cache
+  // invalidation, where it is correct.
   const lastSnapshotRevisionRef = useRef<string | null>(null);
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -1588,7 +1666,7 @@ const App = () => {
     const previous = lastSnapshotRevisionRef.current;
     lastSnapshotRevisionRef.current = rev;
     if (previous === null) return;
-    void loadTabSessions({ background: true, forceRefetchSuggestions: true });
+    void loadTabSessions({ background: true });
   }, [loadTabSessions, state.companionStatus, state.snapshotRevision]);
 
   // 2026-05 cleanup: dropped the 4 s background poll. It was firing
@@ -2460,6 +2538,7 @@ const App = () => {
   const attributeUrlToWorkstream = async (
     canonicalUrl: string,
     workstreamId: string | null,
+    idempotencyKey?: string,
   ): Promise<WorkboardState> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       throw new Error('Companion is not configured.');
@@ -2470,7 +2549,9 @@ const App = () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'idempotency-key': `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
+          'idempotency-key':
+            idempotencyKey ??
+            `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
           'x-bac-bridge-key': bridgeKey,
         },
         body: JSON.stringify({ workstreamId }),
@@ -2549,6 +2630,60 @@ const App = () => {
     void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
   };
 
+  const handleFocusGroupSave = async (input: FocusGroupSaveInput): Promise<void> => {
+    const canonicalUrls = [
+      ...new Set(input.canonicalUrls.map((url) => url.trim()).filter(Boolean)),
+    ];
+    if (canonicalUrls.length === 0) {
+      throw new Error('No pages were selected for this group.');
+    }
+    setBusy(true);
+    setError(null);
+    const operationId = `focus-group-${String(Date.now())}-${Math.random().toString(36).slice(2)}`;
+    try {
+      let targetWorkstreamId = input.targetWorkstreamId?.replace(/^workstream:/u, '').trim() ?? '';
+      let nextState = state;
+      if (targetWorkstreamId.length === 0) {
+        const beforeIds = new Set(state.workstreams.map((workstream) => workstream.bac_id));
+        nextState = await sendRequest({
+          type: messageTypes.createWorkstream,
+          workstream: {
+            title: input.title,
+            privacy: 'shared',
+            description: `Created from Focus ${input.mode}.`,
+          },
+        });
+        const created =
+          nextState.workstreams.find((workstream) => !beforeIds.has(workstream.bac_id)) ??
+          [...nextState.workstreams]
+            .reverse()
+            .find((workstream) => workstream.title === input.title);
+        if (created === undefined) {
+          throw new Error('Created group could not be found in the refreshed workboard state.');
+        }
+        targetWorkstreamId = created.bac_id;
+      }
+      for (const canonicalUrl of canonicalUrls) {
+        nextState = await attributeUrlToWorkstream(
+          canonicalUrl,
+          targetWorkstreamId,
+          `${operationId}:${targetWorkstreamId}:${canonicalUrl}`,
+        );
+      }
+      setState(nextState);
+      setError(nextState.lastError ?? null);
+      setBridgeKey(nextState.settings.companion.bridgeKey);
+      setPort(String(nextState.settings.companion.port));
+    } catch (actionError) {
+      const message =
+        actionError instanceof Error ? actionError.message : 'Could not save Focus group.';
+      setError(message);
+      throw actionError;
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // Stage 5 polish — explicit "ignore this URL" action. Distinct from
   // workstreamId:null (which is "meaningful one-off"). Writes a
   // urls.ignored event so the URL is hidden from Inbox + skipped by
@@ -2600,8 +2735,8 @@ const App = () => {
       viewMode,
       companionStatus: state.companionStatus,
       focused: {
-        canonicalUrl: focusedUrlRecord?.canonicalUrl,
-        record: focusedUrlRecord,
+        canonicalUrl: focusedDisplayUrlRecord?.canonicalUrl,
+        record: focusedDisplayUrlRecord,
         suggestion: focusedTabSuggestion,
       },
       urlInbox: {
@@ -3766,6 +3901,48 @@ const App = () => {
       state.currentTab?.tabSnapshot?.url ??
       state.currentTab?.threadUrl,
   );
+  useEffect(() => {
+    if (focusedTabUrl === null || port.length === 0 || bridgeKey.length === 0) return undefined;
+    const cached = livePageEvidenceByUrl[focusedTabUrl];
+    if (cached !== undefined) return undefined;
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    void fetchCompanionJson<unknown>(
+      `/v1/page-evidence/summary?canonicalUrl=${encodeURIComponent(focusedTabUrl)}`,
+    )
+      .then((payload) => {
+        if (cancelled || !isPageEvidenceSummaryLookup(payload)) return;
+        if (payload.pageEvidence === null) {
+          retryTimer = setTimeout(() => {
+            setLivePageEvidenceRetryTick((tick) => tick + 1);
+          }, 3_000);
+        } else {
+          const pageEvidence = payload.pageEvidence;
+          setLivePageEvidenceByUrl((current) => ({
+            ...current,
+            [payload.canonicalUrl]: pageEvidence,
+            [focusedTabUrl]: pageEvidence,
+          }));
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        retryTimer = setTimeout(() => {
+          setLivePageEvidenceRetryTick((tick) => tick + 1);
+        }, 3_000);
+      });
+    return () => {
+      cancelled = true;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+    };
+  }, [
+    bridgeKey,
+    fetchCompanionJson,
+    focusedTabUrl,
+    livePageEvidenceByUrl,
+    livePageEvidenceRetryTick,
+    port,
+  ]);
   // Per-URL state: every visible attribution surface (Current tab,
   // Inbox, Pages-in-this-workstream) reads from `urlProjection` instead
   // of the tab-session projection. The synthesized TabSessionRecord
@@ -3789,15 +3966,50 @@ const App = () => {
     // urlRecords is sorted by lastSeenAt desc.
     return urlRecords.find((record) => comparableTabUrl(record.canonicalUrl) === focusedTabUrl);
   }, [focusedTabUrl, urlProjection, urlRecords]);
+  const focusedDisplayUrlRecord = useMemo(() => {
+    if (focusedUrlRecord !== undefined) return focusedUrlRecord;
+    if (focusedTabUrl === null) return undefined;
+    return urlRecordFromLiveTab({
+      canonicalUrl: focusedTabUrl,
+      liveUrl:
+        liveActiveTabUrl ??
+        state.activeTabUrl ??
+        state.currentTab?.tabSnapshot?.url ??
+        state.currentTab?.threadUrl ??
+        focusedTabUrl,
+      title:
+        liveActiveTabTitle ??
+        state.currentTab?.tabSnapshot?.title ??
+        state.currentTab?.title ??
+        undefined,
+      pageEvidence: livePageEvidenceByUrl[focusedTabUrl],
+    });
+  }, [
+    focusedTabUrl,
+    focusedUrlRecord,
+    liveActiveTabTitle,
+    liveActiveTabUrl,
+    livePageEvidenceByUrl,
+    state.activeTabUrl,
+    state.currentTab?.tabSnapshot?.title,
+    state.currentTab?.tabSnapshot?.url,
+    state.currentTab?.threadUrl,
+    state.currentTab?.title,
+  ]);
   const focusedTabSession = useMemo(
-    () => (focusedUrlRecord === undefined ? undefined : tabSessionRecordFromUrl(focusedUrlRecord)),
-    [focusedUrlRecord],
+    () =>
+      focusedDisplayUrlRecord === undefined
+        ? undefined
+        : tabSessionRecordFromUrl(focusedDisplayUrlRecord),
+    [focusedDisplayUrlRecord],
   );
   const focusedTabSuggestion =
-    focusedUrlRecord === undefined ? undefined : urlSuggestions[focusedUrlRecord.canonicalUrl];
+    focusedDisplayUrlRecord === undefined
+      ? undefined
+      : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
   const focusedSuggestionIsActionable =
-    focusedUrlRecord !== undefined &&
-    focusedUrlRecord.currentAttribution === undefined &&
+    focusedDisplayUrlRecord !== undefined &&
+    focusedDisplayUrlRecord.currentAttribution === undefined &&
     focusedTabSuggestion?.decision.action === 'suggest' &&
     focusedTabSuggestion.decision.workstreamId !== undefined;
   const fallbackSuggestedUrl = useMemo(
@@ -3812,7 +4024,9 @@ const App = () => {
       }),
     [urlRecords, urlSuggestions],
   );
-  const suggestedOpenUrl = focusedSuggestionIsActionable ? focusedUrlRecord : fallbackSuggestedUrl;
+  const suggestedOpenUrl = focusedSuggestionIsActionable
+    ? focusedDisplayUrlRecord
+    : fallbackSuggestedUrl;
   const suggestedOpenTabSession = useMemo(
     () => (suggestedOpenUrl === undefined ? undefined : tabSessionRecordFromUrl(suggestedOpenUrl)),
     [suggestedOpenUrl],
@@ -5605,12 +5819,26 @@ const App = () => {
             <div className="tab-attribution-card-head">
               <span className="tab-attribution-card-eyebrow mono">Current tab</span>
               {focusedTabSession !== undefined ? (
-                <span
-                  className="tab-attribution-card-title"
-                  title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
-                >
-                  {tabSessionDisplayTitle(focusedTabSession)}
-                </span>
+                <>
+                  <span
+                    className="tab-attribution-card-title"
+                    title={focusedTabSession.latestUrl ?? tabSessionDisplayTitle(focusedTabSession)}
+                  >
+                    {tabSessionDisplayTitle(focusedTabSession)}
+                  </span>
+                  {focusedTabSession.pageEvidence === undefined ? (
+                    <span
+                      className="tab-session-capture-badge is-unknown"
+                      title="Capture status: waiting for PageEvidence metadata from the companion."
+                      aria-label="Capture status: pending"
+                      data-testid="page-evidence-capture-badge"
+                    >
+                      Capturing
+                    </span>
+                  ) : (
+                    <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
+                  )}
+                </>
               ) : liveActiveTabUrl !== undefined ? (
                 // Optimistic render before urlProjection has the entry.
                 // The companion takes a few seconds to materialize the visit
@@ -5679,9 +5907,9 @@ const App = () => {
               Renders for any unattributed/un-ignored focused URL — when
               the resolver has no candidates we still draw the empty
               placeholder so the user sees why the badge is "?". */}
-                  {focusedUrlRecord !== undefined &&
-                  focusedUrlRecord.currentAttribution === undefined &&
-                  focusedUrlRecord.currentIgnored === undefined ? (
+                  {focusedDisplayUrlRecord !== undefined &&
+                  focusedDisplayUrlRecord.currentAttribution === undefined &&
+                  focusedDisplayUrlRecord.currentIgnored === undefined ? (
                     <SuggestionStats
                       suggestion={
                         focusedTabSuggestion === undefined
@@ -5706,19 +5934,19 @@ const App = () => {
             high-enough suggestion exists; the other three always
             render so the user can take the corresponding action even
             when no suggestion is present. */}
-                {focusedUrlRecord !== undefined ? (
+                {focusedDisplayUrlRecord !== undefined ? (
                   <div className="tab-attribution-card-actions">
                     {focusedTabSuggestion !== undefined &&
                     focusedTabSuggestion.decision.workstreamId !== undefined &&
-                    focusedUrlRecord.currentAttribution === undefined &&
-                    focusedUrlRecord.currentIgnored === undefined ? (
+                    focusedDisplayUrlRecord.currentAttribution === undefined &&
+                    focusedDisplayUrlRecord.currentIgnored === undefined ? (
                       <button
                         type="button"
                         className="tab-attribution-card-action primary"
                         onClick={() => {
                           if (focusedTabSuggestion.decision.workstreamId !== undefined) {
                             handleUrlAttribute(
-                              focusedUrlRecord.canonicalUrl,
+                              focusedDisplayUrlRecord.canonicalUrl,
                               focusedTabSuggestion.decision.workstreamId,
                             );
                           }
@@ -5732,7 +5960,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        setTabSessionMoveId(focusedUrlRecord.canonicalUrl);
+                        setTabSessionMoveId(focusedDisplayUrlRecord.canonicalUrl);
                       }}
                       title="Pick a different workstream"
                     >
@@ -5742,7 +5970,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        handleUrlAttribute(focusedUrlRecord.canonicalUrl, null);
+                        handleUrlAttribute(focusedDisplayUrlRecord.canonicalUrl, null);
                       }}
                       title="This page is meaningful but doesn't belong to any workstream"
                     >
@@ -5752,7 +5980,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        handleUrlIgnore(focusedUrlRecord.canonicalUrl, 'noise');
+                        handleUrlIgnore(focusedDisplayUrlRecord.canonicalUrl, 'noise');
                       }}
                       title="Mute this URL — don't bother me about it again"
                     >
@@ -5768,7 +5996,7 @@ const App = () => {
                       type="button"
                       className="tab-attribution-card-action"
                       onClick={() => {
-                        requestSwitchToConnections(focusedUrlRecord.canonicalUrl);
+                        requestSwitchToConnections(focusedDisplayUrlRecord.canonicalUrl);
                       }}
                       title="Open this URL's neighborhood in the Connections graph"
                       data-testid="focused-tab-open-in-connections"
@@ -6072,6 +6300,7 @@ const App = () => {
             setConnectionsAnchorRequest('');
           }}
           onOpenInInbox={requestSwitchToInbox}
+          onSaveFocusGroup={handleFocusGroupSave}
           workstreamAnchors={state.workstreams.map((w) => ({
             id: `workstream:${w.bac_id}`,
             label: workstreamPath(w.bac_id, state.workstreams),
@@ -6238,8 +6467,8 @@ const App = () => {
               .map(tabSessionRecordFromUrl)
               .filter(
                 (item) =>
-                  focusedUrlRecord === undefined ||
-                  item.tabSessionId !== focusedUrlRecord.canonicalUrl,
+                  focusedDisplayUrlRecord === undefined ||
+                  item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl,
               ),
             total: urlInbox.total,
             limit: urlInbox.limit,
@@ -7169,6 +7398,7 @@ const App = () => {
             autoTrack: state.settings.autoTrack,
             vaultPath: state.vaultPath ?? '',
             notifyOnQueueComplete: state.settings.notifyOnQueueComplete,
+            pageEvidenceAutoExtractEnabled: state.settings.pageEvidenceAutoExtractEnabled,
           }}
           companionConfigured={bridgeKey.length > 0}
           workstreams={state.workstreams}
@@ -7386,9 +7616,9 @@ export default App;
 // Spec-aligned UI subcomponents (PR 2 / design rewrite)
 // =====================================================
 
-// Per-row workstream-suggestion fetcher. Calls
-// GET /v1/suggestions/thread/{id} (PR #76 Track F) when companion is
-// configured. Caches the top suggestion via the parent's onCache so
+// Per-row workstream-suggestion fetcher. Calls the unified resolver
+// compatibility route, GET /v1/suggestions/thread/{id}, when companion
+// is configured. Caches the top suggestion via the parent's onCache so
 // repeated row renders don't re-fetch.
 
 interface NeedsOrganizeSuggestionRowProps {
@@ -7455,6 +7685,21 @@ function NeedsOrganizeSuggestionRow({
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
 
+  // Latest-ref pattern. onCache / resolveLabel are recreated by the
+  // parent every render; the effect calls onCache() on success →
+  // parent setState → re-render → new callback identities → effect
+  // re-fires → fetch → onCache → … an unbounded fetch-on-render
+  // loop. It was masked only by the ~600ms server latency + the
+  // global fetch slot; server-side caching of /v1/suggestions/thread
+  // made the response instant and exposed it as ~500 req/s/thread
+  // (~93k req/90s). Keep these OUT of the effect deps and call the
+  // latest via refs so the effect re-runs only on real input changes
+  // (matches the existing latest-ref usage elsewhere in this file).
+  const onCacheRef = useRef(onCache);
+  onCacheRef.current = onCache;
+  const resolveLabelRef = useRef(resolveLabel);
+  resolveLabelRef.current = resolveLabel;
+
   useEffect(() => {
     if (companionPort === null || bridgeKey === null) return undefined;
     // Suppress fetches while the recall index is rebuilding —
@@ -7504,10 +7749,10 @@ function NeedsOrganizeSuggestionRow({
           setSuggestion(null);
           return;
         }
-        const label = resolveLabel(top.workstreamId);
+        const label = resolveLabelRef.current(top.workstreamId);
         const next = { workstreamId: top.workstreamId, label, confidence: top.score };
         setSuggestion(next);
-        onCache(next);
+        onCacheRef.current(next);
       } catch {
         // Silent — empty render
       } finally {
@@ -7519,12 +7764,12 @@ function NeedsOrganizeSuggestionRow({
     return () => {
       cancelled = true;
     };
+    // onCache / resolveLabel intentionally excluded — called via
+    // refs above to break the fetch-on-render loop.
   }, [
     companionPort,
     bridgeKey,
     threadId,
-    onCache,
-    resolveLabel,
     workstreamFingerprint,
     indexRebuilding,
     refreshTick,

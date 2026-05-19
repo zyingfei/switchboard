@@ -11,6 +11,7 @@ import {
   type TopicRevision,
   type TopicRevisionTopic,
 } from '../producers/topic-revision.js';
+import type { PageEvidenceSimilarityMetadata } from '../page-evidence/types.js';
 import { topicId } from './topicId.js';
 import { UnionFind } from './unionFind.js';
 
@@ -27,6 +28,7 @@ export interface VisitSimilarityEdge {
   readonly fromVisitKey: string;
   readonly toVisitKey: string;
   readonly cosine: number;
+  readonly metadata?: PageEvidenceSimilarityMetadata;
 }
 
 export interface VisitSimilarityRevisionInput {
@@ -568,6 +570,68 @@ export class IncrementalTopicClusterAccumulator {
   // new one. removeEdge handles the disconnect path.
 }
 
+// W2 — the canonical "member groups -> TopicRevision" assembly:
+// per-component topicId + metadata, ≥2-member filter, lineage vs
+// previousRevision, deterministic revisionId. Extracted verbatim from
+// buildTopicRevision's tail so every producer (union-find, leiden-cpm,
+// …) shares ONE lineage/identity-continuity implementation — clustering
+// differs, assembly + lineage must not.
+export const assembleTopicRevisionFromGroups = async (params: {
+  readonly groups: readonly (readonly string[])[];
+  readonly visitsByCanonical: ReadonlyMap<string, TopicVisit>;
+  readonly visitSimilarity: VisitSimilarityRevisionInput;
+  readonly previousRevision?: TopicRevision;
+  readonly cosineThreshold: number;
+  readonly algorithmVersion: TopicAlgorithmVersion;
+  readonly producedAt: number;
+}): Promise<TopicRevision> => {
+  const observedAt = new Date(params.producedAt).toISOString();
+  const currentComponents: CurrentComponent[] = [];
+  for (const group of params.groups) {
+    const memberCanonicalUrls = [...group].sort(compareString);
+    const metadata = buildMetadata(
+      memberCanonicalUrls,
+      params.visitsByCanonical,
+      params.visitSimilarity.edges,
+      params.cosineThreshold,
+    );
+    currentComponents.push({
+      topicId: await topicId(memberCanonicalUrls),
+      memberCanonicalUrls,
+      metadata,
+    });
+  }
+  currentComponents.sort((a, b) => compareString(a.topicId, b.topicId));
+
+  const topics: TopicRevisionTopic[] = [];
+  for (const component of currentComponents) {
+    if (component.memberCanonicalUrls.length < 2) continue;
+    topics.push({
+      topicId: component.topicId,
+      memberCanonicalUrls: component.memberCanonicalUrls,
+      metadata: component.metadata,
+    });
+  }
+  topics.sort((a, b) => compareString(a.topicId, b.topicId));
+
+  const lineage = await computeLineage(params.previousRevision, currentComponents, observedAt);
+  const revisionId = await createTopicRevisionId({
+    visitSimilarityRevisionId: params.visitSimilarity.revisionId,
+    cosineThreshold: params.cosineThreshold,
+    algorithmVersion: params.algorithmVersion,
+  });
+
+  return {
+    revisionId,
+    visitSimilarityRevisionId: params.visitSimilarity.revisionId,
+    cosineThreshold: params.cosineThreshold,
+    algorithmVersion: params.algorithmVersion,
+    topics,
+    lineage,
+    producedAt: params.producedAt,
+  };
+};
+
 export const buildTopicRevision = async (
   input: BuildTopicRevisionInput,
 ): Promise<TopicRevision> => {
@@ -636,50 +700,19 @@ export const buildTopicRevision = async (
     uf.union(edge.fromVisitKey, edge.toVisitKey);
   }
 
-  const currentComponents: CurrentComponent[] = [];
-  for (const component of uf.components()) {
-    const memberCanonicalUrls = [...component.members].sort(compareString);
-    const metadata = buildMetadata(
-      memberCanonicalUrls,
-      visitsByCanonical,
-      input.visitSimilarity.edges,
-      cosineThreshold,
-    );
-    currentComponents.push({
-      topicId: await topicId(memberCanonicalUrls),
-      memberCanonicalUrls,
-      metadata,
-    });
-  }
-  currentComponents.sort((a, b) => compareString(a.topicId, b.topicId));
-
-  const topics: TopicRevisionTopic[] = [];
-  for (const component of currentComponents) {
-    if (component.memberCanonicalUrls.length < 2) continue;
-    topics.push({
-      topicId: component.topicId,
-      memberCanonicalUrls: component.memberCanonicalUrls,
-      metadata: component.metadata,
-    });
-  }
-  topics.sort((a, b) => compareString(a.topicId, b.topicId));
-
-  const lineage = await computeLineage(input.previousRevision, currentComponents, observedAt);
-  const revisionId = await createTopicRevisionId({
-    visitSimilarityRevisionId: input.visitSimilarity.revisionId,
+  const groups: string[][] = [];
+  for (const component of uf.components()) groups.push([...component.members]);
+  return assembleTopicRevisionFromGroups({
+    groups,
+    visitsByCanonical,
+    visitSimilarity: input.visitSimilarity,
+    ...(input.previousRevision === undefined
+      ? {}
+      : { previousRevision: input.previousRevision }),
     cosineThreshold,
     algorithmVersion,
-  });
-
-  return {
-    revisionId,
-    visitSimilarityRevisionId: input.visitSimilarity.revisionId,
-    cosineThreshold,
-    algorithmVersion,
-    topics,
-    lineage,
     producedAt,
-  };
+  });
 };
 
 // -- Stage 5.2 W4 — derive-from-accumulator topic revision -----------

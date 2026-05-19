@@ -18,6 +18,7 @@
 
 import type { SerializedTabSessionProjection } from '../tabsession/projection.js';
 import type { SerializedUrlProjection } from '../urls/projection.js';
+import type { PageEvidenceSimilarityMetadata } from '../page-evidence/types.js';
 
 export type ConnectionNodeKind =
   | 'thread'
@@ -238,6 +239,7 @@ export interface VisitSimilarityEdge {
   readonly fromVisitKey: string;
   readonly toVisitKey: string;
   readonly cosine: number;
+  readonly metadata?: PageEvidenceSimilarityMetadata;
 }
 
 // Stage 5 / T2 — `producer` distinguishes whether the edges came from

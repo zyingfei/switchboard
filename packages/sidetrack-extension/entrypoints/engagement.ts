@@ -11,6 +11,7 @@ import {
 import { safeSendRuntimeMessage } from '../src/content/inject';
 
 const SUB_EMIT_MS = 30_000;
+const ATTENTION_GATE_EMIT_MS = 5_000;
 
 export const startEngagementTracking = (): void => {
   const visitId = engagementVisitIdForLocation(window.location);
@@ -22,10 +23,25 @@ export const startEngagementTracking = (): void => {
   });
 
   let finalized = false;
+  let attentionGateEmitted = false;
   const emit = (final: boolean): void => {
     if (finalized && final) return;
     if (final) finalized = true;
     safeSendRuntimeMessage(aggregator.snapshot(final));
+  };
+  const emitAttentionGateSnapshot = (): void => {
+    if (finalized || attentionGateEmitted) return;
+    const snapshot = aggregator.snapshot(false);
+    const focusedWindowMs = snapshot.dimensions.engagement.focusedWindowMs;
+    if (focusedWindowMs >= ATTENTION_GATE_EMIT_MS) {
+      attentionGateEmitted = true;
+      safeSendRuntimeMessage(snapshot);
+      return;
+    }
+    window.setTimeout(
+      emitAttentionGateSnapshot,
+      Math.max(1_000, ATTENTION_GATE_EMIT_MS - focusedWindowMs),
+    );
   };
 
   document.addEventListener('visibilitychange', () => {
@@ -88,6 +104,7 @@ export const startEngagementTracking = (): void => {
   window.setInterval(() => {
     emit(false);
   }, SUB_EMIT_MS);
+  window.setTimeout(emitAttentionGateSnapshot, ATTENTION_GATE_EMIT_MS);
 };
 
 export default defineContentScript({

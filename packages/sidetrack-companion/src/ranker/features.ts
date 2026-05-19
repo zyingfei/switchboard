@@ -88,6 +88,7 @@ interface FeatureModel {
   // excluded: they are intra-lineage continuity, not a cross-topic
   // split/merge relationship.
   readonly topicLineageMergeSplitGraph: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly similarityEdgesByPair: ReadonlyMap<string, readonly ConnectionEdge[]>;
   // Page-content quality tier per visit alias (canonicalUrl). Latest
   // page-content event wins by (acceptedAt, replicaId, seq). Tombstone
   // events clear the value, so deleted/policy-revoked content is
@@ -882,10 +883,21 @@ const buildFeatureModel = (
     navigationGraph: buildChainGraph(recordsById, (record) => record.previousVisitId),
     primaryTopicsByVisitKey: buildPrimaryTopicsByVisitKey(snapshot),
     topicLineageMergeSplitGraph: buildTopicLineageMergeSplitGraph(snapshot),
+    similarityEdgesByPair: buildSimilarityEdgesByPair(snapshot),
     pageQualityByVisitKey: buildPageQualityByVisitKey(events),
     snapshot,
     referenceMs: referenceMsFor(events, snapshot),
   };
+};
+
+const featureModelsByContext = new WeakMap<object, FeatureModel>();
+
+const featureModelFor = (context: Parameters<ExtractFeatures>[1]): FeatureModel => {
+  const cached = featureModelsByContext.get(context);
+  if (cached !== undefined) return cached;
+  const model = buildFeatureModel(context.merged, context.snapshot);
+  featureModelsByContext.set(context, model);
+  return model;
 };
 
 const sameWorkstreamFeature = (candidate: Candidate, model: FeatureModel): BinaryFeature => {
@@ -1004,6 +1016,48 @@ const edgeConnectsCandidate = (
   );
 };
 
+const visitPairKey = (left: string, right: string): string =>
+  left <= right ? `${left}\u0000${right}` : `${right}\u0000${left}`;
+
+const buildSimilarityEdgesByPair = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, readonly ConnectionEdge[]> => {
+  const byPair = new Map<string, ConnectionEdge[]>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_resembles_visit') continue;
+    const fromVisit = visitKeyFromNodeOrRaw(edge.fromNodeId);
+    const toVisit = visitKeyFromNodeOrRaw(edge.toNodeId);
+    const key = visitPairKey(fromVisit, toVisit);
+    const rows = byPair.get(key) ?? [];
+    rows.push(edge);
+    byPair.set(key, rows);
+  }
+  return byPair;
+};
+
+const similarityEdgesForCandidate = (
+  candidate: Candidate,
+  model: FeatureModel,
+): readonly ConnectionEdge[] => {
+  const fromAliases = aliasesForVisit(model, candidate.fromVisitId);
+  const toAliases = aliasesForVisit(model, candidate.toVisitId);
+  const seen = new Set<string>();
+  const out: ConnectionEdge[] = [];
+  for (const fromAlias of fromAliases) {
+    for (const toAlias of toAliases) {
+      const rows = model.similarityEdgesByPair.get(visitPairKey(fromAlias, toAlias));
+      if (rows === undefined) continue;
+      for (const edge of rows) {
+        if (seen.has(edge.id)) continue;
+        if (!edgeConnectsCandidate(edge, fromAliases, toAliases)) continue;
+        seen.add(edge.id);
+        out.push(edge);
+      }
+    }
+  }
+  return out;
+};
+
 const clampedUnit = (value: number): number => {
   if (!Number.isFinite(value)) return 0;
   if (value < 0) return 0;
@@ -1012,19 +1066,76 @@ const clampedUnit = (value: number): number => {
 };
 
 const cosineSimilarityFeature = (candidate: Candidate, model: FeatureModel): number => {
-  const fromAliases = aliasesForVisit(model, candidate.fromVisitId);
-  const toAliases = aliasesForVisit(model, candidate.toVisitId);
   let best = 0;
-  for (const edge of model.snapshot.edges) {
-    if (edge.kind !== 'visit_resembles_visit') continue;
-    if (!edgeConnectsCandidate(edge, fromAliases, toAliases)) continue;
+  for (const edge of similarityEdgesForCandidate(candidate, model)) {
     const raw =
+      edge.metadata?.['score'] ??
       edge.metadata?.['cosine'] ??
       edge.metadata?.['cosine_similarity'] ??
       edge.metadata?.['similarity'];
     if (typeof raw === 'number') best = Math.max(best, clampedUnit(raw));
   }
   return best;
+};
+
+const bestSimilarityEdgeForCandidate = (
+  candidate: Candidate,
+  model: FeatureModel,
+): ConnectionEdge | null => {
+  let best: ConnectionEdge | null = null;
+  let bestScore = 0;
+  for (const edge of similarityEdgesForCandidate(candidate, model)) {
+    const rawScore = edge.metadata?.['score'] ?? edge.metadata?.['cosine'];
+    const score = typeof rawScore === 'number' ? clampedUnit(rawScore) : 0;
+    if (best === null || score > bestScore) {
+      best = edge;
+      bestScore = score;
+    }
+  }
+  return best;
+};
+
+const metadataStringArray = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): readonly string[] => {
+  const value = metadata?.[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+};
+
+const metadataNumberFeature = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): number => {
+  const value = metadata?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+};
+
+const channelNumber = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): number => {
+  const channels = metadata?.['channels'];
+  if (!isRecord(channels)) return 0;
+  const value = channels[key];
+  return typeof value === 'number' && Number.isFinite(value) ? clampedUnit(value) : 0;
+};
+
+const evidenceTierValue = (value: unknown): number => {
+  if (value === 'indexed_chunks') return 2;
+  if (value === 'content_features_only') return 1;
+  return 0;
+};
+
+const contentQualityPairMinFeature = (
+  candidate: Candidate,
+  model: FeatureModel,
+  edge: ConnectionEdge | null,
+): number => {
+  if (edge === null) return 0;
+  const fromQuality = pageQualityTierForVisit(candidate.fromVisitId, model);
+  const toQuality = pageQualityTierForVisit(candidate.toVisitId, model);
+  return fromQuality === 0 || toQuality === 0 ? 0 : Math.min(fromQuality, toQuality);
 };
 
 const latestObservedAtForVisit = (candidateVisitId: string, model: FeatureModel): number | null => {
@@ -1179,7 +1290,14 @@ const pageQualityTierToFeature = (candidate: Candidate, model: FeatureModel): nu
   pageQualityTierForVisit(candidate.toVisitId, model);
 
 export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
-  const model = buildFeatureModel(context.merged, context.snapshot);
+  const model = featureModelFor(context);
+  const contentEdge = bestSimilarityEdgeForCandidate(candidate, model);
+  const contentMetadata = contentEdge?.metadata;
+  const sharedContentTerms = metadataStringArray(contentMetadata, 'matchedTerms').length;
+  const sharedContentKeyphrases = metadataStringArray(contentMetadata, 'matchedKeyphrases').length;
+  const sharedContentEntities = metadataStringArray(contentMetadata, 'matchedEntities').length;
+  const contentTierFrom = evidenceTierValue(contentMetadata?.['evidenceTierFrom']);
+  const contentTierTo = evidenceTierValue(contentMetadata?.['evidenceTierTo']);
 
   return {
     schemaVersion: FEATURE_SCHEMA_VERSION,
@@ -1205,5 +1323,19 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
     topic_lineage_merge_split_related: topicLineageMergeSplitRelatedFeature(candidate, model),
     page_quality_tier_from: pageQualityTierFromFeature(candidate, model),
     page_quality_tier_to: pageQualityTierToFeature(candidate, model),
+    shared_content_terms: sharedContentTerms,
+    shared_content_keyphrases: sharedContentKeyphrases,
+    content_weighted_jaccard: Math.max(
+      channelNumber(contentMetadata, 'contentTerms'),
+      channelNumber(contentMetadata, 'keyphrases'),
+    ),
+    content_vector_cosine: channelNumber(contentMetadata, 'contentVector'),
+    content_entity_overlap: Math.max(channelNumber(contentMetadata, 'entities'), sharedContentEntities),
+    content_evidence_tier_from: contentTierFrom,
+    content_evidence_tier_to: contentTierTo,
+    content_both_available: toBinary(contentTierFrom > 0 && contentTierTo > 0),
+    content_quality_pair_min: contentQualityPairMinFeature(candidate, model, contentEdge),
+    chunk_support_count: metadataNumberFeature(contentMetadata, 'chunkSupportCount'),
+    max_chunk_pair_score: metadataNumberFeature(contentMetadata, 'maxChunkPairScore'),
   };
 };

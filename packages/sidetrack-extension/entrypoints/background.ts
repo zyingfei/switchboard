@@ -74,6 +74,7 @@ import {
   type SelectionCopiedPayload,
   type SelectionPastedPayload,
 } from '../src/content/engagement/copy-paste';
+import type { EngagementIntervalMessage } from '../src/content/engagement/aggregator';
 import {
   VISUAL_FINGERPRINT_OBSERVED,
   VISUAL_FINGERPRINT_PRIVACY_GET,
@@ -86,6 +87,7 @@ import { createRecallClient } from '../src/companion/recallClient';
 import {
   createPageContentClient,
   type PageContentCoverage,
+  type PageEvidenceRecord,
 } from '../src/companion/pageContentClient';
 import { buildReviewFollowUpText } from '../src/review/draft';
 import type { ReviewDraft } from '../src/review/types';
@@ -146,6 +148,7 @@ import {
   pruneReminders,
   reorderLocalQueueItems,
   saveNotifyOnQueueComplete,
+  savePageEvidenceAutoExtractEnabled,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -973,6 +976,125 @@ const extractPageContentFromTab = async (
     throw new Error('Companion not configured.');
   }
   return await createPageContentClient(settings.companion).index(result.data.payload);
+};
+
+type PageEvidenceTrigger =
+  | 'manual'
+  | 'workstream-policy'
+  | 'save-suggestion'
+  | 'allowlist'
+  | 'auto-observed'
+  | 'attention-gate'
+  | 'bulk-open-tabs';
+
+const extractPageEvidenceFromTab = async (
+  tab: chrome.tabs.Tab,
+  trigger: PageEvidenceTrigger,
+): Promise<PageEvidenceRecord> => {
+  if (typeof tab.id !== 'number') {
+    throw new Error('Current tab has no tab id.');
+  }
+  if (tab.incognito === true) {
+    throw new Error('Page-evidence extraction is disabled in incognito tabs.');
+  }
+  const tabUrl = tab.url ?? '';
+  if (!/^https?:\/\//u.test(tabUrl)) {
+    throw new Error('Page-evidence extraction only supports HTTP(S) pages.');
+  }
+  const request = {
+    type: messageTypes.pageContentExtract,
+    mode: 'page',
+    trigger,
+  } as const;
+  let result = await sendToContentScriptWithRecovery(tab.id, request);
+  if (result.ok && !isPageContentExtractContentResponse(result.data)) {
+    const inject = await ensureContentScriptInTab(tab.id);
+    if (!inject.ok) {
+      throw new Error(
+        `Content script returned an invalid page-evidence response. Tried to recover but: ${inject.error ?? 'inject failed'}.`,
+      );
+    }
+    result = await sendToContentScriptWithRecovery(tab.id, request);
+  }
+  if (!result.ok) {
+    throw new Error(result.error ?? 'Content script is not reachable.');
+  }
+  if (!isPageContentExtractContentResponse(result.data)) {
+    throw new Error('Content script returned an invalid page-evidence response.');
+  }
+  if (!result.data.ok) {
+    throw new Error(result.data.error);
+  }
+  const settings = await readSettings();
+  if (settings.companion.bridgeKey.trim().length === 0) {
+    throw new Error('Companion not configured.');
+  }
+  return await createPageContentClient(settings.companion).evidence(
+    result.data.payload,
+    'features_only',
+  );
+};
+
+const PAGE_EVIDENCE_ATTENTION_GATE_MS = 5_000;
+const PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+const pageEvidenceAutoExtractedAtByCanonical = new Map<string, number>();
+
+const maybeExtractAutoPageEvidence = async (
+  tab: chrome.tabs.Tab,
+  trigger: PageEvidenceTrigger,
+  detail: Record<string, unknown> = {},
+): Promise<void> => {
+  const settings = await readSettings();
+  if (settings.pageEvidenceAutoExtractEnabled !== true) return;
+  if (typeof tab.id !== 'number') return;
+  if (tab.incognito === true) return;
+  const tabUrl = tab.url ?? '';
+  if (!/^https?:\/\//u.test(tabUrl)) return;
+  const canonicalUrl = canonicalThreadUrl(tabUrl);
+  const now = Date.now();
+  const previous = pageEvidenceAutoExtractedAtByCanonical.get(canonicalUrl);
+  if (previous !== undefined && now - previous < PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS) return;
+  pageEvidenceAutoExtractedAtByCanonical.set(canonicalUrl, now);
+  try {
+    await extractPageEvidenceFromTab(tab, trigger);
+    await recordEngagementSyncDiag('pageEvidence.extracted', {
+      ...detail,
+      tabId: tab.id,
+      trigger,
+      canonicalUrl,
+    });
+    void broadcastWorkboardChanged('thread');
+  } catch (error) {
+    await recordEngagementSyncDiag('pageEvidence.failed', {
+      ...detail,
+      tabId: tab.id,
+      trigger,
+      canonicalUrl,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
+
+const maybeExtractObservedPageEvidenceForTabId = async (
+  tabId: number,
+  detail: Record<string, unknown> = {},
+): Promise<void> => {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab === null) return;
+  await maybeExtractAutoPageEvidence(tab, 'auto-observed', detail);
+};
+
+const maybeExtractAttentionGatePageEvidence = async (
+  tabId: number,
+  message: EngagementIntervalMessage,
+): Promise<void> => {
+  const focusedWindowMs = message.dimensions.engagement.focusedWindowMs;
+  if (focusedWindowMs < PAGE_EVIDENCE_ATTENTION_GATE_MS) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab === null) return;
+  await maybeExtractAutoPageEvidence(tab, 'attention-gate', {
+    focusedWindowMs,
+  });
 };
 
 const openTabPreviewForPageContent = (tab: chrome.tabs.Tab): PageContentOpenTabPreview => {
@@ -3029,6 +3151,19 @@ const handleRequest = async (
       if (typeof request.preferences.notifyOnQueueComplete === 'boolean') {
         await saveNotifyOnQueueComplete(request.preferences.notifyOnQueueComplete);
       }
+      if (typeof request.preferences.pageEvidenceAutoExtractEnabled === 'boolean') {
+        await savePageEvidenceAutoExtractEnabled(
+          request.preferences.pageEvidenceAutoExtractEnabled,
+        );
+        if (request.preferences.pageEvidenceAutoExtractEnabled) {
+          const tab = await activeTab();
+          if (tab !== undefined) {
+            void maybeExtractAutoPageEvidence(tab, 'auto-observed', {
+              source: 'settings-enabled',
+            });
+          }
+        }
+      }
     }, 'settings');
   }
 
@@ -3378,6 +3513,7 @@ export default defineBackground(() => {
       final: message.final,
       payloadCount: payloads.length,
     });
+    void maybeExtractAttentionGatePageEvidence(tabId, message);
   };
 
   const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
@@ -3786,17 +3922,24 @@ export default defineBackground(() => {
       })
       .catch(() => undefined);
   };
-  chrome.tabs.onActivated.addListener(() => {
+  chrome.tabs.onActivated.addListener((info) => {
     dismissAndBroadcast();
+    void maybeExtractObservedPageEvidenceForTabId(info.tabId, {
+      source: 'tab-activated',
+    });
   });
-  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // Only react when the URL actually changed — ignore title/favicon
     // updates that fire on every page mutation.
-    if (changeInfo.url === undefined) {
-      return;
+    if (changeInfo.url !== undefined) {
+      void detectCodingAttachForTab(tabId, changeInfo.url);
+      dismissAndBroadcast();
     }
-    void detectCodingAttachForTab(tabId, changeInfo.url);
-    dismissAndBroadcast();
+    if (changeInfo.status === 'complete') {
+      void maybeExtractAutoPageEvidence(tab, 'auto-observed', {
+        source: 'tab-complete',
+      });
+    }
   });
   chrome.windows.onFocusChanged.addListener((windowId) => {
     if (windowId === chrome.windows.WINDOW_ID_NONE) {

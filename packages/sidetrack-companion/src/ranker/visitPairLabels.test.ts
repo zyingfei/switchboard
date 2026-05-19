@@ -1,5 +1,6 @@
-// closest_visit ranker label shaping. Workstream closure is allowed as
-// a candidate source, but must never mint positive labels.
+// closest_visit ranker label shaping. Workstream membership is scope,
+// not pairwise evidence: it must never mint positive labels or pair
+// candidates without an independent source.
 
 import { describe, expect, it } from 'vitest';
 

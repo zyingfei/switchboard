@@ -51,6 +51,7 @@ export interface LocalPreferences {
   readonly autoTrack: boolean;
   readonly vaultPath: string;
   readonly notifyOnQueueComplete: boolean;
+  readonly pageEvidenceAutoExtractEnabled: boolean;
 }
 
 export interface ArchivedThreadRow {
@@ -81,6 +82,7 @@ export interface SettingsPanelProps {
     readonly autoTrack?: boolean;
     readonly vaultPath?: string;
     readonly notifyOnQueueComplete?: boolean;
+    readonly pageEvidenceAutoExtractEnabled?: boolean;
   }) => void;
   readonly onRestoreThread: (threadId: string) => void;
   readonly onDeleteThread: (threadId: string) => void;
@@ -455,6 +457,9 @@ export function SettingsPanel({
   const [draftNotifyOnQueueComplete, setDraftNotifyOnQueueComplete] = useState(
     localPreferences.notifyOnQueueComplete,
   );
+  const [draftPageEvidenceAutoExtractEnabled, setDraftPageEvidenceAutoExtractEnabled] = useState(
+    localPreferences.pageEvidenceAutoExtractEnabled,
+  );
 
   const companionDirty =
     draftAutoSend.chatgpt !== initial.autoSendOptIn.chatgpt ||
@@ -465,7 +470,8 @@ export function SettingsPanel({
     draftTarget !== initial.defaultDispatchTarget;
   const localDirty =
     draftVaultPath.trim() !== localPreferences.vaultPath.trim() ||
-    draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete;
+    draftNotifyOnQueueComplete !== localPreferences.notifyOnQueueComplete ||
+    draftPageEvidenceAutoExtractEnabled !== localPreferences.pageEvidenceAutoExtractEnabled;
   const dirty = companionDirty || localDirty;
   const privateWorkstreams = workstreams.filter((workstream) => workstream.privacy === 'private');
 
@@ -493,6 +499,9 @@ export function SettingsPanel({
         ...(draftNotifyOnQueueComplete === localPreferences.notifyOnQueueComplete
           ? {}
           : { notifyOnQueueComplete: draftNotifyOnQueueComplete }),
+        ...(draftPageEvidenceAutoExtractEnabled === localPreferences.pageEvidenceAutoExtractEnabled
+          ? {}
+          : { pageEvidenceAutoExtractEnabled: draftPageEvidenceAutoExtractEnabled }),
       });
     }
   };
@@ -789,6 +798,28 @@ export function SettingsPanel({
               {draftNotifyOnQueueComplete
                 ? 'system toast when the last item ships'
                 : 'silent — check the side panel'}
+            </span>
+          </span>
+        </label>
+        <label
+          className={'switch ' + (draftPageEvidenceAutoExtractEnabled ? 'on' : '')}
+          style={{ marginTop: 8 }}
+        >
+          <input
+            type="checkbox"
+            checked={draftPageEvidenceAutoExtractEnabled}
+            disabled={busy}
+            onChange={() => {
+              setDraftPageEvidenceAutoExtractEnabled(!draftPageEvidenceAutoExtractEnabled);
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Capture page evidence after focus
+            <span className="desc mono">
+              {draftPageEvidenceAutoExtractEnabled
+                ? 'features-only capture after 5s focused'
+                : 'off — new pages stay metadata-only'}
             </span>
           </span>
         </label>

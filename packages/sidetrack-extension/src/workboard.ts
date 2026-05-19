@@ -169,6 +169,7 @@ export interface UiSettings {
   // whole point of auto-send is so the user can context-switch
   // away and come back when it's done.
   readonly notifyOnQueueComplete: boolean;
+  readonly pageEvidenceAutoExtractEnabled: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /
@@ -388,6 +389,7 @@ export const defaultSettings: UiSettings = {
     codex: true,
   },
   notifyOnQueueComplete: true,
+  pageEvidenceAutoExtractEnabled: false,
 };
 
 export const createEmptyWorkboardState = (

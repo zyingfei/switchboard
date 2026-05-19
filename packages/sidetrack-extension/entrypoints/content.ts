@@ -258,7 +258,13 @@ const isContentRequest = (value: unknown): value is ContentRequest =>
       'mode' in value &&
       (value.mode === 'page' || value.mode === 'selection') &&
       'trigger' in value &&
-      (value.trigger === 'manual' || value.trigger === 'bulk-open-tabs')));
+      (value.trigger === 'manual' ||
+        value.trigger === 'workstream-policy' ||
+        value.trigger === 'save-suggestion' ||
+        value.trigger === 'allowlist' ||
+        value.trigger === 'auto-observed' ||
+        value.trigger === 'attention-gate' ||
+        value.trigger === 'bulk-open-tabs')));
 
 export default defineContentScript({
   matches: [

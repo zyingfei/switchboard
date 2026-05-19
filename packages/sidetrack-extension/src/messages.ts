@@ -253,7 +253,14 @@ export const isContentResponse = (value: unknown): value is ContentResponse => {
 export interface PageContentExtractContentRequest {
   readonly type: typeof messageTypes.pageContentExtract;
   readonly mode: 'page' | 'selection';
-  readonly trigger: 'manual' | 'bulk-open-tabs';
+  readonly trigger:
+    | 'manual'
+    | 'workstream-policy'
+    | 'save-suggestion'
+    | 'allowlist'
+    | 'auto-observed'
+    | 'attention-gate'
+    | 'bulk-open-tabs';
 }
 
 export type PageContentExtractContentResponse =
@@ -399,6 +406,7 @@ export type WorkboardRequest =
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
         readonly notifyOnQueueComplete?: boolean;
+        readonly pageEvidenceAutoExtractEnabled?: boolean;
       };
     }
   | {

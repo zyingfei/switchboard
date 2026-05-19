@@ -45,8 +45,16 @@ export interface PageContentExtractedPayload {
   readonly extractedAt: string;
   readonly extractionSource: PageContentExtractionStrategy;
   readonly extractionPolicy: {
-    readonly trigger: 'manual' | 'bulk-open-tabs';
+    readonly trigger:
+      | 'manual'
+      | 'workstream-policy'
+      | 'save-suggestion'
+      | 'allowlist'
+      | 'auto-observed'
+      | 'attention-gate'
+      | 'bulk-open-tabs';
     readonly workstreamId?: string;
+    readonly domainPolicyId?: string;
   };
   readonly quality: PageContentQuality;
   readonly qualitySignals: PageContentQualitySignals;
@@ -59,6 +67,22 @@ export interface PageContentExtractedPayload {
   readonly redaction?: {
     readonly applied: boolean;
     readonly rules: readonly string[];
+  };
+}
+
+export type PageEvidenceStorageMode = 'features_only' | 'indexed_chunks';
+
+export interface PageEvidenceRecord {
+  readonly schemaVersion: 1;
+  readonly canonicalUrl: string;
+  readonly evidenceRevision: string;
+  readonly updatedAt: string;
+  readonly evidenceTier: 'metadata_only' | 'content_features_only' | 'indexed_chunks';
+  readonly metadata: {
+    readonly title?: string;
+    readonly host: string;
+    readonly pathTokens: readonly string[];
+    readonly titleTokens: readonly string[];
   };
 }
 
@@ -100,6 +124,40 @@ const isContentSearchHit = (value: unknown): value is ContentSearchHit =>
   typeof value.score === 'number' &&
   typeof value.capturedAt === 'string';
 
+const isPageEvidenceRecord = (value: unknown): value is PageEvidenceRecord =>
+  isRecord(value) &&
+  value.schemaVersion === 1 &&
+  typeof value.canonicalUrl === 'string' &&
+  typeof value.evidenceRevision === 'string' &&
+  typeof value.updatedAt === 'string' &&
+  typeof value.evidenceTier === 'string' &&
+  isRecord(value.metadata);
+
+const sha256Hex = async (value: string): Promise<string> => {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+};
+
+const contentWriteIdempotencyKey = async (
+  prefix: 'page-content' | 'page-evidence',
+  payload: PageContentExtractedPayload,
+  storageMode?: PageEvidenceStorageMode,
+): Promise<string> => {
+  const fingerprint = await sha256Hex(
+    JSON.stringify({
+      payloadVersion: payload.payloadVersion,
+      canonicalUrl: payload.canonicalUrl,
+      contentHash: payload.content.contentHash,
+      charCount: payload.content.charCount,
+      extractedAt: payload.extractedAt,
+      extractionSource: payload.extractionSource,
+      storageMode,
+    }),
+  );
+  return `${prefix}-${fingerprint.slice(0, 40)}`;
+};
+
 export class PageContentClient {
   private readonly baseUrl: string;
 
@@ -116,18 +174,40 @@ export class PageContentClient {
   }
 
   async index(payload: PageContentExtractedPayload): Promise<PageContentCoverage> {
+    const idempotencyKey = await contentWriteIdempotencyKey('page-content', payload);
     const response = await fetch(`${this.baseUrl}/page-content/extracted`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-bac-bridge-key': this.settings.bridgeKey,
-        'idempotency-key': `page-content-${payload.content.contentHash.slice(0, 32)}`,
+        'idempotency-key': idempotencyKey,
       },
       body: JSON.stringify(payload),
     });
     const body = await this.parseOrThrow(response);
     const data = isRecord(body) && isRecord(body.data) ? body.data['coverage'] : undefined;
     if (!isCoverage(data)) throw new Error('Companion returned an invalid coverage payload.');
+    return data;
+  }
+
+  async evidence(
+    payload: PageContentExtractedPayload,
+    storageMode: PageEvidenceStorageMode = 'features_only',
+  ): Promise<PageEvidenceRecord> {
+    const idempotencyKey = await contentWriteIdempotencyKey('page-evidence', payload, storageMode);
+    const response = await fetch(`${this.baseUrl}/page-evidence/extracted`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': this.settings.bridgeKey,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify({ ...payload, storageMode }),
+    });
+    const body = await this.parseOrThrow(response);
+    const data = isRecord(body) && isRecord(body.data) ? body.data['evidence'] : undefined;
+    if (!isPageEvidenceRecord(data))
+      throw new Error('Companion returned an invalid evidence payload.');
     return data;
   }
 

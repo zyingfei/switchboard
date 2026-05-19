@@ -48,7 +48,7 @@ export interface ExplainRankingOutput {
 
 export interface ExplainRankingPrediction {
   readonly score: number;
-  readonly contributions: Readonly<Record<keyof CandidatePairFeatures, number>>;
+  readonly contributions: Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>;
 }
 
 export interface ExplainRankingRanker {
@@ -91,7 +91,7 @@ const roundDebugNumber = (value: number): number => Number(value.toFixed(6));
 const stableFeatureObject = (features: CandidatePairFeatures): CandidatePairFeatures => {
   const out = {} as Record<keyof CandidatePairFeatures, number>;
   for (const key of CANDIDATE_PAIR_FEATURE_KEYS) {
-    out[key] = features[key];
+    out[key] = features[key] ?? 0;
   }
   return out as CandidatePairFeatures;
 };
@@ -108,11 +108,11 @@ const featureKeys = CANDIDATE_PAIR_FEATURE_KEYS.filter(
 );
 
 const contributionArray = (
-  contributions: Readonly<Record<keyof CandidatePairFeatures, number>>,
+  contributions: Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>,
 ): readonly ExplainRankingContribution[] =>
   featureKeys.map((feature) => ({
     feature,
-    weight: roundDebugNumber(contributions[feature]),
+    weight: roundDebugNumber(contributions[feature] ?? 0),
   }));
 
 const topContributions = (

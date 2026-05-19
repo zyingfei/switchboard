@@ -234,17 +234,17 @@ const extract = (
 };
 
 describe('ranker feature schema', () => {
-  it('keeps schema version 1 and byte-stable feature serialization', () => {
+  it('keeps schema version 4 and byte-stable feature serialization', () => {
     const first = JSON.stringify(extract());
     const second = JSON.stringify(extract());
 
-    expect(FEATURE_SCHEMA_VERSION).toBe(3);
+    expect(FEATURE_SCHEMA_VERSION).toBe(4);
     expect(first).toBe(second);
     expect(Object.keys(JSON.parse(first) as Record<string, unknown>)).toEqual(
       CANDIDATE_PAIR_FEATURE_KEYS,
     );
     expect(JSON.parse(first) as CandidatePairFeatures).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       same_workstream: 0,
       opener_chain_depth: 0,
       in_navigation_chain: 0,
@@ -267,6 +267,17 @@ describe('ranker feature schema', () => {
       topic_lineage_merge_split_related: 0,
       page_quality_tier_from: 0,
       page_quality_tier_to: 0,
+      shared_content_terms: 0,
+      shared_content_keyphrases: 0,
+      content_weighted_jaccard: 0,
+      content_vector_cosine: 0,
+      content_entity_overlap: 0,
+      content_evidence_tier_from: 0,
+      content_evidence_tier_to: 0,
+      content_both_available: 0,
+      content_quality_pair_min: 0,
+      chunk_support_count: 0,
+      max_chunk_pair_score: 0,
     });
   });
 });
@@ -502,6 +513,73 @@ describe('ranker content, recency, and engagement features', () => {
     });
 
     expect(features.cosine_similarity).toBe(0.87);
+  });
+
+  it('extracts content-evidence ranker features from enriched similarity metadata', () => {
+    const features = extract({
+      candidate: candidate({
+        fromVisitId: 'https://alpha.test/f16',
+        toVisitId: 'https://bravo.test/fabric',
+      }),
+      merged: [
+        event({
+          seq: 1,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://alpha.test/f16',
+            quality: 'high',
+          }),
+        }),
+        event({
+          seq: 2,
+          type: PAGE_CONTENT_EXTRACTED,
+          payload: pageContentPayload({
+            canonicalUrl: 'https://bravo.test/fabric',
+            quality: 'medium',
+          }),
+        }),
+      ],
+      edges: [
+        edge({
+          kind: 'visit_resembles_visit',
+          fromNodeId: nodeIdFor('timeline-visit', 'https://alpha.test/f16'),
+          toNodeId: nodeIdFor('timeline-visit', 'https://bravo.test/fabric'),
+          metadata: {
+            producer: 'content-enriched',
+            score: 0.91,
+            confidence: 0.82,
+            evidenceTierFrom: 'content_features_only',
+            evidenceTierTo: 'indexed_chunks',
+            channels: {
+              contentVector: 0.93,
+              contentTerms: 0.72,
+              keyphrases: 0.64,
+              entities: 0.5,
+              metadata: 0.2,
+            },
+            matchedTerms: ['Minipack', 'F16', 'fabric'],
+            matchedKeyphrases: ['data center fabric'],
+            matchedEntities: ['Minipack'],
+            chunkSupportCount: 2,
+            maxChunkPairScore: 0.76,
+            featureSchemaVersion: 2,
+          },
+        }),
+      ],
+    });
+
+    expect(features.cosine_similarity).toBe(0.91);
+    expect(features.shared_content_terms).toBe(3);
+    expect(features.shared_content_keyphrases).toBe(1);
+    expect(features.content_weighted_jaccard).toBe(0.72);
+    expect(features.content_vector_cosine).toBe(0.93);
+    expect(features.content_entity_overlap).toBe(1);
+    expect(features.content_evidence_tier_from).toBe(1);
+    expect(features.content_evidence_tier_to).toBe(2);
+    expect(features.content_both_available).toBe(1);
+    expect(features.content_quality_pair_min).toBe(2);
+    expect(features.chunk_support_count).toBe(2);
+    expect(features.max_chunk_pair_score).toBe(0.76);
   });
 
   it('computes recency scores from deterministic snapshot time', () => {

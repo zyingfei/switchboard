@@ -16,11 +16,13 @@ import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerDiagnostics,
   type MaterializerDiagnosticsStore,
+  type MaterializerPhaseDuration,
   type MaterializerRankerAugmentationCounters,
   type MaterializerRankerMethodologySpineDiagnostics,
   type MaterializerRankerModelFreshness,
 } from '../../connections/materializerDiagnostics.js';
 import {
+  augmentConnectionsSnapshotWithClosestVisitRanker,
   buildConnectionsSnapshot,
   type ClosestVisitRanker,
   type ConnectionsInput,
@@ -37,7 +39,9 @@ import {
   knownCanonicalUrlsFor,
 } from '../../connections/userAssertedRelations.js';
 import {
+  buildReusedShadowDiagnostics,
   buildTopicShadowCandidate,
+  expectedShadowRevisionId,
   shouldBuildTopicShadowCandidate,
   type TopicShadowDiagnostics,
 } from '../../connections/topicShadowCandidate.js';
@@ -46,6 +50,20 @@ import {
   type TopicShadowObservationDiagnostics,
 } from '../../connections/topicShadowObservation.js';
 import { buildHdbscanTopicRevision } from '../../connections/hdbscanClusterer.js';
+import {
+  buildLeidenCpmTopicRevision,
+  LEIDEN_CPM_COSINE_THRESHOLD,
+} from '../../connections/leidenCpmTopicRevision.js';
+import {
+  buildServedTopicProducerReport,
+  resolveServedTopicProducer,
+  type ServedTopicProducer,
+} from '../../connections/servedTopicProducer.js';
+import {
+  hotSimilarityModeEnabled,
+  hotTopicsModeEnabled,
+  type HotPathDiagnostics,
+} from '../../connections/hotPathMode.js';
 import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
@@ -77,6 +95,7 @@ import {
 import {
   DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
@@ -132,6 +151,11 @@ import {
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
+import {
+  ensurePageEvidenceForTimelineEntries,
+  readPageEvidenceVectorMap,
+} from '../../page-evidence/store.js';
+import { readPageContentChunksForCanonicalUrls } from '../../page-content/store.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
   THREAD_ARCHIVED,
@@ -207,6 +231,31 @@ const FAILURE_COOLDOWN_MS = 5_000;
 // per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
 const DRAIN_DEBOUNCE_MS = 1500;
 
+// Stage 5.2 W1b/W1c — minimum wall-clock interval between drain
+// STARTS. DRAIN_DEBOUNCE_MS only coalesces a burst into ONE start;
+// it does NOT bound the cadence of successive starts. Measured:
+// buildConnectionsSnapshot ≈4-5s/pass, and with a steady
+// extension-flush trigger stream each post-debounce start fired
+// every ~DRAIN_DEBOUNCE_MS → a ~5s rebuild every ~6.5s ≈ a pinned
+// core (the dogfood runaway). This floor governs BOTH the in-flight
+// `while (dirty)` continuation (W1b) AND the gap between separate
+// debounced starts (W1c, see startDrainWhenIntervalElapsed): a drain
+// starts at most once per interval; intervening triggers coalesce
+// into the next one (dirty stays set — no starvation; awaitIdle
+// stays correct: dirty&&!error keeps it waiting through the defer).
+// Connections is contextual ("not user-immediate-feedback" per the
+// W2b note), so an interval of staleness is acceptable. Default
+// raised 15s→30s so the default is sane WITHOUT the dogfood
+// suppression env. Env-overridable (`SIDETRACK_CONNECTIONS_DRAIN_MIN_INTERVAL_MS`,
+// set 0 to disable); resolved per call (not a frozen module const)
+// so a test can set the env before constructing the materializer.
+const DEFAULT_DRAIN_MIN_INTERVAL_MS = 30_000;
+const resolveDrainMinIntervalMs = (): number => {
+  const raw = process.env['SIDETRACK_CONNECTIONS_DRAIN_MIN_INTERVAL_MS'];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DRAIN_MIN_INTERVAL_MS;
+};
+
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
 // eventTypesForMaterializer('connections') — and we don't want to,
@@ -230,6 +279,20 @@ const DRAIN_DEBOUNCE_MS = 1500;
 //     `browser.timeline.observed` event for the same nav, so its
 //     arrival never triggers a structurally-new rebuild — the paired
 //     timeline observation does.
+//   - `page.evidence.extracted` is emitted per page-evidence
+//     auto-capture (page observation / live current-tab / early
+//     engagement snapshot — high frequency, multiple per nav and
+//     re-emitted on engagement ticks). It is reconstructed from the
+//     page-evidence store inside every drain via
+//     `ensurePageEvidenceForTimelineEntries`, so leaving it OUT of
+//     HANDLES keeps the snapshot's evidence-derived edges correct —
+//     they just refresh on the next structural event (the paired
+//     `browser.timeline.observed` nav already triggered a drain).
+//     Routing it through HANDLES re-created the W2b per-event rebuild
+//     storm: a steady auto-capture stream keeps `dirty` set so the
+//     `drain()` while-loop rebuilds the full connections snapshot
+//     back-to-back with the debounce bypassed (debounce only gates
+//     the idle→drain entry, not the in-flight loop), pinning a core.
 // If a session never produces a HOT event for an extended period
 // (passive read of one page), the engagement classification stays
 // stale until the next navigation or mutation. That is acceptable
@@ -338,6 +401,8 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
       return buildTopicRevision;
     case TOPIC_HDBSCAN_REVISION_KEY:
       return buildHdbscanTopicRevision;
+    case TOPIC_LEIDEN_CPM_REVISION_KEY:
+      return buildLeidenCpmTopicRevision;
     case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
       return buildTopicRevision;
   }
@@ -480,6 +545,12 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+  // W1c — wall-clock of the last drain pass START. Reference for the
+  // minimum interval between drain STARTS (not just the within-drain
+  // while-loop continuation), so a steady trigger stream can't pace
+  // full rebuilds at the weak DRAIN_DEBOUNCE_MS cadence. 0 ⇒ the
+  // first drain is never deferred.
+  let lastDrainStartedAtMs = 0;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
   // (e.g. multiple tabs activating in sequence, peer-event imports)
   // into one drain. Cleared when a fresh requestDrain arrives within
@@ -792,12 +863,17 @@ export const createConnectionsMaterializer = (
     const phaseLogs = process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1';
     const phaseStart = Date.now();
     let phaseLast = phaseStart;
+    const phaseDurations: MaterializerPhaseDuration[] = [];
     const mark = (label: string): void => {
-      if (!phaseLogs) return;
       const now = Date.now();
-      console.warn(
-        `[connections-phase] ${label} dt=${String(now - phaseLast)}ms total=${String(now - phaseStart)}ms`,
-      );
+      const durationMs = now - phaseLast;
+      const totalMs = now - phaseStart;
+      phaseDurations.push({ label, durationMs, totalMs });
+      if (phaseLogs) {
+        console.warn(
+          `[connections-phase] ${label} dt=${String(durationMs)}ms total=${String(totalMs)}ms`,
+        );
+      }
       phaseLast = now;
     };
     // Stage 5.2 W6 — snapshot the invalidation keys accumulated since
@@ -871,10 +947,36 @@ export const createConnectionsMaterializer = (
     // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
     // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
     const similarityConfig: EffectiveVisitSimilarityConfig = resolveVisitSimilarityConfig();
-    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(
-      similarityEntries,
-      similarityConfig,
+    const similarityEligibleCount = similarityEntries.filter(
+      (entry) => focusedWindowMsFromEntry(entry) >= similarityConfig.engagementGateMs,
+    ).length;
+    const similarityPairBudget = Math.max(
+      0,
+      (similarityEligibleCount * (similarityEligibleCount - 1)) / 2,
     );
+    const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
+      deps.vaultRoot,
+      similarityEntries,
+    );
+    mark(`pageEvidence.ensure records=${String(pageEvidenceByCanonicalUrl.size)}`);
+    const pageEvidenceVectorsByVectorId = await readPageEvidenceVectorMap(
+      deps.vaultRoot,
+      pageEvidenceByCanonicalUrl.values(),
+    );
+    mark(`pageEvidence.vectorMapRead vectors=${String(pageEvidenceVectorsByVectorId.size)}`);
+    const pageContentChunksByCanonicalUrl = await readPageContentChunksForCanonicalUrls(
+      deps.vaultRoot,
+      [...pageEvidenceByCanonicalUrl.keys()],
+    );
+    mark(
+      `pageEvidence.chunkRead indexedChunkPages=${String(pageContentChunksByCanonicalUrl.size)}`,
+    );
+    const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(similarityEntries, {
+      ...similarityConfig,
+      evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+      pageContentChunksByCanonicalUrl,
+    });
     const cachedSimilarityRevision = await readVisitSimilarityRevision(
       deps.vaultRoot,
       expectedSimilarityRevisionId,
@@ -889,12 +991,30 @@ export const createConnectionsMaterializer = (
     // IncrementalVisitSimilarityIndex for cosine-only top-K. The
     // resulting revisionId carries a `:incremental` suffix so on-disk
     // cached revisions stay distinct from the legacy hybrid path.
-    const hotSimilarityMode = process.env['SIDETRACK_CONNECTIONS_HOT_SIMILARITY'] === '1';
+    const hotSimilarityMode = hotSimilarityModeEnabled();
+    const hotSimCorpusSize = incrementalSimilarityIndex.size();
     const hotSimilarityDecision = hotSimilarityMode
-      ? decideHotPathEmbed(embedderWarmthTracker.snapshot(incrementalSimilarityIndex.size()))
+      ? decideHotPathEmbed(embedderWarmthTracker.snapshot(hotSimCorpusSize))
       : { shouldEmbedOnHotPath: false as const };
+    // U2 — captured for HotPathDiagnostics (no extra compute; locals
+    // the drain already produces).
+    let usedHotSimilarityPath = false;
+    let hotSimNewEmbedded: number | null = null;
     let visitSimilarity;
-    if (cachedSimilarityRevision !== null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
+    if (cachedSimilarityRevision !== null) {
+      // U2 — a valid cached revision means the W3 skip-gate id (a pure
+      // function of inputs+config) matched: the inputs are unchanged,
+      // so the cached revision IS the correct output. Reuse it
+      // unconditionally — even when the hot decision says "embed".
+      // The pre-U2 `&& !shouldEmbedOnHotPath` qualifier let default-on
+      // hot mode bypass the cache and re-embed on UNCHANGED inputs
+      // (the legacy drain never populates the in-memory incremental
+      // index, which also does not survive child-per-drain), flipping
+      // the revisionId (`:incremental` suffix) every drain and
+      // cascading to defeat the topic + shadow skip-gates — i.e. the
+      // exact per-drain re-embed/rebuild the connections CPU work
+      // removed. The hot path still engages on a genuine cache miss
+      // (new/changed inputs) where amortised embedding is the win.
       visitSimilarity = cachedSimilarityRevision;
     } else if (hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Embed only entries not yet in the index. The legacy path embeds
@@ -902,9 +1022,13 @@ export const createConnectionsMaterializer = (
       const newEntries = similarityEntries.filter(
         (entry) => !incrementalSimilarityIndex.has(visitKeyForVisitEntry(entry)),
       );
+      usedHotSimilarityPath = true;
+      hotSimNewEmbedded = newEntries.length;
       const embeddingsByVisitKey = new Map<string, Float32Array>();
       if (newEntries.length > 0) {
-        const texts = newEntries.map((e) => `passage: ${corpusForVisitEntry(e)}`);
+        const texts = newEntries.map(
+          (e) => `passage: ${corpusForVisitEntry(e, pageEvidenceByCanonicalUrl)}`,
+        );
         try {
           const embedded = await (deps.embed ?? defaultEmbed)(texts);
           for (let i = 0; i < newEntries.length; i += 1) {
@@ -924,7 +1048,12 @@ export const createConnectionsMaterializer = (
           visitSimilarity = await buildVisitSimilarity(
             similarityEntries,
             deps.embed ?? defaultEmbed,
-            similarityConfig,
+            {
+              ...similarityConfig,
+              evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+              evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+              pageContentChunksByCanonicalUrl,
+            },
           );
         }
       }
@@ -935,21 +1064,28 @@ export const createConnectionsMaterializer = (
         options: {
           threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
           topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+          pageContentChunksByCanonicalUrl,
         },
       });
       mark(
-        `buildVisitSimilarityIncremental newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
+        `buildVisitSimilarityIncremental pairs=${String(similarityPairBudget)} newEmbedded=${String(newEntries.length)} indexSize=${String(incrementalSimilarityIndex.size())}`,
       );
     } else {
       // Legacy path with PR #141's resolved similarityConfig
       // (threshold / topK / engagementGateMs / lexical fallback).
-      visitSimilarity = await buildVisitSimilarity(
-        similarityEntries,
-        deps.embed ?? defaultEmbed,
-        similarityConfig,
-      );
-      mark('buildVisitSimilarity');
+      visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
+        ...similarityConfig,
+        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+        evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+        pageContentChunksByCanonicalUrl,
+      });
+      mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
+    // U2 — similarity-stage wall time for HotPathDiagnostics (the
+    // visitSimilarity revision is finalized here).
+    const hotSimRuntimeMs = Date.now() - similarityStartedAtMs;
     if (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
       // (cache hits don't exercise the embedder). Divide by entry count
@@ -980,13 +1116,13 @@ export const createConnectionsMaterializer = (
       const newSimilarityPairs = new Set<string>(
         visitSimilarity.edges.map((e) =>
           e.fromVisitKey < e.toVisitKey
-            ? `${e.fromVisitKey} ${e.toVisitKey}`
-            : `${e.toVisitKey} ${e.fromVisitKey}`,
+            ? `${e.fromVisitKey}\u0000${e.toVisitKey}`
+            : `${e.toVisitKey}\u0000${e.fromVisitKey}`,
         ),
       );
       let removedCount = 0;
       for (const edge of prevSimilarityEdges) {
-        const sig = edge.a < edge.b ? `${edge.a} ${edge.b}` : `${edge.b} ${edge.a}`;
+        const sig = edge.a < edge.b ? `${edge.a}\u0000${edge.b}` : `${edge.b}\u0000${edge.a}`;
         if (!newSimilarityPairs.has(sig)) {
           topicAccumulator.removeEdge(edge.a, edge.b);
           removedCount += 1;
@@ -1048,9 +1184,19 @@ export const createConnectionsMaterializer = (
     // above via the revision-flip diff + per-drain addSimilarityEdge.
     // PR #141's userAssertedRelations are still passed when falling
     // through to the legacy builder.
-    const hotTopicsMode = process.env['SIDETRACK_CONNECTIONS_HOT_TOPICS'] === '1';
+    const hotTopicsMode = hotTopicsModeEnabled();
+    const topicComponentCount = (await topicAccumulator.getComponents()).length;
+    // U2 — the accumulator fast path is test-asserted byte-equal to
+    // the UNION-FIND builder only. When a different topic algorithm is
+    // explicitly selected (HDBSCAN / idf-rkn via deps), it must NOT be
+    // silently overridden by the accumulator, so gate the fast path on
+    // the selected algorithm being the union-find baseline (the
+    // default — so default-on still engages it for the normal case).
     const useTopicAccumulatorFastPath =
-      hotTopicsMode && (await topicAccumulator.getComponents()).length > 0;
+      hotTopicsMode &&
+      topicRevisionAlgorithm === TOPIC_UNION_FIND_REVISION_KEY &&
+      topicComponentCount > 0;
+    const topicBuildStartedAtMs = Date.now();
     let topicRevision;
     if (
       previousTopicRevision !== null &&
@@ -1077,48 +1223,187 @@ export const createConnectionsMaterializer = (
     mark(
       `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,
     );
-    if (topicRevision !== previousTopicRevision) {
-      await topicRevisionStore.putActiveRevision(topicRevision);
-      mark('putActiveTopicRevision');
-    }
-    // FLIP (shadow->active): when the idf-rkn-split shadow clustering is
-    // enabled it is the intended production clustering. The baseline
-    // union-find revision starves on raw e5 cosine (~0 topics on real
-    // embeddings). `topicRevision` stays the BASELINE so the diagnostics
-    // artifact and shadow-vs-baseline observation remain meaningful;
-    // `servedTopicRevision` is what we persist active + feed into the
-    // served snapshot. When shadow is disabled this is a no-op.
+    // U2 — decision + cheap counters for the (now default-on)
+    // incremental hot paths. No baseline re-run: every field is a
+    // local the drain already produced. Surfaced via workGraphHealth
+    // similarity.hot-incremental / topic.hot-incremental.
+    const hotPathDiagnostics: HotPathDiagnostics = {
+      similarity: {
+        enabled: hotSimilarityMode,
+        shouldEmbedOnHotPath: hotSimilarityDecision.shouldEmbedOnHotPath,
+        reason:
+          'reason' in hotSimilarityDecision && hotSimilarityDecision.reason !== undefined
+            ? hotSimilarityDecision.reason
+            : null,
+        usedHotPath: usedHotSimilarityPath,
+        corpusSize: hotSimCorpusSize,
+        newEmbedded: hotSimNewEmbedded,
+        edgeCount: visitSimilarity.edges.length,
+        runtimeMs: hotSimRuntimeMs,
+      },
+      topics: {
+        enabled: hotTopicsMode,
+        usedFastPath: useTopicAccumulatorFastPath,
+        cacheHit: topicRevision === previousTopicRevision,
+        componentCount: topicComponentCount,
+        topicCount: topicRevision.topics.length,
+        runtimeMs: Date.now() - topicBuildStartedAtMs,
+      },
+    };
+    // W2 — SERVED TOPIC PRODUCER selection (feature-flagged, instant
+    // rollback via SIDETRACK_TOPIC_PRODUCER + restart):
+    //  - 'leiden-cpm'    = G: the W0c-stable winner that beats the
+    //                      retired idf-rkn-split (3× blind-judged).
+    //  - 'idf-rkn-split' = pre-W2 path (shadow flip), UNCHANGED.
+    //  - 'union-find'    = conservative baseline fallback.
     let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
-    if (shouldBuildTopicShadowCandidate()) {
+    const servedProducer: ServedTopicProducer = resolveServedTopicProducer();
+    if (servedProducer === 'leiden-cpm') {
+      // Skip-gated like the shadow (revisionId is a pure fn of
+      // visitSimilarity.revisionId + threshold + algo). Lineage via
+      // the dedicated leiden candidate slot ⇒ same-algorithm topic-id
+      // continuity across drains (W2 acceptance, not bespoke).
+      const prevLeiden = await topicRevisionStore.readCandidateShadowRevision(
+        TOPIC_LEIDEN_CPM_REVISION_KEY,
+      );
+      const expectedLeidenId = await createTopicRevisionId({
+        visitSimilarityRevisionId: visitSimilarity.revisionId,
+        cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+        algorithmVersion: TOPIC_LEIDEN_CPM_REVISION_KEY,
+      });
+      let leidenRevision;
+      if (prevLeiden !== null && prevLeiden.revisionId === expectedLeidenId) {
+        leidenRevision = prevLeiden;
+        mark(`servedProducer=leiden-cpm cacheHit topics=${String(leidenRevision.topics.length)}`);
+      } else {
+        leidenRevision = await buildLeidenCpmTopicRevision({
+          visits: topicVisits,
+          visitSimilarity,
+          ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
+          ...(prevLeiden === null ? {} : { previousRevision: prevLeiden }),
+        });
+        await topicRevisionStore.putCandidateShadowRevision(
+          TOPIC_LEIDEN_CPM_REVISION_KEY,
+          leidenRevision,
+        );
+        mark(`servedProducer=leiden-cpm build topics=${String(leidenRevision.topics.length)}`);
+      }
+      servedTopicRevision = leidenRevision;
+      await topicRevisionStore.putActiveRevision(leidenRevision);
+    }
+    // Non-leiden producers ('idf-rkn-split' default, 'union-find')
+    // keep the EXACT pre-W2 path: shadow-off ⇒ the selected baseline
+    // is served (G1 guard); shadow-on ⇒ the idf-rkn flip below. The
+    // only W2 change is excluding the case where leiden already served.
+    if (
+      servedProducer !== 'leiden-cpm' &&
+      !shouldBuildTopicShadowCandidate() &&
+      topicRevision !== previousTopicRevision
+    ) {
+      await topicRevisionStore.putActiveRevision(topicRevision);
+      mark('putActiveTopicRevision');
+    }
+    // FLIP (shadow->active): idf-rkn-split path, unchanged from pre-W2.
+    // `topicRevision` stays the BASELINE input so the shadow-vs-baseline
+    // A/B observation remains meaningful; `servedTopicRevision` is what
+    // we persist active + feed into the served snapshot.
+    if (servedProducer !== 'leiden-cpm' && shouldBuildTopicShadowCandidate()) {
       const previousShadowRevision = await topicRevisionStore.readShadowRevision();
-      const shadow = await buildTopicShadowCandidate({
+      // Stage 5.2 W4 (shadow) — skip-gate, mirroring the baseline
+      // topic-revision reuse above. The shadow revision id is a
+      // deterministic function of its inputs, so when nothing relevant
+      // changed we reuse the persisted shadow instead of recomputing
+      // the expensive idf-rkn-split clustering. Recomputing it every
+      // drain (unconditionally, even on baseline cache-hit) was the
+      // dominant per-drain CPU cost behind the constant-CPU runaway.
+      const expectedShadowId = await expectedShadowRevisionId({
         visits: topicVisits,
         visitSimilarity,
-        userAssertedRelations,
-        baselineRevision: topicRevision,
-        ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
         cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
       });
-      await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
-      topicShadowDiagnostics = shadow.diagnostics;
-      topicShadowObservation = buildTopicShadowObservationDiagnostics({
-        baselineRevision: topicRevision,
-        previousBaselineRevision: previousTopicRevision,
-        shadowRevision: shadow.revision,
-        previousShadowRevision,
-      });
-      mark(
-        `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
-      );
-      // Promote the shadow clustering to the active/served revision so
-      // GET /v1/connections (no topicVariant) and the materialized
-      // snapshot serve it, and current.json mirrors current.shadow.json.
-      servedTopicRevision = shadow.revision;
-      await topicRevisionStore.putActiveRevision(shadow.revision);
-      mark('topicShadowCandidate->active (flip)');
+      if (
+        previousShadowRevision !== null &&
+        previousShadowRevision.revisionId === expectedShadowId
+      ) {
+        // Unchanged — reuse. Mirrors the baseline guard: the prior
+        // shadow is already the active/served revision on disk so the
+        // expensive buildTopicShadowCandidate is skipped (the CPU
+        // win). G2 — but we DO recompute the shadow-vs-baseline A/B
+        // diagnostics from the reused revision (cheap: prune only, no
+        // clustering) so the HealthPanel experiments lane and the
+        // workGraphHealth `topic.shadow-idf-rkn-split` candidate are
+        // populated every drain instead of being perpetually
+        // "unavailable" on skip drains.
+        servedTopicRevision = previousShadowRevision;
+        // G1 — keep idf-rkn-split the ACTIVE revision even on the
+        // skip path. Without this, skip drains left the starved
+        // union-find baseline as the persisted active revision.
+        await topicRevisionStore.putActiveRevision(previousShadowRevision);
+        topicShadowDiagnostics = buildReusedShadowDiagnostics({
+          visits: topicVisits,
+          visitSimilarity,
+          userAssertedRelations,
+          baselineRevision: topicRevision,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          reusedRevision: previousShadowRevision,
+        });
+        topicShadowObservation = buildTopicShadowObservationDiagnostics({
+          baselineRevision: topicRevision,
+          previousBaselineRevision: previousTopicRevision,
+          // Shadow is unchanged this drain, so shadow-vs-prior-shadow
+          // churn is 0 by construction (reused === previous).
+          shadowRevision: previousShadowRevision,
+          previousShadowRevision,
+        });
+        mark(
+          `topicShadowCandidate cacheHit=true (skip rebuild, kept active, A/B emitted topics=${String(topicShadowDiagnostics.shadowTopicCount)})`,
+        );
+      } else {
+        const shadow = await buildTopicShadowCandidate({
+          visits: topicVisits,
+          visitSimilarity,
+          userAssertedRelations,
+          baselineRevision: topicRevision,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
+          cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
+        });
+        await writeShadowTopicRevision(deps.vaultRoot, shadow.revision);
+        topicShadowDiagnostics = shadow.diagnostics;
+        topicShadowObservation = buildTopicShadowObservationDiagnostics({
+          baselineRevision: topicRevision,
+          previousBaselineRevision: previousTopicRevision,
+          shadowRevision: shadow.revision,
+          previousShadowRevision,
+        });
+        mark(
+          `topicShadowCandidate ${shadow.diagnostics.candidate} topics=${String(shadow.diagnostics.shadowTopicCount)} max=${String(shadow.diagnostics.shadowMaxTopicSize)} edges=${String(shadow.diagnostics.edgeCountAfterPruning)}`,
+        );
+        // Promote the shadow clustering to the active/served revision
+        // so GET /v1/connections (no topicVariant) and the
+        // materialized snapshot serve it, and current.json mirrors
+        // current.shadow.json.
+        servedTopicRevision = shadow.revision;
+        await topicRevisionStore.putActiveRevision(shadow.revision);
+        mark('topicShadowCandidate->active (flip)');
+      }
     }
+    // W2 step 5 — served-producer marker + observability (the
+    // post-flip auto-rollback signal). algorithmVersion on the
+    // revision already records the producer; this adds churn/lineage.
+    const servedTopicProducerReport = buildServedTopicProducerReport(
+      servedProducer,
+      servedTopicRevision,
+      previousTopicRevision,
+    );
+    mark(
+      `servedProducer=${servedProducer} topics=${String(
+        servedTopicProducerReport.topicCount,
+      )} churnP90=${String(servedTopicProducerReport.churnP90)}`,
+    );
     await yieldToEventLoop();
     const input: ConnectionsInput = {
       events: merged,
@@ -1128,6 +1413,8 @@ export const createConnectionsMaterializer = (
       urlProjection,
       visitSimilarity,
       topicRevision: servedTopicRevision,
+      pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
       engagementClassRevision,
     };
     mark('projectionAccumulators.derive');
@@ -1144,7 +1431,12 @@ export const createConnectionsMaterializer = (
     await deps.store.putCurrent(baseSnapshot);
     mark('putCurrent baseSnapshot');
     await yieldToEventLoop();
-    const rankerRetrainResult = await rankerRetrainer({ merged, snapshot: baseSnapshot });
+    const rankerRetrainResult = await rankerRetrainer({
+      merged,
+      snapshot: baseSnapshot,
+      pageEvidenceByCanonicalUrl,
+      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+    });
     mark('rankerRetrainer');
     // Track the snapshot we ultimately wrote so diagnostics see the
     // ranker-augmented form when it was produced, the base form when
@@ -1171,12 +1463,15 @@ export const createConnectionsMaterializer = (
         );
         if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
-          finalSnapshot = buildConnectionsSnapshot({
-            ...input,
-            closestVisitRanker: closestVisitRanker.ranker,
-          });
+          finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
+            {
+              ...input,
+              closestVisitRanker: closestVisitRanker.ranker,
+            },
+            baseSnapshot,
+          );
           mark(
-            `buildConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
+            `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
           );
           await deps.store.putCurrent(finalSnapshot);
           mark('putCurrent ranker-augmented');
@@ -1235,8 +1530,12 @@ export const createConnectionsMaterializer = (
       urlProjection,
       snapshot: finalSnapshot,
       rankerAugmentation,
+      pageEvidenceRecords: [...pageEvidenceByCanonicalUrl.values()],
+      phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
+      hotPathDiagnostics,
+      servedTopicProducerReport,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
     // through the change detectors and fold the status into the
@@ -1356,6 +1655,8 @@ export const createConnectionsMaterializer = (
 
   const drain = async (): Promise<void> => {
     while (dirty) {
+      const passStartedAtMs = Date.now();
+      lastDrainStartedAtMs = passStartedAtMs;
       dirty = false;
       try {
         if (shouldUseWorker()) {
@@ -1373,6 +1674,19 @@ export const createConnectionsMaterializer = (
         dirty = true;
         return;
       }
+      // Stage 5.2 W1b — coalesce at the DRAIN level. Only relevant when
+      // `dirty` was re-set DURING the rebuild (a HANDLES event arrived
+      // mid-pass): without this the loop would immediately run another
+      // full O(graph) rebuild with zero gap. Wait out the remainder of
+      // DRAIN_MIN_INTERVAL_MS so events that arrived during the rebuild
+      // + this gap collapse into the next single pass. Fire-then-
+      // awaitIdle callers never hit this (dirty is false post-pass).
+      if (dirty) {
+        const remainingMs = resolveDrainMinIntervalMs() - (Date.now() - passStartedAtMs);
+        if (remainingMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, remainingMs));
+        }
+      }
     }
   };
 
@@ -1387,6 +1701,31 @@ export const createConnectionsMaterializer = (
         pending = dirty;
       }
     })();
+  };
+
+  // Stage 5.2 W1c — enforce a true minimum interval between drain
+  // STARTS. DRAIN_DEBOUNCE_MS only coalesces a burst into one start;
+  // with a steady trigger stream each post-debounce start still fired
+  // every ~DRAIN_DEBOUNCE_MS, so a ~5s buildConnectionsSnapshot ran
+  // ~every 6.5s (the runaway). Defer the start until
+  // DRAIN_MIN_INTERVAL_MS has elapsed since the last drain START;
+  // intervening triggers coalesce into it (dirty stays set ⇒ no
+  // starvation). Re-arms itself via the same unref'd debounce slot.
+  // The first drain (lastDrainStartedAtMs===0) is never deferred.
+  const startDrainWhenIntervalElapsed = (): void => {
+    if (!dirty || running) return;
+    const minIntervalMs = resolveDrainMinIntervalMs();
+    const sinceLastStartMs = Date.now() - lastDrainStartedAtMs;
+    if (sinceLastStartMs < minIntervalMs) {
+      if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
+      drainDebounceTimer = setTimeout(() => {
+        drainDebounceTimer = null;
+        startDrainWhenIntervalElapsed();
+      }, minIntervalMs - sinceLastStartMs);
+      drainDebounceTimer.unref();
+      return;
+    }
+    startDrain();
   };
 
   const requestDrain = (): void => {
@@ -1404,8 +1743,7 @@ export const createConnectionsMaterializer = (
     if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
     drainDebounceTimer = setTimeout(() => {
       drainDebounceTimer = null;
-      if (!dirty || running) return;
-      startDrain();
+      startDrainWhenIntervalElapsed();
     }, DRAIN_DEBOUNCE_MS);
     drainDebounceTimer.unref();
   };
@@ -1417,7 +1755,7 @@ export const createConnectionsMaterializer = (
     // and don't touch the queue; Group B events mark their sourceUnitId
     // dirty (or tombstoned) and optionally record the latest extraction
     // revisionId. No I/O, no chunk/embed work — that's the reconciler's
-    // job. The buildAndWrite drain remains the byte-determinism oracle;
+    // job. The buildAndWrite drain remains the byte-determinism reference;
     // this queue is purely for the off-path content reconciler.
     foldGroupBEventIntoQueue(dirtySourceQueue, event);
     // Stage 5.2 W6 — accumulate invalidation keys for this event so the

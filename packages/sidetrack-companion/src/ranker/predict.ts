@@ -17,7 +17,7 @@ export interface LightGBMModel {
   readonly dispose: () => void;
 }
 
-export type RankerContributions = Record<keyof CandidatePairFeatures, number>;
+export type RankerContributions = Partial<Record<keyof CandidatePairFeatures, number>>;
 
 export type RankerPredict = (
   features: CandidatePairFeatures,
@@ -75,6 +75,17 @@ const emptyContributions = (): RankerContributions => ({
   topic_lineage_merge_split_related: 0,
   page_quality_tier_from: 0,
   page_quality_tier_to: 0,
+  shared_content_terms: 0,
+  shared_content_keyphrases: 0,
+  content_weighted_jaccard: 0,
+  content_vector_cosine: 0,
+  content_entity_overlap: 0,
+  content_evidence_tier_from: 0,
+  content_evidence_tier_to: 0,
+  content_both_available: 0,
+  content_quality_pair_min: 0,
+  chunk_support_count: 0,
+  max_chunk_pair_score: 0,
 });
 
 const contributionsFor = (rawContributions: Float64Array): RankerContributions => {

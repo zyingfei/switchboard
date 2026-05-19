@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
@@ -36,6 +37,12 @@ import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
+import {
+  expandSemanticRecallCandidates,
+  getOrBuildSemanticRecallPool,
+  readSemanticRecallPool,
+  semanticRecallPoolEnabled,
+} from '../recall/semanticRecallPool.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import {
@@ -45,6 +52,18 @@ import {
   type PageContentExtractedPayload,
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
+import {
+  listPageEvidenceRecords,
+  readPageEvidence,
+  readPageEvidenceMap,
+  writeExtractedPageEvidence,
+} from '../page-evidence/store.js';
+import {
+  type PageEvidenceExtractedEventPayload,
+  type PageEvidenceExtractedRequest,
+  type PageEvidenceRecord,
+} from '../page-evidence/types.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../page-evidence/events.js';
 import {
   canonicalizePageUrl,
   pageContentCoverageCounts,
@@ -103,7 +122,11 @@ import {
 } from '../tabsession/projection.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
-import { resolveAttribution, resolveUrlAttribution } from '../tabsession/resolver.js';
+import {
+  resolveAttribution,
+  resolveThreadAttribution,
+  resolveUrlAttribution,
+} from '../tabsession/resolver.js';
 import {
   deserializeUrlProjection,
   projectUrls,
@@ -128,8 +151,6 @@ import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudg
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
-import { buildSignals, type BuildSignalsWorkstream } from '../suggestions/buildSignals.js';
-import { scoreSuggestions } from '../suggestions/score.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { vectorFromEvents, type TargetRef, type VersionVector } from '../sync/causal.js';
@@ -311,6 +332,7 @@ import {
   contentQuerySchema,
   pageContentCoverageQuerySchema,
   pageContentExtractedSchema,
+  pageEvidenceExtractedSchema,
   pageContentTombstonedSchema,
   reviewDraftEventBatchSchema,
   reviewDraftListQuerySchema,
@@ -458,6 +480,12 @@ export interface CompanionHttpConfig {
   readonly importEdgeEvent?: (
     event: import('../sync/causal.js').AcceptedEvent,
   ) => Promise<{ imported: boolean }>;
+  // P2 — batched edge-event ingest: ONE readMerged + dedupe + shard
+  // write for the whole flush instead of ~3 whole-log scans/event.
+  // Returns per-clientEventId imported flags (false ⇒ duplicate).
+  readonly importEdgeEvents?: (
+    events: readonly import('../sync/causal.js').AcceptedEvent[],
+  ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
   // Optional timeline projection store, exposing read access for
   // the GET /v1/timeline route. When unset that route returns 503.
   readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
@@ -762,29 +790,39 @@ const readWorkstreamThreadIds = async (
   return ids;
 };
 
-const readWorkstreams = async (vaultRoot: string): Promise<readonly BuildSignalsWorkstream[]> => {
-  const root = join(vaultRoot, '_BAC', 'workstreams');
+interface ThreadSuggestionTarget {
+  readonly threadId: string;
+  readonly providerThreadId?: string;
+  readonly threadUrl?: string;
+}
+
+const readThreadSuggestionTarget = async (
+  vaultRoot: string,
+  requestedThreadId: string,
+): Promise<ThreadSuggestionTarget> => {
+  const root = join(vaultRoot, '_BAC', 'threads');
   const names = await readdir(root).catch(() => []);
-  const workstreams: BuildSignalsWorkstream[] = [];
   for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
     try {
       const parsed = JSON.parse(await readFile(join(root, name), 'utf8')) as {
         readonly bac_id?: unknown;
-        readonly title?: unknown;
-        readonly description?: unknown;
+        readonly threadId?: unknown;
+        readonly threadUrl?: unknown;
       };
-      if (typeof parsed.bac_id === 'string' && typeof parsed.title === 'string') {
-        workstreams.push({
-          id: parsed.bac_id,
-          title: parsed.title,
-          ...(typeof parsed.description === 'string' ? { description: parsed.description } : {}),
-        });
+      const bacId = typeof parsed.bac_id === 'string' ? parsed.bac_id : undefined;
+      const providerThreadId = typeof parsed.threadId === 'string' ? parsed.threadId : undefined;
+      if (bacId === requestedThreadId || providerThreadId === requestedThreadId) {
+        return {
+          threadId: bacId ?? requestedThreadId,
+          ...(providerThreadId === undefined ? {} : { providerThreadId }),
+          ...(typeof parsed.threadUrl === 'string' ? { threadUrl: parsed.threadUrl } : {}),
+        };
       }
     } catch {
-      // Ignore malformed workstream records.
+      // Ignore malformed thread records.
     }
   }
-  return workstreams;
+  return { threadId: requestedThreadId };
 };
 
 const applyPageContentCoverageToSnapshot = async (
@@ -839,6 +877,127 @@ const applyPageContentCoverageToSnapshot = async (
       };
     }),
   };
+};
+
+const trimTrailingUrlSlash = (value: string): string =>
+  value.length > 0 ? value.replace(/\/+$/u, '') : value;
+
+const metadataString = (
+  metadata: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): string | undefined => {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+};
+
+const addNodeAnchorAlias = (
+  aliases: Map<string, string>,
+  alias: string | undefined,
+  targetNodeId: string,
+): void => {
+  if (alias === undefined || alias.length === 0) return;
+  if (!aliases.has(alias)) aliases.set(alias, targetNodeId);
+  const trimmed = trimTrailingUrlSlash(alias);
+  if (trimmed.length > 0 && !aliases.has(trimmed)) aliases.set(trimmed, targetNodeId);
+};
+
+const resolveConnectionsNodeId = (
+  snapshot: import('../connections/snapshot.js').ConnectionsSnapshot,
+  nodeId: string,
+): string => {
+  if (snapshot.nodes.some((node) => node.id === nodeId)) return nodeId;
+
+  const aliases = new Map<string, string>();
+  for (const node of snapshot.nodes) {
+    addNodeAnchorAlias(aliases, node.id, node.id);
+    const canonicalUrl = metadataString(node.metadata, ['canonicalUrl', 'url', 'latestUrl']);
+    if (canonicalUrl !== undefined) {
+      if (node.kind === 'timeline-visit') {
+        addNodeAnchorAlias(aliases, `timeline-visit:${canonicalUrl}`, node.id);
+        addNodeAnchorAlias(aliases, canonicalUrl, node.id);
+      }
+    }
+    addNodeAnchorAlias(aliases, metadataString(node.metadata, ['timelineVisitId']), node.id);
+  }
+
+  return aliases.get(nodeId) ?? aliases.get(trimTrailingUrlSlash(nodeId)) ?? nodeId;
+};
+
+// W4(b-lite) — semantic recall pool: lazy non-blocking refresh +
+// read-only candidate expansion. NEVER runs in the materializer
+// drain; the query path only READS the cached artifact (bounded
+// latency); the build is fire-and-forget off the request path.
+let semanticRecallRefreshInFlight = false;
+const kickSemanticRecallPoolRefresh = (vaultRoot: string): void => {
+  if (semanticRecallRefreshInFlight) return;
+  semanticRecallRefreshInFlight = true;
+  void (async () => {
+    try {
+      const records = await listPageEvidenceRecords(vaultRoot);
+      const items = records
+        .map((r) => ({
+          canonicalUrl: r.canonicalUrl,
+          text: [
+            r.metadata.title ?? '',
+            r.metadata.host ?? '',
+            ...(r.metadata.pathTokens ?? []),
+          ]
+            .join(' ')
+            .trim(),
+        }))
+        .filter((i) => i.text.length > 0);
+      if (items.length >= 2) {
+        await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
+      }
+    } catch {
+      /* offline / embed unavailable — keep last good artifact */
+    } finally {
+      semanticRecallRefreshInFlight = false;
+    }
+  })();
+};
+
+const semanticRecallExpansion = async (
+  vaultRoot: string,
+  anchorHits: readonly ContentSearchHit[],
+  limit: number,
+): Promise<readonly ContentSearchHit[]> => {
+  const pool = await readSemanticRecallPool(vaultRoot);
+  kickSemanticRecallPoolRefresh(vaultRoot); // opportunistic, non-blocking
+  if (pool === null) return [];
+  const anchors = anchorHits
+    .map((h) => h.canonicalUrl)
+    .filter((u): u is string => u !== undefined);
+  if (anchors.length === 0) return [];
+  const expanded = expandSemanticRecallCandidates(pool, anchors, {
+    limit,
+    exclude: new Set(anchors),
+  });
+  if (expanded.length === 0) return [];
+  const evidenceByUrl = await readPageEvidenceMap(
+    vaultRoot,
+    expanded.map((e) => e.canonicalUrl),
+  );
+  const nowIso = new Date().toISOString();
+  return expanded.map((e) => ({
+    id: `semantic-recall-pool:${e.canonicalUrl}`,
+    sourceKind: 'semantic-recall-pool' as const,
+    sourceEvidence: {
+      source: 'semantic_recall_pool' as const,
+      similarity: e.cosine,
+      via: e.via,
+    },
+    anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
+    canonicalUrl: e.canonicalUrl,
+    title: evidenceByUrl.get(e.canonicalUrl)?.metadata.title ?? e.canonicalUrl,
+    // Capped low so semantic-pool hits EXPAND (fill remaining slots)
+    // and never displace primary lexical/vector candidates.
+    score: Math.min(0.49, e.cosine * 0.5),
+    capturedAt: nowIso,
+  }));
 };
 
 const queryRecallContent = async (
@@ -957,6 +1116,67 @@ const compactPageContentExtractedPayload = (
   ...(payload.dimensions === undefined ? {} : { dimensions: payload.dimensions }),
 });
 
+const compactPageEvidenceExtractedPayload = (
+  payload: ReturnType<typeof pageEvidenceExtractedSchema.parse>,
+): PageEvidenceExtractedRequest => ({
+  ...compactPageContentExtractedPayload(payload),
+  storageMode: payload.storageMode,
+});
+
+const pageEvidenceExtractedEventPayload = (
+  evidence: PageEvidenceRecord,
+  request: PageEvidenceExtractedRequest,
+): PageEvidenceExtractedEventPayload => ({
+  payloadVersion: 1,
+  canonicalUrl: evidence.canonicalUrl,
+  evidenceRevision: evidence.evidenceRevision,
+  semanticFeatureRevision: evidence.semanticFeatureRevision,
+  behaviorMetadataRevision: evidence.behaviorMetadataRevision,
+  evidenceTier: evidence.evidenceTier,
+  ...(evidence.content?.contentHash === undefined
+    ? {}
+    : { contentHash: evidence.content.contentHash }),
+  storageMode: request.storageMode,
+  versions: evidence.versions,
+  ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+  termCount: evidence.content?.terms.length ?? 0,
+  keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+  entityCount: evidence.content?.entities.length ?? 0,
+  ...(evidence.content?.docEmbeddingRef === undefined
+    ? {}
+    : {
+        vectorRef: {
+          modelId: evidence.content.docEmbeddingRef.modelId,
+          modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+          dimensions: evidence.content.docEmbeddingRef.dimensions,
+        },
+      }),
+  ...(evidence.content?.embeddingState === undefined
+    ? {}
+    : { embeddingState: evidence.content.embeddingState }),
+  trigger: request.extractionPolicy.trigger,
+});
+
+const pageEvidenceSummaryPayload = (evidence: PageEvidenceRecord): Record<string, unknown> => ({
+  tier: evidence.evidenceTier,
+  evidenceRevision: evidence.evidenceRevision,
+  semanticFeatureRevision: evidence.semanticFeatureRevision,
+  updatedAt: evidence.updatedAt,
+  termCount: evidence.content?.terms.length ?? 0,
+  keyphraseCount: evidence.content?.keyphrases.length ?? 0,
+  entityCount: evidence.content?.entities.length ?? 0,
+  ...(evidence.content?.quality === undefined ? {} : { quality: evidence.content.quality }),
+  ...(evidence.content?.docEmbeddingRef === undefined
+    ? {}
+    : {
+        vector: {
+          modelId: evidence.content.docEmbeddingRef.modelId,
+          modelVersion: evidence.content.docEmbeddingRef.modelVersion,
+          dimensions: evidence.content.docEmbeddingRef.dimensions,
+        },
+      }),
+});
+
 const compactPageContentTombstonedPayload = (
   payload: ReturnType<typeof pageContentTombstonedSchema.parse>,
 ): PageContentTombstonedPayload => ({
@@ -1037,6 +1257,268 @@ const directorySize = async (path: string): Promise<number> => {
     names.map((name) => directorySize(join(path, name)).catch(() => 0)),
   );
   return sizes.reduce((sum, size) => sum + size, 0);
+};
+
+// `/v1/system/health` is polled by the extension (App.tsx every
+// ~15-30s, HealthPanel ~30s) with NO in-flight dedupe across its
+// (observed: 6) stacked sockets. Each call is ~0.85s and fully
+// UNCACHED: directorySize() recurses the entire multi-GB _BAC tree,
+// collectWorkGraphHealth re-reads the 15MB connections snapshot +
+// re-merges the event log + fingerprints every training label.
+// Concurrent/rapid polls pile up into N overlapping full-tree walks
+// ⇒ a pinned core (the second, non-connections CPU runaway). Mirror
+// the /v1/system/hygiene-status fix (gcInventoryCached): a short TTL
+// + in-flight dedupe so rapid/overlapping polls coalesce to ~1
+// compute. Health is a status indicator; ≤TTL staleness is fine (the
+// hygiene sibling uses a 5-MIN TTL — this is far more conservative).
+// P3 — default raised 10s→60s. The extension polls /v1/system/health
+// ~every 30s, so a 10s TTL guaranteed a cache MISS on every poll
+// (~441ms recompute each). Health is a status indicator; ≤60s
+// staleness is fine (the sibling /v1/system/hygiene-status uses a
+// 5-min TTL). Env-tunable; resolved once (process-lifetime const).
+const SYSTEM_HEALTH_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_SYSTEM_HEALTH_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
+})();
+interface SystemHealthCacheEntry {
+  readonly value: HealthReport;
+  readonly computedAtMs: number;
+}
+const systemHealthCache = new Map<string, SystemHealthCacheEntry>();
+const systemHealthInFlight = new Map<string, Promise<HealthReport>>();
+const cachedCollectHealth = async (
+  vaultRoot: string,
+  build: () => Promise<HealthReport>,
+): Promise<HealthReport> => {
+  const cached = systemHealthCache.get(vaultRoot);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < SYSTEM_HEALTH_TTL_MS) {
+    return cached.value;
+  }
+  const existing = systemHealthInFlight.get(vaultRoot);
+  if (existing !== undefined) return existing;
+  const compute = (async (): Promise<HealthReport> => {
+    try {
+      const value = await build();
+      systemHealthCache.set(vaultRoot, { value, computedAtMs: Date.now() });
+      return value;
+    } catch (err) {
+      // A failed refresh must not poison: serve the last good value
+      // if we have one (mirrors gcInventoryCached).
+      const prev = systemHealthCache.get(vaultRoot);
+      if (prev !== undefined) return prev.value;
+      throw err;
+    } finally {
+      systemHealthInFlight.delete(vaultRoot);
+    }
+  })();
+  systemHealthInFlight.set(vaultRoot, compute);
+  return compute;
+};
+
+// GET /v1/connections rebuilds a ~14MB response per call: readCurrent
+// (14MB) + readMerged (whole event log → feedback overlay) +
+// applyPageContentCoverage + JSON-serialize ~14MB — UNCACHED,
+// measured ~1.5-2.7s/call. The extension's connections view polls it
+// across (observed) 6+ stacked sockets ⇒ a pinned core (the second,
+// non-connections CPU runaway, "consumer #2"). current.json is
+// stable under the W1c drain floor and the event log only advances
+// on the extension's ~1/min flush, so a CHEAP fingerprint —
+// current.json + shadow file stat (mtime+size) + replica.peekSeq()
+// (cheap in-memory event-log version, the only thing the feedback
+// overlay depends on) + the query string — hits constantly between
+// flushes. A TTL ceiling bounds any fingerprint miss; in-flight
+// dedupe collapses the concurrent polls into one compute.
+const CONNECTIONS_RESPONSE_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_CONNECTIONS_RESPONSE_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface ConnectionsResponseCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly etag: string;
+  readonly computedAtMs: number;
+}
+const connectionsResponseCache = new Map<string, ConnectionsResponseCacheEntry>();
+const connectionsResponseInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const statSig = async (path: string): Promise<string> => {
+  try {
+    const s = await stat(path);
+    return `${String(s.mtimeMs)}:${String(s.size)}`;
+  } catch {
+    return 'absent';
+  }
+};
+// NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
+// position. The feedback + page-content overlays do depend on the
+// event log, but it advances on EVERY extension event flush (~1/min
+// of edge events, many per flush), so a seq-keyed cache never hits
+// under the real workload (validated: 0 hits, CPU unchanged). Key
+// only on what makes the GRAPH change — current.json (W1c-floored,
+// so stable between drains) + the shadow revision file + the query.
+// The overlays' freshness is bounded by CONNECTIONS_RESPONSE_TTL_MS
+// instead: graph structure is exact, contextual overlays are
+// ≤TTL stale. Consistent with the W2b "connections is contextual,
+// not user-immediate-feedback; staleness is acceptable" stance.
+const connectionsResponseCacheKey = async (
+  vaultRoot: string,
+  querySearch: string,
+): Promise<string> => {
+  const root = join(vaultRoot, '_BAC', 'connections');
+  const [cur, shadow] = await Promise.all([
+    statSig(join(root, 'current.json')),
+    statSig(join(root, 'topics', 'current.shadow.json')),
+  ]);
+  return `cur=${cur}|shadow=${shadow}|q=${querySearch}`;
+};
+// Stable short ETag derived from the (already collision-resistant)
+// cache key. Exposed for HTTP If-None-Match → 304 (staged separately).
+const connectionsResponseEtag = (key: string): string =>
+  `"c-${createHash('sha256').update(key).digest('hex').slice(0, 16)}"`;
+const cachedConnectionsResponse = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<{ result: readonly [number, unknown]; etag: string }> => {
+  const cached = connectionsResponseCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return { result: cached.result, etag: cached.etag };
+  }
+  const inFlight = connectionsResponseInFlight.get(key);
+  if (inFlight !== undefined) {
+    return { result: await inFlight, etag: connectionsResponseEtag(key) };
+  }
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      // Only pin successful full-snapshot responses; errors/empties
+      // are cheap and must not be cached.
+      if (result[0] === 200) {
+        connectionsResponseCache.set(key, {
+          result,
+          etag: connectionsResponseEtag(key),
+          computedAtMs: Date.now(),
+        });
+        // Bound memory: the key changes every flush, so prune expired
+        // entries when the map grows (each entry can be ~14MB).
+        if (connectionsResponseCache.size > 16) {
+          const now = Date.now();
+          for (const [k, v] of connectionsResponseCache) {
+            if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      connectionsResponseInFlight.delete(key);
+    }
+  })();
+  connectionsResponseInFlight.set(key, compute);
+  return { result: await compute, etag: connectionsResponseEtag(key) };
+};
+
+// GET /v1/suggestions/thread/<id> is the dominant "consumer #2"
+// (ground-truth request log: the sidepanel fires one fetch PER
+// visible thread row on every render — observed ~1.3 req/s per
+// thread, ~600ms each: readCurrent 14MB + readMerged whole log +
+// resolveThreadAttribution graph PPR/sim/cluster, UNCACHED). Same
+// fix: cache per (threadId, current.json stat, query). TTL bounds
+// the event-log-derived attribution freshness (deliberately NOT
+// keyed on event seq — that floods, see connections cache note);
+// in-flight dedupe collapses the concurrent duplicate fetches the
+// extension fires on re-render.
+const THREAD_SUGGESTIONS_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_THREAD_SUGGESTIONS_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface ThreadSuggestionsCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly computedAtMs: number;
+}
+const threadSuggestionsCache = new Map<string, ThreadSuggestionsCacheEntry>();
+const threadSuggestionsInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const cachedThreadSuggestions = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> => {
+  const cached = threadSuggestionsCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return cached.result;
+  }
+  const inFlight = threadSuggestionsInFlight.get(key);
+  if (inFlight !== undefined) return inFlight;
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      if (result[0] === 200) {
+        threadSuggestionsCache.set(key, { result, computedAtMs: Date.now() });
+        if (threadSuggestionsCache.size > 64) {
+          const now = Date.now();
+          for (const [k, v] of threadSuggestionsCache) {
+            if (now - v.computedAtMs >= ttlMs) threadSuggestionsCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      threadSuggestionsInFlight.delete(key);
+    }
+  })();
+  threadSuggestionsInFlight.set(key, compute);
+  return compute;
+};
+
+// Generic stat-fingerprint + TTL + in-flight-dedupe cache for the
+// remaining uncached GET resolver/projection endpoints the extension
+// polls (tabsessions/visits resolve — ~4x/min PER visible card ×
+// many cards, each readCurrent 14MB + readMerged + resolve ~1s;
+// workstreams/projections — readMerged + project, polled by
+// refreshCachedWorkstreams). Same rationale + tradeoff as the
+// connections/suggestions caches: graph-exact via current.json stat,
+// event-log-derived parts ≤TTL stale (W2b "contextual" stance).
+const ROUTE_CACHE_TTL_MS = ((): number => {
+  const raw = process.env['SIDETRACK_ROUTE_CACHE_TTL_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+})();
+interface RouteCacheEntry {
+  readonly result: readonly [number, unknown];
+  readonly computedAtMs: number;
+}
+const routeCache = new Map<string, RouteCacheEntry>();
+const routeInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const cachedRoute = async (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> => {
+  const cached = routeCache.get(key);
+  if (cached !== undefined && Date.now() - cached.computedAtMs < ttlMs) {
+    return cached.result;
+  }
+  const inFlight = routeInFlight.get(key);
+  if (inFlight !== undefined) return inFlight;
+  const compute = (async (): Promise<readonly [number, unknown]> => {
+    try {
+      const result = await build();
+      if (result[0] === 200) {
+        routeCache.set(key, { result, computedAtMs: Date.now() });
+        if (routeCache.size > 256) {
+          const now = Date.now();
+          for (const [k, v] of routeCache) {
+            if (now - v.computedAtMs >= ttlMs) routeCache.delete(k);
+          }
+        }
+      }
+      return result;
+    } finally {
+      routeInFlight.delete(key);
+    }
+  })();
+  routeInFlight.set(key, compute);
+  return compute;
 };
 
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
@@ -1962,35 +2444,44 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
-      const merged = await context.eventLog.readMerged();
-      // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
-      const { projection } = await loadTabSessionProjection(context, context.eventLog);
-      if (!projection.bySessionId.has(tabSessionId)) {
-        throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
-      }
-      return [
-        200,
-        {
-          data: resolveAttribution({
-            tabSessionId,
-            snapshot,
-            projection,
-            events: merged,
-          }),
-          ...(snapshot.snapshotRevision === undefined
-            ? {}
-            : { snapshotRevision: snapshot.snapshotRevision }),
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await statSig(
+        join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+      )}|${url.search}`;
+      return cachedRoute(
+        tabResKey,
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const merged = await context.eventLog!.readMerged();
+          // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
+          const { projection } = await loadTabSessionProjection(context, context.eventLog!);
+          if (!projection.bySessionId.has(tabSessionId)) {
+            throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
+          }
+          return [
+            200,
+            {
+              data: resolveAttribution({
+                tabSessionId,
+                snapshot,
+                projection,
+                events: merged,
+              }),
+              ...(snapshot.snapshotRevision === undefined
+                ? {}
+                : { snapshotRevision: snapshot.snapshotRevision }),
+            },
+          ];
         },
-      ];
+      );
     },
   },
   {
@@ -2255,29 +2746,38 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const snapshot = await context.connectionsStore.readCurrent();
-      if (snapshot === null) {
-        throw new HttpRouteError(
-          409,
-          'CONNECTIONS_SNAPSHOT_MISSING',
-          'Connections snapshot is not ready.',
-        );
-      }
-      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
-      if (canonicalUrl.length === 0) {
-        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
-      }
-      const merged = await context.eventLog.readMerged();
-      return [
-        200,
-        {
-          data: resolveUrlAttribution({
-            canonicalUrl,
-            snapshot,
-            events: merged,
-          }),
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await statSig(
+        join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+      )}|${url.search}`;
+      return cachedRoute(
+        visResKey,
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+          if (canonicalUrl.length === 0) {
+            throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+          }
+          const merged = await context.eventLog!.readMerged();
+          return [
+            200,
+            {
+              data: resolveUrlAttribution({
+                canonicalUrl,
+                snapshot,
+                events: merged,
+              }),
+            },
+          ];
         },
-      ];
+      );
     },
   },
   {
@@ -2556,82 +3056,84 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
-          data: await collectHealth({
-            startedAt: context.startedAt ?? new Date(),
-            vaultRoot,
-            vaultWritable: async () => {
-              try {
-                await access(vaultRoot);
-                return true;
-              } catch {
-                return false;
-              }
-            },
-            vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
-            captureSummary: () => captureHealthSummary(vaultRoot),
-            recallSummary: async () => {
-              const [index, info, lifecycleReport, modelStatus] = await Promise.all([
-                readIndex(indexPath),
-                stat(indexPath).catch(() => undefined),
-                context.recallLifecycle?.report() ?? Promise.resolve(undefined),
-                getModelCacheStatus().catch(() => undefined),
-              ]);
-              const indexExists = index !== null;
-              return {
-                indexExists,
-                entryCount: index?.items.length ?? null,
-                modelId: index?.modelId ?? null,
-                sizeBytes: info?.size ?? null,
-                // Lifecycle fields are optional so legacy callers
-                // (no recallLifecycle injected) keep the old shape.
-                ...(lifecycleReport === undefined
-                  ? {}
-                  : {
-                      status: lifecycleReport.status,
-                      eventTurnCount: lifecycleReport.eventTurnCount,
-                      currentModelId: lifecycleReport.currentModelId,
-                      companionVersion: lifecycleReport.companionVersion,
-                      lastRebuildAt: lifecycleReport.lastRebuildAt,
-                      lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
-                      lastError: lifecycleReport.lastError,
-                      rebuildEmbedded: lifecycleReport.rebuildEmbedded,
-                      rebuildTotal: lifecycleReport.rebuildTotal,
-                      rebuildPhase: lifecycleReport.rebuildPhase,
-                      embedderDevice: lifecycleReport.embedderDevice,
-                      embedderAccelerator: lifecycleReport.embedderAccelerator,
-                      drift: lifecycleReport.drift,
-                    }),
-                ...(context.recallActivity === undefined
-                  ? {}
-                  : { activity: context.recallActivity.report() }),
-                ...(modelStatus === undefined
-                  ? {}
-                  : {
-                      model: {
-                        id: modelStatus.modelId,
-                        revision: modelStatus.revision,
-                        cacheDir: modelStatus.cacheDir,
-                        present: modelStatus.present,
-                        verified: modelStatus.verified,
-                        offline: modelStatus.offline,
-                      },
-                    }),
-              };
-            },
-            serviceStatus: async () => {
-              const status = await (context.serviceInstaller ?? pickInstaller()).status();
-              return { installed: status.installed, running: status.running };
-            },
-            workGraphSummary: () =>
-              collectWorkGraphHealth({
-                vaultRoot,
-                ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
-                ...(context.connectionsDiagnostics === undefined
-                  ? {}
-                  : { connectionsDiagnostics: context.connectionsDiagnostics }),
-              }),
-            ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
-          }),
+          data: await cachedCollectHealth(vaultRoot, () =>
+            collectHealth({
+              startedAt: context.startedAt ?? new Date(),
+              vaultRoot,
+              vaultWritable: async () => {
+                try {
+                  await access(vaultRoot);
+                  return true;
+                } catch {
+                  return false;
+                }
+              },
+              vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
+              captureSummary: () => captureHealthSummary(vaultRoot),
+              recallSummary: async () => {
+                const [index, info, lifecycleReport, modelStatus] = await Promise.all([
+                  readIndex(indexPath),
+                  stat(indexPath).catch(() => undefined),
+                  context.recallLifecycle?.report() ?? Promise.resolve(undefined),
+                  getModelCacheStatus().catch(() => undefined),
+                ]);
+                const indexExists = index !== null;
+                return {
+                  indexExists,
+                  entryCount: index?.items.length ?? null,
+                  modelId: index?.modelId ?? null,
+                  sizeBytes: info?.size ?? null,
+                  // Lifecycle fields are optional so legacy callers
+                  // (no recallLifecycle injected) keep the old shape.
+                  ...(lifecycleReport === undefined
+                    ? {}
+                    : {
+                        status: lifecycleReport.status,
+                        eventTurnCount: lifecycleReport.eventTurnCount,
+                        currentModelId: lifecycleReport.currentModelId,
+                        companionVersion: lifecycleReport.companionVersion,
+                        lastRebuildAt: lifecycleReport.lastRebuildAt,
+                        lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
+                        lastError: lifecycleReport.lastError,
+                        rebuildEmbedded: lifecycleReport.rebuildEmbedded,
+                        rebuildTotal: lifecycleReport.rebuildTotal,
+                        rebuildPhase: lifecycleReport.rebuildPhase,
+                        embedderDevice: lifecycleReport.embedderDevice,
+                        embedderAccelerator: lifecycleReport.embedderAccelerator,
+                        drift: lifecycleReport.drift,
+                      }),
+                  ...(context.recallActivity === undefined
+                    ? {}
+                    : { activity: context.recallActivity.report() }),
+                  ...(modelStatus === undefined
+                    ? {}
+                    : {
+                        model: {
+                          id: modelStatus.modelId,
+                          revision: modelStatus.revision,
+                          cacheDir: modelStatus.cacheDir,
+                          present: modelStatus.present,
+                          verified: modelStatus.verified,
+                          offline: modelStatus.offline,
+                        },
+                      }),
+                };
+              },
+              serviceStatus: async () => {
+                const status = await (context.serviceInstaller ?? pickInstaller()).status();
+                return { installed: status.installed, running: status.running };
+              },
+              workGraphSummary: () =>
+                collectWorkGraphHealth({
+                  vaultRoot,
+                  ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+                  ...(context.connectionsDiagnostics === undefined
+                    ? {}
+                    : { connectionsDiagnostics: context.connectionsDiagnostics }),
+                }),
+              ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
+            }),
+          ),
         },
       ];
     },
@@ -4132,6 +4634,10 @@ const routes: readonly RouteDefinition[] = [
       );
       return await runIdempotent(context, 'pageContentExtracted', idempotencyKey, async () => {
         const coverage = await writePageContentExtracted(vaultRoot, payload);
+        const evidence = await writeExtractedPageEvidence(vaultRoot, {
+          ...payload,
+          storageMode: 'indexed_chunks',
+        });
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({
             clientEventId: idempotencyKey,
@@ -4139,8 +4645,96 @@ const routes: readonly RouteDefinition[] = [
             type: PAGE_CONTENT_EXTRACTED,
             payload: { ...payload },
           });
+          await context.eventLog.appendServerObserved({
+            clientEventId: `${idempotencyKey}:page-evidence`,
+            aggregateId: `page-evidence:${evidence.canonicalUrl}`,
+            type: PAGE_EVIDENCE_EXTRACTED,
+            payload: {
+              ...pageEvidenceExtractedEventPayload(evidence, {
+                ...payload,
+                storageMode: 'indexed_chunks',
+              }),
+            },
+          });
         }
         return [202, { data: { coverage } }];
+      });
+    },
+  },
+  {
+    method: 'GET',
+    pattern: /^\/v1\/page-evidence\/summary(?:\?.*)?$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const canonicalUrl = url.searchParams.get('canonicalUrl');
+      if (canonicalUrl === null || canonicalUrl.length === 0) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'canonicalUrl query parameter is required.',
+          'GET /v1/page-evidence/summary requires a canonicalUrl query parameter.',
+        );
+      }
+      try {
+        const result = await readPageEvidence(vaultRoot, canonicalUrl);
+        return [
+          200,
+          {
+            data: {
+              canonicalUrl: result.record?.canonicalUrl ?? canonicalUrl,
+              pageEvidence:
+                result.record === null ? null : pageEvidenceSummaryPayload(result.record),
+              stale: result.stale,
+              ...(result.staleReason === undefined ? {} : { staleReason: result.staleReason }),
+            },
+          },
+        ];
+      } catch (error) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          error instanceof Error ? error.message : 'Invalid canonicalUrl.',
+        );
+      }
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/page-evidence\/extracted$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const idempotencyKey = requireIdempotencyKey(request);
+      const payload = compactPageEvidenceExtractedPayload(
+        pageEvidenceExtractedSchema.parse(await readBody(request)),
+      );
+      return await runIdempotent(context, 'pageEvidenceExtracted', idempotencyKey, async () => {
+        const pageContentPayload = compactPageContentExtractedPayload(payload);
+        const coverage =
+          payload.storageMode === 'indexed_chunks'
+            ? await writePageContentExtracted(vaultRoot, pageContentPayload)
+            : null;
+        const evidence = await writeExtractedPageEvidence(vaultRoot, payload);
+        if (context.eventLog !== undefined) {
+          if (coverage !== null) {
+            await context.eventLog.appendServerObserved({
+              clientEventId: `${idempotencyKey}:page-content`,
+              aggregateId: `page-content:${coverage.canonicalUrl}`,
+              type: PAGE_CONTENT_EXTRACTED,
+              payload: { ...pageContentPayload },
+            });
+          }
+          await context.eventLog.appendServerObserved({
+            clientEventId: `${idempotencyKey}:page-evidence`,
+            aggregateId: `page-evidence:${evidence.canonicalUrl}`,
+            type: PAGE_EVIDENCE_EXTRACTED,
+            payload: { ...pageEvidenceExtractedEventPayload(evidence, payload) },
+          });
+        }
+        return [202, { data: { evidence, ...(coverage === null ? {} : { coverage }) } }];
       });
     },
   },
@@ -4215,7 +4809,17 @@ const routes: readonly RouteDefinition[] = [
             ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
           })
         : [];
-      const merged = [...pageHits, ...recallHits]
+      // W4(b-lite) — additive, gated, read-only semantic expansion of
+      // the primary hits. One-step off via the runtime flag.
+      const semanticHits =
+        sourceKinds.has('semantic-recall-pool') && semanticRecallPoolEnabled()
+          ? await semanticRecallExpansion(
+              vaultRoot,
+              [...pageHits, ...recallHits],
+              query.limit,
+            )
+          : [];
+      const merged = [...pageHits, ...recallHits, ...semanticHits]
         .sort(
           (left, right) =>
             right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
@@ -4229,6 +4833,7 @@ const routes: readonly RouteDefinition[] = [
             sourceKinds: [...sourceKinds].sort(),
             pageContentCount: pageHits.length,
             chatTurnCount: recallHits.length,
+            semanticRecallPoolCount: semanticHits.length,
           },
         },
       ];
@@ -4297,39 +4902,90 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, _requestId, match, context) => {
       const vaultRoot = requireVaultRoot(context);
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
       if (match.threadId === undefined) {
         throw new Error('Missing threadId path parameter.');
       }
+      // Capture the guard-narrowed values: TS narrowing from the
+      // throws above does not carry into the cached builder closure.
+      const threadId = match.threadId;
+      const eventLog = context.eventLog;
       const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const query = suggestionQuerySchema.parse({
         limit: url.searchParams.get('limit') ?? undefined,
         threshold: url.searchParams.get('threshold') ?? undefined,
       });
-      const workstreams = await readWorkstreams(vaultRoot);
-      const signals = await buildSignals(vaultRoot, match.threadId, workstreams);
-      // Threshold precedence: per-request param wins, then env var,
-      // then a permissive default (0.25). The pre-fix value (0.55)
-      // was calibrated for richly-populated workstreams where the
-      // 0.5*vector term dominated; with the cold-start title-
-      // embedding fallback and the asymmetric ws→thread containment
-      // signal, real positive matches typically score 0.25–0.45,
-      // so 0.25 surfaces them without a flood of noise.
-      const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
-      const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
-      const threshold = query.threshold ?? defaultThreshold;
-      const suggestions = scoreSuggestions(
-        {
-          thread: { id: match.threadId },
-          workstreams,
-          signals,
+      const suggestionsCacheKey = `thread:${threadId}|${await statSig(
+        join(vaultRoot, '_BAC', 'connections', 'current.json'),
+      )}|l=${String(query.limit)}|th=${String(query.threshold ?? '')}`;
+      return cachedThreadSuggestions(
+        suggestionsCacheKey,
+        THREAD_SUGGESTIONS_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const snapshot = await context.connectionsStore!.readCurrent();
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const target = await readThreadSuggestionTarget(vaultRoot, threadId);
+          const merged = await eventLog.readMerged();
+          const resolution = resolveThreadAttribution({
+            threadId: target.threadId,
+            ...(target.providerThreadId === undefined
+              ? {}
+              : { providerThreadId: target.providerThreadId }),
+            ...(target.threadUrl === undefined ? {} : { threadUrl: target.threadUrl }),
+            snapshot,
+            events: merged,
+          });
+          // Compatibility route: callers still receive a ranked
+          // Suggestion[] array, but the score now comes from the same
+          // graph resolver used by URL/current-tab suggestions.
+          const envThreshold = Number.parseFloat(process.env['SIDETRACK_SUGGEST_THRESHOLD'] ?? '');
+          const defaultThreshold = Number.isFinite(envThreshold) ? envThreshold : 0.25;
+          const threshold = query.threshold ?? defaultThreshold;
+          const suggestions = resolution.fusedCandidates
+            .map((candidate) => {
+              const score = 1 / (1 + Math.exp(-candidate.rawFusionLogit));
+              return {
+                workstreamId: candidate.workstreamId,
+                score,
+                breakdown: {
+                  ppr: candidate.pprScore,
+                  similarity: candidate.simTopScore,
+                  cluster: candidate.clusterPosterior,
+                  corroboration: candidate.corroborationCount,
+                  margin: resolution.decision.margin,
+                },
+                resolver: {
+                  modelRevision: resolution.reasons.modelRevision,
+                  graphRevision: resolution.reasons.graphRevision,
+                  dominantSource: candidate.dominantSource,
+                  action: resolution.decision.action,
+                },
+              };
+            })
+            .filter((suggestion) => suggestion.score >= threshold)
+            .slice(0, query.limit);
+          context.recallActivity?.recordSuggestion({
+            threadId,
+            resultCount: suggestions.length,
+          });
+          return [200, { data: suggestions }];
         },
-        { threshold },
-      ).slice(0, query.limit);
-      context.recallActivity?.recordSuggestion({
-        threadId: match.threadId,
-        resultCount: suggestions.length,
-      });
-      return [200, { data: suggestions }];
+      );
     },
   },
   {
@@ -4611,15 +5267,23 @@ const routes: readonly RouteDefinition[] = [
       // from the companion's relay-replicated event log to the extension's
       // chrome.storage cache, so workstreams created on Browser A reach
       // Browser B's side panel via the standard sync path.
-      const events = await context.eventLog.readMerged();
-      const aggregateIds = new Set<string>();
-      for (const event of events) {
-        if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
-          aggregateIds.add(event.aggregateId);
-        }
-      }
-      const projections = [...aggregateIds].sort().map((bacId) => projectWorkstream(bacId, events));
-      return [200, { data: projections }];
+      return cachedRoute(
+        'wsproj',
+        ROUTE_CACHE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          const events = await context.eventLog!.readMerged();
+          const aggregateIds = new Set<string>();
+          for (const event of events) {
+            if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
+              aggregateIds.add(event.aggregateId);
+            }
+          }
+          const projections = [...aggregateIds]
+            .sort()
+            .map((bacId) => projectWorkstream(bacId, events));
+          return [200, { data: projections }];
+        },
+      );
     },
   },
   {
@@ -5103,6 +5767,7 @@ const routes: readonly RouteDefinition[] = [
         EDGE_EVENT_VALIDATORS.get(type)?.(payload) ?? false;
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      const valid: import('../sync/causal.js').AcceptedEvent[] = [];
       for (const candidate of body.events) {
         if (
           candidate === null ||
@@ -5130,26 +5795,57 @@ const routes: readonly RouteDefinition[] = [
           });
           continue;
         }
-        try {
-          const result = await context.importEdgeEvent(event);
-          if (result.imported) {
-            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
-          } else {
-            skipped.push({
-              replicaId: event.dot.replicaId,
-              seq: event.dot.seq,
-              reason: 'already-imported',
-            });
-          }
-        } catch (err) {
+        valid.push(event);
+      }
+      void requestId;
+      // P2 — batch the whole flush: ONE readMerged + dedupe + shard
+      // write, vs ~3 whole-log scans PER event (the 39s-on-backlog
+      // quadratic). Fallback to the per-event path when the batch
+      // dep isn't wired (tests / programmatic startCompanion users).
+      const recordResult = (
+        event: import('../sync/causal.js').AcceptedEvent,
+        wasImported: boolean,
+      ): void => {
+        if (wasImported) {
+          imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+        } else {
           skipped.push({
             replicaId: event.dot.replicaId,
             seq: event.dot.seq,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: 'already-imported',
           });
         }
+      };
+      const recordError = (
+        event: import('../sync/causal.js').AcceptedEvent,
+        err: unknown,
+      ): void => {
+        skipped.push({
+          replicaId: event.dot.replicaId,
+          seq: event.dot.seq,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      };
+      if (context.importEdgeEvents !== undefined) {
+        try {
+          const res = await context.importEdgeEvents(valid);
+          const importedById = new Map(res.map((r) => [r.clientEventId, r.imported]));
+          for (const event of valid) {
+            recordResult(event, importedById.get(event.clientEventId) === true);
+          }
+        } catch (err) {
+          for (const event of valid) recordError(event, err);
+        }
+      } else {
+        for (const event of valid) {
+          try {
+            const result = await context.importEdgeEvent!(event);
+            recordResult(event, result.imported);
+          } catch (err) {
+            recordError(event, err);
+          }
+        }
       }
-      void requestId;
       return [200, { data: { imported, skipped } }];
     },
   },
@@ -5362,122 +6058,133 @@ const routes: readonly RouteDefinition[] = [
       }
       const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
-      let snap = await context.connectionsStore.readCurrent();
-      if (snap === null) {
-        // Materializer hasn't run yet — return an empty scoped
-        // envelope so callers don't have to special-case 404.
-        return [
-          200,
-          {
-            data: {
-              scope: 'companion-extended',
-              snapshot: {
-                scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
-                nodes: [],
-                edges: [],
-                updatedAt: '1970-01-01T00:00:00.000Z',
-                nodeCount: 0,
-                edgeCount: 0,
+      const cacheVaultRoot = requireVaultRoot(context);
+      const cacheKey = await connectionsResponseCacheKey(cacheVaultRoot, url.search);
+      const { result: connectionsResult } = await cachedConnectionsResponse(
+        cacheKey,
+        CONNECTIONS_RESPONSE_TTL_MS,
+        async (): Promise<readonly [number, unknown]> => {
+          let snap = await context.connectionsStore!.readCurrent();
+          if (snap === null) {
+            // Materializer hasn't run yet — return an empty scoped
+            // envelope so callers don't have to special-case 404.
+            return [
+              200,
+              {
+                data: {
+                  scope: 'companion-extended',
+                  snapshot: {
+                    scope: { ...(topicVariant === undefined ? {} : { topicVariant }) },
+                    nodes: [],
+                    edges: [],
+                    updatedAt: '1970-01-01T00:00:00.000Z',
+                    nodeCount: 0,
+                    edgeCount: 0,
+                  },
+                },
               },
-            },
-          },
-        ];
-      }
-      if (topicVariant === 'shadow') {
-        const shadowRevision = await createTopicRevisionStore(
-          requireVaultRoot(context),
-        ).readShadowRevision();
-        if (shadowRevision === null) {
+            ];
+          }
+          if (topicVariant === 'shadow') {
+            const shadowRevision = await createTopicRevisionStore(
+              requireVaultRoot(context),
+            ).readShadowRevision();
+            if (shadowRevision === null) {
+              return [
+                200,
+                {
+                  data: {
+                    scope: 'companion-extended',
+                    snapshot: {
+                      scope: { topicVariant },
+                      nodes: [],
+                      edges: [],
+                      updatedAt: snap.updatedAt,
+                      nodeCount: 0,
+                      edgeCount: 0,
+                      ...(snap.snapshotRevision === undefined
+                        ? {}
+                        : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                    },
+                  },
+                },
+              ];
+            }
+            snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
+          }
+          if (context.eventLog !== undefined) {
+            snap = applyFeedbackOverlayToSnapshot(
+              snap,
+              projectFeedback(await context.eventLog.readMerged()),
+            );
+          }
+          snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
+          // Coarse filters — honoured by simple matchers. workstreamId
+          // narrows to nodes either matching the ws id directly or
+          // having metadata.workstreamId pointing to it; edges between
+          // selected nodes survive.
+          let nodes = snap.nodes;
+          let edges = snap.edges;
+          if (workstreamId !== undefined) {
+            const wsNodeId = `workstream:${workstreamId}`;
+            const keepNodeIds = new Set<string>([wsNodeId]);
+            for (const n of nodes) {
+              if (n.metadata.workstreamId === workstreamId) keepNodeIds.add(n.id);
+            }
+            // Pull in edge endpoints reachable from the kept set in one
+            // hop so the projection is comprehensible.
+            for (const e of edges) {
+              if (keepNodeIds.has(e.fromNodeId)) keepNodeIds.add(e.toNodeId);
+              if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
+            }
+            nodes = nodes.filter((n) => keepNodeIds.has(n.id));
+            edges = edges.filter(
+              (e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId),
+            );
+          }
+          if (nodeKind !== undefined) {
+            nodes = nodes.filter((n) => n.kind === nodeKind);
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
+          if (edgeKind !== undefined) {
+            edges = edges.filter((e) => e.kind === edgeKind);
+          }
+          if (provider !== undefined) {
+            nodes = nodes.filter((n) => n.metadata.provider === provider);
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
+          if (originReplicaId !== undefined) {
+            nodes = nodes.filter((n) => n.originReplicaIds.includes(originReplicaId));
+            const kept = new Set(nodes.map((n) => n.id));
+            edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
+          }
           return [
             200,
             {
               data: {
                 scope: 'companion-extended',
                 snapshot: {
-                  scope: { topicVariant },
-                  nodes: [],
-                  edges: [],
+                  scope: {
+                    ...(workstreamId === undefined ? {} : { workstreamId }),
+                    ...(topicVariant === undefined ? {} : { topicVariant }),
+                  },
+                  nodes,
+                  edges,
                   updatedAt: snap.updatedAt,
-                  nodeCount: 0,
-                  edgeCount: 0,
+                  nodeCount: nodes.length,
+                  edgeCount: edges.length,
                   ...(snap.snapshotRevision === undefined
                     ? {}
-                    : { snapshotRevision: `${snap.snapshotRevision}:shadow-missing` }),
+                    : { snapshotRevision: snap.snapshotRevision }),
                 },
               },
             },
           ];
-        }
-        snap = overlayTopicRevisionOnSnapshot(snap, shadowRevision);
-      }
-      if (context.eventLog !== undefined) {
-        snap = applyFeedbackOverlayToSnapshot(
-          snap,
-          projectFeedback(await context.eventLog.readMerged()),
-        );
-      }
-      snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
-      // Coarse filters — honoured by simple matchers. workstreamId
-      // narrows to nodes either matching the ws id directly or
-      // having metadata.workstreamId pointing to it; edges between
-      // selected nodes survive.
-      let nodes = snap.nodes;
-      let edges = snap.edges;
-      if (workstreamId !== undefined) {
-        const wsNodeId = `workstream:${workstreamId}`;
-        const keepNodeIds = new Set<string>([wsNodeId]);
-        for (const n of nodes) {
-          if (n.metadata.workstreamId === workstreamId) keepNodeIds.add(n.id);
-        }
-        // Pull in edge endpoints reachable from the kept set in one
-        // hop so the projection is comprehensible.
-        for (const e of edges) {
-          if (keepNodeIds.has(e.fromNodeId)) keepNodeIds.add(e.toNodeId);
-          if (keepNodeIds.has(e.toNodeId)) keepNodeIds.add(e.fromNodeId);
-        }
-        nodes = nodes.filter((n) => keepNodeIds.has(n.id));
-        edges = edges.filter((e) => keepNodeIds.has(e.fromNodeId) && keepNodeIds.has(e.toNodeId));
-      }
-      if (nodeKind !== undefined) {
-        nodes = nodes.filter((n) => n.kind === nodeKind);
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      if (edgeKind !== undefined) {
-        edges = edges.filter((e) => e.kind === edgeKind);
-      }
-      if (provider !== undefined) {
-        nodes = nodes.filter((n) => n.metadata.provider === provider);
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      if (originReplicaId !== undefined) {
-        nodes = nodes.filter((n) => n.originReplicaIds.includes(originReplicaId));
-        const kept = new Set(nodes.map((n) => n.id));
-        edges = edges.filter((e) => kept.has(e.fromNodeId) && kept.has(e.toNodeId));
-      }
-      return [
-        200,
-        {
-          data: {
-            scope: 'companion-extended',
-            snapshot: {
-              scope: {
-                ...(workstreamId === undefined ? {} : { workstreamId }),
-                ...(topicVariant === undefined ? {} : { topicVariant }),
-              },
-              nodes,
-              edges,
-              updatedAt: snap.updatedAt,
-              nodeCount: nodes.length,
-              edgeCount: edges.length,
-              ...(snap.snapshotRevision === undefined
-                ? {}
-                : { snapshotRevision: snap.snapshotRevision }),
-            },
-          },
         },
-      ];
+      );
+      return connectionsResult;
     },
   },
   {
@@ -5521,7 +6228,8 @@ const routes: readonly RouteDefinition[] = [
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
       const { subgraphForNode } = await import('../connections/snapshot.js');
-      const sub = subgraphForNode(snap, nodeId, hops);
+      const resolvedNodeId = resolveConnectionsNodeId(snap, nodeId);
+      const sub = subgraphForNode(snap, resolvedNodeId, hops);
       return [200, { data: { scope: 'companion-extended', snapshot: sub } }];
     },
   },
@@ -5715,7 +6423,19 @@ export const handleRequest = async (
 
   try {
     const match = route.pattern.exec(url.pathname);
+    // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
+    // what the extension actually polls + per-request latency. Written
+    // to a file because the screen-session pty isn't capturable.
+    // Fire-and-forget; zero overhead when the env is unset.
+    const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
+    const httpLogStartedMs = httpLog ? Date.now() : 0;
     const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
+    if (httpLog) {
+      void appendFile(
+        '/tmp/sidetrack-http-debug.log',
+        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(status)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+      ).catch(() => undefined);
+    }
     sendJson(response, status, body);
   } catch (error) {
     const issues = getValidationIssues(error);

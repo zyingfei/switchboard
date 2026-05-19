@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../connections/snapshot.js';
-import type { ConnectionsSnapshot } from '../connections/types.js';
+import type { ConnectionEdge, ConnectionsSnapshot } from '../connections/types.js';
 import { nodeIdFor } from '../connections/types.js';
 import {
   USER_FLOW_CONFIRMED,
@@ -99,6 +99,51 @@ const snapshotWithVisits = (urls: readonly string[]): ConnectionsSnapshot => ({
   nodeCount: urls.length,
   edgeCount: 0,
 });
+
+const edge = (
+  kind: ConnectionEdge['kind'],
+  fromNodeId: string,
+  toNodeId: string,
+  metadata?: Record<string, unknown>,
+): ConnectionEdge => ({
+  id: `edge:${kind}:${fromNodeId}:${toNodeId}`,
+  kind,
+  fromNodeId,
+  toNodeId,
+  observedAt,
+  producedBy: { source: 'event-log' },
+  confidence: 'inferred',
+  ...(metadata === undefined ? {} : { metadata }),
+});
+
+const snapshotWithWorkstreamMembership = (
+  urls: readonly string[],
+  workstreamId: string,
+): ConnectionsSnapshot => {
+  const base = snapshotWithVisits(urls);
+  const workstreamNodeId = nodeIdFor('workstream', workstreamId);
+  const membershipEdges: ConnectionEdge[] = urls.map((url) => ({
+    ...edge('visit_in_workstream', nodeIdFor('timeline-visit', url), workstreamNodeId),
+    confidence: 'asserted' as const,
+    producedBy: { source: 'event-log' as const, eventType: USER_ORGANIZED_ITEM },
+  }));
+  return {
+    ...base,
+    nodes: [
+      ...base.nodes,
+      {
+        id: workstreamNodeId,
+        kind: 'workstream',
+        label: workstreamId,
+        originReplicaIds: ['replica-a'],
+        metadata: {},
+      },
+    ],
+    edges: membershipEdges,
+    nodeCount: base.nodeCount + 1,
+    edgeCount: membershipEdges.length,
+  };
+};
 
 const feedbackEvent = (seq: number, fromId: string, toId: string): AcceptedEvent => ({
   clientEventId: `feedback-${String(seq)}`,
@@ -316,6 +361,31 @@ describe('ranker retraining loop', () => {
     ).toMatchObject({ action: 'train', newLabelCount: 1 });
   });
 
+  it('force flag retrains unchanged labels for model or candidate-generation changes', () => {
+    const fingerprint = fingerprintFeedbackTrainingLabels(projection(manyLabels(10)));
+    const state: RankerRetrainState = {
+      schemaVersion: 1,
+      lastTrainedLabelDatasetHash: fingerprint.hash,
+      lastTrainedLabelCount: fingerprint.labelCount,
+      lastTrainedPositiveLabelCount: fingerprint.positiveLabelCount,
+      lastTrainedNegativeLabelCount: fingerprint.negativeLabelCount,
+      activeRevisionId: 'old-revision',
+      rankerTrainingDatasetHash: '0'.repeat(64),
+      updatedAt: observedAtMs,
+    };
+
+    expect(
+      planRankerRetrain({
+        fingerprint,
+        state,
+        threshold: 50,
+        cooldownMs: 10 * 60_000,
+        nowMs: observedAtMs,
+        force: true,
+      }),
+    ).toMatchObject({ action: 'train', newLabelCount: 0 });
+  });
+
   it('builds ranker training candidates from feedback labels and snapshot features', () => {
     const from = 'https://example.test/a';
     const positive = 'https://example.test/b';
@@ -335,6 +405,60 @@ describe('ranker retraining loop', () => {
     expect(candidates[0]?.features.same_host).toBe(1);
     expect(candidates[1]?.candidate.sources).toEqual(['recently_skipped']);
     expect(candidates[1]?.features.same_host).toBe(1);
+  });
+
+  it('does not build ranker training candidates from shared workstream membership alone', () => {
+    const from = 'https://alpha.test/reference';
+    const to = 'https://bravo.invalid/handbook';
+    const candidates = buildRankerTrainingCandidates({
+      feedback: projection([]),
+      merged: [],
+      snapshot: snapshotWithWorkstreamMembership([from, to], 'ws_scope'),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    expect(candidates).toEqual([]);
+  });
+
+  it('keeps explicit user-confirmed training candidates inside a shared workstream', () => {
+    const from = 'https://alpha.test/reference';
+    const to = 'https://bravo.invalid/handbook';
+    const candidates = buildRankerTrainingCandidates({
+      feedback: projection([label(from, to)]),
+      merged: [],
+      snapshot: snapshotWithWorkstreamMembership([from, to], 'ws_scope'),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    expect(candidates.map((candidate) => candidate.candidate.toVisitId)).toEqual([to]);
+    expect(candidates[0]?.candidate.sources).toEqual(['user_confirmed']);
+  });
+
+  it('keeps independent similarity training candidates inside a shared workstream', () => {
+    const from = 'https://alpha.test/reference';
+    const to = 'https://bravo.invalid/handbook';
+    const membership = snapshotWithWorkstreamMembership([from, to], 'ws_scope');
+    const similarity = edge(
+      'visit_resembles_visit',
+      nodeIdFor('timeline-visit', from),
+      nodeIdFor('timeline-visit', to),
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback: projection([]),
+      merged: [],
+      snapshot: {
+        ...membership,
+        edges: [...membership.edges, similarity],
+        edgeCount: membership.edgeCount + 1,
+      },
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    const fromCandidates = candidates.filter(
+      (candidate) => candidate.candidate.fromVisitId === from,
+    );
+    expect(fromCandidates.map((candidate) => candidate.candidate.toVisitId)).toEqual([to]);
+    expect(fromCandidates[0]?.candidate.sources).toEqual(['embedding_neighborhood']);
   });
 
   it('trains, writes the active revision, and persists retrain state when threshold is met', async () => {

@@ -509,6 +509,16 @@ describe('live side-panel App wiring', () => {
             clientEventId: 'evt-1',
           },
           attributionHistory: [],
+          pageEvidence: {
+            tier: 'content_features_only',
+            evidenceRevision: 'evidence-research',
+            semanticFeatureRevision: 'semantic-research',
+            updatedAt: NOW,
+            termCount: 64,
+            keyphraseCount: 32,
+            entityCount: 12,
+            quality: 'high',
+          },
         },
         'https://copy.fail': {
           canonicalUrl: 'https://copy.fail',
@@ -519,6 +529,16 @@ describe('live side-panel App wiring', () => {
           latestUrl: 'https://copy.fail',
           latestTitle: 'Copy fail',
           attributionHistory: [],
+          pageEvidence: {
+            tier: 'indexed_chunks',
+            evidenceRevision: 'evidence-copy',
+            semanticFeatureRevision: 'semantic-copy',
+            updatedAt: NOW,
+            termCount: 48,
+            keyphraseCount: 24,
+            entityCount: 8,
+            quality: 'medium',
+          },
         },
       },
     };
@@ -576,11 +596,13 @@ describe('live side-panel App wiring', () => {
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sidetrack');
     });
+    expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Features only');
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
     // Stage 5 polish — flat 4-action layout aligned with Current Tab.
     // Both the Current Tab card and the Inbox card now render "Pick
     // another…"; scope the click to the inbox card for this URL.
     const inboxCard = await screen.findByTestId('tab-session-card-https://copy.fail');
+    expect(inboxCard).toHaveTextContent('Indexed chunks');
     fireEvent.click(within(inboxCard).getByRole('button', { name: 'Pick another…' }));
     fireEvent.click(await screen.findByRole('button', { name: /^Sidetrack/ }));
 

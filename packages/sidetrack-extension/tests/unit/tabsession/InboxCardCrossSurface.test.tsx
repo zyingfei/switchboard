@@ -34,6 +34,28 @@ describe('InboxCard — cross-surface "Graph" jump', () => {
     expect(onOpen).toHaveBeenCalledWith('https://news.ycombinator.com/item?id=47952181');
   });
 
+  it('uses latestUrl for real tab-session records whose id is not a URL', () => {
+    const onOpen = vi.fn();
+    render(
+      <InboxCard
+        record={record({
+          tabSessionId: 'tses_01KRRXB6ENZFFJWPCPSHY3MXBW',
+          latestUrl:
+            'https://engineering.fb.com/2014/11/14/production-engineering/introducing-data-center-fabric-the-next-generation-facebook-data-center-network/',
+        })}
+        workstreams={workstreams}
+        onAttribute={vi.fn()}
+        onOpenInConnections={onOpen}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('Open in Connections'));
+
+    expect(onOpen).toHaveBeenCalledWith(
+      'https://engineering.fb.com/2014/11/14/production-engineering/introducing-data-center-fabric-the-next-generation-facebook-data-center-network/',
+    );
+  });
+
   it('does not render the Graph button when onOpenInConnections is omitted', () => {
     render(<InboxCard record={record()} workstreams={workstreams} onAttribute={vi.fn()} />);
     expect(screen.queryByLabelText('Open in Connections')).toBeNull();
@@ -42,12 +64,39 @@ describe('InboxCard — cross-surface "Graph" jump', () => {
   it('does not render the Graph button when the record has no URL', () => {
     render(
       <InboxCard
-        record={record({ latestUrl: undefined })}
+        record={record({ tabSessionId: 'tses_01KRRXB6ENZFFJWPCPSHY3MXBW', latestUrl: undefined })}
         workstreams={workstreams}
         onAttribute={vi.fn()}
         onOpenInConnections={vi.fn()}
       />,
     );
     expect(screen.queryByLabelText('Open in Connections')).toBeNull();
+  });
+
+  it('renders the PageEvidence capture tier when present', () => {
+    render(
+      <InboxCard
+        record={record({
+          pageEvidence: {
+            tier: 'content_features_only',
+            evidenceRevision: 'evidence-rev',
+            semanticFeatureRevision: 'semantic-rev',
+            updatedAt: '2026-05-10T10:06:00.000Z',
+            termCount: 64,
+            keyphraseCount: 32,
+            entityCount: 7,
+            quality: 'high',
+          },
+        })}
+        workstreams={workstreams}
+        onAttribute={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('Capture type: Features only')).toBeInTheDocument();
+    expect(screen.getByText('Features only')).toHaveAttribute(
+      'title',
+      expect.stringContaining('64 terms'),
+    );
   });
 });

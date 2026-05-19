@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 
 import { TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY } from '../producers/topic-revision.js';
 import { buildTopicRevision, type TopicVisit } from './topicClusterer.js';
-import { buildTopicShadowCandidate } from './topicShadowCandidate.js';
+import {
+  buildTopicShadowCandidate,
+  expectedShadowRevisionId,
+} from './topicShadowCandidate.js';
 import type { VisitSimilarityRevision } from './types.js';
 
 const visit = (canonicalUrl: string, title: string): TopicVisit => ({
@@ -187,5 +190,84 @@ describe('buildTopicShadowCandidate', () => {
       ),
     ).toHaveLength(1);
     expect(shadow.diagnostics.secondaryAffiliationCount).toBe(1);
+  });
+});
+
+describe('expectedShadowRevisionId (W4 shadow skip-gate)', () => {
+  const visits = [
+    visit('https://matching.dev/order-book', 'matching engine order book'),
+    visit('https://matching.dev/price-time-priority', 'matching engine price time priority'),
+    visit('https://oracle.cloud/landing-zone', 'oracle cloud landing zone'),
+    visit('https://oracle.cloud/cis-quickstart', 'oracle cloud cis quickstart'),
+  ];
+  const visitSimilarity = similarityRevision([
+    {
+      fromVisitKey: 'https://matching.dev/order-book',
+      toVisitKey: 'https://matching.dev/price-time-priority',
+      cosine: 0.95,
+    },
+    {
+      fromVisitKey: 'https://matching.dev/price-time-priority',
+      toVisitKey: 'https://oracle.cloud/landing-zone',
+      cosine: 0.86,
+    },
+    {
+      fromVisitKey: 'https://oracle.cloud/landing-zone',
+      toVisitKey: 'https://oracle.cloud/cis-quickstart',
+      cosine: 0.95,
+    },
+  ]);
+
+  // The skip-gate's correctness rests entirely on this invariant: the
+  // id computed cheaply (prune only) must equal the id the full
+  // (expensive) build actually produces, so reusing a persisted shadow
+  // when they match is byte-safe.
+  it('equals the revisionId buildTopicShadowCandidate actually produces', async () => {
+    const baselineRevision = await buildTopicRevision({
+      visits,
+      visitSimilarity,
+      options: { producedAt: Date.parse('2026-05-14T10:12:00.000Z') },
+    });
+    const shadow = await buildTopicShadowCandidate({
+      visits,
+      visitSimilarity,
+      userAssertedRelations: [],
+      baselineRevision,
+      cosineThreshold: 0.85,
+    });
+    const expected = await expectedShadowRevisionId({
+      visits,
+      visitSimilarity,
+      cosineThreshold: 0.85,
+    });
+    expect(expected).toBe(shadow.revision.revisionId);
+  });
+
+  it('is deterministic for identical inputs and sensitive to input changes', async () => {
+    const a = await expectedShadowRevisionId({ visits, visitSimilarity, cosineThreshold: 0.85 });
+    const b = await expectedShadowRevisionId({ visits, visitSimilarity, cosineThreshold: 0.85 });
+    expect(a).toBe(b);
+    // Different cosine threshold => different id (gate must not
+    // false-positive-skip when inputs change).
+    const differentThreshold = await expectedShadowRevisionId({
+      visits,
+      visitSimilarity,
+      cosineThreshold: 0.5,
+    });
+    expect(differentThreshold).not.toBe(a);
+    // Different similarity edges => different id (edges are hashed
+    // into the pruned revision id).
+    const differentEdges = await expectedShadowRevisionId({
+      visits,
+      visitSimilarity: similarityRevision([
+        {
+          fromVisitKey: 'https://matching.dev/order-book',
+          toVisitKey: 'https://oracle.cloud/cis-quickstart',
+          cosine: 0.5,
+        },
+      ]),
+      cosineThreshold: 0.85,
+    });
+    expect(differentEdges).not.toBe(a);
   });
 });

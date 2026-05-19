@@ -9,7 +9,7 @@
 // verified against the deltas in these counters, not against "the code
 // runs."
 
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { appendHealthHistory } from './healthHistory.js';
@@ -30,6 +30,8 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import type { ConnectionsSnapshot, VisitSimilarityRevision } from './types.js';
 import type { TopicShadowDiagnostics } from './topicShadowCandidate.js';
 import type { TopicShadowObservationDiagnostics } from './topicShadowObservation.js';
+import type { HotPathDiagnostics } from './hotPathMode.js';
+import type { ServedTopicProducerReport } from './servedTopicProducer.js';
 import {
   DriftMonitor,
   extractDriftSamples,
@@ -38,8 +40,10 @@ import {
   type DriftReport,
 } from './drift/driftMonitor.js';
 import { createDriftStateStore, type DriftStateStore } from './drift/driftStateStore.js';
+import { edgeKindIsPairwiseRelatedness } from './edgeSemantics.js';
 import type { SilhouetteSimilarityEdge, SilhouetteTopic } from './drift/temporalSilhouette.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
+import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
 
@@ -48,6 +52,14 @@ export const MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION = 1;
 const DIAGNOSTICS_RELATIVE_DIR = '_BAC/connections/diagnostics';
 const DIAGNOSTICS_LATEST_FILENAME = 'latest.json';
 const DIAGNOSTICS_HISTORY_DIRNAME = 'history';
+// Bounded retention for the per-drain history files. This dir had NO
+// pruner — it grew one JSON per drain forever (observed at 4k+ files),
+// and the reconcile path re-walked it, compounding the constant-CPU
+// runaway. The health-history ring (HEALTH_HISTORY_MAX) is the trend
+// source; this dir is ad-hoc forensics, so a few hundred is plenty.
+export const DIAGNOSTICS_HISTORY_MAX = 240;
+const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
+const WORKSTREAM_PREFIX = 'workstream:';
 
 export interface MaterializerTimelineCounters {
   readonly entryCount: number;
@@ -70,6 +82,13 @@ export interface MaterializerSimilarityCounters {
   // forwarded to `buildVisitSimilarity`, captured here so dogfood can
   // confirm env overrides actually took effect. Optional because the
   // collector accepts legacy input shapes that didn't carry it.
+  readonly contentEnrichedEdges: number;
+  readonly metadataOnlyEdges: number;
+  readonly mixedTierEdges: number;
+  readonly avgEvidenceConfidence: number;
+  readonly vectorSkippedMissingCount: number;
+  readonly vectorSkippedModelMismatchCount: number;
+  readonly topMatchedTerms: readonly string[];
   readonly effectiveConfig?: {
     readonly threshold: number;
     readonly topK: number;
@@ -179,6 +198,63 @@ export interface MaterializerSnapshotCounters {
   readonly edgeCountByKind: Readonly<Record<string, number>>;
 }
 
+export interface MaterializerPairEvidenceCounters {
+  // Counts candidate-source metadata on emitted closest_visit edges.
+  // `same_workstream` must stay zero/absent; workstream membership is
+  // graph scope, not pairwise evidence.
+  readonly candidatesBySource: Readonly<Record<string, number>>;
+  readonly closestVisitEdgesByPrimarySource: Readonly<Record<string, number>>;
+  readonly sameWorkstreamCandidateSourceCount: number;
+  readonly membershipOnlyClosestVisitEdgeCount: number;
+  readonly membershipOnlyPairEdgesBlocked: number;
+}
+
+export interface MaterializerPageEvidenceCounters {
+  readonly metadataOnlyCount: number;
+  readonly featuresOnlyCount: number;
+  readonly indexedChunkCount: number;
+  readonly contentVectorReadyCount: number;
+  readonly contentVectorMissingCount: number;
+  readonly contentVectorDisabledCount: number;
+  readonly contentVectorFailedCount: number;
+  readonly avgTopTermCount: number;
+  readonly featureOnlyPages: number;
+}
+
+export interface MaterializerPhaseDuration {
+  readonly label: string;
+  readonly durationMs: number;
+  readonly totalMs: number;
+}
+
+export interface MaterializerLatencyCounters {
+  readonly pageEvidence: {
+    readonly evidenceReadP95Ms: number;
+    readonly vectorMapReadP95Ms: number;
+    readonly chunkReadP95Ms: number;
+  };
+  readonly contentSimilarity: {
+    readonly pairScoringP95Ms: number;
+    readonly buildP95Ms: number;
+  };
+  readonly snapshot: {
+    readonly rebuildP95Ms: number;
+    readonly baseRebuildP95Ms: number;
+    readonly rankerAugmentedRebuildP95Ms: number;
+  };
+  readonly phases: {
+    readonly readMergedP95Ms: number;
+    readonly readVaultStoresP95Ms: number;
+    readonly buildTimelineDaysP95Ms: number;
+    readonly engagementClassifierP95Ms: number;
+    readonly topicRevisionP95Ms: number;
+    readonly topicShadowP95Ms: number;
+    readonly rankerRetrainerP95Ms: number;
+    readonly rankerLoadP95Ms: number;
+    readonly putCurrentP95Ms: number;
+  };
+}
+
 export interface MaterializerDiagnostics {
   readonly schemaVersion: typeof MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION;
   readonly producedAt: string;
@@ -193,8 +269,17 @@ export interface MaterializerDiagnostics {
   readonly engagement: MaterializerEngagementCounters;
   readonly urls: MaterializerUrlCounters;
   readonly snapshot: MaterializerSnapshotCounters;
+  readonly pairEvidence: MaterializerPairEvidenceCounters;
+  readonly pageEvidence?: MaterializerPageEvidenceCounters;
+  readonly latency?: MaterializerLatencyCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
   readonly shadowObservation?: TopicShadowObservationDiagnostics;
+  // U2 — incremental hot-path decision + cheap counters (similarity +
+  // topics). Always present (the materializer always produces it).
+  readonly hotPath?: HotPathDiagnostics;
+  // W2 — which clustering produced the served revision + its
+  // churn/lineage vs the previous served (auto-rollback signal).
+  readonly servedTopicProducer?: ServedTopicProducerReport;
   // Statistical drift/evaluation layer. Optional: present once the
   // drift monitor has run for the drain. Absent for legacy fixtures
   // and for the pure `collectMaterializerDiagnostics` path (which does
@@ -221,8 +306,12 @@ export interface MaterializerDiagnosticsInput {
   readonly events: readonly AcceptedEvent[];
   readonly urlProjection: UrlProjection;
   readonly snapshot: ConnectionsSnapshot;
+  readonly pageEvidenceRecords?: readonly PageEvidenceRecord[];
+  readonly phaseDurations?: readonly MaterializerPhaseDuration[];
   readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
+  readonly hotPathDiagnostics?: HotPathDiagnostics;
+  readonly servedTopicProducerReport?: ServedTopicProducerReport;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -237,6 +326,120 @@ const focusedWindowMsOf = (dimensions: unknown): number | undefined => {
     return undefined;
   }
   return focused;
+};
+
+const collectPageEvidenceCounters = (
+  records: readonly PageEvidenceRecord[],
+): MaterializerPageEvidenceCounters => {
+  const metadataOnlyCount = records.filter(
+    (record) => record.evidenceTier === 'metadata_only',
+  ).length;
+  const featuresOnlyCount = records.filter(
+    (record) => record.evidenceTier === 'content_features_only',
+  ).length;
+  const indexedChunkCount = records.filter(
+    (record) => record.evidenceTier === 'indexed_chunks',
+  ).length;
+  const contentRecords = records.filter((record) => record.content !== undefined);
+  const contentVectorDisabledCount = contentRecords.filter(
+    (record) => record.content?.embeddingState === 'disabled',
+  ).length;
+  const contentVectorFailedCount = contentRecords.filter(
+    (record) => record.content?.embeddingState === 'failed',
+  ).length;
+  return {
+    metadataOnlyCount,
+    featuresOnlyCount,
+    indexedChunkCount,
+    contentVectorReadyCount: contentRecords.filter(
+      (record) => record.content?.docEmbeddingRef !== undefined,
+    ).length,
+    contentVectorMissingCount: contentRecords.filter(
+      (record) =>
+        record.content?.docEmbeddingRef === undefined &&
+        record.content?.embeddingState !== 'disabled' &&
+        record.content?.embeddingState !== 'failed',
+    ).length,
+    contentVectorDisabledCount,
+    contentVectorFailedCount,
+    avgTopTermCount:
+      records.length === 0
+        ? 0
+        : Number(
+            (
+              records.reduce((sum, record) => sum + (record.content?.terms.length ?? 0), 0) /
+              records.length
+            ).toFixed(2),
+          ),
+    featureOnlyPages: featuresOnlyCount,
+  };
+};
+
+const p95 = (values: readonly number[]): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+  return Number((sorted[index] ?? 0).toFixed(3));
+};
+
+const collectLatencyCounters = (
+  phaseDurations: readonly MaterializerPhaseDuration[] | undefined,
+): MaterializerLatencyCounters | undefined => {
+  if (phaseDurations === undefined || phaseDurations.length === 0) return undefined;
+  const labelNumber = (label: string, key: string): number | undefined => {
+    const match = new RegExp(`(?:^| )${key}=([0-9]+(?:\\.[0-9]+)?)`, 'u').exec(label);
+    if (match?.[1] === undefined) return undefined;
+    const parsed = Number(match[1]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  };
+  const durationsFor = (prefixes: readonly string[]): readonly number[] =>
+    phaseDurations
+      .filter((phase) => prefixes.some((prefix) => phase.label.startsWith(prefix)))
+      .map((phase) => phase.durationMs);
+  const phaseP95 = (prefixes: readonly string[]): number => p95(durationsFor(prefixes));
+  const perRecordDurationsFor = (
+    prefixes: readonly string[],
+    countKey: string,
+  ): readonly number[] =>
+    phaseDurations
+      .filter((phase) => prefixes.some((prefix) => phase.label.startsWith(prefix)))
+      .map((phase) => phase.durationMs / (labelNumber(phase.label, countKey) ?? 1));
+  return {
+    pageEvidence: {
+      evidenceReadP95Ms: p95(perRecordDurationsFor(['pageEvidence.ensure'], 'records')),
+      vectorMapReadP95Ms: phaseP95(['pageEvidence.vectorMapRead']),
+      chunkReadP95Ms: phaseP95(['pageEvidence.chunkRead']),
+    },
+    contentSimilarity: {
+      pairScoringP95Ms: p95(
+        perRecordDurationsFor(['buildVisitSimilarity', 'buildVisitSimilarityIncremental'], 'pairs'),
+      ),
+      buildP95Ms: phaseP95(['buildVisitSimilarity', 'buildVisitSimilarityIncremental']),
+    },
+    snapshot: {
+      rebuildP95Ms: p95(durationsFor(['buildConnectionsSnapshot'])),
+      baseRebuildP95Ms: phaseP95(['buildConnectionsSnapshot base']),
+      rankerAugmentedRebuildP95Ms: phaseP95([
+        'buildConnectionsSnapshot ranker-augmented',
+        'augmentConnectionsSnapshot ranker-augmented',
+      ]),
+    },
+    phases: {
+      readMergedP95Ms: phaseP95(['readMerged']),
+      readVaultStoresP95Ms: phaseP95(['readVaultStores']),
+      buildTimelineDaysP95Ms: phaseP95(['buildTimelineDays']),
+      engagementClassifierP95Ms: phaseP95(['engagementClassifier']),
+      topicRevisionP95Ms: phaseP95([
+        'topicRevision',
+        'buildTopicRevisionFromAccumulator',
+        'putActiveTopicRevision',
+      ]),
+      topicShadowP95Ms: phaseP95(['topicShadowCandidate']),
+      rankerRetrainerP95Ms: phaseP95(['rankerRetrainer']),
+      rankerLoadP95Ms: phaseP95(['loadClosestVisitRanker']),
+      putCurrentP95Ms: phaseP95(['putCurrent']),
+    },
+  };
 };
 
 const emptyUserAssertionsByKind = (): Record<UserOrganizedItemKind, number> => {
@@ -276,24 +479,75 @@ const collectTimelineCounters = (
 const collectSimilarityCounters = (
   revision: VisitSimilarityRevision,
   effectiveConfig: EffectiveVisitSimilarityConfig | undefined,
-): MaterializerSimilarityCounters => ({
-  revisionId: revision.revisionId,
-  modelRevision: revision.modelRevision,
-  threshold: revision.threshold,
-  edgeCount: revision.edges.length,
-  producer: revision.producer ?? 'unknown',
-  ...(effectiveConfig === undefined
-    ? {}
-    : {
-        effectiveConfig: {
-          threshold: effectiveConfig.threshold,
-          topK: effectiveConfig.topK,
-          engagementGateMs: effectiveConfig.engagementGateMs,
-          lexicalThreshold: effectiveConfig.lexicalThreshold,
-          lexicalFallbackEnabled: effectiveConfig.lexicalFallbackEnabled,
-        },
-      }),
-});
+): MaterializerSimilarityCounters => {
+  const contentEnriched = revision.edges.filter(
+    (edge) => edge.metadata?.producer === 'content-enriched',
+  );
+  const metadataOnly = revision.edges.filter((edge) => edge.metadata?.producer === 'metadata-only');
+  const confidences = revision.edges.flatMap((edge) =>
+    typeof edge.metadata?.confidence === 'number' ? [edge.metadata.confidence] : [],
+  );
+  const matchedTermCounts = new Map<string, number>();
+  let vectorSkippedMissingCount = 0;
+  let vectorSkippedModelMismatchCount = 0;
+  for (const edge of revision.edges) {
+    const metadata = edge.metadata;
+    if (metadata === undefined) continue;
+    if (
+      metadata.evidenceTierFrom !== metadata.evidenceTierTo &&
+      (metadata.evidenceTierFrom === 'metadata_only' || metadata.evidenceTierTo === 'metadata_only')
+    ) {
+      vectorSkippedMissingCount += 1;
+    }
+    if (
+      metadata.evidenceTierFrom !== 'metadata_only' &&
+      metadata.evidenceTierTo !== 'metadata_only' &&
+      metadata.channels.contentVector === undefined
+    ) {
+      vectorSkippedModelMismatchCount += 1;
+    }
+    for (const term of metadata.matchedTerms ?? []) {
+      matchedTermCounts.set(term, (matchedTermCounts.get(term) ?? 0) + 1);
+    }
+  }
+  return {
+    revisionId: revision.revisionId,
+    modelRevision: revision.modelRevision,
+    threshold: revision.threshold,
+    edgeCount: revision.edges.length,
+    producer: revision.producer ?? 'unknown',
+    contentEnrichedEdges: contentEnriched.length,
+    metadataOnlyEdges: metadataOnly.length,
+    mixedTierEdges: revision.edges.filter(
+      (edge) =>
+        edge.metadata !== undefined &&
+        edge.metadata.evidenceTierFrom !== edge.metadata.evidenceTierTo,
+    ).length,
+    avgEvidenceConfidence:
+      confidences.length === 0
+        ? 0
+        : Number(
+            (confidences.reduce((sum, value) => sum + value, 0) / confidences.length).toFixed(4),
+          ),
+    vectorSkippedMissingCount,
+    vectorSkippedModelMismatchCount,
+    topMatchedTerms: [...matchedTermCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .slice(0, 20)
+      .map(([term]) => term),
+    ...(effectiveConfig === undefined
+      ? {}
+      : {
+          effectiveConfig: {
+            threshold: effectiveConfig.threshold,
+            topK: effectiveConfig.topK,
+            engagementGateMs: effectiveConfig.engagementGateMs,
+            lexicalThreshold: effectiveConfig.lexicalThreshold,
+            lexicalFallbackEnabled: effectiveConfig.lexicalFallbackEnabled,
+          },
+        }),
+  };
+};
 
 const collectTopicCounters = (revision: TopicRevision): MaterializerTopicCounters => {
   const componentSizes = revision.topics
@@ -383,6 +637,129 @@ const collectDefaultRankerAugmentationCounters = (
   rankerSourceEdgeCount: snapshot.edges.filter((edge) => edge.producedBy.source === 'ranker')
     .length,
 });
+
+const metadataString = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): string | null => {
+  const value = metadata?.[key];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+};
+
+const metadataStringList = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  key: string,
+): readonly string[] => {
+  const value = metadata?.[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+};
+
+const incrementCounter = (record: Record<string, number>, key: string): void => {
+  record[key] = (record[key] ?? 0) + 1;
+};
+
+const parsePrefixedId = (value: string, prefix: string): string | null => {
+  if (!value.startsWith(prefix)) return null;
+  const id = value.slice(prefix.length);
+  return id.length > 0 ? id : null;
+};
+
+const addToSetMap = (map: Map<string, Set<string>>, key: string, value: string): void => {
+  let set = map.get(key);
+  if (set === undefined) {
+    set = new Set<string>();
+    map.set(key, set);
+  }
+  set.add(value);
+};
+
+const pairKey = (left: string, right: string): string =>
+  left < right ? `${left}\u0000${right}` : `${right}\u0000${left}`;
+
+const collectVisitWorkstreamMemberships = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const groups = new Map<string, Set<string>>();
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'visit_in_workstream') continue;
+    const visitId = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
+    const workstreamId = parsePrefixedId(edge.toNodeId, WORKSTREAM_PREFIX);
+    if (visitId === null || workstreamId === null) continue;
+    addToSetMap(groups, workstreamId, visitId);
+  }
+  return groups;
+};
+
+const collectPairwiseRelatednessKeys = (snapshot: ConnectionsSnapshot): ReadonlySet<string> => {
+  const keys = new Set<string>();
+  for (const edge of snapshot.edges) {
+    if (!edgeKindIsPairwiseRelatedness(edge.kind)) continue;
+    const fromVisitId = parsePrefixedId(edge.fromNodeId, TIMELINE_VISIT_PREFIX);
+    const toVisitId = parsePrefixedId(edge.toNodeId, TIMELINE_VISIT_PREFIX);
+    if (fromVisitId === null || toVisitId === null || fromVisitId === toVisitId) continue;
+    keys.add(pairKey(fromVisitId, toVisitId));
+  }
+  return keys;
+};
+
+const countMembershipOnlyPairsBlocked = (snapshot: ConnectionsSnapshot): number => {
+  const groups = collectVisitWorkstreamMemberships(snapshot);
+  if (groups.size === 0) return 0;
+  const pairwiseRelatedness = collectPairwiseRelatednessKeys(snapshot);
+  let blocked = 0;
+  for (const visitIds of groups.values()) {
+    const n = visitIds.size;
+    if (n < 2) continue;
+    blocked += (n * (n - 1)) / 2;
+    const visits = [...visitIds];
+    for (let left = 0; left < visits.length; left += 1) {
+      for (let right = left + 1; right < visits.length; right += 1) {
+        const leftVisit = visits[left];
+        const rightVisit = visits[right];
+        if (
+          leftVisit !== undefined &&
+          rightVisit !== undefined &&
+          pairwiseRelatedness.has(pairKey(leftVisit, rightVisit))
+        ) {
+          blocked -= 1;
+        }
+      }
+    }
+  }
+  return Math.max(0, blocked);
+};
+
+const collectPairEvidenceCounters = (
+  snapshot: ConnectionsSnapshot,
+): MaterializerPairEvidenceCounters => {
+  const candidatesBySource: Record<string, number> = {};
+  const closestVisitEdgesByPrimarySource: Record<string, number> = {};
+  let sameWorkstreamCandidateSourceCount = 0;
+  let membershipOnlyClosestVisitEdgeCount = 0;
+
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== 'closest_visit') continue;
+    const candidateSources = metadataStringList(edge.metadata, 'candidateSources');
+    for (const source of candidateSources) {
+      incrementCounter(candidatesBySource, source);
+      if (source === 'same_workstream') sameWorkstreamCandidateSourceCount += 1;
+    }
+    const primarySource = metadataString(edge.metadata, 'primaryCandidateSource');
+    if (primarySource !== null) incrementCounter(closestVisitEdgesByPrimarySource, primarySource);
+    if (candidateSources.length === 1 && candidateSources[0] === 'same_workstream') {
+      membershipOnlyClosestVisitEdgeCount += 1;
+    }
+  }
+
+  return {
+    candidatesBySource,
+    closestVisitEdgesByPrimarySource,
+    sameWorkstreamCandidateSourceCount,
+    membershipOnlyClosestVisitEdgeCount,
+    membershipOnlyPairEdgesBlocked: countMembershipOnlyPairsBlocked(snapshot),
+  };
+};
 
 const isRecordLite = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -497,6 +874,7 @@ export const collectMaterializerDiagnostics = (
   input: MaterializerDiagnosticsInput,
 ): MaterializerDiagnostics => {
   const eventCounters = collectEventCounters(input.events);
+  const latency = collectLatencyCounters(input.phaseDurations);
   return {
     schemaVersion: MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION,
     producedAt: input.producedAt,
@@ -512,12 +890,23 @@ export const collectMaterializerDiagnostics = (
     engagement: eventCounters.engagement,
     urls: collectUrlCounters(input.urlProjection),
     snapshot: collectSnapshotCounters(input.snapshot),
+    pairEvidence: collectPairEvidenceCounters(input.snapshot),
+    ...(input.pageEvidenceRecords === undefined
+      ? {}
+      : { pageEvidence: collectPageEvidenceCounters(input.pageEvidenceRecords) }),
+    ...(latency === undefined ? {} : { latency }),
     ...(input.topicShadowDiagnostics === undefined
       ? {}
       : { shadowVsBaseline: input.topicShadowDiagnostics }),
     ...(input.topicShadowObservation === undefined
       ? {}
       : { shadowObservation: input.topicShadowObservation }),
+    ...(input.hotPathDiagnostics === undefined
+      ? {}
+      : { hotPath: input.hotPathDiagnostics }),
+    ...(input.servedTopicProducerReport === undefined
+      ? {}
+      : { servedTopicProducer: input.servedTopicProducerReport }),
   };
 };
 
@@ -556,6 +945,9 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
     `rankerNeedsRetrain=${String(diagnostics.rankerAugmentation.needsRetrain)}`,
     `closestVisit=${String(diagnostics.rankerAugmentation.closestVisitEdgeCount)}`,
     `rankerSource=${String(diagnostics.rankerAugmentation.rankerSourceEdgeCount)}`,
+    `sameWorkstreamPairSources=${String(
+      diagnostics.pairEvidence.sameWorkstreamCandidateSourceCount,
+    )}`,
     `labels=${String(diagnostics.ranker.labelCount)}(+${String(diagnostics.ranker.positiveLabelCount)}/-${String(diagnostics.ranker.negativeLabelCount)})`,
     `newLabels=${diagnostics.ranker.newLabelCount === null ? 'n/a' : String(diagnostics.ranker.newLabelCount)}`,
     `userAssertions=${String(diagnostics.userAssertions.total)}`,
@@ -638,6 +1030,23 @@ export const createMaterializerDiagnosticsStore = (
     await rename(tmpPath, latestPath);
     const historyPath = join(historyDir, `${safeFilenameTimestamp(diagnostics.producedAt)}.json`);
     await writeFile(historyPath, body, 'utf8');
+    // Bounded retention — prune oldest beyond DIAGNOSTICS_HISTORY_MAX.
+    // safeFilenameTimestamp is ISO-derived (fixed-width, `:`/`.` -> `-`)
+    // so lexicographic sort == chronological. Best-effort: observability
+    // must never fail a drain.
+    try {
+      const historyFiles = (await readdir(historyDir))
+        .filter((name) => name.endsWith('.json'))
+        .sort();
+      if (historyFiles.length > DIAGNOSTICS_HISTORY_MAX) {
+        const stale = historyFiles.slice(0, historyFiles.length - DIAGNOSTICS_HISTORY_MAX);
+        await Promise.all(
+          stale.map((name) => unlink(join(historyDir, name)).catch(() => undefined)),
+        );
+      }
+    } catch {
+      /* prune is best-effort; never fail the drain */
+    }
     // Feed the dumb fixed-window ring (plan TODO-H5). Best-effort:
     // observability must never break a drain, and the ring is the
     // trend source the Focus surface reads instead of scanning the

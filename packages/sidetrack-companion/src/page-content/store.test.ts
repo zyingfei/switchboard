@@ -61,6 +61,12 @@ describe('page-content store', () => {
       readFile(join(root, '_BAC', 'page-content', 'raw', 'hash-oracle-cloud.json'), 'utf8'),
     ).resolves.toContain('Oracle cloud adoption');
 
+    const chunkManifest = JSON.parse(
+      await readFile(join(root, '_BAC', 'page-content', 'chunks', 'hash-oracle-cloud.json'), 'utf8'),
+    ) as { readonly chunks: readonly { readonly terms?: readonly unknown[]; readonly qualityWeight?: number }[] };
+    expect(chunkManifest.chunks[0]?.terms?.length).toBeGreaterThan(0);
+    expect(chunkManifest.chunks[0]?.qualityWeight).toBe(1);
+
     const queried = await queryPageContent(root, 'oracle guardrails', { limit: 5 });
     expect(queried).toHaveLength(1);
     expect(queried[0]?.sourceKind).toBe('page-content');

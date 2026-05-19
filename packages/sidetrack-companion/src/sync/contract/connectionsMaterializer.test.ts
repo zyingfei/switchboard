@@ -285,11 +285,18 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   // baseline; the shadow-specific test opts back in explicitly.
   let prevShadowFlag: string | undefined;
   let prevSkipRankerSnapshot: string | undefined;
+  // W2 — leiden-cpm is now the DEFAULT served producer. This suite
+  // exercises the pre-W2 path (baseline/idf-rkn/HDBSCAN-select/
+  // skip-gate), so pin the producer to idf-rkn-split here; leiden-cpm
+  // has its own coverage in leidenCpmTopicRevision.test.ts.
+  let prevTopicProducer: string | undefined;
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-mat-'));
     prevShadowFlag = process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
     prevSkipRankerSnapshot = process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
+    prevTopicProducer = process.env['SIDETRACK_TOPIC_PRODUCER'];
     process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = 'off';
+    process.env['SIDETRACK_TOPIC_PRODUCER'] = 'idf-rkn-split';
     delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
   });
   afterEach(async () => {
@@ -298,6 +305,8 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     else process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = prevShadowFlag;
     if (prevSkipRankerSnapshot === undefined) delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
     else process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = prevSkipRankerSnapshot;
+    if (prevTopicProducer === undefined) delete process.env['SIDETRACK_TOPIC_PRODUCER'];
+    else process.env['SIDETRACK_TOPIC_PRODUCER'] = prevTopicProducer;
   });
 
   it('catchUp rebuilds the snapshot from event log alone (replay-recoverable)', async () => {
@@ -1372,8 +1381,14 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   });
 
   // Stage 5.2 W2b — high-frequency events that fold into the next
-  // natural drain (engagement aggregates, visual fingerprints) MUST NOT
-  // be in HANDLES, so they don't trigger their own per-event rebuild.
+  // natural drain (engagement aggregates, visual fingerprints,
+  // page-evidence auto-capture) MUST NOT be in HANDLES, so they don't
+  // trigger their own per-event rebuild. page.evidence.extracted was
+  // regressed into HANDLES by the page-evidence auto-capture work and
+  // re-created the dogfood rebuild storm (one core pinned by
+  // back-to-back full connections rebuilds); it is reconstructed from
+  // the page-evidence store inside every drain, so omitting it keeps
+  // the snapshot correct.
   it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
@@ -1383,6 +1398,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
 
     expect(m.handles.has('engagement.session.aggregated')).toBe(false);
     expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
+    expect(m.handles.has('page.evidence.extracted')).toBe(false);
   });
 
   it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {

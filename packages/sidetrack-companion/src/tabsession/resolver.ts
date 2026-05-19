@@ -86,6 +86,38 @@ export interface ResolveAttributionInput {
   readonly closestVisitRanker?: ClosestVisitRanker;
 }
 
+interface ResolveTargetAttributionInput {
+  readonly targetKind: 'tab-session' | 'url' | 'thread';
+  readonly targetId: string;
+  readonly seedAnchorIds: readonly string[];
+  readonly targetVisitNodeIds: readonly string[];
+  readonly snapshot: ConnectionsSnapshot;
+  readonly events: readonly AcceptedEvent[];
+  readonly negativeSeeds: ReadonlyMap<string, number>;
+  readonly policyMode?: AttributionPolicyMode;
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
+  readonly nowMs?: number;
+  readonly closestVisitRanker?: ClosestVisitRanker;
+}
+
+interface ResolvedTargetAttribution {
+  readonly policyMode: AttributionPolicyMode;
+  readonly decision: {
+    readonly action: AttributionAction;
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly ResolverCandidate[];
+  readonly reasons: {
+    readonly dependencyKey: string;
+    readonly modelRevision: string;
+    readonly graphRevision: string;
+    readonly evidenceHash: string;
+    readonly targetAnchors: readonly string[];
+    readonly topContributingAnchors: readonly string[];
+  };
+}
+
 const compareString = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
@@ -117,6 +149,8 @@ const targetVisitNodes = (snapshot: ConnectionsSnapshot, tabSessionId: string): 
   }
   return visits;
 };
+
+const uniqueSorted = (values: Iterable<string>): readonly string[] => [...new Set(values)].sort();
 
 const allWorkstreamIds = (snapshot: ConnectionsSnapshot): Set<string> => {
   const ids = new Set<string>();
@@ -210,9 +244,13 @@ const evidenceReasons = (
     });
   }
   if (candidate.simTopScore > 0) {
+    const matched =
+      candidate.simMatchedTerms === undefined || candidate.simMatchedTerms.length === 0
+        ? ''
+        : ` via ${candidate.simMatchedTerms.slice(0, 3).join(', ')}`;
     reasons.push({
       source: 'similarity',
-      summary: `Similarity top ${candidate.simTopScore.toFixed(3)}, margin ${candidate.simMargin.toFixed(3)}`,
+      summary: `Similarity top ${candidate.simTopScore.toFixed(3)}, margin ${candidate.simMargin.toFixed(3)}${matched}`,
       anchors,
     });
   }
@@ -224,6 +262,106 @@ const evidenceReasons = (
     });
   }
   return reasons;
+};
+
+const resolveTargetAttribution = (
+  input: ResolveTargetAttributionInput,
+): ResolvedTargetAttribution => {
+  const mode = input.policyMode ?? 'balanced';
+  const evidence = buildEvidenceGraph(input.snapshot);
+  const anchors = uniqueSorted(input.seedAnchorIds).filter((anchor) =>
+    evidence.graph.hasNode(anchor),
+  );
+  const targetVisitAnchors = uniqueSorted(input.targetVisitNodeIds).filter((anchor) =>
+    evidence.graph.hasNode(anchor),
+  );
+  const seed = new Map<string, number>();
+  for (const anchor of anchors) seed.set(anchor, 1);
+  for (const [anchor, value] of input.negativeSeeds) seed.set(anchor, value);
+
+  const seedFingerprint = seedHash(seed);
+  const evidenceHash = createHash('sha256')
+    .update(
+      `${MODEL_REVISION}|${input.targetKind}:${input.targetId}|${evidence.revision}|${seedFingerprint}`,
+    )
+    .digest('hex');
+  const cacheKey = `${input.targetKind}:${input.targetId}|${evidence.revision}|${seedFingerprint}`;
+  const nowMs = input.nowMs ?? Date.now();
+  const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
+  pprCache.set(cacheKey, ppr, nowMs);
+
+  const similarity = new Map(
+    buildSimilarityEvidence({
+      snapshot: input.snapshot,
+      targetVisitNodeIds: new Set(targetVisitAnchors),
+      events: input.events,
+      ...(input.closestVisitRanker === undefined
+        ? {}
+        : { closestVisitRanker: input.closestVisitRanker }),
+    }).map((item) => [item.workstreamId, item]),
+  );
+  const cluster = new Map(
+    buildClusterEvidence(input.snapshot, new Set(targetVisitAnchors)).map((item) => [
+      item.workstreamId,
+      item,
+    ]),
+  );
+  const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
+  for (const key of similarity.keys()) workstreamIds.add(key);
+  for (const key of cluster.keys()) workstreamIds.add(key);
+
+  const candidateEvidence: CandidateEvidence[] = [...workstreamIds]
+    .sort(compareString)
+    .map((workstreamId) => {
+      const sim = similarity.get(workstreamId);
+      const clusterEvidence = cluster.get(workstreamId);
+      const pprScore = Math.max(0, ppr.get(`${WORKSTREAM_PREFIX}${workstreamId}`) ?? 0);
+      const corroborationCount =
+        (pprScore > 0.01 ? 1 : 0) +
+        ((sim?.simTopScore ?? 0) > 0 ? 1 : 0) +
+        ((clusterEvidence?.posterior ?? 0) > 0 ? 1 : 0);
+      return {
+        workstreamId,
+        pprScore,
+        simTopScore: sim?.simTopScore ?? 0,
+        simMeanScore: sim?.simMeanScore ?? 0,
+        simAgreement: sim?.simAgreement ?? 0,
+        simMargin: sim?.simMargin ?? 0,
+        ...(sim?.simMatchedTerms === undefined ? {} : { simMatchedTerms: sim.simMatchedTerms }),
+        clusterPosterior: clusterEvidence?.posterior ?? 0,
+        corroborationCount,
+      };
+    });
+
+  const nodeById = new Map<string, ConnectionNode>(
+    input.snapshot.nodes.map((node) => [node.id, node] as const),
+  );
+  const enrichedAnchors: readonly AttributionAnchor[] = anchors
+    .slice(0, 3)
+    .map((anchorId) => enrichAnchor(anchorId, nodeById));
+
+  const fusedCandidates = fuseCandidates(candidateEvidence)
+    .filter((candidate) => candidate.corroborationCount > 0)
+    .slice(0, 5)
+    .map((candidate) => ({
+      ...candidate,
+      reasons: evidenceReasons(candidate, enrichedAnchors),
+    }));
+  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
+
+  return {
+    policyMode: mode,
+    decision,
+    fusedCandidates,
+    reasons: {
+      dependencyKey: cacheKey,
+      modelRevision: MODEL_REVISION,
+      graphRevision: evidence.revision,
+      evidenceHash,
+      targetAnchors: anchors,
+      topContributingAnchors: anchors.slice(0, 3),
+    },
+  };
 };
 
 // Per-canonical-URL resolver. Anchors are every visit-instance and
@@ -301,193 +439,205 @@ const collectUrlAnchors = (
   return out.sort(compareString);
 };
 
+const stripFragmentAndTrailingSlash = (url: string): string =>
+  url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const collectThreadAnchors = (input: {
+  readonly snapshot: ConnectionsSnapshot;
+  readonly threadId: string;
+  readonly providerThreadId?: string;
+  readonly threadUrl?: string;
+}): {
+  readonly seedAnchorIds: readonly string[];
+  readonly targetVisitNodeIds: readonly string[];
+} => {
+  const seedAnchorIds = new Set<string>();
+  const canonicalUrls = new Set<string>();
+  const threadNodeIds = new Set([`thread:${input.threadId}`]);
+  if (input.providerThreadId !== undefined && input.providerThreadId.length > 0) {
+    threadNodeIds.add(`thread:${input.providerThreadId}`);
+  }
+  if (input.threadUrl !== undefined && input.threadUrl.length > 0) {
+    canonicalUrls.add(stripFragmentAndTrailingSlash(input.threadUrl));
+  }
+
+  for (const node of input.snapshot.nodes) {
+    if (node.kind !== 'thread') continue;
+    const metadataThreadId =
+      typeof node.metadata.threadId === 'string' ? node.metadata.threadId : undefined;
+    const metadataCanonical =
+      typeof node.metadata.canonicalUrl === 'string'
+        ? node.metadata.canonicalUrl
+        : typeof node.metadata.url === 'string'
+          ? node.metadata.url
+          : undefined;
+    if (
+      threadNodeIds.has(node.id) ||
+      metadataThreadId === input.threadId ||
+      (input.providerThreadId !== undefined && metadataThreadId === input.providerThreadId) ||
+      (metadataCanonical !== undefined &&
+        canonicalUrls.has(stripFragmentAndTrailingSlash(metadataCanonical)))
+    ) {
+      seedAnchorIds.add(node.id);
+      if (metadataCanonical !== undefined) {
+        canonicalUrls.add(stripFragmentAndTrailingSlash(metadataCanonical));
+      }
+    }
+  }
+  for (const threadNodeId of threadNodeIds) {
+    if (input.snapshot.nodes.some((node) => node.id === threadNodeId))
+      seedAnchorIds.add(threadNodeId);
+  }
+
+  const targetVisitNodeIds = new Set<string>();
+  for (const canonicalUrl of canonicalUrls) {
+    for (const anchor of collectUrlAnchors(input.snapshot, canonicalUrl)) {
+      seedAnchorIds.add(anchor);
+      targetVisitNodeIds.add(anchor);
+    }
+  }
+  return {
+    seedAnchorIds: uniqueSorted(seedAnchorIds),
+    targetVisitNodeIds: uniqueSorted(targetVisitNodeIds),
+  };
+};
+
 export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlResolutionResult => {
-  const mode = input.policyMode ?? 'balanced';
-  const evidence = buildEvidenceGraph(input.snapshot);
-  const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl).filter((anchor) =>
-    evidence.graph.hasNode(anchor),
-  );
-  const seed = new Map<string, number>();
-  for (const anchor of anchors) seed.set(anchor, 1);
-  for (const [anchor, value] of urlNegativeSeeds(input)) seed.set(anchor, value);
-
-  const seedFingerprint = seedHash(seed);
-  const evidenceHash = createHash('sha256')
-    .update(`${MODEL_REVISION}|url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`)
-    .digest('hex');
-  const cacheKey = `url:${input.canonicalUrl}|${evidence.revision}|${seedFingerprint}`;
-  const nowMs = input.nowMs ?? Date.now();
-  const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
-  pprCache.set(cacheKey, ppr, nowMs);
-
-  // For similarity/cluster, target the visit-instance / timeline-visit
-  // anchors (same set as PPR's positive seeds).
-  const similarity = new Map(
-    buildSimilarityEvidence({
-      snapshot: input.snapshot,
-      targetVisitNodeIds: new Set(anchors),
-      events: input.events,
-      ...(input.closestVisitRanker === undefined
-        ? {}
-        : { closestVisitRanker: input.closestVisitRanker }),
-    }).map((item) => [item.workstreamId, item]),
-  );
-  const cluster = new Map(
-    buildClusterEvidence(input.snapshot, new Set(anchors)).map((item) => [item.workstreamId, item]),
-  );
-  const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
-  for (const key of similarity.keys()) workstreamIds.add(key);
-  for (const key of cluster.keys()) workstreamIds.add(key);
-
-  const candidateEvidence: CandidateEvidence[] = [...workstreamIds]
-    .sort(compareString)
-    .map((workstreamId) => {
-      const sim = similarity.get(workstreamId);
-      const clusterEvidence = cluster.get(workstreamId);
-      const pprScore = Math.max(0, ppr.get(`${WORKSTREAM_PREFIX}${workstreamId}`) ?? 0);
-      const corroborationCount =
-        (pprScore > 0.01 ? 1 : 0) +
-        ((sim?.simTopScore ?? 0) > 0 ? 1 : 0) +
-        ((clusterEvidence?.posterior ?? 0) > 0 ? 1 : 0);
-      return {
-        workstreamId,
-        pprScore,
-        simTopScore: sim?.simTopScore ?? 0,
-        simMeanScore: sim?.simMeanScore ?? 0,
-        simAgreement: sim?.simAgreement ?? 0,
-        simMargin: sim?.simMargin ?? 0,
-        clusterPosterior: clusterEvidence?.posterior ?? 0,
-        corroborationCount,
-      };
-    });
-
-  const nodeById = new Map<string, ConnectionNode>(
-    input.snapshot.nodes.map((node) => [node.id, node] as const),
-  );
-  const enrichedAnchors: readonly AttributionAnchor[] = anchors
-    .slice(0, 3)
-    .map((anchorId) => enrichAnchor(anchorId, nodeById));
-
-  const fusedCandidates = fuseCandidates(candidateEvidence)
-    .filter((candidate) => candidate.corroborationCount > 0)
-    .slice(0, 5)
-    .map((candidate) => ({
-      ...candidate,
-      reasons: evidenceReasons(candidate, enrichedAnchors),
-    }));
-  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
+  const anchors = collectUrlAnchors(input.snapshot, input.canonicalUrl);
+  const resolved = resolveTargetAttribution({
+    targetKind: 'url',
+    targetId: input.canonicalUrl,
+    seedAnchorIds: anchors,
+    targetVisitNodeIds: anchors,
+    snapshot: input.snapshot,
+    events: input.events,
+    negativeSeeds: urlNegativeSeeds(input),
+    ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
+    ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
+    ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }),
+    ...(input.closestVisitRanker === undefined
+      ? {}
+      : { closestVisitRanker: input.closestVisitRanker }),
+  });
 
   return {
     canonicalUrl: input.canonicalUrl,
     dryRun: true,
-    policyMode: mode,
-    decision,
-    fusedCandidates,
-    reasons: {
-      dependencyKey: cacheKey,
-      modelRevision: MODEL_REVISION,
-      graphRevision: evidence.revision,
-      evidenceHash,
-      targetAnchors: anchors,
-      topContributingAnchors: anchors.slice(0, 3),
-    },
+    ...resolved,
+  };
+};
+
+export interface ResolveThreadAttributionInput {
+  readonly threadId: string;
+  readonly providerThreadId?: string;
+  readonly threadUrl?: string;
+  readonly snapshot: ConnectionsSnapshot;
+  readonly events: readonly AcceptedEvent[];
+  readonly policyMode?: AttributionPolicyMode;
+  readonly policyTelemetry?: AttributionPolicyTelemetry;
+  readonly nowMs?: number;
+  readonly closestVisitRanker?: ClosestVisitRanker;
+}
+
+export interface ThreadResolutionResult {
+  readonly threadId: string;
+  readonly dryRun: true;
+  readonly policyMode: AttributionPolicyMode;
+  readonly decision: {
+    readonly action: AttributionAction;
+    readonly workstreamId?: string;
+    readonly margin: number;
+  };
+  readonly fusedCandidates: readonly ResolverCandidate[];
+  readonly reasons: {
+    readonly dependencyKey: string;
+    readonly modelRevision: string;
+    readonly graphRevision: string;
+    readonly evidenceHash: string;
+    readonly targetAnchors: readonly string[];
+    readonly topContributingAnchors: readonly string[];
+  };
+}
+
+const threadNegativeSeeds = (input: ResolveThreadAttributionInput): Map<string, number> => {
+  const seeds = new Map<string, number>();
+  const canonicalUrl =
+    input.threadUrl === undefined || input.threadUrl.length === 0
+      ? undefined
+      : stripFragmentAndTrailingSlash(input.threadUrl);
+  for (const event of input.events) {
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      seeds.set(event.payload.toId, -0.5);
+    }
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) continue;
+    const isThreadMove =
+      event.payload.itemKind === 'thread' &&
+      (event.payload.itemId === input.threadId ||
+        (input.providerThreadId !== undefined && event.payload.itemId === input.providerThreadId));
+    const isUrlMove =
+      canonicalUrl !== undefined &&
+      event.payload.itemKind === 'canonical-url' &&
+      stripFragmentAndTrailingSlash(event.payload.itemId) === canonicalUrl;
+    if (
+      (isThreadMove || isUrlMove) &&
+      event.payload.toContainer === null &&
+      typeof event.payload.fromContainer === 'string'
+    ) {
+      seeds.set(`${WORKSTREAM_PREFIX}${event.payload.fromContainer}`, -0.75);
+    }
+  }
+  return seeds;
+};
+
+export const resolveThreadAttribution = (
+  input: ResolveThreadAttributionInput,
+): ThreadResolutionResult => {
+  const anchors = collectThreadAnchors(input);
+  const resolved = resolveTargetAttribution({
+    targetKind: 'thread',
+    targetId: input.threadId,
+    seedAnchorIds: anchors.seedAnchorIds,
+    targetVisitNodeIds: anchors.targetVisitNodeIds,
+    snapshot: input.snapshot,
+    events: input.events,
+    negativeSeeds: threadNegativeSeeds(input),
+    ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
+    ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
+    ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }),
+    ...(input.closestVisitRanker === undefined
+      ? {}
+      : { closestVisitRanker: input.closestVisitRanker }),
+  });
+  return {
+    threadId: input.threadId,
+    dryRun: true,
+    ...resolved,
   };
 };
 
 export const resolveAttribution = (input: ResolveAttributionInput): ResolutionResult => {
-  const mode = input.policyMode ?? 'balanced';
-  const evidence = buildEvidenceGraph(input.snapshot);
   const tabNode = tabSessionNodeId(input.tabSessionId);
   const visits = targetVisitNodes(input.snapshot, input.tabSessionId);
-  const anchors = [tabNode, ...[...visits].sort(compareString)].filter((anchor) =>
-    evidence.graph.hasNode(anchor),
-  );
-  const seed = new Map<string, number>();
-  for (const anchor of anchors) seed.set(anchor, 1);
-  for (const [anchor, value] of negativeSeeds(input)) seed.set(anchor, value);
-
-  const seedFingerprint = seedHash(seed);
-  const evidenceHash = createHash('sha256')
-    .update(`${MODEL_REVISION}|${input.tabSessionId}|${evidence.revision}|${seedFingerprint}`)
-    .digest('hex');
-  const cacheKey = `${input.tabSessionId}|${evidence.revision}|${seedFingerprint}`;
-  const nowMs = input.nowMs ?? Date.now();
-  const ppr = pprCache.get(cacheKey, nowMs) ?? runPPR(evidence, seed);
-  pprCache.set(cacheKey, ppr, nowMs);
-
-  const similarity = new Map(
-    buildSimilarityEvidence({
-      snapshot: input.snapshot,
-      targetVisitNodeIds: visits,
-      events: input.events,
-      ...(input.closestVisitRanker === undefined
-        ? {}
-        : { closestVisitRanker: input.closestVisitRanker }),
-    }).map((item) => [item.workstreamId, item]),
-  );
-  const cluster = new Map(
-    buildClusterEvidence(input.snapshot, visits).map((item) => [item.workstreamId, item]),
-  );
-  const workstreamIds = candidateWorkstreamIds(evidence, anchors, allWorkstreamIds(input.snapshot));
-  for (const key of similarity.keys()) workstreamIds.add(key);
-  for (const key of cluster.keys()) workstreamIds.add(key);
-
-  const candidateEvidence: CandidateEvidence[] = [...workstreamIds]
-    .sort(compareString)
-    .map((workstreamId) => {
-      const sim = similarity.get(workstreamId);
-      const clusterEvidence = cluster.get(workstreamId);
-      const pprScore = Math.max(0, ppr.get(`${WORKSTREAM_PREFIX}${workstreamId}`) ?? 0);
-      const corroborationCount =
-        (pprScore > 0.01 ? 1 : 0) +
-        ((sim?.simTopScore ?? 0) > 0 ? 1 : 0) +
-        ((clusterEvidence?.posterior ?? 0) > 0 ? 1 : 0);
-      return {
-        workstreamId,
-        pprScore,
-        simTopScore: sim?.simTopScore ?? 0,
-        simMeanScore: sim?.simMeanScore ?? 0,
-        simAgreement: sim?.simAgreement ?? 0,
-        simMargin: sim?.simMargin ?? 0,
-        clusterPosterior: clusterEvidence?.posterior ?? 0,
-        corroborationCount,
-      };
-    });
-
-  // Build the enriched anchor list once and reuse across reasons.
-  // Each anchor is { id, kind, label } where kind/label are pulled
-  // from the connections snapshot (which hydrates tab-session labels
-  // from the projection — see snapshot.ts).
-  const nodeById = new Map<string, ConnectionNode>(
-    input.snapshot.nodes.map((node) => [node.id, node] as const),
-  );
-  const enrichedAnchors: readonly AttributionAnchor[] = anchors
-    .slice(0, 3)
-    .map((anchorId) => enrichAnchor(anchorId, nodeById));
-
-  const fusedCandidates = fuseCandidates(candidateEvidence)
-    .filter((candidate) => candidate.corroborationCount > 0)
-    .slice(0, 5)
-    .map((candidate) => ({
-      ...candidate,
-      reasons: evidenceReasons(candidate, enrichedAnchors),
-    }));
-  const decision = decideAttribution(fusedCandidates, mode, input.policyTelemetry);
+  const resolved = resolveTargetAttribution({
+    targetKind: 'tab-session',
+    targetId: input.tabSessionId,
+    seedAnchorIds: [tabNode, ...visits],
+    targetVisitNodeIds: [...visits],
+    snapshot: input.snapshot,
+    events: input.events,
+    negativeSeeds: negativeSeeds(input),
+    ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
+    ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
+    ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }),
+    ...(input.closestVisitRanker === undefined
+      ? {}
+      : { closestVisitRanker: input.closestVisitRanker }),
+  });
 
   return {
     tabSessionId: input.tabSessionId,
     dryRun: true,
-    policyMode: mode,
-    decision,
-    fusedCandidates,
-    reasons: {
-      dependencyKey: cacheKey,
-      modelRevision: MODEL_REVISION,
-      graphRevision: evidence.revision,
-      evidenceHash,
-      targetAnchors: anchors,
-      topContributingAnchors: anchors.slice(0, 3),
-    },
+    ...resolved,
   };
 };
 

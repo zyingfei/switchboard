@@ -15,7 +15,14 @@ export type PageContentExtractionMode = 'page' | 'selection';
 
 export interface PageContentExtractRequest {
   readonly mode: PageContentExtractionMode;
-  readonly trigger: 'manual' | 'bulk-open-tabs';
+  readonly trigger:
+    | 'manual'
+    | 'workstream-policy'
+    | 'save-suggestion'
+    | 'allowlist'
+    | 'auto-observed'
+    | 'attention-gate'
+    | 'bulk-open-tabs';
 }
 
 export type PageContentExtractResponse =

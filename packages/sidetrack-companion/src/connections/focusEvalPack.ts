@@ -25,7 +25,7 @@ export interface FocusEvalPack {
 }
 
 const CLUSTERS = [
-  'oracle-26ai',
+  'database-release',
   'postgres-indexing',
   'ai-decision-frameworks',
   'browser-history',

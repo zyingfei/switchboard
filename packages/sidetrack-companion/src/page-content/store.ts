@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:
 import { basename, dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
+import { extractPageEvidenceFeatures } from '../page-evidence/extract.js';
 import {
   PAGE_CONTENT_COVERAGE_STATES,
   PAGE_CONTENT_EXTRACTED,
@@ -137,6 +138,26 @@ export const splitPageContentIntoChunks = (input: {
   return chunks;
 };
 
+const qualityWeightFor = (quality: 'high' | 'medium' | 'low'): number => {
+  if (quality === 'high') return 1;
+  if (quality === 'medium') return 0.75;
+  return 0.25;
+};
+
+const enrichChunksWithEvidence = (
+  chunks: readonly PageContentChunk[],
+): readonly PageContentChunk[] =>
+  chunks.map((chunk) => ({
+    ...chunk,
+    terms: extractPageEvidenceFeatures({
+      canonicalUrl: chunk.canonicalUrl,
+      url: chunk.url,
+      ...(chunk.title === undefined ? {} : { title: chunk.title }),
+      text: chunk.text,
+    }).terms.slice(0, 24),
+    qualityWeight: qualityWeightFor(chunk.quality),
+  }));
+
 const readAllRecords = async (vaultRoot: string): Promise<readonly PageContentRecord[]> => {
   const dir = byUrlDir(vaultRoot);
   const names = await readdir(dir).catch(() => []);
@@ -244,16 +265,18 @@ export const writePageContentExtracted = async (
   }
 
   const text = payload.content.text.slice(0, MAX_RAW_TEXT_CHARS);
-  const chunks = splitPageContentIntoChunks({
-    canonicalUrl,
-    url: payload.url,
-    ...(payload.title === undefined ? {} : { title: payload.title }),
-    contentHash,
-    text,
-    extractedAt: payload.extractedAt,
-    quality: quality.quality ?? payload.quality,
-    extractionStrategy: payload.extractionSource,
-  });
+  const chunks = enrichChunksWithEvidence(
+    splitPageContentIntoChunks({
+      canonicalUrl,
+      url: payload.url,
+      ...(payload.title === undefined ? {} : { title: payload.title }),
+      contentHash,
+      text,
+      extractedAt: payload.extractedAt,
+      quality: quality.quality ?? payload.quality,
+      extractionStrategy: payload.extractionSource,
+    }),
+  );
   await atomicWriteJson(rawPathForContentHash(vaultRoot, contentHash), {
     version: 1,
     canonicalUrl,
@@ -315,6 +338,92 @@ export const writePageContentTombstoned = async (
   } satisfies PageContentRecord);
   await rebuildManifests(vaultRoot);
   return coverage;
+};
+
+export const readPageContentExtractedPayloadForEvidence = async (
+  vaultRoot: string,
+  rawCanonicalUrl: string,
+): Promise<PageContentExtractedPayload | null> => {
+  const canonicalUrl = canonicalizePageUrl(rawCanonicalUrl);
+  const record = safeRecordFromUnknown(
+    await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
+  );
+  const coverage = record?.coverage;
+  if (
+    record === null ||
+    coverage === undefined ||
+    coverage.contentHash === undefined ||
+    coverage.quality === undefined ||
+    coverage.qualitySignals === undefined ||
+    coverage.extractionSource === undefined ||
+    (coverage.state !== 'indexed' &&
+      coverage.state !== 'indexed_low_quality' &&
+      coverage.state !== 'stale_index')
+  ) {
+    return null;
+  }
+  const raw = await readJson<{
+    readonly url?: unknown;
+    readonly title?: unknown;
+    readonly extractedAt?: unknown;
+    readonly text?: unknown;
+    readonly markdown?: unknown;
+  }>(rawPathForContentHash(vaultRoot, coverage.contentHash));
+  if (raw === null || typeof raw.text !== 'string' || raw.text.length === 0) return null;
+  return {
+    payloadVersion: 1,
+    canonicalUrl,
+    url: typeof raw.url === 'string' ? raw.url : record.url,
+    ...(typeof raw.title === 'string'
+      ? { title: raw.title }
+      : record.title === undefined
+        ? {}
+        : { title: record.title }),
+    ...(record.provider === undefined ? {} : { provider: record.provider }),
+    extractedAt:
+      typeof raw.extractedAt === 'string'
+        ? raw.extractedAt
+        : (coverage.lastIndexedAt ?? record.updatedAt),
+    extractionSource: coverage.extractionSource,
+    extractionPolicy: { trigger: 'manual' },
+    quality: coverage.quality,
+    qualitySignals: coverage.qualitySignals,
+    content: {
+      text: raw.text,
+      ...(typeof raw.markdown === 'string' ? { markdown: raw.markdown } : {}),
+      contentHash: coverage.contentHash,
+      charCount: raw.text.length,
+    },
+  };
+};
+
+export const readPageContentChunksForCanonicalUrls = async (
+  vaultRoot: string,
+  rawCanonicalUrls: readonly string[],
+): Promise<ReadonlyMap<string, readonly PageContentChunk[]>> => {
+  const out = new Map<string, readonly PageContentChunk[]>();
+  const uniqueCanonicalUrls = [...new Set(rawCanonicalUrls.map(canonicalizePageUrl))].sort();
+  for (const canonicalUrl of uniqueCanonicalUrls) {
+    const record = safeRecordFromUnknown(
+      await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
+    );
+    const coverage = record?.coverage;
+    if (
+      coverage === undefined ||
+      coverage.contentHash === undefined ||
+      (coverage.state !== 'indexed' &&
+        coverage.state !== 'indexed_low_quality' &&
+        coverage.state !== 'stale_index')
+    ) {
+      continue;
+    }
+    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
+      join(chunksDir(vaultRoot), `${coverage.contentHash}.json`),
+    );
+    const chunks = raw?.chunks ?? [];
+    if (chunks.length > 0) out.set(canonicalUrl, enrichChunksWithEvidence(chunks));
+  }
+  return out;
 };
 
 const tokenize = (input: string): readonly string[] =>
