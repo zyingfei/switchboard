@@ -3045,6 +3045,63 @@ const handleRequest = async (
     }, 'queue');
   }
 
+  if (request.type === messageTypes.submitSelectionDispatch) {
+    return await withCompanionStatus(async () => {
+      const { url, body, provider, title } = request;
+      // Make a Déjà-vu selection "Ask AI" a FIRST-CLASS tracked
+      // dispatch: record it on the companion so it appears in Recent
+      // dispatches and auto-links back when the new chat is captured —
+      // exactly like a thread dispatch, just with no source thread /
+      // workstream (both optional end-to-end). If the companion isn't
+      // configured we still open + auto-send (graceful degrade).
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length > 0) {
+          const client = createDispatchClient(settings.companion);
+          const idempotencyKey = `disp_sel_${String(Date.now())}_${Math.random()
+            .toString(36)
+            .slice(2, 10)}`;
+          const result = await client.submit(
+            { kind: 'research', target: { provider, mode: 'auto-send' }, title, body },
+            idempotencyKey,
+          );
+          // Feeds the auto-link matcher (it compares the UNREDACTED
+          // body against the captured chat's first user turn).
+          await writeDispatchOriginal(result.bac_id, body);
+          // Optimistic local row so it shows immediately; the next
+          // companion poll merge is idempotent by bac_id.
+          const record: DispatchEventRecord = {
+            bac_id: result.bac_id,
+            kind: 'research',
+            target: { provider, mode: 'auto-send' },
+            title,
+            body,
+            createdAt: new Date().toISOString(),
+            redactionSummary: result.redactionSummary ?? { matched: 0, categories: [] },
+            tokenEstimate: result.tokenEstimate ?? 0,
+            status: 'sent',
+          };
+          await writeCachedDispatches([record, ...(await readCachedDispatches())].slice(0, 50));
+        }
+      } catch (error) {
+        console.warn('[submitSelectionDispatch] companion submit failed:', error);
+      }
+      // Open + auto-send + auto-capture — identical to the
+      // dispatchAutoSendInNewTab path (drives the auto-link too).
+      try {
+        const created = await chrome.tabs.create({ url, active: true });
+        const tabId = created.id;
+        if (typeof tabId !== 'number') {
+          console.warn('[submitSelectionDispatch] tab create returned no tabId');
+          return;
+        }
+        autoSendOnceTabReady(tabId, body);
+      } catch (error) {
+        console.warn('[submitSelectionDispatch] open failed:', error);
+      }
+    }, 'queue');
+  }
+
   if (request.type === messageTypes.moveThread) {
     return await withCompanionStatus(
       () => moveThread(request.threadId, request.workstreamId),
@@ -3918,7 +3975,16 @@ export default defineBackground(() => {
   const dismissAndBroadcast = (): void => {
     void dismissRemindersForActiveTab()
       .then((changed) => {
-        void broadcastWorkboardChanged(changed ? 'reminder' : 'thread');
+        // Only broadcast when a reminder was ACTUALLY dismissed.
+        // Previously this fired a 'thread' workboard-changed on EVERY
+        // tab activation / URL change / window focus even when nothing
+        // changed — a refresh firehose that (especially now the
+        // content script injects on all pages) drove the side panel's
+        // full resolve fan-out on every ambient navigation, a primary
+        // feeder of the CPU resolve-flood. Real content changes are
+        // still surfaced by the snapshot-revision watcher and the
+        // explicit url-change handlers.
+        if (changed) void broadcastWorkboardChanged('reminder');
       })
       .catch(() => undefined);
   };

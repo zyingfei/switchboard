@@ -11,7 +11,7 @@ import {
   type ContentResponse,
   type ListAnnotationsByUrlResponse,
   type PageContentExtractContentResponse,
-  type RecallQueryResponse,
+  type ContentQueryResponse,
 } from '../src/messages';
 import {
   mountAnnotationOverlay,
@@ -20,7 +20,7 @@ import {
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
-import type { RankedItem } from '../src/companion/recallClient';
+import { buildDejaVuHits } from '../src/contentOverlays/dejaVuModel';
 import { settleAndExtractPageContent } from '../src/pageContent/extraction';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
@@ -267,14 +267,15 @@ const isContentRequest = (value: unknown): value is ContentRequest =>
         value.trigger === 'bulk-open-tabs')));
 
 export default defineContentScript({
-  matches: [
-    'https://chatgpt.com/*',
-    'https://chat.openai.com/*',
-    'https://claude.ai/*',
-    'https://gemini.google.com/*',
-    'http://127.0.0.1/*',
-    'http://localhost/*',
-  ],
+  // Broad injection (user-chosen): Déjà-vu / selection recall must
+  // work on ANY page, not just the 4 chat providers — so the content
+  // script runs everywhere. Provider-only work (capture, turn
+  // annotation) is still gated by detectProviderFromUrl / thread-URL
+  // checks below, so non-provider pages only get the selection →
+  // Déjà-vu path. NOTE: a content script matching <all_urls> means
+  // the install prompt is "read & change all your data on all
+  // websites" (accepted tradeoff for cross-site Déjà-vu).
+  matches: ['https://*/*', 'http://*/*'],
   runAt: 'document_idle',
   main() {
     let lastCaptureSignature = '';
@@ -859,6 +860,27 @@ export default defineContentScript({
       });
     };
 
+    // Déjà-vu-only chip — for any page/selection that is NOT inside an
+    // extracted provider turn (regular web pages, or composer/non-turn
+    // text on a provider page). No Comment button (nothing to
+    // annotate); just the explicit "Déjà-vu" affordance so cross-site
+    // recall is reachable everywhere, matching the chat-page UX.
+    const offerDejaVuChip = (selection: Selection, anchorRect: DOMRect): void => {
+      const quote = selection.toString();
+      closeReviewChip();
+      reviewChipMounted = mountReviewSelectionChip({
+        anchorRect,
+        quote,
+        onDismiss: () => {
+          reviewChipMounted = null;
+        },
+        onDejaVu: () => {
+          reviewChipMounted = null;
+          void fetchDejaVu(quote.trim(), anchorRect, true);
+        },
+      });
+    };
+
     const fetchDejaVu = async (
       text: string,
       anchorRect: DOMRect,
@@ -877,52 +899,91 @@ export default defineContentScript({
         // — and the resulting "Failed to fetch" was caught by the
         // outer try/catch and rendered as an empty popover. The SW's
         // chrome-extension:// origin bypasses the block.
-        const response: Omit<RecallQueryResponse, 'items'> & {
-          readonly items: readonly RankedItem[];
-        } = await chrome.runtime.sendMessage({
-          type: messageTypes.recallQuery,
-          q: text,
-          limit: 5,
+        // Déjà-vu recall — three RESILIENT queries via
+        // Promise.allSettled. One query rejecting (MV3 port-closed) or
+        // returning undefined must NEVER silently kill the whole
+        // popover — the prior Promise.all + `responses.some(r=>r.ok)`
+        // threw on the first bad/undefined response and the outer
+        // catch swallowed it, so "nothing showed" even with force.
+        //  • page-content alone + chat-turn alone → each facet gets
+        //    guaranteed slots, so chats aren't score-buried under the
+        //    BM25-scaled page hits in a merged+sliced call (the a2
+        //    issue: a chat "All threads" finds wasn't surfacing here).
+        //  • [page-content, chat-turn, semantic-recall-pool] → the
+        //    "Similar" vector group. semantic-recall-pool is an
+        //    EXPANSION of the page/chat anchor hits, so it returns
+        //    NOTHING unless those anchors are in the SAME query — the
+        //    reason querying it alone (the old 3rd call) yielded zero.
+        //    buildDejaVuHits dedupes the page/chat overlap.
+        type SK = 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+        const QUERIES: readonly (readonly SK[])[] = [
+          ['page-content'],
+          ['chat-turn'],
+          ['page-content', 'chat-turn', 'semantic-recall-pool'],
+        ];
+        const settled = await Promise.allSettled(
+          QUERIES.map(
+            (sourceKind) =>
+              chrome.runtime.sendMessage({
+                type: messageTypes.contentQuery,
+                q: text,
+                limit: sourceKind.length === 1 ? 6 : 12,
+                sourceKind,
+              }) as Promise<ContentQueryResponse>,
+          ),
+        );
+        const okResponses = settled.flatMap((s) =>
+          s.status === 'fulfilled' &&
+          s.value != null &&
+          typeof s.value === 'object' &&
+          s.value.ok === true &&
+          Array.isArray(s.value.items)
+            ? [s.value]
+            : [],
+        );
+        if (okResponses.length === 0) {
+          console.warn('[sidetrack] déjà-vu: all recall queries failed');
+        }
+        const mergedItems = okResponses.flatMap((r) => r.items);
+        // Dedupe, drop the page you're on, derive facets (unit-tested).
+        const built = buildDejaVuHits(mergedItems, {
           currentUrl: window.location.href,
         });
-        if (!response.ok) {
-          // Surface the failure in the console so future regressions
-          // are visible to anyone with devtools open. The popover
-          // keeps showing the empty state — a noisy alert here would
-          // be worse than silence.
-          console.warn('[sidetrack] recall query failed:', response.error);
-          if (!force) return;
-        }
-        const results = response.items;
-        if (results.length === 0 && !force) return;
+        if (built.hits.length === 0 && !force) return;
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
-          items: results.map(
-            (r: RankedItem): DejaVuItem => ({
-              id: r.id,
-              title: r.title ?? `thread ${r.threadId.slice(0, 12)}`,
-              snippet: r.snippet ?? '',
-              score: r.score,
-              relativeWhen: r.capturedAt,
-              // Provider is derived from the matched thread's URL when
-              // we have it (different chat → different provider chip);
-              // we fall back to the current page's provider for legacy
-              // results that don't carry a threadUrl yet.
-              provider: detectProviderFromUrl(r.threadUrl ?? window.location.href),
-              // Jump must go to the MATCHED thread, not the current
-              // page. Setting threadUrl to window.location.href here
-              // was a copy-paste leftover that made every Jump a no-op
-              // (focus-in-side-panel for the page you're already on).
-              ...(r.threadUrl === undefined ? {} : { threadUrl: r.threadUrl }),
-              bacId: r.threadId,
+          items: built.hits.map(
+            (h): DejaVuItem => ({
+              id: h.id,
+              title: h.title,
+              snippet: h.snippet ?? '',
+              score: h.score,
+              relativeWhen: h.capturedAt ?? '',
+              facet: h.facet,
+              // Provider chip from the matched item's own URL (chat →
+              // its threadUrl, page → its canonicalUrl); fall back to
+              // the current page only when neither is present.
+              provider: detectProviderFromUrl(
+                h.threadUrl ?? h.canonicalUrl ?? window.location.href,
+              ),
+              ...(h.threadUrl === undefined ? {} : { threadUrl: h.threadUrl }),
+              ...(h.canonicalUrl === undefined ? {} : { canonicalUrl: h.canonicalUrl }),
+              ...(h.threadId === undefined ? {} : { bacId: h.threadId }),
+              ...(h.similarity === undefined ? {} : { similarity: h.similarity }),
             }),
           ),
           anchorRect,
           onJump: (item) => {
-            if (item.threadUrl !== undefined) {
+            // Chat hits from /v1/content/query carry the conversation
+            // URL as canonicalUrl (no threadUrl) — still focus it in
+            // the side panel like the old recall flow did, instead of
+            // opening a raw tab. Only true page hits open a tab.
+            const threadTarget =
+              item.threadUrl ?? (item.facet === 'chat' ? item.canonicalUrl : undefined);
+            if (threadTarget !== undefined) {
               void chrome.runtime.sendMessage({
                 type: messageTypes.focusThreadInSidePanel,
-                threadUrl: item.threadUrl,
+                threadUrl: threadTarget,
                 // Pass the matched thread's bac_id + title + last-seen
                 // through to the side panel. Lets the focus handler
                 // render a synthetic card for recall results that
@@ -932,6 +993,9 @@ export default defineContentScript({
                 title: item.title,
                 lastSeenAt: item.relativeWhen,
               });
+            } else if (item.canonicalUrl !== undefined) {
+              // Page-content hit — no thread to focus; open the page.
+              window.open(item.canonicalUrl, '_blank', 'noopener,noreferrer');
             }
             closeDejaVu();
           },
@@ -942,6 +1006,47 @@ export default defineContentScript({
           onDismiss: () => {
             dejaVuMounted = null;
           },
+          // (c) Always-shown actions on the highlighted selection.
+          onWebSearch: () => {
+            window.open(
+              `https://www.google.com/search?q=${encodeURIComponent(text)}`,
+              '_blank',
+              'noopener,noreferrer',
+            );
+          },
+          onTranslate: () => {
+            window.open(
+              `https://translate.google.com/?sl=auto&tl=en&op=translate&text=${encodeURIComponent(
+                text,
+              )}`,
+              '_blank',
+              'noopener,noreferrer',
+            );
+          },
+          onAskAi: (provider: 'chatgpt' | 'claude' | 'gemini') => {
+            const NEW_CHAT: Record<'chatgpt' | 'claude' | 'gemini', string> = {
+              chatgpt: 'https://chatgpt.com/',
+              claude: 'https://claude.ai/new',
+              gemini: 'https://gemini.google.com/app',
+            };
+            // Ask-AI is a FIRST-CLASS tracked dispatch (user-chosen):
+            // the background submits it to the companion so it lands
+            // in Recent dispatches exactly like a thread dispatch
+            // (re-openable, auto-linked back when the new chat is
+            // captured), then runs the same open-tab + type-into-
+            // composer + capture orchestration as the Dispatch button.
+            void chrome.runtime.sendMessage({
+              type: messageTypes.submitSelectionDispatch,
+              url: NEW_CHAT[provider],
+              body: text,
+              provider,
+              title: (document.title || text).slice(0, 80),
+            });
+          },
+          defaultAiProvider: ((): 'chatgpt' | 'claude' | 'gemini' => {
+            const p = detectProviderFromUrl(window.location.href);
+            return p === 'claude' || p === 'gemini' ? p : 'chatgpt';
+          })(),
         });
       } catch {
         // Silent — recall is best-effort
@@ -976,6 +1081,11 @@ export default defineContentScript({
         // drafts) so recall keeps working everywhere.
         if (selectionInsideTurn(selection)) {
           offerReviewChip(selection, rect);
+        } else {
+          // Non-provider page, or a non-turn selection on a provider
+          // page → Déjà-vu-only chip so recall is reachable on EVERY
+          // page (the gap the user hit on engineering.fb.com).
+          offerDejaVuChip(selection, rect);
         }
         // Auto-fire the popover only at the original min — the
         // explicit Déjà-vu chip works regardless.

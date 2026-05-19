@@ -65,6 +65,7 @@ export const messageTypes = {
   // once the tab finishes loading. Used by Recent Dispatches'
   // "Dispatch" button on auto-send-mode rows.
   dispatchAutoSendInNewTab: 'sidetrack.dispatch.autoSend.newTab',
+  submitSelectionDispatch: 'sidetrack.dispatch.submitSelection',
   // Side panel records the unredacted dispatch body (what the user
   // actually copied to clipboard) keyed by the companion-assigned
   // dispatch bac_id. Background stashes it in chrome.storage so the
@@ -350,6 +351,17 @@ export type WorkboardRequest =
       readonly body: string;
     }
   | {
+      // Déjà-vu selection "Ask AI": submit a FIRST-CLASS tracked
+      // dispatch (companion-recorded → Recent dispatches, auto-linked
+      // back on capture) AND open+autosend the provider tab — like a
+      // thread dispatch, but with no sourceThread/workstream.
+      readonly type: typeof messageTypes.submitSelectionDispatch;
+      readonly url: string;
+      readonly body: string;
+      readonly provider: 'chatgpt' | 'claude' | 'gemini';
+      readonly title: string;
+    }
+  | {
       readonly type: typeof messageTypes.cacheDispatchOriginal;
       readonly dispatchId: string;
       readonly body: string;
@@ -502,7 +514,7 @@ export type WorkboardRequest =
       readonly type: typeof messageTypes.contentQuery;
       readonly q: string;
       readonly limit?: number;
-      readonly sourceKind?: readonly ('page-content' | 'chat-turn')[];
+      readonly sourceKind?: readonly ('page-content' | 'chat-turn' | 'semantic-recall-pool')[];
     }
   | {
       readonly type: typeof messageTypes.annotateTurn;
@@ -733,6 +745,17 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     );
   }
 
+  if (hasType(value, messageTypes.submitSelectionDispatch)) {
+    return (
+      typeof value.url === 'string' &&
+      typeof value.body === 'string' &&
+      (value.provider === 'chatgpt' ||
+        value.provider === 'claude' ||
+        value.provider === 'gemini') &&
+      typeof value.title === 'string'
+    );
+  }
+
   if (hasType(value, messageTypes.cacheDispatchOriginal)) {
     return typeof value.dispatchId === 'string' && typeof value.body === 'string';
   }
@@ -887,7 +910,12 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       (value.limit === undefined || typeof value.limit === 'number') &&
       (value.sourceKind === undefined ||
         (Array.isArray(value.sourceKind) &&
-          value.sourceKind.every((kind) => kind === 'page-content' || kind === 'chat-turn')))
+          value.sourceKind.every(
+            (kind) =>
+              kind === 'page-content' ||
+              kind === 'chat-turn' ||
+              kind === 'semantic-recall-pool',
+          )))
     );
   }
 
