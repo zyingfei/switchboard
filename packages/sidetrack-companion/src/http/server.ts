@@ -120,6 +120,7 @@ import {
   tabSessionInbox,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
+import { overlayUrlAttributionOntoTabSessions } from '../tabsession/urlAttributionOverlay.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
 import {
@@ -930,10 +931,29 @@ const resolveConnectionsNodeId = (
 // read-only candidate expansion. NEVER runs in the materializer
 // drain; the query path only READS the cached artifact (bounded
 // latency); the build is fire-and-forget off the request path.
+// Déjà-vu's semantic-recall-pool query fires this detached
+// full-corpus re-embed (ONNX e5 sidecar). With a cold/warming
+// embedder each attempt fails, persists nothing, and the NEXT Déjà-vu
+// re-triggers it → query→rebuild→still-cold→rebuild, ~99% CPU in the
+// embedder child (HTTP log stays fast — the work isn't on the request
+// path). Two structural guards, mirroring /v1/recall/query's
+// isVectorUsable: (1) don't kick unless the embedder is usable;
+// (2) a cooldown so serial Déjà-vu auto-fires can't thrash a
+// full-corpus re-embed even once warm. The pool is a background
+// "Similar" nicety — ≤cooldown staleness is fine.
+const SEMANTIC_REFRESH_COOLDOWN_MS = ((): number => {
+  const raw = process.env['SIDETRACK_SEMANTIC_REFRESH_COOLDOWN_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 300_000;
+})();
 let semanticRecallRefreshInFlight = false;
-const kickSemanticRecallPoolRefresh = (vaultRoot: string): void => {
+let semanticRecallLastRefreshMs = 0;
+const kickSemanticRecallPoolRefresh = (vaultRoot: string, embedderUsable: boolean): void => {
   if (semanticRecallRefreshInFlight) return;
+  if (!embedderUsable) return;
+  if (Date.now() - semanticRecallLastRefreshMs < SEMANTIC_REFRESH_COOLDOWN_MS) return;
   semanticRecallRefreshInFlight = true;
+  semanticRecallLastRefreshMs = Date.now();
   void (async () => {
     try {
       const records = await listPageEvidenceRecords(vaultRoot);
@@ -964,9 +984,12 @@ const semanticRecallExpansion = async (
   vaultRoot: string,
   anchorHits: readonly ContentSearchHit[],
   limit: number,
+  embedderUsable: boolean,
 ): Promise<readonly ContentSearchHit[]> => {
   const pool = await readSemanticRecallPool(vaultRoot);
-  kickSemanticRecallPoolRefresh(vaultRoot); // opportunistic, non-blocking
+  // Read-only serve of the cached pool always happens (cheap); the
+  // rebuild is gated/cooldowned so a cold embedder can't loop.
+  kickSemanticRecallPoolRefresh(vaultRoot, embedderUsable);
   if (pool === null) return [];
   const anchors = anchorHits
     .map((h) => h.canonicalUrl)
@@ -1035,11 +1058,20 @@ const queryRecallContent = async (
   const meta = new Map<string, { title: string; threadUrl: string }>();
   const hits = await Promise.all(
     ranked.map(async (item): Promise<ContentSearchHit> => {
-      let info = meta.get(item.threadId);
+      // The recall index keys hybrid entries' `threadId` by the
+      // PROVIDER conversation id (a UUID), but thread files + the
+      // extension's local thread cache + focusThreadInSidePanel are
+      // keyed by the BAC id. `metadata.sourceBacId` is that bac id
+      // (fall back to threadId for back-compat entries where threadId
+      // IS the bac id). Resolving the thread file / returned threadId
+      // by the bac id is what makes Déjà-vu "Jump" to a chat work
+      // (was a silent no-op: no resolvable URL + wrong id).
+      const bacId = item.metadata?.sourceBacId ?? item.threadId;
+      let info = meta.get(bacId);
       if (info === undefined) {
         try {
           const threadFile = await readFile(
-            join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
+            join(vaultRoot, '_BAC', 'threads', `${bacId}.json`),
             'utf8',
           );
           const parsed = JSON.parse(threadFile) as {
@@ -1053,13 +1085,19 @@ const queryRecallContent = async (
         } catch {
           info = { title: '', threadUrl: '' };
         }
-        meta.set(item.threadId, info);
+        // Prefer the chunk metadata's own threadUrl when the thread
+        // file is absent (recall-only / uncaptured thread).
+        if (info.threadUrl.length === 0 && typeof item.metadata?.threadUrl === 'string') {
+          info = { ...info, threadUrl: item.metadata.threadUrl };
+        }
+        meta.set(bacId, info);
       }
       return {
         id: item.id,
         sourceKind: 'chat-turn',
-        anchorNodeId: `thread:${item.threadId}`,
-        threadId: item.threadId,
+        anchorNodeId: `thread:${bacId}`,
+        threadId: bacId,
+        ...(info.threadUrl.length > 0 ? { canonicalUrl: info.threadUrl } : {}),
         title: item.metadata?.title ?? info.title,
         ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
         score: item.score,
@@ -1349,6 +1387,36 @@ const statSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
+// Resolve-cache signature. Like statSig but the mtime is floored to
+// RESOLVE_SIG_BUCKET_MS. The visres:/tabres: dry-run resolve caches
+// keyed on raw statSig(current.json) NEVER hit under load: ambient
+// observation (esp. now the content script injects on all pages)
+// drives frequent materializer drains that rewrite current.json, so
+// the raw mtime rotates the key on essentially every request and the
+// SAME url is recomputed (full PPR+cluster+ranker) 30+×/min → 99%
+// CPU, /status starvation (the recurring resolve-flood). Bucketing
+// the mtime collapses a burst of rewrites to one key so the 30s TTL
+// actually applies, while still rotating within one bucket of a real
+// change (≤bucket dry-run-preview staleness — the documented
+// "contextual, staleness acceptable" tradeoff); `size` still catches
+// length-changing rewrites and user mutations call
+// invalidateResolveCaches() for immediate freshness. Companion-side
+// so it holds regardless of which extension build is loaded.
+const RESOLVE_SIG_BUCKET_MS = ((): number => {
+  const raw = process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 15_000;
+})();
+const resolveSig = async (path: string): Promise<string> => {
+  try {
+    const s = await stat(path);
+    const bucket =
+      RESOLVE_SIG_BUCKET_MS > 0 ? Math.floor(s.mtimeMs / RESOLVE_SIG_BUCKET_MS) : s.mtimeMs;
+    return `${String(bucket)}:${String(s.size)}`;
+  } catch {
+    return 'absent';
+  }
+};
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
 // position. The feedback + page-content overlays do depend on the
 // event log, but it advances on EVERY extension event flush (~1/min
@@ -1519,6 +1587,73 @@ const cachedRoute = async (
   })();
   routeInFlight.set(key, compute);
   return compute;
+};
+
+// Hard concurrency cap on the expensive resolve build (readCurrent
+// ~14MB + readMerged + PPR/cluster/ranker ≈ 0.5–3 s of CPU each).
+// cachedRoute's in-flight map only dedupes the SAME key; a flooding
+// client (the recurring resolve-flood) requests MANY distinct
+// urls/tab-sessions, so without a cross-key cap N concurrent builds
+// peg every core and starve /status. This bounds resolver CPU to
+// RESOLVE_MAX_CONCURRENCY computes regardless of request rate or
+// which extension build is loaded — excess requests queue (each
+// build is short; cache hits don't take a slot). /status and other
+// endpoints are NOT wrapped, so the companion stays responsive even
+// while resolves are queued. A permit is handed directly to the next
+// waiter on release so the cap is never exceeded.
+const RESOLVE_MAX_CONCURRENCY = ((): number => {
+  const raw = process.env['SIDETRACK_RESOLVE_MAX_CONCURRENCY'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 2;
+})();
+let resolvePermits = RESOLVE_MAX_CONCURRENCY;
+const resolveWaiters: Array<() => void> = [];
+const acquireResolveSlot = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    if (resolvePermits > 0) {
+      resolvePermits -= 1;
+      resolve();
+    } else {
+      resolveWaiters.push(resolve);
+    }
+  });
+const releaseResolveSlot = (): void => {
+  const next = resolveWaiters.shift();
+  if (next !== undefined) {
+    next();
+  } else {
+    resolvePermits += 1;
+  }
+};
+const cachedResolveRoute = (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> =>
+  cachedRoute(key, ttlMs, async (): Promise<readonly [number, unknown]> => {
+    await acquireResolveSlot();
+    try {
+      return await build();
+    } finally {
+      releaseResolveSlot();
+    }
+  });
+
+// The suggestion-resolve caches (visres:/tabres:) are keyed on the
+// connections snapshot, deliberately NOT the event log (see the statSig
+// note — seq advances every flush, so seq-keying never hits). But an
+// explicit user attribution/ignore decision MUST take effect at once,
+// and the resolver fuses graph signals so one decision can shift other
+// suggestions too. Purge both resolve caches on every user decision.
+// This is rare (a few/session), so it does NOT reintroduce the
+// per-flush cache-busting the snapshot keying avoids.
+const invalidateResolveCaches = (): void => {
+  for (const key of [...routeCache.keys()]) {
+    if (key.startsWith('visres:') || key.startsWith('tabres:')) routeCache.delete(key);
+  }
+  for (const key of [...routeInFlight.keys()]) {
+    if (key.startsWith('visres:') || key.startsWith('tabres:')) routeInFlight.delete(key);
+  }
 };
 
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
@@ -1952,15 +2087,28 @@ const loadTabSessionProjection = async (
   eventLog: EventLog,
 ): Promise<{ projection: TabSessionProjection; snapshotRevision: string | null }> => {
   const snapshot = await context.connectionsStore?.readCurrent();
-  if (snapshot?.tabSessionProjection !== undefined) {
-    return {
-      projection: deserializeTabSessionProjection(snapshot.tabSessionProjection),
-      snapshotRevision: snapshot.snapshotRevision ?? null,
-    };
-  }
+  const snapshotRevision = snapshot?.snapshotRevision ?? null;
+  // Re-fold from the event log at most once (cold start / pre-R1
+  // snapshot) and reuse it for BOTH projections.
+  type Merged = Awaited<ReturnType<EventLog['readMerged']>>;
+  let merged: Merged | undefined;
+  const ensureMerged = async (): Promise<Merged> =>
+    merged ?? (merged = await eventLog.readMerged());
+  const tab =
+    snapshot?.tabSessionProjection !== undefined
+      ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
+      : projectTabSessions(await ensureMerged());
+  // Same snapshot's URL projection (no extra re-fold in steady state) —
+  // a chat thread the user filed via the Current-tab card is a URL
+  // attribution; overlay it so All-threads / inbox / the resolver stop
+  // re-asking. Single seam → every tab-session consumer is consistent.
+  const url =
+    snapshot?.urlProjection !== undefined
+      ? deserializeUrlProjection(snapshot.urlProjection)
+      : projectUrls(await ensureMerged());
   return {
-    projection: projectTabSessions(await eventLog.readMerged()),
-    snapshotRevision: snapshot?.snapshotRevision ?? null,
+    projection: overlayUrlAttributionOntoTabSessions(tab, url),
+    snapshotRevision,
   };
 };
 
@@ -2444,10 +2592,10 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await statSig(
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await resolveSig(
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
-      return cachedRoute(
+      return cachedResolveRoute(
         tabResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
@@ -2640,6 +2788,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         // Stage 5.2 R5 — post-write response goes through the
         // snapshot-first helper so we don't pay a full event-log
         // re-projection when the materializer has already published
@@ -2746,10 +2895,10 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await statSig(
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await resolveSig(
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
-      return cachedRoute(
+      return cachedResolveRoute(
         visResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
@@ -2908,6 +3057,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         // Stage 5.2 R5 — see matching block in the tab-session POST
         // route. (PR #141's invalidateCachedUrlProjection was a TTL
         // cache buster that R2/R5 makes redundant.)
@@ -2967,6 +3117,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         const { projection: postProjection } = await loadUrlProjection(context, eventLog);
         return [
           201,
@@ -4817,14 +4968,54 @@ const routes: readonly RouteDefinition[] = [
               vaultRoot,
               [...pageHits, ...recallHits],
               query.limit,
+              ((): boolean => {
+                const s = context.getEmbedderStatus?.()?.state ?? 'disabled';
+                return s === 'ready' || s === 'disabled';
+              })(),
             )
           : [];
-      const merged = [...pageHits, ...recallHits, ...semanticHits]
-        .sort(
-          (left, right) =>
-            right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
-        )
-        .slice(0, query.limit);
+      // Balanced merge. A pure global-score slice let one sourceKind
+      // crowd out the others: page-content is BM25-scaled (~20-30)
+      // while semantic-recall-pool similarity / chat-turn recall are
+      // ~0–1, so when several kinds were requested the response was
+      // 100% page-content and the Déjà-vu "Similar" group never
+      // reached the client even though the pool had hits
+      // (semanticRecallPoolCount>0, zero in data). Reserve a per-kind
+      // quota so every requested+non-empty kind is represented within
+      // the limit, then fill the remaining slots by score. Final order
+      // is still score-desc (consumers/chips re-group anyway); the
+      // point is the lower-scaled kinds are no longer sliced away.
+      const orderByScore = (
+        a: ContentSearchHit,
+        b: ContentSearchHit,
+      ): number => b.score - a.score || b.capturedAt.localeCompare(a.capturedAt);
+      const groups = [pageHits, recallHits, semanticHits].filter((g) => g.length > 0);
+      let chosen: ContentSearchHit[];
+      if (groups.length <= 1) {
+        chosen = [...pageHits, ...recallHits, ...semanticHits];
+      } else {
+        const quota = Math.max(1, Math.floor(query.limit / groups.length));
+        const taken = new Set<string>();
+        const picked: ContentSearchHit[] = [];
+        for (const g of groups) {
+          for (const h of g.slice(0, quota)) {
+            if (!taken.has(h.id)) {
+              taken.add(h.id);
+              picked.push(h);
+            }
+          }
+        }
+        const leftover = [...pageHits, ...recallHits, ...semanticHits]
+          .filter((h) => !taken.has(h.id))
+          .sort(orderByScore);
+        for (const h of leftover) {
+          if (picked.length >= query.limit) break;
+          taken.add(h.id);
+          picked.push(h);
+        }
+        chosen = picked;
+      }
+      const merged = chosen.sort(orderByScore).slice(0, query.limit);
       return [
         200,
         {

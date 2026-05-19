@@ -88,7 +88,15 @@ export interface PageEvidenceRecord {
 
 export interface ContentSearchHit {
   readonly id: string;
-  readonly sourceKind: 'page-content' | 'chat-turn';
+  readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  // Present only on 'semantic-recall-pool' hits (W4(b-lite)): a
+  // vector-similarity expansion, not an exact text match — carries
+  // the cosine similarity instead of a snippet.
+  readonly sourceEvidence?: {
+    readonly source: 'semantic_recall_pool';
+    readonly similarity: number;
+    readonly via: 'cluster' | 'neighbor';
+  };
   readonly anchorNodeId: string;
   readonly canonicalUrl?: string;
   readonly threadId?: string;
@@ -119,7 +127,9 @@ const isCoverage = (value: unknown): value is PageContentCoverage =>
 const isContentSearchHit = (value: unknown): value is ContentSearchHit =>
   isRecord(value) &&
   typeof value.id === 'string' &&
-  (value.sourceKind === 'page-content' || value.sourceKind === 'chat-turn') &&
+  (value.sourceKind === 'page-content' ||
+    value.sourceKind === 'chat-turn' ||
+    value.sourceKind === 'semantic-recall-pool') &&
   typeof value.anchorNodeId === 'string' &&
   typeof value.score === 'number' &&
   typeof value.capturedAt === 'string';
@@ -246,7 +256,7 @@ export class PageContentClient {
 
   async query(input: {
     readonly q: string;
-    readonly sourceKind?: readonly ('page-content' | 'chat-turn')[];
+    readonly sourceKind?: readonly ('page-content' | 'chat-turn' | 'semantic-recall-pool')[];
     readonly limit?: number;
   }): Promise<readonly ContentSearchHit[]> {
     const params = new URLSearchParams({ q: input.q });

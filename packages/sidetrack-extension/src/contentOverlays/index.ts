@@ -1,6 +1,14 @@
 import type { SerializedAnchor } from '../annotation/anchors';
 import type { ProviderId } from '../companion/model';
+import type { SearchHitFacet } from '../sidepanel/search/types';
 import { formatRelative } from '../util/time';
+import {
+  dejaVuCategoriesPresent,
+  dejaVuCategoryLabel,
+  dejaVuCategoryOf,
+  dejaVuFacetChipLabel,
+  dejaVuFacetLabel,
+} from './dejaVuModel';
 
 // Native-DOM overlay mounters for the content script. The sidepanel
 // React components (DejaVuPopover, AnnotationOverlay) can't mount in
@@ -178,6 +186,47 @@ const OVERLAY_CSS = `
   border-color: var(--signal-tint);
   background: var(--signal-bg);
 }
+.sidetrack-deja-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 7px 12px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.sidetrack-deja-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.sidetrack-deja-chip:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+}
+.sidetrack-deja-chip.active {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
+}
+.sidetrack-deja-facet {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--signal);
+  background: var(--signal-bg);
+  border: 1px solid var(--signal-tint);
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
 .sidetrack-deja-list {
   max-height: 280px;
   overflow: auto;
@@ -277,6 +326,18 @@ const OVERLAY_CSS = `
   font-family: var(--mono);
   font-size: 10px;
   color: var(--ink-3);
+}
+.sidetrack-deja-foot-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sidetrack-deja-actions {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .sidetrack-rv-chip-group {
   position: absolute;
@@ -801,7 +862,17 @@ export interface DejaVuItem {
   // for threads that aren't yet in the local thread cache (e.g.
   // captured on another device, only in the companion's vault).
   readonly bacId?: string;
+  // P3 unified search: which facet this hit is (page vs chat vs
+  // thread) — drives the type-filter chips + the per-row tag.
+  readonly facet?: SearchHitFacet;
+  // Set for page-content hits (no threadUrl); Jump opens it.
+  readonly canonicalUrl?: string;
+  // 0–1 cosine, only on 'similar' (semantic) hits — shown instead of
+  // a snippet (these are topical/vector matches, not exact text).
+  readonly similarity?: number;
 }
+
+type AskAiProvider = 'chatgpt' | 'claude' | 'gemini';
 
 interface DejaVuMountOptions {
   readonly items: readonly DejaVuItem[];
@@ -809,6 +880,13 @@ interface DejaVuMountOptions {
   readonly onJump?: (item: DejaVuItem) => void;
   readonly onMute?: () => void;
   readonly onDismiss?: () => void;
+  // Always-shown footer actions on the highlighted selection: web
+  // search + copy-and-open-a-new-AI-chat. Rendered only when wired.
+  readonly onWebSearch?: () => void;
+  readonly onTranslate?: () => void;
+  readonly onAskAi?: (provider: AskAiProvider) => void;
+  /** Provider highlighted as the default (the current page's, else gpt). */
+  readonly defaultAiProvider?: AskAiProvider;
 }
 
 const POP_WIDTH = 360;
@@ -832,7 +910,10 @@ const clearDejaPop = (root: HTMLElement): void => {
 interface ReviewChipMountOptions {
   readonly anchorRect: DOMRect;
   readonly quote: string;
-  readonly onSave: (comment: string) => Promise<void> | void;
+  // Optional: when omitted the "+ Comment" button is not rendered
+  // (Déjà-vu-only chip — used on non-provider pages where there is no
+  // turn/thread to annotate).
+  readonly onSave?: (comment: string) => Promise<void> | void;
   readonly onDismiss?: () => void;
   // When provided, the chip renders a second button "Déjà-vu" that
   // unconditionally invokes this callback. The caller (content
@@ -867,7 +948,12 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
   const COMMENT_W = 84;
   const DEJA_W = 84;
   const GAP = 4;
-  const totalWidth = opts.onDejaVu !== undefined ? COMMENT_W + GAP + DEJA_W : COMMENT_W;
+  const hasComment = opts.onSave !== undefined;
+  const hasDeja = opts.onDejaVu !== undefined;
+  const totalWidth =
+    (hasComment ? COMMENT_W : 0) +
+    (hasComment && hasDeja ? GAP : 0) +
+    (hasDeja ? DEJA_W : 0);
   const viewportWidth = document.documentElement.clientWidth;
   let leftAnchor = Math.max(8, opts.anchorRect.right - 50);
   if (leftAnchor + totalWidth > viewportWidth - 8) {
@@ -876,25 +962,28 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
   if (leftAnchor < 8) leftAnchor = 8;
   const chipTop = opts.anchorRect.bottom + 6;
 
-  const commentBtn = document.createElement('button');
-  commentBtn.type = 'button';
-  commentBtn.className = 'sidetrack-rv-chip';
-  commentBtn.style.left = `${String(leftAnchor)}px`;
-  commentBtn.style.top = `${String(chipTop)}px`;
-  commentBtn.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+  let commentBtn: HTMLButtonElement | undefined;
+  if (hasComment) {
+    commentBtn = document.createElement('button');
+    commentBtn.type = 'button';
+    commentBtn.className = 'sidetrack-rv-chip';
+    commentBtn.style.left = `${String(leftAnchor)}px`;
+    commentBtn.style.top = `${String(chipTop)}px`;
+    commentBtn.innerHTML = '<span class="glyph">+</span><span>Comment</span>';
+  }
 
   let dejaBtn: HTMLButtonElement | undefined;
-  if (opts.onDejaVu !== undefined) {
+  if (hasDeja) {
     dejaBtn = document.createElement('button');
     dejaBtn.type = 'button';
     dejaBtn.className = 'sidetrack-rv-chip';
-    dejaBtn.style.left = `${String(leftAnchor + COMMENT_W + GAP)}px`;
+    dejaBtn.style.left = `${String(hasComment ? leftAnchor + COMMENT_W + GAP : leftAnchor)}px`;
     dejaBtn.style.top = `${String(chipTop)}px`;
     dejaBtn.innerHTML = '<span class="glyph">⟲</span><span>Déjà-vu</span>';
   }
 
   const close = (): void => {
-    commentBtn.remove();
+    commentBtn?.remove();
     dejaBtn?.remove();
     for (const pop of root.querySelectorAll('.sidetrack-rv-pop')) {
       pop.remove();
@@ -903,7 +992,9 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
   };
 
   const expandToPopover = (): void => {
-    commentBtn.remove();
+    const onSave = opts.onSave;
+    if (onSave === undefined) return;
+    commentBtn?.remove();
     dejaBtn?.remove();
     const pop = document.createElement('div');
     pop.className = 'sidetrack-rv-pop';
@@ -942,7 +1033,7 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
         const value = textarea.value.trim();
         if (value.length === 0) return;
         saveBtn.disabled = true;
-        Promise.resolve(opts.onSave(value))
+        Promise.resolve(onSave(value))
           .then(() => {
             close();
           })
@@ -957,22 +1048,27 @@ export const mountReviewSelectionChip = (opts: ReviewChipMountOptions): { close:
     window.setTimeout(() => textarea?.focus(), 0);
   };
 
-  commentBtn.addEventListener('click', (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    expandToPopover();
-  });
+  if (commentBtn !== undefined) {
+    const commentBtnHandle = commentBtn;
+    commentBtnHandle.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      expandToPopover();
+    });
+  }
   if (dejaBtn !== undefined) {
     const dejaBtnHandle = dejaBtn;
     dejaBtnHandle.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      commentBtn.remove();
+      commentBtn?.remove();
       dejaBtnHandle.remove();
       opts.onDejaVu?.();
     });
   }
-  root.appendChild(commentBtn);
+  if (commentBtn !== undefined) {
+    root.appendChild(commentBtn);
+  }
   if (dejaBtn !== undefined) {
     root.appendChild(dejaBtn);
   }
@@ -1008,68 +1104,211 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   pop.style.maxHeight = `${String(Math.min(420, document.documentElement.clientHeight - 40))}px`;
   pop.style.overflow = 'auto';
   const isEmpty = opts.items.length === 0;
+  const presentFacets = (['page', 'chat', 'similar', 'thread'] as SearchHitFacet[]).filter(
+    (f) => opts.items.some((i) => i.facet === f),
+  );
+  const presentCategories = dejaVuCategoriesPresent(opts.items);
+  const itemCategory = (i: DejaVuItem): string =>
+    dejaVuCategoryOf(i.canonicalUrl ?? i.threadUrl);
+  // Show the Page/Chat + AI Chats/Google Services grouping whenever
+  // there is more than one result — even if a dimension is
+  // homogeneous (all-chat / all-web). The user wants the breakdown
+  // visible CONSISTENTLY everywhere (regular pages and chat pages
+  // alike), not silently dropped on single-type result sets the way
+  // the old "only when it splits" gate did.
+  const multi = opts.items.length > 1;
+  const facetChips = multi ? presentFacets : [];
+  // a1: drop the generic "Web" chip — it's "everything not AI-chat /
+  // not Google", i.e. noise that duplicated the Page facet count and
+  // confused (the "Page 4 / Web 4 — what's the difference?"). Keep
+  // only the meaningful service categories; Web items still appear
+  // under "All" and their Pages/Chats/Similar facet chip. Only the
+  // "Google" category chip is kept: "AI Chats" overlapped the Chats
+  // facet almost entirely (confusing duplicate); "Web" was noise.
+  // Google-service pages are the one case the category adds info.
+  const categoryChips = multi ? presentCategories.filter((c) => c === 'google') : [];
+  const hasFilter = facetChips.length + categoryChips.length > 0;
   pop.innerHTML = `
     <div class="sidetrack-deja-head">
       <span class="dot"></span>
       <span>${isEmpty ? 'Déjà-vu' : 'Seen this before'}</span>
       <span class="meta">${
         isEmpty
-          ? 'no prior threads matched'
-          : `${String(opts.items.length)} prior thread${opts.items.length === 1 ? '' : 's'}`
+          ? 'no prior matches'
+          : `${String(opts.items.length)} prior result${opts.items.length === 1 ? '' : 's'}`
       }</span>
       <button type="button" class="sidetrack-deja-mute">Mute on this page</button>
       <button type="button" class="close" aria-label="Dismiss">×</button>
     </div>
+    <div class="sidetrack-deja-chips"></div>
     <div class="sidetrack-deja-list"></div>
     <div class="sidetrack-deja-foot">
-      <span style="flex:1">on-device · vector recall</span>
+      <span class="sidetrack-deja-foot-label">on-device · unified recall</span>
+      <span class="sidetrack-deja-actions"></span>
     </div>
   `;
   const list = pop.querySelector<HTMLDivElement>('.sidetrack-deja-list');
-  if (isEmpty && list !== null) {
-    const empty = document.createElement('div');
-    empty.className = 'sidetrack-deja-empty';
-    empty.style.cssText =
-      'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
-    empty.textContent = 'No similar prior threads found in your vault.';
-    list.appendChild(empty);
-  }
-  if (!isEmpty && list !== null) {
-    for (const item of opts.items) {
-      const row = document.createElement('div');
-      row.className = 'sidetrack-deja-row';
-      row.innerHTML = `
-        <div class="r1">
-          <span class="title"></span>
-          <span class="sidetrack-deja-provider"></span>
-          <span class="sidetrack-deja-when"></span>
-          <span class="score"></span>
-        </div>
-        <div class="snippet"></div>
-        <div class="r2">
-          <button type="button" class="jump">Jump</button>
-          <button type="button" class="mute">Mute on this page</button>
-        </div>
-      `;
-      const titleEl = row.querySelector('.title');
-      if (titleEl !== null) titleEl.textContent = item.title;
-      const providerEl = row.querySelector('.sidetrack-deja-provider');
-      if (providerEl !== null) providerEl.textContent = providerLabel(item.provider);
-      const whenEl = row.querySelector('.sidetrack-deja-when');
-      if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
-      const scoreEl = row.querySelector('.score');
-      if (scoreEl !== null) scoreEl.textContent = item.score.toFixed(2);
-      const snippetEl = row.querySelector('.snippet');
-      if (snippetEl !== null) snippetEl.textContent = item.snippet;
-      row.querySelector('.jump')?.addEventListener('click', () => {
-        opts.onJump?.(item);
+  const chipsBar = pop.querySelector<HTMLDivElement>('.sidetrack-deja-chips');
+
+  // Always-shown footer actions on the highlighted selection.
+  const actionsBar = pop.querySelector<HTMLSpanElement>('.sidetrack-deja-actions');
+  if (actionsBar !== null) {
+    const mkAction = (label: string, title: string, onClick: () => void): void => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'sidetrack-deja-chip';
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onClick();
       });
-      row.querySelector('.mute')?.addEventListener('click', () => {
-        opts.onMute?.();
-      });
-      list.appendChild(row);
+      actionsBar.appendChild(b);
+    };
+    if (opts.onWebSearch !== undefined) {
+      mkAction('🔍 Google', 'Google-search the highlighted text', opts.onWebSearch);
+    }
+    if (opts.onTranslate !== undefined) {
+      mkAction('🌐 Translate', 'Translate the highlighted text (Google Translate)', opts.onTranslate);
+    }
+    if (opts.onAskAi !== undefined) {
+      const onAskAi = opts.onAskAi;
+      const dflt: AskAiProvider = opts.defaultAiProvider ?? 'chatgpt';
+      const PROVIDERS: readonly { id: AskAiProvider; label: string }[] = [
+        { id: 'chatgpt', label: 'GPT' },
+        { id: 'claude', label: 'Claude' },
+        { id: 'gemini', label: 'Gemini' },
+      ];
+      // Default provider first, then the others — one click each:
+      // copies the selection + opens that provider's new chat.
+      for (const p of [...PROVIDERS].sort((a) => (a.id === dflt ? -1 : 0))) {
+        mkAction(
+          p.id === dflt ? `🤖 Ask ${p.label}` : p.label,
+          `Copy the selection and open a new ${p.label} chat`,
+          () => onAskAi(p.id),
+        );
+      }
     }
   }
+
+  const renderRow = (item: DejaVuItem): HTMLDivElement => {
+    const row = document.createElement('div');
+    row.className = 'sidetrack-deja-row';
+    row.innerHTML = `
+      <div class="r1">
+        <span class="title"></span>
+        <span class="sidetrack-deja-facet"></span>
+        <span class="sidetrack-deja-provider"></span>
+        <span class="sidetrack-deja-when"></span>
+        <span class="score"></span>
+      </div>
+      <div class="snippet"></div>
+      <div class="r2">
+        <button type="button" class="jump">Jump</button>
+        <button type="button" class="mute">Mute on this page</button>
+      </div>
+    `;
+    const titleEl = row.querySelector('.title');
+    if (titleEl !== null) titleEl.textContent = item.title;
+    const facetEl = row.querySelector('.sidetrack-deja-facet');
+    if (facetEl !== null) {
+      if (item.facet === undefined) facetEl.remove();
+      else facetEl.textContent = dejaVuFacetLabel(item.facet);
+    }
+    const providerEl = row.querySelector('.sidetrack-deja-provider');
+    if (providerEl !== null) providerEl.textContent = providerLabel(item.provider);
+    const whenEl = row.querySelector('.sidetrack-deja-when');
+    if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
+    const scoreEl = row.querySelector('.score');
+    if (scoreEl !== null) {
+      // 'similar' = vector/topic match → show how similar (NN%),
+      // not the raw lexical score (which is meaningless here).
+      scoreEl.textContent =
+        item.facet === 'similar' && item.similarity !== undefined
+          ? `${String(Math.round(item.similarity * 100))}% similar`
+          : item.score.toFixed(2);
+    }
+    const snippetEl = row.querySelector('.snippet');
+    if (snippetEl !== null) {
+      // Semantic hits intentionally have no exact-text snippet — drop
+      // the empty line so the row is just title + similarity.
+      if (item.facet === 'similar' || item.snippet.length === 0) snippetEl.remove();
+      else snippetEl.textContent = item.snippet;
+    }
+    row.querySelector('.jump')?.addEventListener('click', () => {
+      opts.onJump?.(item);
+    });
+    row.querySelector('.mute')?.addEventListener('click', () => {
+      opts.onMute?.();
+    });
+    return row;
+  };
+
+  // Single-select filter key: 'all' | `f:<facet>` | `c:<category>`.
+  // Facet and category are two orthogonal chip groups (Page/Chat vs
+  // AI Chats/Google Services) but one active selection keeps the UX
+  // simple and consistent with the rest of the panel.
+  let activeKey = 'all';
+  const matches = (i: DejaVuItem): boolean => {
+    if (activeKey === 'all') return true;
+    if (activeKey.startsWith('f:')) return i.facet === activeKey.slice(2);
+    if (activeKey.startsWith('c:')) return itemCategory(i) === activeKey.slice(2);
+    return true;
+  };
+  const renderList = (): void => {
+    if (list === null) return;
+    list.textContent = '';
+    const shown = opts.items.filter(matches);
+    if (shown.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'sidetrack-deja-empty';
+      empty.style.cssText =
+        'padding: 18px 14px; text-align: center; color: var(--ink-3); font-style: italic; font-size: 12px;';
+      empty.textContent = isEmpty
+        ? 'No similar prior pages or conversations found in your vault.'
+        : 'No results of this type.';
+      list.appendChild(empty);
+      return;
+    }
+    for (const item of shown) list.appendChild(renderRow(item));
+  };
+
+  if (chipsBar !== null && hasFilter) {
+    const chipEls = new Map<string, HTMLButtonElement>();
+    const syncChips = (): void => {
+      for (const [k, el] of chipEls) el.classList.toggle('active', k === activeKey);
+    };
+    const addChip = (key: string, label: string, count: number): void => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'sidetrack-deja-chip';
+      chip.textContent = `${label} ${String(count)}`;
+      chip.addEventListener('click', () => {
+        activeKey = key;
+        syncChips();
+        renderList();
+      });
+      chipEls.set(key, chip);
+      chipsBar.appendChild(chip);
+    };
+    addChip('all', 'All', opts.items.length);
+    for (const f of facetChips) {
+      addChip(`f:${f}`, dejaVuFacetChipLabel(f), opts.items.filter((i) => i.facet === f).length);
+    }
+    for (const c of categoryChips) {
+      addChip(
+        `c:${c}`,
+        dejaVuCategoryLabel(c),
+        opts.items.filter((i) => itemCategory(i) === c).length,
+      );
+    }
+    syncChips();
+  } else if (chipsBar !== null) {
+    chipsBar.remove();
+  }
+
+  renderList();
   const close = () => {
     pop.remove();
     opts.onDismiss?.();

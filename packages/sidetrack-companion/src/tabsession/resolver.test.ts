@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -521,6 +522,59 @@ describe('tab-session resolver', () => {
     );
     expect(threadResult.reasons.targetAnchors).toContain('thread:thread_a');
     expect(threadResult.reasons.targetAnchors).toContain(`timeline-visit:${currentUrl}`);
+  });
+
+  it('respects "Not in any stream": a user decline settles the URL instead of re-asking', () => {
+    const url = 'https://example.test/declined';
+    const anchorUrl = 'https://example.test/anchor';
+    const snap = snapshot(
+      [`timeline-visit:${url}`, `timeline-visit:${anchorUrl}`, 'workstream:ws_security'],
+      [
+        { kind: 'closest_visit', from: `timeline-visit:${url}`, to: `timeline-visit:${anchorUrl}` },
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const baseEvents = [observed(1, 'tses_a', url), observed(2, 'tses_anchor', anchorUrl)];
+
+    // Baseline: no user decision → the resolver emits a best-guess.
+    const before = resolveUrlAttribution({
+      canonicalUrl: url,
+      snapshot: snap,
+      events: baseEvents,
+      policyMode: 'balanced',
+    });
+    expect(before.fusedCandidates.length).toBeGreaterThan(0);
+
+    // The user picks "Not in any stream" (USER_ORGANIZED_ITEM move,
+    // toContainer:null) → the resolver must settle, not re-ask.
+    const decline: AcceptedEvent = {
+      clientEventId: 'evt-decline',
+      dot: { replicaId: 'replica-a', seq: 3 },
+      deps: {},
+      aggregateId: 'feedback-decline',
+      type: USER_ORGANIZED_ITEM,
+      acceptedAtMs: Date.parse('2026-05-10T10:05:00.000Z'),
+      payload: {
+        payloadVersion: 1,
+        itemKind: 'canonical-url',
+        itemId: url,
+        action: 'move',
+        toContainer: null,
+      },
+    };
+    const after = resolveUrlAttribution({
+      canonicalUrl: url,
+      snapshot: snap,
+      events: [...baseEvents, decline],
+      policyMode: 'balanced',
+    });
+    expect(after.decision.action).toBe('inbox');
+    expect(after.decision.workstreamId).toBeUndefined();
+    expect(after.fusedCandidates).toHaveLength(0);
   });
 
   it('blocks auto-apply when source regret exceeds the policy budget', () => {

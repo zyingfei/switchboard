@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { ANNOTATION_CREATED, isAnnotationCreatedPayload } from '../annotations/events.js';
@@ -3206,11 +3206,8 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   const dayPath = (date: string): string => join(snapshotsDir, `${date}.json`);
 
   // Stage 5.2 W5 — store-level skip-write. The materializer publishes
-  // snapshots on every drain even when the inputs haven't changed
-  // (e.g., a benign event that lands while no relevant materializer
-  // input shifted). Each putCurrent writes 200KB+ to disk. We track
-  // the last-written snapshotRevision in memory and short-circuit if
-  // the new snapshot has the same revision id.
+  // snapshots on every drain even when the inputs haven't changed;
+  // skip the 200KB+ write when the snapshotRevision id is unchanged.
   let lastWrittenRevision: string | null = null;
 
   const putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
@@ -3222,12 +3219,54 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     await writeAtomic(currentPath, JSON.stringify(snapshot, null, 2));
     if (revision !== undefined) lastWrittenRevision = revision;
   };
+
+  // P-perf — readCurrent() memoization keyed on current.json
+  // (mtimeMs,size), mirroring readMerged()'s proven memo in
+  // sync/eventLog.ts. current.json is ~20MB; re-reading + JSON.parse
+  // on every resolve cache-miss / projection overlay was the dominant
+  // CPU cost. putCurrent's skip-write means the file only changes
+  // when the snapshot REVISION actually changed — so an unchanged
+  // graph keeps a stable signature and the memo holds (no re-parse
+  // storm on benign drains); a genuinely changed graph correctly
+  // invalidates and re-parses (correctness > the parse cost — proven
+  // by the connectionsRoutes/timelineRelaySync contract tests).
+  // Single-flight collapses concurrent misses; snapshot is read-only
+  // by contract for every caller.
+  let currentMemo: { signature: string; value: ConnectionsSnapshot } | null = null;
+  let currentInFlight: {
+    signature: string;
+    promise: Promise<ConnectionsSnapshot | null>;
+  } | null = null;
   const readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
+    let signature: string;
     try {
-      return JSON.parse(await readFile(currentPath, 'utf8')) as ConnectionsSnapshot;
+      const s = await stat(currentPath);
+      signature = `${String(s.mtimeMs)}:${String(s.size)}`;
     } catch {
+      currentMemo = null;
       return null;
     }
+    if (currentMemo !== null && currentMemo.signature === signature) {
+      return currentMemo.value;
+    }
+    if (currentInFlight !== null && currentInFlight.signature === signature) {
+      return currentInFlight.promise;
+    }
+    const promise = (async (): Promise<ConnectionsSnapshot | null> => {
+      try {
+        const value = JSON.parse(await readFile(currentPath, 'utf8')) as ConnectionsSnapshot;
+        currentMemo = { signature, value };
+        return value;
+      } catch {
+        return null;
+      } finally {
+        if (currentInFlight !== null && currentInFlight.signature === signature) {
+          currentInFlight = null;
+        }
+      }
+    })();
+    currentInFlight = { signature, promise };
+    return promise;
   };
 
   const putDay = async (date: string, snapshot: ConnectionsSnapshot): Promise<void> => {

@@ -152,14 +152,12 @@ describe('NodeSearchBox', () => {
     expect(screen.getByTestId('connections-search-recall-head')).toHaveTextContent(/searching…/i);
   });
 
-  it('shows a "searching the whole vault" hint while loading', () => {
+  it('shows a "searching" hint while loading', () => {
     render(<NodeSearchBox nodes={[]} extras={[]} ctx={ctx} onPick={vi.fn()} loading />);
     fireEvent.change(screen.getByLabelText('Find an anchor by title'), {
       target: { value: 'anything' },
     });
-    expect(screen.getByTestId('connections-search-loading')).toHaveTextContent(
-      /Searching the whole vault/i,
-    );
+    expect(screen.getByTestId('connections-search-loading')).toHaveTextContent(/Searching…/);
   });
 
   it('clears + closes on Escape', () => {

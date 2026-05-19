@@ -15,6 +15,7 @@ export type AutoApplyUrlAttributionStatus =
   | 'skipped-existing-attribution'
   | 'skipped-ignored'
   | 'skipped-policy'
+  | 'skipped-grace-window'
   | 'skipped-disabled';
 
 // Env gate. Auto-apply is ON by default; the env is an opt-OUT for
@@ -98,6 +99,24 @@ export const autoApplyUrlAttribution = async (
   if (ignored !== undefined) {
     return {
       status: 'skipped-ignored',
+      resolution,
+      projection: beforeProjection,
+    };
+  }
+
+  // Grace window: a freshly-captured URL must stay a triageable Inbox
+  // row on its first observation, instead of being auto-filed before
+  // the user can even see it (the reported "graph-adjacent page
+  // auto-attributed to a workstream, never an Inbox row"). visitCount
+  // is incremented per observe (1 = seen exactly once). Auto-apply
+  // only assists on a revisit (>= 2) when still high-confidence — the
+  // user's manual decision on the first visit always wins. An
+  // already-inferred record is exempt so re-runs/idempotency still
+  // reconcile.
+  const record = beforeProjection.byCanonicalUrl.get(input.canonicalUrl);
+  if (existing?.source !== 'inferred' && (record === undefined || record.visitCount <= 1)) {
+    return {
+      status: 'skipped-grace-window',
       resolution,
       projection: beforeProjection,
     };

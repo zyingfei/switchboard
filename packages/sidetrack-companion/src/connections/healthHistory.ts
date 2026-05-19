@@ -16,6 +16,19 @@ export interface HealthHistorySample {
   readonly shadowTopicCount: number | null;
   readonly runtimeMs: number | null;
   readonly vaultBytes: number | null;
+  // F2 — per-drain stats for the SERVED topic producer (post-W2
+  // leiden-cpm). The shadow* fields above are perpetually null once the
+  // idf-rkn shadow is retired from serving, so the Focus "Drain trend"
+  // reads these instead. Optional: pre-F2 persisted samples lack them
+  // and must still validate (absent → null on read), so the schema
+  // check below tolerates their absence.
+  readonly servedTopicCount?: number | null;
+  readonly servedCoveredPages?: number | null;
+  readonly servedChurnP50?: number | null;
+  readonly servedChurnP90?: number | null;
+  readonly servedLineageContinue?: number | null;
+  readonly servedLineageSplit?: number | null;
+  readonly servedLineageMerge?: number | null;
 }
 
 /**
@@ -31,6 +44,11 @@ const historyPath = (vaultRoot: string): string =>
 const isFiniteNumberOrNull = (value: unknown): value is number | null =>
   value === null || (typeof value === 'number' && Number.isFinite(value));
 
+// Tolerant variant for the F2 served* fields: a pre-F2 sample simply
+// omits them, and that must not invalidate the whole sample.
+const isFiniteNumberOrNullOrAbsent = (value: unknown): value is number | null | undefined =>
+  value === undefined || isFiniteNumberOrNull(value);
+
 const isHealthHistorySample = (value: unknown): value is HealthHistorySample => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -41,7 +59,14 @@ const isHealthHistorySample = (value: unknown): value is HealthHistorySample => 
     isFiniteNumberOrNull(record['noiseShare']) &&
     isFiniteNumberOrNull(record['shadowTopicCount']) &&
     isFiniteNumberOrNull(record['runtimeMs']) &&
-    isFiniteNumberOrNull(record['vaultBytes'])
+    isFiniteNumberOrNull(record['vaultBytes']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedTopicCount']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedCoveredPages']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedChurnP50']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedChurnP90']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedLineageContinue']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedLineageSplit']) &&
+    isFiniteNumberOrNullOrAbsent(record['servedLineageMerge'])
   );
 };
 
@@ -53,6 +78,13 @@ const normalizeSample = (sample: HealthHistorySample): HealthHistorySample => ({
   shadowTopicCount: sample.shadowTopicCount,
   runtimeMs: sample.runtimeMs,
   vaultBytes: sample.vaultBytes,
+  servedTopicCount: sample.servedTopicCount ?? null,
+  servedCoveredPages: sample.servedCoveredPages ?? null,
+  servedChurnP50: sample.servedChurnP50 ?? null,
+  servedChurnP90: sample.servedChurnP90 ?? null,
+  servedLineageContinue: sample.servedLineageContinue ?? null,
+  servedLineageSplit: sample.servedLineageSplit ?? null,
+  servedLineageMerge: sample.servedLineageMerge ?? null,
 });
 
 const atomicWriteJson = async (path: string, value: unknown): Promise<void> => {

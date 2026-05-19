@@ -93,10 +93,25 @@ export const applyFeedbackOverlayToSnapshot = (
   const topicLabels = new Map<string, string>();
   const engagementClassByVisit = new Map<string, string>();
   const visitTopicVisibility = new Map<string, boolean>();
+  // A topic's id is a content hash of its member set, so it changes
+  // whenever membership changes (that is *why* topic.lineage exists).
+  // A rename recorded against the id-at-rename-time would orphan on the
+  // next re-cluster. Collect renames in acceptedAt/seq order and resolve
+  // each to a CURRENT topic node below — exact id → lineage hop →
+  // unique representative-title anchor — so the name follows the topic.
+  const renames: {
+    readonly oldTopicId: string;
+    readonly previousName: string;
+    readonly newName: string;
+  }[] = [];
 
   for (const action of allActions(projection)) {
     if (action.eventType === USER_TOPIC_RENAMED && isUserTopicRenamedPayload(action.payload)) {
-      topicLabels.set(action.payload.topicId, action.payload.newName);
+      renames.push({
+        oldTopicId: action.payload.topicId,
+        previousName: action.payload.previousName,
+        newName: action.payload.newName,
+      });
       continue;
     }
 
@@ -139,11 +154,69 @@ export const applyFeedbackOverlayToSnapshot = (
   }
 
   if (
-    topicLabels.size === 0 &&
+    renames.length === 0 &&
     engagementClassByVisit.size === 0 &&
     visitTopicVisibility.size === 0
   ) {
     return snapshot;
+  }
+
+  // Resolve each rename to a live topic node id. Tier 1: the recorded
+  // id is still current (no re-cluster since). Tier 2: walk topic.lineage
+  // forward from the recorded id to a unique current topic (one-drain
+  // gap). Tier 3: the rename payload kept the algorithmic title at
+  // rename time — bind to the current topic that still carries it, but
+  // only if that match is unique (never mis-bind; an ambiguous or lost
+  // anchor is a silent no-op, not a wrong label).
+  if (renames.length > 0) {
+    const currentTopicIds = new Set<string>();
+    const titleToTopicIds = new Map<string, Set<string>>();
+    for (const node of snapshot.nodes) {
+      if (node.kind !== 'topic') continue;
+      currentTopicIds.add(node.id);
+      const titles = node.metadata['representativeTitles'];
+      if (Array.isArray(titles)) {
+        for (const title of titles) {
+          if (typeof title !== 'string' || title.length === 0) continue;
+          const set = titleToTopicIds.get(title) ?? new Set<string>();
+          set.add(node.id);
+          titleToTopicIds.set(title, set);
+        }
+      }
+    }
+    const lineageForward = new Map<string, Set<string>>();
+    for (const edge of snapshot.edges) {
+      if (edge.kind !== 'topic.lineage') continue;
+      const set = lineageForward.get(edge.fromNodeId) ?? new Set<string>();
+      set.add(edge.toNodeId);
+      lineageForward.set(edge.fromNodeId, set);
+    }
+    const reachableCurrent = (start: string): string | undefined => {
+      const seen = new Set<string>([start]);
+      const queue: string[] = [start];
+      const hits = new Set<string>();
+      while (queue.length > 0) {
+        const current = queue.shift() as string;
+        for (const next of lineageForward.get(current) ?? []) {
+          if (seen.has(next)) continue;
+          seen.add(next);
+          if (currentTopicIds.has(next)) hits.add(next);
+          queue.push(next);
+        }
+      }
+      return hits.size === 1 ? [...hits][0] : undefined;
+    };
+    for (const rename of renames) {
+      let target: string | undefined;
+      if (currentTopicIds.has(rename.oldTopicId)) target = rename.oldTopicId;
+      else target = reachableCurrent(rename.oldTopicId);
+      if (target === undefined) {
+        const byTitle = titleToTopicIds.get(rename.previousName);
+        if (byTitle !== undefined && byTitle.size === 1) target = [...byTitle][0];
+      }
+      // Later renames win (renames is acceptedAt/seq-ordered).
+      if (target !== undefined) topicLabels.set(target, rename.newName);
+    }
   }
 
   const nodes = snapshot.nodes.map((node) => {
