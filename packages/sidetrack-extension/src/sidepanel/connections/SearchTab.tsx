@@ -5,6 +5,7 @@ import { ExternalLinkIcon, FilterIcon, KindIcons, SearchIcon } from './icons';
 import type { RecallSearchHit, SearchableAnchor } from './NodeSearchBox';
 import type { ConnectionNode, ConnectionNodeKind } from './types';
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
+import { rankSubstring } from '../search/ranking';
 
 interface SearchTabProps {
   readonly nodes: readonly ConnectionNode[];
@@ -30,15 +31,12 @@ interface SearchHit {
   readonly url?: string;
 }
 
-const rank = (query: string, primary: string): number => {
-  const p = primary.toLowerCase();
-  const q = query.toLowerCase();
-  const idx = p.indexOf(q);
-  if (idx === -1) return -1;
-  const prefixBonus = idx === 0 ? 100 : 0;
-  const lengthPenalty = Math.min(80, p.length);
-  return 250 - lengthPenalty + prefixBonus;
-};
+const rank = (query: string, primary: string): number => rankSubstring(query, primary);
+
+// Empty-query browse: when the user has narrowed the kind filter (e.g.
+// only "topic"), an empty query lists EVERY object of the visible kinds
+// — paginated, since a kind can have hundreds of members.
+const BROWSE_PAGE_SIZE = 50;
 
 const isConnectionNodeKind = (value: string | undefined): value is ConnectionNodeKind =>
   value !== undefined && value in KindIcons;
@@ -74,6 +72,34 @@ const metadataUrl = (metadata: Record<string, unknown>): string | undefined => {
 
 const urlForNode = (node: ConnectionNode): string | undefined =>
   metadataUrl(node.metadata) ?? urlFromNodeId(node.id);
+
+// Extra strings to rank a query against, beyond the visible `primary`.
+// A topic node's `primary` is only its FIRST representative title, so a
+// search for a term that lives in any other member title (or the label)
+// would miss the whole cluster. Widen topic matching to every
+// representative title + the raw label; all other kinds keep matching
+// on `primary` alone (no behavior change). Display text is untouched.
+const auxSearchTextsFor = (node: ConnectionNode): readonly string[] => {
+  if (node.kind !== 'topic') return [];
+  const out: string[] = [];
+  const titles = node.metadata['representativeTitles'];
+  if (Array.isArray(titles)) {
+    for (const title of titles) {
+      if (typeof title === 'string' && title.trim().length > 0) out.push(title);
+    }
+  }
+  if (typeof node.label === 'string' && node.label.trim().length > 0) out.push(node.label);
+  return out;
+};
+
+const bestRank = (query: string, texts: readonly string[]): number => {
+  let best = -1;
+  for (const text of texts) {
+    const score = rank(query, text);
+    if (score > best) best = score;
+  }
+  return best;
+};
 
 const sourceLabelForRecallHit = (hit: RecallSearchHit): string =>
   hit.sourceKind === 'page-content' ? 'Page' : 'Thread';
@@ -135,6 +161,7 @@ export const SearchTab = ({
   const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<ConnectionNodeKind>>(
     () => new Set<ConnectionNodeKind>(),
   );
+  const [browseLimit, setBrowseLimit] = useState<number>(BROWSE_PAGE_SIZE);
   const trimmed = query.trim();
 
   useEffect(() => {
@@ -145,12 +172,18 @@ export const SearchTab = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Restart pagination whenever the browse set changes (a kind toggle or
+  // the query going (non-)empty) so "Show more" never strands an offset.
+  useEffect(() => {
+    setBrowseLimit(BROWSE_PAGE_SIZE);
+  }, [hiddenKinds, trimmed]);
+
   const titleHits = useMemo<readonly SearchHit[]>(() => {
     if (trimmed.length === 0) return [];
     const byId = new Map<string, SearchHit>();
     for (const node of nodes) {
       const display = formatEntityDisplay(node, ctx);
-      const score = rank(trimmed, display.primary);
+      const score = bestRank(trimmed, [display.primary, ...auxSearchTextsFor(node)]);
       if (score < 0) continue;
       byId.set(node.id, {
         id: node.id,
@@ -208,7 +241,7 @@ export const SearchTab = ({
     return [...byId.values()].slice(0, 8);
   }, [ctx, extras, nodes]);
 
-  const kindCounts = useMemo(() => {
+  const kindIndex = useMemo(() => {
     const counts = new Map<ConnectionNodeKind, number>();
     for (const node of nodes) counts.set(node.kind, (counts.get(node.kind) ?? 0) + 1);
     for (const extra of extras) {
@@ -219,14 +252,20 @@ export const SearchTab = ({
       const kind = kindForRecallHit(hit);
       counts.set(kind, (counts.get(kind) ?? 0) + 1);
     }
-    return [...counts.entries()]
-      .sort(
-        (left, right) =>
-          right[1] - left[1] ||
-          nodeKindDisplayFor(left[0]).label.localeCompare(nodeKindDisplayFor(right[0]).label),
-      )
-      .slice(0, 8);
+    return [...counts.entries()].sort(
+      (left, right) =>
+        right[1] - left[1] ||
+        nodeKindDisplayFor(left[0]).label.localeCompare(nodeKindDisplayFor(right[0]).label),
+    );
   }, [extras, nodes, recallHits]);
+
+  // The checkbox list shows the top kinds only; "Deselect all" must hide
+  // EVERY kind present (including ones past the visible cap) so the
+  // results truly empty out.
+  const kindCounts = useMemo(() => kindIndex.slice(0, 8), [kindIndex]);
+  const allKinds = useMemo(() => kindIndex.map(([kind]) => kind), [kindIndex]);
+  const allKindsShown = hiddenKinds.size === 0;
+  const noKindsShown = allKinds.length > 0 && allKinds.every((kind) => hiddenKinds.has(kind));
 
   const filteredTitleHits = useMemo(
     () => titleHits.filter((hit) => !hiddenKinds.has(hit.kind)),
@@ -243,8 +282,52 @@ export const SearchTab = ({
     [hiddenKinds, recallHits],
   );
 
-  const titleCountLabel =
-    trimmed.length === 0 ? 'Quick picks' : `Title matches · ${String(filteredTitleHits.length)}`;
+  // Every node + named anchor as a hit, sorted by title. Drives the
+  // empty-query browse list (e.g. "all 87 topics"). Memoized on the
+  // snapshot, not on the kind filter, so toggling kinds is cheap.
+  const browseAll = useMemo<readonly SearchHit[]>(() => {
+    const byId = new Map<string, SearchHit>();
+    for (const node of nodes) {
+      const display = formatEntityDisplay(node, ctx);
+      byId.set(node.id, {
+        id: node.id,
+        primary: display.primary,
+        ...(display.secondary === undefined ? {} : { secondary: display.secondary }),
+        kind: node.kind,
+        score: 0,
+        ...(urlForNode(node) === undefined ? {} : { url: urlForNode(node) }),
+      });
+    }
+    for (const extra of extras) {
+      if (byId.has(extra.id)) continue;
+      const kind = isConnectionNodeKind(extra.kind) ? extra.kind : kindFromAnchorId(extra.id);
+      byId.set(extra.id, {
+        id: extra.id,
+        primary: extra.label,
+        ...(extra.meta === undefined ? {} : { secondary: extra.meta }),
+        kind,
+        score: 0,
+        ...(urlFromNodeId(extra.id) === undefined ? {} : { url: urlFromNodeId(extra.id) }),
+      });
+    }
+    return [...byId.values()].sort((left, right) => left.primary.localeCompare(right.primary));
+  }, [ctx, extras, nodes]);
+
+  const filteredBrowse = useMemo(
+    () => browseAll.filter((hit) => !hiddenKinds.has(hit.kind)),
+    [browseAll, hiddenKinds],
+  );
+
+  // Browse mode = no query AND the kind filter is narrowed. With every
+  // kind shown an empty query keeps the small "Quick picks" teaser
+  // rather than dumping the entire snapshot.
+  const browsing = trimmed.length === 0 && hiddenKinds.size > 0;
+
+  const titleCountLabel = browsing
+    ? `Browsing · ${String(filteredBrowse.length)}`
+    : trimmed.length === 0
+      ? 'Quick picks'
+      : `Title matches · ${String(filteredTitleHits.length)}`;
   const recallCountLabel = recallLoading
     ? 'Content matches · searching…'
     : `Content matches · ${String(filteredRecallHits.length)}`;
@@ -326,7 +409,7 @@ export const SearchTab = ({
                 pickTop();
               }
             }}
-            placeholder="Find by title — type to filter…"
+            placeholder="Search the graph by title…"
             aria-label="Search connections"
             data-testid="connections-search-tab-input"
           />
@@ -346,7 +429,7 @@ export const SearchTab = ({
         {loading || recallLoading ? (
           <span className="cx-search-tab-status cx-mono cx-dim">
             <span className="cx-search-tab-pulse" aria-hidden />
-            {loading ? 'Searching the whole vault…' : 'recall hits loading…'}
+            {loading ? 'Searching…' : 'Searching…'}
           </span>
         ) : null}
         <span className="cx-grow" />
@@ -367,6 +450,31 @@ export const SearchTab = ({
           </div>
           <div className="cx-section cx-section-last">
             <h4>Object kind</h4>
+            <div className="cx-search-tab-kind-controls">
+              <button
+                type="button"
+                className="cx-search-tab-kind-toggle"
+                onClick={() => {
+                  setHiddenKinds(new Set<ConnectionNodeKind>());
+                }}
+                disabled={allKindsShown}
+                data-testid="connections-search-kind-select-all"
+              >
+                Select all
+              </button>
+              <span aria-hidden>·</span>
+              <button
+                type="button"
+                className="cx-search-tab-kind-toggle"
+                onClick={() => {
+                  setHiddenKinds(new Set<ConnectionNodeKind>(allKinds));
+                }}
+                disabled={noKindsShown}
+                data-testid="connections-search-kind-deselect-all"
+              >
+                Deselect all
+              </button>
+            </div>
             <div className="cx-search-tab-kind-list">
               {kindCounts.map(([kind, count]) => {
                 const display = nodeKindDisplayFor(kind);
@@ -402,14 +510,27 @@ export const SearchTab = ({
           <section className="cx-search-tab-section">
             <div className="cx-search-tab-section-head">
               <h3>{titleCountLabel}</h3>
-              {trimmed.length > 0 ? (
+              {trimmed.length > 0 || browsing ? (
                 <span className="cx-mono cx-dim">
                   {String(searchNodesDescription(nodes.length, extras.length))}
                 </span>
               ) : null}
             </div>
             <div className="cx-search-tab-list">
-              {(trimmed.length === 0 ? filteredQuickPicks : filteredTitleHits).map(renderTitleHit)}
+              {(browsing
+                ? filteredBrowse.slice(0, browseLimit)
+                : trimmed.length === 0
+                  ? filteredQuickPicks
+                  : filteredTitleHits
+              ).map(renderTitleHit)}
+              {browsing && filteredBrowse.length === 0 ? (
+                <div
+                  className="cx-search-tab-empty"
+                  data-testid="connections-search-tab-browse-empty"
+                >
+                  No objects of the selected kind in the loaded snapshot.
+                </div>
+              ) : null}
               {trimmed.length > 0 && filteredTitleHits.length === 0 ? (
                 <div
                   className="cx-search-tab-empty"
@@ -420,6 +541,19 @@ export const SearchTab = ({
                 </div>
               ) : null}
             </div>
+            {browsing && filteredBrowse.length > browseLimit ? (
+              <button
+                type="button"
+                className="cx-search-tab-more"
+                onClick={() => {
+                  setBrowseLimit((current) => current + BROWSE_PAGE_SIZE);
+                }}
+                data-testid="connections-search-tab-show-more"
+              >
+                Show {String(Math.min(BROWSE_PAGE_SIZE, filteredBrowse.length - browseLimit))} more
+                · {String(filteredBrowse.length - browseLimit)} remaining
+              </button>
+            ) : null}
           </section>
           <section className="cx-search-tab-section">
             <div className="cx-search-tab-section-head">
