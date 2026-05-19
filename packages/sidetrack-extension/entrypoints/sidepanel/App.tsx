@@ -18,12 +18,20 @@ import {
   isWorkboardChangedMessage,
   messageTypes,
   type AnnotateTurnResponse,
+  type PageContentBulkOperationResponse,
+  type PageContentOpenTabPreview,
+  type PageContentOpenTabsPreviewResponse,
+  type PageContentOperationResponse,
   type PublishAnnotationToChatResponse,
   type RecallQueryResponse,
   type RuntimeResponse,
   type WorkboardRequest,
 } from '../../src/messages';
-import { canonicalThreadUrl, detectProviderFromUrl } from '../../src/capture/providerDetection';
+import {
+  canonicalThreadUrl,
+  detectProviderFromUrl,
+  isProviderThreadUrl,
+} from '../../src/capture/providerDetection';
 import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
   CodingAttach,
@@ -87,7 +95,19 @@ import {
   ConnectionsView,
   type FocusGroupSaveInput,
 } from '../../src/sidepanel/connections/ConnectionsView';
+import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
+import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
+import { resolveFocusedUrlRecord } from '../../src/sidepanel/inbox/focusedUrlRecord';
+import { withEffectiveThreadWorkstream } from '../../src/sidepanel/inbox/effectiveThreadWorkstream';
+import {
+  clearOptimisticDecision,
+  hasOptimisticDecision,
+  isReconciled,
+  setOptimisticDecision,
+  withOptimisticAttribution,
+  type OptimisticDecisions,
+} from '../../src/sidepanel/inbox/optimisticAttribution';
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
@@ -96,7 +116,6 @@ import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTi
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
 import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBadge';
-import { SuggestionBanner } from '../../src/sidepanel/tabsession/SuggestionBanner';
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
@@ -700,6 +719,9 @@ const App = () => {
   // via its requestAnchor prop; when set non-empty, the view auto-anchors
   // there. `inboxSearchRequest` is similar for InboxView's initialQuery.
   const [connectionsAnchorRequest, setConnectionsAnchorRequest] = useState<string>('');
+  // Bumped to focus the Connections SearchTab from the global top-bar
+  // search button (so it doesn't open a 2nd search panel on that page).
+  const [connectionsSearchRequest, setConnectionsSearchRequest] = useState<number>(0);
   const [inboxSearchRequest, setInboxSearchRequest] = useState<string>('');
   // #4 — the current-tab attribution card only belongs in the Inbox
   // context, and is collapsible there.
@@ -843,6 +865,11 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  // Optimistic-attribution overlay: the moment the user decides, the
+  // inbox row + current-tab card show the FINAL state and stop
+  // re-resolving until the server projection reconciles (then this is
+  // cleared with no visible change). Kills the pick→flicker→settle lag.
+  const [optimisticDecisions, setOptimisticDecisions] = useState<OptimisticDecisions>({});
   const [livePageEvidenceByUrl, setLivePageEvidenceByUrl] = useState<
     Record<string, TabSessionPageEvidenceSummary>
   >({});
@@ -1361,6 +1388,25 @@ const App = () => {
   //
   // The cache is invalidated entirely on user mutation (attribution,
   // dismiss) because those change the resolver inputs.
+  //
+  // Negative cache (resolve-flood guard). Empty resolutions are
+  // deliberately NOT cached as results (so they self-heal when the
+  // materializer finally folds the visit). But `state.updatedAt` is a
+  // fresh nonce on every getWorkboardState, so the refetch effects
+  // re-fire constantly and every still-empty URL/tab-session (e.g. a
+  // non-provider blog the resolver will never attribute) was
+  // re-resolved on EVERY pass — the same urls 30+×/min, each a full
+  // PPR+cluster+ranker run, pegging the companion to 99% CPU. Record
+  // when a key last resolved empty and skip re-resolving it for a
+  // short TTL. forceRefetch (user mutation / snapshot-revision watcher)
+  // ignores this, and the TTL lapses, so genuinely-late drains are
+  // still picked up — just not hammered every pass.
+  const emptyResolveAtRef = useRef<Map<string, number>>(new Map());
+  const EMPTY_RESOLVE_TTL_MS = 60_000;
+  const recentlyResolvedEmpty = useCallback((key: string): boolean => {
+    const at = emptyResolveAtRef.current.get(key);
+    return at !== undefined && Date.now() - at < EMPTY_RESOLVE_TTL_MS;
+  }, []);
   const loadTabSessionSuggestions = useCallback(
     async (
       projection: TabSessionProjection,
@@ -1385,7 +1431,7 @@ const App = () => {
         if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
       }
       const idsToFetch = [...recordsById.keys()].filter((id) =>
-        forceRefetch ? true : next[id] === undefined,
+        forceRefetch ? true : next[id] === undefined && !recentlyResolvedEmpty(id),
       );
       const fetched = await mapWithConcurrency(idsToFetch, 4, async (tabSessionId) => {
         try {
@@ -1400,19 +1446,20 @@ const App = () => {
       for (const entry of fetched) {
         if (entry === null) continue;
         const [id, result] = entry;
-        // Skip caching empty results. An empty resolution most often
-        // means the materializer hasn't folded the new visit into the
-        // snapshot yet (materializer drains run async in a child
-        // process). If we cached an empty result we'd stick on
-        // "No signal yet" forever — the snapshot.revision watcher
-        // will force a refetch when the drain lands, and any unrelated
-        // refresh trigger in the meantime gets a fresh attempt too.
-        if (result.fusedCandidates.length === 0) continue;
+        // Empty results still aren't cached as results (self-heal),
+        // but we stamp the negative cache so the resolve-flood guard
+        // skips re-resolving this id for EMPTY_RESOLVE_TTL_MS instead
+        // of hammering it every refetch pass.
+        if (result.fusedCandidates.length === 0) {
+          emptyResolveAtRef.current.set(id, Date.now());
+          continue;
+        }
+        emptyResolveAtRef.current.delete(id);
         next[id] = result;
       }
       return next;
     },
-    [fetchCompanionJson, mapWithConcurrency],
+    [fetchCompanionJson, mapWithConcurrency, recentlyResolvedEmpty],
   );
 
   // Resolve every unattributed URL in the Inbox so the cards can show
@@ -1436,7 +1483,7 @@ const App = () => {
         if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
       }
       const toFetch = canonicalUrls.filter((url) =>
-        forceRefetch ? true : next[url] === undefined,
+        forceRefetch ? true : next[url] === undefined && !recentlyResolvedEmpty(url),
       );
       const fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
         try {
@@ -1451,16 +1498,19 @@ const App = () => {
       for (const entry of fetched) {
         if (entry === null) continue;
         const [url, result] = entry;
-        // Same self-heal as the tab-session cache: empty results
-        // usually mean the materializer hasn't drained the new visit
-        // yet. Don't cache them; let snapshot.revision changes (or
-        // any other refresh trigger) force a refetch.
-        if (result.fusedCandidates.length === 0) continue;
+        // Same self-heal as the tab-session cache (empties uncached),
+        // plus the negative-cache stamp so the resolve-flood guard
+        // skips re-resolving this url for EMPTY_RESOLVE_TTL_MS.
+        if (result.fusedCandidates.length === 0) {
+          emptyResolveAtRef.current.set(url, Date.now());
+          continue;
+        }
+        emptyResolveAtRef.current.delete(url);
         next[url] = result;
       }
       return next;
     },
-    [fetchCompanionJson, mapWithConcurrency],
+    [fetchCompanionJson, mapWithConcurrency, recentlyResolvedEmpty],
   );
 
   // Per-row refresh: re-resolves a single URL's suggestion without
@@ -1624,17 +1674,26 @@ const App = () => {
     [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
   );
 
-  // Stage 5 follow-up — `state.updatedAt` and `viewMode` are reactive
-  // (workboard state bumps, panel-tab switches), not user-initiated
-  // loads. Firing the foreground loader here flipped
-  // `tabSessionLoading` every time an attribution landed, which made
-  // the "Loading tab sessions…" line appear above the existing cards
-  // and shift them down. Use background mode; the InboxView still
-  // shows a loading skeleton when there's no projection yet.
+  // STRUCTURAL CPU FIX (root of the recurring "lack of response").
+  // This effect used to depend on `state.updatedAt` — but that is a
+  // fresh `new Date()` nonce minted on EVERY getWorkboardState (every
+  // workboard broadcast: attribution, reminder, capture, ambient
+  // tab event …). So every broadcast re-ran loadTabSessions, which
+  // re-resolves EVERY unattributed URL + tab-session. Under active
+  // browsing the graph genuinely changes every few seconds, so this
+  // became a sustained burst of resolve-pipeline runs (+19MB snapshot
+  // parses) on the companion's single JS event loop → /status
+  // starved → "did not respond within 45s". The legitimate refresh
+  // triggers already exist WITHOUT the nonce: the snapshot-revision
+  // watcher below (content actually changed), the push-on-navigation
+  // effect, and the explicit forceRefetch on user mutations. So this
+  // effect now fires only on the things that genuinely need a full
+  // (re)load: initial connect and a user view switch — NOT the
+  // per-broadcast nonce.
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
     void loadTabSessions({ background: true });
-  }, [loadTabSessions, state.companionStatus, state.updatedAt, viewMode]);
+  }, [loadTabSessions, state.companionStatus, viewMode]);
 
   // Watch the companion's snapshot revision. When the materializer
   // produces a new snapshot (typically 1-5s after a freshly visited
@@ -2535,6 +2594,40 @@ const App = () => {
 
   // Per-canonical-URL attribution (Phase B). The Inbox + Current-tab
   // card now route through here — they attribute the PAGE, not the tab.
+  // Read-your-writes: the decision POST already returns the freshly
+  // re-folded URL projection. Apply it (and drop the now-answered
+  // suggestion) immediately so the inbox / current-tab card reflects
+  // the choice on the first round-trip, instead of staying stale until
+  // the slow loadTabSessions + workboard refetch chain resolves. The
+  // awaited refetch below still runs and reconciles.
+  const applyUrlDecisionResponse = async (
+    response: Response,
+    canonicalUrl: string,
+  ): Promise<void> => {
+    setUrlSuggestions((current) => {
+      if (!(canonicalUrl in current)) return current;
+      const next = { ...current };
+      delete next[canonicalUrl];
+      return next;
+    });
+    // The Inbox LIST renders from urlInbox.items (a separately fetched
+    // array), NOT urlProjection — so without pruning it here the
+    // decided row lingered until the slow refetch ("stumbled a while
+    // until disappear"). Drop it immediately; the awaited refetch
+    // reconciles.
+    setUrlInbox((current) => {
+      const items = current.items.filter((item) => item.canonicalUrl !== canonicalUrl);
+      if (items.length === current.items.length) return current;
+      return { ...current, items, total: Math.max(0, current.total - 1) };
+    });
+    try {
+      const body = (await response.json()) as { readonly data?: { readonly projection?: unknown } };
+      if (isUrlProjection(body.data?.projection)) setUrlProjection(body.data.projection);
+    } catch {
+      /* optimistic only — the awaited refetch reconciles on failure */
+    }
+  };
+
   const attributeUrlToWorkstream = async (
     canonicalUrl: string,
     workstreamId: string | null,
@@ -2560,6 +2653,7 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL attribution failed (${String(response.status)}).`);
     }
+    await applyUrlDecisionResponse(response, canonicalUrl);
     // User mutation — refetch resolver suggestions (cache is stale).
     await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
@@ -2627,7 +2721,28 @@ const App = () => {
   // `tabSessionRecordFromUrl` in this file. This dispatches to the
   // per-URL attribution endpoint.
   const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
-    void runAction(() => attributeUrlToWorkstream(canonicalUrl, workstreamId));
+    setOptimisticDecisions((current) =>
+      setOptimisticDecision(
+        current,
+        canonicalUrl,
+        workstreamId === null ? { kind: 'none' } : { kind: 'workstream', workstreamId },
+      ),
+    );
+    // Do NOT clear on POST-settle: the URL-suggestion refetch is
+    // fire-and-forget (loadUrlState/loadUrlSuggestions) and lands
+    // LATER with the stale resolver hit, so clearing here let the
+    // suggestion re-appear (the "snaps then flips, not stable"). The
+    // reconcile effect drops the overlay only once urlProjection
+    // actually reflects the decision (isReconciled) — zero-visible-
+    // change. Rollback happens here ONLY on a confirmed failure.
+    void runAction(async () => {
+      try {
+        return await attributeUrlToWorkstream(canonicalUrl, workstreamId);
+      } catch (error) {
+        setOptimisticDecisions((current) => clearOptimisticDecision(current, canonicalUrl));
+        throw error;
+      }
+    });
   };
 
   const handleFocusGroupSave = async (input: FocusGroupSaveInput): Promise<void> => {
@@ -2711,6 +2826,7 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL ignore failed (${String(response.status)}).`);
     }
+    await applyUrlDecisionResponse(response, canonicalUrl);
     await loadTabSessions({ forceRefetchSuggestions: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
   };
@@ -2719,7 +2835,20 @@ const App = () => {
     canonicalUrl: string,
     reason: 'noise' | 'duplicate' | 'private' = 'noise',
   ) => {
-    void runAction(() => ignoreUrl(canonicalUrl, reason));
+    setOptimisticDecisions((current) =>
+      setOptimisticDecision(current, canonicalUrl, { kind: 'ignored', reason }),
+    );
+    // Same contract as handleUrlAttribute: reconcile effect drops the
+    // overlay when urlProjection reflects the ignore; rollback here
+    // only on confirmed failure.
+    void runAction(async () => {
+      try {
+        return await ignoreUrl(canonicalUrl, reason);
+      } catch (error) {
+        setOptimisticDecisions((current) => clearOptimisticDecision(current, canonicalUrl));
+        throw error;
+      }
+    });
   };
 
   // Stage 5 polish — "Dump panel state" button handler. Collects the
@@ -3012,6 +3141,15 @@ const App = () => {
         }
         const match = state.threads.find((t) => t.threadUrl === url);
         if (match === undefined) {
+          // A regular (non-chat-thread) page has no thread row — route
+          // to the Inbox, where the current-tab attribution card
+          // surfaces it, instead of erroring. Chat-thread URLs that
+          // just aren't tracked yet keep the explanatory error.
+          if (!isProviderThreadUrl(detectProviderFromUrl(url), url)) {
+            setFindPulseDismissedUrl(url);
+            requestSwitchToInbox(canonicalThreadUrl(url));
+            return;
+          }
           setError(
             'The active tab is not a tracked thread. Open one of your tracked chats and try again.',
           );
@@ -3957,82 +4095,267 @@ const App = () => {
           ),
     [urlProjection],
   );
-  const focusedUrlRecord = useMemo(() => {
-    if (focusedTabUrl === null) return undefined;
-    // `byCanonicalUrl` is keyed by exact canonical URL; the comparable
-    // form may differ (canonicalThreadUrl strips fragments). Try both.
-    const direct = urlProjection?.byCanonicalUrl[focusedTabUrl];
-    if (direct !== undefined) return direct;
-    // urlRecords is sorted by lastSeenAt desc.
-    return urlRecords.find((record) => comparableTabUrl(record.canonicalUrl) === focusedTabUrl);
-  }, [focusedTabUrl, urlProjection, urlRecords]);
-  const focusedDisplayUrlRecord = useMemo(() => {
-    if (focusedUrlRecord !== undefined) return focusedUrlRecord;
-    if (focusedTabUrl === null) return undefined;
-    return urlRecordFromLiveTab({
-      canonicalUrl: focusedTabUrl,
-      liveUrl:
-        liveActiveTabUrl ??
-        state.activeTabUrl ??
-        state.currentTab?.tabSnapshot?.url ??
-        state.currentTab?.threadUrl ??
+  // Single source of truth for the focused tab's record (was two
+  // disagreeing memos whose synthetic fallback dropped the
+  // attribution → an already-filed page kept re-asking). Pure +
+  // unit-tested in src/sidepanel/inbox/focusedUrlRecord.ts.
+  const focusedDisplayUrlRecord = useMemo(
+    () =>
+      resolveFocusedUrlRecord({
         focusedTabUrl,
-      title:
-        liveActiveTabTitle ??
-        state.currentTab?.tabSnapshot?.title ??
-        state.currentTab?.title ??
-        undefined,
-      pageEvidence: livePageEvidenceByUrl[focusedTabUrl],
-    });
-  }, [
-    focusedTabUrl,
-    focusedUrlRecord,
-    liveActiveTabTitle,
-    liveActiveTabUrl,
-    livePageEvidenceByUrl,
-    state.activeTabUrl,
-    state.currentTab?.tabSnapshot?.title,
-    state.currentTab?.tabSnapshot?.url,
-    state.currentTab?.threadUrl,
-    state.currentTab?.title,
-  ]);
-  const focusedTabSession = useMemo(
+        projection: urlProjection,
+        comparable: comparableTabUrl,
+        synthesize: () =>
+          urlRecordFromLiveTab({
+            canonicalUrl: focusedTabUrl ?? '',
+            liveUrl:
+              liveActiveTabUrl ??
+              state.activeTabUrl ??
+              state.currentTab?.tabSnapshot?.url ??
+              state.currentTab?.threadUrl ??
+              focusedTabUrl ??
+              '',
+            title:
+              liveActiveTabTitle ??
+              state.currentTab?.tabSnapshot?.title ??
+              state.currentTab?.title ??
+              undefined,
+            pageEvidence: livePageEvidenceByUrl[focusedTabUrl ?? ''],
+          }),
+      }),
+    [
+      focusedTabUrl,
+      urlProjection,
+      liveActiveTabTitle,
+      liveActiveTabUrl,
+      livePageEvidenceByUrl,
+      state.activeTabUrl,
+      state.currentTab?.tabSnapshot?.title,
+      state.currentTab?.tabSnapshot?.url,
+      state.currentTab?.threadUrl,
+      state.currentTab?.title,
+    ],
+  );
+  // Stable, display-only timestamp for optimistic overlays (the value
+  // is never rendered; a fixed string keeps memo identity stable).
+  const optimisticIso = useMemo(() => new Date().toISOString(), []);
+  // The current-tab card persists (it always shows the focused tab),
+  // so it must reflect a just-made decision instantly. Overlay it +
+  // suppress the suggestion until reconcile → no flicker / no
+  // "Checking signals…" after a pick.
+  const focusedRecordEffective = useMemo(
     () =>
       focusedDisplayUrlRecord === undefined
         ? undefined
-        : tabSessionRecordFromUrl(focusedDisplayUrlRecord),
-    [focusedDisplayUrlRecord],
+        : withOptimisticAttribution(
+            focusedDisplayUrlRecord,
+            optimisticDecisions[focusedDisplayUrlRecord.canonicalUrl],
+            optimisticIso,
+          ),
+    [focusedDisplayUrlRecord, optimisticDecisions, optimisticIso],
   );
+  const focusedTabSession = useMemo(
+    () =>
+      focusedRecordEffective === undefined
+        ? undefined
+        : tabSessionRecordFromUrl(focusedRecordEffective),
+    [focusedRecordEffective],
+  );
+
+  // ── task #50 Stage 2 — PageTextPanel on the current-tab card.
+  // The SAME presentational <PageTextPanel> ConnectionsView mounts on
+  // a graph anchor, driven here against the LIVE current tab. The
+  // controller is ported verbatim from ConnectionsView (coverage
+  // fetch + the page-content message dispatches + busy/bulk/error
+  // state); refresh() → a background tab-session reload so the card's
+  // evidence badge refreshes too.
+  const currentTabCanonicalUrl = focusedRecordEffective?.canonicalUrl ?? null;
+  const [currentTabPageTextOpen, setCurrentTabPageTextOpen] = useState(false);
+  const [currentTabCoverage, setCurrentTabCoverage] = useState<PageContentCoverage | null>(null);
+  const [currentTabPageContentBusy, setCurrentTabPageContentBusy] = useState<
+    'index' | 'selection' | 'delete' | null
+  >(null);
+  const [currentTabBulkBusy, setCurrentTabBulkBusy] = useState<'preview' | 'index' | null>(null);
+  const [currentTabBulkPreview, setCurrentTabBulkPreview] = useState<
+    readonly PageContentOpenTabPreview[] | null
+  >(null);
+  const [currentTabPageContentError, setCurrentTabPageContentError] = useState<string | null>(null);
+  const currentTabCardRef = useRef<HTMLElement | null>(null);
+  const [currentTabFocusing, setCurrentTabFocusing] = useState(false);
+
+  useEffect(() => {
+    if (currentTabCanonicalUrl === null) {
+      setCurrentTabCoverage(null);
+      setCurrentTabBulkPreview(null);
+      return;
+    }
+    if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
+    let active = true;
+    // Clear stale coverage while the new URL's fetch is in flight so
+    // the card never shows the previous page's index state.
+    setCurrentTabCoverage(null);
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentCoverage, canonicalUrl: currentTabCanonicalUrl },
+      (response: unknown) => {
+        if (!active) return;
+        const parsed = response as PageContentOperationResponse;
+        setCurrentTabCoverage(
+          parsed.ok && parsed.coverage !== undefined ? parsed.coverage : null,
+        );
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [currentTabCanonicalUrl]);
+
+  const runCurrentTabPageContentAction = (
+    type:
+      | typeof messageTypes.pageContentIndexCurrent
+      | typeof messageTypes.pageContentIndexSelection
+      | typeof messageTypes.pageContentDelete,
+  ): void => {
+    if (type === messageTypes.pageContentDelete && currentTabCanonicalUrl === null) return;
+    setCurrentTabPageContentBusy(
+      type === messageTypes.pageContentDelete
+        ? 'delete'
+        : type === messageTypes.pageContentIndexSelection
+          ? 'selection'
+          : 'index',
+    );
+    setCurrentTabPageContentError(null);
+    const message =
+      type === messageTypes.pageContentDelete
+        ? { type, canonicalUrl: currentTabCanonicalUrl }
+        : { type };
+    chrome.runtime.sendMessage(message, (response: unknown) => {
+      setCurrentTabPageContentBusy(null);
+      const lastError = chrome.runtime.lastError;
+      if (lastError !== undefined) {
+        setCurrentTabPageContentError(lastError.message ?? 'Page-content operation failed.');
+        return;
+      }
+      const parsed = response as PageContentOperationResponse;
+      if (parsed.ok && parsed.coverage !== undefined) {
+        setCurrentTabCoverage(parsed.coverage);
+        void loadTabSessions({ background: true });
+        return;
+      }
+      setCurrentTabPageContentError(parsed.error ?? 'Page-content operation failed.');
+    });
+  };
+
+  const loadCurrentTabBulkPreview = (): void => {
+    setCurrentTabBulkBusy('preview');
+    setCurrentTabPageContentError(null);
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentOpenTabsPreview },
+      (response: unknown) => {
+        setCurrentTabBulkBusy(null);
+        const lastError = chrome.runtime.lastError;
+        if (lastError !== undefined) {
+          setCurrentTabPageContentError(lastError.message ?? 'Open-tab preview failed.');
+          return;
+        }
+        const parsed = response as PageContentOpenTabsPreviewResponse;
+        if (!parsed.ok) {
+          setCurrentTabPageContentError(parsed.error ?? 'Open-tab preview failed.');
+          return;
+        }
+        setCurrentTabBulkPreview(parsed.tabs);
+      },
+    );
+  };
+
+  const runCurrentTabBulkIndex = (): void => {
+    setCurrentTabBulkBusy('index');
+    setCurrentTabPageContentError(null);
+    chrome.runtime.sendMessage(
+      { type: messageTypes.pageContentIndexOpenTabs },
+      (response: unknown) => {
+        setCurrentTabBulkBusy(null);
+        const lastError = chrome.runtime.lastError;
+        if (lastError !== undefined) {
+          setCurrentTabPageContentError(lastError.message ?? 'Open-tab indexing failed.');
+          return;
+        }
+        const parsed = response as PageContentBulkOperationResponse;
+        if (parsed.coverages.length > 0) {
+          const match =
+            currentTabCanonicalUrl === null
+              ? undefined
+              : parsed.coverages.find((c) => c.canonicalUrl === currentTabCanonicalUrl);
+          if (match !== undefined) setCurrentTabCoverage(match);
+          void loadTabSessions({ background: true });
+        }
+        setCurrentTabBulkPreview(null);
+        if (!parsed.ok && parsed.error !== undefined) {
+          setCurrentTabPageContentError(parsed.error);
+        }
+      },
+    );
+  };
+
+  // Highlight: scroll the current-tab card into view + flash the
+  // `.focusing` accent (same affordance as a thread-row Jump) when
+  // auto page-text capture is on, so the user sees where the evidence
+  // they just enabled/triggered lands. Mirrors scrollAndFlashThread.
+  const prevFocusedEvidenceUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!state.settings.pageEvidenceAutoExtractEnabled) return;
+    const url = focusedRecordEffective?.canonicalUrl ?? null;
+    const hasEvidence = focusedTabSession?.pageEvidence !== undefined;
+    if (url === null) {
+      prevFocusedEvidenceUrlRef.current = null;
+      return;
+    }
+    if (hasEvidence && prevFocusedEvidenceUrlRef.current !== url) {
+      prevFocusedEvidenceUrlRef.current = url;
+      window.setTimeout(() => {
+        currentTabCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setCurrentTabFocusing(true);
+        window.setTimeout(() => {
+          setCurrentTabFocusing(false);
+        }, 1500);
+      }, 120);
+    }
+  }, [
+    focusedRecordEffective?.canonicalUrl,
+    focusedTabSession?.pageEvidence,
+    state.settings.pageEvidenceAutoExtractEnabled,
+  ]);
   const focusedTabSuggestion =
-    focusedDisplayUrlRecord === undefined
+    focusedDisplayUrlRecord === undefined ||
+    hasOptimisticDecision(optimisticDecisions, focusedDisplayUrlRecord.canonicalUrl)
       ? undefined
       : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
-  const focusedSuggestionIsActionable =
-    focusedDisplayUrlRecord !== undefined &&
-    focusedDisplayUrlRecord.currentAttribution === undefined &&
-    focusedTabSuggestion?.decision.action === 'suggest' &&
-    focusedTabSuggestion.decision.workstreamId !== undefined;
-  const fallbackSuggestedUrl = useMemo(
-    () =>
-      urlRecords.find((record) => {
-        const suggestion = urlSuggestions[record.canonicalUrl];
-        return (
-          record.currentAttribution === undefined &&
-          suggestion?.decision.action === 'suggest' &&
-          suggestion.decision.workstreamId !== undefined
-        );
-      }),
-    [urlRecords, urlSuggestions],
-  );
-  const suggestedOpenUrl = focusedSuggestionIsActionable
-    ? focusedDisplayUrlRecord
-    : fallbackSuggestedUrl;
-  const suggestedOpenTabSession = useMemo(
-    () => (suggestedOpenUrl === undefined ? undefined : tabSessionRecordFromUrl(suggestedOpenUrl)),
-    [suggestedOpenUrl],
-  );
-  const suggestedOpenTabSessionResolution =
-    suggestedOpenUrl === undefined ? undefined : urlSuggestions[suggestedOpenUrl.canonicalUrl];
+  // Reconcile gate (Theme A, completed). Every optimistic entry is
+  // keyed by canonicalUrl (URL inbox items carry the canonical URL as
+  // tabSessionId; the real tab-session handler doesn't use the
+  // overlay), so urlProjection.byCanonicalUrl is the authoritative
+  // record for all of them. Drop an entry only once the projection
+  // reflects the decision — until then the suggestion stays
+  // suppressed, so a late fire-and-forget suggestion refetch can't
+  // make the card "snap then flip".
+  useEffect(() => {
+    if (urlProjection === null) return;
+    setOptimisticDecisions((current) => {
+      let next = current;
+      for (const canonicalUrl of Object.keys(current)) {
+        const record = urlProjection.byCanonicalUrl[canonicalUrl];
+        const decision = current[canonicalUrl];
+        if (record !== undefined && decision !== undefined && isReconciled(record, decision)) {
+          next = clearOptimisticDecision(next, canonicalUrl);
+        }
+      }
+      return next;
+    });
+  }, [urlProjection]);
+  // (Removed with the duplicate SuggestionBanner: the
+  // focusedSuggestionIsActionable / fallbackSuggestedUrl /
+  // suggestedOpenUrl / suggestedOpenTabSession chain only fed that
+  // now-deleted fallback card. The CURRENT TAB card + inbox rows
+  // already surface the same decision.)
   const currentWorkstreamTabSessions = useMemo(
     () =>
       currentWsId === null
@@ -4043,10 +4366,19 @@ const App = () => {
             .map(tabSessionRecordFromUrl),
     [currentWsId, urlRecords],
   );
+  // "Derive now": a chat filed via the Inbox writes only the URL
+  // attribution; its thread's primaryWorkstreamId stays undefined and
+  // All-threads/Workstream bucket it as ungrouped. Overlay the URL
+  // decision at the DISPLAY/bucketing seam only (write-path reads keep
+  // the raw stored value). One pick now reflects in All-threads.
+  const effectiveThreads = useMemo(
+    () => threads.map((t) => withEffectiveThreadWorkstream(t, urlProjection, canonicalThreadUrl)),
+    [threads, urlProjection],
+  );
   const currentWsThreads = sortThreadsByLifecycle(
     currentWsId === null
-      ? threads.filter((t) => t.primaryWorkstreamId === undefined)
-      : threads.filter((t) => t.primaryWorkstreamId === currentWsId),
+      ? effectiveThreads.filter((t) => t.primaryWorkstreamId === undefined)
+      : effectiveThreads.filter((t) => t.primaryWorkstreamId === currentWsId),
     state.reminders,
   );
   const activeCount = currentWsThreads.filter(
@@ -4067,7 +4399,7 @@ const App = () => {
     const buckets = new Map<AllThreadsBucket, TrackedThread[]>(
       ALL_THREAD_BUCKET_ORDER.map((b) => [b, []] as const),
     );
-    for (const t of threads) {
+    for (const t of effectiveThreads) {
       const bucket = classifyAllThread(t, state.reminders);
       buckets.get(bucket)?.push(t);
     }
@@ -5319,14 +5651,24 @@ const App = () => {
             </svg>
           </button>
           <button
-            className={'icon-btn' + (threadSearchOpen ? ' on' : '')}
-            title="Search indexed threads"
+            className={'icon-btn' + (threadSearchOpen && viewMode !== 'connections' ? ' on' : '')}
+            title={
+              viewMode === 'connections'
+                ? 'Search connections'
+                : 'Search indexed threads'
+            }
             onClick={() => {
+              // On Connections, reuse that view's own SearchTab instead
+              // of opening a second "indexed threads" panel over it.
+              if (viewMode === 'connections') {
+                setConnectionsSearchRequest((n) => n + 1);
+                return;
+              }
               setThreadSearchOpen((open) => !open);
             }}
             type="button"
-            aria-label="Search indexed threads"
-            aria-pressed={threadSearchOpen}
+            aria-label={viewMode === 'connections' ? 'Search connections' : 'Search indexed threads'}
+            aria-pressed={threadSearchOpen && viewMode !== 'connections'}
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
@@ -5805,13 +6147,15 @@ const App = () => {
       {viewMode === 'inbox' ? (
         <>
           <section
+            ref={currentTabCardRef}
             className={
               'tab-attribution-card' +
               (focusedTabSession !== undefined
                 ? ' is-active'
                 : liveActiveTabUrl !== undefined
                   ? ' is-loading'
-                  : ' is-empty')
+                  : ' is-empty') +
+              (currentTabFocusing ? ' focusing' : '')
             }
             data-testid="focused-tab-attribution"
             aria-label="Current tab attribution"
@@ -5827,14 +6171,29 @@ const App = () => {
                     {tabSessionDisplayTitle(focusedTabSession)}
                   </span>
                   {focusedTabSession.pageEvidence === undefined ? (
-                    <span
-                      className="tab-session-capture-badge is-unknown"
-                      title="Capture status: waiting for PageEvidence metadata from the companion."
-                      aria-label="Capture status: pending"
-                      data-testid="page-evidence-capture-badge"
-                    >
-                      Capturing
-                    </span>
+                    state.settings.pageEvidenceAutoExtractEnabled ? (
+                      <span
+                        className="tab-session-capture-badge is-unknown"
+                        title="Indexing this page's text in the background — updates automatically when the companion finishes (the first pass can take a bit)."
+                        aria-label="Capture status: indexing in background"
+                        data-testid="page-evidence-capture-badge"
+                      >
+                        Indexing…
+                      </span>
+                    ) : (
+                      // Auto page-text capture is OFF by default: just
+                      // viewing a page never extracts evidence, so an
+                      // "Indexing…" badge would never resolve. Be honest
+                      // + actionable instead of implying perpetual work.
+                      <span
+                        className="tab-session-capture-badge is-unknown"
+                        title="This page's text isn't indexed. Auto page-text capture is off — turn it on in Settings, or use “Index page” on this card. (Just viewing a page doesn't index it.)"
+                        aria-label="Capture status: not indexed (auto-capture off)"
+                        data-testid="page-evidence-capture-badge"
+                      >
+                        Not indexed
+                      </span>
+                    )
                   ) : (
                     <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
                   )}
@@ -5907,9 +6266,9 @@ const App = () => {
               Renders for any unattributed/un-ignored focused URL — when
               the resolver has no candidates we still draw the empty
               placeholder so the user sees why the badge is "?". */}
-                  {focusedDisplayUrlRecord !== undefined &&
-                  focusedDisplayUrlRecord.currentAttribution === undefined &&
-                  focusedDisplayUrlRecord.currentIgnored === undefined ? (
+                  {focusedRecordEffective !== undefined &&
+                  focusedRecordEffective.currentAttribution === undefined &&
+                  focusedRecordEffective.currentIgnored === undefined ? (
                     <SuggestionStats
                       suggestion={
                         focusedTabSuggestion === undefined
@@ -5926,6 +6285,37 @@ const App = () => {
               has "Pick another…" with the same behavior (opens the
               WorkstreamPicker); rendering both was a duplicate
               affordance the user flagged. */}
+                  {/* task #50 Stage 2 — Page-text / index controls for
+              the LIVE current tab (same panel ConnectionsView mounts
+              on a graph anchor). Renders nothing when the focused URL
+              has no canonical URL (workstream/topic focus). */}
+                  <PageTextPanel
+                    testIdPrefix="current-tab"
+                    canonicalUrl={currentTabCanonicalUrl}
+                    open={currentTabPageTextOpen}
+                    onToggleOpen={() => {
+                      setCurrentTabPageTextOpen((v) => !v);
+                    }}
+                    coverage={currentTabCoverage}
+                    busy={currentTabPageContentBusy}
+                    bulkBusy={currentTabBulkBusy}
+                    error={currentTabPageContentError}
+                    bulkPreview={currentTabBulkPreview}
+                    onIndexPage={() => {
+                      runCurrentTabPageContentAction(messageTypes.pageContentIndexCurrent);
+                    }}
+                    onIndexSelection={() => {
+                      runCurrentTabPageContentAction(messageTypes.pageContentIndexSelection);
+                    }}
+                    onDelete={() => {
+                      runCurrentTabPageContentAction(messageTypes.pageContentDelete);
+                    }}
+                    onBulkPreview={loadCurrentTabBulkPreview}
+                    onBulkIndex={runCurrentTabBulkIndex}
+                    onBulkCancel={() => {
+                      setCurrentTabBulkPreview(null);
+                    }}
+                  />
                 </div>
                 {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the
@@ -5936,26 +6326,31 @@ const App = () => {
             when no suggestion is present. */}
                 {focusedDisplayUrlRecord !== undefined ? (
                   <div className="tab-attribution-card-actions">
-                    {focusedTabSuggestion !== undefined &&
-                    focusedTabSuggestion.decision.workstreamId !== undefined &&
-                    focusedDisplayUrlRecord.currentAttribution === undefined &&
-                    focusedDisplayUrlRecord.currentIgnored === undefined ? (
-                      <button
-                        type="button"
-                        className="tab-attribution-card-action primary"
-                        onClick={() => {
-                          if (focusedTabSuggestion.decision.workstreamId !== undefined) {
-                            handleUrlAttribute(
-                              focusedDisplayUrlRecord.canonicalUrl,
-                              focusedTabSuggestion.decision.workstreamId,
-                            );
-                          }
-                        }}
-                        title="Confirm the suggested workstream"
-                      >
-                        Yes, that's right
-                      </button>
-                    ) : null}
+                    {(() => {
+                      // Confirmable target: the confident decision OR
+                      // the top "Best guess" candidate (mirrors the
+                      // InboxCard fix — "Likely 75%" must be one-click
+                      // confirmable too). Gate on the EFFECTIVE record
+                      // so the button hides the instant you pick.
+                      const suggestedWs =
+                        focusedTabSuggestion?.decision.workstreamId ??
+                        focusedTabSuggestion?.fusedCandidates?.[0]?.workstreamId;
+                      return focusedTabSuggestion !== undefined &&
+                        suggestedWs !== undefined &&
+                        focusedRecordEffective?.currentAttribution === undefined &&
+                        focusedRecordEffective?.currentIgnored === undefined ? (
+                        <button
+                          type="button"
+                          className="tab-attribution-card-action primary"
+                          onClick={() => {
+                            handleUrlAttribute(focusedDisplayUrlRecord.canonicalUrl, suggestedWs);
+                          }}
+                          title="Confirm the suggested workstream"
+                        >
+                          Yes, that's right
+                        </button>
+                      ) : null;
+                    })()}
                     <button
                       type="button"
                       className="tab-attribution-card-action"
@@ -6008,20 +6403,10 @@ const App = () => {
               </>
             ) : null}
           </section>
-
-          {suggestedOpenTabSession !== undefined &&
-          suggestedOpenTabSessionResolution !== undefined ? (
-            <SuggestionBanner
-              record={suggestedOpenTabSession}
-              suggestion={tabSessionResolutionFromUrl(suggestedOpenTabSessionResolution)}
-              workstreams={tabSessionWorkstreams}
-              onAttribute={handleUrlAttribute}
-              onPickAnother={(canonicalUrl) => {
-                setTabSessionMoveId(canonicalUrl);
-              }}
-              onIgnore={handleUrlIgnore}
-            />
-          ) : null}
+          {/* Removed: the duplicate SuggestionBanner fallback card. It
+              re-rendered the same workstream decision already shown by
+              the CURRENT TAB card and the inbox row below (the
+              confusing triple-ask). */}
         </>
       ) : null}
 
@@ -6042,7 +6427,7 @@ const App = () => {
             <input
               type="search"
               className="thread-search-input mono"
-              placeholder="Search indexed threads"
+              placeholder="Search indexed threads…"
               value={threadSearchQuery}
               onChange={(event) => {
                 setThreadSearchQuery(event.target.value);
@@ -6296,6 +6681,7 @@ const App = () => {
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
           requestAnchor={connectionsAnchorRequest}
+          requestSearch={connectionsSearchRequest}
           onRequestConsumed={() => {
             setConnectionsAnchorRequest('');
           }}
@@ -6467,8 +6853,12 @@ const App = () => {
               .map(tabSessionRecordFromUrl)
               .filter(
                 (item) =>
-                  focusedDisplayUrlRecord === undefined ||
-                  item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl,
+                  (focusedDisplayUrlRecord === undefined ||
+                    item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl) &&
+                  // Just-decided rows leave the list at once (matches
+                  // the eventual pruned/attributed state) → no
+                  // "No attribution → That's right → workstream" cycle.
+                  !hasOptimisticDecision(optimisticDecisions, item.tabSessionId),
               ),
             total: urlInbox.total,
             limit: urlInbox.limit,

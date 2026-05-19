@@ -221,7 +221,7 @@ describe('live side-panel App wiring', () => {
 
     await screen.findByRole('main', { name: 'Sidetrack workboard' });
     fireEvent.click(screen.getByRole('button', { name: 'Search indexed threads' }));
-    fireEvent.change(screen.getByPlaceholderText('Search indexed threads'), {
+    fireEvent.change(screen.getByPlaceholderText('Search indexed threads…'), {
       target: { value: 'state machine' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
@@ -245,7 +245,7 @@ describe('live side-panel App wiring', () => {
 
     await screen.findByRole('main', { name: 'Sidetrack workboard' });
     fireEvent.click(screen.getByRole('button', { name: 'Search indexed threads' }));
-    fireEvent.change(screen.getByPlaceholderText('Search indexed threads'), {
+    fireEvent.change(screen.getByPlaceholderText('Search indexed threads…'), {
       target: { value: 'missing' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Search' }));
@@ -451,7 +451,7 @@ describe('live side-panel App wiring', () => {
   });
 
   it('renders the tab-session Inbox tab and posts move decisions', async () => {
-    installChromeMock(
+    const sendMessage = installChromeMock(
       {
         ...liveState(),
         companionStatus: 'connected',
@@ -616,6 +616,28 @@ describe('live side-panel App wiring', () => {
         }),
       );
     });
+
+    // task #50 Stage 2 — the SAME <PageTextPanel> ConnectionsView
+    // mounts on a graph anchor is now on the current-tab card, driven
+    // against the live focused URL. Its actions must dispatch the
+    // page-content messages.
+    const currentTabCard = within(
+      screen.getByTestId('focused-tab-attribution'),
+    ).getByTestId('current-tab-page-content-card');
+    expect(currentTabCard).toHaveTextContent('Page text');
+    // Coverage was fetched for the live focused URL (panel is wired to
+    // the current tab, not a graph anchor).
+    expect(sendMessage).toHaveBeenCalledWith(
+      { type: messageTypes.pageContentCoverage, canonicalUrl: 'https://example.test/research' },
+      expect.any(Function),
+    );
+    // Toggle expands; "Index page" dispatches the page-content action.
+    fireEvent.click(within(currentTabCard).getByTestId('current-tab-summary-toggle'));
+    fireEvent.click(within(currentTabCard).getByRole('button', { name: 'Index page' }));
+    expect(sendMessage).toHaveBeenCalledWith(
+      { type: messageTypes.pageContentIndexCurrent },
+      expect.any(Function),
+    );
   });
 
   it('renders resolver suggestions and confirms them through tab-session attribution', async () => {
@@ -737,12 +759,20 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    // #4 — the suggestion banner is part of the current-tab
-    // attribution cluster, Inbox-only now.
+    // The duplicate fallback SuggestionBanner was removed; the same
+    // resolver suggestion + confirm now lives on the CURRENT TAB
+    // attribution card (Inbox view), the single non-duplicated surface.
     fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
-    const banner = await screen.findByLabelText('Tab-session suggestion');
+    const banner = await screen.findByLabelText('Current tab attribution');
+    // The card resolves its suggestion asynchronously ("Checking
+    // signals…" → suggestion); wait for the confirm affordance.
+    const confirm = await within(banner).findByRole(
+      'button',
+      { name: "Yes, that's right" },
+      { timeout: 3000 },
+    );
     expect(banner).toHaveTextContent('Sibling');
-    fireEvent.click(within(banner).getByRole('button', { name: "Yes, that's right" }));
+    fireEvent.click(confirm);
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
