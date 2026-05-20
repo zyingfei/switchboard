@@ -44,7 +44,13 @@ export const SEMANTIC_RECALL_POOL_ENV = 'SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL';
 // textHash; the version is in the signature, so it naturally
 // mismatches and is rebuilt once (full) into v2 — clean migration,
 // no special-casing.
-const SEMANTIC_RECALL_POOL_FEATURE_VERSION = 2;
+// v3: the embed INPUT changed from `[title, host, pathTokens]` (URL
+// identity, dominated by host → same-host URLs got cosine ≥ 0.92 to
+// each other regardless of topic) to content-derived keyphrases +
+// entities + top-weighted terms when available, with the bare host
+// token dropped. Same signature mechanism handles the migration —
+// v2 entries invalidate on signature mismatch and rebuild once.
+const SEMANTIC_RECALL_POOL_FEATURE_VERSION = 3;
 const DEFAULT_K = 10;
 // Mild cosine floor: content-embedding kNN edges below this are noise
 // (the leiden-cpm step further cuts weak bridges).

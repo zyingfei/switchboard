@@ -957,17 +957,43 @@ const kickSemanticRecallPoolRefresh = (vaultRoot: string, embedderUsable: boolea
   void (async () => {
     try {
       const records = await listPageEvidenceRecords(vaultRoot);
+      // Embed CONTENT (keyphrases/entities/top-weighted terms) when
+      // available, not URL identity. The previous shape
+      // `[title, host, pathTokens]` was dominated by the host token
+      // for any same-host-but-different-page set (every chatgpt.com
+      // chat URL got cosine ≥ 0.92 to every other one regardless of
+      // topic — 16% of pool edges were ≥ 0.99). Content-derived
+      // tokens give the embedding actual topic signal; for records
+      // without `content` (page-text auto-extract off — every chat
+      // URL today, since chat-turn capture goes through a separate
+      // pipeline), fall back to the URL-identity shape but drop the
+      // bare host token so the embedding doesn't collapse to the
+      // same-host vector. Chat-URL similarity becomes meaningful
+      // once the chunk-text source is wired in (tracked separately).
       const items = records
-        .map((r) => ({
-          canonicalUrl: r.canonicalUrl,
-          text: [
-            r.metadata.title ?? '',
-            r.metadata.host ?? '',
-            ...(r.metadata.pathTokens ?? []),
-          ]
-            .join(' ')
-            .trim(),
-        }))
+        .map((r) => {
+          const c = r.content;
+          const contentTokens = c
+            ? [
+                ...c.keyphrases.slice(0, 20).map((k) => k.term),
+                ...c.entities.slice(0, 20).map((e) => e.text),
+                ...c.terms.slice(0, 30).map((t) => t.term),
+              ]
+            : [];
+          const base = [r.metadata.title ?? '', ...(r.metadata.pathTokens ?? [])];
+          // Host stays out of the embed input entirely — its
+          // domination of cosine for same-host clusters was the
+          // primary bug. The provenance still has host via pathTokens
+          // upstream where it matters; recall similarity is about
+          // topic, not URL structure.
+          return {
+            canonicalUrl: r.canonicalUrl,
+            text: [...base, ...contentTokens]
+              .filter((s) => s.length > 0)
+              .join(' ')
+              .trim(),
+          };
+        })
         .filter((i) => i.text.length > 0);
       if (items.length >= 2) {
         await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
@@ -1004,23 +1030,37 @@ const semanticRecallExpansion = async (
     vaultRoot,
     expanded.map((e) => e.canonicalUrl),
   );
+  // Déjà-vu wants "when did I FIRST encounter this" semantics for
+  // the Similar hits — otherwise every Similar row reads "a few
+  // seconds ago" (every fresh autoCapture / page-evidence refresh
+  // would bump capturedAt to now, hiding the actual recency the
+  // user cares about). Prefer firstSeenAt, fall back through
+  // lastSeenAt → record.updatedAt → now.
   const nowIso = new Date().toISOString();
-  return expanded.map((e) => ({
-    id: `semantic-recall-pool:${e.canonicalUrl}`,
-    sourceKind: 'semantic-recall-pool' as const,
-    sourceEvidence: {
-      source: 'semantic_recall_pool' as const,
-      similarity: e.cosine,
-      via: e.via,
-    },
-    anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
-    canonicalUrl: e.canonicalUrl,
-    title: evidenceByUrl.get(e.canonicalUrl)?.metadata.title ?? e.canonicalUrl,
-    // Capped low so semantic-pool hits EXPAND (fill remaining slots)
-    // and never displace primary lexical/vector candidates.
-    score: Math.min(0.49, e.cosine * 0.5),
-    capturedAt: nowIso,
-  }));
+  return expanded.map((e) => {
+    const ev = evidenceByUrl.get(e.canonicalUrl);
+    const capturedAt =
+      ev?.metadata.firstSeenAt ??
+      ev?.metadata.lastSeenAt ??
+      ev?.updatedAt ??
+      nowIso;
+    return {
+      id: `semantic-recall-pool:${e.canonicalUrl}`,
+      sourceKind: 'semantic-recall-pool' as const,
+      sourceEvidence: {
+        source: 'semantic_recall_pool' as const,
+        similarity: e.cosine,
+        via: e.via,
+      },
+      anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
+      canonicalUrl: e.canonicalUrl,
+      title: ev?.metadata.title ?? e.canonicalUrl,
+      // Capped low so semantic-pool hits EXPAND (fill remaining slots)
+      // and never displace primary lexical/vector candidates.
+      score: Math.min(0.49, e.cosine * 0.5),
+      capturedAt,
+    };
+  });
 };
 
 const queryRecallContent = async (
