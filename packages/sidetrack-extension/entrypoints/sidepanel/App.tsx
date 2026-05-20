@@ -1111,7 +1111,15 @@ const App = () => {
   const [suggestionCache, setSuggestionCache] = useState<
     ReadonlyMap<
       string,
-      { readonly workstreamId: string; readonly label: string; readonly confidence: number }
+      {
+        readonly workstreamId: string;
+        readonly label: string;
+        readonly confidence: number;
+        // Margin to the runner-up; lets NeedsOrganizeSuggestion apply
+        // the SAME tie gate as the Inbox SuggestionStats (see
+        // src/sidepanel/suggestion/confidence.ts).
+        readonly margin?: number;
+      }
     >
   >(() => new Map());
   const lastFingerprintRef = useRef<string | null>(null);
@@ -8103,6 +8111,7 @@ interface NeedsOrganizeSuggestionRowProps {
     readonly workstreamId: string;
     readonly label: string;
     readonly confidence: number;
+    readonly margin?: number;
   };
   // Stable string that changes whenever the workstream graph
   // changes (counts, revisions, members). The fetch effect depends
@@ -8125,6 +8134,7 @@ interface NeedsOrganizeSuggestionRowProps {
     readonly workstreamId: string;
     readonly label: string;
     readonly confidence: number;
+    readonly margin?: number;
   }) => void;
   readonly onClearCache: () => void;
   readonly onAccept: (workstreamId: string) => void;
@@ -8155,6 +8165,7 @@ function NeedsOrganizeSuggestionRow({
     readonly workstreamId: string;
     readonly label: string;
     readonly confidence: number;
+    readonly margin?: number;
   } | null>(cached ?? null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
@@ -8212,6 +8223,12 @@ function NeedsOrganizeSuggestionRow({
           readonly data?: readonly {
             readonly workstreamId: string;
             readonly score: number;
+            // The tab-session-resolver also returns a breakdown with
+            // the margin to the runner-up — we need it for the
+            // shared confidence tie gate so this surface and the
+            // Inbox SuggestionStats handle "no clear pick" the same
+            // way (see src/sidepanel/suggestion/confidence.ts).
+            readonly breakdown?: { readonly margin?: number };
           }[];
         };
         const top = body.data?.[0];
@@ -8224,7 +8241,17 @@ function NeedsOrganizeSuggestionRow({
           return;
         }
         const label = resolveLabelRef.current(top.workstreamId);
-        const next = { workstreamId: top.workstreamId, label, confidence: top.score };
+        const next: {
+          readonly workstreamId: string;
+          readonly label: string;
+          readonly confidence: number;
+          readonly margin?: number;
+        } = {
+          workstreamId: top.workstreamId,
+          label,
+          confidence: top.score,
+          ...(typeof top.breakdown?.margin === 'number' ? { margin: top.breakdown.margin } : {}),
+        };
         setSuggestion(next);
         onCacheRef.current(next);
       } catch {
@@ -8268,6 +8295,9 @@ function NeedsOrganizeSuggestionRow({
     <NeedsOrganizeSuggestion
       suggestedLabel={suggestedLabel}
       confidence={hasAuto && !indexRebuilding ? suggestion.confidence : 0}
+      {...(hasAuto && !indexRebuilding && suggestion.margin !== undefined
+        ? { margin: suggestion.margin }
+        : {})}
       pending={pending || indexRebuilding}
       onAccept={() => {
         if (hasAuto && suggestion.workstreamId.length > 0) {
