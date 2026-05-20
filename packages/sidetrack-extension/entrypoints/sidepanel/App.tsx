@@ -822,6 +822,21 @@ const App = () => {
   // on every focus change.
   const liveActiveTabUrlRef = useRef(liveActiveTabUrl);
   liveActiveTabUrlRef.current = liveActiveTabUrl;
+  // Latest-ref handle for the URL-attribution callback. Needed because
+  // moveThreadToWorkstream propagates to handleUrlAttribute (a chat
+  // thread's URL also gets the same workstream so the Inbox card and
+  // the All-Threads bucket agree — see handleUrlAttribute below), and
+  // moveThreadToWorkstream is declared BEFORE handleUrlAttribute in
+  // this component. The ref is assigned right after handleUrlAttribute
+  // is declared.
+  const handleUrlAttributeRef = useRef<
+    | ((
+        canonicalUrl: string,
+        workstreamId: string | null,
+        options?: { readonly skipThreadPropagation?: boolean },
+      ) => void)
+    | null
+  >(null);
   const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
   const [threadSearchOpen, setThreadSearchOpen] = useState(false);
   const [threadSearchQuery, setThreadSearchQuery] = useState('');
@@ -2636,6 +2651,16 @@ const App = () => {
   const moveThreadToWorkstream = async (
     threadId: string,
     workstreamId: string,
+    // Bidirectional pick alignment (URL ↔ thread). The Inbox card
+    // picks via handleUrlAttribute → URL.currentAttribution; the
+    // All-Threads/anywhere thread move picks via this →
+    // thread.primaryWorkstreamId. Without propagation the two
+    // surfaces showed independent picks for the SAME chat (Inbox
+    // said "ai", All-Threads still said "Ungrouped + No clear pick").
+    // After a successful thread move we also stamp the matching URL
+    // attribution so both records align. skipUrlPropagation breaks
+    // recursion when handleUrlAttribute is the original caller.
+    options?: { readonly skipUrlPropagation?: boolean },
   ): Promise<WorkboardState> => {
     const thread = state.threads.find((candidate) => candidate.bac_id === threadId);
     const next = await sendRequest({
@@ -2652,6 +2677,18 @@ const App = () => {
         : { fromContainer: thread.primaryWorkstreamId }),
       toContainer: workstreamId,
     });
+    if (
+      options?.skipUrlPropagation !== true &&
+      thread?.threadUrl !== undefined &&
+      thread.threadUrl.length > 0
+    ) {
+      const canonical = canonicalThreadUrl(thread.threadUrl);
+      if (canonical.length > 0) {
+        handleUrlAttributeRef.current?.(canonical, workstreamId, {
+          skipThreadPropagation: true,
+        });
+      }
+    }
     return next;
   };
 
@@ -2812,7 +2849,19 @@ const App = () => {
   // whose `tabSessionId` field carries the canonical URL — see
   // `tabSessionRecordFromUrl` in this file. This dispatches to the
   // per-URL attribution endpoint.
-  const handleUrlAttribute = (canonicalUrl: string, workstreamId: string | null) => {
+  const handleUrlAttribute = (
+    canonicalUrl: string,
+    workstreamId: string | null,
+    // Bidirectional pick alignment (URL ↔ thread). For a chat-thread
+    // URL with a tracked thread (matched by canonicalThreadUrl), also
+    // align thread.primaryWorkstreamId so All-Threads buckets the
+    // chat under the same workstream the Inbox card just picked.
+    // Skipped for unassign (workstreamId === null) since
+    // messageTypes.moveThread is assignment-only. skipThreadPropagation
+    // breaks recursion when moveThreadToWorkstream is the original
+    // caller.
+    options?: { readonly skipThreadPropagation?: boolean },
+  ) => {
     setOptimisticDecisions((current) =>
       setOptimisticDecision(
         current,
@@ -2835,7 +2884,25 @@ const App = () => {
         throw error;
       }
     });
+    if (workstreamId !== null && options?.skipThreadPropagation !== true) {
+      const canonical = canonicalThreadUrl(canonicalUrl);
+      const thread =
+        canonical.length === 0
+          ? undefined
+          : state.threads.find(
+              (t) =>
+                t.threadUrl !== undefined && canonicalThreadUrl(t.threadUrl) === canonical,
+            );
+      if (thread !== undefined && thread.primaryWorkstreamId !== workstreamId) {
+        void runAction(() =>
+          moveThreadToWorkstream(thread.bac_id, workstreamId, { skipUrlPropagation: true }),
+        );
+      }
+    }
   };
+  // Latest-ref binding so moveThreadToWorkstream (declared earlier)
+  // can call into this function without a forward-reference TDZ error.
+  handleUrlAttributeRef.current = handleUrlAttribute;
 
   const handleFocusGroupSave = async (input: FocusGroupSaveInput): Promise<void> => {
     const canonicalUrls = [
