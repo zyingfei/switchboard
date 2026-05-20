@@ -5014,6 +5014,19 @@ const routes: readonly RouteDefinition[] = [
               query.limit,
               ((): boolean => {
                 const s = context.getEmbedderStatus?.()?.state ?? 'disabled';
+                // The gate exists for a real reason — proven 2026-05-20
+                // by reverting C5 (a quick try to lift it for the
+                // v2→v3 migration): the pool's full build runs the
+                // N² cosine + leiden clustering on the MAIN thread,
+                // and a cold-start full rebuild over 911 records
+                // pegs the event loop for 5+ minutes (same failure
+                // class as the earlier resolve-flood peg). The
+                // gate's "embedder ready" was a proxy for "pool
+                // already exists at the current version → rebuild
+                // is INCREMENTAL", not just embedder-warmth. v2→v3
+                // migration is tracked separately as a follow-up
+                // (needs incremental migration, worker thread, or
+                // explicit operator-triggered rebuild).
                 return s === 'ready' || s === 'disabled';
               })(),
             )
