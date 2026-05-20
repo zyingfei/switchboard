@@ -1312,11 +1312,20 @@ export default defineContentScript({
     // a ChatGPT thread with 1 user + 2 assistant blocks (last 8903
     // chars) ended up with ONLY the 89c user turn in the recall
     // index, despite selectors finding all 3 blocks when probed.
-    // Periodic re-fire while the tab is visible gives the capture
-    // pipeline multiple bites at the apple — eventually it sees a
-    // state with all turns rendered and the (already
-    // length-aware) signature lets the fuller snapshot through.
-    // Bounded: max ~4 min of low-frequency captures per page load.
+    // Periodic re-fire gives the capture pipeline multiple bites at
+    // the apple — eventually it sees a state with all turns rendered
+    // and the (already length-aware) signature lets the fuller
+    // snapshot through. Bounded: max ~4 min of low-frequency captures
+    // per page load.
+    //
+    // 2026-05-20 follow-up: an earlier iteration gated this on
+    // document.visibilityState === 'visible' to save CPU. WRONG —
+    // the dogfood pattern is "side panel + chat tab in different
+    // windows or split layout," so the chat tab is HIDDEN most of
+    // the time the user is reading the assistant's reply. The gate
+    // defeated the whole point. scheduleAutoCapture has its own
+    // 2.5s debounce + signature dedup so hidden-tab firing is cheap
+    // when nothing has changed.
     const PERIODIC_CAPTURE_INTERVAL_MS = 8_000;
     const PERIODIC_CAPTURE_MAX_FIRES = 30;
     let periodicCaptureFireCount = 0;
@@ -1325,16 +1334,18 @@ export default defineContentScript({
         window.clearInterval(periodicCaptureTimer);
         return;
       }
-      // Don't poll while the tab is in the background — saves CPU
-      // and avoids ingesting state the user can't have caused since
-      // the last fire (chat shells don't stream updates without an
-      // active session).
-      if (document.visibilityState !== 'visible') return;
       periodicCaptureFireCount += 1;
-      // scheduleAutoCapture (debounced) + captureSignature dedup
-      // make this cheap when nothing has changed.
       scheduleAutoCapture();
     }, PERIODIC_CAPTURE_INTERVAL_MS);
+    // Immediate re-extract when the tab becomes visible again. The
+    // user returning to the chat tab is a strong signal that the
+    // assistant has finished streaming (the prior reads of the chat
+    // happened off-screen and may have left the capture stale).
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        scheduleAutoCapture();
+      }
+    });
 
     // Annotation re-anchor observer. Provider chat shells virtualize
     // long threads (turns above the viewport leave the DOM until the
