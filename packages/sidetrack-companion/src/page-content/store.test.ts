@@ -109,6 +109,57 @@ describe('page-content store', () => {
     await expect(queryPageContent(root, 'oracle', { limit: 5 })).resolves.toEqual([]);
   });
 
+  it('CJK query 分布式系统 hits a page-content chunk via shared analyzer', async () => {
+    // A page whose body contains the CJK term run-on with no
+    // internal punctuation — the case the old `[^a-z0-9...]+` split
+    // missed entirely. The shared analyzer's bigram/unigram fan-out
+    // makes it findable.
+    await writePageContentExtracted(
+      root,
+      extractedPayload({
+        canonicalUrl: 'https://example.zh/distributed',
+        url: 'https://example.zh/distributed',
+        title: '分布式系统测试',
+        content: {
+          text: `${'再抽出它的分布式系统模型 '.repeat(60)}`,
+          contentHash: 'hash-zh-distributed',
+          charCount: 2400,
+        },
+      }),
+    );
+
+    const hits = await queryPageContent(root, '分布式系统', { limit: 5 });
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0]?.canonicalUrl).toBe('https://example.zh/distributed');
+    expect(hits[0]?.sourceKind).toBe('page-content');
+  });
+
+  it('dotted identifier sidetrack.threads.move hits a page-content chunk on the whole AND parts', async () => {
+    await writePageContentExtracted(
+      root,
+      extractedPayload({
+        canonicalUrl: 'https://docs.example.com/api/sidetrack-threads',
+        url: 'https://docs.example.com/api/sidetrack-threads',
+        title: 'Sidetrack threads API',
+        content: {
+          text: `${'Call sidetrack.threads.move on the workstream to relocate a thread. '.repeat(50)}`,
+          contentHash: 'hash-sidetrack-threads',
+          charCount: 3300,
+        },
+      }),
+    );
+
+    // Whole identifier: hits.
+    const whole = await queryPageContent(root, 'sidetrack.threads.move', { limit: 5 });
+    expect(whole.length).toBeGreaterThan(0);
+    expect(whole[0]?.canonicalUrl).toBe('https://docs.example.com/api/sidetrack-threads');
+
+    // Partial term: also hits (analyzer emits the split parts).
+    const partial = await queryPageContent(root, 'move', { limit: 5 });
+    expect(partial.length).toBeGreaterThan(0);
+    expect(partial[0]?.canonicalUrl).toBe('https://docs.example.com/api/sidetrack-threads');
+  });
+
   it('aggregates per-state coverage counts with explicit zeros', async () => {
     // indexed (high quality)
     await writePageContentExtracted(
