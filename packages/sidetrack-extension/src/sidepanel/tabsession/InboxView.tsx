@@ -38,6 +38,11 @@ export interface InboxViewProps {
   // applied it once so back-navigation doesn't re-fire.
   readonly initialQuery?: string;
   readonly onQueryConsumed?: () => void;
+  /** True when the record's URL has a tracked chat thread (the chat-
+   * turn pipeline has produced content for it). Forwarded to
+   * InboxCard → PageEvidenceBadge so captured chats don't render as
+   * "Metadata only" just because page-text auto-extract is off. */
+  readonly isChatThreadCaptured?: (record: TabSessionRecord) => boolean;
 }
 
 // Stage 5 polish — Inbox-only search filter. Pure client-side, runs on
@@ -71,6 +76,7 @@ export function InboxView({
   refreshingSuggestionIds,
   initialQuery,
   onQueryConsumed,
+  isChatThreadCaptured,
 }: InboxViewProps) {
   const [query, setQuery] = useState('');
   // Cross-surface request — accept a pre-filled query exactly once,
@@ -154,6 +160,7 @@ export function InboxView({
             {...(onOpenInConnections === undefined ? {} : { onOpenInConnections })}
             {...(onRefreshSuggestion === undefined ? {} : { onRefreshSuggestion })}
             refreshingSuggestion={refreshingSuggestionIds?.has(record.tabSessionId) === true}
+            chatThreadCaptured={isChatThreadCaptured?.(record) === true}
           />
         ))}
       </div>

@@ -2370,6 +2370,26 @@ const App = () => {
         : threads.find((thread) => thread.threadUrl === state.activeTabUrl),
     [state.activeTabUrl, threads],
   );
+  // True when an Inbox/current-tab record's URL has a tracked chat
+  // thread (chat-turn pipeline produced content). Threaded into
+  // PageEvidenceBadge so a captured chat doesn't render the
+  // misleading "Metadata only" label just because page-text
+  // auto-extract is off — the two pipelines are independent.
+  const isChatThreadCapturedForRecord = useCallback(
+    (record: TabSessionRecord): boolean => {
+      const url = record.latestUrl;
+      if (typeof url !== 'string' || url.length === 0) return false;
+      const canonical = canonicalThreadUrl(url);
+      if (canonical.length === 0) return false;
+      return threads.some(
+        (t) =>
+          typeof t.threadUrl === 'string' &&
+          t.threadUrl.length > 0 &&
+          canonicalThreadUrl(t.threadUrl) === canonical,
+      );
+    },
+    [threads],
+  );
   const findIconPulsing =
     activeTabTrackedThread !== undefined &&
     focusingThreadId !== activeTabTrackedThread.bac_id &&
@@ -6354,7 +6374,10 @@ const App = () => {
                       </span>
                     )
                   ) : (
-                    <PageEvidenceBadge pageEvidence={focusedTabSession.pageEvidence} />
+                    <PageEvidenceBadge
+                      pageEvidence={focusedTabSession.pageEvidence}
+                      chatThreadCaptured={isChatThreadCapturedForRecord(focusedTabSession)}
+                    />
                   )}
                 </>
               ) : liveActiveTabUrl !== undefined ? (
@@ -6987,6 +7010,7 @@ const App = () => {
                         onIgnore={handleUrlIgnore}
                         displayCtx={displayCtx}
                         onOpenInConnections={requestSwitchToConnections}
+                        chatThreadCaptured={isChatThreadCapturedForRecord(record)}
                       />
                     );
                   })}
@@ -7054,6 +7078,7 @@ const App = () => {
           onQueryConsumed={() => {
             setInboxSearchRequest('');
           }}
+          isChatThreadCaptured={isChatThreadCapturedForRecord}
         />
       ) : (
         <>
