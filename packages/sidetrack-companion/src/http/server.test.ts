@@ -2999,6 +2999,8 @@ describe('companion HTTP server', () => {
           readonly primary: readonly string[];
           readonly primaryReturned: number;
           readonly expansionReturned: number;
+          readonly primaryBudget: number;
+          readonly expansionQuota: number;
         };
       };
     };
@@ -3012,6 +3014,10 @@ describe('companion HTTP server', () => {
     expect(body.meta.fusion.primary).toEqual(['page-content', 'chat-turn']);
     expect(body.meta.fusion.primaryReturned).toBe(body.data.length);
     expect(body.meta.fusion.expansionReturned).toBe(0);
+    // C4: pool returned 0 hits → no expansion quota carved out, so
+    // primary gets the full limit budget.
+    expect(body.meta.fusion.expansionQuota).toBe(0);
+    expect(body.meta.fusion.primaryBudget).toBe(5);
   });
 
   it('content/query — sourceKind filter excludes unrequested kinds', async () => {

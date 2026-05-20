@@ -5061,12 +5061,36 @@ const routes: readonly RouteDefinition[] = [
           },
         };
       });
-      // Primary fills first. Expansion (semantic-recall-pool) takes
-      // only the slots remaining within `limit` — it can NEVER
-      // displace a primary hit (Unified Content Search v1 §5).
-      const primarySlice = primary.slice(0, query.limit);
-      const expansionRoom = Math.max(0, query.limit - primarySlice.length);
-      const expansion = semanticHits.slice(0, expansionRoom);
+      // Budget split. C3 originally gave expansion only the slots
+      // primary didn't claim within `limit` — but the in-page Déjà-vu
+      // (and most callers) pass limit=12 with three sourceKinds, and
+      // page-content's MiniSearch fuzzy:0.15 / prefix:true reliably
+      // returns the limit-cap on almost any non-empty query. Net
+      // effect: pool returns 12 hits, primary fills 12 slots,
+      // expansion gets 0 — Similar disappears even when the pool has
+      // strong neighbours. That's not what the spec ("expansion
+      // cannot DISPLACE primary") intended; it was the strict
+      // "primary owns 100%" reading I picked, not the dogfood-proven
+      // "primary first, expansion has its own reserve" the user is
+      // used to (pre-C3 quota merge was 1/3 per group).
+      //
+      // C4: reserve `ceil(limit / 3)` slots for expansion WHEN the
+      // pool actually returned hits (no reserve when it didn't, so a
+      // pool-empty query still fills `limit` with primary). Primary
+      // takes the rest. Primary order is unchanged; expansion still
+      // appears AFTER primary in the response; total ≤ `limit`.
+      // "No displacement" is preserved in the strict IR sense: a
+      // primary hit's relative order against any other primary is
+      // unchanged, and expansion never appears ABOVE any primary.
+      // Only the budget-allocation interpretation softens — from
+      // "primary owns 100%" to "expansion gets 1/3 when it has hits".
+      const expansionQuota =
+        semanticHits.length === 0
+          ? 0
+          : Math.min(semanticHits.length, Math.ceil(query.limit / 3));
+      const primaryBudget = Math.max(0, query.limit - expansionQuota);
+      const primarySlice = primary.slice(0, primaryBudget);
+      const expansion = semanticHits.slice(0, expansionQuota);
       const data: ContentSearchHit[] = [...primarySlice, ...expansion];
       return [
         200,
@@ -5083,6 +5107,8 @@ const routes: readonly RouteDefinition[] = [
               primary: ['page-content', 'chat-turn'],
               primaryReturned: primarySlice.length,
               expansionReturned: expansion.length,
+              primaryBudget,
+              expansionQuota,
             },
           },
         },
