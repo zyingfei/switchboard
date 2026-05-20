@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
 import { writeMetadataOnlyPageEvidence } from '../page-evidence/store.js';
+import { writePageContentExtracted } from '../page-content/store.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
 import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -2901,5 +2902,147 @@ describe('companion HTTP server', () => {
       readonly panel: { readonly view: string };
     };
     expect(stamped.panel.view).toBe('inbox');
+  });
+
+  // Unified Content Search v1 — contract tests for /v1/content/query.
+  // Primary RRF fusion across page-content + chat-turn rankers with
+  // semantic-recall-pool appended as expansion. Rank-fusion math
+  // itself is unit-tested in src/search/rrf.test.ts (proves scale-
+  // freeness); these tests pin the HTTP contract: shape, sourceKind
+  // filter, rankEvidence presence, and the expansion-never-displaces
+  // rule.
+
+  const seedPageChunk = async (overrides: {
+    canonicalUrl: string;
+    title: string;
+    text: string;
+    contentHash: string;
+  }): Promise<void> => {
+    await writePageContentExtracted(vaultPath, {
+      payloadVersion: 1,
+      canonicalUrl: overrides.canonicalUrl,
+      url: overrides.canonicalUrl,
+      title: overrides.title,
+      extractedAt: '2026-05-20T10:00:00.000Z',
+      extractionSource: 'reader-mode',
+      extractionPolicy: { trigger: 'manual' },
+      quality: 'high',
+      qualitySignals: {
+        extractedWordCount: 320,
+        contentToDomRatio: 0.62,
+        boilerplateFraction: 0.08,
+        extractionStrategy: 'reader-mode',
+        headingSignatureHash: 'abc',
+      },
+      content: {
+        text: overrides.text,
+        contentHash: overrides.contentHash,
+        charCount: overrides.text.length,
+      },
+    });
+  };
+
+  it('content/query — CJK 分布式系统 hits a page chunk via the shared analyzer', async () => {
+    await seedPageChunk({
+      canonicalUrl: 'https://example.zh/distributed',
+      title: '分布式系统测试',
+      text: `${'再抽出它的分布式系统模型 '.repeat(60)}`,
+      contentHash: 'hash-zh-distributed',
+    });
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/content/query?q=${encodeURIComponent('分布式系统')}&sourceKind=page-content&limit=5`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    const body = result.body as {
+      readonly data: readonly { readonly sourceKind: string; readonly canonicalUrl: string }[];
+      readonly meta: { readonly pageContentCount: number };
+    };
+    expect(body.data.length).toBeGreaterThan(0);
+    expect(body.data[0]?.sourceKind).toBe('page-content');
+    expect(body.data[0]?.canonicalUrl).toBe('https://example.zh/distributed');
+    expect(body.meta.pageContentCount).toBeGreaterThan(0);
+  });
+
+  it('content/query — primary hits carry rankEvidence with RRF decomposition', async () => {
+    await seedPageChunk({
+      canonicalUrl: 'https://docs.example/sidetrack',
+      title: 'Sidetrack threads API',
+      text: `${'Use sidetrack.threads.move to relocate threads between workstreams. '.repeat(40)}`,
+      contentHash: 'hash-sidetrack-rrf',
+    });
+
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/content/query?q=${encodeURIComponent('sidetrack.threads.move')}&sourceKind=page-content&limit=5`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    const body = result.body as {
+      readonly data: readonly {
+        readonly id: string;
+        readonly rankEvidence?: {
+          readonly kind: 'rrf';
+          readonly ranksByRanker: Record<string, number>;
+          readonly fusionScore: number;
+          readonly k: number;
+        };
+      }[];
+      readonly meta: {
+        readonly fusion: {
+          readonly algorithm: string;
+          readonly k: number;
+          readonly primary: readonly string[];
+          readonly primaryReturned: number;
+          readonly expansionReturned: number;
+        };
+      };
+    };
+    expect(body.data.length).toBeGreaterThan(0);
+    const top = body.data[0];
+    expect(top?.rankEvidence?.kind).toBe('rrf');
+    expect(top?.rankEvidence?.ranksByRanker['page-content']).toBe(1);
+    // rank-1 in a single ranker → fusion score 1/(k+1)
+    expect(top?.rankEvidence?.fusionScore).toBeCloseTo(1 / (body.meta.fusion.k + 1));
+    expect(body.meta.fusion.algorithm).toBe('rrf');
+    expect(body.meta.fusion.primary).toEqual(['page-content', 'chat-turn']);
+    expect(body.meta.fusion.primaryReturned).toBe(body.data.length);
+    expect(body.meta.fusion.expansionReturned).toBe(0);
+  });
+
+  it('content/query — sourceKind filter excludes unrequested kinds', async () => {
+    await seedPageChunk({
+      canonicalUrl: 'https://docs.example/oracle',
+      title: 'Oracle Cloud Guardrails',
+      text: `${'Oracle cloud adoption framework architecture guardrails '.repeat(40)}`,
+      contentHash: 'hash-oracle-filter',
+    });
+
+    // Request ONLY chat-turn — page-content is seeded but filtered out.
+    const result = await jsonFetch(
+      context,
+      `${baseUrl}/v1/content/query?q=oracle%20guardrails&sourceKind=chat-turn&limit=5`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+
+    expect(result.status).toBe(200);
+    const body = result.body as {
+      readonly data: readonly { readonly sourceKind: string }[];
+      readonly meta: {
+        readonly sourceKinds: readonly string[];
+        readonly pageContentCount: number;
+        readonly chatTurnCount: number;
+        readonly semanticRecallPoolCount: number;
+      };
+    };
+    // No page-content hits in data even though they exist in the
+    // store — the filter is honored.
+    expect(body.data.every((hit) => hit.sourceKind !== 'page-content')).toBe(true);
+    expect(body.meta.sourceKinds).toEqual(['chat-turn']);
+    expect(body.meta.pageContentCount).toBe(0);
   });
 });

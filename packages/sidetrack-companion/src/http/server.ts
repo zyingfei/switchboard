@@ -145,6 +145,7 @@ import {
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
+import { RRF_K, fuseByRank } from '../search/rrf.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -5000,8 +5001,11 @@ const routes: readonly RouteDefinition[] = [
             ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
           })
         : [];
-      // W4(b-lite) — additive, gated, read-only semantic expansion of
-      // the primary hits. One-step off via the runtime flag.
+      // W4(b-lite) — additive, gated, read-only semantic expansion
+      // of the primary hits. NOT a primary ranker: its hits are
+      // appended AFTER the RRF-fused primaries with their own
+      // sourceEvidence (Unified Content Search v1 §5). One-step off
+      // via the runtime flag.
       const semanticHits =
         sourceKinds.has('semantic-recall-pool') && semanticRecallPoolEnabled()
           ? await semanticRecallExpansion(
@@ -5014,57 +5018,72 @@ const routes: readonly RouteDefinition[] = [
               })(),
             )
           : [];
-      // Balanced merge. A pure global-score slice let one sourceKind
-      // crowd out the others: page-content is BM25-scaled (~20-30)
-      // while semantic-recall-pool similarity / chat-turn recall are
-      // ~0–1, so when several kinds were requested the response was
-      // 100% page-content and the Déjà-vu "Similar" group never
-      // reached the client even though the pool had hits
-      // (semanticRecallPoolCount>0, zero in data). Reserve a per-kind
-      // quota so every requested+non-empty kind is represented within
-      // the limit, then fill the remaining slots by score. Final order
-      // is still score-desc (consumers/chips re-group anyway); the
-      // point is the lower-scaled kinds are no longer sliced away.
-      const orderByScore = (
-        a: ContentSearchHit,
-        b: ContentSearchHit,
-      ): number => b.score - a.score || b.capturedAt.localeCompare(a.capturedAt);
-      const groups = [pageHits, recallHits, semanticHits].filter((g) => g.length > 0);
-      let chosen: ContentSearchHit[];
-      if (groups.length <= 1) {
-        chosen = [...pageHits, ...recallHits, ...semanticHits];
-      } else {
-        const quota = Math.max(1, Math.floor(query.limit / groups.length));
-        const taken = new Set<string>();
-        const picked: ContentSearchHit[] = [];
-        for (const g of groups) {
-          for (const h of g.slice(0, quota)) {
-            if (!taken.has(h.id)) {
-              taken.add(h.id);
-              picked.push(h);
-            }
-          }
-        }
-        const leftover = [...pageHits, ...recallHits, ...semanticHits]
-          .filter((h) => !taken.has(h.id))
-          .sort(orderByScore);
-        for (const h of leftover) {
-          if (picked.length >= query.limit) break;
-          taken.add(h.id);
-          picked.push(h);
-        }
-        chosen = picked;
-      }
-      const merged = chosen.sort(orderByScore).slice(0, query.limit);
+      // Unified Content Search v1 rank fusion.
+      //
+      // Replaces the prior quota-merge (which mixed three
+      // incompatible score scales — BM25-ish ~20-30 for
+      // page-content vs ~0-1 for chat-turn recall vs cosine for the
+      // pool — and let one source crowd the others). RRF is
+      // rank-based: scale-free by construction, so a chat-turn at
+      // its own rank-1 ranks alongside a page-content at rank-1
+      // without either dominating because of larger raw scores.
+      //
+      // The two primary rankers are query-driven lexical+vector
+      // hybrids (queryPageContent is MiniSearch-only today, but
+      // both share the analyzer from C1 so the rank lists are
+      // comparable in coverage); semanticRecallExpansion is
+      // additive-only and never enters the fusion. We dedupe by
+      // ContentSearchHit.id — page-content chunk ids and chat-turn
+      // chunk ids namespace-disjoint in practice, so RRF reduces to
+      // an interleave by 1/(k+rank), but the fuse handles overlap
+      // by summing contributions which is the correct RRF semantic
+      // if it ever happens.
+      const fused = fuseByRank(
+        [
+          { name: 'page-content', items: pageHits },
+          { name: 'chat-turn', items: recallHits },
+        ],
+        (hit) => hit.id,
+      );
+      const primary: ContentSearchHit[] = fused.map(({ item, ranks }) => {
+        const ranksByRanker: Partial<Record<'page-content' | 'chat-turn', number>> = {};
+        const pageRank = ranks.perRanker.get('page-content');
+        if (pageRank !== undefined) ranksByRanker['page-content'] = pageRank;
+        const chatRank = ranks.perRanker.get('chat-turn');
+        if (chatRank !== undefined) ranksByRanker['chat-turn'] = chatRank;
+        return {
+          ...item,
+          rankEvidence: {
+            kind: 'rrf' as const,
+            ranksByRanker,
+            fusionScore: ranks.fusionScore,
+            k: ranks.k,
+          },
+        };
+      });
+      // Primary fills first. Expansion (semantic-recall-pool) takes
+      // only the slots remaining within `limit` — it can NEVER
+      // displace a primary hit (Unified Content Search v1 §5).
+      const primarySlice = primary.slice(0, query.limit);
+      const expansionRoom = Math.max(0, query.limit - primarySlice.length);
+      const expansion = semanticHits.slice(0, expansionRoom);
+      const data: ContentSearchHit[] = [...primarySlice, ...expansion];
       return [
         200,
         {
-          data: merged,
+          data,
           meta: {
             sourceKinds: [...sourceKinds].sort(),
             pageContentCount: pageHits.length,
             chatTurnCount: recallHits.length,
             semanticRecallPoolCount: semanticHits.length,
+            fusion: {
+              algorithm: 'rrf',
+              k: RRF_K,
+              primary: ['page-content', 'chat-turn'],
+              primaryReturned: primarySlice.length,
+              expansionReturned: expansion.length,
+            },
           },
         },
       ];

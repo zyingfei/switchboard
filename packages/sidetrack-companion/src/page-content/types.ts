@@ -118,6 +118,22 @@ export interface PageContentChunk {
   readonly qualityWeight?: number;
 }
 
+// Unified Content Search v1 rank evidence. Present on primary
+// (page-content + chat-turn) hits to surface the RRF decomposition;
+// absent on semantic-recall-pool expansion hits (those carry
+// `sourceEvidence` instead — the two are mutually exclusive by design,
+// matching the spec's "no raw-score sort across sources, semantic
+// stays as expansion").
+export interface ContentSearchHitRankEvidence {
+  readonly kind: 'rrf';
+  // 1-indexed rank in each ranker the hit appeared in. Rankers the
+  // hit was absent from are omitted from this map.
+  readonly ranksByRanker: Readonly<Partial<Record<'page-content' | 'chat-turn', number>>>;
+  // RRF fused score: Σ 1/(k + rank_i).
+  readonly fusionScore: number;
+  readonly k: number;
+}
+
 export interface ContentSearchHit {
   readonly id: string;
   readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
@@ -129,6 +145,10 @@ export interface ContentSearchHit {
     readonly similarity: number;
     readonly via: 'cluster' | 'neighbor';
   };
+  // Unified Content Search v1 — only on primary RRF-fused hits
+  // (page-content + chat-turn). semantic-recall-pool hits use
+  // sourceEvidence instead and never carry rankEvidence.
+  readonly rankEvidence?: ContentSearchHitRankEvidence;
   readonly anchorNodeId: string;
   readonly canonicalUrl?: string;
   readonly threadId?: string;
