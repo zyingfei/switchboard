@@ -290,21 +290,65 @@ export interface HybridLexicalIndex {
   readonly idToEntry: ReadonlyMap<string, IndexEntry>;
 }
 
+// CJK character ranges: Unified Ideographs Extension A + Basic
+// Unified Ideographs + Hiragana + Katakana. Covers the dogfood
+// Chinese/Japanese chats. Used both for boundary detection
+// (CJK↔Latin) and for the bigram-emission step.
+const CJK_CLASS = '\\u3400-\\u9fff\\u3040-\\u30ff';
+const CJK_ONLY_RE = new RegExp(`^[${CJK_CLASS}]+$`, 'u');
+const CJK_BOUNDARY_RE = new RegExp(
+  `(?<=[${CJK_CLASS}])(?=[a-z0-9])|(?<=[a-z0-9])(?=[${CJK_CLASS}])`,
+  'u',
+);
+
+// Overlapping 2-grams for a pure-CJK token. Critical for natural
+// Chinese prose: a sentence like "再抽出它的测试模型" tokenizes (after
+// punctuation splits) to ONE long token, so a `prefix: true`
+// MiniSearch query of "测试" never matches it (the token starts with
+// "再抽出"). Emitting bigrams (..., "的测", "测试", "试模", "模型")
+// lets "测试" hit via the bigram entry instead. Industry-standard
+// approach — same as Lucene's CJKBigramAnalyzer / Elasticsearch's
+// cjk_bigram filter. Length-2 tokens skip the step (the original
+// token itself IS the bigram).
+const cjkBigrams = (s: string): readonly string[] => {
+  if (s.length < 3) return [];
+  const chars = Array.from(s); // CJK ideographs in CJK_CLASS are BMP — Array.from is safe
+  const out: string[] = [];
+  for (let i = 0; i + 1 < chars.length; i += 1) out.push(chars[i]! + chars[i + 1]!);
+  return out;
+};
+
 const tokenizer = (s: string): string[] =>
   s
     .toLowerCase()
+    // Splitter extended with CJK punctuation, ideographic space,
+    // full-width brackets, and ASCII `/` so English terms embedded
+    // in CJK-dominant text surface as their own tokens
+    // ("Jepsen、Elle、TLA+" → ["jepsen", "elle", "tla+"];
+    // "故障注入/检查器" → ["故障注入", "检查器"]).
+    // eslint-disable-next-line no-irregular-whitespace -- CJK punctuation deliberate
+    .split(/[\s　,;:!?()[\]{}<>"'`/\\，、。：；！？（）【】「」『』《》〈〉…—／]+/)
+    // CJK↔Latin boundary split for the no-separator case
+    // ("故障注入Jepsen" → ["故障注入", "jepsen"]).
+    .flatMap((token) => token.split(CJK_BOUNDARY_RE))
     // Keep dotted identifiers (`sidetrack.threads.move`) as single
     // tokens AND emit their split parts so a query for either form
     // hits. Without this minisearch's default whitespace tokenizer
     // would treat `sidetrack.threads.move` as one term that fails to
     // match a query of just `move`.
-    .split(/[\s,;:!?()[\]{}<>"'`]+/)
     .flatMap((token) => {
       const trimmed = token.replace(/^[.\-_]+|[.\-_]+$/g, '');
       if (trimmed.length === 0) return [];
       if (/[.\-_]/.test(trimmed)) return [trimmed, ...trimmed.split(/[.\-_]+/)];
       return [trimmed];
     })
+    // For pure-CJK tokens, additionally emit overlapping 2-grams so
+    // a substring CJK query (the common case for Chinese/Japanese)
+    // finds the chunk regardless of where the term sits in the
+    // glued-paragraph token. Same tokenizer is applied to queries —
+    // a 4-char query "测试模型" produces ["测试模型","测试","试模","模型"]
+    // and MiniSearch ORs them, so any bigram match is a hit.
+    .flatMap((token) => (CJK_ONLY_RE.test(token) ? [token, ...cjkBigrams(token)] : [token]))
     .filter((token) => token.length > 0);
 
 export const buildLexicalIndex = (items: readonly IndexEntry[]): HybridLexicalIndex => {

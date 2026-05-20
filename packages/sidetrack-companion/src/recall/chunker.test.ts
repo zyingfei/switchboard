@@ -127,18 +127,55 @@ Some prose after the code.`;
     }
   });
 
-  it('prefers markdown over formattedText over plain text', () => {
-    const a = chunkTurn(
-      baseInput({
-        markdown: '# Heading\n\nFrom markdown.',
-        formattedText: 'From formatted',
-        text: 'From text',
-      }),
-    );
+  it('prefers markdown over formattedText over plain text when all are comparably complete', () => {
+    // Three sources of comparable length — markdown's structure
+    // (headings, fences) wins so chunk boundaries respect them.
+    const md = '# Heading\n\nFrom markdown content roughly matching text length.';
+    const fmt = 'From formatted content roughly matching text length.';
+    const txt = 'From text only roughly matching the same length.';
+    const a = chunkTurn(baseInput({ markdown: md, formattedText: fmt, text: txt }));
     expect(a[0]?.text).toContain('From markdown');
-    const b = chunkTurn(baseInput({ formattedText: 'From formatted', text: 'From text' }));
+    const b = chunkTurn(baseInput({ formattedText: fmt, text: txt }));
     expect(b[0]?.text).toContain('From formatted');
     const c = chunkTurn(baseInput({ text: 'From text only' }));
     expect(c[0]?.text).toContain('From text only');
+  });
+
+  it('skips a truncated markdown — falls back to text when markdown is much shorter than text', () => {
+    // The upstream extractor's mergeAdjacentTurns shallow-copies the
+    // FIRST block's element ref into the merged turn, so enrichTurn
+    // produces a `markdown` reflecting only that first block — a
+    // 73-char head for a turn whose `text` is 8586 chars (the actual
+    // dogfood case, 2026-05-20). Without this gate the chunker would
+    // index ONLY the 73c head and silently drop the entire tail
+    // (Jepsen, scenario nemesis, 9-state verdict — all gone from
+    // recall search). Defensive completeness threshold (≥ 50% of
+    // text length): markdown that fails to meet it gets shadowed.
+    const tailMarker = 'TAIL_UNIQUE_TOKEN';
+    const truncatedMd = '我会先看 repo 的 README/目录结构';
+    const fullText = `${truncatedMd}。${'又是一段中文 '.repeat(80)} ${tailMarker} ${'更多段落 '.repeat(80)}`;
+    const result = chunkTurn(
+      baseInput({
+        markdown: truncatedMd, // suspiciously short — would shadow the tail
+        text: fullText,
+      }),
+    );
+    // The tail unique marker must appear in some chunk — proving the
+    // chunker fell back to text instead of being misled by markdown.
+    const allChunkText = result.map((c) => c.text).join('\n');
+    expect(allChunkText).toContain(tailMarker);
+  });
+
+  it('still prefers markdown when it is comparably complete (heading structure preserved)', () => {
+    // A markdown that's longer than text (heading + body) — still
+    // counts as complete, so markdown's structure (heading
+    // breadcrumbs) populates headingPath. Confirms the gate only
+    // shadows TRUNCATED markdown, not the normal case.
+    const text = `Paragraph one ${'word '.repeat(50)}\n\nParagraph two ${'word '.repeat(50)}`;
+    const md = `# Section heading\n\n${text}`;
+    const result = chunkTurn(baseInput({ markdown: md, text }));
+    // Heading from markdown lands in headingPath (chunker extracts
+    // headings as breadcrumbs separate from chunk body).
+    expect(result[0]?.headingPath).toContain('Section heading');
   });
 });

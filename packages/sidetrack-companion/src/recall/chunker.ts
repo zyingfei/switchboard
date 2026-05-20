@@ -74,12 +74,32 @@ const sha256Hex = (s: string): string => createHash('sha256').update(s).digest('
 // Pick the richest source representation. Markdown carries heading +
 // list + code-fence structure; falls back to formattedText (often a
 // pre-rendered plain form) and finally to text.
+//
+// Defensive completeness gate (2026-05-20): the upstream extractor's
+// mergeAdjacentTurns shallow-copies the first block's element ref
+// into the merged turn, so enrichTurn produces a `markdown` that
+// reflects only the FIRST adjacent block's content. For a ChatGPT
+// thread with two adjacent assistant blocks (73c + 8903c → text
+// 8586c merged), the resulting `markdown` was 73c — would silently
+// shadow the full content from the chunker, indexing only the head
+// and dropping the entire tail from recall search. Pick the LONGEST
+// non-empty source that's at least 50% of the raw text length; that
+// rejects a truncated markdown without rejecting a legitimately
+// shorter one (whitespace collapsed, link prose folded). Upstream
+// extractor fix tracked separately so the next layer is correct too.
+const COMPLETENESS_MIN_RATIO = 0.5;
 const pickSource = (input: RecallChunkInput): string => {
-  if (typeof input.markdown === 'string' && input.markdown.length > 0) return input.markdown;
-  if (typeof input.formattedText === 'string' && input.formattedText.length > 0) {
-    return input.formattedText;
-  }
-  return input.text;
+  const text = input.text;
+  const md =
+    typeof input.markdown === 'string' && input.markdown.length > 0 ? input.markdown : null;
+  const fmt =
+    typeof input.formattedText === 'string' && input.formattedText.length > 0
+      ? input.formattedText
+      : null;
+  const minLen = text.length * COMPLETENESS_MIN_RATIO;
+  if (md !== null && md.length >= minLen) return md;
+  if (fmt !== null && fmt.length >= minLen) return fmt;
+  return text;
 };
 
 interface Block {
