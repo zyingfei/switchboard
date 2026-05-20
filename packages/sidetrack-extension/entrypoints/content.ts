@@ -1304,6 +1304,38 @@ export default defineContentScript({
       characterData: true,
     });
 
+    // Periodic safety-net re-extract. The MutationObserver above
+    // catches DOM changes, but in practice the assistant-side block's
+    // late paint sometimes lands between scheduleAutoCapture's 2.5s
+    // debounce and the captureSignature dedup in a way that keeps the
+    // last-captured snapshot user-only. Empirical case (2026-05-20):
+    // a ChatGPT thread with 1 user + 2 assistant blocks (last 8903
+    // chars) ended up with ONLY the 89c user turn in the recall
+    // index, despite selectors finding all 3 blocks when probed.
+    // Periodic re-fire while the tab is visible gives the capture
+    // pipeline multiple bites at the apple — eventually it sees a
+    // state with all turns rendered and the (already
+    // length-aware) signature lets the fuller snapshot through.
+    // Bounded: max ~4 min of low-frequency captures per page load.
+    const PERIODIC_CAPTURE_INTERVAL_MS = 8_000;
+    const PERIODIC_CAPTURE_MAX_FIRES = 30;
+    let periodicCaptureFireCount = 0;
+    const periodicCaptureTimer = window.setInterval(() => {
+      if (periodicCaptureFireCount >= PERIODIC_CAPTURE_MAX_FIRES) {
+        window.clearInterval(periodicCaptureTimer);
+        return;
+      }
+      // Don't poll while the tab is in the background — saves CPU
+      // and avoids ingesting state the user can't have caused since
+      // the last fire (chat shells don't stream updates without an
+      // active session).
+      if (document.visibilityState !== 'visible') return;
+      periodicCaptureFireCount += 1;
+      // scheduleAutoCapture (debounced) + captureSignature dedup
+      // make this cheap when nothing has changed.
+      scheduleAutoCapture();
+    }, PERIODIC_CAPTURE_INTERVAL_MS);
+
     // Annotation re-anchor observer. Provider chat shells virtualize
     // long threads (turns above the viewport leave the DOM until the
     // user scrolls back). When new turn elements get inserted, any
