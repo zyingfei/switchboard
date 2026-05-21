@@ -37,6 +37,7 @@ import { join } from 'node:path';
 
 import { leidenCpmPartition } from '../connections/leidenCpm.js';
 import type { VisitSimilarityEdge } from '../connections/topicClusterer.js';
+import { parseUrlIdentity } from '../search/identity.js';
 
 export const SEMANTIC_RECALL_POOL_ENV = 'SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL';
 // v2: entries carry textHash (delta detection) + a sidecar vector
@@ -647,11 +648,94 @@ export interface SemanticRecallHit {
   readonly via: 'cluster' | 'neighbor';
 }
 
+// Per-host UPPER-QUARTILE (Q3, p75) cosine across SAME-HOST pairs in
+// the pool. Calibrated from the pool's own neighbor distribution at
+// first use — invariant 5 (rank against local pool, not a global
+// constant). Cached per pool object so repeated calls don't re-walk.
+//
+// Used by `expandSemanticRecallCandidates` to detect "the candidate
+// is similar BECAUSE of shared host identity, not BECAUSE of
+// content overlap". For a host whose URLs are host-dominated by the
+// embed input (every chatgpt.com/c/<hash> ≈ 0.91 cosine to every
+// other chatgpt.com/c/<hash> regardless of topic, p75 ≈ 0.93), any
+// candidate at-or-below p75 is in the typical-noise band and is
+// filtered. Only candidates in the top quartile of their host's
+// distribution survive — that's "this candidate's cosine is
+// unusually high for any same-host pair", which is the closest
+// proxy we have for "content signal beyond shared identity"
+// without re-embedding.
+//
+// Why p75 and not p50: the v2 dogfood pool's same-host distribution
+// has a fat noise band right around the median (q1=0.90, p50=0.91,
+// q3=0.93 for chatgpt.com), so a median cut still leaves 25% of
+// pairs above as noise. The upper quartile cuts at the natural
+// shoulder of the distribution. Same statistical family
+// (percentile, local), no global magic constant.
+//
+// For v4 (future, after pool rebuild with the evidence layer), the
+// same-host distribution would be RIGHT-SKEWED with most pairs near
+// the noise floor — p75 there would naturally land low, letting
+// legitimate same-host content matches surface. The filter is
+// distribution-shape-agnostic by construction.
+const baselineCache = new WeakMap<SemanticRecallPool, ReadonlyMap<string, number>>();
+
+const hostOf = (url: string): string | null => parseUrlIdentity(url)?.host ?? null;
+
+/** Visible for tests. Upper quartile (p75) cosine of pool's same-host pairs, per host. */
+export const computeSameHostBaselines = (
+  pool: SemanticRecallPool,
+): ReadonlyMap<string, number> => {
+  const samples = new Map<string, number[]>();
+  for (const [anchorUrl, entry] of Object.entries(pool.byUrl)) {
+    const aHost = hostOf(anchorUrl);
+    if (aHost === null) continue;
+    for (const nb of entry.neighbors) {
+      const nHost = hostOf(nb.canonicalUrl);
+      if (nHost !== aHost) continue;
+      let list = samples.get(aHost);
+      if (list === undefined) {
+        list = [];
+        samples.set(aHost, list);
+      }
+      list.push(nb.cosine);
+    }
+  }
+  const baselines = new Map<string, number>();
+  for (const [host, vs] of samples.entries()) {
+    if (vs.length === 0) continue;
+    vs.sort((a, b) => a - b);
+    // Q3 = element at the 75th percentile position (Math.floor for
+    // small samples keeps the index in-bounds and is the standard
+    // "nearest-rank" percentile definition).
+    baselines.set(host, vs[Math.floor((3 * vs.length) / 4)] ?? 0);
+  }
+  return baselines;
+};
+
+const getSameHostBaselines = (pool: SemanticRecallPool): ReadonlyMap<string, number> => {
+  let cached = baselineCache.get(pool);
+  if (cached === undefined) {
+    cached = computeSameHostBaselines(pool);
+    baselineCache.set(pool, cached);
+  }
+  return cached;
+};
+
 // READ-ONLY candidate expansion: given anchor urls (e.g. the page
 // hits a query already returned), return their E-cluster co-members +
 // nearest neighbours, cosine-ranked, excluding the anchors / already
 // seen. No embedding at request time. Empty if the pool is absent
 // (graceful) — callers must also gate on semanticRecallPoolEnabled().
+//
+// Anti-collapse (invariant 8 — exclude candidates better explained
+// by URL identity than by semantic evidence): when a candidate
+// shares host with some anchor AND its cosine is at-or-below the
+// pool's local UPPER QUARTILE (Q3) cosine for that host's same-host
+// pairs, the candidate's similarity is fully explained by shared
+// URL identity (no content signal beyond what identity predicts)
+// and is dropped. Cross-host candidates are never filtered — their
+// cosine MUST be content-driven since identity can't explain it.
+// Calibration is per-host from the pool itself; no magic constants.
 export const expandSemanticRecallCandidates = (
   pool: SemanticRecallPool | null,
   anchorUrls: readonly string[],
@@ -662,22 +746,51 @@ export const expandSemanticRecallCandidates = (
   const exclude = new Set(options.exclude ?? []);
   for (const a of anchorUrls) exclude.add(a);
   const best = new Map<string, SemanticRecallHit>();
-  const consider = (url: string, cosine: number, clusterId: string, via: 'cluster' | 'neighbor') => {
+  const consider = (
+    url: string,
+    cosine: number,
+    clusterId: string,
+    via: 'cluster' | 'neighbor',
+  ) => {
     if (exclude.has(url)) return;
     const prev = best.get(url);
-    if (prev === undefined || cosine > prev.cosine) best.set(url, { canonicalUrl: url, cosine, clusterId, via });
+    if (prev === undefined || cosine > prev.cosine)
+      best.set(url, { canonicalUrl: url, cosine, clusterId, via });
   };
   for (const anchor of anchorUrls) {
     const entry = pool.byUrl[anchor];
     if (entry === undefined) continue;
-    for (const nb of entry.neighbors) consider(nb.canonicalUrl, nb.cosine, entry.clusterId, 'neighbor');
+    for (const nb of entry.neighbors)
+      consider(nb.canonicalUrl, nb.cosine, entry.clusterId, 'neighbor');
     if (!entry.clusterId.startsWith('e:singleton:')) {
       for (const url of Object.keys(pool.byUrl)) {
-        if (pool.byUrl[url]?.clusterId === entry.clusterId) consider(url, 0, entry.clusterId, 'cluster');
+        if (pool.byUrl[url]?.clusterId === entry.clusterId)
+          consider(url, 0, entry.clusterId, 'cluster');
       }
     }
   }
+  const baselines = getSameHostBaselines(pool);
+  const anchorHosts = new Set<string>();
+  for (const a of anchorUrls) {
+    const h = hostOf(a);
+    if (h !== null) anchorHosts.add(h);
+  }
+  const survives = (hit: SemanticRecallHit): boolean => {
+    const cHost = hostOf(hit.canonicalUrl);
+    if (cHost === null) return false; // unparseable URL — drop conservatively
+    if (!anchorHosts.has(cHost)) return true; // cross-host: cosine must be content-driven
+    const baseline = baselines.get(cHost);
+    if (baseline === undefined) return true; // no baseline for this host yet
+    // Same-host: keep only if cosine exceeds the host's local Q3
+    // (top quartile of same-host pairs). Candidates at-or-below Q3
+    // sit in the typical-noise band — their similarity is no more
+    // than what shared identity already explains. The Q3 line is
+    // the natural cut-off at the upper shoulder of the
+    // distribution (75% of same-host pairs are at-or-below it).
+    return hit.cosine > baseline;
+  };
   return [...best.values()]
+    .filter(survives)
     .sort((a, b) => b.cosine - a.cosine || (a.canonicalUrl < b.canonicalUrl ? -1 : 1))
     .slice(0, limit);
 };
