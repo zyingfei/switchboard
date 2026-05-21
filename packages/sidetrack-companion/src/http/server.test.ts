@@ -189,6 +189,45 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({ status: 'ok' });
   });
 
+  it('serves unauthenticated /v1/version with vault + code identity', async () => {
+    // The extension's connection identity check pins {vaultRoot,
+    // codePath} from this endpoint and compares on every poll —
+    // catching a port reused by a different companion.
+    const result = await jsonFetch(context, `${baseUrl}/v1/version`);
+
+    expect(result.status).toBe(200);
+    const body = result.body as {
+      readonly data: {
+        readonly companionVersion: string;
+        readonly vaultRoot?: string;
+        readonly codePath?: string;
+        readonly pid: number;
+        readonly instanceLabel?: string;
+      };
+    };
+    expect(typeof body.data.companionVersion).toBe('string');
+    // vaultRoot comes from context — set in this test harness
+    expect(body.data.vaultRoot).toBe(vaultPath);
+    // codePath = process.argv[1] (the vitest entry under test) — present
+    expect(typeof body.data.codePath).toBe('string');
+    expect((body.data.codePath ?? '').length).toBeGreaterThan(0);
+    // pid is always present
+    expect(body.data.pid).toBe(process.pid);
+  });
+
+  it('/v1/version surfaces SIDETRACK_INSTANCE_LABEL when set', async () => {
+    const prev = process.env['SIDETRACK_INSTANCE_LABEL'];
+    process.env['SIDETRACK_INSTANCE_LABEL'] = 'test';
+    try {
+      const result = await jsonFetch(context, `${baseUrl}/v1/version`);
+      const body = result.body as { readonly data: { readonly instanceLabel?: string } };
+      expect(body.data.instanceLabel).toBe('test');
+    } finally {
+      if (prev === undefined) delete process.env['SIDETRACK_INSTANCE_LABEL'];
+      else process.env['SIDETRACK_INSTANCE_LABEL'] = prev;
+    }
+  });
+
   it('rejects state routes without bridge key auth', async () => {
     const result = await jsonFetch(context, `${baseUrl}/v1/status`);
 

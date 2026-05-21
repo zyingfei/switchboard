@@ -2161,11 +2161,17 @@ const routes: readonly RouteDefinition[] = [
     handle: (_request, requestId) => Promise.resolve([200, { status: 'ok', requestId }]),
   },
   {
-    // Stage 5 follow-up — minimal version/identity probe used by the
-    // attach-diagnostic to detect a stale companion process (extension
-    // rebuilt but companion still running the prior build). Returns
-    // companion-controlled fields only; no auth needed because the
-    // information leak is harmless.
+    // Minimal version/identity probe. Two consumers:
+    //  - the attach-diagnostic (detect a stale companion: extension
+    //    rebuilt but companion still on the prior build);
+    //  - the extension's connection identity check — it pins
+    //    {vaultRoot, codePath} on first attach and compares on every
+    //    poll, so a port reused by a DIFFERENT companion (a common
+    //    dogfood foot-gun: a test instance and the daily instance
+    //    both want :17373) surfaces instead of silently serving the
+    //    wrong vault.
+    // Returns companion-controlled fields only; no auth needed
+    // because the information leak is harmless (all local).
     method: 'GET',
     pattern: /^\/v1\/version$/,
     authRequired: false,
@@ -2179,6 +2185,26 @@ const routes: readonly RouteDefinition[] = [
             ...(context.startedAt === undefined
               ? {}
               : { startedAt: context.startedAt.toISOString() }),
+            // codePath: the absolute path of the running entry script
+            // (`dist/cli.js`). Directly answers "which checkout is
+            // this companion built from" — the field the extension
+            // compares to catch a build/checkout swap on a reused
+            // port. process.argv[1] is the entry script; absent only
+            // in exotic embeddings (then the field is just omitted).
+            ...(typeof process.argv[1] === 'string' && process.argv[1].length > 0
+              ? { codePath: process.argv[1] }
+              : {}),
+            // pid distinguishes restarts of the same companion from a
+            // genuinely different process on the port.
+            pid: process.pid,
+            // instanceLabel: free-form operator tag via
+            // SIDETRACK_INSTANCE_LABEL (e.g. "test" vs "daily"). Lets
+            // the extension show, and the operator eyeball, which
+            // instance is answering.
+            ...(typeof process.env['SIDETRACK_INSTANCE_LABEL'] === 'string' &&
+            process.env['SIDETRACK_INSTANCE_LABEL'].length > 0
+              ? { instanceLabel: process.env['SIDETRACK_INSTANCE_LABEL'] }
+              : {}),
             // gitSha is best-effort: it's set when the CLI is invoked
             // with --git-sha or with the SIDETRACK_COMPANION_GIT_SHA
             // env var. Absent in normal `bun dist/cli.js` runs.

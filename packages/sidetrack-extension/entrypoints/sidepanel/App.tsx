@@ -6858,6 +6858,29 @@ const App = () => {
 
       {error ? <div className="banner danger">{error}</div> : null}
 
+      {state.companionIdentityWarning ? (
+        <div
+          className={`banner ${
+            state.companionIdentityWarning.severity === 'blocking' ? 'danger' : 'warning'
+          }`}
+        >
+          <div>{state.companionIdentityWarning.message}</div>
+          {state.companionIdentityWarning.severity === 'blocking' ? (
+            <button
+              type="button"
+              className="banner-action"
+              onClick={() => {
+                void runAction(async () =>
+                  sendRequest({ type: messageTypes.trustCurrentCompanion }),
+                );
+              }}
+            >
+              Trust this companion
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       {viewMode === 'connections' ? (
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}

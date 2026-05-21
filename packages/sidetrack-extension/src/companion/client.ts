@@ -16,9 +16,13 @@ import type {
   WorkstreamUpdate,
 } from './model';
 import type { CodingSession } from '../workboard';
+import { parseCompanionIdentity, type CompanionIdentity } from './identity';
 
 export interface CompanionClient {
   readonly status: () => Promise<CompanionStatus>;
+  /** Fetch /v1/version — companion identity (vault + code path).
+   *  Returns null if the payload is unrecognizable. */
+  readonly version: () => Promise<CompanionIdentity | null>;
   readonly appendEvent: (event: CaptureEvent, idempotencyKey: string) => Promise<MutationResult>;
   readonly upsertThread: (thread: ThreadUpsert) => Promise<MutationResult>;
   readonly createWorkstream: (workstream: WorkstreamCreate) => Promise<MutationResult>;
@@ -421,6 +425,13 @@ export class HttpCompanionClient implements CompanionClient {
       throw new Error('Companion detach response missing data.');
     }
     return (value as { data: CodingSession }).data;
+  }
+
+  async version(): Promise<CompanionIdentity | null> {
+    // /v1/version is unauthenticated + cheap (no work triggered);
+    // short timeout is fine. The bridge-key header `request` always
+    // sets is harmless on an unauthenticated route.
+    return parseCompanionIdentity(await this.request('/version', { method: 'GET' }, 5_000));
   }
 
   private async request(

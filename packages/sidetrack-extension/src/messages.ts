@@ -34,6 +34,11 @@ export const messageTypes = {
   selectorCanary: 'sidetrack.capture.selector-canary',
   getWorkboardState: 'sidetrack.workboard.state',
   saveCompanionSettings: 'sidetrack.settings.companion.save',
+  // Re-pin the companion identity to whatever is currently answering
+  // on the configured port. Sent from the connection-identity banner
+  // when the operator confirms a flagged companion swap was
+  // intentional.
+  trustCurrentCompanion: 'sidetrack.companion.identity.trust',
   // Connections graph fetches — proxied to the companion's
   // /v1/connections endpoint by background.ts, with a 30 s TTL
   // cache so the side panel can poll cheaply.
@@ -286,6 +291,9 @@ export type WorkboardRequest =
     }
   | {
       readonly type: typeof messageTypes.captureCurrentTab;
+    }
+  | {
+      readonly type: typeof messageTypes.trustCurrentCompanion;
     }
   | {
       readonly type: typeof messageTypes.retryFailedCaptures;
@@ -658,6 +666,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       Number.isInteger(settings.port) &&
       typeof settings.bridgeKey === 'string'
     );
+  }
+
+  if (hasType(value, messageTypes.trustCurrentCompanion)) {
+    return true;
   }
 
   if (hasType(value, messageTypes.selectorCanary)) {
