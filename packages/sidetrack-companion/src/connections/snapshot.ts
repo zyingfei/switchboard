@@ -3282,6 +3282,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #root: string;
   readonly #snapshotsDir: string;
   readonly #databasePath: string;
+  readonly #currentJsonPath: string;
   #db: SqliteDatabase | null = null;
   #initialized = false;
 
@@ -3289,6 +3290,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     this.#root = join(vaultRoot, '_BAC', 'connections');
     this.#snapshotsDir = join(this.#root, SNAPSHOTS_DIR);
     this.#databasePath = options?.databasePath ?? join(this.#root, 'current.db');
+    this.#currentJsonPath = join(this.#root, 'current.json');
   }
 
   async #database(): Promise<SqliteDatabase> {
@@ -3326,8 +3328,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   async #readMetadata(db: SqliteDatabase): Promise<StoredConnectionsMetadata | null> {
     const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
-    if (metadataRow === null || metadataRow === undefined) return null;
+    if (metadataRow === null || metadataRow === undefined) {
+      return await this.#bootstrapFromJson(db);
+    }
     return JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+  }
+
+  async #bootstrapFromJson(db: SqliteDatabase): Promise<StoredConnectionsMetadata | null> {
+    try {
+      const snapshot = JSON.parse(
+        await readFile(this.#currentJsonPath, 'utf8'),
+      ) as ConnectionsSnapshot;
+      this.#writeCurrentRows(db, snapshot);
+      return metadataForSnapshot(snapshot);
+    } catch {
+      return null;
+    }
   }
 
   #readNode(db: SqliteDatabase, nodeId: string): ConnectionNode | null {
@@ -3408,6 +3424,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const db = await this.#database();
+    this.#writeCurrentRows(db, snapshot);
+  };
+
+  #writeCurrentRows(db: SqliteDatabase, snapshot: ConnectionsSnapshot): void {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -3488,7 +3508,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.exec('ROLLBACK');
       throw error;
     }
-  };
+  }
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
