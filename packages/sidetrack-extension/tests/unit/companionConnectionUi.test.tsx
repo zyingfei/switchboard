@@ -110,7 +110,8 @@ describe('Wizard CompanionStep — Advanced port input', () => {
         onPortChange={onPortChange}
       />,
     );
-    // Step through Welcome → Vault → Companion.
+    // Step through Welcome (pick Local) → Vault → Companion.
+    fireEvent.click(screen.getByText('Local vault'));
     fireEvent.click(screen.getByText('Next'));
     fireEvent.click(screen.getByText('Next'));
     // The Advanced toggle is collapsed by default for the canonical
@@ -134,6 +135,7 @@ describe('Wizard CompanionStep — Advanced port input', () => {
         onPortChange={() => undefined}
       />,
     );
+    fireEvent.click(screen.getByText('Local vault'));
     fireEvent.click(screen.getByText('Next'));
     fireEvent.click(screen.getByText('Next'));
     // Auto-open: the input is rendered immediately, no need to click toggle.

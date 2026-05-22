@@ -212,8 +212,9 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
-    // Vault step is now first after Welcome; advance twice to reach
-    // the Companion step.
+    // Welcome forks on mode; pick Local, then advance twice (vault →
+    // companion step).
+    fireEvent.click(screen.getByRole('button', { name: /Local vault/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText(/Waiting for companion/)).toBeInTheDocument();
@@ -234,9 +235,9 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
-    // Vault step is now first after Welcome (vaultPath defaults to
-    // '~/Documents/Sidetrack-vault' so the bunx command can render
-    // it). Next twice → companion step.
+    // Welcome forks on mode; pick Local, then Next twice → vault →
+    // companion step.
+    fireEvent.click(screen.getByRole('button', { name: /Local vault/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
@@ -258,9 +259,9 @@ describe('UX skeleton components — render-without-crash + key text present', (
         onReadClipboard={readClipboard}
       />,
     );
-    // Vault step is now first after Welcome (vaultPath defaults to
-    // '~/Documents/Sidetrack-vault' so the bunx command can render
-    // it). Next twice → companion step.
+    // Welcome forks on mode; pick Local, then Next twice → vault →
+    // companion step.
+    fireEvent.click(screen.getByRole('button', { name: /Local vault/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Paste from clipboard' }));
@@ -281,6 +282,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
       />
     );
     const { rerender } = render(renderWizard());
+    fireEvent.click(screen.getByRole('button', { name: /Local vault/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
 

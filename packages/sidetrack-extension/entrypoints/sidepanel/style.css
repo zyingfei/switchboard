@@ -2847,6 +2847,30 @@ textarea.preview-body:focus {
   color: var(--ink-3);
   margin-top: 8px;
 }
+.wizard-choice-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.wizard-choice {
+  text-align: left;
+  padding: 14px;
+  border: var(--hair);
+  border-radius: var(--rad-m);
+  background: var(--paper);
+  cursor: pointer;
+  min-height: auto;
+}
+.wizard-choice:hover {
+  border-color: var(--ink-3);
+}
+.wizard-choice.on {
+  border: 1.5px solid var(--ink);
+  background: var(--paper-deep);
+}
+.wizard-choice .wizard-card-meta {
+  margin-top: 6px;
+}
 .wizard-status {
   display: flex;
   align-items: center;
