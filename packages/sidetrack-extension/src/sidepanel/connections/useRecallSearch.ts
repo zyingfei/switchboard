@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { messageTypes } from '../../messages';
+import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 // Stage 5 polish — recall-index full-text search hook. The
 // companion's `/v1/recall/query` route does hybrid lexical +
@@ -53,8 +54,8 @@ export const useRecallSearch = (
     readonly limit?: number;
   } = {},
 ): RecallSearchState => {
-  const debounceMs = options.debounceMs ?? 300;
-  const minLength = options.minQueryLength ?? 3;
+  const debounceMs = options.debounceMs ?? SEARCH_DEBOUNCE_MS;
+  const minLength = options.minQueryLength ?? SEARCH_MIN_QUERY_CHARS;
   const limit = options.limit ?? 12;
   const [state, setState] = useState<RecallSearchState>({
     query: '',

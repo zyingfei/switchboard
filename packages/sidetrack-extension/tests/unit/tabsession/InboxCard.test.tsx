@@ -60,6 +60,42 @@ describe('InboxCard', () => {
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
+  it('confirms a low-confidence "Best guess" (decision has no workstreamId; uses fusedCandidates[0])', () => {
+    const onAttribute = vi.fn();
+    const bestGuess: TabSessionResolutionResult = {
+      tabSessionId: 'tses_test',
+      dryRun: true,
+      // Low-confidence: decision carries NO workstreamId, only a
+      // top fused candidate — this is the "Best guess: …" provenance.
+      decision: { action: 'inbox', margin: 0.05 },
+      fusedCandidates: [
+        {
+          workstreamId: 'ws_switchboard',
+          rawFusionLogit: 0.4,
+          dominantSource: 'similarity',
+          reasons: [
+            {
+              source: 'similarity',
+              summary: 'Weak similarity',
+              anchors: ['timeline-visit:https://example.test/research'],
+            },
+          ],
+        },
+      ],
+    };
+    render(
+      <InboxCard
+        record={record()}
+        suggestion={bestGuess}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: "Yes, that's right" }));
+    expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
+  });
+
   it('opens the workstream picker via "Pick another…"', () => {
     const onAttribute = vi.fn();
     const onPickAnother = vi.fn();

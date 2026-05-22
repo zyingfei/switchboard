@@ -546,3 +546,96 @@ describe('rankHybrid — vector-only fallback preserved', () => {
     expect(results[0]?.vector?.rank).toBe(1);
   });
 });
+
+// Mixed CJK + Latin tokenization regression (#69). The original
+// tokenizer split only on Latin whitespace + ASCII punctuation, so a
+// Chinese paragraph became one giant token (e.g. "再抽出它的测试模型")
+// and MiniSearch's `prefix: true` search only matched query terms
+// that the token STARTED with — embedded Latin terms ("Jepsen、Elle、
+// TLA+、DST、fuzzing") AND mid-paragraph Chinese terms ("测试" inside
+// "再抽出它的测试模型") were both invisible. The dogfood symptom: a
+// captured ChatGPT thread whose full assistant text was in the events
+// log returned zero recall hits for those embedded terms.
+//
+// Fix is in two layers:
+//   1) Extend the splitter with CJK punctuation, ideographic space,
+//      and ASCII `/`, plus a CJK↔Latin boundary lookahead/lookbehind
+//      so embedded English in CJK text surfaces as its own token.
+//   2) For pure-CJK tokens, additionally emit overlapping 2-grams so
+//      MiniSearch's prefix-match can find a CJK query anywhere in a
+//      glued Chinese paragraph (the Lucene CJKBigramAnalyzer pattern).
+// Both layers are required: (1) alone misses mid-paragraph CJK like
+// "测试" inside "再抽出它的测试模型"; (2) alone misses "Jepsen" because
+// it gets glued onto "、Elle、TLA+…" with no whitespace.
+describe('tokenizer — mixed CJK + Latin (regression for #69)', () => {
+  const TARGET_ID = `chunk:target:0:0:${'a'.repeat(12)}`;
+  const OTHER_ID = `chunk:other:0:0:${'b'.repeat(12)}`;
+  const baseDate = new Date('2026-05-20T00:00:00.000Z');
+
+  const queryHits = (q: string, items: readonly IndexEntry[]): readonly string[] => {
+    const lexical = buildLexicalIndex(items);
+    return rankHybrid(q, Float32Array.from([1, 0]), items, baseDate, { lexical }).map(
+      (r) => r.id,
+    );
+  };
+
+  it('embedded English in a CJK paragraph (Jepsen、Elle、TLA+) — was 0 hits', () => {
+    const items: readonly IndexEntry[] = [
+      entry(TARGET_ID, 'thread_target', '2026-05-20T00:00:00.000Z', [1, 0], {
+        text: '它不替代 Jepsen、Elle、TLA+、DST、fuzzing，而是给 agent 一个上层框架。',
+      }),
+      entry(OTHER_ID, 'thread_other', '2026-05-20T00:00:00.000Z', [0, 1], {
+        text: 'Unrelated chunk about persistence and replication.',
+      }),
+    ];
+    for (const q of ['Jepsen', 'Elle', 'fuzzing', 'agent']) {
+      expect(queryHits(q, items), `query=${q}`).toContain(TARGET_ID);
+    }
+  });
+
+  it('mid-paragraph CJK term inside a long Chinese glued token — was 0 hits without bigrams', () => {
+    // Same shape as the dogfood-captured chunk: a Chinese paragraph
+    // where "测试" sits in the MIDDLE of a longer token (after
+    // punctuation splits) so prefix-match alone never finds it.
+    const items: readonly IndexEntry[] = [
+      entry(TARGET_ID, 'thread_target', '2026-05-20T00:00:00.000Z', [1, 0], {
+        text: '我会先看 repo 的 README/目录结构，再抽出它的测试模型和故障注入检查器。',
+      }),
+      entry(OTHER_ID, 'thread_other', '2026-05-20T00:00:00.000Z', [0, 1], {
+        text: 'Unrelated chunk text.',
+      }),
+    ];
+    for (const q of ['测试', '故障注入', 'README', '检查器']) {
+      expect(queryHits(q, items), `query=${q}`).toContain(TARGET_ID);
+    }
+  });
+
+  it('CJK↔Latin no-separator boundary still splits (lookbehind path)', () => {
+    const items: readonly IndexEntry[] = [
+      entry(TARGET_ID, 'thread_target', '2026-05-20T00:00:00.000Z', [1, 0], {
+        text: '故障注入Jepsen混合段落',
+      }),
+      entry(OTHER_ID, 'thread_other', '2026-05-20T00:00:00.000Z', [0, 1], {
+        text: 'Unrelated.',
+      }),
+    ];
+    for (const q of ['Jepsen', '故障注入', '混合']) {
+      expect(queryHits(q, items), `query=${q}`).toContain(TARGET_ID);
+    }
+  });
+
+  it('preserves existing dotted-identifier split (sidetrack.threads.move)', () => {
+    const items: readonly IndexEntry[] = [
+      entry(TARGET_ID, 'thread_target', '2026-05-20T00:00:00.000Z', [1, 0], {
+        text: 'Move the thread by calling sidetrack.threads.move on the workstream.',
+      }),
+      entry(OTHER_ID, 'thread_other', '2026-05-20T00:00:00.000Z', [0, 1], {
+        text: 'Unrelated chunk text.',
+      }),
+    ];
+    for (const q of ['sidetrack.threads.move', 'move', 'threads', 'sidetrack']) {
+      expect(queryHits(q, items), `query=${q}`).toContain(TARGET_ID);
+    }
+  });
+
+});

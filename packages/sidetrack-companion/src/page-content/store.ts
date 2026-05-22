@@ -2,8 +2,11 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
+import MiniSearch from 'minisearch';
+
 import { createRevision } from '../domain/ids.js';
 import { extractPageEvidenceFeatures } from '../page-evidence/extract.js';
+import { ANALYZER_VERSION, analyze } from '../search/analyzer.js';
 import {
   PAGE_CONTENT_COVERAGE_STATES,
   PAGE_CONTENT_EXTRACTED,
@@ -261,6 +264,7 @@ export const writePageContentExtracted = async (
       sourceEventType: PAGE_CONTENT_EXTRACTED,
     } satisfies PageContentRecord);
     await rebuildManifests(vaultRoot);
+    invalidatePageContentLexicalIndex(vaultRoot);
     return coverage;
   }
 
@@ -308,6 +312,7 @@ export const writePageContentExtracted = async (
   } satisfies PageContentRecord);
   await atomicWriteJson(join(chunksDir(vaultRoot), `${contentHash}.json`), { version: 1, chunks });
   await rebuildManifests(vaultRoot);
+  invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
 };
 
@@ -337,6 +342,7 @@ export const writePageContentTombstoned = async (
     sourceEventType: PAGE_CONTENT_TOMBSTONED,
   } satisfies PageContentRecord);
   await rebuildManifests(vaultRoot);
+  invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
 };
 
@@ -426,17 +432,16 @@ export const readPageContentChunksForCanonicalUrls = async (
   return out;
 };
 
-const tokenize = (input: string): readonly string[] =>
-  input
-    .toLowerCase()
-    .split(/[^a-z0-9\u4e00-\u9fff]+/u)
-    .filter((token) => token.length >= 2);
-
-const snippetFor = (text: string, tokens: readonly string[], maxChars = 220): string => {
+// Snippet around the first analyzed term that appears in the text.
+// Analyzer-aware so CJK queries find a relevant window (every
+// bigram/unigram counts as a candidate anchor) and dotted-identifier
+// parts hit the right spot.
+const snippetFor = (text: string, query: string, maxChars = 220): string => {
   const lower = text.toLowerCase();
+  const tokens = analyze(query);
   const pos =
     tokens
-      .map((token) => lower.indexOf(token.toLowerCase()))
+      .map((token) => lower.indexOf(token))
       .filter((index) => index >= 0)
       .sort((a, b) => a - b)[0] ?? 0;
   const start = Math.max(0, pos - Math.floor(maxChars / 3));
@@ -446,27 +451,62 @@ const snippetFor = (text: string, tokens: readonly string[], maxChars = 220): st
     .trim();
 };
 
-const chunkMatches = (chunk: PageContentChunk, tokens: readonly string[]): number => {
-  const haystack = `${chunk.title ?? ''} ${chunk.text}`.toLowerCase();
-  let score = 0;
-  for (const token of tokens) {
-    if (haystack.includes(token)) score += token.length;
-  }
-  if (score === 0) return 0;
-  const qualityBoost = chunk.quality === 'high' ? 1.2 : chunk.quality === 'medium' ? 1 : 0.8;
-  return Number((score * qualityBoost).toFixed(6));
-};
+// In-memory MiniSearch over every indexed chunk. Built lazily per
+// vaultRoot, cached by promise so concurrent callers share the same
+// in-flight build, invalidated on every write/tombstone so the next
+// query rebuilds against fresh content. Companion startup may
+// pre-warm via `ensurePageContentLexicalIndex` (fire-and-forget) to
+// move the build off the first-query critical path.
 
-export const queryPageContent = async (
+interface PageContentIndexEntry {
+  readonly chunk: PageContentChunk;
+  readonly coverage: PageContentCoverage;
+  readonly recordTitle?: string;
+}
+
+export interface PageContentLexicalIndex {
+  readonly mini: MiniSearch<{
+    id: string;
+    text: string;
+    title: string;
+    canonicalUrl: string;
+  }>;
+  readonly idToEntry: ReadonlyMap<string, PageContentIndexEntry>;
+  // Stable signature: bumping ANALYZER_VERSION OR adding/removing
+  // chunks changes this. Surfaced to /v1/system/health so an
+  // operator can confirm the analyzer they're querying against.
+  readonly revision: string;
+}
+
+let cached: { vaultRoot: string; promise: Promise<PageContentLexicalIndex> } | null = null;
+
+const buildPageContentLexicalIndex = async (
   vaultRoot: string,
-  q: string,
-  options: { readonly limit?: number } = {},
-): Promise<readonly ContentSearchHit[]> => {
-  const tokens = tokenize(q);
-  if (tokens.length === 0) return [];
+): Promise<PageContentLexicalIndex> => {
   const records = await readAllRecords(vaultRoot);
-  const hits: ContentSearchHit[] = [];
-  for (const record of records) {
+  const mini = new MiniSearch<{
+    id: string;
+    text: string;
+    title: string;
+    canonicalUrl: string;
+  }>({
+    fields: ['text', 'title'],
+    storeFields: ['id', 'canonicalUrl'],
+    idField: 'id',
+    tokenize: analyze,
+    processTerm: (term) => term.toLowerCase(),
+    searchOptions: {
+      tokenize: analyze,
+      processTerm: (term) => term.toLowerCase(),
+      boost: { text: 1, title: 2 },
+      prefix: true,
+      fuzzy: 0.15,
+    },
+  });
+  const idToEntry = new Map<string, PageContentIndexEntry>();
+  let indexedChunks = 0;
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]!;
     const coverage = record.coverage;
     if (
       coverage.contentHash === undefined ||
@@ -480,28 +520,83 @@ export const queryPageContent = async (
       join(chunksDir(vaultRoot), `${coverage.contentHash}.json`),
     );
     for (const chunk of raw?.chunks ?? []) {
-      const score = chunkMatches(chunk, tokens);
-      if (score <= 0) continue;
-      hits.push({
-        id: chunk.id,
-        sourceKind: 'page-content',
-        anchorNodeId: `timeline-visit:${coverage.canonicalUrl}`,
-        canonicalUrl: coverage.canonicalUrl,
-        title: chunk.title ?? record.title ?? coverage.canonicalUrl,
-        snippet: snippetFor(chunk.text, tokens),
-        score,
-        capturedAt: chunk.extractedAt,
-        coverageState: coverage.state,
-        ...(coverage.quality === undefined ? {} : { quality: coverage.quality }),
+      idToEntry.set(chunk.id, {
+        chunk,
+        coverage,
+        ...(record.title === undefined ? {} : { recordTitle: record.title }),
       });
+      mini.add({
+        id: chunk.id,
+        text: chunk.text,
+        title: chunk.title ?? record.title ?? '',
+        canonicalUrl: coverage.canonicalUrl,
+      });
+      indexedChunks += 1;
+    }
+    // Yield to the event loop every ~50 indexed chunks so `/v1/status`
+    // stays responsive while a large vault rebuilds at startup.
+    if (indexedChunks > 0 && indexedChunks % 50 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
+  return {
+    mini,
+    idToEntry,
+    revision: `${String(ANALYZER_VERSION)}:${String(indexedChunks)}`,
+  };
+};
+
+export const ensurePageContentLexicalIndex = (
+  vaultRoot: string,
+): Promise<PageContentLexicalIndex> => {
+  if (cached !== null && cached.vaultRoot === vaultRoot) return cached.promise;
+  cached = { vaultRoot, promise: buildPageContentLexicalIndex(vaultRoot) };
+  return cached.promise;
+};
+
+export const invalidatePageContentLexicalIndex = (vaultRoot: string): void => {
+  if (cached?.vaultRoot === vaultRoot) cached = null;
+};
+
+// Visible for tests.
+export const __resetPageContentLexicalIndexCacheForTests = (): void => {
+  cached = null;
+};
+
+export const queryPageContent = async (
+  vaultRoot: string,
+  q: string,
+  options: { readonly limit?: number } = {},
+): Promise<readonly ContentSearchHit[]> => {
+  const trimmed = q.trim();
+  if (trimmed.length === 0) return [];
+  const index = await ensurePageContentLexicalIndex(vaultRoot);
   const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
-  return hits
-    .sort(
-      (left, right) => right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
-    )
-    .slice(0, limit);
+  // MiniSearch returns results sorted by its internal score. We keep
+  // those raw scores for downstream RRF (rank-based, score-scale
+  // irrelevant) and emit hits in MiniSearch's order \u2014 never re-sort
+  // by raw score across sources.
+  const results = index.mini.search(trimmed);
+  const out: ContentSearchHit[] = [];
+  for (let i = 0; i < results.length && out.length < limit; i += 1) {
+    const result = results[i]!;
+    const entry = index.idToEntry.get(result.id);
+    if (entry === undefined) continue;
+    const { chunk, coverage, recordTitle } = entry;
+    out.push({
+      id: chunk.id,
+      sourceKind: 'page-content',
+      anchorNodeId: `timeline-visit:${coverage.canonicalUrl}`,
+      canonicalUrl: coverage.canonicalUrl,
+      title: chunk.title ?? recordTitle ?? coverage.canonicalUrl,
+      snippet: snippetFor(chunk.text, trimmed),
+      score: result.score,
+      capturedAt: chunk.extractedAt,
+      coverageState: coverage.state,
+      ...(coverage.quality === undefined ? {} : { quality: coverage.quality }),
+    });
+  }
+  return out;
 };
 
 export const pageContentStorageStats = async (

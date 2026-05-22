@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
+import { ensurePageContentLexicalIndex } from './page-content/store.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
 import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
@@ -914,6 +915,18 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   });
 
   writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
+  // Background pre-warm: build the page-content MiniSearch index
+  // against the live `ANALYZER_VERSION`. This is the "forced rebuild
+  // on companion start" migration policy for tokenizer changes —
+  // bumping `ANALYZER_VERSION` reseeds the index here without any
+  // operator action. Fire-and-forget so startup stays snappy; the
+  // first query awaits the same promise if the warm hasn't finished.
+  void ensurePageContentLexicalIndex(runtime.vaultPath).catch((err: unknown) => {
+    writeLine(
+      streams.stderr,
+      `[page-content] background index warm failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
   writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
   writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
   writeLine(

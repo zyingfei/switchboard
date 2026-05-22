@@ -120,6 +120,7 @@ import {
   tabSessionInbox,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
+import { overlayUrlAttributionOntoTabSessions } from '../tabsession/urlAttributionOverlay.js';
 import { autoApplyTabSessionAttribution } from '../tabsession/autoApply.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
 import {
@@ -144,6 +145,7 @@ import {
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
+import { RRF_K, fuseByRank } from '../search/rrf.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -930,24 +932,69 @@ const resolveConnectionsNodeId = (
 // read-only candidate expansion. NEVER runs in the materializer
 // drain; the query path only READS the cached artifact (bounded
 // latency); the build is fire-and-forget off the request path.
+// Déjà-vu's semantic-recall-pool query fires this detached
+// full-corpus re-embed (ONNX e5 sidecar). With a cold/warming
+// embedder each attempt fails, persists nothing, and the NEXT Déjà-vu
+// re-triggers it → query→rebuild→still-cold→rebuild, ~99% CPU in the
+// embedder child (HTTP log stays fast — the work isn't on the request
+// path). Two structural guards, mirroring /v1/recall/query's
+// isVectorUsable: (1) don't kick unless the embedder is usable;
+// (2) a cooldown so serial Déjà-vu auto-fires can't thrash a
+// full-corpus re-embed even once warm. The pool is a background
+// "Similar" nicety — ≤cooldown staleness is fine.
+const SEMANTIC_REFRESH_COOLDOWN_MS = ((): number => {
+  const raw = process.env['SIDETRACK_SEMANTIC_REFRESH_COOLDOWN_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 300_000;
+})();
 let semanticRecallRefreshInFlight = false;
-const kickSemanticRecallPoolRefresh = (vaultRoot: string): void => {
+let semanticRecallLastRefreshMs = 0;
+const kickSemanticRecallPoolRefresh = (vaultRoot: string, embedderUsable: boolean): void => {
   if (semanticRecallRefreshInFlight) return;
+  if (!embedderUsable) return;
+  if (Date.now() - semanticRecallLastRefreshMs < SEMANTIC_REFRESH_COOLDOWN_MS) return;
   semanticRecallRefreshInFlight = true;
+  semanticRecallLastRefreshMs = Date.now();
   void (async () => {
     try {
       const records = await listPageEvidenceRecords(vaultRoot);
+      // Embed CONTENT (keyphrases/entities/top-weighted terms) when
+      // available, not URL identity. The previous shape
+      // `[title, host, pathTokens]` was dominated by the host token
+      // for any same-host-but-different-page set (every chatgpt.com
+      // chat URL got cosine ≥ 0.92 to every other one regardless of
+      // topic — 16% of pool edges were ≥ 0.99). Content-derived
+      // tokens give the embedding actual topic signal; for records
+      // without `content` (page-text auto-extract off — every chat
+      // URL today, since chat-turn capture goes through a separate
+      // pipeline), fall back to the URL-identity shape but drop the
+      // bare host token so the embedding doesn't collapse to the
+      // same-host vector. Chat-URL similarity becomes meaningful
+      // once the chunk-text source is wired in (tracked separately).
       const items = records
-        .map((r) => ({
-          canonicalUrl: r.canonicalUrl,
-          text: [
-            r.metadata.title ?? '',
-            r.metadata.host ?? '',
-            ...(r.metadata.pathTokens ?? []),
-          ]
-            .join(' ')
-            .trim(),
-        }))
+        .map((r) => {
+          const c = r.content;
+          const contentTokens = c
+            ? [
+                ...c.keyphrases.slice(0, 20).map((k) => k.term),
+                ...c.entities.slice(0, 20).map((e) => e.text),
+                ...c.terms.slice(0, 30).map((t) => t.term),
+              ]
+            : [];
+          const base = [r.metadata.title ?? '', ...(r.metadata.pathTokens ?? [])];
+          // Host stays out of the embed input entirely — its
+          // domination of cosine for same-host clusters was the
+          // primary bug. The provenance still has host via pathTokens
+          // upstream where it matters; recall similarity is about
+          // topic, not URL structure.
+          return {
+            canonicalUrl: r.canonicalUrl,
+            text: [...base, ...contentTokens]
+              .filter((s) => s.length > 0)
+              .join(' ')
+              .trim(),
+          };
+        })
         .filter((i) => i.text.length > 0);
       if (items.length >= 2) {
         await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
@@ -964,9 +1011,12 @@ const semanticRecallExpansion = async (
   vaultRoot: string,
   anchorHits: readonly ContentSearchHit[],
   limit: number,
+  embedderUsable: boolean,
 ): Promise<readonly ContentSearchHit[]> => {
   const pool = await readSemanticRecallPool(vaultRoot);
-  kickSemanticRecallPoolRefresh(vaultRoot); // opportunistic, non-blocking
+  // Read-only serve of the cached pool always happens (cheap); the
+  // rebuild is gated/cooldowned so a cold embedder can't loop.
+  kickSemanticRecallPoolRefresh(vaultRoot, embedderUsable);
   if (pool === null) return [];
   const anchors = anchorHits
     .map((h) => h.canonicalUrl)
@@ -981,23 +1031,37 @@ const semanticRecallExpansion = async (
     vaultRoot,
     expanded.map((e) => e.canonicalUrl),
   );
+  // Déjà-vu wants "when did I FIRST encounter this" semantics for
+  // the Similar hits — otherwise every Similar row reads "a few
+  // seconds ago" (every fresh autoCapture / page-evidence refresh
+  // would bump capturedAt to now, hiding the actual recency the
+  // user cares about). Prefer firstSeenAt, fall back through
+  // lastSeenAt → record.updatedAt → now.
   const nowIso = new Date().toISOString();
-  return expanded.map((e) => ({
-    id: `semantic-recall-pool:${e.canonicalUrl}`,
-    sourceKind: 'semantic-recall-pool' as const,
-    sourceEvidence: {
-      source: 'semantic_recall_pool' as const,
-      similarity: e.cosine,
-      via: e.via,
-    },
-    anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
-    canonicalUrl: e.canonicalUrl,
-    title: evidenceByUrl.get(e.canonicalUrl)?.metadata.title ?? e.canonicalUrl,
-    // Capped low so semantic-pool hits EXPAND (fill remaining slots)
-    // and never displace primary lexical/vector candidates.
-    score: Math.min(0.49, e.cosine * 0.5),
-    capturedAt: nowIso,
-  }));
+  return expanded.map((e) => {
+    const ev = evidenceByUrl.get(e.canonicalUrl);
+    const capturedAt =
+      ev?.metadata.firstSeenAt ??
+      ev?.metadata.lastSeenAt ??
+      ev?.updatedAt ??
+      nowIso;
+    return {
+      id: `semantic-recall-pool:${e.canonicalUrl}`,
+      sourceKind: 'semantic-recall-pool' as const,
+      sourceEvidence: {
+        source: 'semantic_recall_pool' as const,
+        similarity: e.cosine,
+        via: e.via,
+      },
+      anchorNodeId: `timeline-visit:${e.canonicalUrl}`,
+      canonicalUrl: e.canonicalUrl,
+      title: ev?.metadata.title ?? e.canonicalUrl,
+      // Capped low so semantic-pool hits EXPAND (fill remaining slots)
+      // and never displace primary lexical/vector candidates.
+      score: Math.min(0.49, e.cosine * 0.5),
+      capturedAt,
+    };
+  });
 };
 
 const queryRecallContent = async (
@@ -1035,11 +1099,20 @@ const queryRecallContent = async (
   const meta = new Map<string, { title: string; threadUrl: string }>();
   const hits = await Promise.all(
     ranked.map(async (item): Promise<ContentSearchHit> => {
-      let info = meta.get(item.threadId);
+      // The recall index keys hybrid entries' `threadId` by the
+      // PROVIDER conversation id (a UUID), but thread files + the
+      // extension's local thread cache + focusThreadInSidePanel are
+      // keyed by the BAC id. `metadata.sourceBacId` is that bac id
+      // (fall back to threadId for back-compat entries where threadId
+      // IS the bac id). Resolving the thread file / returned threadId
+      // by the bac id is what makes Déjà-vu "Jump" to a chat work
+      // (was a silent no-op: no resolvable URL + wrong id).
+      const bacId = item.metadata?.sourceBacId ?? item.threadId;
+      let info = meta.get(bacId);
       if (info === undefined) {
         try {
           const threadFile = await readFile(
-            join(vaultRoot, '_BAC', 'threads', `${item.threadId}.json`),
+            join(vaultRoot, '_BAC', 'threads', `${bacId}.json`),
             'utf8',
           );
           const parsed = JSON.parse(threadFile) as {
@@ -1053,13 +1126,19 @@ const queryRecallContent = async (
         } catch {
           info = { title: '', threadUrl: '' };
         }
-        meta.set(item.threadId, info);
+        // Prefer the chunk metadata's own threadUrl when the thread
+        // file is absent (recall-only / uncaptured thread).
+        if (info.threadUrl.length === 0 && typeof item.metadata?.threadUrl === 'string') {
+          info = { ...info, threadUrl: item.metadata.threadUrl };
+        }
+        meta.set(bacId, info);
       }
       return {
         id: item.id,
         sourceKind: 'chat-turn',
-        anchorNodeId: `thread:${item.threadId}`,
-        threadId: item.threadId,
+        anchorNodeId: `thread:${bacId}`,
+        threadId: bacId,
+        ...(info.threadUrl.length > 0 ? { canonicalUrl: info.threadUrl } : {}),
         title: item.metadata?.title ?? info.title,
         ...(item.snippet === undefined ? {} : { snippet: item.snippet }),
         score: item.score,
@@ -1349,6 +1428,36 @@ const statSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
+// Resolve-cache signature. Like statSig but the mtime is floored to
+// RESOLVE_SIG_BUCKET_MS. The visres:/tabres: dry-run resolve caches
+// keyed on raw statSig(current.json) NEVER hit under load: ambient
+// observation (esp. now the content script injects on all pages)
+// drives frequent materializer drains that rewrite current.json, so
+// the raw mtime rotates the key on essentially every request and the
+// SAME url is recomputed (full PPR+cluster+ranker) 30+×/min → 99%
+// CPU, /status starvation (the recurring resolve-flood). Bucketing
+// the mtime collapses a burst of rewrites to one key so the 30s TTL
+// actually applies, while still rotating within one bucket of a real
+// change (≤bucket dry-run-preview staleness — the documented
+// "contextual, staleness acceptable" tradeoff); `size` still catches
+// length-changing rewrites and user mutations call
+// invalidateResolveCaches() for immediate freshness. Companion-side
+// so it holds regardless of which extension build is loaded.
+const RESOLVE_SIG_BUCKET_MS = ((): number => {
+  const raw = process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 15_000;
+})();
+const resolveSig = async (path: string): Promise<string> => {
+  try {
+    const s = await stat(path);
+    const bucket =
+      RESOLVE_SIG_BUCKET_MS > 0 ? Math.floor(s.mtimeMs / RESOLVE_SIG_BUCKET_MS) : s.mtimeMs;
+    return `${String(bucket)}:${String(s.size)}`;
+  } catch {
+    return 'absent';
+  }
+};
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
 // position. The feedback + page-content overlays do depend on the
 // event log, but it advances on EVERY extension event flush (~1/min
@@ -1519,6 +1628,73 @@ const cachedRoute = async (
   })();
   routeInFlight.set(key, compute);
   return compute;
+};
+
+// Hard concurrency cap on the expensive resolve build (readCurrent
+// ~14MB + readMerged + PPR/cluster/ranker ≈ 0.5–3 s of CPU each).
+// cachedRoute's in-flight map only dedupes the SAME key; a flooding
+// client (the recurring resolve-flood) requests MANY distinct
+// urls/tab-sessions, so without a cross-key cap N concurrent builds
+// peg every core and starve /status. This bounds resolver CPU to
+// RESOLVE_MAX_CONCURRENCY computes regardless of request rate or
+// which extension build is loaded — excess requests queue (each
+// build is short; cache hits don't take a slot). /status and other
+// endpoints are NOT wrapped, so the companion stays responsive even
+// while resolves are queued. A permit is handed directly to the next
+// waiter on release so the cap is never exceeded.
+const RESOLVE_MAX_CONCURRENCY = ((): number => {
+  const raw = process.env['SIDETRACK_RESOLVE_MAX_CONCURRENCY'];
+  const n = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 2;
+})();
+let resolvePermits = RESOLVE_MAX_CONCURRENCY;
+const resolveWaiters: Array<() => void> = [];
+const acquireResolveSlot = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    if (resolvePermits > 0) {
+      resolvePermits -= 1;
+      resolve();
+    } else {
+      resolveWaiters.push(resolve);
+    }
+  });
+const releaseResolveSlot = (): void => {
+  const next = resolveWaiters.shift();
+  if (next !== undefined) {
+    next();
+  } else {
+    resolvePermits += 1;
+  }
+};
+const cachedResolveRoute = (
+  key: string,
+  ttlMs: number,
+  build: () => Promise<readonly [number, unknown]>,
+): Promise<readonly [number, unknown]> =>
+  cachedRoute(key, ttlMs, async (): Promise<readonly [number, unknown]> => {
+    await acquireResolveSlot();
+    try {
+      return await build();
+    } finally {
+      releaseResolveSlot();
+    }
+  });
+
+// The suggestion-resolve caches (visres:/tabres:) are keyed on the
+// connections snapshot, deliberately NOT the event log (see the statSig
+// note — seq advances every flush, so seq-keying never hits). But an
+// explicit user attribution/ignore decision MUST take effect at once,
+// and the resolver fuses graph signals so one decision can shift other
+// suggestions too. Purge both resolve caches on every user decision.
+// This is rare (a few/session), so it does NOT reintroduce the
+// per-flush cache-busting the snapshot keying avoids.
+const invalidateResolveCaches = (): void => {
+  for (const key of [...routeCache.keys()]) {
+    if (key.startsWith('visres:') || key.startsWith('tabres:')) routeCache.delete(key);
+  }
+  for (const key of [...routeInFlight.keys()]) {
+    if (key.startsWith('visres:') || key.startsWith('tabres:')) routeInFlight.delete(key);
+  }
 };
 
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
@@ -1952,15 +2128,28 @@ const loadTabSessionProjection = async (
   eventLog: EventLog,
 ): Promise<{ projection: TabSessionProjection; snapshotRevision: string | null }> => {
   const snapshot = await context.connectionsStore?.readCurrent();
-  if (snapshot?.tabSessionProjection !== undefined) {
-    return {
-      projection: deserializeTabSessionProjection(snapshot.tabSessionProjection),
-      snapshotRevision: snapshot.snapshotRevision ?? null,
-    };
-  }
+  const snapshotRevision = snapshot?.snapshotRevision ?? null;
+  // Re-fold from the event log at most once (cold start / pre-R1
+  // snapshot) and reuse it for BOTH projections.
+  type Merged = Awaited<ReturnType<EventLog['readMerged']>>;
+  let merged: Merged | undefined;
+  const ensureMerged = async (): Promise<Merged> =>
+    merged ?? (merged = await eventLog.readMerged());
+  const tab =
+    snapshot?.tabSessionProjection !== undefined
+      ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
+      : projectTabSessions(await ensureMerged());
+  // Same snapshot's URL projection (no extra re-fold in steady state) —
+  // a chat thread the user filed via the Current-tab card is a URL
+  // attribution; overlay it so All-threads / inbox / the resolver stop
+  // re-asking. Single seam → every tab-session consumer is consistent.
+  const url =
+    snapshot?.urlProjection !== undefined
+      ? deserializeUrlProjection(snapshot.urlProjection)
+      : projectUrls(await ensureMerged());
   return {
-    projection: projectTabSessions(await eventLog.readMerged()),
-    snapshotRevision: snapshot?.snapshotRevision ?? null,
+    projection: overlayUrlAttributionOntoTabSessions(tab, url),
+    snapshotRevision,
   };
 };
 
@@ -1972,11 +2161,17 @@ const routes: readonly RouteDefinition[] = [
     handle: (_request, requestId) => Promise.resolve([200, { status: 'ok', requestId }]),
   },
   {
-    // Stage 5 follow-up — minimal version/identity probe used by the
-    // attach-diagnostic to detect a stale companion process (extension
-    // rebuilt but companion still running the prior build). Returns
-    // companion-controlled fields only; no auth needed because the
-    // information leak is harmless.
+    // Minimal version/identity probe. Two consumers:
+    //  - the attach-diagnostic (detect a stale companion: extension
+    //    rebuilt but companion still on the prior build);
+    //  - the extension's connection identity check — it pins
+    //    {vaultRoot, codePath} on first attach and compares on every
+    //    poll, so a port reused by a DIFFERENT companion (a common
+    //    dogfood foot-gun: a test instance and the daily instance
+    //    both want :17373) surfaces instead of silently serving the
+    //    wrong vault.
+    // Returns companion-controlled fields only; no auth needed
+    // because the information leak is harmless (all local).
     method: 'GET',
     pattern: /^\/v1\/version$/,
     authRequired: false,
@@ -1990,6 +2185,26 @@ const routes: readonly RouteDefinition[] = [
             ...(context.startedAt === undefined
               ? {}
               : { startedAt: context.startedAt.toISOString() }),
+            // codePath: the absolute path of the running entry script
+            // (`dist/cli.js`). Directly answers "which checkout is
+            // this companion built from" — the field the extension
+            // compares to catch a build/checkout swap on a reused
+            // port. process.argv[1] is the entry script; absent only
+            // in exotic embeddings (then the field is just omitted).
+            ...(typeof process.argv[1] === 'string' && process.argv[1].length > 0
+              ? { codePath: process.argv[1] }
+              : {}),
+            // pid distinguishes restarts of the same companion from a
+            // genuinely different process on the port.
+            pid: process.pid,
+            // instanceLabel: free-form operator tag via
+            // SIDETRACK_INSTANCE_LABEL (e.g. "test" vs "daily"). Lets
+            // the extension show, and the operator eyeball, which
+            // instance is answering.
+            ...(typeof process.env['SIDETRACK_INSTANCE_LABEL'] === 'string' &&
+            process.env['SIDETRACK_INSTANCE_LABEL'].length > 0
+              ? { instanceLabel: process.env['SIDETRACK_INSTANCE_LABEL'] }
+              : {}),
             // gitSha is best-effort: it's set when the CLI is invoked
             // with --git-sha or with the SIDETRACK_COMPANION_GIT_SHA
             // env var. Absent in normal `bun dist/cli.js` runs.
@@ -2444,10 +2659,10 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await statSig(
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await resolveSig(
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
-      return cachedRoute(
+      return cachedResolveRoute(
         tabResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
@@ -2640,6 +2855,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         // Stage 5.2 R5 — post-write response goes through the
         // snapshot-first helper so we don't pay a full event-log
         // re-projection when the materializer has already published
@@ -2746,10 +2962,10 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await statSig(
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await resolveSig(
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
-      return cachedRoute(
+      return cachedResolveRoute(
         visResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
@@ -2908,6 +3124,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         // Stage 5.2 R5 — see matching block in the tab-session POST
         // route. (PR #141's invalidateCachedUrlProjection was a TTL
         // cache buster that R2/R5 makes redundant.)
@@ -2967,6 +3184,7 @@ const routes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        invalidateResolveCaches();
         const { projection: postProjection } = await loadUrlProjection(context, eventLog);
         return [
           201,
@@ -4809,31 +5027,128 @@ const routes: readonly RouteDefinition[] = [
             ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
           })
         : [];
-      // W4(b-lite) — additive, gated, read-only semantic expansion of
-      // the primary hits. One-step off via the runtime flag.
+      // W4(b-lite) — additive, gated, read-only semantic expansion
+      // of the primary hits. NOT a primary ranker: its hits are
+      // appended AFTER the RRF-fused primaries with their own
+      // sourceEvidence (Unified Content Search v1 §5). One-step off
+      // via the runtime flag.
       const semanticHits =
         sourceKinds.has('semantic-recall-pool') && semanticRecallPoolEnabled()
           ? await semanticRecallExpansion(
               vaultRoot,
               [...pageHits, ...recallHits],
               query.limit,
+              ((): boolean => {
+                const s = context.getEmbedderStatus?.()?.state ?? 'disabled';
+                // The gate exists for a real reason — proven 2026-05-20
+                // by reverting C5 (a quick try to lift it for the
+                // v2→v3 migration): the pool's full build runs the
+                // N² cosine + leiden clustering on the MAIN thread,
+                // and a cold-start full rebuild over 911 records
+                // pegs the event loop for 5+ minutes (same failure
+                // class as the earlier resolve-flood peg). The
+                // gate's "embedder ready" was a proxy for "pool
+                // already exists at the current version → rebuild
+                // is INCREMENTAL", not just embedder-warmth. v2→v3
+                // migration is tracked separately as a follow-up
+                // (needs incremental migration, worker thread, or
+                // explicit operator-triggered rebuild).
+                return s === 'ready' || s === 'disabled';
+              })(),
             )
           : [];
-      const merged = [...pageHits, ...recallHits, ...semanticHits]
-        .sort(
-          (left, right) =>
-            right.score - left.score || right.capturedAt.localeCompare(left.capturedAt),
-        )
-        .slice(0, query.limit);
+      // Unified Content Search v1 rank fusion.
+      //
+      // Replaces the prior quota-merge (which mixed three
+      // incompatible score scales — BM25-ish ~20-30 for
+      // page-content vs ~0-1 for chat-turn recall vs cosine for the
+      // pool — and let one source crowd the others). RRF is
+      // rank-based: scale-free by construction, so a chat-turn at
+      // its own rank-1 ranks alongside a page-content at rank-1
+      // without either dominating because of larger raw scores.
+      //
+      // The two primary rankers are query-driven lexical+vector
+      // hybrids (queryPageContent is MiniSearch-only today, but
+      // both share the analyzer from C1 so the rank lists are
+      // comparable in coverage); semanticRecallExpansion is
+      // additive-only and never enters the fusion. We dedupe by
+      // ContentSearchHit.id — page-content chunk ids and chat-turn
+      // chunk ids namespace-disjoint in practice, so RRF reduces to
+      // an interleave by 1/(k+rank), but the fuse handles overlap
+      // by summing contributions which is the correct RRF semantic
+      // if it ever happens.
+      const fused = fuseByRank(
+        [
+          { name: 'page-content', items: pageHits },
+          { name: 'chat-turn', items: recallHits },
+        ],
+        (hit) => hit.id,
+      );
+      const primary: ContentSearchHit[] = fused.map(({ item, ranks }) => {
+        const ranksByRanker: Partial<Record<'page-content' | 'chat-turn', number>> = {};
+        const pageRank = ranks.perRanker.get('page-content');
+        if (pageRank !== undefined) ranksByRanker['page-content'] = pageRank;
+        const chatRank = ranks.perRanker.get('chat-turn');
+        if (chatRank !== undefined) ranksByRanker['chat-turn'] = chatRank;
+        return {
+          ...item,
+          rankEvidence: {
+            kind: 'rrf' as const,
+            ranksByRanker,
+            fusionScore: ranks.fusionScore,
+            k: ranks.k,
+          },
+        };
+      });
+      // Budget split. C3 originally gave expansion only the slots
+      // primary didn't claim within `limit` — but the in-page Déjà-vu
+      // (and most callers) pass limit=12 with three sourceKinds, and
+      // page-content's MiniSearch fuzzy:0.15 / prefix:true reliably
+      // returns the limit-cap on almost any non-empty query. Net
+      // effect: pool returns 12 hits, primary fills 12 slots,
+      // expansion gets 0 — Similar disappears even when the pool has
+      // strong neighbours. That's not what the spec ("expansion
+      // cannot DISPLACE primary") intended; it was the strict
+      // "primary owns 100%" reading I picked, not the dogfood-proven
+      // "primary first, expansion has its own reserve" the user is
+      // used to (pre-C3 quota merge was 1/3 per group).
+      //
+      // C4: reserve `ceil(limit / 3)` slots for expansion WHEN the
+      // pool actually returned hits (no reserve when it didn't, so a
+      // pool-empty query still fills `limit` with primary). Primary
+      // takes the rest. Primary order is unchanged; expansion still
+      // appears AFTER primary in the response; total ≤ `limit`.
+      // "No displacement" is preserved in the strict IR sense: a
+      // primary hit's relative order against any other primary is
+      // unchanged, and expansion never appears ABOVE any primary.
+      // Only the budget-allocation interpretation softens — from
+      // "primary owns 100%" to "expansion gets 1/3 when it has hits".
+      const expansionQuota =
+        semanticHits.length === 0
+          ? 0
+          : Math.min(semanticHits.length, Math.ceil(query.limit / 3));
+      const primaryBudget = Math.max(0, query.limit - expansionQuota);
+      const primarySlice = primary.slice(0, primaryBudget);
+      const expansion = semanticHits.slice(0, expansionQuota);
+      const data: ContentSearchHit[] = [...primarySlice, ...expansion];
       return [
         200,
         {
-          data: merged,
+          data,
           meta: {
             sourceKinds: [...sourceKinds].sort(),
             pageContentCount: pageHits.length,
             chatTurnCount: recallHits.length,
             semanticRecallPoolCount: semanticHits.length,
+            fusion: {
+              algorithm: 'rrf',
+              k: RRF_K,
+              primary: ['page-content', 'chat-turn'],
+              primaryReturned: primarySlice.length,
+              expansionReturned: expansion.length,
+              primaryBudget,
+              expansionQuota,
+            },
           },
         },
       ];

@@ -1633,6 +1633,10 @@ export const buildWorkboardState = async (
   companionStatus: WorkboardState['companionStatus'],
   lastError?: string,
   relayHealth?: WorkboardState['relayHealth'],
+  identityInfo?: {
+    readonly identity?: WorkboardState['companionIdentity'];
+    readonly warning?: WorkboardState['companionIdentityWarning'];
+  },
 ): Promise<WorkboardState> => {
   const vaultPath = await readVaultPath();
   const failedList = await readFailedCaptures();
@@ -1671,5 +1675,9 @@ export const buildWorkboardState = async (
     collapsedBuckets: await readCollapsedBuckets(),
     ...(lastError === undefined ? {} : { lastError }),
     ...(vaultPath === undefined ? {} : { vaultPath }),
+    ...(identityInfo?.identity === undefined ? {} : { companionIdentity: identityInfo.identity }),
+    ...(identityInfo?.warning === undefined
+      ? {}
+      : { companionIdentityWarning: identityInfo.warning }),
   });
 };

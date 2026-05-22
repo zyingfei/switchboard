@@ -6,6 +6,7 @@ import { createRevision } from '../domain/ids.js';
 import { classifyPageContentQuality } from '../page-content/quality.js';
 import { readPageContentExtractedPayloadForEvidence } from '../page-content/store.js';
 import type { TimelineEntry } from '../timeline/projection.js';
+import { sanitizeTimelineUrl } from '../timeline/sanitize.js';
 import {
   isCurrentPageEvidenceVectorRef,
   readPageEvidenceDocVector,
@@ -39,11 +40,15 @@ const compareText = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
 export const canonicalizeEvidenceUrl = (raw: string): string => {
-  const parsed = new URL(raw);
-  parsed.hash = '';
-  parsed.search = '';
-  const normalized = parsed.toString().replace(/\/$/u, '');
-  return normalized.length > 0 ? normalized : parsed.toString();
+  // Align with the URL projection's canonicalization
+  // (sanitizeTimelineUrl: strips the fragment + sensitive/marketing
+  // params but PRESERVES content-distinguishing params like Hacker
+  // News `?id=` or `?p=`). A blanket `search=''` collapsed every
+  // news.ycombinator.com/item?id=* into ONE evidence record (item X's
+  // text served for item Y) and disagreed with the URL projection key.
+  const sanitized = sanitizeTimelineUrl(raw);
+  const trimmed = sanitized.replace(/\/$/u, '');
+  return trimmed.length > 0 ? trimmed : sanitized;
 };
 
 export const pageEvidenceHash = (input: string): string =>
@@ -319,6 +324,37 @@ export const writeExtractedPageEvidence = async (
     canonicalUrl,
     quality: quality.quality ?? payload.quality,
   };
+
+  // Fast-first prelude. The synchronous doc embedding below takes
+  // 5-10s on large pages (Show HN comment threads, big GitHub
+  // READMEs); until the record exists, /v1/page-evidence/summary —
+  // the extension's "Indexing…" badge poll — returns null and the
+  // badge sticks on "Indexing…" the whole time. readPageEvidence
+  // reads the by-url record file directly (not the manifest), so
+  // pre-persisting a features-tier record here lets the badge resolve
+  // on its very next 3s poll; the original tail below then upgrades
+  // the same record in place once the embedding lands.
+  //
+  // Gated to exactly the case that shows "Indexing…": a page with no
+  // usable embedding yet (first extraction or a prior failure). When
+  // re-extracting an already-embedded page we skip the prelude and
+  // fall straight through to the original single-write path, which
+  // carries the existing embedding forward — a 'missing' pre-write
+  // there would transiently downgrade a 'ready' record. The manifest
+  // is intentionally NOT rebuilt here (the tail does the single
+  // rebuild, exactly as before).
+  if (options.embeddingsEnabled !== false && previous?.content?.embeddingState !== 'ready') {
+    const fastRecord = buildExtractedPageEvidence(normalizedPayload, previous ?? undefined, {
+      embeddingState: 'missing',
+    });
+    if (
+      previous?.evidenceRevision !== fastRecord.evidenceRevision ||
+      previous?.behaviorMetadataRevision !== fastRecord.behaviorMetadataRevision
+    ) {
+      await writeRecord(vaultRoot, fastRecord);
+    }
+  }
+
   if (options.embeddingsEnabled !== false) {
     try {
       docEmbeddingRef = await writePageEvidenceDocEmbedding(

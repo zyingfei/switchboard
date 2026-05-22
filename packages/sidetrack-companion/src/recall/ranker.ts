@@ -236,6 +236,8 @@ export const rank = (
 
 import MiniSearch, { type SearchResult } from 'minisearch';
 
+import { analyze } from '../search/analyzer.js';
+
 // Tunables. RRF k-constant of 60 is the canonical default
 // (Cormack et al., SIGIR'09) and lands close-but-not-equal-rank
 // chunks within the top-K of both lists rather than dominating on
@@ -290,32 +292,23 @@ export interface HybridLexicalIndex {
   readonly idToEntry: ReadonlyMap<string, IndexEntry>;
 }
 
-const tokenizer = (s: string): string[] =>
-  s
-    .toLowerCase()
-    // Keep dotted identifiers (`sidetrack.threads.move`) as single
-    // tokens AND emit their split parts so a query for either form
-    // hits. Without this minisearch's default whitespace tokenizer
-    // would treat `sidetrack.threads.move` as one term that fails to
-    // match a query of just `move`.
-    .split(/[\s,;:!?()[\]{}<>"'`]+/)
-    .flatMap((token) => {
-      const trimmed = token.replace(/^[.\-_]+|[.\-_]+$/g, '');
-      if (trimmed.length === 0) return [];
-      if (/[.\-_]/.test(trimmed)) return [trimmed, ...trimmed.split(/[.\-_]+/)];
-      return [trimmed];
-    })
-    .filter((token) => token.length > 0);
+// Tokenizer lifted to `src/search/analyzer.ts` — single source of
+// truth shared by the recall MiniSearch (here) and the page-content
+// MiniSearch (`src/page-content/store.ts`). Same analyzer on both
+// the index and query sides keeps `/v1/content/query` consistent
+// across sources: a CJK query that hits a chat-turn chunk also hits
+// a page-content chunk (and vice versa). Bump `ANALYZER_VERSION` in
+// the shared module to force-rebuild both indexes.
 
 export const buildLexicalIndex = (items: readonly IndexEntry[]): HybridLexicalIndex => {
   const mini = new MiniSearch<{ id: string; text: string; title: string; heading: string }>({
     fields: ['text', 'title', 'heading'],
     storeFields: ['id'],
     idField: 'id',
-    tokenize: tokenizer,
+    tokenize: analyze,
     processTerm: (term) => term.toLowerCase(),
     searchOptions: {
-      tokenize: tokenizer,
+      tokenize: analyze,
       processTerm: (term) => term.toLowerCase(),
       boost: { text: 1, title: 2, heading: 1.5 },
       prefix: true,

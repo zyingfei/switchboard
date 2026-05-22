@@ -244,6 +244,24 @@ export interface RelayHealth {
 export interface WorkboardState {
   readonly companionStatus: CompanionStatus;
   readonly vaultPath?: string;
+  // Connection identity (from /v1/version). `companionIdentity` is
+  // the live identity of whatever companion answered on the
+  // configured port; `companionIdentityWarning` is set when that
+  // identity diverges from the one pinned on first attach — a
+  // blocking severity means the vault differs (wrong data), a
+  // notice means only the code path / build changed. Drives the
+  // side-panel identity banner.
+  readonly companionIdentity?: {
+    readonly vaultRoot?: string;
+    readonly codePath?: string;
+    readonly instanceLabel?: string;
+    readonly pid?: number;
+    readonly companionVersion?: string;
+  };
+  readonly companionIdentityWarning?: {
+    readonly severity: 'blocking' | 'notice';
+    readonly message: string;
+  };
   readonly queuedCaptureCount: number;
   readonly droppedCaptureCount: number;
   readonly relayHealth?: RelayHealth;

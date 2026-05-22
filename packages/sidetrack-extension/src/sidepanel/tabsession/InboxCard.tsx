@@ -58,6 +58,11 @@ export interface InboxCardProps {
   // True while the per-card refresh is in flight. Used to dim the
   // button + show a small spinner.
   readonly refreshingSuggestion?: boolean;
+  // True when a tracked chat thread exists for this URL — flows into
+  // PageEvidenceBadge so a captured chat doesn't render "Metadata
+  // only" just because page-text auto-extract is off (the two
+  // pipelines are separate). Caller computes from state.threads.
+  readonly chatThreadCaptured?: boolean;
 }
 
 export function InboxCard({
@@ -73,10 +78,17 @@ export function InboxCard({
   onOpenInConnections,
   onRefreshSuggestion,
   refreshingSuggestion = false,
+  chatThreadCaptured = false,
 }: InboxCardProps) {
   const host = hostFor(record);
   const title = tabSessionDisplayTitle(record);
-  const suggestedWorkstreamId = suggestion?.decision.workstreamId;
+  // Decision-level workstreamId is set only for confident suggest/
+  // auto-apply. For a low-confidence "Best guess" the target lives in
+  // fusedCandidates[0] (same source AttributionProvenance renders) —
+  // confirming the best guess is exactly the documented one-click
+  // intent, so fall back to it instead of hiding "Yes, that's right".
+  const suggestedWorkstreamId =
+    suggestion?.decision.workstreamId ?? suggestion?.fusedCandidates[0]?.workstreamId;
   const canConfirmSuggestion =
     suggestedWorkstreamId !== undefined &&
     record.currentAttribution === undefined &&
@@ -108,7 +120,10 @@ export function InboxCard({
             {title}
           </span>
           <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
-          <PageEvidenceBadge pageEvidence={record.pageEvidence} />
+          <PageEvidenceBadge
+            pageEvidence={record.pageEvidence}
+            chatThreadCaptured={chatThreadCaptured}
+          />
           {canOpenTab ? (
             <button
               type="button"

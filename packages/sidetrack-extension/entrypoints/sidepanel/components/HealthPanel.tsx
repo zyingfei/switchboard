@@ -222,12 +222,36 @@ interface FocusHealthShadowObservation {
   readonly adjacentPerVisitChurn?: number;
   readonly shadowRevisionId?: string;
 }
+// F2 — per-drain stats of the SERVED topic producer (post-W2
+// leiden-cpm). The shadow* fields are perpetually null once the
+// idf-rkn shadow is retired; the drill + Drain trend read these.
+interface FocusHealthServedTopicProducer {
+  readonly producer?: string;
+  readonly algorithmId?: string;
+  readonly cosineThreshold?: number;
+  readonly topicCount?: number;
+  readonly coveredPages?: number;
+  readonly lineageContinue?: number;
+  readonly lineageSplit?: number;
+  readonly lineageMerge?: number;
+  readonly churnP50?: number | null;
+  readonly churnP90?: number | null;
+  readonly revisionId?: string;
+  readonly previousRevisionId?: string | null;
+}
 interface FocusHealthHistorySample {
   readonly at: string;
   readonly adjacentPerVisitChurn: number | null;
   readonly shadowMaxTopicShare: number | null;
   readonly noiseShare: number | null;
   readonly shadowTopicCount: number | null;
+  readonly servedTopicCount?: number | null;
+  readonly servedCoveredPages?: number | null;
+  readonly servedChurnP50?: number | null;
+  readonly servedChurnP90?: number | null;
+  readonly servedLineageContinue?: number | null;
+  readonly servedLineageSplit?: number | null;
+  readonly servedLineageMerge?: number | null;
 }
 interface FocusHealthResponse {
   readonly availability: 'ok' | 'unavailable';
@@ -235,6 +259,7 @@ interface FocusHealthResponse {
   readonly digest: {
     readonly shadowVsBaseline?: FocusHealthShadowVsBaseline;
     readonly shadowObservation?: FocusHealthShadowObservation;
+    readonly servedTopicProducer?: FocusHealthServedTopicProducer;
   } | null;
   readonly history: readonly FocusHealthHistorySample[];
 }
@@ -896,10 +921,11 @@ export function HealthPanel({
             : `${String(topicHealth.topicCount)} topic${topicHealth.topicCount === 1 ? '' : 's'}`;
 
     // Sparkline series only where a real series exists. Topics uses the
-    // focus-health history shadowTopicCount; Vault uses gc family sizes.
+    // served producer's per-drain topic count from focus-health history
+    // (post-W2 the shadow* series is dead); Vault uses gc family sizes.
     // No series → omit the sparkline (the design forbids faking bars).
     const topicSpark = (focusHealth?.history ?? [])
-      .map((h) => h.shadowTopicCount)
+      .map((h) => h.servedTopicCount)
       .filter((v): v is number => typeof v === 'number');
 
     return [
@@ -1194,9 +1220,18 @@ export function HealthPanel({
       focusHealth === null ||
       focusHealth.availability === 'unavailable' ||
       focusHealth.digest === null;
-    const svb = focusHealth?.digest?.shadowVsBaseline;
-    const obs = focusHealth?.digest?.shadowObservation;
+    // Post-W2 the idf-rkn shadow is retired from serving, so
+    // shadowVsBaseline / shadowObservation are perpetually null. The
+    // drill reads the SERVED producer's per-drain report instead (F2).
+    const stp = focusHealth?.digest?.servedTopicProducer;
+    const stpMissing = fhUnavailable || stp === undefined;
     const history = focusHealth?.history ?? [];
+    const lineageTriple = (
+      c: number | null | undefined,
+      s: number | null | undefined,
+      m: number | null | undefined,
+    ): string =>
+      `${c ?? '—'}/${s ?? '—'}/${m ?? '—'}`;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <h2 className="sx-drill-title">Topics</h2>
@@ -1219,72 +1254,88 @@ export function HealthPanel({
               {tp?.algorithmVersion ?? (workGraphUnavailable ? 'metrics didn’t load' : '—')}
             </div>
           </div>
-          <div className={`sx-tile${fhUnavailable ? ' unavail' : ''}`}>
-            <div className="lbl">Shadow comparison</div>
+          <div
+            className={`sx-tile${stpMissing ? ' unavail' : ''}`}
+            data-testid="hp-topics-served-stability"
+          >
+            <div className="lbl">Drain stability</div>
             <div className="num">
               {fhUnavailable
                 ? 'unavailable'
-                : svb?.shadowTopicCount === undefined
+                : stp === undefined
                   ? 'no signal yet'
-                  : String(svb.shadowTopicCount)}
-              {!fhUnavailable && svb?.shadowTopicCount !== undefined ? (
-                <small> topics</small>
+                  : fmtNum(stp.churnP50, 3)}
+              {!stpMissing && stp.churnP50 !== null && stp.churnP50 !== undefined ? (
+                <small> churn p50</small>
               ) : null}
             </div>
             <div className="foot">
               {fhUnavailable
                 ? 'focus digest didn’t load'
-                : `max share ${fmtNum(svb?.shadowMaxTopicShare, 3)} · noise ${fmtNum(
-                    svb?.noiseShare,
-                    2,
-                  )} · adjacent churn ${fmtNum(obs?.adjacentPerVisitChurn, 2)}`}
+                : stp === undefined
+                  ? 'served producer report not in digest yet'
+                  : `p90 ${fmtNum(stp.churnP90, 3)} · ${fmtNum(
+                      stp.coveredPages,
+                      0,
+                    )} pages · lineage ${lineageTriple(
+                      stp.lineageContinue,
+                      stp.lineageSplit,
+                      stp.lineageMerge,
+                    )}`}
             </div>
           </div>
         </div>
 
         <div className="sx-callout">
-          The shadow comparison surfaces <code>shadowObservation.adjacentPerVisitChurn</code> (per
-          drain), not <code>shadowVsBaseline.perVisitChurn</code> — the latter is degenerate when
-          the baseline revision has collapsed. Absent figures render{' '}
-          <em>&quot;no signal yet&quot;</em>, never a fabricated value.
+          Drain stability is the served producer’s label-invariant per-page co-membership churn vs
+          the <em>previous served revision</em> (the same metric the W0c gate uses) —{' '}
+          <code>0</code> means a page’s topic-mates were unchanged this drain. Lineage{' '}
+          <code>c/s/m</code> counts continue / split / merge edges that carry topic identity across
+          drains. Absent figures render <em>&quot;no signal yet&quot;</em>, never a fabricated
+          value.
         </div>
 
         <div className="sx-receipt">
           <div className="sx-receipt-head">
-            <span className={`sx-stamp ${fhUnavailable ? 'partial' : 'deterministic'}`}>
+            <span className={`sx-stamp ${stpMissing ? 'partial' : 'deterministic'}`}>
               <span />
-              {fhUnavailable ? 'Unavailable' : 'Observed'}
+              {stpMissing ? 'Unavailable' : 'Observed'}
             </span>
             <span className="sx-mono sx-dim" style={{ flex: 1 }}>
-              focus-health.digest
+              focus-health.digest · servedTopicProducer
             </span>
           </div>
           <dl>
-            <ReceiptRow dt="Active revision" dd={tp?.activeRevisionId ?? 'no signal yet'} mono />
-            <ReceiptRow dt="Active algorithm" dd={tp?.algorithmVersion ?? 'no signal yet'} mono />
+            <ReceiptRow dt="Served revision" dd={stp?.revisionId ?? 'no signal yet'} mono />
+            <ReceiptRow dt="Served algorithm" dd={stp?.algorithmId ?? 'no signal yet'} mono />
             <ReceiptRow
-              dt="Active topics"
-              dd={tp === undefined ? 'no signal yet' : String(tp.topicCount)}
-            />
-            <ReceiptRow
-              dt="Shadow revision"
-              dd={obs?.shadowRevisionId ?? svb?.candidate ?? 'no signal yet'}
-              mono
-            />
-            <ReceiptRow
-              dt="Shadow topics"
+              dt="Served topics"
               dd={
-                svb?.shadowTopicCount === undefined
+                stp?.topicCount === undefined
                   ? 'no signal yet'
-                  : `${String(svb.shadowTopicCount)} (max share ${fmtNum(
-                      svb.shadowMaxTopicShare,
-                      3,
-                    )} · noise ${fmtNum(svb.noiseShare, 2)})`
+                  : `${String(stp.topicCount)} (${fmtNum(stp.coveredPages, 0)} pages covered)`
               }
             />
             <ReceiptRow
-              dt="Adjacent churn"
-              dd={<span className="sx-mono">{fmtNum(obs?.adjacentPerVisitChurn, 2)}</span>}
+              dt="Co-membership churn"
+              dd={
+                <span className="sx-mono">
+                  p50 {fmtNum(stp?.churnP50, 3)} · p90 {fmtNum(stp?.churnP90, 3)}
+                </span>
+              }
+            />
+            <ReceiptRow
+              dt="Lineage (c/s/m)"
+              dd={
+                stp === undefined
+                  ? 'no signal yet'
+                  : lineageTriple(stp.lineageContinue, stp.lineageSplit, stp.lineageMerge)
+              }
+            />
+            <ReceiptRow
+              dt="Previous revision"
+              dd={stp?.previousRevisionId ?? 'no signal yet'}
+              mono
             />
             <ReceiptRow
               dt="Digest as-of"
@@ -1300,14 +1351,14 @@ export function HealthPanel({
             empty. This is the honest unavailable state, not zero churn.
           </div>
         ) : (
-          <table className="sx-monotbl">
+          <table className="sx-monotbl" data-testid="hp-topics-drain-trend">
             <thead>
               <tr>
                 <th>Drain</th>
-                <th className="right">Shadow topics</th>
-                <th className="right">Max share</th>
-                <th className="right">Noise</th>
-                <th className="right">Adjacent churn</th>
+                <th className="right">Topics</th>
+                <th className="right">Churn p50</th>
+                <th className="right">Churn p90</th>
+                <th className="right">Lineage c/s/m</th>
               </tr>
             </thead>
             <tbody>
@@ -1318,10 +1369,16 @@ export function HealthPanel({
                 .map((h, i) => (
                   <tr key={`${h.at}-${String(i)}`}>
                     <td>{formatWhen(h.at)}</td>
-                    <td className="right">{h.shadowTopicCount ?? '—'}</td>
-                    <td className="right">{fmtNum(h.shadowMaxTopicShare, 3)}</td>
-                    <td className="right">{fmtNum(h.noiseShare, 2)}</td>
-                    <td className="right">{fmtNum(h.adjacentPerVisitChurn, 2)}</td>
+                    <td className="right">{h.servedTopicCount ?? '—'}</td>
+                    <td className="right">{fmtNum(h.servedChurnP50, 3)}</td>
+                    <td className="right">{fmtNum(h.servedChurnP90, 3)}</td>
+                    <td className="right">
+                      {lineageTriple(
+                        h.servedLineageContinue,
+                        h.servedLineageSplit,
+                        h.servedLineageMerge,
+                      )}
+                    </td>
                   </tr>
                 ))}
             </tbody>

@@ -10,6 +10,7 @@ import {
   TrashIcon,
 } from './icons';
 import { messageTypes, type ContentQueryResponse } from '../../messages';
+import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 export const ENGAGEMENT_CLASSES = [
   'parked_background',
@@ -85,7 +86,7 @@ export interface FocusWorkstreamOption {
 export interface FocusGroupSaveInput {
   readonly topicId: string;
   readonly title: string;
-  readonly mode: 'create' | 'move-existing' | 'split-new' | 'current-page';
+  readonly mode: 'create' | 'move-existing' | 'split-new';
   readonly canonicalUrls: readonly string[];
   readonly memberVisitIds: readonly string[];
   readonly targetWorkstreamId?: string;
@@ -121,6 +122,7 @@ export interface FocusViewProps {
   readonly onFocusGroupSave?: (input: FocusGroupSaveInput) => Promise<void> | void;
   readonly onVisitMarkNotRelated?: (input: {
     readonly topicId: string;
+    readonly fromVisitId?: string;
     readonly visitId: string;
     readonly memberVisitIds: readonly string[];
   }) => Promise<void> | void;
@@ -504,7 +506,7 @@ export const FocusView = ({
       setSearchError(null);
       return undefined;
     }
-    if (trimmed.length < 3) {
+    if (trimmed.length < SEARCH_MIN_QUERY_CHARS) {
       setSearchItems(EMPTY_SEARCH_ITEMS);
       setSearchLoading(false);
       setSearchError(null);
@@ -541,7 +543,7 @@ export const FocusView = ({
           setSearchError(parsed?.ok === false ? (parsed.error ?? 'Search failed') : null);
         },
       );
-    }, 250);
+    }, SEARCH_DEBOUNCE_MS);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
@@ -766,7 +768,14 @@ export const FocusView = ({
       next.add(visitId);
       return { ...current, [topic.id]: next };
     });
-    void Promise.resolve(onVisitMarkNotRelated({ topicId: topic.id, visitId, memberVisitIds }))
+    void Promise.resolve(
+      onVisitMarkNotRelated({
+        topicId: topic.id,
+        ...(anchorVisitId === undefined ? {} : { fromVisitId: anchorVisitId }),
+        visitId,
+        memberVisitIds,
+      }),
+    )
       .catch((error: unknown) => {
         setRejectedVisitIdsByTopic((current) => {
           const next = new Set(current[topic.id] ?? []);
@@ -933,51 +942,6 @@ export const FocusView = ({
                 ? 'Loading the candidate topic graph for this suggestion.'
                 : 'This page is not in the current candidate topic output.')}
           </p>
-          {anchorVisitId !== undefined && onFocusGroupSave !== undefined ? (
-            <div className="cx-focus-triage-actions">
-              <button
-                type="button"
-                className="cx-focus-expand cx-focus-inline-action"
-                disabled={savingTopicId === anchorVisitId}
-                onClick={() => {
-                  const canonicalUrl = canonicalUrlFromVisitId(anchorVisitId);
-                  if (canonicalUrl === undefined) {
-                    setSaveError('This page does not have a canonical URL to save.');
-                    setSaveErrorTopicId(anchorVisitId);
-                    return;
-                  }
-                  setSavingTopicId(anchorVisitId);
-                  setSaveError(null);
-                  setSaveErrorTopicId(null);
-                  void Promise.resolve(
-                    onFocusGroupSave({
-                      topicId: `focus:current-page:${anchorVisitId}`,
-                      title: 'New focus group',
-                      mode: 'current-page',
-                      canonicalUrls: [canonicalUrl],
-                      memberVisitIds: [anchorVisitId],
-                    }),
-                  )
-                    .catch((error: unknown) => {
-                      setSaveError(error instanceof Error ? error.message : String(error));
-                      setSaveErrorTopicId(anchorVisitId);
-                    })
-                    .finally(() => {
-                      setSavingTopicId(null);
-                    });
-                }}
-                data-testid="focus-create-current-page"
-              >
-                {iconSlot(SaveIcon)}
-                Create group around this page
-              </button>
-            </div>
-          ) : null}
-          {saveError !== null && saveErrorTopicId === anchorVisitId ? (
-            <div className="cx-mono cx-dim" role="alert" data-testid="focus-save-error">
-              {saveError}
-            </div>
-          ) : null}
         </article>
       </section>
     );
@@ -1340,7 +1304,7 @@ export const FocusView = ({
                       <input
                         className="cx-focus-search-input"
                         value={searchQueryByTopic[topic.id] ?? ''}
-                        placeholder="Search pages"
+                        placeholder="Search pages by title or URL…"
                         onChange={(event) => {
                           setSearchQueryByTopic((current) => ({
                             ...current,

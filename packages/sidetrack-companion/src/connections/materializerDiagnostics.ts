@@ -1054,6 +1054,11 @@ export const createMaterializerDiagnosticsStore = (
     try {
       const shadow = diagnostics.shadowVsBaseline;
       const observation = diagnostics.shadowObservation;
+      // Post-W2 the idf-rkn shadow is retired from serving, so the
+      // shadow* fields are perpetually null. Record the SERVED
+      // producer's per-drain stats so the Focus "Drain trend" reads a
+      // live series instead of a dead ring (F2).
+      const served = diagnostics.servedTopicProducer;
       await appendHealthHistory(vaultRoot, {
         at: diagnostics.producedAt,
         adjacentPerVisitChurn: observation?.adjacentPerVisitChurn ?? null,
@@ -1062,6 +1067,13 @@ export const createMaterializerDiagnosticsStore = (
         shadowTopicCount: shadow?.shadowTopicCount ?? null,
         runtimeMs: shadow?.runtimeMs ?? null,
         vaultBytes: null,
+        servedTopicCount: served?.topicCount ?? null,
+        servedCoveredPages: served?.coveredPages ?? null,
+        servedChurnP50: served?.churnP50 ?? null,
+        servedChurnP90: served?.churnP90 ?? null,
+        servedLineageContinue: served?.lineageContinue ?? null,
+        servedLineageSplit: served?.lineageSplit ?? null,
+        servedLineageMerge: served?.lineageMerge ?? null,
       });
     } catch {
       /* ring-buffer write is best-effort; never fail the drain */

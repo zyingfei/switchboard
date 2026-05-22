@@ -4,6 +4,7 @@ import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/for
 import { NODE_KIND_DISPLAY } from './edgeKinds';
 import { ExternalLinkIcon, KindIcons } from './icons';
 import type { ConnectionNode } from './types';
+import { NODE_SEARCH_RANK, rankSubstring } from '../search/ranking';
 
 // Stage 5 polish — find-by-title search. The advanced-anchor input
 // only accepts a raw `kind:id` string, which assumes the user
@@ -67,19 +68,8 @@ interface SearchHit {
   readonly score: number;
 }
 
-// Lowercase substring match with a small score bias: exact prefix
-// matches sort above mid-string matches; shorter primary lines sort
-// above longer ones so a hit on "Hacker News" beats a hit on
-// "(775) I was laid off… - YouTube" when both match "ne".
-const rank = (query: string, primary: string): number => {
-  const p = primary.toLowerCase();
-  const q = query.toLowerCase();
-  const idx = p.indexOf(q);
-  if (idx === -1) return -1;
-  const prefixBonus = idx === 0 ? 100 : 0;
-  const lengthPenalty = Math.min(50, p.length);
-  return 200 - lengthPenalty + prefixBonus;
-};
+const rank = (query: string, primary: string): number =>
+  rankSubstring(query, primary, NODE_SEARCH_RANK);
 
 export const NodeSearchBox = ({
   nodes,
@@ -140,7 +130,7 @@ export const NodeSearchBox = ({
         <input
           type="search"
           className="cx-search-input"
-          placeholder="Find by title — type to filter…"
+          placeholder="Search the graph by title…"
           aria-label="Find an anchor by title"
           value={query}
           onChange={(event) => {
@@ -198,7 +188,7 @@ export const NodeSearchBox = ({
         <div className="cx-search-results" data-testid="connections-search-results">
           {loading === true ? (
             <div className="cx-search-loading mono cx-dim" data-testid="connections-search-loading">
-              Searching the whole vault…
+              Searching…
             </div>
           ) : null}
           {hits.length > 0 ? (

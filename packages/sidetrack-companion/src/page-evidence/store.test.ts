@@ -99,6 +99,51 @@ describe('page-evidence store', () => {
     expect(stats.pageEvidenceRawTextPersistedBytes).toBe(0);
   });
 
+  it('persists the features-tier record BEFORE the doc embedding runs (fast-first — kills the "Indexing…" lag)', async () => {
+    let recordExistedAtEmbedTime = false;
+    let embeddingStateAtEmbedTime: string | undefined;
+    const embedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      // The "Indexing…" badge polls /v1/page-evidence/summary →
+      // readPageEvidence, which reads the by-url record file directly.
+      // By the time this (deliberately slow in prod, ~5-10s) embedder
+      // is invoked, that record must ALREADY exist at the features
+      // tier so the badge stops saying "Indexing…" without waiting
+      // for the embedding.
+      const mid = await readPageEvidence(root, payload().canonicalUrl);
+      recordExistedAtEmbedTime = mid.record !== null;
+      embeddingStateAtEmbedTime = mid.record?.content?.embeddingState;
+      return texts.map(() => {
+        const vector = new Float32Array(384);
+        vector[0] = 1;
+        return vector;
+      });
+    };
+
+    const finalRecord = await writeExtractedPageEvidence(root, payload(), { embedder });
+
+    expect(recordExistedAtEmbedTime).toBe(true);
+    expect(embeddingStateAtEmbedTime).toBe('missing');
+    // …and the same record is upgraded in place once embedding lands.
+    expect(finalRecord.content?.embeddingState).toBe('ready');
+    expect(finalRecord.content?.docEmbeddingRef).toBeDefined();
+  });
+
+  it('re-extracting unchanged content does not downgrade an existing embedded record', async () => {
+    const embedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> =>
+      texts.map(() => {
+        const vector = new Float32Array(384);
+        vector[0] = 1;
+        return vector;
+      });
+    const first = await writeExtractedPageEvidence(root, payload(), { embedder });
+    expect(first.content?.embeddingState).toBe('ready');
+    const second = await writeExtractedPageEvidence(root, payload(), { embedder });
+    expect(second.content?.embeddingState).toBe('ready');
+    const onDisk = await readPageEvidence(root, payload().canonicalUrl);
+    expect(onDisk.record?.content?.embeddingState).toBe('ready');
+    expect(onDisk.record?.content?.docEmbeddingRef).toBeDefined();
+  });
+
   it('does not mark embedding ready when no vector ref is written', async () => {
     const embedder = async (): Promise<readonly Float32Array[]> => [];
 

@@ -15,6 +15,11 @@ import {
   validateBridgeKeyCandidate,
 } from '../src/companion/bridgeKeyValidation';
 import { createCompanionClient } from '../src/companion/client';
+import {
+  compareCompanionIdentity,
+  identityWarningFor,
+  type CompanionIdentity,
+} from '../src/companion/identity';
 import { listPendingOffers, markStatus, upsertOffer } from '../src/codingAttach/state';
 import type { CodingSurface } from '../src/codingAttach/detection';
 import { createSettingsClient } from '../src/settings/client';
@@ -1463,19 +1468,109 @@ let cachedSnapshotRevision: string | null = null;
 export const peekCachedRelayStatus = (): typeof cachedRelayStatus => cachedRelayStatus;
 export const peekCachedSnapshotRevision = (): string | null => cachedSnapshotRevision;
 
+// Connection identity (from /v1/version). Cached from the most
+// recent poll like cachedRelayStatus. `cachedIdentityWarning` is set
+// only when the live companion's vault diverges from the one pinned
+// for this port on first attach — the foot-gun where a test/stale
+// companion silently owns the daily port.
+let cachedCompanionIdentity: WorkboardState['companionIdentity'] | null = null;
+let cachedIdentityWarning: WorkboardState['companionIdentityWarning'] | null = null;
+
+// Per-port pin of the companion identity. Keyed by port: changing
+// the port is itself an explicit choice of a different companion,
+// so it gets its own fresh pin. The "Trust this companion" action
+// overwrites the pin for the current port.
+const COMPANION_IDENTITY_PIN_KEY = 'sidetrack.companionIdentityPins';
+
+const toWorkboardIdentity = (
+  id: CompanionIdentity,
+): NonNullable<WorkboardState['companionIdentity']> => ({
+  companionVersion: id.companionVersion,
+  ...(id.vaultRoot === undefined ? {} : { vaultRoot: id.vaultRoot }),
+  ...(id.codePath === undefined ? {} : { codePath: id.codePath }),
+  ...(id.instanceLabel === undefined ? {} : { instanceLabel: id.instanceLabel }),
+  ...(id.pid === undefined ? {} : { pid: id.pid }),
+});
+
+const readIdentityPins = async (): Promise<Record<string, CompanionIdentity>> => {
+  const stored = await chrome.storage.local.get({ [COMPANION_IDENTITY_PIN_KEY]: {} });
+  const raw = stored[COMPANION_IDENTITY_PIN_KEY];
+  return typeof raw === 'object' && raw !== null
+    ? (raw as Record<string, CompanionIdentity>)
+    : {};
+};
+
+const writeIdentityPin = async (port: number, identity: CompanionIdentity): Promise<void> => {
+  const pins = await readIdentityPins();
+  pins[String(port)] = identity;
+  await chrome.storage.local.set({ [COMPANION_IDENTITY_PIN_KEY]: pins });
+};
+
+// Fetch /v1/version, compare against the per-port pin, update the
+// cached identity + warning. Best-effort: a failed /v1/version (old
+// companion, transient error) leaves caches as-is — the /v1/status
+// probe already surfaces a true disconnect.
+const refreshCompanionIdentity = async (
+  client: ReturnType<typeof createCompanionClient>,
+  port: number,
+): Promise<void> => {
+  let identity: CompanionIdentity | null;
+  try {
+    identity = await client.version();
+  } catch {
+    return;
+  }
+  if (identity === null) {
+    cachedCompanionIdentity = null;
+    cachedIdentityWarning = null;
+    return;
+  }
+  cachedCompanionIdentity = toWorkboardIdentity(identity);
+  const pinned = (await readIdentityPins())[String(port)] ?? null;
+  const verdict = compareCompanionIdentity(pinned, identity);
+  if (verdict.kind === 'first-attach') {
+    await writeIdentityPin(port, identity);
+    cachedIdentityWarning = null;
+    return;
+  }
+  if (verdict.kind === 'code-changed') {
+    // Same vault — safe. Re-pin silently so a routine rebuild from
+    // another checkout doesn't nag every poll; the Health panel
+    // still shows the live codePath.
+    await writeIdentityPin(port, identity);
+    cachedIdentityWarning = null;
+    return;
+  }
+  // match → no warning; vault-mismatch → blocking warning, NOT
+  // re-pinned (the operator must fix the rogue companion or
+  // explicitly Trust the new one).
+  cachedIdentityWarning = identityWarningFor(verdict);
+};
+
+export const peekCachedCompanionIdentity = (): typeof cachedCompanionIdentity =>
+  cachedCompanionIdentity;
+export const peekCachedIdentityWarning = (): typeof cachedIdentityWarning =>
+  cachedIdentityWarning;
+
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
     cachedRelayStatus = null;
     cachedSnapshotRevision = null;
+    cachedCompanionIdentity = null;
+    cachedIdentityWarning = null;
     return 'local-only';
   }
-  const status = await createCompanionClient(settings.companion).status();
+  const client = createCompanionClient(settings.companion);
+  const status = await client.status();
   // Capture the live relay block (if any) so the workboard-state
   // builder can route a relay-disconnected banner without a
   // second round-trip.
   cachedRelayStatus = status.sync?.relay ?? null;
   cachedSnapshotRevision = status.snapshotRevision ?? null;
+  // Connection identity check — detects a different companion (test
+  // vs daily, stale build) silently owning the configured port.
+  await refreshCompanionIdentity(client, settings.companion.port);
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
@@ -1927,7 +2022,10 @@ const buildState = async (
   const relayHealth = cachedRelayStatus ?? undefined;
   const snapshotRevision = cachedSnapshotRevision ?? undefined;
   return {
-    ...(await buildWorkboardState(companionStatus, lastError, relayHealth)),
+    ...(await buildWorkboardState(companionStatus, lastError, relayHealth, {
+      ...(cachedCompanionIdentity === null ? {} : { identity: cachedCompanionIdentity }),
+      ...(cachedIdentityWarning === null ? {} : { warning: cachedIdentityWarning }),
+    })),
     ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
     ...(tab?.url === undefined ? {} : { activeTabUrl: tab.url }),
     ...(activeTabSessionId === undefined ? {} : { activeTabSessionId }),
@@ -2582,6 +2680,25 @@ const handleRequest = async (
     return await withCompanionStatus(() => Promise.resolve(), 'settings');
   }
 
+  if (request.type === messageTypes.trustCurrentCompanion) {
+    // Operator confirmed the flagged companion is the intended one
+    // — re-pin the identity for the current port to whatever is
+    // answering now, clearing the blocking banner.
+    return await withCompanionStatus(async () => {
+      const settings = await readSettings();
+      try {
+        const identity = await createCompanionClient(settings.companion).version();
+        if (identity !== null) {
+          await writeIdentityPin(settings.companion.port, identity);
+          cachedCompanionIdentity = toWorkboardIdentity(identity);
+        }
+      } catch {
+        // version() failed — leave the pin; the next poll retries.
+      }
+      cachedIdentityWarning = null;
+    }, 'settings');
+  }
+
   if (request.type === messageTypes.captureCurrentTab) {
     return await withCompanionStatus(captureTab, 'capture');
   }
@@ -3041,6 +3158,63 @@ const handleRequest = async (
         autoSendOnceTabReady(tabId, body);
       } catch (error) {
         console.warn('[dispatchAutoSendInNewTab] open failed:', error);
+      }
+    }, 'queue');
+  }
+
+  if (request.type === messageTypes.submitSelectionDispatch) {
+    return await withCompanionStatus(async () => {
+      const { url, body, provider, title } = request;
+      // Make a Déjà-vu selection "Ask AI" a FIRST-CLASS tracked
+      // dispatch: record it on the companion so it appears in Recent
+      // dispatches and auto-links back when the new chat is captured —
+      // exactly like a thread dispatch, just with no source thread /
+      // workstream (both optional end-to-end). If the companion isn't
+      // configured we still open + auto-send (graceful degrade).
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length > 0) {
+          const client = createDispatchClient(settings.companion);
+          const idempotencyKey = `disp_sel_${String(Date.now())}_${Math.random()
+            .toString(36)
+            .slice(2, 10)}`;
+          const result = await client.submit(
+            { kind: 'research', target: { provider, mode: 'auto-send' }, title, body },
+            idempotencyKey,
+          );
+          // Feeds the auto-link matcher (it compares the UNREDACTED
+          // body against the captured chat's first user turn).
+          await writeDispatchOriginal(result.bac_id, body);
+          // Optimistic local row so it shows immediately; the next
+          // companion poll merge is idempotent by bac_id.
+          const record: DispatchEventRecord = {
+            bac_id: result.bac_id,
+            kind: 'research',
+            target: { provider, mode: 'auto-send' },
+            title,
+            body,
+            createdAt: new Date().toISOString(),
+            redactionSummary: result.redactionSummary ?? { matched: 0, categories: [] },
+            tokenEstimate: result.tokenEstimate ?? 0,
+            status: 'sent',
+          };
+          await writeCachedDispatches([record, ...(await readCachedDispatches())].slice(0, 50));
+        }
+      } catch (error) {
+        console.warn('[submitSelectionDispatch] companion submit failed:', error);
+      }
+      // Open + auto-send + auto-capture — identical to the
+      // dispatchAutoSendInNewTab path (drives the auto-link too).
+      try {
+        const created = await chrome.tabs.create({ url, active: true });
+        const tabId = created.id;
+        if (typeof tabId !== 'number') {
+          console.warn('[submitSelectionDispatch] tab create returned no tabId');
+          return;
+        }
+        autoSendOnceTabReady(tabId, body);
+      } catch (error) {
+        console.warn('[submitSelectionDispatch] open failed:', error);
       }
     }, 'queue');
   }
@@ -3918,7 +4092,16 @@ export default defineBackground(() => {
   const dismissAndBroadcast = (): void => {
     void dismissRemindersForActiveTab()
       .then((changed) => {
-        void broadcastWorkboardChanged(changed ? 'reminder' : 'thread');
+        // Only broadcast when a reminder was ACTUALLY dismissed.
+        // Previously this fired a 'thread' workboard-changed on EVERY
+        // tab activation / URL change / window focus even when nothing
+        // changed — a refresh firehose that (especially now the
+        // content script injects on all pages) drove the side panel's
+        // full resolve fan-out on every ambient navigation, a primary
+        // feeder of the CPU resolve-flood. Real content changes are
+        // still surfaced by the snapshot-revision watcher and the
+        // explicit url-change handlers.
+        if (changed) void broadcastWorkboardChanged('reminder');
       })
       .catch(() => undefined);
   };
