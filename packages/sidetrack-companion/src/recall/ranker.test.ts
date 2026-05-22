@@ -208,6 +208,34 @@ describe('rankHybrid — lexical + vector fusion', () => {
     expect(results[0]?.snippet?.length ?? 0).toBeGreaterThan(0);
     expect(results[0]?.metadata?.title).toBe('Capture queue');
   });
+
+  it('honors excludeIds on the lexical arm, not just the vector arm', () => {
+    // chunk:A is a verbatim lexical match for the query. With its id
+    // in excludeIds it must be dropped from the lexical results too —
+    // excludeIds means "exclude from results", and visit-similarity
+    // shares one lexical index across every source query, excluding
+    // the source itself per call. (The vector arm honors excludeIds
+    // inside vectorIndex.query; here, with no vectorIndex, chunk:A
+    // still appears via the flat-scan fallback, so the assertion is
+    // specifically that its *lexical* contribution is gone.)
+    const items: readonly IndexEntry[] = [
+      entry('chunk:A:0:0:aaaaaaaaaaaa', 'thread_a', '2026-05-03T00:00:00.000Z', [0.01, 0], {
+        text: 'Move the thread by calling sidetrack.threads.move on the workstream.',
+      }),
+      entry('chunk:B:0:0:bbbbbbbbbbbb', 'thread_b', '2026-05-03T00:00:00.000Z', [1, 0], {
+        text: 'Unrelated discussion about archive workflows.',
+      }),
+    ];
+    const lexical = buildLexicalIndex(items);
+    const query = 'sidetrack.threads.move';
+    const withA = rankHybrid(query, Float32Array.from([1, 0]), items, baseDate, { lexical });
+    const withoutA = rankHybrid(query, Float32Array.from([1, 0]), items, baseDate, {
+      lexical,
+      excludeIds: new Set(['chunk:A:0:0:aaaaaaaaaaaa']),
+    });
+    expect(withA.find((r) => r.id === 'chunk:A:0:0:aaaaaaaaaaaa')?.lexical).toBeDefined();
+    expect(withoutA.find((r) => r.id === 'chunk:A:0:0:aaaaaaaaaaaa')?.lexical).toBeUndefined();
+  });
 });
 
 describe('rankHybrid — quality tiebreak', () => {

@@ -394,6 +394,15 @@ export const rankHybrid = (
   const lexResults: SearchResult[] = opts.lexical.mini
     .search(queryText, { combineWith: 'OR' })
     .filter((result): result is SearchResult => {
+      // excludeIds applies to BOTH retrieval arms. The vector arm
+      // honors it inside vectorIndex.query; the lexical arm filters
+      // here so a caller sharing one lexical index across many
+      // queries and excluding the query document itself per call
+      // (visit-similarity's self-pair exclusion) does not leak it
+      // back through the lexical side. Filtered before the
+      // FUSION_WINDOW slice so an excluded id never displaces a real
+      // candidate.
+      if (opts.excludeIds?.has(String(result.id)) === true) return false;
       const entry = opts.lexical.idToEntry.get(String(result.id));
       if (entry === undefined) return false;
       if (entry.tombstoned === true) return false;
