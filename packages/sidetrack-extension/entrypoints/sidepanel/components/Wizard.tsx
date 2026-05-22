@@ -8,10 +8,19 @@ import {
 
 export type WizardStep = 'welcome' | 'vault' | 'companion' | 'providers' | 'done';
 
-// Vault before Companion — the companion's bunx command needs the
-// vault path the user just picked, so we collect it first and
-// interpolate the chosen path into the command shown to the user.
-const STEP_ORDER: readonly WizardStep[] = ['welcome', 'vault', 'companion', 'providers', 'done'];
+// Local vs synced/remote. Local-only setups create a new vault on this
+// machine, so we collect the folder path up front and interpolate it
+// into the companion's bunx command. Synced/remote setups attach to a
+// companion that is already running — the vault lives wherever that
+// companion put it, so we skip the path question entirely and read
+// `vaultRoot` back from `/v1/version` once connected.
+export type WizardMode = 'local' | 'synced';
+
+const LOCAL_STEPS: readonly WizardStep[] = ['welcome', 'vault', 'companion', 'providers', 'done'];
+const SYNCED_STEPS: readonly WizardStep[] = ['welcome', 'companion', 'providers', 'done'];
+
+const stepsForMode = (mode: WizardMode | null): readonly WizardStep[] =>
+  mode === 'synced' ? SYNCED_STEPS : LOCAL_STEPS;
 
 const STEP_LABEL: Record<WizardStep, string> = {
   welcome: 'Welcome',
@@ -44,6 +53,12 @@ export interface WizardProps {
   readonly onPingCompanion?: () => Promise<CompanionPingResult>;
   /** Read clipboard contents. Defaults to `navigator.clipboard.readText()`. */
   readonly onReadClipboard?: () => Promise<string>;
+  /**
+   * Resolve the companion's vault root for synced/remote setups. Defaults
+   * to a `GET /v1/version` against `http://127.0.0.1:<port>` — the path
+   * the user would otherwise type by hand is reported by the server.
+   */
+  readonly onResolveVaultRoot?: () => Promise<string | null>;
 }
 
 const defaultPingCompanion = async (port: number): Promise<CompanionPingResult> => {
@@ -56,6 +71,26 @@ const defaultPingCompanion = async (port: number): Promise<CompanionPingResult> 
 };
 
 const defaultReadClipboard = (): Promise<string> => navigator.clipboard.readText();
+
+// `/v1/version` is unauthenticated + cheap; the bridge-key header is
+// harmless on it. The companion answers `{ data: { vaultRoot, … } }`.
+const defaultResolveVaultRoot = async (
+  port: number,
+  bridgeKey: string,
+): Promise<string | null> => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(port)}/v1/version`, {
+      method: 'GET',
+      headers: bridgeKey.length > 0 ? { 'x-bac-bridge-key': bridgeKey } : undefined,
+    });
+    if (!response.ok) return null;
+    const body: unknown = await response.json();
+    const root = (body as { data?: { vaultRoot?: unknown } } | null)?.data?.vaultRoot;
+    return typeof root === 'string' && root.length > 0 ? root : null;
+  } catch {
+    return null;
+  }
+};
 
 export function Wizard({
   bridgeKey = '',
@@ -72,18 +107,26 @@ export function Wizard({
   vaultPath = '',
   onPingCompanion,
   onReadClipboard,
+  onResolveVaultRoot,
 }: WizardProps) {
+  const [mode, setMode] = useState<WizardMode | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
   const [bridgeKeyFailure, setBridgeKeyFailure] = useState<BridgeKeyValidationFailure | null>(null);
-  const step = STEP_ORDER[stepIndex] ?? 'welcome';
+  const steps = stepsForMode(mode);
+  const step = steps[stepIndex] ?? 'welcome';
 
   useEffect(() => {
     if (connectionError !== null) {
-      setStepIndex(STEP_ORDER.indexOf('companion'));
+      const companionIndex = stepsForMode(mode).indexOf('companion');
+      if (companionIndex >= 0) setStepIndex(companionIndex);
     }
-  }, [connectionError]);
+  }, [connectionError, mode]);
 
   const next = () => {
+    // The Welcome step is a fork: pick a mode before advancing.
+    if (step === 'welcome' && mode === null) {
+      return;
+    }
     if (step === 'companion') {
       const failure = validateBridgeKeyCandidate(bridgeKey);
       if (failure !== null) {
@@ -92,7 +135,7 @@ export function Wizard({
       }
       setBridgeKeyFailure(null);
     }
-    if (stepIndex < STEP_ORDER.length - 1) {
+    if (stepIndex < steps.length - 1) {
       setStepIndex(stepIndex + 1);
     }
   };
@@ -105,7 +148,7 @@ export function Wizard({
   const footer = (
     <>
       <div className="wizard-dots">
-        {STEP_ORDER.map((s, idx) => (
+        {steps.map((s, idx) => (
           <span key={s} className={'dot' + (idx === stepIndex ? ' on' : '')} aria-hidden />
         ))}
       </div>
@@ -115,8 +158,13 @@ export function Wizard({
           Back
         </button>
       ) : null}
-      {stepIndex < STEP_ORDER.length - 1 ? (
-        <button type="button" className="btn btn-primary" onClick={next}>
+      {stepIndex < steps.length - 1 ? (
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={step === 'welcome' && mode === null}
+          onClick={next}
+        >
           Next
         </button>
       ) : (
@@ -130,14 +178,17 @@ export function Wizard({
   return (
     <Modal
       title="Set up Sidetrack"
-      subtitle={`step ${String(stepIndex + 1)} of ${String(STEP_ORDER.length)} · ${STEP_LABEL[step]}`}
+      subtitle={`step ${String(stepIndex + 1)} of ${String(steps.length)} · ${STEP_LABEL[step]}`}
       width={580}
       onClose={onClose}
       footer={footer}
     >
-      {step === 'welcome' ? <WelcomeStep onSkip={onSkip} /> : null}
+      {step === 'welcome' ? (
+        <WelcomeStep mode={mode} onModeChange={setMode} onSkip={onSkip} />
+      ) : null}
       {step === 'companion' ? (
         <CompanionStep
+          mode={mode ?? 'local'}
           bridgeKey={bridgeKey}
           bridgeKeyFailure={bridgeKeyFailure}
           companionReachable={companionReachable}
@@ -149,6 +200,10 @@ export function Wizard({
           onPortChange={onPortChange}
           onPingCompanion={onPingCompanion ?? (() => defaultPingCompanion(port))}
           onReadClipboard={onReadClipboard ?? defaultReadClipboard}
+          onResolveVaultRoot={
+            onResolveVaultRoot ?? (() => defaultResolveVaultRoot(port, bridgeKey))
+          }
+          onVaultPathChange={onVaultPathChange}
           port={port}
           vaultPath={vaultPath}
         />
@@ -166,7 +221,15 @@ export function Wizard({
   );
 }
 
-function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
+function WelcomeStep({
+  mode,
+  onModeChange,
+  onSkip,
+}: {
+  readonly mode: WizardMode | null;
+  readonly onModeChange: (mode: WizardMode) => void;
+  readonly onSkip?: () => void;
+}) {
   return (
     <div className="wizard-step">
       <div className="wizard-display">Track your AI work without losing the thread.</div>
@@ -175,9 +238,38 @@ function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
         models — without copy-paste fatigue.
       </div>
       <p className="wizard-lede">
-        You can use Sidetrack right now — everything is stored locally in your browser. The next
-        steps are optional: connect a vault to sync across devices and persist beyond uninstall.
+        Connect a vault to sync across devices and persist beyond uninstall. Pick how this browser
+        reaches it:
       </p>
+      <div className="wizard-choice-row">
+        <button
+          type="button"
+          className={'wizard-choice' + (mode === 'local' ? ' on' : '')}
+          aria-pressed={mode === 'local'}
+          onClick={() => {
+            onModeChange('local');
+          }}
+        >
+          <div className="wizard-card-title">Local vault</div>
+          <div className="wizard-card-meta">
+            Set up a new vault on this machine. You&apos;ll choose a folder and start the companion.
+          </div>
+        </button>
+        <button
+          type="button"
+          className={'wizard-choice' + (mode === 'synced' ? ' on' : '')}
+          aria-pressed={mode === 'synced'}
+          onClick={() => {
+            onModeChange('synced');
+          }}
+        >
+          <div className="wizard-card-title">Synced / remote</div>
+          <div className="wizard-card-meta">
+            Connect to a companion that&apos;s already running. The vault path comes from the
+            companion.
+          </div>
+        </button>
+      </div>
       <button type="button" className="wizard-skip mono" onClick={onSkip}>
         Use Sidetrack without vault sync →
       </button>
@@ -186,6 +278,7 @@ function WelcomeStep({ onSkip }: { readonly onSkip?: () => void }) {
 }
 
 function CompanionStep({
+  mode,
   bridgeKey,
   bridgeKeyFailure,
   companionReachable,
@@ -195,9 +288,12 @@ function CompanionStep({
   onPortChange,
   onPingCompanion,
   onReadClipboard,
+  onResolveVaultRoot,
+  onVaultPathChange,
   port,
   vaultPath,
 }: {
+  readonly mode: WizardMode;
   readonly bridgeKey: string;
   readonly bridgeKeyFailure: BridgeKeyValidationFailure | null;
   readonly companionReachable: boolean;
@@ -207,13 +303,19 @@ function CompanionStep({
   readonly onPortChange?: (port: number) => void;
   readonly onPingCompanion: () => Promise<CompanionPingResult>;
   readonly onReadClipboard: () => Promise<string>;
+  readonly onResolveVaultRoot: () => Promise<string | null>;
+  readonly onVaultPathChange?: (vaultPath: string) => void;
   readonly port: number;
   readonly vaultPath: string;
 }) {
+  const synced = mode === 'synced';
   const commandPath = vaultPath.trim() || 'path';
   const bridgeKeyPath = `${commandPath.replace(/\/$/, '')}/_BAC/.config/bridge.key`;
   const [pingState, setPingState] = useState<'idle' | 'testing' | CompanionPingResult>('idle');
   const [clipboardError, setClipboardError] = useState<string | null>(null);
+  // Vault root reported by the companion (synced mode) — the path the
+  // user would otherwise type by hand. Resolved after a reachable ping.
+  const [resolvedVaultRoot, setResolvedVaultRoot] = useState<string | null>(null);
   // Port edits stay local to this step until the user blurs the
   // input (or hits Enter); committing on every keystroke would fire
   // the auto-save debounce + chrome.storage write per character.
@@ -243,6 +345,18 @@ function CompanionStep({
     void onPingCompanion()
       .then((result) => {
         setPingState(result);
+        // Synced/remote: the moment the companion answers, ask it where
+        // its vault lives so the user never types the path.
+        if (result === 'reachable' && synced) {
+          void onResolveVaultRoot()
+            .then((root) => {
+              if (root !== null) {
+                setResolvedVaultRoot(root);
+                onVaultPathChange?.(root);
+              }
+            })
+            .catch(() => undefined);
+        }
       })
       .catch(() => {
         setPingState('unreachable');
@@ -280,18 +394,22 @@ function CompanionStep({
   return (
     <div className="wizard-step">
       <div className="wizard-lede ai-italic">
-        Start the companion, then paste the bridge key it creates for this vault.
+        {synced
+          ? 'Connect to a companion that is already running, then paste the bridge key for its vault.'
+          : 'Start the companion, then paste the bridge key it creates for this vault.'}
       </div>
-      <div className="wizard-card-row single">
-        <div className="wizard-card primary">
-          <div className="wizard-card-title">HTTP loopback</div>
-          <code className="wizard-card-cmd mono">
-            bunx @sidetrack/companion --vault {commandPath}
-          </code>
-          <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
+      {synced ? null : (
+        <div className="wizard-card-row single">
+          <div className="wizard-card primary">
+            <div className="wizard-card-title">HTTP loopback</div>
+            <code className="wizard-card-cmd mono">
+              bunx @sidetrack/companion --vault {commandPath}
+            </code>
+            <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
+          </div>
         </div>
-      </div>
-      {__DEV__ ? (
+      )}
+      {!synced && __DEV__ ? (
         <div className="wizard-card-row single">
           <div className="wizard-card">
             <div className="wizard-card-title">Dev build — run from local worktree</div>
@@ -319,6 +437,15 @@ function CompanionStep({
           {pingState === 'testing' ? 'Testing…' : 'Test connection'}
         </button>
       </div>
+      {synced && resolvedVaultRoot !== null ? (
+        <div className="wizard-card">
+          <div className="wizard-card-title">Vault</div>
+          <div className="wizard-card-meta mono">{resolvedVaultRoot}</div>
+          <div className="wizard-card-meta mono">
+            Reported by the companion — no need to enter it by hand.
+          </div>
+        </div>
+      ) : null}
       <label>
         Bridge key
         <input
@@ -385,8 +512,9 @@ function CompanionStep({
       </div>
       <div className="wizard-footnote mono">
         <em>
-          The companion runs locally on your machine. The bridge key keeps the vault outside
-          Chrome's profile so other extensions can't reach it.
+          {synced
+            ? 'The bridge key keeps the vault outside Chrome’s profile so other extensions can’t reach it.'
+            : 'The companion runs locally on your machine. The bridge key keeps the vault outside Chrome’s profile so other extensions can’t reach it.'}
         </em>
       </div>
     </div>
