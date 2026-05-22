@@ -15,10 +15,14 @@ making changes.
 ## What this repo is
 
 Sidetrack is a local-first browser AI companion: a Chrome MV3
-extension + Node companion process + stateless MCP reader that helps a
+extension + Bun companion process + stateless MCP reader that helps a
 user track active AI work across providers (ChatGPT / Claude / Gemini /
 coding agents), reorganize it manually, queue follow-ups, recover lost
 tabs, and generate portable packets for other AIs and notebooks.
+
+Production code lives under `packages/*`:
+`sidetrack-extension`, `sidetrack-companion`, `sidetrack-mcp`. Each
+has its own README. To run it end to end, see [`INSTALL.md`](INSTALL.md).
 
 Core product context:
 
@@ -27,15 +31,12 @@ Core product context:
   to navigate. **Architectural anchors live here** (§23.0, §24.5,
   §24.10, §27, §27.6, §28). Do not contradict these without an
   explicit user override.
-- **PRD (in flight)**: see PR #11 on `prd/switchboard-mvp-v1` for the
-  v1 MVP scope. The PRD references the brainstorm anchors by section
-  number.
-- **ADRs**: under `docs/adr/` (created on the PRD branch). ADR-0001
-  locks the companion install path as HTTP loopback over Native
-  Messaging — see [PR #11 → docs/adr/0001-companion-install-http-loopback.md](docs/adr/0001-companion-install-http-loopback.md).
-  When adding new architectural decisions, follow the same numbered
-  convention; use `templates/adr.md`.
-- **PoC code**: under [`poc/`](poc/) — five PoCs validated specific
+- **PRD**: [`PRD.md`](PRD.md) — the v1 MVP scope; references the
+  brainstorm anchors by section number.
+- **ADRs**: under [`docs/adr/`](docs/adr/). ADR-0001 locks the
+  companion install path as HTTP loopback. Add new architectural
+  decisions with the same numbered convention; use `templates/adr.md`.
+- **PoC code**: under [`poc/`](poc/) — the PoCs validated specific
   unknowns. Treat as evidence, not as production code. Per
   [`CODING_STANDARDS.md`](CODING_STANDARDS.md) §"POC-to-product
   conversion rule," capture useful PoC behavior as tests before
@@ -82,8 +83,8 @@ Use these when authoring new boundary contracts:
 
 ## Configs to wire into packages
 
-When scaffolding a new TypeScript package under `poc/` or eventually
-under `packages/`, extend the shared configs:
+When scaffolding a new TypeScript package under `packages/`, extend
+the shared configs:
 
 - [`configs/ts/tsconfig.base.json`](configs/ts/tsconfig.base.json) — strict TS settings
 - [`configs/ts/eslint.config.mjs`](configs/ts/eslint.config.mjs) — typed linting
@@ -94,55 +95,23 @@ under `packages/`, extend the shared configs:
 
 The verify script at [`scripts/verify-standards.sh`](scripts/verify-standards.sh) runs the kit's basic checks; wire it into CI.
 
-## Milestone-PR convention
+## How production work is organized
 
-Production work is organized into **milestones**. Each milestone has its
-own branch (`mN/<short-name>`), a planning artifact under
-`docs/milestones/MN-<short-name>/`, and an open PR against `main` until
-the milestone's done-criteria are met.
+The foundation was built as numbered **milestones** —
+`docs/milestones/M1-foundation/` and `M2-dispatch/` keep those
+planning artifacts as a record, and
+[`docs/milestones/ROADMAP.md`](docs/milestones/ROADMAP.md) tracks
+direction. Work since then ships as focused feature PRs against
+`main`. Whatever the unit of work:
 
-Per-milestone files (mandatory):
-
-- `docs/milestones/MN-<short-name>/README.md` — milestone scope: what's
-  in, what's out (with FAQ for the "should I build X?" questions
-  agents commonly ask), source artifacts the work depends on,
-  deliverables, E2E acceptance criteria, failure modes, sequencing
-  (numbered steps), reference reading order with time estimates.
-- `docs/milestones/MN-<short-name>/AGENT-PROMPT.md` — paste-ready,
-  self-contained handoff prompt for any coding agent (Codex CLI,
-  Claude Code, Cursor, etc.). Designed so the agent can read the
-  prompt + linked references and start without any prior conversation
-  context.
-
-Per-milestone files (created when work completes):
-
-- `docs/milestones/MN-<short-name>/DEMO.md` — copy-paste runbook
-  exercising the E2E acceptance scenario.
-- `docs/milestones/MN-<short-name>/STANDARDS-CHECK.md` — filled
-  checklists from `checklists/`.
-- (Optional) `docs/milestones/MN-<short-name>/SURPRISES.md` — out-of-
-  scope items the agent discovered mid-build.
-
-Conventions:
-
-- **Per-step commits** within the milestone branch — reviewers can
-  sample step boundaries without staring at a 50-file PR.
-- **Time-box per step** named in the milestone README; if any step
-  takes more than the budget, stop and flag, don't silently push past.
-- **Final PR title**: `M<n>: <Name> — <one-line summary>`. Body
-  references the README + AGENT-PROMPT and lists all DoD items as a
-  checklist.
-- **Forward design refs into the milestone PR** (not just
-  `docs/milestones/`) so the agent doing the work has them in the
-  same branch context.
-- The next milestone is **named in the prior milestone's README** so
-  the chain is explicit (e.g., M1 README names M2 as the dispatch
-  milestone).
-- Don't bundle scope changes to PRD / BRAINSTORM / standards into a
-  milestone PR — those are separate fix-PRs.
-
-Track milestones in this file's "Repo navigation" section as they're
-added.
+- **Small, reviewable commits** — a reviewer should be able to sample
+  commit boundaries without staring at a 50-file diff.
+- **Don't bundle scope changes** to PRD / BRAINSTORM / standards into
+  a feature PR — those are separate docs PRs.
+- A larger multi-part effort may still carry a planning doc under
+  `docs/proposals/` (or `docs/milestones/`); the multi-agent
+  stage-PR protocol lives in
+  [`docs/templates/codex-lead-stage-pr.md`](docs/templates/codex-lead-stage-pr.md).
 
 ## Repo conventions
 
@@ -196,13 +165,3 @@ If you are an AI agent picking up work here:
 
 If a Sidetrack convention conflicts with the generic kit standards,
 the convention wins (this file is the override surface).
-
-## Deviations / open issues
-
-- Some `poc/` folders still hold `TODO.md` from earlier planning;
-  those should be deleted as the post-build READMEs land. See PoC
-  folder READMEs for canonical state.
-- The kit's `INSTALL.md` describes adoption from a fresh repo; it's
-  kept for reference but the kit is already integrated here. New
-  packages should follow [`INSTALL.md`](INSTALL.md) §"Wire TypeScript
-  packages" / §"Wire API contracts" / §"Wire MCP standards."
