@@ -228,6 +228,7 @@ const focusedWindowMsForTimelineEntry = (entry: TimelineEvidenceEntry): number |
 export const ensurePageEvidenceForTimelineEntries = async (
   vaultRoot: string,
   entries: readonly TimelineEvidenceEntry[],
+  options: { readonly rebuildManifestAfterWrite?: boolean } = {},
 ): Promise<ReadonlyMap<string, PageEvidenceRecord>> => {
   const byCanonical = new Map<string, PageEvidenceMetadataInput>();
   for (const entry of entries) {
@@ -280,7 +281,12 @@ export const ensurePageEvidenceForTimelineEntries = async (
     }
     out.set(record.canonicalUrl, record);
   }
-  await rebuildManifest(vaultRoot);
+  // The ingest-time caller (importTimelineEvents) passes false: the
+  // per-URL record files are written above and `readPageEvidence`
+  // (the badge poll) reads those directly, so the page is visible
+  // without the O(records) manifest walk. The connections reconcile
+  // still runs this with the default and rebuilds the manifest once.
+  if (options.rebuildManifestAfterWrite !== false) await rebuildManifest(vaultRoot);
   return out;
 };
 

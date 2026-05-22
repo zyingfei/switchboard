@@ -222,4 +222,32 @@ describe('page-evidence store', () => {
     expect(refreshed.record?.content?.contentHash).toBe('hash-f16-minipack');
     expect(refreshed.record?.metadata.title).toBe('New timeline title');
   });
+
+  it('rebuildManifestAfterWrite:false still writes a directly-readable per-URL record (D)', async () => {
+    // D — the timeline-ingest path writes page-evidence records right
+    // after ingest, decoupled from the connections reconcile, and
+    // skips the O(records) manifest walk. readPageEvidence (the badge
+    // poll) reads the per-URL record file directly, so the record
+    // must be present + readable without a manifest rebuild.
+    const url = 'https://example.test/d-fast-page-evidence';
+    const records = await ensurePageEvidenceForTimelineEntries(
+      root,
+      [
+        {
+          id: `timeline-visit:${url}`,
+          firstSeenAt: '2026-05-22T09:00:00.000Z',
+          lastSeenAt: '2026-05-22T09:00:00.000Z',
+          url,
+          canonicalUrl: url,
+          title: 'D Fast Page Evidence',
+          provider: 'generic',
+          visitCount: 1,
+        },
+      ],
+      { rebuildManifestAfterWrite: false },
+    );
+    expect(records.get(url)?.evidenceTier).toBe('metadata_only');
+    const direct = await readPageEvidence(root, url);
+    expect(direct.record?.metadata.title).toBe('D Fast Page Evidence');
+  });
 });
