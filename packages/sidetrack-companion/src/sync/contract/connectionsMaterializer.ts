@@ -7,6 +7,7 @@ import {
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
+import { createIncrementalConnectionsGraphView } from '../../connections/incrementalView.js';
 import { readVaultStores } from '../../connections/loader.js';
 import {
   attachDriftReport,
@@ -515,6 +516,7 @@ export const createConnectionsMaterializer = (
   let tabSessionAccumulator: TabSessionProjectionAccumulator =
     createEmptyTabSessionProjectionAccumulator();
   let projectionAccumulatorsInitialized = false;
+  const incrementalGraphView = createIncrementalConnectionsGraphView();
   // Stage 5.2 W6 per-pass skip — cache the last engagement class
   // revision so a drain whose W6 key set contains no engagement-touching
   // keys can reuse it.
@@ -882,6 +884,7 @@ export const createConnectionsMaterializer = (
     const buildKeys = dedupeInvalidationKeys(accumulatedInvalidations);
     accumulatedInvalidations = [];
     lastBuildInvalidations = buildKeys;
+    const incrementalGraphPlan = incrementalGraphView.drainPlan();
     mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
     mark(`readMerged events=${String(merged.length)}`);
@@ -1420,6 +1423,12 @@ export const createConnectionsMaterializer = (
     mark('projectionAccumulators.derive');
     await yieldToEventLoop();
     const baseSnapshot = buildConnectionsSnapshot(input);
+    incrementalGraphView.seed(baseSnapshot);
+    if (incrementalGraphPlan.pendingEventCount > 0) {
+      mark(
+        `incrementalGraph plan rowLocal=${String(incrementalGraphPlan.rowLocalEventCount)} fullReducer=${String(incrementalGraphPlan.fullReducerEventCount)} ready=${String(incrementalGraphPlan.canUseRowLocalOnly)}`,
+      );
+    }
     mark(
       `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
     );
@@ -1775,6 +1784,7 @@ export const createConnectionsMaterializer = (
       foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
       foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
     }
+    incrementalGraphView.fold(event);
     requestDrain();
   };
 
@@ -1789,6 +1799,7 @@ export const createConnectionsMaterializer = (
     projectionAccumulatorsInitialized = false;
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+    incrementalGraphView.reset();
     // Stage 5.2 W6 per-pass — invalidate the engagement cache on
     // catchUp so the next drain rebuilds against the fresh log.
     lastEngagementClassRevision = undefined;
