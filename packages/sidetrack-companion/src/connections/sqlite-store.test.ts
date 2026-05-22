@@ -273,4 +273,26 @@ describe('SqliteConnectionsStore', () => {
     expect(store).toBeInstanceOf(SqliteConnectionsStore);
     if (store instanceof SqliteConnectionsStore) store.close();
   });
+
+  sqliteIt(
+    'factory-selected SQLite store preserves JSON readCurrent behavior under the flag',
+    async () => {
+      vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-factory-parity-'));
+      const sqliteRoot = join(vaultRoot, 'sqlite');
+      const jsonRoot = join(vaultRoot, 'json');
+      const snapshot = buildTraversalSnapshot();
+
+      process.env['SIDETRACK_CONNECTIONS_STORE'] = 'sqlite';
+      const sqliteStore = createConnectionsStore(sqliteRoot);
+      delete process.env['SIDETRACK_CONNECTIONS_STORE'];
+      const jsonStore = createConnectionsStore(jsonRoot);
+
+      await sqliteStore.putCurrent(snapshot);
+      await jsonStore.putCurrent(snapshot);
+
+      expect(await sqliteStore.readCurrent()).toEqual(await jsonStore.readCurrent());
+      expect(await stat(join(sqliteRoot, '_BAC', 'connections', 'current.db'))).toBeDefined();
+      if (sqliteStore instanceof SqliteConnectionsStore) sqliteStore.close();
+    },
+  );
 });
