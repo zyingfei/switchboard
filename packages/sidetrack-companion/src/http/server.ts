@@ -152,6 +152,7 @@ import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
+import { SqliteConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -1063,9 +1064,7 @@ const semanticRecallExpansion = async (
   // rebuild is gated/cooldowned so a cold embedder can't loop.
   kickSemanticRecallPoolRefresh(vaultRoot, embedderUsable);
   if (pool === null) return [];
-  const anchors = anchorHits
-    .map((h) => h.canonicalUrl)
-    .filter((u): u is string => u !== undefined);
+  const anchors = anchorHits.map((h) => h.canonicalUrl).filter((u): u is string => u !== undefined);
   if (anchors.length === 0) return [];
   const expanded = expandSemanticRecallCandidates(pool, anchors, {
     limit,
@@ -1086,10 +1085,7 @@ const semanticRecallExpansion = async (
   return expanded.map((e) => {
     const ev = evidenceByUrl.get(e.canonicalUrl);
     const capturedAt =
-      ev?.metadata.firstSeenAt ??
-      ev?.metadata.lastSeenAt ??
-      ev?.updatedAt ??
-      nowIso;
+      ev?.metadata.firstSeenAt ?? ev?.metadata.lastSeenAt ?? ev?.updatedAt ?? nowIso;
     return {
       id: `semantic-recall-pool:${e.canonicalUrl}`,
       sourceKind: 'semantic-recall-pool' as const,
@@ -2155,6 +2151,15 @@ const loadUrlProjection = async (
   context: CompanionHttpConfig,
   eventLog: EventLog,
 ): Promise<{ projection: UrlProjection; snapshotRevision: string | null }> => {
+  if (context.connectionsStore instanceof SqliteConnectionsStore) {
+    const metadata = await context.connectionsStore.readSnapshotMetadata();
+    if (metadata?.urlProjection !== undefined) {
+      return {
+        projection: deserializeUrlProjection(metadata.urlProjection),
+        snapshotRevision: metadata.snapshotRevision ?? null,
+      };
+    }
+  }
   const snapshot = await context.connectionsStore?.readCurrent();
   if (snapshot?.urlProjection !== undefined) {
     return {
@@ -2172,6 +2177,18 @@ const loadTabSessionProjection = async (
   context: CompanionHttpConfig,
   eventLog: EventLog,
 ): Promise<{ projection: TabSessionProjection; snapshotRevision: string | null }> => {
+  if (context.connectionsStore instanceof SqliteConnectionsStore) {
+    const metadata = await context.connectionsStore.readSnapshotMetadata();
+    if (metadata?.tabSessionProjection !== undefined && metadata.urlProjection !== undefined) {
+      return {
+        projection: overlayUrlAttributionOntoTabSessions(
+          deserializeTabSessionProjection(metadata.tabSessionProjection),
+          deserializeUrlProjection(metadata.urlProjection),
+        ),
+        snapshotRevision: metadata.snapshotRevision ?? null,
+      };
+    }
+  }
   const snapshot = await context.connectionsStore?.readCurrent();
   const snapshotRevision = snapshot?.snapshotRevision ?? null;
   // Re-fold from the event log at most once (cold start / pre-R1
@@ -2748,7 +2765,11 @@ const routes: readonly RouteDefinition[] = [
         tabResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
-          const snapshot = await context.connectionsStore!.readCurrent();
+          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const snapshot =
+            context.connectionsStore instanceof SqliteConnectionsStore
+              ? await context.connectionsStore.readResolverSubgraphForTabSession(tabSessionId)
+              : await context.connectionsStore!.readCurrent();
           if (snapshot === null) {
             throw new HttpRouteError(
               409,
@@ -2756,7 +2777,6 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
           const merged = await context.eventLog!.readMerged();
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
           const { projection } = await loadTabSessionProjection(context, context.eventLog!);
@@ -2813,7 +2833,11 @@ const routes: readonly RouteDefinition[] = [
               'Body must set dryRun:false for auto-apply.',
             );
           }
-          const snapshot = await connectionsStore.readCurrent();
+          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const snapshot =
+            connectionsStore instanceof SqliteConnectionsStore
+              ? await connectionsStore.readResolverSubgraphForTabSession(tabSessionId)
+              : await connectionsStore.readCurrent();
           if (snapshot === null) {
             throw new HttpRouteError(
               409,
@@ -2839,7 +2863,6 @@ const routes: readonly RouteDefinition[] = [
               `Expected snapshotRevision=${snapshot.snapshotRevision}; client sent dependencyKey=${dependencyKey}. Re-fetch the resolve dry-run and retry.`,
             );
           }
-          const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection;
           // the event-log fallback covers a snapshot loaded from disk that
           // was produced before R1 (no embedded projection).
@@ -3051,7 +3074,11 @@ const routes: readonly RouteDefinition[] = [
         visResKey,
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
-          const snapshot = await context.connectionsStore!.readCurrent();
+          const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+          const snapshot =
+            context.connectionsStore instanceof SqliteConnectionsStore
+              ? await context.connectionsStore.readResolverSubgraphForUrl(canonicalUrl)
+              : await context.connectionsStore!.readCurrent();
           if (snapshot === null) {
             throw new HttpRouteError(
               409,
@@ -3059,7 +3086,6 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
           if (canonicalUrl.length === 0) {
             throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
           }
@@ -3106,7 +3132,11 @@ const routes: readonly RouteDefinition[] = [
             'Body must set dryRun:false for auto-apply.',
           );
         }
-        const snapshot = await connectionsStore.readCurrent();
+        const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+        const snapshot =
+          connectionsStore instanceof SqliteConnectionsStore
+            ? await connectionsStore.readResolverSubgraphForUrl(canonicalUrl)
+            : await connectionsStore.readCurrent();
         if (snapshot === null) {
           throw new HttpRouteError(
             409,
@@ -3114,7 +3144,6 @@ const routes: readonly RouteDefinition[] = [
             'Connections snapshot is not ready.',
           );
         }
-        const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
         if (canonicalUrl.length === 0) {
           throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
         }
@@ -5213,9 +5242,7 @@ const routes: readonly RouteDefinition[] = [
       // Only the budget-allocation interpretation softens — from
       // "primary owns 100%" to "expansion gets 1/3 when it has hits".
       const expansionQuota =
-        semanticHits.length === 0
-          ? 0
-          : Math.min(semanticHits.length, Math.ceil(query.limit / 3));
+        semanticHits.length === 0 ? 0 : Math.min(semanticHits.length, Math.ceil(query.limit / 3));
       const primaryBudget = Math.max(0, query.limit - expansionQuota);
       const primarySlice = primary.slice(0, primaryBudget);
       const expansion = semanticHits.slice(0, expansionQuota);
@@ -6625,6 +6652,19 @@ const routes: readonly RouteDefinition[] = [
       const url = new URL(request.url ?? '/v1/connections', 'http://internal');
       const hopsRaw = Number.parseInt(url.searchParams.get('hops') ?? '1', 10);
       const hops = Number.isFinite(hopsRaw) && hopsRaw >= 0 ? Math.min(hopsRaw, 4) : 1;
+      if (context.connectionsStore instanceof SqliteConnectionsStore) {
+        let sub = await context.connectionsStore.readSubgraphForNode(nodeId, hops);
+        if (sub !== null && sub.nodes.length > 0) {
+          if (context.eventLog !== undefined) {
+            sub = applyFeedbackOverlayToSnapshot(
+              sub,
+              projectFeedback(await context.eventLog.readMerged()),
+            );
+          }
+          sub = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), sub);
+          return [200, { data: { scope: 'companion-extended', snapshot: sub } }];
+        }
+      }
       let snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         return [
@@ -6666,6 +6706,13 @@ const routes: readonly RouteDefinition[] = [
         throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
       }
       const edgeId = decodeURIComponent(match.connectionsEdgeId ?? '');
+      if (context.connectionsStore instanceof SqliteConnectionsStore) {
+        const edge = await context.connectionsStore.readEdge(edgeId);
+        if (edge === null) {
+          throw new HttpRouteError(404, 'EDGE_NOT_FOUND', 'Edge not found.');
+        }
+        return [200, { data: { edge } }];
+      }
       const snap = await context.connectionsStore.readCurrent();
       if (snap === null) {
         throw new HttpRouteError(404, 'EDGE_NOT_FOUND', 'No connections snapshot yet.');

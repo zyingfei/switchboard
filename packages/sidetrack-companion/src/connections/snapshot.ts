@@ -3231,7 +3231,7 @@ const textField = (value: unknown, field: string): string => {
   return value[field];
 };
 
-interface StoredConnectionsMetadata {
+export interface StoredConnectionsMetadata {
   readonly scope: ConnectionsSnapshotScope;
   readonly updatedAt: string;
   readonly nodeCount: number;
@@ -3259,13 +3259,14 @@ const snapshotFromParts = (
   metadata: StoredConnectionsMetadata,
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
+  options?: { readonly preserveMetadataCounts?: boolean },
 ): ConnectionsSnapshot => ({
   scope: metadata.scope,
   nodes,
   edges,
   updatedAt: metadata.updatedAt,
-  nodeCount: nodes.length,
-  edgeCount: edges.length,
+  nodeCount: options?.preserveMetadataCounts === true ? metadata.nodeCount : nodes.length,
+  edgeCount: options?.preserveMetadataCounts === true ? metadata.edgeCount : edges.length,
   ...(metadata.urlProjection === undefined ? {} : { urlProjection: metadata.urlProjection }),
   ...(metadata.tabSessionProjection === undefined
     ? {}
@@ -3322,6 +3323,88 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
     return this.#db;
   }
+
+  async #readMetadata(db: SqliteDatabase): Promise<StoredConnectionsMetadata | null> {
+    const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+    if (metadataRow === null || metadataRow === undefined) return null;
+    return JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+  }
+
+  #readNode(db: SqliteDatabase, nodeId: string): ConnectionNode | null {
+    const row = db.query('SELECT data FROM nodes WHERE id = ?').get(nodeId);
+    if (row === null || row === undefined) return null;
+    return JSON.parse(textField(row, 'data')) as ConnectionNode;
+  }
+
+  #readIncidentEdges(db: SqliteDatabase, nodeId: string): readonly ConnectionEdge[] {
+    return db
+      .query('SELECT data FROM edges WHERE src = ? OR dst = ?')
+      .all(nodeId, nodeId)
+      .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[]);
+  }
+
+  async #readTraversedSubgraph(
+    seedNodeIds: readonly string[],
+    options: { readonly hops?: number; readonly preserveMetadataCounts?: boolean },
+  ): Promise<ConnectionsSnapshot | null> {
+    const db = await this.#database();
+    const metadata = await this.#readMetadata(db);
+    if (metadata === null) return null;
+
+    const maxHops = options.hops ?? Number.POSITIVE_INFINITY;
+    const visited = new Set<string>();
+    let frontier = new Set<string>();
+    for (const id of seedNodeIds) {
+      if (this.#readNode(db, id) === null) continue;
+      visited.add(id);
+      frontier.add(id);
+    }
+
+    const edgeById = new Map<string, ConnectionEdge>();
+    for (let depth = 0; frontier.size > 0 && depth < maxHops; depth += 1) {
+      const next = new Set<string>();
+      for (const nodeId of frontier) {
+        for (const edge of this.#readIncidentEdges(db, nodeId)) {
+          edgeById.set(edge.id, edge);
+          const endpoints = [edge.fromNodeId, edge.toNodeId];
+          for (const endpoint of endpoints) {
+            if (visited.has(endpoint) || this.#readNode(db, endpoint) === null) continue;
+            visited.add(endpoint);
+            next.add(endpoint);
+          }
+        }
+      }
+      frontier = next;
+    }
+
+    for (const nodeId of visited) {
+      for (const edge of this.#readIncidentEdges(db, nodeId)) {
+        if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
+          edgeById.set(edge.id, edge);
+        }
+      }
+    }
+
+    const nodes = [...visited].flatMap((id) => {
+      const node = this.#readNode(db, id);
+      return node === null ? [] : [node];
+    });
+    return snapshotFromParts(
+      metadata,
+      sortAlphaById(nodes),
+      sortAlphaById([...edgeById.values()]),
+      {
+        ...(options.preserveMetadataCounts === undefined
+          ? {}
+          : { preserveMetadataCounts: options.preserveMetadataCounts }),
+      },
+    );
+  }
+
+  readonly readSnapshotMetadata = async (): Promise<StoredConnectionsMetadata | null> => {
+    const db = await this.#database();
+    return await this.#readMetadata(db);
+  };
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const db = await this.#database();
@@ -3396,10 +3479,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
-    const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
-    if (metadataRow === null || metadataRow === undefined) return null;
-
-    const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+    const metadata = await this.#readMetadata(db);
+    if (metadata === null) return null;
     const nodesById = new Map(
       db
         .query('SELECT data FROM nodes ORDER BY id')
@@ -3441,12 +3522,11 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     nodeIds: readonly string[],
   ): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
-    const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
-    if (metadataRow === null || metadataRow === undefined) return null;
+    const metadata = await this.#readMetadata(db);
+    if (metadata === null) return null;
 
     const wanted = [...new Set(nodeIds)].sort();
     if (wanted.length === 0) {
-      const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
       return snapshotFromParts(metadata, [], []);
     }
 
@@ -3474,8 +3554,56 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       }
     }
 
-    const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
     return snapshotFromParts(metadata, sortAlphaById([...nodeById.values()]), sortAlphaById(edges));
+  };
+
+  readonly readSubgraphForNode = async (
+    nodeId: string,
+    hops: number,
+  ): Promise<ConnectionsSnapshot | null> =>
+    await this.#readTraversedSubgraph([nodeId], { hops: Math.max(0, Math.min(hops, 4)) });
+
+  readonly readResolverSubgraphForTabSession = async (
+    tabSessionId: string,
+  ): Promise<ConnectionsSnapshot | null> =>
+    await this.#readTraversedSubgraph([`tab-session:${tabSessionId}`], {
+      preserveMetadataCounts: true,
+    });
+
+  readonly readResolverSubgraphForUrl = async (
+    canonicalUrl: string,
+  ): Promise<ConnectionsSnapshot | null> => {
+    const db = await this.#database();
+    const seeds = new Set<string>();
+    const timelineNode = this.#readNode(db, `timeline-visit:${canonicalUrl}`);
+    if (timelineNode !== null) seeds.add(timelineNode.id);
+    for (const row of db
+      .query(
+        `
+          SELECT data FROM nodes
+          WHERE json_extract(data, '$.kind') = 'visit-instance'
+            AND (
+              json_extract(data, '$.metadata.canonicalUrl') = ?
+              OR json_extract(data, '$.metadata.url') = ?
+            )
+        `,
+      )
+      .all(canonicalUrl, canonicalUrl)) {
+      const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+      seeds.add(node.id);
+    }
+    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
+  };
+
+  readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
+    const db = await this.#database();
+    for (const row of db.query('SELECT data FROM edges').all()) {
+      const match = (JSON.parse(textField(row, 'data')) as ConnectionEdge[]).find(
+        (edge) => edge.id === edgeId,
+      );
+      if (match !== undefined) return match;
+    }
+    return null;
   };
 
   readonly putDay = async (date: string, snapshot: ConnectionsSnapshot): Promise<void> => {
