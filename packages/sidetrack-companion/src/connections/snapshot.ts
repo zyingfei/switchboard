@@ -3190,7 +3190,7 @@ export interface ConnectionsStore {
 }
 
 const SNAPSHOTS_DIR = 'snapshots';
-const CONNECTIONS_STORE_SQLITE_FLAG = 'sqlite';
+const CONNECTIONS_STORE_JSON_FLAG = 'json';
 
 interface SqliteStatement {
   readonly run: (...params: readonly unknown[]) => unknown;
@@ -3736,7 +3736,7 @@ const writeConnectionsSnapshotJson = async (
 };
 
 export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
-  if (process.env['SIDETRACK_CONNECTIONS_STORE'] === CONNECTIONS_STORE_SQLITE_FLAG) {
+  if (process.env['SIDETRACK_CONNECTIONS_STORE'] !== CONNECTIONS_STORE_JSON_FLAG) {
     return new SqliteConnectionsStore(vaultRoot);
   }
 
