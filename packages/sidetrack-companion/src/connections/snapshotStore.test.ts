@@ -19,9 +19,11 @@ const buildSnapshot = (revisionId: string): ConnectionsSnapshot => ({
 describe('connectionsStore — Stage 5.2 W5 store-level skip-write', () => {
   let vaultRoot: string;
   beforeEach(async () => {
+    process.env['SIDETRACK_CONNECTIONS_STORE'] = 'json';
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-store-skipwrite-'));
   });
   afterEach(async () => {
+    delete process.env['SIDETRACK_CONNECTIONS_STORE'];
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
