@@ -55,6 +55,44 @@ const buildSnapshot = (): ConnectionsSnapshot => {
   };
 };
 
+const buildTraversalSnapshot = (): ConnectionsSnapshot => {
+  const tab = node('tab-session:ts-1', 'tab-session', 'Tab 1');
+  const visit = node('timeline-visit:https://example.test/page', 'timeline-visit', 'Example');
+  const instance: ConnectionNode = {
+    ...node('visit-instance:ts-1:0:https://example.test/page', 'visit-instance', 'Example visit'),
+    metadata: { canonicalUrl: 'https://example.test/page' },
+  };
+  const workstream = node('workstream:main', 'workstream', 'Main');
+  const unrelated = node('workstream:other', 'workstream', 'Other');
+  return {
+    scope: {},
+    nodes: [tab, visit, instance, workstream, unrelated],
+    edges: [
+      edge('visit_in_tab_session', visit.id, tab.id, '2026-05-01T00:00:00.000Z'),
+      edge(
+        'visit_instance_same_url_as_timeline_visit',
+        instance.id,
+        visit.id,
+        '2026-05-01T00:00:01.000Z',
+      ),
+      edge('visit_in_workstream', visit.id, workstream.id, '2026-05-01T00:00:02.000Z'),
+    ],
+    updatedAt: '2026-05-01T00:00:02.000Z',
+    nodeCount: 5,
+    edgeCount: 3,
+    urlProjection: {
+      schemaVersion: 1,
+      byCanonicalUrl: {},
+    },
+    tabSessionProjection: {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    },
+    snapshotRevision: 'rev-traversal',
+  };
+};
+
 describe('SqliteConnectionsStore', () => {
   let vaultRoot: string | null = null;
 
@@ -90,6 +128,58 @@ describe('SqliteConnectionsStore', () => {
     ]);
     expect(subgraph?.nodeCount).toBe(2);
     expect(subgraph?.edgeCount).toBe(2);
+    store.close();
+  });
+
+  sqliteIt('reads node neighborhoods without materializing unrelated nodes', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.putCurrent(buildTraversalSnapshot());
+
+    const subgraph = await store.readSubgraphForNode('tab-session:ts-1', 1);
+
+    expect(subgraph?.nodes.map((n) => n.id)).toEqual([
+      'tab-session:ts-1',
+      'timeline-visit:https://example.test/page',
+    ]);
+    expect(subgraph?.edges.map((e) => e.kind)).toEqual(['visit_in_tab_session']);
+    expect(subgraph?.nodeCount).toBe(2);
+    expect(subgraph?.edgeCount).toBe(1);
+    store.close();
+  });
+
+  sqliteIt(
+    'reads resolver subgraphs with full snapshot counts preserved for stable revisions',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      await store.putCurrent(buildTraversalSnapshot());
+
+      const subgraph = await store.readResolverSubgraphForUrl('https://example.test/page');
+
+      expect(subgraph?.nodes.map((n) => n.id)).toEqual([
+        'tab-session:ts-1',
+        'timeline-visit:https://example.test/page',
+        'visit-instance:ts-1:0:https://example.test/page',
+        'workstream:main',
+      ]);
+      expect(subgraph?.edgeCount).toBe(3);
+      expect(subgraph?.nodeCount).toBe(5);
+      expect(subgraph?.edges).toHaveLength(3);
+      store.close();
+    },
+  );
+
+  sqliteIt('reads snapshot metadata and individual edges without full snapshot reads', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildTraversalSnapshot();
+    await store.putCurrent(snapshot);
+
+    const metadata = await store.readSnapshotMetadata();
+    const foundEdge = await store.readEdge(snapshot.edges[0]?.id ?? '');
+
+    expect(metadata?.snapshotRevision).toBe('rev-traversal');
+    expect(metadata?.urlProjection).toEqual(snapshot.urlProjection);
+    expect(metadata?.tabSessionProjection).toEqual(snapshot.tabSessionProjection);
+    expect(foundEdge).toEqual(snapshot.edges[0]);
     store.close();
   });
 
