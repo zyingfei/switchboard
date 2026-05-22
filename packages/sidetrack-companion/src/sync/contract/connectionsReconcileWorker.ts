@@ -28,6 +28,8 @@ import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
+import { buildReconcileChildEnv } from './connectionsReconcileChildClient.js';
+
 export interface ReconcileWorkerJob {
   readonly vaultRoot: string;
   readonly seq: number;
@@ -72,6 +74,7 @@ export const runReconcileInWorker = (job: ReconcileWorkerJob): Promise<Reconcile
   new Promise<ReconcileWorkerResult>((resolve) => {
     const worker = new Worker(workerScriptPath, {
       workerData: job,
+      env: buildReconcileChildEnv(),
     });
     let settled = false;
     const settle = (result: ReconcileWorkerResult): void => {
