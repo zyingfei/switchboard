@@ -3608,6 +3608,56 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   ): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
     const seeds = new Set<string>();
+    this.#addUrlSeeds(db, canonicalUrl, seeds);
+    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
+  };
+
+  readonly readResolverSubgraphForThread = async (input: {
+    readonly threadId: string;
+    readonly providerThreadId?: string;
+    readonly threadUrl?: string;
+  }): Promise<ConnectionsSnapshot | null> => {
+    const db = await this.#database();
+    const seeds = new Set<string>();
+    for (const id of [input.threadId, input.providerThreadId]) {
+      if (id === undefined || id.length === 0) continue;
+      const node = this.#readNode(db, `thread:${id}`);
+      if (node !== null) seeds.add(node.id);
+    }
+    for (const row of db
+      .query(
+        `
+          SELECT data FROM nodes
+          WHERE json_extract(data, '$.kind') = 'thread'
+            AND (
+              json_extract(data, '$.metadata.threadId') = ?
+              OR json_extract(data, '$.metadata.threadId') = ?
+              OR json_extract(data, '$.metadata.canonicalUrl') = ?
+              OR json_extract(data, '$.metadata.url') = ?
+            )
+        `,
+      )
+      .all(
+        input.threadId,
+        input.providerThreadId ?? '',
+        input.threadUrl ?? '',
+        input.threadUrl ?? '',
+      )) {
+      const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+      seeds.add(node.id);
+      const canonicalUrl =
+        typeof node.metadata.canonicalUrl === 'string'
+          ? node.metadata.canonicalUrl
+          : typeof node.metadata.url === 'string'
+            ? node.metadata.url
+            : undefined;
+      if (canonicalUrl !== undefined) this.#addUrlSeeds(db, canonicalUrl, seeds);
+    }
+    if (input.threadUrl !== undefined) this.#addUrlSeeds(db, input.threadUrl, seeds);
+    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
+  };
+
+  #addUrlSeeds(db: SqliteDatabase, canonicalUrl: string, seeds: Set<string>): void {
     const timelineNode = this.#readNode(db, `timeline-visit:${canonicalUrl}`);
     if (timelineNode !== null) seeds.add(timelineNode.id);
     for (const row of db
@@ -3625,8 +3675,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
       seeds.add(node.id);
     }
-    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
-  };
+  }
 
   readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
     const db = await this.#database();
