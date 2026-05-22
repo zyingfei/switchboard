@@ -1,5 +1,11 @@
-import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -14,6 +20,7 @@ import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import type { VaultChangeEvent } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
@@ -2583,6 +2590,7 @@ describe('companion HTTP server', () => {
           });
           return () => undefined;
         },
+        subscriberCount: () => 0,
       },
     };
 
@@ -2593,6 +2601,60 @@ describe('companion HTTP server', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toContain('text/event-stream');
     expect(response.bodyText).toContain('data: {"type":"modified"');
+  });
+
+  it('releases the vault-changes subscription when the SSE client disconnects', async () => {
+    // Regression guard for the SSE subscription leak. /v1/vault/changes
+    // subscribes a listener + starts a heartbeat timer per connection.
+    // If the disconnect path fails to unsubscribe, every reconnect
+    // leaks a listener whose ServerResponse write-buffer then grows
+    // without bound — the companion's multi-GB memory leak.
+    const subscribers = new Set<(event: VaultChangeEvent) => void>();
+    context = {
+      ...context,
+      vaultChanges: {
+        subscribe(listener) {
+          subscribers.add(listener);
+          return () => {
+            subscribers.delete(listener);
+          };
+        },
+        subscriberCount: () => subscribers.size,
+      },
+    };
+    const server = createServer((req, res) => {
+      void handleRequest(req, res, context);
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address() as AddressInfo;
+    try {
+      const controller = new AbortController();
+      const streamed = fetch(`http://127.0.0.1:${String(port)}/v1/vault/changes`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => {
+        expect(subscribers.size).toBe(1);
+      });
+      // Abrupt client disconnect — the companion MUST release the
+      // subscription (and clear the heartbeat) within a few seconds.
+      controller.abort();
+      await vi.waitFor(
+        () => {
+          expect(subscribers.size).toBe(0);
+        },
+        { timeout: 4000 },
+      );
+      await streamed.catch(() => undefined);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
+    }
   });
 
   it('manages workstream trust — allow-by-default; explicit empty list denies', async () => {

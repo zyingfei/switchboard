@@ -424,6 +424,10 @@ export interface CompanionHttpConfig {
   };
   readonly vaultChanges?: {
     readonly subscribe: (listener: (event: VaultChangeEvent) => void) => () => void;
+    /** Live count of attached subscribers — surfaced on /v1/status so a
+     *  leaking SSE consumer (subscriptions that outlive their socket)
+     *  is observable instead of silent. */
+    readonly subscriberCount: () => number;
   };
   readonly hygieneStatus?: {
     lastIdempotencyGcAt?: string;
@@ -2431,6 +2435,9 @@ const routes: readonly RouteDefinition[] = [
             ...(recallState === undefined ? {} : { recall: recallState }),
             ...(materializerState === undefined ? {} : { materializer: materializerState }),
             ...(eventLoopState === undefined ? {} : { eventLoop: eventLoopState }),
+            ...(context.vaultChanges === undefined
+              ? {}
+              : { vaultChangeSubscribers: context.vaultChanges.subscriberCount() }),
             // P1-review: vaultRoot lets the side panel build Codex
             // MCP config snippets without asking the user to paste
             // the absolute vault path. Only included when the
@@ -4942,7 +4949,14 @@ const routes: readonly RouteDefinition[] = [
           payload.storageMode === 'indexed_chunks'
             ? await writePageContentExtracted(vaultRoot, pageContentPayload)
             : null;
-        const evidence = await writeExtractedPageEvidence(vaultRoot, payload);
+        // Skip the O(records) manifest rebuild on the request path —
+        // the per-URL record file is written regardless, the badge poll
+        // (`readPageEvidence`) reads those directly, and the connections
+        // reconcile rebuilds the aggregate manifest once. Rebuilding it
+        // per POST re-read all ~800 record files (multi-second stall).
+        const evidence = await writeExtractedPageEvidence(vaultRoot, payload, {
+          rebuildManifestAfterWrite: false,
+        });
         if (context.eventLog !== undefined) {
           if (coverage !== null) {
             await context.eventLog.appendServerObserved({

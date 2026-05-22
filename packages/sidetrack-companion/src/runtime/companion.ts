@@ -59,6 +59,7 @@ import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { loadOrCreateReplicaKeyPair } from '../sync/replicaKeyPair.js';
 import type { LogTransport } from '../sync/transport.js';
 import { enforceRetention } from '../vault/auditRetention.js';
+import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -151,7 +152,12 @@ export const startCompanion = async (
       watcher = createVaultWatcher(options.vaultPath, {
         onChange: (event) => {
           for (const listener of listeners) {
-            listener(event);
+            try {
+              listener(event);
+            } catch {
+              // A subscriber's handler must never break fan-out to the
+              // other subscribers (or throw into the vault watcher).
+            }
           }
         },
       });
@@ -162,7 +168,11 @@ export const startCompanion = async (
       const w = watcher;
       teardown.push(() => w.close());
     }
-    const hygieneStatus: { lastIdempotencyGcAt?: string; lastAuditRetentionAt?: string } = {};
+    const hygieneStatus: {
+      lastIdempotencyGcAt?: string;
+      lastAuditRetentionAt?: string;
+      lastDerivedRevisionGcAt?: string;
+    } = {};
     const idempotencyGc = setInterval(
       () => {
         void idempotencyStore.gcExpired?.(new Date()).then(() => {
@@ -184,6 +194,39 @@ export const startCompanion = async (
     );
     teardown.push(() => {
       clearInterval(auditRetention);
+    });
+    // Derived-revision sweep: visit-similarity / topic / closest-visit
+    // revision files (one written per rebuild) plus stale connections
+    // temp files. buildGcPlan keeps the newest N of each; previously the
+    // sweep ran ONLY as a manual CLI command, so these dirs grew
+    // unbounded — visit-similarity alone reached ~1.7 GiB per vault.
+    const runDerivedRevisionGc = async (): Promise<void> => {
+      try {
+        const plan = await buildGcPlan(options.vaultPath);
+        if (plan.entries.length > 0) {
+          await applyGcPlan(plan);
+        }
+        hygieneStatus.lastDerivedRevisionGcAt = new Date().toISOString();
+      } catch {
+        // Best-effort — a failed sweep must never crash the companion.
+      }
+    };
+    const derivedRevisionGc = setInterval(
+      () => {
+        void runDerivedRevisionGc();
+      },
+      60 * 60 * 1000,
+    );
+    teardown.push(() => {
+      clearInterval(derivedRevisionGc);
+    });
+    // Clear any startup backlog without competing with boot's catch-up
+    // reconcile.
+    const derivedRevisionGcKickoff = setTimeout(() => {
+      void runDerivedRevisionGc();
+    }, 60_000);
+    teardown.push(() => {
+      clearTimeout(derivedRevisionGcKickoff);
     });
     const recallActivity = createRecallActivityTracker();
     const baseEventLog = createEventLog(options.vaultPath, replica);
@@ -826,6 +869,7 @@ export const startCompanion = async (
             listeners.delete(listener);
           };
         },
+        subscriberCount: () => listeners.size,
       },
     });
     const started: StartedHttpServer = await startHttpServer(server, options.port);
