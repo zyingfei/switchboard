@@ -324,46 +324,67 @@ const addUndirected = (graph: Map<string, Set<string>>, left: string, right: str
   addToSetMap(graph, right, left);
 };
 
-const walkGraph = (
+// Connected components of an undirected graph, computed in ONE pass.
+// Every node maps to the sorted member list of its component (the
+// array instance is shared across all members of that component).
+// Replaces a per-node walkGraph() BFS when many nodes of the same
+// graph are queried — O(graph) once instead of O(nodes × component).
+const buildComponents = (
   graph: ReadonlyMap<string, ReadonlySet<string>>,
-  start: string,
-): readonly string[] => {
-  const seen = new Set<string>([start]);
-  const queue: string[] = [...toSortedIds(graph.get(start))];
-
-  let index = 0;
-  while (index < queue.length) {
-    const current = queue[index];
-    index += 1;
-    if (current === undefined || seen.has(current)) continue;
-    seen.add(current);
-    for (const next of toSortedIds(graph.get(current))) {
-      if (!seen.has(next)) queue.push(next);
+): ReadonlyMap<string, readonly string[]> => {
+  const componentByNode = new Map<string, readonly string[]>();
+  for (const start of graph.keys()) {
+    if (componentByNode.has(start)) continue;
+    const seen = new Set<string>([start]);
+    const queue: string[] = [start];
+    let index = 0;
+    while (index < queue.length) {
+      const current = queue[index];
+      index += 1;
+      if (current === undefined) continue;
+      for (const next of graph.get(current) ?? []) {
+        if (!seen.has(next)) {
+          seen.add(next);
+          queue.push(next);
+        }
+      }
     }
+    const members = [...seen].sort(compareText);
+    for (const node of members) componentByNode.set(node, members);
   }
-
-  seen.delete(start);
-  return [...seen].sort(compareText);
+  return componentByNode;
 };
 
-const pairSourceGenerator =
-  (
-    source: CandidateSource,
-    readPairs: (
-      context: CandidateContext,
-    ) => readonly { readonly from: string; readonly to: string }[],
-  ): SourceGenerator =>
-  (fromVisitId, context, generatedAt) => {
-    const fromKey = fromKeyFor(fromVisitId);
+const pairSourceGenerator = (
+  source: CandidateSource,
+  readPairs: (
+    context: CandidateContext,
+  ) => readonly { readonly from: string; readonly to: string }[],
+): SourceGenerator => {
+  // Index readPairs(context) into a from→to map ONCE per context. The
+  // old code re-ran readPairs (a full scan of context.merged) and
+  // re-filtered the whole pair list for every visit — O(visits × events).
+  const byFromCache = new WeakMap<object, ReadonlyMap<string, readonly string[]>>();
+  return (fromVisitId, context, generatedAt) => {
+    let byFrom = byFromCache.get(context);
+    if (byFrom === undefined) {
+      const built = new Map<string, string[]>();
+      for (const pair of readPairs(context)) {
+        const list = built.get(pair.from);
+        if (list === undefined) built.set(pair.from, [pair.to]);
+        else list.push(pair.to);
+      }
+      byFrom = built;
+      byFromCache.set(context, byFrom);
+    }
     return candidatesFromIds(
       fromVisitId,
-      readPairs(context)
-        .filter((pair) => pair.from === fromKey)
-        .map((pair) => pair.to),
+      byFrom.get(fromKeyFor(fromVisitId)) ?? [],
       source,
       generatedAt,
     );
   };
+};
 
 const sourceWrapper =
   (source: CandidateSource, generator: SourceGenerator): GenerateCandidates =>
@@ -405,12 +426,16 @@ const groupedRecordCandidates = (
   return candidatesFromIds(fromVisitId, toVisitIds, source, generatedAt);
 };
 
-const chainGenerator =
-  (
-    source: CandidateSource,
-    linkForRecord: (record: VisitRecord) => string | undefined,
-  ): SourceGenerator =>
-  (fromVisitId, context, generatedAt) => {
+const chainGenerator = (
+  source: CandidateSource,
+  linkForRecord: (record: VisitRecord) => string | undefined,
+): SourceGenerator => {
+  // Precompute connected components ONCE per context. The old code ran
+  // a fresh walkGraph() BFS — with a sort at every node visited — for
+  // every visit, i.e. O(visits × component). Components are stable for
+  // the graph, so one pass serves all visits.
+  const componentsCache = new WeakMap<object, ReadonlyMap<string, readonly string[]>>();
+  return (fromVisitId, context, generatedAt) => {
     const indexes = indexesFor(context);
     let graph = indexes.chainGraphs.get(source);
     if (graph === undefined) {
@@ -422,13 +447,17 @@ const chainGenerator =
       graph = nextGraph;
       indexes.chainGraphs.set(source, graph);
     }
-    return candidatesFromIds(
-      fromVisitId,
-      walkGraph(graph, fromKeyFor(fromVisitId)),
-      source,
-      generatedAt,
-    );
+    let components = componentsCache.get(context);
+    if (components === undefined) {
+      components = buildComponents(graph);
+      componentsCache.set(context, components);
+    }
+    const fromKey = fromKeyFor(fromVisitId);
+    // walkGraph excluded the start node; match that exactly.
+    const reachable = (components.get(fromKey) ?? []).filter((id) => id !== fromKey);
+    return candidatesFromIds(fromVisitId, reachable, source, generatedAt);
   };
+};
 
 const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
   try {
