@@ -2455,7 +2455,10 @@ const routes: readonly RouteDefinition[] = [
         | undefined;
       if (context.connectionsStore !== undefined) {
         try {
-          const current = await context.connectionsStore.readCurrent();
+          const current =
+            context.connectionsStore instanceof SqliteConnectionsStore
+              ? await context.connectionsStore.readSnapshotMetadata()
+              : await context.connectionsStore.readCurrent();
           if (current === null) {
             snapshotState = { state: 'missing' };
           } else {
@@ -5362,7 +5365,11 @@ const routes: readonly RouteDefinition[] = [
         suggestionsCacheKey,
         THREAD_SUGGESTIONS_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
-          const snapshot = await context.connectionsStore!.readCurrent();
+          const target = await readThreadSuggestionTarget(vaultRoot, threadId);
+          const snapshot =
+            context.connectionsStore instanceof SqliteConnectionsStore
+              ? await context.connectionsStore.readResolverSubgraphForThread(target)
+              : await context.connectionsStore!.readCurrent();
           if (snapshot === null) {
             throw new HttpRouteError(
               409,
@@ -5370,7 +5377,6 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const target = await readThreadSuggestionTarget(vaultRoot, threadId);
           const merged = await eventLog.readMerged();
           const resolution = resolveThreadAttribution({
             threadId: target.threadId,

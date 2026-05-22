@@ -10,7 +10,7 @@
 // hand-off: the child writes the new snapshot, the parent reads it
 // from disk on the next HTTP request.
 
-import { createConnectionsStore } from '../../connections/snapshot.js';
+import { createConnectionsStore, SqliteConnectionsStore } from '../../connections/snapshot.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -69,13 +69,16 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
       store,
     });
     await materializer.catchUp(eventLog);
-    const snapshot = await store.readCurrent();
+    const metadata =
+      store instanceof SqliteConnectionsStore
+        ? await store.readSnapshotMetadata()
+        : await store.readCurrent();
     post({
       seq: msg.seq,
       ok: true,
-      ...(snapshot?.snapshotRevision === undefined
+      ...(metadata?.snapshotRevision === undefined
         ? {}
-        : { snapshotRevision: snapshot.snapshotRevision }),
+        : { snapshotRevision: metadata.snapshotRevision }),
     });
     process.exit(0);
   } catch (err) {
