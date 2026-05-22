@@ -38,6 +38,15 @@ interface ReconcileChildMessage {
   readonly seq: number;
 }
 
+export const buildReconcileChildEnv = (
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv => ({
+  ...source,
+  ...(source['SIDETRACK_CONNECTIONS_STORE'] === undefined
+    ? {}
+    : { SIDETRACK_CONNECTIONS_STORE: source['SIDETRACK_CONNECTIONS_STORE'] }),
+});
+
 /**
  * Fork a child process and run one reconcile pass. The promise resolves
  * with the child's result; the seq token round-trips so the caller can
@@ -55,7 +64,7 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
       return;
     }
     const child: ChildProcess = fork(entry, [], {
-      env: process.env,
+      env: buildReconcileChildEnv(),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     let settled = false;
