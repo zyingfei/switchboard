@@ -41,6 +41,8 @@ import { createConnectionsMaterializer } from '../sync/contract/connectionsMater
 import { createConnectionsStore } from '../connections/snapshot.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
+import { ensurePageEvidenceForTimelineEntries } from '../page-evidence/store.js';
+import type { TimelineProvider } from '../timeline/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
@@ -724,8 +726,8 @@ export const startCompanion = async (
       // reproduces the singular path's dispatch exactly (contract
       // runner + relay publish + privacy refresh), per event, while
       // the dedupe scan is amortized once over the batch.
-      importTimelineEvents: async (events) =>
-        eventLog.appendClientObservedBatch(
+      importTimelineEvents: async (events) => {
+        const results = await eventLog.appendClientObservedBatch(
           events.map((event) => ({
             clientEventId: event.clientEventId,
             aggregateId: event.aggregateId,
@@ -734,7 +736,52 @@ export const startCompanion = async (
             baseVector: {},
           })),
           onLocalAccepted,
-        ),
+        );
+        // D — fast page evidence. Write the page-evidence record
+        // (metadata_only, + indexed-chunks upgrade if content was
+        // already extracted) for each observed URL right after
+        // ingest, so `/v1/page-evidence/summary` — the side-panel
+        // badge poll — resolves on its next tick. Previously the only
+        // writer of these records was the connections reconcile
+        // (`ensurePageEvidenceForTimelineEntries` inside the ~3-min
+        // buildVisitSimilarity cycle), so a freshly-navigated page's
+        // badge was reconcile-gated. Fire-and-forget — it must add
+        // zero latency to the ingest response (B's whole point);
+        // `rebuildManifestAfterWrite:false` keeps it to per-URL record
+        // writes (the badge reads record files directly). The
+        // reconcile still runs the bulk ensure as the catchUp /
+        // peer-event backstop and rebuilds the manifest.
+        const observed = events.flatMap((event) => {
+          const p = event.payload as Record<string, unknown>;
+          const url = p['url'];
+          if (typeof url !== 'string') return [];
+          const observedAt =
+            typeof p['observedAt'] === 'string' ? p['observedAt'] : new Date().toISOString();
+          return [
+            {
+              id: event.clientEventId,
+              url,
+              ...(typeof p['canonicalUrl'] === 'string'
+                ? { canonicalUrl: p['canonicalUrl'] }
+                : {}),
+              ...(typeof p['title'] === 'string' ? { title: p['title'] } : {}),
+              ...(typeof p['provider'] === 'string'
+                ? { provider: p['provider'] as TimelineProvider }
+                : {}),
+              firstSeenAt: observedAt,
+              lastSeenAt: observedAt,
+              visitCount: 1,
+              ...(p['dimensions'] === undefined ? {} : { dimensions: p['dimensions'] }),
+            },
+          ];
+        });
+        if (observed.length > 0) {
+          void ensurePageEvidenceForTimelineEntries(options.vaultPath, observed, {
+            rebuildManifestAfterWrite: false,
+          }).catch(() => undefined);
+        }
+        return results;
+      },
       timelineStore,
       connectionsStore,
       refreshConnections: async () => {
