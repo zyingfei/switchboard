@@ -337,4 +337,53 @@ describe('event log', () => {
       await rm(fresh, { recursive: true, force: true });
     }
   });
+
+  it('appendClientObservedBatch onAccepted hook fires once per NEW event, never for dedupes', async () => {
+    // The timeline ingest (POST /v1/timeline/events) batches the
+    // dedupe scan but must still dispatch each accepted event to the
+    // contract runner. The hook is how it does that — it must fire
+    // exactly once per genuinely-new event and never for a duplicate
+    // clientEventId, or the timeline/projection materializers would
+    // either miss an event or double-process one.
+    const log = createEventLog(vaultRoot, replica);
+    const mk = (id: string, x: number) => ({
+      clientEventId: id,
+      aggregateId: 'agg-batch',
+      type: 'browser.timeline.observed',
+      payload: { x },
+      baseVector: {},
+    });
+
+    const seen1: { clientEventId: string; seq: number }[] = [];
+    const batch1 = await log.appendClientObservedBatch([mk('b-1', 1), mk('b-2', 2)], (event) => {
+      seen1.push({ clientEventId: event.clientEventId, seq: event.dot.seq });
+    });
+    expect(batch1.map((r) => r.imported)).toEqual([true, true]);
+    // Hook fired per new event, with real server-stamped AcceptedEvents.
+    expect(seen1.map((s) => s.clientEventId)).toEqual(['b-1', 'b-2']);
+    expect(seen1.every((s) => s.seq > 0)).toBe(true);
+
+    // Re-submit b-2 (duplicate) alongside a genuinely-new b-3.
+    const seen2: string[] = [];
+    const batch2 = await log.appendClientObservedBatch([mk('b-2', 2), mk('b-3', 3)], (event) => {
+      seen2.push(event.clientEventId);
+    });
+    expect(batch2.map((r) => r.imported)).toEqual([false, true]);
+    // Hook fired ONLY for b-3 — the deduped b-2 must not dispatch.
+    expect(seen2).toEqual(['b-3']);
+  });
+
+  it('appendClientObservedBatch with no hook still appends + dedupes (edge-event path)', async () => {
+    const log = createEventLog(vaultRoot, replica);
+    const input = {
+      clientEventId: 'no-hook-1',
+      aggregateId: 'agg',
+      type: 'engagement.interval.observed',
+      payload: {},
+      baseVector: {},
+    };
+    expect((await log.appendClientObservedBatch([input])).map((r) => r.imported)).toEqual([true]);
+    expect((await log.appendClientObservedBatch([input])).map((r) => r.imported)).toEqual([false]);
+    expect((await log.readMerged()).filter((e) => e.clientEventId === 'no-hook-1')).toHaveLength(1);
+  });
 });

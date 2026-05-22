@@ -488,6 +488,13 @@ export interface CompanionHttpConfig {
   readonly importEdgeEvents?: (
     events: readonly import('../sync/causal.js').AcceptedEvent[],
   ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
+  // Batched timeline ingest: ONE readMerged dedupe for the whole
+  // POST + per-event contract-runner dispatch. Used by
+  // POST /v1/timeline/events; when unset the route falls back to the
+  // per-event importEdgeEvent path.
+  readonly importTimelineEvents?: (
+    events: readonly import('../sync/causal.js').AcceptedEvent[],
+  ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
   // Optional timeline projection store, exposing read access for
   // the GET /v1/timeline route. When unset that route returns 503.
   readonly timelineStore?: import('../timeline/projection.js').TimelineStore;
@@ -5967,6 +5974,20 @@ const routes: readonly RouteDefinition[] = [
       }
       const imported: { replicaId: string; seq: number }[] = [];
       const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      const recordImported = (event: import('../sync/causal.js').AcceptedEvent): void => {
+        imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
+      };
+      const recordSkipped = (
+        event: import('../sync/causal.js').AcceptedEvent,
+        reason: string,
+      ): void => {
+        skipped.push({ replicaId: event.dot.replicaId, seq: event.dot.seq, reason });
+      };
+      // Validate + sanitize every candidate first, collecting the
+      // accepted ones, so the import can run as ONE batched dedupe
+      // pass instead of a per-event whole-log scan (the per-event
+      // path made multi-event POSTs run 0.4-3.4 s).
+      const valid: import('../sync/causal.js').AcceptedEvent[] = [];
       for (const candidate of body.events) {
         if (
           candidate === null ||
@@ -5984,19 +6005,11 @@ const routes: readonly RouteDefinition[] = [
         // selection / visual-fingerprint events go through the
         // companion's `/v1/edge/events` route (defined below).
         if (event.type !== BROWSER_TIMELINE_OBSERVED) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: 'invalid-event-type',
-          });
+          recordSkipped(event, 'invalid-event-type');
           continue;
         }
         if (!isBrowserTimelineObservedPayload(event.payload)) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: 'invalid-payload',
-          });
+          recordSkipped(event, 'invalid-payload');
           continue;
         }
         // Reviewer-flagged defense-in-depth: sanitize URLs BEFORE
@@ -6009,25 +6022,39 @@ const routes: readonly RouteDefinition[] = [
         // sanitized payload (preserving the edge dot + clientEventId
         // so importPeerEvent dedupe still works).
         const sanitizedPayload = sanitizeTimelinePayload(event.payload);
-        const sanitizedEvent =
-          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
+        valid.push(
+          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload },
+        );
+      }
+      // Batched ingest — ONE readMerged dedupe for the whole POST.
+      // importTimelineEvents dispatches each accepted event to the
+      // contract runner (timeline/projection materializers are
+      // event-driven), exactly like the per-event path. Falls back
+      // to per-event importEdgeEvent when the batched importer is
+      // not wired (tests / programmatic startCompanion callers).
+      if (context.importTimelineEvents !== undefined && valid.length > 0) {
+        const byClientEventId = new Map(valid.map((event) => [event.clientEventId, event]));
         try {
-          const result = await context.importEdgeEvent(sanitizedEvent);
-          if (result.imported) {
-            imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
-          } else {
-            skipped.push({
-              replicaId: event.dot.replicaId,
-              seq: event.dot.seq,
-              reason: 'already-imported',
-            });
+          const results = await context.importTimelineEvents(valid);
+          for (const result of results) {
+            const event = byClientEventId.get(result.clientEventId);
+            if (event === undefined) continue;
+            if (result.imported) recordImported(event);
+            else recordSkipped(event, 'already-imported');
           }
         } catch (err) {
-          skipped.push({
-            replicaId: event.dot.replicaId,
-            seq: event.dot.seq,
-            reason: err instanceof Error ? err.message : String(err),
-          });
+          const reason = err instanceof Error ? err.message : String(err);
+          for (const event of valid) recordSkipped(event, reason);
+        }
+      } else {
+        for (const event of valid) {
+          try {
+            const result = await context.importEdgeEvent(event);
+            if (result.imported) recordImported(event);
+            else recordSkipped(event, 'already-imported');
+          } catch (err) {
+            recordSkipped(event, err instanceof Error ? err.message : String(err));
+          }
         }
       }
       void requestId;

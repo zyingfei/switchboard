@@ -698,7 +698,10 @@ export const startCompanion = async (
       // P2 — batched edge-event ingest. The plugin's ~1-min flush
       // imports a whole buffered batch; per-event importEdgeEvent did
       // ~3 whole-log scans each (~quadratic; 39s on backlog). One
-      // readMerged + dedupe + shard write for the batch.
+      // readMerged + dedupe + shard write for the batch. No dispatch
+      // hook: edge events (engagement / selection / fingerprint) are
+      // consumed by the connections materializer's full-log reconcile,
+      // not by per-event dirty-marking.
       importEdgeEvents: async (events) =>
         eventLog.appendClientObservedBatch(
           events.map((event) => ({
@@ -708,6 +711,29 @@ export const startCompanion = async (
             payload: event.payload as Record<string, unknown>,
             baseVector: {},
           })),
+        ),
+      // Batched timeline ingest — `POST /v1/timeline/events`. Same
+      // ONE-readMerged dedupe as importEdgeEvents (vs the singular
+      // importEdgeEvent's per-event whole-log scan, measured at
+      // 0.4-3.4 s/POST). The difference: timeline events MUST still
+      // be dispatched per event — the timeline / projection /
+      // extraction materializers are dirty-bit + event-driven and
+      // `runner.catchUpAll` runs at startup only, so a batch append
+      // that skipped dispatch would leave the daily timeline
+      // projection stale. Passing `onLocalAccepted` as the hook
+      // reproduces the singular path's dispatch exactly (contract
+      // runner + relay publish + privacy refresh), per event, while
+      // the dedupe scan is amortized once over the batch.
+      importTimelineEvents: async (events) =>
+        eventLog.appendClientObservedBatch(
+          events.map((event) => ({
+            clientEventId: event.clientEventId,
+            aggregateId: event.aggregateId,
+            type: event.type,
+            payload: event.payload as Record<string, unknown>,
+            baseVector: {},
+          })),
+          onLocalAccepted,
         ),
       timelineStore,
       connectionsStore,
