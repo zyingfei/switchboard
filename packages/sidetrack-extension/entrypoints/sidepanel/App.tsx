@@ -1371,22 +1371,49 @@ const App = () => {
     // Default to "not set" (Inbox) on first load — user picks via the ws-bar.
   };
 
+  // In-flight GET dedupe. fetchCompanionJson is GET-only, and the
+  // panel fires the same path from overlapping effects / poll cycles
+  // — a slow companion makes poll N+1 start before N returns, and
+  // the resolver fan-out can request the same /resolve twice. Each
+  // duplicate is another request piled onto the companion's single
+  // event loop. Coalesce concurrent identical (port, path) GETs onto
+  // one fetch + one round-trip; the key clears the moment it
+  // settles, so the next call re-fetches (no staleness past the
+  // in-flight window).
+  const inFlightCompanionGetsRef = useRef<Map<string, Promise<unknown>>>(new Map());
   const fetchCompanionJson = useCallback(
     async <T,>(path: string): Promise<T> => {
       if (port.length === 0 || bridgeKey.length === 0) {
         throw new Error('Companion is not configured.');
       }
-      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-        headers: { 'x-bac-bridge-key': bridgeKey },
-      });
-      if (!response.ok) {
-        throw new Error(`Companion ${path} failed (${String(response.status)}).`);
-      }
-      const body = (await response.json()) as { readonly data?: T };
-      if (body.data === undefined) {
-        throw new Error(`Companion ${path} returned no data.`);
-      }
-      return body.data;
+      const key = `${port} ${path}`;
+      const inFlight = inFlightCompanionGetsRef.current;
+      const existing = inFlight.get(key);
+      if (existing !== undefined) return existing as Promise<T>;
+      const fetchPromise = (async (): Promise<T> => {
+        const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+          headers: { 'x-bac-bridge-key': bridgeKey },
+        });
+        if (!response.ok) {
+          throw new Error(`Companion ${path} failed (${String(response.status)}).`);
+        }
+        const body = (await response.json()) as { readonly data?: T };
+        if (body.data === undefined) {
+          throw new Error(`Companion ${path} returned no data.`);
+        }
+        return body.data;
+      })();
+      inFlight.set(key, fetchPromise);
+      // Clear the entry once settled. The cleanup chain gets its own
+      // .catch so a rejected fetch doesn't surface as an unhandled
+      // rejection HERE — the caller still receives (and handles) the
+      // rejection via the returned `fetchPromise`.
+      void fetchPromise
+        .finally(() => {
+          inFlight.delete(key);
+        })
+        .catch(() => undefined);
+      return fetchPromise;
     },
     [bridgeKey, port],
   );
@@ -1752,7 +1779,11 @@ const App = () => {
           )
             .then(setTabSessionSuggestions)
             .catch(() => {
-              if (!background) setTabSessionSuggestions({});
+              // Stale-snapshot display: a transient resolve failure
+              // (companion starved by an ingest burst) must NOT blank
+              // the suggestions — keep the last-good set on screen.
+              // The next poll refreshes them; an empty panel is worse
+              // than slightly-stale advice.
             })
             .finally(() => {
               tabSessionSuggestionLoadInFlightRef.current = false;
@@ -1769,10 +1800,14 @@ const App = () => {
         // action (refresh button, view-mode change, initial mount)
         // will surface it.
         if (!background) {
+          // Surface the error banner, but DON'T blank the panel —
+          // keep the last-good projection + suggestions visible
+          // (stale-snapshot display). The banner is the staleness
+          // signal; an empty panel on a transient poll failure is
+          // pure jank.
           setTabSessionError(
             loadError instanceof Error ? loadError.message : 'Could not load tab sessions.',
           );
-          setTabSessionSuggestions({});
         }
       } finally {
         if (!background) setTabSessionLoading(false);

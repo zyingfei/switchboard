@@ -387,8 +387,7 @@ const companionJson = async (path: string, init: RequestInit = {}): Promise<unkn
   return body;
 };
 
-const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
-  const body = await companionJson('/v1/privacy/projection', { method: 'GET' });
+const parsePrivacyProjection = (body: unknown): PrivacyProjectionPayload => {
   const data = isObjectRecord(body) ? body['data'] : undefined;
   if (!isObjectRecord(data)) return {};
   const gateStates = isObjectRecord(data['gateStates']) ? data['gateStates'] : undefined;
@@ -400,6 +399,37 @@ const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
       ? { gateEventCount: data['gateEventCount'] }
       : {}),
   };
+};
+
+// /v1/privacy/projection is read by the timeline gate predicate, the
+// collector capability gates, and the workboard-state builder — under
+// active navigation that is ~5 reads per page, each a round-trip onto
+// the companion's single event loop. Memoize the raw projection with
+// a short TTL + in-flight coalescing so those callers share one
+// fetch. Invalidated immediately on a gate flip
+// (invalidateTimelineGateCache) so a privacy change still propagates
+// without waiting out the TTL.
+const PRIVACY_PROJECTION_TTL_MS = 5_000;
+let cachedPrivacyProjection: { value: PrivacyProjectionPayload; expiresAtMs: number } | null = null;
+let privacyProjectionInFlight: Promise<PrivacyProjectionPayload> | null = null;
+
+const readPrivacyProjection = async (): Promise<PrivacyProjectionPayload> => {
+  if (cachedPrivacyProjection !== null && cachedPrivacyProjection.expiresAtMs > Date.now()) {
+    return cachedPrivacyProjection.value;
+  }
+  if (privacyProjectionInFlight !== null) return privacyProjectionInFlight;
+  privacyProjectionInFlight = (async (): Promise<PrivacyProjectionPayload> => {
+    try {
+      const value = parsePrivacyProjection(
+        await companionJson('/v1/privacy/projection', { method: 'GET' }),
+      );
+      cachedPrivacyProjection = { value, expiresAtMs: Date.now() + PRIVACY_PROJECTION_TTL_MS };
+      return value;
+    } finally {
+      privacyProjectionInFlight = null;
+    }
+  })();
+  return privacyProjectionInFlight;
 };
 
 // chrome.tabs.onUpdated can fire many times per navigation. Every call
@@ -415,6 +445,10 @@ let cachedTimelineGateState: { value: boolean; expiresAtMs: number } | null = nu
 
 const invalidateTimelineGateCache = (): void => {
   cachedTimelineGateState = null;
+  // A gate flip also stales the raw privacy projection memo — drop
+  // it so the new gate state propagates immediately, not after the
+  // TTL.
+  cachedPrivacyProjection = null;
 };
 
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
