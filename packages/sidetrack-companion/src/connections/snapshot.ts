@@ -3190,18 +3190,349 @@ export interface ConnectionsStore {
 }
 
 const SNAPSHOTS_DIR = 'snapshots';
+const CONNECTIONS_STORE_SQLITE_FLAG = 'sqlite';
+
+interface SqliteStatement {
+  readonly run: (...params: readonly unknown[]) => unknown;
+  readonly get: (...params: readonly unknown[]) => unknown;
+  readonly all: (...params: readonly unknown[]) => readonly unknown[];
+}
+
+interface SqliteDatabase {
+  readonly exec: (sql: string) => unknown;
+  readonly query: (sql: string) => SqliteStatement;
+  readonly close?: () => void;
+}
+
+interface SqliteModule {
+  readonly Database: new (
+    filename: string,
+    options?: { readonly create?: boolean; readonly readwrite?: boolean },
+  ) => SqliteDatabase;
+}
+
+const loadSqlite = async (): Promise<SqliteModule> => {
+  // @ts-expect-error bun:sqlite is provided by the Bun runtime and is
+  // loaded lazily so Node-based tests can still import the JSON store.
+  const module = (await import('bun:sqlite')) as Partial<SqliteModule>;
+  if (typeof module.Database !== 'function') {
+    throw new Error('bun:sqlite Database export is unavailable');
+  }
+  return { Database: module.Database };
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const textField = (value: unknown, field: string): string => {
+  if (!isRecord(value) || typeof value[field] !== 'string') {
+    throw new Error(`SQLite connections row is missing text field: ${field}`);
+  }
+  return value[field];
+};
+
+interface StoredConnectionsMetadata {
+  readonly scope: ConnectionsSnapshotScope;
+  readonly updatedAt: string;
+  readonly nodeCount: number;
+  readonly edgeCount: number;
+  readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
+  readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
+  readonly snapshotRevision?: string;
+}
+
+const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMetadata => ({
+  scope: snapshot.scope,
+  updatedAt: snapshot.updatedAt,
+  nodeCount: snapshot.nodeCount,
+  edgeCount: snapshot.edgeCount,
+  ...(snapshot.urlProjection === undefined ? {} : { urlProjection: snapshot.urlProjection }),
+  ...(snapshot.tabSessionProjection === undefined
+    ? {}
+    : { tabSessionProjection: snapshot.tabSessionProjection }),
+  ...(snapshot.snapshotRevision === undefined
+    ? {}
+    : { snapshotRevision: snapshot.snapshotRevision }),
+});
+
+const snapshotFromParts = (
+  metadata: StoredConnectionsMetadata,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+): ConnectionsSnapshot => ({
+  scope: metadata.scope,
+  nodes,
+  edges,
+  updatedAt: metadata.updatedAt,
+  nodeCount: nodes.length,
+  edgeCount: edges.length,
+  ...(metadata.urlProjection === undefined ? {} : { urlProjection: metadata.urlProjection }),
+  ...(metadata.tabSessionProjection === undefined
+    ? {}
+    : { tabSessionProjection: metadata.tabSessionProjection }),
+  ...(metadata.snapshotRevision === undefined
+    ? {}
+    : { snapshotRevision: metadata.snapshotRevision }),
+});
+
+const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+
+export class SqliteConnectionsStore implements ConnectionsStore {
+  readonly #root: string;
+  readonly #snapshotsDir: string;
+  readonly #databasePath: string;
+  #db: SqliteDatabase | null = null;
+  #initialized = false;
+
+  constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
+    this.#root = join(vaultRoot, '_BAC', 'connections');
+    this.#snapshotsDir = join(this.#root, SNAPSHOTS_DIR);
+    this.#databasePath = options?.databasePath ?? join(this.#root, 'current.db');
+  }
+
+  async #database(): Promise<SqliteDatabase> {
+    if (this.#db === null) {
+      if (this.#databasePath !== ':memory:') {
+        await mkdir(this.#root, { recursive: true });
+      }
+      const sqlite = await loadSqlite();
+      this.#db = new sqlite.Database(this.#databasePath, { create: true, readwrite: true });
+    }
+    if (!this.#initialized) {
+      this.#db.exec(`
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE IF NOT EXISTS nodes (
+          id TEXT PRIMARY KEY,
+          data TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS edges (
+          src TEXT NOT NULL,
+          dst TEXT NOT NULL,
+          data TEXT NOT NULL,
+          PRIMARY KEY (src, dst)
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
+        CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+        CREATE TABLE IF NOT EXISTS metadata (
+          key TEXT PRIMARY KEY,
+          data TEXT NOT NULL
+        );
+      `);
+      this.#initialized = true;
+    }
+    return this.#db;
+  }
+
+  readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
+    const db = await this.#database();
+    const nodeIds = snapshot.nodes.map((node) => node.id);
+    const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
+    for (const edge of snapshot.edges) {
+      const key = edgeBucketKey(edge);
+      const existing = edgeBuckets.get(key) ?? [];
+      edgeBuckets.set(key, [...existing, edge]);
+    }
+    const edgeKeys = [...edgeBuckets.keys()].map((key) => {
+      const [src, dst] = key.split('\u0000');
+      if (src === undefined || dst === undefined) {
+        throw new Error('invalid edge bucket key');
+      }
+      return { src, dst };
+    });
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const upsertNode = db.query(
+        'INSERT INTO nodes (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+      );
+      const upsertEdge = db.query(
+        'INSERT INTO edges (src, dst, data) VALUES (?, ?, ?) ON CONFLICT(src, dst) DO UPDATE SET data = excluded.data',
+      );
+      const upsertMetadata = db.query(
+        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+      );
+      const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
+      const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
+
+      const currentNodeIds = new Set(
+        db
+          .query('SELECT id FROM nodes')
+          .all()
+          .map((row) => textField(row, 'id')),
+      );
+      for (const node of snapshot.nodes) {
+        upsertNode.run(node.id, JSON.stringify(node));
+        currentNodeIds.delete(node.id);
+      }
+      for (const staleId of currentNodeIds) {
+        deleteNode.run(staleId);
+      }
+
+      const currentEdgeKeys = new Set(
+        db
+          .query('SELECT src, dst FROM edges')
+          .all()
+          .map((row) => `${textField(row, 'src')}\u0000${textField(row, 'dst')}`),
+      );
+      for (const { src, dst } of edgeKeys) {
+        const bucket = edgeBuckets.get(`${src}\u0000${dst}`) ?? [];
+        upsertEdge.run(src, dst, JSON.stringify(bucket));
+        currentEdgeKeys.delete(`${src}\u0000${dst}`);
+      }
+      for (const staleKey of currentEdgeKeys) {
+        const [src, dst] = staleKey.split('\u0000');
+        if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
+      }
+
+      upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
+      upsertMetadata.run('node_order', JSON.stringify(nodeIds));
+      upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
+  readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
+    const db = await this.#database();
+    const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+    if (metadataRow === null || metadataRow === undefined) return null;
+
+    const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+    const nodesById = new Map(
+      db
+        .query('SELECT data FROM nodes ORDER BY id')
+        .all()
+        .map((row) => {
+          const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+          return [node.id, node] as const;
+        }),
+    );
+    const edgeById = new Map(
+      db
+        .query('SELECT data FROM edges ORDER BY src, dst')
+        .all()
+        .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[])
+        .map((edge) => [edge.id, edge] as const),
+    );
+    const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
+    const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
+    const nodeOrder =
+      nodeOrderRow === null || nodeOrderRow === undefined
+        ? [...nodesById.keys()].sort()
+        : (JSON.parse(textField(nodeOrderRow, 'data')) as string[]);
+    const edgeOrder =
+      edgeOrderRow === null || edgeOrderRow === undefined
+        ? [...edgeById.keys()].sort()
+        : (JSON.parse(textField(edgeOrderRow, 'data')) as string[]);
+    const nodes = nodeOrder.flatMap((id) => {
+      const node = nodesById.get(id);
+      return node === undefined ? [] : [node];
+    });
+    const edges = edgeOrder.flatMap((id) => {
+      const edge = edgeById.get(id);
+      return edge === undefined ? [] : [edge];
+    });
+    return snapshotFromParts(metadata, nodes, edges);
+  };
+
+  readonly readSubgraph = async (
+    nodeIds: readonly string[],
+  ): Promise<ConnectionsSnapshot | null> => {
+    const db = await this.#database();
+    const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+    if (metadataRow === null || metadataRow === undefined) return null;
+
+    const wanted = [...new Set(nodeIds)].sort();
+    if (wanted.length === 0) {
+      const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+      return snapshotFromParts(metadata, [], []);
+    }
+
+    const nodeById = new Map<string, ConnectionNode>();
+    const getNode = db.query('SELECT data FROM nodes WHERE id = ?');
+    for (const nodeId of wanted) {
+      const row = getNode.get(nodeId);
+      if (row !== null && row !== undefined) {
+        const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+        nodeById.set(node.id, node);
+      }
+    }
+
+    const wantedSet = new Set(wanted);
+    const edges: ConnectionEdge[] = [];
+    const edgesFrom = db.query('SELECT data FROM edges WHERE src = ?');
+    for (const nodeId of wanted) {
+      for (const row of edgesFrom.all(nodeId)) {
+        const bucket = JSON.parse(textField(row, 'data')) as ConnectionEdge[];
+        edges.push(
+          ...bucket.filter(
+            (edge) => wantedSet.has(edge.fromNodeId) && wantedSet.has(edge.toNodeId),
+          ),
+        );
+      }
+    }
+
+    const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+    return snapshotFromParts(metadata, sortAlphaById([...nodeById.values()]), sortAlphaById(edges));
+  };
+
+  readonly putDay = async (date: string, snapshot: ConnectionsSnapshot): Promise<void> => {
+    await writeConnectionsSnapshotJson(join(this.#snapshotsDir, `${date}.json`), snapshot);
+  };
+
+  readonly readDay = async (date: string): Promise<ConnectionsSnapshot | null> => {
+    try {
+      return JSON.parse(
+        await readFile(join(this.#snapshotsDir, `${date}.json`), 'utf8'),
+      ) as ConnectionsSnapshot;
+    } catch {
+      return null;
+    }
+  };
+
+  readonly listDays = async (): Promise<readonly string[]> => {
+    try {
+      const entries = await readdir(this.#snapshotsDir);
+      return entries
+        .filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name))
+        .map((name) => name.replace(/\.json$/u, ''))
+        .sort();
+    } catch {
+      return [];
+    }
+  };
+
+  close(): void {
+    this.#db?.close?.();
+    this.#db = null;
+    this.#initialized = false;
+  }
+}
+
+const writeAtomic = async (path: string, body: string): Promise<void> => {
+  await mkdir(join(path, '..'), { recursive: true });
+  const tmp = `${path}.${createRevision()}.tmp`;
+  await writeFile(tmp, body, 'utf8');
+  await rename(tmp, path);
+};
+
+const writeConnectionsSnapshotJson = async (
+  path: string,
+  snapshot: ConnectionsSnapshot,
+): Promise<void> => {
+  await writeAtomic(path, JSON.stringify(snapshot, null, 2));
+};
 
 export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
+  if (process.env['SIDETRACK_CONNECTIONS_STORE'] === CONNECTIONS_STORE_SQLITE_FLAG) {
+    return new SqliteConnectionsStore(vaultRoot);
+  }
+
   const root = join(vaultRoot, '_BAC', 'connections');
   const snapshotsDir = join(root, SNAPSHOTS_DIR);
   const currentPath = join(root, 'current.json');
-
-  const writeAtomic = async (path: string, body: string): Promise<void> => {
-    await mkdir(join(path, '..'), { recursive: true });
-    const tmp = `${path}.${createRevision()}.tmp`;
-    await writeFile(tmp, body, 'utf8');
-    await rename(tmp, path);
-  };
 
   const dayPath = (date: string): string => join(snapshotsDir, `${date}.json`);
 
@@ -3216,7 +3547,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
       // Same revision as last write — disk already has this snapshot.
       return;
     }
-    await writeAtomic(currentPath, JSON.stringify(snapshot, null, 2));
+    await writeConnectionsSnapshotJson(currentPath, snapshot);
     if (revision !== undefined) lastWrittenRevision = revision;
   };
 
@@ -3270,7 +3601,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   };
 
   const putDay = async (date: string, snapshot: ConnectionsSnapshot): Promise<void> => {
-    await writeAtomic(dayPath(date), JSON.stringify(snapshot, null, 2));
+    await writeConnectionsSnapshotJson(dayPath(date), snapshot);
   };
   const readDay = async (date: string): Promise<ConnectionsSnapshot | null> => {
     try {
