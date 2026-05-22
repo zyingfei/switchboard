@@ -189,7 +189,9 @@ describe('SqliteConnectionsStore', () => {
       vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-parity-'));
       const jsonRoot = join(vaultRoot, 'json');
       const sqliteStore = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      process.env['SIDETRACK_CONNECTIONS_STORE'] = 'json';
       const jsonStore = createConnectionsStore(jsonRoot);
+      delete process.env['SIDETRACK_CONNECTIONS_STORE'];
       const first = buildSnapshot();
       const second: ConnectionsSnapshot = {
         ...first,
@@ -242,8 +244,9 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
-  it('keeps JSON current.json as the default when the flag is unset', async () => {
+  it('uses JSON current.json when SIDETRACK_CONNECTIONS_STORE=json', async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-fallback-'));
+    process.env['SIDETRACK_CONNECTIONS_STORE'] = 'json';
     const store = createConnectionsStore(vaultRoot);
     const snapshot: ConnectionsSnapshot = {
       scope: {},
@@ -264,14 +267,30 @@ describe('SqliteConnectionsStore', () => {
     expect(await store.readCurrent()).toEqual(snapshot);
   });
 
-  it('returns the SQLite store when SIDETRACK_CONNECTIONS_STORE=sqlite', async () => {
+  it('returns the SQLite store by default', async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-flag-'));
-    process.env['SIDETRACK_CONNECTIONS_STORE'] = 'sqlite';
 
     const store = createConnectionsStore(vaultRoot);
 
     expect(store).toBeInstanceOf(SqliteConnectionsStore);
     if (store instanceof SqliteConnectionsStore) store.close();
+  });
+
+  sqliteIt('imports current.json into an empty SQLite database on first read', async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-bootstrap-'));
+    const snapshot = buildTraversalSnapshot();
+    process.env['SIDETRACK_CONNECTIONS_STORE'] = 'json';
+    const jsonStore = createConnectionsStore(vaultRoot);
+    await jsonStore.putCurrent(snapshot);
+    delete process.env['SIDETRACK_CONNECTIONS_STORE'];
+
+    const sqliteStore = new SqliteConnectionsStore(vaultRoot, { databasePath: ':memory:' });
+
+    expect(await sqliteStore.readCurrent()).toEqual(snapshot);
+    expect(await sqliteStore.readSubgraph(['tab-session:ts-1'])).toMatchObject({
+      snapshotRevision: 'rev-traversal',
+    });
+    sqliteStore.close();
   });
 
   sqliteIt(
@@ -282,10 +301,10 @@ describe('SqliteConnectionsStore', () => {
       const jsonRoot = join(vaultRoot, 'json');
       const snapshot = buildTraversalSnapshot();
 
-      process.env['SIDETRACK_CONNECTIONS_STORE'] = 'sqlite';
       const sqliteStore = createConnectionsStore(sqliteRoot);
-      delete process.env['SIDETRACK_CONNECTIONS_STORE'];
+      process.env['SIDETRACK_CONNECTIONS_STORE'] = 'json';
       const jsonStore = createConnectionsStore(jsonRoot);
+      delete process.env['SIDETRACK_CONNECTIONS_STORE'];
 
       await sqliteStore.putCurrent(snapshot);
       await jsonStore.putCurrent(snapshot);
