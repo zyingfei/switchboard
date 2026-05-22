@@ -154,6 +154,19 @@ export interface EventLog {
    */
   readonly appendClientObservedBatch: <TPayload extends Record<string, unknown>>(
     inputs: readonly AppendInputObserved<TPayload>[],
+    /**
+     * Optional per-event hook, invoked once per NEWLY-accepted event
+     * (not for deduped inputs) AFTER the durable batch write. The
+     * runtime passes its `onLocalAccepted` here so the timeline ingest
+     * still dispatches each event to the contract runner — the
+     * timeline / projection / extraction materializers are dirty-bit
+     * + event-driven and `catchUpAll` is startup-only, so a batch
+     * append that skipped dispatch would leave their projections
+     * stale until the next process start. Edge-event ingest passes
+     * no hook (the connections materializer picks edge events up on
+     * its next full-log reconcile).
+     */
+    onAccepted?: (event: AcceptedEvent<TPayload>) => void,
   ) => Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]>;
   /**
    * Server-driven event append. System stamps deps from the
@@ -468,6 +481,7 @@ export const createEventLog = (
 
   const appendClientObservedBatch = <TPayload extends Record<string, unknown>>(
     inputs: readonly AppendInputObserved<TPayload>[],
+    onAccepted?: (event: AcceptedEvent<TPayload>) => void,
   ): Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]> =>
     enqueueAppend(async () => {
       if (inputs.length === 0) return [];
@@ -517,6 +531,12 @@ export const createEventLog = (
           `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
           { encoding: 'utf8', flag: 'a' },
         );
+      }
+      // Dispatch AFTER the durable write so a hook only ever sees
+      // events that are on disk — same ordering guarantee as the
+      // singular `appendClientObserved` → `onLocalAccepted` path.
+      if (onAccepted !== undefined) {
+        for (const event of events) onAccepted(event);
       }
       return results;
     });
