@@ -183,6 +183,46 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
+  sqliteIt(
+    'keeps readCurrent parity with the JSON store across changed and stale rows',
+    async () => {
+      vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-sqlite-parity-'));
+      const jsonRoot = join(vaultRoot, 'json');
+      const sqliteStore = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      const jsonStore = createConnectionsStore(jsonRoot);
+      const first = buildSnapshot();
+      const second: ConnectionsSnapshot = {
+        ...first,
+        nodes: [
+          {
+            ...first.nodes[0]!,
+            label: 'Alpha renamed',
+          },
+          first.nodes[1]!,
+        ],
+        edges: [first.edges[0]!],
+        nodeCount: 2,
+        edgeCount: 1,
+        snapshotRevision: 'rev-sqlite-test-2',
+      };
+
+      await sqliteStore.putCurrent(first);
+      await jsonStore.putCurrent(first);
+      expect(await sqliteStore.readCurrent()).toEqual(await jsonStore.readCurrent());
+
+      await sqliteStore.putCurrent(second);
+      await jsonStore.putCurrent(second);
+
+      expect(await sqliteStore.readCurrent()).toEqual(await jsonStore.readCurrent());
+      expect(await sqliteStore.readSubgraph(['thread:alpha', 'workstream:main'])).toEqual({
+        ...second,
+        nodes: second.nodes,
+        edges: second.edges,
+      });
+      sqliteStore.close();
+    },
+  );
+
   sqliteIt('handles empty current snapshots and empty subgraph requests', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const snapshot: ConnectionsSnapshot = {

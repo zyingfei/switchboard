@@ -3437,32 +3437,45 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
 
-      const currentNodeIds = new Set(
+      const currentNodeData = new Map(
         db
-          .query('SELECT id FROM nodes')
+          .query('SELECT id, data FROM nodes')
           .all()
-          .map((row) => textField(row, 'id')),
+          .map((row) => [textField(row, 'id'), textField(row, 'data')] as const),
       );
       for (const node of snapshot.nodes) {
-        upsertNode.run(node.id, JSON.stringify(node));
-        currentNodeIds.delete(node.id);
+        const body = JSON.stringify(node);
+        if (currentNodeData.get(node.id) !== body) {
+          upsertNode.run(node.id, body);
+        }
+        currentNodeData.delete(node.id);
       }
-      for (const staleId of currentNodeIds) {
+      for (const staleId of currentNodeData.keys()) {
         deleteNode.run(staleId);
       }
 
-      const currentEdgeKeys = new Set(
+      const currentEdgeData = new Map<string, string>(
         db
-          .query('SELECT src, dst FROM edges')
+          .query('SELECT src, dst, data FROM edges')
           .all()
-          .map((row) => `${textField(row, 'src')}\u0000${textField(row, 'dst')}`),
+          .map(
+            (row) =>
+              [
+                `${textField(row, 'src')}\u0000${textField(row, 'dst')}`,
+                textField(row, 'data'),
+              ] as const,
+          ),
       );
       for (const { src, dst } of edgeKeys) {
-        const bucket = edgeBuckets.get(`${src}\u0000${dst}`) ?? [];
-        upsertEdge.run(src, dst, JSON.stringify(bucket));
-        currentEdgeKeys.delete(`${src}\u0000${dst}`);
+        const key = `${src}\u0000${dst}`;
+        const bucket = edgeBuckets.get(key) ?? [];
+        const body = JSON.stringify(bucket);
+        if (currentEdgeData.get(key) !== body) {
+          upsertEdge.run(src, dst, body);
+        }
+        currentEdgeData.delete(key);
       }
-      for (const staleKey of currentEdgeKeys) {
+      for (const staleKey of currentEdgeData.keys()) {
         const [src, dst] = staleKey.split('\u0000');
         if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
       }
