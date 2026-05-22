@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
@@ -571,6 +572,39 @@ class HttpRouteError extends Error {
     super(message ?? title);
   }
 }
+
+type BunHeapSnapshot = {
+  readonly version: number;
+  readonly type: string;
+  readonly nodes: readonly number[];
+  readonly nodeClassNames: readonly string[];
+  readonly edges: readonly number[];
+  readonly edgeTypes: readonly string[];
+  readonly edgeNames: readonly string[];
+};
+
+type BunRuntimeWithHeapSnapshot = {
+  readonly Bun?: {
+    readonly generateHeapSnapshot?: () => BunHeapSnapshot;
+  };
+};
+
+const writeDebugHeapSnapshot = async (): Promise<string> => {
+  const bunRuntime = globalThis as BunRuntimeWithHeapSnapshot;
+  const generateHeapSnapshot = bunRuntime.Bun?.generateHeapSnapshot;
+  if (generateHeapSnapshot === undefined) {
+    throw new HttpRouteError(
+      503,
+      'HEAP_SNAPSHOT_UNAVAILABLE',
+      'Bun heap snapshots are unavailable in this runtime.',
+    );
+  }
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const path = join(tmpdir(), `heap-${String(process.pid)}-${ts}.heapsnapshot`);
+  await writeFile(path, JSON.stringify(generateHeapSnapshot()), 'utf8');
+  return path;
+};
 
 const readBody = async (request: IncomingMessage): Promise<unknown> => {
   const raw = await new Promise<string>((resolve, reject) => {
@@ -2165,6 +2199,40 @@ const loadTabSessionProjection = async (
 };
 
 const routes: readonly RouteDefinition[] = [
+  ...(process.env['DEBUG_HEAP_SNAPSHOT'] === '1'
+    ? [
+        {
+          method: 'POST' as const,
+          pattern: /^\/debug\/heap-snapshot$/,
+          authRequired: false,
+          handle: async () => {
+            const path = await writeDebugHeapSnapshot();
+            return [201, { data: { path } }] as const;
+          },
+        },
+        {
+          method: 'POST' as const,
+          pattern: /^\/debug\/gc$/,
+          authRequired: false,
+          handle: async () => {
+            const before = process.memoryUsage().rss;
+            (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc?.(true);
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            const after = process.memoryUsage().rss;
+            return [
+              200,
+              {
+                data: {
+                  rssBeforeMb: Math.round(before / 1048576),
+                  rssAfterMb: Math.round(after / 1048576),
+                  freedMb: Math.round((before - after) / 1048576),
+                },
+              },
+            ] as const;
+          },
+        },
+      ]
+    : []),
   {
     method: 'GET',
     pattern: /^\/v1\/health$/,
