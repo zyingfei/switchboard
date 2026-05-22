@@ -15,7 +15,7 @@
 
 import { parentPort, workerData } from 'node:worker_threads';
 
-import { createConnectionsStore } from '../../connections/snapshot.js';
+import { createConnectionsStore, SqliteConnectionsStore } from '../../connections/snapshot.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -44,13 +44,16 @@ const run = async (): Promise<void> => {
       store,
     });
     await materializer.catchUp(eventLog);
-    const snapshot = await store.readCurrent();
+    const metadata =
+      store instanceof SqliteConnectionsStore
+        ? await store.readSnapshotMetadata()
+        : await store.readCurrent();
     post({
       seq: job.seq,
       ok: true,
-      ...(snapshot?.snapshotRevision === undefined
+      ...(metadata?.snapshotRevision === undefined
         ? {}
-        : { snapshotRevision: snapshot.snapshotRevision }),
+        : { snapshotRevision: metadata.snapshotRevision }),
     });
   } catch (error) {
     post({
