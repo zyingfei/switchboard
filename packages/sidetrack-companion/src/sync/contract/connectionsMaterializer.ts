@@ -2207,6 +2207,7 @@ export const createConnectionsMaterializer = (
         );
         const ordered = sortAcceptedEvents(pendingEvents);
         if (ordered.length === 0) {
+          lastBuildInvalidations = [];
           lastSuccessAt = new Date().toISOString();
           lastError = null;
           return;

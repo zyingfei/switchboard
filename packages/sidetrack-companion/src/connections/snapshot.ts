@@ -1102,12 +1102,12 @@ const topClosestVisitContributions = (
     .map(([feature, weight]) => ({ feature, weight: roundRankerMetric(weight) }));
 
 export interface RankerFrontierOptions {
-  readonly includeSameUrlSiblings: boolean;
-  readonly includeSameTabSession: boolean;
-  readonly includeSameWorkstream: boolean;
-  readonly includeSameThread: boolean;
-  readonly includePriorClosestNeighbors: boolean;
-  readonly includeSimEdgeChanged: boolean;
+  readonly includeSameUrlSiblings?: boolean;
+  readonly includeSameTabSession?: boolean;
+  readonly includeSameWorkstream?: boolean;
+  readonly includeSameThread?: boolean;
+  readonly includePriorClosestNeighbors?: boolean;
+  readonly includeSimEdgeChanged?: boolean;
 }
 
 const timelineVisitKeyFromNodeId = (nodeId: string): string | null =>
@@ -1116,10 +1116,18 @@ const timelineVisitKeyFromNodeId = (nodeId: string): string | null =>
     : null;
 
 export const expandRankerFrontier = (
-  touchedVisitIds: ReadonlySet<string>,
+  touchedVisitIds: ReadonlySet<string> | readonly string[],
   currentSnapshot: ConnectionsSnapshot,
-  options: RankerFrontierOptions,
+  options: RankerFrontierOptions = {},
 ): ReadonlySet<string> => {
+  const resolvedOptions = {
+    includeSameUrlSiblings: options.includeSameUrlSiblings ?? true,
+    includeSameTabSession: options.includeSameTabSession ?? true,
+    includeSameWorkstream: options.includeSameWorkstream ?? true,
+    includeSameThread: options.includeSameThread ?? true,
+    includePriorClosestNeighbors: options.includePriorClosestNeighbors ?? true,
+    includeSimEdgeChanged: options.includeSimEdgeChanged ?? true,
+  };
   const frontier = new Set<string>([...touchedVisitIds].filter((id) => id.length > 0));
   if (frontier.size === 0) return frontier;
 
@@ -1196,36 +1204,37 @@ export const expandRankerFrontier = (
   const seed = [...frontier];
   for (const visitKey of seed) {
     const node = visitNodeByKey.get(visitKey);
-    if (node !== undefined && options.includeSameUrlSiblings) {
+    if (node !== undefined && resolvedOptions.includeSameUrlSiblings) {
       const canonicalUrl = node.metadata['canonicalUrl'];
       if (typeof canonicalUrl === 'string') {
         for (const sibling of visitKeyByCanonicalUrl.get(canonicalUrl) ?? []) frontier.add(sibling);
       }
     }
-    if (options.includeSameWorkstream) {
+    if (resolvedOptions.includeSameWorkstream) {
       const workstreamId = node?.metadata['workstreamId'];
       if (typeof workstreamId === 'string') {
         for (const sibling of visitKeysByWorkstream.get(workstreamId) ?? []) frontier.add(sibling);
       }
     }
-    if (options.includeSameTabSession) {
+    if (resolvedOptions.includeSameTabSession) {
       for (const [tabSessionId, members] of visitKeysByTabSession.entries()) {
         if (!members.has(visitKey)) continue;
         for (const sibling of visitKeysByTabSession.get(tabSessionId) ?? []) frontier.add(sibling);
       }
     }
-    if (options.includeSameThread) {
+    if (resolvedOptions.includeSameThread) {
       for (const threadId of threadIdsByVisitKey.get(visitKey) ?? []) {
         for (const sibling of visitKeysByThreadId.get(threadId) ?? []) frontier.add(sibling);
       }
     }
   }
 
-  if (options.includePriorClosestNeighbors || options.includeSimEdgeChanged) {
+  if (resolvedOptions.includePriorClosestNeighbors || resolvedOptions.includeSimEdgeChanged) {
     for (const edge of currentSnapshot.edges) {
-      const includeClosest = options.includePriorClosestNeighbors && edge.kind === 'closest_visit';
+      const includeClosest =
+        resolvedOptions.includePriorClosestNeighbors && edge.kind === 'closest_visit';
       const includeSimilarity =
-        options.includeSimEdgeChanged && edge.kind === 'visit_resembles_visit';
+        resolvedOptions.includeSimEdgeChanged && edge.kind === 'visit_resembles_visit';
       if (!includeClosest && !includeSimilarity) continue;
       const fromVisitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
       const toVisitKey = timelineVisitKeyFromNodeId(edge.toNodeId);
