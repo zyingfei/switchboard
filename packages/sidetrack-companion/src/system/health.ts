@@ -141,6 +141,21 @@ export interface HealthReport {
         readonly lastSuccessAt: string | null;
         readonly lastError: string | null;
         readonly pending: boolean;
+        readonly frontier?: Record<string, number>;
+        readonly lastDriftCheck?: {
+          readonly at: string;
+          readonly conclusion: 'clean' | 'drift';
+          readonly nodeDiffSummary: {
+            readonly added: number;
+            readonly removed: number;
+            readonly changed: number;
+          };
+          readonly edgeDiffSummary: {
+            readonly added: number;
+            readonly removed: number;
+            readonly changed: number;
+          };
+        };
       }
     >;
   };

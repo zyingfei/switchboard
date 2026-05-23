@@ -1,4 +1,5 @@
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -28,6 +29,7 @@ import {
   type ClosestVisitRanker,
   type ConnectionsInput,
   type ConnectionsSnapshot,
+  SqliteConnectionsStore,
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
 import {
@@ -179,12 +181,13 @@ import {
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { isMainThread } from 'node:worker_threads';
-import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent } from '../causal.js';
+import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent, type Dot } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
   addDotsToIntervals,
   EMPTY_PROGRESS,
+  frontierFromIntervals,
   intervalsContainDot,
   type MaterializerProgress,
 } from './materializerProgress.js';
@@ -226,6 +229,20 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase1';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
+const DEFAULT_DRIFT_EVERY_DRAINS = 10;
+const DEFAULT_DRIFT_EVERY_MS = 3_600_000;
+const DRIFT_DISABLED_ENV = 'SIDETRACK_CONNECTIONS_DRIFT_DISABLED';
+
+export interface DriftReport {
+  readonly checkedAt: string;
+  readonly materializerVersion: string;
+  readonly appliedFrontier: Record<string, number>;
+  readonly missingDots: readonly Dot[];
+  readonly extraDots: readonly Dot[];
+  readonly nodeDiff: { readonly added: number; readonly removed: number; readonly changed: number };
+  readonly edgeDiff: { readonly added: number; readonly removed: number; readonly changed: number };
+  readonly conclusion: 'clean' | 'drift';
+}
 
 // Stage 5.2 W1a — debounce window between event accept and drain trigger.
 // Coalesces burst arrivals (multi-tab navigation, peer-event imports) into
@@ -490,6 +507,87 @@ export interface ContentLaneSourceUnitReconciler {
   readonly reconcileTombstone: (sourceUnitId: string) => Promise<boolean>;
 }
 
+const resolvePositiveNumberEnv = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const dotsFromIntervals = (
+  intervals: MaterializerProgress['appliedDotIntervals'],
+): readonly Dot[] => {
+  const dots: Dot[] = [];
+  for (const [replicaId, replicaIntervals] of Object.entries(intervals)) {
+    for (const [startSeq, endSeq] of replicaIntervals) {
+      for (let seq = startSeq; seq <= endSeq; seq += 1) dots.push({ replicaId, seq });
+    }
+  }
+  return dots.sort((a, b) =>
+    a.replicaId === b.replicaId ? a.seq - b.seq : a.replicaId < b.replicaId ? -1 : 1,
+  );
+};
+
+const dotKey = (dot: Dot): string => `${dot.replicaId}\u0000${String(dot.seq)}`;
+
+const diffByStableJson = <T extends { readonly id: string }>(
+  live: readonly T[],
+  shadow: readonly T[],
+): { readonly added: number; readonly removed: number; readonly changed: number } => {
+  const liveById = new Map(live.map((item) => [item.id, JSON.stringify(item)] as const));
+  const shadowById = new Map(shadow.map((item) => [item.id, JSON.stringify(item)] as const));
+  let added = 0;
+  let removed = 0;
+  let changed = 0;
+  for (const [id, body] of shadowById) {
+    const liveBody = liveById.get(id);
+    if (liveBody === undefined) added += 1;
+    else if (liveBody !== body) changed += 1;
+  }
+  for (const id of liveById.keys()) {
+    if (!shadowById.has(id)) removed += 1;
+  }
+  return { added, removed, changed };
+};
+
+export const compareConnectionsDrift = (input: {
+  readonly checkedAt: string;
+  readonly materializerVersion: string;
+  readonly liveSnapshot: ConnectionsSnapshot;
+  readonly shadowSnapshot: ConnectionsSnapshot;
+  readonly liveProgress: MaterializerProgress;
+  readonly shadowEvents: readonly AcceptedEvent[];
+}): DriftReport => {
+  const shadowDots = input.shadowEvents.map((event) => event.dot);
+  const shadowDotKeys = new Set(shadowDots.map(dotKey));
+  const liveDots = dotsFromIntervals(input.liveProgress.appliedDotIntervals);
+  const liveDotKeys = new Set(liveDots.map(dotKey));
+  const missingDots = shadowDots.filter((dot) => !liveDotKeys.has(dotKey(dot)));
+  const extraDots = liveDots.filter((dot) => !shadowDotKeys.has(dotKey(dot)));
+  const nodeDiff = diffByStableJson(input.liveSnapshot.nodes, input.shadowSnapshot.nodes);
+  const edgeDiff = diffByStableJson(input.liveSnapshot.edges, input.shadowSnapshot.edges);
+  const conclusion =
+    missingDots.length === 0 &&
+    extraDots.length === 0 &&
+    nodeDiff.added === 0 &&
+    nodeDiff.removed === 0 &&
+    nodeDiff.changed === 0 &&
+    edgeDiff.added === 0 &&
+    edgeDiff.removed === 0 &&
+    edgeDiff.changed === 0
+      ? 'clean'
+      : 'drift';
+  return {
+    checkedAt: input.checkedAt,
+    materializerVersion: input.materializerVersion,
+    appliedFrontier: frontierFromIntervals(input.liveProgress.appliedDotIntervals),
+    missingDots,
+    extraDots,
+    nodeDiff,
+    edgeDiff,
+    conclusion,
+  };
+};
+
 export const createConnectionsMaterializer = (
   deps: CreateConnectionsMaterializerDeps,
 ): ConnectionsMaterializer => {
@@ -556,6 +654,10 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
+  let successfulDrainCount = 0;
+  let lastDriftCheckAtMs = 0;
+  let lastDriftReport: DriftReport | null = null;
+  let lastFrontier: Record<string, number> | undefined;
   // W1c — wall-clock of the last drain pass START. Reference for the
   // minimum interval between drain STARTS (not just the within-drain
   // while-loop continuation), so a steady trigger stream can't pace
@@ -883,7 +985,16 @@ export const createConnectionsMaterializer = (
     snapshotRevisionId: snapshot.snapshotRevision ?? null,
   });
 
-  const buildAndWrite = async (): Promise<void> => {
+  const writeSnapshotWithProgress = async (
+    snapshot: ConnectionsSnapshot,
+    events: readonly AcceptedEvent[],
+  ): Promise<void> => {
+    const progress = progressForSnapshot(events, snapshot);
+    await deps.store.writeSnapshotAndProgress(snapshot, progress);
+    lastFrontier = progress.appliedFrontier;
+  };
+
+  const buildAndWrite = async (): Promise<ConnectionsSnapshot> => {
     const phaseLogs = process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1';
     const phaseStart = Date.now();
     let phaseLast = phaseStart;
@@ -1459,10 +1570,7 @@ export const createConnectionsMaterializer = (
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
     // synchronous CPU which would otherwise block HTTP.
-    await deps.store.writeSnapshotAndProgress(
-      baseSnapshot,
-      progressForSnapshot(merged, baseSnapshot),
-    );
+    await writeSnapshotWithProgress(baseSnapshot, merged);
     mark('writeSnapshotAndProgress baseSnapshot');
     await yieldToEventLoop();
     const rankerRetrainResult = await rankerRetrainer({
@@ -1507,10 +1615,7 @@ export const createConnectionsMaterializer = (
           mark(
             `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
           );
-          await deps.store.writeSnapshotAndProgress(
-            finalSnapshot,
-            progressForSnapshot(merged, finalSnapshot),
-          );
+          await writeSnapshotWithProgress(finalSnapshot, merged);
           mark('writeSnapshotAndProgress ranker-augmented');
           rankerAugmentation = rankerAugmentationCounters({
             status: 'emitted',
@@ -1596,6 +1701,8 @@ export const createConnectionsMaterializer = (
       console.warn(`[materializer-diag] write failed: ${message}`);
     }
     diagnosticsLogger(diagnosticsWithDrift);
+    await maybeRunShadowDriftCheck(finalSnapshot);
+    return finalSnapshot;
   };
 
   // Stage 5.2 W1 — worker drain sequence counter. Increments per
@@ -1688,6 +1795,85 @@ export const createConnectionsMaterializer = (
     if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') return true;
     if (process.env['SIDETRACK_CONNECTIONS_CHILD'] === '1') return true;
     return false;
+  };
+
+  const runShadowRebuildAndCompare = async (
+    eventLog: EventLog,
+    currentSnapshot: ConnectionsSnapshot,
+    currentProgress: MaterializerProgress,
+  ): Promise<DriftReport> => {
+    const shadowRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-shadow-'));
+    const shadowStore = new SqliteConnectionsStore(deps.vaultRoot, {
+      databasePath: join(shadowRoot, 'current.shadow.db'),
+    });
+    const previousDriftDisabled = process.env[DRIFT_DISABLED_ENV];
+    const previousInprocess = process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
+    process.env[DRIFT_DISABLED_ENV] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
+    try {
+      const shadowMaterializer = createConnectionsMaterializer({
+        ...deps,
+        store: shadowStore,
+        diagnosticsLogger: () => {},
+      });
+      await shadowMaterializer.catchUp(eventLog);
+      const shadowSnapshot = await shadowStore.readCurrent();
+      if (shadowSnapshot === null) {
+        throw new Error('shadow rebuild did not write a snapshot');
+      }
+      const shadowEvents = await eventLog.readMerged();
+      return compareConnectionsDrift({
+        checkedAt: diagnosticsNow().toISOString(),
+        materializerVersion: MATERIALIZER_VERSION,
+        liveSnapshot: currentSnapshot,
+        shadowSnapshot,
+        liveProgress: currentProgress,
+        shadowEvents,
+      });
+    } finally {
+      if (previousDriftDisabled === undefined) delete process.env[DRIFT_DISABLED_ENV];
+      else process.env[DRIFT_DISABLED_ENV] = previousDriftDisabled;
+      if (previousInprocess === undefined) delete process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
+      else process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = previousInprocess;
+      shadowStore.close();
+      await rm(shadowRoot, { recursive: true, force: true });
+    }
+  };
+
+  const maybeRunShadowDriftCheck = async (currentSnapshot: ConnectionsSnapshot): Promise<void> => {
+    if (process.env[DRIFT_DISABLED_ENV] === '1') return;
+    successfulDrainCount += 1;
+    const everyDrains = resolvePositiveNumberEnv(
+      'SIDETRACK_CONNECTIONS_DRIFT_EVERY_DRAINS',
+      DEFAULT_DRIFT_EVERY_DRAINS,
+    );
+    const everyMs = resolvePositiveNumberEnv(
+      'SIDETRACK_CONNECTIONS_DRIFT_EVERY_MS',
+      DEFAULT_DRIFT_EVERY_MS,
+    );
+    const nowMs = Date.now();
+    if (successfulDrainCount % everyDrains !== 0 && nowMs - lastDriftCheckAtMs < everyMs) {
+      return;
+    }
+    const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
+    try {
+      const report = await runShadowRebuildAndCompare(deps.eventLog, currentSnapshot, progress);
+      lastDriftReport = report;
+      lastDriftCheckAtMs = nowMs;
+      if (report.conclusion === 'drift') {
+        console.warn(
+          `[connections] materializer drift detected nodes=${JSON.stringify(
+            report.nodeDiff,
+          )} edges=${JSON.stringify(report.edgeDiff)} missingDots=${String(
+            report.missingDots.length,
+          )} extraDots=${String(report.extraDots.length)}`,
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[connections] materializer drift check failed: ${message}`);
+    }
   };
 
   const drain = async (): Promise<void> => {
@@ -1842,6 +2028,7 @@ export const createConnectionsMaterializer = (
       const merged = await deps.eventLog.readMerged();
       const versionMatches = progress?.materializerVersion === MATERIALIZER_VERSION;
       if (progress !== null && versionMatches) {
+        lastFrontier = progress.appliedFrontier;
         const pendingEvents = merged.filter(
           (event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot),
         );
@@ -1902,6 +2089,17 @@ export const createConnectionsMaterializer = (
     lastSuccessAt,
     lastError,
     pending,
+    ...(lastFrontier === undefined ? {} : { frontier: lastFrontier }),
+    ...(lastDriftReport === null
+      ? {}
+      : {
+          lastDriftCheck: {
+            at: lastDriftReport.checkedAt,
+            conclusion: lastDriftReport.conclusion,
+            nodeDiffSummary: lastDriftReport.nodeDiff,
+            edgeDiffSummary: lastDriftReport.edgeDiff,
+          },
+        }),
   });
 
   const getDirtySources = (): DirtySourceQueueSnapshot => dirtySourceQueue.snapshot();

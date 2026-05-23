@@ -3,14 +3,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createConnectionsStore } from '../../connections/snapshot.js';
+import { createConnectionsStore, type ConnectionsSnapshot } from '../../connections/snapshot.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
-import { createConnectionsMaterializer, MATERIALIZER_VERSION } from './connectionsMaterializer.js';
-import { intervalsContainDot } from './materializerProgress.js';
+import {
+  compareConnectionsDrift,
+  createConnectionsMaterializer,
+  MATERIALIZER_VERSION,
+} from './connectionsMaterializer.js';
+import { addDotsToIntervals, intervalsContainDot } from './materializerProgress.js';
 
 const threadEvent = (seq: number): AcceptedEvent => ({
   clientEventId: `thread-${String(seq)}`,
@@ -26,6 +30,16 @@ const threadEvent = (seq: number): AcceptedEvent => ({
     lastSeenAt: '2026-05-22T10:00:00.000Z',
   },
   acceptedAtMs: Date.parse('2026-05-22T10:00:00.000Z') + seq,
+});
+
+const emptySnapshot = (nodes: ConnectionsSnapshot['nodes'] = []): ConnectionsSnapshot => ({
+  scope: { kind: 'current' },
+  nodes,
+  edges: [],
+  updatedAt: '2026-05-22T10:00:00.000Z',
+  nodeCount: nodes.length,
+  edgeCount: 0,
+  snapshotRevision: 'rev',
 });
 
 describe('connections materializer progress', () => {
@@ -173,5 +187,58 @@ describe('connections materializer progress', () => {
         ? false
         : intervalsContainDot(progress.appliedDotIntervals, threadEvent(1).dot),
     ).toBe(true);
+  });
+
+  it('reports clean drift comparison for matching shadow state', () => {
+    const event = threadEvent(1);
+    const snapshot = emptySnapshot();
+    const report = compareConnectionsDrift({
+      checkedAt: '2026-05-22T10:00:00.000Z',
+      materializerVersion: MATERIALIZER_VERSION,
+      liveSnapshot: snapshot,
+      shadowSnapshot: snapshot,
+      liveProgress: {
+        materializerName: 'connections',
+        materializerVersion: MATERIALIZER_VERSION,
+        appliedDotIntervals: addDotsToIntervals({}, [event.dot]),
+        appliedFrontier: { 'replica-progress': 1 },
+        snapshotRevisionId: 'rev',
+      },
+      shadowEvents: [event],
+    });
+
+    expect(report.conclusion).toBe('clean');
+    expect(report.nodeDiff).toEqual({ added: 0, removed: 0, changed: 0 });
+    expect(report.edgeDiff).toEqual({ added: 0, removed: 0, changed: 0 });
+  });
+
+  it('reports drift when the live snapshot has a manual node mismatch', () => {
+    const event = threadEvent(1);
+    const liveSnapshot = emptySnapshot([
+      {
+        id: 'thread:manual',
+        kind: 'thread',
+        label: 'Manual',
+        metadata: {},
+      },
+    ]);
+    const shadowSnapshot = emptySnapshot();
+    const report = compareConnectionsDrift({
+      checkedAt: '2026-05-22T10:00:00.000Z',
+      materializerVersion: MATERIALIZER_VERSION,
+      liveSnapshot,
+      shadowSnapshot,
+      liveProgress: {
+        materializerName: 'connections',
+        materializerVersion: MATERIALIZER_VERSION,
+        appliedDotIntervals: addDotsToIntervals({}, [event.dot]),
+        appliedFrontier: { 'replica-progress': 1 },
+        snapshotRevisionId: 'rev',
+      },
+      shadowEvents: [event],
+    });
+
+    expect(report.conclusion).toBe('drift');
+    expect(report.nodeDiff).toEqual({ added: 0, removed: 1, changed: 0 });
   });
 });
