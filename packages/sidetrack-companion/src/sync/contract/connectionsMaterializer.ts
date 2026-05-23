@@ -1904,7 +1904,9 @@ export const createConnectionsMaterializer = (
     // synchronous CPU which would otherwise block HTTP.
     if (scopeIncrementalEnabled) {
       if (dirtyScopes.length > 0) {
-        const scoped = unionScopeOutputs(dirtyScopes.map((scope) => recomputeScope(scope, input)));
+        const scoped = unionScopeOutputs(
+          dirtyScopes.map((scope) => recomputeScope(scope, baseSnapshot)),
+        );
         const progress = progressForSnapshot(merged, baseSnapshot);
         await deps.store.replaceScopeRows!({
           scopes: dirtyScopes,

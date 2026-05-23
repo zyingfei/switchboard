@@ -1,4 +1,4 @@
-import { buildConnectionsSnapshot, type ConnectionsSnapshot } from './snapshot.js';
+import type { ConnectionsSnapshot } from './snapshot.js';
 import type { ConnectionEdge, ConnectionNode } from './types.js';
 import type { Scope } from '../sync/contract/connectionsScopes.js';
 import {
@@ -6,7 +6,6 @@ import {
   scopeKey,
   scopesForGraphRows,
 } from '../sync/contract/connectionsScopes.js';
-import type { ConnectionsInput } from './snapshot.js';
 
 // Scope recompute consumes the same causal projection as full rebuilds:
 // Class A aggregate events are folded by `mergeRegister`-backed
@@ -42,47 +41,50 @@ export const scopesForConnectionsSnapshot = (snapshot: ConnectionsSnapshot): Sco
 
 export const recomputeVisitScope = (
   visitId: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'visit', id: visitId });
+  rowsForScope(fullSnapshot, { kind: 'visit', id: visitId });
 
 export const recomputeUrlScope = (
   canonicalUrl: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'url', id: canonicalUrl });
+  rowsForScope(fullSnapshot, { kind: 'url', id: canonicalUrl });
 
 export const recomputeTabSessionScope = (
   tabSessionId: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'tab-session', id: tabSessionId });
+  rowsForScope(fullSnapshot, { kind: 'tab-session', id: tabSessionId });
 
 export const recomputeWorkstreamScope = (
   workstreamId: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'workstream', id: workstreamId });
+  rowsForScope(fullSnapshot, { kind: 'workstream', id: workstreamId });
 
 export const recomputeThreadScope = (
   threadId: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'thread', id: threadId });
+  rowsForScope(fullSnapshot, { kind: 'thread', id: threadId });
 
 export const recomputeTopicScope = (
   topicId: string,
-  input: ConnectionsInput,
+  fullSnapshot: ConnectionsSnapshot,
 ): ScopeRecomputeOutput =>
-  rowsForScope(buildConnectionsSnapshot(input), { kind: 'topic', id: topicId });
+  rowsForScope(fullSnapshot, { kind: 'topic', id: topicId });
 
-export const recomputeScope = (scope: Scope, input: ConnectionsInput): ScopeRecomputeOutput => {
-  if (scope.kind === 'visit') return recomputeVisitScope(scope.id, input);
-  if (scope.kind === 'url') return recomputeUrlScope(scope.id, input);
-  if (scope.kind === 'tab-session') return recomputeTabSessionScope(scope.id, input);
-  if (scope.kind === 'workstream') return recomputeWorkstreamScope(scope.id, input);
-  if (scope.kind === 'thread') return recomputeThreadScope(scope.id, input);
-  return recomputeTopicScope(scope.id, input);
+export const recomputeScope = (
+  scope: Scope,
+  fullSnapshot: ConnectionsSnapshot,
+): ScopeRecomputeOutput => {
+  if (scope.kind === 'visit') return recomputeVisitScope(scope.id, fullSnapshot);
+  if (scope.kind === 'url') return recomputeUrlScope(scope.id, fullSnapshot);
+  if (scope.kind === 'tab-session') return recomputeTabSessionScope(scope.id, fullSnapshot);
+  if (scope.kind === 'workstream') return recomputeWorkstreamScope(scope.id, fullSnapshot);
+  if (scope.kind === 'thread') return recomputeThreadScope(scope.id, fullSnapshot);
+  return recomputeTopicScope(scope.id, fullSnapshot);
 };
 
 export const unionScopeOutputs = (
