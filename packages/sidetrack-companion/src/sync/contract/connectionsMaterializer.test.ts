@@ -32,7 +32,10 @@ import {
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
-import { createConnectionsMaterializer } from './connectionsMaterializer.js';
+import {
+  classifyConnectionsMaterializerHealth,
+  createConnectionsMaterializer,
+} from './connectionsMaterializer.js';
 
 const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
   clientEventId: `evt-${String(input.seq)}`,
@@ -1404,6 +1407,27 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(m.health().pending).toBe(true);
     expect(m.health().lastError).toContain('disk full');
     expect(m.health().status).toBe('failed');
+  });
+
+  it('classifies pending recent success as busy within the 60s health window', () => {
+    const nowMs = Date.parse('2026-05-07T10:00:00.000Z');
+
+    expect(
+      classifyConnectionsMaterializerHealth({
+        pending: true,
+        lastSuccessAt: new Date(nowMs - 30_000).toISOString(),
+        lastError: null,
+        nowMs,
+      }),
+    ).toBe('busy');
+    expect(
+      classifyConnectionsMaterializerHealth({
+        pending: true,
+        lastSuccessAt: new Date(nowMs - 90_000).toISOString(),
+        lastError: null,
+        nowMs,
+      }),
+    ).toBe('degraded');
   });
 
   it('awaitIdle does not hang when a drain has parked the materializer in a failed state', async () => {

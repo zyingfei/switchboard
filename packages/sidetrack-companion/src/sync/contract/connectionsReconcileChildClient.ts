@@ -22,6 +22,11 @@ import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsRec
 
 let childScriptPath: string | undefined;
 
+const markPostDrain = (label: string, startedAtMs: number): void => {
+  const elapsedMs = Date.now() - startedAtMs;
+  console.warn(`[connections-phase] post-drain.${label} dt=${String(elapsedMs)}ms`);
+};
+
 const defaultEntryPath = (): string => {
   const here = fileURLToPath(import.meta.url);
   return join(dirname(here), 'connectionsReconcileChild.entry.js');
@@ -81,7 +86,12 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
       process.stderr.write(`[reconcile.child] ${buf.toString('utf8')}`);
     });
     child.on('message', (raw: unknown) => {
-      settle(raw as ReconcileWorkerResult);
+      const receivedAtMs = Date.now();
+      const result = raw as ReconcileWorkerResult;
+      if (result.ok && result.snapshotRevision !== undefined) {
+        markPostDrain('ipc-message', receivedAtMs);
+      }
+      settle(result);
     });
     child.on('error', (err) => {
       settle({ seq: job.seq, ok: false, error: err.message });

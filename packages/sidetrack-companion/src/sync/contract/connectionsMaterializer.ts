@@ -303,6 +303,27 @@ const DEFAULT_TOPIC_EVERY_DRAINS = 50;
 const DEFAULT_TOPIC_EVERY_MS = 300_000;
 const BUSY_LAST_SUCCESS_WINDOW_MS = 60_000;
 
+const markPostDrain = (label: string, previousAtMs: number): number => {
+  const now = Date.now();
+  console.warn(`[connections-phase] post-drain.${label} dt=${String(now - previousAtMs)}ms`);
+  return now;
+};
+
+export const classifyConnectionsMaterializerHealth = (input: {
+  readonly pending: boolean;
+  readonly lastSuccessAt: string | null;
+  readonly lastError: string | null;
+  readonly nowMs?: number;
+}): MaterializerHealth['status'] => {
+  if (input.lastError !== null) return 'failed';
+  if (!input.pending) return input.lastSuccessAt === null ? 'degraded' : 'healthy';
+  if (input.lastSuccessAt === null) return 'degraded';
+  const successAtMs = Date.parse(input.lastSuccessAt);
+  if (!Number.isFinite(successAtMs)) return 'degraded';
+  const ageMs = Math.max(0, (input.nowMs ?? Date.now()) - successAtMs);
+  return ageMs <= BUSY_LAST_SUCCESS_WINDOW_MS ? 'busy' : 'degraded';
+};
+
 const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
 const incrementalSimilarityEnabled = (): boolean =>
   process.env[INCREMENTAL_SIMILARITY_ENV] !== '0';
@@ -2209,6 +2230,7 @@ export const createConnectionsMaterializer = (
     const seq = workerDrainSeq;
     const runner = pickSubprocessRunner();
     const result = await runner({ vaultRoot: deps.vaultRoot, seq });
+    let postDrainAtMs = markPostDrain('ipc-result', Date.now());
     if (seq <= lastWorkerDrainSeqCompleted) {
       // A newer drain already completed; ignore stale output.
       return;
@@ -2218,10 +2240,13 @@ export const createConnectionsMaterializer = (
     }
     lastWorkerDrainSeqCompleted = seq;
     const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    postDrainAtMs = markPostDrain('snapshot-revision.reload-progress', postDrainAtMs);
     if (progress !== null && progress.materializerVersion === MATERIALIZER_VERSION) {
       lastFrontier = progress.appliedFrontier;
     }
+    postDrainAtMs = markPostDrain('route-cache.memo-rebuild.skipped-lazy', postDrainAtMs);
     lastSuccessAt = new Date().toISOString();
+    postDrainAtMs = markPostDrain('health.lastSuccessAt', postDrainAtMs);
     // The subprocess re-instantiated its own materializer + accumulators
     // inside the child context. The main-thread in-process state
     // (urlAccumulator, tabSessionAccumulator, lastEngagementClassRevision)
@@ -2232,6 +2257,7 @@ export const createConnectionsMaterializer = (
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
     lastEngagementClassRevision = undefined;
+    markPostDrain('observer.accumulator-reset', postDrainAtMs);
   };
 
   // Decide whether the next pass (catchUp or drain) should be offloaded
@@ -2574,12 +2600,7 @@ export const createConnectionsMaterializer = (
   };
 
   const healthStatus = (): MaterializerHealth['status'] => {
-    if (lastError !== null) return 'failed';
-    if (!pending) return lastSuccessAt === null ? 'degraded' : 'healthy';
-    if (lastSuccessAt === null) return 'degraded';
-    return Date.now() - Date.parse(lastSuccessAt) <= BUSY_LAST_SUCCESS_WINDOW_MS
-      ? 'busy'
-      : 'degraded';
+    return classifyConnectionsMaterializerHealth({ pending, lastSuccessAt, lastError });
   };
 
   const health: Materializer['health'] = (): MaterializerHealth => {

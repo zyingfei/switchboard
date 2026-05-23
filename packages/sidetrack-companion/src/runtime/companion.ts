@@ -246,18 +246,34 @@ export const startCompanion = async (
     const pageEvidenceWriteQueue = createPageEvidenceWriteQueue(options.vaultPath);
     const idempotencyStore = createIdempotencyStore(options.vaultPath);
     const listeners = new Set<(event: VaultChangeEvent) => void>();
+    const markPostDrain = (label: string, startedAtMs: number): void => {
+      console.warn(
+        `[connections-phase] post-drain.${label} dt=${String(
+          Math.round(performance.now() - startedAtMs),
+        )}ms`,
+      );
+    };
     let watcher: VaultWatcher | undefined;
     try {
       watcher = createVaultWatcher(options.vaultPath, {
         onChange: (event) => {
+          const isConnectionsChange = event.relPath
+            .split('/')
+            .join('/')
+            .startsWith('_BAC/connections/');
+          const fanoutStartedAtMs = performance.now();
           for (const listener of listeners) {
+            const listenerStartedAtMs = performance.now();
             try {
               listener(event);
             } catch {
               // A subscriber's handler must never break fan-out to the
               // other subscribers (or throw into the vault watcher).
+            } finally {
+              if (isConnectionsChange) markPostDrain('observer.listener', listenerStartedAtMs);
             }
           }
+          if (isConnectionsChange) markPostDrain('observer.listeners', fanoutStartedAtMs);
         },
       });
     } catch {
