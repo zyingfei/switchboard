@@ -8,6 +8,7 @@ import { embed } from './embedder.js';
 import {
   INDEX_CHUNK_SCHEMA_VERSION,
   INDEX_VERSION,
+  readIndex,
   tombstoneByThread,
   upsertEntries,
 } from './indexFile.js';
@@ -111,6 +112,12 @@ const metadataFromChunk = (chunk: RecallChunk): ChunkMetadata => ({
 const EMBED_BATCH = 16;
 const EMBED_TEXT_CHARS = 4000;
 
+const recallDedupKey = (input: {
+  readonly threadId: string;
+  readonly role?: string | undefined;
+  readonly textHash: string;
+}): string => `${input.threadId}\u0000${input.role ?? 'unknown'}\u0000${input.textHash}`;
+
 interface IngestSummary {
   readonly indexedChunks: number;
   // Distinct thread ids tombstoned by recall.tombstone.target events
@@ -206,13 +213,43 @@ export const ingestIncremental = async (
     }
   }
 
+  const existingIndex = await readIndex(indexPath(vaultRoot));
+  const seenRecallKeys = new Set<string>();
+  for (const entry of existingIndex?.items ?? []) {
+    const textHash = entry.metadata?.textHash;
+    if (typeof textHash !== 'string' || textHash.length === 0) continue;
+    seenRecallKeys.add(
+      recallDedupKey({
+        threadId: entry.threadId,
+        role: entry.metadata?.role,
+        textHash,
+      }),
+    );
+  }
+  const dedupedChunks: typeof chunks = [];
+  for (const item of chunks) {
+    const key = recallDedupKey({
+      threadId: item.chunk.threadId,
+      role: item.chunk.role,
+      textHash: item.chunk.textHash,
+    });
+    if (seenRecallKeys.has(key)) {
+      // Skip rather than touch: duplicate recall entries would only
+      // churn timestamps / embeddings while adding no retrievable
+      // content for the same thread-role-hash tuple.
+      continue;
+    }
+    seenRecallKeys.add(key);
+    dedupedChunks.push(item);
+  }
+
   // Embed in batches, then upsert. Once the upsert succeeds the
   // ingest state moves forward; a kill-9 between batches loses at
   // most one batch of progress but the chunks are deterministic so
   // a re-run produces the same entries.
   let indexedCount = 0;
-  for (let offset = 0; offset < chunks.length; offset += EMBED_BATCH) {
-    const batch = chunks.slice(offset, offset + EMBED_BATCH);
+  for (let offset = 0; offset < dedupedChunks.length; offset += EMBED_BATCH) {
+    const batch = dedupedChunks.slice(offset, offset + EMBED_BATCH);
     const vectors = await embed(
       batch.map(({ chunk }) => chunk.embedText.slice(0, EMBED_TEXT_CHARS)),
     );
