@@ -66,7 +66,6 @@ import {
   type ServedTopicProducer,
 } from '../../connections/servedTopicProducer.js';
 import {
-  hotSimilarityModeEnabled,
   hotTopicsModeEnabled,
   type HotPathDiagnostics,
 } from '../../connections/hotPathMode.js';
@@ -149,7 +148,10 @@ import {
   visitKeyForVisitEntry,
   VISIT_SIMILARITY_DEFAULT_THRESHOLD,
   VISIT_SIMILARITY_DEFAULT_TOP_K,
+  VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+  VISIT_SIMILARITY_MODEL_ID,
 } from '../../connections/visitSimilarity.js';
+import { createSimilarityHnswStore } from '../../connections/visitSimilarityHnsw.js';
 import {
   createDirtySourceQueue,
   foldGroupBEventIntoQueue,
@@ -158,6 +160,7 @@ import {
 import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
+import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import {
   ensurePageEvidenceForTimelineEntries,
   readPageEvidenceVectorMap,
@@ -188,6 +191,7 @@ import { isMainThread } from 'node:worker_threads';
 import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent, type Dot } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
+import type { VisitSimilarityEdge, VisitSimilarityRevision } from '../../connections/types.js';
 import {
   addDotsToIntervals,
   EMPTY_PROGRESS,
@@ -289,6 +293,7 @@ const resolveDrainMinIntervalMs = (): number => {
 };
 
 const INCREMENTAL_RANKER_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_RANKER';
+const INCREMENTAL_SIMILARITY_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY';
 const TOPIC_EVERY_DRAINS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS';
 const TOPIC_EVERY_MS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS';
 const DEFAULT_TOPIC_EVERY_DRAINS = 50;
@@ -296,6 +301,8 @@ const DEFAULT_TOPIC_EVERY_MS = 300_000;
 const BUSY_LAST_SUCCESS_WINDOW_MS = 60_000;
 
 const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
+const incrementalSimilarityEnabled = (): boolean =>
+  process.env[INCREMENTAL_SIMILARITY_ENV] !== '0';
 
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
@@ -700,6 +707,7 @@ export const createConnectionsMaterializer = (
   const incrementalSimilarityIndex = new IncrementalVisitSimilarityIndex(
     incrementalSimilarityIndexOptions,
   );
+  const hnswSimilarityStore = createSimilarityHnswStore();
   let pending = false;
   let running = false;
   let dirty = false;
@@ -759,6 +767,183 @@ export const createConnectionsMaterializer = (
 
   const stripFragmentAndTrailingSlash = (url: string): string =>
     url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+  const orderedSimilarityPair = (a: string, b: string): [string, string] =>
+    a < b ? [a, b] : [b, a];
+
+  const similarityPairKey = (a: string, b: string): string => {
+    const [left, right] = orderedSimilarityPair(a, b);
+    return `${left}\u0000${right}`;
+  };
+
+  const visitKeyFromTimelineNodeId = (nodeId: string): string | null => {
+    const prefix = 'timeline-visit:';
+    return nodeId.startsWith(prefix) ? nodeId.slice(prefix.length) : null;
+  };
+
+  const retainedSimilarityEdgesFromSnapshot = (
+    snapshot: ConnectionsSnapshot | null,
+    touchedVisitIds: ReadonlySet<string>,
+    activeVisitIds: ReadonlySet<string>,
+  ): readonly VisitSimilarityEdge[] => {
+    if (snapshot === null) return [];
+    const byPair = new Map<string, VisitSimilarityEdge>();
+    for (const edge of snapshot.edges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const fromVisitKey = visitKeyFromTimelineNodeId(edge.fromNodeId);
+      const toVisitKey = visitKeyFromTimelineNodeId(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      if (
+        touchedVisitIds.has(fromVisitKey) ||
+        touchedVisitIds.has(toVisitKey) ||
+        !activeVisitIds.has(fromVisitKey) ||
+        !activeVisitIds.has(toVisitKey)
+      ) {
+        continue;
+      }
+      const cosine = edge.metadata?.['cosine'];
+      if (typeof cosine !== 'number' || !Number.isFinite(cosine)) continue;
+      const [fromKey, toKey] = orderedSimilarityPair(fromVisitKey, toVisitKey);
+      byPair.set(similarityPairKey(fromKey, toKey), {
+        fromVisitKey: fromKey,
+        toVisitKey: toKey,
+        cosine: Number(cosine.toFixed(6)),
+      });
+    }
+    return [...byPair.values()].sort((left, right) => {
+      if (left.fromVisitKey !== right.fromVisitKey) return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+      if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
+      return left.cosine - right.cosine;
+    });
+  };
+
+  const resetHnswSimilarityFiles = async (): Promise<void> => {
+    await hnswSimilarityStore.close();
+    await rm(join(deps.vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.bin'), {
+      force: true,
+    });
+    await rm(join(deps.vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.json'), {
+      force: true,
+    });
+  };
+
+  const buildHnswVisitSimilarity = async (input: {
+    readonly entries: readonly TimelineEntryWithDimensions[];
+    readonly revisionId: string;
+    readonly config: EffectiveVisitSimilarityConfig;
+    readonly touchedVisitIds: ReadonlySet<string>;
+    readonly fullRebuild: boolean;
+    readonly previousSnapshot: ConnectionsSnapshot | null;
+    readonly embed: VisitSimilarityEmbedder;
+    readonly evidenceByCanonicalUrl: Parameters<typeof corpusForVisitEntry>[1];
+  }): Promise<VisitSimilarityRevision> => {
+    const activeEntries = input.entries.filter(
+      (entry) => focusedWindowMsFromEntry(entry) >= input.config.engagementGateMs,
+    );
+    const activeVisitIds = new Set(activeEntries.map(visitKeyForVisitEntry));
+    if (activeEntries.length === 0) {
+      if (input.fullRebuild) await resetHnswSimilarityFiles();
+      return {
+        revisionId: input.revisionId,
+        modelId: VISIT_SIMILARITY_MODEL_ID,
+        modelRevision: RECALL_MODEL.revision,
+        featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+        threshold: input.config.threshold,
+        edges: [],
+        producedAt: Date.now(),
+        producer: 'embedding',
+      };
+    }
+    const touchedVisitIds = input.fullRebuild ? activeVisitIds : input.touchedVisitIds;
+    const entriesToEmbed = input.fullRebuild
+      ? activeEntries
+      : activeEntries.filter((entry) => touchedVisitIds.has(visitKeyForVisitEntry(entry)));
+    if (input.fullRebuild) await resetHnswSimilarityFiles();
+
+    const embeddingsByVisitKey = new Map<string, Float32Array>();
+    if (entriesToEmbed.length > 0) {
+      const texts = entriesToEmbed.map(
+        (entry) => `passage: ${corpusForVisitEntry(entry, input.evidenceByCanonicalUrl)}`,
+      );
+      const embedded = await input.embed(texts);
+      if (embedded.length !== entriesToEmbed.length) {
+        throw new Error(
+          `expected ${String(entriesToEmbed.length)} HNSW embeddings, received ${String(embedded.length)}`,
+        );
+      }
+      for (let i = 0; i < entriesToEmbed.length; i += 1) {
+        const entry = entriesToEmbed[i];
+        const embedding = embedded[i];
+        if (entry !== undefined && embedding !== undefined) {
+          embeddingsByVisitKey.set(visitKeyForVisitEntry(entry), embedding);
+        }
+      }
+    }
+
+    const firstEmbedding = embeddingsByVisitKey.values().next().value;
+    if (firstEmbedding !== undefined) {
+      await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, firstEmbedding.length);
+      for (const visitId of input.fullRebuild ? [] : input.touchedVisitIds) {
+        if (!activeVisitIds.has(visitId)) await hnswSimilarityStore.delete(visitId);
+      }
+      for (const [visitId, embedding] of embeddingsByVisitKey) {
+        await hnswSimilarityStore.insertOrUpdate(visitId, Array.from(embedding));
+      }
+    } else if (input.fullRebuild) {
+      return {
+        revisionId: input.revisionId,
+        modelId: VISIT_SIMILARITY_MODEL_ID,
+        modelRevision: RECALL_MODEL.revision,
+        featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+        threshold: input.config.threshold,
+        edges: [],
+        producedAt: Date.now(),
+        producer: 'embedding',
+      };
+    }
+
+    const edgeByPair = new Map<string, VisitSimilarityEdge>();
+    for (const edge of retainedSimilarityEdgesFromSnapshot(
+      input.previousSnapshot,
+      touchedVisitIds,
+      activeVisitIds,
+    )) {
+      edgeByPair.set(similarityPairKey(edge.fromVisitKey, edge.toVisitKey), edge);
+    }
+
+    const queryVisitIds = input.fullRebuild ? activeVisitIds : touchedVisitIds;
+    for (const visitId of [...queryVisitIds].sort()) {
+      if (!activeVisitIds.has(visitId)) continue;
+      for (const neighbor of await hnswSimilarityStore.queryTopK(visitId, 50)) {
+        if (!activeVisitIds.has(neighbor.neighborVisitId)) continue;
+        const cosine = Number((1 - neighbor.distance).toFixed(6));
+        if (cosine < input.config.threshold) continue;
+        const [fromVisitKey, toVisitKey] = orderedSimilarityPair(visitId, neighbor.neighborVisitId);
+        const key = similarityPairKey(fromVisitKey, toVisitKey);
+        const existing = edgeByPair.get(key);
+        if (existing === undefined || cosine > existing.cosine) {
+          edgeByPair.set(key, { fromVisitKey, toVisitKey, cosine });
+        }
+      }
+    }
+    await hnswSimilarityStore.persist();
+    return {
+      revisionId: input.revisionId,
+      modelId: VISIT_SIMILARITY_MODEL_ID,
+      modelRevision: RECALL_MODEL.revision,
+      featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
+      threshold: input.config.threshold,
+      edges: [...edgeByPair.values()].sort((left, right) => {
+        if (left.fromVisitKey !== right.fromVisitKey) {
+          return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+        }
+        if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
+        return left.cosine - right.cosine;
+      }),
+      producedAt: Date.now(),
+      producer: 'embedding',
+    };
+  };
 
   const topicVisitFromEntry = (entry: TimelineEntryWithDimensions): TopicVisit => {
     const canonicalUrl = stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
@@ -1148,6 +1333,13 @@ export const createConnectionsMaterializer = (
       0,
       (similarityEligibleCount * (similarityEligibleCount - 1)) / 2,
     );
+    const dirtyScopes = invalidationKeysToScopes(buildKeys);
+    const previousSnapshotForRanker = await deps.store.readCurrent();
+    const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    const hnswFullRebuild =
+      existingProgress === null ||
+      existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
+      lastFrontier === undefined;
     const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
       deps.vaultRoot,
       similarityEntries,
@@ -1185,7 +1377,8 @@ export const createConnectionsMaterializer = (
     // IncrementalVisitSimilarityIndex for cosine-only top-K. The
     // resulting revisionId carries a `:incremental` suffix so on-disk
     // cached revisions stay distinct from the legacy hybrid path.
-    const hotSimilarityMode = hotSimilarityModeEnabled();
+    const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
+    const hotSimilarityMode = !persistentHnswSimilarityMode && false;
     const hotSimCorpusSize = incrementalSimilarityIndex.size();
     const hotSimilarityDecision = hotSimilarityMode
       ? decideHotPathEmbed(embedderWarmthTracker.snapshot(hotSimCorpusSize))
@@ -1194,8 +1387,25 @@ export const createConnectionsMaterializer = (
     // the drain already produces).
     let usedHotSimilarityPath = false;
     let hotSimNewEmbedded: number | null = null;
-    let visitSimilarity;
-    if (cachedSimilarityRevision !== null) {
+    let visitSimilarity: VisitSimilarityRevision;
+    if (persistentHnswSimilarityMode) {
+      const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+      usedHotSimilarityPath = true;
+      hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
+      visitSimilarity = await buildHnswVisitSimilarity({
+        entries: similarityEntries,
+        revisionId: expectedSimilarityRevisionId,
+        config: similarityConfig,
+        touchedVisitIds,
+        fullRebuild: hnswFullRebuild,
+        previousSnapshot: previousSnapshotForRanker,
+        embed: deps.embed ?? defaultEmbed,
+        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+      });
+      mark(
+        `buildVisitSimilarityHnsw full=${String(hnswFullRebuild)} touched=${String(touchedVisitIds.size)} edges=${String(visitSimilarity.edges.length)}`,
+      );
+    } else if (cachedSimilarityRevision !== null) {
       // U2 — a valid cached revision means the W3 skip-gate id (a pure
       // function of inputs+config) matched: the inputs are unchanged,
       // so the cached revision IS the correct output. Reuse it
@@ -1280,7 +1490,10 @@ export const createConnectionsMaterializer = (
     // U2 — similarity-stage wall time for HotPathDiagnostics (the
     // visitSimilarity revision is finalized here).
     const hotSimRuntimeMs = Date.now() - similarityStartedAtMs;
-    if (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath) {
+    if (
+      persistentHnswSimilarityMode ||
+      (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath)
+    ) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
       // (cache hits don't exercise the embedder). Divide by entry count
       // for a per-embed proxy when entries > 0; treat the full pass as
@@ -1653,14 +1866,12 @@ export const createConnectionsMaterializer = (
     mark(
       `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
     );
-    const previousSnapshotForRanker = await deps.store.readCurrent();
     const scopeIncrementalEnabled =
       process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
       deps.store.replaceScopeRows !== undefined &&
       previousSnapshotForRanker !== null;
     let wroteScopeIncremental = false;
-    const dirtyScopes = invalidationKeysToScopes(buildKeys);
     const dirtyScopeWrites =
       process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       previousSnapshotForRanker !== null &&
