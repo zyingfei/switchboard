@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import HnswLib from 'hnswlib-node';
@@ -32,21 +32,42 @@ interface SimilarityHnswSidecar {
 
 interface LoadedState {
   readonly vaultRoot: string;
-  readonly indexPath: string;
-  readonly sidecarPath: string;
+  readonly basePath: string;
+  readonly pointerPath: string;
   readonly index: HnswLib.HierarchicalNSW;
   dimension: number;
   maxElements: number;
   elementCount: number;
+  version: number;
   readonly visitIdToLabel: Map<string, number>;
   readonly labelToVisitId: Map<number, string>;
 }
 
-const indexPathFor = (vaultRoot: string): string =>
-  join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.bin');
+interface SimilarityHnswStoreOptions {
+  readonly renameFile?: typeof rename;
+}
 
-const sidecarPathFor = (vaultRoot: string): string =>
-  join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.json');
+const basePathFor = (vaultRoot: string): string =>
+  join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw');
+
+const pointerPathFor = (vaultRoot: string): string => `${basePathFor(vaultRoot)}.current`;
+
+const indexPathFor = (vaultRoot: string): string => `${basePathFor(vaultRoot)}.bin`;
+
+const sidecarPathFor = (vaultRoot: string): string => `${basePathFor(vaultRoot)}.json`;
+
+const versionedIndexPath = (basePath: string, version: number): string =>
+  `${basePath}.v${String(version)}.bin`;
+
+const versionedSidecarPath = (basePath: string, version: number): string =>
+  `${basePath}.v${String(version)}.json`;
+
+const parsePointer = (raw: string): number => {
+  const trimmed = raw.trim();
+  const match = /^v(\d+)$/u.exec(trimmed);
+  if (match === null) throw new Error(`invalid HNSW pointer: ${trimmed}`);
+  return Number(match[1]);
+};
 
 const pathExists = async (path: string): Promise<boolean> => {
   try {
@@ -126,6 +147,31 @@ const sidecarFor = (state: LoadedState): SimilarityHnswSidecar => ({
   ),
 });
 
+const gcOldVersions = async (basePath: string, keepVersion: number): Promise<void> => {
+  const dir = dirname(basePath);
+  const prefix = `${basePath.slice(dir.length + 1)}.v`;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    entries
+      .filter((entry) => {
+        if (!entry.startsWith(prefix)) return false;
+        return !entry.startsWith(`${prefix}${String(keepVersion)}.`);
+      })
+      .map(async (entry) => {
+        try {
+          await unlink(join(dir, entry));
+        } catch {
+          // Best-effort cleanup; pointer publication is already complete.
+        }
+      }),
+  );
+};
+
 const assertEmbedding = (embedding: readonly number[], dimension: number): void => {
   if (embedding.length !== dimension) {
     throw new Error(
@@ -137,7 +183,10 @@ const assertEmbedding = (embedding: readonly number[], dimension: number): void 
   }
 };
 
-export const createSimilarityHnswStore = (): SimilarityHnswStore => {
+export const createSimilarityHnswStore = (
+  options: SimilarityHnswStoreOptions = {},
+): SimilarityHnswStore => {
+  const renameFile = options.renameFile ?? rename;
   let state: LoadedState | null = null;
 
   const requireLoaded = (): LoadedState => {
@@ -157,29 +206,59 @@ export const createSimilarityHnswStore = (): SimilarityHnswStore => {
         return;
       }
 
-      const indexPath = indexPathFor(vaultRoot);
-      const sidecarPath = sidecarPathFor(vaultRoot);
-      await mkdir(dirname(indexPath), { recursive: true });
+      const basePath = basePathFor(vaultRoot);
+      const pointerPath = pointerPathFor(vaultRoot);
+      await mkdir(dirname(basePath), { recursive: true });
       const index = new HnswLib.HierarchicalNSW('cosine', dimension);
-      const hasIndex = await pathExists(indexPath);
-      const hasSidecar = await pathExists(sidecarPath);
-      if (hasIndex && hasSidecar) {
-        const sidecar = parseSidecar(await readFile(sidecarPath, 'utf8'));
+      const hasPointer = await pathExists(pointerPath);
+      if (hasPointer) {
+        const version = parsePointer(await readFile(pointerPath, 'utf8'));
+        const sidecar = parseSidecar(await readFile(versionedSidecarPath(basePath, version), 'utf8'));
         if (sidecar.dimension !== dimension) {
           throw new Error(
             `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
           );
         }
-        await index.readIndex(indexPath);
+        await index.readIndex(versionedIndexPath(basePath, version));
         index.setEf(HNSW_EF_SEARCH);
         state = {
           vaultRoot,
-          indexPath,
-          sidecarPath,
+          basePath,
+          pointerPath,
           index,
           dimension,
           maxElements: index.getMaxElements(),
           elementCount: sidecar.elementCount,
+          version,
+          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+          labelToVisitId: new Map(
+            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
+          ),
+        };
+        return;
+      }
+      const legacyIndexPath = indexPathFor(vaultRoot);
+      const legacySidecarPath = sidecarPathFor(vaultRoot);
+      const hasIndex = await pathExists(legacyIndexPath);
+      const hasSidecar = await pathExists(legacySidecarPath);
+      if (hasIndex && hasSidecar) {
+        const sidecar = parseSidecar(await readFile(legacySidecarPath, 'utf8'));
+        if (sidecar.dimension !== dimension) {
+          throw new Error(
+            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
+          );
+        }
+        await index.readIndex(legacyIndexPath);
+        index.setEf(HNSW_EF_SEARCH);
+        state = {
+          vaultRoot,
+          basePath,
+          pointerPath,
+          index,
+          dimension,
+          maxElements: index.getMaxElements(),
+          elementCount: sidecar.elementCount,
+          version: 0,
           visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
           labelToVisitId: new Map(
             Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
@@ -192,12 +271,13 @@ export const createSimilarityHnswStore = (): SimilarityHnswStore => {
       index.setEf(HNSW_EF_SEARCH);
       state = {
         vaultRoot,
-        indexPath,
-        sidecarPath,
+        basePath,
+        pointerPath,
         index,
         dimension,
         maxElements: INITIAL_MAX_ELEMENTS,
         elementCount: 0,
+        version: 0,
         visitIdToLabel: new Map(),
         labelToVisitId: new Map(),
       };
@@ -263,13 +343,21 @@ export const createSimilarityHnswStore = (): SimilarityHnswStore => {
 
     async persist(): Promise<void> {
       const loaded = requireLoaded();
-      await mkdir(dirname(loaded.indexPath), { recursive: true });
-      const indexTmpPath = `${loaded.indexPath}.tmp`;
-      const sidecarTmpPath = `${loaded.sidecarPath}.tmp`;
+      await mkdir(dirname(loaded.basePath), { recursive: true });
+      const nextVersion = loaded.version + 1;
+      const nextIndexPath = versionedIndexPath(loaded.basePath, nextVersion);
+      const nextSidecarPath = versionedSidecarPath(loaded.basePath, nextVersion);
+      const indexTmpPath = `${nextIndexPath}.tmp`;
+      const sidecarTmpPath = `${nextSidecarPath}.tmp`;
+      const pointerTmpPath = `${loaded.pointerPath}.tmp`;
       await loaded.index.writeIndex(indexTmpPath);
       await writeFile(sidecarTmpPath, `${JSON.stringify(sidecarFor(loaded), null, 2)}\n`, 'utf8');
-      await rename(indexTmpPath, loaded.indexPath);
-      await rename(sidecarTmpPath, loaded.sidecarPath);
+      await renameFile(indexTmpPath, nextIndexPath);
+      await renameFile(sidecarTmpPath, nextSidecarPath);
+      await writeFile(pointerTmpPath, `v${String(nextVersion)}\n`, 'utf8');
+      await renameFile(pointerTmpPath, loaded.pointerPath);
+      loaded.version = nextVersion;
+      await gcOldVersions(loaded.basePath, nextVersion);
     },
 
     async close(): Promise<void> {

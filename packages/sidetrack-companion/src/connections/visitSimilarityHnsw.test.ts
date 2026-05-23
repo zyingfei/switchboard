@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -94,6 +94,34 @@ describe('SimilarityHnswStore', () => {
     const second = createSimilarityHnswStore();
     await second.ensureLoaded(vaultRoot, 16);
     expect(await second.queryTopK('vid-3', 8)).toEqual(before);
+  });
+
+  it('keeps the previous published version loadable when pointer rename fails', async () => {
+    const first = createSimilarityHnswStore();
+    await first.ensureLoaded(vaultRoot, 4);
+    await first.insertOrUpdate('query', [1, 0, 0, 0]);
+    await first.insertOrUpdate('old-neighbor', [0.99, 0.01, 0, 0]);
+    const before = await first.queryTopK('query', 1);
+    await first.persist();
+    await first.close();
+
+    const failing = createSimilarityHnswStore({
+      renameFile: async (oldPath, newPath) => {
+        if (String(newPath).endsWith('visit-similarity-hnsw.current')) {
+          throw new Error('simulated pointer rename crash');
+        }
+        await rename(oldPath, newPath);
+      },
+    });
+    await failing.ensureLoaded(vaultRoot, 4);
+    await failing.insertOrUpdate('new-neighbor', [0.999, 0.001, 0, 0]);
+    await expect(failing.persist()).rejects.toThrow('simulated pointer rename crash');
+    await failing.close();
+
+    const recovered = createSimilarityHnswStore();
+    await recovered.ensureLoaded(vaultRoot, 4);
+
+    expect(await recovered.queryTopK('query', 1)).toEqual(before);
   });
 
   it('insertOrUpdate replaces a visit embedding', async () => {
