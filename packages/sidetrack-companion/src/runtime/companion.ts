@@ -41,7 +41,10 @@ import { createConnectionsMaterializer } from '../sync/contract/connectionsMater
 import { createConnectionsStore } from '../connections/snapshot.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
-import { ensurePageEvidenceForTimelineEntries } from '../page-evidence/store.js';
+import {
+  canonicalizeEvidenceUrl,
+  ensurePageEvidenceForTimelineEntries,
+} from '../page-evidence/store.js';
 import type { TimelineProvider } from '../timeline/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
@@ -63,6 +66,65 @@ import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
+
+type PageEvidenceTimelineEntry = Parameters<typeof ensurePageEvidenceForTimelineEntries>[1][number];
+
+const maxLastSeenAt = (entries: readonly PageEvidenceTimelineEntry[]): string | undefined => {
+  let latest: string | undefined;
+  for (const entry of entries) {
+    if (latest === undefined || entry.lastSeenAt > latest) latest = entry.lastSeenAt;
+  }
+  return latest;
+};
+
+export const createPageEvidenceWriteQueue = (
+  vaultRoot: string,
+): ((entries: readonly PageEvidenceTimelineEntry[]) => Promise<void>) => {
+  const pendingByCanonicalUrl = new Map<string, Promise<void>>();
+  const latestLastSeenAtByCanonicalUrl = new Map<string, string>();
+
+  return async (entries: readonly PageEvidenceTimelineEntry[]): Promise<void> => {
+    const byCanonicalUrl = new Map<string, PageEvidenceTimelineEntry[]>();
+    for (const entry of entries) {
+      const canonicalUrl = canonicalizeEvidenceUrl(entry.canonicalUrl ?? entry.url);
+      const existing = byCanonicalUrl.get(canonicalUrl);
+      if (existing === undefined) byCanonicalUrl.set(canonicalUrl, [entry]);
+      else existing.push(entry);
+    }
+
+    await Promise.all(
+      [...byCanonicalUrl.entries()].map(([canonicalUrl, groupedEntries]) => {
+        const previous = pendingByCanonicalUrl.get(canonicalUrl) ?? Promise.resolve();
+        const write = previous
+          .catch(() => undefined)
+          .then(async () => {
+            const incomingLastSeenAt = maxLastSeenAt(groupedEntries);
+            const latestKnown = latestLastSeenAtByCanonicalUrl.get(canonicalUrl);
+            if (
+              incomingLastSeenAt !== undefined &&
+              latestKnown !== undefined &&
+              incomingLastSeenAt < latestKnown
+            ) {
+              return;
+            }
+            await ensurePageEvidenceForTimelineEntries(vaultRoot, groupedEntries, {
+              rebuildManifestAfterWrite: false,
+            });
+            if (incomingLastSeenAt !== undefined) {
+              latestLastSeenAtByCanonicalUrl.set(canonicalUrl, incomingLastSeenAt);
+            }
+          });
+        pendingByCanonicalUrl.set(canonicalUrl, write);
+        void write.finally(() => {
+          if (pendingByCanonicalUrl.get(canonicalUrl) === write) {
+            pendingByCanonicalUrl.delete(canonicalUrl);
+          }
+        });
+        return write;
+      }),
+    );
+  };
+};
 
 export interface CompanionRuntimeOptions {
   readonly vaultPath: string;
@@ -145,6 +207,7 @@ export const startCompanion = async (
     // Idempotent; runs every startup.
     await cleanupOrphanIndexTmpFiles(options.vaultPath);
     const vaultWriter = createVaultWriter(options.vaultPath);
+    const pageEvidenceWriteQueue = createPageEvidenceWriteQueue(options.vaultPath);
     const idempotencyStore = createIdempotencyStore(options.vaultPath);
     const listeners = new Set<(event: VaultChangeEvent) => void>();
     let watcher: VaultWatcher | undefined;
@@ -819,9 +882,7 @@ export const startCompanion = async (
           ];
         });
         if (observed.length > 0) {
-          void ensurePageEvidenceForTimelineEntries(options.vaultPath, observed, {
-            rebuildManifestAfterWrite: false,
-          }).catch(() => undefined);
+          void pageEvidenceWriteQueue(observed).catch(() => undefined);
         }
         return results;
       },
