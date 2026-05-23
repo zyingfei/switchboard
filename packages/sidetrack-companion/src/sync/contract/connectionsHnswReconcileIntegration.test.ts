@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
+import type { ConnectionsSnapshot } from '../../connections/snapshot.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createEventLog, type EventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
@@ -41,19 +42,24 @@ const appendVisit = async (
     readonly index: number;
     readonly observedAt: string;
     readonly focusedWindowMs?: number;
+    readonly title?: string;
+    readonly variant?: string;
   },
 ): Promise<void> => {
+  const eventId = `hnsw-visit-${String(input.index)}`;
+  const clientEventId =
+    input.variant === undefined ? eventId : `${eventId}-${input.variant}`;
   await eventLog.appendClientObserved({
-    clientEventId: `hnsw-visit-${String(input.index)}`,
-    aggregateId: `hnsw-visit-${String(input.index)}`,
+    clientEventId,
+    aggregateId: clientEventId,
     type: BROWSER_TIMELINE_OBSERVED,
     baseVector: {},
     payload: {
-      eventId: `hnsw-visit-${String(input.index)}`,
+      eventId,
       observedAt: input.observedAt,
       url: `https://hnsw.test/${String(input.index)}`,
       canonicalUrl: `https://hnsw.test/${String(input.index)}`,
-      title: `sidetrack_eval_postgres hnsw visit ${String(input.index)}`,
+      title: input.title ?? `sidetrack_eval_postgres hnsw visit ${String(input.index)}`,
       provider: 'generic',
       transition: 'activated',
       payloadVersion: 1,
@@ -61,6 +67,33 @@ const appendVisit = async (
     },
   });
 };
+
+const hnswBasePath = (root: string): string =>
+  join(root, '_BAC', 'connections', 'visit-similarity-hnsw');
+
+const currentHnswVersion = async (root: string): Promise<string> =>
+  (await readFile(`${hnswBasePath(root)}.current`, 'utf8')).trim();
+
+const expectCurrentHnswFiles = async (root: string): Promise<void> => {
+  const version = await currentHnswVersion(root);
+  await expectFile(`${hnswBasePath(root)}.${version}.bin`);
+  await expectFile(`${hnswBasePath(root)}.${version}.json`);
+};
+
+const similarityRows = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyArray<{ readonly pair: string; readonly cosine: number }> =>
+  snapshot.edges
+    .filter((edge) => edge.kind === 'visit_resembles_visit')
+    .map((edge) => {
+      const cosine = edge.metadata?.['cosine'];
+      if (typeof cosine !== 'number') throw new Error('missing similarity cosine metadata');
+      return {
+        pair: `${edge.fromNodeId}\u0000${edge.toNodeId}`,
+        cosine,
+      };
+    })
+    .sort((left, right) => left.pair.localeCompare(right.pair));
 
 const expectFile = async (path: string): Promise<void> => {
   const info = await stat(path);
@@ -128,8 +161,7 @@ describe('HNSW reconcile child integration', () => {
     const result = await runReconcileInChild({ vaultRoot, seq: 2 });
     expect(result).toMatchObject({ seq: 2, ok: true });
 
-    await expectFile(join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.bin'));
-    await expectFile(join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.json'));
+    await expectCurrentHnswFiles(vaultRoot);
 
     const snapshot = await createConnectionsStore(vaultRoot).readCurrent();
     expect(snapshot).not.toBeNull();
@@ -146,5 +178,95 @@ describe('HNSW reconcile child integration', () => {
     // eligible visit to embed, so the materializer itself must load the persisted store.
     const noEligibleEmbeddingResult = await runReconcileInChild({ vaultRoot, seq: 3 });
     expect(noEligibleEmbeddingResult).toMatchObject({ seq: 3, ok: true });
+  });
+
+  it('recovers from a partial published pair on restart', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    await appendVisit(eventLog, {
+      index: 0,
+      observedAt: '2026-05-22T10:00:00.000Z',
+    });
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+    await expectCurrentHnswFiles(vaultRoot);
+
+    await writeFile(`${hnswBasePath(vaultRoot)}.current`, 'v999\n', 'utf8');
+    await writeFile(`${hnswBasePath(vaultRoot)}.v999.json`, '{}\n', 'utf8');
+    await appendVisit(eventLog, {
+      index: 1,
+      observedAt: '2026-05-22T10:01:00.000Z',
+    });
+
+    expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    await expectCurrentHnswFiles(vaultRoot);
+  });
+
+  it('reconciles deleted and changed visit embeddings in the child HNSW path', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let index = 0; index < 8; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:${String(index).padStart(2, '0')}:00.000Z`,
+      });
+    }
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+    const before = await createConnectionsStore(vaultRoot).readCurrent();
+    if (before === null) throw new Error('expected initial HNSW snapshot');
+    const beforeRows = similarityRows(before);
+
+    await appendVisit(eventLog, {
+      index: 1,
+      variant: 'inactive',
+      observedAt: '2026-05-22T11:01:00.000Z',
+      focusedWindowMs: 1,
+    });
+    await appendVisit(eventLog, {
+      index: 2,
+      variant: 'changed',
+      observedAt: '2026-05-22T11:02:00.000Z',
+      title: 'completely different changed embedding text',
+    });
+
+    expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    const after = await createConnectionsStore(vaultRoot).readCurrent();
+    if (after === null) throw new Error('expected reconciled HNSW snapshot');
+    const afterRows = similarityRows(after);
+
+    expect(afterRows).not.toEqual(beforeRows);
+    expect(afterRows.length).toBeLessThan(beforeRows.length);
+  });
+
+  it('matches pairwise similarity rows through the actual reconcile child', async () => {
+    const pairwiseRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hnsw-child-pairwise-'));
+    try {
+      for (const [root, incremental] of [
+        [vaultRoot, '1'],
+        [pairwiseRoot, '0'],
+      ] as const) {
+        process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'] = incremental;
+        const replica = await loadOrCreateReplica(root);
+        const eventLog = createEventLog(root, replica);
+        for (let index = 0; index < 16; index += 1) {
+          await appendVisit(eventLog, {
+            index,
+            observedAt: `2026-05-22T10:${String(index).padStart(2, '0')}:00.000Z`,
+          });
+        }
+        expect(await runReconcileInChild({ vaultRoot: root, seq: incremental === '1' ? 1 : 2 }))
+          .toMatchObject({ ok: true });
+      }
+
+      const hnswSnapshot = await createConnectionsStore(vaultRoot).readCurrent();
+      const pairwiseSnapshot = await createConnectionsStore(pairwiseRoot).readCurrent();
+      if (hnswSnapshot === null || pairwiseSnapshot === null) {
+        throw new Error('expected child snapshots for HNSW and pairwise runs');
+      }
+
+      expect(similarityRows(hnswSnapshot)).toEqual(similarityRows(pairwiseSnapshot));
+    } finally {
+      await rm(pairwiseRoot, { recursive: true, force: true });
+    }
   });
 });

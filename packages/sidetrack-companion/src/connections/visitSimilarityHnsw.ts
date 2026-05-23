@@ -301,30 +301,41 @@ export const createSimilarityHnswStore = (
       const index = new HnswLib.HierarchicalNSW('cosine', dimension);
       const hasPointer = await pathExists(pointerPath);
       if (hasPointer) {
-        const version = parsePointer(await readFile(pointerPath, 'utf8'));
-        const sidecar = parseSidecar(await readFile(versionedSidecarPath(basePath, version), 'utf8'));
-        if (sidecar.dimension !== dimension) {
-          throw new Error(
-            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
+        try {
+          const version = parsePointer(await readFile(pointerPath, 'utf8'));
+          const sidecar = parseSidecar(
+            await readFile(versionedSidecarPath(basePath, version), 'utf8'),
           );
+          if (sidecar.dimension !== dimension) {
+            throw new Error(
+              `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
+            );
+          }
+          await index.readIndex(versionedIndexPath(basePath, version));
+          index.setEf(HNSW_EF_SEARCH);
+          state = {
+            vaultRoot,
+            basePath,
+            pointerPath,
+            index,
+            dimension,
+            maxElements: index.getMaxElements(),
+            elementCount: sidecar.elementCount,
+            version,
+            visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+            labelToVisitId: new Map(
+              Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [
+                Number(label),
+                visitId,
+              ]),
+            ),
+          };
+          return loadedStore;
+        } catch {
+          // A crash can leave the pointer or one half of a versioned pair
+          // missing. Treat that as an empty store; the reconcile pass
+          // rebuilds from the event log and publishes a fresh pair.
         }
-        await index.readIndex(versionedIndexPath(basePath, version));
-        index.setEf(HNSW_EF_SEARCH);
-        state = {
-          vaultRoot,
-          basePath,
-          pointerPath,
-          index,
-          dimension,
-          maxElements: index.getMaxElements(),
-          elementCount: sidecar.elementCount,
-          version,
-          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
-          labelToVisitId: new Map(
-            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
-          ),
-        };
-        return loadedStore;
       }
       const legacyIndexPath = indexPathFor(vaultRoot);
       const legacySidecarPath = sidecarPathFor(vaultRoot);
