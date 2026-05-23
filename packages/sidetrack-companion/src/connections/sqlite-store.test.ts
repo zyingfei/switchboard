@@ -1,3 +1,5 @@
+// These tests require Bun: the SQLite store loads `bun:sqlite`, which
+// is unavailable in Node-only test jobs. Keep a Bun package job in CI.
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
