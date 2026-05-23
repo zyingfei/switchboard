@@ -13,6 +13,7 @@ import {
   SEMANTIC_RECALL_POOL_ENV,
   semanticRecallPoolEnabled,
   semanticRecallPoolSignature,
+  writeSemanticRecallPool,
   type SemanticRecallPool,
 } from './semanticRecallPool.js';
 
@@ -407,5 +408,56 @@ describe('getOrBuildSemanticRecallPool (lazy + cached, offline-safe)', () => {
       incr!.byUrl['https://x/a1']!.clusterId,
     );
     expect(incr!.byUrl['https://x/a1']!.clusterId.startsWith('e:singleton:')).toBe(false);
+  });
+
+  it('v2→v3 full migration lets the event loop tick while clustering runs off-thread', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'srp-'));
+    const many = Array.from({ length: 160 }, (_, index) => ({
+      canonicalUrl: `https://bulk.test/${String(index)}`,
+      text: `bulk semantic item ${String(index)}`,
+    }));
+    await writeSemanticRecallPool(dir, {
+      signature: 'v2-stale',
+      modelId: 'e5-test',
+      featureVersion: 2,
+      producedAtMs: 0,
+      entryCount: many.length,
+      clusterCount: 0,
+      byUrl: Object.fromEntries(
+        many.map((item) => [
+          item.canonicalUrl,
+          {
+            canonicalUrl: item.canonicalUrl,
+            clusterId: `e:singleton:${item.canonicalUrl}`,
+            neighbors: [],
+            textHash: 'stale',
+          },
+        ]),
+      ),
+    });
+    const bulkEmbed = (texts: readonly string[]): Promise<readonly Float32Array[]> =>
+      Promise.resolve(
+        texts.map((_, index) => {
+          const v = new Float32Array(8);
+          v[0] = 1;
+          v[1] = index / texts.length / 100;
+          return v;
+        }),
+      );
+    let ticks = 0;
+    const timer = setInterval(() => {
+      ticks += 1;
+    }, 1);
+    try {
+      const migrated = await getOrBuildSemanticRecallPool(dir, {
+        items: many,
+        embed: bulkEmbed,
+        modelId: 'e5-test',
+      });
+      expect(migrated?.featureVersion).toBe(3);
+      expect(ticks).toBeGreaterThan(0);
+    } finally {
+      clearInterval(timer);
+    }
   });
 });
