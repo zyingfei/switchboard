@@ -146,8 +146,9 @@ export const invalidationKeysToScopes = (keys: readonly InvalidationKey[]): Scop
     else if (key.kind === 'workstreamPathMemo') scopes.push({ kind: 'workstream', id: key.bacId });
     else if (key.kind === 'engagementVisit') scopes.push({ kind: 'visit', id: key.visitId });
     else if (key.kind === 'topicMember') {
-      // Topic membership can be emitted by visit-scoped engagement changes
-      // and URL-scoped topic projection changes; invalidate both local owners.
+      // Topic membership is keyed by canonical visit URL: engagement changes
+      // touch the visit owner, while topic projection rows hang off the URL
+      // owner, so both local scopes must be invalidated together.
       scopes.push({ kind: 'visit', id: key.visitId });
       scopes.push({ kind: 'url', id: key.visitId });
     } else if (key.kind === 'pageEvidence') scopes.push({ kind: 'url', id: key.canonicalUrl });
