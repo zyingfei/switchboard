@@ -3361,8 +3361,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       ) as ConnectionsSnapshot;
       this.#writeCurrentRows(db, snapshot);
       return metadataForSnapshot(snapshot);
-    } catch {
-      return null;
+    } catch (error) {
+      if (
+        (isRecord(error) && error['code'] === 'ENOENT') ||
+        error instanceof SyntaxError
+      ) {
+        return null;
+      }
+      throw error;
     }
   }
 
