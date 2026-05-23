@@ -850,6 +850,7 @@ export const createConnectionsMaterializer = (
     readonly revisionId: string;
     readonly config: EffectiveVisitSimilarityConfig;
     readonly touchedVisitIds: ReadonlySet<string>;
+    readonly reconcileVisitIds: ReadonlySet<string>;
     readonly fullRebuild: boolean;
     readonly previousSnapshot: ConnectionsSnapshot | null;
     readonly embed: VisitSimilarityEmbedder;
@@ -873,15 +874,24 @@ export const createConnectionsMaterializer = (
       };
     }
     const touchedVisitIds = input.fullRebuild ? activeVisitIds : input.touchedVisitIds;
+    const reconcileVisitIds = input.fullRebuild
+      ? activeVisitIds
+      : new Set([...touchedVisitIds, ...input.reconcileVisitIds]);
     const entriesToEmbed = input.fullRebuild
       ? activeEntries
-      : activeEntries.filter((entry) => touchedVisitIds.has(visitKeyForVisitEntry(entry)));
+      : activeEntries.filter((entry) => reconcileVisitIds.has(visitKeyForVisitEntry(entry)));
     if (input.fullRebuild) await resetHnswSimilarityFiles();
     const loadedHnswStore = await hnswSimilarityStore.ensureLoaded(
       deps.vaultRoot,
       RECALL_MODEL.embeddingDim,
     );
     loadedHnswSimilarityStore = loadedHnswStore;
+    const staleKnownVisitIds = input.fullRebuild
+      ? new Set<string>()
+      : new Set(
+          [...(await loadedHnswStore.knownLabels())].filter((visitId) => !activeVisitIds.has(visitId)),
+        );
+    const edgeInvalidationVisitIds = new Set([...reconcileVisitIds, ...staleKnownVisitIds]);
 
     const embeddingsByVisitKey = new Map<string, Float32Array>();
     if (entriesToEmbed.length > 0) {
@@ -903,11 +913,10 @@ export const createConnectionsMaterializer = (
       }
     }
 
+    for (const visitId of staleKnownVisitIds) await loadedHnswStore.delete(visitId);
+
     const firstEmbedding = embeddingsByVisitKey.values().next().value;
     if (firstEmbedding !== undefined) {
-      for (const visitId of input.fullRebuild ? [] : input.touchedVisitIds) {
-        if (!activeVisitIds.has(visitId)) await loadedHnswStore.delete(visitId);
-      }
       for (const [visitId, embedding] of embeddingsByVisitKey) {
         await loadedHnswStore.insertOrUpdate(visitId, Array.from(embedding));
       }
@@ -927,13 +936,13 @@ export const createConnectionsMaterializer = (
     const edgeByPair = new Map<string, VisitSimilarityEdge>();
     for (const edge of retainedSimilarityEdgesFromSnapshot(
       input.previousSnapshot,
-      touchedVisitIds,
+      edgeInvalidationVisitIds,
       activeVisitIds,
     )) {
       edgeByPair.set(similarityPairKey(edge.fromVisitKey, edge.toVisitKey), edge);
     }
 
-    const queryVisitIds = input.fullRebuild ? activeVisitIds : touchedVisitIds;
+    const queryVisitIds = input.fullRebuild ? activeVisitIds : reconcileVisitIds;
     for (const visitId of [...queryVisitIds].sort()) {
       if (!activeVisitIds.has(visitId)) continue;
       for (const neighbor of await loadedHnswStore.queryTopK(visitId, 50)) {
@@ -1422,11 +1431,28 @@ export const createConnectionsMaterializer = (
     let hotSimNewEmbedded: number | null = null;
     let visitSimilarity: VisitSimilarityRevision;
     if (persistentHnswSimilarityMode) {
-      const similarityVisitIds = new Set(similarityEntries.map(visitKeyForVisitEntry));
+      const eligibleVisitIds = new Set(similarityEntries.map(visitKeyForVisitEntry));
+      const knownLabels = await loadedHnswStoreForGate?.knownLabels() ?? new Set<string>();
       const touchedVisitIds = new Set(
-        [...collectTouchedVisits(dirtyScopes, pendingEventsForDrain)].filter((visitId) =>
-          similarityVisitIds.has(visitId),
-        ),
+        [...eligibleVisitIds].filter((visitId) => !knownLabels.has(visitId)),
+      );
+      const pendingTimelineVisitIds = new Set(
+        pendingEventsForDrain
+          .filter(
+            (event) =>
+              event.type === BROWSER_TIMELINE_OBSERVED &&
+              isBrowserTimelineObservedPayload(event.payload),
+          )
+          .map((event) =>
+            normalizeVisitUrl(
+              (event.payload as BrowserTimelineObservedPayload).canonicalUrl ??
+                (event.payload as BrowserTimelineObservedPayload).url,
+            ),
+          )
+          .filter((visitId) => visitId.length > 0),
+      );
+      const reconcileVisitIds = new Set(
+        [...pendingTimelineVisitIds].filter((visitId) => eligibleVisitIds.has(visitId)),
       );
       usedHotSimilarityPath = true;
       hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
@@ -1437,6 +1463,7 @@ export const createConnectionsMaterializer = (
           revisionId: expectedSimilarityRevisionId,
           config: similarityConfig,
           touchedVisitIds,
+          reconcileVisitIds,
           fullRebuild: hnswFullRebuild,
           previousSnapshot: previousSnapshotForRanker,
           embed: deps.embed ?? defaultEmbed,
