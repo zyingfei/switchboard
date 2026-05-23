@@ -42,6 +42,7 @@ import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
+import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScopes.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   serializeTabSessionProjection,
@@ -3189,6 +3190,18 @@ export interface ConnectionsStore {
     progress: MaterializerProgress,
   ) => Promise<void>;
   readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
+  readonly readScopesForNode?: (nodeId: string) => Promise<Scope[]>;
+  readonly readScopesForEdge?: (src: string, dst: string) => Promise<Scope[]>;
+  readonly readNodesForScope?: (scope: Scope) => Promise<string[]>;
+  readonly readEdgesForScope?: (
+    scope: Scope,
+  ) => Promise<Array<{ readonly src: string; readonly dst: string }>>;
+  readonly replaceScopeRows?: (input: {
+    readonly scopes: readonly Scope[];
+    readonly nodes: readonly ConnectionNode[];
+    readonly edges: readonly ConnectionEdge[];
+    readonly progress: MaterializerProgress;
+  }) => Promise<void>;
   readonly readCurrent: () => Promise<ConnectionsSnapshot | null>;
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
   readonly readDay: (date: string) => Promise<ConnectionsSnapshot | null>;
@@ -3327,6 +3340,23 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+        CREATE TABLE IF NOT EXISTS connections_scope_nodes (
+          scope_kind TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          PRIMARY KEY (scope_kind, scope_id, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_nodes_node
+          ON connections_scope_nodes (node_id);
+        CREATE TABLE IF NOT EXISTS connections_scope_edges (
+          scope_kind TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          edge_src TEXT NOT NULL,
+          edge_dst TEXT NOT NULL,
+          PRIMARY KEY (scope_kind, scope_id, edge_src, edge_dst)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_edges_edge
+          ON connections_scope_edges (edge_src, edge_dst);
         -- Expression indexes for the json_extract WHERE clauses used by
         -- the resolver seed-finding helpers (#addUrlSeeds /
         -- readResolverSubgraphForThread). SQLite materializes
@@ -3475,6 +3505,215 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     this.#writeCurrentRows(db, snapshot, progress);
   };
 
+  readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT scope_kind, scope_id
+         FROM connections_scope_nodes
+         WHERE node_id = ?
+         ORDER BY scope_kind, scope_id`,
+      )
+      .all(nodeId)
+      .map((row) => ({
+        kind: textField(row, 'scope_kind') as Scope['kind'],
+        id: textField(row, 'scope_id'),
+      }));
+  };
+
+  readonly readScopesForEdge = async (src: string, dst: string): Promise<Scope[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT scope_kind, scope_id
+         FROM connections_scope_edges
+         WHERE edge_src = ? AND edge_dst = ?
+         ORDER BY scope_kind, scope_id`,
+      )
+      .all(src, dst)
+      .map((row) => ({
+        kind: textField(row, 'scope_kind') as Scope['kind'],
+        id: textField(row, 'scope_id'),
+      }));
+  };
+
+  readonly readNodesForScope = async (scope: Scope): Promise<string[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT node_id
+         FROM connections_scope_nodes
+         WHERE scope_kind = ? AND scope_id = ?
+         ORDER BY node_id`,
+      )
+      .all(scope.kind, scope.id)
+      .map((row) => textField(row, 'node_id'));
+  };
+
+  readonly readEdgesForScope = async (
+    scope: Scope,
+  ): Promise<Array<{ readonly src: string; readonly dst: string }>> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT edge_src, edge_dst
+         FROM connections_scope_edges
+         WHERE scope_kind = ? AND scope_id = ?
+         ORDER BY edge_src, edge_dst`,
+      )
+      .all(scope.kind, scope.id)
+      .map((row) => ({ src: textField(row, 'edge_src'), dst: textField(row, 'edge_dst') }));
+  };
+
+  readonly replaceScopeRows = async (input: {
+    readonly scopes: readonly Scope[];
+    readonly nodes: readonly ConnectionNode[];
+    readonly edges: readonly ConnectionEdge[];
+    readonly progress: MaterializerProgress;
+  }): Promise<void> => {
+    const db = await this.#database();
+    const edgeBuckets = new Map<string, ConnectionEdge[]>();
+    for (const edge of input.edges) {
+      const key = edgeBucketKey(edge);
+      const bucket = edgeBuckets.get(key) ?? [];
+      bucket.push(edge);
+      edgeBuckets.set(key, bucket);
+    }
+    const memberships = scopesForGraphRows({ nodes: input.nodes, edges: input.edges });
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const oldNodeIds = new Set<string>();
+      const oldEdgeKeys = new Set<string>();
+      const selectScopeNodes = db.query(
+        `SELECT node_id FROM connections_scope_nodes
+         WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const selectScopeEdges = db.query(
+        `SELECT edge_src, edge_dst FROM connections_scope_edges
+         WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const deleteScopeNodes = db.query(
+        `DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const deleteScopeEdges = db.query(
+        `DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const countNodeScopes = db.query(
+        'SELECT COUNT(*) AS count FROM connections_scope_nodes WHERE node_id = ?',
+      );
+      const countEdgeScopes = db.query(
+        `SELECT COUNT(*) AS count FROM connections_scope_edges
+         WHERE edge_src = ? AND edge_dst = ?`,
+      );
+      const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
+      const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
+      const upsertNode = db.query(
+        'INSERT INTO nodes (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+      );
+      const upsertEdge = db.query(
+        'INSERT INTO edges (src, dst, data) VALUES (?, ?, ?) ON CONFLICT(src, dst) DO UPDATE SET data = excluded.data',
+      );
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
+      const upsertMetadata = db.query(
+        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+      );
+
+      for (const scope of input.scopes) {
+        for (const row of selectScopeNodes.all(scope.kind, scope.id)) {
+          oldNodeIds.add(textField(row, 'node_id'));
+        }
+        for (const row of selectScopeEdges.all(scope.kind, scope.id)) {
+          oldEdgeKeys.add(`${textField(row, 'edge_src')}\u0000${textField(row, 'edge_dst')}`);
+        }
+        deleteScopeNodes.run(scope.kind, scope.id);
+        deleteScopeEdges.run(scope.kind, scope.id);
+      }
+      for (const nodeId of oldNodeIds) {
+        const row = countNodeScopes.get(nodeId);
+        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
+        if (count === 0) deleteNode.run(nodeId);
+      }
+      for (const key of oldEdgeKeys) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) continue;
+        const row = countEdgeScopes.get(src, dst);
+        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
+        if (count === 0) deleteEdge.run(src, dst);
+      }
+
+      for (const node of input.nodes) {
+        upsertNode.run(node.id, JSON.stringify(node));
+        for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
+          insertScopeNode.run(scope.kind, scope.id, node.id);
+        }
+      }
+      for (const [key, bucket] of edgeBuckets.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
+        upsertEdge.run(src, dst, JSON.stringify(sortAlphaById(bucket)));
+        for (const scope of memberships.edgeScopes.get(key) ?? []) {
+          insertScopeEdge.run(scope.kind, scope.id, src, dst);
+        }
+      }
+
+      const allNodes = db
+        .query('SELECT data FROM nodes ORDER BY id')
+        .all()
+        .map((row) => JSON.parse(textField(row, 'data')) as ConnectionNode);
+      const allEdges = db
+        .query('SELECT data FROM edges ORDER BY src, dst')
+        .all()
+        .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[]);
+      const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+      const previousMetadata =
+        metadataRow === null || metadataRow === undefined
+          ? {
+              scope: {},
+              updatedAt: '1970-01-01T00:00:00.000Z',
+              nodeCount: 0,
+              edgeCount: 0,
+            }
+          : (JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata);
+      const updatedAt = allEdges.reduce(
+        (max, edge) => (edge.observedAt > max ? edge.observedAt : max),
+        previousMetadata.updatedAt,
+      );
+      const metadata: StoredConnectionsMetadata = {
+        ...previousMetadata,
+        updatedAt,
+        nodeCount: allNodes.length,
+        edgeCount: allEdges.length,
+        ...(input.progress.snapshotRevisionId === null
+          ? {}
+          : { snapshotRevision: input.progress.snapshotRevisionId }),
+      };
+      upsertMetadata.run('current', JSON.stringify(metadata));
+      upsertMetadata.run(
+        'node_order',
+        JSON.stringify(sortAlphaById(allNodes).map((node) => node.id)),
+      );
+      upsertMetadata.run(
+        'edge_order',
+        JSON.stringify(sortAlphaById(allEdges).map((edge) => edge.id)),
+      );
+      this.#writeProgressRows(db, input.progress);
+      db.exec('COMMIT');
+      this.#cachedSnapshot = null;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
   #writeCurrentRows(
     db: SqliteDatabase,
     snapshot: ConnectionsSnapshot,
@@ -3508,6 +3747,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
+      const deleteAllScopeNodes = db.query('DELETE FROM connections_scope_nodes');
+      const deleteAllScopeEdges = db.query('DELETE FROM connections_scope_edges');
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
 
       const currentNodeData = new Map(
         db
@@ -3550,6 +3801,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       for (const staleKey of currentEdgeData.keys()) {
         const [src, dst] = staleKey.split('\u0000');
         if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
+      }
+
+      const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+      deleteAllScopeNodes.run();
+      deleteAllScopeEdges.run();
+      for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
+        for (const scope of scopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
+      }
+      for (const [key, scopes] of memberships.edgeScopes.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
+        for (const scope of scopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
       }
 
       upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
