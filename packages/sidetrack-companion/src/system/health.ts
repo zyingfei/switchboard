@@ -137,10 +137,25 @@ export interface HealthReport {
     readonly materializers?: Record<
       string,
       {
-        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
         readonly lastSuccessAt: string | null;
         readonly lastError: string | null;
         readonly pending: boolean;
+        readonly frontier?: Record<string, number>;
+        readonly lastDriftCheck?: {
+          readonly at: string;
+          readonly conclusion: 'clean' | 'drift';
+          readonly nodeDiffSummary: {
+            readonly added: number;
+            readonly removed: number;
+            readonly changed: number;
+          };
+          readonly edgeDiffSummary: {
+            readonly added: number;
+            readonly removed: number;
+            readonly changed: number;
+          };
+        };
       }
     >;
   };

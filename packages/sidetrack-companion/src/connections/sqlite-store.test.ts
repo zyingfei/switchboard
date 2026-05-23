@@ -1,9 +1,7 @@
-// These tests require Bun: the SQLite store loads `bun:sqlite`, which
-// is unavailable in Node-only test jobs. Keep a Bun package job in CI.
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createConnectionsStore, SqliteConnectionsStore } from './snapshot.js';
 import {
@@ -12,6 +10,7 @@ import {
   type ConnectionNode,
   type ConnectionsSnapshot,
 } from './types.js';
+import { EMPTY_PROGRESS } from '../sync/contract/materializerProgress.js';
 
 const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
 
@@ -95,11 +94,20 @@ const buildTraversalSnapshot = (): ConnectionsSnapshot => {
   };
 };
 
+const progressFor = (snapshot: ConnectionsSnapshot) => ({
+  ...EMPTY_PROGRESS('connections', 'connections@test'),
+  appliedDotIntervals: { replica: [[1, 1] as const] },
+  appliedFrontier: { replica: 1 },
+  snapshotRevisionId: snapshot.snapshotRevision ?? null,
+});
+
 describe('SqliteConnectionsStore', () => {
   let vaultRoot: string | null = null;
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     delete process.env['SIDETRACK_CONNECTIONS_STORE'];
+    delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
     if (vaultRoot !== null) {
       await rm(vaultRoot, { recursive: true, force: true });
       vaultRoot = null;
@@ -149,61 +157,55 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
-  sqliteIt(
-    'resolver subgraph reads route through bulk readCurrent (perf parity)',
-    async () => {
-      // The seed-expansion BFS-based partial read walked the connected
-      // component one node at a time and was measurably slower than the
-      // bulk readCurrent on a dense graph (live cold-path resolves were
-      // ~1–3s before the change). The resolver subgraph methods now
-      // forward to readCurrent; this test pins the new contract
-      // (full-snapshot parity) so the BFS path is not silently
-      // reintroduced. See the TODO comment in snapshot.ts for the
-      // future bounded-hops + bulk-expansion partial-read design.
-      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
-      await store.putCurrent(buildTraversalSnapshot());
+  sqliteIt('resolver subgraph reads route through bulk readCurrent (perf parity)', async () => {
+    // The seed-expansion BFS-based partial read walked the connected
+    // component one node at a time and was measurably slower than the
+    // bulk readCurrent on a dense graph (live cold-path resolves were
+    // ~1–3s before the change). The resolver subgraph methods now
+    // forward to readCurrent; this test pins the new contract
+    // (full-snapshot parity) so the BFS path is not silently
+    // reintroduced. See the TODO comment in snapshot.ts for the
+    // future bounded-hops + bulk-expansion partial-read design.
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.putCurrent(buildTraversalSnapshot());
 
-      const fromUrl = await store.readResolverSubgraphForUrl('https://example.test/page');
-      const fromTabSession = await store.readResolverSubgraphForTabSession('ts-1');
-      const fromThread = await store.readResolverSubgraphForThread({ threadId: 'alpha' });
-      const current = await store.readCurrent();
+    const fromUrl = await store.readResolverSubgraphForUrl('https://example.test/page');
+    const fromTabSession = await store.readResolverSubgraphForTabSession('ts-1');
+    const fromThread = await store.readResolverSubgraphForThread({ threadId: 'alpha' });
+    const current = await store.readCurrent();
 
-      expect(fromUrl).toEqual(current);
-      expect(fromTabSession).toEqual(current);
-      expect(fromThread).toEqual(current);
-      // Full-snapshot counts and edge cardinality preserved.
-      expect(fromUrl?.nodeCount).toBe(5);
-      expect(fromUrl?.edgeCount).toBe(3);
-      expect(fromUrl?.edges).toHaveLength(3);
-      store.close();
-    },
-  );
+    expect(fromUrl).toEqual(current);
+    expect(fromTabSession).toEqual(current);
+    expect(fromThread).toEqual(current);
+    // Full-snapshot counts and edge cardinality preserved.
+    expect(fromUrl?.nodeCount).toBe(5);
+    expect(fromUrl?.edgeCount).toBe(3);
+    expect(fromUrl?.edges).toHaveLength(3);
+    store.close();
+  });
 
-  sqliteIt(
-    'memoizes readCurrent across calls and invalidates on putCurrent',
-    async () => {
-      // Without the memo, every cold resolve repeats ~17K JSON.parses
-      // to materialize the whole snapshot. Sibling resolves within the
-      // same revision must share a single bulk read.
-      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
-      await store.putCurrent(buildTraversalSnapshot());
+  sqliteIt('memoizes readCurrent across calls and invalidates on putCurrent', async () => {
+    // Without the memo, every cold resolve repeats ~17K JSON.parses
+    // to materialize the whole snapshot. Sibling resolves within the
+    // same revision must share a single bulk read.
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.putCurrent(buildTraversalSnapshot());
 
-      const a = await store.readCurrent();
-      const b = await store.readCurrent();
-      expect(b).toBe(a); // same object identity proves the memo
+    const a = await store.readCurrent();
+    const b = await store.readCurrent();
+    expect(b).toBe(a); // same object identity proves the memo
 
-      // putCurrent invalidates; next read re-materializes against the
-      // new snapshotRevision.
-      await store.putCurrent({
-        ...buildTraversalSnapshot(),
-        snapshotRevision: 'rev-changed',
-      });
-      const c = await store.readCurrent();
-      expect(c).not.toBe(a);
-      expect(c?.snapshotRevision).toBe('rev-changed');
-      store.close();
-    },
-  );
+    // putCurrent invalidates; next read re-materializes against the
+    // new snapshotRevision.
+    await store.putCurrent({
+      ...buildTraversalSnapshot(),
+      snapshotRevision: 'rev-changed',
+    });
+    const c = await store.readCurrent();
+    expect(c).not.toBe(a);
+    expect(c?.snapshotRevision).toBe('rev-changed');
+    store.close();
+  });
 
   sqliteIt('reads snapshot metadata and individual edges without full snapshot reads', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
@@ -217,6 +219,200 @@ describe('SqliteConnectionsStore', () => {
     expect(metadata?.urlProjection).toEqual(snapshot.urlProjection);
     expect(metadata?.tabSessionProjection).toEqual(snapshot.tabSessionProjection);
     expect(foundEdge).toEqual(snapshot.edges[0]);
+    store.close();
+  });
+
+  sqliteIt('skips scope membership writes when incremental scopes flag is off', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+
+    await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([]);
+    store.close();
+  });
+
+  sqliteIt('writes scope membership rows when incremental scopes flag is on', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+
+    await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'dispatch:one',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+    ]);
+    store.close();
+  });
+
+  sqliteIt('selectively replaces only dirty scope membership rows', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const first = buildSnapshot();
+    const second: ConnectionsSnapshot = {
+      ...first,
+      nodes: [first.nodes[0]!, first.nodes[1]!],
+      edges: [first.edges[0]!],
+      nodeCount: 2,
+      edgeCount: 1,
+      snapshotRevision: 'rev-sqlite-test-2',
+    };
+
+    await store.writeSnapshotAndProgress(first, progressFor(first));
+    await new Promise((resolve) => setImmediate(resolve));
+    await store.writeSnapshotAndProgress(
+      second,
+      progressFor(second),
+      new Set([{ kind: 'thread', id: 'alpha' }]),
+    );
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'dispatch:one',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+    ]);
+    store.close();
+  });
+
+  sqliteIt('rolls back selective scope replacement with graph and progress writes', async () => {
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const first = buildSnapshot();
+    const firstProgress = progressFor(first);
+    const second: ConnectionsSnapshot = {
+      ...first,
+      nodes: [{ ...first.nodes[0]!, label: 'Changed Alpha' }, first.nodes[1]!],
+      edges: [first.edges[0]!],
+      nodeCount: 2,
+      edgeCount: 1,
+      snapshotRevision: 'rev-sqlite-test-2',
+    };
+
+    await store.writeSnapshotAndProgress(first, firstProgress);
+    await new Promise((resolve) => setImmediate(resolve));
+    vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithProgressCrash(
+      this: InstanceType<typeof Database>,
+      sql: string,
+    ) {
+      const statement = originalQuery.call(this, sql);
+      if (!sql.includes('INSERT INTO connections_materializer_meta')) return statement;
+      return {
+        ...statement,
+        run: () => {
+          throw new Error('simulated progress write crash');
+        },
+      };
+    });
+
+    await expect(
+      store.writeSnapshotAndProgress(
+        second,
+        progressFor(second),
+        new Set([{ kind: 'thread', id: 'alpha' }]),
+      ),
+    ).rejects.toThrow('simulated progress write crash');
+
+    expect(await store.readCurrent()).toEqual(first);
+    expect(await store.readMaterializerProgress('connections')).toEqual(firstProgress);
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    store.close();
+  });
+
+  sqliteIt('round-trips scope membership rows through replaceScopeRows', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const thread = node('thread:alpha', 'thread', 'Alpha');
+    const workstream = node('workstream:main', 'workstream', 'Main');
+    const membership = edge(
+      'thread_in_workstream',
+      thread.id,
+      workstream.id,
+      '2026-05-01T00:00:00.000Z',
+    );
+
+    await store.replaceScopeRows({
+      scopes: [
+        { kind: 'thread', id: 'alpha' },
+        { kind: 'workstream', id: 'main' },
+      ],
+      nodes: [thread, workstream],
+      edges: [membership],
+      progress: {
+        ...EMPTY_PROGRESS('connections', 'connections@test'),
+        snapshotRevisionId: 'rev-scopes',
+      },
+    });
+
+    await expect(store.readScopesForNode('thread:alpha')).resolves.toEqual([
+      { kind: 'thread', id: 'alpha' },
+    ]);
+    await expect(store.readScopesForEdge(thread.id, workstream.id)).resolves.toEqual([
+      { kind: 'thread', id: 'alpha' },
+    ]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: thread.id, dst: workstream.id },
+    ]);
+    expect((await store.readCurrent())?.snapshotRevision).toBe('rev-scopes');
+    store.close();
+  });
+
+  sqliteIt('rolls back scope replacement when progress write fails', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+    const progress = {
+      ...EMPTY_PROGRESS('connections', 'connections@test'),
+      appliedDotIntervals: { replica: [[1, 1] as const] },
+      appliedFrontier: { replica: 1 },
+      snapshotRevisionId: snapshot.snapshotRevision ?? null,
+    };
+    await store.writeSnapshotAndProgress(snapshot, progress);
+
+    const changedThread = { ...snapshot.nodes[0]!, label: 'Changed' };
+    await expect(
+      store.replaceScopeRows({
+        scopes: [{ kind: 'thread', id: 'alpha' }],
+        nodes: [changedThread],
+        edges: [],
+        progress: {
+          ...progress,
+          appliedDotIntervals: { replica: [[1, 1] as const, [1, 2] as const] },
+          appliedFrontier: { replica: 2 },
+          snapshotRevisionId: 'rev-should-roll-back',
+        },
+      }),
+    ).rejects.toThrow();
+
+    expect(await store.readCurrent()).toEqual(snapshot);
+    expect(await store.readMaterializerProgress('connections')).toEqual(progress);
     store.close();
   });
 

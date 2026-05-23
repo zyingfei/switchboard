@@ -195,7 +195,7 @@ const syncSummaryDeps = (
     materializers?: Record<
       string,
       {
-        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
         readonly lastSuccessAt: string | null;
         readonly lastError: string | null;
         readonly pending: boolean;
@@ -458,7 +458,7 @@ export interface CompanionHttpConfig {
   readonly syncMaterializerHealth?: () => Record<
     string,
     {
-      readonly status: 'healthy' | 'degraded' | 'failed';
+      readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
       readonly lastSuccessAt: string | null;
       readonly lastError: string | null;
       readonly pending: boolean;
@@ -7000,27 +7000,47 @@ export const handleRequest = async (
   }
 };
 
+const randomLoopbackPort = (): number => 30_000 + Math.floor(Math.random() * 20_000);
+
 export const startHttpServer = async (server: Server, port: number): Promise<StartedHttpServer> =>
   new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => {
-      server.off('error', reject);
-      const address = server.address();
-      const actualPort = typeof address === 'object' && address !== null ? address.port : port;
-      resolve({
-        server,
-        port: actualPort,
-        url: `http://127.0.0.1:${String(actualPort)}`,
-        close: () =>
-          new Promise((closeResolve, closeReject) => {
-            server.close((error) => {
-              if (error !== undefined) {
-                closeReject(error);
-                return;
-              }
-              closeResolve();
-            });
-          }),
-      });
-    });
+    let attempts = 0;
+    const requestedEphemeral = port === 0;
+    const listen = (): void => {
+      const targetPort = requestedEphemeral ? randomLoopbackPort() : port;
+      const onError = (error: Error & { readonly code?: string }): void => {
+        server.off('listening', onListening);
+        if (requestedEphemeral && error.code === 'EADDRINUSE' && attempts < 20) {
+          attempts += 1;
+          listen();
+          return;
+        }
+        reject(error);
+      };
+      const onListening = (): void => {
+        server.off('error', onError);
+        const address = server.address();
+        const actualPort =
+          typeof address === 'object' && address !== null ? address.port : targetPort;
+        resolve({
+          server,
+          port: actualPort,
+          url: `http://127.0.0.1:${String(actualPort)}`,
+          close: () =>
+            new Promise((closeResolve, closeReject) => {
+              server.close((error) => {
+                if (error !== undefined) {
+                  closeReject(error);
+                  return;
+                }
+                closeResolve();
+              });
+            }),
+        });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(targetPort, '127.0.0.1');
+    };
+    listen();
   });

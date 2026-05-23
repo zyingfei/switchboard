@@ -47,7 +47,7 @@ import type { EventLog } from '../eventLog.js';
 //      via replay, never via "we'll call you next time" semantics.
 
 export interface MaterializerHealth {
-  readonly status: 'healthy' | 'degraded' | 'failed';
+  readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
   readonly lastSuccessAt: string | null;
   readonly lastError: string | null;
   // True while a worker is in-flight OR a coalesced re-run is queued.
@@ -55,6 +55,20 @@ export interface MaterializerHealth {
   // Optional per-replica progress bound. Populated by materializers
   // that track a frontier (e.g., recall ingestor).
   readonly frontier?: VersionVector;
+  readonly lastDriftCheck?: {
+    readonly at: string;
+    readonly conclusion: 'clean' | 'drift';
+    readonly nodeDiffSummary: {
+      readonly added: number;
+      readonly removed: number;
+      readonly changed: number;
+    };
+    readonly edgeDiffSummary: {
+      readonly added: number;
+      readonly removed: number;
+      readonly changed: number;
+    };
+  };
 }
 
 export interface AcceptedEventContext {

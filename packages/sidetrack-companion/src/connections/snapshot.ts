@@ -40,7 +40,9 @@ import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/fe
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
-import type { AcceptedEvent } from '../sync/causal.js';
+import type { AcceptedEvent, RegisterProjection } from '../sync/causal.js';
+import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
+import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScopes.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   serializeTabSessionProjection,
@@ -53,7 +55,15 @@ import {
   type UrlProjection,
 } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
-import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
+import {
+  THREAD_ARCHIVED,
+  THREAD_DELETED,
+  THREAD_UNARCHIVED,
+  THREAD_UPSERTED,
+  isThreadStatusPayload,
+  isThreadUpsertedPayload,
+} from '../threads/events.js';
+import { projectThread } from '../threads/projection.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   isBrowserTimelineObservedPayload,
@@ -63,7 +73,13 @@ import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
 import { projectVisualFingerprints } from '../visual/projection.js';
-import { WORKSTREAM_UPSERTED, isWorkstreamUpsertedPayload } from '../workstreams/events.js';
+import {
+  WORKSTREAM_DELETED,
+  WORKSTREAM_UPSERTED,
+  isWorkstreamDeletedPayload,
+  isWorkstreamUpsertedPayload,
+} from '../workstreams/events.js';
+import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
@@ -279,6 +295,23 @@ const compareRankerServingCandidate = (left: Candidate, right: Candidate): numbe
   rankerServingPriority(left) - rankerServingPriority(right) ||
   right.generatedAt - left.generatedAt ||
   compareString(left.toVisitId, right.toVisitId);
+
+const registerMetadata = <T>(
+  projection: RegisterProjection<T>,
+): Record<string, unknown> | undefined => {
+  if (projection.status === 'resolved') return undefined;
+  return {
+    causalRegister: {
+      status: 'conflict',
+      candidates: projection.candidates.map((candidate) => ({
+        value: candidate.value,
+        event: candidate.event,
+        replicaId: candidate.replicaId,
+        acceptedAtMs: candidate.acceptedAtMs,
+      })),
+    },
+  };
+};
 
 // Internal accumulator for nodes — allows merging origin replica
 // ids and merging metadata from multiple sources.
@@ -1068,10 +1101,157 @@ const topClosestVisitContributions = (
     .slice(0, Math.max(0, Math.floor(limit)))
     .map(([feature, weight]) => ({ feature, weight: roundRankerMetric(weight) }));
 
-const closestVisitRankerEdgesForSnapshot = (
+export interface RankerFrontierOptions {
+  readonly includeSameUrlSiblings?: boolean;
+  readonly includeSameTabSession?: boolean;
+  readonly includeSameWorkstream?: boolean;
+  readonly includeSameThread?: boolean;
+  readonly includePriorClosestNeighbors?: boolean;
+  readonly includeSimEdgeChanged?: boolean;
+}
+
+const timelineVisitKeyFromNodeId = (nodeId: string): string | null =>
+  nodeId.startsWith('timeline-visit:') && nodeId.length > 'timeline-visit:'.length
+    ? nodeId.slice('timeline-visit:'.length)
+    : null;
+
+export const expandRankerFrontier = (
+  touchedVisitIds: ReadonlySet<string> | readonly string[],
+  currentSnapshot: ConnectionsSnapshot,
+  options: RankerFrontierOptions = {},
+): ReadonlySet<string> => {
+  const resolvedOptions = {
+    includeSameUrlSiblings: options.includeSameUrlSiblings ?? true,
+    includeSameTabSession: options.includeSameTabSession ?? true,
+    includeSameWorkstream: options.includeSameWorkstream ?? true,
+    includeSameThread: options.includeSameThread ?? true,
+    includePriorClosestNeighbors: options.includePriorClosestNeighbors ?? true,
+    includeSimEdgeChanged: options.includeSimEdgeChanged ?? true,
+  };
+  const frontier = new Set<string>([...touchedVisitIds].filter((id) => id.length > 0));
+  if (frontier.size === 0) return frontier;
+
+  const visitNodeByKey = new Map<string, ConnectionNode>();
+  const visitKeyByCanonicalUrl = new Map<string, Set<string>>();
+  const visitKeysByWorkstream = new Map<string, Set<string>>();
+  const visitKeysByTabSession = new Map<string, Set<string>>();
+  const visitInstanceTimelineById = new Map<string, string>();
+  const visitInstanceTabSessionById = new Map<string, string>();
+  const threadIdsByVisitKey = new Map<string, Set<string>>();
+  const visitKeysByThreadId = new Map<string, Set<string>>();
+
+  const addToIndex = (index: Map<string, Set<string>>, key: string, visitKey: string): void => {
+    const existing = index.get(key);
+    if (existing === undefined) index.set(key, new Set([visitKey]));
+    else existing.add(visitKey);
+  };
+
+  for (const node of currentSnapshot.nodes) {
+    if (node.kind === 'timeline-visit') {
+      const visitKey = timelineVisitKeyFromNodeId(node.id);
+      if (visitKey === null) continue;
+      visitNodeByKey.set(visitKey, node);
+      const canonicalUrl = node.metadata['canonicalUrl'];
+      if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+        addToIndex(visitKeyByCanonicalUrl, canonicalUrl, visitKey);
+      }
+      const workstreamId = node.metadata['workstreamId'];
+      if (typeof workstreamId === 'string' && workstreamId.length > 0) {
+        addToIndex(visitKeysByWorkstream, workstreamId, visitKey);
+      }
+    } else if (node.kind === 'visit-instance') {
+      const timelineVisitId = node.metadata['timelineVisitId'];
+      const tabSessionId = node.metadata['tabSessionId'];
+      const visitKey =
+        typeof timelineVisitId === 'string' ? timelineVisitKeyFromNodeId(timelineVisitId) : null;
+      if (visitKey !== null) visitInstanceTimelineById.set(node.id, visitKey);
+      if (typeof tabSessionId === 'string' && tabSessionId.length > 0) {
+        visitInstanceTabSessionById.set(node.id, tabSessionId);
+        if (visitKey !== null) addToIndex(visitKeysByTabSession, tabSessionId, visitKey);
+      }
+    }
+  }
+
+  for (const edge of currentSnapshot.edges) {
+    if (edge.kind === 'visit_instance_in_tab_session') {
+      const visitKey = visitInstanceTimelineById.get(edge.fromNodeId);
+      const tabSessionId = edge.toNodeId.startsWith('tab-session:')
+        ? edge.toNodeId.slice('tab-session:'.length)
+        : visitInstanceTabSessionById.get(edge.fromNodeId);
+      if (visitKey !== undefined && tabSessionId !== undefined && tabSessionId.length > 0) {
+        addToIndex(visitKeysByTabSession, tabSessionId, visitKey);
+      }
+    } else if (edge.kind === 'visit_in_workstream') {
+      const visitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const workstreamId = edge.toNodeId.startsWith('workstream:')
+        ? edge.toNodeId.slice('workstream:'.length)
+        : null;
+      if (visitKey !== null && workstreamId !== null) {
+        addToIndex(visitKeysByWorkstream, workstreamId, visitKey);
+      }
+    } else if (edge.kind === 'timeline_same_url_as_thread') {
+      const visitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const threadId = edge.toNodeId.startsWith('thread:')
+        ? edge.toNodeId.slice('thread:'.length)
+        : null;
+      if (visitKey !== null && threadId !== null) {
+        addToIndex(threadIdsByVisitKey, visitKey, threadId);
+        addToIndex(visitKeysByThreadId, threadId, visitKey);
+      }
+    }
+  }
+
+  const seed = [...frontier];
+  for (const visitKey of seed) {
+    const node = visitNodeByKey.get(visitKey);
+    if (node !== undefined && resolvedOptions.includeSameUrlSiblings) {
+      const canonicalUrl = node.metadata['canonicalUrl'];
+      if (typeof canonicalUrl === 'string') {
+        for (const sibling of visitKeyByCanonicalUrl.get(canonicalUrl) ?? []) frontier.add(sibling);
+      }
+    }
+    if (resolvedOptions.includeSameWorkstream) {
+      const workstreamId = node?.metadata['workstreamId'];
+      if (typeof workstreamId === 'string') {
+        for (const sibling of visitKeysByWorkstream.get(workstreamId) ?? []) frontier.add(sibling);
+      }
+    }
+    if (resolvedOptions.includeSameTabSession) {
+      for (const [tabSessionId, members] of visitKeysByTabSession.entries()) {
+        if (!members.has(visitKey)) continue;
+        for (const sibling of visitKeysByTabSession.get(tabSessionId) ?? []) frontier.add(sibling);
+      }
+    }
+    if (resolvedOptions.includeSameThread) {
+      for (const threadId of threadIdsByVisitKey.get(visitKey) ?? []) {
+        for (const sibling of visitKeysByThreadId.get(threadId) ?? []) frontier.add(sibling);
+      }
+    }
+  }
+
+  if (resolvedOptions.includePriorClosestNeighbors || resolvedOptions.includeSimEdgeChanged) {
+    for (const edge of currentSnapshot.edges) {
+      const includeClosest =
+        resolvedOptions.includePriorClosestNeighbors && edge.kind === 'closest_visit';
+      const includeSimilarity =
+        resolvedOptions.includeSimEdgeChanged && edge.kind === 'visit_resembles_visit';
+      if (!includeClosest && !includeSimilarity) continue;
+      const fromVisitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const toVisitKey = timelineVisitKeyFromNodeId(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      if (frontier.has(fromVisitKey)) frontier.add(toVisitKey);
+      if (frontier.has(toVisitKey)) frontier.add(fromVisitKey);
+    }
+  }
+
+  return new Set([...frontier].sort());
+};
+
+export const closestVisitRankerEdgesForSnapshot = (
   input: ConnectionsInput,
   baseSnapshot: ConnectionsSnapshot,
   ranker: ClosestVisitRanker,
+  visitFrontier?: ReadonlySet<string>,
 ): readonly ConnectionEdge[] => {
   const threshold = ranker.threshold ?? 0.3;
   const topK = Math.max(0, Math.floor(ranker.topK ?? 5));
@@ -1083,7 +1263,10 @@ const closestVisitRankerEdgesForSnapshot = (
       baseSnapshot.nodes
         .filter((node) => node.kind === 'timeline-visit')
         .map((node) => visitKeyFromNodeOrRaw(node.id))
-        .filter((visitKey) => visitKey.length > 0),
+        .filter(
+          (visitKey) =>
+            visitKey.length > 0 && (visitFrontier === undefined || visitFrontier.has(visitKey)),
+        ),
     ),
   ].sort();
   const merged = [...input.events];
@@ -1174,6 +1357,22 @@ const closestVisitRankerEdgesForSnapshot = (
   return sortAlphaById([...rankerEdges.values()]);
 };
 
+const tagClosestVisitRankerEdge = (
+  edge: ConnectionEdge,
+  input: {
+    readonly producerRevision: string;
+    readonly inputFrontier: Readonly<Record<string, number>>;
+  },
+): ConnectionEdge => ({
+  ...edge,
+  metadata: {
+    ...(edge.metadata ?? {}),
+    producer: 'closest-visit',
+    producerRevision: input.producerRevision,
+    inputFrontier: input.inputFrontier,
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Pass 1: walk events, populate nodes + emit event-derived edges.
 // Pass 2: walk vault records, hydrate node metadata + emit
@@ -1213,95 +1412,191 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // queue.created, annotation.created. Each produces a node and may emit
   // edges that are derivable from the event payload alone.
   // -------------------------------------------------------------------
+  const threadIds = new Set<string>();
+  const workstreamIds = new Set<string>();
+  for (const event of input.events) {
+    if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
+      threadIds.add(event.payload.bac_id);
+    } else if (
+      (event.type === THREAD_ARCHIVED ||
+        event.type === THREAD_UNARCHIVED ||
+        event.type === THREAD_DELETED) &&
+      isThreadStatusPayload(event.payload)
+    ) {
+      threadIds.add(event.payload.bac_id);
+    } else if (event.type === WORKSTREAM_UPSERTED && isWorkstreamUpsertedPayload(event.payload)) {
+      workstreamIds.add(event.payload.bac_id);
+    } else if (event.type === WORKSTREAM_DELETED && isWorkstreamDeletedPayload(event.payload)) {
+      workstreamIds.add(event.payload.bac_id);
+    }
+  }
+
+  for (const threadId of [...threadIds].sort()) {
+    const projection = projectThread(threadId, input.events);
+    if (projection.deleted) continue;
+    const observedAtIso = new Date(projection.updatedAtMs).toISOString();
+    trackObservedAt(observedAtIso);
+    const record =
+      projection.record.status === 'resolved'
+        ? projection.record.value
+        : projection.record.candidates[0]?.value;
+    if (record === undefined) continue;
+    trackObservedAt(record.lastSeenAt);
+    const candidateEvents =
+      projection.record.status === 'resolved'
+        ? projection.record.event === undefined
+          ? []
+          : [projection.record.event]
+        : projection.record.candidates.map((candidate) => candidate.event);
+    upsertNode(nodes, {
+      kind: 'thread',
+      key: record.bac_id,
+      label: record.title ?? record.threadUrl ?? record.bac_id,
+      observedAt: record.lastSeenAt ?? observedAtIso,
+      ...(candidateEvents[0] === undefined ? {} : { replicaId: candidateEvents[0].replicaId }),
+      metadata: {
+        provider: record.provider,
+        url: record.threadUrl,
+        title: record.title,
+        ...(record.primaryWorkstreamId === undefined
+          ? {}
+          : { workstreamId: record.primaryWorkstreamId }),
+        ...registerMetadata(projection.record),
+      },
+    });
+    for (const event of candidateEvents.slice(1)) {
+      upsertNode(nodes, {
+        kind: 'thread',
+        key: record.bac_id,
+        label: record.title ?? record.threadUrl ?? record.bac_id,
+        observedAt: record.lastSeenAt ?? observedAtIso,
+        replicaId: event.replicaId,
+      });
+    }
+    const membershipCandidates =
+      projection.record.status === 'resolved'
+        ? record.primaryWorkstreamId === undefined || projection.record.event === undefined
+          ? []
+          : [{ workstreamId: record.primaryWorkstreamId, event: projection.record.event }]
+        : projection.record.candidates
+            .filter((candidate) => candidate.value.primaryWorkstreamId !== undefined)
+            .map((candidate) => ({
+              workstreamId: candidate.value.primaryWorkstreamId!,
+              event: candidate.event,
+            }));
+    for (const candidate of membershipCandidates) {
+      const wsKey = candidate.workstreamId;
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: wsKey,
+        label: wsKey,
+        observedAt: observedAtIso,
+        replicaId: candidate.event.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: 'thread_in_workstream',
+        fromNodeId: nodeIdFor('thread', record.bac_id),
+        toNodeId: nodeIdFor('workstream', wsKey),
+        observedAt: observedAtIso,
+        producedBy: {
+          source: 'event-log',
+          eventType: THREAD_UPSERTED,
+          dot: candidate.event,
+        },
+        confidence: 'asserted',
+        ...(projection.record.status === 'resolved'
+          ? {}
+          : { metadata: { causalRegisterStatus: 'conflict' } }),
+      });
+    }
+  }
+
+  for (const workstreamId of [...workstreamIds].sort()) {
+    const projection = projectWorkstream(workstreamId, input.events);
+    if (projection.deleted) continue;
+    const observedAtIso = new Date(projection.updatedAtMs).toISOString();
+    trackObservedAt(observedAtIso);
+    const record =
+      projection.record.status === 'resolved'
+        ? projection.record.value
+        : projection.record.candidates[0]?.value;
+    if (record === undefined) continue;
+    const candidateEvents =
+      projection.record.status === 'resolved'
+        ? projection.record.event === undefined
+          ? []
+          : [projection.record.event]
+        : projection.record.candidates.map((candidate) => candidate.event);
+    upsertNode(nodes, {
+      kind: 'workstream',
+      key: record.bac_id,
+      label: record.title ?? record.bac_id,
+      observedAt: observedAtIso,
+      ...(candidateEvents[0] === undefined ? {} : { replicaId: candidateEvents[0].replicaId }),
+      metadata: {
+        title: record.title,
+        ...registerMetadata(projection.record),
+      },
+    });
+    for (const event of candidateEvents.slice(1)) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: record.bac_id,
+        label: record.title ?? record.bac_id,
+        observedAt: observedAtIso,
+        replicaId: event.replicaId,
+      });
+    }
+    const parentCandidates =
+      projection.record.status === 'resolved'
+        ? record.parentId === undefined || projection.record.event === undefined
+          ? []
+          : [{ parentId: record.parentId, event: projection.record.event }]
+        : projection.record.candidates
+            .filter((candidate) => candidate.value.parentId !== undefined)
+            .map((candidate) => ({
+              parentId: candidate.value.parentId!,
+              event: candidate.event,
+            }));
+    for (const candidate of parentCandidates) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: candidate.parentId,
+        label: candidate.parentId,
+        observedAt: observedAtIso,
+        replicaId: candidate.event.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: 'workstream_parent_of',
+        fromNodeId: nodeIdFor('workstream', candidate.parentId),
+        toNodeId: nodeIdFor('workstream', record.bac_id),
+        observedAt: observedAtIso,
+        producedBy: {
+          source: 'event-log',
+          eventType: WORKSTREAM_UPSERTED,
+          dot: candidate.event,
+        },
+        confidence: 'asserted',
+        ...(projection.record.status === 'resolved'
+          ? {}
+          : { metadata: { causalRegisterStatus: 'conflict' } }),
+      });
+    }
+  }
+
   for (const event of input.events) {
     const observedAtIso = new Date(event.acceptedAtMs).toISOString();
     trackObservedAt(observedAtIso);
     const replicaId = event.dot.replicaId;
 
-    if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
-      const p = event.payload;
-      const threadKey = p.bac_id;
-      // The thread payload's lastSeenAt is the user-relevant
-      // timestamp (the moment the user touched the thread); track
-      // it for global maxObservedAt so the snapshot updatedAt
-      // reflects user-perspective time, not just runner accept
-      // time.
-      trackObservedAt(p.lastSeenAt);
-      upsertNode(nodes, {
-        kind: 'thread',
-        key: threadKey,
-        label: p.title ?? p.threadUrl ?? threadKey,
-        observedAt: p.lastSeenAt ?? observedAtIso,
-        replicaId,
-        metadata: {
-          provider: p.provider,
-          url: p.threadUrl,
-          title: p.title,
-          ...(p.primaryWorkstreamId === undefined ? {} : { workstreamId: p.primaryWorkstreamId }),
-        },
-      });
-      if (p.primaryWorkstreamId !== undefined) {
-        // Edge target may not exist yet; we create the workstream
-        // node lazily so the edge has a valid endpoint either way.
-        const wsKey = p.primaryWorkstreamId;
-        upsertNode(nodes, {
-          kind: 'workstream',
-          key: wsKey,
-          label: wsKey,
-          observedAt: observedAtIso,
-          replicaId,
-        });
-        const fromId = nodeIdFor('thread', threadKey);
-        const toId = nodeIdFor('workstream', wsKey);
-        upsertEdge(edges, {
-          kind: 'thread_in_workstream',
-          fromNodeId: fromId,
-          toNodeId: toId,
-          observedAt: observedAtIso,
-          producedBy: {
-            source: 'event-log',
-            eventType: THREAD_UPSERTED,
-            dot: { replicaId, seq: event.dot.seq },
-          },
-          confidence: 'asserted',
-        });
-      }
-      continue;
-    }
-
-    if (event.type === WORKSTREAM_UPSERTED && isWorkstreamUpsertedPayload(event.payload)) {
-      const p = event.payload;
-      upsertNode(nodes, {
-        kind: 'workstream',
-        key: p.bac_id,
-        label: p.title ?? p.bac_id,
-        observedAt: observedAtIso,
-        replicaId,
-        metadata: {
-          title: p.title,
-        },
-      });
-      if (typeof p.parentId === 'string' && p.parentId.length > 0) {
-        upsertNode(nodes, {
-          kind: 'workstream',
-          key: p.parentId,
-          label: p.parentId,
-          observedAt: observedAtIso,
-          replicaId,
-        });
-        upsertEdge(edges, {
-          kind: 'workstream_parent_of',
-          fromNodeId: nodeIdFor('workstream', p.parentId),
-          toNodeId: nodeIdFor('workstream', p.bac_id),
-          observedAt: observedAtIso,
-          producedBy: {
-            source: 'event-log',
-            eventType: WORKSTREAM_UPSERTED,
-            dot: { replicaId, seq: event.dot.seq },
-          },
-          confidence: 'asserted',
-        });
-      }
+    if (
+      event.type === THREAD_UPSERTED ||
+      event.type === THREAD_ARCHIVED ||
+      event.type === THREAD_UNARCHIVED ||
+      event.type === THREAD_DELETED ||
+      event.type === WORKSTREAM_UPSERTED ||
+      event.type === WORKSTREAM_DELETED
+    ) {
       continue;
     }
 
@@ -3150,7 +3445,11 @@ export const augmentConnectionsSnapshotWithClosestVisitRanker = (
     input.closestVisitRanker,
   )) {
     if (edge.observedAt > maxObservedAt) maxObservedAt = edge.observedAt;
-    const { id: _id, ...edgeInput } = edge;
+    const taggedEdge = tagClosestVisitRankerEdge(edge, {
+      producerRevision: input.closestVisitRanker.revisionId,
+      inputFrontier: {},
+    });
+    const { id: _id, ...edgeInput } = taggedEdge;
     void _id;
     upsertEdge(edges, edgeInput);
   }
@@ -3177,12 +3476,91 @@ export const augmentConnectionsSnapshotWithClosestVisitRanker = (
   };
 };
 
+export const augmentConnectionsSnapshotWithClosestVisitRankerFrontier = (
+  input: ConnectionsInput & {
+    readonly closestVisitRanker: ClosestVisitRanker;
+    readonly rankerFrontier: ReadonlySet<string>;
+    readonly inputFrontier: Readonly<Record<string, number>>;
+  },
+  currentSnapshot: ConnectionsSnapshot,
+): ConnectionsSnapshot => {
+  const frontierNodeIds = new Set(
+    [...input.rankerFrontier].map((visitKey) => nodeIdFor('timeline-visit', visitKey)),
+  );
+  const preservedEdges = currentSnapshot.edges.filter(
+    (edge) =>
+      edge.kind !== 'closest_visit' ||
+      (!frontierNodeIds.has(edge.fromNodeId) && !frontierNodeIds.has(edge.toNodeId)),
+  );
+  const baseWithoutFrontierClosestVisit = {
+    ...currentSnapshot,
+    edges: preservedEdges,
+    edgeCount: preservedEdges.length,
+  };
+  const edges = new Map<string, ConnectionEdge>(preservedEdges.map((edge) => [edge.id, edge]));
+  let maxObservedAt = baseWithoutFrontierClosestVisit.updatedAt;
+  for (const edge of closestVisitRankerEdgesForSnapshot(
+    input,
+    baseWithoutFrontierClosestVisit,
+    input.closestVisitRanker,
+    input.rankerFrontier,
+  )) {
+    if (edge.observedAt > maxObservedAt) maxObservedAt = edge.observedAt;
+    edges.set(
+      edge.id,
+      tagClosestVisitRankerEdge(edge, {
+        producerRevision: input.closestVisitRanker.revisionId,
+        inputFrontier: input.inputFrontier,
+      }),
+    );
+  }
+  const sortedEdges = sortAlphaById([...edges.values()]);
+  const updatedAt = maxObservedAt.length > 0 ? maxObservedAt : currentSnapshot.updatedAt;
+  return {
+    ...currentSnapshot,
+    edges: sortedEdges,
+    updatedAt,
+    edgeCount: sortedEdges.length,
+    snapshotRevision: computeSnapshotRevision({
+      updatedAt,
+      nodeCount: currentSnapshot.nodeCount,
+      edgeCount: sortedEdges.length,
+      urlProjectionKeyCount:
+        currentSnapshot.urlProjection === undefined
+          ? 0
+          : Object.keys(currentSnapshot.urlProjection.byCanonicalUrl).length,
+      tabSessionProjectionKeyCount:
+        currentSnapshot.tabSessionProjection === undefined
+          ? 0
+          : Object.keys(currentSnapshot.tabSessionProjection.bySessionId).length,
+    }),
+  };
+};
+
 // ---------------------------------------------------------------------------
 // On-disk store: rolling current.json + daily snapshots.
 // ---------------------------------------------------------------------------
 
 export interface ConnectionsStore {
   readonly putCurrent: (snapshot: ConnectionsSnapshot) => Promise<void>;
+  readonly writeSnapshotAndProgress: (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+    dirtyScopes?: ReadonlySet<Scope>,
+  ) => Promise<void>;
+  readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
+  readonly readScopesForNode?: (nodeId: string) => Promise<Scope[]>;
+  readonly readScopesForEdge?: (src: string, dst: string) => Promise<Scope[]>;
+  readonly readNodesForScope?: (scope: Scope) => Promise<string[]>;
+  readonly readEdgesForScope?: (
+    scope: Scope,
+  ) => Promise<Array<{ readonly src: string; readonly dst: string }>>;
+  readonly replaceScopeRows?: (input: {
+    readonly scopes: readonly Scope[];
+    readonly nodes: readonly ConnectionNode[];
+    readonly edges: readonly ConnectionEdge[];
+    readonly progress: MaterializerProgress;
+  }) => Promise<void>;
   readonly readCurrent: () => Promise<ConnectionsSnapshot | null>;
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
   readonly readDay: (date: string) => Promise<ConnectionsSnapshot | null>;
@@ -3277,6 +3655,8 @@ const snapshotFromParts = (
 });
 
 const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+const incrementalScopesEnabled = (): boolean =>
+  process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] !== '0';
 
 export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #root: string;
@@ -3289,9 +3669,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // cold resolve repeats the ~17K JSON.parses to materialize the whole
   // snapshot; with it, sibling resolves within the same revision share
   // a single bulk read. Invalidated when #writeCurrentRows commits.
-  #cachedSnapshot:
-    | { readonly revision: string; readonly value: ConnectionsSnapshot }
-    | null = null;
+  #cachedSnapshot: { readonly revision: string; readonly value: ConnectionsSnapshot } | null = null;
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
     this.#root = join(vaultRoot, '_BAC', 'connections');
@@ -3323,10 +3701,43 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+        CREATE TABLE IF NOT EXISTS connections_scope_nodes (
+          scope_kind TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          PRIMARY KEY (scope_kind, scope_id, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_nodes_node
+          ON connections_scope_nodes (node_id);
+        CREATE TABLE IF NOT EXISTS connections_scope_edges (
+          scope_kind TEXT NOT NULL,
+          scope_id TEXT NOT NULL,
+          edge_src TEXT NOT NULL,
+          edge_dst TEXT NOT NULL,
+          PRIMARY KEY (scope_kind, scope_id, edge_src, edge_dst)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scope_edges_edge
+          ON connections_scope_edges (edge_src, edge_dst);
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS connections_materializer_meta (
+          materializer_name TEXT PRIMARY KEY,
+          version TEXT NOT NULL,
+          snapshot_revision_id TEXT,
+          applied_frontier TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS connections_applied_intervals (
+          materializer_name TEXT NOT NULL,
+          replica_id TEXT NOT NULL,
+          start_seq INTEGER NOT NULL,
+          end_seq INTEGER NOT NULL,
+          PRIMARY KEY (materializer_name, replica_id, start_seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_applied_intervals_lookup
+          ON connections_applied_intervals (materializer_name, replica_id, start_seq, end_seq);
       `);
       this.#initialized = true;
     }
@@ -3346,7 +3757,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const snapshot = JSON.parse(
         await readFile(this.#currentJsonPath, 'utf8'),
       ) as ConnectionsSnapshot;
-      this.#writeCurrentRows(db, snapshot);
+      this.#writeCurrentRows(db, snapshot, null);
       return metadataForSnapshot(snapshot);
     } catch (error) {
       if (
@@ -3437,10 +3848,285 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const db = await this.#database();
-    this.#writeCurrentRows(db, snapshot);
+    this.#writeCurrentRows(db, snapshot, null);
   };
 
-  #writeCurrentRows(db: SqliteDatabase, snapshot: ConnectionsSnapshot): void {
+  readonly writeSnapshotAndProgress = async (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+    dirtyScopes?: ReadonlySet<Scope>,
+  ): Promise<void> => {
+    const db = await this.#database();
+    const shouldBootstrapScopeMembership = this.#writeCurrentRows(
+      db,
+      snapshot,
+      progress,
+      dirtyScopes,
+    );
+    if (shouldBootstrapScopeMembership) {
+      setImmediate(() => {
+        void this.#bootstrapScopeMembership(snapshot).catch(() => undefined);
+      });
+    }
+  };
+
+  readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT scope_kind, scope_id
+         FROM connections_scope_nodes
+         WHERE node_id = ?
+         ORDER BY scope_kind, scope_id`,
+      )
+      .all(nodeId)
+      .map((row) => ({
+        kind: textField(row, 'scope_kind') as Scope['kind'],
+        id: textField(row, 'scope_id'),
+      }));
+  };
+
+  readonly readScopesForEdge = async (src: string, dst: string): Promise<Scope[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT scope_kind, scope_id
+         FROM connections_scope_edges
+         WHERE edge_src = ? AND edge_dst = ?
+         ORDER BY scope_kind, scope_id`,
+      )
+      .all(src, dst)
+      .map((row) => ({
+        kind: textField(row, 'scope_kind') as Scope['kind'],
+        id: textField(row, 'scope_id'),
+      }));
+  };
+
+  readonly readNodesForScope = async (scope: Scope): Promise<string[]> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT node_id
+         FROM connections_scope_nodes
+         WHERE scope_kind = ? AND scope_id = ?
+         ORDER BY node_id`,
+      )
+      .all(scope.kind, scope.id)
+      .map((row) => textField(row, 'node_id'));
+  };
+
+  readonly readEdgesForScope = async (
+    scope: Scope,
+  ): Promise<Array<{ readonly src: string; readonly dst: string }>> => {
+    const db = await this.#database();
+    return db
+      .query(
+        `SELECT edge_src, edge_dst
+         FROM connections_scope_edges
+         WHERE scope_kind = ? AND scope_id = ?
+         ORDER BY edge_src, edge_dst`,
+      )
+      .all(scope.kind, scope.id)
+      .map((row) => ({ src: textField(row, 'edge_src'), dst: textField(row, 'edge_dst') }));
+  };
+
+  readonly replaceScopeRows = async (input: {
+    readonly scopes: readonly Scope[];
+    readonly nodes: readonly ConnectionNode[];
+    readonly edges: readonly ConnectionEdge[];
+    readonly progress: MaterializerProgress;
+  }): Promise<void> => {
+    const db = await this.#database();
+    const edgeBuckets = new Map<string, ConnectionEdge[]>();
+    for (const edge of input.edges) {
+      const key = edgeBucketKey(edge);
+      const bucket = edgeBuckets.get(key) ?? [];
+      bucket.push(edge);
+      edgeBuckets.set(key, bucket);
+    }
+    const memberships = scopesForGraphRows({ nodes: input.nodes, edges: input.edges });
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const oldNodeIds = new Set<string>();
+      const oldEdgeKeys = new Set<string>();
+      const selectScopeNodes = db.query(
+        `SELECT node_id FROM connections_scope_nodes
+         WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const selectScopeEdges = db.query(
+        `SELECT edge_src, edge_dst FROM connections_scope_edges
+         WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const deleteScopeNodes = db.query(
+        `DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const deleteScopeEdges = db.query(
+        `DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?`,
+      );
+      const countNodeScopes = db.query(
+        'SELECT COUNT(*) AS count FROM connections_scope_nodes WHERE node_id = ?',
+      );
+      const countEdgeScopes = db.query(
+        `SELECT COUNT(*) AS count FROM connections_scope_edges
+         WHERE edge_src = ? AND edge_dst = ?`,
+      );
+      const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
+      const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
+      const upsertNode = db.query(
+        'INSERT INTO nodes (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+      );
+      const upsertEdge = db.query(
+        'INSERT INTO edges (src, dst, data) VALUES (?, ?, ?) ON CONFLICT(src, dst) DO UPDATE SET data = excluded.data',
+      );
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
+      const upsertMetadata = db.query(
+        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+      );
+
+      for (const scope of input.scopes) {
+        for (const row of selectScopeNodes.all(scope.kind, scope.id)) {
+          oldNodeIds.add(textField(row, 'node_id'));
+        }
+        for (const row of selectScopeEdges.all(scope.kind, scope.id)) {
+          oldEdgeKeys.add(`${textField(row, 'edge_src')}\u0000${textField(row, 'edge_dst')}`);
+        }
+        deleteScopeNodes.run(scope.kind, scope.id);
+        deleteScopeEdges.run(scope.kind, scope.id);
+      }
+      for (const nodeId of oldNodeIds) {
+        const row = countNodeScopes.get(nodeId);
+        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
+        if (count === 0) deleteNode.run(nodeId);
+      }
+      for (const key of oldEdgeKeys) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) continue;
+        const row = countEdgeScopes.get(src, dst);
+        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
+        if (count === 0) deleteEdge.run(src, dst);
+      }
+
+      for (const node of input.nodes) {
+        upsertNode.run(node.id, JSON.stringify(node));
+        for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
+          insertScopeNode.run(scope.kind, scope.id, node.id);
+        }
+      }
+      for (const [key, bucket] of edgeBuckets.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
+        upsertEdge.run(src, dst, JSON.stringify(sortAlphaById(bucket)));
+        for (const scope of memberships.edgeScopes.get(key) ?? []) {
+          insertScopeEdge.run(scope.kind, scope.id, src, dst);
+        }
+      }
+
+      const allNodes = db
+        .query('SELECT data FROM nodes ORDER BY id')
+        .all()
+        .map((row) => JSON.parse(textField(row, 'data')) as ConnectionNode);
+      const allEdges = db
+        .query('SELECT data FROM edges ORDER BY src, dst')
+        .all()
+        .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[]);
+      const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+      const previousMetadata =
+        metadataRow === null || metadataRow === undefined
+          ? {
+              scope: {},
+              updatedAt: '1970-01-01T00:00:00.000Z',
+              nodeCount: 0,
+              edgeCount: 0,
+            }
+          : (JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata);
+      const updatedAt = allEdges.reduce(
+        (max, edge) => (edge.observedAt > max ? edge.observedAt : max),
+        previousMetadata.updatedAt,
+      );
+      const metadata: StoredConnectionsMetadata = {
+        ...previousMetadata,
+        updatedAt,
+        nodeCount: allNodes.length,
+        edgeCount: allEdges.length,
+        ...(input.progress.snapshotRevisionId === null
+          ? {}
+          : { snapshotRevision: input.progress.snapshotRevisionId }),
+      };
+      upsertMetadata.run('current', JSON.stringify(metadata));
+      upsertMetadata.run(
+        'node_order',
+        JSON.stringify(sortAlphaById(allNodes).map((node) => node.id)),
+      );
+      upsertMetadata.run(
+        'edge_order',
+        JSON.stringify(sortAlphaById(allEdges).map((edge) => edge.id)),
+      );
+      this.#writeProgressRows(db, input.progress);
+      db.exec('COMMIT');
+      this.#cachedSnapshot = null;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
+  async #bootstrapScopeMembership(snapshot: ConnectionsSnapshot): Promise<void> {
+    const scopes = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+    const scopeKeys = new Set<string>();
+    for (const nodeScopes of scopes.nodeScopes.values()) {
+      for (const scope of nodeScopes) scopeKeys.add(`${scope.kind}\u0000${scope.id}`);
+    }
+    for (const edgeScopes of scopes.edgeScopes.values()) {
+      for (const scope of edgeScopes) scopeKeys.add(`${scope.kind}\u0000${scope.id}`);
+    }
+    const db = await this.#database();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
+      db.query('DELETE FROM connections_scope_nodes').run();
+      db.query('DELETE FROM connections_scope_edges').run();
+      for (const [nodeId, nodeScopes] of scopes.nodeScopes.entries()) {
+        for (const scope of nodeScopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
+      }
+      for (const [key, edgeScopes] of scopes.edgeScopes.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
+        for (const scope of edgeScopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
+      }
+      db.exec('COMMIT');
+      console.warn(
+        `[connections-phase] scopeMembership.bootstrap mode=A scopes=${String(scopeKeys.size)}`,
+      );
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  #writeCurrentRows(
+    db: SqliteDatabase,
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress | null,
+    dirtyScopes?: ReadonlySet<Scope>,
+  ): boolean {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -3469,6 +4155,24 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
+      const deleteAllScopeNodes = db.query('DELETE FROM connections_scope_nodes');
+      const deleteAllScopeEdges = db.query('DELETE FROM connections_scope_edges');
+      const deleteScopeNodes = db.query(
+        'DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?',
+      );
+      const deleteScopeEdges = db.query(
+        'DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?',
+      );
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
 
       const currentNodeData = new Map(
         db
@@ -3513,18 +4217,154 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
       }
 
+      const scopeMembershipEmpty =
+        incrementalScopesEnabled() &&
+        (
+          db.query('SELECT COUNT(*) AS count FROM connections_scope_nodes').get() as
+            | { readonly count: number }
+            | undefined
+        )?.count === 0 &&
+        (
+          db.query('SELECT COUNT(*) AS count FROM connections_scope_edges').get() as
+            | { readonly count: number }
+            | undefined
+        )?.count === 0;
+      if (incrementalScopesEnabled() && !scopeMembershipEmpty) {
+        const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+        const dirtyScopeKeys =
+          dirtyScopes === undefined
+            ? null
+            : new Set([...dirtyScopes].map((scope) => `${scope.kind}\u0000${scope.id}`));
+        if (dirtyScopes === undefined) {
+          deleteAllScopeNodes.run();
+          deleteAllScopeEdges.run();
+        } else {
+          for (const scope of dirtyScopes) {
+            deleteScopeNodes.run(scope.kind, scope.id);
+            deleteScopeEdges.run(scope.kind, scope.id);
+          }
+        }
+        for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
+          for (const scope of scopes) {
+            if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
+              continue;
+            }
+            insertScopeNode.run(scope.kind, scope.id, nodeId);
+          }
+        }
+        for (const [key, scopes] of memberships.edgeScopes.entries()) {
+          const [src, dst] = key.split('\u0000');
+          if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
+          for (const scope of scopes) {
+            if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
+              continue;
+            }
+            insertScopeEdge.run(scope.kind, scope.id, src, dst);
+          }
+        }
+      }
+
       upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
       // new snapshotRevision and rebuild.
       this.#cachedSnapshot = null;
+      return progress !== null && scopeMembershipEmpty;
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
     }
   }
+
+  #writeProgressRows(db: SqliteDatabase, progress: MaterializerProgress): void {
+    const upsertMeta = db.query(
+      `INSERT INTO connections_materializer_meta
+        (materializer_name, version, snapshot_revision_id, applied_frontier, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(materializer_name) DO UPDATE SET
+         version = excluded.version,
+         snapshot_revision_id = excluded.snapshot_revision_id,
+         applied_frontier = excluded.applied_frontier,
+         updated_at = excluded.updated_at`,
+    );
+    const deleteIntervals = db.query(
+      'DELETE FROM connections_applied_intervals WHERE materializer_name = ?',
+    );
+    const insertInterval = db.query(
+      `INSERT INTO connections_applied_intervals
+        (materializer_name, replica_id, start_seq, end_seq)
+       VALUES (?, ?, ?, ?)`,
+    );
+
+    upsertMeta.run(
+      progress.materializerName,
+      progress.materializerVersion,
+      progress.snapshotRevisionId,
+      JSON.stringify(progress.appliedFrontier),
+      new Date().toISOString(),
+    );
+    deleteIntervals.run(progress.materializerName);
+    for (const [replicaId, intervals] of Object.entries(progress.appliedDotIntervals)) {
+      for (const [startSeq, endSeq] of intervals) {
+        insertInterval.run(progress.materializerName, replicaId, startSeq, endSeq);
+      }
+    }
+  }
+
+  readonly readMaterializerProgress = async (
+    name: string,
+  ): Promise<MaterializerProgress | null> => {
+    const db = await this.#database();
+    const metaRow = db
+      .query(
+        `SELECT materializer_name, version, snapshot_revision_id, applied_frontier
+         FROM connections_materializer_meta
+         WHERE materializer_name = ?`,
+      )
+      .get(name);
+    if (metaRow === null || metaRow === undefined) return null;
+
+    const appliedDotIntervals: Record<string, Array<readonly [number, number]>> = {};
+    for (const row of db
+      .query(
+        `SELECT replica_id, start_seq, end_seq
+         FROM connections_applied_intervals
+         WHERE materializer_name = ?
+         ORDER BY replica_id, start_seq, end_seq`,
+      )
+      .all(name)) {
+      if (!isRecord(row)) throw new Error('SQLite progress row is not a record');
+      const replicaId = row['replica_id'];
+      const startSeq = row['start_seq'];
+      const endSeq = row['end_seq'];
+      if (
+        typeof replicaId !== 'string' ||
+        typeof startSeq !== 'number' ||
+        typeof endSeq !== 'number'
+      ) {
+        throw new Error('SQLite progress row has invalid interval fields');
+      }
+      const intervals = appliedDotIntervals[replicaId] ?? [];
+      intervals.push([startSeq, endSeq]);
+      appliedDotIntervals[replicaId] = intervals;
+    }
+    if (!isRecord(metaRow)) throw new Error('SQLite progress metadata row is not a record');
+    const snapshotRevisionId = metaRow['snapshot_revision_id'];
+    const appliedFrontier = metaRow['applied_frontier'];
+    return {
+      materializerName: textField(metaRow, 'materializer_name'),
+      materializerVersion: textField(metaRow, 'version'),
+      appliedDotIntervals,
+      appliedFrontier:
+        typeof appliedFrontier === 'string'
+          ? (JSON.parse(appliedFrontier) as Record<string, number>)
+          : {},
+      snapshotRevisionId: typeof snapshotRevisionId === 'string' ? snapshotRevisionId : null,
+    };
+  };
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
@@ -3715,6 +4555,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   const root = join(vaultRoot, '_BAC', 'connections');
   const snapshotsDir = join(root, SNAPSHOTS_DIR);
   const currentPath = join(root, 'current.json');
+  const progressPath = join(root, 'current.progress.json');
 
   const dayPath = (date: string): string => join(snapshotsDir, `${date}.json`);
 
@@ -3731,6 +4572,24 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     }
     await writeConnectionsSnapshotJson(currentPath, snapshot);
     if (revision !== undefined) lastWrittenRevision = revision;
+  };
+
+  const writeSnapshotAndProgress = async (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+    _dirtyScopes?: ReadonlySet<Scope>,
+  ): Promise<void> => {
+    await putCurrent(snapshot);
+    await writeAtomic(progressPath, JSON.stringify(progress, null, 2));
+  };
+
+  const readMaterializerProgress = async (name: string): Promise<MaterializerProgress | null> => {
+    try {
+      const progress = JSON.parse(await readFile(progressPath, 'utf8')) as MaterializerProgress;
+      return progress.materializerName === name ? progress : null;
+    } catch {
+      return null;
+    }
   };
 
   // P-perf — readCurrent() memoization keyed on current.json
@@ -3805,7 +4664,15 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     }
   };
 
-  return { putCurrent, readCurrent, putDay, readDay, listDays };
+  return {
+    putCurrent,
+    writeSnapshotAndProgress,
+    readMaterializerProgress,
+    readCurrent,
+    putDay,
+    readDay,
+    listDays,
+  };
 };
 
 // Subgraph helpers — used by the HTTP routes + MCP tools to crop a
