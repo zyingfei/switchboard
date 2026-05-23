@@ -128,6 +128,7 @@ import {
   resolveAttribution,
   resolveThreadAttribution,
   resolveUrlAttribution,
+  type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import {
   deserializeUrlProjection,
@@ -434,6 +435,9 @@ export interface CompanionHttpConfig {
   readonly hygieneStatus?: {
     lastIdempotencyGcAt?: string;
     lastAuditRetentionAt?: string;
+    lastDerivedRevisionGcAt?: string;
+    lastVacuumAt?: string;
+    lastVacuumDurationMs?: number;
   };
   // Owns the recall index lifecycle (auto-rebuild on stale, status
   // surface for /v1/system/health). Optional so tests + legacy
@@ -1636,7 +1640,7 @@ const cachedThreadSuggestions = async (
 const ROUTE_CACHE_TTL_MS = ((): number => {
   const raw = process.env['SIDETRACK_ROUTE_CACHE_TTL_MS'];
   const n = raw === undefined ? Number.NaN : Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 30_000;
+  return Number.isFinite(n) && n >= 0 ? n : 300_000;
 })();
 interface RouteCacheEntry {
   readonly result: readonly [number, unknown];
@@ -3099,19 +3103,119 @@ const routes: readonly RouteDefinition[] = [
           if (canonicalUrl.length === 0) {
             throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
           }
+          const snapshotRevision = snapshot.snapshotRevision;
+          if (
+            snapshotRevision !== undefined &&
+            context.connectionsStore instanceof SqliteConnectionsStore
+          ) {
+            const cached = await context.connectionsStore.getCachedResolverResult(
+              canonicalUrl,
+              snapshotRevision,
+            );
+            if (cached !== null) {
+              return [
+                200,
+                {
+                  data: cached as UrlResolutionResult,
+                  snapshotRevision,
+                },
+              ];
+            }
+          }
           const merged = await context.eventLog!.readMerged();
+          const result = resolveUrlAttribution({
+            canonicalUrl,
+            snapshot,
+            events: merged,
+          });
+          if (
+            snapshotRevision !== undefined &&
+            context.connectionsStore instanceof SqliteConnectionsStore
+          ) {
+            await context.connectionsStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+          }
           return [
             200,
             {
-              data: resolveUrlAttribution({
-                canonicalUrl,
-                snapshot,
-                events: merged,
-              }),
+              data: result,
+              ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
             },
           ];
         },
       );
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/batch-resolve$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.connectionsStore === undefined) {
+        throw new HttpRouteError(503, 'CONNECTIONS_NOT_WIRED', 'Connections is not configured.');
+      }
+      const body = objectRecord(await readBody(request));
+      const canonicalUrls = body?.['canonicalUrls'];
+      if (
+        !Array.isArray(canonicalUrls) ||
+        canonicalUrls.length === 0 ||
+        !canonicalUrls.every((item): item is string => typeof item === 'string' && item.length > 0)
+      ) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must contain canonicalUrls as a non-empty string array.',
+        );
+      }
+      const uniqueUrls = [...new Set(canonicalUrls)];
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const snapshotRevision = snapshot.snapshotRevision;
+      const merged = await context.eventLog.readMerged();
+      const results: Record<string, UrlResolutionResult> = {};
+      for (const canonicalUrl of uniqueUrls) {
+        if (
+          snapshotRevision !== undefined &&
+          context.connectionsStore instanceof SqliteConnectionsStore
+        ) {
+          const cached = await context.connectionsStore.getCachedResolverResult(
+            canonicalUrl,
+            snapshotRevision,
+          );
+          if (cached !== null) {
+            results[canonicalUrl] = cached as UrlResolutionResult;
+            continue;
+          }
+        }
+        const result = resolveUrlAttribution({ canonicalUrl, snapshot, events: merged });
+        results[canonicalUrl] = result;
+        if (
+          snapshotRevision !== undefined &&
+          context.connectionsStore instanceof SqliteConnectionsStore
+        ) {
+          await context.connectionsStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+        }
+      }
+      return [
+        200,
+        {
+          data: { results },
+          ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+        },
+      ];
     },
   },
   {

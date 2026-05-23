@@ -17,8 +17,12 @@ vi.mock('../recall/embedder.js', () => ({
   },
 }));
 
+vi.mock('../collectors/framework/runtime.js', () => ({
+  bootCollectorFramework: () => null,
+}));
+
 import { readPageEvidence } from '../page-evidence/store.js';
-import { createPageEvidenceWriteQueue, startCompanion } from './companion.js';
+import { createPageEvidenceWriteQueue, scheduleSqliteVacuumGc, startCompanion } from './companion.js';
 
 describe('startCompanion bind-failure rollback', () => {
   let vaultRoot: string;
@@ -86,6 +90,43 @@ describe('startCompanion bind-failure rollback', () => {
       const handles = process.getActiveResourcesInfo();
       expect(handles).toBeInstanceOf(Array);
     }
+  });
+});
+
+describe('startCompanion SQLite VACUUM hygiene task', () => {
+  let vaultRoot: string;
+
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    vaultRoot = await mkdtemp(join(tmpdir(), 'startcompanion-vacuum-'));
+    process.env['SIDETRACK_SQLITE_VACUUM_EVERY_MS'] = '1000';
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    delete process.env['SIDETRACK_SQLITE_VACUUM_EVERY_MS'];
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('runs SQLite VACUUM on startup delay and scheduled cadence', async () => {
+    const vacuum = vi.fn(() => Promise.resolve());
+    const hygieneStatus: { lastVacuumAt?: string; lastVacuumDurationMs?: number } = {};
+    const teardown = scheduleSqliteVacuumGc(
+      { vacuum },
+      hygieneStatus,
+      { everyMs: 3_600_000, startupDelayMs: 60_000 },
+    );
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(vacuum).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(vacuum).toHaveBeenCalledTimes(1);
+    expect(hygieneStatus.lastVacuumAt).toBeDefined();
+    expect(hygieneStatus.lastVacuumDurationMs).toBeGreaterThanOrEqual(0);
+    await vi.advanceTimersByTimeAsync(3_540_000);
+    expect(vacuum).toHaveBeenCalledTimes(2);
+
+    teardown();
   });
 });
 

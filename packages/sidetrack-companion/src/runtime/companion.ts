@@ -69,6 +69,42 @@ import { COMPANION_VERSION } from '../version.js';
 
 type PageEvidenceTimelineEntry = Parameters<typeof ensurePageEvidenceForTimelineEntries>[1][number];
 
+export interface HygieneStatus {
+  lastIdempotencyGcAt?: string;
+  lastAuditRetentionAt?: string;
+  lastDerivedRevisionGcAt?: string;
+  lastVacuumAt?: string;
+  lastVacuumDurationMs?: number;
+}
+
+export const scheduleSqliteVacuumGc = (
+  store: { readonly vacuum?: () => Promise<void> },
+  hygieneStatus: HygieneStatus,
+  options: { readonly everyMs: number; readonly startupDelayMs?: number },
+): (() => void) => {
+  const runSqliteVacuumGc = async (): Promise<void> => {
+    if (store.vacuum === undefined) return;
+    const started = performance.now();
+    try {
+      await store.vacuum();
+      hygieneStatus.lastVacuumAt = new Date().toISOString();
+      hygieneStatus.lastVacuumDurationMs = Math.round(performance.now() - started);
+    } catch {
+      // Best-effort — a failed VACUUM must never crash the companion.
+    }
+  };
+  const sqliteVacuumGc = setInterval(() => {
+    void runSqliteVacuumGc();
+  }, options.everyMs);
+  const sqliteVacuumGcKickoff = setTimeout(() => {
+    void runSqliteVacuumGc();
+  }, options.startupDelayMs ?? 60_000);
+  return () => {
+    clearInterval(sqliteVacuumGc);
+    clearTimeout(sqliteVacuumGcKickoff);
+  };
+};
+
 const maxLastSeenAt = (entries: readonly PageEvidenceTimelineEntry[]): string | undefined => {
   let latest: string | undefined;
   for (const entry of entries) {
@@ -231,11 +267,7 @@ export const startCompanion = async (
       const w = watcher;
       teardown.push(() => w.close());
     }
-    const hygieneStatus: {
-      lastIdempotencyGcAt?: string;
-      lastAuditRetentionAt?: string;
-      lastDerivedRevisionGcAt?: string;
-    } = {};
+    const hygieneStatus: HygieneStatus = {};
     const idempotencyGc = setInterval(
       () => {
         void idempotencyStore.gcExpired?.(new Date()).then(() => {
@@ -291,6 +323,11 @@ export const startCompanion = async (
     teardown.push(() => {
       clearTimeout(derivedRevisionGcKickoff);
     });
+    const sqliteVacuumEveryMs = (() => {
+      const raw = process.env['SIDETRACK_SQLITE_VACUUM_EVERY_MS'];
+      const parsed = raw === undefined ? Number.NaN : Number(raw);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 6 * 60 * 60 * 1000;
+    })();
     const recallActivity = createRecallActivityTracker();
     const baseEventLog = createEventLog(options.vaultPath, replica);
     const projectionChanges = createProjectionChangeFeed(options.vaultPath);
@@ -339,6 +376,9 @@ export const startCompanion = async (
     // (threads, workstreams, dispatches, queue, reminders, coding
     // sessions) + timeline daily projections at snapshot time.
     const connectionsStore = createConnectionsStore(options.vaultPath);
+    teardown.push(
+      scheduleSqliteVacuumGc(connectionsStore, hygieneStatus, { everyMs: sqliteVacuumEveryMs }),
+    );
     const connectionsMaterializer = createConnectionsMaterializer({
       vaultRoot: options.vaultPath,
       eventLog: baseEventLog,

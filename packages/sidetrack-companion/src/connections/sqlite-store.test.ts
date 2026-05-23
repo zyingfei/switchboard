@@ -207,6 +207,31 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
+  sqliteIt('round-trips resolver-result cache by visit id and snapshot revision', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await expect(store.getCachedResolverResult('https://example.test/a', 'rev-a')).resolves.toBeNull();
+
+    const result = { canonicalUrl: 'https://example.test/a', decision: { action: 'inbox' } };
+    await store.cacheResolverResult('https://example.test/a', 'rev-a', result);
+
+    await expect(store.getCachedResolverResult('https://example.test/a', 'rev-a')).resolves.toEqual(
+      result,
+    );
+    store.close();
+  });
+
+  sqliteIt('invalidates resolver-result cache entries from older snapshot revisions', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.cacheResolverResult('https://example.test/a', 'rev-old', { old: true });
+    await store.cacheResolverResult('https://example.test/b', 'rev-current', { current: true });
+
+    await expect(store.getCachedResolverResult('https://example.test/b', 'rev-current')).resolves.toEqual(
+      { current: true },
+    );
+    await expect(store.getCachedResolverResult('https://example.test/a', 'rev-old')).resolves.toBeNull();
+    store.close();
+  });
+
   sqliteIt('reads snapshot metadata and individual edges without full snapshot reads', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const snapshot = buildTraversalSnapshot();

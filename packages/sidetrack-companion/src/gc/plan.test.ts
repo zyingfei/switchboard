@@ -61,6 +61,45 @@ describe('derived-data GC plan', () => {
     expect(plan.entries.some((entry) => entry.path.includes('_BAC/threads/'))).toBe(false);
   });
 
+  it('keeps five recent derived revisions by default and ten closest-visit revisions', async () => {
+    const now = new Date('2026-05-15T12:00:00.000Z');
+    for (let index = 0; index < 6; index += 1) {
+      await writeFixture(
+        `_BAC/connections/visit-similarity/rev-${String(index)}.json`,
+        '{}\n',
+        now.getTime() - index * 1_000,
+      );
+      await writeFixture(
+        `_BAC/connections/topics/rev-${String(index)}.json`,
+        '{}\n',
+        now.getTime() - index * 1_000,
+      );
+    }
+    for (let index = 0; index < 11; index += 1) {
+      await writeFixture(
+        `_BAC/connections/closest-visit/rev-${String(index)}.json`,
+        '{}\n',
+        now.getTime() - index * 1_000,
+      );
+    }
+
+    const plan = await buildGcPlan(root, { now });
+
+    expect(plan.entries.filter((entry) => entry.group === 'visit-similarity-revisions')).toHaveLength(
+      1,
+    );
+    expect(plan.entries.filter((entry) => entry.group === 'topic-revisions')).toHaveLength(1);
+    expect(plan.entries.filter((entry) => entry.group === 'closest-visit-revisions')).toHaveLength(
+      1,
+    );
+    expect(plan.entries.find((entry) => entry.group === 'visit-similarity-revisions')?.reason).toBe(
+      'derived visit-similarity revision outside newest 5',
+    );
+    expect(plan.entries.find((entry) => entry.group === 'closest-visit-revisions')?.reason).toBe(
+      'derived closest-visit ranker file outside newest 10',
+    );
+  });
+
   it('applies the planned deletes only when requested', async () => {
     const now = new Date('2026-05-15T12:00:00.000Z');
     const stale = await writeFixture(
