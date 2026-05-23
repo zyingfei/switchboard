@@ -27,6 +27,9 @@ export interface GcPlan {
 export interface BuildGcPlanOptions {
   readonly now?: Date;
   readonly keepRecentRevisions?: number;
+  readonly keepVisitSimilarityRevisions?: number;
+  readonly keepClosestVisitRevisions?: number;
+  readonly keepTopicRevisions?: number;
   readonly keepDiagnostics?: number;
   readonly keepDebugDumps?: number;
 }
@@ -125,7 +128,11 @@ export const buildGcPlan = async (
   options: BuildGcPlanOptions = {},
 ): Promise<GcPlan> => {
   const now = options.now ?? new Date();
-  const keepRecentRevisions = options.keepRecentRevisions ?? 20;
+  const keepRecentRevisions = options.keepRecentRevisions ?? 5;
+  const keepVisitSimilarityRevisions =
+    options.keepVisitSimilarityRevisions ?? keepRecentRevisions;
+  const keepClosestVisitRevisions = options.keepClosestVisitRevisions ?? 10;
+  const keepTopicRevisions = options.keepTopicRevisions ?? keepRecentRevisions;
   const keepDiagnostics = options.keepDiagnostics ?? 500;
   const keepDebugDumps = options.keepDebugDumps ?? 10;
   const entries: GcPlanEntry[] = [];
@@ -145,22 +152,22 @@ export const buildGcPlan = async (
     entries,
     oldRevisions(
       await listFiles(join(connectionsRoot, 'visit-similarity')),
-      keepRecentRevisions,
+      keepVisitSimilarityRevisions,
       new Set(['current.json']),
     ),
     'visit-similarity-revisions',
-    `derived visit-similarity revision outside newest ${String(keepRecentRevisions)}`,
+    `derived visit-similarity revision outside newest ${String(keepVisitSimilarityRevisions)}`,
   );
 
   appendEntries(
     entries,
     oldRevisions(
       await listFiles(join(connectionsRoot, 'topics')),
-      keepRecentRevisions,
+      keepTopicRevisions,
       new Set(['current.json', 'current.shadow.json']),
     ),
     'topic-revisions',
-    `derived topic revision outside newest ${String(keepRecentRevisions)}`,
+    `derived topic revision outside newest ${String(keepTopicRevisions)}`,
   );
 
   appendEntries(
@@ -189,11 +196,11 @@ export const buildGcPlan = async (
     entries,
     oldRevisions(
       await listFiles(join(connectionsRoot, 'closest-visit')),
-      keepRecentRevisions,
+      keepClosestVisitRevisions,
       new Set(['current.json', 'current.model.b64']),
     ),
     'closest-visit-revisions',
-    `derived closest-visit ranker file outside newest ${String(keepRecentRevisions)}`,
+    `derived closest-visit ranker file outside newest ${String(keepClosestVisitRevisions)}`,
   );
 
   appendEntries(

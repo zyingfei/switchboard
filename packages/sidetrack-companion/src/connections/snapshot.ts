@@ -3543,6 +3543,16 @@ export const augmentConnectionsSnapshotWithClosestVisitRankerFrontier = (
 
 export interface ConnectionsStore {
   readonly putCurrent: (snapshot: ConnectionsSnapshot) => Promise<void>;
+  readonly vacuum?: () => Promise<void>;
+  readonly cacheResolverResult?: (
+    visitId: string,
+    snapshotRevision: string,
+    result: unknown,
+  ) => Promise<void>;
+  readonly getCachedResolverResult?: (
+    visitId: string,
+    snapshotRevision: string,
+  ) => Promise<unknown | null>;
   readonly writeSnapshotAndProgress: (
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
@@ -3738,6 +3748,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_applied_intervals_lookup
           ON connections_applied_intervals (materializer_name, replica_id, start_seq, end_seq);
+        CREATE TABLE IF NOT EXISTS connections_resolver_cache (
+          visit_id TEXT NOT NULL,
+          snapshot_revision TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          computed_at TEXT NOT NULL,
+          PRIMARY KEY (visit_id, snapshot_revision)
+        );
       `);
       this.#initialized = true;
     }
@@ -3844,6 +3861,46 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly readSnapshotMetadata = async (): Promise<StoredConnectionsMetadata | null> => {
     const db = await this.#database();
     return await this.#readMetadata(db);
+  };
+
+  readonly vacuum = async (): Promise<void> => {
+    const db = await this.#database();
+    db.exec('VACUUM');
+  };
+
+  readonly cacheResolverResult = async (
+    visitId: string,
+    snapshotRevision: string,
+    result: unknown,
+  ): Promise<void> => {
+    const db = await this.#database();
+    db.query(
+      `INSERT INTO connections_resolver_cache
+        (visit_id, snapshot_revision, result_json, computed_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(visit_id, snapshot_revision) DO UPDATE SET
+         result_json = excluded.result_json,
+         computed_at = excluded.computed_at`,
+    ).run(visitId, snapshotRevision, JSON.stringify(result), new Date().toISOString());
+  };
+
+  readonly getCachedResolverResult = async (
+    visitId: string,
+    snapshotRevision: string,
+  ): Promise<unknown | null> => {
+    const db = await this.#database();
+    db.query('DELETE FROM connections_resolver_cache WHERE snapshot_revision != ?').run(
+      snapshotRevision,
+    );
+    const row = db
+      .query(
+        `SELECT result_json
+         FROM connections_resolver_cache
+         WHERE visit_id = ? AND snapshot_revision = ?`,
+      )
+      .get(visitId, snapshotRevision);
+    if (row === null || row === undefined) return null;
+    return JSON.parse(textField(row, 'result_json')) as unknown;
   };
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {

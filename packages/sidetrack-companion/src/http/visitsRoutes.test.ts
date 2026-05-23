@@ -1,9 +1,10 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
+import { SqliteConnectionsStore } from '../connections/snapshot.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
@@ -498,5 +499,105 @@ describe('per-URL HTTP routes — Stage 5.2 R2 snapshot-first read path', () => 
     expect(body.data.items).toHaveLength(1);
     expect(body.data.items[0]?.canonicalUrl).toBe('https://snapshot.test/a');
     expect(body.snapshotRevision).toBe('rev-test-abc');
+  });
+});
+
+describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
+  let vaultRoot: string;
+  let serverUrl: string;
+  let eventLog: EventLog;
+  let connectionsStore: SqliteConnectionsStore;
+  let close: (() => Promise<void>) | null = null;
+  const bridgeKey = 'visits-resolver-cache-bridge-key';
+
+  const snapshotForUrls = (urls: readonly string[], revision: string): ConnectionsSnapshot => ({
+    scope: {},
+    nodes: urls.map((canonicalUrl) => ({
+      id: `timeline-visit:${canonicalUrl}`,
+      kind: 'timeline-visit',
+      label: canonicalUrl,
+      originReplicaIds: [],
+      metadata: { canonicalUrl },
+    })),
+    edges: [],
+    updatedAt: '2026-05-07T10:00:00.000Z',
+    nodeCount: urls.length,
+    edgeCount: 0,
+    snapshotRevision: revision,
+  });
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-resolver-cache-'));
+    const replica = await loadOrCreateReplica(vaultRoot);
+    eventLog = createEventLog(vaultRoot, replica);
+    connectionsStore = new SqliteConnectionsStore(vaultRoot, { databasePath: ':memory:' });
+    const server = createCompanionHttpServer({
+      bridgeKey,
+      vaultWriter: createVaultWriter(vaultRoot),
+      vaultRoot,
+      idempotencyStore: createIdempotencyStore(vaultRoot),
+      replica,
+      eventLog,
+      connectionsStore,
+    });
+    const started = await startHttpServer(server, 0);
+    serverUrl = started.url;
+    close = started.close;
+  });
+
+  afterEach(async () => {
+    if (close !== null) await close();
+    close = null;
+    connectionsStore.close();
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const reqHeaders = (): Record<string, string> => ({
+    'content-type': 'application/json',
+    'x-bac-bridge-key': bridgeKey,
+  });
+
+  it('memoizes GET /v1/visits/{url}/resolve by snapshotRevision', async () => {
+    const canonicalUrl = 'https://cache.test/a';
+    await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-cache-a'));
+    const readMerged = vi.spyOn(eventLog, 'readMerged');
+
+    const first = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+      { headers: reqHeaders() },
+    );
+    const second = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+      { headers: reqHeaders() },
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(await first.json());
+    expect(readMerged).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST /v1/visits/batch-resolve returns one result per URL', async () => {
+    const urls = Array.from({ length: 10 }, (_value, index) => `https://batch.test/${String(index)}`);
+    await connectionsStore.putCurrent(snapshotForUrls(urls, 'rev-batch-a'));
+    const readCurrent = vi.spyOn(connectionsStore, 'readCurrent');
+    const readMerged = vi.spyOn(eventLog, 'readMerged');
+
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: urls }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { results: Record<string, { canonicalUrl: string }> };
+    };
+    expect(Object.keys(body.data.results).sort()).toEqual([...urls].sort());
+    expect(Object.values(body.data.results).map((result) => result.canonicalUrl).sort()).toEqual(
+      [...urls].sort(),
+    );
+    expect(readCurrent).toHaveBeenCalledTimes(1);
+    expect(readMerged).toHaveBeenCalledTimes(1);
   });
 });
