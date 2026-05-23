@@ -17,6 +17,7 @@
         "@wlearn/lightgbm": "^0.1.0",
         "gpt-tokenizer": "^3.4.0",
         "graphology": "^0.26.0",
+        "hnswlib-node": "^3.0.0",
         "minisearch": "^7.2.0",
         "usearch": "2.25.1",
         "ws": "^8.20.0",
@@ -258,6 +259,7 @@
     "sharp",
     "esbuild",
     "fsevents",
+    "hnswlib-node",
     "protobufjs",
     "onnxruntime-node",
     "usearch",
@@ -1304,6 +1306,8 @@
     "hermes-estree": ["hermes-estree@0.25.1", "", {}, "sha512-0wUoCcLp+5Ev5pDW2OriHC2MJCbwLwuRx+gAqMTOkGKJJiBCLjtrvy4PWUGn6MIVefecRpzoOZ/UV6iGdOr+Cw=="],
 
     "hermes-parser": ["hermes-parser@0.25.1", "", { "dependencies": { "hermes-estree": "0.25.1" } }, "sha512-6pEjquH3rqaI6cYAXYPcz9MS4rY6R4ngRgrgfDshRptUZIc3lw0MCIJIGDj9++mfySOuPTHB4nrSW99BCvOPIA=="],
+
+    "hnswlib-node": ["hnswlib-node@3.0.0", "", { "dependencies": { "bindings": "^1.5.0", "node-addon-api": "^8.0.0" } }, "sha512-fypn21qvVORassppC8/qNfZ5KAOspZpm/IbUkAtlqvbtDNnF5VVk5RWF7O5V6qwr7z+T3s1ePej6wQt5wRQ4Cg=="],
 
     "hono": ["hono@4.12.18", "", {}, "sha512-RWzP96k/yv0PQfyXnWjs6zot20TqfpfsNXhOnev8d1InAxubW93L11/oNUc3tQqn2G0bSdAOBpX+2uDFHV7kdQ=="],
 
