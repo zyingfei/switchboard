@@ -15,6 +15,8 @@ export interface UnloadedSimilarityHnswStore {
 }
 
 export interface LoadedSimilarityHnswStore {
+  elementCount(): number;
+  recoveredFromCorruption(): boolean;
   insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void>;
   delete(visitId: string): Promise<void>;
   queryTopK(
@@ -44,6 +46,7 @@ interface LoadedState {
   version: number;
   readonly visitIdToLabel: Map<string, number>;
   readonly labelToVisitId: Map<number, string>;
+  readonly recoveredFromCorruption: boolean;
 }
 
 interface SimilarityHnswStoreOptions {
@@ -198,6 +201,14 @@ export const createSimilarityHnswStore = (
   };
 
   const loadedStore: LoadedSimilarityHnswStore = {
+    elementCount(): number {
+      return requireLoaded().visitIdToLabel.size;
+    },
+
+    recoveredFromCorruption(): boolean {
+      return requireLoaded().recoveredFromCorruption;
+    },
+
     async insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void> {
       const loaded = requireLoaded();
       if (visitId.length === 0) throw new Error('invalid HNSW visitId: empty');
@@ -300,6 +311,7 @@ export const createSimilarityHnswStore = (
       await mkdir(dirname(basePath), { recursive: true });
       const index = new HnswLib.HierarchicalNSW('cosine', dimension);
       const hasPointer = await pathExists(pointerPath);
+      let recoveredFromCorruption = false;
       if (hasPointer) {
         try {
           const version = parsePointer(await readFile(pointerPath, 'utf8'));
@@ -329,12 +341,14 @@ export const createSimilarityHnswStore = (
                 visitId,
               ]),
             ),
+            recoveredFromCorruption: false,
           };
           return loadedStore;
         } catch {
           // A crash can leave the pointer or one half of a versioned pair
           // missing. Treat that as an empty store; the reconcile pass
           // rebuilds from the event log and publishes a fresh pair.
+          recoveredFromCorruption = true;
         }
       }
       const legacyIndexPath = indexPathFor(vaultRoot);
@@ -363,6 +377,7 @@ export const createSimilarityHnswStore = (
           labelToVisitId: new Map(
             Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
           ),
+          recoveredFromCorruption: false,
         };
         return loadedStore;
       }
@@ -380,6 +395,7 @@ export const createSimilarityHnswStore = (
         version: 0,
         visitIdToLabel: new Map(),
         labelToVisitId: new Map(),
+        recoveredFromCorruption,
       };
       return loadedStore;
     },
