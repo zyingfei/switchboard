@@ -1,7 +1,7 @@
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createConnectionsStore, SqliteConnectionsStore } from './snapshot.js';
 import {
@@ -105,6 +105,7 @@ describe('SqliteConnectionsStore', () => {
   let vaultRoot: string | null = null;
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     delete process.env['SIDETRACK_CONNECTIONS_STORE'];
     delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
     if (vaultRoot !== null) {
@@ -255,6 +256,97 @@ describe('SqliteConnectionsStore', () => {
       'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    store.close();
+  });
+
+  sqliteIt('selectively replaces only dirty scope membership rows', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const first = buildSnapshot();
+    const second: ConnectionsSnapshot = {
+      ...first,
+      nodes: [first.nodes[0]!, first.nodes[1]!],
+      edges: [first.edges[0]!],
+      nodeCount: 2,
+      edgeCount: 1,
+      snapshotRevision: 'rev-sqlite-test-2',
+    };
+
+    await store.writeSnapshotAndProgress(first, progressFor(first));
+    await store.writeSnapshotAndProgress(
+      second,
+      progressFor(second),
+      new Set([{ kind: 'thread', id: 'alpha' }]),
+    );
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'dispatch:one',
+      'thread:alpha',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    store.close();
+  });
+
+  sqliteIt('rolls back selective scope replacement with graph and progress writes', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const first = buildSnapshot();
+    const firstProgress = progressFor(first);
+    const second: ConnectionsSnapshot = {
+      ...first,
+      nodes: [{ ...first.nodes[0]!, label: 'Changed Alpha' }, first.nodes[1]!],
+      edges: [first.edges[0]!],
+      nodeCount: 2,
+      edgeCount: 1,
+      snapshotRevision: 'rev-sqlite-test-2',
+    };
+
+    await store.writeSnapshotAndProgress(first, firstProgress);
+    vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithProgressCrash(
+      this: InstanceType<typeof Database>,
+      sql: string,
+    ) {
+      const statement = originalQuery.call(this, sql);
+      if (!sql.includes('INSERT INTO connections_materializer_meta')) return statement;
+      return {
+        ...statement,
+        run: () => {
+          throw new Error('simulated progress write crash');
+        },
+      };
+    });
+
+    await expect(
+      store.writeSnapshotAndProgress(
+        second,
+        progressFor(second),
+        new Set([{ kind: 'thread', id: 'alpha' }]),
+      ),
+    ).rejects.toThrow('simulated progress write crash');
+
+    expect(await store.readCurrent()).toEqual(first);
+    expect(await store.readMaterializerProgress('connections')).toEqual(firstProgress);
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       { src: 'dispatch:one', dst: 'workstream:main' },
       { src: 'thread:alpha', dst: 'workstream:main' },
     ]);

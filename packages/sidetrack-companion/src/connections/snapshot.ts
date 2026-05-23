@@ -3546,6 +3546,7 @@ export interface ConnectionsStore {
   readonly writeSnapshotAndProgress: (
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
+    dirtyScopes?: ReadonlySet<Scope>,
   ) => Promise<void>;
   readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
   readonly readScopesForNode?: (nodeId: string) => Promise<Scope[]>;
@@ -3858,9 +3859,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly writeSnapshotAndProgress = async (
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
+    dirtyScopes?: ReadonlySet<Scope>,
   ): Promise<void> => {
     const db = await this.#database();
-    this.#writeCurrentRows(db, snapshot, progress);
+    this.#writeCurrentRows(db, snapshot, progress, dirtyScopes);
   };
 
   readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
@@ -4076,6 +4078,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     db: SqliteDatabase,
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress | null,
+    dirtyScopes?: ReadonlySet<Scope>,
   ): void {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
@@ -4107,6 +4110,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
       const deleteAllScopeNodes = db.query('DELETE FROM connections_scope_nodes');
       const deleteAllScopeEdges = db.query('DELETE FROM connections_scope_edges');
+      const deleteScopeNodes = db.query(
+        'DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?',
+      );
+      const deleteScopeEdges = db.query(
+        'DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?',
+      );
       const insertScopeNode = db.query(
         `INSERT OR IGNORE INTO connections_scope_nodes
           (scope_kind, scope_id, node_id)
@@ -4163,15 +4172,36 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
       if (process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] === '1') {
         const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
-        deleteAllScopeNodes.run();
-        deleteAllScopeEdges.run();
+        const dirtyScopeKeys =
+          dirtyScopes === undefined
+            ? null
+            : new Set([...dirtyScopes].map((scope) => `${scope.kind}\u0000${scope.id}`));
+        if (dirtyScopes === undefined) {
+          deleteAllScopeNodes.run();
+          deleteAllScopeEdges.run();
+        } else {
+          for (const scope of dirtyScopes) {
+            deleteScopeNodes.run(scope.kind, scope.id);
+            deleteScopeEdges.run(scope.kind, scope.id);
+          }
+        }
         for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
-          for (const scope of scopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
+          for (const scope of scopes) {
+            if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
+              continue;
+            }
+            insertScopeNode.run(scope.kind, scope.id, nodeId);
+          }
         }
         for (const [key, scopes] of memberships.edgeScopes.entries()) {
           const [src, dst] = key.split('\u0000');
           if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
-          for (const scope of scopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
+          for (const scope of scopes) {
+            if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
+              continue;
+            }
+            insertScopeEdge.run(scope.kind, scope.id, src, dst);
+          }
         }
       }
 
@@ -4508,6 +4538,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   const writeSnapshotAndProgress = async (
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
+    _dirtyScopes?: ReadonlySet<Scope>,
   ): Promise<void> => {
     await putCurrent(snapshot);
     await writeAtomic(progressPath, JSON.stringify(progress, null, 2));

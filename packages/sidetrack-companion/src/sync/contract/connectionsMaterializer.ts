@@ -1040,9 +1040,10 @@ export const createConnectionsMaterializer = (
   const writeSnapshotWithProgress = async (
     snapshot: ConnectionsSnapshot,
     events: readonly AcceptedEvent[],
+    dirtyScopes?: ReadonlySet<Scope>,
   ): Promise<void> => {
     const progress = progressForSnapshot(events, snapshot);
-    await deps.store.writeSnapshotAndProgress(snapshot, progress);
+    await deps.store.writeSnapshotAndProgress(snapshot, progress, dirtyScopes);
     lastFrontier = progress.appliedFrontier;
   };
 
@@ -1659,6 +1660,12 @@ export const createConnectionsMaterializer = (
       previousSnapshotForRanker !== null;
     let wroteScopeIncremental = false;
     const dirtyScopes = invalidationKeysToScopes(buildKeys);
+    const dirtyScopeWrites =
+      process.env[INCREMENTAL_SCOPES_ENV] === '1' &&
+      previousSnapshotForRanker !== null &&
+      dirtyScopes.length > 0
+        ? new Set(dirtyScopes)
+        : undefined;
     // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
@@ -1682,7 +1689,7 @@ export const createConnectionsMaterializer = (
       }
     }
     if (!wroteScopeIncremental) {
-      await writeSnapshotWithProgress(baseSnapshot, merged);
+      await writeSnapshotWithProgress(baseSnapshot, merged, dirtyScopeWrites);
       mark('writeSnapshotAndProgress baseSnapshot');
     }
     await yieldToEventLoop();
@@ -1779,7 +1786,7 @@ export const createConnectionsMaterializer = (
             );
           }
           lastRankerProducerRevision = producerRevision;
-          await writeSnapshotWithProgress(finalSnapshot, merged);
+          await writeSnapshotWithProgress(finalSnapshot, merged, dirtyScopeWrites);
           mark('writeSnapshotAndProgress ranker-augmented');
           rankerAugmentation = rankerAugmentationCounters({
             status: 'emitted',
