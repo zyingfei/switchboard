@@ -245,20 +245,16 @@ describe('SqliteConnectionsStore', () => {
 
     await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       'thread:alpha',
-      'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
-      { src: 'dispatch:one', dst: 'workstream:main' },
       { src: 'thread:alpha', dst: 'workstream:main' },
     ]);
     await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
       'dispatch:one',
-      'thread:alpha',
       'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
       { src: 'dispatch:one', dst: 'workstream:main' },
-      { src: 'thread:alpha', dst: 'workstream:main' },
     ]);
     store.close();
   });
@@ -285,19 +281,16 @@ describe('SqliteConnectionsStore', () => {
 
     await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       'thread:alpha',
-      'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       { src: 'thread:alpha', dst: 'workstream:main' },
     ]);
     await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
       'dispatch:one',
-      'thread:alpha',
       'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
       { src: 'dispatch:one', dst: 'workstream:main' },
-      { src: 'thread:alpha', dst: 'workstream:main' },
     ]);
     store.close();
   });
@@ -345,10 +338,8 @@ describe('SqliteConnectionsStore', () => {
     expect(await store.readMaterializerProgress('connections')).toEqual(firstProgress);
     await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       'thread:alpha',
-      'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
-      { src: 'dispatch:one', dst: 'workstream:main' },
       { src: 'thread:alpha', dst: 'workstream:main' },
     ]);
     store.close();
@@ -380,14 +371,11 @@ describe('SqliteConnectionsStore', () => {
 
     await expect(store.readScopesForNode('thread:alpha')).resolves.toEqual([
       { kind: 'thread', id: 'alpha' },
-      { kind: 'workstream', id: 'main' },
     ]);
     await expect(store.readScopesForEdge(thread.id, workstream.id)).resolves.toEqual([
       { kind: 'thread', id: 'alpha' },
-      { kind: 'workstream', id: 'main' },
     ]);
     await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
-      'thread:alpha',
       'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
