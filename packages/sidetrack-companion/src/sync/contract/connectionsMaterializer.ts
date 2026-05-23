@@ -1259,10 +1259,15 @@ export const createConnectionsMaterializer = (
     const incrementalGraphPlan = incrementalGraphView.drainPlan();
     mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
+    const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    const effectiveLastFrontier =
+      lastFrontier ?? existingProgress?.appliedFrontier ?? undefined;
     const pendingEventsForDrain =
-      lastFrontier === undefined
+      effectiveLastFrontier === undefined
         ? merged
-        : merged.filter((event) => event.dot.seq > (lastFrontier?.[event.dot.replicaId] ?? 0));
+        : merged.filter(
+            (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
+          );
     mark(`readMerged events=${String(merged.length)}`);
     // Stage 5.2 W2b/c wiring — first build (or post-catchUp reset)
     // seeds the projection accumulators from the full event log; same
@@ -1335,11 +1340,10 @@ export const createConnectionsMaterializer = (
     );
     const dirtyScopes = invalidationKeysToScopes(buildKeys);
     const previousSnapshotForRanker = await deps.store.readCurrent();
-    const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
     const hnswFullRebuild =
       existingProgress === null ||
       existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
-      lastFrontier === undefined;
+      effectiveLastFrontier === undefined;
     const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
       deps.vaultRoot,
       similarityEntries,

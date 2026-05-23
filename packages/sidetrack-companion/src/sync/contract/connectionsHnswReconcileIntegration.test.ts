@@ -101,8 +101,11 @@ describe('HNSW reconcile child integration', () => {
 
   it('persists HNSW similarity files and advances the snapshot in a real child process', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
-    const eventLog = createEventLog(vaultRoot, replica);
-    const store = createConnectionsStore(vaultRoot);
+    let eventNowMs = Date.parse('2026-05-22T10:00:00.000Z');
+    const eventLog = createEventLog(vaultRoot, replica, {
+      now: () => new Date(eventNowMs),
+    });
+    const baselineStore = createConnectionsStore(vaultRoot);
 
     await appendVisit(eventLog, {
       index: 0,
@@ -110,13 +113,14 @@ describe('HNSW reconcile child integration', () => {
     });
     const baselineResult = await runReconcileInChild({ vaultRoot, seq: 1 });
     expect(baselineResult).toMatchObject({ seq: 1, ok: true });
-    const baselineSnapshot = await store.readCurrent();
+    const baselineSnapshot = await baselineStore.readCurrent();
     expect(baselineSnapshot).not.toBeNull();
 
     for (let index = 1; index <= 20; index += 1) {
+      eventNowMs = Date.parse(`2026-05-22T11:${String(index).padStart(2, '0')}:00.000Z`);
       await appendVisit(eventLog, {
         index,
-        observedAt: `2026-05-22T10:${String(index).padStart(2, '0')}:00.000Z`,
+        observedAt: `2026-05-22T11:${String(index).padStart(2, '0')}:00.000Z`,
       });
     }
 
@@ -126,7 +130,7 @@ describe('HNSW reconcile child integration', () => {
     await expectFile(join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.bin'));
     await expectFile(join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.json'));
 
-    const snapshot = await store.readCurrent();
+    const snapshot = await createConnectionsStore(vaultRoot).readCurrent();
     expect(snapshot).not.toBeNull();
     expect(Date.parse(snapshot!.updatedAt)).toBeGreaterThan(Date.parse(baselineSnapshot!.updatedAt));
   });
