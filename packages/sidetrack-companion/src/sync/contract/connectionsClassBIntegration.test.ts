@@ -632,6 +632,48 @@ describe('connections Class B integration invariants', () => {
     expect(await first.store.readMaterializerProgress('connections')).toEqual(preResetProgress);
   });
 
+  it('scoped incremental drain equals a full rebuild for a 50-event fixture', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const store = createConnectionsStore(vaultRoot);
+    let replaceCount = 0;
+    const recordingStore: ConnectionsStore = {
+      ...store,
+      replaceScopeRows:
+        store.replaceScopeRows === undefined
+          ? undefined
+          : async (...args) => {
+              replaceCount += 1;
+              await store.replaceScopeRows!(...args);
+            },
+    };
+    const materializer = createNoisyFreeMaterializer({
+      vaultRoot,
+      eventLog,
+      store: recordingStore,
+    });
+    const events = Array.from({ length: 50 }, (_, index) =>
+      threadUpserted({
+        replicaId: 'scope-eq',
+        seq: index + 1,
+        bacId: `T${String(index + 1)}`,
+        title: `Thread ${String(index + 1)}`,
+      }),
+    );
+    await importEvents(eventLog, events.slice(0, 1));
+    await materializer.catchUp(eventLog);
+    await importEvents(eventLog, events.slice(1));
+
+    await materializer.catchUp(eventLog);
+
+    const incremental = await store.readCurrent();
+    if (incremental === null) throw new Error('expected scoped incremental snapshot');
+    expect(replaceCount).toBe(1);
+    expect(normalizeGeneratedSnapshot(incremental)).toEqual(
+      normalizeGeneratedSnapshot(fullSnapshotFor(events)),
+    );
+  });
+
   it('HNSW path produces the same similarity edges as pairwise for deterministic embeddings', async () => {
     const pairwiseRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-pairwise-'));
     try {
