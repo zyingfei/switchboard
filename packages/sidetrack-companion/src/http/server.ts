@@ -6055,7 +6055,10 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const imported: { replicaId: string; seq: number }[] = [];
-      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      const skipped: (
+        | { replicaId: string; seq: number; reason: string }
+        | { status: 'duplicate-in-batch'; clientEventId: string; droppedAt: number }
+      )[] = [];
       const recordImported = (event: import('../sync/causal.js').AcceptedEvent): void => {
         imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
       };
@@ -6070,7 +6073,8 @@ const routes: readonly RouteDefinition[] = [
       // pass instead of a per-event whole-log scan (the per-event
       // path made multi-event POSTs run 0.4-3.4 s).
       const valid: import('../sync/causal.js').AcceptedEvent[] = [];
-      for (const candidate of body.events) {
+      const seenClientEventIds = new Set<string>();
+      for (const [index, candidate] of body.events.entries()) {
         if (
           candidate === null ||
           typeof candidate !== 'object' ||
@@ -6104,9 +6108,18 @@ const routes: readonly RouteDefinition[] = [
         // sanitized payload (preserving the edge dot + clientEventId
         // so importPeerEvent dedupe still works).
         const sanitizedPayload = sanitizeTimelinePayload(event.payload);
-        valid.push(
-          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload },
-        );
+        const sanitized =
+          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
+        if (seenClientEventIds.has(sanitized.clientEventId)) {
+          skipped.push({
+            status: 'duplicate-in-batch',
+            clientEventId: sanitized.clientEventId,
+            droppedAt: index,
+          });
+          continue;
+        }
+        seenClientEventIds.add(sanitized.clientEventId);
+        valid.push(sanitized);
       }
       // Batched ingest — ONE readMerged dedupe for the whole POST.
       // importTimelineEvents dispatches each accepted event to the
