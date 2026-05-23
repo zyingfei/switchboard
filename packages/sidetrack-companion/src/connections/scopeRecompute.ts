@@ -8,6 +8,11 @@ import {
 } from '../sync/contract/connectionsScopes.js';
 import type { ConnectionsInput } from './snapshot.js';
 
+// Scope recompute consumes the same causal projection as full rebuilds:
+// Class A aggregate events are folded by `mergeRegister`-backed
+// projectors before graph rows are emitted, and tombstones only delete
+// events whose creating dot is covered by the tombstone deps.
+
 export interface ScopeRecomputeOutput {
   readonly nodes: readonly ConnectionNode[];
   readonly edges: readonly ConnectionEdge[];

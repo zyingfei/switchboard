@@ -40,7 +40,7 @@ import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/fe
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
-import type { AcceptedEvent } from '../sync/causal.js';
+import type { AcceptedEvent, RegisterProjection } from '../sync/causal.js';
 import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
 import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScopes.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
@@ -55,7 +55,15 @@ import {
   type UrlProjection,
 } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
-import { THREAD_UPSERTED, isThreadUpsertedPayload } from '../threads/events.js';
+import {
+  THREAD_ARCHIVED,
+  THREAD_DELETED,
+  THREAD_UNARCHIVED,
+  THREAD_UPSERTED,
+  isThreadStatusPayload,
+  isThreadUpsertedPayload,
+} from '../threads/events.js';
+import { projectThread } from '../threads/projection.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   isBrowserTimelineObservedPayload,
@@ -65,7 +73,13 @@ import type { TimelineDayProjection } from '../timeline/projection.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../visual/events.js';
 import { projectVisualFingerprints } from '../visual/projection.js';
-import { WORKSTREAM_UPSERTED, isWorkstreamUpsertedPayload } from '../workstreams/events.js';
+import {
+  WORKSTREAM_DELETED,
+  WORKSTREAM_UPSERTED,
+  isWorkstreamDeletedPayload,
+  isWorkstreamUpsertedPayload,
+} from '../workstreams/events.js';
+import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import {
@@ -281,6 +295,23 @@ const compareRankerServingCandidate = (left: Candidate, right: Candidate): numbe
   rankerServingPriority(left) - rankerServingPriority(right) ||
   right.generatedAt - left.generatedAt ||
   compareString(left.toVisitId, right.toVisitId);
+
+const registerMetadata = <T>(
+  projection: RegisterProjection<T>,
+): Record<string, unknown> | undefined => {
+  if (projection.status === 'resolved') return undefined;
+  return {
+    causalRegister: {
+      status: 'conflict',
+      candidates: projection.candidates.map((candidate) => ({
+        value: candidate.value,
+        event: candidate.event,
+        replicaId: candidate.replicaId,
+        acceptedAtMs: candidate.acceptedAtMs,
+      })),
+    },
+  };
+};
 
 // Internal accumulator for nodes — allows merging origin replica
 // ids and merging metadata from multiple sources.
@@ -1215,95 +1246,191 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // queue.created, annotation.created. Each produces a node and may emit
   // edges that are derivable from the event payload alone.
   // -------------------------------------------------------------------
+  const threadIds = new Set<string>();
+  const workstreamIds = new Set<string>();
+  for (const event of input.events) {
+    if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
+      threadIds.add(event.payload.bac_id);
+    } else if (
+      (event.type === THREAD_ARCHIVED ||
+        event.type === THREAD_UNARCHIVED ||
+        event.type === THREAD_DELETED) &&
+      isThreadStatusPayload(event.payload)
+    ) {
+      threadIds.add(event.payload.bac_id);
+    } else if (event.type === WORKSTREAM_UPSERTED && isWorkstreamUpsertedPayload(event.payload)) {
+      workstreamIds.add(event.payload.bac_id);
+    } else if (event.type === WORKSTREAM_DELETED && isWorkstreamDeletedPayload(event.payload)) {
+      workstreamIds.add(event.payload.bac_id);
+    }
+  }
+
+  for (const threadId of [...threadIds].sort()) {
+    const projection = projectThread(threadId, input.events);
+    if (projection.deleted) continue;
+    const observedAtIso = new Date(projection.updatedAtMs).toISOString();
+    trackObservedAt(observedAtIso);
+    const record =
+      projection.record.status === 'resolved'
+        ? projection.record.value
+        : projection.record.candidates[0]?.value;
+    if (record === undefined) continue;
+    trackObservedAt(record.lastSeenAt);
+    const candidateEvents =
+      projection.record.status === 'resolved'
+        ? projection.record.event === undefined
+          ? []
+          : [projection.record.event]
+        : projection.record.candidates.map((candidate) => candidate.event);
+    upsertNode(nodes, {
+      kind: 'thread',
+      key: record.bac_id,
+      label: record.title ?? record.threadUrl ?? record.bac_id,
+      observedAt: record.lastSeenAt ?? observedAtIso,
+      ...(candidateEvents[0] === undefined ? {} : { replicaId: candidateEvents[0].replicaId }),
+      metadata: {
+        provider: record.provider,
+        url: record.threadUrl,
+        title: record.title,
+        ...(record.primaryWorkstreamId === undefined
+          ? {}
+          : { workstreamId: record.primaryWorkstreamId }),
+        ...registerMetadata(projection.record),
+      },
+    });
+    for (const event of candidateEvents.slice(1)) {
+      upsertNode(nodes, {
+        kind: 'thread',
+        key: record.bac_id,
+        label: record.title ?? record.threadUrl ?? record.bac_id,
+        observedAt: record.lastSeenAt ?? observedAtIso,
+        replicaId: event.replicaId,
+      });
+    }
+    const membershipCandidates =
+      projection.record.status === 'resolved'
+        ? record.primaryWorkstreamId === undefined || projection.record.event === undefined
+          ? []
+          : [{ workstreamId: record.primaryWorkstreamId, event: projection.record.event }]
+        : projection.record.candidates
+            .filter((candidate) => candidate.value.primaryWorkstreamId !== undefined)
+            .map((candidate) => ({
+              workstreamId: candidate.value.primaryWorkstreamId!,
+              event: candidate.event,
+            }));
+    for (const candidate of membershipCandidates) {
+      const wsKey = candidate.workstreamId;
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: wsKey,
+        label: wsKey,
+        observedAt: observedAtIso,
+        replicaId: candidate.event.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: 'thread_in_workstream',
+        fromNodeId: nodeIdFor('thread', record.bac_id),
+        toNodeId: nodeIdFor('workstream', wsKey),
+        observedAt: observedAtIso,
+        producedBy: {
+          source: 'event-log',
+          eventType: THREAD_UPSERTED,
+          dot: candidate.event,
+        },
+        confidence: 'asserted',
+        ...(projection.record.status === 'resolved'
+          ? {}
+          : { metadata: { causalRegisterStatus: 'conflict' } }),
+      });
+    }
+  }
+
+  for (const workstreamId of [...workstreamIds].sort()) {
+    const projection = projectWorkstream(workstreamId, input.events);
+    if (projection.deleted) continue;
+    const observedAtIso = new Date(projection.updatedAtMs).toISOString();
+    trackObservedAt(observedAtIso);
+    const record =
+      projection.record.status === 'resolved'
+        ? projection.record.value
+        : projection.record.candidates[0]?.value;
+    if (record === undefined) continue;
+    const candidateEvents =
+      projection.record.status === 'resolved'
+        ? projection.record.event === undefined
+          ? []
+          : [projection.record.event]
+        : projection.record.candidates.map((candidate) => candidate.event);
+    upsertNode(nodes, {
+      kind: 'workstream',
+      key: record.bac_id,
+      label: record.title ?? record.bac_id,
+      observedAt: observedAtIso,
+      ...(candidateEvents[0] === undefined ? {} : { replicaId: candidateEvents[0].replicaId }),
+      metadata: {
+        title: record.title,
+        ...registerMetadata(projection.record),
+      },
+    });
+    for (const event of candidateEvents.slice(1)) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: record.bac_id,
+        label: record.title ?? record.bac_id,
+        observedAt: observedAtIso,
+        replicaId: event.replicaId,
+      });
+    }
+    const parentCandidates =
+      projection.record.status === 'resolved'
+        ? record.parentId === undefined || projection.record.event === undefined
+          ? []
+          : [{ parentId: record.parentId, event: projection.record.event }]
+        : projection.record.candidates
+            .filter((candidate) => candidate.value.parentId !== undefined)
+            .map((candidate) => ({
+              parentId: candidate.value.parentId!,
+              event: candidate.event,
+            }));
+    for (const candidate of parentCandidates) {
+      upsertNode(nodes, {
+        kind: 'workstream',
+        key: candidate.parentId,
+        label: candidate.parentId,
+        observedAt: observedAtIso,
+        replicaId: candidate.event.replicaId,
+      });
+      upsertEdge(edges, {
+        kind: 'workstream_parent_of',
+        fromNodeId: nodeIdFor('workstream', candidate.parentId),
+        toNodeId: nodeIdFor('workstream', record.bac_id),
+        observedAt: observedAtIso,
+        producedBy: {
+          source: 'event-log',
+          eventType: WORKSTREAM_UPSERTED,
+          dot: candidate.event,
+        },
+        confidence: 'asserted',
+        ...(projection.record.status === 'resolved'
+          ? {}
+          : { metadata: { causalRegisterStatus: 'conflict' } }),
+      });
+    }
+  }
+
   for (const event of input.events) {
     const observedAtIso = new Date(event.acceptedAtMs).toISOString();
     trackObservedAt(observedAtIso);
     const replicaId = event.dot.replicaId;
 
-    if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
-      const p = event.payload;
-      const threadKey = p.bac_id;
-      // The thread payload's lastSeenAt is the user-relevant
-      // timestamp (the moment the user touched the thread); track
-      // it for global maxObservedAt so the snapshot updatedAt
-      // reflects user-perspective time, not just runner accept
-      // time.
-      trackObservedAt(p.lastSeenAt);
-      upsertNode(nodes, {
-        kind: 'thread',
-        key: threadKey,
-        label: p.title ?? p.threadUrl ?? threadKey,
-        observedAt: p.lastSeenAt ?? observedAtIso,
-        replicaId,
-        metadata: {
-          provider: p.provider,
-          url: p.threadUrl,
-          title: p.title,
-          ...(p.primaryWorkstreamId === undefined ? {} : { workstreamId: p.primaryWorkstreamId }),
-        },
-      });
-      if (p.primaryWorkstreamId !== undefined) {
-        // Edge target may not exist yet; we create the workstream
-        // node lazily so the edge has a valid endpoint either way.
-        const wsKey = p.primaryWorkstreamId;
-        upsertNode(nodes, {
-          kind: 'workstream',
-          key: wsKey,
-          label: wsKey,
-          observedAt: observedAtIso,
-          replicaId,
-        });
-        const fromId = nodeIdFor('thread', threadKey);
-        const toId = nodeIdFor('workstream', wsKey);
-        upsertEdge(edges, {
-          kind: 'thread_in_workstream',
-          fromNodeId: fromId,
-          toNodeId: toId,
-          observedAt: observedAtIso,
-          producedBy: {
-            source: 'event-log',
-            eventType: THREAD_UPSERTED,
-            dot: { replicaId, seq: event.dot.seq },
-          },
-          confidence: 'asserted',
-        });
-      }
-      continue;
-    }
-
-    if (event.type === WORKSTREAM_UPSERTED && isWorkstreamUpsertedPayload(event.payload)) {
-      const p = event.payload;
-      upsertNode(nodes, {
-        kind: 'workstream',
-        key: p.bac_id,
-        label: p.title ?? p.bac_id,
-        observedAt: observedAtIso,
-        replicaId,
-        metadata: {
-          title: p.title,
-        },
-      });
-      if (typeof p.parentId === 'string' && p.parentId.length > 0) {
-        upsertNode(nodes, {
-          kind: 'workstream',
-          key: p.parentId,
-          label: p.parentId,
-          observedAt: observedAtIso,
-          replicaId,
-        });
-        upsertEdge(edges, {
-          kind: 'workstream_parent_of',
-          fromNodeId: nodeIdFor('workstream', p.parentId),
-          toNodeId: nodeIdFor('workstream', p.bac_id),
-          observedAt: observedAtIso,
-          producedBy: {
-            source: 'event-log',
-            eventType: WORKSTREAM_UPSERTED,
-            dot: { replicaId, seq: event.dot.seq },
-          },
-          confidence: 'asserted',
-        });
-      }
+    if (
+      event.type === THREAD_UPSERTED ||
+      event.type === THREAD_ARCHIVED ||
+      event.type === THREAD_UNARCHIVED ||
+      event.type === THREAD_DELETED ||
+      event.type === WORKSTREAM_UPSERTED ||
+      event.type === WORKSTREAM_DELETED
+    ) {
       continue;
     }
 
