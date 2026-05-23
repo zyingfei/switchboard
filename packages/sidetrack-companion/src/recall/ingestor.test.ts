@@ -92,6 +92,39 @@ describe('ingestor', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it('dedups recall-index ingest by threadId, role, and content hash', async () => {
+    const { createEventLog } = await import('../sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    for (const ordinal of [0, 1]) {
+      await eventLog.appendClient({
+        clientEventId: `cap-dup-${String(ordinal)}`,
+        aggregateId: 'thread_dup',
+        type: 'capture.recorded',
+        payload: {
+          bac_id: 'thread_dup',
+          threadId: 'thread_dup',
+          capturedAt: '2026-05-06T18:00:00.000Z',
+          turns: [{ ordinal, role: 'assistant', text: 'same recalled answer' }],
+        },
+        baseVector: {},
+      });
+    }
+
+    const summary = await ingestIncremental(vaultRoot, eventLog);
+    expect(summary.indexedChunks).toBe(1);
+    const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
+    const live = (index?.items ?? []).filter(
+      (item) =>
+        item.threadId === 'thread_dup' &&
+        item.metadata?.role === 'assistant' &&
+        item.metadata?.textHash !== undefined,
+    );
+    expect(live).toHaveLength(1);
+  });
+
   it('honors recall.tombstone.target events from the merged log', async () => {
     const { createEventLog } = await import('../sync/eventLog.js');
     const { loadOrCreateReplica } = await import('../sync/replicaId.js');
