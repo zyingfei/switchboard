@@ -195,7 +195,7 @@ const syncSummaryDeps = (
     materializers?: Record<
       string,
       {
-        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
         readonly lastSuccessAt: string | null;
         readonly lastError: string | null;
         readonly pending: boolean;
@@ -458,7 +458,7 @@ export interface CompanionHttpConfig {
   readonly syncMaterializerHealth?: () => Record<
     string,
     {
-      readonly status: 'healthy' | 'degraded' | 'failed';
+      readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
       readonly lastSuccessAt: string | null;
       readonly lastError: string | null;
       readonly pending: boolean;

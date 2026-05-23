@@ -47,7 +47,7 @@ import type { EventLog } from '../eventLog.js';
 //      via replay, never via "we'll call you next time" semantics.
 
 export interface MaterializerHealth {
-  readonly status: 'healthy' | 'degraded' | 'failed';
+  readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
   readonly lastSuccessAt: string | null;
   readonly lastError: string | null;
   // True while a worker is in-flight OR a coalesced re-run is queued.

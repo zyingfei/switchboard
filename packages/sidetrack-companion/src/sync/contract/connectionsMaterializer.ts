@@ -293,6 +293,7 @@ const TOPIC_EVERY_DRAINS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS';
 const TOPIC_EVERY_MS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS';
 const DEFAULT_TOPIC_EVERY_DRAINS = 50;
 const DEFAULT_TOPIC_EVERY_MS = 300_000;
+const BUSY_LAST_SUCCESS_WINDOW_MS = 60_000;
 
 const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
 
@@ -2270,23 +2271,35 @@ export const createConnectionsMaterializer = (
     }
   };
 
-  const health: Materializer['health'] = (): MaterializerHealth => ({
-    status: lastError !== null ? 'failed' : pending ? 'degraded' : 'healthy',
-    lastSuccessAt,
-    lastError,
-    pending,
-    ...(lastFrontier === undefined ? {} : { frontier: lastFrontier }),
-    ...(lastDriftReport === null
-      ? {}
-      : {
-          lastDriftCheck: {
-            at: lastDriftReport.checkedAt,
-            conclusion: lastDriftReport.conclusion,
-            nodeDiffSummary: lastDriftReport.nodeDiff,
-            edgeDiffSummary: lastDriftReport.edgeDiff,
-          },
-        }),
-  });
+  const healthStatus = (): MaterializerHealth['status'] => {
+    if (lastError !== null) return 'failed';
+    if (!pending) return lastSuccessAt === null ? 'degraded' : 'healthy';
+    if (lastSuccessAt === null) return 'degraded';
+    return Date.now() - Date.parse(lastSuccessAt) <= BUSY_LAST_SUCCESS_WINDOW_MS
+      ? 'busy'
+      : 'degraded';
+  };
+
+  const health: Materializer['health'] = (): MaterializerHealth => {
+    const status = healthStatus();
+    return {
+      status,
+      lastSuccessAt,
+      lastError,
+      pending,
+      ...(lastFrontier === undefined ? {} : { frontier: lastFrontier }),
+      ...(lastDriftReport === null
+        ? {}
+        : {
+            lastDriftCheck: {
+              at: lastDriftReport.checkedAt,
+              conclusion: lastDriftReport.conclusion,
+              nodeDiffSummary: lastDriftReport.nodeDiff,
+              edgeDiffSummary: lastDriftReport.edgeDiff,
+            },
+          }),
+    };
+  };
 
   const getDirtySources = (): DirtySourceQueueSnapshot => dirtySourceQueue.snapshot();
   const clearDirtySources = (sourceUnitIds: readonly string[]): void => {

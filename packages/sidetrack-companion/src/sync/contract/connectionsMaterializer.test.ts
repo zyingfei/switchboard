@@ -1,9 +1,13 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createConnectionsStore, type ConnectionsSnapshot } from '../../connections/snapshot.js';
+import {
+  createConnectionsStore,
+  type ConnectionsSnapshot,
+  type ConnectionsStore,
+} from '../../connections/snapshot.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
 import { activeClosestVisitRevisionManifestPath } from '../../producers/closest-visit-revision.js';
 import { FEATURE_SCHEMA_VERSION } from '../../ranker/feature-schema.js';
@@ -76,6 +80,41 @@ const noRetrain = () =>
     },
     newLabelCount: 0,
   });
+
+const blockingConnectionsStore = (blockOnCall: number) => {
+  let calls = 0;
+  let releaseWrite: (() => void) | undefined;
+  let writeStartedResolve: (() => void) | undefined;
+  const writeStarted = new Promise<void>((resolve) => {
+    writeStartedResolve = resolve;
+  });
+  const store = {
+    putCurrent: async (snapshot: ConnectionsSnapshot): Promise<void> => {
+      void snapshot;
+      calls += 1;
+      if (calls === blockOnCall) {
+        writeStartedResolve?.();
+        await new Promise<void>((resolve) => {
+          releaseWrite = resolve;
+        });
+      }
+    },
+    writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+      store.putCurrent(snapshot),
+    readMaterializerProgress: () => Promise.resolve(null),
+    readCurrent: () => Promise.resolve(null),
+    putDay: () => Promise.resolve(undefined),
+    readDay: () => Promise.resolve(null),
+    listDays: () => Promise.resolve([]),
+  } satisfies ConnectionsStore;
+  return {
+    store,
+    writeStarted,
+    release: (): void => {
+      releaseWrite?.();
+    },
+  };
+};
 
 const rankerContributions = (weight: number): RankerContributions => ({
   schemaVersion: 0,
@@ -305,6 +344,7 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
   });
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(vaultRoot, { recursive: true, force: true });
     if (prevShadowFlag === undefined) delete process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'];
     else process.env['SIDETRACK_TOPIC_SHADOW_CANDIDATE'] = prevShadowFlag;
@@ -1165,6 +1205,205 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     await m.awaitIdle();
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(m.health().status).toBe('healthy');
+  });
+
+  it('health is healthy after recent success with no pending work', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+
+    await m.catchUp(eventLog);
+
+    expect(m.health().pending).toBe(false);
+    expect(m.health().lastSuccessAt).not.toBeNull();
+    expect(m.health().status).toBe('healthy');
+  });
+
+  it('health is busy when pending work follows a recent success', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writeStarted, release } = blockingConnectionsStore(2);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+    await m.catchUp(eventLog);
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_b',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/b',
+          title: 'B',
+          lastSeenAt: '2026-05-07T10:01:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+
+    const catchUp = m.catchUp(eventLog);
+    await writeStarted;
+
+    expect(m.health().pending).toBe(true);
+    expect(m.health().lastError).toBeNull();
+    expect(m.health().status).toBe('busy');
+
+    release();
+    await catchUp;
+  });
+
+  it('health is degraded when pending work has a stale last success', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writeStarted, release } = blockingConnectionsStore(2);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+    await m.catchUp(eventLog);
+    const lastSuccessAt = m.health().lastSuccessAt;
+    if (lastSuccessAt === null) throw new Error('expected successful catchUp');
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 2,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_b',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/b',
+          title: 'B',
+          lastSeenAt: '2026-05-07T10:01:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+
+    const catchUp = m.catchUp(eventLog);
+    await writeStarted;
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse(lastSuccessAt) + 61_000);
+
+    expect(m.health().pending).toBe(true);
+    expect(m.health().lastError).toBeNull();
+    expect(m.health().status).toBe('degraded');
+
+    release();
+    vi.restoreAllMocks();
+    await catchUp;
+  });
+
+  it('health is degraded when pending work has no last success', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const { store, writeStarted, release } = blockingConnectionsStore(1);
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+
+    const catchUp = m.catchUp(eventLog);
+    await writeStarted;
+
+    expect(m.health().pending).toBe(true);
+    expect(m.health().lastSuccessAt).toBeNull();
+    expect(m.health().lastError).toBeNull();
+    expect(m.health().status).toBe('degraded');
+
+    release();
+    await catchUp;
+  });
+
+  it('health is failed when lastError is set regardless of pending work', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = {
+      putCurrent: (snapshot: ConnectionsSnapshot): Promise<void> => {
+        void snapshot;
+        return Promise.reject(new Error('disk full'));
+      },
+      writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+        store.putCurrent(snapshot),
+      readMaterializerProgress: () => Promise.resolve(null),
+      readCurrent: () => Promise.resolve(null),
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
+    };
+    const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+
+    await m.catchUp(eventLog);
+
+    expect(m.health().pending).toBe(true);
+    expect(m.health().lastError).toContain('disk full');
+    expect(m.health().status).toBe('failed');
   });
 
   it('awaitIdle does not hang when a drain has parked the materializer in a failed state', async () => {

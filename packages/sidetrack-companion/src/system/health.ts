@@ -137,7 +137,7 @@ export interface HealthReport {
     readonly materializers?: Record<
       string,
       {
-        readonly status: 'healthy' | 'degraded' | 'failed';
+        readonly status: 'healthy' | 'busy' | 'degraded' | 'failed';
         readonly lastSuccessAt: string | null;
         readonly lastError: string | null;
         readonly pending: boolean;
