@@ -831,6 +831,9 @@ export const createConnectionsMaterializer = (
     await rm(join(deps.vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.json'), {
       force: true,
     });
+    await rm(join(deps.vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.current'), {
+      force: true,
+    });
   };
 
   const buildHnswVisitSimilarity = async (input: {
@@ -1350,10 +1353,16 @@ export const createConnectionsMaterializer = (
     );
     const dirtyScopes = invalidationKeysToScopes(buildKeys);
     const previousSnapshotForRanker = await deps.store.readCurrent();
+    const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
+    const loadedHnswStoreForGate = persistentHnswSimilarityMode
+      ? await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim)
+      : null;
+    if (loadedHnswStoreForGate !== null) loadedHnswSimilarityStore = loadedHnswStoreForGate;
     const hnswFullRebuild =
       existingProgress === null ||
       existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
-      effectiveLastFrontier === undefined;
+      (loadedHnswStoreForGate?.elementCount() ?? 0) === 0 ||
+      (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false);
     const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
       deps.vaultRoot,
       similarityEntries,
@@ -1391,7 +1400,6 @@ export const createConnectionsMaterializer = (
     // IncrementalVisitSimilarityIndex for cosine-only top-K. The
     // resulting revisionId carries a `:incremental` suffix so on-disk
     // cached revisions stay distinct from the legacy hybrid path.
-    const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
     const hotSimilarityMode = !persistentHnswSimilarityMode && false;
     const hotSimCorpusSize = incrementalSimilarityIndex.size();
     const hotSimilarityDecision = hotSimilarityMode
@@ -2166,6 +2174,11 @@ export const createConnectionsMaterializer = (
       throw new Error(result.error ?? 'subprocess drain failed without a message');
     }
     lastWorkerDrainSeqCompleted = seq;
+    const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    if (progress !== null && progress.materializerVersion === MATERIALIZER_VERSION) {
+      lastFrontier = progress.appliedFrontier;
+    }
+    lastSuccessAt = new Date().toISOString();
     // The subprocess re-instantiated its own materializer + accumulators
     // inside the child context. The main-thread in-process state
     // (urlAccumulator, tabSessionAccumulator, lastEngagementClassRevision)

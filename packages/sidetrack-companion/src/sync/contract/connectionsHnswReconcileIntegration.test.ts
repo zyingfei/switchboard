@@ -3,13 +3,17 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import type { ConnectionsSnapshot } from '../../connections/snapshot.js';
+import { DISPATCH_RECORDED } from '../../dispatches/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
+import { createTimelineStore } from '../../timeline/projection.js';
 import { createEventLog, type EventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
+import { createSyncContractRunner } from './runner.js';
+import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import {
   runReconcileInChild,
   setReconcileChildScriptOverride,
@@ -22,6 +26,8 @@ const envKeys = [
   'SIDETRACK_SIMILARITY_THRESHOLD',
   'SIDETRACK_SIMILARITY_TOP_K',
   'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS',
+  'SIDETRACK_CONNECTIONS_CHILD',
+  'SIDETRACK_CONNECTIONS_PHASE_LOG',
 ] as const;
 
 const childEntryPath = (): string =>
@@ -45,11 +51,11 @@ const appendVisit = async (
     readonly title?: string;
     readonly variant?: string;
   },
-): Promise<void> => {
+): ReturnType<EventLog['appendClientObserved']> => {
   const eventId = `hnsw-visit-${String(input.index)}`;
   const clientEventId =
     input.variant === undefined ? eventId : `${eventId}-${input.variant}`;
-  await eventLog.appendClientObserved({
+  return eventLog.appendClientObserved({
     clientEventId,
     aggregateId: clientEventId,
     type: BROWSER_TIMELINE_OBSERVED,
@@ -67,6 +73,23 @@ const appendVisit = async (
     },
   });
 };
+
+const appendDispatch = (
+  eventLog: EventLog,
+  input: { readonly index: number },
+): ReturnType<EventLog['appendClientObserved']> =>
+  eventLog.appendClientObserved({
+    clientEventId: `hnsw-dispatch-${String(input.index)}`,
+    aggregateId: `dispatch-${String(input.index)}`,
+    type: DISPATCH_RECORDED,
+    baseVector: {},
+    payload: {
+      bac_id: `dispatch-${String(input.index)}`,
+      target: { provider: 'claude' },
+      createdAt: '2026-05-22T10:00:00.000Z',
+      body: 'summarize current work',
+    },
+  });
 
 const hnswBasePath = (root: string): string =>
   join(root, '_BAC', 'connections', 'visit-similarity-hnsw');
@@ -178,6 +201,66 @@ describe('HNSW reconcile child integration', () => {
     // eligible visit to embed, so the materializer itself must load the persisted store.
     const noEligibleEmbeddingResult = await runReconcileInChild({ vaultRoot, seq: 3 });
     expect(noEligibleEmbeddingResult).toMatchObject({ seq: 3, ok: true });
+  });
+
+  it('does not full-rebuild HNSW in a child pass when no visits changed', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let index = 0; index < 4; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:0${String(index)}:00.000Z`,
+      });
+    }
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+    await appendDispatch(eventLog, { index: 1 });
+
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({
+        seq: 2,
+        ok: true,
+      });
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=0');
+  });
+
+  it('marks parent health successful when a runner drain completes in a child process', async () => {
+    process.env['SIDETRACK_CONNECTIONS_CHILD'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const store = createConnectionsStore(vaultRoot);
+    const materializer = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore: createTimelineStore(vaultRoot),
+      store,
+      diagnosticsStore: { write: async () => undefined },
+      diagnosticsLogger: () => {},
+    });
+    const runner = createSyncContractRunner();
+    runner.register(materializer);
+    const accepted = await appendVisit(eventLog, {
+      index: 0,
+      observedAt: '2026-05-22T10:00:00.000Z',
+    });
+    const before = Date.now();
+
+    runner.onAcceptedEvent(accepted, { origin: 'local' });
+    await runner.awaitIdle();
+
+    const health = runner.health()['connections'];
+    expect(health?.pending).toBe(false);
+    expect(health?.lastSuccessAt).not.toBeNull();
+    expect(Date.parse(health!.lastSuccessAt!)).toBeGreaterThanOrEqual(before - 5_000);
   });
 
   it('recovers from a partial published pair on restart', async () => {
