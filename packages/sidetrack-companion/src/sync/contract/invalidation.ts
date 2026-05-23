@@ -139,9 +139,11 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
     const p = asRecord(event.payload);
     const bacId = str(p['bac_id']);
     const canonicalUrl = str(p['threadUrl']);
+    const workstreamId = str(p['primaryWorkstreamId']);
     const keys: InvalidationKey[] = [];
     if (bacId !== undefined) keys.push({ kind: 'thread', bacId });
     if (canonicalUrl !== undefined) keys.push({ kind: 'url', canonicalUrl });
+    if (workstreamId !== undefined) keys.push({ kind: 'workstream', bacId: workstreamId });
     return keys;
   },
   [THREAD_ARCHIVED]: (event) => {
@@ -197,8 +199,10 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
     const p = asRecord(event.payload);
     const canonicalUrl = str(p['canonicalUrl']) ?? str(p['url']);
     const visitId = str(p['eventId']);
+    const tabSessionId = str(p['tabSessionId']);
     const keys: InvalidationKey[] = [];
     if (canonicalUrl !== undefined) keys.push({ kind: 'url', canonicalUrl });
+    if (tabSessionId !== undefined) keys.push({ kind: 'tabSession', tabSessionId });
     if (visitId !== undefined) {
       keys.push({ kind: 'engagementVisit', visitId });
       keys.push({ kind: 'topicMember', visitId });

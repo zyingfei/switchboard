@@ -68,6 +68,9 @@ export const scopesForNode = (node: Pick<ConnectionNode, 'id' | 'kind' | 'metada
     if (typeof workstreamId === 'string') scopes.push({ kind: 'workstream', id: workstreamId });
   } else if (node.kind === 'topic') {
     scopes.push({ kind: 'topic', id: idAfterPrefix(node.id, 'topic:') ?? node.id });
+  } else if (node.kind === 'annotation') {
+    const url = node.metadata['url'];
+    if (typeof url === 'string') scopes.push({ kind: 'url', id: url });
   } else {
     const threadId = node.metadata['threadId'];
     const workstreamId = node.metadata['workstreamId'];
@@ -105,19 +108,36 @@ export const scopesForGraphRows = (input: {
   readonly edgeScopes: ReadonlyMap<string, readonly Scope[]>;
 } => {
   const nodeById = new Map(input.nodes.map((node) => [node.id, node] as const));
-  const nodeScopes = new Map<string, readonly Scope[]>();
+  const nodeScopes = new Map<string, Scope[]>();
   for (const node of input.nodes) nodeScopes.set(node.id, scopesForNode(node));
+  for (const edge of input.edges) {
+    const fromScopes =
+      nodeById.get(edge.fromNodeId) === undefined
+        ? scopesForNodeId(edge.fromNodeId)
+        : scopesForNode(nodeById.get(edge.fromNodeId)!);
+    const toScopes =
+      nodeById.get(edge.toNodeId) === undefined
+        ? scopesForNodeId(edge.toNodeId)
+        : scopesForNode(nodeById.get(edge.toNodeId)!);
+    const endpointScopes = dedupeScopes([...fromScopes, ...toScopes]);
+    nodeScopes.set(
+      edge.fromNodeId,
+      dedupeScopes([...(nodeScopes.get(edge.fromNodeId) ?? []), ...endpointScopes]),
+    );
+    nodeScopes.set(
+      edge.toNodeId,
+      dedupeScopes([...(nodeScopes.get(edge.toNodeId) ?? []), ...endpointScopes]),
+    );
+  }
   const edgeScopes = new Map<string, readonly Scope[]>();
   for (const edge of input.edges) {
-    const endpointScopes = [
-      ...(nodeById.get(edge.fromNodeId) === undefined
-        ? scopesForNodeId(edge.fromNodeId)
-        : scopesForNode(nodeById.get(edge.fromNodeId)!)),
-      ...(nodeById.get(edge.toNodeId) === undefined
-        ? scopesForNodeId(edge.toNodeId)
-        : scopesForNode(nodeById.get(edge.toNodeId)!)),
-    ];
-    edgeScopes.set(`${edge.fromNodeId}\u0000${edge.toNodeId}`, dedupeScopes(endpointScopes));
+    edgeScopes.set(
+      `${edge.fromNodeId}\u0000${edge.toNodeId}`,
+      dedupeScopes([
+        ...(nodeScopes.get(edge.fromNodeId) ?? scopesForNodeId(edge.fromNodeId)),
+        ...(nodeScopes.get(edge.toNodeId) ?? scopesForNodeId(edge.toNodeId)),
+      ]),
+    );
   }
   return { nodeScopes, edgeScopes };
 };
