@@ -1,5 +1,5 @@
 import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
@@ -231,6 +231,17 @@ const readJsonRecord = async (path: string): Promise<Record<string, unknown>> =>
 const readStringArray = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 
+const turnContentHash = (turn: TurnRecord): string =>
+  createHash('sha256')
+    .update(
+      JSON.stringify({
+        role: turn.role,
+        text: turn.text,
+        formattedText: turn.formattedText ?? null,
+      }),
+    )
+    .digest('hex');
+
 const isMissingPathError = (error: unknown): boolean =>
   typeof error === 'object' &&
   error !== null &&
@@ -436,11 +447,10 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       throw error;
     }
 
-    const dedupe = new Map<string, TurnRecord>();
+    const dedupe = new Map<number, { readonly turn: TurnRecord; readonly contentHash: string }>();
     for (const name of names
       .filter((candidate) => /^\d{4}-\d{2}-\d{2}\.jsonl$/u.test(candidate))
-      .sort()
-      .reverse()) {
+      .sort()) {
       const fileEvents = await readEventFile(join(eventsRoot, name));
       for (const event of fileEvents) {
         if (event.threadUrl !== query.threadUrl) {
@@ -450,27 +460,26 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
           if (query.role !== undefined && turn.role !== query.role) {
             continue;
           }
-          const key = `${String(turn.ordinal)}::${turn.role}`;
-          const existing = dedupe.get(key);
-          // Keep the EARLIEST capturedAt for each (ordinal, role) so
-          // re-captures of the same chat (e.g. extension reload
-          // re-injection) don't overwrite the original time we first
-          // saw the turn. The user's "X min ago" stamp should reflect
-          // when the AI actually replied, not when we last extracted.
-          if (existing === undefined || existing.capturedAt > turn.capturedAt) {
-            dedupe.set(key, turn);
+          const existing = dedupe.get(turn.ordinal);
+          const contentHash = turnContentHash(turn);
+          // Merge captures by ordinal. A partial re-capture must only
+          // update the ordinals it contains, never replace the whole
+          // remembered thread. Equal content keeps the existing turn to
+          // avoid last-seen churn; changed content takes the newer
+          // capture for that ordinal.
+          if (
+            existing === undefined ||
+            (existing.contentHash !== contentHash && existing.turn.capturedAt <= turn.capturedAt)
+          ) {
+            dedupe.set(turn.ordinal, { turn, contentHash });
           }
         }
       }
-      if (dedupe.size >= query.limit * 4) {
-        break;
-      }
     }
 
-    // Sort by ordinal desc (newest turn in chat sequence first) —
-    // capturedAt sort breaks once we preserve earliest timestamps,
-    // because a re-stamp on an older turn would float it to the top.
+    // Sort by ordinal desc (newest turn in chat sequence first).
     return Array.from(dedupe.values())
+      .map(({ turn }) => turn)
       .sort((left, right) => right.ordinal - left.ordinal)
       .slice(0, query.limit);
   };

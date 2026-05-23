@@ -702,7 +702,7 @@ describe('companion HTTP server', () => {
     expect(auditLog).toContain('appendEvent');
   });
 
-  it('returns recent turns for a threadUrl, deduped by ordinal earliest-wins', async () => {
+  it('returns recent turns for a threadUrl, merging by ordinal without blind replacement', async () => {
     const earlier = '2026-04-26T20:00:00.000Z';
     const later = '2026-04-26T22:00:00.000Z';
     const threadUrl = 'https://claude.ai/chat/turns-test';
@@ -729,9 +729,19 @@ describe('companion HTTP server', () => {
     const p1 = await post(earlier, 'turns-test-001', 'first capture v1');
     const p2 = await post(later, 'turns-test-002', 'first capture v2');
     const p3 = await post(later, 'turns-test-003', 'second turn', 1);
+    const p4 = await post(later, 'turns-test-004', 'third turn', 2);
+    const p5 = await post(later, 'turns-test-005', 'fourth turn', 3);
+    const p6 = await post(later, 'turns-test-006', 'fifth turn', 4);
+    const partial2 = await post('2026-04-26T23:00:00.000Z', 'turns-test-007', 'third turn', 2);
+    const partial3 = await post('2026-04-26T23:00:00.000Z', 'turns-test-008', 'fourth turn', 3);
     expect(p1.status).toBe(201);
     expect(p2.status).toBe(201);
     expect(p3.status).toBe(201);
+    expect(p4.status).toBe(201);
+    expect(p5.status).toBe(201);
+    expect(p6.status).toBe(201);
+    expect(partial2.status).toBe(201);
+    expect(partial3.status).toBe(201);
 
     const list = await jsonFetch(
       context,
@@ -742,14 +752,16 @@ describe('companion HTTP server', () => {
     const data = (
       list.body as { readonly data: readonly { readonly text: string; readonly ordinal: number }[] }
     ).data;
-    expect(data).toHaveLength(2);
-    // Dedup keeps the EARLIEST capturedAt per (ordinal, role) so the
-    // "X min ago" stamp reflects when the AI actually replied, not
-    // when we last re-captured. v1 (the first write at the earlier
-    // timestamp) wins for ordinal 0.
+    expect(data).toHaveLength(5);
     const byOrdinal = new Map(data.map((turn) => [turn.ordinal, turn.text]));
-    expect(byOrdinal.get(0)).toBe('first capture v1');
+    // Changed content at the same ordinal takes the newer capture;
+    // same-content partial captures at ordinals 2-3 do not drop
+    // surrounding ordinals 0, 1, and 4.
+    expect(byOrdinal.get(0)).toBe('first capture v2');
     expect(byOrdinal.get(1)).toBe('second turn');
+    expect(byOrdinal.get(2)).toBe('third turn');
+    expect(byOrdinal.get(3)).toBe('fourth turn');
+    expect(byOrdinal.get(4)).toBe('fifth turn');
   });
 
   it('rejects /v1/turns without a threadUrl query param', async () => {
