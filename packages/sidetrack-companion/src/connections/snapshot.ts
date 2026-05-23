@@ -1101,10 +1101,148 @@ const topClosestVisitContributions = (
     .slice(0, Math.max(0, Math.floor(limit)))
     .map(([feature, weight]) => ({ feature, weight: roundRankerMetric(weight) }));
 
-const closestVisitRankerEdgesForSnapshot = (
+export interface RankerFrontierOptions {
+  readonly includeSameUrlSiblings: boolean;
+  readonly includeSameTabSession: boolean;
+  readonly includeSameWorkstream: boolean;
+  readonly includeSameThread: boolean;
+  readonly includePriorClosestNeighbors: boolean;
+  readonly includeSimEdgeChanged: boolean;
+}
+
+const timelineVisitKeyFromNodeId = (nodeId: string): string | null =>
+  nodeId.startsWith('timeline-visit:') && nodeId.length > 'timeline-visit:'.length
+    ? nodeId.slice('timeline-visit:'.length)
+    : null;
+
+export const expandRankerFrontier = (
+  touchedVisitIds: ReadonlySet<string>,
+  currentSnapshot: ConnectionsSnapshot,
+  options: RankerFrontierOptions,
+): ReadonlySet<string> => {
+  const frontier = new Set<string>([...touchedVisitIds].filter((id) => id.length > 0));
+  if (frontier.size === 0) return frontier;
+
+  const visitNodeByKey = new Map<string, ConnectionNode>();
+  const visitKeyByCanonicalUrl = new Map<string, Set<string>>();
+  const visitKeysByWorkstream = new Map<string, Set<string>>();
+  const visitKeysByTabSession = new Map<string, Set<string>>();
+  const visitInstanceTimelineById = new Map<string, string>();
+  const visitInstanceTabSessionById = new Map<string, string>();
+  const threadIdsByVisitKey = new Map<string, Set<string>>();
+  const visitKeysByThreadId = new Map<string, Set<string>>();
+
+  const addToIndex = (index: Map<string, Set<string>>, key: string, visitKey: string): void => {
+    const existing = index.get(key);
+    if (existing === undefined) index.set(key, new Set([visitKey]));
+    else existing.add(visitKey);
+  };
+
+  for (const node of currentSnapshot.nodes) {
+    if (node.kind === 'timeline-visit') {
+      const visitKey = timelineVisitKeyFromNodeId(node.id);
+      if (visitKey === null) continue;
+      visitNodeByKey.set(visitKey, node);
+      const canonicalUrl = node.metadata['canonicalUrl'];
+      if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+        addToIndex(visitKeyByCanonicalUrl, canonicalUrl, visitKey);
+      }
+      const workstreamId = node.metadata['workstreamId'];
+      if (typeof workstreamId === 'string' && workstreamId.length > 0) {
+        addToIndex(visitKeysByWorkstream, workstreamId, visitKey);
+      }
+    } else if (node.kind === 'visit-instance') {
+      const timelineVisitId = node.metadata['timelineVisitId'];
+      const tabSessionId = node.metadata['tabSessionId'];
+      const visitKey =
+        typeof timelineVisitId === 'string' ? timelineVisitKeyFromNodeId(timelineVisitId) : null;
+      if (visitKey !== null) visitInstanceTimelineById.set(node.id, visitKey);
+      if (typeof tabSessionId === 'string' && tabSessionId.length > 0) {
+        visitInstanceTabSessionById.set(node.id, tabSessionId);
+        if (visitKey !== null) addToIndex(visitKeysByTabSession, tabSessionId, visitKey);
+      }
+    }
+  }
+
+  for (const edge of currentSnapshot.edges) {
+    if (edge.kind === 'visit_instance_in_tab_session') {
+      const visitKey = visitInstanceTimelineById.get(edge.fromNodeId);
+      const tabSessionId = edge.toNodeId.startsWith('tab-session:')
+        ? edge.toNodeId.slice('tab-session:'.length)
+        : visitInstanceTabSessionById.get(edge.fromNodeId);
+      if (visitKey !== undefined && tabSessionId !== undefined && tabSessionId.length > 0) {
+        addToIndex(visitKeysByTabSession, tabSessionId, visitKey);
+      }
+    } else if (edge.kind === 'visit_in_workstream') {
+      const visitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const workstreamId = edge.toNodeId.startsWith('workstream:')
+        ? edge.toNodeId.slice('workstream:'.length)
+        : null;
+      if (visitKey !== null && workstreamId !== null) {
+        addToIndex(visitKeysByWorkstream, workstreamId, visitKey);
+      }
+    } else if (edge.kind === 'timeline_same_url_as_thread') {
+      const visitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const threadId = edge.toNodeId.startsWith('thread:')
+        ? edge.toNodeId.slice('thread:'.length)
+        : null;
+      if (visitKey !== null && threadId !== null) {
+        addToIndex(threadIdsByVisitKey, visitKey, threadId);
+        addToIndex(visitKeysByThreadId, threadId, visitKey);
+      }
+    }
+  }
+
+  const seed = [...frontier];
+  for (const visitKey of seed) {
+    const node = visitNodeByKey.get(visitKey);
+    if (node !== undefined && options.includeSameUrlSiblings) {
+      const canonicalUrl = node.metadata['canonicalUrl'];
+      if (typeof canonicalUrl === 'string') {
+        for (const sibling of visitKeyByCanonicalUrl.get(canonicalUrl) ?? []) frontier.add(sibling);
+      }
+    }
+    if (options.includeSameWorkstream) {
+      const workstreamId = node?.metadata['workstreamId'];
+      if (typeof workstreamId === 'string') {
+        for (const sibling of visitKeysByWorkstream.get(workstreamId) ?? []) frontier.add(sibling);
+      }
+    }
+    if (options.includeSameTabSession) {
+      for (const [tabSessionId, members] of visitKeysByTabSession.entries()) {
+        if (!members.has(visitKey)) continue;
+        for (const sibling of visitKeysByTabSession.get(tabSessionId) ?? []) frontier.add(sibling);
+      }
+    }
+    if (options.includeSameThread) {
+      for (const threadId of threadIdsByVisitKey.get(visitKey) ?? []) {
+        for (const sibling of visitKeysByThreadId.get(threadId) ?? []) frontier.add(sibling);
+      }
+    }
+  }
+
+  if (options.includePriorClosestNeighbors || options.includeSimEdgeChanged) {
+    for (const edge of currentSnapshot.edges) {
+      const includeClosest = options.includePriorClosestNeighbors && edge.kind === 'closest_visit';
+      const includeSimilarity =
+        options.includeSimEdgeChanged && edge.kind === 'visit_resembles_visit';
+      if (!includeClosest && !includeSimilarity) continue;
+      const fromVisitKey = timelineVisitKeyFromNodeId(edge.fromNodeId);
+      const toVisitKey = timelineVisitKeyFromNodeId(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      if (frontier.has(fromVisitKey)) frontier.add(toVisitKey);
+      if (frontier.has(toVisitKey)) frontier.add(fromVisitKey);
+    }
+  }
+
+  return new Set([...frontier].sort());
+};
+
+export const closestVisitRankerEdgesForSnapshot = (
   input: ConnectionsInput,
   baseSnapshot: ConnectionsSnapshot,
   ranker: ClosestVisitRanker,
+  visitFrontier?: ReadonlySet<string>,
 ): readonly ConnectionEdge[] => {
   const threshold = ranker.threshold ?? 0.3;
   const topK = Math.max(0, Math.floor(ranker.topK ?? 5));
@@ -1116,7 +1254,10 @@ const closestVisitRankerEdgesForSnapshot = (
       baseSnapshot.nodes
         .filter((node) => node.kind === 'timeline-visit')
         .map((node) => visitKeyFromNodeOrRaw(node.id))
-        .filter((visitKey) => visitKey.length > 0),
+        .filter(
+          (visitKey) =>
+            visitKey.length > 0 && (visitFrontier === undefined || visitFrontier.has(visitKey)),
+        ),
     ),
   ].sort();
   const merged = [...input.events];
@@ -1206,6 +1347,22 @@ const closestVisitRankerEdgesForSnapshot = (
 
   return sortAlphaById([...rankerEdges.values()]);
 };
+
+const tagClosestVisitRankerEdge = (
+  edge: ConnectionEdge,
+  input: {
+    readonly producerRevision: string;
+    readonly inputFrontier: Readonly<Record<string, number>>;
+  },
+): ConnectionEdge => ({
+  ...edge,
+  metadata: {
+    ...(edge.metadata ?? {}),
+    producer: 'closest-visit',
+    producerRevision: input.producerRevision,
+    inputFrontier: input.inputFrontier,
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Pass 1: walk events, populate nodes + emit event-derived edges.
@@ -3279,7 +3436,11 @@ export const augmentConnectionsSnapshotWithClosestVisitRanker = (
     input.closestVisitRanker,
   )) {
     if (edge.observedAt > maxObservedAt) maxObservedAt = edge.observedAt;
-    const { id: _id, ...edgeInput } = edge;
+    const taggedEdge = tagClosestVisitRankerEdge(edge, {
+      producerRevision: input.closestVisitRanker.revisionId,
+      inputFrontier: {},
+    });
+    const { id: _id, ...edgeInput } = taggedEdge;
     void _id;
     upsertEdge(edges, edgeInput);
   }
@@ -3302,6 +3463,67 @@ export const augmentConnectionsSnapshotWithClosestVisitRanker = (
         baseSnapshot.tabSessionProjection === undefined
           ? 0
           : Object.keys(baseSnapshot.tabSessionProjection.bySessionId).length,
+    }),
+  };
+};
+
+export const augmentConnectionsSnapshotWithClosestVisitRankerFrontier = (
+  input: ConnectionsInput & {
+    readonly closestVisitRanker: ClosestVisitRanker;
+    readonly rankerFrontier: ReadonlySet<string>;
+    readonly inputFrontier: Readonly<Record<string, number>>;
+  },
+  currentSnapshot: ConnectionsSnapshot,
+): ConnectionsSnapshot => {
+  const frontierNodeIds = new Set(
+    [...input.rankerFrontier].map((visitKey) => nodeIdFor('timeline-visit', visitKey)),
+  );
+  const preservedEdges = currentSnapshot.edges.filter(
+    (edge) =>
+      edge.kind !== 'closest_visit' ||
+      (!frontierNodeIds.has(edge.fromNodeId) && !frontierNodeIds.has(edge.toNodeId)),
+  );
+  const baseWithoutFrontierClosestVisit = {
+    ...currentSnapshot,
+    edges: preservedEdges,
+    edgeCount: preservedEdges.length,
+  };
+  const edges = new Map<string, ConnectionEdge>(preservedEdges.map((edge) => [edge.id, edge]));
+  let maxObservedAt = baseWithoutFrontierClosestVisit.updatedAt;
+  for (const edge of closestVisitRankerEdgesForSnapshot(
+    input,
+    baseWithoutFrontierClosestVisit,
+    input.closestVisitRanker,
+    input.rankerFrontier,
+  )) {
+    if (edge.observedAt > maxObservedAt) maxObservedAt = edge.observedAt;
+    edges.set(
+      edge.id,
+      tagClosestVisitRankerEdge(edge, {
+        producerRevision: input.closestVisitRanker.revisionId,
+        inputFrontier: input.inputFrontier,
+      }),
+    );
+  }
+  const sortedEdges = sortAlphaById([...edges.values()]);
+  const updatedAt = maxObservedAt.length > 0 ? maxObservedAt : currentSnapshot.updatedAt;
+  return {
+    ...currentSnapshot,
+    edges: sortedEdges,
+    updatedAt,
+    edgeCount: sortedEdges.length,
+    snapshotRevision: computeSnapshotRevision({
+      updatedAt,
+      nodeCount: currentSnapshot.nodeCount,
+      edgeCount: sortedEdges.length,
+      urlProjectionKeyCount:
+        currentSnapshot.urlProjection === undefined
+          ? 0
+          : Object.keys(currentSnapshot.urlProjection.byCanonicalUrl).length,
+      tabSessionProjectionKeyCount:
+        currentSnapshot.tabSessionProjection === undefined
+          ? 0
+          : Object.keys(currentSnapshot.tabSessionProjection.bySessionId).length,
     }),
   };
 };

@@ -25,7 +25,9 @@ import {
 } from '../../connections/materializerDiagnostics.js';
 import {
   augmentConnectionsSnapshotWithClosestVisitRanker,
+  augmentConnectionsSnapshotWithClosestVisitRankerFrontier,
   buildConnectionsSnapshot,
+  expandRankerFrontier,
   type ClosestVisitRanker,
   type ConnectionsInput,
   type ConnectionsSnapshot,
@@ -125,7 +127,7 @@ import {
   invalidationsForEvent,
   type InvalidationKey,
 } from './invalidation.js';
-import { invalidationKeysToScopes } from './connectionsScopes.js';
+import { invalidationKeysToScopes, type Scope } from './connectionsScopes.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
 import { runReconcileInChild } from './connectionsReconcileChildClient.js';
 import {
@@ -286,6 +288,26 @@ const resolveDrainMinIntervalMs = (): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DRAIN_MIN_INTERVAL_MS;
 };
 
+const INCREMENTAL_RANKER_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_RANKER';
+const TOPIC_EVERY_DRAINS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS';
+const TOPIC_EVERY_MS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS';
+const DEFAULT_TOPIC_EVERY_DRAINS = 50;
+const DEFAULT_TOPIC_EVERY_MS = 300_000;
+
+const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] === '1';
+
+const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+};
+
+const resolveTopicEveryDrains = (): number =>
+  resolvePositiveIntegerEnv(TOPIC_EVERY_DRAINS_ENV, DEFAULT_TOPIC_EVERY_DRAINS);
+
+const resolveTopicEveryMs = (): number =>
+  resolvePositiveIntegerEnv(TOPIC_EVERY_MS_ENV, DEFAULT_TOPIC_EVERY_MS);
+
 // Hardcoded event types this materializer reacts to. Connections
 // has no registry surface, so we can't derive handles from
 // eventTypesForMaterializer('connections') — and we don't want to,
@@ -436,6 +458,28 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
     case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
       return buildTopicRevision;
   }
+};
+
+const normalizeVisitUrl = (url: string): string => url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+export const collectTouchedVisits = (
+  dirtyScopes: readonly Scope[],
+  pendingEvents: readonly AcceptedEvent[],
+): ReadonlySet<string> => {
+  const touched = new Set<string>();
+  for (const scope of dirtyScopes) {
+    if (scope.kind === 'url' || scope.kind === 'visit') touched.add(scope.id);
+  }
+  for (const event of pendingEvents) {
+    if (
+      event.type !== BROWSER_TIMELINE_OBSERVED ||
+      !isBrowserTimelineObservedPayload(event.payload)
+    ) {
+      continue;
+    }
+    touched.add(normalizeVisitUrl(event.payload.canonicalUrl ?? event.payload.url));
+  }
+  return new Set([...touched].filter((visitKey) => visitKey.length > 0).sort());
 };
 
 const writeShadowTopicRevision = async (
@@ -640,6 +684,10 @@ export const createConnectionsMaterializer = (
   // revision flip (re-embedding, model upgrade) drives a removeEdge
   // diff against the new revision's edges.
   let lastAcceptedSimilarityRevisionId: string | undefined;
+  let lastTopicRunAtMs = 0;
+  let topicDrainsSinceLastRun = 0;
+  let lastTopicRunSimilarityRevisionId: string | undefined;
+  let lastRankerProducerRevision: string | undefined;
   // Stage 5.2 W3 fast-path — incremental visit similarity index used
   // when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1 AND the embedder
   // warmth + corpus budget pass `decideHotPathEmbed`. Persisted across
@@ -963,6 +1011,7 @@ export const createConnectionsMaterializer = (
   const closestVisitRankerLoader =
     deps.closestVisitRankerLoader ??
     ((): Promise<ClosestVisitRankerLoadResult> => loadClosestVisitRanker());
+  const disposedRankerModels = new WeakSet<object>();
 
   // Stage 5.2 W1b — cooperative yielding. Each major sync-CPU phase
   // is preceded by `yieldToEventLoop()` so HTTP request handlers and
@@ -1023,6 +1072,10 @@ export const createConnectionsMaterializer = (
     const incrementalGraphPlan = incrementalGraphView.drainPlan();
     mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
+    const pendingEventsForDrain =
+      lastFrontier === undefined
+        ? merged
+        : merged.filter((event) => event.dot.seq > (lastFrontier?.[event.dot.replicaId] ?? 0));
     mark(`readMerged events=${String(merged.length)}`);
     // Stage 5.2 W2b/c wiring — first build (or post-catchUp reset)
     // seeds the projection accumulators from the full event log; same
@@ -1336,8 +1389,28 @@ export const createConnectionsMaterializer = (
       topicRevisionAlgorithm === TOPIC_UNION_FIND_REVISION_KEY &&
       topicComponentCount > 0;
     const topicBuildStartedAtMs = Date.now();
+    if (previousTopicRevision !== null && lastTopicRunSimilarityRevisionId === undefined) {
+      lastTopicRunSimilarityRevisionId = previousTopicRevision.visitSimilarityRevisionId;
+      lastTopicRunAtMs = Date.now();
+    }
+    topicDrainsSinceLastRun += 1;
+    const topicSimilarityChanged = lastTopicRunSimilarityRevisionId !== visitSimilarity.revisionId;
+    const topicCadenceDue =
+      topicDrainsSinceLastRun >= resolveTopicEveryDrains() ||
+      Date.now() - lastTopicRunAtMs >= resolveTopicEveryMs();
+    const shouldRunTopicRevision =
+      previousTopicRevision === null || (topicSimilarityChanged && topicCadenceDue);
     let topicRevision;
-    if (
+    if (!shouldRunTopicRevision && previousTopicRevision !== null) {
+      // Topic clustering (especially leiden-cpm) is global rather than
+      // cheaply IVM-able. During heavy ingest we accept topics being a
+      // few minutes stale; repeatedly freezing the graph for ~30 seconds
+      // is worse UX than serving the previous topic revision.
+      topicRevision = previousTopicRevision;
+      mark(
+        `topicRevision cadenceSkip drains=${String(topicDrainsSinceLastRun)} similarityChanged=${String(topicSimilarityChanged)}`,
+      );
+    } else if (
       previousTopicRevision !== null &&
       previousTopicRevision.revisionId === expectedTopicRevisionId
     ) {
@@ -1358,6 +1431,11 @@ export const createConnectionsMaterializer = (
         ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
       });
+    }
+    if (shouldRunTopicRevision) {
+      lastTopicRunAtMs = Date.now();
+      topicDrainsSinceLastRun = 0;
+      lastTopicRunSimilarityRevisionId = visitSimilarity.revisionId;
     }
     mark(
       `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,
@@ -1399,7 +1477,8 @@ export const createConnectionsMaterializer = (
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
     const servedProducer: ServedTopicProducer = resolveServedTopicProducer();
-    if (servedProducer === 'leiden-cpm') {
+    const topicCadenceSkipped = !shouldRunTopicRevision && previousTopicRevision !== null;
+    if (servedProducer === 'leiden-cpm' && !topicCadenceSkipped) {
       // Skip-gated like the shadow (revisionId is a pure fn of
       // visitSimilarity.revisionId + threshold + algo). Lineage via
       // the dedicated leiden candidate slot ⇒ same-algorithm topic-id
@@ -1448,7 +1527,11 @@ export const createConnectionsMaterializer = (
     // `topicRevision` stays the BASELINE input so the shadow-vs-baseline
     // A/B observation remains meaningful; `servedTopicRevision` is what
     // we persist active + feed into the served snapshot.
-    if (servedProducer !== 'leiden-cpm' && shouldBuildTopicShadowCandidate()) {
+    if (
+      servedProducer !== 'leiden-cpm' &&
+      !topicCadenceSkipped &&
+      shouldBuildTopicShadowCandidate()
+    ) {
       const previousShadowRevision = await topicRevisionStore.readShadowRevision();
       // Stage 5.2 W4 (shadow) — skip-gate, mirroring the baseline
       // topic-revision reuse above. The shadow revision id is a
@@ -1568,19 +1651,20 @@ export const createConnectionsMaterializer = (
     mark(
       `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
     );
+    const previousSnapshotForRanker = await deps.store.readCurrent();
     const scopeIncrementalEnabled =
       process.env[INCREMENTAL_SCOPES_ENV] === '1' &&
       process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
       deps.store.replaceScopeRows !== undefined &&
-      (await deps.store.readCurrent()) !== null;
+      previousSnapshotForRanker !== null;
     let wroteScopeIncremental = false;
+    const dirtyScopes = invalidationKeysToScopes(buildKeys);
     // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
     // synchronous CPU which would otherwise block HTTP.
     if (scopeIncrementalEnabled) {
-      const dirtyScopes = invalidationKeysToScopes(buildKeys);
       if (dirtyScopes.length > 0) {
         const scoped = unionScopeOutputs(dirtyScopes.map((scope) => recomputeScope(scope, input)));
         const progress = progressForSnapshot(merged, baseSnapshot);
@@ -1636,16 +1720,65 @@ export const createConnectionsMaterializer = (
         );
         if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
-          finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
-            {
-              ...input,
-              closestVisitRanker: closestVisitRanker.ranker,
-            },
-            baseSnapshot,
-          );
-          mark(
-            `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
-          );
+          const previousClosestVisitEdges =
+            previousSnapshotForRanker?.edges.filter((edge) => edge.kind === 'closest_visit') ?? [];
+          const currentSnapshot =
+            previousSnapshotForRanker === null
+              ? null
+              : {
+                  ...baseSnapshot,
+                  edges: [...baseSnapshot.edges, ...previousClosestVisitEdges],
+                  edgeCount: baseSnapshot.edges.length + previousClosestVisitEdges.length,
+                };
+          const producerRevision = closestVisitRanker.ranker.revisionId;
+          const currentSnapshotRankerRevision = currentSnapshot?.edges.find(
+            (edge) => edge.kind === 'closest_visit' && edge.producedBy.source === 'ranker',
+          )?.producedBy.revisionId;
+          const producerRevisionChanged =
+            (lastRankerProducerRevision !== undefined &&
+              lastRankerProducerRevision !== producerRevision) ||
+            (currentSnapshotRankerRevision !== undefined &&
+              currentSnapshotRankerRevision !== producerRevision);
+          const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+          const canUseIncrementalRanker =
+            incrementalRankerEnabled() &&
+            currentSnapshot !== null &&
+            touchedVisitIds.size > 0 &&
+            !producerRevisionChanged;
+          if (canUseIncrementalRanker) {
+            const rankerFrontier = expandRankerFrontier(touchedVisitIds, currentSnapshot, {
+              includeSameUrlSiblings: true,
+              includeSameTabSession: true,
+              includeSameWorkstream: true,
+              includeSameThread: true,
+              includePriorClosestNeighbors: true,
+              includeSimEdgeChanged: true,
+            });
+            finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRankerFrontier(
+              {
+                ...input,
+                closestVisitRanker: closestVisitRanker.ranker,
+                rankerFrontier,
+                inputFrontier: vectorFromEvents(merged),
+              },
+              currentSnapshot,
+            );
+            mark(
+              `augmentConnectionsSnapshot ranker-frontier visits=${String(rankerFrontier.size)} nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
+            );
+          } else {
+            finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
+              {
+                ...input,
+                closestVisitRanker: closestVisitRanker.ranker,
+              },
+              baseSnapshot,
+            );
+            mark(
+              `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)} full=${String(producerRevisionChanged)}`,
+            );
+          }
+          lastRankerProducerRevision = producerRevision;
           await writeSnapshotWithProgress(finalSnapshot, merged);
           mark('writeSnapshotAndProgress ranker-augmented');
           rankerAugmentation = rankerAugmentationCounters({
@@ -1685,7 +1818,14 @@ export const createConnectionsMaterializer = (
         });
       }
     } finally {
-      if (closestVisitRanker?.status === 'ready') closestVisitRanker.model.dispose();
+      if (
+        closestVisitRanker?.status === 'ready' &&
+        typeof closestVisitRanker.model === 'object' &&
+        !disposedRankerModels.has(closestVisitRanker.model)
+      ) {
+        disposedRankerModels.add(closestVisitRanker.model);
+        closestVisitRanker.model.dispose();
+      }
     }
     // PR #141 — write the diagnostics artifact after publishing. Uses
     // `finalSnapshot` so the artifact reflects whichever snapshot the
@@ -1845,6 +1985,7 @@ export const createConnectionsMaterializer = (
       const shadowMaterializer = createConnectionsMaterializer({
         ...deps,
         store: shadowStore,
+        diagnosticsStore: { write: async () => undefined },
         diagnosticsLogger: () => {},
       });
       await shadowMaterializer.catchUp(eventLog);
@@ -2039,6 +2180,7 @@ export const createConnectionsMaterializer = (
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
     incrementalGraphView.reset();
     lastEngagementClassRevision = undefined;
+    lastRankerProducerRevision = undefined;
   };
 
   const catchUp: Materializer['catchUp'] = async () => {
