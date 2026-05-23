@@ -15,6 +15,7 @@ import {
 import { nodeIdFor } from '../../connections/types.js';
 import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { mergeRegister, type AcceptedEvent, type VersionVector } from '../causal.js';
@@ -37,8 +38,12 @@ const envKeys = [
   'SIDETRACK_SKIP_RANKER_SNAPSHOT',
   'SIDETRACK_CONNECTIONS_INPROCESS',
   'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES',
+  'SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY',
   'SIDETRACK_CONNECTIONS_DRIFT_DISABLED',
   'SIDETRACK_TOPIC_PRODUCER',
+  'SIDETRACK_SIMILARITY_THRESHOLD',
+  'SIDETRACK_SIMILARITY_TOP_K',
+  'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS',
 ] as const;
 
 const at = (seq: number): number => Date.parse('2026-05-22T10:00:00.000Z') + seq;
@@ -180,12 +185,14 @@ const createNoisyFreeMaterializer = (input: {
   readonly vaultRoot: string;
   readonly eventLog: EventLog;
   readonly store: ConnectionsStore;
+  readonly embed?: (texts: readonly string[]) => Promise<readonly Float32Array[]>;
 }): ConnectionsMaterializer =>
   createConnectionsMaterializer({
     vaultRoot: input.vaultRoot,
     eventLog: input.eventLog,
     timelineStore: createTimelineStore(input.vaultRoot),
     store: input.store,
+    ...(input.embed === undefined ? {} : { embed: input.embed }),
     rankerRetrainer: () =>
       Promise.resolve({
         status: 'skipped',
@@ -225,6 +232,113 @@ const appendLocalSequence = async (
     out.push(accepted);
   }
   return out;
+};
+
+const timelineObserved = (input: {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly index: number;
+}): AcceptedEvent =>
+  event({
+    type: BROWSER_TIMELINE_OBSERVED,
+    replicaId: input.replicaId,
+    seq: input.seq,
+    aggregateId: `visit-${String(input.index)}`,
+    payload: {
+      eventId: `visit-${String(input.index)}`,
+      observedAt: new Date(at(input.seq)).toISOString(),
+      url: `https://v${String(input.index)}.example.test/p${String(input.index)}`,
+      canonicalUrl: `https://v${String(input.index)}.example.test/p${String(input.index)}`,
+      title: `visit-${String(input.index)}`,
+      provider: 'generic',
+      transition: 'activated',
+      payloadVersion: 1,
+      dimensions: { engagement: { focusedWindowMs: 10_000 } },
+    },
+  });
+
+const unitVector = (values: readonly number[]): Float32Array => {
+  const norm = Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
+  return Float32Array.from(values.map((value) => value / norm));
+};
+
+const deterministicSimilarityVectors = (count: number): ReadonlyMap<number, Float32Array> => {
+  const vectors = new Map<number, Float32Array>();
+  for (let index = 0; index < count; index += 1) {
+    const group = Math.floor(index / 10);
+    const slot = index % 10;
+    vectors.set(
+      index,
+      unitVector([
+        group === 0 ? 1 : 0,
+        group === 1 ? 1 : 0,
+        group === 2 ? 1 : 0,
+        group === 3 ? 1 : 0,
+        group === 4 ? 1 : 0,
+        slot / 100,
+      ]),
+    );
+  }
+  return vectors;
+};
+
+const embedFromVisitTitle = (
+  vectors: ReadonlyMap<number, Float32Array>,
+): ((texts: readonly string[]) => Promise<readonly Float32Array[]>) => {
+  const fallback = Float32Array.from([1, 0, 0, 0, 0, 0]);
+  return async (texts) =>
+    texts.map((text) => {
+      const match = /visit-(\d+)/u.exec(text);
+      if (match === null) return fallback;
+      return vectors.get(Number(match[1])) ?? fallback;
+    });
+};
+
+const similarityRows = (
+  snapshot: ConnectionsSnapshot,
+): ReadonlyArray<{ readonly pair: string; readonly cosine: number }> =>
+  snapshot.edges
+    .filter((edge) => edge.kind === 'visit_resembles_visit')
+    .map((edge) => {
+      const cosine = edge.metadata?.['cosine'];
+      if (typeof cosine !== 'number') throw new Error('missing similarity cosine metadata');
+      return {
+        pair: `${edge.fromNodeId}\u0000${edge.toNodeId}`,
+        cosine,
+      };
+    })
+    .sort((left, right) => left.pair.localeCompare(right.pair));
+
+const materializeSimilarityFixture = async (input: {
+  readonly root: string;
+  readonly flag: 'on' | 'off';
+  readonly count: number;
+}): Promise<ConnectionsSnapshot> => {
+  process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'] =
+    input.flag === 'on' ? '1' : '0';
+  process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.9';
+  process.env['SIDETRACK_SIMILARITY_TOP_K'] = '50';
+  process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '0';
+  const replica = await loadOrCreateReplica(input.root);
+  const eventLog = createEventLog(input.root, replica);
+  const store = createConnectionsStore(input.root);
+  const vectors = deterministicSimilarityVectors(input.count);
+  const materializer = createNoisyFreeMaterializer({
+    vaultRoot: input.root,
+    eventLog,
+    store,
+    embed: embedFromVisitTitle(vectors),
+  });
+  await importEvents(
+    eventLog,
+    Array.from({ length: input.count }, (_, index) =>
+      timelineObserved({ replicaId: 'sim', seq: index + 1, index }),
+    ),
+  );
+  await materializer.catchUp(eventLog);
+  const snapshot = await store.readCurrent();
+  if (snapshot === null) throw new Error('expected similarity snapshot');
+  return snapshot;
 };
 
 const createDeterministicEventLog = (vaultPath: string, replica: ReplicaContext): EventLog => {
@@ -516,5 +630,40 @@ describe('connections Class B integration invariants', () => {
     expect(writeCount).toBe(0);
     expect(await first.store.readCurrent()).toEqual(preResetSnapshot);
     expect(await first.store.readMaterializerProgress('connections')).toEqual(preResetProgress);
+  });
+
+  it('HNSW path produces the same similarity edges as pairwise for deterministic embeddings', async () => {
+    const pairwiseRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-pairwise-'));
+    try {
+      const hnswSnapshot = await materializeSimilarityFixture({
+        root: vaultRoot,
+        flag: 'on',
+        count: 50,
+      });
+      const pairwiseSnapshot = await materializeSimilarityFixture({
+        root: pairwiseRoot,
+        flag: 'off',
+        count: 50,
+      });
+      const hnswRows = similarityRows(hnswSnapshot);
+      const pairwiseRows = similarityRows(pairwiseSnapshot);
+
+      expect(hnswRows.map((row) => row.pair)).toEqual(pairwiseRows.map((row) => row.pair));
+      for (let i = 0; i < hnswRows.length; i += 1) {
+        expect(Math.abs(hnswRows[i]!.cosine - pairwiseRows[i]!.cosine)).toBeLessThanOrEqual(1e-6);
+      }
+    } finally {
+      await rm(pairwiseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to pairwise similarity when incremental similarity is disabled', async () => {
+    const snapshot = await materializeSimilarityFixture({
+      root: vaultRoot,
+      flag: 'off',
+      count: 12,
+    });
+
+    expect(similarityRows(snapshot).length).toBeGreaterThan(0);
   });
 });
