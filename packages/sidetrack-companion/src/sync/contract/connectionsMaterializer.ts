@@ -179,12 +179,13 @@ import {
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { isMainThread } from 'node:worker_threads';
-import { vectorFromEvents, type AcceptedEvent } from '../causal.js';
+import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
   addDotsToIntervals,
   EMPTY_PROGRESS,
+  intervalsContainDot,
   type MaterializerProgress,
 } from './materializerProgress.js';
 import {
@@ -224,6 +225,7 @@ import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase1';
+const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 
 // Stage 5.2 W1a — debounce window between event accept and drain trigger.
 // Coalesces burst arrivals (multi-tab navigation, peer-event imports) into
@@ -1814,23 +1816,47 @@ export const createConnectionsMaterializer = (
     requestDrain();
   };
 
+  const resetInMemoryProjectionState = (): void => {
+    projectionAccumulatorsInitialized = false;
+    urlAccumulator = createEmptyUrlProjectionAccumulator();
+    tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+    incrementalGraphView.reset();
+    lastEngagementClassRevision = undefined;
+  };
+
   const catchUp: Materializer['catchUp'] = async () => {
     pending = true;
-    if (running) return;
+    if (running) {
+      await awaitIdle();
+      return;
+    }
     running = true;
     // Stage 5.2 W2b/c wiring — catchUp is the recovery / boot-time path;
     // force a re-seed so any drift between the in-memory accumulators
     // and the event log is corrected. The next buildAndWrite (or worker
     // pass) seeds.
-    projectionAccumulatorsInitialized = false;
-    urlAccumulator = createEmptyUrlProjectionAccumulator();
-    tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
-    incrementalGraphView.reset();
-    // Stage 5.2 W6 per-pass — invalidate the engagement cache on
-    // catchUp so the next drain rebuilds against the fresh log.
-    lastEngagementClassRevision = undefined;
+    resetInMemoryProjectionState();
     dirty = false;
     try {
+      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      const merged = await deps.eventLog.readMerged();
+      const versionMatches = progress?.materializerVersion === MATERIALIZER_VERSION;
+      if (progress !== null && versionMatches) {
+        const pendingEvents = merged.filter(
+          (event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot),
+        );
+        const ordered = sortAcceptedEvents(pendingEvents);
+        if (ordered.length === 0) {
+          lastSuccessAt = new Date().toISOString();
+          lastError = null;
+          return;
+        }
+        if (ordered.length <= BACKLOG_FALLBACK_THRESHOLD) {
+          // Phase 1 intentionally keeps the apply path as a full rebuild.
+          // The durable dot-interval filter is the safety foundation for
+          // Phase 2's scoped recompute.
+        }
+      }
       // 2026-05 cold-start fix: route catchUp through the worker the
       // same way drain does. The previous direct buildAndWrite()
       // pinned the main thread for the full re-projection (~30 s on a
