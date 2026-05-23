@@ -12,22 +12,20 @@ export const scopeKey = (scope: Scope): string => `${scope.kind}:${scope.id}`;
 
 /**
  * Scope ownership is the replacement boundary for the Class B
- * materializer. Each graph entity has at least one owning scope; shared
- * entities may also be registered in secondary scopes so either scope
- * can replace its local view without orphaning rows owned elsewhere.
+ * materializer. Each graph entity has exactly one local primary scope.
  *
  * Primary ownership:
- * - visit: visit-instance nodes and instance/tab/session/url/workstream edges.
- * - url: timeline-visit nodes and URL aggregate/reference/similarity edges.
- * - tab-session: tab-session nodes plus visit/session and opener edges.
- * - workstream: workstream nodes plus thread/topic/queue/coding/workstream membership edges.
- * - thread: thread nodes plus dispatch, annotation, queue, quote, and content-reference edges.
- * - topic: topic nodes plus topic membership and lineage edges.
+ * - visit: visit-instance nodes and edges originating from them.
+ * - url: timeline-visit nodes and URL attribution/reference/similarity edges.
+ * - tab-session: tab-session nodes and tab-session attribution/opener edges.
+ * - workstream: workstream nodes and direct workstream edges only.
+ * - thread: thread nodes and thread attribution/reference/quote edges.
+ * - topic: topic nodes and topic membership/lineage edges.
  *
- * Secondary membership is endpoint-derived: when an edge touches a known
- * scoped node, that endpoint scope also owns the edge membership row.
- * Actual node/edge rows are single-copy in SQLite and are deleted only
- * after every membership row for that entity has been removed.
+ * Scope rows are deliberately not transitive. A workstream scope owns
+ * only the workstream node and direct workstream-originated rows; it
+ * does not accumulate everything reachable through visit/thread/topic
+ * edges.
  */
 
 const dedupeScopes = (scopes: readonly Scope[]): Scope[] => {
@@ -50,22 +48,14 @@ export const scopesForNode = (node: Pick<ConnectionNode, 'id' | 'kind' | 'metada
   const scopes: Scope[] = [];
   if (node.kind === 'visit-instance') {
     scopes.push({ kind: 'visit', id: idAfterPrefix(node.id, 'visit-instance:') ?? node.id });
-    const canonicalUrl = node.metadata['canonicalUrl'];
-    const tabSessionId = node.metadata['tabSessionId'];
-    if (typeof canonicalUrl === 'string') scopes.push({ kind: 'url', id: canonicalUrl });
-    if (typeof tabSessionId === 'string') scopes.push({ kind: 'tab-session', id: tabSessionId });
   } else if (node.kind === 'timeline-visit') {
     scopes.push({ kind: 'url', id: idAfterPrefix(node.id, 'timeline-visit:') ?? node.id });
-    const workstreamId = node.metadata['workstreamId'];
-    if (typeof workstreamId === 'string') scopes.push({ kind: 'workstream', id: workstreamId });
   } else if (node.kind === 'tab-session') {
     scopes.push({ kind: 'tab-session', id: idAfterPrefix(node.id, 'tab-session:') ?? node.id });
   } else if (node.kind === 'workstream') {
     scopes.push({ kind: 'workstream', id: idAfterPrefix(node.id, 'workstream:') ?? node.id });
   } else if (node.kind === 'thread') {
     scopes.push({ kind: 'thread', id: idAfterPrefix(node.id, 'thread:') ?? node.id });
-    const workstreamId = node.metadata['workstreamId'];
-    if (typeof workstreamId === 'string') scopes.push({ kind: 'workstream', id: workstreamId });
   } else if (node.kind === 'topic') {
     scopes.push({ kind: 'topic', id: idAfterPrefix(node.id, 'topic:') ?? node.id });
   } else if (node.kind === 'annotation') {
@@ -97,8 +87,19 @@ const scopesForNodeId = (nodeId: string): Scope[] => {
   return direct;
 };
 
-export const scopesForEdge = (edge: ConnectionEdge): Scope[] =>
-  dedupeScopes([...scopesForNodeId(edge.fromNodeId), ...scopesForNodeId(edge.toNodeId)]);
+const firstScopeForNodeId = (nodeId: string): Scope | null => scopesForNodeId(nodeId)[0] ?? null;
+
+const scopeForEdge = (edge: ConnectionEdge): Scope | null => {
+  if (edge.kind === 'visit_in_topic' || edge.kind === 'topic.lineage') {
+    return firstScopeForNodeId(edge.toNodeId) ?? firstScopeForNodeId(edge.fromNodeId);
+  }
+  return firstScopeForNodeId(edge.fromNodeId) ?? firstScopeForNodeId(edge.toNodeId);
+};
+
+export const scopesForEdge = (edge: ConnectionEdge): Scope[] => {
+  const scope = scopeForEdge(edge);
+  return scope === null ? [] : [scope];
+};
 
 export const scopesForGraphRows = (input: {
   readonly nodes: readonly ConnectionNode[];
@@ -107,37 +108,30 @@ export const scopesForGraphRows = (input: {
   readonly nodeScopes: ReadonlyMap<string, readonly Scope[]>;
   readonly edgeScopes: ReadonlyMap<string, readonly Scope[]>;
 } => {
-  const nodeById = new Map(input.nodes.map((node) => [node.id, node] as const));
   const nodeScopes = new Map<string, Scope[]>();
   for (const node of input.nodes) nodeScopes.set(node.id, scopesForNode(node));
-  for (const edge of input.edges) {
-    const fromScopes =
-      nodeById.get(edge.fromNodeId) === undefined
-        ? scopesForNodeId(edge.fromNodeId)
-        : scopesForNode(nodeById.get(edge.fromNodeId)!);
-    const toScopes =
-      nodeById.get(edge.toNodeId) === undefined
-        ? scopesForNodeId(edge.toNodeId)
-        : scopesForNode(nodeById.get(edge.toNodeId)!);
-    const endpointScopes = dedupeScopes([...fromScopes, ...toScopes]);
-    nodeScopes.set(
-      edge.fromNodeId,
-      dedupeScopes([...(nodeScopes.get(edge.fromNodeId) ?? []), ...endpointScopes]),
-    );
-    nodeScopes.set(
-      edge.toNodeId,
-      dedupeScopes([...(nodeScopes.get(edge.toNodeId) ?? []), ...endpointScopes]),
-    );
-  }
   const edgeScopes = new Map<string, readonly Scope[]>();
-  for (const edge of input.edges) {
-    edgeScopes.set(
-      `${edge.fromNodeId}\u0000${edge.toNodeId}`,
-      dedupeScopes([
-        ...(nodeScopes.get(edge.fromNodeId) ?? scopesForNodeId(edge.fromNodeId)),
-        ...(nodeScopes.get(edge.toNodeId) ?? scopesForNodeId(edge.toNodeId)),
-      ]),
-    );
+  for (const edge of [...input.edges].sort((a, b) => a.id.localeCompare(b.id))) {
+    const scopes = scopesForEdge(edge);
+    edgeScopes.set(`${edge.fromNodeId}\u0000${edge.toNodeId}`, scopes);
+    const primaryScope = scopes[0];
+    if (primaryScope === undefined) continue;
+    for (const nodeId of [edge.fromNodeId, edge.toNodeId]) {
+      if ((nodeScopes.get(nodeId) ?? []).length > 0) continue;
+      nodeScopes.set(nodeId, [primaryScope]);
+    }
+  }
+  for (const edge of [...input.edges].sort((a, b) => a.id.localeCompare(b.id))) {
+    const edgeKey = `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+    if ((edgeScopes.get(edgeKey) ?? []).length > 0) continue;
+    const primaryScope =
+      (nodeScopes.get(edge.fromNodeId) ?? [])[0] ?? (nodeScopes.get(edge.toNodeId) ?? [])[0];
+    if (primaryScope === undefined) continue;
+    edgeScopes.set(edgeKey, [primaryScope]);
+    for (const nodeId of [edge.fromNodeId, edge.toNodeId]) {
+      if ((nodeScopes.get(nodeId) ?? []).length > 0) continue;
+      nodeScopes.set(nodeId, [primaryScope]);
+    }
   }
   return { nodeScopes, edgeScopes };
 };
@@ -152,6 +146,8 @@ export const invalidationKeysToScopes = (keys: readonly InvalidationKey[]): Scop
     else if (key.kind === 'workstreamPathMemo') scopes.push({ kind: 'workstream', id: key.bacId });
     else if (key.kind === 'engagementVisit') scopes.push({ kind: 'visit', id: key.visitId });
     else if (key.kind === 'topicMember') {
+      // Topic membership can be emitted by visit-scoped engagement changes
+      // and URL-scoped topic projection changes; invalidate both local owners.
       scopes.push({ kind: 'visit', id: key.visitId });
       scopes.push({ kind: 'url', id: key.visitId });
     } else if (key.kind === 'pageEvidence') scopes.push({ kind: 'url', id: key.canonicalUrl });

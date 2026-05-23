@@ -235,7 +235,7 @@ import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 
 const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
-export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase1';
+export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 const DEFAULT_DRIFT_EVERY_DRAINS = 10;
 const DEFAULT_DRIFT_EVERY_MS = 3_600_000;
