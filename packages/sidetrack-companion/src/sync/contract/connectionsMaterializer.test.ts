@@ -140,6 +140,11 @@ const createRecordingStore = (
         writes.push(snapshot);
         await base.putCurrent(snapshot);
       },
+      writeSnapshotAndProgress: async (snapshot, progress) => {
+        writes.push(snapshot);
+        await base.writeSnapshotAndProgress(snapshot, progress);
+      },
+      readMaterializerProgress: () => Promise.resolve(null),
     },
   };
 };
@@ -1123,6 +1128,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         void snapshot;
         return Promise.resolve();
       },
+      writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+        store.putCurrent(snapshot),
+      readMaterializerProgress: () => Promise.resolve(null),
       readCurrent: () => Promise.resolve(null),
       putDay: () => Promise.resolve(undefined),
       readDay: () => Promise.resolve(null),
@@ -1177,6 +1185,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         void snapshot;
         return Promise.reject(new Error('disk wedged'));
       },
+      writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+        store.putCurrent(snapshot),
+      readMaterializerProgress: () => Promise.resolve(null),
       readCurrent: () => Promise.resolve(null),
       putDay: () => Promise.resolve(undefined),
       readDay: () => Promise.resolve(null),
@@ -1247,6 +1258,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
           });
         }
       },
+      writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+        store.putCurrent(snapshot),
+      readMaterializerProgress: () => Promise.resolve(null),
       readCurrent: () => Promise.resolve(null),
       putDay: () => Promise.resolve(undefined),
       readDay: () => Promise.resolve(null),
@@ -1412,6 +1426,9 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         void snapshot;
         return Promise.resolve();
       },
+      writeSnapshotAndProgress: (snapshot: ConnectionsSnapshot): Promise<void> =>
+        store.putCurrent(snapshot),
+      readMaterializerProgress: () => Promise.resolve(null),
       readCurrent: () => Promise.resolve(null),
       putDay: () => Promise.resolve(undefined),
       readDay: () => Promise.resolve(null),
