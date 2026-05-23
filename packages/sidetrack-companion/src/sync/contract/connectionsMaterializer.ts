@@ -698,6 +698,7 @@ export const createConnectionsMaterializer = (
   let lastTopicRunAtMs = 0;
   let topicDrainsSinceLastRun = 0;
   let lastTopicRunSimilarityRevisionId: string | undefined;
+  let pendingTopicRecompute = false;
   let lastRankerProducerRevision: string | undefined;
   // Stage 5.2 W3 fast-path — incremental visit similarity index used
   // when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1 AND the embedder
@@ -1641,8 +1642,10 @@ export const createConnectionsMaterializer = (
     const topicCadenceDue =
       topicDrainsSinceLastRun >= resolveTopicEveryDrains() ||
       Date.now() - lastTopicRunAtMs >= resolveTopicEveryMs();
+    const forcePendingTopicRecompute = pendingTopicRecompute && topicSimilarityChanged;
     const shouldRunTopicRevision =
-      previousTopicRevision === null || (topicSimilarityChanged && topicCadenceDue);
+      previousTopicRevision === null ||
+      (topicSimilarityChanged && (topicCadenceDue || forcePendingTopicRecompute));
     let topicRevision;
     if (!shouldRunTopicRevision && previousTopicRevision !== null) {
       // Topic clustering (especially leiden-cpm) is global rather than
@@ -1653,6 +1656,7 @@ export const createConnectionsMaterializer = (
       mark(
         `topicRevision cadenceSkip drains=${String(topicDrainsSinceLastRun)} similarityChanged=${String(topicSimilarityChanged)}`,
       );
+      if (topicSimilarityChanged) pendingTopicRecompute = true;
     } else if (
       previousTopicRevision !== null &&
       previousTopicRevision.revisionId === expectedTopicRevisionId
@@ -1679,6 +1683,7 @@ export const createConnectionsMaterializer = (
       lastTopicRunAtMs = Date.now();
       topicDrainsSinceLastRun = 0;
       lastTopicRunSimilarityRevisionId = visitSimilarity.revisionId;
+      pendingTopicRecompute = false;
     }
     mark(
       `topicRevision cacheHit=${String(topicRevision === previousTopicRevision)} fastPath=${String(useTopicAccumulatorFastPath)}`,

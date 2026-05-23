@@ -20,7 +20,6 @@ import {
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
   createTopicRevisionStore,
-  type TopicRevision,
 } from '../../producers/topic-revision.js';
 import type { RankerContributions } from '../../ranker/predict.js';
 import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
@@ -398,7 +397,7 @@ describe('connections incremental ranker frontier', () => {
     ]);
   });
 
-  it('reuses cached topics for 49 drains and recomputes on the 50th when similarity changed', async () => {
+  it('forces the next drain after cadence skips a similarity-changing topic recompute', async () => {
     process.env['SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS'] = '50';
     process.env['SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS'] = '999999999';
     process.env['SIDETRACK_TOPIC_PRODUCER'] = 'union-find';
@@ -414,7 +413,7 @@ describe('connections incremental ranker frontier', () => {
       cosineThreshold: 0.82,
       algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
     });
-    const oldRevision: TopicRevision = {
+    await topicRevisionStore.putActiveRevision({
       revisionId: oldRevisionId,
       visitSimilarityRevisionId: 'old-sim',
       cosineThreshold: 0.82,
@@ -422,8 +421,7 @@ describe('connections incremental ranker frontier', () => {
       topics: [],
       lineage: [],
       producedAt: 1,
-    };
-    await topicRevisionStore.putActiveRevision(oldRevision);
+    });
     let activeWrites = 0;
     const embed: VisitSimilarityEmbedder = (texts) =>
       Promise.resolve(texts.map(() => Float32Array.from([1, 0])));
@@ -444,7 +442,7 @@ describe('connections incremental ranker frontier', () => {
         Promise.resolve({ status: 'skipped', reason: 'no-labels', newLabelCount: 0 }),
     });
 
-    for (let i = 0; i < 49; i += 1) await materializer.catchUp(eventLog);
+    await materializer.catchUp(eventLog);
     expect(activeWrites).toBe(0);
     await materializer.catchUp(eventLog);
     expect(activeWrites).toBe(1);
