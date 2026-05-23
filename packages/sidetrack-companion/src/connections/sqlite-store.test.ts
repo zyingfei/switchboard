@@ -94,11 +94,19 @@ const buildTraversalSnapshot = (): ConnectionsSnapshot => {
   };
 };
 
+const progressFor = (snapshot: ConnectionsSnapshot) => ({
+  ...EMPTY_PROGRESS('connections', 'connections@test'),
+  appliedDotIntervals: { replica: [[1, 1] as const] },
+  appliedFrontier: { replica: 1 },
+  snapshotRevisionId: snapshot.snapshotRevision ?? null,
+});
+
 describe('SqliteConnectionsStore', () => {
   let vaultRoot: string | null = null;
 
   afterEach(async () => {
     delete process.env['SIDETRACK_CONNECTIONS_STORE'];
+    delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
     if (vaultRoot !== null) {
       await rm(vaultRoot, { recursive: true, force: true });
       vaultRoot = null;
@@ -210,6 +218,46 @@ describe('SqliteConnectionsStore', () => {
     expect(metadata?.urlProjection).toEqual(snapshot.urlProjection);
     expect(metadata?.tabSessionProjection).toEqual(snapshot.tabSessionProjection);
     expect(foundEdge).toEqual(snapshot.edges[0]);
+    store.close();
+  });
+
+  sqliteIt('skips scope membership writes when incremental scopes flag is off', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+
+    await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([]);
+    store.close();
+  });
+
+  sqliteIt('writes scope membership rows when incremental scopes flag is on', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+
+    await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+
+    await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      'thread:alpha',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
+    await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'dispatch:one',
+      'thread:alpha',
+      'workstream:main',
+    ]);
+    await expect(store.readEdgesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      { src: 'dispatch:one', dst: 'workstream:main' },
+      { src: 'thread:alpha', dst: 'workstream:main' },
+    ]);
     store.close();
   });
 

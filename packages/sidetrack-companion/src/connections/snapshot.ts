@@ -4161,16 +4161,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
       }
 
-      const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
-      deleteAllScopeNodes.run();
-      deleteAllScopeEdges.run();
-      for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
-        for (const scope of scopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
-      }
-      for (const [key, scopes] of memberships.edgeScopes.entries()) {
-        const [src, dst] = key.split('\u0000');
-        if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
-        for (const scope of scopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
+      if (process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] === '1') {
+        const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+        deleteAllScopeNodes.run();
+        deleteAllScopeEdges.run();
+        for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
+          for (const scope of scopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
+        }
+        for (const [key, scopes] of memberships.edgeScopes.entries()) {
+          const [src, dst] = key.split('\u0000');
+          if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
+          for (const scope of scopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
+        }
       }
 
       upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
