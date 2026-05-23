@@ -17,7 +17,8 @@ vi.mock('../recall/embedder.js', () => ({
   },
 }));
 
-import { startCompanion } from './companion.js';
+import { readPageEvidence } from '../page-evidence/store.js';
+import { createPageEvidenceWriteQueue, startCompanion } from './companion.js';
 
 describe('startCompanion bind-failure rollback', () => {
   let vaultRoot: string;
@@ -85,5 +86,50 @@ describe('startCompanion bind-failure rollback', () => {
       const handles = process.getActiveResourcesInfo();
       expect(handles).toBeInstanceOf(Array);
     }
+  });
+});
+
+
+describe('page-evidence ingest write queue', () => {
+  let vaultRoot: string;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'page-evidence-write-queue-'));
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('serializes concurrent writes for the same canonical URL so the newest timestamp wins', async () => {
+    const queue = createPageEvidenceWriteQueue(vaultRoot);
+    const url = 'https://example.test/thread';
+    const observedAt = [
+      '2026-05-22T10:04:00.000Z',
+      '2026-05-22T10:03:00.000Z',
+      '2026-05-22T10:02:00.000Z',
+      '2026-05-22T10:01:00.000Z',
+      '2026-05-22T10:00:00.000Z',
+    ];
+
+    await Promise.all(
+      observedAt.map((timestamp, index) =>
+        queue([
+          {
+            id: `visit-${String(index)}`,
+            url,
+            canonicalUrl: url,
+            title: `Visit ${String(index)}`,
+            firstSeenAt: timestamp,
+            lastSeenAt: timestamp,
+            visitCount: 1,
+          },
+        ]),
+      ),
+    );
+
+    const evidence = await readPageEvidence(vaultRoot, url);
+
+    expect(evidence.record?.metadata.lastSeenAt).toBe('2026-05-22T10:04:00.000Z');
   });
 });
