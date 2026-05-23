@@ -16,6 +16,7 @@ export interface UnloadedSimilarityHnswStore {
 
 export interface LoadedSimilarityHnswStore {
   elementCount(): number;
+  knownLabels(): Promise<ReadonlySet<string>>;
   recoveredFromCorruption(): boolean;
   insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void>;
   delete(visitId: string): Promise<void>;
@@ -203,6 +204,10 @@ export const createSimilarityHnswStore = (
   const loadedStore: LoadedSimilarityHnswStore = {
     elementCount(): number {
       return requireLoaded().visitIdToLabel.size;
+    },
+
+    async knownLabels(): Promise<ReadonlySet<string>> {
+      return new Set(requireLoaded().visitIdToLabel.keys());
     },
 
     recoveredFromCorruption(): boolean {

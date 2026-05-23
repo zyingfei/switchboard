@@ -307,6 +307,46 @@ describe('HNSW reconcile child integration', () => {
     expect(afterRows.length).toBe(beforeRows.length + newRows.length);
   });
 
+  it('reuses existing HNSW labels — touched is the set difference, not dirty-scopes', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let index = 0; index < 50; index += 1) {
+      const observedAt = new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000)
+        .toISOString();
+      await appendVisit(eventLog, {
+        index,
+        observedAt,
+      });
+    }
+
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+
+    for (let index = 50; index < 53; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T11:${String(index - 50).padStart(2, '0')}:00.000Z`,
+      });
+    }
+
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({
+        seq: 2,
+        ok: true,
+      });
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=3');
+  });
+
   it('marks parent health successful when a runner drain completes in a child process', async () => {
     process.env['SIDETRACK_CONNECTIONS_CHILD'] = '1';
     const replica = await loadOrCreateReplica(vaultRoot);
