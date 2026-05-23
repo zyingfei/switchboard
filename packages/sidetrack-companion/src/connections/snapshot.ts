@@ -3675,6 +3675,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #currentJsonPath: string;
   #db: SqliteDatabase | null = null;
   #initialized = false;
+  #resolverCachePruneScheduledFor: string | null = null;
+  #resolverCacheCurrentRevision: string | null = null;
+  readonly #resolverCacheStaleRevisions = new Set<string>();
   // readCurrent memo, keyed on snapshotRevision. Without this, every
   // cold resolve repeats the ~17K JSON.parses to materialize the whole
   // snapshot; with it, sibling resolves within the same revision share
@@ -3888,10 +3891,20 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     visitId: string,
     snapshotRevision: string,
   ): Promise<unknown | null> => {
+    if (this.#resolverCacheStaleRevisions.has(snapshotRevision)) {
+      return null;
+    }
+    if (
+      this.#resolverCacheCurrentRevision !== null &&
+      this.#resolverCacheCurrentRevision !== snapshotRevision
+    ) {
+      this.#resolverCacheStaleRevisions.add(this.#resolverCacheCurrentRevision);
+      this.#resolverCacheCurrentRevision = snapshotRevision;
+      this.#scheduleResolverCachePrune(snapshotRevision);
+      return null;
+    }
+    this.#resolverCacheCurrentRevision = snapshotRevision;
     const db = await this.#database();
-    db.query('DELETE FROM connections_resolver_cache WHERE snapshot_revision != ?').run(
-      snapshotRevision,
-    );
     const row = db
       .query(
         `SELECT result_json
@@ -3899,9 +3912,32 @@ export class SqliteConnectionsStore implements ConnectionsStore {
          WHERE visit_id = ? AND snapshot_revision = ?`,
       )
       .get(visitId, snapshotRevision);
+    this.#scheduleResolverCachePrune(snapshotRevision);
     if (row === null || row === undefined) return null;
     return JSON.parse(textField(row, 'result_json')) as unknown;
   };
+
+  #scheduleResolverCachePrune(snapshotRevision: string): void {
+    if (this.#resolverCachePruneScheduledFor === snapshotRevision) return;
+    this.#resolverCachePruneScheduledFor = snapshotRevision;
+    setTimeout(() => {
+      void (async (): Promise<void> => {
+        try {
+          const db = await this.#database();
+          db.query('DELETE FROM connections_resolver_cache WHERE snapshot_revision != ?').run(
+            snapshotRevision,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.warn(`[connections] resolver cache prune failed: ${message}`);
+        } finally {
+          if (this.#resolverCachePruneScheduledFor === snapshotRevision) {
+            this.#resolverCachePruneScheduledFor = null;
+          }
+        }
+      })();
+    }, 0).unref?.();
+  }
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const db = await this.#database();
