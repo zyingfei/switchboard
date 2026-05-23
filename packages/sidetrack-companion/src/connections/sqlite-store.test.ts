@@ -148,22 +148,57 @@ describe('SqliteConnectionsStore', () => {
   });
 
   sqliteIt(
-    'reads resolver subgraphs with full snapshot counts preserved for stable revisions',
+    'resolver subgraph reads route through bulk readCurrent (perf parity)',
     async () => {
+      // The seed-expansion BFS-based partial read walked the connected
+      // component one node at a time and was measurably slower than the
+      // bulk readCurrent on a dense graph (live cold-path resolves were
+      // ~1–3s before the change). The resolver subgraph methods now
+      // forward to readCurrent; this test pins the new contract
+      // (full-snapshot parity) so the BFS path is not silently
+      // reintroduced. See the TODO comment in snapshot.ts for the
+      // future bounded-hops + bulk-expansion partial-read design.
       const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
       await store.putCurrent(buildTraversalSnapshot());
 
-      const subgraph = await store.readResolverSubgraphForUrl('https://example.test/page');
+      const fromUrl = await store.readResolverSubgraphForUrl('https://example.test/page');
+      const fromTabSession = await store.readResolverSubgraphForTabSession('ts-1');
+      const fromThread = await store.readResolverSubgraphForThread({ threadId: 'alpha' });
+      const current = await store.readCurrent();
 
-      expect(subgraph?.nodes.map((n) => n.id)).toEqual([
-        'tab-session:ts-1',
-        'timeline-visit:https://example.test/page',
-        'visit-instance:ts-1:0:https://example.test/page',
-        'workstream:main',
-      ]);
-      expect(subgraph?.edgeCount).toBe(3);
-      expect(subgraph?.nodeCount).toBe(5);
-      expect(subgraph?.edges).toHaveLength(3);
+      expect(fromUrl).toEqual(current);
+      expect(fromTabSession).toEqual(current);
+      expect(fromThread).toEqual(current);
+      // Full-snapshot counts and edge cardinality preserved.
+      expect(fromUrl?.nodeCount).toBe(5);
+      expect(fromUrl?.edgeCount).toBe(3);
+      expect(fromUrl?.edges).toHaveLength(3);
+      store.close();
+    },
+  );
+
+  sqliteIt(
+    'memoizes readCurrent across calls and invalidates on putCurrent',
+    async () => {
+      // Without the memo, every cold resolve repeats ~17K JSON.parses
+      // to materialize the whole snapshot. Sibling resolves within the
+      // same revision must share a single bulk read.
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      await store.putCurrent(buildTraversalSnapshot());
+
+      const a = await store.readCurrent();
+      const b = await store.readCurrent();
+      expect(b).toBe(a); // same object identity proves the memo
+
+      // putCurrent invalidates; next read re-materializes against the
+      // new snapshotRevision.
+      await store.putCurrent({
+        ...buildTraversalSnapshot(),
+        snapshotRevision: 'rev-changed',
+      });
+      const c = await store.readCurrent();
+      expect(c).not.toBe(a);
+      expect(c?.snapshotRevision).toBe('rev-changed');
       store.close();
     },
   );

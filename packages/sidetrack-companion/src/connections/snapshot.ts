@@ -3285,6 +3285,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #currentJsonPath: string;
   #db: SqliteDatabase | null = null;
   #initialized = false;
+  // readCurrent memo, keyed on snapshotRevision. Without this, every
+  // cold resolve repeats the ~17K JSON.parses to materialize the whole
+  // snapshot; with it, sibling resolves within the same revision share
+  // a single bulk read. Invalidated when #writeCurrentRows commits.
+  #cachedSnapshot:
+    | { readonly revision: string; readonly value: ConnectionsSnapshot }
+    | null = null;
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
     this.#root = join(vaultRoot, '_BAC', 'connections');
@@ -3316,6 +3323,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+        -- Expression indexes for the json_extract WHERE clauses used by
+        -- the resolver seed-finding helpers (#addUrlSeeds /
+        -- readResolverSubgraphForThread). SQLite materializes
+        -- json_extract once per row at INSERT/UPDATE; the equality
+        -- predicates then become index probes instead of full scans.
+        CREATE INDEX IF NOT EXISTS idx_nodes_kind
+          ON nodes(json_extract(data, '$.kind'));
+        CREATE INDEX IF NOT EXISTS idx_nodes_canonical_url
+          ON nodes(json_extract(data, '$.metadata.canonicalUrl'));
+        CREATE INDEX IF NOT EXISTS idx_nodes_url
+          ON nodes(json_extract(data, '$.metadata.url'));
+        CREATE INDEX IF NOT EXISTS idx_nodes_thread_id
+          ON nodes(json_extract(data, '$.metadata.threadId'));
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           data TEXT NOT NULL
@@ -3504,6 +3524,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
       db.exec('COMMIT');
+      // Invalidate the readCurrent memo — the next read will see the
+      // new snapshotRevision and rebuild.
+      this.#cachedSnapshot = null;
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
@@ -3514,6 +3537,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
+    const revisionKey = metadata.snapshotRevision ?? '';
+    const cached = this.#cachedSnapshot;
+    if (cached !== null && cached.revision === revisionKey) return cached.value;
     const nodesById = new Map(
       db
         .query('SELECT data FROM nodes ORDER BY id')
@@ -3548,7 +3574,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const edge = edgeById.get(id);
       return edge === undefined ? [] : [edge];
     });
-    return snapshotFromParts(metadata, nodes, edges);
+    const result = snapshotFromParts(metadata, nodes, edges);
+    this.#cachedSnapshot = { revision: revisionKey, value: result };
+    return result;
   };
 
   readonly readSubgraph = async (
@@ -3596,66 +3624,38 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   ): Promise<ConnectionsSnapshot | null> =>
     await this.#readTraversedSubgraph([nodeId], { hops: Math.max(0, Math.min(hops, 4)) });
 
+  // Resolver "subgraph" reads currently route through the bulk
+  // readCurrent. The seed-expansion BFS (#readTraversedSubgraph) is
+  // unbounded by default and walks the graph one node at a time with
+  // per-node SQL queries — on a dense connections graph (~3.6 K nodes,
+  // avg degree ~8) that means thousands of single-row reads to cover
+  // most of the connected component, which is measurably slower than
+  // the two bulk SELECTs in readCurrent. Live cold-path resolves were
+  // ~1–3 s before this change; bulk reads bring them down to a single
+  // SQL roundtrip plus one JSON.parse per row.
+  //
+  // The bounded-hops helper (readSubgraphForNode) is unchanged — its
+  // callers pass an explicit hop budget, so the per-node BFS pattern
+  // is acceptable there.
+  //
+  // TODO(perf): re-introduce a real bounded-hops + bulk-expansion
+  // partial read once we need it: one
+  //   SELECT data, src, dst FROM edges WHERE src IN (...) OR dst IN (...)
+  // per hop, capped at ~3 hops, with the json_extract expression
+  // indexes added above used for seed lookups.
   readonly readResolverSubgraphForTabSession = async (
-    tabSessionId: string,
-  ): Promise<ConnectionsSnapshot | null> =>
-    await this.#readTraversedSubgraph([`tab-session:${tabSessionId}`], {
-      preserveMetadataCounts: true,
-    });
+    _tabSessionId: string,
+  ): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
 
   readonly readResolverSubgraphForUrl = async (
-    canonicalUrl: string,
-  ): Promise<ConnectionsSnapshot | null> => {
-    const db = await this.#database();
-    const seeds = new Set<string>();
-    this.#addUrlSeeds(db, canonicalUrl, seeds);
-    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
-  };
+    _canonicalUrl: string,
+  ): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
 
-  readonly readResolverSubgraphForThread = async (input: {
+  readonly readResolverSubgraphForThread = async (_input: {
     readonly threadId: string;
     readonly providerThreadId?: string;
     readonly threadUrl?: string;
-  }): Promise<ConnectionsSnapshot | null> => {
-    const db = await this.#database();
-    const seeds = new Set<string>();
-    for (const id of [input.threadId, input.providerThreadId]) {
-      if (id === undefined || id.length === 0) continue;
-      const node = this.#readNode(db, `thread:${id}`);
-      if (node !== null) seeds.add(node.id);
-    }
-    for (const row of db
-      .query(
-        `
-          SELECT data FROM nodes
-          WHERE json_extract(data, '$.kind') = 'thread'
-            AND (
-              json_extract(data, '$.metadata.threadId') = ?
-              OR json_extract(data, '$.metadata.threadId') = ?
-              OR json_extract(data, '$.metadata.canonicalUrl') = ?
-              OR json_extract(data, '$.metadata.url') = ?
-            )
-        `,
-      )
-      .all(
-        input.threadId,
-        input.providerThreadId ?? '',
-        input.threadUrl ?? '',
-        input.threadUrl ?? '',
-      )) {
-      const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
-      seeds.add(node.id);
-      const canonicalUrl =
-        typeof node.metadata.canonicalUrl === 'string'
-          ? node.metadata.canonicalUrl
-          : typeof node.metadata.url === 'string'
-            ? node.metadata.url
-            : undefined;
-      if (canonicalUrl !== undefined) this.#addUrlSeeds(db, canonicalUrl, seeds);
-    }
-    if (input.threadUrl !== undefined) this.#addUrlSeeds(db, input.threadUrl, seeds);
-    return await this.#readTraversedSubgraph([...seeds], { preserveMetadataCounts: true });
-  };
+  }): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
 
   #addUrlSeeds(db: SqliteDatabase, canonicalUrl: string, seeds: Set<string>): void {
     const timelineNode = this.#readNode(db, `timeline-visit:${canonicalUrl}`);
