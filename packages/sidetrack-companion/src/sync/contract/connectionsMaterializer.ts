@@ -1392,19 +1392,34 @@ export const createConnectionsMaterializer = (
       const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
       usedHotSimilarityPath = true;
       hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
-      visitSimilarity = await buildHnswVisitSimilarity({
-        entries: similarityEntries,
-        revisionId: expectedSimilarityRevisionId,
-        config: similarityConfig,
-        touchedVisitIds,
-        fullRebuild: hnswFullRebuild,
-        previousSnapshot: previousSnapshotForRanker,
-        embed: deps.embed ?? defaultEmbed,
-        evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-      });
-      mark(
-        `buildVisitSimilarityHnsw full=${String(hnswFullRebuild)} touched=${String(touchedVisitIds.size)} edges=${String(visitSimilarity.edges.length)}`,
-      );
+      mark(`buildVisitSimilarityHnsw.start entries=${String(similarityEntries.length)}`);
+      try {
+        visitSimilarity = await buildHnswVisitSimilarity({
+          entries: similarityEntries,
+          revisionId: expectedSimilarityRevisionId,
+          config: similarityConfig,
+          touchedVisitIds,
+          fullRebuild: hnswFullRebuild,
+          previousSnapshot: previousSnapshotForRanker,
+          embed: deps.embed ?? defaultEmbed,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+        });
+        mark(
+          `buildVisitSimilarityHnsw full=${String(hnswFullRebuild)} touched=${String(touchedVisitIds.size)} edges=${String(visitSimilarity.edges.length)}`,
+        );
+      } catch (err) {
+        mark(
+          `buildVisitSimilarityHnsw.fallback error=${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
+          ...similarityConfig,
+          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+          pageContentChunksByCanonicalUrl,
+        });
+      }
     } else if (cachedSimilarityRevision !== null) {
       // U2 — a valid cached revision means the W3 skip-gate id (a pure
       // function of inputs+config) matched: the inputs are unchanged,
