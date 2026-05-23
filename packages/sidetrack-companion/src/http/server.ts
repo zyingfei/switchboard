@@ -152,7 +152,7 @@ import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
-import { SqliteConnectionsStore } from '../connections/snapshot.js';
+import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -1499,6 +1499,10 @@ const resolveSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
+const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> =>
+  (await store.readSnapshotMetadata())?.snapshotRevision ?? 'none';
+const connectionsGraphSig = async (store: ConnectionsStore, jsonPath: string): Promise<string> =>
+  store instanceof SqliteConnectionsStore ? await sqliteSig(store) : await resolveSig(jsonPath);
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
 // position. The feedback + page-content overlays do depend on the
 // event log, but it advances on EVERY extension event flush (~1/min
@@ -1511,12 +1515,13 @@ const resolveSig = async (path: string): Promise<string> => {
 // ≤TTL stale. Consistent with the W2b "connections is contextual,
 // not user-immediate-feedback; staleness is acceptable" stance.
 const connectionsResponseCacheKey = async (
+  store: ConnectionsStore,
   vaultRoot: string,
   querySearch: string,
 ): Promise<string> => {
   const root = join(vaultRoot, '_BAC', 'connections');
   const [cur, shadow] = await Promise.all([
-    statSig(join(root, 'current.json')),
+    connectionsGraphSig(store, join(root, 'current.json')),
     statSig(join(root, 'topics', 'current.shadow.json')),
   ]);
   return `cur=${cur}|shadow=${shadow}|q=${querySearch}`;
@@ -2761,7 +2766,8 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await resolveSig(
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
       return cachedResolveRoute(
@@ -3070,7 +3076,8 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await resolveSig(
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
       return cachedResolveRoute(
@@ -5358,7 +5365,8 @@ const routes: readonly RouteDefinition[] = [
         limit: url.searchParams.get('limit') ?? undefined,
         threshold: url.searchParams.get('threshold') ?? undefined,
       });
-      const suggestionsCacheKey = `thread:${threadId}|${await statSig(
+      const suggestionsCacheKey = `thread:${threadId}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(vaultRoot, '_BAC', 'connections', 'current.json'),
       )}|l=${String(query.limit)}|th=${String(query.threshold ?? '')}`;
       return cachedThreadSuggestions(
@@ -6529,7 +6537,11 @@ const routes: readonly RouteDefinition[] = [
       const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
       const cacheVaultRoot = requireVaultRoot(context);
-      const cacheKey = await connectionsResponseCacheKey(cacheVaultRoot, url.search);
+      const cacheKey = await connectionsResponseCacheKey(
+        context.connectionsStore,
+        cacheVaultRoot,
+        url.search,
+      );
       const { result: connectionsResult } = await cachedConnectionsResponse(
         cacheKey,
         CONNECTIONS_RESPONSE_TTL_MS,
