@@ -56,8 +56,7 @@ describe('SimilarityHnswStore', () => {
 
   it('returns top-k neighbors matching brute-force cosine for a small corpus', async () => {
     const vectors = randomUnitVectors(100, 64);
-    const store = createSimilarityHnswStore();
-    await store.ensureLoaded(vaultRoot, 64);
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 64);
     for (let i = 0; i < vectors.length; i += 1) {
       await store.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
     }
@@ -82,8 +81,7 @@ describe('SimilarityHnswStore', () => {
 
   it('persists and reopens the index with stable query results', async () => {
     const vectors = randomUnitVectors(20, 16);
-    const first = createSimilarityHnswStore();
-    await first.ensureLoaded(vaultRoot, 16);
+    const first = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 16);
     for (let i = 0; i < vectors.length; i += 1) {
       await first.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
     }
@@ -91,42 +89,37 @@ describe('SimilarityHnswStore', () => {
     await first.persist();
     await first.close();
 
-    const second = createSimilarityHnswStore();
-    await second.ensureLoaded(vaultRoot, 16);
+    const second = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 16);
     expect(await second.queryTopK('vid-3', 8)).toEqual(before);
   });
 
   it('keeps the previous published version loadable when pointer rename fails', async () => {
-    const first = createSimilarityHnswStore();
-    await first.ensureLoaded(vaultRoot, 4);
+    const first = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
     await first.insertOrUpdate('query', [1, 0, 0, 0]);
     await first.insertOrUpdate('old-neighbor', [0.99, 0.01, 0, 0]);
     const before = await first.queryTopK('query', 1);
     await first.persist();
     await first.close();
 
-    const failing = createSimilarityHnswStore({
+    const failing = await createSimilarityHnswStore({
       renameFile: async (oldPath, newPath) => {
         if (String(newPath).endsWith('visit-similarity-hnsw.current')) {
           throw new Error('simulated pointer rename crash');
         }
         await rename(oldPath, newPath);
       },
-    });
-    await failing.ensureLoaded(vaultRoot, 4);
+    }).ensureLoaded(vaultRoot, 4);
     await failing.insertOrUpdate('new-neighbor', [0.999, 0.001, 0, 0]);
     await expect(failing.persist()).rejects.toThrow('simulated pointer rename crash');
     await failing.close();
 
-    const recovered = createSimilarityHnswStore();
-    await recovered.ensureLoaded(vaultRoot, 4);
+    const recovered = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
 
     expect(await recovered.queryTopK('query', 1)).toEqual(before);
   });
 
   it('insertOrUpdate replaces a visit embedding', async () => {
-    const store = createSimilarityHnswStore();
-    await store.ensureLoaded(vaultRoot, 4);
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
     await store.insertOrUpdate('x', [1, 0, 0, 0]);
     await store.insertOrUpdate('near-a', [0.99, 0.01, 0, 0]);
     await store.insertOrUpdate('near-b', [0, 0.99, 0.01, 0]);
@@ -139,8 +132,7 @@ describe('SimilarityHnswStore', () => {
   });
 
   it('delete removes a visit from query results', async () => {
-    const store = createSimilarityHnswStore();
-    await store.ensureLoaded(vaultRoot, 3);
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 3);
     const vectors = [
       [1, 0, 0],
       [0.9, 0.1, 0],

@@ -151,7 +151,10 @@ import {
   VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
   VISIT_SIMILARITY_MODEL_ID,
 } from '../../connections/visitSimilarity.js';
-import { createSimilarityHnswStore } from '../../connections/visitSimilarityHnsw.js';
+import {
+  createSimilarityHnswStore,
+  type LoadedSimilarityHnswStore,
+} from '../../connections/visitSimilarityHnsw.js';
 import {
   createDirtySourceQueue,
   foldGroupBEventIntoQueue,
@@ -708,6 +711,7 @@ export const createConnectionsMaterializer = (
     incrementalSimilarityIndexOptions,
   );
   const hnswSimilarityStore = createSimilarityHnswStore();
+  let loadedHnswSimilarityStore: LoadedSimilarityHnswStore | null = null;
   let pending = false;
   let running = false;
   let dirty = false;
@@ -818,7 +822,8 @@ export const createConnectionsMaterializer = (
   };
 
   const resetHnswSimilarityFiles = async (): Promise<void> => {
-    await hnswSimilarityStore.close();
+    await loadedHnswSimilarityStore?.close();
+    loadedHnswSimilarityStore = null;
     await rm(join(deps.vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw.bin'), {
       force: true,
     });
@@ -859,7 +864,11 @@ export const createConnectionsMaterializer = (
       ? activeEntries
       : activeEntries.filter((entry) => touchedVisitIds.has(visitKeyForVisitEntry(entry)));
     if (input.fullRebuild) await resetHnswSimilarityFiles();
-    await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim);
+    const loadedHnswStore = await hnswSimilarityStore.ensureLoaded(
+      deps.vaultRoot,
+      RECALL_MODEL.embeddingDim,
+    );
+    loadedHnswSimilarityStore = loadedHnswStore;
 
     const embeddingsByVisitKey = new Map<string, Float32Array>();
     if (entriesToEmbed.length > 0) {
@@ -884,10 +893,10 @@ export const createConnectionsMaterializer = (
     const firstEmbedding = embeddingsByVisitKey.values().next().value;
     if (firstEmbedding !== undefined) {
       for (const visitId of input.fullRebuild ? [] : input.touchedVisitIds) {
-        if (!activeVisitIds.has(visitId)) await hnswSimilarityStore.delete(visitId);
+        if (!activeVisitIds.has(visitId)) await loadedHnswStore.delete(visitId);
       }
       for (const [visitId, embedding] of embeddingsByVisitKey) {
-        await hnswSimilarityStore.insertOrUpdate(visitId, Array.from(embedding));
+        await loadedHnswStore.insertOrUpdate(visitId, Array.from(embedding));
       }
     } else if (input.fullRebuild) {
       return {
@@ -914,7 +923,7 @@ export const createConnectionsMaterializer = (
     const queryVisitIds = input.fullRebuild ? activeVisitIds : touchedVisitIds;
     for (const visitId of [...queryVisitIds].sort()) {
       if (!activeVisitIds.has(visitId)) continue;
-      for (const neighbor of await hnswSimilarityStore.queryTopK(visitId, 50)) {
+      for (const neighbor of await loadedHnswStore.queryTopK(visitId, 50)) {
         if (!activeVisitIds.has(neighbor.neighborVisitId)) continue;
         const cosine = Number((1 - neighbor.distance).toFixed(6));
         if (cosine < input.config.threshold) continue;
@@ -926,7 +935,7 @@ export const createConnectionsMaterializer = (
         }
       }
     }
-    await hnswSimilarityStore.persist();
+    await loadedHnswStore.persist();
     return {
       revisionId: input.revisionId,
       modelId: VISIT_SIMILARITY_MODEL_ID,

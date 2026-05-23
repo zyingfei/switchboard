@@ -10,8 +10,11 @@ const HNSW_EF_CONSTRUCTION = 200;
 const HNSW_EF_SEARCH = 64;
 const HNSW_RANDOM_SEED = 100;
 
-export interface SimilarityHnswStore {
-  ensureLoaded(vaultRoot: string, dimension: number): Promise<void>;
+export interface UnloadedSimilarityHnswStore {
+  ensureLoaded(vaultRoot: string, dimension: number): Promise<LoadedSimilarityHnswStore>;
+}
+
+export interface LoadedSimilarityHnswStore {
   insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void>;
   delete(visitId: string): Promise<void>;
   queryTopK(
@@ -185,7 +188,7 @@ const assertEmbedding = (embedding: readonly number[], dimension: number): void 
 
 export const createSimilarityHnswStore = (
   options: SimilarityHnswStoreOptions = {},
-): SimilarityHnswStore => {
+): UnloadedSimilarityHnswStore => {
   const renameFile = options.renameFile ?? rename;
   let state: LoadedState | null = null;
 
@@ -194,95 +197,7 @@ export const createSimilarityHnswStore = (
     return state;
   };
 
-  return {
-    async ensureLoaded(vaultRoot: string, dimension: number): Promise<void> {
-      if (!Number.isInteger(dimension) || dimension <= 0) {
-        throw new Error(`invalid HNSW dimension: ${String(dimension)}`);
-      }
-      if (state !== null) {
-        if (state.vaultRoot !== vaultRoot || state.dimension !== dimension) {
-          throw new Error('HNSW similarity store already loaded for a different vault or dimension');
-        }
-        return;
-      }
-
-      const basePath = basePathFor(vaultRoot);
-      const pointerPath = pointerPathFor(vaultRoot);
-      await mkdir(dirname(basePath), { recursive: true });
-      const index = new HnswLib.HierarchicalNSW('cosine', dimension);
-      const hasPointer = await pathExists(pointerPath);
-      if (hasPointer) {
-        const version = parsePointer(await readFile(pointerPath, 'utf8'));
-        const sidecar = parseSidecar(await readFile(versionedSidecarPath(basePath, version), 'utf8'));
-        if (sidecar.dimension !== dimension) {
-          throw new Error(
-            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
-          );
-        }
-        await index.readIndex(versionedIndexPath(basePath, version));
-        index.setEf(HNSW_EF_SEARCH);
-        state = {
-          vaultRoot,
-          basePath,
-          pointerPath,
-          index,
-          dimension,
-          maxElements: index.getMaxElements(),
-          elementCount: sidecar.elementCount,
-          version,
-          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
-          labelToVisitId: new Map(
-            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
-          ),
-        };
-        return;
-      }
-      const legacyIndexPath = indexPathFor(vaultRoot);
-      const legacySidecarPath = sidecarPathFor(vaultRoot);
-      const hasIndex = await pathExists(legacyIndexPath);
-      const hasSidecar = await pathExists(legacySidecarPath);
-      if (hasIndex && hasSidecar) {
-        const sidecar = parseSidecar(await readFile(legacySidecarPath, 'utf8'));
-        if (sidecar.dimension !== dimension) {
-          throw new Error(
-            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
-          );
-        }
-        await index.readIndex(legacyIndexPath);
-        index.setEf(HNSW_EF_SEARCH);
-        state = {
-          vaultRoot,
-          basePath,
-          pointerPath,
-          index,
-          dimension,
-          maxElements: index.getMaxElements(),
-          elementCount: sidecar.elementCount,
-          version: 0,
-          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
-          labelToVisitId: new Map(
-            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
-          ),
-        };
-        return;
-      }
-
-      index.initIndex(INITIAL_MAX_ELEMENTS, HNSW_M, HNSW_EF_CONSTRUCTION, HNSW_RANDOM_SEED);
-      index.setEf(HNSW_EF_SEARCH);
-      state = {
-        vaultRoot,
-        basePath,
-        pointerPath,
-        index,
-        dimension,
-        maxElements: INITIAL_MAX_ELEMENTS,
-        elementCount: 0,
-        version: 0,
-        visitIdToLabel: new Map(),
-        labelToVisitId: new Map(),
-      };
-    },
-
+  const loadedStore: LoadedSimilarityHnswStore = {
     async insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void> {
       const loaded = requireLoaded();
       if (visitId.length === 0) throw new Error('invalid HNSW visitId: empty');
@@ -362,6 +277,100 @@ export const createSimilarityHnswStore = (
 
     async close(): Promise<void> {
       state = null;
+    },
+  };
+
+  return {
+    async ensureLoaded(
+      vaultRoot: string,
+      dimension: number,
+    ): Promise<LoadedSimilarityHnswStore> {
+      if (!Number.isInteger(dimension) || dimension <= 0) {
+        throw new Error(`invalid HNSW dimension: ${String(dimension)}`);
+      }
+      if (state !== null) {
+        if (state.vaultRoot !== vaultRoot || state.dimension !== dimension) {
+          throw new Error('HNSW similarity store already loaded for a different vault or dimension');
+        }
+        return loadedStore;
+      }
+
+      const basePath = basePathFor(vaultRoot);
+      const pointerPath = pointerPathFor(vaultRoot);
+      await mkdir(dirname(basePath), { recursive: true });
+      const index = new HnswLib.HierarchicalNSW('cosine', dimension);
+      const hasPointer = await pathExists(pointerPath);
+      if (hasPointer) {
+        const version = parsePointer(await readFile(pointerPath, 'utf8'));
+        const sidecar = parseSidecar(await readFile(versionedSidecarPath(basePath, version), 'utf8'));
+        if (sidecar.dimension !== dimension) {
+          throw new Error(
+            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
+          );
+        }
+        await index.readIndex(versionedIndexPath(basePath, version));
+        index.setEf(HNSW_EF_SEARCH);
+        state = {
+          vaultRoot,
+          basePath,
+          pointerPath,
+          index,
+          dimension,
+          maxElements: index.getMaxElements(),
+          elementCount: sidecar.elementCount,
+          version,
+          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+          labelToVisitId: new Map(
+            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
+          ),
+        };
+        return loadedStore;
+      }
+      const legacyIndexPath = indexPathFor(vaultRoot);
+      const legacySidecarPath = sidecarPathFor(vaultRoot);
+      const hasIndex = await pathExists(legacyIndexPath);
+      const hasSidecar = await pathExists(legacySidecarPath);
+      if (hasIndex && hasSidecar) {
+        const sidecar = parseSidecar(await readFile(legacySidecarPath, 'utf8'));
+        if (sidecar.dimension !== dimension) {
+          throw new Error(
+            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
+          );
+        }
+        await index.readIndex(legacyIndexPath);
+        index.setEf(HNSW_EF_SEARCH);
+        state = {
+          vaultRoot,
+          basePath,
+          pointerPath,
+          index,
+          dimension,
+          maxElements: index.getMaxElements(),
+          elementCount: sidecar.elementCount,
+          version: 0,
+          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+          labelToVisitId: new Map(
+            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
+          ),
+        };
+        return loadedStore;
+      }
+
+      index.initIndex(INITIAL_MAX_ELEMENTS, HNSW_M, HNSW_EF_CONSTRUCTION, HNSW_RANDOM_SEED);
+      index.setEf(HNSW_EF_SEARCH);
+      state = {
+        vaultRoot,
+        basePath,
+        pointerPath,
+        index,
+        dimension,
+        maxElements: INITIAL_MAX_ELEMENTS,
+        elementCount: 0,
+        version: 0,
+        visitIdToLabel: new Map(),
+        labelToVisitId: new Map(),
+      };
+      return loadedStore;
     },
   };
 };
