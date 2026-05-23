@@ -859,6 +859,7 @@ export const createConnectionsMaterializer = (
       ? activeEntries
       : activeEntries.filter((entry) => touchedVisitIds.has(visitKeyForVisitEntry(entry)));
     if (input.fullRebuild) await resetHnswSimilarityFiles();
+    await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim);
 
     const embeddingsByVisitKey = new Map<string, Float32Array>();
     if (entriesToEmbed.length > 0) {
@@ -882,7 +883,6 @@ export const createConnectionsMaterializer = (
 
     const firstEmbedding = embeddingsByVisitKey.values().next().value;
     if (firstEmbedding !== undefined) {
-      await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, firstEmbedding.length);
       for (const visitId of input.fullRebuild ? [] : input.touchedVisitIds) {
         if (!activeVisitIds.has(visitId)) await hnswSimilarityStore.delete(visitId);
       }
