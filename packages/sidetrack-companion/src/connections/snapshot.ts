@@ -3323,19 +3323,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
-        -- Expression indexes for the json_extract WHERE clauses used by
-        -- the resolver seed-finding helpers (#addUrlSeeds /
-        -- readResolverSubgraphForThread). SQLite materializes
-        -- json_extract once per row at INSERT/UPDATE; the equality
-        -- predicates then become index probes instead of full scans.
-        CREATE INDEX IF NOT EXISTS idx_nodes_kind
-          ON nodes(json_extract(data, '$.kind'));
-        CREATE INDEX IF NOT EXISTS idx_nodes_canonical_url
-          ON nodes(json_extract(data, '$.metadata.canonicalUrl'));
-        CREATE INDEX IF NOT EXISTS idx_nodes_url
-          ON nodes(json_extract(data, '$.metadata.url'));
-        CREATE INDEX IF NOT EXISTS idx_nodes_thread_id
-          ON nodes(json_extract(data, '$.metadata.threadId'));
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           data TEXT NOT NULL
@@ -3647,8 +3634,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // TODO(perf): re-introduce a real bounded-hops + bulk-expansion
   // partial read once we need it: one
   //   SELECT data, src, dst FROM edges WHERE src IN (...) OR dst IN (...)
-  // per hop, capped at ~3 hops, with the json_extract expression
-  // indexes added above used for seed lookups.
+  // per hop, capped at ~3 hops.
   readonly readResolverSubgraphForTabSession = async (
     _tabSessionId: string,
   ): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
@@ -3662,26 +3648,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly providerThreadId?: string;
     readonly threadUrl?: string;
   }): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
-
-  #addUrlSeeds(db: SqliteDatabase, canonicalUrl: string, seeds: Set<string>): void {
-    const timelineNode = this.#readNode(db, `timeline-visit:${canonicalUrl}`);
-    if (timelineNode !== null) seeds.add(timelineNode.id);
-    for (const row of db
-      .query(
-        `
-          SELECT data FROM nodes
-          WHERE json_extract(data, '$.kind') = 'visit-instance'
-            AND (
-              json_extract(data, '$.metadata.canonicalUrl') = ?
-              OR json_extract(data, '$.metadata.url') = ?
-            )
-        `,
-      )
-      .all(canonicalUrl, canonicalUrl)) {
-      const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
-      seeds.add(node.id);
-    }
-  }
 
   readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
     const db = await this.#database();
