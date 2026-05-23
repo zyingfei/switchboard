@@ -40,6 +40,7 @@ const appendVisit = async (
   input: {
     readonly index: number;
     readonly observedAt: string;
+    readonly focusedWindowMs?: number;
   },
 ): Promise<void> => {
   await eventLog.appendClientObserved({
@@ -56,7 +57,7 @@ const appendVisit = async (
       provider: 'generic',
       transition: 'activated',
       payloadVersion: 1,
-      dimensions: { engagement: { focusedWindowMs: 10_000 } },
+      dimensions: { engagement: { focusedWindowMs: input.focusedWindowMs ?? 10_000 } },
     },
   });
 };
@@ -82,7 +83,7 @@ describe('HNSW reconcile child integration', () => {
     delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'];
     process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.8';
     process.env['SIDETRACK_SIMILARITY_TOP_K'] = '20';
-    process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '0';
+    process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '5000';
     setReconcileChildScriptOverride(childEntryPath());
   });
 
@@ -133,5 +134,17 @@ describe('HNSW reconcile child integration', () => {
     const snapshot = await createConnectionsStore(vaultRoot).readCurrent();
     expect(snapshot).not.toBeNull();
     expect(Date.parse(snapshot!.updatedAt)).toBeGreaterThan(Date.parse(baselineSnapshot!.updatedAt));
+
+    eventNowMs = Date.parse('2026-05-22T12:00:00.000Z');
+    await appendVisit(eventLog, {
+      index: 21,
+      observedAt: '2026-05-22T12:00:00.000Z',
+      focusedWindowMs: 1,
+    });
+
+    // Regression: this child reconcile has existing active HNSW entries but no newly
+    // eligible visit to embed, so the materializer itself must load the persisted store.
+    const noEligibleEmbeddingResult = await runReconcileInChild({ vaultRoot, seq: 3 });
+    expect(noEligibleEmbeddingResult).toMatchObject({ seq: 3, ok: true });
   });
 });
