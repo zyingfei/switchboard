@@ -41,6 +41,7 @@ import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js'
 import {
   expandSemanticRecallCandidates,
   getOrBuildSemanticRecallPool,
+  getSemanticRecallPoolMigrationStatus,
   readSemanticRecallPool,
   semanticRecallPoolEnabled,
 } from '../recall/semanticRecallPool.js';
@@ -2490,6 +2491,9 @@ const routes: readonly RouteDefinition[] = [
             readonly state: 'disabled' | 'rebuilding' | 'ready';
             readonly vectorState: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
             readonly vectorError?: string;
+            readonly semanticRecallPoolMigration: ReturnType<
+              typeof getSemanticRecallPoolMigrationStatus
+            >;
           }
         | undefined;
       if (context.recallLifecycle !== undefined) {
@@ -2499,9 +2503,14 @@ const routes: readonly RouteDefinition[] = [
           ...(embedderStatus.lastError === undefined
             ? {}
             : { vectorError: embedderStatus.lastError }),
+          semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
         };
       } else {
-        recallState = { state: 'disabled', vectorState: embedderStatus.state };
+        recallState = {
+          state: 'disabled',
+          vectorState: embedderStatus.state,
+          semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
+        };
       }
       // Materializer state — cached health snapshot (sync).
       const materializerHealth = context.syncMaterializerHealth?.() ?? undefined;
@@ -3422,6 +3431,7 @@ const routes: readonly RouteDefinition[] = [
                   entryCount: index?.items.length ?? null,
                   modelId: index?.modelId ?? null,
                   sizeBytes: info?.size ?? null,
+                  semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
                   // Lifecycle fields are optional so legacy callers
                   // (no recallLifecycle injected) keep the old shape.
                   ...(lifecycleReport === undefined

@@ -34,9 +34,8 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 
-import { leidenCpmPartition } from '../connections/leidenCpm.js';
-import type { VisitSimilarityEdge } from '../connections/topicClusterer.js';
 import { parseUrlIdentity } from '../search/identity.js';
 
 export const SEMANTIC_RECALL_POOL_ENV = 'SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL';
@@ -78,6 +77,28 @@ export const semanticRecallPoolEnabled = (): boolean => {
   if (raw === undefined) return true;
   return !DISABLED.has(raw.trim().toLowerCase());
 };
+
+export type SemanticRecallPoolMigrationStatus =
+  | { readonly state: 'idle' }
+  | { readonly state: 'in-progress'; readonly startedAtMs: number; readonly reason: string }
+  | {
+      readonly state: 'complete';
+      readonly startedAtMs: number;
+      readonly completedAtMs: number;
+      readonly reason: string;
+    }
+  | {
+      readonly state: 'failed';
+      readonly startedAtMs: number;
+      readonly failedAtMs: number;
+      readonly reason: string;
+      readonly error: string;
+    };
+
+let semanticRecallPoolMigrationStatus: SemanticRecallPoolMigrationStatus = { state: 'idle' };
+
+export const getSemanticRecallPoolMigrationStatus = (): SemanticRecallPoolMigrationStatus =>
+  semanticRecallPoolMigrationStatus;
 
 export interface SemanticRecallNeighbor {
   readonly canonicalUrl: string;
@@ -200,24 +221,69 @@ const topKNeighborsFull = async (
 // O(communities·edges) refinement — multiple seconds at ~900 nodes,
 // one synchronous block. So it runs ONLY on the (rare) full build;
 // the incremental path keeps clusters up to date without it. Pure.
-const clustersFromNeighbors = (
+type ClusterWorkerMessage =
+  | { readonly kind: 'done'; readonly clusters: readonly (readonly [string, string])[] }
+  | { readonly kind: 'error'; readonly error: string };
+
+const clustersFromNeighborsOffThread = async (
   urls: readonly string[],
   neighbors: ReadonlyMap<string, readonly SemanticRecallNeighbor[]>,
-): Map<string, string> => {
-  const edges: VisitSimilarityEdge[] = [];
-  for (const u of urls) {
-    for (const nb of neighbors.get(u) ?? []) {
-      edges.push({ fromVisitKey: u, toVisitKey: nb.canonicalUrl, cosine: nb.cosine });
+): Promise<Map<string, string>> => {
+  const workerSource = `
+    import { parentPort, workerData } from 'node:worker_threads';
+    import { createHash } from 'node:crypto';
+    import { leidenCpmPartition } from ${JSON.stringify(new URL('../connections/leidenCpm.js', import.meta.url).href)};
+    try {
+      const urls = workerData.urls;
+      const edges = [];
+      for (const [u, list] of workerData.neighbors) {
+        for (const nb of list) {
+          edges.push({ fromVisitKey: u, toVisitKey: nb.canonicalUrl, cosine: nb.cosine });
+        }
+      }
+      const groups = leidenCpmPartition([...urls].sort(), edges);
+      const clusters = [];
+      for (const g of groups) {
+        if (g.length < 2) continue;
+        const id = 'e:' + createHash('sha1').update([...g].sort().join('\\n')).digest('hex').slice(0, 12);
+        for (const u of g) clusters.push([u, id]);
+      }
+      parentPort.postMessage({ kind: 'done', clusters });
+    } catch (error) {
+      parentPort.postMessage({ kind: 'error', error: error instanceof Error ? error.message : String(error) });
     }
-  }
-  const groups = leidenCpmPartition([...urls].sort(), edges);
-  const clusterByUrl = new Map<string, string>();
-  for (const g of groups) {
-    if (g.length < 2) continue;
-    const id = `e:${createHash('sha1').update([...g].sort().join('\n')).digest('hex').slice(0, 12)}`;
-    for (const u of g) clusterByUrl.set(u, id);
-  }
-  return clusterByUrl;
+  `;
+  const workerData = {
+    urls: [...urls],
+    neighbors: [...neighbors.entries()].map(([url, list]) => [
+      url,
+      list.map((nb) => ({ canonicalUrl: nb.canonicalUrl, cosine: nb.cosine })),
+    ]),
+  };
+  return await new Promise<Map<string, string>>((resolve, reject) => {
+    const worker = new Worker(workerSource, { eval: true, workerData });
+    let settled = false;
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    worker.on('message', (raw: ClusterWorkerMessage) => {
+      if (raw.kind === 'done') {
+        settle(() => resolve(new Map(raw.clusters.map(([url, cluster]) => [url, cluster]))));
+        return;
+      }
+      settle(() => reject(new Error(raw.error)));
+    });
+    worker.on('error', (error) => {
+      settle(() => reject(error));
+    });
+    worker.on('exit', (code) => {
+      if (code !== 0) {
+        settle(() => reject(new Error(`semantic recall cluster worker exited ${String(code)}`)));
+      }
+    });
+  });
 };
 
 // Pure assembly from an ALREADY-decided cluster map (no leiden). Used
@@ -303,7 +369,7 @@ export const buildSemanticRecallPoolWithVectors = async (params: {
   }
   const vecs = await embedNormalized(params.embed, items);
   const neighbors = await topKNeighborsFull(urls, vecs, k);
-  const clusterByUrl = clustersFromNeighbors(urls, neighbors); // leiden — full only
+  const clusterByUrl = await clustersFromNeighborsOffThread(urls, neighbors); // leiden — worker, full only
   const vectors = new Map<string, Float32Array>();
   for (let i = 0; i < urls.length; i += 1) vectors.set(urls[i]!, vecs[i]!);
   return {
@@ -563,19 +629,46 @@ const buildOrExtend = async (
   expected: string,
   params: { readonly embed: SemanticRecallEmbed; readonly modelId: string },
 ): Promise<{ pool: SemanticRecallPool; vectors: Map<string, Float32Array> }> => {
-  const full = (): Promise<{ pool: SemanticRecallPool; vectors: Map<string, Float32Array> }> =>
-    buildSemanticRecallPoolWithVectors({
-      items: filtered,
-      embed: params.embed,
-      modelId: params.modelId,
-    });
+  const full = async (
+    reason: string,
+  ): Promise<{ pool: SemanticRecallPool; vectors: Map<string, Float32Array> }> => {
+    const startedAtMs = Date.now();
+    semanticRecallPoolMigrationStatus = { state: 'in-progress', startedAtMs, reason };
+    try {
+      const built = await buildSemanticRecallPoolWithVectors({
+        items: filtered,
+        embed: params.embed,
+        modelId: params.modelId,
+      });
+      semanticRecallPoolMigrationStatus = {
+        state: 'complete',
+        startedAtMs,
+        completedAtMs: Date.now(),
+        reason,
+      };
+      return built;
+    } catch (error) {
+      semanticRecallPoolMigrationStatus = {
+        state: 'failed',
+        startedAtMs,
+        failedAtMs: Date.now(),
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    }
+  };
   if (
     current === null ||
     current.featureVersion !== SEMANTIC_RECALL_POOL_FEATURE_VERSION ||
     current.modelId !== params.modelId ||
     Object.keys(current.byUrl).length === 0
   ) {
-    return full();
+    return full(
+      current?.featureVersion === 2 && SEMANTIC_RECALL_POOL_FEATURE_VERSION === 3
+        ? 'v2-to-v3'
+        : 'full-build',
+    );
   }
   const prevUrls = Object.keys(current.byUrl);
   const curHash = new Map(filtered.map((i) => [i.canonicalUrl, textHash12(i.text)]));
@@ -586,18 +679,18 @@ const buildOrExtend = async (
   }
   let removed = 0;
   for (const u of prevUrls) if (!curHash.has(u)) removed += 1;
-  if (dirty === 0 && removed === 0) return full(); // signature drift w/o item delta (k/floor)
+  if (dirty === 0 && removed === 0) return full('signature-drift'); // signature drift w/o item delta (k/floor)
   // Large delta ⇒ R approaches N (O(N²)) and a fresh leiden partition
   // is worth it anyway. Otherwise stay incremental.
   if (dirty + removed > Math.max(LARGE_DELTA_FLOOR, Math.floor(prevUrls.length / 2))) {
-    return full();
+    return full('large-delta');
   }
   const prevVectors = await readVectorStore(vaultRoot, params.modelId);
-  if (prevVectors === null) return full();
+  if (prevVectors === null) return full('missing-vector-store');
   for (const i of filtered) {
     const p = current.byUrl[i.canonicalUrl];
     const kept = p !== undefined && curHash.get(i.canonicalUrl) === p.textHash;
-    if (kept && !prevVectors.has(i.canonicalUrl)) return full(); // store/pool out of sync
+    if (kept && !prevVectors.has(i.canonicalUrl)) return full('vector-store-mismatch'); // store/pool out of sync
   }
   return incrementalRebuild({
     prevPool: current,
