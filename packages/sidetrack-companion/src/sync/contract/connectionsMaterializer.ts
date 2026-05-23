@@ -294,7 +294,7 @@ const TOPIC_EVERY_MS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS';
 const DEFAULT_TOPIC_EVERY_DRAINS = 50;
 const DEFAULT_TOPIC_EVERY_MS = 300_000;
 
-const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] === '1';
+const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
 
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
@@ -1654,14 +1654,14 @@ export const createConnectionsMaterializer = (
     );
     const previousSnapshotForRanker = await deps.store.readCurrent();
     const scopeIncrementalEnabled =
-      process.env[INCREMENTAL_SCOPES_ENV] === '1' &&
+      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
       deps.store.replaceScopeRows !== undefined &&
       previousSnapshotForRanker !== null;
     let wroteScopeIncremental = false;
     const dirtyScopes = invalidationKeysToScopes(buildKeys);
     const dirtyScopeWrites =
-      process.env[INCREMENTAL_SCOPES_ENV] === '1' &&
+      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       previousSnapshotForRanker !== null &&
       dirtyScopes.length > 0
         ? new Set(dirtyScopes)
@@ -2223,7 +2223,7 @@ export const createConnectionsMaterializer = (
           // Phase 1 intentionally keeps the apply path as a full rebuild.
           // The durable dot-interval filter is the safety foundation for
           // Phase 2's scoped recompute.
-          if (process.env[INCREMENTAL_SCOPES_ENV] === '1') {
+          if (process.env[INCREMENTAL_SCOPES_ENV] !== '0') {
             for (const event of ordered) {
               for (const key of invalidationsForEvent(event)) accumulatedInvalidations.push(key);
             }

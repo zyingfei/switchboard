@@ -3655,6 +3655,8 @@ const snapshotFromParts = (
 });
 
 const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+const incrementalScopesEnabled = (): boolean =>
+  process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] !== '0';
 
 export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #root: string;
@@ -3862,7 +3864,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     dirtyScopes?: ReadonlySet<Scope>,
   ): Promise<void> => {
     const db = await this.#database();
-    this.#writeCurrentRows(db, snapshot, progress, dirtyScopes);
+    const shouldBootstrapScopeMembership = this.#writeCurrentRows(
+      db,
+      snapshot,
+      progress,
+      dirtyScopes,
+    );
+    if (shouldBootstrapScopeMembership) {
+      setImmediate(() => {
+        void this.#bootstrapScopeMembership(snapshot).catch(() => undefined);
+      });
+    }
   };
 
   readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
@@ -4074,12 +4086,54 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   };
 
+  async #bootstrapScopeMembership(snapshot: ConnectionsSnapshot): Promise<void> {
+    const scopes = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+    const scopeKeys = new Set<string>();
+    for (const nodeScopes of scopes.nodeScopes.values()) {
+      for (const scope of nodeScopes) scopeKeys.add(`${scope.kind}\u0000${scope.id}`);
+    }
+    for (const edgeScopes of scopes.edgeScopes.values()) {
+      for (const scope of edgeScopes) scopeKeys.add(`${scope.kind}\u0000${scope.id}`);
+    }
+    const db = await this.#database();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const insertScopeNode = db.query(
+        `INSERT OR IGNORE INTO connections_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertScopeEdge = db.query(
+        `INSERT OR IGNORE INTO connections_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
+      db.query('DELETE FROM connections_scope_nodes').run();
+      db.query('DELETE FROM connections_scope_edges').run();
+      for (const [nodeId, nodeScopes] of scopes.nodeScopes.entries()) {
+        for (const scope of nodeScopes) insertScopeNode.run(scope.kind, scope.id, nodeId);
+      }
+      for (const [key, edgeScopes] of scopes.edgeScopes.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge scope key');
+        for (const scope of edgeScopes) insertScopeEdge.run(scope.kind, scope.id, src, dst);
+      }
+      db.exec('COMMIT');
+      console.warn(
+        `[connections-phase] scopeMembership.bootstrap mode=A scopes=${String(scopeKeys.size)}`,
+      );
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   #writeCurrentRows(
     db: SqliteDatabase,
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress | null,
     dirtyScopes?: ReadonlySet<Scope>,
-  ): void {
+  ): boolean {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -4170,7 +4224,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
       }
 
-      if (process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] === '1') {
+      const scopeMembershipEmpty =
+        incrementalScopesEnabled() &&
+        (
+          db.query('SELECT COUNT(*) AS count FROM connections_scope_nodes').get() as
+            | { readonly count: number }
+            | undefined
+        )?.count === 0 &&
+        (
+          db.query('SELECT COUNT(*) AS count FROM connections_scope_edges').get() as
+            | { readonly count: number }
+            | undefined
+        )?.count === 0;
+      if (incrementalScopesEnabled() && !scopeMembershipEmpty) {
         const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
         const dirtyScopeKeys =
           dirtyScopes === undefined
@@ -4213,6 +4279,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // Invalidate the readCurrent memo — the next read will see the
       // new snapshotRevision and rebuild.
       this.#cachedSnapshot = null;
+      return progress !== null && scopeMembershipEmpty;
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;

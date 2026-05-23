@@ -151,7 +151,6 @@ describe('connections materializer progress', () => {
   });
 
   it('can drain pending events through the flag-gated scope replacement path', async () => {
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);

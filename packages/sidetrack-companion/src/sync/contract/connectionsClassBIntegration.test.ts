@@ -273,7 +273,6 @@ describe('connections Class B integration invariants', () => {
     >;
     process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
     process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
     process.env['SIDETRACK_CONNECTIONS_DRIFT_DISABLED'] = '1';
     process.env['SIDETRACK_TOPIC_PRODUCER'] = 'union-find';
   });
@@ -477,9 +476,9 @@ describe('connections Class B integration invariants', () => {
     const health = materializer.health();
     const progress = await store.readMaterializerProgress('connections');
     expect(health.pending).toBe(false);
-    expect(health.lastSuccessAt === null ? 0 : Date.parse(health.lastSuccessAt)).toBeGreaterThanOrEqual(
-      before,
-    );
+    expect(
+      health.lastSuccessAt === null ? 0 : Date.parse(health.lastSuccessAt),
+    ).toBeGreaterThanOrEqual(before);
     expect(progress?.appliedFrontier).toEqual({ B: 100 });
   });
 

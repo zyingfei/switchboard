@@ -223,6 +223,7 @@ describe('SqliteConnectionsStore', () => {
   });
 
   sqliteIt('skips scope membership writes when incremental scopes flag is off', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const snapshot = buildSnapshot();
 
@@ -236,11 +237,11 @@ describe('SqliteConnectionsStore', () => {
   });
 
   sqliteIt('writes scope membership rows when incremental scopes flag is on', async () => {
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const snapshot = buildSnapshot();
 
     await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+    await new Promise((resolve) => setImmediate(resolve));
 
     await expect(store.readNodesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       'thread:alpha',
@@ -263,7 +264,6 @@ describe('SqliteConnectionsStore', () => {
   });
 
   sqliteIt('selectively replaces only dirty scope membership rows', async () => {
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const first = buildSnapshot();
     const second: ConnectionsSnapshot = {
@@ -276,6 +276,7 @@ describe('SqliteConnectionsStore', () => {
     };
 
     await store.writeSnapshotAndProgress(first, progressFor(first));
+    await new Promise((resolve) => setImmediate(resolve));
     await store.writeSnapshotAndProgress(
       second,
       progressFor(second),
@@ -302,7 +303,6 @@ describe('SqliteConnectionsStore', () => {
   });
 
   sqliteIt('rolls back selective scope replacement with graph and progress writes', async () => {
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
     const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
     const originalQuery = Database.prototype.query;
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
@@ -318,6 +318,7 @@ describe('SqliteConnectionsStore', () => {
     };
 
     await store.writeSnapshotAndProgress(first, firstProgress);
+    await new Promise((resolve) => setImmediate(resolve));
     vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithProgressCrash(
       this: InstanceType<typeof Database>,
       sql: string,

@@ -349,7 +349,6 @@ describe('connections incremental ranker frontier', () => {
   });
 
   it('forces a full ranker augmentation when the producer revision changes', async () => {
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_RANKER'] = '1';
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
