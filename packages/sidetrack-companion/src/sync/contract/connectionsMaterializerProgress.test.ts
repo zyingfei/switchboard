@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createConnectionsStore, type ConnectionsSnapshot } from '../../connections/snapshot.js';
+import {
+  buildConnectionsSnapshot,
+  createConnectionsStore,
+  type ConnectionsSnapshot,
+} from '../../connections/snapshot.js';
+import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import type { AcceptedEvent } from '../causal.js';
@@ -46,11 +51,13 @@ describe('connections materializer progress', () => {
   let vaultRoot: string;
   let previousSkipRankerSnapshot: string | undefined;
   let previousConnectionsInprocess: string | undefined;
+  let previousIncrementalScopes: string | undefined;
 
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-progress-'));
     previousSkipRankerSnapshot = process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
     previousConnectionsInprocess = process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
+    previousIncrementalScopes = process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
     process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
     process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
   });
@@ -63,6 +70,9 @@ describe('connections materializer progress', () => {
     if (previousConnectionsInprocess === undefined)
       delete process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
     else process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = previousConnectionsInprocess;
+    if (previousIncrementalScopes === undefined)
+      delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
+    else process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = previousIncrementalScopes;
   });
 
   it('writes progress on first catchUp and no-ops on a subsequent catchUp', async () => {
@@ -138,6 +148,54 @@ describe('connections materializer progress', () => {
           : intervalsContainDot(after.appliedDotIntervals, threadEvent(seq).dot),
       ).toBe(true);
     }
+  });
+
+  it('can drain pending events through the flag-gated scope replacement path', async () => {
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let replaceCount = 0;
+    const recordingStore = {
+      ...store,
+      replaceScopeRows:
+        store.replaceScopeRows === undefined
+          ? undefined
+          : async (...args: Parameters<NonNullable<typeof store.replaceScopeRows>>) => {
+              replaceCount += 1;
+              await store.replaceScopeRows!(...args);
+            },
+    };
+    await eventLog.importPeerEvent(threadEvent(1));
+    const materializer = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store: recordingStore,
+    });
+    await materializer.catchUp(eventLog);
+    const seeded = await store.readCurrent();
+    if (seeded === null) throw new Error('expected seeded snapshot');
+
+    await eventLog.importPeerEvent(threadEvent(2));
+    await materializer.catchUp(eventLog);
+
+    expect(replaceCount).toBe(1);
+    const incremental = await store.readCurrent();
+    const full = buildConnectionsSnapshot({
+      events: await eventLog.readMerged(),
+      threads: [],
+      workstreams: [],
+      dispatches: [],
+      queueItems: [],
+      reminders: [],
+      codingSessions: [],
+      timelineDays: [],
+      tabSessionProjection: createEmptyTabSessionProjection(),
+    });
+    expect(incremental?.nodes).toEqual(full.nodes);
+    expect(incremental?.edges).toEqual(full.edges);
   });
 
   it('forces a full rebuild when persisted materializer version mismatches', async () => {

@@ -239,18 +239,51 @@ describe('SqliteConnectionsStore', () => {
 
     await expect(store.readScopesForNode('thread:alpha')).resolves.toEqual([
       { kind: 'thread', id: 'alpha' },
+      { kind: 'workstream', id: 'main' },
     ]);
     await expect(store.readScopesForEdge(thread.id, workstream.id)).resolves.toEqual([
       { kind: 'thread', id: 'alpha' },
       { kind: 'workstream', id: 'main' },
     ]);
     await expect(store.readNodesForScope({ kind: 'workstream', id: 'main' })).resolves.toEqual([
+      'thread:alpha',
       'workstream:main',
     ]);
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       { src: thread.id, dst: workstream.id },
     ]);
     expect((await store.readCurrent())?.snapshotRevision).toBe('rev-scopes');
+    store.close();
+  });
+
+  sqliteIt('rolls back scope replacement when progress write fails', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+    const progress = {
+      ...EMPTY_PROGRESS('connections', 'connections@test'),
+      appliedDotIntervals: { replica: [[1, 1] as const] },
+      appliedFrontier: { replica: 1 },
+      snapshotRevisionId: snapshot.snapshotRevision ?? null,
+    };
+    await store.writeSnapshotAndProgress(snapshot, progress);
+
+    const changedThread = { ...snapshot.nodes[0]!, label: 'Changed' };
+    await expect(
+      store.replaceScopeRows({
+        scopes: [{ kind: 'thread', id: 'alpha' }],
+        nodes: [changedThread],
+        edges: [],
+        progress: {
+          ...progress,
+          appliedDotIntervals: { replica: [[1, 1] as const, [1, 2] as const] },
+          appliedFrontier: { replica: 2 },
+          snapshotRevisionId: 'rev-should-roll-back',
+        },
+      }),
+    ).rejects.toThrow();
+
+    expect(await store.readCurrent()).toEqual(snapshot);
+    expect(await store.readMaterializerProgress('connections')).toEqual(progress);
     store.close();
   });
 

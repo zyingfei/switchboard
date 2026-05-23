@@ -32,6 +32,7 @@ import {
   SqliteConnectionsStore,
 } from '../../connections/snapshot.js';
 import type { ConnectionsStore } from '../../connections/snapshot.js';
+import { recomputeScope, unionScopeOutputs } from '../../connections/scopeRecompute.js';
 import {
   buildTopicRevision,
   type BuildTopicRevisionInput,
@@ -124,6 +125,7 @@ import {
   invalidationsForEvent,
   type InvalidationKey,
 } from './invalidation.js';
+import { invalidationKeysToScopes } from './connectionsScopes.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
 import { runReconcileInChild } from './connectionsReconcileChildClient.js';
 import {
@@ -232,6 +234,7 @@ const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 const DEFAULT_DRIFT_EVERY_DRAINS = 10;
 const DEFAULT_DRIFT_EVERY_MS = 3_600_000;
 const DRIFT_DISABLED_ENV = 'SIDETRACK_CONNECTIONS_DRIFT_DISABLED';
+const INCREMENTAL_SCOPES_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES';
 
 export interface DriftReport {
   readonly checkedAt: string;
@@ -1565,13 +1568,39 @@ export const createConnectionsMaterializer = (
     mark(
       `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
     );
+    const scopeIncrementalEnabled =
+      process.env[INCREMENTAL_SCOPES_ENV] === '1' &&
+      process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
+      deps.store.replaceScopeRows !== undefined &&
+      (await deps.store.readCurrent()) !== null;
+    let wroteScopeIncremental = false;
     // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
     // synchronous CPU which would otherwise block HTTP.
-    await writeSnapshotWithProgress(baseSnapshot, merged);
-    mark('writeSnapshotAndProgress baseSnapshot');
+    if (scopeIncrementalEnabled) {
+      const dirtyScopes = invalidationKeysToScopes(buildKeys);
+      if (dirtyScopes.length > 0) {
+        const scoped = unionScopeOutputs(dirtyScopes.map((scope) => recomputeScope(scope, input)));
+        const progress = progressForSnapshot(merged, baseSnapshot);
+        await deps.store.replaceScopeRows!({
+          scopes: dirtyScopes,
+          nodes: scoped.nodes,
+          edges: scoped.edges,
+          progress,
+        });
+        lastFrontier = progress.appliedFrontier;
+        wroteScopeIncremental = true;
+        mark(
+          `replaceScopeRows scopes=${String(dirtyScopes.length)} nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)}`,
+        );
+      }
+    }
+    if (!wroteScopeIncremental) {
+      await writeSnapshotWithProgress(baseSnapshot, merged);
+      mark('writeSnapshotAndProgress baseSnapshot');
+    }
     await yieldToEventLoop();
     const rankerRetrainResult = await rankerRetrainer({
       merged,
@@ -1583,7 +1612,9 @@ export const createConnectionsMaterializer = (
     // Track the snapshot we ultimately wrote so diagnostics see the
     // ranker-augmented form when it was produced, the base form when
     // the ranker pass was skipped.
-    let finalSnapshot = baseSnapshot;
+    let finalSnapshot = wroteScopeIncremental
+      ? ((await deps.store.readCurrent()) ?? baseSnapshot)
+      : baseSnapshot;
     let closestVisitRanker: ClosestVisitRankerLoadResult | null = null;
     let rankerAugmentation = rankerAugmentationCounters({
       status: 'not-run',
@@ -2042,6 +2073,11 @@ export const createConnectionsMaterializer = (
           // Phase 1 intentionally keeps the apply path as a full rebuild.
           // The durable dot-interval filter is the safety foundation for
           // Phase 2's scoped recompute.
+          if (process.env[INCREMENTAL_SCOPES_ENV] === '1') {
+            for (const event of ordered) {
+              for (const key of invalidationsForEvent(event)) accumulatedInvalidations.push(key);
+            }
+          }
         }
       }
       // 2026-05 cold-start fix: route catchUp through the worker the
