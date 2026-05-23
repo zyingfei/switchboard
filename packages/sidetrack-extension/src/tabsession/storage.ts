@@ -4,6 +4,7 @@ export interface StoredTabSession {
   readonly tabSessionId: string;
   readonly openedAt: string;
   readonly lastActivityAt: string;
+  readonly endTimeMs?: number;
   readonly idleSince?: string;
   readonly openerTabSessionId?: string;
   readonly windowIdHash?: string;
@@ -40,6 +41,7 @@ const parseStoredTabSession = (value: unknown): StoredTabSession | undefined => 
   if (typeof openedAt !== 'string' || openedAt.length === 0) return undefined;
   if (typeof lastActivityAt !== 'string' || lastActivityAt.length === 0) return undefined;
   const idleSince = value['idleSince'];
+  const endTimeMs = value['endTimeMs'];
   const openerTabSessionId = value['openerTabSessionId'];
   const windowIdHash = value['windowIdHash'];
   const providerThreadKey = value['providerThreadKey'];
@@ -47,6 +49,7 @@ const parseStoredTabSession = (value: unknown): StoredTabSession | undefined => 
     tabSessionId,
     openedAt,
     lastActivityAt,
+    ...(typeof endTimeMs === 'number' && Number.isFinite(endTimeMs) ? { endTimeMs } : {}),
     ...(typeof idleSince === 'string' && idleSince.length > 0 ? { idleSince } : {}),
     ...(typeof openerTabSessionId === 'string' && openerTabSessionId.length > 0
       ? { openerTabSessionId }
@@ -56,6 +59,30 @@ const parseStoredTabSession = (value: unknown): StoredTabSession | undefined => 
       ? { providerThreadKey }
       : {}),
   };
+};
+
+export interface SealOrphanTabSessionsResult {
+  readonly sealed: number;
+}
+
+export const sealOrphanTabSessionsOnWake = async (
+  storage: TabSessionStorage,
+  wakeTimeMs: number = Date.now(),
+): Promise<SealOrphanTabSessionsResult> => {
+  let sealed = 0;
+  await storage.mutate((records) => {
+    const next: TabSessionByTabIdHash = {};
+    for (const [tabIdHash, record] of Object.entries(records)) {
+      if (record.endTimeMs === undefined) {
+        sealed += 1;
+        next[tabIdHash] = { ...record, endTimeMs: wakeTimeMs };
+        continue;
+      }
+      next[tabIdHash] = record;
+    }
+    return next;
+  });
+  return { sealed };
 };
 
 const parseByTabIdHash = (value: unknown): TabSessionByTabIdHash => {

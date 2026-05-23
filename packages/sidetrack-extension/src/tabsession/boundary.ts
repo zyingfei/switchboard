@@ -116,20 +116,21 @@ export const createTabSessionBoundary = (deps: TabSessionBoundaryDeps): TabSessi
     const now = input.at ?? clock();
     const providerThreadKey = knownProviderThreadKey(input.url);
     const existing = await deps.storage.get(input.tabIdHash);
+    const openExisting = existing?.endTimeMs === undefined ? existing : undefined;
     const threadChanged =
-      existing !== undefined &&
+      openExisting !== undefined &&
       providerThreadKey !== undefined &&
-      existing.providerThreadKey !== undefined &&
-      existing.providerThreadKey !== providerThreadKey;
+      openExisting.providerThreadKey !== undefined &&
+      openExisting.providerThreadKey !== providerThreadKey;
     const record = (() => {
-      if (existing === undefined || threadChanged) {
+      if (openExisting === undefined || threadChanged) {
         return createRecord({
           now,
           ...(input.windowIdHash === undefined ? {} : { windowIdHash: input.windowIdHash }),
           ...(providerThreadKey === undefined ? {} : { providerThreadKey }),
         });
       }
-      const { idleSince, ...awakeExisting } = existing;
+      const { idleSince, ...awakeExisting } = openExisting;
       void idleSince;
       return {
         ...awakeExisting,

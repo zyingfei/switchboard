@@ -101,7 +101,10 @@ import {
   type TabGroupFeedbackEvent,
   type TabGroupWiring,
 } from '../src/tabgroups/wiring';
-import { createChromeTabSessionStorage } from '../src/tabsession/storage';
+import {
+  createChromeTabSessionStorage,
+  sealOrphanTabSessionsOnWake,
+} from '../src/tabsession/storage';
 import {
   isContentResponse,
   isPageContentExtractContentResponse,
@@ -3989,9 +3992,21 @@ export default defineBackground(() => {
     }
   };
 
+  const sealTabSessionsOnServiceWorkerWake = async (): Promise<void> => {
+    try {
+      const result = await sealOrphanTabSessionsOnWake(createChromeTabSessionStorage());
+      if (result.sealed > 0) {
+        console.warn(`[tabsession.sealed-on-wake] sealed ${String(result.sealed)} orphan sessions`);
+      }
+    } catch (error) {
+      console.warn('[tabsession.sealed-on-wake] failed:', error);
+    }
+  };
+
   chrome.runtime.onInstalled.addListener((details) => {
     void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
     void pruneOrphanRemindersAndLinks();
+    void sealTabSessionsOnServiceWorkerWake();
     void ensureDispatchPollAlarm();
     void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
     // Heal pre-existing tabs after an install/update/reload so the
@@ -4012,10 +4027,12 @@ export default defineBackground(() => {
   // so we can always do it.
   chrome.runtime.onStartup.addListener(() => {
     void pruneOrphanRemindersAndLinks();
+    void sealTabSessionsOnServiceWorkerWake();
     void reinjectContentScriptIntoOpenTabs();
     void ensureDispatchPollAlarm();
     void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
   });
+  void sealTabSessionsOnServiceWorkerWake();
   void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
 
   chrome.permissions.onAdded.addListener(() => {
