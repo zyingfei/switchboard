@@ -493,6 +493,15 @@ export const collectTouchedVisits = (
   return new Set([...touched].filter((visitKey) => visitKey.length > 0).sort());
 };
 
+const hnswStoreCountDriftRequiresFullRebuild = (
+  storeVisitCount: number,
+  eligibleVisitCount: number,
+): boolean => {
+  const drift = Math.abs(storeVisitCount - eligibleVisitCount);
+  const denominator = Math.max(storeVisitCount, eligibleVisitCount, 1);
+  return drift / denominator > 0.5;
+};
+
 const writeShadowTopicRevision = async (
   vaultRoot: string,
   revision: TopicRevision,
@@ -1358,11 +1367,13 @@ export const createConnectionsMaterializer = (
       ? await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim)
       : null;
     if (loadedHnswStoreForGate !== null) loadedHnswSimilarityStore = loadedHnswStoreForGate;
+    const hnswStoreVisitCount = loadedHnswStoreForGate?.elementCount() ?? 0;
     const hnswFullRebuild =
       existingProgress === null ||
       existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
-      (loadedHnswStoreForGate?.elementCount() ?? 0) === 0 ||
-      (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false);
+      hnswStoreVisitCount === 0 ||
+      (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
+      hnswStoreCountDriftRequiresFullRebuild(hnswStoreVisitCount, similarityEligibleCount);
     const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
       deps.vaultRoot,
       similarityEntries,
@@ -1411,7 +1422,12 @@ export const createConnectionsMaterializer = (
     let hotSimNewEmbedded: number | null = null;
     let visitSimilarity: VisitSimilarityRevision;
     if (persistentHnswSimilarityMode) {
-      const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+      const similarityVisitIds = new Set(similarityEntries.map(visitKeyForVisitEntry));
+      const touchedVisitIds = new Set(
+        [...collectTouchedVisits(dirtyScopes, pendingEventsForDrain)].filter((visitId) =>
+          similarityVisitIds.has(visitId),
+        ),
+      );
       usedHotSimilarityPath = true;
       hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
       mark(`buildVisitSimilarityHnsw.start entries=${String(similarityEntries.length)}`);
