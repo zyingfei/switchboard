@@ -179,9 +179,14 @@ import {
 } from '../../timeline/projection.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { isMainThread } from 'node:worker_threads';
-import type { AcceptedEvent } from '../causal.js';
+import { vectorFromEvents, type AcceptedEvent } from '../causal.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
+import {
+  addDotsToIntervals,
+  EMPTY_PROGRESS,
+  type MaterializerProgress,
+} from './materializerProgress.js';
 import {
   createEmptyTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
@@ -217,6 +222,8 @@ import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 //     prevent tight loops; catchUp always bypasses.
 
 const FAILURE_COOLDOWN_MS = 5_000;
+const MATERIALIZER_NAME = 'connections';
+export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase1';
 
 // Stage 5.2 W1a — debounce window between event accept and drain trigger.
 // Coalesces burst arrivals (multi-tab navigation, peer-event imports) into
@@ -861,6 +868,19 @@ export const createConnectionsMaterializer = (
       setImmediate(resolve);
     });
 
+  const progressForSnapshot = (
+    events: readonly AcceptedEvent[],
+    snapshot: ConnectionsSnapshot,
+  ): MaterializerProgress => ({
+    ...EMPTY_PROGRESS(MATERIALIZER_NAME, MATERIALIZER_VERSION),
+    appliedDotIntervals: addDotsToIntervals(
+      {},
+      events.map((event) => event.dot),
+    ),
+    appliedFrontier: vectorFromEvents(events),
+    snapshotRevisionId: snapshot.snapshotRevision ?? null,
+  });
+
   const buildAndWrite = async (): Promise<void> => {
     const phaseLogs = process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1';
     const phaseStart = Date.now();
@@ -1437,8 +1457,11 @@ export const createConnectionsMaterializer = (
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
     // synchronous CPU which would otherwise block HTTP.
-    await deps.store.putCurrent(baseSnapshot);
-    mark('putCurrent baseSnapshot');
+    await deps.store.writeSnapshotAndProgress(
+      baseSnapshot,
+      progressForSnapshot(merged, baseSnapshot),
+    );
+    mark('writeSnapshotAndProgress baseSnapshot');
     await yieldToEventLoop();
     const rankerRetrainResult = await rankerRetrainer({
       merged,
@@ -1482,8 +1505,11 @@ export const createConnectionsMaterializer = (
           mark(
             `augmentConnectionsSnapshot ranker-augmented nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
           );
-          await deps.store.putCurrent(finalSnapshot);
-          mark('putCurrent ranker-augmented');
+          await deps.store.writeSnapshotAndProgress(
+            finalSnapshot,
+            progressForSnapshot(merged, finalSnapshot),
+          );
+          mark('writeSnapshotAndProgress ranker-augmented');
           rankerAugmentation = rankerAugmentationCounters({
             status: 'emitted',
             reason: null,
@@ -1895,7 +1921,7 @@ export const createConnectionsMaterializer = (
   };
 
   return {
-    name: 'connections',
+    name: MATERIALIZER_NAME,
     handles: HANDLES,
     onAccepted,
     catchUp,

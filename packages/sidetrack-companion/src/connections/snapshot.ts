@@ -41,6 +41,7 @@ import { extractFeatures } from '../ranker/features.js';
 import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   serializeTabSessionProjection,
@@ -3183,6 +3184,11 @@ export const augmentConnectionsSnapshotWithClosestVisitRanker = (
 
 export interface ConnectionsStore {
   readonly putCurrent: (snapshot: ConnectionsSnapshot) => Promise<void>;
+  readonly writeSnapshotAndProgress: (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+  ) => Promise<void>;
+  readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
   readonly readCurrent: () => Promise<ConnectionsSnapshot | null>;
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
   readonly readDay: (date: string) => Promise<ConnectionsSnapshot | null>;
@@ -3289,9 +3295,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // cold resolve repeats the ~17K JSON.parses to materialize the whole
   // snapshot; with it, sibling resolves within the same revision share
   // a single bulk read. Invalidated when #writeCurrentRows commits.
-  #cachedSnapshot:
-    | { readonly revision: string; readonly value: ConnectionsSnapshot }
-    | null = null;
+  #cachedSnapshot: { readonly revision: string; readonly value: ConnectionsSnapshot } | null = null;
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
     this.#root = join(vaultRoot, '_BAC', 'connections');
@@ -3340,6 +3344,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           key TEXT PRIMARY KEY,
           data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS connections_materializer_meta (
+          materializer_name TEXT PRIMARY KEY,
+          version TEXT NOT NULL,
+          snapshot_revision_id TEXT,
+          applied_frontier TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS connections_applied_intervals (
+          materializer_name TEXT NOT NULL,
+          replica_id TEXT NOT NULL,
+          start_seq INTEGER NOT NULL,
+          end_seq INTEGER NOT NULL,
+          PRIMARY KEY (materializer_name, replica_id, start_seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_applied_intervals_lookup
+          ON connections_applied_intervals (materializer_name, replica_id, start_seq, end_seq);
       `);
       this.#initialized = true;
     }
@@ -3359,7 +3379,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const snapshot = JSON.parse(
         await readFile(this.#currentJsonPath, 'utf8'),
       ) as ConnectionsSnapshot;
-      this.#writeCurrentRows(db, snapshot);
+      this.#writeCurrentRows(db, snapshot, null);
       return metadataForSnapshot(snapshot);
     } catch {
       return null;
@@ -3444,10 +3464,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
     const db = await this.#database();
-    this.#writeCurrentRows(db, snapshot);
+    this.#writeCurrentRows(db, snapshot, null);
   };
 
-  #writeCurrentRows(db: SqliteDatabase, snapshot: ConnectionsSnapshot): void {
+  readonly writeSnapshotAndProgress = async (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+  ): Promise<void> => {
+    const db = await this.#database();
+    this.#writeCurrentRows(db, snapshot, progress);
+  };
+
+  #writeCurrentRows(
+    db: SqliteDatabase,
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress | null,
+  ): void {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -3523,6 +3555,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
       // new snapshotRevision and rebuild.
@@ -3532,6 +3565,93 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       throw error;
     }
   }
+
+  #writeProgressRows(db: SqliteDatabase, progress: MaterializerProgress): void {
+    const upsertMeta = db.query(
+      `INSERT INTO connections_materializer_meta
+        (materializer_name, version, snapshot_revision_id, applied_frontier, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(materializer_name) DO UPDATE SET
+         version = excluded.version,
+         snapshot_revision_id = excluded.snapshot_revision_id,
+         applied_frontier = excluded.applied_frontier,
+         updated_at = excluded.updated_at`,
+    );
+    const deleteIntervals = db.query(
+      'DELETE FROM connections_applied_intervals WHERE materializer_name = ?',
+    );
+    const insertInterval = db.query(
+      `INSERT INTO connections_applied_intervals
+        (materializer_name, replica_id, start_seq, end_seq)
+       VALUES (?, ?, ?, ?)`,
+    );
+
+    upsertMeta.run(
+      progress.materializerName,
+      progress.materializerVersion,
+      progress.snapshotRevisionId,
+      JSON.stringify(progress.appliedFrontier),
+      new Date().toISOString(),
+    );
+    deleteIntervals.run(progress.materializerName);
+    for (const [replicaId, intervals] of Object.entries(progress.appliedDotIntervals)) {
+      for (const [startSeq, endSeq] of intervals) {
+        insertInterval.run(progress.materializerName, replicaId, startSeq, endSeq);
+      }
+    }
+  }
+
+  readonly readMaterializerProgress = async (
+    name: string,
+  ): Promise<MaterializerProgress | null> => {
+    const db = await this.#database();
+    const metaRow = db
+      .query(
+        `SELECT materializer_name, version, snapshot_revision_id, applied_frontier
+         FROM connections_materializer_meta
+         WHERE materializer_name = ?`,
+      )
+      .get(name);
+    if (metaRow === null || metaRow === undefined) return null;
+
+    const appliedDotIntervals: Record<string, Array<readonly [number, number]>> = {};
+    for (const row of db
+      .query(
+        `SELECT replica_id, start_seq, end_seq
+         FROM connections_applied_intervals
+         WHERE materializer_name = ?
+         ORDER BY replica_id, start_seq, end_seq`,
+      )
+      .all(name)) {
+      if (!isRecord(row)) throw new Error('SQLite progress row is not a record');
+      const replicaId = row['replica_id'];
+      const startSeq = row['start_seq'];
+      const endSeq = row['end_seq'];
+      if (
+        typeof replicaId !== 'string' ||
+        typeof startSeq !== 'number' ||
+        typeof endSeq !== 'number'
+      ) {
+        throw new Error('SQLite progress row has invalid interval fields');
+      }
+      const intervals = appliedDotIntervals[replicaId] ?? [];
+      intervals.push([startSeq, endSeq]);
+      appliedDotIntervals[replicaId] = intervals;
+    }
+    if (!isRecord(metaRow)) throw new Error('SQLite progress metadata row is not a record');
+    const snapshotRevisionId = metaRow['snapshot_revision_id'];
+    const appliedFrontier = metaRow['applied_frontier'];
+    return {
+      materializerName: textField(metaRow, 'materializer_name'),
+      materializerVersion: textField(metaRow, 'version'),
+      appliedDotIntervals,
+      appliedFrontier:
+        typeof appliedFrontier === 'string'
+          ? (JSON.parse(appliedFrontier) as Record<string, number>)
+          : {},
+      snapshotRevisionId: typeof snapshotRevisionId === 'string' ? snapshotRevisionId : null,
+    };
+  };
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
     const db = await this.#database();
@@ -3743,6 +3863,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   const root = join(vaultRoot, '_BAC', 'connections');
   const snapshotsDir = join(root, SNAPSHOTS_DIR);
   const currentPath = join(root, 'current.json');
+  const progressPath = join(root, 'current.progress.json');
 
   const dayPath = (date: string): string => join(snapshotsDir, `${date}.json`);
 
@@ -3759,6 +3880,23 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     }
     await writeConnectionsSnapshotJson(currentPath, snapshot);
     if (revision !== undefined) lastWrittenRevision = revision;
+  };
+
+  const writeSnapshotAndProgress = async (
+    snapshot: ConnectionsSnapshot,
+    progress: MaterializerProgress,
+  ): Promise<void> => {
+    await putCurrent(snapshot);
+    await writeAtomic(progressPath, JSON.stringify(progress, null, 2));
+  };
+
+  const readMaterializerProgress = async (name: string): Promise<MaterializerProgress | null> => {
+    try {
+      const progress = JSON.parse(await readFile(progressPath, 'utf8')) as MaterializerProgress;
+      return progress.materializerName === name ? progress : null;
+    } catch {
+      return null;
+    }
   };
 
   // P-perf — readCurrent() memoization keyed on current.json
@@ -3833,7 +3971,15 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     }
   };
 
-  return { putCurrent, readCurrent, putDay, readDay, listDays };
+  return {
+    putCurrent,
+    writeSnapshotAndProgress,
+    readMaterializerProgress,
+    readCurrent,
+    putDay,
+    readDay,
+    listDays,
+  };
 };
 
 // Subgraph helpers — used by the HTTP routes + MCP tools to crop a
