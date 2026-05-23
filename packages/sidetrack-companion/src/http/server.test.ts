@@ -20,6 +20,11 @@ import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import {
+  BROWSER_TIMELINE_OBSERVED,
+  type BrowserTimelineObservedPayload,
+} from '../timeline/events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
 import type { VaultChangeEvent } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
@@ -194,6 +199,80 @@ describe('companion HTTP server', () => {
 
     expect(result.status).toBe(200);
     expect(result.body).toMatchObject({ status: 'ok' });
+  });
+
+  it('dedupes duplicate clientEventIds before batched timeline ingest', async () => {
+    const payload = (input: {
+      readonly eventId: string;
+      readonly observedAt: string;
+      readonly url: string;
+    }): BrowserTimelineObservedPayload => ({
+      eventId: input.eventId,
+      observedAt: input.observedAt,
+      url: input.url,
+      canonicalUrl: input.url,
+      transition: 'activated',
+    });
+    const event = (
+      input: { readonly seq: number; readonly payload: BrowserTimelineObservedPayload },
+    ): AcceptedEvent<BrowserTimelineObservedPayload> => ({
+      clientEventId: input.payload.eventId,
+      dot: { replicaId: 'edge_test', seq: input.seq },
+      deps: {},
+      aggregateId: input.payload.observedAt.slice(0, 10),
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: input.payload,
+      acceptedAtMs: Date.parse(input.payload.observedAt),
+    });
+    const first = event({
+      seq: 1,
+      payload: payload({
+        eventId: 'dup-client-event',
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: 'https://x/first',
+      }),
+    });
+    const duplicate = event({
+      seq: 2,
+      payload: payload({
+        eventId: 'dup-client-event',
+        observedAt: '2026-05-07T10:05:00.000Z',
+        url: 'https://x/duplicate',
+      }),
+    });
+    let importedBatch: readonly AcceptedEvent[] = [];
+    context = {
+      ...context,
+      importEdgeEvent: async () => {
+        throw new Error('unexpected singular import');
+      },
+      importTimelineEvents: async (events) => {
+        importedBatch = events;
+        return events.map((observed) => ({ clientEventId: observed.clientEventId, imported: true }));
+      },
+    };
+
+    const result = await jsonFetch(context, baseUrl + '/v1/timeline/events', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({ events: [first, duplicate] }),
+    });
+
+    expect(result.status).toBe(200);
+    expect(importedBatch.map((observed) => observed.dot.seq)).toEqual([1]);
+    const body = result.body as {
+      data: {
+        imported: { replicaId: string; seq: number }[];
+        skipped: { status?: string; clientEventId?: string; droppedAt?: number }[];
+      };
+    };
+    expect(body.data.imported).toEqual([{ replicaId: 'edge_test', seq: 1 }]);
+    expect(body.data.skipped).toEqual([
+      { status: 'duplicate-in-batch', clientEventId: 'dup-client-event', droppedAt: 1 },
+    ]);
   });
 
   it('serves unauthenticated /v1/version with vault + code identity', async () => {

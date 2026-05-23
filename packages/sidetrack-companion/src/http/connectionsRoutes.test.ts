@@ -3,8 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { createConnectionsStore } from '../connections/snapshot.js';
-import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
+import { createConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
+import {
+  edgeIdFor,
+  type ConnectionNode,
+  type ConnectionsSnapshot,
+} from '../connections/types.js';
 import {
   createTopicRevisionStore,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
@@ -33,6 +37,7 @@ const buildEvent = (input: { seq: number; type: string; payload: unknown }): Acc
 describe('connections HTTP routes', () => {
   let vaultRoot: string;
   let serverUrl: string;
+  let connectionsStore: ConnectionsStore;
   let close: (() => Promise<void>) | null = null;
   const BRIDGE = 'connections-bridge-key';
 
@@ -41,7 +46,7 @@ describe('connections HTTP routes', () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
-    const connectionsStore = createConnectionsStore(vaultRoot);
+    connectionsStore = createConnectionsStore(vaultRoot);
     const runner = createSyncContractRunner();
     runner.register(
       createConnectionsMaterializer({
@@ -120,6 +125,41 @@ describe('connections HTTP routes', () => {
     expect(ids).toContain('thread:thread_a');
     expect(ids).toContain('workstream:ws_x');
     expect(body.data.snapshot.edges.find((e) => e.kind === 'thread_in_workstream')).toBeDefined();
+  });
+
+  it('invalidates the cached connections response when the SQLite snapshot revision changes', async () => {
+    const first = await get('/v1/connections');
+    expect(first.status).toBe(200);
+    const firstBody = first.data as {
+      data: { snapshot: { nodes: { id: string }[]; snapshotRevision?: string } };
+    };
+    expect(firstBody.data.snapshot.nodes.map((n) => n.id)).toContain('thread:thread_a');
+
+    const replacementNode: ConnectionNode = {
+      id: 'thread:thread_b',
+      kind: 'thread',
+      label: 'B',
+      originReplicaIds: [],
+      metadata: { provider: 'chatgpt', threadId: 'provider-thread-b' },
+    };
+    const replacement: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [replacementNode],
+      edges: [],
+      updatedAt: '2026-05-07T10:02:00.000Z',
+      nodeCount: 1,
+      edgeCount: 0,
+      snapshotRevision: 'sqlite-cache-revision-b',
+    };
+    await connectionsStore.putCurrent(replacement);
+
+    const second = await get('/v1/connections');
+    expect(second.status).toBe(200);
+    const secondBody = second.data as {
+      data: { snapshot: { nodes: { id: string }[]; snapshotRevision?: string } };
+    };
+    expect(secondBody.data.snapshot.snapshotRevision).toBe('sqlite-cache-revision-b');
+    expect(secondBody.data.snapshot.nodes.map((n) => n.id)).toEqual(['thread:thread_b']);
   });
 
   it('GET /v1/connections?workstreamId= filters to the workstream subgraph', async () => {

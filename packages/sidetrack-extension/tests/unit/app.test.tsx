@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import App, { formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
+import App, { companionGetInFlightKey, formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
 import {
   createEmptyWorkboardState,
@@ -160,6 +160,20 @@ afterEach(() => {
 });
 
 describe('live side-panel App wiring', () => {
+  it('keys in-flight companion GETs by bridge key as well as port and path', () => {
+    const oldKey = companionGetInFlightKey('17373', 'old-bridge-key', '/v1/visits/projection');
+    const rotatedKey = companionGetInFlightKey(
+      '17373',
+      'new-bridge-key',
+      '/v1/visits/projection',
+    );
+    const inFlight = new Map<string, Promise<unknown>>([[oldKey, Promise.resolve('old')]]);
+
+    expect(rotatedKey).toBe('17373\0new-bridge-key\0/v1/visits/projection');
+    expect(rotatedKey).not.toBe(oldKey);
+    expect(inFlight.has(rotatedKey)).toBe(false);
+  });
+
   it('formats build timestamps with date and UTC time', () => {
     expect(formatBuildTimestamp('2026-05-03T20:16:57.395Z')).toBe('2026-05-03 20:16Z');
   });

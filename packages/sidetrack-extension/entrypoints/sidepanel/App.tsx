@@ -447,6 +447,12 @@ export const formatBuildTimestamp = (iso: string): string => {
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
 
+export const companionGetInFlightKey = (
+  port: string,
+  bridgeKey: string,
+  path: string,
+): string => `${port}\0${bridgeKey}\0${path}`;
+
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
 const readSetupCompleted = async (): Promise<boolean> => {
@@ -1386,7 +1392,7 @@ const App = () => {
       if (port.length === 0 || bridgeKey.length === 0) {
         throw new Error('Companion is not configured.');
       }
-      const key = `${port} ${path}`;
+      const key = companionGetInFlightKey(port, bridgeKey, path);
       const inFlight = inFlightCompanionGetsRef.current;
       const existing = inFlight.get(key);
       if (existing !== undefined) return existing as Promise<T>;

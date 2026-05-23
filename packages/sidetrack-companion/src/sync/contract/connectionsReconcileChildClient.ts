@@ -40,12 +40,7 @@ interface ReconcileChildMessage {
 
 export const buildReconcileChildEnv = (
   source: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv => ({
-  ...source,
-  ...(source['SIDETRACK_CONNECTIONS_STORE'] === undefined
-    ? {}
-    : { SIDETRACK_CONNECTIONS_STORE: source['SIDETRACK_CONNECTIONS_STORE'] }),
-});
+): NodeJS.ProcessEnv => ({ ...source });
 
 /**
  * Fork a child process and run one reconcile pass. The promise resolves

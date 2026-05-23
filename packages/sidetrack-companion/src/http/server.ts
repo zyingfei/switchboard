@@ -152,7 +152,7 @@ import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
-import { SqliteConnectionsStore } from '../connections/snapshot.js';
+import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -1499,6 +1499,10 @@ const resolveSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
+const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> =>
+  (await store.readSnapshotMetadata())?.snapshotRevision ?? 'none';
+const connectionsGraphSig = async (store: ConnectionsStore, jsonPath: string): Promise<string> =>
+  store instanceof SqliteConnectionsStore ? await sqliteSig(store) : await resolveSig(jsonPath);
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
 // position. The feedback + page-content overlays do depend on the
 // event log, but it advances on EVERY extension event flush (~1/min
@@ -1511,12 +1515,13 @@ const resolveSig = async (path: string): Promise<string> => {
 // ≤TTL stale. Consistent with the W2b "connections is contextual,
 // not user-immediate-feedback; staleness is acceptable" stance.
 const connectionsResponseCacheKey = async (
+  store: ConnectionsStore,
   vaultRoot: string,
   querySearch: string,
 ): Promise<string> => {
   const root = join(vaultRoot, '_BAC', 'connections');
   const [cur, shadow] = await Promise.all([
-    statSig(join(root, 'current.json')),
+    connectionsGraphSig(store, join(root, 'current.json')),
     statSig(join(root, 'topics', 'current.shadow.json')),
   ]);
   return `cur=${cur}|shadow=${shadow}|q=${querySearch}`;
@@ -2761,7 +2766,8 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await resolveSig(
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
       return cachedResolveRoute(
@@ -3070,7 +3076,8 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await resolveSig(
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       )}|${url.search}`;
       return cachedResolveRoute(
@@ -5358,7 +5365,8 @@ const routes: readonly RouteDefinition[] = [
         limit: url.searchParams.get('limit') ?? undefined,
         threshold: url.searchParams.get('threshold') ?? undefined,
       });
-      const suggestionsCacheKey = `thread:${threadId}|${await statSig(
+      const suggestionsCacheKey = `thread:${threadId}|${await connectionsGraphSig(
+        context.connectionsStore,
         join(vaultRoot, '_BAC', 'connections', 'current.json'),
       )}|l=${String(query.limit)}|th=${String(query.threshold ?? '')}`;
       return cachedThreadSuggestions(
@@ -6088,7 +6096,10 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const imported: { replicaId: string; seq: number }[] = [];
-      const skipped: { replicaId: string; seq: number; reason: string }[] = [];
+      const skipped: (
+        | { replicaId: string; seq: number; reason: string }
+        | { status: 'duplicate-in-batch'; clientEventId: string; droppedAt: number }
+      )[] = [];
       const recordImported = (event: import('../sync/causal.js').AcceptedEvent): void => {
         imported.push({ replicaId: event.dot.replicaId, seq: event.dot.seq });
       };
@@ -6103,7 +6114,8 @@ const routes: readonly RouteDefinition[] = [
       // pass instead of a per-event whole-log scan (the per-event
       // path made multi-event POSTs run 0.4-3.4 s).
       const valid: import('../sync/causal.js').AcceptedEvent[] = [];
-      for (const candidate of body.events) {
+      const seenClientEventIds = new Set<string>();
+      for (const [index, candidate] of body.events.entries()) {
         if (
           candidate === null ||
           typeof candidate !== 'object' ||
@@ -6137,9 +6149,18 @@ const routes: readonly RouteDefinition[] = [
         // sanitized payload (preserving the edge dot + clientEventId
         // so importPeerEvent dedupe still works).
         const sanitizedPayload = sanitizeTimelinePayload(event.payload);
-        valid.push(
-          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload },
-        );
+        const sanitized =
+          sanitizedPayload === event.payload ? event : { ...event, payload: sanitizedPayload };
+        if (seenClientEventIds.has(sanitized.clientEventId)) {
+          skipped.push({
+            status: 'duplicate-in-batch',
+            clientEventId: sanitized.clientEventId,
+            droppedAt: index,
+          });
+          continue;
+        }
+        seenClientEventIds.add(sanitized.clientEventId);
+        valid.push(sanitized);
       }
       // Batched ingest — ONE readMerged dedupe for the whole POST.
       // importTimelineEvents dispatches each accepted event to the
@@ -6516,7 +6537,11 @@ const routes: readonly RouteDefinition[] = [
       const topicVariant = topicVariantRaw === 'shadow' ? topicVariantRaw : undefined;
 
       const cacheVaultRoot = requireVaultRoot(context);
-      const cacheKey = await connectionsResponseCacheKey(cacheVaultRoot, url.search);
+      const cacheKey = await connectionsResponseCacheKey(
+        context.connectionsStore,
+        cacheVaultRoot,
+        url.search,
+      );
       const { result: connectionsResult } = await cachedConnectionsResponse(
         cacheKey,
         CONNECTIONS_RESPONSE_TTL_MS,
@@ -6975,27 +7000,47 @@ export const handleRequest = async (
   }
 };
 
+const randomLoopbackPort = (): number => 30_000 + Math.floor(Math.random() * 20_000);
+
 export const startHttpServer = async (server: Server, port: number): Promise<StartedHttpServer> =>
   new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => {
-      server.off('error', reject);
-      const address = server.address();
-      const actualPort = typeof address === 'object' && address !== null ? address.port : port;
-      resolve({
-        server,
-        port: actualPort,
-        url: `http://127.0.0.1:${String(actualPort)}`,
-        close: () =>
-          new Promise((closeResolve, closeReject) => {
-            server.close((error) => {
-              if (error !== undefined) {
-                closeReject(error);
-                return;
-              }
-              closeResolve();
-            });
-          }),
-      });
-    });
+    let attempts = 0;
+    const requestedEphemeral = port === 0;
+    const listen = (): void => {
+      const targetPort = requestedEphemeral ? randomLoopbackPort() : port;
+      const onError = (error: Error & { readonly code?: string }): void => {
+        server.off('listening', onListening);
+        if (requestedEphemeral && error.code === 'EADDRINUSE' && attempts < 20) {
+          attempts += 1;
+          listen();
+          return;
+        }
+        reject(error);
+      };
+      const onListening = (): void => {
+        server.off('error', onError);
+        const address = server.address();
+        const actualPort =
+          typeof address === 'object' && address !== null ? address.port : targetPort;
+        resolve({
+          server,
+          port: actualPort,
+          url: `http://127.0.0.1:${String(actualPort)}`,
+          close: () =>
+            new Promise((closeResolve, closeReject) => {
+              server.close((error) => {
+                if (error !== undefined) {
+                  closeReject(error);
+                  return;
+                }
+                closeResolve();
+              });
+            }),
+        });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(targetPort, '127.0.0.1');
+    };
+    listen();
   });

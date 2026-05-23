@@ -17,9 +17,12 @@ to all coding agents (Claude Code, Cursor, Codex CLI, etc.).
 - **Worktrees** for parallel branch work: `EnterWorktree` to start an
   isolated branch session; `ExitWorktree` with `action: "keep"` to
   preserve mid-session work.
-- **Memory** lives at `~/.claude/projects/-Users-yingfei-Documents-playground/memory/`
-  per the project's auto-memory policy. Update `MEMORY.md` index when
-  adding new memory files; keep the index under 200 lines.
+- **Memory** lives under the auto-memory directory for this repo's
+  working path (`~/.claude/projects/<cwd-slug>/memory/`, where the
+  slug is the absolute cwd with separators replaced by `-`). Update
+  the `MEMORY.md` index when adding new memory files; keep the index
+  under 200 lines. The slug is cwd-derived — if the repo moves, the
+  directory changes with it.
 
 ## Repo navigation shortcuts
 
