@@ -9034,6 +9034,51 @@ pre.diff {
   flex: none;
   overflow: auto;
 }
+@media (max-width: 860px) {
+  .cx-cols:not(.is-search-mode) {
+    position: relative;
+    min-width: 0;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l,
+  .cx-cols:not(.is-search-mode) .cx-col-r {
+    width: min(240px, 72vw);
+    max-width: 72vw;
+    background: var(--paper);
+    z-index: 2;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-r {
+    width: min(320px, 74vw);
+    max-width: 74vw;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l:not(.is-collapsed),
+  .cx-cols:not(.is-search-mode) .cx-col-r:not(.is-collapsed) {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l:not(.is-collapsed) {
+    left: 0;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-r:not(.is-collapsed) {
+    right: 0;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l.is-collapsed,
+  .cx-cols:not(.is-search-mode) .cx-col-r.is-collapsed {
+    width: 30px;
+    min-width: 30px;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l.is-collapsed > .cx-rail-toggle,
+  .cx-cols:not(.is-search-mode) .cx-col-r.is-collapsed > .cx-rightpanel-toggle {
+    width: 30px;
+    min-height: 100%;
+    justify-content: center;
+    padding: 8px 0;
+  }
+  .cx-cols:not(.is-search-mode) .cx-col-l.is-collapsed .cx-rail-toggle-label,
+  .cx-cols:not(.is-search-mode) .cx-col-r.is-collapsed .cx-rail-toggle-label {
+    display: none;
+  }
+}
 .cx-section {
   padding: 14px 16px;
   border-bottom: var(--hair-soft);
@@ -9258,6 +9303,27 @@ pre.diff {
 .cx-mode.is-disabled:hover,
 .cx-mode:disabled:hover {
   color: var(--ink-3);
+}
+@media (max-width: 860px) {
+  .cx-modes {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding: 6px 8px;
+    overflow-x: visible;
+  }
+  .cx-mode {
+    width: 100%;
+    justify-content: space-between;
+    border-bottom: 0;
+    border-left: 2px solid transparent;
+    padding: 8px 10px;
+  }
+  .cx-mode.is-active {
+    border-bottom-color: transparent;
+    border-left-color: var(--signal);
+    background: var(--signal-bg);
+  }
 }
 /* Stage 5 polish — Connections time-range pill bar in the filter row. */
 .cx-timerange {
@@ -10992,6 +11058,14 @@ pre.diff {
 .cx-col-r.is-collapsed {
   width: auto;
   min-width: 0;
+}
+.cx-rail-toggle-icon {
+  flex: none;
+}
+.cx-rail-toggle-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .cx-col-l.is-collapsed > :not(.cx-rail-toggle),
 .cx-col-r.is-collapsed > :not(.cx-rightpanel-toggle),
