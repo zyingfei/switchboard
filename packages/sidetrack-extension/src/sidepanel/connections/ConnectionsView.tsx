@@ -177,6 +177,12 @@ const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
 type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search';
 
 const FILTERED_SUBMODES = new Set<SubMode>(['linked', 'orbital', 'flow']);
+const CONNECTIONS_NARROW_QUERY = '(max-width: 860px)';
+
+const isNarrowConnectionsViewport = (): boolean =>
+  typeof window !== 'undefined' &&
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia(CONNECTIONS_NARROW_QUERY).matches;
 
 const edgeFamilyForKind = (kind: string): EdgeFamily => {
   const meta = (EDGE_KINDS as Partial<Record<string, { readonly family: EdgeFamily }>>)[kind];
@@ -1701,9 +1707,30 @@ export const ConnectionsView = ({
   // left rail (Find/Workstream/Recent/Shortcuts), the right anchor
   // summary (cx-col-r: why-related / provenance), and the page-text
   // card. Collapsing reclaims the fixed column width.
-  const [leftRailOpen, setLeftRailOpen] = useState(true);
-  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [leftRailOpen, setLeftRailOpen] = useState(() => !isNarrowConnectionsViewport());
+  const [rightPanelOpen, setRightPanelOpen] = useState(() => !isNarrowConnectionsViewport());
   const [anchorSummaryOpen, setAnchorSummaryOpen] = useState(true);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia(CONNECTIONS_NARROW_QUERY);
+    const syncRailDefaults = (): void => {
+      const openByDefault = !query.matches;
+      setLeftRailOpen(openByDefault);
+      setRightPanelOpen(openByDefault);
+    };
+    syncRailDefaults();
+    if (typeof query.addEventListener === 'function') {
+      query.addEventListener('change', syncRailDefaults);
+      return () => {
+        query.removeEventListener('change', syncRailDefaults);
+      };
+    }
+    query.addListener(syncRailDefaults);
+    return () => {
+      query.removeListener(syncRailDefaults);
+    };
+  }, []);
 
   // Honest "Recent anchors" — built from real navigation history
   // (clicks/navigation), not the thread/workstream shortcut prop.
@@ -2758,7 +2785,10 @@ export const ConnectionsView = ({
               aria-expanded={leftRailOpen}
               data-testid="connections-rail-toggle"
             >
-              {leftRailOpen ? '▾' : '▸'} Panel
+              <span className="cx-rail-toggle-icon" aria-hidden>
+                {leftRailOpen ? '▾' : '▸'}
+              </span>
+              <span className="cx-rail-toggle-label">Panel</span>
             </button>
             <div className="cx-section">
               <h4>Find</h4>
@@ -3169,7 +3199,10 @@ export const ConnectionsView = ({
               aria-expanded={rightPanelOpen}
               data-testid="connections-rightpanel-toggle"
             >
-              {rightPanelOpen ? '▸ Anchor summary' : '◂ Anchor summary'}
+              <span className="cx-rail-toggle-icon" aria-hidden>
+                {rightPanelOpen ? '▸' : '◂'}
+              </span>
+              <span className="cx-rail-toggle-label">Anchor summary</span>
             </button>
             <div className="cx-section cx-section-last cx-section-padded">
               {whyVisitId !== null && result !== null ? (
