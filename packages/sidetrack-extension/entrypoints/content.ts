@@ -1129,7 +1129,16 @@ export default defineContentScript({
     };
 
     document.addEventListener('selectionchange', onSelectionChange);
-    document.addEventListener('pointerdown', reportNavigationLinkClick, { capture: true });
+    // Primary-button clicks fire `click` (button=0); middle clicks fire
+    // `auxclick` (button=1). Together they cover every button reportNavigationLinkClick
+    // accepts. An earlier iteration also listened on `pointerdown`, which
+    // (a) fires BEFORE the click, so we'd record a navigation the user could
+    // still cancel by releasing the mouse off the link, and (b) duplicates
+    // every real click — `pointerdown` + `click` for primary, `pointerdown`
+    // + `auxclick` for middle — sending two identical messages per click and
+    // racing two recordLinkClick handlers that each `await hydrate()` and
+    // see existing=undefined, appending two distinct NAVIGATION_COMMITTED
+    // source-fallback events with different visitIds.
     document.addEventListener('click', reportNavigationLinkClick, { capture: true });
     document.addEventListener('auxclick', reportNavigationLinkClick, { capture: true });
     document.addEventListener('mousedown', (event) => {
