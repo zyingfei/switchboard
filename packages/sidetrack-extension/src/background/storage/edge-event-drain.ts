@@ -61,6 +61,13 @@ const PERMANENT_SKIP_REASONS = new Set([
   'invalid-payload',
 ]);
 
+const PRIORITY_STREAMS = new Set<BufferedEvent['streamName']>(['navigation.committed']);
+
+export const selectEdgeEventDrainScanBatch = (
+  priorityBatch: readonly BufferedEvent[],
+  scannedBatch: readonly BufferedEvent[],
+): readonly BufferedEvent[] => (priorityBatch.length > 0 ? priorityBatch : scannedBatch);
+
 export const partitionEdgeEventDrainBatch = (
   batch: readonly BufferedEvent[],
   maxRouteBatchSize: number,
@@ -70,7 +77,13 @@ export const partitionEdgeEventDrainBatch = (
   // unknown types come back as `'invalid-event-type'` skips and
   // `summarizeEdgeEventDrain` evicts them on the next pass.
   const routeLimit = Math.max(0, Math.floor(maxRouteBatchSize));
-  const routeBatch = batch.slice(0, routeLimit);
+  const priority: BufferedEvent[] = [];
+  const normal: BufferedEvent[] = [];
+  for (const event of batch) {
+    if (PRIORITY_STREAMS.has(event.streamName)) priority.push(event);
+    else normal.push(event);
+  }
+  const routeBatch = [...priority, ...normal].slice(0, routeLimit);
   return {
     routeBatch,
     locallyRejectedBatch: [],

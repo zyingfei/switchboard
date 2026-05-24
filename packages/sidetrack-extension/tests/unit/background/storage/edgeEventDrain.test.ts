@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
+  selectEdgeEventDrainScanBatch,
   summarizeEdgeEventDrain,
   type EdgeEventImportAck,
   type EdgeEventImportSkip,
@@ -22,6 +23,14 @@ const event = (
 });
 
 describe('summarizeEdgeEventDrain', () => {
+  it('keeps a navigation-triggered scan focused on navigation backlog', () => {
+    const priority = [event('navigation.committed', 50)];
+    const scanned = [event('engagement.interval.observed', 1), event('selection.copied', 2)];
+
+    expect(selectEdgeEventDrainScanBatch(priority, scanned)).toEqual(priority);
+    expect(selectEdgeEventDrainScanBatch([], scanned)).toEqual(scanned);
+  });
+
   it('caps the upload batch at the route batch size; companion is the sole type gatekeeper', () => {
     // The drain used to filter event types locally with a hand-
     // maintained whitelist, which is the bug that hid
@@ -40,10 +49,27 @@ describe('summarizeEdgeEventDrain', () => {
 
     const partition = partitionEdgeEventDrainBatch(batch, 3);
 
-    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([1, 2, 3]);
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([1, 4, 2]);
     expect(partition.locallyRejectedBatch).toEqual([]);
     expect(partition.evictedByType).toEqual({});
     expect(partition.skippedByReason).toEqual({});
+  });
+
+  it('prioritizes navigation lineage over older engagement backlog', () => {
+    const batch = [
+      event('engagement.interval.observed', 1),
+      event('engagement.interval.observed', 2),
+      event('engagement.interval.observed', 3),
+      event('navigation.committed', 50),
+    ];
+
+    const partition = partitionEdgeEventDrainBatch(batch, 2);
+
+    expect(partition.routeBatch.map((e) => e.streamName)).toEqual([
+      'navigation.committed',
+      'engagement.interval.observed',
+    ]);
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([50, 1]);
   });
 
   it('keeps uploaded accounting separate from permanent skip eviction', () => {

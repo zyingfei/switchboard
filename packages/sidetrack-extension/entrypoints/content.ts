@@ -66,6 +66,39 @@ const findFirstElement = (selectors: readonly string[]): Element | null => {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+const isHttpUrl = (value: string): boolean =>
+  value.startsWith('https://') || value.startsWith('http://');
+
+const anchorFromEventTarget = (target: EventTarget | null): HTMLAnchorElement | null => {
+  if (!(target instanceof Element)) return null;
+  const anchor = target.closest('a[href]');
+  return anchor instanceof HTMLAnchorElement ? anchor : null;
+};
+
+const reportNavigationLinkClick = (event: MouseEvent): void => {
+  if (event.button !== 0 && event.button !== 1) return;
+  const anchor = anchorFromEventTarget(event.target);
+  if (anchor === null) return;
+  const targetUrl = anchor.href;
+  const sourceUrl = window.location.href;
+  if (!isHttpUrl(sourceUrl) || !isHttpUrl(targetUrl)) return;
+  void chrome.runtime
+    .sendMessage({
+      type: messageTypes.recordNavigationLinkClick,
+      version: 1,
+      sourceUrl,
+      targetUrl,
+      clickedAtMs: Date.now(),
+      button: event.button,
+      ...(anchor.target.length === 0 ? {} : { target: anchor.target }),
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+    })
+    .catch(() => undefined);
+};
+
 const waitFor = async (
   predicate: () => boolean,
   timeoutMs: number,
@@ -1096,6 +1129,9 @@ export default defineContentScript({
     };
 
     document.addEventListener('selectionchange', onSelectionChange);
+    document.addEventListener('pointerdown', reportNavigationLinkClick, { capture: true });
+    document.addEventListener('click', reportNavigationLinkClick, { capture: true });
+    document.addEventListener('auxclick', reportNavigationLinkClick, { capture: true });
     document.addEventListener('mousedown', (event) => {
       // Click outside the popover dismisses it. Inside-pop clicks bubble
       // to the popover's own listeners (jump / close button).

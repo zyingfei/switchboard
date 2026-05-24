@@ -20,6 +20,7 @@ export interface BufferedEvent {
 export interface EventBuffer {
   appendMany(events: readonly BufferedEvent[]): Promise<void>;
   peek(limit: number): Promise<BufferedEvent[]>;
+  peekByStream?(streamName: EventStreamName, limit: number): Promise<BufferedEvent[]>;
   deleteMany(
     keys: readonly Pick<BufferedEvent, 'streamName' | 'lamport' | 'replicaId'>[],
   ): Promise<number>;
@@ -40,6 +41,15 @@ export class InMemoryEventBuffer implements EventBuffer {
 
   async peek(limit: number): Promise<BufferedEvent[]> {
     return [...this.map.values()]
+      .sort((a, b) =>
+        a.lamport === b.lamport ? a.replicaId.localeCompare(b.replicaId) : a.lamport - b.lamport,
+      )
+      .slice(0, Math.max(0, limit));
+  }
+
+  async peekByStream(streamName: EventStreamName, limit: number): Promise<BufferedEvent[]> {
+    return [...this.map.values()]
+      .filter((event) => event.streamName === streamName)
       .sort((a, b) =>
         a.lamport === b.lamport ? a.replicaId.localeCompare(b.replicaId) : a.lamport - b.lamport,
       )

@@ -1501,7 +1501,11 @@ export const ConnectionsView = ({
   // Snapshot fetching: cached by (anchor, hops), revalidated in the
   // background when revisited so the user gets instant flips through
   // history with no perceptible loading state.
-  const { snapshot: rawSnapshot, loading, error, refresh } = useConnectionsSnapshot(anchor, hops);
+  const effectiveSnapshotHops = subMode === 'flow' ? Math.max(hops, 2) : hops;
+  const { snapshot: rawSnapshot, loading, error, refresh } = useConnectionsSnapshot(
+    anchor,
+    effectiveSnapshotHops,
+  );
   // Edge detail enrichment — companion serves extra metadata (ranker
   // contributions, etc.) the neighbor scope strips for size.
   const edgeDetail = useConnectionsEdge(selectedEdge);

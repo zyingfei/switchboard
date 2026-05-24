@@ -17,9 +17,19 @@ afterEach(() => {
   delete (globalThis as unknown as { chrome?: unknown }).chrome;
 });
 
-const makeDeps = (tabs: Map<number, { readonly windowId: number }>) => {
+const makeDeps = (
+  tabs: Map<number, { readonly windowId: number; readonly url?: string }>,
+) => {
   const buffer = new InMemoryEventBuffer();
   const store = createTabOpenerStore();
+  const navigationStateStorageBacking: Record<string, unknown> = {};
+  const navigationStateStorage = {
+    get: vi.fn((key: string) => Promise.resolve({ [key]: navigationStateStorageBacking[key] })),
+    set: vi.fn((entries: Record<string, unknown>) => {
+      Object.assign(navigationStateStorageBacking, entries);
+      return Promise.resolve();
+    }),
+  };
   let seq = 1;
   const webNavigation: WebNavigationApi = {
     onCommitted: { addListener: () => undefined },
@@ -28,14 +38,21 @@ const makeDeps = (tabs: Map<number, { readonly windowId: number }>) => {
     async get(tabId) {
       const tab = tabs.get(tabId);
       if (tab === undefined) throw new Error('tab not found');
-      return { id: tabId, windowId: tab.windowId };
+      return {
+        id: tabId,
+        windowId: tab.windowId,
+        ...(tab.url === undefined ? {} : { url: tab.url }),
+      };
     },
   };
+  const onNavigationBuffered = vi.fn();
   const listener = createWebNavigationListener({
     webNavigation,
     tabs: tabsApi,
     tabOpenerStore: store,
     eventBuffer: buffer,
+    navigationStateStorage,
+    onNavigationBuffered,
     browserSessionStartMs: 1778260000000,
     edgeReplicaId: 'edge_test',
     allocateSeq: async (count = 1) => {
@@ -45,7 +62,31 @@ const makeDeps = (tabs: Map<number, { readonly windowId: number }>) => {
     },
     now: () => new Date('2026-05-08T12:00:00.000Z'),
   });
-  return { buffer, listener, store };
+  const createRestartedListener = () =>
+    createWebNavigationListener({
+      webNavigation,
+      tabs: tabsApi,
+      tabOpenerStore: store,
+      eventBuffer: buffer,
+      navigationStateStorage,
+      onNavigationBuffered,
+      browserSessionStartMs: 1778260000000,
+      edgeReplicaId: 'edge_test',
+      allocateSeq: async (count = 1) => {
+        const fromSeq = seq;
+        seq += count;
+        return { edgeReplicaId: 'edge_test', fromSeq, toSeq: seq - 1 };
+      },
+      now: () => new Date('2026-05-08T12:00:00.000Z'),
+    });
+  return {
+    buffer,
+    createRestartedListener,
+    listener,
+    navigationStateStorage,
+    onNavigationBuffered,
+    store,
+  };
 };
 
 const payloads = async (buffer: InMemoryEventBuffer): Promise<NavigationCommittedPayload[]> =>
@@ -97,6 +138,21 @@ describe('webNavigation committed listener', () => {
     expect(second?.navigationSequence).toBe(2);
     expect(second?.parentDocumentId).toBe('doc-a');
     expect(second?.transitionQualifiers).toEqual(['client_redirect']);
+  });
+
+  it('notifies after buffering a top-frame navigation event', async () => {
+    const { listener, onNavigationBuffered } = makeDeps(new Map([[1, { windowId: 9 }]]));
+
+    await listener.handleCommitted({
+      tabId: 1,
+      frameId: 0,
+      url: 'https://example.com/story',
+      timeStamp: 100,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    expect(onNavigationBuffered).toHaveBeenCalledTimes(1);
   });
 
   it('resolves openerVisitId only while the opener tab is alive', async () => {
@@ -170,6 +226,138 @@ describe('webNavigation committed listener', () => {
     const latest = emitted.at(-1);
     expect(latest?.previousVisitId).toBe('visit_existing');
     expect(latest?.navigationSequence).toBe(4);
+  });
+
+  it('hydrates previous visit state from session storage after buffered events drain', async () => {
+    const { buffer, createRestartedListener, listener, navigationStateStorage } = makeDeps(
+      new Map([[7, { windowId: 8 }]]),
+    );
+
+    await listener.handleCommitted({
+      tabId: 7,
+      frameId: 0,
+      url: 'https://news.ycombinator.com/item?id=1',
+      timeStamp: 500,
+      transitionType: 'typed',
+      transitionQualifiers: [],
+    });
+    const [source] = await payloads(buffer);
+    expect(source?.previousVisitId).toBeNull();
+    await buffer.deleteMany(await buffer.peek(100));
+
+    const restarted = createRestartedListener();
+    await restarted.handleCommitted({
+      tabId: 7,
+      frameId: 0,
+      url: 'https://example.com/from-hn',
+      timeStamp: 600,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    const [destination] = await payloads(buffer);
+    expect(navigationStateStorage.set).toHaveBeenCalled();
+    expect(destination?.previousVisitId).toBe(source?.visitId);
+    expect(destination?.navigationSequence).toBe(2);
+  });
+
+  it('uses a link-click fallback as same-tab provenance when source state was missing', async () => {
+    const { buffer, listener } = makeDeps(new Map([[9, { windowId: 8 }]]));
+
+    await listener.recordLinkClick({
+      tabId: 9,
+      sourceUrl: 'https://news.ycombinator.com/news',
+      targetUrl: 'https://example.com/story',
+      timeStamp: 700,
+    });
+    await listener.handleCommitted({
+      tabId: 9,
+      frameId: 0,
+      url: 'https://example.com/story',
+      timeStamp: 750,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    const [source, destination] = await payloads(buffer);
+    expect(source?.canonicalUrl).toBe('https://news.ycombinator.com/news');
+    expect(source?.dimensions?.provenance?.source).toBe(
+      'content-script.link-click.source-fallback',
+    );
+    expect(destination?.canonicalUrl).toBe('https://example.com/story');
+    expect(destination?.previousVisitId).toBe(source?.visitId);
+    expect(destination?.openerVisitId).toBeNull();
+  });
+
+  it('uses a link-click fallback as opener provenance when new-tab opener state was missing', async () => {
+    const { buffer, listener } = makeDeps(
+      new Map([
+        [10, { windowId: 8 }],
+        [11, { windowId: 8 }],
+      ]),
+    );
+
+    await listener.handleCommitted({
+      tabId: 10,
+      frameId: 0,
+      url: 'https://news.ycombinator.com/news',
+      timeStamp: 800,
+      transitionType: 'typed',
+      transitionQualifiers: [],
+    });
+    await listener.recordLinkClick({
+      tabId: 10,
+      sourceUrl: 'https://news.ycombinator.com/news',
+      targetUrl: 'https://example.com/from-hn',
+      timeStamp: 810,
+    });
+    await listener.handleCommitted({
+      tabId: 11,
+      frameId: 0,
+      url: 'https://example.com/from-hn',
+      timeStamp: 850,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    const [source, destination] = await payloads(buffer);
+    expect(destination?.previousVisitId).toBeNull();
+    expect(destination?.openerVisitId).toBe(source?.visitId);
+  });
+
+  it('uses webNavigation target-created as opener provenance for new-tab links', async () => {
+    const tabs = new Map([
+      [12, { windowId: 8, url: 'https://news.ycombinator.com/newest' }],
+      [13, { windowId: 8 }],
+    ]);
+    const { buffer, listener } = makeDeps(tabs);
+
+    await listener.handleCommitted({
+      tabId: 12,
+      frameId: 0,
+      url: 'https://news.ycombinator.com/newest',
+      timeStamp: 900,
+      transitionType: 'typed',
+      transitionQualifiers: [],
+    });
+    await listener.recordNavigationTargetCreated({
+      sourceTabId: 12,
+      tabId: 13,
+      url: 'https://example.com/from-hn-new-tab',
+      timeStamp: 910,
+    });
+    await listener.handleCommitted({
+      tabId: 13,
+      frameId: 0,
+      url: 'https://example.com/from-hn-new-tab',
+      timeStamp: 950,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    const [source, destination] = await payloads(buffer);
+    expect(destination?.previousVisitId).toBeNull();
+    expect(destination?.openerVisitId).toBe(source?.visitId);
   });
 
   it('persists browser session start across service-worker restarts', async () => {

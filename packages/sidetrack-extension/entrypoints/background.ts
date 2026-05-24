@@ -64,6 +64,7 @@ import { registerDefaultWebNavigationListeners } from '../src/background/listene
 import {
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
+  selectEdgeEventDrainScanBatch,
   summarizeEdgeEventDrain,
 } from '../src/background/storage/edge-event-drain';
 import { IndexedDbEventBuffer } from '../src/background/storage/indexeddb-event-buffer';
@@ -107,6 +108,7 @@ import {
 } from '../src/tabsession/storage';
 import {
   isContentResponse,
+  isNavigationLinkClickMessage,
   isPageContentExtractContentResponse,
   isRuntimeRequest,
   messageTypes,
@@ -1532,9 +1534,7 @@ const toWorkboardIdentity = (
 const readIdentityPins = async (): Promise<Record<string, CompanionIdentity>> => {
   const stored = await chrome.storage.local.get({ [COMPANION_IDENTITY_PIN_KEY]: {} });
   const raw = stored[COMPANION_IDENTITY_PIN_KEY];
-  return typeof raw === 'object' && raw !== null
-    ? (raw as Record<string, CompanionIdentity>)
-    : {};
+  return typeof raw === 'object' && raw !== null ? (raw as Record<string, CompanionIdentity>) : {};
 };
 
 const writeIdentityPin = async (port: number, identity: CompanionIdentity): Promise<void> => {
@@ -1586,8 +1586,7 @@ const refreshCompanionIdentity = async (
 
 export const peekCachedCompanionIdentity = (): typeof cachedCompanionIdentity =>
   cachedCompanionIdentity;
-export const peekCachedIdentityWarning = (): typeof cachedIdentityWarning =>
-  cachedIdentityWarning;
+export const peekCachedIdentityWarning = (): typeof cachedIdentityWarning => cachedIdentityWarning;
 
 const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
@@ -3652,7 +3651,10 @@ export default defineBackground(() => {
 
   const tabOpenerStore = createTabOpenerStore();
   registerTabLifecycleListeners(chrome.tabs, tabOpenerStore);
-  registerDefaultWebNavigationListeners(tabOpenerStore);
+  let requestEdgeEventDrain: () => void = () => undefined;
+  const webNavigationRuntime = registerDefaultWebNavigationListeners(tabOpenerStore, {
+    onNavigationBuffered: () => requestEdgeEventDrain(),
+  });
 
   const engagementEventBuffer = new IndexedDbEventBuffer();
   let engagementRuntimePromise: Promise<{
@@ -3842,7 +3844,16 @@ export default defineBackground(() => {
       return emptyEdgeEventDrainStats(await engagementEventBuffer.count());
     }
 
-    const batch = await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE);
+    const priorityBatch =
+      (await engagementEventBuffer.peekByStream?.(
+        'navigation.committed',
+        EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
+      )) ?? [];
+    const scannedBatch =
+      priorityBatch.length > 0
+        ? []
+        : await engagementEventBuffer.peek(EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE);
+    const batch = selectEdgeEventDrainScanBatch(priorityBatch, scannedBatch);
     if (batch.length === 0) {
       return emptyEdgeEventDrainStats(0);
     }
@@ -3931,6 +3942,11 @@ export default defineBackground(() => {
   const drainBufferedEdgeEventsBulk = createEdgeEventDrainSingleFlight(() =>
     drainBufferedEdgeEventsLoop(EDGE_EVENT_DRAIN_BULK_MAX_BATCHES),
   );
+  requestEdgeEventDrain = () => {
+    void drainBufferedEdgeEvents().catch((error: unknown) => {
+      console.warn('[edge-events.drain] navigation-triggered drain failed:', error);
+    });
+  };
 
   // Drop reminders bound to thread bac_ids that no longer exist.
   // Cleanup pass for the historical mess caused by the pre-fix
@@ -4417,6 +4433,31 @@ export default defineBackground(() => {
           sendResponse({
             ok: false,
             error: error instanceof Error ? error.message : 'engagement interval failed',
+          } as unknown as RuntimeResponse);
+        });
+      return true;
+    }
+
+    if (isNavigationLinkClickMessage(message)) {
+      const tabId = sender.tab?.id;
+      void (async () => {
+        if (typeof tabId !== 'number') {
+          throw new Error('navigation link click has no sender tab');
+        }
+        await webNavigationRuntime.recordLinkClick({
+          tabId,
+          sourceUrl: message.sourceUrl,
+          targetUrl: message.targetUrl,
+          timeStamp: message.clickedAtMs,
+        });
+      })()
+        .then(() => {
+          sendResponse({ ok: true } as unknown as RuntimeResponse);
+        })
+        .catch((error: unknown) => {
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : 'navigation link click failed',
           } as unknown as RuntimeResponse);
         });
       return true;
