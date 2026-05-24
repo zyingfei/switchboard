@@ -1,9 +1,0 @@
-{
-  "revisionId": "lxEbypZumvm3Rs2E",
-  "visitSimilarityRevisionId": "d28e8d47eba74084",
-  "cosineThreshold": 0.85,
-  "algorithmVersion": "topic-revision:v1:union-find",
-  "topics": [],
-  "lineage": [],
-  "producedAt": 1778447294947
-}

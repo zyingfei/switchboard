@@ -21,3 +21,24 @@ test-sessions/
 imports/
 # Claude -> Codex worker local config and logs
 .claude-codex-worker/
+
+# Claude Code project state (worktrees, settings, agent dumps)
+.claude/
+.codex/
+
+# JetBrains / IntelliJ workspace
+.idea/
+
+# Local dogfood / manual-test browser profiles and vaults.
+# These directories contain real bridge keys, rendezvous secrets, replica
+# keypairs, audit logs, recall indices, and workstream content — they MUST
+# NOT be committed even when they live under packages/.
+.sidetrack-browser-profiles/
+packages/.sidetrack-browser-profiles/
+
+# Local vault overrides (auto-generated runtime state)
+.sidetrack-vault*/
+sidetrack-vault*/
+
+# Screen session logs
+screenlog.*

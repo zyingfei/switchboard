@@ -1,9 +1,0 @@
-{
-  "revisionId": "11b1398ea09ed38a",
-  "modelId": "Xenova/multilingual-e5-small",
-  "modelRevision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
-  "featureSchemaVersion": 1,
-  "threshold": 0.85,
-  "producedAt": 1778447230073,
-  "edges": []
-}
