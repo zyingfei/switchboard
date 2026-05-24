@@ -1,8 +1,0 @@
-{
-  "indexVersion": 3,
-  "chunkSchemaVersion": 1,
-  "modelId": "Xenova/multilingual-e5-small",
-  "modelRevision": "761b726dd34fb83930e26aab4e9ac3899aa1fa78",
-  "embeddingDim": 384,
-  "builtAt": "2026-05-10T21:08:12.967Z"
-}
