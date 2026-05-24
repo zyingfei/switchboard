@@ -47,7 +47,7 @@ import {
   THREAD_UNARCHIVED,
   THREAD_UPSERTED,
 } from '../../threads/events.js';
-import { URL_ATTRIBUTION_INFERRED } from '../../urls/events.js';
+import { URL_ATTRIBUTION_INFERRED, URL_IGNORED } from '../../urls/events.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import type { AcceptedEvent } from '../causal.js';
 
@@ -165,6 +165,10 @@ export const INVALIDATION_RULES: Readonly<Record<string, InvalidationRule>> = {
       : [{ kind: 'thread', bacId }, { kind: 'inboxFilter' }];
   },
   [URL_ATTRIBUTION_INFERRED]: (event) => {
+    const canonicalUrl = str(asRecord(event.payload)['canonicalUrl']);
+    return canonicalUrl === undefined ? [] : [{ kind: 'url', canonicalUrl }];
+  },
+  [URL_IGNORED]: (event) => {
     const canonicalUrl = str(asRecord(event.payload)['canonicalUrl']);
     return canonicalUrl === undefined ? [] : [{ kind: 'url', canonicalUrl }];
   },

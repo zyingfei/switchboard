@@ -25,6 +25,8 @@ const ROW_LOCAL_EVENT_TYPES = new Set<string>([
   'workstreams.upserted',
   'tabsession.attribution.inferred',
   'url.attribution.inferred',
+  'urls.attribution.inferred',
+  'urls.ignored',
   'user.organized.item',
 ]);
 
@@ -35,7 +37,10 @@ const rowLocalReason = (eventType: string): string => {
   if (eventType === 'threads.upserted') return 'thread node row';
   if (eventType === 'workstreams.upserted') return 'workstream node row';
   if (eventType === 'tabsession.attribution.inferred') return 'tab-session attribution edge rows';
-  if (eventType === 'url.attribution.inferred') return 'url attribution edge rows';
+  if (eventType === 'url.attribution.inferred' || eventType === 'urls.attribution.inferred') {
+    return 'url attribution edge rows';
+  }
+  if (eventType === 'urls.ignored') return 'url ignored-state row';
   if (eventType === 'user.organized.item') return 'user assertion overlay rows';
   return 'row-local';
 };

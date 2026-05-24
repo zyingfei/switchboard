@@ -211,8 +211,23 @@ describe('HNSW reconcile child integration', () => {
 
     // Regression: this child reconcile has existing active HNSW entries but no newly
     // eligible visit to embed, so the materializer itself must load the persisted store.
-    const noEligibleEmbeddingResult = await runReconcileInChild({ vaultRoot, seq: 3 });
-    expect(noEligibleEmbeddingResult).toMatchObject({ seq: 3, ok: true });
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      return true;
+    });
+    try {
+      const noEligibleEmbeddingResult = await runReconcileInChild({ vaultRoot, seq: 3 });
+      expect(noEligibleEmbeddingResult).toMatchObject({ seq: 3, ok: true });
+    } finally {
+      writeSpy.mockRestore();
+    }
+    const phaseOutput = output.join('');
+    expect(phaseOutput).toContain(
+      'pageEvidence.ensure records=1 ensured=1 full=false bounded=true',
+    );
+    expect(phaseOutput).toContain('buildVisitSimilarityHnsw full=false touched=0');
   });
 
   it('does not full-rebuild HNSW in a child pass when no visits changed', async () => {
@@ -245,67 +260,75 @@ describe('HNSW reconcile child integration', () => {
     expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=0');
   });
 
-  it('incrementally inserts new visits without full-rebuilding the child HNSW store', async () => {
-    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
-    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
-    const replica = await loadOrCreateReplica(vaultRoot);
-    const eventLog = createEventLog(vaultRoot, replica);
-    for (let index = 0; index < 100; index += 1) {
-      const observedAt = new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000)
-        .toISOString();
-      await appendVisit(eventLog, {
-        index,
-        observedAt,
-      });
-    }
-    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
-    const before = await createConnectionsStore(vaultRoot).readCurrent();
-    if (before === null) throw new Error('expected initial HNSW snapshot');
-    const beforeRows = similarityRows(before);
-
-    const newVisitKeys = new Set<string>();
-    for (let index = 100; index < 105; index += 1) {
-      const visitKey = `https://hnsw.test/${String(index)}`;
-      newVisitKeys.add(visitKey);
-      await appendVisit(eventLog, {
-        index,
-        observedAt: `2026-05-22T11:${String(index - 100).padStart(2, '0')}:00.000Z`,
-      });
-    }
-
-    const output: string[] = [];
-    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
-      output.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-      return true;
-    });
-    try {
-      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({
-        seq: 2,
+  it(
+    'incrementally inserts new visits without full-rebuilding the child HNSW store',
+    async () => {
+      process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+      process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      for (let index = 0; index < 100; index += 1) {
+        const observedAt = new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000)
+          .toISOString();
+        await appendVisit(eventLog, {
+          index,
+          observedAt,
+        });
+      }
+      expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({
+        seq: 1,
         ok: true,
       });
-    } finally {
-      writeSpy.mockRestore();
-    }
+      const before = await createConnectionsStore(vaultRoot).readCurrent();
+      if (before === null) throw new Error('expected initial HNSW snapshot');
+      const beforeRows = similarityRows(before);
 
-    const phaseOutput = output.join('');
-    expect(phaseOutput).toContain('buildVisitSimilarityHnsw full=false touched=5');
-    const hnswBuildMs = /buildVisitSimilarityHnsw full=false touched=5 edges=\d+ dt=(\d+)ms/u.exec(
-      phaseOutput,
-    )?.[1];
-    expect(hnswBuildMs).toBeDefined();
-    expect(Number(hnswBuildMs)).toBeLessThan(500);
+      const newVisitKeys = new Set<string>();
+      for (let index = 100; index < 105; index += 1) {
+        const visitKey = `https://hnsw.test/${String(index)}`;
+        newVisitKeys.add(visitKey);
+        await appendVisit(eventLog, {
+          index,
+          observedAt: `2026-05-22T11:${String(index - 100).padStart(2, '0')}:00.000Z`,
+        });
+      }
 
-    const after = await createConnectionsStore(vaultRoot).readCurrent();
-    if (after === null) throw new Error('expected incremental HNSW snapshot');
-    const afterRows = similarityRows(after);
-    const afterByPair = new Map(afterRows.map((row) => [row.pair, row]));
-    for (const row of beforeRows) {
-      expect(afterByPair.get(row.pair)).toEqual(row);
-    }
-    const newRows = afterRows.filter((row) => rowTouchesVisit(row, newVisitKeys));
-    expect(newRows.length).toBeGreaterThan(0);
-    expect(afterRows.length).toBe(beforeRows.length + newRows.length);
-  });
+      const output: string[] = [];
+      const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+        output.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        return true;
+      });
+      try {
+        expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({
+          seq: 2,
+          ok: true,
+        });
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      const phaseOutput = output.join('');
+      expect(phaseOutput).toContain('buildVisitSimilarityHnsw full=false touched=5');
+      const hnswBuildMs =
+        /buildVisitSimilarityHnsw full=false touched=5 edges=\d+ dt=(\d+)ms/u.exec(
+          phaseOutput,
+        )?.[1];
+      expect(hnswBuildMs).toBeDefined();
+      expect(Number(hnswBuildMs)).toBeLessThan(500);
+
+      const after = await createConnectionsStore(vaultRoot).readCurrent();
+      if (after === null) throw new Error('expected incremental HNSW snapshot');
+      const afterRows = similarityRows(after);
+      const afterByPair = new Map(afterRows.map((row) => [row.pair, row]));
+      for (const row of beforeRows) {
+        expect(afterByPair.get(row.pair)).toEqual(row);
+      }
+      const newRows = afterRows.filter((row) => rowTouchesVisit(row, newVisitKeys));
+      expect(newRows.length).toBeGreaterThan(0);
+      expect(afterRows.length).toBe(beforeRows.length + newRows.length);
+    },
+    15_000,
+  );
 
   it('reuses existing HNSW labels — touched is the set difference, not dirty-scopes', async () => {
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';

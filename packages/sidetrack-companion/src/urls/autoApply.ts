@@ -8,7 +8,16 @@ import {
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { URL_ATTRIBUTION_INFERRED } from './events.js';
-import { projectUrls, type UrlProjection } from './projection.js';
+import {
+  deserializeUrlProjection,
+  foldEventIntoUrlProjectionAccumulator,
+  projectUrls,
+  serializeUrlProjection,
+  type SerializedUrlProjection,
+  type UrlProjection,
+  urlProjectionAccumulatorFromSerialized,
+  urlProjectionFromAccumulator,
+} from './projection.js';
 
 export type AutoApplyUrlAttributionStatus =
   | 'applied'
@@ -43,6 +52,9 @@ export interface AutoApplyUrlAttributionInput {
   readonly eventLog: EventLog;
   readonly snapshot: ConnectionsSnapshot;
   readonly canonicalUrl: string;
+  readonly events?: readonly AcceptedEvent[];
+  readonly urlProjection?: SerializedUrlProjection;
+  readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
 }
@@ -62,13 +74,19 @@ const clientEventIdForResolution = (result: UrlResolutionResult): string =>
 export const autoApplyUrlAttribution = async (
   input: AutoApplyUrlAttributionInput,
 ): Promise<AutoApplyUrlAttributionResult> => {
-  const beforeEvents = await input.eventLog.readMerged();
-  const beforeProjection = projectUrls(beforeEvents);
+  const beforeEvents = input.events ?? (await input.eventLog.readMerged());
+  const beforeProjection =
+    input.urlProjection === undefined
+      ? projectUrls(beforeEvents)
+      : deserializeUrlProjection(input.urlProjection);
   const existing = beforeProjection.byCanonicalUrl.get(input.canonicalUrl)?.currentAttribution;
   const resolution = resolveUrlAttribution({
     canonicalUrl: input.canonicalUrl,
     snapshot: input.snapshot,
     events: beforeEvents,
+    ...(input.useEventCandidateSimilarity === undefined
+      ? {}
+      : { useEventCandidateSimilarity: input.useEventCandidateSimilarity }),
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
   });
@@ -151,6 +169,18 @@ export const autoApplyUrlAttribution = async (
     type: URL_ATTRIBUTION_INFERRED,
     payload: { ...payload },
   });
+  if (input.urlProjection !== undefined) {
+    const accumulator = urlProjectionAccumulatorFromSerialized(
+      serializeUrlProjection(beforeProjection),
+    );
+    foldEventIntoUrlProjectionAccumulator(accumulator, accepted);
+    return {
+      status: 'applied',
+      resolution,
+      accepted,
+      projection: urlProjectionFromAccumulator(accumulator),
+    };
+  }
 
   return {
     status: 'applied',

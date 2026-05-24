@@ -524,6 +524,42 @@ describe('tab-session resolver', () => {
     expect(threadResult.reasons.targetAnchors).toContain(`timeline-visit:${currentUrl}`);
   });
 
+  it('can use materialized snapshot edges without rebuilding event-derived candidates', () => {
+    const targetUrl = 'https://example.test/target';
+    const anchorUrl = 'https://example.test/anchor';
+    const snap = snapshot(
+      [`timeline-visit:${targetUrl}`, `timeline-visit:${anchorUrl}`, 'workstream:ws_security'],
+      [
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_security',
+        },
+      ],
+    );
+    const events = [
+      observed(1, 'tses_target', targetUrl, 'Target'),
+      observed(2, 'tses_anchor', anchorUrl, 'Anchor'),
+    ];
+
+    const eventCandidateResult = resolveUrlAttribution({
+      canonicalUrl: targetUrl,
+      snapshot: snap,
+      events,
+      policyMode: 'balanced',
+    });
+    const snapshotOnlyResult = resolveUrlAttribution({
+      canonicalUrl: targetUrl,
+      snapshot: snap,
+      events,
+      useEventCandidateSimilarity: false,
+      policyMode: 'balanced',
+    });
+
+    expect(eventCandidateResult.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    expect(snapshotOnlyResult.fusedCandidates).toHaveLength(0);
+  });
+
   it('respects "Not in any stream": a user decline settles the URL instead of re-asking', () => {
     const url = 'https://example.test/declined';
     const anchorUrl = 'https://example.test/anchor';

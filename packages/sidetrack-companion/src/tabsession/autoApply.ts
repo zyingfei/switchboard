@@ -41,6 +41,7 @@ export interface AutoApplyTabSessionAttributionInput {
   readonly eventLog: EventLog;
   readonly snapshot: ConnectionsSnapshot;
   readonly tabSessionId: string;
+  readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
 }
@@ -68,6 +69,9 @@ export const autoApplyTabSessionAttribution = async (
     snapshot: input.snapshot,
     projection: beforeProjection,
     events: beforeEvents,
+    ...(input.useEventCandidateSimilarity === undefined
+      ? {}
+      : { useEventCandidateSimilarity: input.useEventCandidateSimilarity }),
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
   });

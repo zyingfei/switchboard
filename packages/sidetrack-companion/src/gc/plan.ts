@@ -32,6 +32,8 @@ export interface BuildGcPlanOptions {
   readonly keepTopicRevisions?: number;
   readonly keepDiagnostics?: number;
   readonly keepDebugDumps?: number;
+  readonly keepIdempotencyReceipts?: number;
+  readonly keepIdempotencyBytes?: number;
 }
 
 export interface GcInventory {
@@ -104,23 +106,33 @@ const appendEntries = (
 const expiredIdempotency = async (
   vaultRoot: string,
   now: Date,
+  options: { readonly keepReceipts: number; readonly keepBytes: number },
 ): Promise<readonly { readonly path: string; readonly bytes: number }[]> => {
   const root = join(vaultRoot, '_BAC', '.config', 'idempotency');
-  const rows = await listFiles(root);
-  const expired: { path: string; bytes: number }[] = [];
+  const rows = (await listFiles(root)).filter((row) => row.path.endsWith('.json'));
+  const selected = new Map<string, { path: string; bytes: number }>();
+  let survivorCount = rows.length;
+  let survivorBytes = rows.reduce((sum, row) => sum + row.bytes, 0);
+  for (const row of [...rows].sort((left, right) => left.mtimeMs - right.mtimeMs)) {
+    if (survivorCount <= options.keepReceipts && survivorBytes <= options.keepBytes) break;
+    selected.set(row.path, { path: row.path, bytes: row.bytes });
+    survivorCount -= 1;
+    survivorBytes -= row.bytes;
+  }
   for (const row of rows) {
+    if (selected.has(row.path)) continue;
     try {
       const parsed = JSON.parse(await readFile(row.path, 'utf8')) as {
         readonly expiresAt?: unknown;
       };
       if (typeof parsed.expiresAt === 'string' && Date.parse(parsed.expiresAt) <= now.getTime()) {
-        expired.push({ path: row.path, bytes: row.bytes });
+        selected.set(row.path, { path: row.path, bytes: row.bytes });
       }
     } catch {
-      expired.push({ path: row.path, bytes: row.bytes });
+      selected.set(row.path, { path: row.path, bytes: row.bytes });
     }
   }
-  return expired;
+  return [...selected.values()];
 };
 
 export const buildGcPlan = async (
@@ -135,6 +147,8 @@ export const buildGcPlan = async (
   const keepTopicRevisions = options.keepTopicRevisions ?? keepRecentRevisions;
   const keepDiagnostics = options.keepDiagnostics ?? 500;
   const keepDebugDumps = options.keepDebugDumps ?? 10;
+  const keepIdempotencyReceipts = options.keepIdempotencyReceipts ?? 5000;
+  const keepIdempotencyBytes = options.keepIdempotencyBytes ?? 128 * 1024 * 1024;
   const entries: GcPlanEntry[] = [];
 
   const connectionsRoot = join(vaultRoot, '_BAC', 'connections');
@@ -205,9 +219,12 @@ export const buildGcPlan = async (
 
   appendEntries(
     entries,
-    await expiredIdempotency(vaultRoot, now),
+    await expiredIdempotency(vaultRoot, now, {
+      keepReceipts: keepIdempotencyReceipts,
+      keepBytes: keepIdempotencyBytes,
+    }),
     'expired-idempotency',
-    'expired idempotency replay record',
+    'expired or retention-budgeted idempotency replay record',
   );
 
   const sorted = entries.sort(

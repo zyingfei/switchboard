@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export interface IdempotencyRecord {
   readonly status: number;
@@ -27,6 +27,7 @@ const TTL_MS = 60 * 60 * 1000;
 // oldest-first once the dir exceeds this, so a burst within the TTL
 // window cannot grow the dir without bound.
 const MAX_RECEIPTS = 5000;
+const MAX_RECEIPT_DIR_BYTES = 128 * 1024 * 1024;
 
 const recordPath = (vaultPath: string, route: string, key: string): string => {
   const digest = createHash('sha256').update(`${route}\n${key}`).digest('hex');
@@ -64,14 +65,15 @@ export const createIdempotencyStore = (vaultPath: string): IdempotencyStore => (
   },
   async write(route, key, record) {
     const path = recordPath(vaultPath, route, key);
-    await mkdir(join(path, '..'), { recursive: true });
+    await mkdir(dirname(path), { recursive: true });
     // Compact JSON — receipts are machine-read only; pretty-printing
     // inflated every body ~1.5× on disk for no benefit.
     await writeFile(
       path,
       `${JSON.stringify({
-        ...record,
         expiresAt: record.expiresAt ?? new Date(Date.now() + TTL_MS).toISOString(),
+        status: record.status,
+        body: record.body,
       })}\n`,
       'utf8',
     );
@@ -82,31 +84,44 @@ export const createIdempotencyStore = (vaultPath: string): IdempotencyStore => (
       candidate.endsWith('.json'),
     );
     let removed = 0;
-    const survivors: { path: string; mtimeMs: number }[] = [];
+    const rows: { path: string; mtimeMs: number; bytes: number }[] = [];
     for (const name of names) {
       const path = join(root, name);
       try {
         const info = await stat(path);
-        const parsed = JSON.parse(await readFile(path, 'utf8')) as { readonly expiresAt?: unknown };
-        if (typeof parsed.expiresAt === 'string' && Date.parse(parsed.expiresAt) <= now.getTime()) {
-          await unlink(path);
-          removed += 1;
-        } else {
-          survivors.push({ path, mtimeMs: info.mtimeMs });
-        }
+        if (info.isFile()) rows.push({ path, mtimeMs: info.mtimeMs, bytes: info.size });
       } catch {
         await unlink(path).catch(() => undefined);
         removed += 1;
       }
     }
-    // Hard count ceiling: evict the oldest still-unexpired receipts once
-    // the dir exceeds MAX_RECEIPTS so a burst cannot grow it unbounded.
-    if (survivors.length > MAX_RECEIPTS) {
-      const surplus = survivors
-        .sort((left, right) => left.mtimeMs - right.mtimeMs)
-        .slice(0, survivors.length - MAX_RECEIPTS);
-      for (const entry of surplus) {
-        await unlink(entry.path).catch(() => undefined);
+
+    const budgetEvictions = new Set<string>();
+    let survivorCount = rows.length;
+    let survivorBytes = rows.reduce((sum, row) => sum + row.bytes, 0);
+    for (const row of [...rows].sort((left, right) => left.mtimeMs - right.mtimeMs)) {
+      if (survivorCount <= MAX_RECEIPTS && survivorBytes <= MAX_RECEIPT_DIR_BYTES) break;
+      budgetEvictions.add(row.path);
+      survivorCount -= 1;
+      survivorBytes -= row.bytes;
+    }
+    for (const path of budgetEvictions) {
+      await unlink(path).catch(() => undefined);
+      removed += 1;
+    }
+
+    for (const row of rows) {
+      if (budgetEvictions.has(row.path)) continue;
+      try {
+        const parsed = JSON.parse(await readFile(row.path, 'utf8')) as {
+          readonly expiresAt?: unknown;
+        };
+        if (typeof parsed.expiresAt === 'string' && Date.parse(parsed.expiresAt) <= now.getTime()) {
+          await unlink(row.path);
+          removed += 1;
+        }
+      } catch {
+        await unlink(row.path).catch(() => undefined);
         removed += 1;
       }
     }

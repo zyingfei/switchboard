@@ -20,6 +20,7 @@ import {
 } from '../../ranker/train.js';
 import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -165,6 +166,79 @@ const timelineObservedEvent = (input: {
       dimensions: { engagement: { focusedWindowMs: 10_000 } },
     },
   });
+
+const timelineObservedUrlEvent = (input: {
+  readonly seq: number;
+  readonly eventId: string;
+  readonly url: string;
+  readonly title: string;
+  readonly observedAt: string;
+}): AcceptedEvent =>
+  buildEvent({
+    seq: input.seq,
+    type: BROWSER_TIMELINE_OBSERVED,
+    payload: {
+      eventId: input.eventId,
+      observedAt: input.observedAt,
+      url: input.url,
+      canonicalUrl: input.url,
+      title: input.title,
+      provider: 'generic',
+      transition: 'activated',
+      payloadVersion: 1,
+      dimensions: { engagement: { focusedWindowMs: 10_000 } },
+    },
+  });
+
+const navigationCommittedEvent = (input: {
+  readonly seq: number;
+  readonly visitId: string;
+  readonly url: string;
+  readonly previousVisitId: string | null;
+  readonly navigationSequence: number;
+  readonly commitTimestamp: number;
+}): AcceptedEvent =>
+  buildEvent({
+    seq: input.seq,
+    type: NAVIGATION_COMMITTED,
+    payload: {
+      payloadVersion: 1,
+      visitId: input.visitId,
+      url: input.url,
+      canonicalUrl: input.url,
+      documentId: `doc-${input.visitId}`,
+      parentDocumentId: null,
+      tabSessionIdHash: 'tab-session-hn',
+      windowSessionIdHash: 'window-session-hn',
+      openerVisitId: null,
+      previousVisitId: input.previousVisitId,
+      navigationSequence: input.navigationSequence,
+      transitionType: 'link',
+      transitionQualifiers: [],
+      commitTimestamp: input.commitTimestamp,
+    },
+  });
+
+const waitForExpect = async (
+  assertion: () => void,
+  input: { readonly timeoutMs?: number; readonly intervalMs?: number } = {},
+): Promise<void> => {
+  const timeoutMs = input.timeoutMs ?? 1_000;
+  const intervalMs = input.intervalMs ?? 10;
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() <= deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  assertion();
+};
 
 const createRecordingStore = (
   root: string,
@@ -1097,6 +1171,226 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
 
     const snap = await store.readCurrent();
     expect(snap?.nodes.find((n) => n.id === 'thread:thread_b')).toBeDefined();
+  });
+
+  it('publishes a foreground navigation chain before the full scoped drain advances progress', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    type ReplaceScopeRowsInput = Parameters<NonNullable<ConnectionsStore['replaceScopeRows']>>[0];
+    let currentSnapshot: ConnectionsSnapshot | null = null;
+    let currentProgress: ReplaceScopeRowsInput['progress'] | null = null;
+    const replaceCalls: ReplaceScopeRowsInput[] = [];
+    const store = {
+      putCurrent: async (snapshot: ConnectionsSnapshot): Promise<void> => {
+        currentSnapshot = snapshot;
+      },
+      writeSnapshotAndProgress: async (
+        snapshot: ConnectionsSnapshot,
+        progress: ReplaceScopeRowsInput['progress'],
+      ): Promise<void> => {
+        currentSnapshot = snapshot;
+        currentProgress = progress;
+      },
+      readMaterializerProgress: () => Promise.resolve(currentProgress),
+      readCurrent: () => Promise.resolve(currentSnapshot),
+      replaceScopeRows: async (input: ReplaceScopeRowsInput): Promise<void> => {
+        replaceCalls.push(input);
+        const nodes = new Map<string, ConnectionsSnapshot['nodes'][number]>(
+          currentSnapshot?.nodes.map((node) => [node.id, node] as const) ?? [],
+        );
+        const edges = new Map<string, ConnectionsSnapshot['edges'][number]>(
+          currentSnapshot?.edges.map((edge) => [edge.id, edge] as const) ?? [],
+        );
+        for (const node of input.nodes) nodes.set(node.id, node);
+        for (const edge of input.edges) edges.set(edge.id, edge);
+        currentSnapshot = {
+          scope: {},
+          ...(currentSnapshot ?? {}),
+          nodes: [...nodes.values()],
+          edges: [...edges.values()],
+          nodeCount: nodes.size,
+          edgeCount: edges.size,
+          updatedAt: currentSnapshot?.updatedAt ?? '1970-01-01T00:00:00.000Z',
+          ...(input.metadata?.urlProjection === undefined
+            ? {}
+            : { urlProjection: input.metadata.urlProjection }),
+          ...(input.metadata?.tabSessionProjection === undefined
+            ? {}
+            : { tabSessionProjection: input.metadata.tabSessionProjection }),
+        };
+        currentProgress = input.progress;
+      },
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
+    } satisfies ConnectionsStore;
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['hn', unit([1, 0])],
+        ['article', unit([0, 1])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+    });
+
+    const hnUrl = 'https://news.ycombinator.com/newest';
+    const articleUrl = 'https://example.test/fresh-article';
+    await eventLog.importPeerEvent(
+      timelineObservedUrlEvent({
+        seq: 1,
+        eventId: 'timeline-hn',
+        url: hnUrl,
+        title: 'hn newest',
+        observedAt: '2026-05-07T11:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      navigationCommittedEvent({
+        seq: 2,
+        visitId: 'visit-hn',
+        url: hnUrl,
+        previousVisitId: null,
+        navigationSequence: 1,
+        commitTimestamp: Date.parse('2026-05-07T11:00:00.000Z'),
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(m.health().lastError).toBeNull();
+    replaceCalls.length = 0;
+
+    const articleNavigation = navigationCommittedEvent({
+      seq: 3,
+      visitId: 'visit-article',
+      url: articleUrl,
+      previousVisitId: 'visit-hn',
+      navigationSequence: 2,
+      commitTimestamp: Date.parse('2026-05-07T11:00:10.000Z'),
+    });
+    await eventLog.importPeerEvent(articleNavigation);
+    m.onAccepted(articleNavigation, { origin: 'peer' });
+    await m.awaitIdle();
+
+    const foregroundWrite = replaceCalls.find(
+      (call) => call.progress.appliedFrontier['replica-A'] === 2,
+    );
+    expect(foregroundWrite).toBeDefined();
+    expect(
+      foregroundWrite?.edges.some(
+        (edge) =>
+          edge.kind === 'previous_visit_in_tab_session' &&
+          edge.fromNodeId === `timeline-visit:${hnUrl}` &&
+          edge.toNodeId === `timeline-visit:${articleUrl}`,
+      ),
+    ).toBe(true);
+    expect(
+      foregroundWrite?.nodes.some(
+        (node) =>
+          node.kind === 'visit-instance' &&
+          node.id ===
+            `visit-instance:tab-session-hn:2026-05-07T11:00:10.000Z:${articleUrl}`,
+      ),
+    ).toBe(true);
+    const finalSnapshot = await store.readCurrent();
+    expect(
+      finalSnapshot?.edges.some(
+        (edge) =>
+          edge.kind === 'previous_visit_in_tab_session' &&
+          edge.fromNodeId === `timeline-visit:${hnUrl}` &&
+          edge.toNodeId === `timeline-visit:${articleUrl}`,
+      ),
+    ).toBe(true);
+  });
+
+  it('applies projection overlays for timeline events before the graph drain catches up', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const overlayEvents: AcceptedEvent[] = [];
+    const store = {
+      putCurrent: async (_snapshot: ConnectionsSnapshot): Promise<void> => undefined,
+      writeSnapshotAndProgress: async (_snapshot: ConnectionsSnapshot): Promise<void> => undefined,
+      readMaterializerProgress: () => Promise.resolve(null),
+      readCurrent: () => Promise.resolve(null),
+      applyProjectionEventOverlay: async (event: AcceptedEvent): Promise<string> => {
+        overlayEvents.push(event);
+        return 'rev-overlay';
+      },
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
+    } satisfies ConnectionsStore;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      rankerRetrainer: noRetrain,
+    });
+
+    const event = timelineObservedEvent({
+      seq: 1,
+      slug: 'overlay',
+      observedAt: '2026-05-07T11:05:00.000Z',
+    });
+    m.onAccepted(event, { origin: 'local' });
+
+    await waitForExpect(() => {
+      expect(overlayEvents).toEqual([event]);
+    });
+    await m.awaitIdle();
+  });
+
+  it('retries projection overlays when SQLite is briefly locked by a child commit', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    let overlayCalls = 0;
+    const overlayEvents: AcceptedEvent[] = [];
+    const store = {
+      putCurrent: async (_snapshot: ConnectionsSnapshot): Promise<void> => undefined,
+      writeSnapshotAndProgress: async (_snapshot: ConnectionsSnapshot): Promise<void> => undefined,
+      readMaterializerProgress: () => Promise.resolve(null),
+      readCurrent: () => Promise.resolve(null),
+      applyProjectionEventOverlay: async (event: AcceptedEvent): Promise<string> => {
+        overlayCalls += 1;
+        if (overlayCalls < 3) {
+          throw new Error('database is locked');
+        }
+        overlayEvents.push(event);
+        return 'rev-overlay';
+      },
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
+    } satisfies ConnectionsStore;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      rankerRetrainer: noRetrain,
+    });
+
+    const event = timelineObservedEvent({
+      seq: 1,
+      slug: 'overlay-retry',
+      observedAt: '2026-05-07T11:06:00.000Z',
+    });
+    m.onAccepted(event, { origin: 'local' });
+
+    await waitForExpect(() => {
+      expect(overlayCalls).toBe(3);
+      expect(overlayEvents).toEqual([event]);
+    });
+    await m.awaitIdle();
   });
 
   it('onAccepted with a non-handled event type is a no-op (does not flag dirty)', async () => {

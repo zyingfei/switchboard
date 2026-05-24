@@ -330,6 +330,21 @@ export const tabSessionProjectionFromAccumulator = (
   ),
 });
 
+export const tabSessionProjectionAccumulatorFromSerialized = (
+  serialized: SerializedTabSessionProjection,
+): TabSessionProjectionAccumulator => ({
+  records: new Map(
+    Object.entries(serialized.bySessionId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  openSessionsByTabId: new Map(
+    Object.entries(serialized.openSessionsByTabId).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+});
+
 export const projectTabSessions = (events: readonly AcceptedEvent[]): TabSessionProjection => {
   if (events.length === 0) return emptyProjection();
   return tabSessionProjectionFromAccumulator(seedTabSessionProjectionAccumulator(events));

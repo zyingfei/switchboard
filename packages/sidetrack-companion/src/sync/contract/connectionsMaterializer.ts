@@ -65,10 +65,7 @@ import {
   resolveServedTopicProducer,
   type ServedTopicProducer,
 } from '../../connections/servedTopicProducer.js';
-import {
-  hotTopicsModeEnabled,
-  type HotPathDiagnostics,
-} from '../../connections/hotPathMode.js';
+import { hotTopicsModeEnabled, type HotPathDiagnostics } from '../../connections/hotPathMode.js';
 import {
   buildVisitSimilarity,
   computeVisitSimilarityRevisionId,
@@ -85,7 +82,11 @@ import {
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
 } from '../../feedback/events.js';
-import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
+import {
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+} from '../../engagement/events.js';
+import { isNavigationCommittedPayload, NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import {
   buildEngagementClassifierInputs,
   createEngagementClassRevisionStore,
@@ -126,7 +127,7 @@ import {
   invalidationsForEvent,
   type InvalidationKey,
 } from './invalidation.js';
-import { invalidationKeysToScopes, type Scope } from './connectionsScopes.js';
+import { dedupeScopeList, invalidationKeysToScopes, type Scope } from './connectionsScopes.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
 import { runReconcileInChild } from './connectionsReconcileChildClient.js';
 import {
@@ -165,9 +166,13 @@ import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import {
+  canonicalizeEvidenceUrl,
   ensurePageEvidenceForTimelineEntries,
+  readPageEvidenceMap,
   readPageEvidenceVectorMap,
 } from '../../page-evidence/store.js';
+import type { PageEvidenceRecord } from '../../page-evidence/types.js';
+import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
 import { readPageContentChunksForCanonicalUrls } from '../../page-content/store.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
 import {
@@ -189,6 +194,7 @@ import {
   type TimelineDayProjection,
   type TimelineStore,
 } from '../../timeline/projection.js';
+import { detectSearchUrl } from '../../timeline/sanitize.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { isMainThread } from 'node:worker_threads';
 import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent, type Dot } from '../causal.js';
@@ -206,6 +212,7 @@ import {
   createEmptyTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
   seedTabSessionProjectionAccumulatorAsync,
+  serializeTabSessionProjection,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
 } from '../../tabsession/projection.js';
@@ -214,10 +221,12 @@ import {
   createEmptyUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   seedUrlProjectionAccumulatorAsync,
+  serializeUrlProjection,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
 } from '../../urls/projection.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
+import { URL_ATTRIBUTION_INFERRED, URL_IGNORED } from '../../urls/events.js';
 
 // Sync Contract v1 / Class B — Connections graph materializer.
 //
@@ -244,6 +253,7 @@ const DEFAULT_DRIFT_EVERY_DRAINS = 10;
 const DEFAULT_DRIFT_EVERY_MS = 3_600_000;
 const DRIFT_DISABLED_ENV = 'SIDETRACK_CONNECTIONS_DRIFT_DISABLED';
 const INCREMENTAL_SCOPES_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES';
+const PROJECTION_OVERLAY_RETRY_DELAYS_MS = [25, 75, 150, 300, 600, 1_200] as const;
 
 export interface DriftReport {
   readonly checkedAt: string;
@@ -269,6 +279,7 @@ export interface DriftReport {
 // drain. Side-panel views poll their own state and don't observe a
 // per-edit reactivity gap below ~2 s, so this is invisible UX-wise.
 const DRAIN_DEBOUNCE_MS = 1500;
+const URGENT_DRAIN_DEBOUNCE_MS = 250;
 
 // Stage 5.2 W1b/W1c — minimum wall-clock interval between drain
 // STARTS. DRAIN_DEBOUNCE_MS only coalesces a burst into ONE start;
@@ -309,6 +320,26 @@ const markPostDrain = (label: string, previousAtMs: number): number => {
   return now;
 };
 
+const delayMs = (ms: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+
+const isSqliteLockError = (error: unknown): boolean => {
+  if (typeof error !== 'object' || error === null) {
+    return String(error).includes('database is locked');
+  }
+  const code = 'code' in error ? error.code : undefined;
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('database is locked') ||
+    message.includes('SQLITE_BUSY') ||
+    message.includes('SQLITE_LOCKED')
+  );
+};
+
 export const classifyConnectionsMaterializerHealth = (input: {
   readonly pending: boolean;
   readonly lastSuccessAt: string | null;
@@ -325,8 +356,7 @@ export const classifyConnectionsMaterializerHealth = (input: {
 };
 
 const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
-const incrementalSimilarityEnabled = (): boolean =>
-  process.env[INCREMENTAL_SIMILARITY_ENV] !== '0';
+const incrementalSimilarityEnabled = (): boolean => process.env[INCREMENTAL_SIMILARITY_ENV] !== '0';
 
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
@@ -397,8 +427,6 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   ANNOTATION_NOTE_SET,
   ANNOTATION_DELETED,
   CAPTURE_RECORDED,
-  CAPTURE_EXTRACTION_PRODUCED,
-  RECALL_TOMBSTONE_TARGET,
   NAVIGATION_COMMITTED,
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -407,6 +435,7 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
   TAB_SESSION_ATTRIBUTION_INFERRED,
+  URL_ATTRIBUTION_INFERRED,
   SELECTION_COPIED,
   SELECTION_PASTED,
   // Timeline observations indirectly contribute (timeline visits
@@ -417,6 +446,39 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   // event payload directly.
   BROWSER_TIMELINE_OBSERVED,
 ]);
+
+const CONTENT_LANE_ONLY_HANDLES: ReadonlySet<string> = new Set<string>([
+  CAPTURE_EXTRACTION_PRODUCED,
+  ENGAGEMENT_INTERVAL_OBSERVED,
+  PAGE_EVIDENCE_EXTRACTED,
+  RECALL_TOMBSTONE_TARGET,
+]);
+
+const PROJECTION_ONLY_HANDLES: ReadonlySet<string> = new Set<string>([URL_IGNORED]);
+
+const PROJECTION_OVERLAY_HANDLES: ReadonlySet<string> = new Set<string>([
+  BROWSER_TIMELINE_OBSERVED,
+  USER_ORGANIZED_ITEM,
+  TAB_SESSION_ATTRIBUTION_INFERRED,
+  URL_ATTRIBUTION_INFERRED,
+  URL_IGNORED,
+]);
+
+const summarizeEventTypes = (events: readonly AcceptedEvent[], limit = 8): string => {
+  const counts = new Map<string, number>();
+  for (const event of events) {
+    counts.set(event.type, (counts.get(event.type) ?? 0) + 1);
+  }
+  const entries = [...counts.entries()].sort((left, right) => {
+    if (right[1] !== left[1]) return right[1] - left[1];
+    return left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+  });
+  const shown = entries
+    .slice(0, limit)
+    .map(([type, count]) => `${type}:${String(count)}`)
+    .join(',');
+  return entries.length > limit ? `${shown},...` : shown;
+};
 
 export interface CreateConnectionsMaterializerDeps {
   readonly vaultRoot: string;
@@ -743,6 +805,7 @@ export const createConnectionsMaterializer = (
   );
   const hnswSimilarityStore = createSimilarityHnswStore();
   let loadedHnswSimilarityStore: LoadedSimilarityHnswStore | null = null;
+  const pageEvidenceRecordCache = new Map<string, PageEvidenceRecord>();
   let pending = false;
   let running = false;
   let dirty = false;
@@ -750,7 +813,11 @@ export const createConnectionsMaterializer = (
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
   let successfulDrainCount = 0;
-  let lastDriftCheckAtMs = 0;
+  // Start the wall-clock cadence from materializer construction. Child
+  // reconcile processes are single-use; initializing this to epoch made
+  // every child immediately run a shadow full rebuild, doubling normal
+  // drain CPU despite DEFAULT_DRIFT_EVERY_MS being one hour.
+  let lastDriftCheckAtMs = Date.now();
   let lastDriftReport: DriftReport | null = null;
   let lastFrontier: Record<string, number> | undefined;
   // W1c — wall-clock of the last drain pass START. Reference for the
@@ -759,6 +826,9 @@ export const createConnectionsMaterializer = (
   // full rebuilds at the weak DRAIN_DEBOUNCE_MS cadence. 0 ⇒ the
   // first drain is never deferred.
   let lastDrainStartedAtMs = 0;
+  let projectionOverlayQueue: Promise<void> = Promise.resolve();
+  let progressOnlyDirty = false;
+  let urgentDrainRequested = false;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
   // (e.g. multiple tabs activating in sequence, peer-event imports)
   // into one drain. Cleared when a fresh requestDrain arrives within
@@ -846,7 +916,8 @@ export const createConnectionsMaterializer = (
       });
     }
     return [...byPair.values()].sort((left, right) => {
-      if (left.fromVisitKey !== right.fromVisitKey) return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+      if (left.fromVisitKey !== right.fromVisitKey)
+        return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
       if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
       return left.cosine - right.cosine;
     });
@@ -910,7 +981,9 @@ export const createConnectionsMaterializer = (
     const staleKnownVisitIds = input.fullRebuild
       ? new Set<string>()
       : new Set(
-          [...(await loadedHnswStore.knownLabels())].filter((visitId) => !activeVisitIds.has(visitId)),
+          [...(await loadedHnswStore.knownLabels())].filter(
+            (visitId) => !activeVisitIds.has(visitId),
+          ),
         );
     const edgeInvalidationVisitIds = new Set([...reconcileVisitIds, ...staleKnownVisitIds]);
 
@@ -989,7 +1062,8 @@ export const createConnectionsMaterializer = (
         if (left.fromVisitKey !== right.fromVisitKey) {
           return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
         }
-        if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
+        if (left.toVisitKey !== right.toVisitKey)
+          return left.toVisitKey < right.toVisitKey ? -1 : 1;
         return left.cosine - right.cosine;
       }),
       producedAt: Date.now(),
@@ -1095,6 +1169,305 @@ export const createConnectionsMaterializer = (
         };
       }),
     }));
+  };
+
+  const timelineEntryVisitKey = (entry: TimelineEntryWithDimensions): string =>
+    stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+
+  const pendingEventIsSearchTimelineVisit = (event: AcceptedEvent): boolean =>
+    event.type === BROWSER_TIMELINE_OBSERVED &&
+    isBrowserTimelineObservedPayload(event.payload) &&
+    detectSearchUrl(event.payload.canonicalUrl ?? event.payload.url) !== null;
+
+  const isScopedTimelineDeltaEvent = (event: AcceptedEvent): boolean =>
+    event.type === BROWSER_TIMELINE_OBSERVED ||
+    event.type === NAVIGATION_COMMITTED ||
+    event.type === ENGAGEMENT_SESSION_AGGREGATED ||
+    event.type === URL_ATTRIBUTION_INFERRED ||
+    event.type === TAB_SESSION_ATTRIBUTION_INFERRED ||
+    CONTENT_LANE_ONLY_HANDLES.has(event.type) ||
+    PROJECTION_ONLY_HANDLES.has(event.type);
+
+  const collectScopedNavigationEventsForDelta = (
+    pendingEvents: readonly AcceptedEvent[],
+    allEvents: readonly AcceptedEvent[],
+    scopedVisitKeys: Set<string>,
+  ): AcceptedEvent[] => {
+    const visitIds = new Set<string>();
+    for (const event of pendingEvents) {
+      if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
+        continue;
+      }
+      const canonicalUrl = normalizeVisitUrl(event.payload.canonicalUrl);
+      scopedVisitKeys.add(canonicalUrl);
+      visitIds.add(event.payload.visitId);
+      for (const relatedVisitId of [event.payload.previousVisitId, event.payload.openerVisitId]) {
+        if (relatedVisitId === null) continue;
+        visitIds.add(relatedVisitId);
+        scopedVisitKeys.add(relatedVisitId);
+      }
+    }
+    if (visitIds.size === 0) return [];
+    const out: AcceptedEvent[] = [];
+    const seen = new Set<string>();
+    for (const event of allEvents) {
+      if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
+        continue;
+      }
+      if (!visitIds.has(event.payload.visitId)) continue;
+      const sig = `${event.dot.replicaId}:${String(event.dot.seq)}`;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      scopedVisitKeys.add(normalizeVisitUrl(event.payload.canonicalUrl));
+      out.push(event);
+    }
+    return out;
+  };
+
+  const visitKeyFromTimelineNodeIdForDelta = (nodeId: string): string | null => {
+    const prefix = 'timeline-visit:';
+    return nodeId.startsWith(prefix) && nodeId.length > prefix.length
+      ? nodeId.slice(prefix.length)
+      : null;
+  };
+
+  const addSimilarityAffectedVisitKeys = (input: {
+    readonly seedVisitKeys: ReadonlySet<string>;
+    readonly scopedVisitKeys: Set<string>;
+    readonly requiredTimelineVisitKeys: Set<string>;
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly visitSimilarity: VisitSimilarityRevision;
+  }): void => {
+    const considerPair = (fromVisitKey: string, toVisitKey: string): void => {
+      if (!input.seedVisitKeys.has(fromVisitKey) && !input.seedVisitKeys.has(toVisitKey)) return;
+      input.scopedVisitKeys.add(fromVisitKey);
+      input.requiredTimelineVisitKeys.add(fromVisitKey);
+      input.requiredTimelineVisitKeys.add(toVisitKey);
+    };
+    for (const edge of input.previousSnapshot.edges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const fromVisitKey = visitKeyFromTimelineNodeIdForDelta(edge.fromNodeId);
+      const toVisitKey = visitKeyFromTimelineNodeIdForDelta(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      considerPair(fromVisitKey, toVisitKey);
+    }
+    for (const edge of input.visitSimilarity.edges) {
+      considerPair(edge.fromVisitKey, edge.toVisitKey);
+    }
+  };
+
+  const filterTimelineDaysForScopedDelta = (
+    days: readonly TimelineDayProjectionWithDimensions[],
+    input: {
+      readonly requiredTimelineVisitKeys: ReadonlySet<string>;
+      readonly tabSessionIds: ReadonlySet<string>;
+      readonly includeTabSessionHistory: boolean;
+    },
+  ): readonly TimelineDayProjectionWithDimensions[] => {
+    const out: TimelineDayProjectionWithDimensions[] = [];
+    for (const day of days) {
+      const entries = day.entries.filter((entry) => {
+        if (input.requiredTimelineVisitKeys.has(timelineEntryVisitKey(entry))) return true;
+        // A tab-session id on a fresh timeline observation identifies the
+        // tab-session row to refresh; it is not a request to rebuild every
+        // historical URL observed in that tab. Only true tab-session
+        // attribution changes need the full session history because they
+        // can affect fallback workstream edges for prior visit instances.
+        return (
+          input.includeTabSessionHistory &&
+          entry.tabSessionId !== undefined &&
+          input.tabSessionIds.has(entry.tabSessionId)
+        );
+      });
+      if (entries.length > 0) out.push({ ...day, entries });
+    }
+    return out;
+  };
+
+  const visitInstanceScopesFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+    input: {
+      readonly visitKeys: ReadonlySet<string>;
+      readonly tabSessionIds: ReadonlySet<string>;
+    },
+  ): readonly Scope[] => {
+    const scopes: Scope[] = [];
+    const prefix = 'visit-instance:';
+    for (const node of snapshot.nodes) {
+      if (node.kind !== 'visit-instance' || !node.id.startsWith(prefix)) continue;
+      const timelineVisitId = node.metadata['timelineVisitId'];
+      const visitKey =
+        typeof timelineVisitId === 'string'
+          ? visitKeyFromTimelineNodeIdForDelta(timelineVisitId)
+          : null;
+      const tabSessionId = node.metadata['tabSessionId'];
+      if (
+        (visitKey !== null && input.visitKeys.has(visitKey)) ||
+        (typeof tabSessionId === 'string' && input.tabSessionIds.has(tabSessionId))
+      ) {
+        scopes.push({ kind: 'visit', id: node.id.slice(prefix.length) });
+      }
+    }
+    return scopes;
+  };
+
+  const scopesOwnGraphRows = (
+    snapshot: ConnectionsSnapshot,
+    scopes: readonly Scope[],
+  ): boolean => {
+    for (const scope of scopes) {
+      const scoped = recomputeScope(scope, snapshot);
+      if (scoped.nodes.length > 0 || scoped.edges.length > 0) return true;
+    }
+    return false;
+  };
+
+  const newestNavigationCommittedEvents = (
+    events: readonly AcceptedEvent[],
+    limit: number,
+  ): AcceptedEvent[] =>
+    events
+      .filter((event) => event.type === NAVIGATION_COMMITTED)
+      .sort((left, right) => {
+        if (left.acceptedAtMs !== right.acceptedAtMs) return right.acceptedAtMs - left.acceptedAtMs;
+        return right.dot.seq - left.dot.seq;
+      })
+      .slice(0, limit)
+      .sort((left, right) => {
+        if (left.acceptedAtMs !== right.acceptedAtMs) return left.acceptedAtMs - right.acceptedAtMs;
+        return left.dot.seq - right.dot.seq;
+      });
+
+  const timelineObservedEventFromNavigation = (event: AcceptedEvent): AcceptedEvent | null => {
+    if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
+      return null;
+    }
+    const observedAt = new Date(event.payload.commitTimestamp);
+    if (!Number.isFinite(observedAt.getTime())) return null;
+    const payload: BrowserTimelineObservedPayload = {
+      eventId: `navigation-foreground:${event.payload.visitId}`,
+      observedAt: observedAt.toISOString(),
+      url: event.payload.url,
+      canonicalUrl: event.payload.canonicalUrl,
+      provider: 'generic',
+      transition: 'updated',
+      tabIdHash: event.payload.tabSessionIdHash,
+      windowIdHash: event.payload.windowSessionIdHash,
+      tabSessionId: event.payload.tabSessionIdHash,
+      payloadVersion: 1,
+    };
+    return {
+      clientEventId: `${event.clientEventId}:foreground-timeline`,
+      dot: event.dot,
+      deps: event.deps,
+      aggregateId: `browser.timeline.observed:${event.payload.tabSessionIdHash}:${event.payload.canonicalUrl}`,
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload,
+      acceptedAtMs: event.acceptedAtMs,
+      ...(event.hlc === undefined ? {} : { hlc: event.hlc }),
+    };
+  };
+
+  const writeForegroundNavigationDelta = async (input: {
+    readonly pendingEventsForDrain: readonly AcceptedEvent[];
+    readonly merged: readonly AcceptedEvent[];
+    readonly existingProgress: MaterializerProgress | null;
+    readonly timelineDays?: readonly TimelineDayProjectionWithDimensions[];
+    readonly tabSessionProjection?: ReturnType<typeof tabSessionProjectionFromAccumulator>;
+    readonly urlProjection?: ReturnType<typeof urlProjectionFromAccumulator>;
+    readonly mark: (label: string) => void;
+  }): Promise<boolean> => {
+    const replaceScopeRows = deps.store.replaceScopeRows;
+    if (
+      replaceScopeRows === undefined ||
+      input.existingProgress === null ||
+      input.existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
+      input.pendingEventsForDrain.length === 0
+    ) {
+      return false;
+    }
+
+    // Foreground UI only needs the newest committed navigation chain to
+    // stop showing "direct visit" after an HN click. The full drain below
+    // still consumes the complete pending set and advances progress.
+    const foregroundNavigationEvents = newestNavigationCommittedEvents(
+      input.pendingEventsForDrain,
+      4,
+    );
+    if (foregroundNavigationEvents.length === 0) return false;
+
+    const scopedVisitKeys = new Set<string>();
+    const currentVisitKeys = new Set<string>();
+    const scopedNavigationEvents = collectScopedNavigationEventsForDelta(
+      foregroundNavigationEvents,
+      input.merged,
+      scopedVisitKeys,
+    );
+    if (scopedNavigationEvents.length === 0) return false;
+
+    const tabSessionIds = new Set<string>();
+    for (const event of foregroundNavigationEvents) {
+      if (!isNavigationCommittedPayload(event.payload)) continue;
+      currentVisitKeys.add(normalizeVisitUrl(event.payload.canonicalUrl));
+      const sessionId = event.payload.tabSessionIdHash;
+      if (typeof sessionId === 'string' && sessionId.length > 0) tabSessionIds.add(sessionId);
+    }
+    const requiredTimelineVisitKeys = new Set(scopedVisitKeys);
+    const scopedTimelineDays =
+      input.timelineDays === undefined
+        ? buildTimelineDays(
+            scopedNavigationEvents.flatMap((event) => {
+              const timelineEvent = timelineObservedEventFromNavigation(event);
+              return timelineEvent === null ? [] : [timelineEvent];
+            }),
+          )
+        : filterTimelineDaysForScopedDelta(input.timelineDays, {
+            requiredTimelineVisitKeys,
+            tabSessionIds,
+            includeTabSessionHistory: false,
+          });
+    const tabSessionProjection =
+      input.tabSessionProjection ??
+      tabSessionProjectionFromAccumulator(createEmptyTabSessionProjectionAccumulator());
+    const scopedSnapshot = buildConnectionsSnapshot({
+      events: scopedNavigationEvents,
+      threads: [],
+      workstreams: [],
+      dispatches: [],
+      queueItems: [],
+      reminders: [],
+      codingSessions: [],
+      timelineDays: scopedTimelineDays,
+      tabSessionProjection,
+      ...(input.urlProjection === undefined ? {} : { urlProjection: input.urlProjection }),
+    });
+    const rowLocalScopes = dedupeScopeList([
+      ...[...currentVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
+      ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
+      ...visitInstanceScopesFromSnapshot(scopedSnapshot, {
+        visitKeys: currentVisitKeys,
+        tabSessionIds,
+      }),
+    ]);
+    if (rowLocalScopes.length === 0) return false;
+    await replaceScopeRows({
+      scopes: rowLocalScopes,
+      nodes: scopedSnapshot.nodes,
+      edges: scopedSnapshot.edges,
+      // Do not mark the dots applied here. This is a UI-latency overlay;
+      // the deterministic full/scoped drain below advances progress.
+      progress: input.existingProgress,
+      metadata: {
+        ...(scopedSnapshot.urlProjection === undefined
+          ? {}
+          : { urlProjection: scopedSnapshot.urlProjection }),
+        tabSessionProjection: scopedSnapshot.tabSessionProjection,
+      },
+    });
+    input.mark(
+      `foregroundNavigationDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scopedSnapshot.nodes.length)} edges=${String(scopedSnapshot.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEvents.length)}`,
+    );
+    return true;
   };
 
   const maxAcceptedAtMs = (events: readonly AcceptedEvent[]): number =>
@@ -1312,8 +1685,7 @@ export const createConnectionsMaterializer = (
     mark(`w6 keys=${String(buildKeys.length)}`);
     const merged = await deps.eventLog.readMerged();
     const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-    const effectiveLastFrontier =
-      lastFrontier ?? existingProgress?.appliedFrontier ?? undefined;
+    const effectiveLastFrontier = lastFrontier ?? existingProgress?.appliedFrontier ?? undefined;
     const pendingEventsForDrain =
       effectiveLastFrontier === undefined
         ? merged
@@ -1321,6 +1693,12 @@ export const createConnectionsMaterializer = (
             (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
           );
     mark(`readMerged events=${String(merged.length)}`);
+    await writeForegroundNavigationDelta({
+      pendingEventsForDrain,
+      merged,
+      existingProgress,
+      mark,
+    });
     // Stage 5.2 W2b/c wiring — first build (or post-catchUp reset)
     // seeds the projection accumulators from the full event log; same
     // cost as the legacy projectUrls(merged) + projectTabSessions(merged)
@@ -1371,6 +1749,8 @@ export const createConnectionsMaterializer = (
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
     mark('enrichTimelineDays');
     await yieldToEventLoop();
+    const dirtyScopes = invalidationKeysToScopes(buildKeys);
+    const previousSnapshotForRanker = await deps.store.readCurrent();
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
     // corpus/focus). If the same set of visits has already been
@@ -1383,15 +1763,17 @@ export const createConnectionsMaterializer = (
     // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
     // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
     const similarityConfig: EffectiveVisitSimilarityConfig = resolveVisitSimilarityConfig();
-    const similarityEligibleCount = similarityEntries.filter(
+    const activeSimilarityEntries = similarityEntries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= similarityConfig.engagementGateMs,
-    ).length;
+    );
+    const similarityEligibleVisitIds = new Set(
+      activeSimilarityEntries.map(visitKeyForVisitEntry),
+    );
+    const similarityEligibleCount = similarityEligibleVisitIds.size;
     const similarityPairBudget = Math.max(
       0,
       (similarityEligibleCount * (similarityEligibleCount - 1)) / 2,
     );
-    const dirtyScopes = invalidationKeysToScopes(buildKeys);
-    const previousSnapshotForRanker = await deps.store.readCurrent();
     const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
     const loadedHnswStoreForGate = persistentHnswSimilarityMode
       ? await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim)
@@ -1399,38 +1781,201 @@ export const createConnectionsMaterializer = (
     if (loadedHnswStoreForGate !== null) loadedHnswSimilarityStore = loadedHnswStoreForGate;
     const hnswStoreVisitCount = loadedHnswStoreForGate?.elementCount() ?? 0;
     const hnswFullRebuild =
+      persistentHnswSimilarityMode &&
+      (existingProgress === null ||
+        existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
+        hnswStoreVisitCount === 0 ||
+        (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
+        hnswStoreCountDriftRequiresFullRebuild(hnswStoreVisitCount, similarityEligibleCount));
+    const knownHnswVisitIds = persistentHnswSimilarityMode
+      ? (await loadedHnswStoreForGate?.knownLabels()) ?? new Set<string>()
+      : new Set<string>();
+    const fullPageEvidenceEnsure =
+      previousSnapshotForRanker === null ||
       existingProgress === null ||
-      existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
-      hnswStoreVisitCount === 0 ||
-      (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
-      hnswStoreCountDriftRequiresFullRebuild(hnswStoreVisitCount, similarityEligibleCount);
-    const pageEvidenceByCanonicalUrl = await ensurePageEvidenceForTimelineEntries(
-      deps.vaultRoot,
-      similarityEntries,
+      existingProgress.materializerVersion !== MATERIALIZER_VERSION;
+    const pendingTimelineVisitIds = new Set(
+      pendingEventsForDrain
+        .filter(
+          (event) =>
+            event.type === BROWSER_TIMELINE_OBSERVED &&
+            isBrowserTimelineObservedPayload(event.payload),
+        )
+        .map((event) =>
+          normalizeVisitUrl(
+            (event.payload as BrowserTimelineObservedPayload).canonicalUrl ??
+              (event.payload as BrowserTimelineObservedPayload).url,
+          ),
+        )
+        .filter((visitKey) => visitKey.length > 0),
     );
-    mark(`pageEvidence.ensure records=${String(pageEvidenceByCanonicalUrl.size)}`);
-    const pageEvidenceVectorsByVectorId = await readPageEvidenceVectorMap(
-      deps.vaultRoot,
-      pageEvidenceByCanonicalUrl.values(),
-    );
-    mark(`pageEvidence.vectorMapRead vectors=${String(pageEvidenceVectorsByVectorId.size)}`);
-    const pageContentChunksByCanonicalUrl = await readPageContentChunksForCanonicalUrls(
-      deps.vaultRoot,
-      [...pageEvidenceByCanonicalUrl.keys()],
-    );
+    const hnswTouchedVisitIds = persistentHnswSimilarityMode
+      ? new Set(
+          [...similarityEligibleVisitIds].filter((visitId) => !knownHnswVisitIds.has(visitId)),
+        )
+      : new Set<string>();
+    const hnswReconcileVisitIds = persistentHnswSimilarityMode
+      ? new Set(
+          [...pendingTimelineVisitIds].filter((visitId) =>
+            similarityEligibleVisitIds.has(visitId),
+          ),
+        )
+      : new Set<string>();
+    const hnswScopedDeltaVisitIds = persistentHnswSimilarityMode
+      ? new Set([...hnswTouchedVisitIds, ...hnswReconcileVisitIds])
+      : new Set<string>();
+    const entriesToEnsureForPageEvidence = fullPageEvidenceEnsure
+      ? similarityEntries
+      : similarityEntries.filter((entry) =>
+          pendingTimelineVisitIds.has(timelineEntryVisitKey(entry)),
+        );
+    const pendingHasSearchVisit = pendingEventsForDrain.some(pendingEventIsSearchTimelineVisit);
+    const canAttemptBoundedScopedDelta =
+      !fullPageEvidenceEnsure &&
+      persistentHnswSimilarityMode &&
+      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
+      process.env['SIDETRACK_CONNECTIONS_SCOPED_TIMELINE_DELTA'] !== '0' &&
+      previousSnapshotForRanker !== null &&
+      existingProgress !== null &&
+      existingProgress.materializerVersion === MATERIALIZER_VERSION &&
+      deps.store.replaceScopeRows !== undefined &&
+      pendingEventsForDrain.length > 0 &&
+      pendingEventsForDrain.every(isScopedTimelineDeltaEvent) &&
+      !pendingHasSearchVisit &&
+      !hnswFullRebuild;
+    const pageEvidenceByCanonicalUrlMutable = new Map<string, PageEvidenceRecord>();
+    const pageEvidenceByCanonicalUrl: ReadonlyMap<string, PageEvidenceRecord> =
+      pageEvidenceByCanonicalUrlMutable;
+    const entriesForVisitKeys = (
+      visitKeys: ReadonlySet<string>,
+    ): readonly TimelineEntryWithDimensions[] => {
+      if (visitKeys.size === 0) return [];
+      const seen = new Set<string>();
+      const out: TimelineEntryWithDimensions[] = [];
+      for (const entry of similarityEntries) {
+        const visitKey = timelineEntryVisitKey(entry);
+        if (!visitKeys.has(visitKey) || seen.has(visitKey)) continue;
+        seen.add(visitKey);
+        out.push(entry);
+      }
+      return out;
+    };
+    const loadPageEvidenceForRawUrls = async (rawUrls: readonly string[]): Promise<number> => {
+      const uniqueRawUrls: string[] = [];
+      const seen = new Set<string>();
+      for (const rawUrl of rawUrls) {
+        const canonicalUrl = canonicalizeEvidenceUrl(rawUrl);
+        if (seen.has(canonicalUrl)) continue;
+        seen.add(canonicalUrl);
+        uniqueRawUrls.push(rawUrl);
+      }
+      const urlsToRead = uniqueRawUrls.filter(
+        (rawUrl) => !pageEvidenceRecordCache.has(canonicalizeEvidenceUrl(rawUrl)),
+      );
+      for (const [canonicalUrl, record] of await readPageEvidenceMap(
+        deps.vaultRoot,
+        urlsToRead,
+      )) {
+        pageEvidenceRecordCache.set(canonicalUrl, record);
+      }
+      for (const rawUrl of uniqueRawUrls) {
+        const canonicalUrl = canonicalizeEvidenceUrl(rawUrl);
+        const record = pageEvidenceRecordCache.get(canonicalUrl);
+        if (record !== undefined) pageEvidenceByCanonicalUrlMutable.set(canonicalUrl, record);
+      }
+      return urlsToRead.length;
+    };
+    const loadPageEvidenceForEntries = async (
+      entries: readonly TimelineEntryWithDimensions[],
+    ): Promise<number> =>
+      loadPageEvidenceForRawUrls(entries.map((entry) => entry.canonicalUrl ?? entry.url));
+    if (fullPageEvidenceEnsure) {
+      const ensured = await ensurePageEvidenceForTimelineEntries(
+        deps.vaultRoot,
+        similarityEntries,
+      );
+      pageEvidenceRecordCache.clear();
+      for (const [canonicalUrl, record] of ensured) {
+        pageEvidenceRecordCache.set(canonicalUrl, record);
+        pageEvidenceByCanonicalUrlMutable.set(canonicalUrl, record);
+      }
+    } else {
+      const initialEvidenceEntries = canAttemptBoundedScopedDelta
+        ? entriesForVisitKeys(
+            new Set([
+              ...pendingTimelineVisitIds,
+              ...hnswTouchedVisitIds,
+              ...hnswReconcileVisitIds,
+              ...dirtyScopes
+                .filter((scope) => scope.kind === 'url')
+                .map((scope) => scope.id),
+            ]),
+          )
+        : similarityEntries;
+      await loadPageEvidenceForEntries(initialEvidenceEntries);
+      const ensured = await ensurePageEvidenceForTimelineEntries(
+        deps.vaultRoot,
+        entriesToEnsureForPageEvidence,
+        { rebuildManifestAfterWrite: false },
+      );
+      for (const [canonicalUrl, record] of ensured) {
+        pageEvidenceRecordCache.set(canonicalUrl, record);
+        pageEvidenceByCanonicalUrlMutable.set(canonicalUrl, record);
+      }
+    }
     mark(
-      `pageEvidence.chunkRead indexedChunkPages=${String(pageContentChunksByCanonicalUrl.size)}`,
+      `pageEvidence.ensure records=${String(pageEvidenceByCanonicalUrl.size)} ensured=${String(entriesToEnsureForPageEvidence.length)} full=${String(fullPageEvidenceEnsure)} bounded=${String(canAttemptBoundedScopedDelta)}`,
     );
+    let pageEvidenceVectorsByVectorId:
+      | Awaited<ReturnType<typeof readPageEvidenceVectorMap>>
+      | undefined;
+    let pageContentChunksByCanonicalUrl:
+      | Awaited<ReturnType<typeof readPageContentChunksForCanonicalUrls>>
+      | undefined;
+    const readPageEvidenceVectorsForDrain = async (): Promise<
+      Awaited<ReturnType<typeof readPageEvidenceVectorMap>>
+    > => {
+      if (pageEvidenceVectorsByVectorId === undefined) {
+        pageEvidenceVectorsByVectorId = await readPageEvidenceVectorMap(
+          deps.vaultRoot,
+          pageEvidenceByCanonicalUrl.values(),
+        );
+        mark(`pageEvidence.vectorMapRead vectors=${String(pageEvidenceVectorsByVectorId.size)}`);
+      }
+      return pageEvidenceVectorsByVectorId;
+    };
+    const readSimilarityEvidenceExtras = async (): Promise<{
+      readonly evidenceVectorsByVectorId: Awaited<ReturnType<typeof readPageEvidenceVectorMap>>;
+      readonly pageContentChunksByCanonicalUrl: Awaited<
+        ReturnType<typeof readPageContentChunksForCanonicalUrls>
+      >;
+    }> => {
+      const evidenceVectorsByVectorId = await readPageEvidenceVectorsForDrain();
+      if (pageContentChunksByCanonicalUrl === undefined) {
+        pageContentChunksByCanonicalUrl = await readPageContentChunksForCanonicalUrls(
+          deps.vaultRoot,
+          [...pageEvidenceByCanonicalUrl.keys()],
+        );
+        mark(
+          `pageEvidence.chunkRead indexedChunkPages=${String(
+            pageContentChunksByCanonicalUrl.size,
+          )}`,
+        );
+      }
+      return { evidenceVectorsByVectorId, pageContentChunksByCanonicalUrl };
+    };
+    if (!persistentHnswSimilarityMode) await readSimilarityEvidenceExtras();
     const expectedSimilarityRevisionId = computeVisitSimilarityRevisionId(similarityEntries, {
       ...similarityConfig,
       evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
-      pageContentChunksByCanonicalUrl,
+      ...(pageEvidenceVectorsByVectorId === undefined
+        ? {}
+        : { evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId }),
+      ...(pageContentChunksByCanonicalUrl === undefined ? {} : { pageContentChunksByCanonicalUrl }),
     });
-    const cachedSimilarityRevision = await readVisitSimilarityRevision(
-      deps.vaultRoot,
-      expectedSimilarityRevisionId,
-    );
+    const cachedSimilarityRevision = persistentHnswSimilarityMode
+      ? null
+      : await readVisitSimilarityRevision(deps.vaultRoot, expectedSimilarityRevisionId);
     mark(
       `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)}`,
     );
@@ -1452,29 +1997,8 @@ export const createConnectionsMaterializer = (
     let hotSimNewEmbedded: number | null = null;
     let visitSimilarity: VisitSimilarityRevision;
     if (persistentHnswSimilarityMode) {
-      const eligibleVisitIds = new Set(similarityEntries.map(visitKeyForVisitEntry));
-      const knownLabels = await loadedHnswStoreForGate?.knownLabels() ?? new Set<string>();
-      const touchedVisitIds = new Set(
-        [...eligibleVisitIds].filter((visitId) => !knownLabels.has(visitId)),
-      );
-      const pendingTimelineVisitIds = new Set(
-        pendingEventsForDrain
-          .filter(
-            (event) =>
-              event.type === BROWSER_TIMELINE_OBSERVED &&
-              isBrowserTimelineObservedPayload(event.payload),
-          )
-          .map((event) =>
-            normalizeVisitUrl(
-              (event.payload as BrowserTimelineObservedPayload).canonicalUrl ??
-                (event.payload as BrowserTimelineObservedPayload).url,
-            ),
-          )
-          .filter((visitId) => visitId.length > 0),
-      );
-      const reconcileVisitIds = new Set(
-        [...pendingTimelineVisitIds].filter((visitId) => eligibleVisitIds.has(visitId)),
-      );
+      const touchedVisitIds = hnswTouchedVisitIds;
+      const reconcileVisitIds = hnswReconcileVisitIds;
       usedHotSimilarityPath = true;
       hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
       mark(`buildVisitSimilarityHnsw.start entries=${String(similarityEntries.length)}`);
@@ -1499,12 +2023,17 @@ export const createConnectionsMaterializer = (
             err instanceof Error ? err.message : String(err)
           }`,
         );
-        visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
-          ...similarityConfig,
-          evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-          evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
-          pageContentChunksByCanonicalUrl,
-        });
+        const extras = await readSimilarityEvidenceExtras();
+        visitSimilarity = await buildVisitSimilarity(
+          similarityEntries,
+          deps.embed ?? defaultEmbed,
+          {
+            ...similarityConfig,
+            evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+            evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
+            pageContentChunksByCanonicalUrl: extras.pageContentChunksByCanonicalUrl,
+          },
+        );
       }
     } else if (cachedSimilarityRevision !== null) {
       // U2 — a valid cached revision means the W3 skip-gate id (a pure
@@ -1550,18 +2079,20 @@ export const createConnectionsMaterializer = (
               error instanceof Error ? error.message : String(error)
             }`,
           );
+          const extras = await readSimilarityEvidenceExtras();
           visitSimilarity = await buildVisitSimilarity(
             similarityEntries,
             deps.embed ?? defaultEmbed,
             {
               ...similarityConfig,
               evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-              evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
-              pageContentChunksByCanonicalUrl,
+              evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
+              pageContentChunksByCanonicalUrl: extras.pageContentChunksByCanonicalUrl,
             },
           );
         }
       }
+      const extras = await readSimilarityEvidenceExtras();
       visitSimilarity ??= buildVisitSimilarityIncremental({
         index: incrementalSimilarityIndex,
         entries: similarityEntries,
@@ -1570,8 +2101,8 @@ export const createConnectionsMaterializer = (
           threshold: VISIT_SIMILARITY_DEFAULT_THRESHOLD,
           topK: VISIT_SIMILARITY_DEFAULT_TOP_K,
           evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-          evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
-          pageContentChunksByCanonicalUrl,
+          evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
+          pageContentChunksByCanonicalUrl: extras.pageContentChunksByCanonicalUrl,
         },
       });
       mark(
@@ -1580,11 +2111,12 @@ export const createConnectionsMaterializer = (
     } else {
       // Legacy path with PR #141's resolved similarityConfig
       // (threshold / topK / engagementGateMs / lexical fallback).
+      const extras = await readSimilarityEvidenceExtras();
       visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
         ...similarityConfig,
         evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
-        evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
-        pageContentChunksByCanonicalUrl,
+        evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
+        pageContentChunksByCanonicalUrl: extras.pageContentChunksByCanonicalUrl,
       });
       mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
@@ -1787,6 +2319,14 @@ export const createConnectionsMaterializer = (
         runtimeMs: Date.now() - topicBuildStartedAtMs,
       },
     };
+    const canPreserveThreadQuoteEdges =
+      previousSnapshotForRanker !== null &&
+      existingProgress !== null &&
+      existingProgress.materializerVersion === MATERIALIZER_VERSION &&
+      pendingEventsForDrain.every((event) => event.type !== CAPTURE_RECORDED);
+    const preservedThreadQuoteEdges = canPreserveThreadQuoteEdges
+      ? previousSnapshotForRanker.edges.filter((edge) => edge.kind === 'thread_quotes_thread')
+      : undefined;
     // W2 — SERVED TOPIC PRODUCER selection (feature-flagged, instant
     // rollback via SIDETRACK_TOPIC_PRODUCER + restart):
     //  - 'leiden-cpm'    = G: the W0c-stable winner that beats the
@@ -1956,33 +2496,217 @@ export const createConnectionsMaterializer = (
       visitSimilarity,
       topicRevision: servedTopicRevision,
       pageEvidenceByCanonicalUrl,
-      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+      ...(pageEvidenceVectorsByVectorId === undefined
+        ? {}
+        : { evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId }),
       engagementClassRevision,
+      ...(preservedThreadQuoteEdges === undefined ? {} : { preservedThreadQuoteEdges }),
     };
     mark('projectionAccumulators.derive');
     await yieldToEventLoop();
-    const baseSnapshot = buildConnectionsSnapshot(input);
-    incrementalGraphView.seed(baseSnapshot);
-    if (incrementalGraphPlan.pendingEventCount > 0) {
-      mark(
-        `incrementalGraph plan rowLocal=${String(incrementalGraphPlan.rowLocalEventCount)} fullReducer=${String(incrementalGraphPlan.fullReducerEventCount)} ready=${String(incrementalGraphPlan.canUseRowLocalOnly)}`,
-      );
-    }
-    mark(
-      `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
-    );
-    const scopeIncrementalEnabled =
-      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
-      process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
-      deps.store.replaceScopeRows !== undefined &&
-      previousSnapshotForRanker !== null;
-    let wroteScopeIncremental = false;
     const dirtyScopeWrites =
       process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       previousSnapshotForRanker !== null &&
       dirtyScopes.length > 0
         ? new Set(dirtyScopes)
         : undefined;
+    let scopedTimelineDeltaApplied = false;
+    let baseSnapshot: ConnectionsSnapshot =
+      previousSnapshotForRanker ?? buildConnectionsSnapshot(input);
+    const baseSnapshotPrebuilt = previousSnapshotForRanker === null;
+    const previousSnapshotForScopedDelta = previousSnapshotForRanker;
+    const replaceScopeRowsForScopedDelta = deps.store.replaceScopeRows;
+    let scopedTimelineDeltaSkipDetail = 'gate';
+    const scopedTimelineDeltaGate = {
+      incrementalScopes: process.env[INCREMENTAL_SCOPES_ENV] !== '0',
+      feature: process.env['SIDETRACK_CONNECTIONS_SCOPED_TIMELINE_DELTA'] !== '0',
+      hasPrevious: previousSnapshotForRanker !== null,
+      hasProgress: existingProgress !== null,
+      version:
+        existingProgress !== null && existingProgress.materializerVersion === MATERIALIZER_VERSION,
+      replace: deps.store.replaceScopeRows !== undefined,
+      pending: pendingEventsForDrain.length > 0,
+      allScopedEvents: pendingEventsForDrain.every(isScopedTimelineDeltaEvent),
+      topicSame: servedTopicRevision === previousTopicRevision,
+      hnswNotFull: !hnswFullRebuild,
+    };
+    if (
+      scopedTimelineDeltaGate.incrementalScopes &&
+      scopedTimelineDeltaGate.feature &&
+      previousSnapshotForScopedDelta !== null &&
+      scopedTimelineDeltaGate.hasProgress &&
+      scopedTimelineDeltaGate.version &&
+      replaceScopeRowsForScopedDelta !== undefined &&
+      scopedTimelineDeltaGate.pending &&
+      scopedTimelineDeltaGate.allScopedEvents &&
+      scopedTimelineDeltaGate.topicSame &&
+      scopedTimelineDeltaGate.hnswNotFull
+    ) {
+      const scopedVisitKeys = new Set(
+        dirtyScopes.filter((scope) => scope.kind === 'url').map((scope) => scope.id),
+      );
+      const tabSessionIds = new Set(
+        dirtyScopes.filter((scope) => scope.kind === 'tab-session').map((scope) => scope.id),
+      );
+      const scopedNavigationEvents = collectScopedNavigationEventsForDelta(
+        pendingEventsForDrain,
+        merged,
+        scopedVisitKeys,
+      );
+      for (const event of pendingEventsForDrain) {
+        if (
+          event.type === BROWSER_TIMELINE_OBSERVED &&
+          isBrowserTimelineObservedPayload(event.payload)
+        ) {
+          scopedVisitKeys.add(normalizeVisitUrl(event.payload.canonicalUrl ?? event.payload.url));
+          if (event.payload.tabSessionId !== undefined) {
+            tabSessionIds.add(event.payload.tabSessionId);
+          }
+        }
+      }
+      for (const visitId of hnswScopedDeltaVisitIds) scopedVisitKeys.add(visitId);
+      const requiredTimelineVisitKeys = new Set(scopedVisitKeys);
+      addSimilarityAffectedVisitKeys({
+        seedVisitKeys: scopedVisitKeys,
+        scopedVisitKeys,
+        requiredTimelineVisitKeys,
+        previousSnapshot: previousSnapshotForScopedDelta,
+        visitSimilarity,
+      });
+      const scopedTimelineDays = filterTimelineDaysForScopedDelta(timelineDays, {
+        requiredTimelineVisitKeys,
+        tabSessionIds,
+        includeTabSessionHistory: pendingEventsForDrain.some(
+          (event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED,
+        ),
+      });
+      if (
+        (scopedTimelineDays.length > 0 || scopedNavigationEvents.length > 0) &&
+        !pendingHasSearchVisit
+      ) {
+        if (canAttemptBoundedScopedDelta && scopedTimelineDays.length > 0) {
+          const beforeScopedEvidenceRecords = pageEvidenceByCanonicalUrl.size;
+          const readCount = await loadPageEvidenceForEntries(
+            scopedTimelineDays.flatMap((day) => day.entries),
+          );
+          if (readCount > 0 || pageEvidenceByCanonicalUrl.size !== beforeScopedEvidenceRecords) {
+            mark(
+              `pageEvidence.scopedRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
+            );
+          }
+        }
+        const {
+          preservedThreadQuoteEdges: _preservedThreadQuoteEdges,
+          topicRevision: _topicRevision,
+          closestVisitRanker: _closestVisitRanker,
+          crossReplica: _crossReplica,
+          ...scopedInputBase
+        } = input;
+        void _preservedThreadQuoteEdges;
+        void _topicRevision;
+        void _closestVisitRanker;
+        void _crossReplica;
+        const scopedSnapshot = buildConnectionsSnapshot({
+          ...scopedInputBase,
+          events: scopedNavigationEvents,
+          workstreams: [],
+          dispatches: [],
+          queueItems: [],
+          reminders: [],
+          codingSessions: [],
+          timelineDays: scopedTimelineDays,
+        });
+        const rowLocalScopes = dedupeScopeList([
+          ...[...scopedVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
+          ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
+          ...visitInstanceScopesFromSnapshot(scopedSnapshot, {
+            visitKeys: scopedVisitKeys,
+            tabSessionIds,
+          }),
+        ]);
+        const scoped = unionScopeOutputs(
+          rowLocalScopes.map((scope) => recomputeScope(scope, scopedSnapshot)),
+        );
+        const progress = progressForSnapshot(merged, scopedSnapshot);
+        await replaceScopeRowsForScopedDelta({
+          scopes: rowLocalScopes,
+          nodes: scoped.nodes,
+          edges: scoped.edges,
+          progress,
+          metadata: {
+            ...(scopedSnapshot.urlProjection === undefined
+              ? {}
+              : { urlProjection: scopedSnapshot.urlProjection }),
+            tabSessionProjection: scopedSnapshot.tabSessionProjection,
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? scopedSnapshot;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        mark(
+          `replaceScopeRows scopedTimelineDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEvents.length)}`,
+        );
+      } else if (
+        scopedTimelineDays.length === 0 &&
+        dirtyScopes.length > 0 &&
+        !scopesOwnGraphRows(previousSnapshotForScopedDelta, dirtyScopes)
+      ) {
+        const progress = progressForSnapshot(merged, previousSnapshotForScopedDelta);
+        await replaceScopeRowsForScopedDelta({
+          scopes: dirtyScopes,
+          nodes: [],
+          edges: [],
+          progress,
+          metadata: {
+            urlProjection: serializeUrlProjection(urlProjection),
+            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        mark(
+          `replaceScopeRows scopedTimelineDeltaMetadataOnly scopes=${String(dirtyScopes.length)} entries=0`,
+        );
+      } else {
+        scopedTimelineDeltaSkipDetail =
+          scopedTimelineDays.length === 0
+            ? 'no-timeline-entries-with-owned-rows'
+            : pendingHasSearchVisit
+              ? 'pending-search-visit'
+              : 'unknown-inner';
+      }
+    }
+    if (!scopedTimelineDeltaApplied) {
+      mark(
+        `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
+      );
+      if (canAttemptBoundedScopedDelta) {
+        const readCount = await loadPageEvidenceForEntries(similarityEntries);
+        mark(
+          `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
+        );
+      }
+      if (!baseSnapshotPrebuilt) baseSnapshot = buildConnectionsSnapshot(input);
+      incrementalGraphView.seed(baseSnapshot);
+      if (incrementalGraphPlan.pendingEventCount > 0) {
+        mark(
+          `incrementalGraph plan rowLocal=${String(incrementalGraphPlan.rowLocalEventCount)} fullReducer=${String(incrementalGraphPlan.fullReducerEventCount)} ready=${String(incrementalGraphPlan.canUseRowLocalOnly)}`,
+        );
+      }
+      mark(
+        `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
+      );
+    }
+    const scopeIncrementalEnabled =
+      !scopedTimelineDeltaApplied &&
+      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
+      process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
+      deps.store.replaceScopeRows !== undefined &&
+      previousSnapshotForRanker !== null;
+    let wroteScopeIncremental = scopedTimelineDeltaApplied;
     // Stage 5.2 W3b — publish the base snapshot immediately so HTTP
     // routes (and the side panel that reads them) have a valid current
     // snapshot to serve. The ranker-augmented build below adds
@@ -1999,6 +2723,12 @@ export const createConnectionsMaterializer = (
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
+          metadata: {
+            ...(baseSnapshot.urlProjection === undefined
+              ? {}
+              : { urlProjection: baseSnapshot.urlProjection }),
+            tabSessionProjection: baseSnapshot.tabSessionProjection,
+          },
         });
         lastFrontier = progress.appliedFrontier;
         wroteScopeIncremental = true;
@@ -2016,7 +2746,9 @@ export const createConnectionsMaterializer = (
       merged,
       snapshot: baseSnapshot,
       pageEvidenceByCanonicalUrl,
-      evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId,
+      ...(pageEvidenceVectorsByVectorId === undefined
+        ? {}
+        : { evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId }),
     });
     mark('rankerRetrainer');
     // Track the snapshot we ultimately wrote so diagnostics see the
@@ -2039,13 +2771,29 @@ export const createConnectionsMaterializer = (
       // Stage 5.2 W3b/c — gate the ranker-augmented build behind
       // SIDETRACK_SKIP_RANKER_SNAPSHOT for HTTP-latency-sensitive
       // consumers (recorder).
-      if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] !== '1') {
+      const deferRankerForScopedTimelineDelta =
+        scopedTimelineDeltaApplied &&
+        deps.closestVisitRankerLoader === undefined &&
+        process.env['SIDETRACK_CONNECTIONS_RANKER_ON_SCOPED_DELTA'] !== '1';
+      if (deferRankerForScopedTimelineDelta) {
+        mark('ranker-augmented skipped (scopedTimelineDelta)');
+        rankerAugmentation = rankerAugmentationCounters({
+          status: 'skipped',
+          reason: 'scopedTimelineDelta',
+          activeRevisionId: null,
+          ...schemaDiagnosticsFor(null),
+          modelFreshness: 'unknown',
+          baseSnapshot,
+          finalSnapshot,
+        });
+      } else if (process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] !== '1') {
         closestVisitRanker = await closestVisitRankerLoader();
         mark(
           `loadClosestVisitRanker status=${closestVisitRanker.status} revision=${closestVisitRanker.activeRevisionId ?? 'none'}`,
         );
         if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
+          const rankerEvidenceVectorsByVectorId = await readPageEvidenceVectorsForDrain();
           const previousClosestVisitEdges =
             previousSnapshotForRanker?.edges.filter((edge) => edge.kind === 'closest_visit') ?? [];
           const currentSnapshot =
@@ -2083,6 +2831,7 @@ export const createConnectionsMaterializer = (
             finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRankerFrontier(
               {
                 ...input,
+                evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId,
                 closestVisitRanker: closestVisitRanker.ranker,
                 rankerFrontier,
                 inputFrontier: vectorFromEvents(merged),
@@ -2096,6 +2845,7 @@ export const createConnectionsMaterializer = (
             finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
               {
                 ...input,
+                evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId,
                 closestVisitRanker: closestVisitRanker.ranker,
               },
               baseSnapshot,
@@ -2388,11 +3138,16 @@ export const createConnectionsMaterializer = (
     while (dirty) {
       const passStartedAtMs = Date.now();
       lastDrainStartedAtMs = passStartedAtMs;
+      urgentDrainRequested = false;
       dirty = false;
       try {
-        if (shouldUseWorker()) {
+        if (progressOnlyDirty && (await tryAdvanceNoGraphBacklog())) {
+          progressOnlyDirty = false;
+        } else if (shouldUseWorker()) {
+          progressOnlyDirty = false;
           await drainViaWorker();
         } else {
+          progressOnlyDirty = false;
           await buildAndWrite();
         }
         lastSuccessAt = new Date().toISOString();
@@ -2413,7 +3168,9 @@ export const createConnectionsMaterializer = (
       // + this gap collapse into the next single pass. Fire-then-
       // awaitIdle callers never hit this (dirty is false post-pass).
       if (dirty) {
-        const remainingMs = resolveDrainMinIntervalMs() - (Date.now() - passStartedAtMs);
+        const remainingMs = urgentDrainRequested
+          ? 0
+          : resolveDrainMinIntervalMs() - (Date.now() - passStartedAtMs);
         if (remainingMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, remainingMs));
         }
@@ -2445,6 +3202,10 @@ export const createConnectionsMaterializer = (
   // The first drain (lastDrainStartedAtMs===0) is never deferred.
   const startDrainWhenIntervalElapsed = (): void => {
     if (!dirty || running) return;
+    if (urgentDrainRequested) {
+      startDrain();
+      return;
+    }
     const minIntervalMs = resolveDrainMinIntervalMs();
     const sinceLastStartMs = Date.now() - lastDrainStartedAtMs;
     if (sinceLastStartMs < minIntervalMs) {
@@ -2459,9 +3220,120 @@ export const createConnectionsMaterializer = (
     startDrain();
   };
 
-  const requestDrain = (): void => {
+  const advanceProgressForContentOnlyEvent = (event: AcceptedEvent): void => {
+    const writeProgress = deps.store.writeMaterializerProgress;
+    if (writeProgress === undefined) return;
+    void (async (): Promise<void> => {
+      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      if (running || dirty) return;
+      if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
+      if (intervalsContainDot(progress.appliedDotIntervals, event.dot)) return;
+      const appliedDotIntervals = addDotsToIntervals(progress.appliedDotIntervals, [event.dot]);
+      const nextProgress: MaterializerProgress = {
+        ...progress,
+        appliedDotIntervals,
+        appliedFrontier: frontierFromIntervals(appliedDotIntervals),
+      };
+      if (running || dirty) return;
+      await writeProgress(nextProgress);
+      lastFrontier = nextProgress.appliedFrontier;
+      lastSuccessAt = new Date().toISOString();
+      lastError = null;
+    })().catch((error: unknown) => {
+      console.warn(
+        `[connections] content-only progress advance failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+
+  const applyProjectionOverlayWithRetry = async (
+    applyProjectionEventOverlay: (event: AcceptedEvent) => Promise<string | null>,
+    event: AcceptedEvent,
+  ): Promise<string | null> => {
+    let retryIndex = 0;
+    while (true) {
+      try {
+        return await applyProjectionEventOverlay(event);
+      } catch (error) {
+        const delay = PROJECTION_OVERLAY_RETRY_DELAYS_MS[retryIndex];
+        if (!isSqliteLockError(error) || delay === undefined) {
+          throw error;
+        }
+        retryIndex += 1;
+        await delayMs(delay);
+      }
+    }
+  };
+
+  const tryAdvanceNoGraphEvents = async (
+    progress: MaterializerProgress,
+    ordered: readonly AcceptedEvent[],
+  ): Promise<boolean> => {
+    const writeProgress = deps.store.writeMaterializerProgress;
+    if (writeProgress === undefined) return false;
+    if (
+      !ordered.every(
+        (event) =>
+          CONTENT_LANE_ONLY_HANDLES.has(event.type) || PROJECTION_ONLY_HANDLES.has(event.type),
+      )
+    ) {
+      return false;
+    }
+    let snapshotRevisionId = progress.snapshotRevisionId;
+    const projectionEvents = ordered.filter((event) => PROJECTION_ONLY_HANDLES.has(event.type));
+    if (projectionEvents.length > 0) {
+      const applyProjectionEventOverlay = deps.store.applyProjectionEventOverlay;
+      if (applyProjectionEventOverlay === undefined) return false;
+      for (const event of projectionEvents) {
+        const nextRevisionId = await applyProjectionOverlayWithRetry(
+          applyProjectionEventOverlay,
+          event,
+        );
+        if (nextRevisionId === null) return false;
+        snapshotRevisionId = nextRevisionId;
+      }
+    }
+    const appliedDotIntervals = addDotsToIntervals(
+      progress.appliedDotIntervals,
+      ordered.map((event) => event.dot),
+    );
+    const nextProgress: MaterializerProgress = {
+      ...progress,
+      appliedDotIntervals,
+      appliedFrontier: frontierFromIntervals(appliedDotIntervals),
+      snapshotRevisionId,
+    };
+    await writeProgress(nextProgress);
+    lastFrontier = nextProgress.appliedFrontier;
+    lastBuildInvalidations = [];
+    lastSuccessAt = new Date().toISOString();
+    lastError = null;
+    return true;
+  };
+
+  const tryAdvanceNoGraphBacklog = async (): Promise<boolean> => {
+    const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return false;
+    lastFrontier = progress.appliedFrontier;
+    const merged = await deps.eventLog.readMerged();
+    const ordered = sortAcceptedEvents(
+      merged.filter((event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot)),
+    );
+    if (ordered.length === 0) {
+      lastBuildInvalidations = [];
+      lastSuccessAt = new Date().toISOString();
+      lastError = null;
+      return true;
+    }
+    return tryAdvanceNoGraphEvents(progress, ordered);
+  };
+
+  const requestDrain = (options: { readonly urgent?: boolean } = {}): void => {
     dirty = true;
     pending = true;
+    if (options.urgent === true) urgentDrainRequested = true;
     if (running) return;
     // Failure cooldown gate — same pattern as timelineMaterializer.
     // catchUp bypasses this gate; onAccepted respects it.
@@ -2475,12 +3347,68 @@ export const createConnectionsMaterializer = (
     drainDebounceTimer = setTimeout(() => {
       drainDebounceTimer = null;
       startDrainWhenIntervalElapsed();
-    }, DRAIN_DEBOUNCE_MS);
+    }, urgentDrainRequested ? URGENT_DRAIN_DEBOUNCE_MS : DRAIN_DEBOUNCE_MS);
     drainDebounceTimer.unref();
   };
 
+  const scheduleProjectionOverlay = (event: AcceptedEvent): void => {
+    if (!PROJECTION_OVERLAY_HANDLES.has(event.type)) return;
+    const applyProjectionEventOverlay = deps.store.applyProjectionEventOverlay;
+    if (applyProjectionEventOverlay === undefined) return;
+    projectionOverlayQueue = projectionOverlayQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await applyProjectionOverlayWithRetry(applyProjectionEventOverlay, event);
+      })
+      .catch((error: unknown) => {
+        console.warn(
+          `[connections] projection overlay failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+  };
+
+  const scheduleForegroundNavigationOverlay = (event: AcceptedEvent): void => {
+    if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
+      return;
+    }
+    if (deps.store.replaceScopeRows === undefined) return;
+    void (async (): Promise<void> => {
+      const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      if (
+        existingProgress === null ||
+        existingProgress.materializerVersion !== MATERIALIZER_VERSION
+      ) {
+        return;
+      }
+      const merged = await deps.eventLog.readMerged();
+      const startedAtMs = Date.now();
+      await writeForegroundNavigationDelta({
+        pendingEventsForDrain: [event],
+        merged,
+        existingProgress,
+        mark: (label) => {
+          if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] !== '1') return;
+          console.warn(
+            `[connections-phase] accepted.${label} dt=${String(Date.now() - startedAtMs)}ms`,
+          );
+        },
+      });
+    })().catch((error: unknown) => {
+      console.warn(
+        `[connections] foreground navigation overlay failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+
   const onAccepted: Materializer['onAccepted'] = (event) => {
-    if (!HANDLES.has(event.type)) return;
+    const handlesGraph = HANDLES.has(event.type);
+    const handlesContentLaneOnly = CONTENT_LANE_ONLY_HANDLES.has(event.type);
+    const handlesProjectionOnly = PROJECTION_ONLY_HANDLES.has(event.type);
+    if (!handlesGraph && !handlesContentLaneOnly && !handlesProjectionOnly) return;
     // Stage 5.2 W7 — accumulate Group B events into the dirty-source
     // queue before scheduling a drain. Non-Group-B events return false
     // and don't touch the queue; Group B events mark their sourceUnitId
@@ -2489,6 +3417,22 @@ export const createConnectionsMaterializer = (
     // job. The buildAndWrite drain remains the byte-determinism reference;
     // this queue is purely for the off-path content reconciler.
     foldGroupBEventIntoQueue(dirtySourceQueue, event);
+    if (event.type === PAGE_EVIDENCE_EXTRACTED && isRecord(event.payload)) {
+      const canonicalUrl = event.payload['canonicalUrl'];
+      if (typeof canonicalUrl === 'string') {
+        pageEvidenceRecordCache.delete(canonicalizeEvidenceUrl(canonicalUrl));
+      }
+    }
+    if (!handlesGraph) {
+      if (handlesContentLaneOnly && !running && !dirty) {
+        advanceProgressForContentOnlyEvent(event);
+        return;
+      }
+      progressOnlyDirty = true;
+      requestDrain();
+      return;
+    }
+    progressOnlyDirty = false;
     // Stage 5.2 W6 — accumulate invalidation keys for this event so the
     // next drain can answer "which slices are dirty?" Most events
     // contribute one or two keys; ANNOTATION_* / DISPATCH_* return [].
@@ -2506,8 +3450,12 @@ export const createConnectionsMaterializer = (
       foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
       foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
     }
+    scheduleProjectionOverlay(event);
+    scheduleForegroundNavigationOverlay(event);
     incrementalGraphView.fold(event);
-    requestDrain();
+    requestDrain({
+      urgent: event.type === NAVIGATION_COMMITTED || event.type === BROWSER_TIMELINE_OBSERVED,
+    });
   };
 
   const resetInMemoryProjectionState = (): void => {
@@ -2533,6 +3481,7 @@ export const createConnectionsMaterializer = (
     resetInMemoryProjectionState();
     dirty = false;
     try {
+      progressOnlyDirty = false;
       const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
       const merged = await deps.eventLog.readMerged();
       const versionMatches = progress?.materializerVersion === MATERIALIZER_VERSION;
@@ -2547,6 +3496,17 @@ export const createConnectionsMaterializer = (
           lastSuccessAt = new Date().toISOString();
           lastError = null;
           return;
+        }
+        if (
+          ordered.every(
+            (event) =>
+              CONTENT_LANE_ONLY_HANDLES.has(event.type) || PROJECTION_ONLY_HANDLES.has(event.type),
+          )
+        ) {
+          const writeProgress = deps.store.writeMaterializerProgress;
+          if (writeProgress !== undefined) {
+            if (await tryAdvanceNoGraphEvents(progress, ordered)) return;
+          }
         }
         if (ordered.length <= BACKLOG_FALLBACK_THRESHOLD) {
           // Phase 1 intentionally keeps the apply path as a full rebuild.
