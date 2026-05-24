@@ -45,14 +45,24 @@ import type { MaterializerProgress } from '../sync/contract/materializerProgress
 import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScopes.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
+  foldEventIntoTabSessionProjectionAccumulator,
   serializeTabSessionProjection,
+  tabSessionProjectionAccumulatorFromSerialized,
+  tabSessionProjectionFromAccumulator,
+  type SerializedTabSessionProjection,
+  type TabSessionRecord,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
 import {
+  foldEventIntoUrlProjectionAccumulator,
   serializeUrlProjection,
+  type SerializedUrlProjection,
   type UrlAttribution,
   type UrlPageEvidenceSummary,
   type UrlProjection,
+  type UrlVisitRecord,
+  urlProjectionAccumulatorFromSerialized,
+  urlProjectionFromAccumulator,
 } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import {
@@ -242,6 +252,7 @@ export interface ConnectionsInput {
   readonly crossReplica?: CrossReplicaMaterialization;
   readonly engagementClassRevision?: EngagementClassRevision;
   readonly closestVisitRanker?: ClosestVisitRanker;
+  readonly preservedThreadQuoteEdges?: readonly ConnectionEdge[];
   readonly scope?: ConnectionsSnapshotScope;
 }
 
@@ -972,6 +983,13 @@ const visitInstanceKey = (input: {
   readonly visitKey: string;
   readonly firstSeenAt: string;
 }): string => `${input.tabSessionId}:${input.firstSeenAt}:${input.visitKey}`;
+
+const threadKeyFromNodeId = (nodeId: string): string | null => {
+  const prefix = 'thread:';
+  return nodeId.startsWith(prefix) && nodeId.length > prefix.length
+    ? nodeId.slice(prefix.length)
+    : null;
+};
 
 const collectVisitInstances = (input: {
   readonly events: readonly AcceptedEvent[];
@@ -2680,102 +2698,120 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // seq) for order-independent concatenation, then run the deterministic
   // shingle index. Emit thread_quotes_thread edges per qualifying pair.
   // -------------------------------------------------------------------
-  interface CaptureGroupEntry {
-    readonly text: string;
-    readonly acceptedAtMs: number;
-    readonly observedAt: string;
-    readonly replicaId: string;
-    readonly seq: number;
-  }
-  const captureByThread = new Map<string, CaptureGroupEntry[]>();
-  for (const event of input.events) {
-    if (event.type !== CAPTURE_RECORDED) continue;
-    if (!isCaptureRecordedPayload(event.payload)) continue;
-    const p = event.payload;
-    const parts: string[] = [];
-    for (const turn of p.turns ?? []) {
-      if (typeof turn.text === 'string' && turn.text.length > 0) parts.push(turn.text);
-      if (typeof turn.markdown === 'string' && turn.markdown.length > 0) parts.push(turn.markdown);
-      if (typeof turn.formattedText === 'string' && turn.formattedText.length > 0)
-        parts.push(turn.formattedText);
+  if (input.preservedThreadQuoteEdges !== undefined) {
+    for (const edge of input.preservedThreadQuoteEdges) {
+      const fromThreadId = threadKeyFromNodeId(edge.fromNodeId);
+      const toThreadId = threadKeyFromNodeId(edge.toNodeId);
+      if (fromThreadId !== null) {
+        upsertNode(nodes, { kind: 'thread', key: fromThreadId, label: fromThreadId });
+      }
+      if (toThreadId !== null) {
+        upsertNode(nodes, { kind: 'thread', key: toThreadId, label: toThreadId });
+      }
+      trackObservedAt(edge.observedAt);
+      const { id: _id, ...edgeInput } = edge;
+      void _id;
+      upsertEdge(edges, edgeInput);
     }
-    if (parts.length === 0) continue;
-    // Group by the actual thread id (with bac_id fallback for the
-    // unit-test convention).
-    const threadKey = p.threadId ?? p.bac_id;
-    const list = captureByThread.get(threadKey);
-    const entry: CaptureGroupEntry = {
-      text: parts.join('\n'),
-      acceptedAtMs: event.acceptedAtMs,
-      observedAt: new Date(event.acceptedAtMs).toISOString(),
-      replicaId: event.dot.replicaId,
-      seq: event.dot.seq,
-    };
-    if (list === undefined) {
-      captureByThread.set(threadKey, [entry]);
-    } else {
-      list.push(entry);
+  } else {
+    interface CaptureGroupEntry {
+      readonly text: string;
+      readonly acceptedAtMs: number;
+      readonly observedAt: string;
+      readonly replicaId: string;
+      readonly seq: number;
     }
-  }
+    const captureByThread = new Map<string, CaptureGroupEntry[]>();
+    for (const event of input.events) {
+      if (event.type !== CAPTURE_RECORDED) continue;
+      if (!isCaptureRecordedPayload(event.payload)) continue;
+      const p = event.payload;
+      const parts: string[] = [];
+      for (const turn of p.turns ?? []) {
+        if (typeof turn.text === 'string' && turn.text.length > 0) parts.push(turn.text);
+        if (typeof turn.markdown === 'string' && turn.markdown.length > 0)
+          parts.push(turn.markdown);
+        if (typeof turn.formattedText === 'string' && turn.formattedText.length > 0)
+          parts.push(turn.formattedText);
+      }
+      if (parts.length === 0) continue;
+      // Group by the actual thread id (with bac_id fallback for the
+      // unit-test convention).
+      const threadKey = p.threadId ?? p.bac_id;
+      const list = captureByThread.get(threadKey);
+      const entry: CaptureGroupEntry = {
+        text: parts.join('\n'),
+        acceptedAtMs: event.acceptedAtMs,
+        observedAt: new Date(event.acceptedAtMs).toISOString(),
+        replicaId: event.dot.replicaId,
+        seq: event.dot.seq,
+      };
+      if (list === undefined) {
+        captureByThread.set(threadKey, [entry]);
+      } else {
+        list.push(entry);
+      }
+    }
 
-  const threadTexts: ThreadText[] = [];
-  // Track the latest observation + a representative dot per thread,
-  // so the emitted edge's observedAt is order-independent and the
-  // producedBy dot is deterministic.
-  const threadLatest = new Map<
-    string,
-    { readonly observedAt: string; readonly replicaId: string; readonly seq: number }
-  >();
-  // Sort threads by id for deterministic threadTexts iteration order.
-  const sortedThreadIds = [...captureByThread.keys()].sort();
-  for (const threadId of sortedThreadIds) {
-    const entries = captureByThread.get(threadId)!;
-    entries.sort((a, b) => {
-      if (a.acceptedAtMs !== b.acceptedAtMs) return a.acceptedAtMs - b.acceptedAtMs;
-      if (a.replicaId !== b.replicaId) return a.replicaId < b.replicaId ? -1 : 1;
-      return a.seq - b.seq;
-    });
-    threadTexts.push({ threadId, text: entries.map((e) => e.text).join('\n') });
-    const last = entries[entries.length - 1]!;
-    threadLatest.set(threadId, {
-      observedAt: last.observedAt,
-      replicaId: last.replicaId,
-      seq: last.seq,
-    });
-  }
-
-  if (threadTexts.length >= 2) {
-    const quoteMatches = findThreadQuotes(threadTexts);
-    for (const match of quoteMatches) {
-      // Lazy-create both endpoint thread nodes.
-      upsertNode(nodes, { kind: 'thread', key: match.fromThreadId, label: match.fromThreadId });
-      upsertNode(nodes, { kind: 'thread', key: match.toThreadId, label: match.toThreadId });
-      const fromLatest = threadLatest.get(match.fromThreadId);
-      const toLatest = threadLatest.get(match.toThreadId);
-      const observedAt =
-        fromLatest === undefined || toLatest === undefined
-          ? ''
-          : fromLatest.observedAt > toLatest.observedAt
-            ? fromLatest.observedAt
-            : toLatest.observedAt;
-      // Pick the "from" thread's dot for provenance — that's the
-      // thread whose capture event surfaced the quote.
-      const fromDot = fromLatest ?? toLatest;
-      upsertEdge(edges, {
-        kind: 'thread_quotes_thread',
-        fromNodeId: nodeIdFor('thread', match.fromThreadId),
-        toNodeId: nodeIdFor('thread', match.toThreadId),
-        observedAt,
-        producedBy: {
-          source: 'event-log',
-          eventType: CAPTURE_RECORDED,
-          recordId: match.recordIdHashPrefix,
-          ...(fromDot === undefined
-            ? {}
-            : { dot: { replicaId: fromDot.replicaId, seq: fromDot.seq } }),
-        },
-        confidence: 'inferred',
+    const threadTexts: ThreadText[] = [];
+    // Track the latest observation + a representative dot per thread,
+    // so the emitted edge's observedAt is order-independent and the
+    // producedBy dot is deterministic.
+    const threadLatest = new Map<
+      string,
+      { readonly observedAt: string; readonly replicaId: string; readonly seq: number }
+    >();
+    // Sort threads by id for deterministic threadTexts iteration order.
+    const sortedThreadIds = [...captureByThread.keys()].sort();
+    for (const threadId of sortedThreadIds) {
+      const entries = captureByThread.get(threadId)!;
+      entries.sort((a, b) => {
+        if (a.acceptedAtMs !== b.acceptedAtMs) return a.acceptedAtMs - b.acceptedAtMs;
+        if (a.replicaId !== b.replicaId) return a.replicaId < b.replicaId ? -1 : 1;
+        return a.seq - b.seq;
       });
+      threadTexts.push({ threadId, text: entries.map((e) => e.text).join('\n') });
+      const last = entries[entries.length - 1]!;
+      threadLatest.set(threadId, {
+        observedAt: last.observedAt,
+        replicaId: last.replicaId,
+        seq: last.seq,
+      });
+    }
+
+    if (threadTexts.length >= 2) {
+      const quoteMatches = findThreadQuotes(threadTexts);
+      for (const match of quoteMatches) {
+        // Lazy-create both endpoint thread nodes.
+        upsertNode(nodes, { kind: 'thread', key: match.fromThreadId, label: match.fromThreadId });
+        upsertNode(nodes, { kind: 'thread', key: match.toThreadId, label: match.toThreadId });
+        const fromLatest = threadLatest.get(match.fromThreadId);
+        const toLatest = threadLatest.get(match.toThreadId);
+        const observedAt =
+          fromLatest === undefined || toLatest === undefined
+            ? ''
+            : fromLatest.observedAt > toLatest.observedAt
+              ? fromLatest.observedAt
+              : toLatest.observedAt;
+        // Pick the "from" thread's dot for provenance — that's the
+        // thread whose capture event surfaced the quote.
+        const fromDot = fromLatest ?? toLatest;
+        upsertEdge(edges, {
+          kind: 'thread_quotes_thread',
+          fromNodeId: nodeIdFor('thread', match.fromThreadId),
+          toNodeId: nodeIdFor('thread', match.toThreadId),
+          observedAt,
+          producedBy: {
+            source: 'event-log',
+            eventType: CAPTURE_RECORDED,
+            recordId: match.recordIdHashPrefix,
+            ...(fromDot === undefined
+              ? {}
+              : { dot: { replicaId: fromDot.replicaId, seq: fromDot.seq } }),
+          },
+          confidence: 'inferred',
+        });
+      }
     }
   }
 
@@ -3558,7 +3594,10 @@ export interface ConnectionsStore {
     progress: MaterializerProgress,
     dirtyScopes?: ReadonlySet<Scope>,
   ) => Promise<void>;
+  readonly applyProjectionEventOverlay?: (event: AcceptedEvent) => Promise<string | null>;
+  readonly writeMaterializerProgress?: (progress: MaterializerProgress) => Promise<void>;
   readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
+  readonly readSnapshotMetadata?: () => Promise<StoredConnectionsMetadata | null>;
   readonly readScopesForNode?: (nodeId: string) => Promise<Scope[]>;
   readonly readScopesForEdge?: (src: string, dst: string) => Promise<Scope[]>;
   readonly readNodesForScope?: (scope: Scope) => Promise<string[]>;
@@ -3570,6 +3609,10 @@ export interface ConnectionsStore {
     readonly nodes: readonly ConnectionNode[];
     readonly edges: readonly ConnectionEdge[];
     readonly progress: MaterializerProgress;
+    readonly metadata?: {
+      readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
+      readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
+    };
   }) => Promise<void>;
   readonly readCurrent: () => Promise<ConnectionsSnapshot | null>;
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
@@ -3667,6 +3710,275 @@ const snapshotFromParts = (
 const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
 const incrementalScopesEnabled = (): boolean =>
   process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] !== '0';
+const SQLITE_IN_CLAUSE_CHUNK_SIZE = 400;
+const RESOLVER_SUBGRAPH_HOPS = 4;
+const RESOLVER_URL_SUBGRAPH_HOPS = 2;
+
+const chunked = <T>(items: readonly T[], size: number): readonly (readonly T[])[] => {
+  const out: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    out.push(items.slice(index, index + size));
+  }
+  return out;
+};
+
+const placeholdersFor = (count: number): string =>
+  Array.from({ length: count }, () => '?').join(',');
+
+const normalizeResolverUrl = (url: string): string => url.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const maxIso = (left: string, right: string | undefined): string => {
+  if (right === undefined || right.length === 0) return left;
+  return right > left ? right : left;
+};
+
+const projectionOverlayUpdatedAt = (input: {
+  readonly fallback: string;
+  readonly urlProjection?: SerializedUrlProjection;
+  readonly tabSessionProjection?: SerializedTabSessionProjection;
+}): string => {
+  let updatedAt = input.fallback;
+  for (const record of Object.values(input.urlProjection?.byCanonicalUrl ?? {})) {
+    updatedAt = maxIso(updatedAt, record.firstSeenAt);
+    updatedAt = maxIso(updatedAt, record.lastSeenAt);
+    updatedAt = maxIso(updatedAt, record.currentAttribution?.observedAt);
+    updatedAt = maxIso(updatedAt, record.currentIgnored?.observedAt);
+  }
+  for (const record of Object.values(input.tabSessionProjection?.bySessionId ?? {})) {
+    updatedAt = maxIso(updatedAt, record.openedAt);
+    updatedAt = maxIso(updatedAt, record.lastActivityAt);
+    updatedAt = maxIso(updatedAt, record.closedAt);
+    updatedAt = maxIso(updatedAt, record.currentAttribution?.observedAt);
+  }
+  return updatedAt;
+};
+
+const maxIsoValue = (fallback: string, ...values: readonly (string | undefined)[]): string => {
+  let out = fallback;
+  for (const value of values) {
+    if (value !== undefined && value.length > 0 && value > out) out = value;
+  }
+  return out;
+};
+
+const urlRecordFreshness = (record: UrlVisitRecord): string =>
+  maxIsoValue(
+    record.firstSeenAt,
+    record.lastSeenAt,
+    record.currentAttribution?.observedAt,
+    record.currentIgnored?.observedAt,
+    record.pageEvidence?.updatedAt,
+  );
+
+const tabSessionRecordFreshness = (record: TabSessionRecord): string =>
+  maxIsoValue(
+    record.openedAt,
+    record.lastActivityAt,
+    record.closedAt,
+    record.currentAttribution?.observedAt,
+  );
+
+const fresherPageEvidence = (
+  left: UrlPageEvidenceSummary | undefined,
+  right: UrlPageEvidenceSummary | undefined,
+): UrlPageEvidenceSummary | undefined => {
+  if (left === undefined) return right;
+  if (right === undefined) return left;
+  return right.updatedAt > left.updatedAt ? right : left;
+};
+
+const mergeUrlProjectionForWrite = (
+  incoming: SerializedUrlProjection | undefined,
+  existing: SerializedUrlProjection | undefined,
+): SerializedUrlProjection | undefined => {
+  if (incoming === undefined || existing === undefined) return incoming;
+  const byCanonicalUrl: Record<string, UrlVisitRecord> = {};
+  const keys = [
+    ...new Set([...Object.keys(incoming.byCanonicalUrl), ...Object.keys(existing.byCanonicalUrl)]),
+  ].sort();
+  for (const key of keys) {
+    const incomingRecord = incoming.byCanonicalUrl[key];
+    const existingRecord = existing.byCanonicalUrl[key];
+    if (incomingRecord === undefined) {
+      if (existingRecord !== undefined) byCanonicalUrl[key] = existingRecord;
+      continue;
+    }
+    if (existingRecord === undefined) {
+      byCanonicalUrl[key] = incomingRecord;
+      continue;
+    }
+    const selected =
+      urlRecordFreshness(existingRecord) > urlRecordFreshness(incomingRecord)
+        ? existingRecord
+        : incomingRecord;
+    const evidence = fresherPageEvidence(incomingRecord.pageEvidence, existingRecord.pageEvidence);
+    byCanonicalUrl[key] =
+      evidence === undefined
+        ? selected
+        : {
+            ...selected,
+            pageEvidence: evidence,
+          };
+  }
+  return {
+    schemaVersion: incoming.schemaVersion,
+    byCanonicalUrl,
+  };
+};
+
+const mergeTabSessionProjectionForWrite = (
+  incoming: SerializedTabSessionProjection | undefined,
+  existing: SerializedTabSessionProjection | undefined,
+): SerializedTabSessionProjection | undefined => {
+  if (incoming === undefined || existing === undefined) return incoming;
+  const bySessionId: Record<string, TabSessionRecord> = {};
+  const sessionIds = [
+    ...new Set([...Object.keys(incoming.bySessionId), ...Object.keys(existing.bySessionId)]),
+  ].sort();
+  for (const sessionId of sessionIds) {
+    const incomingRecord = incoming.bySessionId[sessionId];
+    const existingRecord = existing.bySessionId[sessionId];
+    if (incomingRecord === undefined) {
+      if (existingRecord !== undefined) bySessionId[sessionId] = existingRecord;
+      continue;
+    }
+    if (existingRecord === undefined) {
+      bySessionId[sessionId] = incomingRecord;
+      continue;
+    }
+    bySessionId[sessionId] =
+      tabSessionRecordFreshness(existingRecord) > tabSessionRecordFreshness(incomingRecord)
+        ? existingRecord
+        : incomingRecord;
+  }
+
+  const openSessionsByTabId: Record<string, string> = {};
+  const tabIds = [
+    ...new Set([
+      ...Object.keys(incoming.openSessionsByTabId),
+      ...Object.keys(existing.openSessionsByTabId),
+    ]),
+  ].sort();
+  for (const tabId of tabIds) {
+    const incomingSessionId = incoming.openSessionsByTabId[tabId];
+    const existingSessionId = existing.openSessionsByTabId[tabId];
+    if (incomingSessionId === undefined) {
+      if (existingSessionId !== undefined) openSessionsByTabId[tabId] = existingSessionId;
+      continue;
+    }
+    if (existingSessionId === undefined) {
+      openSessionsByTabId[tabId] = incomingSessionId;
+      continue;
+    }
+    const incomingRecord = bySessionId[incomingSessionId];
+    const existingRecord = bySessionId[existingSessionId];
+    if (
+      existingRecord !== undefined &&
+      (incomingRecord === undefined ||
+        tabSessionRecordFreshness(existingRecord) > tabSessionRecordFreshness(incomingRecord))
+    ) {
+      openSessionsByTabId[tabId] = existingSessionId;
+    } else {
+      openSessionsByTabId[tabId] = incomingSessionId;
+    }
+  }
+
+  return {
+    schemaVersion: incoming.schemaVersion,
+    bySessionId,
+    openSessionsByTabId,
+  };
+};
+
+const metadataForSnapshotWrite = (
+  snapshot: ConnectionsSnapshot,
+  existing: StoredConnectionsMetadata | null,
+): StoredConnectionsMetadata => {
+  const incoming = metadataForSnapshot(snapshot);
+  if (existing === null) return incoming;
+  const urlProjection = mergeUrlProjectionForWrite(incoming.urlProjection, existing.urlProjection);
+  const tabSessionProjection = mergeTabSessionProjectionForWrite(
+    incoming.tabSessionProjection,
+    existing.tabSessionProjection,
+  );
+  const updatedAt = projectionOverlayUpdatedAt({
+    fallback: incoming.updatedAt,
+    ...(urlProjection === undefined ? {} : { urlProjection }),
+    ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+  });
+  const projectionChanged =
+    updatedAt !== incoming.updatedAt ||
+    JSON.stringify(urlProjection ?? null) !== JSON.stringify(incoming.urlProjection ?? null) ||
+    JSON.stringify(tabSessionProjection ?? null) !==
+      JSON.stringify(incoming.tabSessionProjection ?? null);
+  const snapshotRevision = projectionChanged
+    ? computeSnapshotRevision({
+        updatedAt,
+        nodeCount: incoming.nodeCount,
+        edgeCount: incoming.edgeCount,
+        urlProjectionKeyCount:
+          urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
+        tabSessionProjectionKeyCount:
+          tabSessionProjection === undefined
+            ? 0
+            : Object.keys(tabSessionProjection.bySessionId).length,
+      })
+    : incoming.snapshotRevision;
+  return {
+    ...incoming,
+    updatedAt,
+    ...(urlProjection === undefined ? {} : { urlProjection }),
+    ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+  };
+};
+
+const metadataStringArray = (row: unknown): string[] => {
+  if (row === null || row === undefined) return [];
+  const parsed = JSON.parse(textField(row, 'data')) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((value): value is string => typeof value === 'string');
+};
+
+const patchSortedOrder = (input: {
+  readonly current: readonly string[];
+  readonly removed: ReadonlySet<string>;
+  readonly added: ReadonlySet<string>;
+}): string[] => {
+  const ids = new Set<string>();
+  for (const id of input.current) {
+    if (!input.removed.has(id)) ids.add(id);
+  }
+  for (const id of input.added) ids.add(id);
+  return [...ids].sort();
+};
+
+const edgeIdsFromSerializedBucket = (serialized: string): string[] => {
+  const parsed = JSON.parse(serialized) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  const edgeIds: string[] = [];
+  for (const value of parsed) {
+    if (isRecord(value) && typeof value['id'] === 'string') edgeIds.push(value['id']);
+  }
+  return edgeIds;
+};
+
+const maxObservedAtForRows = (
+  fallback: string,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+): string => {
+  let updatedAt = fallback;
+  for (const node of nodes) {
+    if (node.firstSeenAt !== undefined && node.firstSeenAt > updatedAt)
+      updatedAt = node.firstSeenAt;
+    if (node.lastSeenAt !== undefined && node.lastSeenAt > updatedAt) updatedAt = node.lastSeenAt;
+  }
+  for (const edge of edges) {
+    if (edge.observedAt > updatedAt) updatedAt = edge.observedAt;
+  }
+  return updatedAt;
+};
 
 export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #root: string;
@@ -3702,6 +4014,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     if (!this.#initialized) {
       this.#db.exec(`
         PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 2500;
         CREATE TABLE IF NOT EXISTS nodes (
           id TEXT PRIMARY KEY,
           data TEXT NOT NULL
@@ -3780,27 +4093,101 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       this.#writeCurrentRows(db, snapshot, null);
       return metadataForSnapshot(snapshot);
     } catch (error) {
-      if (
-        (isRecord(error) && error['code'] === 'ENOENT') ||
-        error instanceof SyntaxError
-      ) {
+      if ((isRecord(error) && error['code'] === 'ENOENT') || error instanceof SyntaxError) {
         return null;
       }
       throw error;
     }
   }
 
-  #readNode(db: SqliteDatabase, nodeId: string): ConnectionNode | null {
-    const row = db.query('SELECT data FROM nodes WHERE id = ?').get(nodeId);
-    if (row === null || row === undefined) return null;
-    return JSON.parse(textField(row, 'data')) as ConnectionNode;
+  #readNodesByIds(db: SqliteDatabase, nodeIds: readonly string[]): Map<string, ConnectionNode> {
+    const out = new Map<string, ConnectionNode>();
+    const uniqueNodeIds = [...new Set(nodeIds)].filter((nodeId) => nodeId.length > 0);
+    for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
+      if (batch.length === 0) continue;
+      const rows = db
+        .query(`SELECT data FROM nodes WHERE id IN (${placeholdersFor(batch.length)})`)
+        .all(...batch);
+      for (const row of rows) {
+        const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+        out.set(node.id, node);
+      }
+    }
+    return out;
   }
 
-  #readIncidentEdges(db: SqliteDatabase, nodeId: string): readonly ConnectionEdge[] {
-    return db
-      .query('SELECT data FROM edges WHERE src = ? OR dst = ?')
-      .all(nodeId, nodeId)
-      .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[]);
+  #readIncidentEdgesForNodes(
+    db: SqliteDatabase,
+    nodeIds: readonly string[],
+  ): readonly ConnectionEdge[] {
+    const out = new Map<string, ConnectionEdge>();
+    const uniqueNodeIds = [...new Set(nodeIds)].filter((nodeId) => nodeId.length > 0);
+    for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
+      if (batch.length === 0) continue;
+      const placeholders = placeholdersFor(batch.length);
+      const rows = db
+        .query(`SELECT data FROM edges WHERE src IN (${placeholders}) OR dst IN (${placeholders})`)
+        .all(...batch, ...batch);
+      for (const row of rows) {
+        for (const edge of JSON.parse(textField(row, 'data')) as ConnectionEdge[]) {
+          out.set(edge.id, edge);
+        }
+      }
+    }
+    return [...out.values()];
+  }
+
+  #threadResolverSeedNodeIds(
+    db: SqliteDatabase,
+    input: {
+      readonly threadId: string;
+      readonly providerThreadId?: string;
+      readonly threadUrl?: string;
+    },
+  ): readonly string[] {
+    const seedNodeIds = new Set<string>();
+    const threadNodeIds = new Set([nodeIdFor('thread', input.threadId)]);
+    if (input.providerThreadId !== undefined && input.providerThreadId.length > 0) {
+      threadNodeIds.add(nodeIdFor('thread', input.providerThreadId));
+    }
+    for (const threadNodeId of threadNodeIds) seedNodeIds.add(threadNodeId);
+
+    const canonicalUrls = new Set<string>();
+    if (input.threadUrl !== undefined && input.threadUrl.length > 0) {
+      canonicalUrls.add(input.threadUrl);
+      canonicalUrls.add(normalizeResolverUrl(input.threadUrl));
+    }
+
+    for (const row of db.query("SELECT data FROM nodes WHERE id LIKE 'thread:%'").all()) {
+      const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+      const metadataThreadId =
+        typeof node.metadata.threadId === 'string' ? node.metadata.threadId : undefined;
+      const metadataCanonical =
+        typeof node.metadata.canonicalUrl === 'string'
+          ? node.metadata.canonicalUrl
+          : typeof node.metadata.url === 'string'
+            ? node.metadata.url
+            : undefined;
+      if (
+        threadNodeIds.has(node.id) ||
+        metadataThreadId === input.threadId ||
+        (input.providerThreadId !== undefined && metadataThreadId === input.providerThreadId) ||
+        (metadataCanonical !== undefined &&
+          canonicalUrls.has(normalizeResolverUrl(metadataCanonical)))
+      ) {
+        seedNodeIds.add(node.id);
+        if (metadataCanonical !== undefined) {
+          canonicalUrls.add(metadataCanonical);
+          canonicalUrls.add(normalizeResolverUrl(metadataCanonical));
+        }
+      }
+    }
+
+    for (const canonicalUrl of canonicalUrls) {
+      seedNodeIds.add(nodeIdFor('timeline-visit', canonicalUrl));
+    }
+
+    return [...seedNodeIds].sort();
   }
 
   async #readTraversedSubgraph(
@@ -3814,8 +4201,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const maxHops = options.hops ?? Number.POSITIVE_INFINITY;
     const visited = new Set<string>();
     let frontier = new Set<string>();
-    for (const id of seedNodeIds) {
-      if (this.#readNode(db, id) === null) continue;
+    for (const id of this.#readNodesByIds(db, seedNodeIds).keys()) {
       visited.add(id);
       frontier.add(id);
     }
@@ -3823,32 +4209,30 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const edgeById = new Map<string, ConnectionEdge>();
     for (let depth = 0; frontier.size > 0 && depth < maxHops; depth += 1) {
       const next = new Set<string>();
-      for (const nodeId of frontier) {
-        for (const edge of this.#readIncidentEdges(db, nodeId)) {
-          edgeById.set(edge.id, edge);
-          const endpoints = [edge.fromNodeId, edge.toNodeId];
-          for (const endpoint of endpoints) {
-            if (visited.has(endpoint) || this.#readNode(db, endpoint) === null) continue;
-            visited.add(endpoint);
-            next.add(endpoint);
-          }
+      const incidentEdges = this.#readIncidentEdgesForNodes(db, [...frontier]);
+      const endpointCandidates = new Set<string>();
+      for (const edge of incidentEdges) {
+        edgeById.set(edge.id, edge);
+        if (!visited.has(edge.fromNodeId)) endpointCandidates.add(edge.fromNodeId);
+        if (!visited.has(edge.toNodeId)) endpointCandidates.add(edge.toNodeId);
+      }
+      const existingEndpointNodes = this.#readNodesByIds(db, [...endpointCandidates]);
+      for (const endpoint of existingEndpointNodes.keys()) {
+        if (!visited.has(endpoint)) {
+          visited.add(endpoint);
+          next.add(endpoint);
         }
       }
       frontier = next;
     }
 
-    for (const nodeId of visited) {
-      for (const edge of this.#readIncidentEdges(db, nodeId)) {
-        if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
-          edgeById.set(edge.id, edge);
-        }
+    for (const edge of this.#readIncidentEdgesForNodes(db, [...visited])) {
+      if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
+        edgeById.set(edge.id, edge);
       }
     }
 
-    const nodes = [...visited].flatMap((id) => {
-      const node = this.#readNode(db, id);
-      return node === null ? [] : [node];
-    });
+    const nodes = [...this.#readNodesByIds(db, [...visited]).values()];
     return snapshotFromParts(
       metadata,
       sortAlphaById(nodes),
@@ -3963,6 +4347,91 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   };
 
+  readonly applyProjectionEventOverlay = async (event: AcceptedEvent): Promise<string | null> => {
+    const db = await this.#database();
+    const bootstrapped = await this.#readMetadata(db);
+    if (bootstrapped === null) return null;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+      if (metadataRow === null || metadataRow === undefined) {
+        db.exec('COMMIT');
+        return null;
+      }
+      const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+      if (metadata.urlProjection === undefined && metadata.tabSessionProjection === undefined) {
+        db.exec('COMMIT');
+        return null;
+      }
+
+      const urlProjection =
+        metadata.urlProjection === undefined
+          ? undefined
+          : (() => {
+              const accumulator = urlProjectionAccumulatorFromSerialized(metadata.urlProjection);
+              foldEventIntoUrlProjectionAccumulator(accumulator, event);
+              return serializeUrlProjection(urlProjectionFromAccumulator(accumulator));
+            })();
+      const tabSessionProjection =
+        metadata.tabSessionProjection === undefined
+          ? undefined
+          : (() => {
+              const accumulator = tabSessionProjectionAccumulatorFromSerialized(
+                metadata.tabSessionProjection,
+              );
+              foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+              return serializeTabSessionProjection(
+                tabSessionProjectionFromAccumulator(accumulator),
+              );
+            })();
+      const updatedAt = projectionOverlayUpdatedAt({
+        fallback: metadata.updatedAt,
+        ...(urlProjection === undefined ? {} : { urlProjection }),
+        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+      });
+      const snapshotRevision = computeSnapshotRevision({
+        updatedAt,
+        nodeCount: metadata.nodeCount,
+        edgeCount: metadata.edgeCount,
+        urlProjectionKeyCount:
+          urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
+        tabSessionProjectionKeyCount:
+          tabSessionProjection === undefined
+            ? 0
+            : Object.keys(tabSessionProjection.bySessionId).length,
+      });
+      const nextMetadata: StoredConnectionsMetadata = {
+        ...metadata,
+        updatedAt,
+        ...(urlProjection === undefined ? {} : { urlProjection }),
+        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+        snapshotRevision,
+      };
+      db.query(
+        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+      ).run('current', JSON.stringify(nextMetadata));
+      db.exec('COMMIT');
+      this.#cachedSnapshot = null;
+      return snapshotRevision;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
+  readonly writeMaterializerProgress = async (progress: MaterializerProgress): Promise<void> => {
+    const db = await this.#database();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#writeProgressRows(db, progress);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
   readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
     const db = await this.#database();
     return db
@@ -4028,6 +4497,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly nodes: readonly ConnectionNode[];
     readonly edges: readonly ConnectionEdge[];
     readonly progress: MaterializerProgress;
+    readonly metadata?: {
+      readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
+      readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
+    };
   }): Promise<void> => {
     const db = await this.#database();
     const edgeBuckets = new Map<string, ConnectionEdge[]>();
@@ -4038,33 +4511,80 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       edgeBuckets.set(key, bucket);
     }
     const memberships = scopesForGraphRows({ nodes: input.nodes, edges: input.edges });
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS temp_replace_scopes (
+        scope_kind TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS temp_replace_nodes (
+        node_id TEXT PRIMARY KEY
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS temp_replace_edges (
+        edge_src TEXT NOT NULL,
+        edge_dst TEXT NOT NULL,
+        PRIMARY KEY (edge_src, edge_dst)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS temp_replace_new_edges (
+        edge_src TEXT NOT NULL,
+        edge_dst TEXT NOT NULL,
+        PRIMARY KEY (edge_src, edge_dst)
+      ) WITHOUT ROWID;
+      DELETE FROM temp_replace_scopes;
+      DELETE FROM temp_replace_nodes;
+      DELETE FROM temp_replace_edges;
+      DELETE FROM temp_replace_new_edges;
+    `);
     db.exec('BEGIN IMMEDIATE');
     try {
-      const oldNodeIds = new Set<string>();
-      const oldEdgeKeys = new Set<string>();
-      const selectScopeNodes = db.query(
-        `SELECT node_id FROM connections_scope_nodes
-         WHERE scope_kind = ? AND scope_id = ?`,
+      const insertTempScope = db.query(
+        `INSERT OR IGNORE INTO temp_replace_scopes (scope_kind, scope_id)
+         VALUES (?, ?)`,
       );
-      const selectScopeEdges = db.query(
-        `SELECT edge_src, edge_dst FROM connections_scope_edges
-         WHERE scope_kind = ? AND scope_id = ?`,
+      const insertTempNewEdge = db.query(
+        `INSERT OR IGNORE INTO temp_replace_new_edges (edge_src, edge_dst)
+         VALUES (?, ?)`,
       );
       const deleteScopeNodes = db.query(
-        `DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?`,
+        `DELETE FROM connections_scope_nodes
+         WHERE EXISTS (
+           SELECT 1
+           FROM temp_replace_scopes s
+           WHERE s.scope_kind = connections_scope_nodes.scope_kind
+             AND s.scope_id = connections_scope_nodes.scope_id
+         )`,
       );
       const deleteScopeEdges = db.query(
-        `DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?`,
+        `DELETE FROM connections_scope_edges
+         WHERE EXISTS (
+           SELECT 1
+           FROM temp_replace_scopes s
+           WHERE s.scope_kind = connections_scope_edges.scope_kind
+             AND s.scope_id = connections_scope_edges.scope_id
+         )`,
       );
-      const countNodeScopes = db.query(
-        'SELECT COUNT(*) AS count FROM connections_scope_nodes WHERE node_id = ?',
+      const deleteOrphanNodes = db.query(
+        `DELETE FROM nodes
+         WHERE id IN (SELECT node_id FROM temp_replace_nodes)
+           AND NOT EXISTS (
+             SELECT 1
+             FROM connections_scope_nodes c
+             WHERE c.node_id = nodes.id
+           )`,
       );
-      const countEdgeScopes = db.query(
-        `SELECT COUNT(*) AS count FROM connections_scope_edges
-         WHERE edge_src = ? AND edge_dst = ?`,
+      const deleteOrphanEdges = db.query(
+        `DELETE FROM edges
+         WHERE EXISTS (
+           SELECT 1
+           FROM temp_replace_edges t
+           WHERE t.edge_src = edges.src AND t.edge_dst = edges.dst
+         )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM connections_scope_edges c
+             WHERE c.edge_src = edges.src AND c.edge_dst = edges.dst
+           )`,
       );
-      const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
-      const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
       const upsertNode = db.query(
         'INSERT INTO nodes (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
       );
@@ -4081,58 +4601,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           (scope_kind, scope_id, edge_src, edge_dst)
          VALUES (?, ?, ?, ?)`,
       );
-      const upsertMetadata = db.query(
-        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
-      );
-
-      for (const scope of input.scopes) {
-        for (const row of selectScopeNodes.all(scope.kind, scope.id)) {
-          oldNodeIds.add(textField(row, 'node_id'));
-        }
-        for (const row of selectScopeEdges.all(scope.kind, scope.id)) {
-          oldEdgeKeys.add(`${textField(row, 'edge_src')}\u0000${textField(row, 'edge_dst')}`);
-        }
-        deleteScopeNodes.run(scope.kind, scope.id);
-        deleteScopeEdges.run(scope.kind, scope.id);
-      }
-      for (const nodeId of oldNodeIds) {
-        const row = countNodeScopes.get(nodeId);
-        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
-        if (count === 0) deleteNode.run(nodeId);
-      }
-      for (const key of oldEdgeKeys) {
-        const [src, dst] = key.split('\u0000');
-        if (src === undefined || dst === undefined) continue;
-        const row = countEdgeScopes.get(src, dst);
-        const count = isRecord(row) && typeof row['count'] === 'number' ? row['count'] : 0;
-        if (count === 0) deleteEdge.run(src, dst);
-      }
-
-      for (const node of input.nodes) {
-        upsertNode.run(node.id, JSON.stringify(node));
-        for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
-          insertScopeNode.run(scope.kind, scope.id, node.id);
-        }
-      }
-      for (const [key, bucket] of edgeBuckets.entries()) {
-        const [src, dst] = key.split('\u0000');
-        if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
-        upsertEdge.run(src, dst, JSON.stringify(sortAlphaById(bucket)));
-        for (const scope of memberships.edgeScopes.get(key) ?? []) {
-          insertScopeEdge.run(scope.kind, scope.id, src, dst);
-        }
-      }
-
-      const allNodes = db
-        .query('SELECT data FROM nodes ORDER BY id')
-        .all()
-        .map((row) => JSON.parse(textField(row, 'data')) as ConnectionNode);
-      const allEdges = db
-        .query('SELECT data FROM edges ORDER BY src, dst')
-        .all()
-        .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[]);
-      const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
-      const previousMetadata =
+      const selectMetadata = db.query('SELECT data FROM metadata WHERE key = ?');
+      const metadataRow = selectMetadata.get('current');
+      const previousMetadata: StoredConnectionsMetadata =
         metadataRow === null || metadataRow === undefined
           ? {
               scope: {},
@@ -4141,29 +4612,168 @@ export class SqliteConnectionsStore implements ConnectionsStore {
               edgeCount: 0,
             }
           : (JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata);
-      const updatedAt = allEdges.reduce(
-        (max, edge) => (edge.observedAt > max ? edge.observedAt : max),
-        previousMetadata.updatedAt,
+      const upsertMetadata = db.query(
+        'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       );
+      const removedNodeOrderIds = new Set<string>();
+      const addedNodeOrderIds = new Set<string>();
+      const removedEdgeOrderIds = new Set<string>();
+      const addedEdgeOrderIds = new Set<string>();
+      let nodeOrder = metadataStringArray(selectMetadata.get('node_order'));
+      let edgeOrder = metadataStringArray(selectMetadata.get('edge_order'));
+
+      for (const scope of input.scopes) {
+        insertTempScope.run(scope.kind, scope.id);
+      }
+      for (const key of edgeBuckets.keys()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
+        insertTempNewEdge.run(src, dst);
+      }
+
+      db.query(
+        `INSERT OR IGNORE INTO temp_replace_nodes (node_id)
+         SELECT DISTINCT n.node_id
+         FROM connections_scope_nodes n
+         JOIN temp_replace_scopes s
+           ON s.scope_kind = n.scope_kind AND s.scope_id = n.scope_id`,
+      ).run();
+      db.query(
+        `INSERT OR IGNORE INTO temp_replace_edges (edge_src, edge_dst)
+         SELECT DISTINCT e.edge_src, e.edge_dst
+         FROM connections_scope_edges e
+         JOIN temp_replace_scopes s
+           ON s.scope_kind = e.scope_kind AND s.scope_id = e.scope_id`,
+      ).run();
+
+      for (const row of db
+        .query(
+          `SELECT e.data
+           FROM edges e
+           JOIN temp_replace_new_edges n
+             ON n.edge_src = e.src AND n.edge_dst = e.dst`,
+        )
+        .all()) {
+        for (const edgeId of edgeIdsFromSerializedBucket(textField(row, 'data'))) {
+          removedEdgeOrderIds.add(edgeId);
+        }
+      }
+
+      deleteScopeNodes.run();
+      deleteScopeEdges.run();
+
+      for (const row of db
+        .query(
+          `SELECT n.id
+           FROM nodes n
+           JOIN temp_replace_nodes t ON t.node_id = n.id
+           WHERE NOT EXISTS (
+             SELECT 1
+             FROM connections_scope_nodes c
+             WHERE c.node_id = n.id
+           )`,
+        )
+        .all()) {
+        removedNodeOrderIds.add(textField(row, 'id'));
+      }
+      for (const row of db
+        .query(
+          `SELECT e.data
+           FROM edges e
+           JOIN temp_replace_edges t
+             ON t.edge_src = e.src AND t.edge_dst = e.dst
+           WHERE NOT EXISTS (
+             SELECT 1
+             FROM connections_scope_edges c
+             WHERE c.edge_src = e.src AND c.edge_dst = e.dst
+           )`,
+        )
+        .all()) {
+        for (const edgeId of edgeIdsFromSerializedBucket(textField(row, 'data'))) {
+          removedEdgeOrderIds.add(edgeId);
+        }
+      }
+      deleteOrphanNodes.run();
+      deleteOrphanEdges.run();
+
+      for (const node of input.nodes) {
+        upsertNode.run(node.id, JSON.stringify(node));
+        addedNodeOrderIds.add(node.id);
+        for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
+          insertScopeNode.run(scope.kind, scope.id, node.id);
+        }
+      }
+      for (const [key, bucket] of edgeBuckets.entries()) {
+        const [src, dst] = key.split('\u0000');
+        if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
+        upsertEdge.run(src, dst, JSON.stringify(sortAlphaById(bucket)));
+        for (const edge of bucket) addedEdgeOrderIds.add(edge.id);
+        for (const scope of memberships.edgeScopes.get(key) ?? []) {
+          insertScopeEdge.run(scope.kind, scope.id, src, dst);
+        }
+      }
+
+      nodeOrder = patchSortedOrder({
+        current: nodeOrder,
+        removed: removedNodeOrderIds,
+        added: addedNodeOrderIds,
+      });
+      edgeOrder = patchSortedOrder({
+        current: edgeOrder,
+        removed: removedEdgeOrderIds,
+        added: addedEdgeOrderIds,
+      });
+      const urlProjection =
+        input.metadata?.urlProjection === undefined
+          ? previousMetadata.urlProjection
+          : mergeUrlProjectionForWrite(
+              input.metadata.urlProjection,
+              previousMetadata.urlProjection,
+            );
+      const tabSessionProjection =
+        input.metadata?.tabSessionProjection === undefined
+          ? previousMetadata.tabSessionProjection
+          : mergeTabSessionProjectionForWrite(
+              input.metadata.tabSessionProjection,
+              previousMetadata.tabSessionProjection,
+            );
+      const rowUpdatedAt = maxObservedAtForRows(
+        previousMetadata.updatedAt,
+        input.nodes,
+        input.edges,
+      );
+      const updatedAt = projectionOverlayUpdatedAt({
+        fallback: rowUpdatedAt,
+        ...(urlProjection === undefined ? {} : { urlProjection }),
+        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+      });
+      const snapshotRevision = computeSnapshotRevision({
+        updatedAt,
+        nodeCount: nodeOrder.length,
+        edgeCount: edgeOrder.length,
+        urlProjectionKeyCount:
+          urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
+        tabSessionProjectionKeyCount:
+          tabSessionProjection === undefined
+            ? 0
+            : Object.keys(tabSessionProjection.bySessionId).length,
+      });
       const metadata: StoredConnectionsMetadata = {
         ...previousMetadata,
         updatedAt,
-        nodeCount: allNodes.length,
-        edgeCount: allEdges.length,
-        ...(input.progress.snapshotRevisionId === null
-          ? {}
-          : { snapshotRevision: input.progress.snapshotRevisionId }),
+        nodeCount: nodeOrder.length,
+        edgeCount: edgeOrder.length,
+        ...(urlProjection === undefined ? {} : { urlProjection }),
+        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+        snapshotRevision,
       };
       upsertMetadata.run('current', JSON.stringify(metadata));
-      upsertMetadata.run(
-        'node_order',
-        JSON.stringify(sortAlphaById(allNodes).map((node) => node.id)),
-      );
-      upsertMetadata.run(
-        'edge_order',
-        JSON.stringify(sortAlphaById(allEdges).map((edge) => edge.id)),
-      );
-      this.#writeProgressRows(db, input.progress);
+      upsertMetadata.run('node_order', JSON.stringify(nodeOrder));
+      upsertMetadata.run('edge_order', JSON.stringify(edgeOrder));
+      this.#writeProgressRows(db, {
+        ...input.progress,
+        snapshotRevisionId: snapshotRevision,
+      });
       db.exec('COMMIT');
       this.#cachedSnapshot = null;
     } catch (error) {
@@ -4246,6 +4856,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const upsertMetadata = db.query(
         'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       );
+      const selectMetadata = db.query('SELECT data FROM metadata WHERE key = ?');
       const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
       const deleteAllScopeNodes = db.query('DELETE FROM connections_scope_nodes');
@@ -4357,7 +4968,15 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         }
       }
 
-      upsertMetadata.run('current', JSON.stringify(metadataForSnapshot(snapshot)));
+      const metadataRow = selectMetadata.get('current');
+      const existingMetadata =
+        metadataRow === null || metadataRow === undefined
+          ? null
+          : (JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata);
+      upsertMetadata.run(
+        'current',
+        JSON.stringify(metadataForSnapshotWrite(snapshot, existingMetadata)),
+      );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
       if (progress !== null) this.#writeProgressRows(db, progress);
@@ -4550,37 +5169,41 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   ): Promise<ConnectionsSnapshot | null> =>
     await this.#readTraversedSubgraph([nodeId], { hops: Math.max(0, Math.min(hops, 4)) });
 
-  // Resolver "subgraph" reads currently route through the bulk
-  // readCurrent. The seed-expansion BFS (#readTraversedSubgraph) is
-  // unbounded by default and walks the graph one node at a time with
-  // per-node SQL queries — on a dense connections graph (~3.6 K nodes,
-  // avg degree ~8) that means thousands of single-row reads to cover
-  // most of the connected component, which is measurably slower than
-  // the two bulk SELECTs in readCurrent. Live cold-path resolves were
-  // ~1–3 s before this change; bulk reads bring them down to a single
-  // SQL roundtrip plus one JSON.parse per row.
-  //
-  // The bounded-hops helper (readSubgraphForNode) is unchanged — its
-  // callers pass an explicit hop budget, so the per-node BFS pattern
-  // is acceptable there.
-  //
-  // TODO(perf): re-introduce a real bounded-hops + bulk-expansion
-  // partial read once we need it: one
-  //   SELECT data, src, dst FROM edges WHERE src IN (...) OR dst IN (...)
-  // per hop, capped at ~3 hops.
   readonly readResolverSubgraphForTabSession = async (
-    _tabSessionId: string,
-  ): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
+    tabSessionId: string,
+  ): Promise<ConnectionsSnapshot | null> =>
+    await this.#readTraversedSubgraph([nodeIdFor('tab-session', tabSessionId)], {
+      hops: RESOLVER_SUBGRAPH_HOPS,
+    });
 
   readonly readResolverSubgraphForUrl = async (
-    _canonicalUrl: string,
-  ): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
+    canonicalUrl: string,
+  ): Promise<ConnectionsSnapshot | null> => await this.readResolverSubgraphForUrls([canonicalUrl]);
+
+  readonly readResolverSubgraphForUrls = async (
+    canonicalUrls: readonly string[],
+  ): Promise<ConnectionsSnapshot | null> => {
+    const seedNodeIds = new Set<string>();
+    for (const canonicalUrl of canonicalUrls) {
+      if (canonicalUrl.length === 0) continue;
+      seedNodeIds.add(nodeIdFor('timeline-visit', canonicalUrl));
+      seedNodeIds.add(nodeIdFor('timeline-visit', normalizeResolverUrl(canonicalUrl)));
+    }
+    return await this.#readTraversedSubgraph([...seedNodeIds], {
+      hops: RESOLVER_URL_SUBGRAPH_HOPS,
+    });
+  };
 
   readonly readResolverSubgraphForThread = async (_input: {
     readonly threadId: string;
     readonly providerThreadId?: string;
     readonly threadUrl?: string;
-  }): Promise<ConnectionsSnapshot | null> => await this.readCurrent();
+  }): Promise<ConnectionsSnapshot | null> => {
+    const db = await this.#database();
+    return await this.#readTraversedSubgraph(this.#threadResolverSeedNodeIds(db, _input), {
+      hops: RESOLVER_SUBGRAPH_HOPS,
+    });
+  };
 
   readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
     const db = await this.#database();
@@ -4676,6 +5299,10 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     await writeAtomic(progressPath, JSON.stringify(progress, null, 2));
   };
 
+  const writeMaterializerProgress = async (progress: MaterializerProgress): Promise<void> => {
+    await writeAtomic(progressPath, JSON.stringify(progress, null, 2));
+  };
+
   const readMaterializerProgress = async (name: string): Promise<MaterializerProgress | null> => {
     try {
       const progress = JSON.parse(await readFile(progressPath, 'utf8')) as MaterializerProgress;
@@ -4760,6 +5387,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
   return {
     putCurrent,
     writeSnapshotAndProgress,
+    writeMaterializerProgress,
     readMaterializerProgress,
     readCurrent,
     putDay,

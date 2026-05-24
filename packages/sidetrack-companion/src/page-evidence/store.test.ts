@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryPageContent, writePageContentExtracted } from '../page-content/store.js';
 import type { PageEvidenceExtractedRequest } from './types.js';
 import {
+  completeExtractedPageEvidenceEmbedding,
   pageEvidenceStorageStats,
   ensurePageEvidenceForTimelineEntries,
   readPageEvidence,
   readPageEvidenceVectorMap,
   writeExtractedPageEvidence,
+  writeExtractedPageEvidenceFast,
   writeMetadataOnlyPageEvidence,
 } from './store.js';
 
@@ -128,6 +130,70 @@ describe('page-evidence store', () => {
     expect(finalRecord.content?.docEmbeddingRef).toBeDefined();
   });
 
+  it('can return a directly-readable features record before completing doc embedding', async () => {
+    let embedCalls = 0;
+    const embedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      embedCalls += 1;
+      return texts.map(() => {
+        const vector = new Float32Array(384);
+        vector[0] = 1;
+        return vector;
+      });
+    };
+
+    const fastRecord = await writeExtractedPageEvidenceFast(root, payload(), {
+      rebuildManifestAfterWrite: false,
+    });
+
+    expect(embedCalls).toBe(0);
+    expect(fastRecord.content?.embeddingState).toBe('missing');
+    expect(fastRecord.content?.docEmbeddingRef).toBeUndefined();
+    const direct = await readPageEvidence(root, payload().canonicalUrl);
+    expect(direct.record?.content?.embeddingState).toBe('missing');
+
+    const finalRecord = await completeExtractedPageEvidenceEmbedding(root, payload(), {
+      embedder,
+      rebuildManifestAfterWrite: false,
+    });
+
+    expect(embedCalls).toBe(1);
+    expect(finalRecord.content?.embeddingState).toBe('ready');
+    expect(finalRecord.content?.docEmbeddingRef).toBeDefined();
+  });
+
+  it('does not let stale embedding completion overwrite newer evidence for the same URL', async () => {
+    let embedCalls = 0;
+    const embedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      embedCalls += 1;
+      return texts.map(() => {
+        const vector = new Float32Array(384);
+        vector[0] = 1;
+        return vector;
+      });
+    };
+    const newerPayload = payload({
+      extractedAt: '2026-05-16T10:05:00.000Z',
+      title: 'Newer Minipack Evidence',
+      content: {
+        text: 'Newer content hash wins when an older embedding tail completes later.',
+        contentHash: 'hash-f16-minipack-newer',
+        charCount: 82,
+      },
+    });
+
+    await writeExtractedPageEvidenceFast(root, payload(), { rebuildManifestAfterWrite: false });
+    await writeExtractedPageEvidenceFast(root, newerPayload, { rebuildManifestAfterWrite: false });
+    const staleResult = await completeExtractedPageEvidenceEmbedding(root, payload(), {
+      embedder,
+      rebuildManifestAfterWrite: false,
+    });
+
+    expect(embedCalls).toBe(0);
+    expect(staleResult.content?.contentHash).toBe('hash-f16-minipack-newer');
+    const direct = await readPageEvidence(root, payload().canonicalUrl);
+    expect(direct.record?.content?.contentHash).toBe('hash-f16-minipack-newer');
+  });
+
   it('re-extracting unchanged content does not downgrade an existing embedded record', async () => {
     const embedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> =>
       texts.map(() => {
@@ -206,6 +272,8 @@ describe('page-evidence store', () => {
     expect(record?.evidenceTier).toBe('indexed_chunks');
     expect(record?.indexed?.chunkCount).toBeGreaterThan(0);
     expect(record?.content?.terms.some((term) => term.normalized === 'minipack')).toBe(true);
+    expect(record?.content?.embeddingState).toBe('missing');
+    expect(record?.content?.docEmbeddingRef).toBeUndefined();
   });
 
   it('preserves content evidence when later timeline metadata refreshes the record', async () => {

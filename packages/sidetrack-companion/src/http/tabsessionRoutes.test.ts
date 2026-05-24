@@ -408,24 +408,11 @@ describe('tab-session HTTP routes', () => {
     const body = (await response.json()) as {
       readonly data?: {
         readonly status?: string;
-        readonly projection?: {
-          readonly bySessionId?: Record<
-            string,
-            {
-              readonly currentAttribution?: {
-                readonly workstreamId?: string;
-                readonly source?: string;
-              };
-            }
-          >;
-        };
+        readonly projection?: unknown;
       };
     };
     expect(body.data?.status).toBe('applied');
-    expect(body.data?.projection?.bySessionId?.['tses_a']?.currentAttribution).toMatchObject({
-      workstreamId: 'ws_security',
-      source: 'inferred',
-    });
+    expect(body.data?.projection).toBeUndefined();
     await expect(eventLog.readMerged()).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -478,24 +465,11 @@ describe('tab-session HTTP routes', () => {
     const body = (await response.json()) as {
       readonly data?: {
         readonly status?: string;
-        readonly projection?: {
-          readonly bySessionId?: Record<
-            string,
-            {
-              readonly currentAttribution?: {
-                readonly workstreamId?: string;
-                readonly source?: string;
-              };
-            }
-          >;
-        };
+        readonly projection?: unknown;
       };
     };
     expect(body.data?.status).toBe('skipped-existing-attribution');
-    expect(body.data?.projection?.bySessionId?.['tses_a']?.currentAttribution).toMatchObject({
-      workstreamId: 'ws_manual',
-      source: 'user_asserted',
-    });
+    expect(body.data?.projection).toBeUndefined();
     expect(
       (await eventLog.readMerged()).filter(
         (event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED,

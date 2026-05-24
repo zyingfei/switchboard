@@ -33,7 +33,7 @@ import {
 } from '../http/server.js';
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEmbedderClient } from '../recall/embedderClient.js';
-import { createEventLog } from '../sync/eventLog.js';
+import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
@@ -68,6 +68,22 @@ import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
 
 type PageEvidenceTimelineEntry = Parameters<typeof ensurePageEvidenceForTimelineEntries>[1][number];
+
+export const appendObservedEdgeEventsBatch = async (
+  eventLog: Pick<EventLog, 'appendClientObservedBatch'>,
+  events: readonly AcceptedEvent[],
+  onAccepted: (event: AcceptedEvent) => void,
+): Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]> =>
+  eventLog.appendClientObservedBatch(
+    events.map((event) => ({
+      clientEventId: event.clientEventId,
+      aggregateId: event.aggregateId,
+      type: event.type,
+      payload: event.payload as Record<string, unknown>,
+      baseVector: {},
+    })),
+    onAccepted as (event: AcceptedEvent<Record<string, unknown>>) => void,
+  );
 
 export interface HygieneStatus {
   lastIdempotencyGcAt?: string;
@@ -253,6 +269,11 @@ export const startCompanion = async (
         )}ms`,
       );
     };
+    const markSlowPostDrainObserver = (label: string, startedAtMs: number): void => {
+      if (performance.now() - startedAtMs >= 50) {
+        markPostDrain(label, startedAtMs);
+      }
+    };
     let watcher: VaultWatcher | undefined;
     try {
       watcher = createVaultWatcher(options.vaultPath, {
@@ -270,10 +291,14 @@ export const startCompanion = async (
               // A subscriber's handler must never break fan-out to the
               // other subscribers (or throw into the vault watcher).
             } finally {
-              if (isConnectionsChange) markPostDrain('observer.listener', listenerStartedAtMs);
+              if (isConnectionsChange) {
+                markSlowPostDrainObserver('observer.listener', listenerStartedAtMs);
+              }
             }
           }
-          if (isConnectionsChange) markPostDrain('observer.listeners', fanoutStartedAtMs);
+          if (isConnectionsChange) {
+            markSlowPostDrainObserver('observer.listeners', fanoutStartedAtMs);
+          }
         },
       });
     } catch {
@@ -862,20 +887,16 @@ export const startCompanion = async (
       // P2 — batched edge-event ingest. The plugin's ~1-min flush
       // imports a whole buffered batch; per-event importEdgeEvent did
       // ~3 whole-log scans each (~quadratic; 39s on backlog). One
-      // readMerged + dedupe + shard write for the batch. No dispatch
-      // hook: edge events (engagement / selection / fingerprint) are
-      // consumed by the connections materializer's full-log reconcile,
-      // not by per-event dirty-marking.
+      // readMerged + dedupe + shard write for the batch.
+      //
+      // The onAccepted hook is still required. Edge events include
+      // navigation.committed / engagement signals that the connections
+      // materializer handles incrementally; without this hook accepted
+      // edge batches sit in the event log until some unrelated catchUp,
+      // which is exactly the "fresh HN click still says Direct / no
+      // signals" tail.
       importEdgeEvents: async (events) =>
-        eventLog.appendClientObservedBatch(
-          events.map((event) => ({
-            clientEventId: event.clientEventId,
-            aggregateId: event.aggregateId,
-            type: event.type,
-            payload: event.payload as Record<string, unknown>,
-            baseVector: {},
-          })),
-        ),
+        appendObservedEdgeEventsBatch(eventLog, events, onLocalAccepted),
       // Batched timeline ingest — `POST /v1/timeline/events`. Same
       // ONE-readMerged dedupe as importEdgeEvents (vs the singular
       // importEdgeEvent's per-event whole-log scan, measured at
@@ -923,9 +944,7 @@ export const startCompanion = async (
             {
               id: event.clientEventId,
               url,
-              ...(typeof p['canonicalUrl'] === 'string'
-                ? { canonicalUrl: p['canonicalUrl'] }
-                : {}),
+              ...(typeof p['canonicalUrl'] === 'string' ? { canonicalUrl: p['canonicalUrl'] } : {}),
               ...(typeof p['title'] === 'string' ? { title: p['title'] } : {}),
               ...(typeof p['provider'] === 'string'
                 ? { provider: p['provider'] as TimelineProvider }

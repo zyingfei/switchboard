@@ -310,26 +310,11 @@ describe('per-URL HTTP routes', () => {
     const body = (await response.json()) as {
       readonly data?: {
         readonly status?: string;
-        readonly projection?: {
-          readonly byCanonicalUrl?: Record<
-            string,
-            {
-              readonly currentAttribution?: {
-                readonly workstreamId?: string;
-                readonly source?: string;
-              };
-            }
-          >;
-        };
+        readonly projection?: unknown;
       };
     };
     expect(body.data?.status).toBe('applied');
-    expect(body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution).toMatchObject(
-      {
-        workstreamId: 'ws_security',
-        source: 'inferred',
-      },
-    );
+    expect(body.data?.projection).toBeUndefined();
     await expect(eventLog.readMerged()).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -368,18 +353,11 @@ describe('per-URL HTTP routes', () => {
     const body = (await response.json()) as {
       readonly data?: {
         readonly status?: string;
-        readonly projection?: {
-          readonly byCanonicalUrl?: Record<
-            string,
-            { readonly currentAttribution?: unknown }
-          >;
-        };
+        readonly projection?: unknown;
       };
     };
     expect(body.data?.status).toBe('skipped-grace-window');
-    expect(
-      body.data?.projection?.byCanonicalUrl?.[canonicalUrl]?.currentAttribution,
-    ).toBeUndefined();
+    expect(body.data?.projection).toBeUndefined();
     await expect(eventLog.readMerged()).resolves.not.toContainEqual(
       expect.objectContaining({ type: URL_ATTRIBUTION_INFERRED }),
     );
@@ -526,11 +504,120 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     snapshotRevision: revision,
   });
 
+  const snapshotForEventCandidateUrl = (
+    targetUrl: string,
+    anchorUrl: string,
+    revision: string,
+  ): ConnectionsSnapshot => ({
+    scope: {},
+    nodes: [
+      {
+        id: `timeline-visit:${targetUrl}`,
+        kind: 'timeline-visit',
+        label: 'Target URL',
+        originReplicaIds: [],
+        metadata: { canonicalUrl: targetUrl },
+      },
+      {
+        id: `timeline-visit:${anchorUrl}`,
+        kind: 'timeline-visit',
+        label: 'Anchor URL',
+        originReplicaIds: [],
+        metadata: { canonicalUrl: anchorUrl },
+      },
+      {
+        id: 'workstream:ws_security',
+        kind: 'workstream',
+        label: 'Security workstream',
+        originReplicaIds: [],
+        metadata: {},
+      },
+    ],
+    edges: [
+      {
+        id: 'edge:anchor-workstream',
+        kind: 'visit_in_workstream',
+        fromNodeId: `timeline-visit:${anchorUrl}`,
+        toNodeId: 'workstream:ws_security',
+        observedAt: '2026-05-07T10:00:00.000Z',
+        producedBy: { source: 'event-log' },
+        confidence: 'asserted',
+      },
+    ],
+    updatedAt: '2026-05-07T10:00:00.000Z',
+    nodeCount: 3,
+    edgeCount: 1,
+    snapshotRevision: revision,
+  });
+
+  const appendObservation = async (input: {
+    seq: number;
+    url: string;
+    title?: string;
+  }): Promise<void> => {
+    await eventLog.appendClient({
+      clientEventId: `observed-resolver-${String(input.seq)}`,
+      aggregateId: '2026-05-07',
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        eventId: `tl-resolver-${String(input.seq)}`,
+        observedAt: '2026-05-07T10:00:00.000Z',
+        url: input.url,
+        canonicalUrl: input.url,
+        transition: 'updated',
+        ...(input.title === undefined ? {} : { title: input.title }),
+      },
+      baseVector: {},
+    });
+  };
+
+  const createResolverCacheStore = (): SqliteConnectionsStore => {
+    let current: ConnectionsSnapshot | null = null;
+    const cache = new Map<string, unknown>();
+    return Object.assign(Object.create(SqliteConnectionsStore.prototype), {
+      putCurrent: vi.fn(async (snapshot: ConnectionsSnapshot) => {
+        current = snapshot;
+      }),
+      readCurrent: vi.fn(async () => current),
+      readResolverSubgraphForUrl: vi.fn(async () => current),
+      readResolverSubgraphForUrls: vi.fn(async () => current),
+      readSnapshotMetadata: vi.fn(async () =>
+        current === null
+          ? null
+          : {
+              scope: current.scope,
+              updatedAt: current.updatedAt,
+              nodeCount: current.nodeCount,
+              edgeCount: current.edgeCount,
+              ...(current.snapshotRevision === undefined
+                ? {}
+                : { snapshotRevision: current.snapshotRevision }),
+            },
+      ),
+      cacheResolverResult: vi.fn(
+        async (visitId: string, snapshotRevision: string, result: unknown) => {
+          cache.set(`${visitId}\0${snapshotRevision}`, result);
+        },
+      ),
+      getCachedResolverResult: vi.fn(async (visitId: string, snapshotRevision: string) =>
+        cache.get(`${visitId}\0${snapshotRevision}`) ?? null,
+      ),
+      writeSnapshotAndProgress: vi.fn(async (snapshot: ConnectionsSnapshot) => {
+        current = snapshot;
+      }),
+      readMaterializerProgress: vi.fn(async () => null),
+      putDay: vi.fn(async () => undefined),
+      readDay: vi.fn(async () => null),
+      listDays: vi.fn(async () => []),
+      close: vi.fn(() => undefined),
+    }) as unknown as SqliteConnectionsStore;
+  };
+
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-resolver-cache-'));
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
-    connectionsStore = new SqliteConnectionsStore(vaultRoot, { databasePath: ':memory:' });
+    connectionsStore = createResolverCacheStore();
     const server = createCompanionHttpServer({
       bridgeKey,
       vaultWriter: createVaultWriter(vaultRoot),
@@ -578,9 +665,13 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   });
 
   it('POST /v1/visits/batch-resolve returns one result per URL', async () => {
-    const urls = Array.from({ length: 10 }, (_value, index) => `https://batch.test/${String(index)}`);
+    const urls = Array.from(
+      { length: 10 },
+      (_value, index) => `https://batch.test/${String(index)}`,
+    );
     await connectionsStore.putCurrent(snapshotForUrls(urls, 'rev-batch-a'));
     const readCurrent = vi.spyOn(connectionsStore, 'readCurrent');
+    const readResolverSubgraphForUrls = vi.spyOn(connectionsStore, 'readResolverSubgraphForUrls');
     const readMerged = vi.spyOn(eventLog, 'readMerged');
 
     const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
@@ -594,10 +685,58 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       data: { results: Record<string, { canonicalUrl: string }> };
     };
     expect(Object.keys(body.data.results).sort()).toEqual([...urls].sort());
-    expect(Object.values(body.data.results).map((result) => result.canonicalUrl).sort()).toEqual(
-      [...urls].sort(),
-    );
-    expect(readCurrent).toHaveBeenCalledTimes(1);
+    expect(
+      Object.values(body.data.results)
+        .map((result) => result.canonicalUrl)
+        .sort(),
+    ).toEqual([...urls].sort());
+    expect(readResolverSubgraphForUrls).toHaveBeenCalledTimes(1);
+    expect(readResolverSubgraphForUrls).toHaveBeenCalledWith(urls);
+    expect(readCurrent).not.toHaveBeenCalled();
     expect(readMerged).toHaveBeenCalledTimes(1);
+  });
+
+  it('POST /v1/visits/batch-resolve can expand focused URL event candidates', async () => {
+    const targetUrl = 'https://news.ycombinator.com/item?id=48178692';
+    const anchorUrl = 'https://news.ycombinator.com/item?id=48112042';
+    await connectionsStore.putCurrent(
+      snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates'),
+    );
+    await appendObservation({
+      seq: 1,
+      url: targetUrl,
+      title: 'Linux security mailing list almost unmanageable',
+    });
+    await appendObservation({
+      seq: 2,
+      url: anchorUrl,
+      title: 'Linux security follow-up',
+    });
+
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: [targetUrl], eventCandidateUrls: [targetUrl] }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: {
+        results: Record<
+          string,
+          { readonly fusedCandidates: readonly { readonly workstreamId: string }[] }
+        >;
+      };
+    };
+    expect(body.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    expect(connectionsStore.getCachedResolverResult).not.toHaveBeenCalledWith(
+      targetUrl,
+      'rev-event-candidates',
+    );
+    expect(connectionsStore.cacheResolverResult).not.toHaveBeenCalledWith(
+      targetUrl,
+      'rev-event-candidates',
+      expect.anything(),
+    );
   });
 });

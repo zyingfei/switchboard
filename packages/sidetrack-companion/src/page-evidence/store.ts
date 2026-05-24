@@ -194,6 +194,26 @@ const writeRecord = async (vaultRoot: string, record: PageEvidenceRecord): Promi
   await atomicWriteJson(recordPathForCanonicalUrl(vaultRoot, record.canonicalUrl), record);
 };
 
+const shouldWriteRecord = (
+  previous: PageEvidenceRecord | null,
+  record: PageEvidenceRecord,
+): boolean =>
+  previous?.evidenceRevision !== record.evidenceRevision ||
+  previous?.behaviorMetadataRevision !== record.behaviorMetadataRevision ||
+  previous?.content?.embeddingState !== record.content?.embeddingState;
+
+const writeRecordIfChanged = async (
+  vaultRoot: string,
+  previous: PageEvidenceRecord | null,
+  record: PageEvidenceRecord,
+  options: { readonly rebuildManifestAfterWrite?: boolean },
+): Promise<boolean> => {
+  if (!shouldWriteRecord(previous, record)) return false;
+  await writeRecord(vaultRoot, record);
+  if (options.rebuildManifestAfterWrite !== false) await rebuildManifest(vaultRoot);
+  return true;
+};
+
 export const writeMetadataOnlyPageEvidence = async (
   vaultRoot: string,
   input: PageEvidenceMetadataInput,
@@ -270,7 +290,7 @@ export const ensurePageEvidenceForTimelineEntries = async (
         record.evidenceTier !== 'indexed_chunks' ||
         record.content?.contentHash !== indexedPayload.content.contentHash)
     ) {
-      record = await writeExtractedPageEvidence(
+      record = await writeExtractedPageEvidenceFast(
         vaultRoot,
         {
           ...indexedPayload,
@@ -299,6 +319,39 @@ export const writeExtractedPageEvidence = async (
     readonly rebuildManifestAfterWrite?: boolean;
   } = {},
 ): Promise<PageEvidenceRecord> => {
+  const fastState = await writeExtractedPageEvidenceFastState(vaultRoot, payload, {
+    rebuildManifestAfterWrite: false,
+    ...(options.embeddingsEnabled === undefined
+      ? {}
+      : { embeddingsEnabled: options.embeddingsEnabled }),
+  });
+  const fast = fastState.record;
+  if (
+    fast.evidenceTier === 'metadata_only' ||
+    options.embeddingsEnabled === false ||
+    fast.content?.embeddingState === 'ready'
+  ) {
+    if (fastState.wrote && options.rebuildManifestAfterWrite !== false) {
+      await rebuildManifest(vaultRoot);
+    }
+    return fast;
+  }
+  return await completeExtractedPageEvidenceEmbedding(vaultRoot, payload, options);
+};
+
+interface FastExtractedPageEvidenceWriteResult {
+  readonly record: PageEvidenceRecord;
+  readonly wrote: boolean;
+}
+
+const writeExtractedPageEvidenceFastState = async (
+  vaultRoot: string,
+  payload: PageEvidenceExtractedRequest,
+  options: {
+    readonly embeddingsEnabled?: boolean;
+    readonly rebuildManifestAfterWrite?: boolean;
+  } = {},
+): Promise<FastExtractedPageEvidenceWriteResult> => {
   const canonicalUrl = canonicalizeEvidenceUrl(payload.canonicalUrl);
   const previous = await readRawPageEvidence(vaultRoot, canonicalUrl);
   const quality = classifyPageContentQuality(payload.qualitySignals);
@@ -313,79 +366,120 @@ export const writeExtractedPageEvidence = async (
       },
       previous ?? undefined,
     );
-    if (
-      previous?.evidenceRevision !== record.evidenceRevision ||
-      previous?.behaviorMetadataRevision !== record.behaviorMetadataRevision
-    ) {
-      await writeRecord(vaultRoot, record);
-      if (options.rebuildManifestAfterWrite !== false) await rebuildManifest(vaultRoot);
-    }
-    return record;
+    const wrote = await writeRecordIfChanged(vaultRoot, previous, record, options);
+    return { record, wrote };
   }
-  let docEmbeddingRef: VectorRef | undefined;
-  let embeddingState: 'disabled' | 'missing' | 'failed' | 'ready' =
-    options.embeddingsEnabled === false ? 'disabled' : 'missing';
   const normalizedPayload = {
     ...payload,
     canonicalUrl,
     quality: quality.quality ?? payload.quality,
   };
-
-  // Fast-first prelude. The synchronous doc embedding below takes
-  // 5-10s on large pages (Show HN comment threads, big GitHub
-  // READMEs); until the record exists, /v1/page-evidence/summary —
-  // the extension's "Indexing…" badge poll — returns null and the
-  // badge sticks on "Indexing…" the whole time. readPageEvidence
-  // reads the by-url record file directly (not the manifest), so
-  // pre-persisting a features-tier record here lets the badge resolve
-  // on its very next 3s poll; the original tail below then upgrades
-  // the same record in place once the embedding lands.
-  //
-  // Gated to exactly the case that shows "Indexing…": a page with no
-  // usable embedding yet (first extraction or a prior failure). When
-  // re-extracting an already-embedded page we skip the prelude and
-  // fall straight through to the original single-write path, which
-  // carries the existing embedding forward — a 'missing' pre-write
-  // there would transiently downgrade a 'ready' record. The manifest
-  // is intentionally NOT rebuilt here (the tail does the single
-  // rebuild, exactly as before).
-  if (options.embeddingsEnabled !== false && previous?.content?.embeddingState !== 'ready') {
-    const fastRecord = buildExtractedPageEvidence(normalizedPayload, previous ?? undefined, {
-      embeddingState: 'missing',
-    });
-    if (
-      previous?.evidenceRevision !== fastRecord.evidenceRevision ||
-      previous?.behaviorMetadataRevision !== fastRecord.behaviorMetadataRevision
-    ) {
-      await writeRecord(vaultRoot, fastRecord);
-    }
-  }
-
-  if (options.embeddingsEnabled !== false) {
-    try {
-      docEmbeddingRef = await writePageEvidenceDocEmbedding(
-        vaultRoot,
-        normalizedPayload,
-        options.embedder,
-      );
-      embeddingState = docEmbeddingRef === undefined ? 'missing' : 'ready';
-    } catch {
-      docEmbeddingRef = undefined;
-      embeddingState = 'failed';
-    }
-  }
+  const previousDocEmbeddingRef = previous?.content?.docEmbeddingRef;
+  const canCarryCurrentEmbedding =
+    options.embeddingsEnabled !== false &&
+    previous?.content?.contentHash === normalizedPayload.content.contentHash &&
+    previousDocEmbeddingRef !== undefined &&
+    isCurrentPageEvidenceVectorRef(previousDocEmbeddingRef);
   const record = buildExtractedPageEvidence(
     normalizedPayload,
     previous ?? undefined,
+    options.embeddingsEnabled === false
+      ? { embeddingState: 'disabled' }
+      : canCarryCurrentEmbedding
+        ? { docEmbeddingRef: previousDocEmbeddingRef, embeddingState: 'ready' }
+        : { embeddingState: 'missing' },
+  );
+  const wrote = await writeRecordIfChanged(vaultRoot, previous, record, options);
+  return { record, wrote };
+};
+
+export const writeExtractedPageEvidenceFast = async (
+  vaultRoot: string,
+  payload: PageEvidenceExtractedRequest,
+  options: {
+    readonly embeddingsEnabled?: boolean;
+    readonly rebuildManifestAfterWrite?: boolean;
+  } = {},
+): Promise<PageEvidenceRecord> =>
+  (await writeExtractedPageEvidenceFastState(vaultRoot, payload, options)).record;
+
+const isCurrentEvidenceForEmbeddingCompletion = (
+  record: PageEvidenceRecord | null,
+  payload: PageEvidenceExtractedRequest,
+): boolean => {
+  if (record === null) return true;
+  if (
+    record.content?.contentHash !== undefined &&
+    record.content.contentHash !== payload.content.contentHash
+  ) {
+    return false;
+  }
+  return record.updatedAt <= payload.extractedAt;
+};
+
+export const completeExtractedPageEvidenceEmbedding = async (
+  vaultRoot: string,
+  payload: PageEvidenceExtractedRequest,
+  options: {
+    readonly embedder?: PageEvidenceEmbedder;
+    readonly embeddingsEnabled?: boolean;
+    readonly rebuildManifestAfterWrite?: boolean;
+  } = {},
+): Promise<PageEvidenceRecord> => {
+  if (options.embeddingsEnabled === false) {
+    return await writeExtractedPageEvidenceFast(vaultRoot, payload, options);
+  }
+  const canonicalUrl = canonicalizeEvidenceUrl(payload.canonicalUrl);
+  const initial = await readRawPageEvidence(vaultRoot, canonicalUrl);
+  const quality = classifyPageContentQuality(payload.qualitySignals);
+  if (quality.state === 'metadata_only_error') {
+    return await writeExtractedPageEvidenceFast(vaultRoot, payload, options);
+  }
+  const normalizedPayload = {
+    ...payload,
+    canonicalUrl,
+    quality: quality.quality ?? payload.quality,
+  };
+  if (initial !== null && !isCurrentEvidenceForEmbeddingCompletion(initial, normalizedPayload)) {
+    return initial;
+  }
+  const initialDocEmbeddingRef = initial?.content?.docEmbeddingRef;
+  if (
+    initial !== null &&
+    initial?.content?.contentHash === normalizedPayload.content.contentHash &&
+    initialDocEmbeddingRef !== undefined &&
+    isCurrentPageEvidenceVectorRef(initialDocEmbeddingRef)
+  ) {
+    const record = buildExtractedPageEvidence(normalizedPayload, initial, {
+      docEmbeddingRef: initialDocEmbeddingRef,
+      embeddingState: 'ready',
+    });
+    await writeRecordIfChanged(vaultRoot, initial, record, options);
+    return record;
+  }
+  let docEmbeddingRef: VectorRef | undefined;
+  let embeddingState: 'missing' | 'failed' | 'ready' = 'missing';
+  try {
+    docEmbeddingRef = await writePageEvidenceDocEmbedding(
+      vaultRoot,
+      normalizedPayload,
+      options.embedder,
+    );
+    embeddingState = docEmbeddingRef === undefined ? 'missing' : 'ready';
+  } catch {
+    docEmbeddingRef = undefined;
+    embeddingState = 'failed';
+  }
+  const latest = await readRawPageEvidence(vaultRoot, canonicalUrl);
+  if (latest !== null && !isCurrentEvidenceForEmbeddingCompletion(latest, normalizedPayload)) {
+    return latest;
+  }
+  const record = buildExtractedPageEvidence(
+    normalizedPayload,
+    latest ?? undefined,
     docEmbeddingRef === undefined ? { embeddingState } : { docEmbeddingRef, embeddingState },
   );
-  if (
-    previous?.evidenceRevision !== record.evidenceRevision ||
-    previous?.behaviorMetadataRevision !== record.behaviorMetadataRevision
-  ) {
-    await writeRecord(vaultRoot, record);
-    if (options.rebuildManifestAfterWrite !== false) await rebuildManifest(vaultRoot);
-  }
+  await writeRecordIfChanged(vaultRoot, latest, record, options);
   return record;
 };
 

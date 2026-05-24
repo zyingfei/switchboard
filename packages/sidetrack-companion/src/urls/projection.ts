@@ -183,6 +183,7 @@ const upsertAttribution = (
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
+    ...(existing?.pageEvidence === undefined ? {} : { pageEvidence: existing.pageEvidence }),
     ...(currentAttribution === undefined ? {} : { currentAttribution }),
     ...(preserveIgnored && existing.currentIgnored !== undefined
       ? { currentIgnored: existing.currentIgnored }
@@ -231,6 +232,7 @@ const upsertIgnored = (
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
+    ...(existing?.pageEvidence === undefined ? {} : { pageEvidence: existing.pageEvidence }),
     ...(existing?.currentAttribution === undefined
       ? {}
       : { currentAttribution: existing.currentAttribution }),
@@ -372,6 +374,7 @@ const foldObservedVisitIntoAccumulator = (
     ...(latestTitle === undefined ? {} : { latestTitle }),
     ...(provider === undefined ? {} : { provider }),
     ...(derivedHost === undefined ? {} : { host: derivedHost }),
+    ...(existing?.pageEvidence === undefined ? {} : { pageEvidence: existing.pageEvidence }),
   };
   acc.records.set(canonical, next);
   if (candidateIsNewer) acc.observationCursors.set(canonical, cursor);
@@ -483,6 +486,17 @@ export const urlProjectionFromAccumulator = (acc: UrlProjectionAccumulator): Url
   byCanonicalUrl: new Map(
     [...acc.records.entries()].sort(([left], [right]) => compareString(left, right)),
   ),
+});
+
+export const urlProjectionAccumulatorFromSerialized = (
+  serialized: SerializedUrlProjection,
+): UrlProjectionAccumulator => ({
+  records: new Map(
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  observationCursors: new Map(),
 });
 
 // Apply PR #141's thread→URL attribution propagation to the

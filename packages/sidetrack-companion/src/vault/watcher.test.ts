@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import type { FSWatcher } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { describe, expect, it } from 'vitest';
 
 import { createVaultWatcher, type VaultChangeEvent } from './watcher.js';
 
@@ -13,39 +13,86 @@ const delay = async (ms: number): Promise<void> => {
   });
 };
 
+interface WatcherHarness {
+  readonly events: VaultChangeEvent[];
+  readonly emit: (filename: string) => void;
+  readonly removeExistingPath: (relPath: string) => void;
+  readonly close: () => Promise<void>;
+}
+
+const fakeFsWatcher = (close: () => void): FSWatcher =>
+  ({
+    close,
+  }) as unknown as FSWatcher;
+
+const createWatcherHarness = (existingRelPaths: readonly string[]): WatcherHarness => {
+  const vaultRoot = join('/', 'sidetrack-vault-test');
+  const events: VaultChangeEvent[] = [];
+  const existingAbsolutePaths = new Set(
+    existingRelPaths.map((relPath) => join(vaultRoot, relPath)),
+  );
+  let listener: ((event: string, filename: string | Buffer | null) => void) | undefined;
+  const watcher = createVaultWatcher(vaultRoot, {
+    debounceMs: 5,
+    onChange: (event) => {
+      events.push(event);
+    },
+    statImpl: async (absolutePath) => {
+      if (!existingAbsolutePaths.has(absolutePath)) {
+        throw new Error(`missing fixture path ${absolutePath}`);
+      }
+      return { birthtimeMs: 0, mtimeMs: 1 };
+    },
+    watchImpl: (_path, _options, callback) => {
+      listener = callback;
+      return fakeFsWatcher(() => undefined);
+    },
+  });
+  return {
+    events,
+    emit: (filename) => {
+      listener?.('change', filename);
+    },
+    removeExistingPath: (relPath) => {
+      existingAbsolutePaths.delete(join(vaultRoot, relPath));
+    },
+    close: watcher.close,
+  };
+};
+
 describe('vault watcher', () => {
-  let vaultRoot: string;
-
-  beforeEach(async () => {
-    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-watcher-'));
-    await mkdir(join(vaultRoot, '_BAC', 'threads'), { recursive: true });
-  });
-
-  afterEach(async () => {
-    await rm(vaultRoot, { recursive: true, force: true });
-  });
-
   it('emits debounced create/modify/delete events with path kind', async () => {
-    const events: VaultChangeEvent[] = [];
-    const watcher = createVaultWatcher(vaultRoot, {
-      debounceMs: 20,
-      onChange: (event) => {
-        events.push(event);
-      },
-    });
+    const relPath = '_BAC/threads/bac_thread_1.json';
+    const harness = createWatcherHarness([relPath]);
     try {
-      const path = join(vaultRoot, '_BAC', 'threads', 'bac_thread_1.json');
-      await writeFile(path, '{}', 'utf8');
-      await writeFile(path, '{"title":"updated"}', 'utf8');
-      await delay(80);
-      await unlink(path);
-      await delay(80);
+      harness.emit('threads/bac_thread_1.json');
+      harness.emit('threads/bac_thread_1.json');
+      await delay(20);
+      harness.removeExistingPath(relPath);
+      harness.emit('threads/bac_thread_1.json');
+      await delay(20);
     } finally {
-      await watcher.close();
+      await harness.close();
     }
 
-    expect(events.map((event) => event.kind)).toContain('thread');
-    expect(events.map((event) => event.relPath)).toContain('_BAC/threads/bac_thread_1.json');
-    expect(events.some((event) => event.type === 'deleted')).toBe(true);
+    expect(harness.events.map((event) => event.kind)).toContain('thread');
+    expect(harness.events.map((event) => event.relPath)).toContain(relPath);
+    expect(harness.events.some((event) => event.type === 'deleted')).toBe(true);
+  });
+
+  it('coalesces noisy connections-store writes into one vault-change event', async () => {
+    const harness = createWatcherHarness(['_BAC/connections/']);
+    try {
+      harness.emit('connections/current.db');
+      harness.emit('connections/current.db-wal');
+      harness.emit('connections/diagnostics/latest.json');
+      await delay(20);
+    } finally {
+      await harness.close();
+    }
+
+    const connectionsEvents = harness.events.filter((event) => event.kind === 'connections');
+    expect(connectionsEvents).toHaveLength(1);
+    expect(connectionsEvents[0]?.relPath).toBe('_BAC/connections/');
   });
 });

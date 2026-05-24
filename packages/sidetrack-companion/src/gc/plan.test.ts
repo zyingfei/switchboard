@@ -116,6 +116,37 @@ describe('derived-data GC plan', () => {
     await expect(readFile(stale, 'utf8')).rejects.toBeInstanceOf(Error);
   });
 
+  it('plans idempotency receipts over count or byte retention without parsing old bodies', async () => {
+    const now = new Date('2026-05-15T12:00:00.000Z');
+    await writeFixture(
+      '_BAC/.config/idempotency/old-large.json',
+      `${'x'.repeat(200)}\n`,
+      now.getTime() - 3_000,
+    );
+    await writeFixture(
+      '_BAC/.config/idempotency/middle.json',
+      JSON.stringify({ expiresAt: '2099-05-15T12:00:00.000Z' }),
+      now.getTime() - 2_000,
+    );
+    await writeFixture(
+      '_BAC/.config/idempotency/new.json',
+      JSON.stringify({ expiresAt: '2099-05-15T12:00:00.000Z' }),
+      now.getTime() - 1_000,
+    );
+
+    const plan = await buildGcPlan(root, {
+      now,
+      keepIdempotencyReceipts: 2,
+      keepIdempotencyBytes: 50,
+    });
+
+    const idempotency = plan.entries.filter((entry) => entry.group === 'expired-idempotency');
+    expect(idempotency.map((entry) => entry.path.split('/').at(-1)).sort()).toEqual([
+      'middle.json',
+      'old-large.json',
+    ]);
+  });
+
   it('summarises reclaimable groups without deleting anything', async () => {
     const now = new Date('2026-05-15T12:00:00.000Z');
     const tmp = await writeFixture(

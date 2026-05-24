@@ -80,6 +80,7 @@ export interface ResolveAttributionInput {
   readonly snapshot: ConnectionsSnapshot;
   readonly projection: TabSessionProjection;
   readonly events: readonly AcceptedEvent[];
+  readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
@@ -93,6 +94,7 @@ interface ResolveTargetAttributionInput {
   readonly targetVisitNodeIds: readonly string[];
   readonly snapshot: ConnectionsSnapshot;
   readonly events: readonly AcceptedEvent[];
+  readonly useEventCandidateSimilarity?: boolean;
   readonly negativeSeeds: ReadonlyMap<string, number>;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
@@ -294,7 +296,7 @@ const resolveTargetAttribution = (
     buildSimilarityEvidence({
       snapshot: input.snapshot,
       targetVisitNodeIds: new Set(targetVisitAnchors),
-      events: input.events,
+      events: input.useEventCandidateSimilarity === false ? [] : input.events,
       ...(input.closestVisitRanker === undefined
         ? {}
         : { closestVisitRanker: input.closestVisitRanker }),
@@ -372,6 +374,7 @@ export interface ResolveUrlAttributionInput {
   readonly canonicalUrl: string;
   readonly snapshot: ConnectionsSnapshot;
   readonly events: readonly AcceptedEvent[];
+  readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
@@ -537,6 +540,9 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
     targetVisitNodeIds: anchors,
     snapshot: input.snapshot,
     events: input.events,
+    ...(input.useEventCandidateSimilarity === undefined
+      ? {}
+      : { useEventCandidateSimilarity: input.useEventCandidateSimilarity }),
     negativeSeeds: urlNegativeSeeds(input),
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
@@ -572,6 +578,7 @@ export interface ResolveThreadAttributionInput {
   readonly threadUrl?: string;
   readonly snapshot: ConnectionsSnapshot;
   readonly events: readonly AcceptedEvent[];
+  readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
@@ -639,6 +646,9 @@ export const resolveThreadAttribution = (
     targetVisitNodeIds: anchors.targetVisitNodeIds,
     snapshot: input.snapshot,
     events: input.events,
+    ...(input.useEventCandidateSimilarity === undefined
+      ? {}
+      : { useEventCandidateSimilarity: input.useEventCandidateSimilarity }),
     negativeSeeds: threadNegativeSeeds(input),
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),
@@ -664,6 +674,9 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
     targetVisitNodeIds: [...visits],
     snapshot: input.snapshot,
     events: input.events,
+    ...(input.useEventCandidateSimilarity === undefined
+      ? {}
+      : { useEventCandidateSimilarity: input.useEventCandidateSimilarity }),
     negativeSeeds: negativeSeeds(input),
     ...(input.policyMode === undefined ? {} : { policyMode: input.policyMode }),
     ...(input.policyTelemetry === undefined ? {} : { policyTelemetry: input.policyTelemetry }),

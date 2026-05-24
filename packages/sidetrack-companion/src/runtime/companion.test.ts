@@ -22,7 +22,46 @@ vi.mock('../collectors/framework/runtime.js', () => ({
 }));
 
 import { readPageEvidence } from '../page-evidence/store.js';
-import { createPageEvidenceWriteQueue, scheduleSqliteVacuumGc, startCompanion } from './companion.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import type { AppendInputObserved } from '../sync/eventLog.js';
+import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import {
+  appendObservedEdgeEventsBatch,
+  createPageEvidenceWriteQueue,
+  scheduleSqliteVacuumGc,
+  startCompanion,
+} from './companion.js';
+
+const navigationCommitted = (input: {
+  readonly seq: number;
+  readonly visitId: string;
+  readonly url: string;
+  readonly previousVisitId: string | null;
+  readonly navigationSequence: number;
+}): AcceptedEvent => ({
+  clientEventId: `edge:navigation.committed:test:${String(input.seq)}`,
+  dot: { replicaId: 'edge_runtime_test', seq: input.seq },
+  deps: {},
+  aggregateId: `navigation.committed:${input.visitId}`,
+  type: NAVIGATION_COMMITTED,
+  payload: {
+    payloadVersion: 1,
+    visitId: input.visitId,
+    url: input.url,
+    canonicalUrl: input.url,
+    documentId: `doc_${String(input.seq)}`,
+    parentDocumentId: null,
+    tabSessionIdHash: 'tab_hash_runtime',
+    windowSessionIdHash: 'win_hash_runtime',
+    openerVisitId: null,
+    previousVisitId: input.previousVisitId,
+    navigationSequence: input.navigationSequence,
+    transitionType: 'link',
+    transitionQualifiers: [],
+    commitTimestamp: 1_779_600_000_000 + input.seq,
+  },
+  acceptedAtMs: 1_779_600_000_000 + input.seq,
+});
 
 describe('startCompanion bind-failure rollback', () => {
   let vaultRoot: string;
@@ -111,11 +150,10 @@ describe('startCompanion SQLite VACUUM hygiene task', () => {
   it('runs SQLite VACUUM on startup delay and scheduled cadence', async () => {
     const vacuum = vi.fn(() => Promise.resolve());
     const hygieneStatus: { lastVacuumAt?: string; lastVacuumDurationMs?: number } = {};
-    const teardown = scheduleSqliteVacuumGc(
-      { vacuum },
-      hygieneStatus,
-      { everyMs: 3_600_000, startupDelayMs: 60_000 },
-    );
+    const teardown = scheduleSqliteVacuumGc({ vacuum }, hygieneStatus, {
+      everyMs: 3_600_000,
+      startupDelayMs: 60_000,
+    });
 
     await vi.advanceTimersByTimeAsync(59_999);
     expect(vacuum).not.toHaveBeenCalled();
@@ -130,6 +168,57 @@ describe('startCompanion SQLite VACUUM hygiene task', () => {
   });
 });
 
+describe('appendObservedEdgeEventsBatch', () => {
+  it('dispatches newly accepted batched edge events through the local accepted hook', async () => {
+    const source = navigationCommitted({
+      seq: 1,
+      visitId: 'visit_source',
+      url: 'https://news.ycombinator.com/news',
+      previousVisitId: null,
+      navigationSequence: 1,
+    });
+    const accepted = {
+      ...source,
+      dot: { replicaId: 'main_runtime_test', seq: 42 },
+    };
+    const seen: AcceptedEvent[] = [];
+    const calls: { readonly inputs: readonly AppendInputObserved[]; readonly hasHook: boolean }[] =
+      [];
+    const appendClientObservedBatch = async <TPayload extends Record<string, unknown>>(
+      inputs: readonly AppendInputObserved<TPayload>[],
+      onAccepted?: (event: AcceptedEvent<TPayload>) => void,
+    ) => {
+      calls.push({ inputs, hasHook: onAccepted !== undefined });
+      onAccepted?.(accepted as AcceptedEvent<TPayload>);
+      return inputs.map((input) => ({ clientEventId: input.clientEventId, imported: true }));
+    };
+
+    const result = await appendObservedEdgeEventsBatch(
+      { appendClientObservedBatch },
+      [source],
+      (event) => {
+        seen.push(event);
+      },
+    );
+
+    expect(result).toEqual([{ clientEventId: source.clientEventId, imported: true }]);
+    expect(calls).toEqual([
+      {
+        hasHook: true,
+        inputs: [
+          {
+            clientEventId: source.clientEventId,
+            aggregateId: source.aggregateId,
+            type: source.type,
+            payload: source.payload,
+            baseVector: {},
+          },
+        ],
+      },
+    ]);
+    expect(seen).toEqual([accepted]);
+  });
+});
 
 describe('page-evidence ingest write queue', () => {
   let vaultRoot: string;

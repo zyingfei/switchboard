@@ -735,6 +735,53 @@ describe('connections — content-derived edges', () => {
     expect(edges[0]?.producedBy.recordId?.length).toBe(12);
   });
 
+  it('can preserve thread quote edges without rerunning the quote reducer', () => {
+    const input = emptyInput({
+      events: [
+        buildEvent({
+          seq: 1,
+          type: CAPTURE_RECORDED,
+          payload: {
+            bac_id: 'thread_a',
+            capturedAt: '2026-05-07T10:00:00.000Z',
+            turns: [
+              {
+                ordinal: 0,
+                role: 'assistant',
+                text: `here's the helper:\n${QUOTED_BLOCK} 0;\n}`,
+              },
+            ],
+          },
+        }),
+        buildEvent({
+          seq: 2,
+          type: CAPTURE_RECORDED,
+          payload: {
+            bac_id: 'thread_b',
+            capturedAt: '2026-05-07T11:00:00.000Z',
+            turns: [
+              {
+                ordinal: 0,
+                role: 'user',
+                text: `please review:\n${QUOTED_BLOCK} 0;\n}`,
+              },
+            ],
+          },
+        }),
+      ],
+    });
+    const full = buildConnectionsSnapshot(input);
+    const quoteEdges = full.edges.filter((edge) => edge.kind === 'thread_quotes_thread');
+    const preserved = buildConnectionsSnapshot({
+      ...input,
+      preservedThreadQuoteEdges: quoteEdges,
+    });
+
+    expect(preserved.edges.filter((edge) => edge.kind === 'thread_quotes_thread')).toEqual(
+      quoteEdges,
+    );
+  });
+
   it('cross-replica: same capture observed on two replicas dedupes to one edge', () => {
     const snap = buildConnectionsSnapshot(
       emptyInput({

@@ -55,9 +55,11 @@ import {
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
 import {
+  completeExtractedPageEvidenceEmbedding,
   listPageEvidenceRecords,
   readPageEvidence,
   readPageEvidenceMap,
+  writeExtractedPageEvidenceFast,
   writeExtractedPageEvidence,
 } from '../page-evidence/store.js';
 import {
@@ -150,6 +152,7 @@ import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
 import { RRF_K, fuseByRank } from '../search/rrf.js';
 import { rebuildFromEventLog } from '../recall/rebuild.js';
+import { generateCandidates } from '../ranker/candidates.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
 import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
@@ -159,7 +162,12 @@ import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOver
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
-import { vectorFromEvents, type TargetRef, type VersionVector } from '../sync/causal.js';
+import {
+  vectorFromEvents,
+  type AcceptedEvent,
+  type TargetRef,
+  type VersionVector,
+} from '../sync/causal.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 
 // Strip undefined keys produced by zod's `optional()` so the caller's
@@ -1748,6 +1756,117 @@ const invalidateResolveCaches = (): void => {
   }
 };
 
+const pageEvidenceBackgroundEmbeddingEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'];
+  return raw === '1' || raw?.toLowerCase() === 'true';
+};
+
+const resolverSignalEventsForCanonicalUrls = (
+  events: readonly AcceptedEvent[],
+  canonicalUrls: readonly string[],
+): readonly AcceptedEvent[] => {
+  const targets = new Set(canonicalUrls);
+  return events.filter((event) => {
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      return true;
+    }
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) {
+      return false;
+    }
+    return event.payload.itemKind === 'canonical-url' && targets.has(event.payload.itemId);
+  });
+};
+
+const resolverCanonicalUrlKey = (raw: string): string => raw.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+const candidateSourceWeight = (sources: readonly string[]): number => {
+  if (sources.includes('same_canonical_url')) return 0.9;
+  if (sources.includes('opener_chain')) return 0.85;
+  if (sources.includes('navigation_chain')) return 0.8;
+  if (sources.includes('content_embedding_neighborhood')) return 0.75;
+  if (sources.includes('content_term_overlap')) return 0.7;
+  if (sources.includes('same_repo_or_domain')) return 0.65;
+  if (sources.includes('same_search_query')) return 0.6;
+  if (sources.includes('same_copied_snippet')) return 0.55;
+  if (sources.includes('same_title_path_tokens')) return 0.45;
+  if (sources.includes('embedding_neighborhood')) return 0.4;
+  if (sources.includes('cross_replica_continuation')) return 0.35;
+  return 0.1;
+};
+
+const timelineEventsForResolverCandidates = (
+  events: readonly AcceptedEvent[],
+): readonly AcceptedEvent[] =>
+  events.filter((event) => event.type === BROWSER_TIMELINE_OBSERVED);
+
+const resolverTimelineEventsForCanonicalUrls = (
+  events: readonly AcceptedEvent[],
+  canonicalUrls: ReadonlySet<string>,
+): readonly AcceptedEvent[] => {
+  const normalizedTargets = new Set([...canonicalUrls].map(resolverCanonicalUrlKey));
+  return events.filter((event) => {
+    if (event.type !== BROWSER_TIMELINE_OBSERVED || !isBrowserTimelineObservedPayload(event.payload)) {
+      return false;
+    }
+    const visitKey = resolverCanonicalUrlKey(event.payload.canonicalUrl ?? event.payload.url);
+    return normalizedTargets.has(visitKey);
+  });
+};
+
+const resolverExpandedCandidateUrlsForCanonicalUrls = (
+  events: readonly AcceptedEvent[],
+  canonicalUrls: readonly string[],
+  maxPerUrl = 80,
+): ReadonlyMap<string, readonly string[]> => {
+  if (canonicalUrls.length === 0) return new Map();
+  const timelineEvents = timelineEventsForResolverCandidates(events);
+  if (timelineEvents.length === 0) return new Map();
+  const context = { merged: [...timelineEvents], existingEdges: [] };
+  const out = new Map<string, readonly string[]>();
+  for (const canonicalUrl of canonicalUrls) {
+    const targetVisitKey = resolverCanonicalUrlKey(canonicalUrl);
+    const ranked = generateCandidates(targetVisitKey, context)
+      .map((candidate) => ({
+        canonicalUrl: resolverCanonicalUrlKey(candidate.toVisitId),
+        weight: candidateSourceWeight(candidate.sources),
+      }))
+      .filter(
+        (candidate) =>
+          candidate.canonicalUrl.length > 0 &&
+          candidate.canonicalUrl !== targetVisitKey &&
+          /^https?:\/\//iu.test(candidate.canonicalUrl),
+      )
+      .sort(
+        (left, right) =>
+          right.weight - left.weight || left.canonicalUrl.localeCompare(right.canonicalUrl),
+      );
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of ranked) {
+      if (seen.has(candidate.canonicalUrl)) continue;
+      seen.add(candidate.canonicalUrl);
+      deduped.push(candidate.canonicalUrl);
+      if (deduped.length >= maxPerUrl) break;
+    }
+    out.set(canonicalUrl, deduped);
+  }
+  return out;
+};
+
+const resolverSignalEventsForTabSession = (
+  events: readonly AcceptedEvent[],
+  tabSessionId: string,
+): readonly AcceptedEvent[] =>
+  events.filter((event) => {
+    if (event.type === USER_FLOW_REJECTED && isUserFlowRejectedPayload(event.payload)) {
+      return true;
+    }
+    if (event.type !== USER_ORGANIZED_ITEM || !isUserOrganizedItemPayload(event.payload)) {
+      return false;
+    }
+    return event.payload.itemKind === 'tab-session' && event.payload.itemId === tabSessionId;
+  });
+
 const isSelectorCanary = (value: unknown): value is 'ok' | 'warning' | 'failed' =>
   value === 'ok' || value === 'warning' || value === 'failed';
 
@@ -2788,8 +2907,9 @@ const routes: readonly RouteDefinition[] = [
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
           const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const usesSqliteSubgraph = context.connectionsStore instanceof SqliteConnectionsStore;
           const snapshot =
-            context.connectionsStore instanceof SqliteConnectionsStore
+            usesSqliteSubgraph
               ? await context.connectionsStore.readResolverSubgraphForTabSession(tabSessionId)
               : await context.connectionsStore!.readCurrent();
           if (snapshot === null) {
@@ -2800,6 +2920,9 @@ const routes: readonly RouteDefinition[] = [
             );
           }
           const merged = await context.eventLog!.readMerged();
+          const resolverEvents = usesSqliteSubgraph
+            ? resolverSignalEventsForTabSession(merged, tabSessionId)
+            : merged;
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
           const { projection } = await loadTabSessionProjection(context, context.eventLog!);
           if (!projection.bySessionId.has(tabSessionId)) {
@@ -2812,7 +2935,8 @@ const routes: readonly RouteDefinition[] = [
                 tabSessionId,
                 snapshot,
                 projection,
-                events: merged,
+                events: resolverEvents,
+                ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
               }),
               ...(snapshot.snapshotRevision === undefined
                 ? {}
@@ -2856,8 +2980,9 @@ const routes: readonly RouteDefinition[] = [
             );
           }
           const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
+          const usesSqliteSubgraph = connectionsStore instanceof SqliteConnectionsStore;
           const snapshot =
-            connectionsStore instanceof SqliteConnectionsStore
+            usesSqliteSubgraph
               ? await connectionsStore.readResolverSubgraphForTabSession(tabSessionId)
               : await connectionsStore.readCurrent();
           if (snapshot === null) {
@@ -2901,6 +3026,7 @@ const routes: readonly RouteDefinition[] = [
             eventLog,
             snapshot,
             tabSessionId,
+            ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
             ...(policyMode === undefined ? {} : { policyMode }),
             ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
           });
@@ -2914,7 +3040,6 @@ const routes: readonly RouteDefinition[] = [
                 status: result.status,
                 resolution: result.resolution,
                 ...(result.accepted === undefined ? {} : { accepted: result.accepted }),
-                projection: serializeTabSessionProjection(result.projection),
               },
             },
           ];
@@ -3098,9 +3223,30 @@ const routes: readonly RouteDefinition[] = [
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
           const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
-          const snapshot =
+          const expandEventCandidates =
+            url.searchParams.get('eventCandidates') === '1' ||
+            url.searchParams.get('eventCandidates') === 'true';
+          const sqliteStore =
             context.connectionsStore instanceof SqliteConnectionsStore
-              ? await context.connectionsStore.readResolverSubgraphForUrl(canonicalUrl)
+              ? context.connectionsStore
+              : null;
+          const usesSqliteSubgraph = sqliteStore !== null;
+          const preloadedMerged =
+            usesSqliteSubgraph && expandEventCandidates ? await context.eventLog!.readMerged() : null;
+          const expandedCandidateUrls =
+            preloadedMerged === null
+              ? []
+              : (resolverExpandedCandidateUrlsForCanonicalUrls(preloadedMerged, [canonicalUrl]).get(
+                  canonicalUrl,
+                ) ?? []);
+          const snapshot =
+            usesSqliteSubgraph
+              ? expandedCandidateUrls.length === 0
+                ? await sqliteStore.readResolverSubgraphForUrl(canonicalUrl)
+                : await sqliteStore.readResolverSubgraphForUrls([
+                    canonicalUrl,
+                    ...expandedCandidateUrls,
+                  ])
               : await context.connectionsStore!.readCurrent();
           if (snapshot === null) {
             throw new HttpRouteError(
@@ -3115,9 +3261,10 @@ const routes: readonly RouteDefinition[] = [
           const snapshotRevision = snapshot.snapshotRevision;
           if (
             snapshotRevision !== undefined &&
-            context.connectionsStore instanceof SqliteConnectionsStore
+            usesSqliteSubgraph &&
+            !expandEventCandidates
           ) {
-            const cached = await context.connectionsStore.getCachedResolverResult(
+            const cached = await sqliteStore.getCachedResolverResult(
               canonicalUrl,
               snapshotRevision,
             );
@@ -3131,17 +3278,37 @@ const routes: readonly RouteDefinition[] = [
               ];
             }
           }
-          const merged = await context.eventLog!.readMerged();
+          const merged = preloadedMerged ?? (await context.eventLog!.readMerged());
+          const resolverEvents =
+            usesSqliteSubgraph && expandEventCandidates
+              ? [
+                  ...resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl]),
+                  ...resolverTimelineEventsForCanonicalUrls(
+                    merged,
+                    new Set([canonicalUrl, ...expandedCandidateUrls]),
+                  ),
+                ]
+              : usesSqliteSubgraph
+                ? resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl])
+                : merged;
           const result = resolveUrlAttribution({
             canonicalUrl,
             snapshot,
-            events: merged,
+            events: resolverEvents,
+            ...(usesSqliteSubgraph && !expandEventCandidates
+              ? { useEventCandidateSimilarity: false }
+              : {}),
           });
           if (
             snapshotRevision !== undefined &&
-            context.connectionsStore instanceof SqliteConnectionsStore
+            usesSqliteSubgraph &&
+            !expandEventCandidates
           ) {
-            await context.connectionsStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+            await sqliteStore.cacheResolverResult(
+              canonicalUrl,
+              snapshotRevision,
+              result,
+            );
           }
           return [
             200,
@@ -3184,6 +3351,124 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const uniqueUrls = [...new Set(canonicalUrls)];
+      const eventCandidateUrls = body?.['eventCandidateUrls'];
+      if (
+        eventCandidateUrls !== undefined &&
+        (!Array.isArray(eventCandidateUrls) ||
+          !eventCandidateUrls.every(
+            (item): item is string => typeof item === 'string' && item.length > 0,
+          ))
+      ) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'eventCandidateUrls must be a string array when provided.',
+        );
+      }
+      const eventCandidateTargetSet = new Set(
+        (Array.isArray(eventCandidateUrls) ? eventCandidateUrls : []).filter((candidateUrl) =>
+          uniqueUrls.includes(candidateUrl),
+        ),
+      );
+      const sqliteStore =
+        context.connectionsStore instanceof SqliteConnectionsStore ? context.connectionsStore : null;
+      if (sqliteStore !== null) {
+        const metadata = await sqliteStore.readSnapshotMetadata();
+        if (metadata === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        const snapshotRevision = metadata.snapshotRevision;
+        const results: Record<string, UrlResolutionResult> = {};
+        const misses: string[] = [];
+        for (const canonicalUrl of uniqueUrls) {
+          if (eventCandidateTargetSet.has(canonicalUrl)) {
+            misses.push(canonicalUrl);
+            continue;
+          }
+          if (snapshotRevision !== undefined) {
+            const cached = await sqliteStore.getCachedResolverResult(
+              canonicalUrl,
+              snapshotRevision,
+            );
+            if (cached !== null) {
+              results[canonicalUrl] = cached as UrlResolutionResult;
+              continue;
+            }
+          }
+          misses.push(canonicalUrl);
+        }
+        const merged = misses.length === 0 ? [] : await context.eventLog.readMerged();
+        const expandedCandidateUrlsByTarget =
+          eventCandidateTargetSet.size === 0
+            ? new Map<string, readonly string[]>()
+            : resolverExpandedCandidateUrlsForCanonicalUrls(
+                merged,
+                misses.filter((canonicalUrl) => eventCandidateTargetSet.has(canonicalUrl)),
+              );
+        const expandedCandidateUrls = [
+          ...new Set(
+            [...expandedCandidateUrlsByTarget.values()].flatMap((candidateUrls) => candidateUrls),
+          ),
+        ];
+        const missedSnapshot =
+          misses.length === 0
+            ? null
+            : await sqliteStore.readResolverSubgraphForUrls([
+                ...misses,
+                ...expandedCandidateUrls,
+              ]);
+        if (misses.length > 0 && missedSnapshot === null) {
+          throw new HttpRouteError(
+            409,
+            'CONNECTIONS_SNAPSHOT_MISSING',
+            'Connections snapshot is not ready.',
+          );
+        }
+        const missedEvents = resolverSignalEventsForCanonicalUrls(merged, misses);
+        for (const canonicalUrl of misses) {
+          const snapshot = missedSnapshot;
+          if (snapshot === null) {
+            throw new HttpRouteError(
+              409,
+              'CONNECTIONS_SNAPSHOT_MISSING',
+              'Connections snapshot is not ready.',
+            );
+          }
+          const expandEventCandidates = eventCandidateTargetSet.has(canonicalUrl);
+          const expandedForTarget = expandedCandidateUrlsByTarget.get(canonicalUrl) ?? [];
+          const resolverEvents = expandEventCandidates
+            ? [
+                ...resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl]),
+                ...resolverTimelineEventsForCanonicalUrls(
+                  merged,
+                  new Set([canonicalUrl, ...expandedForTarget]),
+                ),
+              ]
+            : missedEvents;
+          const result = resolveUrlAttribution({
+            canonicalUrl,
+            snapshot,
+            events: resolverEvents,
+            ...(expandEventCandidates ? {} : { useEventCandidateSimilarity: false }),
+          });
+          results[canonicalUrl] = result;
+          if (snapshotRevision !== undefined && !expandEventCandidates) {
+            await sqliteStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+          }
+        }
+        return [
+          200,
+          {
+            data: { results },
+            ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+          },
+        ];
+      }
       const snapshot = await context.connectionsStore.readCurrent();
       if (snapshot === null) {
         throw new HttpRouteError(
@@ -3193,30 +3478,15 @@ const routes: readonly RouteDefinition[] = [
         );
       }
       const snapshotRevision = snapshot.snapshotRevision;
-      const merged = await context.eventLog.readMerged();
       const results: Record<string, UrlResolutionResult> = {};
+      const merged = await context.eventLog.readMerged();
       for (const canonicalUrl of uniqueUrls) {
-        if (
-          snapshotRevision !== undefined &&
-          context.connectionsStore instanceof SqliteConnectionsStore
-        ) {
-          const cached = await context.connectionsStore.getCachedResolverResult(
-            canonicalUrl,
-            snapshotRevision,
-          );
-          if (cached !== null) {
-            results[canonicalUrl] = cached as UrlResolutionResult;
-            continue;
-          }
-        }
-        const result = resolveUrlAttribution({ canonicalUrl, snapshot, events: merged });
+        const result = resolveUrlAttribution({
+          canonicalUrl,
+          snapshot,
+          events: merged,
+        });
         results[canonicalUrl] = result;
-        if (
-          snapshotRevision !== undefined &&
-          context.connectionsStore instanceof SqliteConnectionsStore
-        ) {
-          await context.connectionsStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
-        }
       }
       return [
         200,
@@ -3256,8 +3526,9 @@ const routes: readonly RouteDefinition[] = [
           );
         }
         const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+        const usesSqliteSubgraph = connectionsStore instanceof SqliteConnectionsStore;
         const snapshot =
-          connectionsStore instanceof SqliteConnectionsStore
+          usesSqliteSubgraph
             ? await connectionsStore.readResolverSubgraphForUrl(canonicalUrl)
             : await connectionsStore.readCurrent();
         if (snapshot === null) {
@@ -3270,8 +3541,11 @@ const routes: readonly RouteDefinition[] = [
         if (canonicalUrl.length === 0) {
           throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
         }
-        const projection = projectUrls(await eventLog.readMerged());
-        if (!projection.byCanonicalUrl.has(canonicalUrl)) {
+        const snapshotProjection = snapshot.urlProjection;
+        if (
+          snapshotProjection !== undefined &&
+          snapshotProjection.byCanonicalUrl[canonicalUrl] === undefined
+        ) {
           throw new HttpRouteError(404, 'URL_NOT_FOUND', 'URL was not found.');
         }
         const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
@@ -3279,10 +3553,17 @@ const routes: readonly RouteDefinition[] = [
           body['policyTelemetry'],
           'policyTelemetry',
         );
+        const merged = await eventLog.readMerged();
+        const resolverEvents = usesSqliteSubgraph
+          ? resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl])
+          : merged;
         const result = await autoApplyUrlAttribution({
           eventLog,
           snapshot,
           canonicalUrl,
+          events: resolverEvents,
+          ...(snapshotProjection === undefined ? {} : { urlProjection: snapshotProjection }),
+          ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
           ...(policyMode === undefined ? {} : { policyMode }),
           ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
         });
@@ -3292,8 +3573,9 @@ const routes: readonly RouteDefinition[] = [
           result.status === 'applied' ? 201 : 200,
           {
             data: {
-              ...result,
-              projection: serializeUrlProjection(result.projection),
+              status: result.status,
+              resolution: result.resolution,
+              ...(result.accepted === undefined ? {} : { accepted: result.accepted }),
             },
           },
         ];
@@ -5170,14 +5452,31 @@ const routes: readonly RouteDefinition[] = [
           payload.storageMode === 'indexed_chunks'
             ? await writePageContentExtracted(vaultRoot, pageContentPayload)
             : null;
-        // Skip the O(records) manifest rebuild on the request path —
-        // the per-URL record file is written regardless, the badge poll
-        // (`readPageEvidence`) reads those directly, and the connections
-        // reconcile rebuilds the aggregate manifest once. Rebuilding it
-        // per POST re-read all ~800 record files (multi-second stall).
-        const evidence = await writeExtractedPageEvidence(vaultRoot, payload, {
+        // Skip both the O(records) manifest rebuild and doc embedding
+        // on the request path. The per-URL features record is written
+        // immediately so /v1/page-evidence/summary can resolve on the
+        // next badge poll. Doc embedding is intentionally not run on
+        // the default API process; it is still main-loop CPU until the
+        // dedicated worker lane lands.
+        const evidence = await writeExtractedPageEvidenceFast(vaultRoot, payload, {
           rebuildManifestAfterWrite: false,
         });
+        if (
+          pageEvidenceBackgroundEmbeddingEnabled() &&
+          evidence.evidenceTier !== 'metadata_only' &&
+          evidence.content?.embeddingState === 'missing'
+        ) {
+          setTimeout(() => {
+            void completeExtractedPageEvidenceEmbedding(vaultRoot, payload, {
+              rebuildManifestAfterWrite: false,
+            }).catch((error: unknown) => {
+              console.warn(
+                '[page-evidence] background doc embedding failed:',
+                error instanceof Error ? error.message : error,
+              );
+            });
+          }, 0);
+        }
         if (context.eventLog !== undefined) {
           if (coverage !== null) {
             await context.eventLog.appendServerObserved({

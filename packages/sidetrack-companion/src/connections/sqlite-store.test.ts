@@ -10,6 +10,7 @@ import {
   type ConnectionNode,
   type ConnectionsSnapshot,
 } from './types.js';
+import type { AcceptedEvent } from '../sync/causal.js';
 import { EMPTY_PROGRESS } from '../sync/contract/materializerProgress.js';
 
 const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
@@ -57,6 +58,7 @@ const buildSnapshot = (): ConnectionsSnapshot => {
 };
 
 const buildTraversalSnapshot = (): ConnectionsSnapshot => {
+  const thread = node('thread:alpha', 'thread', 'Alpha');
   const tab = node('tab-session:ts-1', 'tab-session', 'Tab 1');
   const visit = node('timeline-visit:https://example.test/page', 'timeline-visit', 'Example');
   const instance: ConnectionNode = {
@@ -67,7 +69,7 @@ const buildTraversalSnapshot = (): ConnectionsSnapshot => {
   const unrelated = node('workstream:other', 'workstream', 'Other');
   return {
     scope: {},
-    nodes: [tab, visit, instance, workstream, unrelated],
+    nodes: [thread, tab, visit, instance, workstream, unrelated],
     edges: [
       edge('visit_in_tab_session', visit.id, tab.id, '2026-05-01T00:00:00.000Z'),
       edge(
@@ -77,10 +79,11 @@ const buildTraversalSnapshot = (): ConnectionsSnapshot => {
         '2026-05-01T00:00:01.000Z',
       ),
       edge('visit_in_workstream', visit.id, workstream.id, '2026-05-01T00:00:02.000Z'),
+      edge('timeline_same_url_as_thread', visit.id, thread.id, '2026-05-01T00:00:03.000Z'),
     ],
-    updatedAt: '2026-05-01T00:00:02.000Z',
-    nodeCount: 5,
-    edgeCount: 3,
+    updatedAt: '2026-05-01T00:00:03.000Z',
+    nodeCount: 6,
+    edgeCount: 4,
     urlProjection: {
       schemaVersion: 1,
       byCanonicalUrl: {},
@@ -99,6 +102,33 @@ const progressFor = (snapshot: ConnectionsSnapshot) => ({
   appliedDotIntervals: { replica: [[1, 1] as const] },
   appliedFrontier: { replica: 1 },
   snapshotRevisionId: snapshot.snapshotRevision ?? null,
+});
+
+const timelineObservedEvent = (input: {
+  readonly seq: number;
+  readonly canonicalUrl: string;
+  readonly tabSessionId: string;
+  readonly observedAt: string;
+  readonly title?: string;
+}): AcceptedEvent => ({
+  clientEventId: `evt-${String(input.seq)}`,
+  dot: { replicaId: 'replica', seq: input.seq },
+  deps: {},
+  aggregateId: `timeline:${input.canonicalUrl}`,
+  type: 'browser.timeline.observed',
+  payload: {
+    payloadVersion: 1,
+    eventId: `visit-${String(input.seq)}`,
+    observedAt: input.observedAt,
+    url: input.canonicalUrl,
+    canonicalUrl: input.canonicalUrl,
+    ...(input.title === undefined ? {} : { title: input.title }),
+    provider: 'generic',
+    transition: 'activated',
+    tabSessionId: input.tabSessionId,
+    tabIdHash: `tab-${input.tabSessionId}`,
+  },
+  acceptedAtMs: Date.parse(input.observedAt),
 });
 
 describe('SqliteConnectionsStore', () => {
@@ -157,32 +187,40 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
-  sqliteIt('resolver subgraph reads route through bulk readCurrent (perf parity)', async () => {
-    // The seed-expansion BFS-based partial read walked the connected
-    // component one node at a time and was measurably slower than the
-    // bulk readCurrent on a dense graph (live cold-path resolves were
-    // ~1–3s before the change). The resolver subgraph methods now
-    // forward to readCurrent; this test pins the new contract
-    // (full-snapshot parity) so the BFS path is not silently
-    // reintroduced. See the TODO comment in snapshot.ts for the
-    // future bounded-hops + bulk-expansion partial-read design.
-    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
-    await store.putCurrent(buildTraversalSnapshot());
+  sqliteIt(
+    'resolver subgraph reads bounded neighborhoods without materializing unrelated rows',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      await store.putCurrent(buildTraversalSnapshot());
 
-    const fromUrl = await store.readResolverSubgraphForUrl('https://example.test/page');
-    const fromTabSession = await store.readResolverSubgraphForTabSession('ts-1');
-    const fromThread = await store.readResolverSubgraphForThread({ threadId: 'alpha' });
-    const current = await store.readCurrent();
+      const fromUrl = await store.readResolverSubgraphForUrl('https://example.test/page');
+      const fromTabSession = await store.readResolverSubgraphForTabSession('ts-1');
+      const fromThread = await store.readResolverSubgraphForThread({ threadId: 'alpha' });
+      const current = await store.readCurrent();
 
-    expect(fromUrl).toEqual(current);
-    expect(fromTabSession).toEqual(current);
-    expect(fromThread).toEqual(current);
-    // Full-snapshot counts and edge cardinality preserved.
-    expect(fromUrl?.nodeCount).toBe(5);
-    expect(fromUrl?.edgeCount).toBe(3);
-    expect(fromUrl?.edges).toHaveLength(3);
-    store.close();
-  });
+      expect(current?.nodes.map((n) => n.id)).toContain('workstream:other');
+      expect(fromUrl?.snapshotRevision).toBe('rev-traversal');
+      expect(fromUrl?.nodes.map((n) => n.id)).toEqual([
+        'tab-session:ts-1',
+        'thread:alpha',
+        'timeline-visit:https://example.test/page',
+        'visit-instance:ts-1:0:https://example.test/page',
+        'workstream:main',
+      ]);
+      expect(fromUrl?.nodes.map((n) => n.id)).not.toContain('workstream:other');
+      expect(fromUrl?.edges.map((e) => e.kind)).toEqual([
+        'timeline_same_url_as_thread',
+        'visit_in_tab_session',
+        'visit_in_workstream',
+        'visit_instance_same_url_as_timeline_visit',
+      ]);
+      expect(fromUrl?.nodeCount).toBe(5);
+      expect(fromUrl?.edgeCount).toBe(4);
+      expect(fromTabSession).toEqual(fromUrl);
+      expect(fromThread).toEqual(fromUrl);
+      store.close();
+    },
+  );
 
   sqliteIt('memoizes readCurrent across calls and invalidates on putCurrent', async () => {
     // Without the memo, every cold resolve repeats ~17K JSON.parses
@@ -207,9 +245,94 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
+  sqliteIt('applies projection event overlays without rewriting graph rows', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildTraversalSnapshot();
+    await store.putCurrent(snapshot);
+
+    const revision = await store.applyProjectionEventOverlay(
+      timelineObservedEvent({
+        seq: 2,
+        canonicalUrl: 'https://news.ycombinator.com/newest',
+        tabSessionId: 'ts-hn',
+        observedAt: '2026-05-23T15:00:00.000Z',
+        title: 'New | Hacker News',
+      }),
+    );
+
+    expect(revision).not.toBeNull();
+    expect(revision).not.toBe(snapshot.snapshotRevision);
+    const metadata = await store.readSnapshotMetadata();
+    expect(metadata?.nodeCount).toBe(snapshot.nodeCount);
+    expect(metadata?.edgeCount).toBe(snapshot.edgeCount);
+    expect(
+      metadata?.urlProjection?.byCanonicalUrl['https://news.ycombinator.com/newest'],
+    ).toMatchObject({
+      latestTitle: 'New | Hacker News',
+      visitCount: 1,
+      tabSessionIds: ['ts-hn'],
+    });
+    expect(metadata?.tabSessionProjection?.bySessionId['ts-hn']).toMatchObject({
+      latestTitle: 'New | Hacker News',
+      latestUrl: 'https://news.ycombinator.com/newest',
+    });
+    const current = await store.readCurrent();
+    expect(current?.nodes).toEqual(snapshot.nodes);
+    expect(current?.edges).toEqual(snapshot.edges);
+    expect(
+      current?.urlProjection?.byCanonicalUrl['https://news.ycombinator.com/newest']?.latestTitle,
+    ).toBe('New | Hacker News');
+    store.close();
+  });
+
+  sqliteIt(
+    'preserves fresher projection overlays when an older full snapshot commits',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      const snapshot = buildTraversalSnapshot();
+      await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+
+      const overlayRevision = await store.applyProjectionEventOverlay(
+        timelineObservedEvent({
+          seq: 2,
+          canonicalUrl: 'https://news.ycombinator.com/newest',
+          tabSessionId: 'ts-hn',
+          observedAt: '2026-05-23T15:00:00.000Z',
+          title: 'New | Hacker News',
+        }),
+      );
+      expect(overlayRevision).not.toBeNull();
+
+      await store.writeSnapshotAndProgress(
+        {
+          ...snapshot,
+          snapshotRevision: 'rev-child-started-before-overlay',
+        },
+        {
+          ...progressFor(snapshot),
+          snapshotRevisionId: 'rev-child-started-before-overlay',
+        },
+      );
+
+      const current = await store.readCurrent();
+      expect(
+        current?.urlProjection?.byCanonicalUrl['https://news.ycombinator.com/newest']?.latestTitle,
+      ).toBe('New | Hacker News');
+      expect(current?.tabSessionProjection?.bySessionId['ts-hn']?.latestUrl).toBe(
+        'https://news.ycombinator.com/newest',
+      );
+      expect(current?.snapshotRevision).not.toBe('rev-child-started-before-overlay');
+      expect(current?.nodes).toEqual(snapshot.nodes);
+      expect(current?.edges).toEqual(snapshot.edges);
+      store.close();
+    },
+  );
+
   sqliteIt('round-trips resolver-result cache by visit id and snapshot revision', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
-    await expect(store.getCachedResolverResult('https://example.test/a', 'rev-a')).resolves.toBeNull();
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-a'),
+    ).resolves.toBeNull();
 
     const result = { canonicalUrl: 'https://example.test/a', decision: { action: 'inbox' } };
     await store.cacheResolverResult('https://example.test/a', 'rev-a', result);
@@ -225,10 +348,12 @@ describe('SqliteConnectionsStore', () => {
     await store.cacheResolverResult('https://example.test/a', 'rev-old', { old: true });
     await store.cacheResolverResult('https://example.test/b', 'rev-current', { current: true });
 
-    await expect(store.getCachedResolverResult('https://example.test/b', 'rev-current')).resolves.toEqual(
-      { current: true },
-    );
-    await expect(store.getCachedResolverResult('https://example.test/a', 'rev-old')).resolves.toBeNull();
+    await expect(
+      store.getCachedResolverResult('https://example.test/b', 'rev-current'),
+    ).resolves.toEqual({ current: true });
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-old'),
+    ).resolves.toBeNull();
     store.close();
   });
 
@@ -406,7 +531,68 @@ describe('SqliteConnectionsStore', () => {
     await expect(store.readEdgesForScope({ kind: 'thread', id: 'alpha' })).resolves.toEqual([
       { src: thread.id, dst: workstream.id },
     ]);
-    expect((await store.readCurrent())?.snapshotRevision).toBe('rev-scopes');
+    const current = await store.readCurrent();
+    const progress = await store.readMaterializerProgress('connections');
+    expect(current?.snapshotRevision).toBe(progress?.snapshotRevisionId);
+    expect(current?.snapshotRevision).not.toBe('rev-scopes');
+    store.close();
+  });
+
+  sqliteIt('replaceScopeRows patches order metadata without full row scans', async () => {
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    const snapshot = buildSnapshot();
+    await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+    await new Promise((resolve) => setImmediate(resolve));
+    await expect(store.readScopesForNode('thread:alpha')).resolves.toEqual([
+      { kind: 'thread', id: 'alpha' },
+    ]);
+
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const queries: string[] = [];
+    const spy = vi
+      .spyOn(Database.prototype, 'query')
+      .mockImplementation(function trackScopeReplaceQueries(
+        this: InstanceType<typeof Database>,
+        sql: string,
+      ) {
+        queries.push(sql);
+        return originalQuery.call(this, sql);
+      });
+    try {
+      await store.replaceScopeRows({
+        scopes: [{ kind: 'thread', id: 'alpha' }],
+        nodes: [{ ...snapshot.nodes[0]!, label: 'Alpha patched' }],
+        edges: [],
+        progress: {
+          ...progressFor(snapshot),
+          appliedDotIntervals: { replica: [[1, 2] as const] },
+          appliedFrontier: { replica: 2 },
+          snapshotRevisionId: 'rev-scope-patched',
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(queries.some((sql) => sql.includes('SELECT data FROM nodes ORDER BY id'))).toBe(false);
+    expect(queries.some((sql) => sql.includes('SELECT data FROM edges ORDER BY src, dst'))).toBe(
+      false,
+    );
+    expect(
+      queries.some((sql) => sql.includes('COUNT(*) AS count FROM connections_scope_edges')),
+    ).toBe(false);
+    expect(queries.some((sql) => sql.includes('SELECT data FROM edges WHERE src = ?'))).toBe(
+      false,
+    );
+    expect(queries.some((sql) => sql.includes('temp_replace_edges'))).toBe(true);
+    const current = await store.readCurrent();
+    const progress = await store.readMaterializerProgress('connections');
+    expect(current?.snapshotRevision).toBe(progress?.snapshotRevisionId);
+    expect(current?.snapshotRevision).not.toBe('rev-scope-patched');
+    expect(current?.nodes.find((item) => item.id === 'thread:alpha')?.label).toBe('Alpha patched');
+    expect(current?.nodeCount).toBe(3);
+    expect(current?.edgeCount).toBe(1);
     store.close();
   });
 
