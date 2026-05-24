@@ -6460,6 +6460,10 @@ button.btn-link.thread-dispatched-name:hover {
   font-size: 10px;
   text-decoration: underline;
 }
+.deja-foot .deja-see-all {
+  color: var(--signal);
+  white-space: nowrap;
+}
 .deja-foot button:hover {
   color: var(--ink);
 }
@@ -9290,6 +9294,16 @@ pre.diff {
   background: var(--paper-tinted);
   color: var(--ink-3);
 }
+.cx-mode-icon,
+.cx-mode-icon svg {
+  width: 12px;
+  height: 12px;
+}
+.cx-mode-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
 .cx-mode.is-active .cx-count {
   background: var(--signal-bg);
   color: var(--signal);
@@ -9349,6 +9363,78 @@ pre.diff {
   margin-left: 6px;
   font-size: 10px;
   color: var(--ink-3);
+}
+
+.cx-cols.is-dejavu-mode {
+  display: block;
+  overflow: auto;
+}
+.cx-deja-view {
+  min-height: 0;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cx-deja-view-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cx-deja-view-head h3 {
+  margin: 0;
+  font-family: var(--display);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.cx-deja-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cx-deja-row {
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--rad-s);
+  background: var(--paper-light);
+  cursor: default;
+}
+.cx-deja-row:hover {
+  background: var(--paper-light);
+}
+.cx-deja-row .r1 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.cx-deja-row .r1 .title {
+  font-weight: 650;
+  font-size: 15px;
+}
+.cx-deja-badges {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cx-deja-time {
+  color: var(--ink-3);
+  background: var(--paper);
+  border-color: var(--rule);
+}
+@media (max-width: 860px) {
+  .cx-deja-view {
+    padding: 12px;
+  }
+  .cx-deja-row .r1 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cx-deja-badges {
+    justify-content: flex-start;
+  }
 }
 /* Stage 5 polish — calendar+quick-select popover.
    Two-column layout matching the design mockup: month calendar

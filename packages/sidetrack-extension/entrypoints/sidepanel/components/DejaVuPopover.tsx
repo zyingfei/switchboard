@@ -29,9 +29,17 @@ interface DejaVuPopoverProps {
   readonly onJump: (item: DejaVuItem) => void;
   readonly onDismiss: () => void;
   readonly onMute?: () => void;
+  readonly onSeeAll?: (items: readonly DejaVuItem[]) => void;
 }
 
-export function DejaVuPopover({ items, anchor, onJump, onDismiss, onMute }: DejaVuPopoverProps) {
+export function DejaVuPopover({
+  items,
+  anchor,
+  onJump,
+  onDismiss,
+  onMute,
+  onSeeAll,
+}: DejaVuPopoverProps) {
   if (items.length === 0) {
     return null;
   }
@@ -79,6 +87,18 @@ export function DejaVuPopover({ items, anchor, onJump, onDismiss, onMute }: Deja
       </div>
       <div className="deja-foot">
         <span className="muted">on-device · vector recall</span>
+        {onSeeAll !== undefined ? (
+          <button
+            type="button"
+            className="deja-see-all"
+            onClick={() => {
+              onSeeAll(items);
+              onDismiss();
+            }}
+          >
+            See all ({items.length})
+          </button>
+        ) : null}
         {onMute !== undefined ? (
           <button type="button" onClick={onMute}>
             Don&apos;t show again for this page
