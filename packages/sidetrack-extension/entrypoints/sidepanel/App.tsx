@@ -7600,117 +7600,125 @@ const App = () => {
         );
       })()}
 
-      <div className="sec-head">
-        <span>Captures</span>
-        <span className="sec-head-actions">
-          <span className="count mono">{String(scopedNotes.length)}</span>
-          <button
-            type="button"
-            className="btn-link sec-head-btn"
-            title={
-              currentWsId === null ? 'Add a note in the Inbox' : `Add a note in ${currentWsLabel}`
-            }
-            onClick={() => {
-              setNoteEditId(null);
-              setNoteDraft('');
-              setNoteComposeOpen(true);
-            }}
-          >
-            + note
-          </button>
-        </span>
-      </div>
-      {noteComposeOpen ? (
-        <form
-          className="note-compose"
-          onSubmit={(e) => {
-            e.preventDefault();
-            submitNote();
-          }}
-        >
-          <textarea
-            autoFocus
-            rows={3}
-            placeholder={
-              currentWsId === null ? 'Note (lands in the Inbox)…' : `Note for ${currentWsLabel}…`
-            }
-            value={noteDraft}
-            onChange={(e) => {
-              setNoteDraft(e.target.value);
-            }}
-          />
-          <div className="note-compose-actions">
-            <button
-              type="submit"
-              className="btn-link"
-              disabled={busy || noteDraft.trim().length === 0}
-            >
-              {noteEditId === null ? 'Save note' : 'Update note'}
-            </button>
-            <button
-              type="button"
-              className="btn-link"
-              onClick={() => {
-                setNoteComposeOpen(false);
-                setNoteDraft('');
-                setNoteEditId(null);
+      {viewMode !== 'connections' ? (
+        <>
+          <div className="sec-head">
+            <span>Captures</span>
+            <span className="sec-head-actions">
+              <span className="count mono">{String(scopedNotes.length)}</span>
+              <button
+                type="button"
+                className="btn-link sec-head-btn"
+                title={
+                  currentWsId === null
+                    ? 'Add a note in the Inbox'
+                    : `Add a note in ${currentWsLabel}`
+                }
+                onClick={() => {
+                  setNoteEditId(null);
+                  setNoteDraft('');
+                  setNoteComposeOpen(true);
+                }}
+              >
+                + note
+              </button>
+            </span>
+          </div>
+          {noteComposeOpen ? (
+            <form
+              className="note-compose"
+              onSubmit={(e) => {
+                e.preventDefault();
+                submitNote();
               }}
             >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : null}
-      <div className="capture-list">
-        {scopedNotes.length === 0 ? (
-          <div className="capture-empty subtle">
-            <p>
-              Notes you save here are scoped to the current workstream. Inbound replies surface as
-              the <strong>Unread reply</strong> badge on the thread row above. Obsidian / external
-              imports come later.
-            </p>
-          </div>
-        ) : null}
-        {scopedNotes.slice(0, 12).map((note) => (
-          <div className="capture capture-note" key={note.bac_id}>
-            <svg viewBox="0 0 24 24" aria-hidden>
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <polyline points="14 2 14 8 20 8" />
-              <line x1="8" y1="13" x2="16" y2="13" />
-              <line x1="8" y1="17" x2="13" y2="17" />
-            </svg>
-            <div className="capture-body">
-              <div className="text">{note.text}</div>
-              <div className="meta mono">
-                note · {formatRelative(note.createdAt)}
-                {note.kind !== 'manual' ? ` · ${note.kind}` : ''}
-              </div>
-              <div className="capture-actions">
+              <textarea
+                autoFocus
+                rows={3}
+                placeholder={
+                  currentWsId === null
+                    ? 'Note (lands in the Inbox)…'
+                    : `Note for ${currentWsLabel}…`
+                }
+                value={noteDraft}
+                onChange={(e) => {
+                  setNoteDraft(e.target.value);
+                }}
+              />
+              <div className="note-compose-actions">
+                <button
+                  type="submit"
+                  className="btn-link"
+                  disabled={busy || noteDraft.trim().length === 0}
+                >
+                  {noteEditId === null ? 'Save note' : 'Update note'}
+                </button>
                 <button
                   type="button"
                   className="btn-link"
-                  title="Edit this note"
                   onClick={() => {
-                    beginEditNote(note.bac_id, note.text);
+                    setNoteComposeOpen(false);
+                    setNoteDraft('');
+                    setNoteEditId(null);
                   }}
                 >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  className="btn-link archive"
-                  title="Delete this note"
-                  onClick={() => {
-                    deleteNote(note.bac_id);
-                  }}
-                >
-                  Delete
+                  Cancel
                 </button>
               </div>
-            </div>
+            </form>
+          ) : null}
+          <div className="capture-list">
+            {scopedNotes.length === 0 ? (
+              <div className="capture-empty subtle">
+                <p>
+                  Notes you save here are scoped to the current workstream. Inbound replies surface
+                  as the <strong>Unread reply</strong> badge on the thread row above. Obsidian /
+                  external imports come later.
+                </p>
+              </div>
+            ) : null}
+            {scopedNotes.slice(0, 12).map((note) => (
+              <div className="capture capture-note" key={note.bac_id}>
+                <svg viewBox="0 0 24 24" aria-hidden>
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                  <line x1="8" y1="13" x2="16" y2="13" />
+                  <line x1="8" y1="17" x2="13" y2="17" />
+                </svg>
+                <div className="capture-body">
+                  <div className="text">{note.text}</div>
+                  <div className="meta mono">
+                    note · {formatRelative(note.createdAt)}
+                    {note.kind !== 'manual' ? ` · ${note.kind}` : ''}
+                  </div>
+                  <div className="capture-actions">
+                    <button
+                      type="button"
+                      className="btn-link"
+                      title="Edit this note"
+                      onClick={() => {
+                        beginEditNote(note.bac_id, note.text);
+                      }}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-link archive"
+                      title="Delete this note"
+                      onClick={() => {
+                        deleteNote(note.bac_id);
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </>
+      ) : null}
 
       {/* Build identity — small mono line at the very bottom of the
           side panel. Lets the user confirm the loaded extension
