@@ -827,6 +827,19 @@ export const createConnectionsMaterializer = (
   // first drain is never deferred.
   let lastDrainStartedAtMs = 0;
   let projectionOverlayQueue: Promise<void> = Promise.resolve();
+  // Serialise scheduleForegroundNavigationOverlay calls so two
+  // NAVIGATION_COMMITTED events landing within ms for the same tab
+  // session don't both readMerged + buildConnectionsSnapshot + replaceScopeRows
+  // and race the writes (an earlier-started but slower task can land
+  // AFTER a later one and overwrite the correct overlay state).
+  let foregroundNavigationOverlayQueue: Promise<void> = Promise.resolve();
+  // Serialise advanceProgressForContentOnlyEvent calls so two
+  // back-to-back CONTENT_LANE_ONLY events don't both read the same
+  // starting progress, compute non-overlapping appliedDotIntervals
+  // patches, and lose one another's dot to a last-writer-wins
+  // overwrite. (writeMaterializerProgress / #writeProgressRows replaces
+  // the interval set rather than merging.)
+  let contentOnlyProgressQueue: Promise<void> = Promise.resolve();
   let progressOnlyDirty = false;
   let urgentDrainRequested = false;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
@@ -1441,8 +1454,21 @@ export const createConnectionsMaterializer = (
       tabSessionProjection,
       ...(input.urlProjection === undefined ? {} : { urlProjection: input.urlProjection }),
     });
+    // Deliberately omit scope:url=X from the replace set. Per
+    // connectionsScopes, edges like closest_visit / visit_resembles_visit
+    // / annotation that incident URL X have primaryScope = scope:url=X.
+    // If we include scope:url=X here, replaceScopeRows orphan-deletes
+    // every one of those historical edges (only this scoped snapshot's
+    // brand-new visit_in_tab_session + visit_instance_same_url_as_timeline_visit
+    // edges are in the replace input) — leaving readResolverSubgraphForUrl(X)
+    // empty of similarity neighbours for the ~250ms between this overlay
+    // commit and the next full drain.
+    //
+    // The new visit-instance node still gets membership inserted into
+    // scope:url=X via INSERT OR IGNORE on the upsert side (scopesForGraphRows
+    // computes it from the node's own kind/id), so the URL keeps the
+    // new visit; we just don't touch the URL's other historical members.
     const rowLocalScopes = dedupeScopeList([
-      ...[...currentVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
       ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
       ...visitInstanceScopesFromSnapshot(scopedSnapshot, {
         visitKeys: currentVisitKeys,
@@ -1456,7 +1482,12 @@ export const createConnectionsMaterializer = (
       edges: scopedSnapshot.edges,
       // Do not mark the dots applied here. This is a UI-latency overlay;
       // the deterministic full/scoped drain below advances progress.
+      // 'snapshot-revision-only' is required because input.existingProgress
+      // was read OUTSIDE the BEGIN IMMEDIATE — a concurrent drain that
+      // committed in the meantime would otherwise have its progress
+      // overwritten with our stale snapshot.
       progress: input.existingProgress,
+      progressMode: 'snapshot-revision-only',
       metadata: {
         ...(scopedSnapshot.urlProjection === undefined
           ? {}
@@ -3223,29 +3254,39 @@ export const createConnectionsMaterializer = (
   const advanceProgressForContentOnlyEvent = (event: AcceptedEvent): void => {
     const writeProgress = deps.store.writeMaterializerProgress;
     if (writeProgress === undefined) return;
-    void (async (): Promise<void> => {
-      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-      if (running || dirty) return;
-      if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
-      if (intervalsContainDot(progress.appliedDotIntervals, event.dot)) return;
-      const appliedDotIntervals = addDotsToIntervals(progress.appliedDotIntervals, [event.dot]);
-      const nextProgress: MaterializerProgress = {
-        ...progress,
-        appliedDotIntervals,
-        appliedFrontier: frontierFromIntervals(appliedDotIntervals),
-      };
-      if (running || dirty) return;
-      await writeProgress(nextProgress);
-      lastFrontier = nextProgress.appliedFrontier;
-      lastSuccessAt = new Date().toISOString();
-      lastError = null;
-    })().catch((error: unknown) => {
-      console.warn(
-        `[connections] content-only progress advance failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
+    // Chain on contentOnlyProgressQueue so the read → modify → write is
+    // serialised across concurrent invocations. Without this, two
+    // back-to-back CAPTURE_EXTRACTION_PRODUCED / PAGE_EVIDENCE_EXTRACTED /
+    // RECALL_TOMBSTONE_TARGET / ENGAGEMENT_INTERVAL_OBSERVED events would
+    // both read the same progress P, both compute P + their own dot, and
+    // both writeMaterializerProgress — the second write overwrites the
+    // first and silently drops one dot from appliedDotIntervals.
+    contentOnlyProgressQueue = contentOnlyProgressQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+        if (running || dirty) return;
+        if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
+        if (intervalsContainDot(progress.appliedDotIntervals, event.dot)) return;
+        const appliedDotIntervals = addDotsToIntervals(progress.appliedDotIntervals, [event.dot]);
+        const nextProgress: MaterializerProgress = {
+          ...progress,
+          appliedDotIntervals,
+          appliedFrontier: frontierFromIntervals(appliedDotIntervals),
+        };
+        if (running || dirty) return;
+        await writeProgress(nextProgress);
+        lastFrontier = nextProgress.appliedFrontier;
+        lastSuccessAt = new Date().toISOString();
+        lastError = null;
+      })
+      .catch((error: unknown) => {
+        console.warn(
+          `[connections] content-only progress advance failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   };
 
   const applyProjectionOverlayWithRetry = async (
@@ -3374,34 +3415,37 @@ export const createConnectionsMaterializer = (
       return;
     }
     if (deps.store.replaceScopeRows === undefined) return;
-    void (async (): Promise<void> => {
-      const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-      if (
-        existingProgress === null ||
-        existingProgress.materializerVersion !== MATERIALIZER_VERSION
-      ) {
-        return;
-      }
-      const merged = await deps.eventLog.readMerged();
-      const startedAtMs = Date.now();
-      await writeForegroundNavigationDelta({
-        pendingEventsForDrain: [event],
-        merged,
-        existingProgress,
-        mark: (label) => {
-          if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] !== '1') return;
-          console.warn(
-            `[connections-phase] accepted.${label} dt=${String(Date.now() - startedAtMs)}ms`,
-          );
-        },
+    foregroundNavigationOverlayQueue = foregroundNavigationOverlayQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+        if (
+          existingProgress === null ||
+          existingProgress.materializerVersion !== MATERIALIZER_VERSION
+        ) {
+          return;
+        }
+        const merged = await deps.eventLog.readMerged();
+        const startedAtMs = Date.now();
+        await writeForegroundNavigationDelta({
+          pendingEventsForDrain: [event],
+          merged,
+          existingProgress,
+          mark: (label) => {
+            if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] !== '1') return;
+            console.warn(
+              `[connections-phase] accepted.${label} dt=${String(Date.now() - startedAtMs)}ms`,
+            );
+          },
+        });
+      })
+      .catch((error: unknown) => {
+        console.warn(
+          `[connections] foreground navigation overlay failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       });
-    })().catch((error: unknown) => {
-      console.warn(
-        `[connections] foreground navigation overlay failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
   };
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
@@ -3424,6 +3468,22 @@ export const createConnectionsMaterializer = (
       }
     }
     if (!handlesGraph) {
+      // PROJECTION_OVERLAY_HANDLES events that aren't graph handles
+      // (URL_IGNORED today) still need their in-memory accumulator
+      // fold here. Without this fold, the next drain — which builds
+      // urlProjection from urlAccumulator — would miss URL_IGNORED
+      // and only the snapshot-metadata merge with the catchUp-time
+      // overlay would save the ignore (fragile: depends on urlRecordFreshness
+      // tiebreaks). The PERSISTED overlay write is left to tryAdvanceNoGraphEvents
+      // inside catchUp/drain (called via requestDrain below) so we
+      // don't double-apply the same dot — scheduleProjectionOverlay
+      // here would fire on top of the catchUp-time overlay, and
+      // applyProjectionEventOverlay isn't deduped against
+      // appliedDotIntervals.
+      if (PROJECTION_OVERLAY_HANDLES.has(event.type) && projectionAccumulatorsInitialized) {
+        foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
+        foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+      }
       if (handlesContentLaneOnly && !running && !dirty) {
         advanceProgressForContentOnlyEvent(event);
         return;

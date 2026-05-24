@@ -3613,6 +3613,18 @@ export interface ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
+    // 'replace' (default): persist input.progress verbatim, advancing
+    // both applied dot intervals and snapshotRevisionId. Used by the
+    // deterministic drain path that has freshly-computed progress.
+    // 'snapshot-revision-only': used by the foreground-navigation
+    // overlay (UI-latency fast path). The caller's input.progress may
+    // be a STALE snapshot (read before the BEGIN IMMEDIATE that a
+    // concurrent drain or sibling overlay just committed against);
+    // writing it back verbatim would regress applied dot intervals.
+    // In this mode the implementation reads persisted progress INSIDE
+    // the transaction, keeps appliedDotIntervals/appliedFrontier as
+    // observed, and only advances snapshotRevisionId.
+    readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }) => Promise<void>;
   readonly readCurrent: () => Promise<ConnectionsSnapshot | null>;
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
@@ -3791,7 +3803,15 @@ const mergeUrlProjectionForWrite = (
   incoming: SerializedUrlProjection | undefined,
   existing: SerializedUrlProjection | undefined,
 ): SerializedUrlProjection | undefined => {
-  if (incoming === undefined || existing === undefined) return incoming;
+  // Preserve the persisted projection when the caller didn't bring a new
+  // one. An earlier `return incoming` here silently dropped the persisted
+  // urlProjection whenever any putCurrent / writeSnapshotAndProgress
+  // landed without urlProjection in the snapshot (partial subgraph, test
+  // fixture, downgrade path). The incremental path at L4729 already
+  // guards before calling, but defensive callers (and the tabSession
+  // sibling below) need the merge function itself to be safe.
+  if (incoming === undefined) return existing;
+  if (existing === undefined) return incoming;
   const byCanonicalUrl: Record<string, UrlVisitRecord> = {};
   const keys = [
     ...new Set([...Object.keys(incoming.byCanonicalUrl), ...Object.keys(existing.byCanonicalUrl)]),
@@ -3830,7 +3850,11 @@ const mergeTabSessionProjectionForWrite = (
   incoming: SerializedTabSessionProjection | undefined,
   existing: SerializedTabSessionProjection | undefined,
 ): SerializedTabSessionProjection | undefined => {
-  if (incoming === undefined || existing === undefined) return incoming;
+  // See mergeUrlProjectionForWrite above — same persistence-preservation
+  // invariant. Returning `incoming` when only existing is defined drops
+  // the persisted tabSession projection.
+  if (incoming === undefined) return existing;
+  if (existing === undefined) return incoming;
   const bySessionId: Record<string, TabSessionRecord> = {};
   const sessionIds = [
     ...new Set([...Object.keys(incoming.bySessionId), ...Object.keys(existing.bySessionId)]),
@@ -4501,6 +4525,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
+    readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
     const db = await this.#database();
     const edgeBuckets = new Map<string, ConnectionEdge[]>();
@@ -4770,8 +4795,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       upsertMetadata.run('current', JSON.stringify(metadata));
       upsertMetadata.run('node_order', JSON.stringify(nodeOrder));
       upsertMetadata.run('edge_order', JSON.stringify(edgeOrder));
+      const baseProgress =
+        input.progressMode === 'snapshot-revision-only'
+          ? // Read persisted progress INSIDE this transaction so we don't
+            // regress applied dot intervals on top of a concurrent drain
+            // that committed between the caller's pre-transaction read of
+            // input.progress and our BEGIN IMMEDIATE acquisition. Falls
+            // back to input.progress if nothing is persisted yet (i.e.
+            // the overlay is the very first writer for this materializer).
+            (this.#readPersistedProgressInTx(db, input.progress.materializerName) ?? input.progress)
+          : input.progress;
       this.#writeProgressRows(db, {
-        ...input.progress,
+        ...baseProgress,
         snapshotRevisionId: snapshotRevision,
       });
       db.exec('COMMIT');
@@ -4989,6 +5024,58 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  // Synchronous read of persisted MaterializerProgress for use inside a
+  // BEGIN IMMEDIATE transaction (so the result can't race a concurrent
+  // writer). Mirrors readMaterializerProgress but without async hops.
+  // Returns null when no row has been written for the named materializer.
+  #readPersistedProgressInTx(db: SqliteDatabase, name: string): MaterializerProgress | null {
+    const metaRow = db
+      .query(
+        `SELECT materializer_name, version, snapshot_revision_id, applied_frontier
+         FROM connections_materializer_meta
+         WHERE materializer_name = ?`,
+      )
+      .get(name);
+    if (metaRow === null || metaRow === undefined) return null;
+    if (!isRecord(metaRow)) return null;
+    const appliedDotIntervals: Record<string, Array<readonly [number, number]>> = {};
+    for (const row of db
+      .query(
+        `SELECT replica_id, start_seq, end_seq
+         FROM connections_applied_intervals
+         WHERE materializer_name = ?
+         ORDER BY replica_id, start_seq, end_seq`,
+      )
+      .all(name)) {
+      if (!isRecord(row)) continue;
+      const replicaId = row['replica_id'];
+      const startSeq = row['start_seq'];
+      const endSeq = row['end_seq'];
+      if (
+        typeof replicaId !== 'string' ||
+        typeof startSeq !== 'number' ||
+        typeof endSeq !== 'number'
+      ) {
+        continue;
+      }
+      const intervals = appliedDotIntervals[replicaId] ?? [];
+      intervals.push([startSeq, endSeq]);
+      appliedDotIntervals[replicaId] = intervals;
+    }
+    const snapshotRevisionId = metaRow['snapshot_revision_id'];
+    const appliedFrontier = metaRow['applied_frontier'];
+    return {
+      materializerName: textField(metaRow, 'materializer_name'),
+      materializerVersion: textField(metaRow, 'version'),
+      appliedDotIntervals,
+      appliedFrontier:
+        typeof appliedFrontier === 'string'
+          ? (JSON.parse(appliedFrontier) as Record<string, number>)
+          : {},
+      snapshotRevisionId: typeof snapshotRevisionId === 'string' ? snapshotRevisionId : null,
+    };
   }
 
   #writeProgressRows(db: SqliteDatabase, progress: MaterializerProgress): void {

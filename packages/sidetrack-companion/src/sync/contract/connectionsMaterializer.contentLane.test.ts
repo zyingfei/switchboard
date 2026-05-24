@@ -644,7 +644,15 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     expect(snapshotWrites).toBe(0);
     expect(replacements).toHaveLength(2);
     const foregroundOverlay = replacements[0];
-    expect(foregroundOverlay?.scopes).toContainEqual({ kind: 'url', id: canonicalUrl });
+    // The foreground overlay deliberately OMITS scope:url=X — including
+    // it would orphan-delete the URL's historical incident edges
+    // (closest_visit, visit_resembles_visit, …) which all have
+    // primaryScope = scope:url=X. The new visit-instance still gets
+    // its URL-membership via INSERT OR IGNORE on the upsert path,
+    // and the URL's historical neighbourhood survives until the
+    // scoped-delta drain below re-asserts scope:url=X with the full
+    // recomputed edge set.
+    expect(foregroundOverlay?.scopes).not.toContainEqual({ kind: 'url', id: canonicalUrl });
     expect(foregroundOverlay?.scopes).toContainEqual({
       kind: 'tab-session',
       id: tabSessionIdHash,
