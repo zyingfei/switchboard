@@ -3433,6 +3433,7 @@ textarea.preview-body:focus {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-width: 0;
   background: var(--paper-light, #fbf7ee);
 }
 .app-mark {
@@ -3484,6 +3485,8 @@ textarea.preview-body:focus {
 }
 .app-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 4px;
 }
 .icon-btn {
