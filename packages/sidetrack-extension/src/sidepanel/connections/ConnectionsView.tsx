@@ -38,7 +38,7 @@ import {
   type TopicVisitAffiliation,
 } from './FocusView';
 import { HopToggle } from './HopToggle';
-import { KindIcons, SearchIcon } from './icons';
+import { ClockIcon, KindIcons, SearchIcon } from './icons';
 import { LinkedCenter } from './LinkedCenter';
 import { NodeChip } from './NodeChip';
 import { NodeSearchBox, type SearchableAnchor } from './NodeSearchBox';
@@ -114,6 +114,16 @@ export interface ConnectionsViewWorkstreamAnchor {
   readonly meta?: string;
 }
 
+export interface ConnectionsDejaVuItem {
+  readonly id: string;
+  readonly providerLabel: string;
+  readonly providerKey: 'gpt' | 'claude' | 'gemini' | 'codex' | 'web';
+  readonly title: string;
+  readonly snippet: string;
+  readonly relativeWhen: string;
+  readonly score: number;
+}
+
 // Derive a node kind from an anchor id prefix so history entries get
 // the right icon/tint without a snapshot round-trip. Unknown shapes
 // fall back to the page kind (still iconed).
@@ -160,6 +170,7 @@ type Props = {
   // the global top-bar search button re-use the Connections search
   // instead of opening a second, separate search panel on this page.
   readonly requestSearch?: number;
+  readonly requestDejaVuMode?: readonly ConnectionsDejaVuItem[];
   readonly onRequestConsumed?: () => void;
   // Cross-surface jump from Connections back to the Inbox. Fired
   // when the user clicks "Find in Inbox" on a URL-bearing anchor.
@@ -174,7 +185,7 @@ const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
   replicaAlias: () => 'Browser',
 };
 
-type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search';
+type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search' | 'dejavu';
 
 const FILTERED_SUBMODES = new Set<SubMode>(['linked', 'orbital', 'flow']);
 const CONNECTIONS_NARROW_QUERY = '(max-width: 860px)';
@@ -1465,6 +1476,45 @@ const requireFeedbackRelationKind = (edge: ConnectionEdge): UserFlowRelationKind
   return relationKind;
 };
 
+const DejaVuFullView = ({
+  items,
+}: {
+  readonly items: readonly ConnectionsDejaVuItem[];
+}): ReactElement => (
+  <section className="cx-deja-view" data-testid="connections-dejavu-view">
+    <div className="cx-deja-view-head">
+      <h3>Déjà-vu</h3>
+      <span className="cx-mono cx-dim">
+        {String(items.length)} prior result{items.length === 1 ? '' : 's'}
+      </span>
+    </div>
+    {items.length === 0 ? (
+      <div className="cx-empty">
+        <h4>No Déjà-vu results yet</h4>
+        <p>Use “See all” from a Déjà-vu popover to keep the full result set here.</p>
+      </div>
+    ) : (
+      <div className="cx-deja-list">
+        {items.map((item) => (
+          <article className="deja-row cx-deja-row" key={item.id}>
+            <div className="r1">
+              <span className="title">{item.title}</span>
+              <span className="cx-deja-badges">
+                <span className={`hp-row prov-pill ${item.providerKey}`}>{item.providerLabel}</span>
+                <span className="score" title="similarity">
+                  {item.score.toFixed(2)}
+                </span>
+                <span className="score cx-deja-time">{item.relativeWhen}</span>
+              </span>
+            </div>
+            <div className="r2">{item.snippet}</div>
+          </article>
+        ))}
+      </div>
+    )}
+  </section>
+);
+
 export const ConnectionsView = ({
   initialAnchor = '',
   recentAnchors = [],
@@ -1473,6 +1523,7 @@ export const ConnectionsView = ({
   displayCtx,
   requestAnchor,
   requestSearch,
+  requestDejaVuMode,
   onRequestConsumed,
   onOpenInInbox,
   onSaveFocusGroup,
@@ -1492,6 +1543,7 @@ export const ConnectionsView = ({
   const [anchorLabelOverrides, setAnchorLabelOverrides] = useState<Record<string, string>>({});
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
+  const [dejaVuItems, setDejaVuItems] = useState<readonly ConnectionsDejaVuItem[]>([]);
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
@@ -1859,6 +1911,12 @@ export const ConnectionsView = ({
     fullSnapshot.prime();
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fire only when a new request arrives
   }, [requestSearch]);
+
+  useEffect(() => {
+    if (requestDejaVuMode === undefined || requestDejaVuMode.length === 0) return;
+    setDejaVuItems([...requestDejaVuMode]);
+    setSubMode('dejavu');
+  }, [requestDejaVuMode]);
 
   // Stage 5 polish — derive a canonical URL from the current anchor
   // so the "Find in Inbox" button can pass it back to App.tsx. Three
@@ -2417,10 +2475,15 @@ export const ConnectionsView = ({
           : 'No topic clusters in this scope. Clear the search/time filter, or anchor a workstream at higher hops.',
       },
       context: {
-        enabled: isWorkstream,
-        reason: isWorkstream
-          ? undefined
-          : 'Context Pack composer only works for workstream anchors. Pick a workstream first.',
+        // Hidden until Context Pack is implemented. Set `hidden: false`
+        // to restore the dim-when-not-applicable tab.
+        enabled: false,
+        hidden: true,
+        reason: 'Coming soon',
+      },
+      dejavu: {
+        enabled: true,
+        reason: undefined,
       },
     };
   }, [anchor, displayedFocusData, filteredFullSnapshot.nodes]);
@@ -2710,21 +2773,23 @@ export const ConnectionsView = ({
         >
           Focus
         </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={subMode === 'context'}
-          className={
-            'cx-mode' +
-            (subMode === 'context' ? ' is-active' : '') +
-            (modeAvailability.context.enabled ? '' : ' is-dim')
-          }
-          onClick={() => setSubMode('context')}
-          title={modeAvailability.context.reason}
-          data-testid="connections-mode-context"
-        >
-          Context Pack
-        </button>
+        {modeAvailability.context.hidden === true ? null : (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={subMode === 'context'}
+            className={
+              'cx-mode' +
+              (subMode === 'context' ? ' is-active' : '') +
+              (modeAvailability.context.enabled ? '' : ' is-dim')
+            }
+            onClick={() => setSubMode('context')}
+            title={modeAvailability.context.reason}
+            data-testid="connections-mode-context"
+          >
+            Context Pack
+          </button>
+        )}
         <button
           type="button"
           role="tab"
@@ -2738,8 +2803,26 @@ export const ConnectionsView = ({
         >
           Search
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={subMode === 'dejavu'}
+          className={
+            'cx-mode' +
+            (subMode === 'dejavu' ? ' is-active' : '') +
+            (modeAvailability.dejavu.enabled ? '' : ' is-dim')
+          }
+          onClick={() => setSubMode('dejavu')}
+          title={modeAvailability.dejavu.reason}
+          data-testid="connections-mode-dejavu"
+        >
+          <span className="cx-mode-icon" aria-hidden>
+            {ClockIcon}
+          </span>
+          Déjà-vu
+        </button>
       </div>
-      {subMode === 'search' ? null : (
+      {subMode === 'search' || subMode === 'dejavu' ? null : (
         <PathFinder
           anchorId={anchor}
           anchorLabel={
@@ -2753,7 +2836,7 @@ export const ConnectionsView = ({
           }}
         />
       )}
-      {result !== null && subMode !== 'search' ? (
+      {result !== null && subMode !== 'search' && subMode !== 'dejavu' ? (
         // Thin filter strip — only renders when there's a loaded
         // result so empty states don't carry an unusable control.
         <div className="cx-filterbar" data-testid="connections-filterbar">
@@ -2765,7 +2848,7 @@ export const ConnectionsView = ({
           />
         </div>
       ) : null}
-      {timeline !== null && subMode !== 'search' ? (
+      {timeline !== null && subMode !== 'search' && subMode !== 'dejavu' ? (
         <TimelineRail
           data={timeline}
           ctx={ctx}
@@ -2773,8 +2856,14 @@ export const ConnectionsView = ({
           onHoverNode={setTimelineHoverNodeId}
         />
       ) : null}
-      <div className={'cx-cols' + (subMode === 'search' ? ' is-search-mode' : '')}>
-        {subMode === 'search' ? null : (
+      <div
+        className={
+          'cx-cols' +
+          (subMode === 'search' ? ' is-search-mode' : '') +
+          (subMode === 'dejavu' ? ' is-dejavu-mode' : '')
+        }
+      >
+        {subMode === 'search' || subMode === 'dejavu' ? null : (
           <aside className={'cx-col-l' + (leftRailOpen ? '' : ' is-collapsed')}>
             <button
               type="button"
@@ -3059,6 +3148,8 @@ export const ConnectionsView = ({
           ) : null}
           {subMode === 'search' ? (
             searchTab
+          ) : subMode === 'dejavu' ? (
+            <DejaVuFullView items={dejaVuItems} />
           ) : result !== null ? (
             subMode === 'linked' ? (
               <LinkedCenter
@@ -3188,7 +3279,7 @@ export const ConnectionsView = ({
             )
           )}
         </main>
-        {subMode === 'search' ? null : (
+        {subMode === 'search' || subMode === 'dejavu' ? null : (
           <aside className={'cx-col-r' + (rightPanelOpen ? '' : ' is-collapsed')}>
             <button
               type="button"
