@@ -291,6 +291,7 @@ const acquireCompanionFetchSlot = async (): Promise<() => void> => {
 const comparableTabUrl = (input: string | undefined): string | null => {
   if (input === undefined || input.length === 0) return null;
   const canonical = sanitizeTimelineUrl(canonicalThreadUrl(input));
+  if (!canonical.startsWith('https://') && !canonical.startsWith('http://')) return null;
   return canonical.length > 1 && canonical.endsWith('/') ? canonical.slice(0, -1) : canonical;
 };
 
@@ -299,8 +300,7 @@ const comparableTabUrl = (input: string | undefined): string | null => {
 const resolveDiagEnabled = (): boolean => {
   try {
     return (
-      typeof localStorage !== 'undefined' &&
-      localStorage.getItem('sidetrack:resolveDiag') === '1'
+      typeof localStorage !== 'undefined' && localStorage.getItem('sidetrack:resolveDiag') === '1'
     );
   } catch {
     return false;
@@ -357,6 +357,42 @@ const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
     typeof value['decision']['workstreamId'] === 'string') &&
   typeof value['decision']['margin'] === 'number' &&
   Array.isArray(value['fusedCandidates']);
+
+const urlResolutionResultsFromBatch = (
+  value: unknown,
+  requestedUrls: ReadonlySet<string>,
+): readonly (readonly [string, UrlResolutionResult])[] => {
+  if (!isPlainRecord(value)) return [];
+  const results = value['results'];
+  if (!isPlainRecord(results)) return [];
+  const entries: (readonly [string, UrlResolutionResult])[] = [];
+  for (const [canonicalUrl, result] of Object.entries(results)) {
+    if (!requestedUrls.has(canonicalUrl)) continue;
+    if (isUrlResolutionResult(result)) entries.push([canonicalUrl, result]);
+  }
+  return entries;
+};
+
+const mergeUrlSuggestionResults = (
+  current: Readonly<Record<string, UrlResolutionResult>>,
+  incoming: Readonly<Record<string, UrlResolutionResult>>,
+  options: { readonly replace?: boolean; readonly preservePositiveOnEmpty?: boolean } = {},
+): Record<string, UrlResolutionResult> => {
+  const next: Record<string, UrlResolutionResult> =
+    options.replace === true ? { ...incoming } : { ...current, ...incoming };
+  if (options.preservePositiveOnEmpty !== true) return next;
+  for (const [canonicalUrl, incomingResult] of Object.entries(incoming)) {
+    const existing = current[canonicalUrl];
+    if (
+      existing !== undefined &&
+      existing.fusedCandidates.length > 0 &&
+      incomingResult.fusedCandidates.length === 0
+    ) {
+      next[canonicalUrl] = existing;
+    }
+  }
+  return next;
+};
 
 const isPageEvidenceSummary = (value: unknown): value is TabSessionPageEvidenceSummary =>
   isPlainRecord(value) &&
@@ -447,11 +483,8 @@ export const formatBuildTimestamp = (iso: string): string => {
 
 const SETUP_COMPLETED_KEY = 'sidetrack:setupCompleted';
 
-export const companionGetInFlightKey = (
-  port: string,
-  bridgeKey: string,
-  path: string,
-): string => `${port}\0${bridgeKey}\0${path}`;
+export const companionGetInFlightKey = (port: string, bridgeKey: string, path: string): string =>
+  `${port}\0${bridgeKey}\0${path}`;
 
 const DEFAULT_VAULT_PATH = '~/Documents/Sidetrack-vault';
 
@@ -924,6 +957,7 @@ const App = () => {
   urlSuggestionsRef.current = urlSuggestions;
   const tabSessionSuggestionLoadInFlightRef = useRef(false);
   const urlSuggestionLoadInFlightRef = useRef(false);
+  const focusedUrlSuggestionLoadInFlightRef = useRef(false);
   // 2026-05 cleanup: with the 4 s background poll gone, the user can
   // refresh a single suggestion via the per-card ↻ button. This set
   // tracks which urls are currently re-fetching so the button can
@@ -935,8 +969,9 @@ const App = () => {
   // one on precedence tie-break) but we still don't want to retry the
   // same URL on every poll cycle. Track in-flight + completed attempts
   // per canonical URL so each URL is auto-applied at most once per
-  // session per server response.
+  // session per unchanged resolver dependency key.
   const urlAutoApplyInFlightRef = useRef<Set<string>>(new Set<string>());
+  const urlAutoApplyAttemptedRef = useRef<Map<string, string>>(new Map<string, string>());
   const [pendingCodingOffers, setPendingCodingOffers] = useState<readonly OfferRecord[]>([]);
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
@@ -1464,23 +1499,26 @@ const App = () => {
   // The cache is invalidated entirely on user mutation (attribution,
   // dismiss) because those change the resolver inputs.
   //
-  // Negative cache (resolve-flood guard). Empty resolutions are
-  // deliberately NOT cached as results (so they self-heal when the
-  // materializer finally folds the visit). But `state.updatedAt` is a
+  // Negative cache (resolve-flood guard). Empty resolutions are cached
+  // only inside a short TTL: that lets the UI show "No signal yet"
+  // without pinning stale empties forever. But `state.updatedAt` is a
   // fresh nonce on every getWorkboardState, so the refetch effects
   // re-fire constantly and every still-empty URL/tab-session (e.g. a
   // non-provider blog the resolver will never attribute) was
   // re-resolved on EVERY pass — the same urls 30+×/min, each a full
   // PPR+cluster+ranker run, pegging the companion to 99% CPU. Record
   // when a key last resolved empty and skip re-resolving it for a
-  // short TTL. forceRefetch (user mutation / snapshot-revision watcher)
-  // ignores this, and the TTL lapses, so genuinely-late drains are
-  // still picked up — just not hammered every pass.
+  // short TTL. The focused current-tab URL uses a much shorter empty
+  // TTL because users are watching that one surface live: it should
+  // self-heal right after page evidence / the graph arrives, while the
+  // larger inbox list still keeps its flood guard.
   const emptyResolveAtRef = useRef<Map<string, number>>(new Map());
   const EMPTY_RESOLVE_TTL_MS = 60_000;
-  const recentlyResolvedEmpty = useCallback((key: string): boolean => {
+  const FOCUSED_EMPTY_RESOLVE_TTL_MS = 2_000;
+  const FOCUSED_RESOLVE_RETRY_WINDOW_MS = 30_000;
+  const recentlyResolvedEmpty = useCallback((key: string, ttlMs = EMPTY_RESOLVE_TTL_MS): boolean => {
     const at = emptyResolveAtRef.current.get(key);
-    return at !== undefined && Date.now() - at < EMPTY_RESOLVE_TTL_MS;
+    return at !== undefined && Date.now() - at < ttlMs;
   }, []);
   const loadTabSessionSuggestions = useCallback(
     async (
@@ -1512,7 +1550,9 @@ const App = () => {
       // longer in the candidate set.
       const next: Record<string, TabSessionResolutionResult> = {};
       for (const id of recordsById.keys()) {
-        if (!forceRefetch && previous[id] !== undefined) next[id] = previous[id];
+        const cached = previous[id];
+        if (forceRefetch || cached === undefined) continue;
+        if (cached.fusedCandidates.length > 0 || recentlyResolvedEmpty(id)) next[id] = cached;
       }
       let negativeCacheSkips = 0;
       const idsToFetch = [...recordsById.keys()].filter((id) => {
@@ -1562,15 +1602,14 @@ const App = () => {
       for (const entry of fetched) {
         if (entry === null) continue;
         const [id, result] = entry;
-        // Empty results still aren't cached as results (self-heal),
-        // but we stamp the negative cache so the resolve-flood guard
-        // skips re-resolving this id for EMPTY_RESOLVE_TTL_MS instead
-        // of hammering it every refetch pass.
+        // Empty results are cached only for EMPTY_RESOLVE_TTL_MS: the UI
+        // needs to render "No signal yet" instead of "Checking signals…",
+        // while the TTL still lets late materializer work self-heal.
         if (result.fusedCandidates.length === 0) {
           emptyResolveAtRef.current.set(id, Date.now());
-          continue;
+        } else {
+          emptyResolveAtRef.current.delete(id);
         }
-        emptyResolveAtRef.current.delete(id);
         next[id] = result;
       }
       return next;
@@ -1594,39 +1633,82 @@ const App = () => {
       // Merge inbox URLs with caller-supplied extras (e.g., the focused
       // tab's URL when it's not in the inbox top page). Dedupe by Set.
       const canonicalUrls = [...new Set<string>([...inboxCanonicalUrls, ...extraCanonicalUrls])];
+      const extraCanonicalUrlSet = new Set(extraCanonicalUrls);
+      const emptyResolveTtlForUrl = (canonicalUrl: string): number =>
+        extraCanonicalUrlSet.has(canonicalUrl)
+          ? FOCUSED_EMPTY_RESOLVE_TTL_MS
+          : EMPTY_RESOLVE_TTL_MS;
       const next: Record<string, UrlResolutionResult> = {};
       for (const url of canonicalUrls) {
-        if (!forceRefetch && previous[url] !== undefined) next[url] = previous[url];
+        const cached = previous[url];
+        if (forceRefetch || cached === undefined) continue;
+        if (
+          cached.fusedCandidates.length > 0 ||
+          recentlyResolvedEmpty(url, emptyResolveTtlForUrl(url))
+        ) {
+          next[url] = cached;
+        }
       }
       const toFetch = canonicalUrls.filter((url) =>
-        forceRefetch ? true : next[url] === undefined && !recentlyResolvedEmpty(url),
+        forceRefetch
+          ? true
+          : next[url] === undefined && !recentlyResolvedEmpty(url, emptyResolveTtlForUrl(url)),
       );
-      const fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
+      let fetched: readonly (readonly [string, UrlResolutionResult] | null)[] = [];
+      if (toFetch.length > 0) {
+        const requestedUrls = new Set(toFetch);
+        const eventCandidateUrls = extraCanonicalUrls.filter((url) => requestedUrls.has(url));
         try {
-          const result = await fetchCompanionJson<unknown>(
-            `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
-          );
-          return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+          const response = await fetch(`http://127.0.0.1:${port}/v1/visits/batch-resolve`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-bac-bridge-key': bridgeKey,
+            },
+            body: JSON.stringify({
+              canonicalUrls: toFetch,
+              ...(eventCandidateUrls.length === 0 ? {} : { eventCandidateUrls }),
+            }),
+          });
+          if (!response.ok) {
+            throw new Error(`Companion batch URL resolve failed (${String(response.status)}).`);
+          }
+          const body = (await response.json()) as { readonly data?: unknown };
+          fetched = urlResolutionResultsFromBatch(body.data, requestedUrls);
         } catch {
-          return null;
+          // Back-compat for older companions and transient batch
+          // failures: keep the old bounded fan-out path so suggestion
+          // rendering degrades gracefully instead of disappearing.
+          fetched = await mapWithConcurrency(toFetch, 4, async (canonicalUrl) => {
+            try {
+              const eventCandidateQuery = extraCanonicalUrls.includes(canonicalUrl)
+                ? '&eventCandidates=1'
+                : '';
+              const result = await fetchCompanionJson<unknown>(
+                `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true${eventCandidateQuery}`,
+              );
+              return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
+            } catch {
+              return null;
+            }
+          });
         }
-      });
+      }
       for (const entry of fetched) {
         if (entry === null) continue;
         const [url, result] = entry;
-        // Same self-heal as the tab-session cache (empties uncached),
-        // plus the negative-cache stamp so the resolve-flood guard
-        // skips re-resolving this url for EMPTY_RESOLVE_TTL_MS.
+        // Same TTL-bound empty cache as tab sessions: show the resolved
+        // empty state, but re-check after the short negative-cache window.
         if (result.fusedCandidates.length === 0) {
           emptyResolveAtRef.current.set(url, Date.now());
-          continue;
+        } else {
+          emptyResolveAtRef.current.delete(url);
         }
-        emptyResolveAtRef.current.delete(url);
         next[url] = result;
       }
       return next;
     },
-    [fetchCompanionJson, mapWithConcurrency, recentlyResolvedEmpty],
+    [bridgeKey, fetchCompanionJson, mapWithConcurrency, port, recentlyResolvedEmpty],
   );
 
   // Per-row refresh: re-resolves a single URL's suggestion without
@@ -1702,30 +1784,68 @@ const App = () => {
           if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
             setUrlProjection(urlProj);
             setUrlInbox(urlInboxResp);
+            // Include the currently-focused tab's URL in the suggestion
+            // fetch even when it's not in the inbox top page — otherwise
+            // the Current Tab card renders without a suggestion for
+            // late-page or attributed URLs the resolver could still
+            // give us advice on. Read from the latest active-tab state.
+            const focusedCanonical =
+              liveActiveTabUrlRef.current ??
+              state.activeTabUrl ??
+              state.currentTab?.tabSnapshot?.url ??
+              state.currentTab?.threadUrl;
+            const focusedComparable = comparableTabUrl(focusedCanonical);
+            const focusedExtras =
+              typeof focusedComparable === 'string' && focusedComparable.length > 0
+                ? [focusedComparable]
+                : [];
+            const focusedNeedsPriorityResolve = focusedExtras.some((canonicalUrl) => {
+              if (forceRefetch) return true;
+              return (
+                urlSuggestionsRef.current[canonicalUrl] === undefined &&
+                !recentlyResolvedEmpty(canonicalUrl, FOCUSED_EMPTY_RESOLVE_TTL_MS)
+              );
+            });
+            if (
+              urlSuggestionLoadInFlightRef.current &&
+              focusedNeedsPriorityResolve &&
+              !focusedUrlSuggestionLoadInFlightRef.current
+            ) {
+              focusedUrlSuggestionLoadInFlightRef.current = true;
+              void loadUrlSuggestions(
+                EMPTY_URL_INBOX,
+                urlSuggestionsRef.current,
+                forceRefetch,
+                focusedExtras,
+              )
+                .then((focusedResults) => {
+                  setUrlSuggestions((current) =>
+                    mergeUrlSuggestionResults(current, focusedResults, {
+                      preservePositiveOnEmpty: true,
+                    }),
+                  );
+                })
+                .catch(() => undefined)
+                .finally(() => {
+                  focusedUrlSuggestionLoadInFlightRef.current = false;
+                });
+            }
             if (!urlSuggestionLoadInFlightRef.current) {
               urlSuggestionLoadInFlightRef.current = true;
-              // Include the currently-focused tab's URL in the suggestion
-              // fetch even when it's not in the inbox top page — otherwise
-              // the Current Tab card renders without a suggestion for
-              // late-page or attributed URLs the resolver could still
-              // give us advice on. Read from the latest active-tab state.
-              const focusedCanonical =
-                liveActiveTabUrlRef.current ??
-                state.activeTabUrl ??
-                state.currentTab?.tabSnapshot?.url ??
-                state.currentTab?.threadUrl;
-              const focusedComparable = comparableTabUrl(focusedCanonical);
-              const focusedExtras =
-                typeof focusedComparable === 'string' && focusedComparable.length > 0
-                  ? [focusedComparable]
-                  : [];
               void loadUrlSuggestions(
                 urlInboxResp,
                 urlSuggestionsRef.current,
                 forceRefetch,
                 focusedExtras,
               )
-                .then(setUrlSuggestions)
+                .then((results) => {
+                  setUrlSuggestions((current) =>
+                    mergeUrlSuggestionResults(current, results, {
+                      replace: true,
+                      preservePositiveOnEmpty: !forceRefetch,
+                    }),
+                  );
+                })
                 .catch(() => undefined)
                 .finally(() => {
                   urlSuggestionLoadInFlightRef.current = false;
@@ -1819,7 +1939,14 @@ const App = () => {
         if (!background) setTabSessionLoading(false);
       }
     },
-    [bridgeKey, fetchCompanionJson, loadTabSessionSuggestions, loadUrlSuggestions, port],
+    [
+      bridgeKey,
+      fetchCompanionJson,
+      loadTabSessionSuggestions,
+      loadUrlSuggestions,
+      port,
+      recentlyResolvedEmpty,
+    ],
   );
 
   // STRUCTURAL CPU FIX (root of the recurring "lack of response").
@@ -1849,20 +1976,18 @@ const App = () => {
   // card stops showing "No signal yet" for URLs the graph now knows
   // about.
   //
-  // This is a NON-forced refresh on purpose. `loadTabSessionSuggestions`
-  // keeps cached non-empty results but never caches empty ("No signal
-  // yet") ones, so a non-forced pass already re-resolves exactly the
-  // stale/empty/new cards the new snapshot can now answer — the
-  // self-heal the comment above wants — WITHOUT re-resolving the
-  // already-known ones. Using forceRefetchSuggestions here re-resolved
-  // *every* unattributed session (observed: 424) on *every* snapshot
-  // revision via /v1/tabsessions/<id>/resolve?dryRun=true; since the
-  // companion bumps the revision every drain and a full sweep
-  // (concurrency 4, ~600ms each) outlasts the drain interval, the
-  // sweeps overlapped and pegged the companion (~146% CPU), which kept
-  // it catching_up → more revisions → a self-sustaining flood. Forced
-  // refetch stays on explicit user Refresh + user-mutation cache
-  // invalidation, where it is correct.
+  // This is a NON-forced refresh on purpose. Empty results have a TTL
+  // guard, so a normal pass re-resolves only entries whose guard has
+  // expired while keeping already-known positives. Using
+  // forceRefetchSuggestions here re-resolved *every* unattributed
+  // session (observed: 424) on *every* snapshot revision via
+  // /v1/tabsessions/<id>/resolve?dryRun=true; since the companion bumps
+  // the revision every drain and a full sweep (concurrency 4, ~600ms
+  // each) outlasts the drain interval, the sweeps overlapped and pegged
+  // the companion (~146% CPU), which kept it catching_up → more
+  // revisions → a self-sustaining flood. Forced refetch stays on
+  // explicit user Refresh + user-mutation cache invalidation, where it
+  // is correct.
   const lastSnapshotRevisionRef = useRef<string | null>(null);
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
@@ -2863,12 +2988,23 @@ const App = () => {
   //      (the companion enforces this too as a safety check).
   //   3. Track in-flight per-URL to avoid spamming the same URL.
   const triggerUrlAutoApply = useCallback(
-    async (canonicalUrl: string): Promise<void> => {
+    async (canonicalUrl: string, result: UrlResolutionResult): Promise<void> => {
       if (port.length === 0 || bridgeKey.length === 0) return;
       if (urlAutoApplyInFlightRef.current.has(canonicalUrl)) return;
+      const topCandidate = result.fusedCandidates[0];
+      const attemptKey = [
+        result.decision.action,
+        result.decision.workstreamId ?? 'none',
+        result.decision.margin.toFixed(6),
+        topCandidate?.workstreamId ?? 'none',
+        topCandidate?.rawFusionLogit.toFixed(6) ?? 'none',
+        String(result.fusedCandidates.length),
+      ].join('\0');
+      if (urlAutoApplyAttemptedRef.current.get(canonicalUrl) === attemptKey) return;
+      urlAutoApplyAttemptedRef.current.set(canonicalUrl, attemptKey);
       urlAutoApplyInFlightRef.current.add(canonicalUrl);
       try {
-        await fetch(
+        const response = await fetch(
           `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve`,
           {
             method: 'POST',
@@ -2880,12 +3016,17 @@ const App = () => {
             body: JSON.stringify({ dryRun: false, policyMode: 'balanced' }),
           },
         );
+        if (!response.ok) {
+          urlAutoApplyAttemptedRef.current.delete(canonicalUrl);
+          return;
+        }
         // Success or skipped-disabled — re-fetch suggestions so the
         // panel reflects the applied attribution (or stays as-is when
         // disabled).
         await loadTabSessions({ background: true, forceRefetchSuggestions: true });
       } catch {
         // Silent — auto-apply is best-effort.
+        urlAutoApplyAttemptedRef.current.delete(canonicalUrl);
       } finally {
         urlAutoApplyInFlightRef.current.delete(canonicalUrl);
       }
@@ -2901,7 +3042,7 @@ const App = () => {
       if (result.decision.action !== 'auto-apply') continue;
       const existing = urlProjection.byCanonicalUrl[canonicalUrl]?.currentAttribution;
       if (existing !== undefined && existing.source !== 'inferred') continue;
-      void triggerUrlAutoApply(canonicalUrl);
+      void triggerUrlAutoApply(canonicalUrl, result);
     }
   }, [urlSuggestions, urlProjection, triggerUrlAutoApply]);
 
@@ -2951,8 +3092,7 @@ const App = () => {
         canonical.length === 0
           ? undefined
           : state.threads.find(
-              (t) =>
-                t.threadUrl !== undefined && canonicalThreadUrl(t.threadUrl) === canonical,
+              (t) => t.threadUrl !== undefined && canonicalThreadUrl(t.threadUrl) === canonical,
             );
       if (thread !== undefined && thread.primaryWorkstreamId !== workstreamId) {
         void runAction(() =>
@@ -4281,6 +4421,20 @@ const App = () => {
             [payload.canonicalUrl]: pageEvidence,
             [focusedTabUrl]: pageEvidence,
           }));
+          emptyResolveAtRef.current.delete(focusedTabUrl);
+          emptyResolveAtRef.current.delete(payload.canonicalUrl);
+          void loadUrlSuggestions(EMPTY_URL_INBOX, urlSuggestionsRef.current, true, [
+            focusedTabUrl,
+          ])
+            .then((focusedResults) => {
+              if (cancelled) return;
+              setUrlSuggestions((current) =>
+                mergeUrlSuggestionResults(current, focusedResults, {
+                  preservePositiveOnEmpty: true,
+                }),
+              );
+            })
+            .catch(() => undefined);
         }
       })
       .catch(() => {
@@ -4299,6 +4453,7 @@ const App = () => {
     focusedTabUrl,
     livePageEvidenceByUrl,
     livePageEvidenceRetryTick,
+    loadUrlSuggestions,
     port,
   ]);
   // Per-URL state: every visible attribution surface (Current tab,
@@ -4363,16 +4518,26 @@ const App = () => {
   // so it must reflect a just-made decision instantly. Overlay it +
   // suppress the suggestion until reconcile → no flicker / no
   // "Checking signals…" after a pick.
+  const focusedRecordWithLiveEvidence = useMemo(() => {
+    if (focusedDisplayUrlRecord === undefined) return undefined;
+    if (focusedDisplayUrlRecord.pageEvidence !== undefined) return focusedDisplayUrlRecord;
+    const liveEvidence =
+      livePageEvidenceByUrl[focusedDisplayUrlRecord.canonicalUrl] ??
+      livePageEvidenceByUrl[focusedTabUrl ?? ''];
+    return liveEvidence === undefined
+      ? focusedDisplayUrlRecord
+      : { ...focusedDisplayUrlRecord, pageEvidence: liveEvidence };
+  }, [focusedDisplayUrlRecord, focusedTabUrl, livePageEvidenceByUrl]);
   const focusedRecordEffective = useMemo(
     () =>
-      focusedDisplayUrlRecord === undefined
+      focusedRecordWithLiveEvidence === undefined
         ? undefined
         : withOptimisticAttribution(
-            focusedDisplayUrlRecord,
-            optimisticDecisions[focusedDisplayUrlRecord.canonicalUrl],
+            focusedRecordWithLiveEvidence,
+            optimisticDecisions[focusedRecordWithLiveEvidence.canonicalUrl],
             optimisticIso,
           ),
-    [focusedDisplayUrlRecord, optimisticDecisions, optimisticIso],
+    [focusedRecordWithLiveEvidence, optimisticDecisions, optimisticIso],
   );
   const focusedTabSession = useMemo(
     () =>
@@ -4402,6 +4567,12 @@ const App = () => {
   const [currentTabPageContentError, setCurrentTabPageContentError] = useState<string | null>(null);
   const currentTabCardRef = useRef<HTMLElement | null>(null);
   const [currentTabFocusing, setCurrentTabFocusing] = useState(false);
+  const focusedResolveRetryRef = useRef<{
+    readonly canonicalUrl: string;
+    readonly startedAt: number;
+    attempts: number;
+  } | null>(null);
+  const [focusedResolveRetryTick, setFocusedResolveRetryTick] = useState(0);
 
   useEffect(() => {
     if (currentTabCanonicalUrl === null) {
@@ -4419,9 +4590,7 @@ const App = () => {
       (response: unknown) => {
         if (!active) return;
         const parsed = response as PageContentOperationResponse;
-        setCurrentTabCoverage(
-          parsed.ok && parsed.coverage !== undefined ? parsed.coverage : null,
-        );
+        setCurrentTabCoverage(parsed.ok && parsed.coverage !== undefined ? parsed.coverage : null);
       },
     );
     return () => {
@@ -4549,6 +4718,75 @@ const App = () => {
     hasOptimisticDecision(optimisticDecisions, focusedDisplayUrlRecord.canonicalUrl)
       ? undefined
       : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
+  useEffect(() => {
+    const canonicalUrl = focusedDisplayUrlRecord?.canonicalUrl;
+    if (
+      canonicalUrl === undefined ||
+      port.length === 0 ||
+      bridgeKey.length === 0 ||
+      focusedRecordEffective === undefined ||
+      focusedRecordEffective.currentAttribution !== undefined ||
+      focusedRecordEffective.currentIgnored !== undefined ||
+      focusedRecordEffective.pageEvidence === undefined ||
+      (focusedTabSuggestion !== undefined && focusedTabSuggestion.fusedCandidates.length > 0)
+    ) {
+      focusedResolveRetryRef.current = null;
+      return undefined;
+    }
+
+    const nowMs = Date.now();
+    const previous = focusedResolveRetryRef.current;
+    const retryState =
+      previous === null || previous.canonicalUrl !== canonicalUrl
+        ? { canonicalUrl, startedAt: nowMs, attempts: 0 }
+        : previous;
+    focusedResolveRetryRef.current = retryState;
+    if (nowMs - retryState.startedAt > FOCUSED_RESOLVE_RETRY_WINDOW_MS) {
+      return undefined;
+    }
+
+    const delayMs =
+      focusedTabSuggestion === undefined
+        ? 500
+        : retryState.attempts < 8
+          ? 1_000
+          : Math.min(2_000 + (retryState.attempts - 8) * 1_000, 5_000);
+    const timer = window.setTimeout(() => {
+      const currentRetryState = focusedResolveRetryRef.current;
+      if (currentRetryState === null || currentRetryState.canonicalUrl !== canonicalUrl) return;
+      if (focusedUrlSuggestionLoadInFlightRef.current) {
+        setFocusedResolveRetryTick((tick) => tick + 1);
+        return;
+      }
+      focusedUrlSuggestionLoadInFlightRef.current = true;
+      currentRetryState.attempts += 1;
+      emptyResolveAtRef.current.delete(canonicalUrl);
+      void loadUrlSuggestions(EMPTY_URL_INBOX, urlSuggestionsRef.current, true, [canonicalUrl])
+        .then((focusedResults) => {
+          setUrlSuggestions((current) =>
+            mergeUrlSuggestionResults(current, focusedResults, {
+              preservePositiveOnEmpty: true,
+            }),
+          );
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          focusedUrlSuggestionLoadInFlightRef.current = false;
+          setFocusedResolveRetryTick((tick) => tick + 1);
+        });
+    }, delayMs);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    bridgeKey,
+    focusedDisplayUrlRecord?.canonicalUrl,
+    focusedRecordEffective,
+    focusedResolveRetryTick,
+    focusedTabSuggestion,
+    loadUrlSuggestions,
+    port,
+  ]);
   // Reconcile gate (Theme A, completed). Every optimistic entry is
   // keyed by canonicalUrl (URL inbox items carry the canonical URL as
   // tabSessionId; the real tab-session handler doesn't use the
@@ -5872,11 +6110,7 @@ const App = () => {
           </button>
           <button
             className={'icon-btn' + (threadSearchOpen && viewMode !== 'connections' ? ' on' : '')}
-            title={
-              viewMode === 'connections'
-                ? 'Search connections'
-                : 'Search indexed threads'
-            }
+            title={viewMode === 'connections' ? 'Search connections' : 'Search indexed threads'}
             onClick={() => {
               // On Connections, reuse that view's own SearchTab instead
               // of opening a second "indexed threads" panel over it.
@@ -5887,7 +6121,9 @@ const App = () => {
               setThreadSearchOpen((open) => !open);
             }}
             type="button"
-            aria-label={viewMode === 'connections' ? 'Search connections' : 'Search indexed threads'}
+            aria-label={
+              viewMode === 'connections' ? 'Search connections' : 'Search indexed threads'
+            }
             aria-pressed={threadSearchOpen && viewMode !== 'connections'}
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
@@ -7096,17 +7332,15 @@ const App = () => {
           // the top, once in the Inbox list) is the "dup items"
           // confusion. Filter it out here.
           inbox={{
-            items: urlInbox.items
-              .map(tabSessionRecordFromUrl)
-              .filter(
-                (item) =>
-                  (focusedDisplayUrlRecord === undefined ||
-                    item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl) &&
-                  // Just-decided rows leave the list at once (matches
-                  // the eventual pruned/attributed state) → no
-                  // "No attribution → That's right → workstream" cycle.
-                  !hasOptimisticDecision(optimisticDecisions, item.tabSessionId),
-              ),
+            items: urlInbox.items.map(tabSessionRecordFromUrl).filter(
+              (item) =>
+                (focusedDisplayUrlRecord === undefined ||
+                  item.tabSessionId !== focusedDisplayUrlRecord.canonicalUrl) &&
+                // Just-decided rows leave the list at once (matches
+                // the eventual pruned/attributed state) → no
+                // "No attribution → That's right → workstream" cycle.
+                !hasOptimisticDecision(optimisticDecisions, item.tabSessionId),
+            ),
             total: urlInbox.total,
             limit: urlInbox.limit,
             offset: urlInbox.offset,
@@ -8423,14 +8657,7 @@ function NeedsOrganizeSuggestionRow({
     };
     // onCache / resolveLabel intentionally excluded — called via
     // refs above to break the fetch-on-render loop.
-  }, [
-    companionPort,
-    bridgeKey,
-    threadId,
-    workstreamFingerprint,
-    indexRebuilding,
-    refreshTick,
-  ]);
+  }, [companionPort, bridgeKey, threadId, workstreamFingerprint, indexRebuilding, refreshTick]);
 
   // Always render the row even when the companion has no automatic
   // suggestion above threshold — surface the manual picker so the

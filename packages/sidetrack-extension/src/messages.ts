@@ -171,6 +171,11 @@ export const messageTypes = {
   // provider pages — the previous direct fetch always 403'd, so no
   // annotations ever rehydrated for users in the wild.
   listAnnotationsByUrl: 'sidetrack.annotation.listByUrl',
+  // Content script reports a user link click before the browser
+  // commits the destination. The background navigation listener uses
+  // this as a provenance fallback when MV3 lost same-tab state or the
+  // new tab's opener edge.
+  recordNavigationLinkClick: 'sidetrack.navigation.linkClick',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -229,6 +234,43 @@ export const isFocusThreadInSidePanelMessage = (
   (value.bacId === undefined || typeof value.bacId === 'string') &&
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
+
+export interface NavigationLinkClickMessage {
+  readonly type: typeof messageTypes.recordNavigationLinkClick;
+  readonly version: 1;
+  readonly sourceUrl: string;
+  readonly targetUrl: string;
+  readonly clickedAtMs: number;
+  readonly button: number;
+  readonly target?: string;
+  readonly metaKey?: boolean;
+  readonly ctrlKey?: boolean;
+  readonly shiftKey?: boolean;
+  readonly altKey?: boolean;
+}
+
+export const isNavigationLinkClickMessage = (
+  value: unknown,
+): value is NavigationLinkClickMessage => {
+  if (!isRecord(value)) return false;
+  return (
+    value.type === messageTypes.recordNavigationLinkClick &&
+    value.version === 1 &&
+    typeof value.sourceUrl === 'string' &&
+    value.sourceUrl.length > 0 &&
+    typeof value.targetUrl === 'string' &&
+    value.targetUrl.length > 0 &&
+    typeof value.clickedAtMs === 'number' &&
+    Number.isFinite(value.clickedAtMs) &&
+    typeof value.button === 'number' &&
+    Number.isFinite(value.button) &&
+    (value.target === undefined || typeof value.target === 'string') &&
+    (value.metaKey === undefined || typeof value.metaKey === 'boolean') &&
+    (value.ctrlKey === undefined || typeof value.ctrlKey === 'boolean') &&
+    (value.shiftKey === undefined || typeof value.shiftKey === 'boolean') &&
+    (value.altKey === undefined || typeof value.altKey === 'boolean')
+  );
+};
 
 export type ContentRequest =
   | {
@@ -924,9 +966,7 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
         (Array.isArray(value.sourceKind) &&
           value.sourceKind.every(
             (kind) =>
-              kind === 'page-content' ||
-              kind === 'chat-turn' ||
-              kind === 'semantic-recall-pool',
+              kind === 'page-content' || kind === 'chat-turn' || kind === 'semantic-recall-pool',
           )))
     );
   }

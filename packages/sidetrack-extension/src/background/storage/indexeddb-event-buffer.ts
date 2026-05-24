@@ -3,12 +3,14 @@ import { type BufferedEvent, type EventBuffer } from './in-memory-event-buffer';
 interface EventStoreDriver {
   put(event: BufferedEvent): Promise<void>;
   peek(limit: number): Promise<BufferedEvent[]>;
+  peekByStream(streamName: BufferedEvent['streamName'], limit: number): Promise<BufferedEvent[]>;
   deleteByKey(key: string): Promise<boolean>;
   count(): Promise<number>;
 }
 
 const DB_NAME = 'sidetrack-event-buffer';
 const STORE_NAME = 'events';
+const DB_VERSION = 2;
 
 const keyOf = (e: Pick<BufferedEvent, 'streamName' | 'lamport' | 'replicaId'>): string =>
   `${e.streamName}|${e.lamport}|${e.replicaId}`;
@@ -19,12 +21,21 @@ class IndexedDbDriver implements EventStoreDriver {
   private openDb(): Promise<IDBDatabase> {
     if (this.dbPromise !== null) return this.dbPromise;
     this.dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, 1);
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-          store.createIndex('by_lamport_replica', ['lamport', 'replicaId'], { unique: false });
+        const store = db.objectStoreNames.contains(STORE_NAME)
+          ? req.transaction?.objectStore(STORE_NAME)
+          : db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        if (store !== undefined) {
+          if (!store.indexNames.contains('by_lamport_replica')) {
+            store.createIndex('by_lamport_replica', ['lamport', 'replicaId'], { unique: false });
+          }
+          if (!store.indexNames.contains('by_stream_lamport_replica')) {
+            store.createIndex('by_stream_lamport_replica', ['streamName', 'lamport', 'replicaId'], {
+              unique: false,
+            });
+          }
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -58,6 +69,28 @@ class IndexedDbDriver implements EventStoreDriver {
       };
       tx.oncomplete = () => resolve(out);
       tx.onerror = () => reject(tx.error ?? new Error('indexedDB peek failed'));
+    });
+  }
+
+  async peekByStream(streamName: BufferedEvent['streamName'], limit: number): Promise<BufferedEvent[]> {
+    const db = await this.openDb();
+    return new Promise((resolve, reject) => {
+      const out: BufferedEvent[] = [];
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const range = IDBKeyRange.bound([streamName], [streamName, []]);
+      const req = tx
+        .objectStore(STORE_NAME)
+        .index('by_stream_lamport_replica')
+        .openCursor(range);
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (cursor === null || out.length >= limit) return;
+        const { id: _id, ...event } = cursor.value as { id: string } & BufferedEvent;
+        out.push(event);
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => reject(tx.error ?? new Error('indexedDB peekByStream failed'));
     });
   }
 
@@ -95,6 +128,10 @@ export class IndexedDbEventBuffer implements EventBuffer {
 
   peek(limit: number): Promise<BufferedEvent[]> {
     return this.driver.peek(limit);
+  }
+
+  peekByStream(streamName: BufferedEvent['streamName'], limit: number): Promise<BufferedEvent[]> {
+    return this.driver.peekByStream(streamName, limit);
   }
 
   async deleteMany(

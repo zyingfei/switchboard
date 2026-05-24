@@ -20,6 +20,12 @@ class MemoryDriver {
       .sort((a, b) => a.lamport - b.lamport || a.replicaId.localeCompare(b.replicaId))
       .slice(0, limit);
   }
+  async peekByStream(streamName: BufferedEvent['streamName'], limit: number): Promise<BufferedEvent[]> {
+    return [...this.map.values()]
+      .filter((event) => event.streamName === streamName)
+      .sort((a, b) => a.lamport - b.lamport || a.replicaId.localeCompare(b.replicaId))
+      .slice(0, limit);
+  }
   async deleteByKey(key: string): Promise<boolean> {
     return this.map.delete(key);
   }
@@ -54,6 +60,18 @@ const runContract = (name: string, create: () => EventBuffer): void => {
       ]);
       expect(removed).toBe(1);
       expect(await b.count()).toBe(1);
+    });
+
+    it('peeks by stream across the buffered set', async () => {
+      const b = create();
+      await b.appendMany([
+        event(3),
+        { ...event(1), streamName: 'navigation.committed' },
+        event(2),
+        { ...event(4), streamName: 'navigation.committed' },
+      ]);
+      const out = await b.peekByStream?.('navigation.committed', 10);
+      expect(out?.map((x) => x.lamport)).toEqual([1, 4]);
     });
   });
 };

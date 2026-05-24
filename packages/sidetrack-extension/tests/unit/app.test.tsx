@@ -1,7 +1,10 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import App, { companionGetInFlightKey, formatBuildTimestamp } from '../../entrypoints/sidepanel/App';
+import App, {
+  companionGetInFlightKey,
+  formatBuildTimestamp,
+} from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
 import {
   createEmptyWorkboardState,
@@ -162,11 +165,7 @@ afterEach(() => {
 describe('live side-panel App wiring', () => {
   it('keys in-flight companion GETs by bridge key as well as port and path', () => {
     const oldKey = companionGetInFlightKey('17373', 'old-bridge-key', '/v1/visits/projection');
-    const rotatedKey = companionGetInFlightKey(
-      '17373',
-      'new-bridge-key',
-      '/v1/visits/projection',
-    );
+    const rotatedKey = companionGetInFlightKey('17373', 'new-bridge-key', '/v1/visits/projection');
     const inFlight = new Map<string, Promise<unknown>>([[oldKey, Promise.resolve('old')]]);
 
     expect(rotatedKey).toBe('17373\0new-bridge-key\0/v1/visits/projection');
@@ -635,9 +634,9 @@ describe('live side-panel App wiring', () => {
     // mounts on a graph anchor is now on the current-tab card, driven
     // against the live focused URL. Its actions must dispatch the
     // page-content messages.
-    const currentTabCard = within(
-      screen.getByTestId('focused-tab-attribution'),
-    ).getByTestId('current-tab-page-content-card');
+    const currentTabCard = within(screen.getByTestId('focused-tab-attribution')).getByTestId(
+      'current-tab-page-content-card',
+    );
     expect(currentTabCard).toHaveTextContent('Page text');
     // Coverage was fetched for the live focused URL (panel is wired to
     // the current tab, not a graph anchor).
@@ -727,7 +726,7 @@ describe('live side-panel App wiring', () => {
       },
       fusedCandidates: suggestion.fusedCandidates,
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/v1/tabsessions/projection')) {
         return { ok: true, status: 200, json: async () => ({ data: projection }) };
@@ -761,6 +760,23 @@ describe('live side-panel App wiring', () => {
           }),
         };
       }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            const rawBody = typeof init?.body === 'string' ? init.body : '{}';
+            const body = JSON.parse(rawBody) as { readonly canonicalUrls?: readonly string[] };
+            const results: Record<string, unknown> = {};
+            for (const canonicalUrl of body.canonicalUrls ?? []) {
+              if (canonicalUrl === 'https://example.test/research') {
+                results[canonicalUrl] = urlSuggestion;
+              }
+            }
+            return { data: { results } };
+          },
+        };
+      }
       if (url.includes('/v1/visits/') && url.includes('/resolve')) {
         return { ok: true, status: 200, json: async () => ({ data: urlSuggestion }) };
       }
@@ -786,6 +802,21 @@ describe('live side-panel App wiring', () => {
       { timeout: 3000 },
     );
     expect(banner).toHaveTextContent('Sibling');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:17373/v1/visits/batch-resolve',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          canonicalUrls: ['https://example.test/research'],
+          eventCandidateUrls: ['https://example.test/research'],
+        }),
+      }),
+    );
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes('/v1/visits/https%3A%2F%2Fexample.test%2Fresearch/resolve'),
+      ),
+    ).toBe(false);
     fireEvent.click(confirm);
 
     await waitFor(() => {
@@ -797,6 +828,272 @@ describe('live side-panel App wiring', () => {
         }),
       );
     });
+  });
+
+  it('clears current-tab loading states after empty resolve and live page-evidence summary', async () => {
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: 'https://news.ycombinator.com/item?id=48173962',
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    };
+    const currentUrl = 'https://news.ycombinator.com/item?id=48173962';
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [currentUrl]: {
+          canonicalUrl: currentUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_hn'],
+          latestUrl: currentUrl,
+          latestTitle: 'WriteUp: 16 Bytes of x86 that turn Matrix rain into sound',
+          attributionHistory: [],
+        },
+      },
+    };
+    const emptySuggestion = {
+      canonicalUrl: currentUrl,
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/page-evidence/summary')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              canonicalUrl: currentUrl,
+              pageEvidence: {
+                tier: 'content_features_only',
+                evidenceRevision: 'evidence-hn',
+                semanticFeatureRevision: 'semantic-hn',
+                updatedAt: NOW,
+                termCount: 64,
+                keyphraseCount: 32,
+                entityCount: 12,
+                quality: 'medium',
+              },
+              stale: false,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            const rawBody = typeof init?.body === 'string' ? init.body : '{}';
+            const body = JSON.parse(rawBody) as { readonly canonicalUrls?: readonly string[] };
+            return {
+              data: {
+                results: Object.fromEntries(
+                  (body.canonicalUrls ?? []).map((canonicalUrl) => [canonicalUrl, emptySuggestion]),
+                ),
+              },
+            };
+          },
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+
+    const card = await screen.findByLabelText('Current tab attribution');
+    await waitFor(() => {
+      expect(card).toHaveTextContent('No signal yet');
+    });
+    expect(card).not.toHaveTextContent('Checking signals');
+    await waitFor(() => {
+      expect(within(card).getByTestId('page-evidence-capture-badge')).toHaveTextContent(
+        'Features only',
+      );
+    });
+    expect(within(card).getByTestId('page-evidence-capture-badge')).not.toHaveTextContent(
+      'Indexing',
+    );
+  });
+
+  it('retries the focused URL resolve after live page-evidence arrives', async () => {
+    const currentUrl = 'https://news.ycombinator.com/item?id=48227446';
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: currentUrl,
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = {
+      schemaVersion: 1,
+      bySessionId: {},
+      openSessionsByTabId: {},
+    };
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [currentUrl]: {
+          canonicalUrl: currentUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_hn'],
+          latestUrl: currentUrl,
+          latestTitle: '22% Layoff at ClickUp | Hacker News',
+          attributionHistory: [],
+        },
+      },
+    };
+    const emptySuggestion = {
+      canonicalUrl: currentUrl,
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    const focusedSuggestion = {
+      canonicalUrl: currentUrl,
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0.22 },
+      fusedCandidates: [
+        {
+          workstreamId: 'bac_workstream_sibling',
+          rawFusionLogit: 2.4,
+          dominantSource: 'similarity',
+          reasons: [
+            {
+              source: 'similarity',
+              summary: 'Similarity top 0.65',
+              anchors: [`timeline-visit:${currentUrl}`],
+            },
+          ],
+        },
+      ],
+    };
+    let batchResolveCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/page-evidence/summary')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              canonicalUrl: currentUrl,
+              pageEvidence: {
+                tier: 'content_features_only',
+                evidenceRevision: 'evidence-hn',
+                semanticFeatureRevision: 'semantic-hn',
+                updatedAt: NOW,
+                termCount: 64,
+                keyphraseCount: 32,
+                entityCount: 7,
+                quality: 'high',
+              },
+              stale: false,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        batchResolveCount += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            const rawBody = typeof init?.body === 'string' ? init.body : '{}';
+            const body = JSON.parse(rawBody) as { readonly canonicalUrls?: readonly string[] };
+            const result = batchResolveCount < 3 ? emptySuggestion : focusedSuggestion;
+            return {
+              data: {
+                results: Object.fromEntries(
+                  (body.canonicalUrls ?? []).map((canonicalUrl) => [canonicalUrl, result]),
+                ),
+              },
+            };
+          },
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+
+    const card = await screen.findByLabelText('Current tab attribution');
+    await waitFor(
+      () => {
+        expect(card).toHaveTextContent('Sibling');
+      },
+      { timeout: 5_000 },
+    );
+    expect(card).not.toHaveTextContent('No signal yet');
+    expect(batchResolveCount).toBeGreaterThanOrEqual(2);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:17373/v1/visits/batch-resolve',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          canonicalUrls: [currentUrl],
+          eventCandidateUrls: [currentUrl],
+        }),
+      }),
+    );
   });
 
   it('matches the focused tab cue by tabSessionId before falling back to URL', async () => {
