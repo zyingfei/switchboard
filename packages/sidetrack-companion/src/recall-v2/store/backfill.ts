@@ -67,26 +67,74 @@ const tsMs = (iso: string | undefined): number | undefined => {
   return Number.isNaN(t) ? undefined : t;
 };
 
+/** Yield to the event loop so /v1/status, /v1/events, and other HTTP
+ *  handlers can run between chunks of sync SQLite work. `setImmediate`
+ *  is a real macrotask boundary (microtask flushes alone don't give
+ *  timers / I/O a chance — see Codex review 2026-05-25). */
+const yieldToEventLoop = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
+/** Target slice budget — bun:sqlite upserts measure ~0.3-0.6ms each on
+ *  hot path; 300 upserts ≈ 100-200ms which keeps `/v1/status` reads
+ *  inside the 250ms `[api.stall]` threshold the runtime already
+ *  watches for. */
+const DEFAULT_CHUNK_SIZE = 300;
+
+const runInChunks = async <T>(
+  items: Iterable<T>,
+  apply: (item: T) => void,
+  chunkSize = DEFAULT_CHUNK_SIZE,
+): Promise<number> => {
+  let n = 0;
+  let inChunk = 0;
+  for (const item of items) {
+    apply(item);
+    n += 1;
+    inChunk += 1;
+    if (inChunk >= chunkSize) {
+      inChunk = 0;
+      // Boundary BETWEEN chunks, NOT inside a transaction.
+      // bun:sqlite has no explicit transaction here — each
+      // upsert is its own write. WAL handles concurrency.
+      await yieldToEventLoop();
+    }
+  }
+  return n;
+};
+
 /** Backfill timeline-visit + page-content rows from page-evidence
  *  records. Every visited URL becomes a row; body_indexed=1 when the
  *  record carries content (Readability succeeded), else body-only row
  *  surfaces as a timeline-visit hit. Sweeps stale rows whose source
  *  JSON disappeared (Codex re-review F1 partial / F10). */
-const backfillFromPageEvidence = async (
+export const backfillFromPageEvidence = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<{ pageContent: number; timelineVisit: number; deleted: number }> => {
+): Promise<{
+  pageContent: number;
+  timelineVisit: number;
+  deleted: number;
+  timingMs: Record<string, number>;
+}> => {
   // Snapshot existing IDs for these two source kinds so we can sweep
   // rows whose page-evidence record was deleted between backfills.
+  const t0 = Date.now();
   const existing = new Set<string>([
     ...store.allEntityIdsByKind('page_content'),
     ...store.allEntityIdsByKind('timeline_visit'),
   ]);
+  const tSnapshot = Date.now() - t0;
   const upserted = new Set<string>();
+  const tListStart = Date.now();
   const records = await listPageEvidenceRecords(vaultRoot);
+  const tList = Date.now() - tListStart;
   let pageContent = 0;
   let timelineVisit = 0;
   const root = join(vaultRoot, '_BAC', 'page-content', 'by-url');
+  const tIngestStart = Date.now();
+  let sinceYield = 0;
   for (const r of records) {
     const url = r.canonicalUrl;
     const first = tsMs(r.metadata.firstSeenAt);
@@ -145,43 +193,69 @@ const backfillFromPageEvidence = async (
       timelineVisit += 1;
     }
     upserted.add(entityId);
+    sinceYield += 1;
+    if (sinceYield >= DEFAULT_CHUNK_SIZE) {
+      sinceYield = 0;
+      await yieldToEventLoop();
+    }
   }
+  const tIngest = Date.now() - tIngestStart;
   // Sweep stale rows — entity_ids in `existing` but not `upserted`
   // had their JSON source disappear (file removed, tombstoned, etc.).
+  const tSweepStart = Date.now();
   let deleted = 0;
-  for (const id of existing) {
+  await runInChunks(existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteDocument(id);
       deleted += 1;
     }
-  }
+  });
+  const tSweep = Date.now() - tSweepStart;
   // Mark unused `root` var so the linter is happy (kept the join for
   // future expansion when we read chunks lazily).
   void root;
-  return { pageContent, timelineVisit, deleted };
+  return {
+    pageContent,
+    timelineVisit,
+    deleted,
+    timingMs: {
+      snapshot: tSnapshot,
+      list: tList,
+      ingest: tIngest,
+      sweep: tSweep,
+    },
+  };
 };
 
 /** Backfill chat-turn rows from the recall index. Each turn becomes
  *  one document; body is the turn text. Sweeps stale chat rows whose
  *  recall index entries were tombstoned / removed. */
-const backfillFromRecallIndex = async (
+export const backfillFromRecallIndex = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<{ chatTurn: number; deleted: number }> => {
+): Promise<{ chatTurn: number; deleted: number; timingMs: Record<string, number> }> => {
+  const t0 = Date.now();
   const existing = new Set<string>(store.allEntityIdsByKind('chat_turn'));
+  const tSnapshot = Date.now() - t0;
   const upserted = new Set<string>();
   const indexPath = join(vaultRoot, '_BAC', 'recall', 'index.bin');
+  const tReadStart = Date.now();
   const index = await readIndex(indexPath);
+  const tRead = Date.now() - tReadStart;
   if (index === null || index.items.length === 0) {
     // No chat-turn data at all → sweep everything previously stored.
-    let deleted = 0;
-    for (const id of existing) {
-      store.deleteDocument(id);
-      deleted += 1;
-    }
-    return { chatTurn: 0, deleted };
+    const tSweepStart = Date.now();
+    const deleted = await runInChunks(existing, (id) => store.deleteDocument(id));
+    return {
+      chatTurn: 0,
+      deleted,
+      timingMs: { snapshot: tSnapshot, read: tRead, sweep: Date.now() - tSweepStart },
+    };
   }
-  let count = 0;
+  const tUpsertStart = Date.now();
+  // Pre-materialize the items we'll touch so the per-chunk loop is
+  // pure sync work — no metadata-extraction overhead inside the tick.
+  const toUpsert: { entityId: string; doc: StoreDocument }[] = [];
   for (const item of index.items) {
     if (item.tombstoned === true) continue;
     const meta = item.metadata;
@@ -190,70 +264,108 @@ const backfillFromRecallIndex = async (
     if (text === undefined || text.length === 0) continue;
     const capturedMs = tsMs(item.capturedAt);
     const entityId = `chat:${item.id}`;
-    store.upsertDocument({
+    toUpsert.push({
       entityId,
-      sourceKind: 'chat_turn',
-      ...(meta.threadUrl === undefined ? {} : { canonicalUrl: meta.threadUrl }),
-      ...(meta.title === undefined ? {} : { title: meta.title }),
-      body: text,
-      threadId: item.threadId,
-      ...(capturedMs === undefined ? {} : { firstSeenAtMs: capturedMs, lastSeenAtMs: capturedMs }),
-      bodyIndexed: 1,
+      doc: {
+        entityId,
+        sourceKind: 'chat_turn',
+        ...(meta.threadUrl === undefined ? {} : { canonicalUrl: meta.threadUrl }),
+        ...(meta.title === undefined ? {} : { title: meta.title }),
+        body: text,
+        threadId: item.threadId,
+        ...(capturedMs === undefined
+          ? {}
+          : { firstSeenAtMs: capturedMs, lastSeenAtMs: capturedMs }),
+        bodyIndexed: 1,
+      },
     });
-    upserted.add(entityId);
-    count += 1;
   }
+  const count = await runInChunks(toUpsert, ({ entityId, doc }) => {
+    store.upsertDocument(doc);
+    upserted.add(entityId);
+  });
+  const tUpsert = Date.now() - tUpsertStart;
+  const tSweepStart = Date.now();
   let deleted = 0;
-  for (const id of existing) {
+  await runInChunks(existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteDocument(id);
       deleted += 1;
     }
-  }
-  return { chatTurn: count, deleted };
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    chatTurn: count,
+    deleted,
+    timingMs: { snapshot: tSnapshot, read: tRead, upsert: tUpsert, sweep: tSweep },
+  };
 };
 
 /** Backfill vectors from the existing JSON sidecar into docs_vec.
  *  Sweeps docs_vec rows whose source vectors were removed from the
  *  JSON sidecar (Codex re-review N2). Only runs when sqlite-vec is
  *  available; otherwise a no-op. */
-const backfillVectors = async (
+export const backfillVectors = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<{ vectors: number; deleted: number }> => {
-  if (!store.vectorBackendAvailable) return { vectors: 0, deleted: 0 };
+): Promise<{ vectors: number; deleted: number; timingMs: Record<string, number> }> => {
+  if (!store.vectorBackendAvailable) {
+    return { vectors: 0, deleted: 0, timingMs: {} };
+  }
+  const t0 = Date.now();
   const existing = store.allVectorEntityIds();
+  const tSnapshot = Date.now() - t0;
   const upserted = new Set<string>();
+  const tReadStart = Date.now();
   const vectors = await readSemanticRecallVectorStore(vaultRoot, MODEL_ID);
+  const tRead = Date.now() - tReadStart;
   let n = 0;
+  let tUpsert = 0;
   if (vectors !== null) {
-    for (const [url, vec] of vectors) {
+    const tUpsertStart = Date.now();
+    n = await runInChunks(vectors, ([url, vec]) => {
       const entityId = entityIdForUrl(url);
       store.upsertVector(entityId, vec);
       upserted.add(entityId);
-      n += 1;
-    }
+    });
+    tUpsert = Date.now() - tUpsertStart;
   }
+  const tSweepStart = Date.now();
   let deleted = 0;
-  for (const id of existing) {
+  await runInChunks(existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteVector(id);
       deleted += 1;
     }
-  }
-  return { vectors: n, deleted };
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    vectors: n,
+    deleted,
+    timingMs: { snapshot: tSnapshot, read: tRead, upsert: tUpsert, sweep: tSweep },
+  };
 };
 
-export const backfillRecallStore = async (
-  vaultRoot: string,
-  store: RecallStore,
-): Promise<{
+/** Result type for backfillRecallStore. */
+export interface BackfillStats {
   readonly pageContent: number;
   readonly timelineVisit: number;
   readonly chatTurn: number;
   readonly vectors: number;
   readonly deleted: number;
-}> => {
+  /** Per-phase wall-clock ms. Surfaced via the [recall-v2] log line so
+   *  /v1/status starvation regressions can be triaged without
+   *  guessing which phase blocked the loop. */
+  readonly timingMs: Record<string, number>;
+}
+
+/** Run all three backfill phases unconditionally. For per-source
+ *  freshness logic that only runs the phase whose source moved, see
+ *  the caller in pipeline.ts:ensureFreshBackfill. */
+export const backfillRecallStore = async (
+  vaultRoot: string,
+  store: RecallStore,
+): Promise<BackfillStats> => {
   const evidence = await backfillFromPageEvidence(vaultRoot, store);
   const chat = await backfillFromRecallIndex(vaultRoot, store);
   const vec = await backfillVectors(vaultRoot, store);
@@ -263,6 +375,14 @@ export const backfillRecallStore = async (
     chatTurn: chat.chatTurn,
     vectors: vec.vectors,
     deleted: evidence.deleted + chat.deleted + vec.deleted,
+    timingMs: {
+      ...Object.fromEntries(
+        Object.entries(chat.timingMs).map(([k, v]) => [`chat.${k}`, v]),
+      ),
+      ...Object.fromEntries(
+        Object.entries(vec.timingMs).map(([k, v]) => [`vec.${k}`, v]),
+      ),
+    },
   };
 };
 
@@ -271,29 +391,29 @@ export const backfillRecallStore = async (
 export const recallStoreIsEmpty = (store: RecallStore): boolean =>
   store.documentCount() === 0;
 
-/** Source-of-truth freshness signature.
+/** Per-source freshness signatures.
  *
- *  Returns a stable string derived from the mtimes + entry counts of
- *  the four JSON source directories that feed `backfillRecallStore`.
- *  When ANY of them changes (new file, removed file, content rewrite
- *  that bumps the parent dir mtime), the signature shifts and the
- *  caller re-runs backfill.
+ *  Split into three keys so a fresh page-evidence write doesn't force
+ *  the chat-turn (7k+ items) or vector (1k+ items) backfill to re-run.
+ *  Each phase compares its own signature and only re-runs when ITS
+ *  source files moved.
  *
- *  Cheaper than a full hash of every JSON file: 4 dir stats + an
- *  optional dirent count on the larger ones. Trade-off: same-file
- *  content edits that don't bump the parent mtime won't be detected;
- *  in practice the page-content + page-evidence writers atomic-write
- *  via rename, which DOES bump the parent dir mtime. */
-export const computeSourceSignature = async (vaultRoot: string): Promise<string> => {
-  const targets: readonly string[] = [
-    join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
-    join(vaultRoot, '_BAC', 'page-content', 'by-url'),
-    join(vaultRoot, '_BAC', 'page-content', 'chunks'),
-    join(vaultRoot, '_BAC', 'recall'),
-    join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json'),
-  ];
+ *  Why split (Codex review 2026-05-25):
+ *    Before this, any new page visit bumped the combined signature
+ *    and forced backfillFromRecallIndex + backfillVectors. Each runs
+ *    a tight sync upsert loop (7791 / 1275 rows) — together a 5-6 s
+ *    single-tick event-loop block. Under SW reload + concurrent
+ *    /v2/recall calls + connections-drain, this compounded into the
+ *    41.6 s `/v1/status` timeout the user hit. */
+export interface SourceSignatures {
+  readonly pageEvidence: string;
+  readonly chatTurn: string;
+  readonly vectors: string;
+}
+
+const sigForPaths = async (paths: readonly string[]): Promise<string> => {
   const parts: string[] = [];
-  for (const path of targets) {
+  for (const path of paths) {
     try {
       const s = await stat(path);
       // mtimeMs has ~ms precision on macOS/Linux — sufficient for the
@@ -305,6 +425,31 @@ export const computeSourceSignature = async (vaultRoot: string): Promise<string>
     }
   }
   return createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 32);
+};
+
+export const computeSourceSignatures = async (
+  vaultRoot: string,
+): Promise<SourceSignatures> => ({
+  pageEvidence: await sigForPaths([
+    join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
+    join(vaultRoot, '_BAC', 'page-content', 'by-url'),
+    join(vaultRoot, '_BAC', 'page-content', 'chunks'),
+  ]),
+  chatTurn: await sigForPaths([join(vaultRoot, '_BAC', 'recall')]),
+  vectors: await sigForPaths([
+    join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json'),
+  ]),
+});
+
+/** @deprecated kept for backward compat; prefer computeSourceSignatures.
+ *  Combined hash of all three for callers that only need a coarse "any
+ *  source moved" signal. */
+export const computeSourceSignature = async (vaultRoot: string): Promise<string> => {
+  const s = await computeSourceSignatures(vaultRoot);
+  return createHash('sha256')
+    .update(`${s.pageEvidence}|${s.chatTurn}|${s.vectors}`)
+    .digest('hex')
+    .slice(0, 32);
 };
 
 export const SOURCE_SIGNATURE_KEY = 'source_signature_v1';

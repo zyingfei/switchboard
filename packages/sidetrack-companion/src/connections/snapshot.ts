@@ -5170,22 +5170,36 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const revisionKey = metadata.snapshotRevision ?? '';
     const cached = this.#cachedSnapshot;
     if (cached !== null && cached.revision === revisionKey) return cached.value;
-    const nodesById = new Map(
-      db
-        .query('SELECT data FROM nodes ORDER BY id')
-        .all()
-        .map((row) => {
-          const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
-          return [node.id, node] as const;
-        }),
-    );
-    const edgeById = new Map(
-      db
-        .query('SELECT data FROM edges ORDER BY src, dst')
-        .all()
-        .flatMap((row) => JSON.parse(textField(row, 'data')) as ConnectionEdge[])
-        .map((edge) => [edge.id, edge] as const),
-    );
+    // .all() returns all rows synchronously; JSON.parse + Map build
+    // over 5000+ nodes and 12000+ edges is the heavy work. Without
+    // periodic yields the loop pegs the event loop for tens of
+    // seconds on large vaults — observed 45s blocks under stress
+    // that starved /v1/status. Chunk + yield between batches.
+    // Yields use setImmediate (real macrotask) so /status, /events
+    // etc. can run between chunks. Each chunk is sub-100ms typically.
+    const yieldEveryRows = 500;
+    const yieldToLoop = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    const nodeRows = db.query('SELECT data FROM nodes ORDER BY id').all() as unknown[];
+    const nodesById = new Map<string, ConnectionNode>();
+    for (let i = 0; i < nodeRows.length; i += 1) {
+      const node = JSON.parse(textField(nodeRows[i], 'data')) as ConnectionNode;
+      nodesById.set(node.id, node);
+      if ((i + 1) % yieldEveryRows === 0) {
+        await yieldToLoop();
+      }
+    }
+    const edgeRows = db.query('SELECT data FROM edges ORDER BY src, dst').all() as unknown[];
+    const edgeById = new Map<string, ConnectionEdge>();
+    for (let i = 0; i < edgeRows.length; i += 1) {
+      const arr = JSON.parse(textField(edgeRows[i], 'data')) as ConnectionEdge[];
+      for (const edge of arr) edgeById.set(edge.id, edge);
+      if ((i + 1) % yieldEveryRows === 0) {
+        await yieldToLoop();
+      }
+    }
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
     const nodeOrder =

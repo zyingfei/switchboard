@@ -2638,20 +2638,44 @@ const routes: readonly RouteDefinition[] = [
       // ---- cached subsystem state — no work allowed ----
       // Snapshot state: the connections snapshot store's last
       // committed revision. Read once, no rebuild trigger.
+      //
+      // CRITICAL — short timeout (500ms) on the SQLite read:
+      //   bun:sqlite serializes queries on a single DB handle. If
+      //   another caller is mid-`readCurrent()` (which can take 30+s
+      //   on a 12k-edge snapshot — see materializer perf debt), the
+      //   /status query queues behind it. The 45s extension timeout
+      //   then fires and the side panel flips to "disconnected"
+      //   even though the companion is reachable. The /status
+      //   contract says "MUST return immediately even if the
+      //   materializer is mid-catchUp" — honor that by reporting
+      //   `state: 'busy'` instead of waiting on the metadata read.
       let snapshotState:
         | {
-            readonly state: 'missing' | 'ready';
+            readonly state: 'missing' | 'ready' | 'busy';
             readonly revision?: string;
             readonly updatedAt?: string;
           }
         | undefined;
       if (context.connectionsStore !== undefined) {
         try {
-          const current =
+          const SNAPSHOT_PROBE_TIMEOUT_MS = 500;
+          const readPromise =
             context.connectionsStore instanceof SqliteConnectionsStore
-              ? await context.connectionsStore.readSnapshotMetadata()
-              : await context.connectionsStore.readCurrent();
-          if (current === null) {
+              ? context.connectionsStore.readSnapshotMetadata()
+              : context.connectionsStore.readCurrent();
+          const timeoutSentinel: unique symbol = Symbol('snapshot-probe-timeout');
+          const current = (await Promise.race([
+            readPromise,
+            new Promise((resolve) =>
+              setTimeout(() => resolve(timeoutSentinel), SNAPSHOT_PROBE_TIMEOUT_MS),
+            ),
+          ])) as Awaited<typeof readPromise> | typeof timeoutSentinel;
+          if (current === timeoutSentinel) {
+            // DB handle contended — caller (likely /v1/connections
+            // doing a snapshot rebuild) has the lock. Don't block
+            // /status; the side panel polls again in 15 s.
+            snapshotState = { state: 'busy' };
+          } else if (current === null) {
             snapshotState = { state: 'missing' };
           } else {
             snapshotState = {

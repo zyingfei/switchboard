@@ -32,10 +32,12 @@ import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
 import {
-  backfillRecallStore,
-  computeSourceSignature,
+  backfillFromPageEvidence,
+  backfillFromRecallIndex,
+  backfillVectors,
+  computeSourceSignatures,
   recallStoreIsEmpty,
-  SOURCE_SIGNATURE_KEY,
+  type SourceSignatures,
 } from './store/backfill.js';
 import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
@@ -85,6 +87,24 @@ export interface PipelineDeps {
 // safety if that changes.
 const storeCache = new Map<string, Promise<RecallStore>>();
 
+// Per-vault single-flight guard for `ensureFreshBackfill`. Concurrent
+// /v2/recall callers (the SW fires several when content scripts
+// re-attach after reload) all await the same in-flight backfill
+// promise instead of each running a fresh ~7000-row chat-turn upsert
+// loop. Without this guard the loops compound and starve /v1/status
+// for tens of seconds. The promise is cleared in finally so a fresh
+// signature change always runs a new backfill.
+const backfillInFlight = new Map<string, Promise<void>>();
+
+// Per-source signature metadata keys. Split (vs the prior combined
+// `source_signature_v1`) so a fresh page-evidence write doesn't
+// invalidate chat-turn or vector signatures — those backfills only
+// re-run when their own source files moved. See Codex review notes
+// 2026-05-25.
+const SIG_KEY_PAGE_EVIDENCE = 'sig_v2_page_evidence';
+const SIG_KEY_CHAT_TURN = 'sig_v2_chat_turn';
+const SIG_KEY_VECTORS = 'sig_v2_vectors';
+
 const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
   let openPromise = storeCache.get(vaultRoot);
   if (openPromise === undefined) {
@@ -96,28 +116,90 @@ const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
   return store;
 };
 
-/** Re-runs backfill when source JSON files are newer than the last
- *  recorded signature. Cheap (4-5 dir stats); the actual rebuild only
- *  fires when sources changed. Catches: new visits, new chat turns,
- *  new page-content extractions, new vectors. */
+/** Re-runs backfill phases whose source signature changed. Cheap
+ *  (3 dir stats) when nothing's moved. Single-flight per vault so
+ *  concurrent /v2/recall callers share one backfill pass instead of
+ *  each running 7000+ sync upserts.
+ *
+ *  Per-source split (2026-05-25): a new page visit only re-runs
+ *  page-evidence backfill, not chat-turn or vectors. */
 const ensureFreshBackfill = async (
   vaultRoot: string,
   store: RecallStore,
 ): Promise<void> => {
-  const currentSig = await computeSourceSignature(vaultRoot);
-  const stored = store.getRecallMetadata(SOURCE_SIGNATURE_KEY);
-  if (stored === currentSig && !recallStoreIsEmpty(store)) return;
-  const stats = await backfillRecallStore(vaultRoot, store);
-  store.setRecallMetadata(SOURCE_SIGNATURE_KEY, currentSig);
+  const existing = backfillInFlight.get(vaultRoot);
+  if (existing !== undefined) return existing;
+  const promise = (async () => {
+    try {
+      await runFreshnessCheck(vaultRoot, store);
+    } finally {
+      // Always release the slot so the NEXT change can trigger
+      // another pass. Even on rejection — Codex guidance: do not
+      // poison the cache. The next caller retries cleanly.
+      backfillInFlight.delete(vaultRoot);
+    }
+  })();
+  backfillInFlight.set(vaultRoot, promise);
+  return promise;
+};
+
+const runFreshnessCheck = async (
+  vaultRoot: string,
+  store: RecallStore,
+): Promise<void> => {
+  const current: SourceSignatures = await computeSourceSignatures(vaultRoot);
+  const storedPageEvidence = store.getRecallMetadata(SIG_KEY_PAGE_EVIDENCE);
+  const storedChatTurn = store.getRecallMetadata(SIG_KEY_CHAT_TURN);
+  const storedVectors = store.getRecallMetadata(SIG_KEY_VECTORS);
+  // Empty-store bootstrap: nothing stored yet → all three phases run.
+  const wasEmpty = recallStoreIsEmpty(store);
+  const ran: string[] = [];
+  const phaseTimings: Record<string, number> = {};
+  let pageContentN = 0;
+  let timelineVisitN = 0;
+  let chatTurnN = 0;
+  let vectorsN = 0;
+  let deletedN = 0;
+  if (wasEmpty || storedPageEvidence !== current.pageEvidence) {
+    const r = await backfillFromPageEvidence(vaultRoot, store);
+    pageContentN = r.pageContent;
+    timelineVisitN = r.timelineVisit;
+    deletedN += r.deleted;
+    for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`pageEv.${k}`] = v;
+    store.setRecallMetadata(SIG_KEY_PAGE_EVIDENCE, current.pageEvidence);
+    ran.push('page-evidence');
+  }
+  if (wasEmpty || storedChatTurn !== current.chatTurn) {
+    const r = await backfillFromRecallIndex(vaultRoot, store);
+    chatTurnN = r.chatTurn;
+    deletedN += r.deleted;
+    for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`chat.${k}`] = v;
+    store.setRecallMetadata(SIG_KEY_CHAT_TURN, current.chatTurn);
+    ran.push('chat-turn');
+  }
+  if (wasEmpty || storedVectors !== current.vectors) {
+    const r = await backfillVectors(vaultRoot, store);
+    vectorsN = r.vectors;
+    deletedN += r.deleted;
+    for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`vec.${k}`] = v;
+    store.setRecallMetadata(SIG_KEY_VECTORS, current.vectors);
+    ran.push('vectors');
+  }
+  if (ran.length === 0) return;
+  const timingStr = Object.entries(phaseTimings)
+    .map(([k, v]) => `${k}=${String(v)}ms`)
+    .join(' ');
+  // eslint-disable-next-line no-console
   console.warn(
-    `[recall-v2] SQLite store backfilled from JSON sources: ` +
-      `${String(stats.pageContent)} page-content, ` +
-      `${String(stats.timelineVisit)} timeline-visit, ` +
-      `${String(stats.chatTurn)} chat-turn, ` +
-      `${String(stats.vectors)} vectors` +
-      `${stats.deleted > 0 ? `, ${String(stats.deleted)} swept stale rows` : ''}` +
+    `[recall-v2] backfill ran=${ran.join(',')} ` +
+      `pageContent=${String(pageContentN)} ` +
+      `timelineVisit=${String(timelineVisitN)} ` +
+      `chatTurn=${String(chatTurnN)} ` +
+      `vectors=${String(vectorsN)}` +
+      `${deletedN > 0 ? ` deleted=${String(deletedN)}` : ''}` +
       `${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
-      `${stored === undefined ? ' (initial)' : ' (sources changed)'}`,
+      `${wasEmpty ? ' (initial)' : ''}` +
+      ` :: ${timingStr}`,
   );
 };
 
@@ -284,21 +366,46 @@ const generateTimelineVisit = async (
   };
 };
 
-/** Chat-turn candidate generator with REAL query embedding. */
+/** Chat-turn candidate generator.
+ *
+ *  Prefers SQLite FTS5 via `store.queryFts` — same path the page-
+ *  content/timeline-visit generators use. Falls back to the legacy
+ *  MiniSearch+rankHybrid path only when no store is injected (older
+ *  test fixtures + the safe-fallback runtime path).
+ *
+ *  WHY: the legacy path called `readIndex()` (deserialize 7000+
+ *  items), built a fresh MiniSearch index, and ran `rankHybrid`
+ *  over every item — all synchronously, on the main thread, on
+ *  EVERY /v2/recall call. Measured ~7.5s per query on the user's
+ *  vault, which is the dominant cause of /v1/status starvation
+ *  under SW reload (Codex review 2026-05-25 + dogfood repro).
+ *  FTS5 keeps the index hot in WAL and matches in ms. */
 const generateChatTurn = async (
   deps: PipelineDeps,
   analysis: QueryAnalysis,
   limit: number,
-  queryEmbedding?: Float32Array,
+  queryEmbedding: Float32Array | undefined,
+  store: RecallStore | undefined,
 ): Promise<CandidateGeneratorOutput> => {
   const start = (deps.now ?? Date.now)();
+  const composedQ = composeLexicalQuery(analysis);
+  if (store !== undefined) {
+    const hits = store.queryFts({ q: composedQ, sourceKind: 'chat_turn', limit });
+    return {
+      sourceKind: 'chat_turn',
+      candidates: hits.map((h, i) => candidateFromStoreHit(h, 'fts5', i + 1)),
+      elapsedMs: timeoutMs(start, deps.now ?? Date.now),
+    };
+  }
+  // Legacy fallback — only hit when caller didn't inject a store.
+  // This is the path the eval fixtures use; production always wires
+  // the SQLite store via getOrOpenStore.
   const indexPath = recallIndexPath(deps.vaultRoot);
   const index = await readIndex(indexPath);
   if (index === null || index.items.length === 0) {
     return { sourceKind: 'chat_turn', candidates: [], elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
   }
   const lexical = buildLexicalIndex(index.items);
-  const composedQ = composeLexicalQuery(analysis);
   const queryVec = queryEmbedding ?? new Float32Array(384);
   const ranked = rankHybrid(composedQ, queryVec, index.items, new Date(), {
     limit,
@@ -326,7 +433,9 @@ const generateChatTurn = async (
           sourceKind: 'chat_turn',
           rawScore: r.score,
           rank: i + 1,
-          ...(r.lexical !== undefined ? { matchedFields: ['lexical-rank-' + String(r.lexical.rank)] } : {}),
+          ...(r.lexical !== undefined
+            ? { matchedFields: ['lexical-rank-' + String(r.lexical.rank)] }
+            : {}),
         },
       ],
     };
@@ -714,7 +823,7 @@ export const runRecall = async (
     groups.push(await generateTimelineVisit(deps, analysis, perSource, store));
   }
   if (sources.has('chat_turn')) {
-    groups.push(await generateChatTurn(deps, analysis, perSource, queryEmbedding));
+    groups.push(await generateChatTurn(deps, analysis, perSource, queryEmbedding, store));
   }
   let anchorUrls: string[] = [];
   if (sources.has('semantic_query')) {
