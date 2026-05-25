@@ -769,8 +769,15 @@ export const runRecall = async (
   const strategy: RecallStrategy = req.strategy ?? {};
   const timings: Record<string, number> = {};
 
-  const wantsEmbedding =
-    sources.has('chat_turn') || sources.has('semantic_query');
+  // chat_turn used to need an embedding for the legacy rankHybrid path
+  // (dense + lexical combined). The current generator routes through
+  // store.queryFts only — purely lexical — so the embed cost is wasted
+  // when chat_turn is the ONLY semantic-flavored source requested.
+  // semantic_query (vec0 KNN) is the one path that genuinely needs the
+  // query embedding. graph_neighbor expands from anchor URLs already
+  // present in upstream candidates, so it also doesn't need its own
+  // query embedding here. (Codex review nit, 2026-05-25.)
+  const wantsEmbedding = sources.has('semantic_query');
   // P1 — embedder lifecycle. ready/disabled = use embedder; everything
   // else (cold/warming/failed) = degrade to lexical-only with an
   // explicit flag in response.meta.flags so the UI can render a hint.

@@ -4015,7 +4015,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // readCurrent memo, keyed on snapshotRevision. Without this, every
   // cold resolve repeats the ~17K JSON.parses to materialize the whole
   // snapshot; with it, sibling resolves within the same revision share
-  // a single bulk read. Invalidated when #writeCurrentRows commits.
+  // a single bulk read. Invalidated when any readCurrent-input writer
+  // commits (see #bumpWriteSeq).
   #cachedSnapshot: { readonly revision: string; readonly value: ConnectionsSnapshot } | null = null;
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
@@ -4433,6 +4434,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.query(
         'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       ).run('current', JSON.stringify(nextMetadata));
+      // H6: applyProjectionEventOverlay mutates metadata.current —
+      // bump the commit token so readCurrent's pre/post check sees
+      // this commit.
+      this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#cachedSnapshot = null;
       return snapshotRevision;
@@ -4807,6 +4812,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         ...baseProgress,
         snapshotRevisionId: snapshotRevision,
       });
+      // H6: replaceScopeRows mutates nodes/edges/current/node_order/
+      // edge_order — all inputs to readCurrent. Bump the commit
+      // token so the pre/post check fires.
+      this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#cachedSnapshot = null;
     } catch (error) {
@@ -4814,6 +4823,21 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       throw error;
     }
   };
+
+  /** Monotonic commit token used by `readCurrent`'s pre/post check.
+   *  Bump from INSIDE every transaction that mutates any of the rows
+   *  `readCurrent` consumes (nodes, edges, metadata.current,
+   *  metadata.node_order, metadata.edge_order). Centralized so adding
+   *  a new writer can't accidentally bypass the consistency check —
+   *  caller just invokes this right before COMMIT. */
+  #bumpWriteSeq(db: SqliteDatabase): void {
+    const row = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+    const prev =
+      row === null || row === undefined ? 0 : Number.parseInt(textField(row, 'data'), 10) || 0;
+    db.query(
+      'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+    ).run('write_seq', String(prev + 1));
+  }
 
   async #bootstrapScopeMembership(snapshot: ConnectionsSnapshot): Promise<void> {
     const scopes = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
@@ -5012,6 +5036,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      // H6: writeCurrentRows mutates nodes/edges/current/node_order/
+      // edge_order — all readCurrent inputs. Bump the commit token.
+      this.#bumpWriteSeq(db);
       if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
@@ -5164,44 +5191,114 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   };
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
+    // Retry loop for the rare write-interleave: if the writer commits
+    // a new snapshot revision between our metadata-read and the final
+    // page, we restart. In steady state this never fires (one writer,
+    // single reader); during a heavy drain it might retry once.
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const result = await this.#readCurrentAttempt();
+      if (result !== 'stale') return result;
+    }
+    // After max attempts, fall back to the "honest stale" read: take
+    // whatever the latest committed metadata says, accept mild
+    // inconsistency in flight. No worse than the pre-paged version.
+    const fallback = await this.#readCurrentAttempt(true);
+    // acceptStale=true never returns the 'stale' sentinel.
+    return fallback === 'stale' ? null : fallback;
+  };
+
+  /** One attempt at reading the current snapshot.
+   *
+   *  Returns:
+   *  - `null` if metadata is missing (no snapshot yet)
+   *  - the snapshot value on success
+   *  - the sentinel `'stale'` if the snapshot_revision changed between
+   *    our pre-read metadata and the post-read re-check. Caller
+   *    retries.
+   *
+   *  When `acceptStale` is true, skips the revision re-check and
+   *  returns whatever was read (used as the final-attempt fallback).
+   *
+   *  Per Codex review 2026-05-25: a writer can commit between the
+   *  paged reads, so a single response could otherwise mix two
+   *  snapshot revisions. We can't use a long-held read transaction
+   *  (BEGIN DEFERRED with awaits would hold a SHARED lock across
+   *  event-loop turns — bad). Instead, validate the revision didn't
+   *  change pre-vs-post. Paged reads are sub-100ms each, so the
+   *  window for a writer to slip in is tiny. */
+  #readCurrentAttempt = async (
+    acceptStale = false,
+  ): Promise<ConnectionsSnapshot | null | 'stale'> => {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
     const revisionKey = metadata.snapshotRevision ?? '';
     const cached = this.#cachedSnapshot;
     if (cached !== null && cached.revision === revisionKey) return cached.value;
-    // .all() returns all rows synchronously; JSON.parse + Map build
-    // over 5000+ nodes and 12000+ edges is the heavy work. Without
-    // periodic yields the loop pegs the event loop for tens of
-    // seconds on large vaults — observed 45s blocks under stress
-    // that starved /v1/status. Chunk + yield between batches.
-    // Yields use setImmediate (real macrotask) so /status, /events
-    // etc. can run between chunks. Each chunk is sub-100ms typically.
-    const yieldEveryRows = 500;
+    // H6: capture write_seq BEFORE any paged read. We compare the
+    // post-read value with this to detect a writer that committed
+    // between our reads. snapshotRevision alone isn't sufficient —
+    // it's a content-hash of metadata-only fields, so two distinct
+    // commits could produce the same revision. write_seq is bumped
+    // by #bumpWriteSeq from every transaction that mutates
+    // readCurrent inputs (#writeCurrentRows, replaceScopeRows,
+    // applyProjectionEventOverlay) and is the strict commit token.
+    const preSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+    const preWriteSeq =
+      preSeqRow === null || preSeqRow === undefined
+        ? 0
+        : Number.parseInt(textField(preSeqRow, 'data'), 10) || 0;
+    // Edge rows store JSON ARRAYS (one row contains many edges), so a
+    // page size that's OK for nodes can be expensive in edge parsing.
+    // Use a smaller page for edges; both are well under the runtime's
+    // 250ms `[api.stall]` threshold per chunk.
+    const NODE_PAGE_SIZE = 500;
+    const EDGE_PAGE_SIZE = 200;
     const yieldToLoop = (): Promise<void> =>
       new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
-    const nodeRows = db.query('SELECT data FROM nodes ORDER BY id').all() as unknown[];
     const nodesById = new Map<string, ConnectionNode>();
-    for (let i = 0; i < nodeRows.length; i += 1) {
-      const node = JSON.parse(textField(nodeRows[i], 'data')) as ConnectionNode;
-      nodesById.set(node.id, node);
-      if ((i + 1) % yieldEveryRows === 0) {
-        await yieldToLoop();
+    const nodePageStmt = db.query('SELECT data FROM nodes ORDER BY id LIMIT ? OFFSET ?');
+    for (let offset = 0; ; offset += NODE_PAGE_SIZE) {
+      const page = nodePageStmt.all(NODE_PAGE_SIZE, offset);
+      if (page.length === 0) break;
+      for (const row of page) {
+        const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+        nodesById.set(node.id, node);
       }
+      if (page.length < NODE_PAGE_SIZE) break;
+      await yieldToLoop();
     }
-    const edgeRows = db.query('SELECT data FROM edges ORDER BY src, dst').all() as unknown[];
     const edgeById = new Map<string, ConnectionEdge>();
-    for (let i = 0; i < edgeRows.length; i += 1) {
-      const arr = JSON.parse(textField(edgeRows[i], 'data')) as ConnectionEdge[];
-      for (const edge of arr) edgeById.set(edge.id, edge);
-      if ((i + 1) % yieldEveryRows === 0) {
-        await yieldToLoop();
+    const edgePageStmt = db.query('SELECT data FROM edges ORDER BY src, dst LIMIT ? OFFSET ?');
+    for (let offset = 0; ; offset += EDGE_PAGE_SIZE) {
+      const page = edgePageStmt.all(EDGE_PAGE_SIZE, offset);
+      if (page.length === 0) break;
+      for (const row of page) {
+        const arr = JSON.parse(textField(row, 'data')) as ConnectionEdge[];
+        for (const edge of arr) edgeById.set(edge.id, edge);
       }
+      if (page.length < EDGE_PAGE_SIZE) break;
+      await yieldToLoop();
     }
+    // H6 — read order rows BEFORE the consistency check, then verify
+    // write_seq didn't move during ANY of the reads. Writer commits
+    // current/node_order/edge_order atomically in one transaction
+    // (#writeCurrentRows), so a single post-read write_seq check
+    // covers all four input rows. snapshotRevision-based equality
+    // could pass even when content changed; write_seq cannot.
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
+    if (!acceptStale) {
+      const postSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+      const postWriteSeq =
+        postSeqRow === null || postSeqRow === undefined
+          ? 0
+          : Number.parseInt(textField(postSeqRow, 'data'), 10) || 0;
+      if (postWriteSeq !== preWriteSeq) return 'stale';
+    }
     const nodeOrder =
       nodeOrderRow === null || nodeOrderRow === undefined
         ? [...nodesById.keys()].sort()
@@ -5210,14 +5307,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       edgeOrderRow === null || edgeOrderRow === undefined
         ? [...edgeById.keys()].sort()
         : (JSON.parse(textField(edgeOrderRow, 'data')) as string[]);
-    const nodes = nodeOrder.flatMap((id) => {
-      const node = nodesById.get(id);
-      return node === undefined ? [] : [node];
-    });
-    const edges = edgeOrder.flatMap((id) => {
-      const edge = edgeById.get(id);
-      return edge === undefined ? [] : [edge];
-    });
+    // H7: chunk the tail materialization too — node_order can be 5k+,
+    // edge_order can be 12k+, each .flatMap was a single sync pass.
+    const TAIL_CHUNK = 1000;
+    const nodes: ConnectionNode[] = [];
+    for (let i = 0; i < nodeOrder.length; i += TAIL_CHUNK) {
+      const slice = nodeOrder.slice(i, i + TAIL_CHUNK);
+      for (const id of slice) {
+        const node = nodesById.get(id);
+        if (node !== undefined) nodes.push(node);
+      }
+      if (i + TAIL_CHUNK < nodeOrder.length) await yieldToLoop();
+    }
+    const edges: ConnectionEdge[] = [];
+    for (let i = 0; i < edgeOrder.length; i += TAIL_CHUNK) {
+      const slice = edgeOrder.slice(i, i + TAIL_CHUNK);
+      for (const id of slice) {
+        const edge = edgeById.get(id);
+        if (edge !== undefined) edges.push(edge);
+      }
+      if (i + TAIL_CHUNK < edgeOrder.length) await yieldToLoop();
+    }
     const result = snapshotFromParts(metadata, nodes, edges);
     this.#cachedSnapshot = { revision: revisionKey, value: result };
     return result;

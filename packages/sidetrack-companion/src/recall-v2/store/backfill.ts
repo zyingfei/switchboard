@@ -76,28 +76,43 @@ const yieldToEventLoop = (): Promise<void> =>
     setImmediate(resolve);
   });
 
-/** Target slice budget — bun:sqlite upserts measure ~0.3-0.6ms each on
- *  hot path; 300 upserts ≈ 100-200ms which keeps `/v1/status` reads
- *  inside the 250ms `[api.stall]` threshold the runtime already
- *  watches for. */
-const DEFAULT_CHUNK_SIZE = 300;
+/** Target slice budget — bun:sqlite upserts measure ~0.3-0.6ms each
+ *  on hot path; 500 upserts inside a single BEGIN IMMEDIATE/COMMIT
+ *  amortizes WAL fsync cost across the chunk. The transaction is
+ *  short enough to keep readers from waiting more than ~100ms and
+ *  stays well under the runtime's 250ms `[api.stall]` threshold. */
+const DEFAULT_CHUNK_SIZE = 500;
 
+/** Run a chunked write loop. Each chunk runs INSIDE a single
+ *  transaction (BEGIN IMMEDIATE / COMMIT) on `store`, then yields to
+ *  the event loop BETWEEN chunks. Per-row autocommit would fsync per
+ *  row; chunking into ~500-row commits cuts write overhead by an
+ *  order of magnitude while keeping each transaction short enough
+ *  that /status and other handlers can run between them.
+ *
+ *  Codex review 2026-05-25: "Prefer BEGIN IMMEDIATE / COMMIT per
+ *  chunk, rollback on chunk failure, then setImmediate after commit.
+ *  That gives amortized writes without yielding inside a
+ *  transaction." */
 const runInChunks = async <T>(
+  store: RecallStore,
   items: Iterable<T>,
   apply: (item: T) => void,
   chunkSize = DEFAULT_CHUNK_SIZE,
 ): Promise<number> => {
+  const arr = Array.from(items);
   let n = 0;
-  let inChunk = 0;
-  for (const item of items) {
-    apply(item);
-    n += 1;
-    inChunk += 1;
-    if (inChunk >= chunkSize) {
-      inChunk = 0;
-      // Boundary BETWEEN chunks, NOT inside a transaction.
-      // bun:sqlite has no explicit transaction here — each
-      // upsert is its own write. WAL handles concurrency.
+  for (let start = 0; start < arr.length; start += chunkSize) {
+    const end = Math.min(start + chunkSize, arr.length);
+    store.runTransaction(() => {
+      for (let i = start; i < end; i += 1) {
+        apply(arr[i]!);
+        n += 1;
+      }
+    });
+    if (end < arr.length) {
+      // Yield BETWEEN chunks, never inside the transaction (would
+      // hold the write lock across event-loop turns).
       await yieldToEventLoop();
     }
   }
@@ -204,7 +219,7 @@ export const backfillFromPageEvidence = async (
   // had their JSON source disappear (file removed, tombstoned, etc.).
   const tSweepStart = Date.now();
   let deleted = 0;
-  await runInChunks(existing, (id) => {
+  await runInChunks(store, existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteDocument(id);
       deleted += 1;
@@ -245,7 +260,7 @@ export const backfillFromRecallIndex = async (
   if (index === null || index.items.length === 0) {
     // No chat-turn data at all → sweep everything previously stored.
     const tSweepStart = Date.now();
-    const deleted = await runInChunks(existing, (id) => store.deleteDocument(id));
+    const deleted = await runInChunks(store, existing, (id) => store.deleteDocument(id));
     return {
       chatTurn: 0,
       deleted,
@@ -280,14 +295,14 @@ export const backfillFromRecallIndex = async (
       },
     });
   }
-  const count = await runInChunks(toUpsert, ({ entityId, doc }) => {
+  const count = await runInChunks(store, toUpsert, ({ entityId, doc }) => {
     store.upsertDocument(doc);
     upserted.add(entityId);
   });
   const tUpsert = Date.now() - tUpsertStart;
   const tSweepStart = Date.now();
   let deleted = 0;
-  await runInChunks(existing, (id) => {
+  await runInChunks(store, existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteDocument(id);
       deleted += 1;
@@ -323,7 +338,7 @@ export const backfillVectors = async (
   let tUpsert = 0;
   if (vectors !== null) {
     const tUpsertStart = Date.now();
-    n = await runInChunks(vectors, ([url, vec]) => {
+    n = await runInChunks(store, vectors, ([url, vec]) => {
       const entityId = entityIdForUrl(url);
       store.upsertVector(entityId, vec);
       upserted.add(entityId);
@@ -332,7 +347,7 @@ export const backfillVectors = async (
   }
   const tSweepStart = Date.now();
   let deleted = 0;
-  await runInChunks(existing, (id) => {
+  await runInChunks(store, existing, (id) => {
     if (!upserted.has(id)) {
       store.deleteVector(id);
       deleted += 1;

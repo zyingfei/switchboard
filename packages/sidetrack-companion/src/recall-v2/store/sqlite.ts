@@ -233,6 +233,25 @@ class SqliteRecallStore implements RecallStore {
     return new Set(rows.map((r) => r.entityId));
   }
 
+  runTransaction<T>(fn: () => T): T {
+    // BEGIN IMMEDIATE acquires the write lock up front so any other
+    // writer blocks at BEGIN instead of conflicting mid-transaction.
+    // Reads are unaffected (WAL allows concurrent readers).
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Already rolled back or never began — best-effort cleanup.
+      }
+      throw err;
+    }
+  }
+
   deleteVector(entityId: string): void {
     if (!this.vecAvailable) return;
     try {
