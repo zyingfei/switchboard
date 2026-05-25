@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
+    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },

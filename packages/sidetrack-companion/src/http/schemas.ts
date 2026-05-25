@@ -549,6 +549,96 @@ export const recallQuerySchema = z.object({
   workstreamId: bacIdSchema.optional(),
 });
 
+// Recall v2 (POST /v2/recall) request validation. Mirrors the
+// `RecallRequest` interface in recall-v2/types.ts — keep them in sync.
+// Unknown fields are stripped (z.object() drops unknown keys by
+// default in v4); enum arrays prevent caller-injected typos from
+// silently changing source-fanout behavior.
+const recallV2SourceKindSchema = z.enum([
+  'page_content',
+  'timeline_visit',
+  'chat_turn',
+  'semantic_query',
+  'graph_neighbor',
+  'current_session',
+]);
+
+const recallV2RetrieverSchema = z.enum([
+  'bm25',
+  'fts5',
+  'dense',
+  'sparse',
+  'rrf',
+  'rerank',
+  'fts5-local',
+]);
+// retriever isn't used in the request, but exported here for
+// completeness so the type-side stays cohesive when we add request
+// fields that reference it.
+void recallV2RetrieverSchema;
+
+const recallV2SuppressionPolicySchema = z
+  .object({
+    suppressCurrentPage: z.enum(['always', 'never', 'unless-discussion']).optional(),
+    suppressActiveChatBacIds: z.array(z.string().min(1)).max(64).optional(),
+    suppressAskAiArtifacts: z.boolean().optional(),
+    minHitAgeMs: z.number().int().nonnegative().max(86_400_000).optional(),
+    excludeEntityIds: z.array(z.string().min(1)).max(1000).optional(),
+    surfaceCurrentSessionAsFacet: z.boolean().optional(),
+  })
+  .strict();
+
+const recallV2StrategySchema = z
+  .object({
+    fusion: z.enum(['rrf', 'weighted_rrf', 'normalized_score']).optional(),
+    rerankTopK: z.number().int().nonnegative().max(50).optional(),
+    explain: z.boolean().optional(),
+    debug: z.boolean().optional(),
+  })
+  .strict();
+
+const recallV2SessionSchema = z
+  .object({
+    sessionId: z.string().min(1).max(256).optional(),
+    currentUrl: z.string().min(1).max(2048).optional(),
+    currentThreadId: z.string().min(1).max(256).optional(),
+    activeChatBacIds: z.array(z.string().min(1)).max(64).optional(),
+    excludeEntityIds: z.array(z.string().min(1)).max(1000).optional(),
+  })
+  .strict();
+
+const recallV2FiltersSchema = z
+  .object({
+    hosts: z.array(z.string().min(1).max(255)).max(64).optional(),
+    sourceKinds: z.array(recallV2SourceKindSchema).max(8).optional(),
+    timeFrom: z.string().min(1).max(64).optional(),
+    timeTo: z.string().min(1).max(64).optional(),
+    workstreamId: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+export const recallV2RequestSchema = z
+  .object({
+    // .refine catches whitespace-only `q` ("   "). Pre-Zod we did
+    // `q.trim().length === 0`; preserving that semantic so the 400
+    // surface is identical.
+    q: z
+      .string()
+      .min(1)
+      .max(8192)
+      .refine((s) => s.trim().length > 0, {
+        message: 'q must contain at least one non-whitespace character',
+      }),
+    limit: z.number().int().positive().max(50).optional(),
+    perSourceLimit: z.number().int().positive().max(50).optional(),
+    sources: z.array(recallV2SourceKindSchema).max(8).optional(),
+    session: recallV2SessionSchema.optional(),
+    filters: recallV2FiltersSchema.optional(),
+    suppression: recallV2SuppressionPolicySchema.optional(),
+    strategy: recallV2StrategySchema.optional(),
+  })
+  .strict();
+
 export const contentQuerySchema = z.object({
   q: z.string().min(1),
   sourceKind: z
@@ -559,15 +649,32 @@ export const contentQuerySchema = z.object({
         ? // W4(b-lite): semantic-recall-pool is in the default set so
           // it expands query candidates by default; the runtime flag
           // SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL is the one-step off.
-          (['page-content', 'chat-turn', 'semantic-recall-pool'] as const)
+          // P1 (2026-05-24): timeline-visit added so visited pages
+          // with title-only evidence (no body extraction — e.g. HN
+          // item pages where Readability bails, Google SERPs, any
+          // URL the user only briefly visited) still surface in
+          // recall instead of being invisible.
+          ([
+            'page-content',
+            'chat-turn',
+            'semantic-recall-pool',
+            'timeline-visit',
+          ] as const)
         : value
             .split(',')
             .map((entry) => entry.trim())
             .filter(
-              (entry): entry is 'page-content' | 'chat-turn' | 'semantic-recall-pool' =>
+              (
+                entry,
+              ): entry is
+                | 'page-content'
+                | 'chat-turn'
+                | 'semantic-recall-pool'
+                | 'timeline-visit' =>
                 entry === 'page-content' ||
                 entry === 'chat-turn' ||
-                entry === 'semantic-recall-pool',
+                entry === 'semantic-recall-pool' ||
+                entry === 'timeline-visit',
             ),
     ),
   limit: z.coerce
@@ -720,6 +827,7 @@ export type AnnotationCreateInput = z.infer<typeof annotationCreateSchema>;
 export type AnnotationListQuery = z.infer<typeof annotationListQuerySchema>;
 export type RecallIndexInput = z.infer<typeof recallIndexSchema>;
 export type RecallQuery = z.infer<typeof recallQuerySchema>;
+export type RecallV2Request = z.infer<typeof recallV2RequestSchema>;
 export type SuggestionQuery = z.infer<typeof suggestionQuerySchema>;
 export type BucketRecord = z.infer<typeof bucketSchema>;
 export type CodingTool = z.infer<typeof codingToolSchema>;

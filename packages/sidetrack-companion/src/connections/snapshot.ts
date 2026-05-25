@@ -3655,8 +3655,6 @@ interface SqliteModule {
 }
 
 const loadSqlite = async (): Promise<SqliteModule> => {
-  // @ts-expect-error bun:sqlite is provided by the Bun runtime and is
-  // loaded lazily so Node-based tests can still import the JSON store.
   const module = (await import('bun:sqlite')) as Partial<SqliteModule>;
   if (typeof module.Database !== 'function') {
     throw new Error('bun:sqlite Database export is unavailable');

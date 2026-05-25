@@ -15,7 +15,9 @@ import {
   isCaptureFeedbackMessage,
   isRuntimeResponse,
   isFocusThreadInSidePanelMessage,
+  isOpenConnectionsDejaVuMessage,
   isWorkboardChangedMessage,
+  type DispatchRecallContext,
   messageTypes,
   type AnnotateTurnResponse,
   type PageContentBulkOperationResponse,
@@ -93,6 +95,7 @@ import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import {
   ConnectionsView,
+  type ConnectionsDejaVuItem,
   type FocusGroupSaveInput,
 } from '../../src/sidepanel/connections/ConnectionsView';
 import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
@@ -780,6 +783,20 @@ const App = () => {
   // Bumped to focus the Connections SearchTab from the global top-bar
   // search button (so it doesn't open a 2nd search panel on that page).
   const [connectionsSearchRequest, setConnectionsSearchRequest] = useState<number>(0);
+  // Content-script Déjà-vu popover "See all" (or a Recent dispatches
+  // "↩ déjà-vu" back-link click) hands its hit list off to
+  // ConnectionsView via requestDejaVuMode. The view auto-switches to
+  // its dejavu submode and persists the list there; we clear this
+  // when onRequestConsumed fires so the same set can be re-handed.
+  // The request now carries the originating selection text + source
+  // URL so the submode can render the same action bar (Google /
+  // Translate / Ask AI need the text), the "from <host>" pill, and
+  // the Search-this cross-link.
+  const [connectionsDejaVuRequest, setConnectionsDejaVuRequest] = useState<{
+    readonly items: readonly ConnectionsDejaVuItem[];
+    readonly selectionText: string;
+    readonly sourceUrl: string;
+  } | null>(null);
   const [inboxSearchRequest, setInboxSearchRequest] = useState<string>('');
   // #4 — the current-tab attribution card only belongs in the Inbox
   // context, and is collapsible there.
@@ -2291,6 +2308,20 @@ const App = () => {
             // Silent: SystemBanners covers the broader companion/vault state.
           });
         }, 150);
+      }
+      if (isOpenConnectionsDejaVuMessage(message)) {
+        // Content-script Déjà-vu "See all" → switch to Connections
+        // and hand the popover hit list + selection text + source URL
+        // to ConnectionsView via requestDejaVuMode. The submode uses
+        // all three: items for the list, selectionText for the action
+        // bar (Google/Translate/AskAI), sourceUrl for the "from
+        // <host>" header pill.
+        setConnectionsDejaVuRequest({
+          items: message.items as readonly ConnectionsDejaVuItem[],
+          selectionText: message.selectionText,
+          sourceUrl: message.sourceUrl,
+        });
+        setViewMode('connections');
       }
       if (isFocusThreadInSidePanelMessage(message)) {
         // Chat-side floating button OR Déjà-vu Jump → find the
@@ -7164,8 +7195,10 @@ const App = () => {
           displayCtx={displayCtx}
           requestAnchor={connectionsAnchorRequest}
           requestSearch={connectionsSearchRequest}
+          {...(connectionsDejaVuRequest === null ? {} : { requestDejaVuMode: connectionsDejaVuRequest })}
           onRequestConsumed={() => {
             setConnectionsAnchorRequest('');
+            setConnectionsDejaVuRequest(null);
           }}
           onOpenInInbox={requestSwitchToInbox}
           onSaveFocusGroup={handleFocusGroupSave}
@@ -7422,7 +7455,7 @@ const App = () => {
         </>
       )}
 
-      {(() => {
+      {viewMode !== 'connections' ? (() => {
         // Recent Dispatches: chronological log of packets sent out of
         // Sidetrack (review submit-backs, dispatch-out packets, coding
         // agent packets). Only render when there's at least one.
@@ -7595,10 +7628,30 @@ const App = () => {
                   sendRequest({ type: messageTypes.unarchiveDispatch, dispatchId: id }),
                 );
               }}
+              hasRecallContext={(id) => state.dispatchRecallContexts[id] !== undefined}
+              onJumpToRecallContext={(id) => {
+                // D: ↩ back-link. Reconstitute the Connections →
+                // Déjà-vu submode from the local breadcrumb stored
+                // by submitSelectionDispatch. Stored as `unknown` in
+                // the workboard state (avoids pulling sidepanel
+                // types up into the cross-context contract); we
+                // narrow here.
+                const raw = state.dispatchRecallContexts[id];
+                if (raw === undefined || raw === null || typeof raw !== 'object') {
+                  return;
+                }
+                const ctx = raw as DispatchRecallContext;
+                setConnectionsDejaVuRequest({
+                  items: ctx.hits as readonly ConnectionsDejaVuItem[],
+                  selectionText: ctx.selectionText,
+                  sourceUrl: ctx.sourceUrl,
+                });
+                setViewMode('connections');
+              }}
             />
           </>
         );
-      })()}
+      })() : null}
 
       {viewMode !== 'connections' ? (
         <>

@@ -1,5 +1,20 @@
 #!/usr/bin/env bun
 
+// MUST be the first import — calls `Database.setCustomSQLite()` to
+// point Bun at a system SQLite with extension loading enabled
+// (Homebrew on macOS, system libsqlite3 on Linux). Required for
+// sqlite-vec to load downstream. If skipped, subsequent imports
+// (notably connections/snapshot.ts) open Database against Bun's
+// bundled SQLite and lock the global handle — setCustomSQLite then
+// fails with "SQLite already loaded".
+//
+// The setup-sqlite module performs the install as a SIDE EFFECT at
+// module evaluation time, so simply importing it (and importing it
+// FIRST in document order) is sufficient — no manual call needed.
+// ESM imports evaluate depth-first in declared order, so the setup
+// runs before any other import body in this file.
+import './recall-v2/store/setup-sqlite.js';
+
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -927,6 +942,25 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       `[page-content] background index warm failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   });
+  // P1 — pre-warm the embedder model in the background so the first
+  // /v2/recall isn't 4-8s while the e5 model loads. Same fire-and-
+  // forget pattern as the page-content lexical warm above.
+  void (async () => {
+    try {
+      const { embed: embedFn } = await import('./recall/embedder.js');
+      const warmStart = Date.now();
+      await embedFn(['warmup']);
+      writeLine(
+        streams.stdout,
+        `[recall] embedder pre-warm complete in ${String(Date.now() - warmStart)}ms`,
+      );
+    } catch (err) {
+      writeLine(
+        streams.stderr,
+        `[recall] embedder pre-warm failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  })();
   writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
   writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
   writeLine(

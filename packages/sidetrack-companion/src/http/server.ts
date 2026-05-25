@@ -39,10 +39,12 @@ import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
 import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
 import {
+  expandSemanticByQuery,
   expandSemanticRecallCandidates,
   getOrBuildSemanticRecallPool,
   getSemanticRecallPoolMigrationStatus,
   readSemanticRecallPool,
+  readSemanticRecallVectorStore,
   semanticRecallPoolEnabled,
 } from '../recall/semanticRecallPool.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
@@ -62,6 +64,8 @@ import {
   writeExtractedPageEvidenceFast,
   writeExtractedPageEvidence,
 } from '../page-evidence/store.js';
+import { queryTimelineVisits } from '../page-evidence/timelineRecall.js';
+import { runRecallWithShadow as runRecallV2 } from '../recall-v2/pipeline.js';
 import {
   type PageEvidenceExtractedEventPayload,
   type PageEvidenceExtractedRequest,
@@ -343,6 +347,7 @@ import {
   recallIndexSchema,
   recallGcSchema,
   recallQuerySchema,
+  recallV2RequestSchema,
   contentQuerySchema,
   pageContentCoverageQuerySchema,
   pageContentExtractedSchema,
@@ -1071,6 +1076,17 @@ const semanticRecallExpansion = async (
   anchorHits: readonly ContentSearchHit[],
   limit: number,
   embedderUsable: boolean,
+  // P0 — when the caller has embedded the selection text we prefer
+  // query-anchored expansion (cosine against the vector store
+  // directly) over the legacy anchor-anchored path. Anchor-anchored
+  // compounded lexical drift: if the primary lexical hits were off-
+  // topic, the expansion found pages near THOSE off-topic pages
+  // instead of near the user's actual query intent. With a query
+  // embedding present this is now a true query-driven candidate
+  // source; when absent (embedder warming / failed) we fall back to
+  // the legacy expansion so partial-degradation still surfaces
+  // SOMETHING rather than going dark.
+  queryEmbedding?: Float32Array,
 ): Promise<readonly ContentSearchHit[]> => {
   const pool = await readSemanticRecallPool(vaultRoot);
   // Read-only serve of the cached pool always happens (cheap); the
@@ -1078,11 +1094,27 @@ const semanticRecallExpansion = async (
   kickSemanticRecallPoolRefresh(vaultRoot, embedderUsable);
   if (pool === null) return [];
   const anchors = anchorHits.map((h) => h.canonicalUrl).filter((u): u is string => u !== undefined);
-  if (anchors.length === 0) return [];
-  const expanded = expandSemanticRecallCandidates(pool, anchors, {
-    limit,
-    exclude: new Set(anchors),
-  });
+  const useQueryAnchor = queryEmbedding !== undefined && queryEmbedding.some((v) => v !== 0);
+  let expanded: readonly {
+    canonicalUrl: string;
+    cosine: number;
+    via: 'cluster' | 'neighbor' | 'query-cosine';
+  }[];
+  if (useQueryAnchor && queryEmbedding !== undefined) {
+    const vectors = await readSemanticRecallVectorStore(vaultRoot, MODEL_ID);
+    expanded = expandSemanticByQuery(vectors, queryEmbedding, {
+      limit,
+      // Exclude pages we already returned via lexical — keeps the
+      // expansion strictly additive (no displacement of primary).
+      exclude: new Set(anchors),
+    });
+  } else {
+    if (anchors.length === 0) return [];
+    expanded = expandSemanticRecallCandidates(pool, anchors, {
+      limit,
+      exclude: new Set(anchors),
+    });
+  }
   if (expanded.length === 0) return [];
   const evidenceByUrl = await readPageEvidenceMap(
     vaultRoot,
@@ -1120,7 +1152,19 @@ const semanticRecallExpansion = async (
 
 const queryRecallContent = async (
   vaultRoot: string,
-  query: { readonly q: string; readonly limit: number; readonly workstreamId?: string },
+  query: {
+    readonly q: string;
+    readonly limit: number;
+    readonly workstreamId?: string;
+    // P0 — the real query embedding when the caller has one. Passed
+    // through to rankHybrid so the vector tier actually fires. The
+    // prior `new Float32Array(384)` zero placeholder silently degraded
+    // chat-turn matching to lexical-only (and worse: the filter on
+    // `.lexical !== undefined` further required a lexical hit so the
+    // vector contribution was double-discarded). Optional so the
+    // back-compat callers stay working — they get the old behavior.
+    readonly queryEmbedding?: Float32Array;
+  },
 ): Promise<readonly ContentSearchHit[]> => {
   const indexFilePath = recallIndexPath(vaultRoot);
   const index = await readIndex(indexFilePath);
@@ -1143,7 +1187,8 @@ const queryRecallContent = async (
     query.workstreamId === undefined
       ? undefined
       : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
-  const ranked = rankHybrid(query.q, new Float32Array(384), index.items, new Date(), {
+  const queryVec = query.queryEmbedding ?? new Float32Array(384);
+  const ranked = rankHybrid(query.q, queryVec, index.items, new Date(), {
     limit: query.limit,
     lexical,
     ...(threadIds === undefined
@@ -5558,6 +5603,35 @@ const routes: readonly RouteDefinition[] = [
         workstreamId: url.searchParams.get('workstreamId') ?? undefined,
       });
       const sourceKinds = new Set(query.sourceKind);
+      // P0 — embed the selection text ONCE when the caller asked for
+      // anything that benefits from a real query vector (chat-turn's
+      // vector tier, semantic-recall-pool query-anchored expansion).
+      // Skipped for page-content-only requests (no benefit; saves the
+      // embedder warm-up). Gated by the embedder state so cold-start
+      // callers degrade to lexical-only chat-turn + anchor-anchored
+      // semantic rather than 503ing.
+      const wantsQueryEmbedding =
+        sourceKinds.has('chat-turn') || sourceKinds.has('semantic-recall-pool');
+      const embedderStateForQuery = context.getEmbedderStatus?.()?.state ?? 'disabled';
+      const embedderUsableForQuery =
+        embedderStateForQuery === 'ready' || embedderStateForQuery === 'disabled';
+      let queryEmbedding: Float32Array | undefined;
+      if (wantsQueryEmbedding && embedderUsableForQuery) {
+        try {
+          [queryEmbedding] = await embed([query.q]);
+        } catch (error) {
+          // RecallModelMissingError or transient failure — degrade
+          // silently. Chat-turn falls back to lexical-only (its prior
+          // behavior); semantic falls back to anchor-anchored. Log
+          // for ops visibility but don't surface a 503 — the user's
+          // popover should still show whatever lexical found.
+          if (!(error instanceof RecallModelMissingError)) {
+            // Re-throw genuine bugs; swallow the offline-model case.
+            console.warn('[content/query] queryEmbedding failed:', error);
+          }
+          queryEmbedding = undefined;
+        }
+      }
       const pageHits = sourceKinds.has('page-content')
         ? await queryPageContent(vaultRoot, query.q, { limit: query.limit })
         : [];
@@ -5566,13 +5640,25 @@ const routes: readonly RouteDefinition[] = [
             q: query.q,
             limit: query.limit,
             ...(query.workstreamId === undefined ? {} : { workstreamId: query.workstreamId }),
+            ...(queryEmbedding === undefined ? {} : { queryEmbedding }),
           })
+        : [];
+      // P1 — title+URL lexical match over every page-evidence record
+      // (= every visited URL, regardless of whether body extraction
+      // succeeded). Closes the "I visited it, why doesn't it
+      // surface?" gap that left HN item pages, Google SERPs, and
+      // brief visits invisible to recall.
+      const timelineHits = sourceKinds.has('timeline-visit')
+        ? await queryTimelineVisits(vaultRoot, query.q, { limit: query.limit })
         : [];
       // W4(b-lite) — additive, gated, read-only semantic expansion
       // of the primary hits. NOT a primary ranker: its hits are
       // appended AFTER the RRF-fused primaries with their own
       // sourceEvidence (Unified Content Search v1 §5). One-step off
-      // via the runtime flag.
+      // via the runtime flag. P0 (2026-05-24): when a query embedding
+      // is available, expansion becomes QUERY-ANCHORED (cosine vs
+      // vector store) instead of anchor-anchored — see comment on
+      // `semanticRecallExpansion`.
       const semanticHits =
         sourceKinds.has('semantic-recall-pool') && semanticRecallPoolEnabled()
           ? await semanticRecallExpansion(
@@ -5596,6 +5682,7 @@ const routes: readonly RouteDefinition[] = [
                 // explicit operator-triggered rebuild).
                 return s === 'ready' || s === 'disabled';
               })(),
+              queryEmbedding,
             )
           : [];
       // Unified Content Search v1 rank fusion.
@@ -5622,15 +5709,27 @@ const routes: readonly RouteDefinition[] = [
         [
           { name: 'page-content', items: pageHits },
           { name: 'chat-turn', items: recallHits },
+          // P1 — timeline-visit enters the SAME RRF fusion as page +
+          // chat (not the post-fusion expansion slot). Rationale: a
+          // visited-but-unindexed page with a strong title match is
+          // qualitatively equivalent to a body-indexed page hit; both
+          // are direct lexical evidence for the query. The expansion
+          // slot stays reserved for semantic-recall-pool, which is
+          // additive/qualitatively different.
+          { name: 'timeline-visit', items: timelineHits },
         ],
         (hit) => hit.id,
       );
       const primary: ContentSearchHit[] = fused.map(({ item, ranks }) => {
-        const ranksByRanker: Partial<Record<'page-content' | 'chat-turn', number>> = {};
+        const ranksByRanker: Partial<
+          Record<'page-content' | 'chat-turn' | 'timeline-visit', number>
+        > = {};
         const pageRank = ranks.perRanker.get('page-content');
         if (pageRank !== undefined) ranksByRanker['page-content'] = pageRank;
         const chatRank = ranks.perRanker.get('chat-turn');
         if (chatRank !== undefined) ranksByRanker['chat-turn'] = chatRank;
+        const timelineRank = ranks.perRanker.get('timeline-visit');
+        if (timelineRank !== undefined) ranksByRanker['timeline-visit'] = timelineRank;
         return {
           ...item,
           rankEvidence: {
@@ -5678,6 +5777,7 @@ const routes: readonly RouteDefinition[] = [
             sourceKinds: [...sourceKinds].sort(),
             pageContentCount: pageHits.length,
             chatTurnCount: recallHits.length,
+            timelineVisitCount: timelineHits.length,
             semanticRecallPoolCount: semanticHits.length,
             fusion: {
               algorithm: 'rrf',
@@ -5691,6 +5791,49 @@ const routes: readonly RouteDefinition[] = [
           },
         },
       ];
+    },
+  },
+  {
+    // Recall v2 — single unified retrieval endpoint. POST so the
+    // extension can pass a typed request body (sources / suppression
+    // policy / strategy) without URL-encoding gymnastics. Initially
+    // delegates to v1.5 functions via recall-v2/pipeline.ts; later
+    // phases swap the SQLite backend + query analysis + cross-encoder
+    // rerank without touching the contract.
+    method: 'POST',
+    pattern: /^\/v2\/recall$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const body = (await readBody(request)) as unknown;
+      const parsed = recallV2RequestSchema.safeParse(body);
+      if (!parsed.success) {
+        // Surface the first Zod issue path so callers can see WHICH
+        // field is wrong without dumping the full ZodError. Keeps the
+        // error shape consistent with the rest of the v1 API.
+        const first = parsed.error.issues[0];
+        const path = first?.path.join('.') ?? 'body';
+        const message = first?.message ?? 'invalid request body';
+        throw new HttpRouteError(
+          400,
+          first === undefined ? 'INVALID_REQUEST' : 'INVALID_FIELD',
+          `${path}: ${message}`,
+          'POST /v2/recall body failed schema validation.',
+        );
+      }
+      const req = parsed.data as import('../recall-v2/types.js').RecallRequest;
+      // P1 — pass embedder lifecycle state so the pipeline can
+      // degrade gracefully when the model is still warming up. Same
+      // status the /v1/status endpoint exposes.
+      const embedderState = context.getEmbedderStatus?.()?.state;
+      const response = await runRecallV2(
+        { vaultRoot, ...(embedderState === undefined ? {} : { embedderState }) },
+        req,
+      );
+      // Wrap in { data } to match the rest of the v1 API convention so
+      // the bridge clients (recallV2 in pageContentClient.ts) can
+      // unwrap consistently with the other endpoints.
+      return [200, { data: response }];
     },
   },
   {

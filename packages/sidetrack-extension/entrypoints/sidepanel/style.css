@@ -9285,7 +9285,6 @@ pre.diff {
 .cx-mode.is-active {
   color: var(--ink);
   border-bottom-color: var(--signal);
-  background: linear-gradient(180deg, transparent 0%, var(--signal-bg) 180%);
 }
 .cx-mode .cx-count {
   font-size: 9.5px;
@@ -9336,7 +9335,6 @@ pre.diff {
   .cx-mode.is-active {
     border-bottom-color: transparent;
     border-left-color: var(--signal);
-    background: var(--signal-bg);
   }
 }
 /* Stage 5 polish — Connections time-range pill bar in the filter row. */
@@ -9379,14 +9377,226 @@ pre.diff {
 .cx-deja-view-head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 .cx-deja-view-head h3 {
   margin: 0;
   font-family: var(--display);
   font-size: 18px;
   font-weight: 600;
+  color: var(--ink);
+  margin-right: auto;
+}
+.cx-deja-source-pill {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.cx-deja-search-pivot,
+.cx-search-dejavu-pivot {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--signal);
+  background: var(--signal-bg);
+  border: 1px solid var(--signal-tint);
+  border-radius: 99px;
+  padding: 3px 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cx-deja-search-pivot:hover,
+.cx-search-dejavu-pivot:hover {
+  color: var(--ink);
+  border-color: var(--signal);
+}
+.cx-deja-selection {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--signal-tint);
+  background: var(--paper);
+  font-family: var(--display);
+  font-style: italic;
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.45;
+}
+.cx-deja-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cx-deja-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cx-deja-chip:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+}
+.cx-deja-chip.is-active {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
+}
+.cx-deja-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--rule-soft);
+  border-bottom: 1px solid var(--rule-soft);
+}
+.cx-deja-action {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 4px 11px;
+  cursor: pointer;
+}
+.cx-deja-action:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+}
+.cx-deja-action.cx-deja-action-primary {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
+}
+.cx-deja-row .r3 {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px 8px;
+}
+.cx-deja-jump {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.cx-deja-jump:hover {
+  color: var(--ink);
+  border-color: var(--signal-tint);
+}
+.dispatch-recall-pill {
+  color: var(--signal) !important;
+  background: var(--signal-bg);
+  border: 1px solid var(--signal-tint);
+  border-radius: 99px;
+  padding: 2px 9px !important;
+  font-size: 10px !important;
+}
+.dispatch-recall-pill:hover {
+  color: var(--ink) !important;
+  border-color: var(--signal);
+}
+.cx-deja-why-btn {
+  color: var(--signal) !important;
+}
+.cx-deja-why-btn[aria-expanded='true'] {
+  background: var(--signal-bg);
+}
+.cx-deja-why-panel {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 9px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.cx-deja-why-line {
+  color: var(--ink-3);
+}
+.cx-deja-why-line + .cx-deja-why-line {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dashed var(--rule-soft);
+}
+/* Cross-submode breadcrumb — surfaces only when there's a persisted
+   Déjà-vu hit set AND the user is in a different submode. One click
+   to return; × to discard the recall session entirely. Lives above
+   the .cx-modes tab bar so it's always in the peripheral vision but
+   never crowds the active submode content. */
+.cx-deja-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  background: var(--signal-bg);
+  border-bottom: 1px solid var(--signal-tint);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+.cx-deja-breadcrumb-pill {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--signal);
+  background: var(--paper-light);
+  border: 1px solid var(--signal-tint);
+  border-radius: 99px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+.cx-deja-breadcrumb-pill:hover {
+  color: var(--ink);
+  border-color: var(--signal);
+}
+.cx-deja-breadcrumb-quote {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+  color: var(--ink-3);
+}
+.cx-deja-breadcrumb-dismiss {
+  flex: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.cx-deja-breadcrumb-dismiss:hover {
   color: var(--ink);
 }
 .cx-deja-list {
@@ -9424,6 +9634,44 @@ pre.diff {
   color: var(--ink-3);
   background: var(--paper);
   border-color: var(--rule);
+}
+/* Unified row pills — same height/typography across facet, provider,
+   time, similarity. The previous mix of .sidetrack-deja-facet,
+   .hp-row.prov-pill, and .cx-deja-time looked ragged because each had
+   its own font-size / padding / border-radius (and prov-pill needed a
+   parent .hp-row selector that we never had, so its rules silently
+   failed). One base class, three role modifiers — every badge in
+   .cx-deja-badges now lines up baseline-to-baseline. */
+.cx-deja-pill {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.cx-deja-pill-facet {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
+}
+.cx-deja-pill-provider {
+  color: var(--ink-2);
+}
+.cx-deja-pill-time {
+  color: var(--ink-3);
+}
+.cx-deja-pill-similarity {
+  color: var(--signal);
+  background: var(--signal-bg);
+  border-color: var(--signal-tint);
 }
 @media (max-width: 860px) {
   .cx-deja-view {

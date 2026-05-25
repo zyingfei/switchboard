@@ -66,6 +66,11 @@ import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
 import { useRecallSearch } from './useRecallSearch';
 import { PageTextPanel } from './PageTextPanel';
 import {
+  dejaVuFacetLabel,
+  dejaVuFacetChipLabel,
+} from '../../contentOverlays/dejaVuModel';
+import { formatRelative } from '../../util/time';
+import {
   messageTypes,
   type PageContentBulkOperationResponse,
   type PageContentOpenTabPreview,
@@ -122,6 +127,23 @@ export interface ConnectionsDejaVuItem {
   readonly snippet: string;
   readonly relativeWhen: string;
   readonly score: number;
+  // Optional v2 fields — drive chip filtering, similarity badge,
+  // and Jump destination. Older payloads (pre-v2) parse without
+  // these; rows just lose the badge / Jump target.
+  readonly facet?: 'page' | 'chat' | 'similar' | 'thread' | 'visited';
+  readonly threadUrl?: string;
+  readonly canonicalUrl?: string;
+  readonly similarity?: number;
+  readonly anchorNodeId?: string;
+  // P3 — per-source evidence for the Why? expander. Set when the v2
+  // pipeline produced the candidate (server emits `evidence[]`).
+  readonly evidence?: readonly {
+    readonly retriever: string;
+    readonly sourceKind: string;
+    readonly rank?: number;
+    readonly rawScore?: number;
+    readonly vectorDistance?: number;
+  }[];
 }
 
 // Derive a node kind from an anchor id prefix so history entries get
@@ -170,7 +192,15 @@ type Props = {
   // the global top-bar search button re-use the Connections search
   // instead of opening a second, separate search panel on this page.
   readonly requestSearch?: number;
-  readonly requestDejaVuMode?: readonly ConnectionsDejaVuItem[];
+  // Reshape for the v2 submode: items + originating selection text +
+  // source URL. The submode renders an action bar (Google/Translate/
+  // Ask AI) and a "from <host>" header pill that need both pieces of
+  // context, so we can't reconstruct them from items alone.
+  readonly requestDejaVuMode?: {
+    readonly items: readonly ConnectionsDejaVuItem[];
+    readonly selectionText: string;
+    readonly sourceUrl: string;
+  };
   readonly onRequestConsumed?: () => void;
   // Cross-surface jump from Connections back to the Inbox. Fired
   // when the user clicks "Find in Inbox" on a URL-bearing anchor.
@@ -1476,44 +1506,306 @@ const requireFeedbackRelationKind = (edge: ConnectionEdge): UserFlowRelationKind
   return relationKind;
 };
 
+type DejaVuFilterKey = 'all' | 'page' | 'chat' | 'similar' | 'thread' | 'visited';
+const DEJAVU_FACET_KEYS: readonly Exclude<DejaVuFilterKey, 'all'>[] = [
+  'page',
+  'chat',
+  'similar',
+  'thread',
+  'visited',
+];
+
+const hostOfUrl = (url: string): string | null => {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+};
+
 const DejaVuFullView = ({
   items,
+  context,
+  filter,
+  onFilterChange,
+  onSearchPivot,
+  onWebSearch,
+  onTranslate,
+  onAskAi,
+  onJump,
+  onInGraph,
+  onInInbox,
 }: {
   readonly items: readonly ConnectionsDejaVuItem[];
-}): ReactElement => (
-  <section className="cx-deja-view" data-testid="connections-dejavu-view">
-    <div className="cx-deja-view-head">
-      <h3>Déjà-vu</h3>
-      <span className="cx-mono cx-dim">
-        {String(items.length)} prior result{items.length === 1 ? '' : 's'}
-      </span>
-    </div>
-    {items.length === 0 ? (
-      <div className="cx-empty">
-        <h4>No Déjà-vu results yet</h4>
-        <p>Use “See all” from a Déjà-vu popover to keep the full result set here.</p>
+  readonly context: { readonly selectionText: string; readonly sourceUrl: string } | null;
+  readonly filter: DejaVuFilterKey;
+  readonly onFilterChange: (next: DejaVuFilterKey) => void;
+  readonly onSearchPivot: (text: string) => void;
+  readonly onWebSearch: (text: string) => void;
+  readonly onTranslate: (text: string) => void;
+  readonly onAskAi: (provider: 'chatgpt' | 'claude' | 'gemini', text: string) => void;
+  readonly onJump?: (item: ConnectionsDejaVuItem) => void;
+  // 1A — pivot to Connections Linked submode anchored on this card.
+  // The submode is a staging surface; deep lateral exploration
+  // (topics, neighbors, bridges, cross-card edges) all live in the
+  // graph, not in the card. Hidden when no anchor is derivable.
+  readonly onInGraph?: (item: ConnectionsDejaVuItem) => void;
+  // 1B — pivot to Inbox pre-filtered by this card's canonical URL.
+  // Symmetric to onInGraph for the workstream/thread surface. Hidden
+  // when the card has no URL.
+  readonly onInInbox?: (item: ConnectionsDejaVuItem) => void;
+}): ReactElement => {
+  const selectionText = context?.selectionText.trim() ?? '';
+  const hasSelection = selectionText.length > 0;
+  const sourceHost = context !== null ? hostOfUrl(context.sourceUrl) : null;
+  const facetCounts: Record<DejaVuFilterKey, number> = {
+    all: items.length,
+    page: 0,
+    chat: 0,
+    similar: 0,
+    thread: 0,
+    visited: 0,
+  };
+  for (const item of items) {
+    if (item.facet !== undefined) facetCounts[item.facet] += 1;
+  }
+  const visibleFacets = DEJAVU_FACET_KEYS.filter((f) => facetCounts[f] > 0);
+  const filteredItems =
+    filter === 'all' ? items : items.filter((i) => i.facet === filter);
+  const selectionPreview =
+    selectionText.length > 140 ? `${selectionText.slice(0, 137)}…` : selectionText;
+  return (
+    <section className="cx-deja-view" data-testid="connections-dejavu-view">
+      <div className="cx-deja-view-head">
+        <h3>Déjà-vu</h3>
+        {sourceHost !== null ? (
+          <span
+            className="cx-deja-source-pill"
+            title={context?.sourceUrl}
+            data-testid="connections-dejavu-source"
+          >
+            from {sourceHost}
+          </span>
+        ) : null}
+        <span className="cx-mono cx-dim">
+          {String(items.length)} prior result{items.length === 1 ? '' : 's'}
+        </span>
+        {hasSelection ? (
+          <button
+            type="button"
+            className="cx-deja-search-pivot"
+            data-testid="connections-dejavu-search-pivot"
+            onClick={() => onSearchPivot(selectionText)}
+            title="Open this query in the Connections Search submode"
+          >
+            ⇄ Search
+          </button>
+        ) : null}
       </div>
-    ) : (
-      <div className="cx-deja-list">
-        {items.map((item) => (
-          <article className="deja-row cx-deja-row" key={item.id}>
-            <div className="r1">
-              <span className="title">{item.title}</span>
-              <span className="cx-deja-badges">
-                <span className={`hp-row prov-pill ${item.providerKey}`}>{item.providerLabel}</span>
-                <span className="score" title="similarity">
-                  {item.score.toFixed(2)}
+      {hasSelection ? (
+        <blockquote className="cx-deja-selection" data-testid="connections-dejavu-selection">
+          “{selectionPreview}”
+        </blockquote>
+      ) : null}
+      {items.length > 0 ? (
+        <div className="cx-deja-chips" role="tablist" aria-label="Filter Déjà-vu results">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={filter === 'all'}
+            className={'cx-deja-chip' + (filter === 'all' ? ' is-active' : '')}
+            onClick={() => onFilterChange('all')}
+            data-testid="connections-dejavu-chip-all"
+          >
+            All {items.length}
+          </button>
+          {visibleFacets.map((f) => (
+            <button
+              key={f}
+              type="button"
+              role="tab"
+              aria-selected={filter === f}
+              className={'cx-deja-chip' + (filter === f ? ' is-active' : '')}
+              onClick={() => onFilterChange(f)}
+              data-testid={`connections-dejavu-chip-${f}`}
+            >
+              {dejaVuFacetChipLabel(f)} {facetCounts[f]}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {hasSelection ? (
+        <div
+          className="cx-deja-actions"
+          role="toolbar"
+          aria-label="Actions on the highlighted selection"
+        >
+          <button
+            type="button"
+            className="cx-deja-action"
+            onClick={() => onWebSearch(selectionText)}
+          >
+            🔍 Google
+          </button>
+          <button
+            type="button"
+            className="cx-deja-action"
+            onClick={() => onTranslate(selectionText)}
+          >
+            🌐 Translate
+          </button>
+          <button
+            type="button"
+            className="cx-deja-action cx-deja-action-primary"
+            onClick={() => onAskAi('chatgpt', selectionText)}
+          >
+            🤖 Ask GPT
+          </button>
+          <button
+            type="button"
+            className="cx-deja-action"
+            onClick={() => onAskAi('claude', selectionText)}
+          >
+            Claude
+          </button>
+          <button
+            type="button"
+            className="cx-deja-action"
+            onClick={() => onAskAi('gemini', selectionText)}
+          >
+            Gemini
+          </button>
+        </div>
+      ) : null}
+      {filteredItems.length === 0 ? (
+        <div className="cx-empty">
+          {items.length === 0 ? (
+            <>
+              <h4>No Déjà-vu results yet</h4>
+              <p>
+                Select text on any page and use “See all” from the Déjà-vu popover, or
+                run a query in the Search submode and click “Déjà-vu this”.
+              </p>
+            </>
+          ) : (
+            <p>No results in this filter.</p>
+          )}
+        </div>
+      ) : (
+        <div className="cx-deja-list">
+          {filteredItems.map((item) => (
+            <article className="deja-row cx-deja-row" key={item.id}>
+              <div className="r1">
+                <span className="title">{item.title.length > 0 ? item.title : '(no title)'}</span>
+                <span className="cx-deja-badges">
+                  {item.facet !== undefined ? (
+                    <span className="cx-deja-pill cx-deja-pill-facet">
+                      {dejaVuFacetLabel(item.facet)}
+                    </span>
+                  ) : null}
+                  <span className={`cx-deja-pill cx-deja-pill-provider prov-${item.providerKey}`}>
+                    {item.providerLabel}
+                  </span>
+                  <span className="cx-deja-pill cx-deja-pill-time">
+                    {formatRelative(item.relativeWhen)}
+                  </span>
+                  {item.facet === 'similar' && item.similarity !== undefined ? (
+                    <span className="cx-deja-pill cx-deja-pill-similarity">
+                      {String(Math.round(item.similarity * 100))}% similar
+                    </span>
+                  ) : null}
                 </span>
-                <span className="score cx-deja-time">{item.relativeWhen}</span>
-              </span>
-            </div>
-            <div className="r2">{item.snippet}</div>
-          </article>
-        ))}
-      </div>
-    )}
-  </section>
-);
+              </div>
+              {item.snippet.length > 0 && item.facet !== 'similar' ? (
+                <div className="r2">{item.snippet}</div>
+              ) : null}
+              <div className="r3">
+                {onInGraph !== undefined && item.anchorNodeId !== undefined ? (
+                  <button
+                    type="button"
+                    className="cx-deja-jump cx-deja-pivot"
+                    data-testid="connections-dejavu-in-graph"
+                    onClick={() => onInGraph(item)}
+                    title="Open this in the Connections graph (Linked submode anchored here)"
+                  >
+                    ⇄ Graph
+                  </button>
+                ) : null}
+                {onInInbox !== undefined && item.canonicalUrl !== undefined ? (
+                  <button
+                    type="button"
+                    className="cx-deja-jump cx-deja-pivot"
+                    data-testid="connections-dejavu-in-inbox"
+                    onClick={() => onInInbox(item)}
+                    title="Find this in the Inbox (filtered by URL)"
+                  >
+                    ⇄ Inbox
+                  </button>
+                ) : null}
+                {onJump !== undefined ? (
+                  <button
+                    type="button"
+                    className="cx-deja-jump"
+                    onClick={() => onJump(item)}
+                    title="Open the source URL in a new tab"
+                  >
+                    ↗ Open
+                  </button>
+                ) : null}
+                {item.evidence !== undefined && item.evidence.length > 0 ? (
+                  <DejaVuWhy evidence={item.evidence} />
+                ) : null}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+};
+
+// P3 — per-row Why? expander for the submode. Mirrors the popover's
+// expander (contentOverlays/index.ts) but renders in React. Click
+// toggles a small details panel showing per-source evidence (retriever,
+// rank, raw score, vector distance).
+const DejaVuWhy = ({
+  evidence,
+}: {
+  readonly evidence: NonNullable<ConnectionsDejaVuItem['evidence']>;
+}): ReactElement => {
+  const [open, setOpen] = useState(false);
+  const fmt = (n: number | undefined): string => (n === undefined ? '—' : n.toFixed(3));
+  return (
+    <>
+      <button
+        type="button"
+        className="cx-deja-jump cx-deja-why-btn"
+        aria-expanded={open}
+        onClick={() => setOpen((p) => !p)}
+        title="Show retrieval evidence: which sources matched, with what scores"
+      >
+        Why?
+      </button>
+      {open ? (
+        <div className="cx-deja-why-panel" role="group" aria-label="Retrieval evidence">
+          {evidence.map((e, i) => {
+            const src = e.sourceKind.replace('_', '-');
+            const rank = e.rank !== undefined ? `rank ${String(e.rank)}` : '';
+            const score = e.rawScore !== undefined ? `bm25 ${fmt(e.rawScore)}` : '';
+            const vec =
+              e.vectorDistance !== undefined ? `cosine ${fmt(1 - e.vectorDistance)}` : '';
+            const bits = [e.retriever, src, rank, score, vec].filter((s) => s.length > 0);
+            return (
+              <div className="cx-deja-why-line" key={i}>
+                {bits.join(' · ')}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </>
+  );
+};
 
 export const ConnectionsView = ({
   initialAnchor = '',
@@ -1544,6 +1836,14 @@ export const ConnectionsView = ({
   const [hops, setHops] = useState<number>(1);
   const [subMode, setSubMode] = useState<SubMode>('linked');
   const [dejaVuItems, setDejaVuItems] = useState<readonly ConnectionsDejaVuItem[]>([]);
+  const [dejaVuContext, setDejaVuContext] = useState<{
+    readonly selectionText: string;
+    readonly sourceUrl: string;
+  } | null>(null);
+  // Single-select chip filter for the submode list. 'all' shows
+  // everything; otherwise we filter by the facet key. Matches the
+  // popover overlay vocabulary so users get consistent behavior.
+  const [dejaVuFilter, setDejaVuFilter] = useState<DejaVuFilterKey>('all');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(ALL_RANGE);
   const [selectedEdge, setSelectedEdge] = useState<ConnectionEdge | null>(null);
   const [whyVisitId, setWhyVisitId] = useState<string | null>(null);
@@ -1913,8 +2213,14 @@ export const ConnectionsView = ({
   }, [requestSearch]);
 
   useEffect(() => {
-    if (requestDejaVuMode === undefined || requestDejaVuMode.length === 0) return;
-    setDejaVuItems([...requestDejaVuMode]);
+    if (requestDejaVuMode === undefined || requestDejaVuMode.items.length === 0) return;
+    setDejaVuItems([...requestDejaVuMode.items]);
+    setDejaVuContext({
+      selectionText: requestDejaVuMode.selectionText,
+      sourceUrl: requestDejaVuMode.sourceUrl,
+    });
+    // Seed Search query so "Search this" pivots without retyping.
+    setSearchQuery(requestDejaVuMode.selectionText);
     setSubMode('dejavu');
   }, [requestDejaVuMode]);
 
@@ -2611,6 +2917,39 @@ export const ConnectionsView = ({
         setSubMode('linked');
       }}
       {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+      onDejaVuPivot={(text) => {
+        // E: Search → Déjà-vu pivot. Hand the query as the selection
+        // text into the submode; items come from `recallResults`
+        // (threads-only for now — pages come via the overlay popover).
+        // The submode itself converts the recall hits when its own
+        // items array is empty.
+        const synthHits: readonly ConnectionsDejaVuItem[] = recallResults.items.map(
+          (h): ConnectionsDejaVuItem => {
+            const anchorNodeId =
+              h.anchorNodeId ??
+              (h.canonicalUrl === undefined
+                ? undefined
+                : `timeline-visit:${h.canonicalUrl}`);
+            return {
+              id: h.id,
+              providerKey: 'web',
+              providerLabel: 'Web',
+              title: h.title ?? '(no title)',
+              snippet: h.snippet ?? '',
+              relativeWhen: h.capturedAt,
+              score: h.score,
+              facet: h.sourceKind === 'chat-turn' ? 'chat' : 'page',
+              ...(h.threadUrl === undefined ? {} : { threadUrl: h.threadUrl }),
+              ...(h.canonicalUrl === undefined ? {} : { canonicalUrl: h.canonicalUrl }),
+              ...(anchorNodeId === undefined ? {} : { anchorNodeId }),
+            };
+          },
+        );
+        setDejaVuItems(synthHits);
+        setDejaVuContext({ selectionText: text, sourceUrl: 'about:blank' });
+        setDejaVuFilter('all');
+        setSubMode('dejavu');
+      }}
     />
   );
 
@@ -2671,7 +3010,7 @@ export const ConnectionsView = ({
             title={`Find in Inbox · ${anchorCanonicalUrl}`}
             data-testid="connections-anchor-open-inbox"
           >
-            ⇄
+            ⇄ Inbox
           </button>
         ) : null}
         <span className="cx-spacer" />
@@ -2708,6 +3047,50 @@ export const ConnectionsView = ({
           setPageContentBulkPreview(null);
         }}
       />
+      {dejaVuItems.length > 0 && subMode !== 'dejavu' ? (
+        <div
+          className="cx-deja-breadcrumb"
+          role="status"
+          aria-label="Déjà-vu recall session is active"
+          data-testid="connections-dejavu-breadcrumb"
+        >
+          <button
+            type="button"
+            className="cx-deja-breadcrumb-pill"
+            onClick={() => setSubMode('dejavu')}
+            title="Return to the Déjà-vu recall result set"
+          >
+            ⇄ Déjà-vu ({String(dejaVuItems.length)})
+          </button>
+          {dejaVuContext !== null && dejaVuContext.selectionText.length > 0 ? (
+            <span
+              className="cx-deja-breadcrumb-quote"
+              title={dejaVuContext.selectionText}
+            >
+              “{dejaVuContext.selectionText.length > 60
+                ? `${dejaVuContext.selectionText.slice(0, 57)}…`
+                : dejaVuContext.selectionText}”
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="cx-deja-breadcrumb-dismiss"
+            onClick={() => {
+              // Explicit dismiss: clear the recall session so the
+              // breadcrumb stops surfacing. The submode itself stays
+              // present (still reachable via its tab); only the
+              // staged hit set goes away. Mirrors how the popover's
+              // × dismisses without breaking future recall.
+              setDejaVuItems([]);
+              setDejaVuContext(null);
+            }}
+            aria-label="Dismiss Déjà-vu recall session"
+            title="Dismiss the active recall session"
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
       <div className="cx-modes" role="tablist" aria-label="View mode">
         <button
           type="button"
@@ -3149,7 +3532,94 @@ export const ConnectionsView = ({
           {subMode === 'search' ? (
             searchTab
           ) : subMode === 'dejavu' ? (
-            <DejaVuFullView items={dejaVuItems} />
+            <DejaVuFullView
+              items={dejaVuItems}
+              context={dejaVuContext}
+              filter={dejaVuFilter}
+              onFilterChange={setDejaVuFilter}
+              onSearchPivot={(text) => {
+                setSearchQuery(text);
+                setSubMode('search');
+                fullSnapshot.prime();
+              }}
+              onWebSearch={(text) => {
+                window.open(
+                  `https://www.google.com/search?q=${encodeURIComponent(text)}`,
+                  '_blank',
+                  'noopener,noreferrer',
+                );
+              }}
+              onTranslate={(text) => {
+                window.open(
+                  `https://translate.google.com/?sl=auto&tl=en&op=translate&text=${encodeURIComponent(text)}`,
+                  '_blank',
+                  'noopener,noreferrer',
+                );
+              }}
+              onAskAi={(provider, text) => {
+                const NEW_CHAT: Record<'chatgpt' | 'claude' | 'gemini', string> = {
+                  chatgpt: 'https://chatgpt.com/',
+                  claude: 'https://claude.ai/new',
+                  gemini: 'https://gemini.google.com/app',
+                };
+                // Mirror the popover's first-class tracked dispatch
+                // flow. Bundle the current submode items + selection
+                // text as recallContext so the resulting Recent
+                // dispatch row gets the ↩ back-link too — identical
+                // semantics to "Ask AI" from the page popover.
+                void chrome.runtime.sendMessage({
+                  type: messageTypes.submitSelectionDispatch,
+                  url: NEW_CHAT[provider],
+                  body: text,
+                  provider,
+                  title: text.slice(0, 80),
+                  recallContext:
+                    dejaVuContext === null
+                      ? undefined
+                      : {
+                          selectionText: dejaVuContext.selectionText,
+                          sourceUrl: dejaVuContext.sourceUrl,
+                          hits: dejaVuItems.map((i) => ({
+                            id: i.id,
+                            providerKey: i.providerKey,
+                            providerLabel: i.providerLabel,
+                            title: i.title,
+                            snippet: i.snippet,
+                            relativeWhen: i.relativeWhen,
+                            score: i.score,
+                            ...(i.facet === undefined ? {} : { facet: i.facet }),
+                            ...(i.similarity === undefined
+                              ? {}
+                              : { similarity: i.similarity }),
+                          })),
+                        },
+                });
+              }}
+              onJump={(item) => {
+                // Prefer canonical/thread URLs (jump out to live web).
+                // Falls back to the current tab if neither is set.
+                const url = item.canonicalUrl ?? item.threadUrl;
+                if (url !== undefined && onOpenUrl !== undefined) {
+                  onOpenUrl(url);
+                }
+              }}
+              onInGraph={(item) => {
+                // 1A — pivot into the graph. The submode is a recall
+                // staging surface; everything else (topics, neighbors,
+                // bridges, cross-card edges) lives in Linked submode
+                // anchored on the card's node.
+                if (item.anchorNodeId === undefined) return;
+                navigateToAnchor(item.anchorNodeId, item.title);
+                setSubMode('linked');
+              }}
+              onInInbox={(item) => {
+                // 1B — symmetric pivot to Inbox. Parent App.tsx wires
+                // requestSwitchToInbox(canonicalUrl) — same flow as
+                // "Find in Inbox" elsewhere in this view.
+                if (item.canonicalUrl === undefined) return;
+                onOpenInInbox?.(item.canonicalUrl);
+              }}
+            />
           ) : result !== null ? (
             subMode === 'linked' ? (
               <LinkedCenter

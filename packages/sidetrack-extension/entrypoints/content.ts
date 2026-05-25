@@ -21,6 +21,8 @@ import {
   type RestoredAnchor,
 } from '../src/contentOverlays';
 import { buildDejaVuHits } from '../src/contentOverlays/dejaVuModel';
+import type { OpenConnectionsDejaVuItem } from '../src/messages';
+import type { SearchHitFacet, UnifiedSearchHit } from '../src/sidepanel/search/types';
 import { settleAndExtractPageContent } from '../src/pageContent/extraction';
 
 // Per-provider composer + send-button + AI-done selectors. Sourced
@@ -35,6 +37,113 @@ interface ProviderDriverConfig {
   // proceeds to the next item only after this disappears.
   readonly stopButton: readonly string[];
 }
+
+// Project a popover hit into the sidepanel-storable shape. Used by
+// both the "See all" handoff and the per-Ask-AI recallContext snapshot
+// so the dispatch back-link reconstitutes exactly what the user saw.
+const mapDejaVuProviderKey = (
+  p: string,
+): 'gpt' | 'claude' | 'gemini' | 'codex' | 'web' => {
+  if (p === 'chatgpt') return 'gpt';
+  if (p === 'claude') return 'claude';
+  if (p === 'gemini') return 'gemini';
+  if (p === 'codex') return 'codex';
+  return 'web';
+};
+const mapDejaVuProviderLabel = (
+  k: 'gpt' | 'claude' | 'gemini' | 'codex' | 'web',
+): string => {
+  if (k === 'gpt') return 'GPT';
+  if (k === 'claude') return 'Claude';
+  if (k === 'gemini') return 'Gemini';
+  if (k === 'codex') return 'Codex';
+  return 'Web';
+};
+// Map a RecallCandidate (from /v2/recall) into the persisted item
+// shape the sidepanel ConnectionsView consumes. Mirrors the legacy
+// buildPersistedDejaVuItem path; lets the popover hand the same
+// data off to "See all" and the Ask-AI dispatch breadcrumb.
+const v2FacetForPersist = (
+  k: string,
+): 'page' | 'chat' | 'similar' | 'thread' | 'visited' | undefined => {
+  if (k === 'page_content') return 'page';
+  if (k === 'timeline_visit') return 'visited';
+  if (k === 'chat_turn') return 'chat';
+  if (k === 'semantic_query' || k === 'graph_neighbor') return 'similar';
+  return undefined;
+};
+const mapResultToPersistedItem = (r: {
+  readonly candidateId?: string;
+  readonly entityId: string;
+  readonly sourceKind: string;
+  readonly canonicalUrl?: string;
+  readonly title?: string;
+  readonly snippet?: string;
+  readonly threadId?: string;
+  readonly fusedScore: number;
+  readonly lastSeenAt?: string;
+  readonly firstSeenAt?: string;
+  readonly evidence: readonly {
+    readonly retriever: string;
+    readonly sourceKind: string;
+    readonly rank?: number;
+    readonly rawScore?: number;
+    readonly vectorDistance?: number;
+  }[];
+}): OpenConnectionsDejaVuItem => {
+  const url = r.canonicalUrl ?? window.location.href;
+  const provider = detectProviderFromUrl(url);
+  const providerKey = mapDejaVuProviderKey(provider);
+  const facet = v2FacetForPersist(r.sourceKind);
+  const vectorDist = r.evidence.find((e) => e.vectorDistance !== undefined)?.vectorDistance;
+  const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
+  return {
+    id: r.candidateId ?? r.entityId,
+    providerKey,
+    providerLabel: mapDejaVuProviderLabel(providerKey),
+    title: r.title ?? '',
+    snippet: r.snippet ?? '',
+    relativeWhen: r.lastSeenAt ?? r.firstSeenAt ?? '',
+    score: r.fusedScore,
+    ...(facet === undefined ? {} : { facet }),
+    ...(r.canonicalUrl === undefined ? {} : { canonicalUrl: r.canonicalUrl }),
+    ...(similarity === undefined ? {} : { similarity }),
+    ...(r.canonicalUrl === undefined
+      ? {}
+      : { anchorNodeId: `timeline-visit:${r.canonicalUrl}` }),
+    evidence: r.evidence,
+  };
+};
+
+const buildPersistedDejaVuItem = (h: UnifiedSearchHit): OpenConnectionsDejaVuItem => {
+  const provider = detectProviderFromUrl(
+    h.threadUrl ?? h.canonicalUrl ?? window.location.href,
+  );
+  const providerKey = mapDejaVuProviderKey(provider);
+  // Derive an anchorNodeId for the "In graph" row pivot. Prefer the
+  // hit's own anchorNodeId (set by buildDejaVuHits when the recall
+  // hit came from a known graph node), else fall back to the
+  // canonical URL prefixed as a timeline-visit (the graph treats
+  // those IDs as the URL itself — same convention App.tsx uses for
+  // requestSwitchToConnections).
+  const anchorNodeId =
+    h.anchorNodeId ??
+    (h.canonicalUrl === undefined ? undefined : `timeline-visit:${h.canonicalUrl}`);
+  return {
+    id: h.id,
+    providerKey,
+    providerLabel: mapDejaVuProviderLabel(providerKey),
+    title: h.title,
+    snippet: h.snippet ?? '',
+    relativeWhen: h.capturedAt ?? '',
+    score: h.score,
+    ...(h.facet === undefined ? {} : { facet: h.facet }),
+    ...(h.threadUrl === undefined ? {} : { threadUrl: h.threadUrl }),
+    ...(h.canonicalUrl === undefined ? {} : { canonicalUrl: h.canonicalUrl }),
+    ...(h.similarity === undefined ? {} : { similarity: h.similarity }),
+    ...(anchorNodeId === undefined ? {} : { anchorNodeId }),
+  };
+};
 
 const PROVIDER_DRIVERS: Record<'chatgpt' | 'claude' | 'gemini', ProviderDriverConfig> = {
   chatgpt: {
@@ -932,78 +1041,93 @@ export default defineContentScript({
         // — and the resulting "Failed to fetch" was caught by the
         // outer try/catch and rendered as an empty popover. The SW's
         // chrome-extension:// origin bypasses the block.
-        // Déjà-vu recall — three RESILIENT queries via
-        // Promise.allSettled. One query rejecting (MV3 port-closed) or
-        // returning undefined must NEVER silently kill the whole
-        // popover — the prior Promise.all + `responses.some(r=>r.ok)`
-        // threw on the first bad/undefined response and the outer
-        // catch swallowed it, so "nothing showed" even with force.
-        //  • page-content alone + chat-turn alone → each facet gets
-        //    guaranteed slots, so chats aren't score-buried under the
-        //    BM25-scaled page hits in a merged+sliced call (the a2
-        //    issue: a chat "All threads" finds wasn't surfacing here).
-        //  • [page-content, chat-turn, semantic-recall-pool] → the
-        //    "Similar" vector group. semantic-recall-pool is an
-        //    EXPANSION of the page/chat anchor hits, so it returns
-        //    NOTHING unless those anchors are in the SAME query — the
-        //    reason querying it alone (the old 3rd call) yielded zero.
-        //    buildDejaVuHits dedupes the page/chat overlap.
-        type SK = 'page-content' | 'chat-turn' | 'semantic-recall-pool';
-        const QUERIES: readonly (readonly SK[])[] = [
-          ['page-content'],
-          ['chat-turn'],
-          ['page-content', 'chat-turn', 'semantic-recall-pool'],
-        ];
-        const settled = await Promise.allSettled(
-          QUERIES.map(
-            (sourceKind) =>
-              chrome.runtime.sendMessage({
-                type: messageTypes.contentQuery,
-                q: text,
-                limit: sourceKind.length === 1 ? 6 : 12,
-                sourceKind,
-              }) as Promise<ContentQueryResponse>,
-          ),
-        );
-        const okResponses = settled.flatMap((s) =>
-          s.status === 'fulfilled' &&
-          s.value != null &&
-          typeof s.value === 'object' &&
-          s.value.ok === true &&
-          Array.isArray(s.value.items)
-            ? [s.value]
-            : [],
-        );
-        if (okResponses.length === 0) {
-          console.warn('[sidetrack] déjà-vu: all recall queries failed');
+        // Recall v2 — SINGLE POST to /v2/recall. Server owns query
+        // analysis, candidate generation across all sources, RRF
+        // fusion, dedupe, suppression, optional rerank, and
+        // explanations. Replaces the prior 3-call orchestration +
+        // extension-side RRF. The content script just renders.
+        const v2Raw = (await chrome.runtime.sendMessage({
+          type: messageTypes.recallV2Query,
+          req: {
+            q: text,
+            limit: 12,
+            perSourceLimit: 20,
+            session: { currentUrl: window.location.href },
+            strategy: { explain: true },
+          },
+        })) as unknown;
+        const v2 = v2Raw as
+          | {
+              readonly ok: true;
+              readonly results: readonly {
+                readonly candidateId?: string;
+                readonly entityId: string;
+                readonly sourceKind: string;
+                readonly canonicalUrl?: string;
+                readonly title?: string;
+                readonly snippet?: string;
+                readonly threadId?: string;
+                readonly fusedScore: number;
+                readonly lastSeenAt?: string;
+                readonly firstSeenAt?: string;
+                readonly evidence: readonly {
+                  readonly retriever: string;
+                  readonly sourceKind: string;
+                  readonly rank?: number;
+                  readonly rawScore?: number;
+                  readonly vectorDistance?: number;
+                }[];
+              }[];
+            }
+          | { readonly ok: false; readonly error?: string }
+          | null
+          | undefined;
+        // Use == null so we accept both `undefined` (no SW response) and
+        // `null` (background's local-fallback short-circuit when there
+        // are no hits / empty query). Without this, `v2.ok` would
+        // TypeError on null.
+        if (v2 == null || v2.ok !== true) {
+          console.warn(
+            '[sidetrack] déjà-vu: /v2/recall failed',
+            v2 != null && 'error' in v2 ? v2.error : 'unknown',
+          );
+          if (!force) return;
         }
-        const mergedItems = okResponses.flatMap((r) => r.items);
-        // Dedupe, drop the page you're on, derive facets (unit-tested).
-        const built = buildDejaVuHits(mergedItems, {
-          currentUrl: window.location.href,
-        });
-        if (built.hits.length === 0 && !force) return;
+        const results = v2 != null && v2.ok === true ? v2.results : [];
+        if (results.length === 0 && !force) return;
+        // Map v2 source_kind → DejaVuItem facet (overlay's UI shape).
+        const v2FacetOf = (k: string): SearchHitFacet | undefined => {
+          if (k === 'page_content' || k === 'timeline_visit') return 'page';
+          if (k === 'chat_turn') return 'chat';
+          if (k === 'semantic_query' || k === 'graph_neighbor') return 'similar';
+          return undefined;
+        };
         closeDejaVu();
         dejaVuMounted = mountDejaVuPopover({
-          items: built.hits.map(
-            (h): DejaVuItem => ({
-              id: h.id,
-              title: h.title,
-              snippet: h.snippet ?? '',
-              score: h.score,
-              relativeWhen: h.capturedAt ?? '',
-              facet: h.facet,
-              // Provider chip from the matched item's own URL (chat →
-              // its threadUrl, page → its canonicalUrl); fall back to
-              // the current page only when neither is present.
-              provider: detectProviderFromUrl(
-                h.threadUrl ?? h.canonicalUrl ?? window.location.href,
-              ),
-              ...(h.threadUrl === undefined ? {} : { threadUrl: h.threadUrl }),
-              ...(h.canonicalUrl === undefined ? {} : { canonicalUrl: h.canonicalUrl }),
-              ...(h.threadId === undefined ? {} : { bacId: h.threadId }),
-              ...(h.similarity === undefined ? {} : { similarity: h.similarity }),
-            }),
+          items: results.map(
+            (r): DejaVuItem => {
+              const facet = v2FacetOf(r.sourceKind);
+              const vectorDist = r.evidence.find((e) => e.vectorDistance !== undefined)
+                ?.vectorDistance;
+              const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
+              return {
+                id: r.candidateId ?? r.entityId,
+                title: r.title ?? r.canonicalUrl ?? '(no title)',
+                snippet: r.snippet ?? '',
+                score: r.fusedScore,
+                relativeWhen: r.lastSeenAt ?? r.firstSeenAt ?? '',
+                ...(facet === undefined ? {} : { facet }),
+                provider: detectProviderFromUrl(
+                  r.canonicalUrl ?? window.location.href,
+                ),
+                ...(r.canonicalUrl === undefined ? {} : { canonicalUrl: r.canonicalUrl }),
+                ...(r.threadId === undefined ? {} : { bacId: r.threadId }),
+                ...(similarity === undefined ? {} : { similarity }),
+                // P3 — surface evidence so the popover row's Why?
+                // expander can show which retrievers contributed.
+                evidence: r.evidence,
+              };
+            },
           ),
           anchorRect,
           onJump: (item) => {
@@ -1039,6 +1163,22 @@ export default defineContentScript({
           onDismiss: () => {
             dejaVuMounted = null;
           },
+          onSeeAll: () => {
+            // Hand the popover's current hit list off to the side
+            // panel. Background relays as a workboard-style broadcast
+            // so App.tsx can switch to Connections → Déjà-vu submode
+            // with the same set persisted PLUS the originating
+            // selection text and source URL (the submode needs both:
+            // selectionText drives the action bar + chip header,
+            // sourceUrl drives the "from <host>" pill).
+            void chrome.runtime.sendMessage({
+              type: messageTypes.openConnectionsDejaVu,
+              selectionText: text,
+              sourceUrl: window.location.href,
+              items: results.map((r) => mapResultToPersistedItem(r)),
+            });
+            closeDejaVu();
+          },
           // (c) Always-shown actions on the highlighted selection.
           onWebSearch: () => {
             window.open(
@@ -1068,12 +1208,23 @@ export default defineContentScript({
             // (re-openable, auto-linked back when the new chat is
             // captured), then runs the same open-tab + type-into-
             // composer + capture orchestration as the Dispatch button.
+            //
+            // We ALSO ship the current popover hit list as a local
+            // recallContext so the resulting dispatch row gets the
+            // "↩" back-link to the Déjà-vu submode — the user can
+            // jump back from "what did I just ask GPT?" to "what
+            // were the prior matches that triggered me asking?".
             void chrome.runtime.sendMessage({
               type: messageTypes.submitSelectionDispatch,
               url: NEW_CHAT[provider],
               body: text,
               provider,
               title: (document.title || text).slice(0, 80),
+              recallContext: {
+                selectionText: text,
+                sourceUrl: window.location.href,
+                hits: results.map((r) => mapResultToPersistedItem(r)),
+              },
             });
           },
           defaultAiProvider: ((): 'chatgpt' | 'claude' | 'gemini' => {

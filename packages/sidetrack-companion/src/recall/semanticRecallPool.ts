@@ -887,3 +887,59 @@ export const expandSemanticRecallCandidates = (
     .sort((a, b) => b.cosine - a.cosine || (a.canonicalUrl < b.canonicalUrl ? -1 : 1))
     .slice(0, limit);
 };
+
+// Public read of the sidecar vector store. The existing
+// `expandSemanticRecallCandidates` is anchor-anchored — given prior
+// page URLs it finds neighbours via pre-clustered membership. The
+// query-anchored expansion below needs the raw url→vector map so it
+// can cosine the query embedding directly. Returns null when the
+// vector store is missing, on a different model, or fails to parse —
+// callers should fall back to the existing anchor-anchored path.
+export const readSemanticRecallVectorStore = async (
+  vaultRoot: string,
+  modelId: string,
+): Promise<ReadonlyMap<string, Float32Array> | null> =>
+  await readVectorStore(vaultRoot, modelId);
+
+// P0 — Query-anchored semantic recall. Solves the load-bearing bug
+// observed in dogfood (case study 2026-05-24): the prior expansion
+// took the LEXICALLY MATCHED page URLs as anchors, so when lexical
+// drifted off-topic (matching "architect" → "architecture" pages on
+// software architecture instead of the AI-agent role), the semantic
+// tier compounded the drift by finding pages cosine-similar to those
+// off-topic pages. By embedding the selection text and cosining
+// against the vector store directly, the tier becomes a true
+// query-driven candidate source — independent of lexical accuracy.
+//
+// Pure: takes a precomputed query embedding (caller embeds, since
+// embedding has its own warm/missing model handling that belongs at
+// the HTTP boundary) and the raw vector map. Returns top-K by cosine
+// with stable ordering. Excludes URLs the caller already has.
+export interface SemanticRecallByQueryHit {
+  readonly canonicalUrl: string;
+  readonly cosine: number;
+  readonly via: 'query-cosine';
+}
+
+export const expandSemanticByQuery = (
+  vectors: ReadonlyMap<string, Float32Array> | null,
+  queryEmbedding: Float32Array,
+  options: { readonly limit?: number; readonly exclude?: ReadonlySet<string> } = {},
+): readonly SemanticRecallByQueryHit[] => {
+  if (vectors === null || vectors.size === 0) return [];
+  const limit = options.limit ?? 20;
+  const exclude = options.exclude ?? new Set<string>();
+  const normQuery = l2normalize(queryEmbedding);
+  const hits: { canonicalUrl: string; cosine: number }[] = [];
+  for (const [url, vec] of vectors) {
+    if (exclude.has(url)) continue;
+    // vec is already L2-normalized on read (see readVectorStore).
+    // normQuery is L2-normalized above. dot == cosine.
+    const c = dot(normQuery, vec);
+    hits.push({ canonicalUrl: url, cosine: c });
+  }
+  return hits
+    .sort((a, b) => b.cosine - a.cosine || (a.canonicalUrl < b.canonicalUrl ? -1 : 1))
+    .slice(0, limit)
+    .map((h) => ({ canonicalUrl: h.canonicalUrl, cosine: h.cosine, via: 'query-cosine' as const }));
+};
