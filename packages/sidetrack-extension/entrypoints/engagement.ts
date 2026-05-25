@@ -80,26 +80,43 @@ export const startEngagementTracking = (): void => {
   window.addEventListener('beforeunload', () => {
     emit(true);
   });
-  chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
-    if (
-      typeof message === 'object' &&
-      message !== null &&
-      (message as { type?: unknown }).type === 'sidetrack.engagement.idle'
-    ) {
-      aggregator.setIdle((message as { idle?: unknown }).idle === true);
-      sendResponse({ ok: true });
-      return undefined;
+  // Guard chrome.runtime.onMessage.addListener — when the extension
+  // reloads, content scripts on existing tabs become orphaned. Any
+  // touch of chrome.runtime can throw "Extension context invalidated".
+  // try/catch + chrome.runtime.id presence check make startup
+  // resilient. Subsequent uses are in safeSendRuntimeMessage which has
+  // its own guard.
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.id !== undefined) {
+      chrome.runtime.onMessage.addListener(
+        (message: unknown, _sender, sendResponse) => {
+          if (
+            typeof message === 'object' &&
+            message !== null &&
+            (message as { type?: unknown }).type === 'sidetrack.engagement.idle'
+          ) {
+            aggregator.setIdle((message as { idle?: unknown }).idle === true);
+            sendResponse({ ok: true });
+            return undefined;
+          }
+          if (
+            typeof message === 'object' &&
+            message !== null &&
+            (message as { type?: unknown }).type === 'sidetrack.engagement.force-finalize'
+          ) {
+            emit(true);
+            sendResponse({ ok: true });
+          }
+          return undefined;
+        },
+      );
     }
-    if (
-      typeof message === 'object' &&
-      message !== null &&
-      (message as { type?: unknown }).type === 'sidetrack.engagement.force-finalize'
-    ) {
-      emit(true);
-      sendResponse({ ok: true });
-    }
-    return undefined;
-  });
+  } catch {
+    // Extension context invalidated mid-registration — drop the
+    // listener. The script's emit() path uses safeSendRuntimeMessage
+    // which has its own guard, so the periodic timer keeps firing
+    // harmlessly.
+  }
 
   window.setInterval(() => {
     emit(false);
@@ -111,6 +128,18 @@ export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
   registration: 'runtime',
   main() {
-    startEngagementTracking();
+    // Wrap so any sync throw from `startEngagementTracking` (e.g. an
+    // "Extension context invalidated" thrown by `chrome.runtime` on
+    // an orphaned content script) is swallowed locally instead of
+    // bubbling up to WXT's content-script wrapper, which re-throws
+    // and shows the error in chrome://extensions. The script's own
+    // emit-via-safeSendRuntimeMessage path already no-ops on
+    // invalidated context, so swallowing is correct: nothing useful
+    // for the script to do once the SW is gone.
+    try {
+      startEngagementTracking();
+    } catch {
+      // intentional: orphaned context cannot recover here
+    }
   },
 });
