@@ -5012,6 +5012,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      // H6 (2026-05-25): bump a monotonic write_seq counter on every
+      // commit. readCurrent reads this pre and post-reconstruction
+      // to detect a writer that committed between paged reads —
+      // snapshotRevision is a hash of updatedAt+counts only, not
+      // strong enough on its own (per Codex review). write_seq is
+      // an unconditional commit token.
+      const prevSeqRow = selectMetadata.get('write_seq');
+      const prevSeq =
+        prevSeqRow === null || prevSeqRow === undefined
+          ? 0
+          : Number.parseInt(textField(prevSeqRow, 'data'), 10) || 0;
+      upsertMetadata.run('write_seq', String(prevSeq + 1));
       if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
@@ -5209,6 +5221,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const revisionKey = metadata.snapshotRevision ?? '';
     const cached = this.#cachedSnapshot;
     if (cached !== null && cached.revision === revisionKey) return cached.value;
+    // H6: capture write_seq BEFORE any paged read. We compare the
+    // post-read value with this to detect a writer that committed
+    // between our reads. snapshotRevision alone isn't sufficient —
+    // it's a content-hash of metadata-only fields, so two distinct
+    // commits could produce the same revision. write_seq is bumped
+    // on every #writeCurrentRows commit and is the strict commit
+    // token.
+    const preSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+    const preWriteSeq =
+      preSeqRow === null || preSeqRow === undefined
+        ? 0
+        : Number.parseInt(textField(preSeqRow, 'data'), 10) || 0;
     // Edge rows store JSON ARRAYS (one row contains many edges), so a
     // page size that's OK for nodes can be expensive in edge parsing.
     // Use a smaller page for edges; both are well under the runtime's
@@ -5243,17 +5267,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       if (page.length < EDGE_PAGE_SIZE) break;
       await yieldToLoop();
     }
-    // H6 revision consistency check: did a writer commit a new
-    // snapshot between our metadata-read and the post-edge-page point?
-    // If so, the paged data may mix two revisions — bail out and let
-    // the caller retry.
-    if (!acceptStale) {
-      const post = await this.#readMetadata(db);
-      const postRevision = post?.snapshotRevision ?? '';
-      if (postRevision !== revisionKey) return 'stale';
-    }
+    // H6 — read order rows BEFORE the consistency check, then verify
+    // write_seq didn't move during ANY of the reads. Writer commits
+    // current/node_order/edge_order atomically in one transaction
+    // (#writeCurrentRows), so a single post-read write_seq check
+    // covers all four input rows. snapshotRevision-based equality
+    // could pass even when content changed; write_seq cannot.
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
+    if (!acceptStale) {
+      const postSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+      const postWriteSeq =
+        postSeqRow === null || postSeqRow === undefined
+          ? 0
+          : Number.parseInt(textField(postSeqRow, 'data'), 10) || 0;
+      if (postWriteSeq !== preWriteSeq) return 'stale';
+    }
     const nodeOrder =
       nodeOrderRow === null || nodeOrderRow === undefined
         ? [...nodesById.keys()].sort()
