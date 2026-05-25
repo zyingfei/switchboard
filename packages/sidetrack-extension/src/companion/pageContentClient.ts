@@ -254,6 +254,46 @@ export class PageContentClient {
     return data;
   }
 
+  // Recall v2 — POST /v2/recall. Single unified endpoint, server-
+  // owned fusion/dedupe/suppression. Returns the RecallResponse with
+  // evidence-rich candidates. Replaces the multi-call /v1/content/query
+  // pattern; that endpoint stays for legacy callers but Déjà-vu now
+  // uses v2.
+  async recallV2(req: unknown): Promise<{
+    readonly results: readonly {
+      readonly entityId: string;
+      readonly sourceKind: string;
+      readonly canonicalUrl?: string;
+      readonly title?: string;
+      readonly snippet?: string;
+      readonly threadId?: string;
+      readonly fusedScore: number;
+      readonly evidence: readonly {
+        readonly retriever: string;
+        readonly sourceKind: string;
+        readonly rawScore?: number;
+        readonly rank?: number;
+        readonly vectorDistance?: number;
+      }[];
+    }[];
+    readonly meta: Record<string, unknown>;
+  }> {
+    // baseUrl is "http://127.0.0.1:port/v1" — swap the prefix to /v2.
+    const v2Base = this.baseUrl.replace(/\/v1$/, '/v2');
+    const response = await fetch(`${v2Base}/recall`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': this.settings.bridgeKey,
+      },
+      body: JSON.stringify(req),
+    });
+    const body = await this.parseOrThrow(response);
+    const data = isRecord(body) ? body.data : undefined;
+    if (!isRecord(data)) throw new Error('Companion /v2/recall returned no data field.');
+    return data as never;
+  }
+
   async query(input: {
     readonly q: string;
     readonly sourceKind?: readonly ('page-content' | 'chat-turn' | 'semantic-recall-pool')[];

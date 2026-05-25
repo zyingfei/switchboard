@@ -302,6 +302,13 @@ export interface WorkboardState {
   // auto-link matcher and surfaced to the dispatch viewer modal so
   // the user can see what they actually shipped, not the vault copy.
   readonly dispatchOriginals: Readonly<Partial<Record<string, string>>>;
+  // Local breadcrumb keyed by bac_id, recorded when a user fires
+  // "Ask AI" from a Déjà-vu selection. Powers the "↩" pill on the
+  // Recent dispatches row that re-opens the Connections → Déjà-vu
+  // submode with the same hit set. Stored as `unknown` here to avoid
+  // pulling sidepanel-render types up into the workboard contract;
+  // App.tsx narrows on read.
+  readonly dispatchRecallContexts: Readonly<Partial<Record<string, unknown>>>;
   readonly dispatchDiagnostics: readonly DispatchDiagnostic[];
   // Map threadId → SendToTarget id of the last dispatch the user
   // fired against that thread. Drives the "Recent" row in the
@@ -430,6 +437,7 @@ export const createEmptyWorkboardState = (
   recentDispatches: [],
   dispatchLinks: {},
   dispatchOriginals: {},
+  dispatchRecallContexts: {},
   dispatchDiagnostics: [],
   lastDispatchTargetByThread: {},
   reviewDrafts: {},

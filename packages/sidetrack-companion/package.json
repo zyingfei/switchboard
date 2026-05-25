@@ -22,6 +22,7 @@
     "graphology": "^0.26.0",
     "hnswlib-node": "^3.0.0",
     "minisearch": "^7.2.0",
+    "sqlite-vec": "^0.1.9",
     "usearch": "2.25.1",
     "ws": "^8.20.0",
     "zod": "^4.3.6"
@@ -35,7 +36,8 @@
     "lint:openapi": "bunx --bun --no-install spectral lint openapi.yaml --ruleset ../../configs/openapi/api-style-rules.yaml",
     "start": "bun dist/cli.js",
     "test": "bunx --no-install vitest run",
-    "test:watch": "bunx --no-install vitest"
+    "test:watch": "bunx --no-install vitest",
+    "eval:recall": "bunx --no-install vitest run src/recall-v2/eval/index.test.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

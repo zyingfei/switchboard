@@ -171,6 +171,7 @@ import {
   writeDispatchDiagnostic,
   writeDispatchLink,
   writeDispatchOriginal,
+  writeDispatchRecallContext,
   writeLastDispatchTargetByThread,
   appendReviewDraftSpan as persistReviewDraftSpan,
   dropReviewDraftSpan,
@@ -181,6 +182,55 @@ import {
   setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
+import { localRecallStore } from '../src/local-recall/store';
+import { ingestVisit } from '../src/local-recall/ingestion';
+
+// Phase 10 — OPFS local-recall fallback. Called from the recallV2Query
+// handler when the companion is unreachable. Returns null if the local
+// store has no matches (caller falls back to its own error path).
+const tryLocalFallback = async (
+  req: Record<string, unknown>,
+  reason: 'no-companion' | 'companion-error',
+): Promise<unknown | null> => {
+  try {
+    const q = typeof req['q'] === 'string' ? req['q'] : '';
+    const limit = typeof req['limit'] === 'number' ? req['limit'] : 12;
+    if (q.trim().length === 0) return null;
+    const hits = await localRecallStore().query({ q, limit });
+    if (hits.length === 0) return null;
+    const results = hits.map((h, i) => ({
+      candidateId: h.entityId,
+      entityId: h.entityId,
+      sourceKind: 'timeline_visit',
+      canonicalUrl: h.canonicalUrl,
+      title: h.title ?? h.canonicalUrl,
+      fusedScore: 1 / (60 + (i + 1)),
+      ...(h.lastSeenAtMs === undefined
+        ? {}
+        : { lastSeenAt: new Date(h.lastSeenAtMs).toISOString() }),
+      evidence: [
+        {
+          retriever: 'fts5-local',
+          sourceKind: 'timeline_visit',
+          rawScore: h.bm25,
+          rank: i + 1,
+        },
+      ],
+    }));
+    return {
+      ok: true,
+      results,
+      meta: {
+        fusion: { strategy: 'rrf-local', perSourceCounts: { timeline_visit: hits.length } },
+        timingsMs: {},
+        flags: { localFallback: true, fallbackReason: reason },
+      },
+    };
+  } catch (err) {
+    console.warn('[local-recall] fallback failed:', err);
+    return null;
+  }
+};
 import type { DispatchEventRecord } from '../src/dispatch/types';
 import { tryLinkCapturedThread } from '../src/companion/dispatchLinking';
 
@@ -3037,6 +3087,97 @@ const handleRequest = async (
     return (await buildContentQueryResponse()) as unknown as RuntimeResponse;
   }
 
+  if (request.type === messageTypes.recallV2Query) {
+    // Recall v2 — POST /v2/recall via the bridge. Returns the
+    // RecallResponse opaque to the extension; callers narrow as
+    // needed. Companion does fusion/dedupe/suppression server-side.
+    //
+    // P0 — active-chat suppression contract. The content script only
+    // knows `currentUrl`; the background SW knows the recent dispatches
+    // (Ask-AI artifacts, very recent thread creations). We ENRICH the
+    // request here by injecting:
+    //   - activeChatBacIds: every dispatch within the last 10 minutes
+    //   - excludeEntityIds: every dispatch within the last 10 minutes
+    //     hashed the way pipeline.ts:entityIdFor would hash them
+    //   - sessionId: the SW startup timestamp as a coarse session id
+    // The server's SuppressionPolicy then strips these from results,
+    // closing the "I just created this chat 9 minutes ago — why is it
+    // surfacing as déjà-vu" leak (case-study residual).
+    const buildRecallV2Response = async (): Promise<unknown> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          // Phase 10 — companion not configured → fall back to local
+          // OPFS-FTS5 store so the user still gets timeline-visit
+          // matches. Best-effort; if local store unavailable, return
+          // the empty error response so the UI shows nothing.
+          return await tryLocalFallback(request.req as Record<string, unknown>, 'no-companion');
+        }
+        const ACTIVE_WINDOW_MS = 10 * 60 * 1000;
+        const cutoffMs = Date.now() - ACTIVE_WINDOW_MS;
+        const dispatches = await readCachedDispatches();
+        const activeArtifactBacIds = dispatches
+          .filter((d) => {
+            const ts = Date.parse(d.createdAt);
+            return !Number.isNaN(ts) && ts >= cutoffMs;
+          })
+          .map((d) => d.bac_id);
+        // Merge user-supplied session info with the SW-derived
+        // suppression context. User overrides take precedence on
+        // currentUrl etc.; we only ADD to activeChatBacIds.
+        const req = request.req as Record<string, unknown>;
+        const userSession =
+          (req['session'] as Record<string, unknown> | undefined) ?? {};
+        const userActive =
+          (userSession['activeChatBacIds'] as readonly string[] | undefined) ?? [];
+        const enrichedReq = {
+          ...req,
+          session: {
+            ...userSession,
+            activeChatBacIds: [
+              ...new Set([...userActive, ...activeArtifactBacIds]),
+            ],
+          },
+          suppression: {
+            // 10 min freshness floor — matches the ACTIVE_WINDOW_MS
+            // above so that even a JUST-created chat the user hasn't
+            // captured locally yet (race between dispatch + capture)
+            // still gets suppressed by the lastSeenAt floor.
+            minHitAgeMs: ACTIVE_WINDOW_MS,
+            suppressActiveChatBacIds: [
+              ...new Set([...userActive, ...activeArtifactBacIds]),
+            ],
+            suppressCurrentPage: 'always' as const,
+            // Caller can still override via req.suppression — let them.
+            ...((req['suppression'] as Record<string, unknown>) ?? {}),
+          },
+        };
+        try {
+          const data = await createPageContentClient(settings.companion).recallV2(enrichedReq);
+          return { ok: true, ...data };
+        } catch (error) {
+          // Companion unreachable / errored — try local before giving up.
+          const local = await tryLocalFallback(enrichedReq, 'companion-error');
+          if (local !== null) return local;
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : 'Recall v2 query failed.',
+            results: [],
+            meta: {},
+          };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : 'Recall v2 query failed.',
+          results: [],
+          meta: {},
+        };
+      }
+    };
+    return (await buildRecallV2Response()) as unknown as RuntimeResponse;
+  }
+
   if (request.type === messageTypes.annotateTurn) {
     // Side-panel-driven turn annotation. We identify the chat tab by
     // canonical URL match — provider SPAs add ?session=… and other
@@ -3177,6 +3318,23 @@ const handleRequest = async (
     return await withCompanionStatus();
   }
 
+  if (request.type === messageTypes.openConnectionsDejaVu) {
+    // Content-script "See all" → relay payload verbatim so the side
+    // panel can switch to Connections → Déjà-vu submode with the
+    // popover hit list persisted. selectionText + sourceUrl ride
+    // along so the submode can render the same action bar / chip
+    // header / "from <host>" pill the popover had.
+    void chrome.runtime
+      .sendMessage({
+        type: messageTypes.openConnectionsDejaVu,
+        items: request.items,
+        selectionText: request.selectionText,
+        sourceUrl: request.sourceUrl,
+      })
+      .catch(() => undefined);
+    return await withCompanionStatus();
+  }
+
   if (request.type === messageTypes.dispatchAutoSendInNewTab) {
     return await withCompanionStatus(async () => {
       const { url, body } = request;
@@ -3221,6 +3379,13 @@ const handleRequest = async (
           // Feeds the auto-link matcher (it compares the UNREDACTED
           // body against the captured chat's first user turn).
           await writeDispatchOriginal(result.bac_id, body);
+          // Persist the Déjà-vu breadcrumb if the caller shipped one
+          // (Ask AI from a popover selection). Stays local-only — the
+          // companion has nothing to do with this; it just powers the
+          // "↩" pill on the Recent dispatches row in the sidepanel.
+          if (request.recallContext !== undefined) {
+            await writeDispatchRecallContext(result.bac_id, request.recallContext);
+          }
           // Optimistic local row so it shows immediately; the next
           // companion poll merge is idempotent by bac_id.
           const record: DispatchEventRecord = {
@@ -4189,6 +4354,17 @@ export default defineBackground(() => {
       void maybeExtractAutoPageEvidence(tab, 'auto-observed', {
         source: 'tab-complete',
       });
+      // Phase 10 — also ingest into OPFS local recall so the visit is
+      // findable offline. Cheap upsert; fire-and-forget; never blocks.
+      if (typeof tab.url === 'string' && /^https?:\/\//u.test(tab.url)) {
+        void ingestVisit({
+          canonicalUrl: tab.url,
+          ...(typeof tab.title === 'string' && tab.title.length > 0
+            ? { title: tab.title }
+            : {}),
+          seenAtMs: Date.now(),
+        });
+      }
     }
   });
   chrome.windows.onFocusChanged.addListener((windowId) => {

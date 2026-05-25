@@ -25,7 +25,13 @@ describe('buildDejaVuHits', () => {
     expect(built.hits.map((h) => h.id)).toEqual(['b']);
   });
 
-  it('dedupes by location then sorts by score desc', () => {
+  it('dedupes by location then preserves input rank (RRF order)', () => {
+    // P2 (2026-05-24): buildDejaVuHits now uses Reciprocal Rank Fusion
+    // instead of raw-score sort, because raw scores are not
+    // comparable across rankers (BM25 5-30 vs cosine 0-0.49). Input
+    // order is treated as the ranker's rank order. For a single
+    // input array, that means the FIRST occurrence wins — the score
+    // field on input rows is not consulted for ordering.
     const built = buildDejaVuHits(
       [
         hit({ id: 'low', sourceKind: 'page-content', canonicalUrl: 'https://a.test/x', score: 0.2 }),
@@ -34,8 +40,10 @@ describe('buildDejaVuHits', () => {
       ],
       { currentUrl: 'https://here.test/now' },
     );
-    // first occurrence of the a.test/x location wins (id 'low'), dup dropped
-    expect(built.hits.map((h) => h.id)).toEqual(['chat', 'low']);
+    // 'low' (rank 1) gets RRF 1/61; 'dup' (rank 2) dedupes into
+    // 'low' adding 1/62; 'chat' (rank 3) gets 1/63. So 'low' wins
+    // (because of double contribution) and 'chat' is second.
+    expect(built.hits.map((h) => h.id)).toEqual(['low', 'chat']);
   });
 
   it('derives only the facets actually present, in page→chat→similar order', () => {

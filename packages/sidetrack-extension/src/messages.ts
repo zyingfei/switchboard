@@ -176,6 +176,16 @@ export const messageTypes = {
   // this as a provenance fallback when MV3 lost same-tab state or the
   // new tab's opener edge.
   recordNavigationLinkClick: 'sidetrack.navigation.linkClick',
+  // Content-script Déjà-vu popover → "See all" → background relays to
+  // the side panel so Connections opens in Déjà-vu submode with the
+  // full result set persisted. Carries the already-built popover hits;
+  // the side panel maps them to ConnectionsDejaVuItem shape.
+  openConnectionsDejaVu: 'sidetrack.sidepanel.openConnectionsDejaVu',
+  // Recall v2 single endpoint — replaces the 3-call /v1/content/query
+  // orchestration. Content script (or any other recall caller) sends
+  // this one message; background POSTs to companion's /v2/recall and
+  // returns the evidence-rich response.
+  recallV2Query: 'sidetrack.recall.v2.query',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -225,6 +235,66 @@ export interface FocusThreadInSidePanelMessage {
   readonly lastSeenAt?: string;
 }
 
+// "See all" handoff payload — pre-mapped from popover DejaVuItem to
+// the sidepanel's ConnectionsDejaVuItem-compatible shape so the
+// listener doesn't need to know overlay internals.
+export interface OpenConnectionsDejaVuItem {
+  readonly id: string;
+  readonly providerLabel: string;
+  readonly providerKey: 'gpt' | 'claude' | 'gemini' | 'codex' | 'web';
+  readonly title: string;
+  readonly snippet: string;
+  readonly relativeWhen: string;
+  readonly score: number;
+  // Facet drives chip filtering in the submode. Same string the
+  // overlay popover uses (mirrors SearchHitFacet). Optional so old
+  // payloads without facet still parse, but new senders set it.
+  readonly facet?: 'page' | 'chat' | 'similar' | 'thread' | 'visited';
+  readonly threadUrl?: string;
+  readonly canonicalUrl?: string;
+  readonly similarity?: number;
+  // P3 — per-source evidence for the Why? expander. Carried through
+  // the See-all handoff so the submode row can render the same
+  // explanation panel the popover shows.
+  readonly evidence?: readonly {
+    readonly retriever: string;
+    readonly sourceKind: string;
+    readonly rank?: number;
+    readonly rawScore?: number;
+    readonly vectorDistance?: number;
+  }[];
+  // Node id this hit anchors on in the Connections graph. Powers
+  // the "In graph" row pivot — clicking calls navigateToAnchor here
+  // and switches to the Linked submode so the user lands in the
+  // graph neighborhood. Optional because some sources (raw vector
+  // hits without a derived node) won't have one.
+  readonly anchorNodeId?: string;
+}
+
+// Per-dispatch context recorded locally when the user fires an
+// "Ask AI" from a Déjà-vu selection. Stored in extension storage
+// keyed by bac_id (NOT pushed to the companion — it's a UI-only
+// breadcrumb), surfaces in Recent dispatches as a "↩" pill.
+export interface DispatchRecallContext {
+  readonly selectionText: string;
+  readonly sourceUrl: string;
+  readonly hits: readonly OpenConnectionsDejaVuItem[];
+}
+
+export interface OpenConnectionsDejaVuMessage {
+  readonly type: typeof messageTypes.openConnectionsDejaVu;
+  readonly items: readonly OpenConnectionsDejaVuItem[];
+  // The text selection (or query string) that produced these hits.
+  // Drives the submode header pill, the per-action buttons (Google /
+  // Translate / Ask AI need the original text), and the dispatch
+  // back-link (see DispatchRecallContext below).
+  readonly selectionText: string;
+  // Origin page of the selection — surfaces as a small "from <host>"
+  // pill so the user can tell at a glance whether this submode view
+  // belongs to the article they were just reading.
+  readonly sourceUrl: string;
+}
+
 export const isFocusThreadInSidePanelMessage = (
   value: unknown,
 ): value is FocusThreadInSidePanelMessage =>
@@ -234,6 +304,15 @@ export const isFocusThreadInSidePanelMessage = (
   (value.bacId === undefined || typeof value.bacId === 'string') &&
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
+
+export const isOpenConnectionsDejaVuMessage = (
+  value: unknown,
+): value is OpenConnectionsDejaVuMessage =>
+  isRecord(value) &&
+  value.type === messageTypes.openConnectionsDejaVu &&
+  Array.isArray(value.items) &&
+  typeof value.selectionText === 'string' &&
+  typeof value.sourceUrl === 'string';
 
 export interface NavigationLinkClickMessage {
   readonly type: typeof messageTypes.recordNavigationLinkClick;
@@ -410,6 +489,12 @@ export type WorkboardRequest =
       readonly body: string;
       readonly provider: 'chatgpt' | 'claude' | 'gemini';
       readonly title: string;
+      // Optional: lets a Recent dispatches row offer a "↩ déjà-vu"
+      // pill that re-opens the Connections submode with the same hit
+      // set the user was looking at when they hit Ask AI. Stored in
+      // extension local storage keyed by bac_id (companion never
+      // sees this) so it survives sidepanel reloads.
+      readonly recallContext?: DispatchRecallContext;
     }
   | {
       readonly type: typeof messageTypes.cacheDispatchOriginal;
@@ -424,6 +509,20 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.focusThreadInSidePanel;
       readonly threadUrl: string;
+    }
+  | {
+      readonly type: typeof messageTypes.openConnectionsDejaVu;
+      readonly items: readonly OpenConnectionsDejaVuItem[];
+      readonly selectionText: string;
+      readonly sourceUrl: string;
+    }
+  | {
+      readonly type: typeof messageTypes.recallV2Query;
+      // Opaque RecallRequest — full schema lives server-side at
+      // packages/sidetrack-companion/src/recall-v2/types.ts. We pass it
+      // through verbatim so the contract evolves on the server without
+      // forcing a coordinated extension release.
+      readonly req: Record<string, unknown>;
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -806,7 +905,8 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
       (value.provider === 'chatgpt' ||
         value.provider === 'claude' ||
         value.provider === 'gemini') &&
-      typeof value.title === 'string'
+      typeof value.title === 'string' &&
+      (value.recallContext === undefined || isRecord(value.recallContext))
     );
   }
 
@@ -820,6 +920,18 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.focusThreadInSidePanel)) {
     return typeof value.threadUrl === 'string';
+  }
+
+  if (hasType(value, messageTypes.openConnectionsDejaVu)) {
+    return (
+      Array.isArray(value.items) &&
+      typeof value.selectionText === 'string' &&
+      typeof value.sourceUrl === 'string'
+    );
+  }
+
+  if (hasType(value, messageTypes.recallV2Query)) {
+    return isRecord(value.req) && typeof value.req['q'] === 'string';
   }
 
   if (hasType(value, messageTypes.createReminder)) {

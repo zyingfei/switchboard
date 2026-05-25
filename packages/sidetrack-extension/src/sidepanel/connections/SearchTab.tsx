@@ -20,6 +20,11 @@ interface SearchTabProps {
   readonly recallLoading?: boolean;
   readonly recallError?: string | null;
   readonly onOpenUrl?: (url: string) => void;
+  // Pivot to Connections → Déjà-vu submode with the current query
+  // text as the selection. Renders a "Déjà-vu this" button in the
+  // header when wired (parent owns the actual mode switch + hit
+  // population). Hidden when omitted.
+  readonly onDejaVuPivot?: (query: string) => void;
 }
 
 interface SearchHit {
@@ -156,6 +161,7 @@ export const SearchTab = ({
   recallLoading = false,
   recallError = null,
   onOpenUrl,
+  onDejaVuPivot,
 }: SearchTabProps): ReactElement => {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<ConnectionNodeKind>>(
@@ -391,6 +397,17 @@ export const SearchTab = ({
     <section className="cx-search-tab" data-testid="connections-search-tab">
       <div className="cx-search-tab-opbar">
         <span className="cx-search-tab-label">Search</span>
+        {onDejaVuPivot !== undefined && trimmed.length > 0 ? (
+          <button
+            type="button"
+            className="cx-search-dejavu-pivot"
+            data-testid="connections-search-dejavu-pivot"
+            onClick={() => onDejaVuPivot(trimmed)}
+            title="Open this query in the Déjà-vu submode (chips, actions, prior matches)"
+          >
+            ⇄ Déjà-vu
+          </button>
+        ) : null}
         <label className="cx-search-tab-input">
           <span className="cx-search-tab-input-icon" aria-hidden>
             {SearchIcon}

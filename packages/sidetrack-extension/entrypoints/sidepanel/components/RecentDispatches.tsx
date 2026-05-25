@@ -51,6 +51,13 @@ export interface RecentDispatchesProps {
   readonly onUnarchive?: (id: string) => void;
   readonly showArchived?: boolean;
   readonly onToggleShowArchived?: () => void;
+  // D: dispatches that originated from a Déjà-vu selection ("Ask AI"
+  // off the popover) carry a local breadcrumb. When `hasRecallContext`
+  // returns true for a row, a small "↩" pill renders next to the
+  // status actions and click fires `onJumpToRecallContext` to re-open
+  // the Connections → Déjà-vu submode with the same hit set.
+  readonly hasRecallContext?: (bac_id: string) => boolean;
+  readonly onJumpToRecallContext?: (bac_id: string) => void;
 }
 
 export function RecentDispatches({
@@ -64,6 +71,8 @@ export function RecentDispatches({
   onUnarchive,
   showArchived = false,
   onToggleShowArchived,
+  hasRecallContext,
+  onJumpToRecallContext,
 }: RecentDispatchesProps) {
   const visible = dispatches.filter((d) => showArchived || d.status !== 'archived');
   const archivedCount = dispatches.filter((d) => d.status === 'archived').length;
@@ -144,7 +153,7 @@ export function RecentDispatches({
                   onClick={() => onOpenTarget?.(dispatch.bac_id)}
                   title="Jump to the destination chat"
                 >
-                  ↗ open
+                  ↗ Open
                 </button>
               ) : dispatch.mode === 'auto-send' ? (
                 <button
@@ -186,6 +195,19 @@ export function RecentDispatches({
                   title="Open a new chat and auto-send this packet"
                 >
                   dispatch
+                </button>
+              ) : null}
+              {hasRecallContext?.(dispatch.bac_id) === true &&
+              onJumpToRecallContext !== undefined ? (
+                <button
+                  type="button"
+                  className="btn btn-link dispatch-action dispatch-recall-pill"
+                  data-testid="dispatch-recall-pill"
+                  onClick={() => onJumpToRecallContext(dispatch.bac_id)}
+                  title="Open the Déjà-vu submode with the hit set that triggered this dispatch"
+                  aria-label="Back to Déjà-vu submode"
+                >
+                  ⇄ Déjà-vu
                 </button>
               ) : null}
               {isArchived ? (

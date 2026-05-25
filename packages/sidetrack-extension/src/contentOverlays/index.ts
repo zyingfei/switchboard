@@ -133,8 +133,8 @@ const OVERLAY_CSS = `
   background: var(--paper-light);
   border: 1px solid var(--ink);
   border-radius: 8px;
-  width: 360px;
-  max-width: 90vw;
+  width: 440px;
+  max-width: 92vw;
   box-shadow: 0 22px 60px -12px rgba(0,0,0,0.45), 0 0 0 1px rgba(0,0,0,0.05);
   pointer-events: auto;
   overflow: hidden;
@@ -251,14 +251,25 @@ const OVERLAY_CSS = `
   margin-bottom: 4px;
 }
 .sidetrack-deja-row .title {
-  flex: 1;
+  flex: 1 1 auto;
+  /* min-width:0 is the load-bearing fix — without it the title
+     refuses to shrink and gets ellipsised at ~12 chars while the
+     metadata pills take their full intrinsic width. */
+  min-width: 0;
   font-family: var(--display);
-  font-weight: 500;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: 13.5px;
+  line-height: 1.3;
   color: var(--ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sidetrack-deja-row .title.is-redacted {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ink-3);
+  font-size: 12px;
 }
 .sidetrack-deja-row .score {
   font-family: var(--mono);
@@ -301,6 +312,25 @@ const OVERLAY_CSS = `
   gap: 6px;
   margin-top: 7px;
 }
+.sidetrack-deja-why-panel {
+  margin-top: 6px;
+  padding: 6px 9px;
+  background: var(--paper);
+  border: 1px solid var(--rule-soft);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.sidetrack-deja-why-line {
+  color: var(--ink-3);
+}
+.sidetrack-deja-why-line + .sidetrack-deja-why-line {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dashed var(--rule-soft);
+}
 .sidetrack-deja-row .r2 button {
   font-family: var(--mono);
   font-size: 10px;
@@ -332,6 +362,31 @@ const OVERLAY_CSS = `
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.sidetrack-deja-seeall-slot {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+.sidetrack-deja-seeall {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--signal);
+  background: var(--signal-bg);
+  border: 1px solid var(--signal-tint);
+  border-radius: 99px;
+  padding: 3px 11px;
+  cursor: pointer;
+  /* nowrap + flex:none keeps the pill from collapsing into the
+     3-line oval it shows when actions wrap and squeeze the footer. */
+  white-space: nowrap;
+  flex: none;
+}
+.sidetrack-deja-seeall:hover {
+  color: var(--ink);
+  border-color: var(--signal);
 }
 .sidetrack-deja-actions {
   display: flex;
@@ -870,6 +925,16 @@ export interface DejaVuItem {
   // 0–1 cosine, only on 'similar' (semantic) hits — shown instead of
   // a snippet (these are topical/vector matches, not exact text).
   readonly similarity?: number;
+  // P3 — per-row evidence for the Why? expander. Each entry is one
+  // source that contributed (bm25 / dense / fts5). Renders as a small
+  // pill panel next to the action row.
+  readonly evidence?: readonly {
+    readonly retriever: string;
+    readonly sourceKind: string;
+    readonly rank?: number;
+    readonly rawScore?: number;
+    readonly vectorDistance?: number;
+  }[];
 }
 
 type AskAiProvider = 'chatgpt' | 'claude' | 'gemini';
@@ -885,11 +950,15 @@ interface DejaVuMountOptions {
   readonly onWebSearch?: () => void;
   readonly onTranslate?: () => void;
   readonly onAskAi?: (provider: AskAiProvider) => void;
+  // Hand the current result set off to the sidepanel Connections →
+  // Déjà-vu submode so the user can browse the full list with the
+  // same chips/snippets at a roomier scale. Rendered only when wired.
+  readonly onSeeAll?: () => void;
   /** Provider highlighted as the default (the current page's, else gpt). */
   readonly defaultAiProvider?: AskAiProvider;
 }
 
-const POP_WIDTH = 360;
+const POP_WIDTH = 440;
 
 const clearDejaPop = (root: HTMLElement): void => {
   for (const node of root.querySelectorAll('.sidetrack-deja-pop')) {
@@ -1144,11 +1213,32 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     <div class="sidetrack-deja-list"></div>
     <div class="sidetrack-deja-foot">
       <span class="sidetrack-deja-foot-label">on-device · unified recall</span>
+      <span class="sidetrack-deja-seeall-slot"></span>
       <span class="sidetrack-deja-actions"></span>
     </div>
   `;
   const list = pop.querySelector<HTMLDivElement>('.sidetrack-deja-list');
   const chipsBar = pop.querySelector<HTMLDivElement>('.sidetrack-deja-chips');
+
+  // "See all" handoff to the sidepanel Connections → Déjà-vu submode.
+  // Rendered as a primary footer pill before the search/translate/ask
+  // actions so it's the first thing the eye lands on when the result
+  // set is bigger than what fits in the popover.
+  const seeAllSlot = pop.querySelector<HTMLSpanElement>('.sidetrack-deja-seeall-slot');
+  if (seeAllSlot !== null && opts.onSeeAll !== undefined && opts.items.length > 0) {
+    const onSeeAll = opts.onSeeAll;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sidetrack-deja-seeall';
+    b.textContent = `⇄ See all (${String(opts.items.length)})`;
+    b.title = 'Open the full result set in the side panel';
+    b.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onSeeAll();
+    });
+    seeAllSlot.appendChild(b);
+  }
 
   // Always-shown footer actions on the highlighted selection.
   const actionsBar = pop.querySelector<HTMLSpanElement>('.sidetrack-deja-actions');
@@ -1205,12 +1295,28 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
       </div>
       <div class="snippet"></div>
       <div class="r2">
-        <button type="button" class="jump">Jump</button>
+        <button type="button" class="jump">↗ Open</button>
         <button type="button" class="mute">Mute on this page</button>
+        <button type="button" class="why" aria-expanded="false">Why?</button>
       </div>
+      <div class="sidetrack-deja-why-panel" hidden></div>
     `;
     const titleEl = row.querySelector('.title');
-    if (titleEl !== null) titleEl.textContent = item.title;
+    if (titleEl !== null) {
+      // Captures with no real title (URL fallback, blank string,
+      // generic placeholder) read as visual noise next to the
+      // metadata pills. Mark them so the CSS can de-emphasize them
+      // and let real titles stand out — that's the "better display
+      // for non-redacted results" the user asked for.
+      const rawTitle = item.title.trim();
+      const looksRedacted =
+        rawTitle.length === 0 ||
+        /^https?:\/\//i.test(rawTitle) ||
+        rawTitle === '(no title)' ||
+        rawTitle === 'Untitled';
+      titleEl.textContent = rawTitle.length === 0 ? '(no title)' : rawTitle;
+      if (looksRedacted) titleEl.classList.add('is-redacted');
+    }
     const facetEl = row.querySelector('.sidetrack-deja-facet');
     if (facetEl !== null) {
       if (item.facet === undefined) facetEl.remove();
@@ -1222,12 +1328,16 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     if (whenEl !== null) whenEl.textContent = formatRelative(item.relativeWhen);
     const scoreEl = row.querySelector('.score');
     if (scoreEl !== null) {
-      // 'similar' = vector/topic match → show how similar (NN%),
-      // not the raw lexical score (which is meaningless here).
-      scoreEl.textContent =
-        item.facet === 'similar' && item.similarity !== undefined
-          ? `${String(Math.round(item.similarity * 100))}% similar`
-          : item.score.toFixed(2);
+      // Only the 'similar' facet has a user-meaningful score (NN%
+      // similar from the vector index). The lexical BM25 number for
+      // pages/chats hits is internal ranking signal — surfacing it as
+      // "186.67" reads as noise and steals horizontal room from the
+      // title. Drop the badge entirely for non-similar rows.
+      if (item.facet === 'similar' && item.similarity !== undefined) {
+        scoreEl.textContent = `${String(Math.round(item.similarity * 100))}% similar`;
+      } else {
+        scoreEl.remove();
+      }
     }
     const snippetEl = row.querySelector('.snippet');
     if (snippetEl !== null) {
@@ -1242,6 +1352,45 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     row.querySelector('.mute')?.addEventListener('click', () => {
       opts.onMute?.();
     });
+    // P3 — Why? expander. Builds a small evidence panel from the
+    // candidate's evidence[] (per-retriever rank + score + vector
+    // distance). Click toggles visibility; folded by default so the
+    // popover stays scannable.
+    const whyBtn = row.querySelector<HTMLButtonElement>('.why');
+    const whyPanel = row.querySelector<HTMLDivElement>('.sidetrack-deja-why-panel');
+    if (whyBtn !== null && whyPanel !== null) {
+      const ev = item.evidence;
+      if (ev === undefined || ev.length === 0) {
+        whyBtn.remove();
+      } else {
+        const fmtScore = (n: number | undefined): string =>
+          n === undefined ? '—' : n.toFixed(3);
+        const lines = ev.map((e) => {
+          const src = e.sourceKind.replace('_', '-');
+          const rank = e.rank !== undefined ? `rank ${String(e.rank)}` : '';
+          const score = e.rawScore !== undefined ? `bm25 ${fmtScore(e.rawScore)}` : '';
+          const vec =
+            e.vectorDistance !== undefined
+              ? `cosine ${fmtScore(1 - e.vectorDistance)}`
+              : '';
+          const bits = [e.retriever, src, rank, score, vec].filter((s) => s.length > 0);
+          return bits.join(' · ');
+        });
+        whyPanel.innerHTML = lines
+          .map((l) => `<div class="sidetrack-deja-why-line">${l}</div>`)
+          .join('');
+        whyBtn.addEventListener('click', () => {
+          const open = whyBtn.getAttribute('aria-expanded') === 'true';
+          if (open) {
+            whyBtn.setAttribute('aria-expanded', 'false');
+            whyPanel.setAttribute('hidden', '');
+          } else {
+            whyBtn.setAttribute('aria-expanded', 'true');
+            whyPanel.removeAttribute('hidden');
+          }
+        });
+      }
+    }
     return row;
   };
 

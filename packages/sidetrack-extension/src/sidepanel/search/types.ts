@@ -13,7 +13,7 @@
 // the adapters are pure and unit-tested so the (browser-only) UI
 // migrations become thin mappers on top of this.
 
-export type SearchHitFacet = 'page' | 'chat' | 'thread' | 'similar';
+export type SearchHitFacet = 'page' | 'chat' | 'thread' | 'similar' | 'visited';
 
 export interface UnifiedSearchHit {
   readonly id: string;
@@ -28,7 +28,11 @@ export interface UnifiedSearchHit {
   readonly threadUrl?: string;
   readonly anchorNodeId?: string;
   readonly provider?: string;
-  readonly sourceKind?: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  readonly sourceKind?:
+    | 'page-content'
+    | 'chat-turn'
+    | 'semantic-recall-pool'
+    | 'timeline-visit';
   /** Cosine similarity (0–1), only on 'similar' (semantic) hits. */
   readonly similarity?: number;
 }
@@ -38,7 +42,11 @@ export interface UnifiedSearchHit {
 
 interface RecallHitLike {
   readonly id: string;
-  readonly sourceKind?: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  readonly sourceKind?:
+    | 'page-content'
+    | 'chat-turn'
+    | 'semantic-recall-pool'
+    | 'timeline-visit';
   readonly anchorNodeId?: string;
   readonly threadId?: string;
   readonly canonicalUrl?: string;
@@ -50,7 +58,7 @@ interface RecallHitLike {
   readonly sourceEvidence?: {
     readonly source: 'semantic_recall_pool';
     readonly similarity: number;
-    readonly via: 'cluster' | 'neighbor';
+    readonly via: 'cluster' | 'neighbor' | 'query-cosine';
   };
 }
 
@@ -91,7 +99,11 @@ const coalesceTitle = (
  * page) so the facet filter stays meaningful even for fuzzy hits.
  */
 export const searchFacetOf = (hit: {
-  readonly sourceKind?: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  readonly sourceKind?:
+    | 'page-content'
+    | 'chat-turn'
+    | 'semantic-recall-pool'
+    | 'timeline-visit';
   readonly threadId?: string;
   readonly canonicalUrl?: string;
 }): SearchHitFacet => {
@@ -99,6 +111,11 @@ export const searchFacetOf = (hit: {
   // exact text hit — its own facet so the user can see/filter it
   // apart from real page/chat matches.
   if (hit.sourceKind === 'semantic-recall-pool') return 'similar';
+  // P1 (2026-05-24): timeline-visit is title+URL evidence only —
+  // "we know you've been there". Own facet so it doesn't masquerade
+  // as a body-indexed page hit AND so the user can filter to "just
+  // things I visited" separately from full-text matches.
+  if (hit.sourceKind === 'timeline-visit') return 'visited';
   if (hit.sourceKind === 'page-content') return 'page';
   if (hit.sourceKind === 'chat-turn') return 'chat';
   if (hit.threadId !== undefined && hit.threadId.length > 0) return 'chat';

@@ -559,15 +559,32 @@ export const contentQuerySchema = z.object({
         ? // W4(b-lite): semantic-recall-pool is in the default set so
           // it expands query candidates by default; the runtime flag
           // SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL is the one-step off.
-          (['page-content', 'chat-turn', 'semantic-recall-pool'] as const)
+          // P1 (2026-05-24): timeline-visit added so visited pages
+          // with title-only evidence (no body extraction — e.g. HN
+          // item pages where Readability bails, Google SERPs, any
+          // URL the user only briefly visited) still surface in
+          // recall instead of being invisible.
+          ([
+            'page-content',
+            'chat-turn',
+            'semantic-recall-pool',
+            'timeline-visit',
+          ] as const)
         : value
             .split(',')
             .map((entry) => entry.trim())
             .filter(
-              (entry): entry is 'page-content' | 'chat-turn' | 'semantic-recall-pool' =>
+              (
+                entry,
+              ): entry is
+                | 'page-content'
+                | 'chat-turn'
+                | 'semantic-recall-pool'
+                | 'timeline-visit' =>
                 entry === 'page-content' ||
                 entry === 'chat-turn' ||
-                entry === 'semantic-recall-pool',
+                entry === 'semantic-recall-pool' ||
+                entry === 'timeline-visit',
             ),
     ),
   limit: z.coerce

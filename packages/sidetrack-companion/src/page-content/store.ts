@@ -580,7 +580,7 @@ export const queryPageContent = async (
   const out: ContentSearchHit[] = [];
   for (let i = 0; i < results.length && out.length < limit; i += 1) {
     const result = results[i]!;
-    const entry = index.idToEntry.get(result.id);
+    const entry = index.idToEntry.get(result.id as string);
     if (entry === undefined) continue;
     const { chunk, coverage, recordTitle } = entry;
     out.push({

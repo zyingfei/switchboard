@@ -136,14 +136,20 @@ export interface ContentSearchHitRankEvidence {
 
 export interface ContentSearchHit {
   readonly id: string;
-  readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
+  readonly sourceKind:
+    | 'page-content'
+    | 'chat-turn'
+    | 'semantic-recall-pool'
+    | 'timeline-visit';
   // W4(b-lite) — present only on 'semantic-recall-pool' hits: marks
   // the candidate as a semantic-recall expansion (NOT topic
-  // membership) with its evidence.
+  // membership) with its evidence. P0 (2026-05-24): expansion can now
+  // also be 'query-cosine' when the new query-anchored path produced
+  // it (vs the legacy anchor-anchored 'cluster' | 'neighbor').
   readonly sourceEvidence?: {
     readonly source: 'semantic_recall_pool';
     readonly similarity: number;
-    readonly via: 'cluster' | 'neighbor';
+    readonly via: 'cluster' | 'neighbor' | 'query-cosine';
   };
   // Unified Content Search v1 — only on primary RRF-fused hits
   // (page-content + chat-turn). semantic-recall-pool hits use

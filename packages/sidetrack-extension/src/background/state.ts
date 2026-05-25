@@ -59,6 +59,12 @@ const MCP_AUTO_DISPATCHED_KEY = 'sidetrack.mcpAutoDispatched';
 // to clipboard — which is the unredacted form. We record it on the
 // extension side at submit time and use it for substring matching.
 const DISPATCH_ORIGINALS_KEY = 'sidetrack.dispatchOriginals';
+// Per-dispatch recall breadcrumb — populated when the user fires an
+// "Ask AI" from a Déjà-vu selection. Lets the Recent dispatches row
+// render a "↩" pill that pivots back to Connections → Déjà-vu submode
+// with the same hit set the user was looking at. Local-only (the
+// companion never sees this; it's a UI breadcrumb, not vault data).
+const DISPATCH_RECALL_CONTEXTS_KEY = 'sidetrack.dispatchRecallContexts';
 // Per-thread "last dispatch target" — surfaces in the SendToDropdown
 // "Recent" section so the user can repeat their last dispatch with
 // one click. Map: threadId → SendToTarget id (string).
@@ -267,6 +273,30 @@ export const writeDispatchOriginal = async (dispatchId: string, body: string): P
   }
   await storageSet({
     [DISPATCH_ORIGINALS_KEY]: { ...current, [dispatchId]: body },
+  });
+};
+
+// Déjà-vu → Ask AI → dispatch breadcrumb. Same access pattern as
+// dispatchOriginals: tri-state Partial keyed by bac_id, absent
+// lookups return undefined. The stored shape is DispatchRecallContext
+// from messages.ts — kept as `unknown` here to avoid a circular import
+// (messages.ts is the cross-context type bus; state.ts is background-
+// only). The sidepanel narrows it back on read.
+export const readDispatchRecallContexts = async (): Promise<
+  Readonly<Partial<Record<string, unknown>>>
+> =>
+  await storageGet<Readonly<Partial<Record<string, unknown>>>>(
+    DISPATCH_RECALL_CONTEXTS_KEY,
+    {},
+  );
+
+export const writeDispatchRecallContext = async (
+  dispatchId: string,
+  context: unknown,
+): Promise<void> => {
+  const current = await readDispatchRecallContexts();
+  await storageSet({
+    [DISPATCH_RECALL_CONTEXTS_KEY]: { ...current, [dispatchId]: context },
   });
 };
 
@@ -1664,6 +1694,7 @@ export const buildWorkboardState = async (
     dispatchLinks: await readDispatchLinks(),
     dispatchDiagnostics: await readDispatchDiagnostics(),
     dispatchOriginals: await readDispatchOriginals(),
+    dispatchRecallContexts: await readDispatchRecallContexts(),
     lastDispatchTargetByThread: await readLastDispatchTargetByThread(),
     reviewDrafts: await readReviewDrafts(),
     queuedReviewDraftCount: (await readReviewDraftQueue()).length,
