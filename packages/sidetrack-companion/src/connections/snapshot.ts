@@ -4015,7 +4015,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // readCurrent memo, keyed on snapshotRevision. Without this, every
   // cold resolve repeats the ~17K JSON.parses to materialize the whole
   // snapshot; with it, sibling resolves within the same revision share
-  // a single bulk read. Invalidated when #writeCurrentRows commits.
+  // a single bulk read. Invalidated when any readCurrent-input writer
+  // commits (see #bumpWriteSeq).
   #cachedSnapshot: { readonly revision: string; readonly value: ConnectionsSnapshot } | null = null;
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
@@ -5240,8 +5241,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // between our reads. snapshotRevision alone isn't sufficient —
     // it's a content-hash of metadata-only fields, so two distinct
     // commits could produce the same revision. write_seq is bumped
-    // on every #writeCurrentRows commit and is the strict commit
-    // token.
+    // by #bumpWriteSeq from every transaction that mutates
+    // readCurrent inputs (#writeCurrentRows, replaceScopeRows,
+    // applyProjectionEventOverlay) and is the strict commit token.
     const preSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
     const preWriteSeq =
       preSeqRow === null || preSeqRow === undefined
