@@ -525,7 +525,51 @@ const fuseRrf = (
       }
     }
   }
-  return [...fused.values()].sort((a, b) => b.fusedScore - a.fusedScore);
+  const entityDeduped = [...fused.values()].sort((a, b) => b.fusedScore - a.fusedScore);
+  return collapseByLocationKey(entityDeduped);
+};
+
+/** Second-pass dedupe: candidates whose canonicalUrls map to the same
+ *  `locationKey` (e.g. `google.com/?zx=1`, `google.com/?zx=2`,
+ *  `google.com/?zx=3` — all just the Google homepage with a cache-
+ *  bust param) collapse into a single result. Without this the
+ *  semantic-pool path can fill the top-N with bouncy-URL noise
+ *  (every visit to a search engine root gets its own vector).
+ *
+ *  Strategy: group by locationKey; within a group keep the
+ *  highest-scoring candidate and merge evidence from the rest.
+ *  Candidates whose URL doesn't yield a locationKey (chat turns,
+ *  malformed URLs) pass through unchanged. */
+const collapseByLocationKey = (
+  candidates: readonly RecallCandidate[],
+): RecallCandidate[] => {
+  const byLoc = new Map<string, RecallCandidate>();
+  const noKey: RecallCandidate[] = [];
+  for (const c of candidates) {
+    const loc = locationKey(c.canonicalUrl);
+    if (loc === undefined) {
+      noKey.push(c);
+      continue;
+    }
+    const prev = byLoc.get(loc);
+    if (prev === undefined) {
+      byLoc.set(loc, c);
+      continue;
+    }
+    const winner = c.fusedScore > prev.fusedScore ? c : prev;
+    const loser = winner === c ? prev : c;
+    byLoc.set(loc, {
+      ...winner,
+      evidence: [...winner.evidence, ...loser.evidence],
+      // Surface the higher-quality title/snippet regardless of which
+      // candidate "won" on score.
+      ...(winner.title === undefined && loser.title !== undefined ? { title: loser.title } : {}),
+      ...(winner.snippet === undefined && loser.snippet !== undefined
+        ? { snippet: loser.snippet }
+        : {}),
+    });
+  }
+  return [...byLoc.values(), ...noKey].sort((a, b) => b.fusedScore - a.fusedScore);
 };
 
 /** Host + pathname location key (search-URL aware). Same logic as the
