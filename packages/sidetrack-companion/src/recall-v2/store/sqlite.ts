@@ -226,6 +226,35 @@ class SqliteRecallStore implements RecallStore {
       .run(key, value);
   }
 
+  allEntityIdsByKind(sourceKind: StoreSourceKind): ReadonlySet<string> {
+    const rows = this.db
+      .prepare('SELECT entity_id AS entityId FROM docs WHERE source_kind = ?')
+      .all<{ entityId: string }>(sourceKind);
+    return new Set(rows.map((r) => r.entityId));
+  }
+
+  deleteVector(entityId: string): void {
+    if (!this.vecAvailable) return;
+    try {
+      this.db.prepare('DELETE FROM docs_vec WHERE entity_id = ?').run(entityId);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[recall-v2] vec delete failed:', err);
+    }
+  }
+
+  allVectorEntityIds(): ReadonlySet<string> {
+    if (!this.vecAvailable) return new Set();
+    try {
+      const rows = this.db
+        .prepare('SELECT entity_id AS entityId FROM docs_vec')
+        .all<{ entityId: string }>();
+      return new Set(rows.map((r) => r.entityId));
+    } catch {
+      return new Set();
+    }
+  }
+
   documentCount(sourceKind?: StoreSourceKind): number {
     const row = (sourceKind === undefined
       ? this.countStmt.get()

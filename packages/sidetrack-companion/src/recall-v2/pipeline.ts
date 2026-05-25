@@ -114,7 +114,9 @@ const ensureFreshBackfill = async (
       `${String(stats.pageContent)} page-content, ` +
       `${String(stats.timelineVisit)} timeline-visit, ` +
       `${String(stats.chatTurn)} chat-turn, ` +
-      `${String(stats.vectors)} vectors${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
+      `${String(stats.vectors)} vectors` +
+      `${stats.deleted > 0 ? `, ${String(stats.deleted)} swept stale rows` : ''}` +
+      `${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
       `${stored === undefined ? ' (initial)' : ' (sources changed)'}`,
   );
 };

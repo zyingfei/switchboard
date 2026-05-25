@@ -70,11 +70,19 @@ const tsMs = (iso: string | undefined): number | undefined => {
 /** Backfill timeline-visit + page-content rows from page-evidence
  *  records. Every visited URL becomes a row; body_indexed=1 when the
  *  record carries content (Readability succeeded), else body-only row
- *  surfaces as a timeline-visit hit. */
+ *  surfaces as a timeline-visit hit. Sweeps stale rows whose source
+ *  JSON disappeared (Codex re-review F1 partial / F10). */
 const backfillFromPageEvidence = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<{ pageContent: number; timelineVisit: number }> => {
+): Promise<{ pageContent: number; timelineVisit: number; deleted: number }> => {
+  // Snapshot existing IDs for these two source kinds so we can sweep
+  // rows whose page-evidence record was deleted between backfills.
+  const existing = new Set<string>([
+    ...store.allEntityIdsByKind('page_content'),
+    ...store.allEntityIdsByKind('timeline_visit'),
+  ]);
+  const upserted = new Set<string>();
   const records = await listPageEvidenceRecords(vaultRoot);
   let pageContent = 0;
   let timelineVisit = 0;
@@ -116,10 +124,11 @@ const backfillFromPageEvidence = async (
         body = chunks.map((c) => c.text).join('\n\n');
       }
     }
+    const entityId = entityIdForUrl(url);
     if (body !== undefined) {
       store.upsertDocument({
         ...baseDoc,
-        entityId: entityIdForUrl(url),
+        entityId,
         sourceKind: 'page_content',
         body,
         ...(contentHash === undefined ? {} : { contentHash }),
@@ -129,28 +138,49 @@ const backfillFromPageEvidence = async (
     } else {
       store.upsertDocument({
         ...baseDoc,
-        entityId: entityIdForUrl(url),
+        entityId,
         sourceKind: 'timeline_visit',
         bodyIndexed: 0,
       });
       timelineVisit += 1;
     }
+    upserted.add(entityId);
+  }
+  // Sweep stale rows — entity_ids in `existing` but not `upserted`
+  // had their JSON source disappear (file removed, tombstoned, etc.).
+  let deleted = 0;
+  for (const id of existing) {
+    if (!upserted.has(id)) {
+      store.deleteDocument(id);
+      deleted += 1;
+    }
   }
   // Mark unused `root` var so the linter is happy (kept the join for
   // future expansion when we read chunks lazily).
   void root;
-  return { pageContent, timelineVisit };
+  return { pageContent, timelineVisit, deleted };
 };
 
 /** Backfill chat-turn rows from the recall index. Each turn becomes
- *  one document; body is the turn text. */
+ *  one document; body is the turn text. Sweeps stale chat rows whose
+ *  recall index entries were tombstoned / removed. */
 const backfillFromRecallIndex = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<number> => {
+): Promise<{ chatTurn: number; deleted: number }> => {
+  const existing = new Set<string>(store.allEntityIdsByKind('chat_turn'));
+  const upserted = new Set<string>();
   const indexPath = join(vaultRoot, '_BAC', 'recall', 'index.bin');
   const index = await readIndex(indexPath);
-  if (index === null || index.items.length === 0) return 0;
+  if (index === null || index.items.length === 0) {
+    // No chat-turn data at all → sweep everything previously stored.
+    let deleted = 0;
+    for (const id of existing) {
+      store.deleteDocument(id);
+      deleted += 1;
+    }
+    return { chatTurn: 0, deleted };
+  }
   let count = 0;
   for (const item of index.items) {
     if (item.tombstoned === true) continue;
@@ -159,8 +189,9 @@ const backfillFromRecallIndex = async (
     const text = meta.text;
     if (text === undefined || text.length === 0) continue;
     const capturedMs = tsMs(item.capturedAt);
+    const entityId = `chat:${item.id}`;
     store.upsertDocument({
-      entityId: `chat:${item.id}`,
+      entityId,
       sourceKind: 'chat_turn',
       ...(meta.threadUrl === undefined ? {} : { canonicalUrl: meta.threadUrl }),
       ...(meta.title === undefined ? {} : { title: meta.title }),
@@ -169,26 +200,48 @@ const backfillFromRecallIndex = async (
       ...(capturedMs === undefined ? {} : { firstSeenAtMs: capturedMs, lastSeenAtMs: capturedMs }),
       bodyIndexed: 1,
     });
+    upserted.add(entityId);
     count += 1;
   }
-  return count;
+  let deleted = 0;
+  for (const id of existing) {
+    if (!upserted.has(id)) {
+      store.deleteDocument(id);
+      deleted += 1;
+    }
+  }
+  return { chatTurn: count, deleted };
 };
 
 /** Backfill vectors from the existing JSON sidecar into docs_vec.
- *  Only writes when sqlite-vec is available; otherwise a no-op. */
+ *  Sweeps docs_vec rows whose source vectors were removed from the
+ *  JSON sidecar (Codex re-review N2). Only runs when sqlite-vec is
+ *  available; otherwise a no-op. */
 const backfillVectors = async (
   vaultRoot: string,
   store: RecallStore,
-): Promise<number> => {
-  if (!store.vectorBackendAvailable) return 0;
+): Promise<{ vectors: number; deleted: number }> => {
+  if (!store.vectorBackendAvailable) return { vectors: 0, deleted: 0 };
+  const existing = store.allVectorEntityIds();
+  const upserted = new Set<string>();
   const vectors = await readSemanticRecallVectorStore(vaultRoot, MODEL_ID);
-  if (vectors === null || vectors.size === 0) return 0;
   let n = 0;
-  for (const [url, vec] of vectors) {
-    store.upsertVector(entityIdForUrl(url), vec);
-    n += 1;
+  if (vectors !== null) {
+    for (const [url, vec] of vectors) {
+      const entityId = entityIdForUrl(url);
+      store.upsertVector(entityId, vec);
+      upserted.add(entityId);
+      n += 1;
+    }
   }
-  return n;
+  let deleted = 0;
+  for (const id of existing) {
+    if (!upserted.has(id)) {
+      store.deleteVector(id);
+      deleted += 1;
+    }
+  }
+  return { vectors: n, deleted };
 };
 
 export const backfillRecallStore = async (
@@ -199,15 +252,17 @@ export const backfillRecallStore = async (
   readonly timelineVisit: number;
   readonly chatTurn: number;
   readonly vectors: number;
+  readonly deleted: number;
 }> => {
   const evidence = await backfillFromPageEvidence(vaultRoot, store);
-  const chatTurn = await backfillFromRecallIndex(vaultRoot, store);
-  const vectors = await backfillVectors(vaultRoot, store);
+  const chat = await backfillFromRecallIndex(vaultRoot, store);
+  const vec = await backfillVectors(vaultRoot, store);
   return {
     pageContent: evidence.pageContent,
     timelineVisit: evidence.timelineVisit,
-    chatTurn,
-    vectors,
+    chatTurn: chat.chatTurn,
+    vectors: vec.vectors,
+    deleted: evidence.deleted + chat.deleted + vec.deleted,
   };
 };
 

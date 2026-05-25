@@ -619,7 +619,16 @@ const recallV2FiltersSchema = z
 
 export const recallV2RequestSchema = z
   .object({
-    q: z.string().min(1).max(8192),
+    // .refine catches whitespace-only `q` ("   "). Pre-Zod we did
+    // `q.trim().length === 0`; preserving that semantic so the 400
+    // surface is identical.
+    q: z
+      .string()
+      .min(1)
+      .max(8192)
+      .refine((s) => s.trim().length > 0, {
+        message: 'q must contain at least one non-whitespace character',
+      }),
     limit: z.number().int().positive().max(50).optional(),
     perSourceLimit: z.number().int().positive().max(50).optional(),
     sources: z.array(recallV2SourceKindSchema).max(8).optional(),

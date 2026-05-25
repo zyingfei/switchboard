@@ -67,6 +67,20 @@ export interface RecallStore {
   /** Delete by entityId. No-op if missing. */
   deleteDocument(entityId: string): void;
 
+  /** Enumerate every entity_id currently stored for `sourceKind`. Used
+   *  by the backfill deletion sweep — backfill snapshots this set,
+   *  upserts every record in JSON, then deletes entityIds in the
+   *  snapshot but not in the upsert set (rows whose source files
+   *  disappeared). Returned as a Set so the diff is cheap. */
+  allEntityIdsByKind(sourceKind: StoreSourceKind): ReadonlySet<string>;
+
+  /** Delete the entity_id from docs_vec (no-op when vec disabled).
+   *  Used by the deletion sweep for vectors. */
+  deleteVector(entityId: string): void;
+
+  /** Enumerate every entity_id currently in docs_vec. */
+  allVectorEntityIds(): ReadonlySet<string>;
+
   /** Read a stored metadata value. Used by the freshness check —
    *  `getRecallMetadata('source_signature')` returns the signature of
    *  the JSON sources captured at last backfill. */
