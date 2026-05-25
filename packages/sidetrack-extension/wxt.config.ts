@@ -106,6 +106,22 @@ export default defineConfig({
       'http://localhost/*',
     ],
     optional_host_permissions: ['https://*/*', 'http://*/*'],
+    // Allow WebAssembly compile/instantiate in extension pages so the
+    // local-recall OPFS-SQLite fallback (sqlite-wasm) can load in the
+    // background service worker. Without this, MV3's default CSP
+    // (`script-src 'self'`) blocks WASM with:
+    //   "Compiling or instantiating WebAssembly module violates the
+    //    following Content Security policy directive because neither
+    //    'wasm-eval' nor 'unsafe-eval' is an allowed source of script
+    //    in the following Content Security Policy directive."
+    // `wasm-unsafe-eval` is the MV3-approved keyword (per the Chrome
+    // extension CSP allowlist) — narrower than `unsafe-eval`. The
+    // WASM blob is bundled in our extension (sqlite-wasm package),
+    // not pulled remotely, so the risk surface is what we already ship.
+    content_security_policy: {
+      extension_pages:
+        "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';",
+    },
     action: {
       default_title: 'Sidetrack',
     },
