@@ -5164,47 +5164,93 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   };
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
+    // Retry loop for the rare write-interleave: if the writer commits
+    // a new snapshot revision between our metadata-read and the final
+    // page, we restart. In steady state this never fires (one writer,
+    // single reader); during a heavy drain it might retry once.
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+      const result = await this.#readCurrentAttempt();
+      if (result !== 'stale') return result;
+    }
+    // After max attempts, fall back to the "honest stale" read: take
+    // whatever the latest committed metadata says, accept mild
+    // inconsistency in flight. No worse than the pre-paged version.
+    const fallback = await this.#readCurrentAttempt(true);
+    // acceptStale=true never returns the 'stale' sentinel.
+    return fallback === 'stale' ? null : fallback;
+  };
+
+  /** One attempt at reading the current snapshot.
+   *
+   *  Returns:
+   *  - `null` if metadata is missing (no snapshot yet)
+   *  - the snapshot value on success
+   *  - the sentinel `'stale'` if the snapshot_revision changed between
+   *    our pre-read metadata and the post-read re-check. Caller
+   *    retries.
+   *
+   *  When `acceptStale` is true, skips the revision re-check and
+   *  returns whatever was read (used as the final-attempt fallback).
+   *
+   *  Per Codex review 2026-05-25: a writer can commit between the
+   *  paged reads, so a single response could otherwise mix two
+   *  snapshot revisions. We can't use a long-held read transaction
+   *  (BEGIN DEFERRED with awaits would hold a SHARED lock across
+   *  event-loop turns — bad). Instead, validate the revision didn't
+   *  change pre-vs-post. Paged reads are sub-100ms each, so the
+   *  window for a writer to slip in is tiny. */
+  #readCurrentAttempt = async (
+    acceptStale = false,
+  ): Promise<ConnectionsSnapshot | null | 'stale'> => {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
     const revisionKey = metadata.snapshotRevision ?? '';
     const cached = this.#cachedSnapshot;
     if (cached !== null && cached.revision === revisionKey) return cached.value;
-    // Paged reads: pull rows in LIMIT/OFFSET chunks instead of one
-    // huge .all() that allocates the entire result before any work
-    // can start. Combined with the per-chunk parse loop + setImmediate
-    // yield, neither the SQL read nor the JSON.parse fan-out can
-    // single-tick the event loop. Codex review 2026-05-25 flagged
-    // the prior version as partial chunking — `.all()` alone could
-    // contribute hundreds of ms on a 12k-row edge table.
-    const PAGE_SIZE = 500;
+    // Edge rows store JSON ARRAYS (one row contains many edges), so a
+    // page size that's OK for nodes can be expensive in edge parsing.
+    // Use a smaller page for edges; both are well under the runtime's
+    // 250ms `[api.stall]` threshold per chunk.
+    const NODE_PAGE_SIZE = 500;
+    const EDGE_PAGE_SIZE = 200;
     const yieldToLoop = (): Promise<void> =>
       new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
     const nodesById = new Map<string, ConnectionNode>();
     const nodePageStmt = db.query('SELECT data FROM nodes ORDER BY id LIMIT ? OFFSET ?');
-    for (let offset = 0; ; offset += PAGE_SIZE) {
-      const page = nodePageStmt.all(PAGE_SIZE, offset);
+    for (let offset = 0; ; offset += NODE_PAGE_SIZE) {
+      const page = nodePageStmt.all(NODE_PAGE_SIZE, offset);
       if (page.length === 0) break;
       for (const row of page) {
         const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
         nodesById.set(node.id, node);
       }
-      if (page.length < PAGE_SIZE) break;
+      if (page.length < NODE_PAGE_SIZE) break;
       await yieldToLoop();
     }
     const edgeById = new Map<string, ConnectionEdge>();
     const edgePageStmt = db.query('SELECT data FROM edges ORDER BY src, dst LIMIT ? OFFSET ?');
-    for (let offset = 0; ; offset += PAGE_SIZE) {
-      const page = edgePageStmt.all(PAGE_SIZE, offset);
+    for (let offset = 0; ; offset += EDGE_PAGE_SIZE) {
+      const page = edgePageStmt.all(EDGE_PAGE_SIZE, offset);
       if (page.length === 0) break;
       for (const row of page) {
         const arr = JSON.parse(textField(row, 'data')) as ConnectionEdge[];
         for (const edge of arr) edgeById.set(edge.id, edge);
       }
-      if (page.length < PAGE_SIZE) break;
+      if (page.length < EDGE_PAGE_SIZE) break;
       await yieldToLoop();
+    }
+    // H6 revision consistency check: did a writer commit a new
+    // snapshot between our metadata-read and the post-edge-page point?
+    // If so, the paged data may mix two revisions — bail out and let
+    // the caller retry.
+    if (!acceptStale) {
+      const post = await this.#readMetadata(db);
+      const postRevision = post?.snapshotRevision ?? '';
+      if (postRevision !== revisionKey) return 'stale';
     }
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
@@ -5216,14 +5262,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       edgeOrderRow === null || edgeOrderRow === undefined
         ? [...edgeById.keys()].sort()
         : (JSON.parse(textField(edgeOrderRow, 'data')) as string[]);
-    const nodes = nodeOrder.flatMap((id) => {
-      const node = nodesById.get(id);
-      return node === undefined ? [] : [node];
-    });
-    const edges = edgeOrder.flatMap((id) => {
-      const edge = edgeById.get(id);
-      return edge === undefined ? [] : [edge];
-    });
+    // H7: chunk the tail materialization too — node_order can be 5k+,
+    // edge_order can be 12k+, each .flatMap was a single sync pass.
+    const TAIL_CHUNK = 1000;
+    const nodes: ConnectionNode[] = [];
+    for (let i = 0; i < nodeOrder.length; i += TAIL_CHUNK) {
+      const slice = nodeOrder.slice(i, i + TAIL_CHUNK);
+      for (const id of slice) {
+        const node = nodesById.get(id);
+        if (node !== undefined) nodes.push(node);
+      }
+      if (i + TAIL_CHUNK < nodeOrder.length) await yieldToLoop();
+    }
+    const edges: ConnectionEdge[] = [];
+    for (let i = 0; i < edgeOrder.length; i += TAIL_CHUNK) {
+      const slice = edgeOrder.slice(i, i + TAIL_CHUNK);
+      for (const id of slice) {
+        const edge = edgeById.get(id);
+        if (edge !== undefined) edges.push(edge);
+      }
+      if (i + TAIL_CHUNK < edgeOrder.length) await yieldToLoop();
+    }
     const result = snapshotFromParts(metadata, nodes, edges);
     this.#cachedSnapshot = { revision: revisionKey, value: result };
     return result;
