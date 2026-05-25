@@ -4433,6 +4433,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.query(
         'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       ).run('current', JSON.stringify(nextMetadata));
+      // H6: applyProjectionEventOverlay mutates metadata.current —
+      // bump the commit token so readCurrent's pre/post check sees
+      // this commit.
+      this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#cachedSnapshot = null;
       return snapshotRevision;
@@ -4807,6 +4811,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         ...baseProgress,
         snapshotRevisionId: snapshotRevision,
       });
+      // H6: replaceScopeRows mutates nodes/edges/current/node_order/
+      // edge_order — all inputs to readCurrent. Bump the commit
+      // token so the pre/post check fires.
+      this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#cachedSnapshot = null;
     } catch (error) {
@@ -4814,6 +4822,21 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       throw error;
     }
   };
+
+  /** Monotonic commit token used by `readCurrent`'s pre/post check.
+   *  Bump from INSIDE every transaction that mutates any of the rows
+   *  `readCurrent` consumes (nodes, edges, metadata.current,
+   *  metadata.node_order, metadata.edge_order). Centralized so adding
+   *  a new writer can't accidentally bypass the consistency check —
+   *  caller just invokes this right before COMMIT. */
+  #bumpWriteSeq(db: SqliteDatabase): void {
+    const row = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+    const prev =
+      row === null || row === undefined ? 0 : Number.parseInt(textField(row, 'data'), 10) || 0;
+    db.query(
+      'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+    ).run('write_seq', String(prev + 1));
+  }
 
   async #bootstrapScopeMembership(snapshot: ConnectionsSnapshot): Promise<void> {
     const scopes = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
@@ -5012,18 +5035,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
-      // H6 (2026-05-25): bump a monotonic write_seq counter on every
-      // commit. readCurrent reads this pre and post-reconstruction
-      // to detect a writer that committed between paged reads —
-      // snapshotRevision is a hash of updatedAt+counts only, not
-      // strong enough on its own (per Codex review). write_seq is
-      // an unconditional commit token.
-      const prevSeqRow = selectMetadata.get('write_seq');
-      const prevSeq =
-        prevSeqRow === null || prevSeqRow === undefined
-          ? 0
-          : Number.parseInt(textField(prevSeqRow, 'data'), 10) || 0;
-      upsertMetadata.run('write_seq', String(prevSeq + 1));
+      // H6: writeCurrentRows mutates nodes/edges/current/node_order/
+      // edge_order — all readCurrent inputs. Bump the commit token.
+      this.#bumpWriteSeq(db);
       if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
