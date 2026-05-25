@@ -891,19 +891,42 @@ const readThreadSuggestionTarget = async (
   return { threadId: requestedThreadId };
 };
 
+// Loose URL-shape check: rejects strings that won't parse as a URL
+// before we hand them to `canonicalizePageUrl` (which throws). The
+// concrete defect that surfaced this in dogfood: some materializer
+// path emitted `timeline-visit` nodes whose id was the visit instance
+// id (`timeline-visit:visit_<ts>_<hash>`) with no `metadata.canonicalUrl`,
+// so the existing "slice off the prefix" fallback returned the visit
+// id itself — which `new URL(...)` rejects with ERR_INVALID_URL,
+// 500-ing the whole /v1/connections endpoint.
+const looksLikeUrl = (s: string): boolean => {
+  if (s.length === 0) return false;
+  // Require a scheme separator. Everything we actually want here
+  // (http, https, chrome-extension, file, about, moz-extension, …)
+  // has `://` or `:`; `visit_<ts>_<hash>` has neither.
+  return s.includes('://') || /^[a-z][a-z0-9+.-]*:/i.test(s);
+};
+
+const deriveTimelineVisitUrl = (node: {
+  readonly id: string;
+  readonly metadata: { readonly canonicalUrl?: unknown };
+}): string | undefined => {
+  const fromMeta = node.metadata.canonicalUrl;
+  if (typeof fromMeta === 'string' && looksLikeUrl(fromMeta)) return fromMeta;
+  if (node.id.startsWith('timeline-visit:')) {
+    const sliced = node.id.slice('timeline-visit:'.length);
+    if (looksLikeUrl(sliced)) return sliced;
+  }
+  return undefined;
+};
+
 const applyPageContentCoverageToSnapshot = async (
   vaultRoot: string,
   snapshot: import('../connections/snapshot.js').ConnectionsSnapshot,
 ): Promise<import('../connections/snapshot.js').ConnectionsSnapshot> => {
   const timelineUrls = snapshot.nodes
     .filter((node) => node.kind === 'timeline-visit')
-    .map((node) =>
-      typeof node.metadata.canonicalUrl === 'string'
-        ? node.metadata.canonicalUrl
-        : node.id.startsWith('timeline-visit:')
-          ? node.id.slice('timeline-visit:'.length)
-          : '',
-    )
+    .map((node) => deriveTimelineVisitUrl(node) ?? '')
     .filter((url) => url.length > 0);
   if (timelineUrls.length === 0) return snapshot;
   const coverageByUrl = await readPageContentCoverageMap(vaultRoot, timelineUrls);
@@ -911,12 +934,7 @@ const applyPageContentCoverageToSnapshot = async (
     ...snapshot,
     nodes: snapshot.nodes.map((node) => {
       if (node.kind !== 'timeline-visit') return node;
-      const canonicalUrl =
-        typeof node.metadata.canonicalUrl === 'string'
-          ? node.metadata.canonicalUrl
-          : node.id.startsWith('timeline-visit:')
-            ? node.id.slice('timeline-visit:'.length)
-            : undefined;
+      const canonicalUrl = deriveTimelineVisitUrl(node);
       if (canonicalUrl === undefined) return node;
       const coverage = coverageByUrl.get(canonicalizePageUrl(canonicalUrl));
       if (coverage === undefined) return node;
@@ -7517,6 +7535,10 @@ export const handleRequest = async (
                 : 500
               : 400);
     const detail = error instanceof Error ? error.message : undefined;
+    if (status === 500 && error instanceof Error) {
+      // eslint-disable-next-line no-console
+      console.error(`[http-500] ${method} ${url.pathname}${url.search} req=${requestId}`, error);
+    }
     sendJson(
       response,
       status,
