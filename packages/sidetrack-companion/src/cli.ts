@@ -7,8 +7,13 @@
 // (notably connections/snapshot.ts) open Database against Bun's
 // bundled SQLite and lock the global handle — setCustomSQLite then
 // fails with "SQLite already loaded".
-import { installCustomSqlite } from './recall-v2/store/setup-sqlite.js';
-installCustomSqlite();
+//
+// The setup-sqlite module performs the install as a SIDE EFFECT at
+// module evaluation time, so simply importing it (and importing it
+// FIRST in document order) is sufficient — no manual call needed.
+// ESM imports evaluate depth-first in declared order, so the setup
+// runs before any other import body in this file.
+import './recall-v2/store/setup-sqlite.js';
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';

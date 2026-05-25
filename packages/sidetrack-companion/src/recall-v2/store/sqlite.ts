@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS docs (
 CREATE INDEX IF NOT EXISTS docs_source ON docs(source_kind);
 CREATE INDEX IF NOT EXISTS docs_last_seen ON docs(last_seen_at);
 
+-- Tracks freshness signatures for the backfill staleness check.
+-- See pipeline.ts:getOrOpenStore — backfill re-runs if the source-
+-- of-truth signature differs from the stored one.
+CREATE TABLE IF NOT EXISTS recall_metadata (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
   title, body, url_tokens, host,
   content='docs', content_rowid='rowid',
@@ -200,6 +208,22 @@ class SqliteRecallStore implements RecallStore {
 
   deleteDocument(entityId: string): void {
     this.deleteStmt.run(entityId);
+  }
+
+  getRecallMetadata(key: string): string | undefined {
+    const row = this.db
+      .prepare('SELECT value FROM recall_metadata WHERE key = ?')
+      .get<{ value: string }>(key);
+    return row?.value;
+  }
+
+  setRecallMetadata(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO recall_metadata (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
   }
 
   documentCount(sourceKind?: StoreSourceKind): number {

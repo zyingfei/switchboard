@@ -4,10 +4,18 @@
 // Top 5 must include at least 3 distinct sourceKinds.
 //
 // `assertions.skipRecallChecks: true` — this fixture tests the
-// source-diversity axis, NOT recall. The mustInclude list is a
-// representative-doc-per-source sample, not an exhaustive correct
-// answer set. R@5/MRR/nDCG are reported but not gated. The
-// `minSourceDiversity` assertion IS the real gate (INVARIANT).
+// source-diversity axis, NOT recall. R@5/MRR/nDCG are reported but
+// not gated; `minSourceDiversity` IS the real assertion.
+//
+// CURRENT STATE (2026-05-24): xfail tracked as
+// `recall-v2-source-diversity-quota`. Today's pipeline favors the
+// source with the most candidates — with 40 page-content matches all
+// scoring high lexically, page-content fills top 5 and the other
+// sources are pushed out (sourceDiv@5 = 1). Lifting the xfail
+// requires source-weighted RRF or a per-source minimum quota in
+// fusion.ts. This fixture is intentional quality debt, not a
+// passing-by-accident bug; the xfail mechanism makes the regression
+// visible in the eval report instead of silently zeroing out.
 
 import type { Fixture } from '../harness.js';
 

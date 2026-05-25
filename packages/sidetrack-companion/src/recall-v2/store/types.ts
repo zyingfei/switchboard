@@ -67,6 +67,12 @@ export interface RecallStore {
   /** Delete by entityId. No-op if missing. */
   deleteDocument(entityId: string): void;
 
+  /** Read a stored metadata value. Used by the freshness check —
+   *  `getRecallMetadata('source_signature')` returns the signature of
+   *  the JSON sources captured at last backfill. */
+  getRecallMetadata(key: string): string | undefined;
+  setRecallMetadata(key: string, value: string): void;
+
   /** Upsert a vector for an existing entity. No-op if the entity row
    *  doesn't exist (vectors are derived; the parent doc rules). */
   upsertVector(entityId: string, vec: Float32Array): void;

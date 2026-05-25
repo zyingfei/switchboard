@@ -347,6 +347,7 @@ import {
   recallIndexSchema,
   recallGcSchema,
   recallQuerySchema,
+  recallV2RequestSchema,
   contentQuerySchema,
   pageContentCoverageQuerySchema,
   pageContentExtractedSchema,
@@ -5805,23 +5806,22 @@ const routes: readonly RouteDefinition[] = [
     handle: async (request, _requestId, _match, context) => {
       const vaultRoot = requireVaultRoot(context);
       const body = (await readBody(request)) as unknown;
-      // Minimal validation — we accept extra fields and trust the
-      // type contract on hot path. A future hardening pass adds
-      // zod schema parsing if drift becomes a real concern.
-      if (
-        typeof body !== 'object' ||
-        body === null ||
-        typeof (body as { q?: unknown }).q !== 'string' ||
-        ((body as { q: string }).q).trim().length === 0
-      ) {
+      const parsed = recallV2RequestSchema.safeParse(body);
+      if (!parsed.success) {
+        // Surface the first Zod issue path so callers can see WHICH
+        // field is wrong without dumping the full ZodError. Keeps the
+        // error shape consistent with the rest of the v1 API.
+        const first = parsed.error.issues[0];
+        const path = first?.path.join('.') ?? 'body';
+        const message = first?.message ?? 'invalid request body';
         throw new HttpRouteError(
           400,
-          'MISSING_PARAMETER',
-          'q query parameter is required and must be non-empty.',
-          'POST /v2/recall requires { "q": string }.',
+          first === undefined ? 'INVALID_REQUEST' : 'INVALID_FIELD',
+          `${path}: ${message}`,
+          'POST /v2/recall body failed schema validation.',
         );
       }
-      const req = body as import('../recall-v2/types.js').RecallRequest;
+      const req = parsed.data as import('../recall-v2/types.js').RecallRequest;
       // P1 — pass embedder lifecycle state so the pipeline can
       // degrade gracefully when the model is still warming up. Same
       // status the /v1/status endpoint exposes.

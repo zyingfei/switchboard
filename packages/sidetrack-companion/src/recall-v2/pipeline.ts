@@ -31,7 +31,12 @@ import { embed, MODEL_ID } from '../recall/embedder.js';
 import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
-import { backfillRecallStore, recallStoreIsEmpty } from './store/backfill.js';
+import {
+  backfillRecallStore,
+  computeSourceSignature,
+  recallStoreIsEmpty,
+  SOURCE_SIGNATURE_KEY,
+} from './store/backfill.js';
 import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
 import { logShadowDiff, shadowQueryEnabled, shadowVariantsFromEnv } from './shadow.js';
@@ -81,24 +86,37 @@ export interface PipelineDeps {
 const storeCache = new Map<string, Promise<RecallStore>>();
 
 const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
-  let promise = storeCache.get(vaultRoot);
-  if (promise !== undefined) return promise;
-  promise = (async () => {
-    const store = openSqliteRecallStore(vaultRoot);
-    if (recallStoreIsEmpty(store)) {
-      const stats = await backfillRecallStore(vaultRoot, store);
-      console.warn(
-        `[recall-v2] SQLite store backfilled from JSON sources: ` +
-          `${String(stats.pageContent)} page-content, ` +
-          `${String(stats.timelineVisit)} timeline-visit, ` +
-          `${String(stats.chatTurn)} chat-turn, ` +
-          `${String(stats.vectors)} vectors${store.vectorBackendAvailable ? '' : ' (vec disabled)'}`,
-      );
-    }
-    return store;
-  })();
-  storeCache.set(vaultRoot, promise);
-  return promise;
+  let openPromise = storeCache.get(vaultRoot);
+  if (openPromise === undefined) {
+    openPromise = (async () => openSqliteRecallStore(vaultRoot))();
+    storeCache.set(vaultRoot, openPromise);
+  }
+  const store = await openPromise;
+  await ensureFreshBackfill(vaultRoot, store);
+  return store;
+};
+
+/** Re-runs backfill when source JSON files are newer than the last
+ *  recorded signature. Cheap (4-5 dir stats); the actual rebuild only
+ *  fires when sources changed. Catches: new visits, new chat turns,
+ *  new page-content extractions, new vectors. */
+const ensureFreshBackfill = async (
+  vaultRoot: string,
+  store: RecallStore,
+): Promise<void> => {
+  const currentSig = await computeSourceSignature(vaultRoot);
+  const stored = store.getRecallMetadata(SOURCE_SIGNATURE_KEY);
+  if (stored === currentSig && !recallStoreIsEmpty(store)) return;
+  const stats = await backfillRecallStore(vaultRoot, store);
+  store.setRecallMetadata(SOURCE_SIGNATURE_KEY, currentSig);
+  console.warn(
+    `[recall-v2] SQLite store backfilled from JSON sources: ` +
+      `${String(stats.pageContent)} page-content, ` +
+      `${String(stats.timelineVisit)} timeline-visit, ` +
+      `${String(stats.chatTurn)} chat-turn, ` +
+      `${String(stats.vectors)} vectors${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
+      `${stored === undefined ? ' (initial)' : ' (sources changed)'}`,
+  );
 };
 
 const hashEntity = (input: string): string =>
@@ -388,7 +406,11 @@ const generateSemanticQuery = async (
     SEMANTIC_ABSOLUTE_MIN_COSINE,
     SEMANTIC_RELATIVE_FRACTION * topCosine,
   );
-  const hits = rawHits.filter((h) => h.cosine >= dynamicFloor);
+  // Cosine filter is INSIDE the fan-out; cap to `limit` AFTER filtering
+  // so we honor the per-source contract. The vec query overfetches
+  // (limit*2) to absorb exclusions + low-cosine drops without
+  // shrinking the final pool below `limit`.
+  const hits = rawHits.filter((h) => h.cosine >= dynamicFloor).slice(0, limit);
   const candidates: RecallCandidate[] = hits.map((h, i) => ({
     candidateId: `semantic-query:${h.canonicalUrl}`,
     entityId: h.entityId ?? entityIdFor({ canonicalUrl: h.canonicalUrl }),

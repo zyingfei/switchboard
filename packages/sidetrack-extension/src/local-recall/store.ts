@@ -96,7 +96,12 @@ class OpfsSqliteStore implements LocalRecallStore {
 
   private async getDb(): Promise<unknown> {
     if (this.dbPromise === null) {
-      this.dbPromise = (async () => {
+      // Capture the in-flight promise so we can clear `dbPromise` on
+      // failure — without this, a transient OPFS init error (often
+      // happens during SW cold-start when storage handles are slow to
+      // arrive) would cache a rejected promise forever and brick the
+      // local-recall fallback for the SW's lifetime.
+      const inFlight = (async () => {
         // Dynamic import keeps the WASM payload off SW cold start.
         const sqlite3InitModule = (await import(
           '@sqlite.org/sqlite-wasm'
@@ -127,6 +132,13 @@ class OpfsSqliteStore implements LocalRecallStore {
         (db as SqliteDb).exec(SCHEMA);
         return db;
       })();
+      this.dbPromise = inFlight.catch((err: unknown) => {
+        // Reset so the next call retries instead of replaying the
+        // rejected promise; rethrow so this awaiter still sees the
+        // original failure.
+        this.dbPromise = null;
+        throw err;
+      });
     }
     return this.dbPromise;
   }

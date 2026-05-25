@@ -7,7 +7,7 @@
 // JSON at any time. This is the same pattern as today's in-memory
 // MiniSearch indexes, just durable.
 
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -17,7 +17,6 @@ import {
   readSemanticRecallVectorStore,
 } from '../../recall/semanticRecallPool.js';
 import { MODEL_ID } from '../../recall/embedder.js';
-import { createHash as _ } from 'node:crypto';
 import type { RecallStore, StoreDocument } from './types.js';
 
 // Local readJson — page-content/store.ts has the same shape internally
@@ -216,4 +215,42 @@ export const backfillRecallStore = async (
  *  warm starts. */
 export const recallStoreIsEmpty = (store: RecallStore): boolean =>
   store.documentCount() === 0;
+
+/** Source-of-truth freshness signature.
+ *
+ *  Returns a stable string derived from the mtimes + entry counts of
+ *  the four JSON source directories that feed `backfillRecallStore`.
+ *  When ANY of them changes (new file, removed file, content rewrite
+ *  that bumps the parent dir mtime), the signature shifts and the
+ *  caller re-runs backfill.
+ *
+ *  Cheaper than a full hash of every JSON file: 4 dir stats + an
+ *  optional dirent count on the larger ones. Trade-off: same-file
+ *  content edits that don't bump the parent mtime won't be detected;
+ *  in practice the page-content + page-evidence writers atomic-write
+ *  via rename, which DOES bump the parent dir mtime. */
+export const computeSourceSignature = async (vaultRoot: string): Promise<string> => {
+  const targets: readonly string[] = [
+    join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
+    join(vaultRoot, '_BAC', 'page-content', 'by-url'),
+    join(vaultRoot, '_BAC', 'page-content', 'chunks'),
+    join(vaultRoot, '_BAC', 'recall'),
+    join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json'),
+  ];
+  const parts: string[] = [];
+  for (const path of targets) {
+    try {
+      const s = await stat(path);
+      // mtimeMs has ~ms precision on macOS/Linux — sufficient for the
+      // staleness check at /v2/recall granularity (typed-into-query
+      // gaps are seconds at minimum).
+      parts.push(`${path}:${String(Math.trunc(s.mtimeMs))}:${String(s.size)}`);
+    } catch {
+      parts.push(`${path}:absent`);
+    }
+  }
+  return createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 32);
+};
+
+export const SOURCE_SIGNATURE_KEY = 'source_signature_v1';
 

@@ -4,8 +4,20 @@
 // handle on first use and refuses subsequent setCustomSQLite calls
 // with "SQLite already loaded".
 //
-// Imported FIRST from cli.ts so the call lands before
-// connections/snapshot.ts or any other module touches Database.
+// IMPORTANT — module side effect:
+//   The setCustomSQLite call runs at MODULE EVALUATION time, not on a
+//   manual `installCustomSqlite()` call from cli.ts. ESM hoists all
+//   `import` declarations above the importing module's body, so a
+//   "call this after import" pattern is racy — any other static
+//   import in cli.ts that transitively touches bun:sqlite could
+//   construct a Database BEFORE the call.
+//
+//   The fix: do the work as a side effect during this module's own
+//   evaluation, then `cli.ts` just needs to import this module FIRST
+//   (depth-first import resolution evaluates the imported module
+//   completely before moving to the next import in the same
+//   document). The exported `installCustomSqlite` is now a no-op
+//   kept for backwards compatibility + manual re-probing in tests.
 
 import { existsSync } from 'node:fs';
 
@@ -26,7 +38,11 @@ const detectCustomSqlitePath = (): string | null => {
   return null;
 };
 
-export const installCustomSqlite = (): void => {
+let installed = false;
+
+const doInstall = (): void => {
+  if (installed) return;
+  installed = true;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('bun:sqlite') as {
@@ -42,4 +58,16 @@ export const installCustomSqlite = (): void => {
     // bun:sqlite unavailable (Node runtime) — silently skip.
     void err;
   }
+};
+
+// Side effect: run on module evaluation so import order alone is
+// sufficient to guarantee setCustomSQLite fires before any other
+// import in cli.ts evaluates Database. Do NOT remove this call.
+doInstall();
+
+/** Kept for callers that want to retry installation explicitly (tests).
+ *  Idempotent — bun:sqlite only honors setCustomSQLite once per
+ *  process. */
+export const installCustomSqlite = (): void => {
+  doInstall();
 };

@@ -7,29 +7,36 @@ let extensionProbe: boolean | null = null;
 
 const probeExtensionsSupported = (): boolean => {
   if (extensionProbe !== null) return extensionProbe;
+  let db: import('bun:sqlite').Database | null = null;
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('bun:sqlite') as typeof import('bun:sqlite');
-    const db = new mod.Database(':memory:');
+    db = new mod.Database(':memory:');
     // sqlite-vec ships a helper that calls loadExtension internally.
     // Use it as the probe so a "yes" here means we can actually load
     // vec, not just that the C API is exposed.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const vec = require('sqlite-vec') as { load?: (db: unknown) => void };
     if (typeof vec.load !== 'function') {
-      db.close();
       extensionProbe = false;
       return false;
     }
     // vec.load() invokes db.loadExtension internally; succeeds only
     // when Bun was pointed at a system libsqlite3 with extensions on.
     vec.load(db);
-    db.close();
     extensionProbe = true;
     return true;
   } catch {
     extensionProbe = false;
     return false;
+  } finally {
+    // Always close the probe db — without this a failed `vec.load`
+    // would leak the :memory: handle for the process lifetime.
+    try {
+      db?.close();
+    } catch {
+      // best-effort; closing an already-broken handle can throw.
+    }
   }
 };
 

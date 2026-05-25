@@ -1080,15 +1080,20 @@ export default defineContentScript({
               }[];
             }
           | { readonly ok: false; readonly error?: string }
+          | null
           | undefined;
-        if (v2 === undefined || v2.ok !== true) {
+        // Use == null so we accept both `undefined` (no SW response) and
+        // `null` (background's local-fallback short-circuit when there
+        // are no hits / empty query). Without this, `v2.ok` would
+        // TypeError on null.
+        if (v2 == null || v2.ok !== true) {
           console.warn(
             '[sidetrack] déjà-vu: /v2/recall failed',
-            v2 && 'error' in v2 ? v2.error : 'unknown',
+            v2 != null && 'error' in v2 ? v2.error : 'unknown',
           );
           if (!force) return;
         }
-        const results = v2 !== undefined && v2.ok === true ? v2.results : [];
+        const results = v2 != null && v2.ok === true ? v2.results : [];
         if (results.length === 0 && !force) return;
         // Map v2 source_kind → DejaVuItem facet (overlay's UI shape).
         const v2FacetOf = (k: string): SearchHitFacet | undefined => {
