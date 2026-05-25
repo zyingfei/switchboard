@@ -5170,35 +5170,41 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const revisionKey = metadata.snapshotRevision ?? '';
     const cached = this.#cachedSnapshot;
     if (cached !== null && cached.revision === revisionKey) return cached.value;
-    // .all() returns all rows synchronously; JSON.parse + Map build
-    // over 5000+ nodes and 12000+ edges is the heavy work. Without
-    // periodic yields the loop pegs the event loop for tens of
-    // seconds on large vaults — observed 45s blocks under stress
-    // that starved /v1/status. Chunk + yield between batches.
-    // Yields use setImmediate (real macrotask) so /status, /events
-    // etc. can run between chunks. Each chunk is sub-100ms typically.
-    const yieldEveryRows = 500;
+    // Paged reads: pull rows in LIMIT/OFFSET chunks instead of one
+    // huge .all() that allocates the entire result before any work
+    // can start. Combined with the per-chunk parse loop + setImmediate
+    // yield, neither the SQL read nor the JSON.parse fan-out can
+    // single-tick the event loop. Codex review 2026-05-25 flagged
+    // the prior version as partial chunking — `.all()` alone could
+    // contribute hundreds of ms on a 12k-row edge table.
+    const PAGE_SIZE = 500;
     const yieldToLoop = (): Promise<void> =>
       new Promise<void>((resolve) => {
         setImmediate(resolve);
       });
-    const nodeRows = db.query('SELECT data FROM nodes ORDER BY id').all() as unknown[];
     const nodesById = new Map<string, ConnectionNode>();
-    for (let i = 0; i < nodeRows.length; i += 1) {
-      const node = JSON.parse(textField(nodeRows[i], 'data')) as ConnectionNode;
-      nodesById.set(node.id, node);
-      if ((i + 1) % yieldEveryRows === 0) {
-        await yieldToLoop();
+    const nodePageStmt = db.query('SELECT data FROM nodes ORDER BY id LIMIT ? OFFSET ?');
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = nodePageStmt.all(PAGE_SIZE, offset);
+      if (page.length === 0) break;
+      for (const row of page) {
+        const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
+        nodesById.set(node.id, node);
       }
+      if (page.length < PAGE_SIZE) break;
+      await yieldToLoop();
     }
-    const edgeRows = db.query('SELECT data FROM edges ORDER BY src, dst').all() as unknown[];
     const edgeById = new Map<string, ConnectionEdge>();
-    for (let i = 0; i < edgeRows.length; i += 1) {
-      const arr = JSON.parse(textField(edgeRows[i], 'data')) as ConnectionEdge[];
-      for (const edge of arr) edgeById.set(edge.id, edge);
-      if ((i + 1) % yieldEveryRows === 0) {
-        await yieldToLoop();
+    const edgePageStmt = db.query('SELECT data FROM edges ORDER BY src, dst LIMIT ? OFFSET ?');
+    for (let offset = 0; ; offset += PAGE_SIZE) {
+      const page = edgePageStmt.all(PAGE_SIZE, offset);
+      if (page.length === 0) break;
+      for (const row of page) {
+        const arr = JSON.parse(textField(row, 'data')) as ConnectionEdge[];
+        for (const edge of arr) edgeById.set(edge.id, edge);
       }
+      if (page.length < PAGE_SIZE) break;
+      await yieldToLoop();
     }
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');

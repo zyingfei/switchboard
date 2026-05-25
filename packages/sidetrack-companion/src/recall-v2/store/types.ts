@@ -81,6 +81,13 @@ export interface RecallStore {
   /** Enumerate every entity_id currently in docs_vec. */
   allVectorEntityIds(): ReadonlySet<string>;
 
+  /** Run `fn` inside a single SQLite transaction (BEGIN IMMEDIATE …
+   *  COMMIT). Used by backfill to amortize per-row autocommit
+   *  overhead — without this, 7000+ upserts in a chunk each fsync
+   *  the WAL, dominating the backfill cost. Rolls back + rethrows
+   *  if `fn` throws. */
+  runTransaction<T>(fn: () => T): T;
+
   /** Read a stored metadata value. Used by the freshness check —
    *  `getRecallMetadata('source_signature')` returns the signature of
    *  the JSON sources captured at last backfill. */
