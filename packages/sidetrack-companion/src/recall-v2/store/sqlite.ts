@@ -352,20 +352,28 @@ class SqliteRecallStore implements RecallStore {
     if (!this.vecAvailable) return [];
     try {
       const target = JSON.stringify(Array.from(opts.vec));
-      // JOIN docs_vec MATCH results back to docs so callers get
-      // canonical_url + title in one round trip. Without the join,
-      // downstream code emits empty-URL candidates that dedupe to a
-      // single entity in fusion.
+      // sqlite-vec rejects KNN queries unless the LIMIT (or `k = ?`
+      // constraint) is bound to the docs_vec MATCH plan. A simple
+      // `LEFT JOIN docs ... LIMIT N` hides the LIMIT from the vec0
+      // virtual table — the runtime throws
+      // `SQLiteError: A LIMIT or 'k = ?' constraint is required on
+      // vec0 knn queries.`
+      //
+      // Fix: do the MATCH+LIMIT in a subquery (vec0 sees its own
+      // LIMIT), then join out to docs for canonical_url / title.
       const sql = `
-        SELECT v.entity_id AS entityId,
+        SELECT v.entityId AS entityId,
                d.canonical_url AS canonicalUrl,
                d.title AS title,
                v.distance AS cosineDistance
-        FROM docs_vec AS v
-        LEFT JOIN docs AS d ON d.entity_id = v.entity_id
-        WHERE v.embedding MATCH ?
-        ORDER BY v.distance
-        LIMIT ?
+        FROM (
+          SELECT entity_id AS entityId, distance
+          FROM docs_vec
+          WHERE embedding MATCH ?
+          ORDER BY distance
+          LIMIT ?
+        ) AS v
+        LEFT JOIN docs AS d ON d.entity_id = v.entityId
       `;
       const rows = this.db.prepare(sql).all(target, opts.limit) as {
         entityId: string;
