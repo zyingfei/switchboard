@@ -4522,36 +4522,58 @@ const App = () => {
           ),
     [urlProjection],
   );
+  // Now history — hoisted ahead of focusedDisplayUrlRecord so the
+  // pin-aware swap below can consume `nowHistory.pinnedUrl`.
+  // useNowHistory has no external deps; safe to call here.
+  const nowHistory = useNowHistory();
   // Single source of truth for the focused tab's record (was two
   // disagreeing memos whose synthetic fallback dropped the
   // attribution → an already-filed page kept re-asking). Pure +
   // unit-tested in src/sidepanel/inbox/focusedUrlRecord.ts.
+  //
+  // Scope E / UX5 — pin-aware display. The Now history strip lets
+  // the user click a chip to "pin" a prior context. When pinned AND
+  // we have a real record for that URL in the projection, swap the
+  // display URL to the pinned one so the Now card renders THAT
+  // page's data (attribution, page evidence, etc.). If the pinned
+  // URL has no projection record (we can't reconstruct a phantom
+  // record from history alone) we silently fall back to the live
+  // tab — the pin still highlights in the chip strip but the card
+  // shows live data. The pin never changes `focusedTabUrl` itself,
+  // so network fetches (`/v1/page-evidence/summary`, the
+  // tab-session resolver, etc.) keep targeting the live tab.
+  const pinnedProjectionRecord = useMemo(() => {
+    if (nowHistory.pinnedUrl === null) return undefined;
+    return urlProjection?.byCanonicalUrl[nowHistory.pinnedUrl];
+  }, [nowHistory.pinnedUrl, urlProjection]);
+  const displayedFocusedTabUrl =
+    pinnedProjectionRecord !== undefined ? nowHistory.pinnedUrl : focusedTabUrl;
   const focusedDisplayUrlRecord = useMemo(
     () =>
       resolveFocusedUrlRecord({
-        focusedTabUrl,
+        focusedTabUrl: displayedFocusedTabUrl,
         projection: urlProjection,
         comparable: comparableTabUrl,
         synthesize: () =>
           urlRecordFromLiveTab({
-            canonicalUrl: focusedTabUrl ?? '',
+            canonicalUrl: displayedFocusedTabUrl ?? '',
             liveUrl:
               liveActiveTabUrl ??
               state.activeTabUrl ??
               state.currentTab?.tabSnapshot?.url ??
               state.currentTab?.threadUrl ??
-              focusedTabUrl ??
+              displayedFocusedTabUrl ??
               '',
             title:
               liveActiveTabTitle ??
               state.currentTab?.tabSnapshot?.title ??
               state.currentTab?.title ??
               undefined,
-            pageEvidence: livePageEvidenceByUrl[focusedTabUrl ?? ''],
+            pageEvidence: livePageEvidenceByUrl[displayedFocusedTabUrl ?? ''],
           }),
       }),
     [
-      focusedTabUrl,
+      displayedFocusedTabUrl,
       urlProjection,
       liveActiveTabTitle,
       liveActiveTabUrl,
@@ -4619,7 +4641,6 @@ const App = () => {
       }),
     [focusedUrl, focusedIsKnownThread, focusedAttributedWorkstreamId],
   );
-  const nowHistory = useNowHistory();
   useEffect(() => {
     if (focusedUrl === undefined || focusedUrl.length === 0) return;
     const title =
@@ -6736,6 +6757,37 @@ const App = () => {
               <span className="tab-attribution-card-eyebrow mono" data-testid="now-page-kind">
                 {pageKindLabel[focusedPageKind]}
               </span>
+              {/* Scope D / UX3 — kind-aware quick action. Chats jump to
+                  the Threads tab; workstream-attributed pages jump to
+                  the Workstreams tab. Page / unknown surfaces stay
+                  silent (the default action bar below is sufficient). */}
+              {focusedPageKind === 'chat' ? (
+                <button
+                  type="button"
+                  className="now-kind-action mono"
+                  onClick={() => {
+                    setViewMode('all');
+                  }}
+                  data-testid="now-kind-action-threads"
+                >
+                  → Threads
+                </button>
+              ) : focusedPageKind === 'workstream' &&
+                focusedAttributedWorkstreamId !== null ? (
+                <button
+                  type="button"
+                  className="now-kind-action mono"
+                  onClick={() => {
+                    setViewMode('workstream');
+                    if (focusedAttributedWorkstreamId !== null) {
+                      setSelectedWorkstream(focusedAttributedWorkstreamId);
+                    }
+                  }}
+                  data-testid="now-kind-action-workstreams"
+                >
+                  → Workstreams
+                </button>
+              ) : null}
               {focusedTabSession !== undefined ? (
                 <>
                   <span
@@ -6855,6 +6907,12 @@ const App = () => {
                       workstreams={tabSessionWorkstreams}
                       showAlternatives
                       showEmptyPlaceholder
+                      // UX4 — Now-card variant tucks the signal/alts
+                      // rows into a "Why" disclosure so the headline
+                      // reads cleanly. Inbox triage keeps the full
+                      // breakdown (no compact prop there).
+                      compact
+
                     />
                   ) : null}
                   {/* Stage 5 polish — the legacy "Change…" button used to live

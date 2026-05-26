@@ -53,6 +53,12 @@ export interface SuggestionStatsProps {
   // domains), pass `showEmptyPlaceholder`. Used by the Current Tab
   // card so the user sees an explanation instead of a blank gap.
   readonly showEmptyPlaceholder?: boolean;
+  // UX4 — Now-tab compact mode. Inbox triage wants the full
+  // "signal: similarity · margin 0.51 · Other candidates: …"
+  // breakdown; the Now card just wants the headline (target +
+  // confidence). When `compact` is true, the signal row and
+  // alternatives row are tucked behind a "details" disclosure.
+  readonly compact?: boolean;
 }
 
 export function SuggestionStats({
@@ -60,6 +66,7 @@ export function SuggestionStats({
   workstreams,
   showAlternatives = false,
   showEmptyPlaceholder = false,
+  compact = false,
 }: SuggestionStatsProps) {
   if (suggestion === undefined) {
     // Distinct from "fetched but empty" below — the suggestion has not
@@ -144,17 +151,12 @@ export function SuggestionStats({
         };
       })
     : [];
-  return (
-    <div className={`suggestion-stats is-${level}`}>
-      <span className="suggestion-stats-row">
-        <span className="suggestion-stats-target">{label}</span>
-        <span className="suggestion-stats-confidence">
-          {confidenceLevelLabel(level)} · {Math.round(probability * 100)}%
-        </span>
-        <span className="suggestion-stats-info" title={tooltip} aria-label={tooltip}>
-          ⓘ
-        </span>
-      </span>
+  // UX4 — in compact mode the signal + alternatives rows tuck into
+  // a <details> disclosure so the headline (target + confidence) is
+  // the only thing the user sees at rest. The tooltip on the info
+  // chip still surfaces the same numbers for power users.
+  const detail = (
+    <>
       <span className="suggestion-stats-source mono">
         signal: {top.dominantSource} ({sourceLabel(top.dominantSource)}) · margin{' '}
         {margin.toFixed(2)}
@@ -169,6 +171,27 @@ export function SuggestionStats({
           ))}
         </span>
       ) : null}
+    </>
+  );
+  return (
+    <div className={`suggestion-stats is-${level}${compact ? ' is-compact' : ''}`}>
+      <span className="suggestion-stats-row">
+        <span className="suggestion-stats-target">{label}</span>
+        <span className="suggestion-stats-confidence">
+          {confidenceLevelLabel(level)} · {Math.round(probability * 100)}%
+        </span>
+        <span className="suggestion-stats-info" title={tooltip} aria-label={tooltip}>
+          ⓘ
+        </span>
+      </span>
+      {compact ? (
+        <details className="suggestion-stats-details">
+          <summary className="suggestion-stats-details-summary">Why</summary>
+          {detail}
+        </details>
+      ) : (
+        detail
+      )}
     </div>
   );
 }

@@ -3660,6 +3660,12 @@ textarea.preview-body:focus {
 .ws-bar .ws-status {
   margin-left: auto;
   color: var(--ink-3, #7a7269);
+  font-size: 10.5px;
+  /* UX6 — leave the row's gap to do the visual separation; the
+   * eyebrow .lbl reads as the section name, ws-status as a quiet
+   * sync-state badge on the far right. */
+  padding-left: 8px;
+  border-left: 1px solid var(--rule-soft, #e5ddc9);
 }
 .ws-bar .swap-arrow {
   color: var(--ink-3, #7a7269);
@@ -12285,4 +12291,52 @@ pre.diff {
   font-size: 10px;
   color: var(--ink-3);
   flex: 0 0 auto;
+}
+/* Scope D / UX3 — kind-aware quick action chip in the Now card head.
+ * Renders next to the eyebrow chip for 'chat' (→ Threads) and
+ * 'workstream' (→ Workstreams) kinds; absent for 'page' / 'unknown'. */
+.now-kind-action {
+  margin-left: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms, color 120ms;
+}
+.now-kind-action:hover {
+  border-color: var(--signal);
+  background: var(--surface-2);
+  color: var(--ink-1);
+}
+/* UX4 — Compact SuggestionStats variant used inside the Now card.
+ * The "Why" details disclosure collapses the signal + alternatives
+ * lines until the user opens it; the headline (target + confidence)
+ * stays visible at rest. */
+.suggestion-stats.is-compact .suggestion-stats-details {
+  display: block;
+  margin-top: 4px;
+}
+.suggestion-stats.is-compact .suggestion-stats-details-summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  letter-spacing: 0.04em;
+  list-style: none;
+}
+.suggestion-stats.is-compact .suggestion-stats-details-summary::-webkit-details-marker {
+  display: none;
+}
+.suggestion-stats.is-compact .suggestion-stats-details[open] .suggestion-stats-details-summary {
+  color: var(--ink-2);
+}
+.suggestion-stats.is-compact .suggestion-stats-details-summary::before {
+  content: '▸ ';
+}
+.suggestion-stats.is-compact .suggestion-stats-details[open] .suggestion-stats-details-summary::before {
+  content: '▾ ';
 }
