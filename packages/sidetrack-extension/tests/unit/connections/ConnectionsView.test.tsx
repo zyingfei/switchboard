@@ -1647,6 +1647,10 @@ describe('ConnectionsView — engineering scaffold', () => {
       // Replica ids may contain dots, colons, slashes; widen past the
       // narrower [A-Za-z0-9_-] character class so we catch real shapes.
       { name: 'replica:<id>', re: /\breplica:[^\s"'<>]+/ },
+      // Bare or prefix-stripped replica ids ("replica-A", "replica-foo")
+      // — TimelineRail used to fall back to the trimmed form in its
+      // visible label, and that's exactly the shape we want to catch.
+      { name: 'replica-<id>', re: /\breplica-[A-Za-z0-9_]+\b/ },
       // Any bare workstream bac_id leaking through (more general than
       // the single fixture id), and the specific fixture for belt-and-
       // suspenders coverage.
@@ -1673,5 +1677,36 @@ describe('ConnectionsView — engineering scaffold', () => {
         }
       }
     }
+  });
+
+  // T1-F-loading — the loading row used to render `<code>{anchor}</code>`
+  // which leaks the raw nodeId for tab-session / visit-instance anchors.
+  // Capture the snapshot fetch in a never-resolving promise so the
+  // loading row stays visible, then assert the visible text contains
+  // no forbidden id patterns.
+  it('never leaks the anchor id in the loading row', async () => {
+    const loadingAnchor = 'tab-session:tses_01KSWEEPLOAD0000000000ANCH';
+    let neverResolve!: () => void;
+    const stuck = new Promise<{ readonly ok: boolean }>((resolve) => {
+      neverResolve = () => resolve({ ok: false });
+    });
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return stuck as unknown as { ok: boolean; data: unknown };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    const { container } = render(<ConnectionsView initialAnchor={loadingAnchor} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-loading')).not.toBeNull();
+    });
+    const loadingRow = container.querySelector('[data-testid="connections-loading"]');
+    const text = loadingRow?.textContent ?? '';
+    expect(text).not.toMatch(/tses_[A-Z0-9]/);
+    expect(text).not.toMatch(/tab-session:/);
+    expect(text).not.toMatch(/visit-instance:/);
+    expect(text).toMatch(/Fetching neighbors of/u);
+    neverResolve();
   });
 });

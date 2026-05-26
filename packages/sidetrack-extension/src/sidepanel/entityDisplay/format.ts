@@ -291,8 +291,10 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       return { primary, secondary, kindBadge, tooltip: undefined };
     }
     case 'replica': {
+      // Alias is sufficient as the primary; the bare replica id is
+      // not safe to expose even as a hover tooltip.
       const replicaId = trimPrefix(node.id, 'replica:');
-      return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: safeTooltip(replicaId) };
+      return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: undefined };
     }
     case 'inbound-reminder': {
       // Stage 5 polish — every inbound-reminder previously rendered as
@@ -400,7 +402,7 @@ export const formatNodeIdDisplay = (
   }
   if (kind === 'replica') {
     const replicaId = trimPrefix(nodeId, 'replica:');
-    return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: safeTooltip(replicaId) };
+    return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: undefined };
   }
   if (kind === 'tab-session') {
     return { primary: 'Tab session', kindBadge, tooltip: undefined };
@@ -408,7 +410,7 @@ export const formatNodeIdDisplay = (
   if (kind === 'timeline-visit') {
     const url = trimPrefix(nodeId, 'timeline-visit:');
     const host = hostOf(url);
-    return { primary: host ?? '(visit)', kindBadge, tooltip: url };
+    return { primary: host ?? '(visit)', kindBadge, tooltip: safeTooltip(url) };
   }
   if (kind === 'visit-instance') {
     // visit-instance:tses_*:<iso>:<url>  — try to recover the URL from the tail.
@@ -417,7 +419,7 @@ export const formatNodeIdDisplay = (
     if (httpIdx >= 0) {
       const url = tail.slice(httpIdx + 1);
       const host = hostOf(url);
-      if (host !== undefined) return { primary: host, kindBadge, tooltip: url };
+      if (host !== undefined) return { primary: host, kindBadge, tooltip: safeTooltip(url) };
     }
     return { primary: '(visit)', kindBadge, tooltip: undefined };
   }
