@@ -60,6 +60,18 @@ export interface RecallStore {
     readonly limit: number;
   }): readonly StoreFtsHit[];
 
+  /** Direct lookup by canonical_url — used by the `focus` source so
+   *  the Now card can surface the active page's own row plus same-URL
+   *  variants (e.g. the page_content extract + the timeline_visit it
+   *  came from). Returns rows from every source kind whose
+   *  canonical_url matches exactly; caller filters/picks. Bypasses
+   *  FTS5 so URL punctuation doesn't trip the tokenizer. Returns []
+   *  when no rows match. */
+  queryByCanonicalUrl(opts: {
+    readonly canonicalUrl: string;
+    readonly limit: number;
+  }): readonly StoreFtsHit[];
+
   /** Total document count for a source kind — used by query-analysis
    *  for IDF estimation later. */
   documentCount(sourceKind?: StoreSourceKind): number;

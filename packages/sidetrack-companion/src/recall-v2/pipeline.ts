@@ -48,10 +48,12 @@ import type {
   CandidateGeneratorOutput,
   RecallCandidate,
   RecallEvidence,
+  RecallIntent,
   RecallRequest,
   RecallResponse,
   RecallSourceKind,
   RecallStrategy,
+  SuppressionPolicy,
 } from './types.js';
 
 const DEFAULT_LIMIT = 12;
@@ -784,15 +786,107 @@ const allSources: readonly RecallSourceKind[] = [
   'semantic_query',
 ];
 
+// Scope A/B — per-intent source-profile + suppression defaults. The
+// extension picks an intent (dejavu / search / focus) and the server
+// resolves it into the right source set + suppression posture
+// without the client having to hard-code the profile. Callers can
+// still override by passing explicit `sources` / `suppression`.
+const SOURCES_BY_INTENT: Readonly<Record<RecallIntent, readonly RecallSourceKind[]>> = {
+  // Déjà-vu — user selected text on a page; want everything that
+  // relates. Includes graph_neighbor so prior captures of the same
+  // topic surface even when direct lexical/semantic miss.
+  dejavu: ['page_content', 'timeline_visit', 'chat_turn', 'semantic_query', 'graph_neighbor'],
+  // Search — global recall; graph_neighbor stays a future opt-in so
+  // we don't surface tangential cluster-mates for an exact query.
+  search: ['page_content', 'timeline_visit', 'chat_turn', 'semantic_query'],
+  // Focus — Now card; current-page-anchored. The `focus` source
+  // looks up the active URL directly; graph_neighbor expands from
+  // there for "related" context.
+  focus: ['focus', 'timeline_visit', 'graph_neighbor'],
+};
+
+const SUPPRESSION_BY_INTENT: Readonly<Record<RecallIntent, SuppressionPolicy>> = {
+  // Déjà-vu — drop the current page (we already know we're on it)
+  // and active-chat artifacts (a chat the user just opened isn't
+  // "déjà-vu"). Default to today's strict suppressCurrentPage.
+  dejavu: {
+    suppressCurrentPage: 'always',
+    suppressAskAiArtifacts: true,
+  },
+  // Search — global query, no current-page context implied. Keep
+  // the current page available so the user can find what they're
+  // looking at. Still respects activeChatBacIds if the caller
+  // passes them.
+  search: {
+    suppressCurrentPage: 'never',
+    suppressAskAiArtifacts: false,
+    // No min-hit-age filter for search — the user typed a query, so
+    // returning a chat they just created IS the right answer.
+    minHitAgeMs: 0,
+  },
+  // Focus — keep the current page; the Now card surfaces it as the
+  // anchor and shows related items around it.
+  focus: {
+    suppressCurrentPage: 'never',
+    suppressAskAiArtifacts: false,
+    minHitAgeMs: 0,
+  },
+};
+
+const resolveIntent = (req: RecallRequest): RecallIntent => req.intent ?? 'dejavu';
+
+const resolveSources = (req: RecallRequest, intent: RecallIntent): Set<RecallSourceKind> =>
+  new Set(req.sources ?? SOURCES_BY_INTENT[intent]);
+
+const resolveSuppression = (req: RecallRequest, intent: RecallIntent): RecallRequest => {
+  // When the caller passes an explicit `suppression` object, respect
+  // it verbatim. Otherwise merge intent defaults onto the request.
+  if (req.suppression !== undefined) return req;
+  return { ...req, suppression: SUPPRESSION_BY_INTENT[intent] };
+};
+
+/** `focus` candidate generator — direct canonical-URL lookup against
+ *  the SQLite docs table. Returns the active page itself (and any
+ *  same-URL variants stored under different source_kind rows) as
+ *  recall candidates. Pairs with `graph_neighbor` for expansion. */
+const generateFocus = async (
+  deps: PipelineDeps,
+  currentUrl: string | undefined,
+  limit: number,
+  store: RecallStore | undefined,
+): Promise<CandidateGeneratorOutput> => {
+  const start = (deps.now ?? Date.now)();
+  if (currentUrl === undefined || currentUrl.length === 0 || store === undefined) {
+    return { sourceKind: 'focus', candidates: [], elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
+  }
+  const hits = store.queryByCanonicalUrl({ canonicalUrl: currentUrl, limit });
+  const candidates = hits.map((h, i): RecallCandidate => candidateFromStoreHit(h, 'fts5', i + 1));
+  // Tag the source kind so the UI can render a "this page" badge.
+  // candidateFromStoreHit emits the hit's own sourceKind on the
+  // candidate; rewrite here so the Now card knows these came from
+  // the focus path, not from a generic timeline-visit query.
+  const focusCandidates = candidates.map((c): RecallCandidate => ({ ...c, sourceKind: 'focus' }));
+  return {
+    sourceKind: 'focus',
+    candidates: focusCandidates,
+    elapsedMs: timeoutMs(start, deps.now ?? Date.now),
+  };
+};
+
 /** Run the recall pipeline (Phase 2 v1.5 delegate). */
 export const runRecall = async (
   deps: PipelineDeps,
-  req: RecallRequest,
+  rawReq: RecallRequest,
 ): Promise<RecallResponse> => {
+  // Scope B — resolve intent + merge per-intent defaults FIRST so
+  // every downstream step (sources, suppression, response meta) sees
+  // a fully-populated request.
+  const intent = resolveIntent(rawReq);
+  const req = resolveSuppression(rawReq, intent);
+  const sources = resolveSources(req, intent);
   const now = (deps.now ?? Date.now)();
   const limit = req.limit ?? DEFAULT_LIMIT;
   const perSource = req.perSourceLimit ?? DEFAULT_PER_SOURCE_LIMIT;
-  const sources = new Set(req.sources ?? allSources);
   const strategy: RecallStrategy = req.strategy ?? {};
   const timings: Record<string, number> = {};
 
@@ -850,6 +944,13 @@ export const runRecall = async (
     }
   }
   const groups: CandidateGeneratorOutput[] = [];
+  // Scope B/C — `focus` runs FIRST when present, so its canonicalUrl
+  // is in the anchor pool used by semantic_query + graph_neighbor.
+  // This lets the Now card request just `focus + graph_neighbor` and
+  // get expansion from the current page automatically.
+  if (sources.has('focus')) {
+    groups.push(await generateFocus(deps, req.session?.currentUrl, perSource, store));
+  }
   if (sources.has('page_content')) {
     groups.push(await generatePageContent(deps, analysis, perSource, store));
   }
@@ -860,13 +961,31 @@ export const runRecall = async (
     groups.push(await generateChatTurn(deps, analysis, perSource, queryEmbedding, store));
   }
   let anchorUrls: string[] = [];
+  // Seed graph expansion with `focus` results FIRST when present (the
+  // Now card's intent: "what is connected to THIS page"). Falls back
+  // to lexical-anchor expansion when focus is empty / not requested.
+  const focusAnchors = new Set(
+    groups
+      .filter((g) => g.sourceKind === 'focus')
+      .flatMap((g) => g.candidates)
+      .map((c) => c.canonicalUrl)
+      .filter((u): u is string => u !== undefined),
+  );
+  // For focus-only intents (no lexical query), the `session.currentUrl`
+  // is the authoritative anchor even if no focus candidates were found
+  // in our docs table (page not indexed yet). Use it as a fallback
+  // anchor so graph_neighbor still has something to expand from.
+  if (focusAnchors.size === 0 && req.session?.currentUrl !== undefined) {
+    focusAnchors.add(req.session.currentUrl);
+  }
   if (sources.has('semantic_query')) {
-    const lexicalAnchors = new Set(
-      groups
+    const lexicalAnchors = new Set([
+      ...focusAnchors,
+      ...groups
         .flatMap((g) => g.candidates)
         .map((c) => c.canonicalUrl)
         .filter((u): u is string => u !== undefined),
-    );
+    ]);
     anchorUrls = [...lexicalAnchors];
     groups.push(await generateSemanticQuery(deps, perSource, queryEmbedding, lexicalAnchors, store));
   }
@@ -877,7 +996,12 @@ export const runRecall = async (
         .map((c) => c.canonicalUrl)
         .filter((u): u is string => u !== undefined),
     );
-    groups.push(await generateGraphNeighbor(deps, anchorUrls, perSource, excludeUrls));
+    // For focus-driven expansion, graph_neighbor should expand from
+    // focusAnchors (the current page) instead of the lexical-anchor
+    // pool. When focus is empty, fall back to anchorUrls (the same
+    // set semantic_query used) for backward compatibility.
+    const seedAnchors = focusAnchors.size > 0 ? [...focusAnchors] : anchorUrls;
+    groups.push(await generateGraphNeighbor(deps, seedAnchors, perSource, excludeUrls));
   }
 
   for (const g of groups) {
@@ -912,6 +1036,7 @@ export const runRecall = async (
     semantic_query: 0,
     graph_neighbor: 0,
     current_session: 0,
+    focus: 0,
   };
   for (const g of groups) perSourceCounts[g.sourceKind] = g.candidates.length;
 
@@ -923,6 +1048,7 @@ export const runRecall = async (
     },
     results,
     meta: {
+      intent,
       fusion: {
         strategy: strategy.fusion ?? 'rrf',
         perSourceCounts,
