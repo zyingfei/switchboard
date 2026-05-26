@@ -220,6 +220,7 @@ const extract = (
     readonly nodes?: readonly ConnectionNode[];
     readonly edges?: readonly ConnectionEdge[];
     readonly updatedAt?: string;
+    readonly negativeContainerPairs?: ReadonlySet<string>;
   } = {},
 ): CandidatePairFeatures => {
   const snapshotInput = {
@@ -230,21 +231,24 @@ const extract = (
   return extractFeatures(input.candidate ?? candidate(), {
     merged: [...(input.merged ?? [])],
     snapshot: snapshot(snapshotInput),
+    ...(input.negativeContainerPairs === undefined
+      ? {}
+      : { negativeContainerPairs: input.negativeContainerPairs }),
   });
 };
 
 describe('ranker feature schema', () => {
-  it('keeps schema version 4 and byte-stable feature serialization', () => {
+  it('keeps schema version 5 and byte-stable feature serialization', () => {
     const first = JSON.stringify(extract());
     const second = JSON.stringify(extract());
 
-    expect(FEATURE_SCHEMA_VERSION).toBe(4);
+    expect(FEATURE_SCHEMA_VERSION).toBe(5);
     expect(first).toBe(second);
     expect(Object.keys(JSON.parse(first) as Record<string, unknown>)).toEqual(
       CANDIDATE_PAIR_FEATURE_KEYS,
     );
     expect(JSON.parse(first) as CandidatePairFeatures).toEqual({
-      schemaVersion: 4,
+      schemaVersion: 5,
       same_workstream: 0,
       opener_chain_depth: 0,
       in_navigation_chain: 0,
@@ -278,6 +282,7 @@ describe('ranker feature schema', () => {
       content_quality_pair_min: 0,
       chunk_support_count: 0,
       max_chunk_pair_score: 0,
+      container_negative_match: 0,
     });
   });
 });
@@ -961,5 +966,58 @@ describe('ranker page-content quality features', () => {
 
     expect(features.page_quality_tier_from).toBe(0);
     expect(features.page_quality_tier_to).toBe(2);
+  });
+});
+
+describe('container_negative_match (Step 7)', () => {
+  // The feature replaces the train-time Cartesian expansion of
+  // container-shaped user negatives with a single learned column.
+  // The retrain caller precomputes the (from, to) pair set via
+  // `deriveNegativeVisitPairLabelsFromSnapshot` and passes it on
+  // the context.
+
+  const fromUrl = 'https://example.test/from';
+  const toUrl = 'https://example.test/to';
+
+  it('returns 1 when the candidate (fromVisit, toVisit) is in the precomputed negative set', async () => {
+    const { negativeContainerPairKey } = await import('./features.js');
+    const set = new Set<string>([negativeContainerPairKey(fromUrl, toUrl)]);
+    const features = extract({
+      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
+      negativeContainerPairs: set,
+    });
+    expect(features.container_negative_match).toBe(1);
+  });
+
+  it('returns 0 when the pair is NOT in the negative set', async () => {
+    const { negativeContainerPairKey } = await import('./features.js');
+    const set = new Set<string>([
+      negativeContainerPairKey('https://other.test/x', 'https://other.test/y'),
+    ]);
+    const features = extract({
+      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
+      negativeContainerPairs: set,
+    });
+    expect(features.container_negative_match).toBe(0);
+  });
+
+  it('defaults to 0 when negativeContainerPairs is absent (serve-time callers without feedback access)', () => {
+    const features = extract({
+      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
+    });
+    expect(features.container_negative_match).toBe(0);
+  });
+
+  it('keys are directional: (from, to) and (to, from) are distinct', async () => {
+    const { negativeContainerPairKey } = await import('./features.js');
+    const set = new Set<string>([negativeContainerPairKey(toUrl, fromUrl)]); // reversed
+    const features = extract({
+      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
+      negativeContainerPairs: set,
+    });
+    // The candidate (from, to) doesn't match the reversed (to, from)
+    // entry — mirrors how `deriveNegativeVisitPairLabelsFromSnapshot`
+    // emits directionally.
+    expect(features.container_negative_match).toBe(0);
   });
 });

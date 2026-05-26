@@ -269,8 +269,8 @@ describe('LightGBM LambdaMART ranker', () => {
 
 describe('ranker model version back-compat', () => {
   it('pins the bumped model + feature-schema versions for the expanded feature set', () => {
-    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v4');
-    expect(FEATURE_SCHEMA_VERSION).toBe(4);
+    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v5');
+    expect(FEATURE_SCHEMA_VERSION).toBe(5);
   });
 
   it('rejects a persisted model whose manifest predates the feature-set bump', async () => {
@@ -330,8 +330,8 @@ describe('ranker model version back-compat', () => {
         options: { seed: 41, numRound: 8, trainedAt: generatedAt },
       }),
     );
-    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v4');
-    expect(revision.featureSchemaVersion).toBe(4);
+    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v5');
+    expect(revision.featureSchemaVersion).toBe(5);
 
     await writeActiveClosestVisitRankerRevision(root, revision);
     const reloaded = await readClosestVisitRankerRevision(root, revision.revisionId);

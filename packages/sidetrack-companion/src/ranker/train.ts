@@ -13,12 +13,19 @@ import {
 } from './feature-schema.js';
 import type { Candidate } from './types.js';
 
+// Bumped v4 → v5 alongside FEATURE_SCHEMA_VERSION 4 → 5: the
+// `container_negative_match` feature joined the input vector (Step 7
+// of the incremental-ranker plan). A v4 model trained without that
+// column would silently mis-score pairs that should now read the
+// new feature, so the manifest validator pins this exact string and
+// the retrain loop produces a fresh v5 model.
+//
 // Bumped v2 → v3 alongside FEATURE_SCHEMA_VERSION 2 → 3: the
 // closest_visit scorer no longer consumes workstream-identity leakage
 // features. The manifest validator pins this exact string, so a model
 // persisted under v2 fails to load and the retrain loop produces a
 // fresh non-leaky model instead of reusing leaked weights.
-export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v4' as const;
+export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v5' as const;
 
 // Step 2 of the incremental-ranker plan — every artifact the training
 // pipeline produces gets its own ship-gate, surfaced as one entry in
@@ -952,6 +959,7 @@ const logisticFeatureValue = (features: CandidatePairFeatures, key: RankerFeatur
     case 'same_active_topic':
     case 'topic_lineage_merge_split_related':
     case 'content_both_available':
+    case 'container_negative_match':
       return value;
   }
 };

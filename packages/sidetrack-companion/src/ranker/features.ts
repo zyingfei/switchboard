@@ -1289,6 +1289,14 @@ const pageQualityTierFromFeature = (candidate: Candidate, model: FeatureModel): 
 const pageQualityTierToFeature = (candidate: Candidate, model: FeatureModel): number =>
   pageQualityTierForVisit(candidate.toVisitId, model);
 
+// Step 7 — composite key for the (fromVisitId, toVisitId) lookup
+// in the negativeContainerPairs set. Same NUL-separator convention
+// the rest of the codebase uses for compound keys (kept as
+// `\u0000` escape syntax — see commit 1082982a for the source-file
+// NUL-byte footgun the Codex review of #231 caught).
+export const negativeContainerPairKey = (fromVisitId: string, toVisitId: string): string =>
+  `${fromVisitId}\u0000${toVisitId}`;
+
 export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
   const model = featureModelFor(context);
   const contentEdge = bestSimilarityEdgeForCandidate(candidate, model);
@@ -1298,6 +1306,16 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
   const sharedContentEntities = metadataStringArray(contentMetadata, 'matchedEntities').length;
   const contentTierFrom = evidenceTierValue(contentMetadata?.['evidenceTierFrom']);
   const contentTierTo = evidenceTierValue(contentMetadata?.['evidenceTierTo']);
+  // Step 7 — container_negative_match: 1 iff the (from, to) pair
+  // would be in the Cartesian expansion of an explicit
+  // container-shaped user negative. Set is precomputed in the
+  // training-time caller; absence ⇒ default 0 (model
+  // under-penalizes, but doesn't crash).
+  const containerNegativeMatch: 0 | 1 = context.negativeContainerPairs?.has(
+    negativeContainerPairKey(candidate.fromVisitId, candidate.toVisitId),
+  )
+    ? 1
+    : 0;
 
   return {
     schemaVersion: FEATURE_SCHEMA_VERSION,
@@ -1337,5 +1355,6 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
     content_quality_pair_min: contentQualityPairMinFeature(candidate, model, contentEdge),
     chunk_support_count: metadataNumberFeature(contentMetadata, 'chunkSupportCount'),
     max_chunk_pair_score: metadataNumberFeature(contentMetadata, 'maxChunkPairScore'),
+    container_negative_match: containerNegativeMatch,
   };
 };
