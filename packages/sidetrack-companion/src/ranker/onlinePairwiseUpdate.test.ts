@@ -210,6 +210,28 @@ describe('applyPairwiseUpdate — vanilla SGD with L2 on non-bias slots', () => 
   });
 });
 
+describe('refuse-to-corrupt — dimension mismatch must NOT mutate weights via L2 (Codex review of #232)', () => {
+  // Codex review caught: `rankNetPairwiseGradient` zeroes the data
+  // term on mismatch, but the L2 shrinkage runs from `weights`
+  // directly — so a mismatched call would still mutate the weight
+  // vector toward zero. Refused updates must be a true no-op.
+  it('returns the input weights when positive/negative feature lengths disagree', () => {
+    const seeded = [0.5, ...new Array(ONLINE_RANKER_WEIGHTS_LENGTH - 1).fill(0.1)] as number[];
+    const pos = new Array(10).fill(0.5) as number[];
+    const neg = new Array(11).fill(0.5) as number[]; // length mismatch
+    const out = applyPairwiseUpdate(seeded, pos, neg);
+    expect(out).toBe(seeded); // same reference: no allocation, no L2 shrinkage
+  });
+
+  it('returns the input weights when weights length disagrees with features+1', () => {
+    const seeded = [0.5, 0.1, 0.1] as number[]; // length 3 → would expect 2 features
+    const pos = new Array(10).fill(0.5) as number[]; // 10 features, doesn't match
+    const neg = new Array(10).fill(0.5) as number[];
+    const out = applyPairwiseUpdate(seeded, pos, neg);
+    expect(out).toBe(seeded);
+  });
+});
+
 describe('replay determinism — applying a sequence in the SAME order produces identical weights', () => {
   it('yields bytewise-identical weights across two runs', () => {
     const seq: ReadonlyArray<readonly [CandidatePairFeatures, CandidatePairFeatures]> = [

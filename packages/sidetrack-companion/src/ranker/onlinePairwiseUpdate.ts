@@ -95,14 +95,26 @@ export const rankNetPairwiseGradient = (
 // (same `from`), so bias receives no learning signal here. L2 is
 // applied to non-bias slots only — biasing the bias is bad practice
 // because it shrinks the marginal class prior toward zero.
+//
+// Refuse-to-corrupt on dimension mismatch: `rankNetPairwiseGradient`
+// returns a zero-vector when the dims disagree, but the L2 shrinkage
+// term below is independent of the gradient and WOULD still mutate
+// weights toward zero even on a "refused" update. Codex review of PR
+// #232 caught this. Check the same dimension invariants here and
+// return `weights` unchanged on mismatch — no shrinkage, no rotation.
 export const applyPairwiseUpdate = (
   weights: readonly number[],
   positiveFeatures: readonly number[],
   negativeFeatures: readonly number[],
   config: OnlineUpdateConfig = DEFAULT_ONLINE_UPDATE_CONFIG,
 ): readonly number[] => {
+  if (
+    positiveFeatures.length !== negativeFeatures.length ||
+    weights.length !== positiveFeatures.length + 1
+  ) {
+    return weights;
+  }
   const gradient = rankNetPairwiseGradient(positiveFeatures, negativeFeatures, weights);
-  if (gradient.length !== weights.length) return weights;
   const next: number[] = new Array(weights.length).fill(0) as number[];
   for (let index = 0; index < weights.length; index += 1) {
     const w = weights[index] ?? 0;
