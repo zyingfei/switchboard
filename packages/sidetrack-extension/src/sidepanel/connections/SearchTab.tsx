@@ -619,11 +619,18 @@ export const SearchTab = ({
               </div>
             ) : null}
             <div className="cx-search-tab-list">
-              {filteredRecallHits.map((hit) => {
+              {filteredRecallHits.map((hit, index) => {
                 const anchorId = anchorIdForRecallHit(hit);
                 if (anchorId === undefined) return null;
                 const url = hit.canonicalUrl ?? hit.threadUrl;
                 const title = titleForRecallHit(hit);
+                // RD3 — show rank instead of raw RRF score. The
+                // server's fused score is 1/(60+rank) so even a
+                // rank-1 hit reads as 0.02 — users see "0.02 =
+                // bad". Rank conveys ordering without the
+                // confusing magnitude; raw score still surfaces
+                // on hover for power users.
+                const rank = index + 1;
                 return (
                   <div
                     className="cx-search-tab-row"
@@ -652,7 +659,12 @@ export const SearchTab = ({
                           <span className="cx-search-tab-hit-meta">{url}</span>
                         ) : null}
                       </span>
-                      <span className="cx-search-tab-score">{hit.score.toFixed(2)}</span>
+                      <span
+                        className="cx-search-tab-score"
+                        title={`fused score ${hit.score.toFixed(3)} (RRF: 1 / (60 + rank))`}
+                      >
+                        #{String(rank)}
+                      </span>
                     </button>
                     {onOpenUrl !== undefined && url !== undefined ? (
                       <button

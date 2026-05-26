@@ -38,6 +38,12 @@ export interface InboxViewProps {
   // applied it once so back-navigation doesn't re-fire.
   readonly initialQuery?: string;
   readonly onQueryConsumed?: () => void;
+  // RD2 — when the local Inbox filter returns 0, surface a link
+  // that bumps the query to the global Search tab. Solves the
+  // common case where the user types a URL not currently in the
+  // pending Inbox queue and gets "No matches" with no obvious
+  // next step.
+  readonly onSearchGlobally?: (query: string) => void;
   /** True when the record's URL has a tracked chat thread (the chat-
    * turn pipeline has produced content for it). Forwarded to
    * InboxCard → PageEvidenceBadge so captured chats don't render as
@@ -76,6 +82,7 @@ export function InboxView({
   refreshingSuggestionIds,
   initialQuery,
   onQueryConsumed,
+  onSearchGlobally,
   isChatThreadCaptured,
 }: InboxViewProps) {
   const [query, setQuery] = useState('');
@@ -141,7 +148,28 @@ export function InboxView({
       {loading ? <div className="thread-empty subtle">Loading tab sessions…</div> : null}
       {!loading && slice.visible.length === 0 ? (
         <div className="thread-empty subtle">
-          {trimmed.length === 0 ? 'No unattributed tab sessions.' : `No matches for "${trimmed}".`}
+          {trimmed.length === 0 ? (
+            'No unattributed tab sessions.'
+          ) : (
+            <>
+              No matches for &quot;{trimmed}&quot; in the Inbox queue.
+              {onSearchGlobally !== undefined ? (
+                <>
+                  {' '}
+                  <button
+                    type="button"
+                    className="btn-link inbox-search-global"
+                    onClick={() => {
+                      onSearchGlobally(trimmed);
+                    }}
+                    data-testid="inbox-search-global"
+                  >
+                    Search globally →
+                  </button>
+                </>
+              ) : null}
+            </>
+          )}
         </div>
       ) : null}
       <div className="tab-session-list">
