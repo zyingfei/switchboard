@@ -1602,6 +1602,19 @@ describe('ConnectionsView — engineering scaffold', () => {
                   originReplicaIds: ['replica-A'],
                   metadata: {},
                 },
+                // Codex round-3 fixture — queue-item whose title field
+                // carries a raw bac_id (companion snapshot.ts stuffs
+                // p.bac_id into title when the user-typed text is
+                // empty). The formatter's annotation/queue-item branch
+                // must clean this out, otherwise PathFinder /
+                // NodeRow's tooltip + primary would leak.
+                {
+                  id: 'queue-item:bac_sweep_queue_x',
+                  kind: 'queue-item',
+                  label: 'bac_sweep_queue_x',
+                  originReplicaIds: ['replica-A'],
+                  metadata: { title: 'bac_sweep_queue_x' },
+                },
               ],
               edges: [
                 {

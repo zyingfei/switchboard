@@ -1,3 +1,4 @@
+import { isInternalIdLike } from '../entityDisplay/format';
 import type { TimeRangeValue } from './TimeRangePicker';
 import { timeRangeWindowFor, type TimeRangeWindow } from './TimeRangePicker';
 import type { ConnectionsSnapshot } from './types';
@@ -74,14 +75,18 @@ const timeLabel = (ms: number): string =>
 const compactDateTimeLabel = (ms: number): string => `${dateLabel(ms)}, ${timeLabel(ms)}`;
 
 const labelForNode = (node: ConnectionsSnapshot['nodes'][number]): string => {
-  if (node.label.length > 0) return node.label;
+  // Filter id-like values at every fallback step — marker labels feed
+  // straight into TimelineRail's visible title/aria-label.
+  if (node.label.length > 0 && !isInternalIdLike(node.label)) return node.label;
   const title = node.metadata['title'];
-  if (typeof title === 'string' && title.length > 0) return title;
+  if (typeof title === 'string' && title.length > 0 && !isInternalIdLike(title)) {
+    return title;
+  }
   const canonicalUrl = node.metadata['canonicalUrl'];
   if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) return canonicalUrl;
   const latestUrl = node.metadata['latestUrl'];
   if (typeof latestUrl === 'string' && latestUrl.length > 0) return latestUrl;
-  return node.id;
+  return '(node)';
 };
 
 const rangeLabel = (startMs: number, endMs: number): string => {

@@ -74,7 +74,10 @@ describe('entityDisplay/format', () => {
         makeCtx({ resolveWorkstreamPath: () => 'sideproject / sidetrack' }),
       );
       expect(display.primary).toBe('sideproject / sidetrack');
-      expect(display.tooltip).toBe('ZYJFNMTB');
+      // Tooltip is undefined when the path is available — surfacing the
+      // raw bacId here would duplicate the primary and leak a raw id
+      // for non-bac_-prefixed workstream ids.
+      expect(display.tooltip).toBeUndefined();
     });
     it('falls back to metadata.title when path is null', () => {
       const node = makeNode({

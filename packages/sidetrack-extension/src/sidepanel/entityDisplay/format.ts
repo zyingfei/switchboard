@@ -185,7 +185,16 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       const title = metaStr(metadata, ['title']);
       const labelClean = cleanLabel(node.label);
       const primary = path ?? title ?? labelClean ?? 'Unknown workstream';
-      return { primary, kindBadge, tooltip: safeTooltip(bacId) };
+      // Only surface bacId as the tooltip when we fell through to the
+      // 'Unknown workstream' placeholder — otherwise the path/title is
+      // already the visible primary and the tooltip would either
+      // duplicate it (bac_-prefixed bacId is filtered out by
+      // safeTooltip) or leak a non-bac_-prefixed raw identifier.
+      const tooltip =
+        path === null && title === undefined && labelClean === undefined
+          ? safeTooltip(bacId)
+          : undefined;
+      return { primary, kindBadge, tooltip };
     }
     case 'thread': {
       const title = metaStr(metadata, ['title']);
@@ -368,7 +377,11 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
     case 'annotation':
     case 'queue-item':
     case 'template': {
-      const title = metaStr(metadata, ['title', 'text', 'note']);
+      // Upstream snapshots sometimes stuff the bac_id into title when
+      // the user-typed text is empty (see companion `snapshot.ts`
+      // queue-item branch). Filter id-like values so they never reach
+      // the visible primary.
+      const title = cleanLabel(metaStr(metadata, ['title', 'text', 'note']));
       const labelClean = cleanLabel(node.label);
       const primary = title ?? labelClean ?? `(${kindBadge.toLowerCase()})`;
       return { primary, kindBadge, tooltip: undefined };
@@ -398,7 +411,10 @@ export const formatNodeIdDisplay = (
   if (kind === 'workstream') {
     const bacId = trimPrefix(nodeId, 'workstream:');
     const path = ctx.resolveWorkstreamPath(bacId);
-    return { primary: path ?? 'Unknown workstream', kindBadge, tooltip: safeTooltip(bacId) };
+    // Mirror the formatEntityDisplay rule: bacId only enters the
+    // tooltip when the primary fell through to the placeholder.
+    const tooltip = path === null ? safeTooltip(bacId) : undefined;
+    return { primary: path ?? 'Unknown workstream', kindBadge, tooltip };
   }
   if (kind === 'replica') {
     const replicaId = trimPrefix(nodeId, 'replica:');
