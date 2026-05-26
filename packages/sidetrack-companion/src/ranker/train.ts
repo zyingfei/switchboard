@@ -879,7 +879,12 @@ const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
 const cappedPositive = (value: number, cap: number): number =>
   Math.min(cap, Math.max(0, value)) / cap;
 
-const deterministicBaselineScore = (features: CandidatePairFeatures): number =>
+// Step 4 — single-row deterministic baseline score, exported so the
+// selector's serving dispatch can use it as the `graph_baseline`
+// fallback when no learned artifact passes its ship-gate. The array
+// form `deterministicBaselineScores` below stays for the
+// training-time evaluation path.
+export const deterministicBaselineScore = (features: CandidatePairFeatures): number =>
   2.8 * clamp01(features.cosine_similarity) +
   0.9 * features.same_canonical_url +
   0.75 * features.in_navigation_chain +
@@ -1008,6 +1013,16 @@ const logisticRegressionScores = (
   weights === undefined
     ? undefined
     : rows.map((row) => sigmoid(dotWithBias(weights, logisticFeatureVector(row.features))));
+
+// Step 4 — single-row sigmoid(w · x + bias) score, exported so the
+// selector's serving dispatch can apply the LR weights persisted on
+// the revision (Step 3) when `logistic_batch` is the selected
+// artifact. Mirrors `deterministicBaselineScore` shape (one row, one
+// number) so the dispatch surface is uniform across artifact kinds.
+export const scoreLogisticBatch = (
+  features: CandidatePairFeatures,
+  weights: readonly number[],
+): number => sigmoid(dotWithBias(weights, logisticFeatureVector(features)));
 
 const scoreEvaluationRowsWithFreshBooster = async (
   trainRows: readonly RankerTrainingRow[],
