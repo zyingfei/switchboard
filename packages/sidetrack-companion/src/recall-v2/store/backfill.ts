@@ -149,70 +149,83 @@ export const backfillFromPageEvidence = async (
   let timelineVisit = 0;
   const root = join(vaultRoot, '_BAC', 'page-content', 'by-url');
   const tIngestStart = Date.now();
-  let sinceYield = 0;
-  for (const r of records) {
-    const url = r.canonicalUrl;
-    const first = tsMs(r.metadata.firstSeenAt);
-    const last = tsMs(r.metadata.lastSeenAt);
-    const baseDoc: Omit<StoreDocument, 'bodyIndexed' | 'sourceKind' | 'entityId'> = {
-      canonicalUrl: url,
-      ...(r.metadata.title === undefined ? {} : { title: r.metadata.title }),
-      urlTokens: slugTokensOf(url),
-      host: hostOf(url),
-      ...(first === undefined ? {} : { firstSeenAtMs: first }),
-      ...(last === undefined ? {} : { lastSeenAtMs: last }),
+  // FU2 — chunked PARALLEL reads. Was: sequential await readJson()
+  // per record (2 reads per record = N×2 serial filesystem ops).
+  // For 1000 URLs on SSD that's ~2-4s of I/O wall-clock; on slower
+  // disks it's much worse. Now each chunk fires all its readJson()
+  // calls concurrently via Promise.all, then upsertDocument runs
+  // synchronously over the resolved data. Yields still happen
+  // per-chunk so the event loop stays responsive.
+  //
+  // Chunk size kept small (50) for the parallel-reads pass because
+  // ~100 concurrent file descriptors is plenty to saturate the OS
+  // page cache without thrashing.
+  const READ_CHUNK_SIZE = 50;
+  for (let start = 0; start < records.length; start += READ_CHUNK_SIZE) {
+    const chunk = records.slice(start, start + READ_CHUNK_SIZE);
+    type Enriched = {
+      readonly record: (typeof records)[number];
+      readonly contentHash: string | undefined;
+      readonly body: string | undefined;
     };
-    // Try to read the body chunks if a page-content record exists for
-    // this canonical URL. Two sources to check (in order):
-    //   1. r.content.contentHash — populated by the slow page-evidence
-    //      writer after content extraction completes.
-    //   2. page-content/by-url/<sha>.json — written by
-    //      writePageContentExtracted; lives independently of the
-    //      page-evidence record. The harness exercises this path.
-    let body: string | undefined;
-    let contentHash: string | undefined = r.content?.contentHash;
-    if (contentHash === undefined) {
-      // Fallback: read the page-content row directly to get the hash.
-      const rec = await readJson<{ readonly coverage?: { readonly contentHash?: string } }>(
-        pageContentRecordPath(vaultRoot, url),
-      );
-      contentHash = rec?.coverage?.contentHash;
-    }
-    if (contentHash !== undefined) {
-      const raw = await readJson<{ readonly chunks?: readonly { readonly text: string }[] }>(
-        pageContentChunksPath(vaultRoot, contentHash),
-      );
-      const chunks = raw?.chunks;
-      if (chunks !== undefined && chunks.length > 0) {
-        body = chunks.map((c) => c.text).join('\n\n');
+    const enriched = await Promise.all(
+      chunk.map(async (r): Promise<Enriched> => {
+        let body: string | undefined;
+        let contentHash: string | undefined = r.content?.contentHash;
+        if (contentHash === undefined) {
+          // Fallback: read the page-content row directly to get the hash.
+          const rec = await readJson<{ readonly coverage?: { readonly contentHash?: string } }>(
+            pageContentRecordPath(vaultRoot, r.canonicalUrl),
+          );
+          contentHash = rec?.coverage?.contentHash;
+        }
+        if (contentHash !== undefined) {
+          const raw = await readJson<{ readonly chunks?: readonly { readonly text: string }[] }>(
+            pageContentChunksPath(vaultRoot, contentHash),
+          );
+          const chunks = raw?.chunks;
+          if (chunks !== undefined && chunks.length > 0) {
+            body = chunks.map((c) => c.text).join('\n\n');
+          }
+        }
+        return { record: r, contentHash, body };
+      }),
+    );
+    for (const { record: r, contentHash, body } of enriched) {
+      const url = r.canonicalUrl;
+      const first = tsMs(r.metadata.firstSeenAt);
+      const last = tsMs(r.metadata.lastSeenAt);
+      const baseDoc: Omit<StoreDocument, 'bodyIndexed' | 'sourceKind' | 'entityId'> = {
+        canonicalUrl: url,
+        ...(r.metadata.title === undefined ? {} : { title: r.metadata.title }),
+        urlTokens: slugTokensOf(url),
+        host: hostOf(url),
+        ...(first === undefined ? {} : { firstSeenAtMs: first }),
+        ...(last === undefined ? {} : { lastSeenAtMs: last }),
+      };
+      const entityId = entityIdForUrl(url);
+      if (body !== undefined) {
+        store.upsertDocument({
+          ...baseDoc,
+          entityId,
+          sourceKind: 'page_content',
+          body,
+          ...(contentHash === undefined ? {} : { contentHash }),
+          bodyIndexed: 1,
+        });
+        pageContent += 1;
+      } else {
+        store.upsertDocument({
+          ...baseDoc,
+          entityId,
+          sourceKind: 'timeline_visit',
+          bodyIndexed: 0,
+        });
+        timelineVisit += 1;
       }
+      upserted.add(entityId);
     }
-    const entityId = entityIdForUrl(url);
-    if (body !== undefined) {
-      store.upsertDocument({
-        ...baseDoc,
-        entityId,
-        sourceKind: 'page_content',
-        body,
-        ...(contentHash === undefined ? {} : { contentHash }),
-        bodyIndexed: 1,
-      });
-      pageContent += 1;
-    } else {
-      store.upsertDocument({
-        ...baseDoc,
-        entityId,
-        sourceKind: 'timeline_visit',
-        bodyIndexed: 0,
-      });
-      timelineVisit += 1;
-    }
-    upserted.add(entityId);
-    sinceYield += 1;
-    if (sinceYield >= DEFAULT_CHUNK_SIZE) {
-      sinceYield = 0;
-      await yieldToEventLoop();
-    }
+    await yieldToEventLoop();
   }
   const tIngest = Date.now() - tIngestStart;
   // Sweep stale rows — entity_ids in `existing` but not `upserted`

@@ -102,3 +102,78 @@ const isRankedItem = (value: unknown): value is RankedItem =>
 
 export const createRecallClient = (settings: CompanionSettings): RecallClient =>
   new RecallClient(settings);
+
+// FU1 — module-level coalescer for indexTurns calls. Multiple
+// capture events firing close together (e.g. user opens several
+// chat tabs in quick succession, or sync replay) used to each post
+// a separate /v1/recall/index request. With the server-side
+// batching fix (PR #221) the per-request cost is now ~400ms even
+// at 50 items, so the urgency is low — but a tiny client-side
+// debounce still helps: it collapses N events within
+// COALESCE_WINDOW_MS into a single POST, halving the embedder
+// warm-up cost (which fires per request) and freeing the bridge
+// for status polls.
+//
+// Trade-off: indexing latency grows by COALESCE_WINDOW_MS in the
+// uncontested case. 200ms is well below human "did my capture
+// land" perception, and the existing capture pipeline already
+// takes longer than that to extract + write.
+const COALESCE_WINDOW_MS = 200;
+type Pending = {
+  readonly items: RecallTurnInput[];
+  readonly resolves: ((value: void) => void)[];
+  readonly rejects: ((reason: unknown) => void)[];
+  timer: ReturnType<typeof setTimeout> | null;
+};
+const pendingByBridge = new Map<string, Pending>();
+
+const bridgeKeyFor = (settings: CompanionSettings): string =>
+  `${String(settings.port)}::${settings.bridgeKey}`;
+
+const flushPending = (settings: CompanionSettings): void => {
+  const key = bridgeKeyFor(settings);
+  const pending = pendingByBridge.get(key);
+  if (pending === undefined) return;
+  pendingByBridge.delete(key);
+  pending.timer = null;
+  const { items, resolves, rejects } = pending;
+  if (items.length === 0) {
+    for (const resolve of resolves) resolve();
+    return;
+  }
+  const client = createRecallClient(settings);
+  client.indexTurns(items).then(
+    () => {
+      for (const resolve of resolves) resolve();
+    },
+    (err: unknown) => {
+      for (const reject of rejects) reject(err);
+    },
+  );
+};
+
+/** Coalescing wrapper around RecallClient.indexTurns. Multiple calls
+ *  within COALESCE_WINDOW_MS collapse into a single POST. Returns a
+ *  promise that resolves when the underlying POST completes. */
+export const indexTurnsCoalesced = (
+  settings: CompanionSettings,
+  items: readonly RecallTurnInput[],
+): Promise<void> => {
+  if (items.length === 0) return Promise.resolve();
+  const key = bridgeKeyFor(settings);
+  return new Promise<void>((resolve, reject) => {
+    let pending = pendingByBridge.get(key);
+    if (pending === undefined) {
+      pending = { items: [], resolves: [], rejects: [], timer: null };
+      pendingByBridge.set(key, pending);
+    }
+    pending.items.push(...items);
+    pending.resolves.push(resolve);
+    pending.rejects.push(reject);
+    if (pending.timer === null) {
+      pending.timer = setTimeout(() => {
+        flushPending(settings);
+      }, COALESCE_WINDOW_MS);
+    }
+  });
+};
