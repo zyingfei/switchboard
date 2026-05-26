@@ -262,6 +262,34 @@ export class PageContentClient {
     return data as never;
   }
 
+  /** Phase 0 — POST /v1/recall/action. The companion appends a
+   *  `recall.action` event tied to the parent `recall.served` by
+   *  `servedContextId`. Idempotent: duplicate clicks with the same
+   *  (servedContextId, entityId, actionKind) collapse server-side. */
+  async recallAction(payload: {
+    readonly payloadVersion: 1;
+    readonly servedContextId: string;
+    readonly entityId: string;
+    readonly actionKind: string;
+    readonly actionAt: string;
+    readonly referencesEventId?: string;
+  }): Promise<void> {
+    const fingerprint = await sha256Hex(
+      `${payload.servedContextId}:${payload.entityId}:${payload.actionKind}`,
+    );
+    const idempotencyKey = `recall-action-${fingerprint.slice(0, 40)}`;
+    const response = await fetch(`${this.baseUrl}/recall/action`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-bac-bridge-key': this.settings.bridgeKey,
+        'idempotency-key': idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+    await this.parseOrThrow(response);
+  }
+
 }
 
 export const createPageContentClient = (settings: CompanionSettings): PageContentClient =>

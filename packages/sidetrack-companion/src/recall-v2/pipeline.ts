@@ -44,6 +44,7 @@ import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
 import { logShadowDiff, shadowQueryEnabled, shadowVariantsFromEnv } from './shadow.js';
 import { rerank } from './rerank.js';
+import type { RecallServedPayload } from '../recall/events.js';
 import type {
   CandidateGeneratorOutput,
   RecallCandidate,
@@ -82,6 +83,16 @@ export interface PipelineDeps {
    *  on-disk store and caches it. When omitted the legacy MiniSearch
    *  path is used (safe fallback during the SQLite rollout). */
   readonly store?: RecallStore;
+  /** Phase 0 — impression logging. When provided, every successful
+   *  /v2/recall response writes a `recall.served` event for the
+   *  group-level ranker trainer. Fire-and-forget; errors are logged
+   *  but never block the response. Tests can omit; production wires
+   *  through eventLog.appendServerObserved. */
+  readonly appendImpression?: (payload: RecallServedPayload) => Promise<void>;
+  /** Phase 0 — monotonic per-replica sequence emitter for ordering
+   *  recall.served vs recall.action records. Production wires through
+   *  the event log's HLC; tests inject a counter. Default: now(). */
+  readonly nextSequenceNumber?: () => number;
 }
 
 // Per-vault SQLite store cache. Opened lazily on first /v2/recall;
@@ -1019,13 +1030,24 @@ export const runRecall = async (
   // P7 — optional cross-encoder rerank. Off by default; on when the
   // caller sets `strategy.rerankTopK > 0`. Reranks the top-N+buffer
   // and re-orders by the cross-encoder relevance score.
+  //
+  // Phase 0 — capture pre-rerank ranks so meta.rerank.rankMovement can
+  // surface "how far did each candidate move." Snapshot is cheap (one
+  // pass over kept); used only when rerank fires.
+  const preRerankRankByEntity = new Map<string, number>();
+  for (let i = 0; i < kept.length; i += 1) {
+    const e = kept[i]?.entityId;
+    if (e !== undefined) preRerankRankByEntity.set(e, i);
+  }
   let resultsAfterRerank = kept;
   let rerankApplied = false;
+  let rerankLatencyMs = 0;
   const rerankTopK = strategy.rerankTopK ?? 0;
   if (rerankTopK > 0 && kept.length > 0) {
     const rerankStart = (deps.now ?? Date.now)();
     resultsAfterRerank = await rerank(req.q, kept, Math.min(rerankTopK, kept.length));
-    timings['rerank'] = (deps.now ?? Date.now)() - rerankStart;
+    rerankLatencyMs = (deps.now ?? Date.now)() - rerankStart;
+    timings['rerank'] = rerankLatencyMs;
     rerankApplied = true;
   }
   const results = resultsAfterRerank.slice(0, limit);
@@ -1039,6 +1061,90 @@ export const runRecall = async (
     focus: 0,
   };
   for (const g of groups) perSourceCounts[g.sourceKind] = g.candidates.length;
+
+  // Phase 0 — assemble + emit the impression record. Fire-and-forget
+  // so /v2/recall latency stays unchanged on slow appenders; errors
+  // go to console and the response still completes. servedContextId
+  // is sha256 of (query + sessionContext + now + RRF count) so two
+  // identical-looking requests at different times get distinct ids.
+  const servedAt = new Date((deps.now ?? Date.now)()).toISOString();
+  const servedContextId = createHash('sha256')
+    .update(
+      [
+        req.q,
+        JSON.stringify(req.session ?? {}),
+        servedAt,
+        String(results.length),
+        String((deps.now ?? Date.now)()),
+      ].join(' '),
+    )
+    .digest('hex')
+    .slice(0, 24);
+
+  let rankMovement: readonly { readonly entityId: string; readonly delta: number }[] | undefined;
+  if (rerankApplied) {
+    const moves: { entityId: string; delta: number }[] = [];
+    for (let postRank = 0; postRank < resultsAfterRerank.length; postRank += 1) {
+      const cand = resultsAfterRerank[postRank];
+      if (cand === undefined) continue;
+      const preRank = preRerankRankByEntity.get(cand.entityId);
+      if (preRank === undefined) continue;
+      const delta = preRank - postRank;
+      if (delta !== 0) moves.push({ entityId: cand.entityId, delta });
+    }
+    rankMovement = moves;
+  }
+
+  // Snapshot of the served candidates the trainer will read. We
+  // intentionally store ONLY what survives suppression (POST-suppression
+  // results) so labels can never reference a hidden candidate. Per-lane
+  // ranks come from each candidate's evidence trail.
+  const servedCandidatesSnapshot = results.map((cand, position) => {
+    const perLaneRanks: Record<string, number> = {};
+    const perLaneScores: Record<string, number> = {};
+    for (const ev of cand.evidence ?? []) {
+      if (ev.rank !== undefined) perLaneRanks[ev.sourceKind] = ev.rank;
+      if (ev.rawScore !== undefined) perLaneScores[ev.sourceKind] = ev.rawScore;
+    }
+    return {
+      entityId: cand.entityId,
+      sourceKind: cand.sourceKind,
+      ...(Object.keys(perLaneRanks).length > 0 ? { perLaneRanks } : {}),
+      ...(Object.keys(perLaneScores).length > 0 ? { perLaneScores } : {}),
+      fusedScore: cand.fusedScore,
+      ...(cand.rerankScore !== undefined ? { rerankScore: cand.rerankScore } : {}),
+      servedPosition: position,
+      ...(cand.canonicalUrl !== undefined ? { canonicalUrl: cand.canonicalUrl } : {}),
+    };
+  });
+
+  const suppressedEntityIds = dropped
+    .map((c) => c.entityId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+  if (deps.appendImpression !== undefined) {
+    const payload: RecallServedPayload = {
+      payloadVersion: 1,
+      servedContextId,
+      query: req.q,
+      intent,
+      ...(req.session !== undefined
+        ? { sessionContext: req.session as Readonly<Record<string, unknown>> }
+        : {}),
+      results: servedCandidatesSnapshot,
+      perSourceCounts: perSourceCounts as Readonly<Record<string, number>>,
+      rerankApplied,
+      ...(rerankApplied ? { rerankTopK } : {}),
+      ...(suppressedEntityIds.length > 0 ? { suppressedEntityIds } : {}),
+      sequenceNumber: (deps.nextSequenceNumber ?? (deps.now ?? Date.now))(),
+      servedAt,
+    };
+    // Fire-and-forget; impression durability must not gate the
+    // response. Failures are diagnostic, not user-visible.
+    void deps.appendImpression(payload).catch((err) => {
+      console.warn('[recall-v2] impression append failed:', err);
+    });
+  }
 
   return {
     query: {
@@ -1060,6 +1166,18 @@ export const runRecall = async (
         rerankApplied,
         degradedToLexical,
       },
+      servedContextId,
+      ...(rerankApplied
+        ? {
+            rerank: {
+              enabled: true,
+              rerankTopK,
+              rerankedCount: Math.min(rerankTopK, kept.length),
+              latencyMs: rerankLatencyMs,
+              ...(rankMovement !== undefined ? { rankMovement } : {}),
+            },
+          }
+        : {}),
       ...(strategy.debug === true ? { debug: { droppedExplanations: dropped } } : {}),
     },
   };

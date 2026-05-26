@@ -5,7 +5,6 @@ import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerRankerMethodologySpineDiagnostics,
 } from '../connections/materializerDiagnostics.js';
-import { createConnectionsStore } from '../connections/snapshot.js';
 import {
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
@@ -27,7 +26,6 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
-  augmentFeedbackWithVisitPairLabels,
   fingerprintFeedbackTrainingLabels,
   planRankerRetrain,
   readRankerRetrainState,
@@ -82,6 +80,8 @@ export interface WorkGraphHealthReport {
     // True when the current feedback fingerprint differs from what the
     // active model was trained on — "data changed, model is behind".
     readonly datasetChangedSinceTrain: boolean;
+    readonly expandedNegativeCount: number;
+    readonly labelDriftWithoutFeedback: number;
     readonly augmentation: {
       readonly status: string;
       readonly reason: string | null;
@@ -113,6 +113,15 @@ export interface WorkGraphHealthReport {
     readonly algorithmVersion: string | null;
     readonly topicCount: number;
     readonly lineageCount: number;
+  };
+  // Phase 0 of the recall+ranker v2 hard-replacement. The trainer
+  // (Phase 3) joins served × action by `servedContextId`. These
+  // counters surface the impression-log volume on the health panel
+  // so cold-start gating is auditable end-to-end.
+  readonly impressionLog: {
+    readonly servedCount: number;
+    readonly actionCount: number;
+    readonly actionsByKind: Readonly<Record<string, number>>;
   };
   readonly candidates: readonly DiagnosticCandidate[];
 }
@@ -720,12 +729,7 @@ export const collectWorkGraphHealth = async ({
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
   const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
-  const baseFeedback = projectFeedback(merged);
-  const currentSnapshot = await createConnectionsStore(vaultRoot).readCurrent();
-  const feedback =
-    currentSnapshot === null
-      ? baseFeedback
-      : augmentFeedbackWithVisitPairLabels(baseFeedback, currentSnapshot);
+  const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [activeManifest, activeManifestProbe, retrainState, ann, topicRevision, diagnostics] =
     await Promise.all([
@@ -790,6 +794,8 @@ export const collectWorkGraphHealth = async ({
     ),
     trainingMix,
     datasetChangedSinceTrain,
+    expandedNegativeCount: 0,
+    labelDriftWithoutFeedback: 0,
     augmentation,
   };
   const topicProducer: WorkGraphHealthReport['topicProducer'] = {
@@ -801,6 +807,27 @@ export const collectWorkGraphHealth = async ({
   const connectionsDiagnosticSnapshot = readConnectionsDiagnostics?.() ?? null;
   const topicProducedAt =
     topicRevision === null ? null : new Date(topicRevision.producedAt).toISOString();
+  // Phase 0 — count recall.served + recall.action events from the
+  // merged log. Cheap single pass; same data the trainer reads.
+  let servedCount = 0;
+  let actionCount = 0;
+  const actionsByKind: Record<string, number> = {};
+  for (const event of merged) {
+    if (event.type === 'recall.served') {
+      servedCount += 1;
+    } else if (event.type === 'recall.action') {
+      actionCount += 1;
+      const kind = (event.payload as { actionKind?: unknown })?.actionKind;
+      if (typeof kind === 'string') {
+        actionsByKind[kind] = (actionsByKind[kind] ?? 0) + 1;
+      }
+    }
+  }
+  const impressionLog: WorkGraphHealthReport['impressionLog'] = {
+    servedCount,
+    actionCount,
+    actionsByKind,
+  };
   return {
     ranker,
     ann,
@@ -810,6 +837,7 @@ export const collectWorkGraphHealth = async ({
       negativeLabelCount: feedback.negativeLabels.length,
     },
     topicProducer,
+    impressionLog,
     candidates: buildDiagnosticCandidates({
       ranker,
       topicProducer,

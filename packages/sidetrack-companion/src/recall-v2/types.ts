@@ -209,6 +209,20 @@ export interface RecallResponse {
     };
     readonly timingsMs: Readonly<Record<string, number>>;
     readonly flags: Readonly<Record<string, boolean>>;
+    /** Stable impression identity — present when the server appended a
+     *  `recall.served` event for this response. The extension echoes
+     *  it back in recall.action so the ranker trainer can join served ×
+     *  action records by impression. */
+    readonly servedContextId?: string;
+    /** Cross-encoder rerank diagnostics. Present when rerank fired. */
+    readonly rerank?: {
+      readonly enabled: boolean;
+      readonly rerankTopK: number;
+      readonly rerankedCount: number;
+      readonly latencyMs: number;
+      /** Per-candidate rank movement (pre-rerank rank − post-rerank rank). */
+      readonly rankMovement?: readonly { readonly entityId: string; readonly delta: number }[];
+    };
     readonly debug?: {
       readonly droppedExplanations?: readonly RecallCandidate[];
     };

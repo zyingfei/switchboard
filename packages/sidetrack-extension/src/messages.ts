@@ -181,6 +181,13 @@ export const messageTypes = {
   // this one message; background POSTs to companion's /v2/recall and
   // returns the evidence-rich response.
   recallV2Query: 'sidetrack.recall.v2.query',
+  // Phase 0 of the recall+ranker v2 hard-replacement. Caller (content
+  // script or sidepanel) emits a user action on a served recall
+  // candidate. Background relays as POST /v1/recall/action so the
+  // companion can append a `recall.action` event, joined to the
+  // parent `recall.served` by `servedContextId`. Fire-and-forget on
+  // the caller side — failures are not user-visible.
+  recallActionEmit: 'sidetrack.recall.v2.action',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -518,6 +525,20 @@ export type WorkboardRequest =
       // through verbatim so the contract evolves on the server without
       // forcing a coordinated extension release.
       readonly req: Record<string, unknown>;
+    }
+  | {
+      // Phase 0 of the recall+ranker v2 hard-replacement — user action
+      // on a served recall candidate. Background relays as POST
+      // /v1/recall/action; companion appends a `recall.action` event.
+      readonly type: typeof messageTypes.recallActionEmit;
+      readonly payload: {
+        readonly payloadVersion: 1;
+        readonly servedContextId: string;
+        readonly entityId: string;
+        readonly actionKind: string;
+        readonly actionAt: string;
+        readonly referencesEventId?: string;
+      };
     }
   | {
       readonly type: typeof messageTypes.createReminder;
@@ -893,6 +914,18 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.recallV2Query)) {
     return isRecord(value.req) && typeof value.req['q'] === 'string';
+  }
+
+  if (hasType(value, messageTypes.recallActionEmit)) {
+    const payload = value['payload'];
+    return (
+      isRecord(payload) &&
+      payload['payloadVersion'] === 1 &&
+      typeof payload['servedContextId'] === 'string' &&
+      typeof payload['entityId'] === 'string' &&
+      typeof payload['actionKind'] === 'string' &&
+      typeof payload['actionAt'] === 'string'
+    );
   }
 
   if (hasType(value, messageTypes.createReminder)) {

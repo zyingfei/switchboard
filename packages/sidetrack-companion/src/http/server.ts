@@ -46,7 +46,13 @@ import {
   readSemanticRecallPool,
   readSemanticRecallVectorStore,
 } from '../recall/semanticRecallPool.js';
-import { CAPTURE_RECORDED } from '../recall/events.js';
+import {
+  CAPTURE_RECORDED,
+  RECALL_ACTION,
+  RECALL_SERVED,
+  isRecallActionPayload,
+  type RecallServedPayload,
+} from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import {
   PAGE_CONTENT_EXTRACTED,
@@ -5486,14 +5492,91 @@ const routes: readonly RouteDefinition[] = [
       // degrade gracefully when the model is still warming up. Same
       // status the /v1/status endpoint exposes.
       const embedderState = context.getEmbedderStatus?.()?.state;
+      // Phase 0 — wire impression logging. When the event log is
+      // configured, every /v2/recall response writes a
+      // `recall.served` event the trainer (Phase 3) can read. Append
+      // is fire-and-forget inside the pipeline.
+      const eventLog = context.eventLog;
+      const appendImpression = eventLog === undefined
+        ? undefined
+        : async (payload: RecallServedPayload): Promise<void> => {
+            await eventLog.appendServerObserved({
+              clientEventId: `recall.served:${payload.servedContextId}:${String(payload.sequenceNumber)}`,
+              aggregateId: payload.servedContextId,
+              type: RECALL_SERVED,
+              payload: payload as unknown as Record<string, unknown>,
+            });
+          };
       const response = await runRecallV2(
-        { vaultRoot, ...(embedderState === undefined ? {} : { embedderState }) },
+        {
+          vaultRoot,
+          ...(embedderState === undefined ? {} : { embedderState }),
+          ...(appendImpression === undefined ? {} : { appendImpression }),
+        },
         req,
       );
       // Wrap in { data } to match the rest of the v1 API convention so
       // the bridge clients (recallV2 in pageContentClient.ts) can
       // unwrap consistently with the other endpoints.
       return [200, { data: response }];
+    },
+  },
+  {
+    // Phase 0 — POST /v1/recall/action. The extension echoes a user
+    // action (click / open-new-tab / explicit feedback) on a served
+    // candidate back to the companion. The companion appends a
+    // `recall.action` event tied to the parent `recall.served` by
+    // servedContextId. The group-level ranker trainer (Phase 3)
+    // joins the two to build training groups.
+    //
+    // Body shape: RecallActionPayload (see recall/events.ts).
+    // Idempotency: the X-Idempotency-Key header is the clientEventId,
+    // so duplicate POSTs collapse to one event.
+    method: 'POST',
+    pattern: /^\/v1\/recall\/action$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'event log not configured for this companion',
+        );
+      }
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'recallAction', idempotencyKey, async () => {
+        const body = await readBody(request);
+        if (!isRecallActionPayload(body)) {
+          throw new HttpRouteError(
+            400,
+            'INVALID_REQUEST',
+            'body did not match RecallActionPayload',
+            'POST /v1/recall/action body failed payload validation.',
+          );
+        }
+        const accepted = await eventLog.appendClientObserved({
+          clientEventId: idempotencyKey,
+          aggregateId: body.servedContextId,
+          type: RECALL_ACTION,
+          payload: body as unknown as Record<string, unknown>,
+          // {} = "browser observed nothing"; the parent recall.served
+          // already lives on the same aggregate, and the deps the
+          // system stamps from frontier will pick it up automatically.
+          baseVector: {},
+        });
+        return [
+          201,
+          {
+            data: {
+              accepted: true,
+              clientEventId: accepted.clientEventId,
+              servedContextId: body.servedContextId,
+              actionKind: body.actionKind,
+            },
+          },
+        ];
+      });
     },
   },
   {

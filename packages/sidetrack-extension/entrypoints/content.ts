@@ -1077,6 +1077,10 @@ export default defineContentScript({
                   readonly vectorDistance?: number;
                 }[];
               }[];
+              // Phase 0 — companion stamps a per-impression id on
+              // every response so click / open-new-tab actions can be
+              // joined back to the served context for ranker training.
+              readonly meta?: { readonly servedContextId?: string };
             }
           | { readonly ok: false; readonly error?: string }
           | null
@@ -1093,7 +1097,34 @@ export default defineContentScript({
           if (!force) return;
         }
         const results = v2 != null && v2.ok === true ? v2.results : [];
+        const servedContextId =
+          v2 != null && v2.ok === true ? v2.meta?.servedContextId : undefined;
         if (results.length === 0 && !force) return;
+        // Phase 0 — pre-build the lookup table for emitting recall.action
+        // when the user clicks/opens a row. Maps the popover row id back
+        // to the original entityId the server stamped.
+        const entityIdByPopoverId = new Map<string, string>();
+        for (const r of results) {
+          entityIdByPopoverId.set(r.candidateId ?? r.entityId, r.entityId);
+        }
+        const emitRecallAction = (
+          popoverId: string,
+          actionKind: 'click' | 'open_new_tab',
+        ): void => {
+          if (servedContextId === undefined) return;
+          const entityId = entityIdByPopoverId.get(popoverId);
+          if (entityId === undefined) return;
+          void chrome.runtime.sendMessage({
+            type: messageTypes.recallActionEmit,
+            payload: {
+              payloadVersion: 1,
+              servedContextId,
+              entityId,
+              actionKind,
+              actionAt: new Date().toISOString(),
+            },
+          });
+        };
         // Map v2 source_kind → DejaVuItem facet (overlay's UI shape).
         const v2FacetOf = (k: string): SearchHitFacet | undefined => {
           if (k === 'page_content' || k === 'timeline_visit') return 'page';
@@ -1137,6 +1168,10 @@ export default defineContentScript({
             const threadTarget =
               item.threadUrl ?? (item.facet === 'chat' ? item.canonicalUrl : undefined);
             if (threadTarget !== undefined) {
+              // Phase 0 — focus-in-sidepanel counts as a 'click' action
+              // (the user engaged with the served candidate but didn't
+              // open it as a fresh navigation).
+              emitRecallAction(item.id, 'click');
               void chrome.runtime.sendMessage({
                 type: messageTypes.focusThreadInSidePanel,
                 threadUrl: threadTarget,
@@ -1151,6 +1186,9 @@ export default defineContentScript({
               });
             } else if (item.canonicalUrl !== undefined) {
               // Page-content hit — no thread to focus; open the page.
+              // Phase 0 — opening in a new tab is the strongest implicit
+              // positive signal we capture in this phase.
+              emitRecallAction(item.id, 'open_new_tab');
               window.open(item.canonicalUrl, '_blank', 'noopener,noreferrer');
             }
             closeDejaVu();

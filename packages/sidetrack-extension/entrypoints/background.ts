@@ -3101,6 +3101,43 @@ const handleRequest = async (
     return (await buildRecallV2Response()) as unknown as RuntimeResponse;
   }
 
+  if (request.type === messageTypes.recallActionEmit) {
+    // Phase 0 of the recall+ranker v2 hard-replacement.
+    // The content script / sidepanel forwards user actions on served
+    // recall candidates here. We POST to /v1/recall/action so the
+    // companion can append a `recall.action` event joined to its
+    // parent `recall.served` by `servedContextId`. Fire-and-forget:
+    // emission failures must never block the user's click.
+    const emit = async (): Promise<void> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          // No companion configured — nothing to log. Silent.
+          return;
+        }
+        const payload = request.payload as {
+          readonly payloadVersion: 1;
+          readonly servedContextId: string;
+          readonly entityId: string;
+          readonly actionKind: string;
+          readonly actionAt: string;
+          readonly referencesEventId?: string;
+        };
+        await createPageContentClient(settings.companion).recallAction(payload);
+      } catch (error) {
+        // Logged but never surfaced. The impression-log is best-effort
+        // from the extension's perspective; the trainer tolerates
+        // missing actions for some served impressions.
+        console.warn(
+          '[sidetrack] recall.action emit failed',
+          error instanceof Error ? error.message : error,
+        );
+      }
+    };
+    void emit();
+    return { ok: true } as unknown as RuntimeResponse;
+  }
+
   if (request.type === messageTypes.annotateTurn) {
     // Side-panel-driven turn annotation. We identify the chat tab by
     // canonical URL match — provider SPAs add ?session=… and other
