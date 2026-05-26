@@ -62,8 +62,20 @@ const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolea
       revision.logisticBatchFeatureStatsVersion !== undefined
     );
   }
-  // Step 6 + 8 artifacts: not yet served by the selector even if a
-  // future writer populates their quality entries.
+  if (kind === 'lightgbm_plus_online_lr') {
+    // Combiner (Step 8) needs ALL its inputs serveable: scoring
+    // applies the combiner weights to per-artifact scores it
+    // computes from the same training-time inputs.
+    return (
+      revision.modelBytes.byteLength > 0 &&
+      revision.logisticBatchWeights !== undefined &&
+      revision.logisticBatchFeatureStatsVersion !== undefined &&
+      revision.combinerWeights !== undefined
+    );
+  }
+  // `logistic_online`: not yet served by the selector. Step 6 lands
+  // the math; materializer-drain integration + ship-gate evaluation
+  // are the follow-up.
   return false;
 };
 
