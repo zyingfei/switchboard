@@ -209,6 +209,9 @@ describe('live side-panel App wiring', () => {
       expect(sendMessage).toHaveBeenCalledWith({ type: messageTypes.getWorkboardState });
     });
     expect(screen.queryByText('Set up Sidetrack')).not.toBeInTheDocument();
+    // Scope D — default view is Now; the workstream scaffolding
+    // (Open threads / Captures / ws-bar) lives under Workstreams now.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
     expect(await screen.findByText('Open threads')).toBeInTheDocument();
     expect(screen.getByText('Captures')).toBeInTheDocument();
     // ws-bar shows the current workstream label (default: "not set")
@@ -336,6 +339,8 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // Scope D — Workstream picker lives under the Workstreams tab.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
     // Switch to the workstream that contains the test thread via the ws picker.
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
@@ -392,6 +397,8 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // Scope D — Workstream pills + picker live under Workstreams.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
     const sidetrackPickerRow = wsRows.find(
@@ -439,6 +446,8 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
+    // Scope D — Workstream pills (drop targets) live under Workstreams.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
     const dataTransfer = {
       dropEffect: 'none',
       effectAllowed: 'move',

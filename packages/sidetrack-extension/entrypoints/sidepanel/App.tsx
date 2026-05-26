@@ -786,13 +786,14 @@ const App = () => {
   // tab (graph stays reachable via the existing connections viewMode
   // for cross-surface jumps).
   //
-  // Initial default stays `workstream` for now — flipping to `now`
-  // is a deliberate UX migration that's covered in a follow-up so
-  // the existing app.test.tsx suite (which asserts workstream view
-  // scaffolding by default) doesn't break in lockstep.
+  // Initial default is `now` — the contextual surface for whatever
+  // browser tab the user is currently on. Spec D rule: tab changes
+  // never auto-switch the side-panel selection out from under the
+  // user, so once they navigate to another panel tab they stay
+  // there until they explicitly choose Now again.
   const [viewMode, setViewMode] = useState<
     'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
-  >('workstream');
+  >('now');
   // Stage 5 polish — cross-surface jumps between Inbox and Connections.
   // `connectionsAnchorRequest` is a string that ConnectionsView watches
   // via its requestAnchor prop; when set non-empty, the view auto-anchors
@@ -2577,7 +2578,7 @@ const App = () => {
   // even though the registration runs only once.
   const viewModeRef = useRef<
     'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
-  >('workstream');
+  >('now');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
