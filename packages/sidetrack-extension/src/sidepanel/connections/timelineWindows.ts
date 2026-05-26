@@ -77,15 +77,27 @@ const compactDateTimeLabel = (ms: number): string => `${dateLabel(ms)}, ${timeLa
 const labelForNode = (node: ConnectionsSnapshot['nodes'][number]): string => {
   // Filter id-like values at every fallback step — marker labels feed
   // straight into TimelineRail's visible title/aria-label.
+  // URLs are not id-like in practice (they start with https://) but
+  // the guard is cheap defense-in-depth: a malformed metadata entry
+  // where canonicalUrl/latestUrl held a `tses_*` or `bac_*` would
+  // otherwise leak through this fallback.
   if (node.label.length > 0 && !isInternalIdLike(node.label)) return node.label;
   const title = node.metadata['title'];
   if (typeof title === 'string' && title.length > 0 && !isInternalIdLike(title)) {
     return title;
   }
   const canonicalUrl = node.metadata['canonicalUrl'];
-  if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) return canonicalUrl;
+  if (
+    typeof canonicalUrl === 'string' &&
+    canonicalUrl.length > 0 &&
+    !isInternalIdLike(canonicalUrl)
+  ) {
+    return canonicalUrl;
+  }
   const latestUrl = node.metadata['latestUrl'];
-  if (typeof latestUrl === 'string' && latestUrl.length > 0) return latestUrl;
+  if (typeof latestUrl === 'string' && latestUrl.length > 0 && !isInternalIdLike(latestUrl)) {
+    return latestUrl;
+  }
   return '(node)';
 };
 

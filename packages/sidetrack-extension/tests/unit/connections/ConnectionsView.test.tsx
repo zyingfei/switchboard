@@ -1654,6 +1654,12 @@ describe('ConnectionsView — engineering scaffold', () => {
     // formatter's `display.tooltip` reaches users through NodeChip /
     // NodeRow / PathFinder.
     const forbidden: readonly { readonly name: string; readonly re: RegExp }[] = [
+      // Crockford-style ULID — uppercase letters + digits, 16-26 chars,
+      // word-bounded. Catches the bare workstream / replica ULIDs that
+      // get past the prefix-targeted patterns below (e.g. `ZYJFNMTB`).
+      // The bound is intentionally narrow so it doesn't match short
+      // all-caps acronyms (HTTP, JSON) or long sentence fragments.
+      { name: 'bare ULID', re: /\b[A-Z0-9]{16,26}\b/ },
       { name: 'tses_*', re: /tses_[A-Z0-9]/ },
       { name: 'visit-instance:', re: /visit-instance:/ },
       { name: 'tab-session:', re: /tab-session:/ },
