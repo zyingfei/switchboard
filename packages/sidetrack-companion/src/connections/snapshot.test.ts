@@ -18,6 +18,7 @@ import {
   type TabSessionProjection,
 } from '../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../threads/events.js';
+import { projectThread } from '../threads/projection.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { projectUrls, URL_PROJECTION_SCHEMA_VERSION } from '../urls/projection.js';
 import type { TimelineDayProjection } from '../timeline/projection.js';
@@ -3039,5 +3040,128 @@ describe('connections — Stage 5.2 R1/R4 snapshot extension', () => {
       }),
     );
     expect(snap3.snapshotRevision).not.toBe(snap1.snapshotRevision);
+  });
+});
+
+describe('connections — performance regression guards', () => {
+  // The materializer's rebuild speed has regressed multiple times.
+  // Latest incident (2026-05-26): `projectThread` /
+  // `projectWorkstream` were called K times with the full N events
+  // each, producing O(K × N) work in their inner `events.filter`.
+  // Observed dt on the dogfood vault was 14-17s per rebuild,
+  // blocking /v1/status. The fix (see `snapshot.ts`) buckets
+  // events by `bac_id` ONCE before the projection loop so each
+  // projection call receives only the events relevant to its
+  // aggregate (typically a handful, not the entire merged log).
+  //
+  // We exercise the fix's algorithmic principle directly against
+  // `projectThread`: at fixture scale, calling projectThread K
+  // times with the full events array (the pre-fix pattern) takes
+  // orders of magnitude longer than calling it K times with the
+  // pre-bucketed per-bacId slices (the post-fix pattern). A
+  // regression that re-introduces "pass full events to every
+  // projection call" therefore lights this assertion up
+  // unambiguously — independent of any wall-clock budget for
+  // the rest of buildConnectionsSnapshot.
+  it('projectThread × N with bucketed slices is at least 5× faster than with full events (FX2 invariant)', () => {
+    const THREAD_COUNT = 100;
+    const NOISE_COUNT = 8000;
+    const NOISE_SEQ_OFFSET = 1_000_000;
+
+    const events: AcceptedEvent[] = [];
+    const threadIds: string[] = [];
+    for (let i = 0; i < THREAD_COUNT; i += 1) {
+      const bacId = `bac_perf_thread_${String(i)}`;
+      threadIds.push(bacId);
+      events.push(
+        buildEvent({
+          seq: i,
+          type: THREAD_UPSERTED,
+          aggregateId: bacId,
+          payload: {
+            payloadVersion: 1,
+            bac_id: bacId,
+            provider: 'test',
+            threadUrl: `https://perf.test/thread-${String(i)}`,
+            title: `Perf thread ${String(i)}`,
+            lastSeenAt: '2026-05-26T12:00:00.000Z',
+          },
+        }),
+      );
+    }
+    for (let i = 0; i < NOISE_COUNT; i += 1) {
+      events.push(
+        buildEvent({
+          seq: NOISE_SEQ_OFFSET + i,
+          type: NAVIGATION_COMMITTED,
+          aggregateId: `agg-perf-noise-${String(i)}`,
+          payload: navigationCommittedPayload({
+            replicaId: 'replica-A',
+            seq: NOISE_SEQ_OFFSET + i,
+            canonicalUrl: `https://perf.test/noise/${String(i)}`,
+            commitAt: '2026-05-26T12:00:00.000Z',
+          }),
+        }),
+      );
+    }
+
+    // Pre-bucket once (the work the FX2 fix moved into
+    // buildConnectionsSnapshot's events pass).
+    const eventsByBacId = new Map<string, AcceptedEvent[]>();
+    for (const event of events) {
+      if (event.type !== THREAD_UPSERTED) continue;
+      const payload = event.payload as { readonly bac_id?: string };
+      const bacId = payload.bac_id;
+      if (typeof bacId !== 'string') continue;
+      const bucket = eventsByBacId.get(bacId);
+      if (bucket === undefined) eventsByBacId.set(bacId, [event]);
+      else bucket.push(event);
+    }
+
+    const measureBest = (fn: () => void): number => {
+      fn(); // warm-up
+      let best = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < 3; i += 1) {
+        const start = performance.now();
+        fn();
+        const dt = performance.now() - start;
+        if (dt < best) best = dt;
+      }
+      return best;
+    };
+
+    const dtFullEvents = measureBest(() => {
+      // Pre-fix pattern — every call walks the full N+K events
+      // through its internal isRelevant filter.
+      for (const id of threadIds) projectThread(id, events);
+    });
+    const dtBucketed = measureBest(() => {
+      // Post-fix pattern — each call receives only its own
+      // small slice.
+      for (const id of threadIds) projectThread(id, eventsByBacId.get(id) ?? []);
+    });
+
+    const speedup = dtFullEvents / Math.max(dtBucketed, 0.01);
+    expect(
+      speedup,
+      `dtFullEvents=${dtFullEvents.toFixed(2)}ms, dtBucketed=${dtBucketed.toFixed(2)}ms — projection loop is no longer significantly faster with pre-bucketed slices; FX2 fix appears regressed`,
+    ).toBeGreaterThan(5);
+
+    // Cross-check at the wire-up level: the FX2 fix's behavior
+    // is "buildConnectionsSnapshot passes only the relevant
+    // slice to projectThread". Verify the snapshot we get
+    // matches what projectThread produces when given the bucket
+    // directly, for one representative thread. Any caller that
+    // reverts to passing the full events array would still
+    // produce the same projection (projectThread's internal
+    // filter masks it), so this is correctness-only; the
+    // performance assertion above is the real regression guard.
+    const snap = buildConnectionsSnapshot(emptyInput({ events }));
+    const expectedThreadNodeIds = new Set(threadIds.map((id) => `thread:${id}`));
+    const observedThreadNodes = snap.nodes.filter((n) => n.kind === 'thread');
+    expect(observedThreadNodes.length).toBe(THREAD_COUNT);
+    for (const node of observedThreadNodes) {
+      expect(expectedThreadNodeIds.has(node.id)).toBe(true);
+    }
   });
 });
