@@ -634,14 +634,22 @@ const fuseRrf = (
     for (let i = 0; i < group.candidates.length; i += 1) {
       const cand = group.candidates[i]!;
       const prev = fused.get(cand.entityId);
-      // Freshness-weighted RRF contribution. Freshness in [0.3, 1.0]
-      // multiplies the pure 1/(k+rank) signal so a 1-day-old doc at
-      // rank 1 contributes 1/61; a 2-year-old doc at rank 1
-      // contributes 0.5/61. Keeps RRF's scale-free fusion property
-      // while letting recency break the otherwise-deterministic
-      // URL-alphabetical ties in the lexical layer.
-      const rrf = 1 / (RRF_K + (i + 1));
-      const contribution = rrf * freshnessFactor(cand, now);
+      // Honor any per-candidate stream multiplier (e.g. the smooth
+      // gap-based gate in generateSemanticQuery emits
+      // `gateMultiplier / (RRF_K + rank)` into `cand.fusedScore`).
+      // Codex review of PR #215: the prior version recomputed pure
+      // RRF from list rank here and silently discarded the
+      // multiplier — only the hard-drop (multiplier=0 → empty
+      // candidates list) ever took effect. Fix: use the candidate's
+      // pre-computed contribution as the base, falling back to
+      // rank-only RRF when a source doesn't set one (covers all
+      // current generators except semantic_query).
+      const baseContribution = cand.fusedScore > 0 ? cand.fusedScore : 1 / (RRF_K + (i + 1));
+      // Freshness multiplier in [0.3, 1.0] — lets recency break the
+      // otherwise-deterministic URL-alphabetical ties in the lexical
+      // layer; stacks on top of any stream multiplier from the
+      // source generator.
+      const contribution = baseContribution * freshnessFactor(cand, now);
       if (prev === undefined) {
         fused.set(cand.entityId, { ...cand, fusedScore: contribution });
       } else {

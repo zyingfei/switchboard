@@ -53,45 +53,24 @@ the evidence array.
 profiling (D7) handles the residual case (e.g. `google.com/?zx=N`
 noise visits).
 
-### D2 — Unified `lexical` source via BM25F (collapses 3 sources to 1)
+### D2 — Unified `lexical` source via BM25F — **DEFERRED to a follow-up PR**
 
-**Replaces:** separate `generatePageContent`, `generateTimelineVisit`,
-`generateChatTurn` generators
+Original intent was to collapse `generatePageContent`,
+`generateTimelineVisit`, `generateChatTurn` into one BM25F query with
+title weight 5x and a body-length modifier. Initial implementation
+caused eval-fixture regressions (forbidden docs leaked into top-5 via
+title-only "security" matches at 5x weight), so the BM25 weights were
+kept at the original `bm25(docs_fts, 2.0, 1.0, 1.0, 0.5)`.
 
-**Why:** RRF requires its inputs to have comparable ranking quality. A
-rank-1 title match in `timeline_visit` and a rank-1 body match in
-`page_content` produce the same RRF contribution (`1/(60+1)`), but
-have wildly different precision. Splitting into per-`source_kind`
-streams was the structural error — FTS5 already supports BM25F (field-
-weighted BM25), which is the principled fix.
+The shipped form retains three separate lexical generators with their
+original BM25 weights. Source-quality differentiation is currently
+handled at fusion (via D3 smooth gate on semantic) and post-retrieval
+(cross-encoder rerank D4). A future PR can re-attempt the unification
+with stricter calibration against the eval fixtures.
 
-One FTS5 query over `docs_fts`:
-
-```sql
-SELECT
-  docs.entity_id, docs.source_kind, ...
-  bm25(docs_fts, 5.0, 1.0, 1.0, 0.5)
-    * (1.0 + 1.0 / log(COALESCE(length(docs.body), 1) + 1))
-    AS modulated_bm25,
-  snippet(docs_fts, 1, '', '', '…', 64) AS body_snippet
-FROM docs JOIN docs_fts ON docs.rowid = docs_fts.rowid
-WHERE docs_fts MATCH ?
-ORDER BY modulated_bm25 DESC LIMIT ?
-```
-
-- `bm25(..., 5.0, 1.0, 1.0, 0.5)` — title weight 5x body. The
-  unified-source design eliminates the source-kind imbalance at the
-  retrieval layer.
-- `COALESCE(length(body), 1) + 1` — title-only docs (body NULL) get
-  the strongest length boost (multiplier ~2.44); long body docs get a
-  smaller boost. Per reviewer: SQLite returns `NULL` from
-  `length(NULL)`, so the COALESCE is required to keep title-only docs
-  in the result.
-- `source_kind` becomes display metadata on the candidate row, not a
-  fusion dimension.
-
-**After this change RRF runs over just two streams:** `lexical` and
-`semantic_query` (plus `graph_neighbor` when on).
+**Currently shipped:** `bm25(docs_fts, 2.0, 1.0, 1.0, 0.5)` per
+source. Snippet column (`snippet(docs_fts, 1, '', '', '…', 64)`) IS
+shipped (D4 below).
 
 ### D3 — Smooth gap-based semantic gate (per-model thresholds)
 
@@ -174,20 +153,30 @@ re-canonicalize stored URLs.
 Runs as a background job on the existing backfill cadence (signature
 flip triggers re-profile). No impact on hot-path latency.
 
-### D6 — RRF stays pure
+### D6 — RRF stays pure (with stream-multiplier passthrough)
 
 **Decision:** do NOT add per-source weights to RRF. The fusion math
-stays `1/(k+rank)` — same `k=60`, same untouched contribution per
-source. All quality differentiation moves UPSTREAM:
+stays `1/(k+rank)` — same `k=60`. All quality differentiation moves
+UPSTREAM:
 
-- Lexical quality → BM25F field weights (D2)
+- Lexical quality → BM25F field weights (D2 — currently 2x title;
+  deferred refactor)
 - Semantic quality → gap-based multiplier on the contribution (D3)
 - Match quality across sources → cross-encoder over top-N (D4)
 
 Per reviewer: "Hacking constants into RRF defeats its mathematical
-elegance." Score-modulated RRF specifically — multiplying the
-reciprocal-rank contribution by a per-stream confidence signal — is
-the principled way to encode source quality.
+elegance." Score-modulated RRF — multiplying the reciprocal-rank
+contribution by a per-stream confidence signal — is the principled
+way to encode source quality.
+
+**Implementation note (Codex review of PR #215):** `fuseRrf` USED
+to recompute `1/(K+rank)` from the candidate's list position and
+silently discarded `cand.fusedScore` that the source generator had
+set. That meant the smooth 0..1 ramp from D3 was lost — only the
+hard-drop (multiplier=0 → empty candidates) ever fired. Fixed: the
+fusion uses `cand.fusedScore > 0 ? cand.fusedScore : 1/(K+rank)` so
+source-emitted pre-weighted scores pass through, with a rank-only
+fallback for sources that don't compute their own.
 
 ## Watch-outs (incorporated)
 
