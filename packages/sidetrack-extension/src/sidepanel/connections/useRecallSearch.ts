@@ -3,15 +3,20 @@ import { useEffect, useRef, useState } from 'react';
 import { messageTypes } from '../../messages';
 import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
-// Stage 5 polish — recall-index full-text search hook. The
-// companion's `/v1/recall/query` route does hybrid lexical +
-// vector retrieval over indexed turn chunks; we proxy through
-// background.ts's existing `messageTypes.recallQuery` handler so
-// we don't reinvent the bridge-key + fetch dance.
+// Scope A — Search migrates from /v1/content/query → /v2/recall with
+// intent='search'. The server owns query analysis, source selection,
+// fusion, dedupe, and suppression so the hook just sends the request,
+// parses the response, and surfaces hits as RecallHit[] for the
+// existing renderers (SearchTab, NodeSearchBox).
 //
-// The hook debounces (default 300ms), skips short queries
-// (< 3 chars), and exposes `{ items, loading, error }` with a
-// stable empty-array reference so consumers don't churn re-renders.
+// Why use intent='search' and not the dejavu defaults: search has no
+// current-page context, so suppressCurrentPage is 'never' and
+// minHitAgeMs is 0 — the user typed a query and a fresh hit (a chat
+// they created 30 seconds ago) IS the right answer.
+//
+// The hook debounces (default 300ms), skips short queries (< 3 chars),
+// and exposes `{ items, loading, error }` with a stable empty-array
+// reference so consumers don't churn re-renders.
 
 export interface RecallHit {
   readonly id: string;
@@ -31,19 +36,72 @@ interface RecallSearchState {
   readonly items: readonly RecallHit[];
   readonly loading: boolean;
   readonly error: string | null;
+  /** True when the response came from the extension's OPFS local
+   *  store because the companion was unreachable. Lets the SearchTab
+   *  show a "Local results only" banner so the user knows the
+   *  semantic / page-content sources are dark. */
+  readonly localFallback: boolean;
 }
 
 const EMPTY_ITEMS: readonly RecallHit[] = [];
 
-const isHit = (value: unknown): value is RecallHit => {
-  if (typeof value !== 'object' || value === null) return false;
-  const v = value as Partial<RecallHit>;
-  return (
-    typeof v.id === 'string' &&
-    (typeof v.threadId === 'string' || typeof v.anchorNodeId === 'string') &&
-    typeof v.capturedAt === 'string' &&
-    typeof v.score === 'number'
-  );
+// Map /v2/recall's sourceKind (page_content / timeline_visit /
+// chat_turn / semantic_query / graph_neighbor / focus) → the legacy
+// RecallHit shape this hook's consumers already understand. Both
+// 'page-content' and 'chat-turn' map cleanly; everything else groups
+// under 'page-content' since the hook doesn't distinguish lexical
+// vs semantic for the user.
+const legacySourceKindOf = (k: string): RecallHit['sourceKind'] => {
+  if (k === 'chat_turn') return 'chat-turn';
+  return 'page-content';
+};
+
+// Map a v2 RecallCandidate (opaque record-shape, since we don't
+// import the companion types into the extension) into a RecallHit.
+// Picks `candidateId`/`entityId` for the row id, prefers the
+// canonical url for the anchor, and surfaces snippet/title for the
+// renderer to display.
+const hitFromV2Candidate = (
+  raw: unknown,
+): RecallHit | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as {
+    readonly candidateId?: unknown;
+    readonly entityId?: unknown;
+    readonly sourceKind?: unknown;
+    readonly canonicalUrl?: unknown;
+    readonly title?: unknown;
+    readonly snippet?: unknown;
+    readonly threadId?: unknown;
+    readonly fusedScore?: unknown;
+    readonly lastSeenAt?: unknown;
+    readonly firstSeenAt?: unknown;
+  };
+  const id =
+    typeof r.candidateId === 'string'
+      ? r.candidateId
+      : typeof r.entityId === 'string'
+        ? r.entityId
+        : null;
+  if (id === null) return null;
+  const capturedAt =
+    typeof r.lastSeenAt === 'string'
+      ? r.lastSeenAt
+      : typeof r.firstSeenAt === 'string'
+        ? r.firstSeenAt
+        : new Date().toISOString();
+  const sourceKind =
+    typeof r.sourceKind === 'string' ? legacySourceKindOf(r.sourceKind) : 'page-content';
+  return {
+    id,
+    sourceKind,
+    capturedAt,
+    score: typeof r.fusedScore === 'number' ? r.fusedScore : 0,
+    ...(typeof r.canonicalUrl === 'string' ? { canonicalUrl: r.canonicalUrl } : {}),
+    ...(typeof r.title === 'string' ? { title: r.title } : {}),
+    ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}),
+    ...(typeof r.threadId === 'string' ? { threadId: r.threadId } : {}),
+  };
 };
 
 export const useRecallSearch = (
@@ -62,6 +120,7 @@ export const useRecallSearch = (
     items: EMPTY_ITEMS,
     loading: false,
     error: null,
+    localFallback: false,
   });
   // Track the most recent in-flight query so a stale response can't
   // overwrite a newer one. Hit-rate guard against the user typing
@@ -72,13 +131,19 @@ export const useRecallSearch = (
     const trimmed = query.trim();
     if (trimmed.length === 0) {
       latestRef.current = '';
-      setState({ query: '', items: EMPTY_ITEMS, loading: false, error: null });
+      setState({ query: '', items: EMPTY_ITEMS, loading: false, error: null, localFallback: false });
       return;
     }
     if (trimmed.length < minLength) {
       // Below threshold — clear results but don't show error.
       latestRef.current = trimmed;
-      setState({ query: trimmed, items: EMPTY_ITEMS, loading: false, error: null });
+      setState({
+        query: trimmed,
+        items: EMPTY_ITEMS,
+        loading: false,
+        error: null,
+        localFallback: false,
+      });
       return;
     }
     latestRef.current = trimmed;
@@ -87,10 +152,14 @@ export const useRecallSearch = (
       const sendQuery = (): void => {
         chrome.runtime.sendMessage(
           {
-            type: messageTypes.contentQuery,
-            q: trimmed,
-            limit,
-            sourceKind: ['page-content', 'chat-turn'],
+            type: messageTypes.recallV2Query,
+            req: {
+              q: trimmed,
+              intent: 'search',
+              limit,
+              perSourceLimit: 20,
+              strategy: { explain: true },
+            },
           },
           (response: unknown) => {
             // Ignore stale responses: user may have typed something new.
@@ -102,26 +171,67 @@ export const useRecallSearch = (
                 items: EMPTY_ITEMS,
                 loading: false,
                 error: lastError.message ?? 'Recall query failed',
+                localFallback: false,
               });
               return;
             }
-            if (typeof response !== 'object' || response === null || !('items' in response)) {
+            // v2 response wraps the RecallResponse under { ok, results }
+            // (per background.ts:recallV2Query handler). `null` /
+            // `undefined` means the SW short-circuited (e.g. local-
+            // fallback path with no hits).
+            if (response == null) {
+              setState({
+                query: trimmed,
+                items: EMPTY_ITEMS,
+                loading: false,
+                error: null,
+                localFallback: false,
+              });
+              return;
+            }
+            if (typeof response !== 'object') {
               setState({
                 query: trimmed,
                 items: EMPTY_ITEMS,
                 loading: false,
                 error: 'Unexpected recall response',
+                localFallback: false,
               });
               return;
             }
-            const items = (response as { items?: unknown }).items;
-            const parsed = Array.isArray(items) ? items.filter(isHit) : [];
-            const error = (response as { error?: string }).error;
+            const wrap = response as {
+              readonly ok?: unknown;
+              readonly results?: unknown;
+              readonly error?: unknown;
+              readonly meta?: {
+                readonly flags?: { readonly localFallback?: unknown };
+              };
+            };
+            if (wrap.ok !== true) {
+              setState({
+                query: trimmed,
+                items: EMPTY_ITEMS,
+                loading: false,
+                error: typeof wrap.error === 'string' ? wrap.error : 'Recall query failed',
+                localFallback: false,
+              });
+              return;
+            }
+            const rawResults = Array.isArray(wrap.results) ? wrap.results : [];
+            const parsed = rawResults
+              .map(hitFromV2Candidate)
+              .filter((h): h is RecallHit => h !== null);
+            // The companion sets meta.flags.localFallback when its SW
+            // tryLocalFallback path produced the results. Honest UX:
+            // surface this so the search tab can warn "Local results
+            // only — semantic + page-content sources are dark."
+            const localFallback = wrap.meta?.flags?.localFallback === true;
             setState({
               query: trimmed,
               items: parsed,
               loading: false,
-              error: typeof error === 'string' && parsed.length === 0 ? error : null,
+              error: null,
+              localFallback,
             });
           },
         );
@@ -134,6 +244,7 @@ export const useRecallSearch = (
           items: EMPTY_ITEMS,
           loading: false,
           error: error instanceof Error ? error.message : String(error),
+          localFallback: false,
         });
       }
     }, debounceMs);

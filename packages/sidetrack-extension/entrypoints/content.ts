@@ -11,7 +11,6 @@ import {
   type ContentResponse,
   type ListAnnotationsByUrlResponse,
   type PageContentExtractContentResponse,
-  type ContentQueryResponse,
 } from '../src/messages';
 import {
   mountAnnotationOverlay,

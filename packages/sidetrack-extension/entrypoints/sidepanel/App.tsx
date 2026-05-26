@@ -101,6 +101,9 @@ import {
 import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
 import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
+import { NowHistoryStrip } from '../../src/sidepanel/now/NowHistoryStrip';
+import { classifyPageKind, pageKindLabel } from '../../src/sidepanel/now/pageKind';
+import { useNowHistory } from '../../src/sidepanel/now/nowHistory';
 import { resolveFocusedUrlRecord } from '../../src/sidepanel/inbox/focusedUrlRecord';
 import { withEffectiveThreadWorkstream } from '../../src/sidepanel/inbox/effectiveThreadWorkstream';
 import {
@@ -772,9 +775,25 @@ const App = () => {
     | { readonly kind: 'dumped'; readonly path: string }
     | { readonly kind: 'error'; readonly message: string }
   >({ kind: 'idle' });
-  const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
-    'workstream',
-  );
+  // Scope D — the new tab shape is Now / Threads / Workstreams /
+  // Inbox / Search. The state keys keep the historical names
+  // (`workstream`, `all`, `connections`) to minimize churn through
+  // App.tsx's many cross-references; only the visible labels +
+  // routing change. `now` is added as a new contextual surface; the
+  // current-tab card lives there instead of inside Inbox. `search`
+  // is a dedicated entry that renders ConnectionsView in its search
+  // submode without exposing the broader graph UI as a top-level
+  // tab (graph stays reachable via the existing connections viewMode
+  // for cross-surface jumps).
+  //
+  // Initial default is `now` — the contextual surface for whatever
+  // browser tab the user is currently on. Spec D rule: tab changes
+  // never auto-switch the side-panel selection out from under the
+  // user, so once they navigate to another panel tab they stay
+  // there until they explicitly choose Now again.
+  const [viewMode, setViewMode] = useState<
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+  >('now');
   // Stage 5 polish — cross-surface jumps between Inbox and Connections.
   // `connectionsAnchorRequest` is a string that ConnectionsView watches
   // via its requestAnchor prop; when set non-empty, the view auto-anchors
@@ -2557,7 +2576,9 @@ const App = () => {
   // the All-Threads bucket containing a given thread. Each is mirrored
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
-  const viewModeRef = useRef<'workstream' | 'all' | 'inbox' | 'connections'>('workstream');
+  const viewModeRef = useRef<
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+  >('now');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
@@ -4577,6 +4598,50 @@ const App = () => {
         : tabSessionRecordFromUrl(focusedRecordEffective),
     [focusedRecordEffective],
   );
+  // Scope D/E — Now page classifier + history strip. Classifier
+  // takes the live URL + whether it maps to a known thread + the
+  // workstream attribution; history hook tracks the last 4 Now
+  // contexts so the user has visual continuity when the active
+  // browser tab changes underneath them.
+  const focusedAttributedWorkstreamId =
+    focusedRecordEffective?.currentAttribution?.workstreamId ?? null;
+  const focusedUrl = focusedTabSession?.latestUrl ?? liveActiveTabUrl;
+  const focusedIsKnownThread = useMemo(() => {
+    if (focusedUrl === undefined || focusedUrl.length === 0) return false;
+    return state.threads.some((t) => t.threadUrl === focusedUrl);
+  }, [focusedUrl, state.threads]);
+  const focusedPageKind = useMemo(
+    () =>
+      classifyPageKind({
+        url: focusedUrl,
+        isKnownThread: focusedIsKnownThread,
+        attributedWorkstreamId: focusedAttributedWorkstreamId,
+      }),
+    [focusedUrl, focusedIsKnownThread, focusedAttributedWorkstreamId],
+  );
+  const nowHistory = useNowHistory();
+  useEffect(() => {
+    if (focusedUrl === undefined || focusedUrl.length === 0) return;
+    const title =
+      focusedTabSession?.latestTitle ??
+      liveActiveTabTitle ??
+      (() => {
+        try {
+          return new URL(focusedUrl).hostname;
+        } catch {
+          return focusedUrl;
+        }
+      })();
+    nowHistory.observe({
+      url: focusedUrl,
+      title,
+      kind: focusedPageKind,
+      enteredAt: new Date().toISOString(),
+    });
+    // observe is stable (useCallback); we only want to push when
+    // the URL or kind changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedUrl, focusedPageKind]);
 
   // ── task #50 Stage 2 — PageTextPanel on the current-tab card.
   // The SAME presentational <PageTextPanel> ConnectionsView mounts on
@@ -6036,31 +6101,43 @@ const App = () => {
           <button
             type="button"
             role="tab"
-            aria-selected={viewMode === 'workstream'}
-            aria-label="Workstream"
-            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            aria-selected={viewMode === 'now'}
+            aria-label="Now"
+            className={'view-tab' + (viewMode === 'now' ? ' on' : '')}
             onClick={() => {
-              setViewMode('workstream');
+              setViewMode('now');
             }}
           >
-            Workstream
-            <span className="ct mono" aria-hidden>
-              {state.workstreams.length}
-            </span>
+            Now
           </button>
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'all'}
-            aria-label="All threads"
+            aria-label="Threads"
             className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
             onClick={() => {
               setViewMode('all');
             }}
           >
-            All threads
+            Threads
             <span className="ct mono" aria-hidden>
               {state.threads.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'workstream'}
+            aria-label="Workstreams"
+            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('workstream');
+            }}
+          >
+            Workstreams
+            <span className="ct mono" aria-hidden>
+              {state.workstreams.length}
             </span>
           </button>
           <button
@@ -6081,14 +6158,14 @@ const App = () => {
           <button
             type="button"
             role="tab"
-            aria-selected={viewMode === 'connections'}
-            aria-label="Connections"
-            className={'view-tab' + (viewMode === 'connections' ? ' on' : '')}
+            aria-selected={viewMode === 'search' || viewMode === 'connections'}
+            aria-label="Search"
+            className={'view-tab' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
             onClick={() => {
-              setViewMode('connections');
+              setViewMode('search');
             }}
           >
-            Connections
+            Search
           </button>
         </div>
         <div className="app-actions">
@@ -6623,20 +6700,28 @@ const App = () => {
           <span className="lbl">
             {viewMode === 'inbox'
               ? 'Inbox'
-              : viewMode === 'connections'
-                ? 'Connections'
-                : 'All threads'}
+              : viewMode === 'search' || viewMode === 'connections'
+                ? 'Search'
+                : viewMode === 'now'
+                  ? 'Now'
+                  : 'Threads'}
           </span>
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
       )}
 
-      {viewMode === 'inbox' ? (
+      {viewMode === 'now' ? (
         <>
+          <NowHistoryStrip
+            contexts={nowHistory.contexts}
+            pinnedUrl={nowHistory.pinnedUrl}
+            onPin={nowHistory.pin}
+          />
           <section
             ref={currentTabCardRef}
             className={
               'tab-attribution-card' +
+              ` now-kind-${focusedPageKind}` +
               (focusedTabSession !== undefined
                 ? ' is-active'
                 : liveActiveTabUrl !== undefined
@@ -6648,7 +6733,9 @@ const App = () => {
             aria-label="Current tab attribution"
           >
             <div className="tab-attribution-card-head">
-              <span className="tab-attribution-card-eyebrow mono">Current tab</span>
+              <span className="tab-attribution-card-eyebrow mono" data-testid="now-page-kind">
+                {pageKindLabel[focusedPageKind]}
+              </span>
               {focusedTabSession !== undefined ? (
                 <>
                   <span
@@ -6778,7 +6865,14 @@ const App = () => {
                   {/* task #50 Stage 2 — Page-text / index controls for
               the LIVE current tab (same panel ConnectionsView mounts
               on a graph anchor). Renders nothing when the focused URL
-              has no canonical URL (workstream/topic focus). */}
+              has no canonical URL (workstream/topic focus).
+
+              Scope D / F3 — hidden for `unknown` (no canonical URL to
+              index, no point) and `chat` (chat threads are captured
+              through the dispatch path, not the page-text indexer).
+              The full per-kind layout split is otherwise CSS-driven
+              via the `now-kind-${kind}` class on the card root. */}
+                  {focusedPageKind === 'page' || focusedPageKind === 'workstream' ? (
                   <PageTextPanel
                     testIdPrefix="current-tab"
                     canonicalUrl={currentTabCanonicalUrl}
@@ -6806,6 +6900,7 @@ const App = () => {
                       setCurrentTabBulkPreview(null);
                     }}
                   />
+                  ) : null}
                 </div>
                 {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the
@@ -7189,12 +7284,19 @@ const App = () => {
         </div>
       ) : null}
 
-      {viewMode === 'connections' ? (
+      {viewMode === 'connections' || viewMode === 'search' ? (
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
           requestAnchor={connectionsAnchorRequest}
-          requestSearch={connectionsSearchRequest}
+          // Scope D — when the user clicks the new "Search" top-level
+          // tab, force ConnectionsView into its search submode. The
+          // existing `requestSearch` bump effect (ConnectionsView.tsx)
+          // handles the actual submode switch; bumping with viewMode
+          // change ensures every tab activation lands in search.
+          requestSearch={
+            viewMode === 'search' ? connectionsSearchRequest + 1 : connectionsSearchRequest
+          }
           {...(connectionsDejaVuRequest === null ? {} : { requestDejaVuMode: connectionsDejaVuRequest })}
           onRequestConsumed={() => {
             setConnectionsAnchorRequest('');

@@ -354,6 +354,57 @@ class SqliteRecallStore implements RecallStore {
     });
   }
 
+  queryByCanonicalUrl(opts: {
+    readonly canonicalUrl: string;
+    readonly limit: number;
+  }): readonly StoreFtsHit[] {
+    // Direct lookup — no FTS5, so URL punctuation doesn't matter and
+    // the result is exact-match only. Used by the `focus` source so
+    // the Now card surfaces the active page itself plus any
+    // same-URL variants stored under different source_kind rows.
+    const sql = `
+      SELECT
+        entity_id    AS entityId,
+        source_kind  AS sourceKind,
+        canonical_url AS canonicalUrl,
+        title        AS title,
+        thread_id    AS threadId,
+        last_seen_at AS lastSeenAt,
+        first_seen_at AS firstSeenAt
+      FROM docs
+      WHERE canonical_url = ?
+      ORDER BY
+        CASE source_kind WHEN 'page_content' THEN 0 WHEN 'timeline_visit' THEN 1 ELSE 2 END,
+        COALESCE(last_seen_at, first_seen_at, 0) DESC
+      LIMIT ?
+    `;
+    const rows = this.db.prepare(sql).all(opts.canonicalUrl, opts.limit) as {
+      entityId: string;
+      sourceKind: string;
+      canonicalUrl: string | null;
+      title: string | null;
+      threadId: string | null;
+      lastSeenAt: number | null;
+      firstSeenAt: number | null;
+    }[];
+    return rows.map((r): StoreFtsHit => ({
+      entityId: r.entityId,
+      sourceKind: r.sourceKind as StoreSourceKind,
+      ...(r.canonicalUrl === null ? {} : { canonicalUrl: r.canonicalUrl }),
+      ...(r.title === null ? {} : { title: r.title }),
+      ...(r.threadId === null ? {} : { threadId: r.threadId }),
+      // bm25 is N/A for direct lookup; use a constant 1.0 so the
+      // pipeline's downstream candidate-from-hit conversion still
+      // emits a stable per-row rank.
+      bm25: 1,
+      ...(r.firstSeenAt === null
+        ? r.lastSeenAt === null
+          ? {}
+          : { capturedAtMs: r.lastSeenAt }
+        : { capturedAtMs: r.firstSeenAt }),
+    }));
+  }
+
   upsertVector(entityId: string, vec: Float32Array): void {
     if (!this.vecAvailable) return;
     try {
