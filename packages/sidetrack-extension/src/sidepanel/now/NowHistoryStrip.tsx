@@ -5,19 +5,12 @@ import { pageKindLabel } from './pageKind';
 
 // Lightweight breadcrumb above the Now card.
 //
-// Shows up to 4 chips (current + 3 prior contexts). Clicking a chip
-// toggles a "pinned" highlight on it — feedback that the user
-// noticed the prior context — but does NOT yet drive the card body
-// to render that prior snapshot. The card stays bound to the live
-// active tab.
-//
-// This is intentional for the first cut: the spec rule "the app
-// must not auto-switch the user's selected tab" means chips must
-// never trigger a browser navigation. Restoring the prior render
-// without restoring the tab needs a synthetic focusedRecord
-// override upstream in App.tsx — left as a follow-up so this PR
-// stays bounded. The pin highlight at least confirms the click
-// landed and surfaces which context the user is asking about.
+// Shows up to 4 chips (current + 3 prior contexts). Clicking an
+// inactive chip pins that context — App.tsx's `displayedFocusedTabUrl`
+// swap then re-renders the Now card from the projection record for
+// that URL (UX5). Clicking the active chip unpins → back to live.
+// The chip never auto-switches the BROWSER tab (spec rule); pin
+// affects rendering only.
 
 export interface NowHistoryStripProps {
   readonly contexts: readonly NowContext[];
@@ -57,6 +50,14 @@ export const NowHistoryStrip = ({
         const isHead = idx === 0;
         const isPinned = pinnedUrl !== null && pinnedUrl === ctx.url;
         const isActive = isPinned || (pinnedUrl === null && isHead);
+        // UX-discoverability: tooltip explains what clicking does
+        // (the chip is just a small pill and users wouldn't guess
+        // the pin/restore behaviour from looking at it).
+        const tooltip = isActive
+          ? isPinned
+            ? `Pinned: ${ctx.url}\nClick to return to the live tab`
+            : `Live current tab: ${ctx.url}`
+          : `Click to pin and view this prior context (no browser-tab switch).\n${ctx.url}`;
         return (
           <button
             type="button"
@@ -67,7 +68,8 @@ export const NowHistoryStrip = ({
               (isHead ? ' is-current' : '')
             }
             data-testid={`now-history-chip-${idx}`}
-            title={ctx.url}
+            title={tooltip}
+            aria-label={tooltip}
             onClick={() => {
               // Clicking the active chip clears the pin (defaults
               // back to live mode showing the current tab); clicking
