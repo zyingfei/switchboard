@@ -92,15 +92,40 @@ const hitFromV2Candidate = (
         : new Date().toISOString();
   const sourceKind =
     typeof r.sourceKind === 'string' ? legacySourceKindOf(r.sourceKind) : 'page-content';
+  const canonicalUrl = typeof r.canonicalUrl === 'string' ? r.canonicalUrl : undefined;
+  const threadId = typeof r.threadId === 'string' ? r.threadId : undefined;
+  // SearchTab drops any RecallHit without an anchorNodeId (the row
+  // renderer needs one for the click-to-anchor handler at
+  // src/sidepanel/connections/SearchTab.tsx ≈ line 599-601). For
+  // chat hits the natural anchor is `thread:<id>`; for every
+  // URL-based source (timeline_visit / page_content / semantic_query
+  // / graph_neighbor / focus on the v2 wire) the natural anchor is
+  // `timeline-visit:<canonicalUrl>` — same convention App.tsx uses
+  // when piping cross-surface jumps into Connections.
+  //
+  // Without this the user types a URL into Search, the companion
+  // returns the matching timeline_visit row, useRecallSearch maps
+  // it through, SearchTab's anchorIdForRecallHit returns undefined,
+  // and the hit gets dropped → "No content matches".
+  // Empirically reproduced against the test companion with the
+  // Microsoft Copilot Cowork URL: /v2/recall returned the page;
+  // the side panel rendered the empty state.
+  const anchorNodeId =
+    sourceKind === 'chat-turn' && threadId !== undefined
+      ? `thread:${threadId}`
+      : canonicalUrl !== undefined
+        ? `timeline-visit:${canonicalUrl}`
+        : undefined;
   return {
     id,
     sourceKind,
     capturedAt,
     score: typeof r.fusedScore === 'number' ? r.fusedScore : 0,
-    ...(typeof r.canonicalUrl === 'string' ? { canonicalUrl: r.canonicalUrl } : {}),
+    ...(anchorNodeId === undefined ? {} : { anchorNodeId }),
+    ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
     ...(typeof r.title === 'string' ? { title: r.title } : {}),
     ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}),
-    ...(typeof r.threadId === 'string' ? { threadId: r.threadId } : {}),
+    ...(threadId === undefined ? {} : { threadId }),
   };
 };
 
