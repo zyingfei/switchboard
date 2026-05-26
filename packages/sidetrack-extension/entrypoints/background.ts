@@ -89,7 +89,7 @@ import {
 } from '../src/content/visual/dom-hash';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
-import { createRecallClient } from '../src/companion/recallClient';
+import { createRecallClient, indexTurnsCoalesced } from '../src/companion/recallClient';
 import {
   createPageContentClient,
   type PageContentCoverage,
@@ -934,22 +934,24 @@ const sendToCompanion = async (
     (turn) => typeof turn.text === 'string' && turn.text.trim().length > 0,
   );
   if (indexableTurns.length > 0) {
-    void createRecallClient(settings.companion)
-      .indexTurns(
-        indexableTurns.map((turn) => ({
-          id: `${threadResult.bac_id}:${String(turn.ordinal)}`,
-          threadId: threadResult.bac_id,
-          capturedAt: turn.capturedAt,
-          text: turn.text,
-        })),
-      )
-      .catch((error: unknown) => {
-        // eslint-disable-next-line no-console
-        console.debug(
-          '[recall] best-effort indexing failed:',
-          error instanceof Error ? error.message : error,
-        );
-      });
+    // FU1 — route through the coalescer so multiple capture events
+    // firing close together (e.g. several chat-tab onboardings)
+    // collapse into one POST instead of N back-to-back requests.
+    void indexTurnsCoalesced(
+      settings.companion,
+      indexableTurns.map((turn) => ({
+        id: `${threadResult.bac_id}:${String(turn.ordinal)}`,
+        threadId: threadResult.bac_id,
+        capturedAt: turn.capturedAt,
+        text: turn.text,
+      })),
+    ).catch((error: unknown) => {
+      // eslint-disable-next-line no-console
+      console.debug(
+        '[recall] best-effort indexing failed:',
+        error instanceof Error ? error.message : error,
+      );
+    });
   }
   await upsertLocalThread(thread, threadResult);
   const lastTurn = event.turns.at(-1);
