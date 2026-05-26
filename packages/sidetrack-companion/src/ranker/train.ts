@@ -41,7 +41,18 @@ export type RankerArtifactKind =
   | 'logistic_batch'
   | 'logistic_online'
   | 'lightgbm_lambdamart'
-  | 'lightgbm_plus_online_lr';
+  | 'lightgbm_plus_online_lr'
+  // Step 9 — hierarchical per-container head (per-workstream /
+  // per-topic bias offsets on top of a global LR). Type lives in the
+  // union so the registry + selector can be aware of the kind, but
+  // the algorithm is plan-deferred ("Not in scope until B + F + D
+  // land and there's quantitative evidence that container-level
+  // personalization adds NDCG"). The selector's `isServeable`
+  // currently returns false for this kind, so it's never picked.
+  // When future work fills in the bias-computation training step,
+  // `perContainerBiases` on RankerRevision carries the persisted
+  // state and `isServeable` flips on.
+  | 'hierarchical_per_container_lr';
 
 export interface RankerArtifactShipGate {
   readonly status: 'pass' | 'fail' | 'unavailable';
@@ -296,6 +307,22 @@ export interface RankerRevision {
   // only when the combiner trains (needs ≥1 valid validation row +
   // both lgb and lr weights present).
   readonly combinerWeights?: readonly number[];
+  // Step 9 — hierarchical per-container heads (framework only).
+  // Per the plan ("Hierarchical: w_container = w_global +
+  // δ_container with L2 shrinkage on δ. Container bias only at
+  // first"), the served score becomes
+  //   score_c(x) = sigmoid(w_global · x + bias_c)
+  // where w_global is `logisticBatchWeights` and `bias_c` lives in
+  // these maps. ALGORITHM IS DEFERRED PER PLAN — the plan
+  // explicitly says "Not in scope until B + F + D land and
+  // there's quantitative evidence that container-level
+  // personalization adds NDCG." The structure ships so the
+  // selector + manifest are aware; the bias-computation training
+  // step is a follow-up gated on replay-eval evidence.
+  readonly perContainerBiases?: {
+    readonly perWorkstream: Readonly<Record<string, number>>;
+    readonly perTopic: Readonly<Record<string, number>>;
+  };
 }
 
 export interface RankerTrainingCandidate {

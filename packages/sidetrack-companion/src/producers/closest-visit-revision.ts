@@ -60,6 +60,17 @@ export interface ClosestVisitRankerRevisionManifest {
    * Optional with lenient parse so older manifests stay readable.
    */
   readonly combinerWeights?: readonly number[];
+  /**
+   * Step 9 — per-container bias offsets (framework only; algorithm
+   * is plan-deferred until replay-eval evidence justifies it).
+   * Container ID → bias scalar; serving adds bias_c to the global
+   * LR's score for the candidate's shared container. Optional with
+   * lenient parse.
+   */
+  readonly perContainerBiases?: {
+    readonly perWorkstream: Readonly<Record<string, number>>;
+    readonly perTopic: Readonly<Record<string, number>>;
+  };
 }
 
 export interface ClosestVisitRankerRevisionManifestProbe {
@@ -124,6 +135,9 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     ...(revision.combinerWeights === undefined
       ? {}
       : { combinerWeights: revision.combinerWeights }),
+    ...(revision.perContainerBiases === undefined
+      ? {}
+      : { perContainerBiases: revision.perContainerBiases }),
   };
 };
 
@@ -674,6 +688,34 @@ const normalizeCombinerWeights = (value: unknown): readonly number[] | undefined
   return out;
 };
 
+// Per-container biases (Step 9) — Record<containerId, finite number>.
+// Lenient: a non-record value or a record with any non-finite entry
+// drops the whole map for that container kind so a stale-shape
+// persisted state can't pollute serving.
+const normalizeBiasRecord = (value: unknown): Readonly<Record<string, number>> | undefined => {
+  if (!isRecord(value)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== 'number' || !Number.isFinite(entry)) return undefined;
+    out[key] = entry;
+  }
+  return out;
+};
+
+const normalizePerContainerBiases = (
+  value: unknown,
+):
+  | {
+      readonly perWorkstream: Readonly<Record<string, number>>;
+      readonly perTopic: Readonly<Record<string, number>>;
+    }
+  | undefined => {
+  if (!isRecord(value)) return undefined;
+  const perWorkstream = normalizeBiasRecord(value['perWorkstream']) ?? {};
+  const perTopic = normalizeBiasRecord(value['perTopic']) ?? {};
+  return { perWorkstream, perTopic };
+};
+
 // Coerce a validated manifest record into the typed shape, normalizing
 // the optional `trainQuality` + `artifactQuality` + LR weights (drop
 // if malformed/absent — none of these gate scoring on their own).
@@ -700,6 +742,9 @@ const finalizeManifest = (
   const combinerWeights = normalizeCombinerWeights(
     (value as { readonly combinerWeights?: unknown }).combinerWeights,
   );
+  const perContainerBiases = normalizePerContainerBiases(
+    (value as { readonly perContainerBiases?: unknown }).perContainerBiases,
+  );
   return {
     revisionId: value.revisionId,
     modelVersion: value.modelVersion,
@@ -717,6 +762,7 @@ const finalizeManifest = (
         }
       : {}),
     ...(combinerWeights === undefined ? {} : { combinerWeights }),
+    ...(perContainerBiases === undefined ? {} : { perContainerBiases }),
   };
 };
 
@@ -860,6 +906,13 @@ export const readClosestVisitRankerRevision = async (
       ...(manifest.combinerWeights === undefined
         ? {}
         : { combinerWeights: manifest.combinerWeights }),
+      // Step 9 — same lesson applied prospectively. The hierarchical
+      // bias-computation algorithm is plan-deferred, but the manifest
+      // schema + loader still propagate the field so the future
+      // training pass can populate it without another loader fix.
+      ...(manifest.perContainerBiases === undefined
+        ? {}
+        : { perContainerBiases: manifest.perContainerBiases }),
     };
   } catch {
     return null;
