@@ -3,7 +3,7 @@ import { Booster, loadLGB } from '@wlearn/lightgbm';
 import type { CandidatePairFeatures, FEATURE_SCHEMA_VERSION } from './feature-schema.js';
 import { selectActiveRanker, type ActiveRankerSelection } from './select.js';
 import {
-  COMBINER_FEATURE_KINDS,
+  composeCombinerVector,
   deterministicBaselineScore,
   encodeRankerFeatureMatrix,
   RANKER_FEATURE_KEYS,
@@ -277,19 +277,16 @@ export const predictActive = (
     handle.logisticBatchWeights !== undefined &&
     handle.combinerWeights !== undefined
   ) {
-    // Compose per-artifact scores in the SAME order the trainer
-    // built `COMBINER_FEATURE_KINDS`. Any reordering breaks the
-    // weight↔input alignment.
-    const inputs: number[] = [];
-    for (const inputKind of COMBINER_FEATURE_KINDS) {
-      if (inputKind === 'lightgbm_lambdamart') {
-        inputs.push(predictRanker(features, handle.lightgbm).score);
-      } else if (inputKind === 'logistic_batch') {
-        inputs.push(scoreLogisticBatch(features, handle.logisticBatchWeights));
-      } else if (inputKind === 'graph_baseline') {
-        inputs.push(deterministicBaselineScore(features));
-      }
-    }
+    // Codex review of #237 (MEDIUM): trainer + dispatch share the
+    // same vector layout via `composeCombinerVector(scoresByKind)`
+    // — a future reorder of `COMBINER_FEATURE_KINDS` threads
+    // through automatically without weights and inputs silently
+    // drifting apart.
+    const inputs = composeCombinerVector({
+      lightgbm_lambdamart: predictRanker(features, handle.lightgbm).score,
+      logistic_batch: scoreLogisticBatch(features, handle.logisticBatchWeights),
+      graph_baseline: deterministicBaselineScore(features),
+    });
     const combined = scoreCombiner(inputs, handle.combinerWeights);
     if (Number.isFinite(combined)) {
       return { score: combined, kind };

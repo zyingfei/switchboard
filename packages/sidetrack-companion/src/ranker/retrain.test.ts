@@ -1026,4 +1026,41 @@ describe('ranker retraining loop', () => {
     expect(retrainCalls).toBe(1);
     expect(mergedEventCount).toBe(1);
   });
+
+  it('container_negative_match is 0 for explicit visit-pair negatives (Codex review of #236)', async () => {
+    // Codex caught: `feedback` arriving into `buildRankerTrainingCandidates`
+    // is already augmented — `negativeLabels` includes the expanded
+    // visit↔visit pairs AND the original explicit visit-pair user
+    // negatives. The pre-fix code routed everything through
+    // `deriveNegativeVisitPairLabelsFromSnapshot` (which passes
+    // pre-existing visit-pair entries through unchanged), so the
+    // pre-existing pairs would incorrectly read `container_negative_match=1`.
+    //
+    // Fix filters the input to container-endpoint negatives only.
+    // This test asserts a visit-pair negative does NOT light up the
+    // feature.
+    const fromUrl = 'https://example.test/from';
+    const toUrl = 'https://example.test/to';
+    // Both pairs are visit↔visit (no container endpoint), so neither
+    // should appear in `negativeContainerPairs`. The feature on the
+    // candidate row for the explicit negative pair stays at 0.
+    const feedback = projection(
+      [], // no positives
+      [label(fromUrl, toUrl)], // explicit visit-pair negative — NOT container-shaped
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback,
+      merged: [],
+      snapshot: snapshotWithVisits([fromUrl, toUrl]),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+    // The labeled negative pair appears as a training row; assert
+    // its feature is 0 (post-fix). Pre-fix this would have been 1.
+    const labeledPair = candidates.find(
+      (c) =>
+        c.candidate.fromVisitId === fromUrl && c.candidate.toVisitId === toUrl,
+    );
+    expect(labeledPair).toBeDefined();
+    expect(labeledPair?.features.container_negative_match).toBe(0);
+  });
 });

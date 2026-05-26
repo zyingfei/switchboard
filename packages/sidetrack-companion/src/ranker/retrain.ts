@@ -175,6 +175,13 @@ const containerMembersFromSnapshot = (
 const isContainerId = (value: string): boolean =>
   value.startsWith(TOPIC_PREFIX) || value.startsWith(WORKSTREAM_PREFIX);
 
+// Step 7 helper, exported via a stable name for the
+// `buildRankerTrainingCandidates` filter that keeps only
+// container-endpoint negatives before expansion. Mirrors
+// `isContainerId` but with the name disambiguated from any
+// caller's local import context.
+const isContainerLabelId = isContainerId;
+
 // Mirror `deriveVisitPairLabelsFromSnapshot` for the negative side.
 // Projection emits `ignore` / `split` / `user.flow.rejected` negatives
 // shaped `(timeline-visit:<url>, topic:<id>)` or `(…, workstream:<id>)`
@@ -951,12 +958,32 @@ export const buildRankerTrainingCandidates = ({
     generatedAt,
   );
 
-  // Step 7 — precompute the (from\0to) pair set for the new
+  // Step 7 — precompute the (from, to) pair set for the new
   // `container_negative_match` feature. Reuses the existing
   // Cartesian-expansion logic so the feature value is bit-exact
-  // with what the expansion path would have produced. Computed
-  // once per training pass, not per candidate.
-  const expandedNegativePairs = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot);
+  // with what the expansion path would have produced for
+  // container-shaped user negatives. Computed once per training
+  // pass, not per candidate.
+  //
+  // Codex review of #236 caught: `feedback` here is already
+  // augmented (caller did `augmentFeedbackWithVisitPairLabels`)
+  // so `negativeLabels` includes the EXPANDED visit↔visit pairs
+  // alongside the original container-shaped negatives.
+  // `deriveNegativeVisitPairLabelsFromSnapshot` passes those
+  // visit-pair entries through unchanged, which would
+  // (incorrectly) mark them as `container_negative_match=1`
+  // even though they're not from container expansion. Filter
+  // upstream to container-endpoint negatives only.
+  const containerOnlyFeedback: FeedbackProjection = {
+    ...feedback,
+    negativeLabels: feedback.negativeLabels.filter(
+      (label) => isContainerLabelId(label.fromId) || isContainerLabelId(label.toId),
+    ),
+  };
+  const expandedNegativePairs = deriveNegativeVisitPairLabelsFromSnapshot(
+    containerOnlyFeedback,
+    snapshot,
+  );
   const negativeContainerPairs = new Set<string>();
   for (const label of expandedNegativePairs) {
     negativeContainerPairs.add(negativeContainerPairKey(label.fromId, label.toId));

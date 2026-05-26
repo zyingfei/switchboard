@@ -3,8 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { FEATURE_SCHEMA_VERSION } from './feature-schema.js';
 import { selectActiveRanker } from './select.js';
 import {
+  COMBINER_FEATURE_KINDS,
+  composeCombinerVector,
   RANKER_FEATURE_KEYS,
   RANKER_MODEL_VERSION,
+  scoreCombiner,
   type RankerArtifactKind,
   type RankerArtifactQuality,
   type RankerRevision,
@@ -185,6 +188,41 @@ describe('selectActiveRanker', () => {
       ],
     });
     expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
+  });
+
+  it('composeCombinerVector + scoreCombiner share the COMBINER_FEATURE_KINDS ordering (Codex review of #237)', () => {
+    // The combiner trains its weights against per-artifact scores
+    // in `COMBINER_FEATURE_KINDS` order; the serving dispatch must
+    // assemble its input vector in the SAME order or weights
+    // silently mis-apply. Both paths go through
+    // `composeCombinerVector(scoresByKind)`. This contract test
+    // walks the layout via per-position one-hot weights so any
+    // reorder of `COMBINER_FEATURE_KINDS` without updating both
+    // call sites lights it up.
+    const sentinelByKind: Readonly<Record<(typeof COMBINER_FEATURE_KINDS)[number], number>> = {
+      lightgbm_lambdamart: 0.42,
+      logistic_batch: 0.13,
+      graph_baseline: 0.07,
+    };
+    const vector = composeCombinerVector(sentinelByKind);
+    expect(vector.length).toBe(COMBINER_FEATURE_KINDS.length);
+    for (let index = 0; index < COMBINER_FEATURE_KINDS.length; index += 1) {
+      const kind = COMBINER_FEATURE_KINDS[index];
+      if (kind === undefined) throw new Error('COMBINER_FEATURE_KINDS unexpectedly sparse');
+      expect(vector[index]).toBe(sentinelByKind[kind]);
+    }
+    // Per-position round-trip: bias=0 + a one-hot weight isolates
+    // each kind's contribution. The resulting score equals
+    // sigmoid(vector[isolated]) iff the dispatch's vector layout
+    // matches the trainer's. Tests every position so even an
+    // adjacent swap fails.
+    for (let isolated = 0; isolated < COMBINER_FEATURE_KINDS.length; isolated += 1) {
+      const oneHot = new Array(COMBINER_FEATURE_KINDS.length + 1).fill(0) as number[];
+      oneHot[isolated + 1] = 1;
+      const score = scoreCombiner(vector, oneHot);
+      const expected = 1 / (1 + Math.exp(-(vector[isolated] ?? 0)));
+      expect(score).toBeCloseTo(expected, 6);
+    }
   });
 
   it('never picks hierarchical_per_container_lr — algorithm is plan-deferred (Step 9)', () => {

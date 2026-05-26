@@ -277,6 +277,17 @@ export type CombinerFeatureKind = (typeof COMBINER_FEATURE_KINDS)[number];
 
 export const COMBINER_FEATURE_COUNT = COMBINER_FEATURE_KINDS.length;
 
+// Single source of truth for the combiner's input ordering. Both
+// the trainer (when fitting weights against per-artifact scores)
+// and the serving dispatch (predict.ts) call this so a future
+// reorder of `COMBINER_FEATURE_KINDS` automatically threads through
+// without the weights and the input vector silently drifting apart.
+// Codex review of #237 (MEDIUM) caught the pre-fix order
+// duplication.
+export const composeCombinerVector = (
+  scoresByKind: Readonly<Record<CombinerFeatureKind, number>>,
+): readonly number[] => COMBINER_FEATURE_KINDS.map((kind) => scoresByKind[kind]);
+
 export interface RankerRevision {
   readonly revisionId: string;
   readonly modelVersion: typeof RANKER_MODEL_VERSION;
@@ -1624,25 +1635,29 @@ export const trainRankerRevisionFromRows = async (
           if (lgb === undefined || lr === undefined || base === undefined) continue;
           const row = heldOutEval.rows[i];
           if (row === undefined) continue;
-          combinerScoreVectors.push([lgb, lr, base]);
+          combinerScoreVectors.push([
+            ...composeCombinerVector({
+              lightgbm_lambdamart: lgb,
+              logistic_batch: lr,
+              graph_baseline: base,
+            }),
+          ]);
           combinerLabels.push(row.label);
         }
         combinerWeights = trainCombinerLogisticRegression(combinerScoreVectors, combinerLabels);
         if (combinerWeights !== undefined) {
-          const combinerHeldScores = combinerScoreVectors.map((vector) =>
-            scoreCombiner(vector, combinerWeights ?? []),
-          );
-          if (combinerHeldScores.every((value) => Number.isFinite(value))) {
-            combinerValidationMetric = metric(
-              `combiner validation ndcg@${String(RANKER_HELD_OUT_NDCG_K)}`,
-              ndcgForGroupedRows(
-                heldOutEval.rows,
-                heldOutEval.groupSizes,
-                combinerHeldScores,
-                RANKER_HELD_OUT_NDCG_K,
-              ),
-            );
-          }
+          // Codex review of #237 (HIGH): the previous version computed
+          // a `combinerValidationMetric` by scoring the SAME heldOut
+          // rows the combiner was fit on. That is in-sample for the
+          // combiner weights and overstates true generalization. The
+          // reserved-test below is genuinely out-of-sample for BOTH
+          // the base models and the combiner, so it stays. Without
+          // an honest validation metric the artifactShipGate returns
+          // `unavailable` for the combiner, making it observe-only
+          // until a proper calibration split is carved (deferred —
+          // splitting heldOut further would shrink the validation
+          // signal for the base models, so the cleaner fix is a
+          // dedicated combiner-eval split in a follow-up).
           if (
             testEval !== null &&
             logisticReservedTestScores !== undefined &&
@@ -1657,7 +1672,13 @@ export const trainRankerRevisionFromRows = async (
               const lr = lrTest?.[i];
               const base = baseTest?.[i];
               if (lgb === undefined || lr === undefined || base === undefined) continue;
-              combinerTestScoreVectors.push([lgb, lr, base]);
+              combinerTestScoreVectors.push([
+                ...composeCombinerVector({
+                  lightgbm_lambdamart: lgb,
+                  logistic_batch: lr,
+                  graph_baseline: base,
+                }),
+              ]);
             }
             const combinerTestScores = combinerTestScoreVectors.map((vector) =>
               scoreCombiner(vector, combinerWeights ?? []),
