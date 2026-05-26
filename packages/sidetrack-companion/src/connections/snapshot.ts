@@ -2205,11 +2205,14 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         return undefined;
       }
     };
+    // Last-resort label is the kind-name placeholder, never the raw
+    // tses_ id — the extension's entityDisplay also strips id-like
+    // labels, but the wire should not carry them in the first place.
     const tabSessionLabel =
       tabSessionLatestTitle ??
       instance.title ??
       hostFromUrl(tabSessionLatestUrl ?? instance.url) ??
-      instance.tabSessionId;
+      '(tab session)';
     upsertNode(nodes, {
       kind: 'tab-session',
       key: instance.tabSessionId,
@@ -2248,9 +2251,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       // projection record is absent.
       const openerRecord = input.tabSessionProjection.bySessionId.get(instance.openerTabSessionId);
       const openerLabel =
-        openerRecord?.latestTitle ??
-        hostFromUrl(openerRecord?.latestUrl) ??
-        instance.openerTabSessionId;
+        openerRecord?.latestTitle ?? hostFromUrl(openerRecord?.latestUrl) ?? '(tab session)';
       upsertNode(nodes, {
         kind: 'tab-session',
         key: instance.openerTabSessionId,

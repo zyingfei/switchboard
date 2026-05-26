@@ -81,7 +81,7 @@ export const TimelineRail = ({
       <div className="cx-timeline-rows">
         {data.rows.map((row, i) => (
           <div key={row.replicaId} className="cx-timeline-row">
-            <div className="device" title={row.replicaId}>
+            <div className="device">
               <span className="cx-replica-dot" />
               <span>{replicaLabel(row.replicaId)}</span>
             </div>

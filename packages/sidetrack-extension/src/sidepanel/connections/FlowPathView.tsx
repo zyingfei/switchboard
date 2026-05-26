@@ -469,7 +469,7 @@ export const FlowPathView = ({
                       <button
                         type="button"
                         className={cellClasses}
-                        title={visit.id}
+                        title={visit.url}
                         onClick={() => onNodeClick(visit.id)}
                         data-testid={`flow-visit-${visit.id}`}
                       >
@@ -547,7 +547,6 @@ export const FlowPathView = ({
               key={edge.id}
               className="cx-flow-edge cx-edge-cross-replica"
               data-testid={`flow-cross-replica-edge-${edge.id}`}
-              title={edge.replicaId}
             >
               also seen on {replicaName(edge.replicaId)}: {visitLabel(edge.fromVisitId)}
             </span>

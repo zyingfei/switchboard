@@ -1521,4 +1521,126 @@ describe('ConnectionsView — engineering scaffold', () => {
     });
     expect(screen.getByText('8f0e2a1b3c4d')).toBeDefined();
   });
+
+  // T1-F — full-snapshot sweep: render a snapshot that exercises every
+  // kind whose raw id is forbidden as visible text (tab-session,
+  // visit-instance, replica, workstream without path), then assert the
+  // rendered text content carries none of the forbidden id patterns.
+  // Excludes attribute strings (data-testid carries raw ids by design)
+  // by sampling only `textContent` of the rendered tree.
+  it('never leaks raw entity ids into visible text', async () => {
+    const sweepAnchor = 'tab-session:tses_01KSWEEP00000000000000ANCH';
+    const sweepOpener = 'tab-session:tses_01KSWEEP00000000000000OPEN';
+    const sweepVisit =
+      'visit-instance:tses_01KSWEEP00000000000000ANCH:2026-05-20T10:00:00.000Z:https://example.test/article';
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: { nodeId: sweepAnchor, hops: 1 },
+              nodes: [
+                {
+                  id: sweepAnchor,
+                  kind: 'tab-session',
+                  label: 'Mullvad VPN blog',
+                  originReplicaIds: ['replica-A'],
+                  firstSeenAt: '2026-05-20T09:55:00.000Z',
+                  lastSeenAt: '2026-05-20T10:30:00.000Z',
+                  metadata: {
+                    latestTitle: 'Mullvad VPN blog',
+                    latestUrl: 'https://mullvad.net/en/blog/exit-ip-fingerprinting',
+                    canonicalUrl: 'https://mullvad.net/en/blog/exit-ip-fingerprinting',
+                    lastActivityAt: '2026-05-20T10:30:00.000Z',
+                  },
+                },
+                {
+                  id: sweepOpener,
+                  kind: 'tab-session',
+                  label: 'Hacker News',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    latestTitle: 'Hacker News',
+                    latestUrl: 'https://news.ycombinator.com/',
+                  },
+                },
+                {
+                  id: sweepVisit,
+                  kind: 'visit-instance',
+                  label: 'Mullvad article',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    title: 'Mullvad article',
+                    canonicalUrl: 'https://example.test/article',
+                  },
+                },
+                {
+                  id: 'timeline-visit:https://example.test/article',
+                  kind: 'timeline-visit',
+                  label: 'Mullvad article',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    title: 'Mullvad article',
+                    canonicalUrl: 'https://example.test/article',
+                    visitCount: 3,
+                  },
+                },
+                {
+                  id: 'workstream:bac_sweep_research',
+                  kind: 'workstream',
+                  label: 'bac_sweep_research',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+                {
+                  id: 'replica:replica-A',
+                  kind: 'replica',
+                  label: 'replica-A',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+              ],
+              edges: [
+                {
+                  id: 'edge:tab_session_opener_chain:opener',
+                  kind: 'tab_session_opener_chain',
+                  fromNodeId: sweepAnchor,
+                  toNodeId: sweepOpener,
+                  observedAt: '2026-05-20T09:55:00.000Z',
+                  producedBy: { source: 'timeline-projection' },
+                  confidence: 'observed',
+                },
+                {
+                  id: 'edge:visit_in_tab:visit',
+                  kind: 'visit_instance_in_tab_session',
+                  fromNodeId: sweepVisit,
+                  toNodeId: sweepAnchor,
+                  observedAt: '2026-05-20T10:00:00.000Z',
+                  producedBy: { source: 'timeline-projection' },
+                  confidence: 'observed',
+                },
+              ],
+              updatedAt: '2026-05-20T10:30:00.000Z',
+              nodeCount: 6,
+              edgeCount: 2,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    const { container } = render(<ConnectionsView initialAnchor={sweepAnchor} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-groups')).not.toBeNull();
+    });
+    const visible = container.textContent ?? '';
+    expect(visible).not.toMatch(/tses_[A-Z0-9]/);
+    expect(visible).not.toMatch(/visit-instance:/);
+    expect(visible).not.toMatch(/tab-session:/);
+    expect(visible).not.toMatch(/\breplica:[A-Za-z0-9_-]/);
+    expect(visible).not.toMatch(/\bbac_sweep_research\b/);
+  });
 });
