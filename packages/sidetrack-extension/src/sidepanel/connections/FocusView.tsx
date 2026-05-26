@@ -9,7 +9,7 @@ import {
   SaveIcon,
   TrashIcon,
 } from './icons';
-import { messageTypes, type ContentQueryResponse } from '../../messages';
+import { messageTypes } from '../../messages';
 import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 export const ENGAGEMENT_CLASSES = [
@@ -348,21 +348,47 @@ const nameSuggestionsForTopic = (
   ]).slice(0, 8);
 };
 
-const contentSearchHitToCandidate = (
-  hit: ContentQueryResponse['items'][number],
-): FocusCandidate | null => {
-  const canonicalUrl = hit.canonicalUrl;
+// Map a v2 RecallCandidate (opaque record, since the companion types
+// aren't imported into the extension) → FocusCandidate.
+const recallCandidateToFocusCandidate = (raw: unknown): FocusCandidate | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as {
+    readonly candidateId?: unknown;
+    readonly entityId?: unknown;
+    readonly sourceKind?: unknown;
+    readonly canonicalUrl?: unknown;
+    readonly title?: unknown;
+    readonly snippet?: unknown;
+    readonly fusedScore?: unknown;
+  };
+  const canonicalUrl = typeof r.canonicalUrl === 'string' ? r.canonicalUrl : undefined;
   if (canonicalUrl === undefined || canonicalUrl.length === 0) return null;
+  const id =
+    typeof r.entityId === 'string'
+      ? r.entityId
+      : typeof r.candidateId === 'string'
+        ? r.candidateId
+        : canonicalUrl;
+  const sourceKind = typeof r.sourceKind === 'string' ? r.sourceKind : '';
+  const reason =
+    sourceKind === 'chat_turn'
+      ? 'Chat turn'
+      : sourceKind === 'page_content'
+        ? 'Page content'
+        : sourceKind === 'timeline_visit'
+          ? 'Visit'
+          : sourceKind === 'semantic_query' || sourceKind === 'graph_neighbor'
+            ? 'Similar'
+            : 'Match';
   return {
-    id: hit.anchorNodeId,
-    label: hit.title ?? canonicalUrl,
+    id,
+    label: typeof r.title === 'string' ? r.title : canonicalUrl,
     url: canonicalUrl,
     canonicalUrl,
     source: 'search',
-    reasons: [hit.sourceKind === 'page-content' ? 'Page content' : 'Chat turn'],
-    score: hit.score,
-    ...(hit.snippet === undefined ? {} : { snippet: hit.snippet }),
-    ...(hit.coverageState === undefined ? {} : { pageEvidenceTier: hit.coverageState }),
+    reasons: [reason],
+    ...(typeof r.fusedScore === 'number' ? { score: r.fusedScore } : {}),
+    ...(typeof r.snippet === 'string' ? { snippet: r.snippet } : {}),
   };
 };
 
@@ -518,10 +544,14 @@ export const FocusView = ({
     const timer = window.setTimeout(() => {
       chrome.runtime.sendMessage(
         {
-          type: messageTypes.contentQuery,
-          q: trimmed,
-          limit: 12,
-          sourceKind: ['page-content', 'chat-turn'],
+          type: messageTypes.recallV2Query,
+          req: {
+            q: trimmed,
+            intent: 'search',
+            limit: 12,
+            perSourceLimit: 20,
+            strategy: { explain: true },
+          },
         },
         (response: unknown) => {
           if (cancelled) return;
@@ -532,15 +562,30 @@ export const FocusView = ({
             setSearchError(lastError.message ?? 'Search failed');
             return;
           }
-          const parsed = response as Partial<ContentQueryResponse> | null;
-          const items = Array.isArray(parsed?.items)
-            ? parsed.items
-                .map(contentSearchHitToCandidate)
-                .filter((item): item is FocusCandidate => item !== null)
-            : [];
+          if (response == null) {
+            setSearchItems(EMPTY_SEARCH_ITEMS);
+            setSearchLoading(false);
+            setSearchError(null);
+            return;
+          }
+          const wrap = response as {
+            readonly ok?: unknown;
+            readonly results?: unknown;
+            readonly error?: unknown;
+          };
+          if (wrap.ok !== true) {
+            setSearchItems(EMPTY_SEARCH_ITEMS);
+            setSearchLoading(false);
+            setSearchError(typeof wrap.error === 'string' ? wrap.error : 'Search failed');
+            return;
+          }
+          const raws = Array.isArray(wrap.results) ? wrap.results : [];
+          const items = raws
+            .map(recallCandidateToFocusCandidate)
+            .filter((item): item is FocusCandidate => item !== null);
           setSearchItems(dedupeCandidates(items));
           setSearchLoading(false);
-          setSearchError(parsed?.ok === false ? (parsed.error ?? 'Search failed') : null);
+          setSearchError(null);
         },
       );
     }, SEARCH_DEBOUNCE_MS);

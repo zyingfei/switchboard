@@ -49,51 +49,83 @@ describe('useRecallSearch', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('debounces + maps the response items', () => {
+  it('sends a recallV2Query request with intent=search', () => {
+    const send = vi.fn((_msg: unknown, cb?: SendCb) =>
+      cb?.({ ok: true, results: [] }),
+    );
+    globalThis.chrome = {
+      runtime: { sendMessage: send, lastError: undefined },
+    } as unknown as typeof chrome;
+    renderHook(() => useRecallSearch('hello world', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(send).toHaveBeenCalled();
+    const message = send.mock.calls[0]![0] as {
+      readonly type: string;
+      readonly req: { readonly q: string; readonly intent: string; readonly limit: number };
+    };
+    expect(message.type).toBe('sidetrack.recall.v2.query');
+    expect(message.req.intent).toBe('search');
+    expect(message.req.q).toBe('hello world');
+    expect(message.req.limit).toBe(12);
+  });
+
+  it('debounces + maps v2 RecallCandidate responses into RecallHits', () => {
     stubChrome((message) => {
-      const m = message as { q: string };
-      if (m.q === 'copy fail') {
+      const m = message as { req: { q: string } };
+      if (m.req.q === 'copy fail') {
         return {
           ok: true,
-          items: [
+          results: [
             {
-              id: 'turn:1',
+              candidateId: 'cand:T1',
+              entityId: 'entity:T1',
+              sourceKind: 'chat_turn',
               threadId: 'thread:T1',
-              capturedAt: '2026-05-12T00:00:00.000Z',
-              score: 0.95,
               title: 'Pro-Questions - Copy Fail',
-              threadUrl: 'https://chatgpt.com/c/abc',
+              snippet: 'matched body chunk…',
+              canonicalUrl: 'https://chatgpt.com/c/abc',
+              fusedScore: 0.95,
+              lastSeenAt: '2026-05-12T00:00:00.000Z',
+              evidence: [{ retriever: 'fts5', sourceKind: 'chat_turn', rank: 1 }],
             },
           ],
         };
       }
-      return { ok: true, items: [] };
+      return { ok: true, results: [] };
     });
     const { result } = renderHook(() => useRecallSearch('copy fail', { debounceMs: 100 }));
     expect(result.current.loading).toBe(true);
     act(() => {
       vi.advanceTimersByTime(150);
     });
-    // Stub responds synchronously inside sendMessage; the effect's
-    // setState updates batch into the same tick.
     expect(result.current.loading).toBe(false);
     expect(result.current.items.length).toBe(1);
-    expect(result.current.items[0]!.title).toBe('Pro-Questions - Copy Fail');
+    const hit = result.current.items[0]!;
+    expect(hit.title).toBe('Pro-Questions - Copy Fail');
+    expect(hit.threadId).toBe('thread:T1');
+    expect(hit.canonicalUrl).toBe('https://chatgpt.com/c/abc');
+    expect(hit.sourceKind).toBe('chat-turn');
+    expect(hit.score).toBe(0.95);
     expect(result.current.error).toBeNull();
   });
 
   it('ignores stale responses when the query changes mid-flight', () => {
     let responder = (message: unknown): unknown => {
-      const m = message as { q: string };
+      const m = message as { req: { q: string } };
       return {
         ok: true,
-        items: [
+        results: [
           {
-            id: `stale:${m.q}`,
+            candidateId: `stale:${m.req.q}`,
+            entityId: `stale:${m.req.q}`,
+            sourceKind: 'chat_turn',
             threadId: 'thread:OLD',
-            capturedAt: '2026-05-12T00:00:00.000Z',
-            score: 0.5,
-            title: `STALE for ${m.q}`,
+            fusedScore: 0.5,
+            title: `STALE for ${m.req.q}`,
+            lastSeenAt: '2026-05-12T00:00:00.000Z',
+            evidence: [],
           },
         ],
       };
@@ -104,16 +136,19 @@ describe('useRecallSearch', () => {
     });
     rerender({ q: 'bbb' }); // change before the first debounce fires
     responder = (message: unknown): unknown => {
-      const m = message as { q: string };
+      const m = message as { req: { q: string } };
       return {
         ok: true,
-        items: [
+        results: [
           {
-            id: `fresh:${m.q}`,
+            candidateId: `fresh:${m.req.q}`,
+            entityId: `fresh:${m.req.q}`,
+            sourceKind: 'chat_turn',
             threadId: 'thread:NEW',
-            capturedAt: '2026-05-12T00:01:00.000Z',
-            score: 0.9,
-            title: `FRESH for ${m.q}`,
+            fusedScore: 0.9,
+            title: `FRESH for ${m.req.q}`,
+            lastSeenAt: '2026-05-12T00:01:00.000Z',
+            evidence: [],
           },
         ],
       };
@@ -122,5 +157,25 @@ describe('useRecallSearch', () => {
       vi.advanceTimersByTime(150);
     });
     expect(result.current.items[0]?.title).toBe('FRESH for bbb');
+  });
+
+  it('reports the error string when the v2 response is not ok', () => {
+    stubChrome(() => ({ ok: false, error: 'companion unreachable' }));
+    const { result } = renderHook(() => useRecallSearch('whatever', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(result.current.items.length).toBe(0);
+    expect(result.current.error).toBe('companion unreachable');
+  });
+
+  it('treats null response as a clean empty (SW short-circuited)', () => {
+    stubChrome(() => null);
+    const { result } = renderHook(() => useRecallSearch('whatever', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(result.current.items.length).toBe(0);
+    expect(result.current.error).toBeNull();
   });
 });
