@@ -183,45 +183,41 @@ fallback for sources that don't compute their own.
 ### D7 — Model-coupled constants live in a registry
 
 ```typescript
-// recall-v2/model-registry.ts
+// recall-v2/model-registry.ts (as shipped)
 export interface RetrievalModelProfile {
   readonly modelId: string;
   readonly embeddingDim: number;
-  readonly semGapNoiseFloor: number;     // calibrated per model
-  readonly semGapFullSignal: number;     // calibrated per model
+  readonly semGapNoiseFloor: number;       // gate-noise threshold (gap below → mute)
+  readonly semGapFullSignal: number;       // gate-full threshold (gap above → pass)
+  readonly semAbsoluteSignalFloor: number; // all-signal cluster bypass
   readonly calibratedAt: string;
 }
 
-export const KNOWN_MODELS: Record<string, RetrievalModelProfile> = {
+const KNOWN_MODELS: Record<string, RetrievalModelProfile> = {
   'Xenova/multilingual-e5-small': {
     modelId: 'Xenova/multilingual-e5-small',
     embeddingDim: 384,
     semGapNoiseFloor: 0.03,
     semGapFullSignal: 0.07,
+    semAbsoluteSignalFloor: 0.6,
     calibratedAt: '2026-05-26',
   },
 };
 
-export const profileFor = (modelId: string): RetrievalModelProfile => {
-  const exact = KNOWN_MODELS[modelId];
-  if (exact !== undefined) return exact;
-  // Unknown model — fall back to "always-on" semantic (multiplier = 1)
-  // and log a warn so the operator notices. Better to over-trust
-  // semantic than to silently break a new model.
-  console.warn(`[recall-v2] unknown embedder ${modelId} — using safe defaults; calibrate by running cosine-distribution probe`);
-  return {
-    modelId,
-    embeddingDim: 384,
-    semGapNoiseFloor: 0,    // always-pass
-    semGapFullSignal: 0.001,
-    calibratedAt: 'default-unsafe',
-  };
+export const profileFor = (modelId: string | undefined): RetrievalModelProfile => {
+  // strips the embedder's revision suffix (#rev=...#prefix-query-v1)
+  // since retrieval profile is a property of the model architecture,
+  // not the revision.
+  // unknown → safe default (gate disabled) + console.warn once per
+  // process per modelId.
+  // ...
 };
 ```
 
-The pipeline reads via `profileFor(deps.modelId)` — not via imported
-constants. Swapping models requires either an entry in `KNOWN_MODELS`
-or an explicit acceptance of the safe-default warn line.
+The pipeline reads via `profileFor(MODEL_ID)` (imported from
+`recall/embedder.js`). Swapping models requires either an entry in
+`KNOWN_MODELS` or an explicit acceptance of the safe-default warn
+line.
 
 ### D8 — Cross-encoder gets snippets, not raw bodies
 
