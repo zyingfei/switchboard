@@ -1202,22 +1202,32 @@ const modelChoiceGraduation = (
 };
 
 // Per-artifact ship-gate decision. Each artifact is judged on its own
-// merits — the existing single-shipGate code (below) bakes in the
+// merits — the legacy single-shipGate (below) bakes in the
 // LightGBM-vs-baseline assumption that the selector (Step 4) replaces.
 //
-// Gate semantics:
-// - `graph_baseline` always passes when its reservedTestMetric exists;
+// Gate semantics mirror the legacy gate's separation of concerns:
+// VALIDATION drives the model-vs-baseline comparison, RESERVED-TEST
+// is the absolute floor consulted exactly once. Codex review of PR
+// #229 caught that using reserved-test for BOTH the delta AND the
+// floor lets reserved-test performance drive model choice, defeating
+// the "used exactly once" invariant the legacy shipGate names.
+//
+// - `graph_baseline` passes whenever its reservedTestMetric exists;
 //   it's the deterministic fallback the selector ships when nothing
 //   else clears. `unavailable` only when no test split could be built.
-// - `logistic_batch` / `lightgbm_lambdamart` must beat the baseline's
-//   reserved-test NDCG by `RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA`
-//   AND clear the absolute floor AND have novel-pair supervision.
-//   Same substance as the legacy shipGate, just keyed per-artifact so
-//   LR can independently pass when LightGBM fails (and vice versa).
+//   Never `fail` — the baseline can't fail to be itself.
+// - `logistic_batch` / `lightgbm_lambdamart` must:
+//     1. beat the baseline's VALIDATION NDCG by
+//        RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA (model-vs-baseline);
+//     2. clear the absolute RESERVED-TEST floor
+//        RANKER_SHIP_GATE_MIN_RESERVED_TEST_NDCG (floor consulted
+//        exactly once);
+//     3. have novel-pair supervision (`novelPositiveRows > 0`).
 const artifactShipGate = (
   kind: RankerArtifactKind,
+  validation: RankerMetric | undefined,
   reservedTest: RankerMetric | undefined,
-  baselineReservedTest: RankerMetric | undefined,
+  baselineValidation: RankerMetric | undefined,
   novelPositiveRows: number,
 ): RankerArtifactShipGate => {
   if (kind === 'graph_baseline') {
@@ -1228,13 +1238,17 @@ const artifactShipGate = (
   }
   // Trained artifacts: logistic_batch, lightgbm_lambdamart (others land
   // with later steps).
-  if (reservedTest === undefined || baselineReservedTest === undefined) {
-    return { status: 'unavailable', reason: 'reserved-test-metric-unavailable' };
+  if (
+    validation === undefined ||
+    reservedTest === undefined ||
+    baselineValidation === undefined
+  ) {
+    return { status: 'unavailable', reason: 'validation-or-test-metric-unavailable' };
   }
   if (novelPositiveRows === 0) {
     return { status: 'unavailable', reason: 'novel-pair-supervision-unavailable' };
   }
-  const delta = reservedTest.value - baselineReservedTest.value;
+  const delta = validation.value - baselineValidation.value;
   if (delta < RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA) {
     return {
       status: 'fail',
@@ -1605,8 +1619,9 @@ export const trainRankerRevisionFromRows = async (
             : { reservedTestMetric: baselineReservedTestMetric }),
           shipGate: artifactShipGate(
             'graph_baseline',
+            baselineValidationMetric,
             baselineReservedTestMetric,
-            baselineReservedTestMetric,
+            baselineValidationMetric,
             novelCounts.positiveRows,
           ),
         },
@@ -1621,8 +1636,9 @@ export const trainRankerRevisionFromRows = async (
             : { reservedTestMetric: logisticReservedTestMetric }),
           shipGate: artifactShipGate(
             'logistic_batch',
+            logisticValidationMetric,
             logisticReservedTestMetric,
-            baselineReservedTestMetric,
+            baselineValidationMetric,
             novelCounts.positiveRows,
           ),
         },
@@ -1637,8 +1653,9 @@ export const trainRankerRevisionFromRows = async (
             : { reservedTestMetric: activeReservedTestMetric }),
           shipGate: artifactShipGate(
             'lightgbm_lambdamart',
+            activeValidationMetric,
             activeReservedTestMetric,
-            baselineReservedTestMetric,
+            baselineValidationMetric,
             novelCounts.positiveRows,
           ),
         },

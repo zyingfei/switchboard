@@ -434,6 +434,46 @@ describe('active-ranker dispatch (Step 4)', () => {
     }
   });
 
+  it('reloads artifactQuality + logisticBatchWeights through readClosestVisitRankerRevision (Codex review of #229)', async () => {
+    // Codex review of PR #229 caught: `readClosestVisitRankerRevision`
+    // was constructing the RankerRevision return value but DROPPING
+    // the new optional fields (`artifactQuality`,
+    // `logisticBatchWeights`, `logisticBatchFeatureStatsVersion`).
+    // The manifest round-trip tests (in retrain.test.ts) only
+    // exercised `readActiveClosestVisitRankerRevisionManifest`, not
+    // the full-revision loader the materializer uses for serving.
+    // This test exercises the load path the selector actually
+    // consumes after restart — without the fix, reloaded.artifactQuality
+    // is undefined and the selector always falls back to baseline.
+    const input = syntheticTrainingSet();
+    const trained = await trainRankerRevision({
+      ...input,
+      options: { seed: 17, numRound: 24, trainedAt: generatedAt },
+    });
+    expect(trained.artifactQuality).toBeDefined();
+    expect(trained.logisticBatchWeights).toBeDefined();
+
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-revision-reload-'));
+    tempRoots.push(root);
+    await writeActiveClosestVisitRankerRevision(root, trained);
+
+    const reloaded = await readClosestVisitRankerRevision(root, trained.revisionId);
+    expect(reloaded).not.toBeNull();
+    if (reloaded === null) return; // narrowing
+    // Each new field round-trips onto the FULL revision object, not
+    // just the manifest. Selector + dispatch read them off the
+    // revision returned by this loader.
+    expect(reloaded.artifactQuality).toBeDefined();
+    expect(reloaded.artifactQuality?.map((a) => a.kind)).toEqual(
+      trained.artifactQuality?.map((a) => a.kind),
+    );
+    expect(reloaded.artifactQuality?.map((a) => a.shipGate.status)).toEqual(
+      trained.artifactQuality?.map((a) => a.shipGate.status),
+    );
+    expect(reloaded.logisticBatchWeights).toEqual(trained.logisticBatchWeights);
+    expect(reloaded.logisticBatchFeatureStatsVersion).toBe('no-normalization-v1');
+  });
+
   it('falls back to graph_baseline when no learned artifact passes', async () => {
     const input = syntheticTrainingSet();
     const trained = await trainRankerRevision({
