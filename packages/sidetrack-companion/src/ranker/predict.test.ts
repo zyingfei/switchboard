@@ -18,7 +18,13 @@ import {
   writeActiveClosestVisitRankerRevision,
 } from '../producers/closest-visit-revision.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from './feature-schema.js';
-import { loadRankerModel, predictRanker, topRankerContributions } from './predict.js';
+import {
+  loadActiveRanker,
+  loadRankerModel,
+  predictActive,
+  predictRanker,
+  topRankerContributions,
+} from './predict.js';
 import {
   buildRankerTrainingRows,
   createRankerRevisionId,
@@ -340,6 +346,127 @@ describe('ranker model version back-compat', () => {
       expect(related.score).toBeGreaterThan(unrelated.score);
     } finally {
       model.dispose();
+    }
+  });
+});
+
+describe('active-ranker dispatch (Step 4)', () => {
+  // The selector+dispatch is the load-bearing change of the
+  // incremental-ranker plan: even when the LightGBM ship-gate fails on
+  // a fresh-retrained revision (the current dogfood state, observed:
+  // active-model-does-not-beat-comparison-baseline), serving routes to
+  // whichever peer artifact still passes its own gate.
+
+  const lightgbmFailsLrPasses = (revision: RankerRevision): RankerRevision => {
+    const artifactQuality = revision.artifactQuality;
+    if (artifactQuality === undefined) {
+      throw new Error('expected revision to carry per-artifact quality records');
+    }
+    // The synthetic training set scores a perfect baseline NDCG (real
+    // vaults won't), so the fixture overrides both the baseline AND
+    // LR reservedTest values to recreate the dogfood ordering
+    // (baseline ~0.5, LR ~0.75, LightGBM fail).
+    return {
+      ...revision,
+      artifactQuality: artifactQuality.map((artifact) => {
+        if (artifact.kind === 'lightgbm_lambdamart') {
+          return {
+            ...artifact,
+            shipGate: {
+              status: 'fail',
+              reason: 'artifact-does-not-beat-baseline',
+            },
+          };
+        }
+        if (artifact.kind === 'logistic_batch') {
+          return {
+            ...artifact,
+            shipGate: {
+              status: 'pass',
+              reason: 'artifact-cleared-baseline-and-floor',
+            },
+            reservedTestMetric: {
+              kind: 'reserved-test ndcg@5',
+              value: 0.75,
+            },
+          };
+        }
+        if (artifact.kind === 'graph_baseline') {
+          return {
+            ...artifact,
+            reservedTestMetric: {
+              kind: 'deterministic baseline reserved-test ndcg@5',
+              value: 0.5,
+            },
+          };
+        }
+        return artifact;
+      }),
+    };
+  };
+
+  it('routes scoring to the regularized LR when LightGBM fails its ship-gate', async () => {
+    const input = syntheticTrainingSet();
+    const trained = await trainRankerRevision({
+      ...input,
+      options: { seed: 17, numRound: 24, trainedAt: generatedAt },
+    });
+    // Sanity: Step 2 wrote artifactQuality + Step 3 wrote LR weights.
+    expect(trained.artifactQuality?.map((a) => a.kind)).toContain('logistic_batch');
+    expect(trained.logisticBatchWeights).toBeDefined();
+
+    const handle = await loadActiveRanker(lightgbmFailsLrPasses(trained));
+    try {
+      expect(handle.selection.selectedKind).toBe('logistic_batch');
+      expect(handle.lightgbm).toBeUndefined(); // LightGBM not loaded on LR path
+      expect(handle.logisticBatchWeights).toBeDefined();
+
+      // LR is a calibrated sigmoid in [0, 1]; scoring a clearly-related
+      // pair should beat scoring an unrelated pair on the same handle.
+      const related = predictActive(featuresFor(0.95, 1), handle);
+      const unrelated = predictActive(featuresFor(0.05, 0), handle);
+      expect(related.kind).toBe('logistic_batch');
+      expect(related.score).toBeGreaterThanOrEqual(0);
+      expect(related.score).toBeLessThanOrEqual(1);
+      expect(related.score).toBeGreaterThan(unrelated.score);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  it('falls back to graph_baseline when no learned artifact passes', async () => {
+    const input = syntheticTrainingSet();
+    const trained = await trainRankerRevision({
+      ...input,
+      options: { seed: 17, numRound: 24, trainedAt: generatedAt },
+    });
+    const allFail: RankerRevision = {
+      ...trained,
+      artifactQuality: (trained.artifactQuality ?? []).map((artifact) =>
+        artifact.kind === 'graph_baseline'
+          ? artifact // baseline can never `fail` by construction
+          : {
+              ...artifact,
+              shipGate: {
+                status: 'fail',
+                reason: 'artifact-does-not-beat-baseline',
+              },
+            },
+      ),
+    };
+
+    const handle = await loadActiveRanker(allFail);
+    try {
+      expect(handle.selection.selectedKind).toBe('graph_baseline');
+      expect(handle.selection.reason).toBe('best_passing'); // baseline still cleared
+      expect(handle.lightgbm).toBeUndefined();
+      expect(handle.logisticBatchWeights).toBeUndefined();
+
+      const score = predictActive(featuresFor(0.95, 1), handle);
+      expect(score.kind).toBe('graph_baseline');
+      expect(Number.isFinite(score.score)).toBe(true);
+    } finally {
+      handle.dispose();
     }
   });
 });
