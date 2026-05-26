@@ -601,6 +601,72 @@ describe('ranker retraining loop', () => {
     });
   });
 
+  it('captures per-artifact RankerArtifactQuality entries on the revision', async () => {
+    // Step 2 of the incremental-ranker plan: every artifact gets its own
+    // ship-gate decision so the selector (Step 4) can route around any
+    // single artifact that fails its own gate (currently the LightGBM
+    // active model fails `active-model-does-not-beat-comparison-baseline`
+    // on the dogfood vault).
+    const fromA = 'https://example.test/from-a';
+    const fromB = 'https://example.test/from-b';
+    const posA = 'https://example.test/pos-a';
+    const negA = 'https://example.test/neg-a';
+    const posB = 'https://example.test/pos-b';
+    const negB = 'https://example.test/neg-b';
+    const feedback = projection(
+      [label(fromA, posA), label(fromB, posB)],
+      [label(fromA, negA), label(fromB, negB)],
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback,
+      merged: [],
+      snapshot: snapshotWithVisits([fromA, fromB, posA, negA, posB, negB]),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    const revision = await trainRankerRevision({
+      feedback,
+      candidates,
+      options: { numRound: 5, trainedAt: observedAtMs },
+    });
+
+    // The three artifacts the training pipeline produces today
+    // (graph_baseline / logistic_batch / lightgbm_lambdamart) each get
+    // one entry. logistic_online + lightgbm_plus_online_lr land with
+    // later plan steps; absent here, present in tomorrow's revisions
+    // when those code paths exist.
+    expect(revision.artifactQuality).toBeDefined();
+    const kinds = (revision.artifactQuality ?? []).map((a) => a.kind);
+    expect(kinds).toEqual(['graph_baseline', 'logistic_batch', 'lightgbm_lambdamart']);
+
+    for (const artifact of revision.artifactQuality ?? []) {
+      // Every entry carries a candidate version string + a shipGate
+      // verdict so the selector can dispatch and the panel can render
+      // the per-artifact status without consulting a separate table.
+      expect(typeof artifact.candidate).toBe('string');
+      expect(['pass', 'fail', 'unavailable']).toContain(artifact.shipGate.status);
+      expect(typeof artifact.shipGate.reason).toBe('string');
+    }
+
+    // Baseline never fails its own gate: it IS the fallback. Either it
+    // has a reservedTestMetric and passes, or the test split couldn't
+    // be built and it reports unavailable. Never `fail`.
+    const baseline = revision.artifactQuality?.find((a) => a.kind === 'graph_baseline');
+    expect(baseline?.shipGate.status === 'fail').toBe(false);
+
+    // Manifest round-trip preserves the array. The selector reads it
+    // from the persisted manifest, not from in-process state.
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-artifactquality-'));
+    tempRoots.push(vaultRoot);
+    await writeActiveClosestVisitRankerRevision(vaultRoot, revision);
+    const manifest = await readActiveClosestVisitRankerRevisionManifest(vaultRoot);
+    expect(manifest?.artifactQuality?.map((a) => a.kind)).toEqual([
+      'graph_baseline',
+      'logistic_batch',
+      'lightgbm_lambdamart',
+    ]);
+  });
+
   it('keeps workstream identity out of the closest_visit scorer feature vector', () => {
     expect([...RANKER_FEATURE_KEYS]).not.toContain('same_workstream');
     expect([...RANKER_FEATURE_KEYS]).not.toContain('user_asserted_in_workstream');
