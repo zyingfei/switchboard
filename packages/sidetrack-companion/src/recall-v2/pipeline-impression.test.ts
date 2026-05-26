@@ -135,9 +135,18 @@ const baseDeps = (overrides?: Partial<PipelineDeps>): PipelineDeps => ({
   ...overrides,
 });
 
+// Phase 5 flipped cross-encoder rerank ON by default; unit tests
+// disable it explicitly so they don't try to load the MiniLM model
+// in environments without it cached. The Phase 5 rerank default is
+// validated by the eval harness against the live model.
+const noRerankStrategy = { rerankTopK: 0 } as const;
+
 describe('runRecall — Phase 0 impression logging', () => {
   it('always stamps meta.servedContextId on the response', async () => {
-    const resp = await runRecall(baseDeps(), { q: 'example' });
+    const resp = await runRecall(baseDeps(), {
+      q: 'example',
+      strategy: noRerankStrategy,
+    });
     expect(typeof resp.meta.servedContextId).toBe('string');
     expect(resp.meta.servedContextId?.length).toBeGreaterThan(0);
   });
@@ -150,6 +159,9 @@ describe('runRecall — Phase 0 impression logging', () => {
     const resp = await runRecall(baseDeps({ appendImpression }), {
       q: 'example',
       intent: 'dejavu',
+      // Phase 5 flipped rerank ON by default; this test asserts on
+      // rerankApplied = false so disable explicitly for determinism.
+      strategy: { rerankTopK: 0 },
     });
     // Pipeline fires the append fire-and-forget; the void-promise
     // resolves within the same microtask tick as the synchronous
@@ -183,7 +195,10 @@ describe('runRecall — Phase 0 impression logging', () => {
     // silently skip emission, response still carries
     // servedContextId in meta for any consumer that wants to
     // dedupe / correlate within a single response cycle.
-    const resp = await runRecall(baseDeps(), { q: 'example' });
+    const resp = await runRecall(baseDeps(), {
+      q: 'example',
+      strategy: noRerankStrategy,
+    });
     expect(typeof resp.meta.servedContextId).toBe('string');
   });
 
@@ -192,7 +207,10 @@ describe('runRecall — Phase 0 impression logging', () => {
     const appendImpression = async (payload: RecallServedPayload): Promise<void> => {
       captured.push(payload);
     };
-    await runRecall(baseDeps({ appendImpression }), { q: 'example' });
+    await runRecall(baseDeps({ appendImpression }), {
+      q: 'example',
+      strategy: { rerankTopK: 0 },
+    });
     await Promise.resolve();
     const payload = captured[0];
     expect(payload).toBeDefined();

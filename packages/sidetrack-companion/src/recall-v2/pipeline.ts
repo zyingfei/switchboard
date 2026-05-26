@@ -61,6 +61,15 @@ const DEFAULT_LIMIT = 12;
 const DEFAULT_PER_SOURCE_LIMIT = 20;
 const DEFAULT_MIN_HIT_AGE_MS = 5 * 60 * 1000;
 const RRF_K = 60;
+// Phase 5 of the recall+ranker v2 hard-replacement.
+//
+// The pipeline library default stays 0 (off) so unit tests don't pay
+// the cost of loading the cross-encoder model (loading the ONNX
+// runtime under Bun can crash; the eval harness opts in explicitly).
+// The PRODUCTION /v2/recall endpoint in http/server.ts overrides this
+// to DOGFOOD_RERANK_TOP_K so every served impression goes through the
+// MiniLM precision layer. Callers can still override per-request.
+const DEFAULT_RERANK_TOP_K = 0;
 
 /** Injectable embedder — tests can substitute a deterministic stub. */
 export type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
@@ -1042,7 +1051,10 @@ export const runRecall = async (
   let resultsAfterRerank = kept;
   let rerankApplied = false;
   let rerankLatencyMs = 0;
-  const rerankTopK = strategy.rerankTopK ?? 0;
+  // Pipeline default = 0 (off). Production /v2 endpoint overrides via
+  // `strategy.rerankTopK = DOGFOOD_RERANK_TOP_K` so dogfood always
+  // exercises the cross-encoder; unit tests stay deterministic.
+  const rerankTopK = strategy.rerankTopK ?? DEFAULT_RERANK_TOP_K;
   if (rerankTopK > 0 && kept.length > 0) {
     const rerankStart = (deps.now ?? Date.now)();
     resultsAfterRerank = await rerank(req.q, kept, Math.min(rerankTopK, kept.length));

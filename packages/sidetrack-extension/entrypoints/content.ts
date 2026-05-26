@@ -19,7 +19,6 @@ import {
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
-import { buildDejaVuHits } from '../src/contentOverlays/dejaVuModel';
 import type { OpenConnectionsDejaVuItem } from '../src/messages';
 import type { SearchHitFacet, UnifiedSearchHit } from '../src/sidepanel/search/types';
 import { settleAndExtractPageContent } from '../src/pageContent/extraction';

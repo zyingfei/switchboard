@@ -123,6 +123,21 @@ export interface WorkGraphHealthReport {
     readonly actionCount: number;
     readonly actionsByKind: Readonly<Record<string, number>>;
   };
+  // Phase 5 of the recall+ranker v2 hard-replacement. Dogfood-config
+  // visibility on the health panel: what retrieval backend the
+  // companion is serving, what vector store is canonical, and whether
+  // the cross-encoder rerank is firing on /v2/recall. These let the
+  // CFT smoke test verify "the system is actually running the new
+  // architecture" without reading internal config.
+  readonly recall: {
+    readonly retrievalBackend: 'v2';
+    readonly vectorStore: 'sqlite' | 'sidecar';
+    readonly fusionImplementation: 'recall-v2';
+    readonly crossEncoder: {
+      readonly enabled: boolean;
+      readonly rerankTopK: number;
+    };
+  };
   readonly candidates: readonly DiagnosticCandidate[];
 }
 
@@ -828,6 +843,21 @@ export const collectWorkGraphHealth = async ({
     actionCount,
     actionsByKind,
   };
+  // Phase 5 — dogfood-config snapshot. Values are constants here
+  // because the server-side wiring is the single source of truth
+  // (http/server.ts sets DOGFOOD_RERANK_TOP_K on every /v2/recall).
+  // Phase 4 will compute `vectorStore` from a real probe; today
+  // recall-v2 already uses sqlite-vec for documents_vec.
+  const DOGFOOD_RERANK_TOP_K = 20;
+  const recall: WorkGraphHealthReport['recall'] = {
+    retrievalBackend: 'v2',
+    vectorStore: 'sqlite',
+    fusionImplementation: 'recall-v2',
+    crossEncoder: {
+      enabled: true,
+      rerankTopK: DOGFOOD_RERANK_TOP_K,
+    },
+  };
   return {
     ranker,
     ann,
@@ -838,6 +868,7 @@ export const collectWorkGraphHealth = async ({
     },
     topicProducer,
     impressionLog,
+    recall,
     candidates: buildDiagnosticCandidates({
       ranker,
       topicProducer,

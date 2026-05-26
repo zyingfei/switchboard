@@ -5507,13 +5507,27 @@ const routes: readonly RouteDefinition[] = [
               payload: payload as unknown as Record<string, unknown>,
             });
           };
+      // Phase 5 — cross-encoder rerank ON by default in the dogfood
+      // serving path. The pipeline library's default is 0 (off) for
+      // test determinism; production /v2 endpoint applies
+      // DOGFOOD_RERANK_TOP_K unless the caller overrides explicitly.
+      // 20 candidates × ~5ms/pair on MiniLM-L-6-v2 ≈ ~100ms added per
+      // request. Tune via the eval harness; calibration follow-up.
+      const DOGFOOD_RERANK_TOP_K = 20;
+      const reqWithDefaultRerank: import('../recall-v2/types.js').RecallRequest = {
+        ...req,
+        strategy: {
+          ...(req.strategy ?? {}),
+          rerankTopK: req.strategy?.rerankTopK ?? DOGFOOD_RERANK_TOP_K,
+        },
+      };
       const response = await runRecallV2(
         {
           vaultRoot,
           ...(embedderState === undefined ? {} : { embedderState }),
           ...(appendImpression === undefined ? {} : { appendImpression }),
         },
-        req,
+        reqWithDefaultRerank,
       );
       // Wrap in { data } to match the rest of the v1 API convention so
       // the bridge clients (recallV2 in pageContentClient.ts) can
