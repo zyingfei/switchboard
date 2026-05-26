@@ -134,9 +134,6 @@ export const messageTypes = {
   // from a content script in an HTTPS page (e.g. chatgpt.com) to
   // http://127.0.0.1 is blocked by Chrome's mixed-content policy
   // even with host_permissions — only chrome-extension:// origins
-  // bypass that block. The SW returns the parsed RankedItem[] so
-  // the popover can render titles and scores.
-  recallQuery: 'sidetrack.recall.query',
   pageContentExtract: 'sidetrack.pageContent.extract',
   pageContentIndexCurrent: 'sidetrack.pageContent.indexCurrent',
   pageContentIndexSelection: 'sidetrack.pageContent.indexSelection',
@@ -627,17 +624,6 @@ export type WorkboardRequest =
       readonly dispatchId: string;
     }
   | {
-      readonly type: typeof messageTypes.recallQuery;
-      readonly q: string;
-      readonly limit?: number;
-      readonly workstreamId?: string;
-      // URL of the page issuing the query. Background uses it to drop
-      // results that point back at the same thread the user is
-      // already reading (no point in saying "you've seen this before"
-      // about the page in front of them).
-      readonly currentUrl?: string;
-    }
-  | {
       readonly type: typeof messageTypes.pageContentIndexCurrent;
     }
   | {
@@ -715,17 +701,6 @@ export type RuntimeResponse =
       readonly error: string;
       readonly state?: WorkboardState;
     };
-
-// Recall-query response — sent only in reply to messageTypes.recallQuery.
-// Kept out of the RuntimeResponse union because it doesn't carry a
-// WorkboardState and a third variant would force every existing caller
-// to narrow before reading `state`. The content script casts the
-// chrome.runtime.sendMessage reply to this type at the call site.
-export interface RecallQueryResponse {
-  readonly ok: boolean;
-  readonly items: readonly unknown[];
-  readonly error?: string;
-}
 
 export interface PageContentOperationResponse {
   readonly ok: boolean;
@@ -1029,15 +1004,6 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     hasType(value, messageTypes.unarchiveDispatch)
   ) {
     return typeof value.dispatchId === 'string';
-  }
-
-  if (hasType(value, messageTypes.recallQuery)) {
-    return (
-      typeof value.q === 'string' &&
-      (value.limit === undefined || typeof value.limit === 'number') &&
-      (value.workstreamId === undefined || typeof value.workstreamId === 'string') &&
-      (value.currentUrl === undefined || typeof value.currentUrl === 'string')
-    );
   }
 
   if (

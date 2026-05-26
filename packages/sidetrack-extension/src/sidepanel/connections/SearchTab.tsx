@@ -4,7 +4,12 @@ import { nodeKindDisplayFor } from './edgeKinds';
 import { ExternalLinkIcon, FilterIcon, KindIcons, SearchIcon } from './icons';
 import type { RecallSearchHit, SearchableAnchor } from './NodeSearchBox';
 import type { ConnectionNode, ConnectionNodeKind } from './types';
-import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
+import {
+  formatEntityDisplay,
+  hostOf,
+  isInternalIdLike,
+  type EntityDisplayCtx,
+} from '../entityDisplay/format';
 import { rankSubstring } from '../search/ranking';
 
 interface SearchTabProps {
@@ -108,6 +113,24 @@ const bestRank = (query: string, texts: readonly string[]): number => {
 
 const sourceLabelForRecallHit = (hit: RecallSearchHit): string =>
   hit.sourceKind === 'page-content' ? 'Page' : 'Thread';
+
+// FU3b — align Search row titles with the unified entity display
+// contract: never render a raw id (`tses_*`, bare UUIDs, hex
+// thread-bac-ids) as a visible title. When the recall hit's own
+// title is id-like, fall back to the canonical URL host (e.g.
+// "chatgpt.com"), then the kind label as a last resort.
+//
+// This is the same rule cleanLabel + safeTooltip apply elsewhere;
+// inlined here so SearchTab doesn't pull in a snapshot-ctx-shaped
+// formatter for what's a flat recall-hit list.
+const titleForRecallHit = (hit: RecallSearchHit): string => {
+  if (hit.title !== undefined && hit.title.length > 0 && !isInternalIdLike(hit.title)) {
+    return hit.title;
+  }
+  const host = hostOf(hit.canonicalUrl ?? hit.threadUrl);
+  if (host !== undefined) return host;
+  return sourceLabelForRecallHit(hit);
+};
 
 const anchorIdForRecallHit = (hit: RecallSearchHit): string | undefined =>
   hit.anchorNodeId ?? (hit.threadId === undefined ? undefined : `thread:${hit.threadId}`);
@@ -600,10 +623,7 @@ export const SearchTab = ({
                 const anchorId = anchorIdForRecallHit(hit);
                 if (anchorId === undefined) return null;
                 const url = hit.canonicalUrl ?? hit.threadUrl;
-                const title =
-                  hit.title !== undefined && hit.title.length > 0
-                    ? hit.title
-                    : sourceLabelForRecallHit(hit);
+                const title = titleForRecallHit(hit);
                 return (
                   <div
                     className="cx-search-tab-row"

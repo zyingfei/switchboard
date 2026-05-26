@@ -89,7 +89,7 @@ import {
 } from '../src/content/visual/dom-hash';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
-import { createRecallClient, indexTurnsCoalesced } from '../src/companion/recallClient';
+import { indexTurnsCoalesced } from '../src/companion/recallClient';
 import {
   createPageContentClient,
   type PageContentCoverage,
@@ -119,7 +119,6 @@ import {
   type PageContentOpenTabPreview,
   type PageContentOpenTabsPreviewResponse,
   type PublishAnnotationToChatResponse,
-  type RecallQueryResponse,
   type RuntimeRequest,
   type RuntimeResponse,
 } from '../src/messages';
@@ -2871,83 +2870,6 @@ const handleRequest = async (
     }, 'queue');
   }
 
-  if (request.type === messageTypes.recallQuery) {
-    // Content scripts on HTTPS chat pages can't fetch http://127.0.0.1
-    // directly — Chrome's mixed-content policy blocks the connection
-    // even with host_permissions. The service worker (chrome-extension://
-    // origin) is the one place fetches to localhost succeed reliably,
-    // so we proxy the recall query through here. Returns the parsed
-    // RankedItem[] (with title/snippet attached server-side) so the
-    // popover can render them. On any failure we return an empty list
-    // and surface the error in `error` for diagnostics.
-    //
-    // The cast to `unknown` and back through RecallQueryResponse keeps
-    // the per-handler return type local — RuntimeResponse stays the
-    // WorkboardState-bearing union for every other consumer.
-    const buildRecallResponse = async (): Promise<RecallQueryResponse> => {
-      try {
-        const settings = await readSettings();
-        const companion = settings.companion;
-        if (companion.bridgeKey.trim().length === 0 || companion.port <= 0) {
-          return { ok: false, items: [], error: 'Companion not configured.' };
-        }
-        const requestedLimit = request.limit ?? 5;
-        const client = createRecallClient(companion);
-        // Over-fetch so the post-filter (drop current thread + dedup
-        // by threadId) still has enough rows to fill `requestedLimit`.
-        // The companion clamps to 50 internally, so cap at 50.
-        const fetchLimit = Math.min(50, Math.max(requestedLimit * 4, 12));
-        const raw = await client.query(request.q, {
-          limit: fetchLimit,
-          ...(request.workstreamId === undefined ? {} : { workstreamId: request.workstreamId }),
-        });
-        // Cache local threads once for both the current-page filter
-        // and bac_id → threadUrl fallback (older companions that
-        // didn't enrich threadUrl).
-        const localThreads = await readThreads();
-        const threadUrlByBacId = new Map(
-          localThreads.map((thread) => [thread.bac_id, thread.threadUrl]),
-        );
-        const currentCanonical =
-          request.currentUrl !== undefined && request.currentUrl.length > 0
-            ? canonicalThreadUrl(request.currentUrl)
-            : '';
-        const dedupKey = (item: (typeof raw)[number]): string => {
-          // Prefer the server-provided threadUrl; fall back to the
-          // local thread record's URL; last resort, the bac_id (so
-          // stale results without any URL still dedup against
-          // themselves rather than collapsing across threads).
-          const url = item.threadUrl ?? threadUrlByBacId.get(item.threadId) ?? '';
-          return url.length > 0 ? canonicalThreadUrl(url) : `bac:${item.threadId}`;
-        };
-        // Dedup by canonical URL, keeping the highest-scoring row per
-        // thread. URL-based dedup catches the case where the same
-        // chat got captured under multiple bac_ids before the
-        // bac_id-stability fix landed (5 rows of "Hacker News
-        // Summary" all from the same Gemini conversation).
-        const bestPerUrl = new Map<string, (typeof raw)[number]>();
-        for (const item of raw) {
-          const key = dedupKey(item);
-          if (key === currentCanonical) continue; // skip current page
-          const existing = bestPerUrl.get(key);
-          if (existing === undefined || item.score > existing.score) {
-            bestPerUrl.set(key, item);
-          }
-        }
-        const items = Array.from(bestPerUrl.values())
-          .sort((left, right) => right.score - left.score)
-          .slice(0, requestedLimit);
-        return { ok: true, items };
-      } catch (error) {
-        return {
-          ok: false,
-          items: [],
-          error: error instanceof Error ? error.message : 'recall query failed',
-        };
-      }
-    };
-    return (await buildRecallResponse()) as unknown as RuntimeResponse;
-  }
 
   if (
     request.type === messageTypes.pageContentIndexCurrent ||
