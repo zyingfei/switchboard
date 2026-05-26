@@ -16,6 +16,7 @@ import {
   gcEntries as gcEntriesRaw,
   readIndex,
   tombstoneByThread as tombstoneByThreadRaw,
+  upsertEntries as upsertEntriesRaw,
 } from './indexFile.js';
 import type { IndexEntry } from './ranker.js';
 import { rebuildFromEventLog, type RecallRebuildPhase } from './rebuild.js';
@@ -91,6 +92,14 @@ export interface RecallLifecycle {
   // recall index file MUST flow through one of these so a rebuild
   // can't interleave with an appendEntry mid-write.
   readonly appendEntry: (entry: IndexEntry) => Promise<void>;
+  // Batched variant — coalesces N appendEntry calls into a single
+  // upsertEntries pass. `upsertEntries` does one read+stringify+write
+  // of the full ~MB index file regardless of batch size, so calling
+  // it once with N items is ~Nx cheaper than calling appendEntry N
+  // times in a loop. The /v1/recall/index handler used to loop, which
+  // is what produced the 35-second event-loop blocks under live
+  // capture flows (a 100-turn chat capture). No-op for empty input.
+  readonly appendEntries: (entries: readonly IndexEntry[]) => Promise<void>;
   readonly gcEntries: (validIds: ReadonlySet<string>) => Promise<{ readonly removed: number }>;
   readonly tombstoneByThread: (threadId: string) => Promise<{ readonly tombstoned: number }>;
   // Mutex-serialised incremental ingest. Walks the merged event
@@ -450,6 +459,18 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
       await appendEntryRaw(indexPath(), entry, currentModelId);
     });
 
+  // FX2 — batched variant. `upsertEntriesRaw` already accepts an
+  // array and does one read+stringify+write of the full index file
+  // regardless of batch size. Calling it ONCE with N items is ~Nx
+  // cheaper than the legacy "appendEntry in a loop" pattern that
+  // produced 35s POST /v1/recall/index responses (each call did
+  // one full-file read+write under the enqueueWrite mutex).
+  const appendEntries = (entries: readonly IndexEntry[]): Promise<void> =>
+    enqueueWrite(async () => {
+      if (entries.length === 0) return;
+      await upsertEntriesRaw(indexPath(), entries, currentModelId);
+    });
+
   const gcEntries = (validIds: ReadonlySet<string>): Promise<{ readonly removed: number }> =>
     enqueueWrite(async () => await gcEntriesRaw(indexPath(), validIds));
 
@@ -500,6 +521,7 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     waitForRebuild,
     isRebuilding,
     appendEntry,
+    appendEntries,
     gcEntries,
     tombstoneByThread,
     ingestIncremental,
