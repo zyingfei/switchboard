@@ -114,7 +114,6 @@ import {
   messageTypes,
   type AnnotateTurnResponse,
   type ListAnnotationsByUrlResponse,
-  type ContentQueryResponse,
   type PageContentBulkOperationResponse,
   type PageContentOperationResponse,
   type PageContentOpenTabPreview,
@@ -3061,30 +3060,6 @@ const handleRequest = async (
       }
     };
     return (await buildDeleteResponse()) as unknown as RuntimeResponse;
-  }
-
-  if (request.type === messageTypes.contentQuery) {
-    const buildContentQueryResponse = async (): Promise<ContentQueryResponse> => {
-      try {
-        const settings = await readSettings();
-        if (settings.companion.bridgeKey.trim().length === 0) {
-          return { ok: false, items: [], error: 'Companion not configured.' };
-        }
-        const items = await createPageContentClient(settings.companion).query({
-          q: request.q,
-          ...(request.limit === undefined ? {} : { limit: request.limit }),
-          ...(request.sourceKind === undefined ? {} : { sourceKind: request.sourceKind }),
-        });
-        return { ok: true, items };
-      } catch (error) {
-        return {
-          ok: false,
-          items: [],
-          error: error instanceof Error ? error.message : 'Content query failed.',
-        };
-      }
-    };
-    return (await buildContentQueryResponse()) as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.recallV2Query) {

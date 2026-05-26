@@ -86,28 +86,6 @@ export interface PageEvidenceRecord {
   };
 }
 
-export interface ContentSearchHit {
-  readonly id: string;
-  readonly sourceKind: 'page-content' | 'chat-turn' | 'semantic-recall-pool';
-  // Present only on 'semantic-recall-pool' hits (W4(b-lite)): a
-  // vector-similarity expansion, not an exact text match — carries
-  // the cosine similarity instead of a snippet.
-  readonly sourceEvidence?: {
-    readonly source: 'semantic_recall_pool';
-    readonly similarity: number;
-    readonly via: 'cluster' | 'neighbor';
-  };
-  readonly anchorNodeId: string;
-  readonly canonicalUrl?: string;
-  readonly threadId?: string;
-  readonly title?: string;
-  readonly snippet?: string;
-  readonly score: number;
-  readonly capturedAt: string;
-  readonly coverageState?: PageContentCoverageState;
-  readonly quality?: PageContentQuality;
-}
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
@@ -123,16 +101,6 @@ const parseProblemMessage = (value: unknown): string | undefined => {
 
 const isCoverage = (value: unknown): value is PageContentCoverage =>
   isRecord(value) && typeof value.canonicalUrl === 'string' && typeof value.state === 'string';
-
-const isContentSearchHit = (value: unknown): value is ContentSearchHit =>
-  isRecord(value) &&
-  typeof value.id === 'string' &&
-  (value.sourceKind === 'page-content' ||
-    value.sourceKind === 'chat-turn' ||
-    value.sourceKind === 'semantic-recall-pool') &&
-  typeof value.anchorNodeId === 'string' &&
-  typeof value.score === 'number' &&
-  typeof value.capturedAt === 'string';
 
 const isPageEvidenceRecord = (value: unknown): value is PageEvidenceRecord =>
   isRecord(value) &&
@@ -294,21 +262,6 @@ export class PageContentClient {
     return data as never;
   }
 
-  async query(input: {
-    readonly q: string;
-    readonly sourceKind?: readonly ('page-content' | 'chat-turn' | 'semantic-recall-pool')[];
-    readonly limit?: number;
-  }): Promise<readonly ContentSearchHit[]> {
-    const params = new URLSearchParams({ q: input.q });
-    if (input.limit !== undefined) params.set('limit', String(input.limit));
-    if (input.sourceKind !== undefined) params.set('sourceKind', input.sourceKind.join(','));
-    const response = await fetch(`${this.baseUrl}/content/query?${params.toString()}`, {
-      headers: { 'x-bac-bridge-key': this.settings.bridgeKey },
-    });
-    const body = await this.parseOrThrow(response);
-    const data = isRecord(body) ? body.data : undefined;
-    return Array.isArray(data) ? data.filter(isContentSearchHit) : [];
-  }
 }
 
 export const createPageContentClient = (settings: CompanionSettings): PageContentClient =>
