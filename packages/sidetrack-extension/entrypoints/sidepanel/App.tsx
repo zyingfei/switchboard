@@ -4522,36 +4522,66 @@ const App = () => {
           ),
     [urlProjection],
   );
+  // Now history — hoisted ahead of focusedDisplayUrlRecord so the
+  // pin-aware swap below can consume `nowHistory.pinnedUrl`.
+  // useNowHistory has no external deps; safe to call here.
+  const nowHistory = useNowHistory();
   // Single source of truth for the focused tab's record (was two
   // disagreeing memos whose synthetic fallback dropped the
   // attribution → an already-filed page kept re-asking). Pure +
   // unit-tested in src/sidepanel/inbox/focusedUrlRecord.ts.
+  //
+  // Scope E / UX5 — pin-aware display. The Now history strip lets
+  // the user click a chip to "pin" a prior context. When pinned AND
+  // we have a real record for that URL in the projection, swap the
+  // display URL to the pinned one so the Now card renders THAT
+  // page's data (attribution, page evidence, etc.). If the pinned
+  // URL has no projection record (we can't reconstruct a phantom
+  // record from history alone) we silently fall back to the live
+  // tab — the pin still highlights in the chip strip but the card
+  // shows live data. The pin never changes `focusedTabUrl` itself,
+  // so network fetches (`/v1/page-evidence/summary`, the
+  // tab-session resolver, etc.) keep targeting the live tab.
+  const pinnedProjectionRecord = useMemo(() => {
+    if (nowHistory.pinnedUrl === null) return undefined;
+    return urlProjection?.byCanonicalUrl[nowHistory.pinnedUrl];
+  }, [nowHistory.pinnedUrl, urlProjection]);
+  const displayedFocusedTabUrl =
+    pinnedProjectionRecord !== undefined ? nowHistory.pinnedUrl : focusedTabUrl;
+  // UX5b — when the card is showing a pinned (not live) context the
+  // action bar + index controls would silently target the wrong URL
+  // (loadTabSessions + the page-content background handlers read
+  // the LIVE active tab, not whatever the card is rendering).
+  // Treat pinned mode as a read-only display so the user can review
+  // the prior context safely; clicking the active chip (head, or
+  // the pinned chip itself) unpins → back to live + actions.
+  const isCardPinned = pinnedProjectionRecord !== undefined;
   const focusedDisplayUrlRecord = useMemo(
     () =>
       resolveFocusedUrlRecord({
-        focusedTabUrl,
+        focusedTabUrl: displayedFocusedTabUrl,
         projection: urlProjection,
         comparable: comparableTabUrl,
         synthesize: () =>
           urlRecordFromLiveTab({
-            canonicalUrl: focusedTabUrl ?? '',
+            canonicalUrl: displayedFocusedTabUrl ?? '',
             liveUrl:
               liveActiveTabUrl ??
               state.activeTabUrl ??
               state.currentTab?.tabSnapshot?.url ??
               state.currentTab?.threadUrl ??
-              focusedTabUrl ??
+              displayedFocusedTabUrl ??
               '',
             title:
               liveActiveTabTitle ??
               state.currentTab?.tabSnapshot?.title ??
               state.currentTab?.title ??
               undefined,
-            pageEvidence: livePageEvidenceByUrl[focusedTabUrl ?? ''],
+            pageEvidence: livePageEvidenceByUrl[displayedFocusedTabUrl ?? ''],
           }),
       }),
     [
-      focusedTabUrl,
+      displayedFocusedTabUrl,
       urlProjection,
       liveActiveTabTitle,
       liveActiveTabUrl,
@@ -4573,13 +4603,19 @@ const App = () => {
   const focusedRecordWithLiveEvidence = useMemo(() => {
     if (focusedDisplayUrlRecord === undefined) return undefined;
     if (focusedDisplayUrlRecord.pageEvidence !== undefined) return focusedDisplayUrlRecord;
+    // UX5b — Codex caught an evidence bleed: this fallback used to
+    // index `livePageEvidenceByUrl[focusedTabUrl]` (the LIVE tab),
+    // so when pinned to a prior context the card would display
+    // page evidence from the live tab instead. Use the displayed
+    // URL so the rendered card stays internally consistent —
+    // pinned URL display ↔ pinned URL evidence.
     const liveEvidence =
       livePageEvidenceByUrl[focusedDisplayUrlRecord.canonicalUrl] ??
-      livePageEvidenceByUrl[focusedTabUrl ?? ''];
+      livePageEvidenceByUrl[displayedFocusedTabUrl ?? ''];
     return liveEvidence === undefined
       ? focusedDisplayUrlRecord
       : { ...focusedDisplayUrlRecord, pageEvidence: liveEvidence };
-  }, [focusedDisplayUrlRecord, focusedTabUrl, livePageEvidenceByUrl]);
+  }, [focusedDisplayUrlRecord, displayedFocusedTabUrl, livePageEvidenceByUrl]);
   const focusedRecordEffective = useMemo(
     () =>
       focusedRecordWithLiveEvidence === undefined
@@ -4619,7 +4655,6 @@ const App = () => {
       }),
     [focusedUrl, focusedIsKnownThread, focusedAttributedWorkstreamId],
   );
-  const nowHistory = useNowHistory();
   useEffect(() => {
     if (focusedUrl === undefined || focusedUrl.length === 0) return;
     const title =
@@ -6736,6 +6771,37 @@ const App = () => {
               <span className="tab-attribution-card-eyebrow mono" data-testid="now-page-kind">
                 {pageKindLabel[focusedPageKind]}
               </span>
+              {/* Scope D / UX3 — kind-aware quick action. Chats jump to
+                  the Threads tab; workstream-attributed pages jump to
+                  the Workstreams tab. Page / unknown surfaces stay
+                  silent (the default action bar below is sufficient). */}
+              {focusedPageKind === 'chat' ? (
+                <button
+                  type="button"
+                  className="now-kind-action mono"
+                  onClick={() => {
+                    setViewMode('all');
+                  }}
+                  data-testid="now-kind-action-threads"
+                >
+                  → Threads
+                </button>
+              ) : focusedPageKind === 'workstream' &&
+                focusedAttributedWorkstreamId !== null ? (
+                <button
+                  type="button"
+                  className="now-kind-action mono"
+                  onClick={() => {
+                    setViewMode('workstream');
+                    if (focusedAttributedWorkstreamId !== null) {
+                      setSelectedWorkstream(focusedAttributedWorkstreamId);
+                    }
+                  }}
+                  data-testid="now-kind-action-workstreams"
+                >
+                  → Workstreams
+                </button>
+              ) : null}
               {focusedTabSession !== undefined ? (
                 <>
                   <span
@@ -6855,6 +6921,12 @@ const App = () => {
                       workstreams={tabSessionWorkstreams}
                       showAlternatives
                       showEmptyPlaceholder
+                      // UX4 — Now-card variant tucks the signal/alts
+                      // rows into a "Why" disclosure so the headline
+                      // reads cleanly. Inbox triage keeps the full
+                      // breakdown (no compact prop there).
+                      compact
+
                     />
                   ) : null}
                   {/* Stage 5 polish — the legacy "Change…" button used to live
@@ -6872,7 +6944,8 @@ const App = () => {
               through the dispatch path, not the page-text indexer).
               The full per-kind layout split is otherwise CSS-driven
               via the `now-kind-${kind}` class on the card root. */}
-                  {focusedPageKind === 'page' || focusedPageKind === 'workstream' ? (
+                  {!isCardPinned &&
+                  (focusedPageKind === 'page' || focusedPageKind === 'workstream') ? (
                   <PageTextPanel
                     testIdPrefix="current-tab"
                     canonicalUrl={currentTabCanonicalUrl}
@@ -6909,7 +6982,25 @@ const App = () => {
             high-enough suggestion exists; the other three always
             render so the user can take the corresponding action even
             when no suggestion is present. */}
-                {focusedDisplayUrlRecord !== undefined ? (
+                {isCardPinned ? (
+                  <div className="tab-attribution-card-pinned-banner" data-testid="now-pinned-banner">
+                    <span className="mono">
+                      Pinned · read-only · click the active chip in the history strip to return to
+                      the live tab
+                    </span>
+                    <button
+                      type="button"
+                      className="tab-attribution-card-pinned-unpin"
+                      onClick={() => {
+                        nowHistory.pin(null);
+                      }}
+                      title="Unpin and return to the live current-tab card"
+                    >
+                      Back to live tab
+                    </button>
+                  </div>
+                ) : null}
+                {focusedDisplayUrlRecord !== undefined && !isCardPinned ? (
                   <div className="tab-attribution-card-actions">
                     {(() => {
                       // Confirmable target: the confident decision OR
@@ -7513,7 +7604,13 @@ const App = () => {
           }}
           isChatThreadCaptured={isChatThreadCapturedForRecord}
         />
-      ) : (
+      ) : viewMode === 'all' ? (
+        // Scope D — the all-threads feed used to be the ternary's
+        // catch-all branch, so a viewMode of 'now' / 'connections' /
+        // 'search' silently fell through and rendered ALL THREADS
+        // below the Now card. Gate explicitly to the Threads viewMode
+        // (the 'workstream' branch has its own surface above at line
+        // 7355 and never reaches this fallback).
         <>
           <div className="sec-head">
             <span>All threads</span>
@@ -7555,7 +7652,7 @@ const App = () => {
             );
           })}
         </>
-      )}
+      ) : null}
 
       {viewMode !== 'connections' ? (() => {
         // Recent Dispatches: chronological log of packets sent out of
