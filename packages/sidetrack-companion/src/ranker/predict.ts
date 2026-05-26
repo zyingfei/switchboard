@@ -1,10 +1,14 @@
 import { Booster, loadLGB } from '@wlearn/lightgbm';
 
 import type { CandidatePairFeatures, FEATURE_SCHEMA_VERSION } from './feature-schema.js';
+import { selectActiveRanker, type ActiveRankerSelection } from './select.js';
 import {
+  deterministicBaselineScore,
   encodeRankerFeatureMatrix,
   RANKER_FEATURE_KEYS,
   RANKER_MODEL_FEATURE_COUNT,
+  scoreLogisticBatch,
+  type RankerArtifactKind,
   type RankerRevision,
   type RANKER_MODEL_VERSION,
 } from './train.js';
@@ -133,3 +137,102 @@ export const topRankerContributions = (
     )
     .slice(0, Math.max(0, Math.floor(limit)))
     .map(([feature, weight]) => ({ feature, weight }));
+
+// =============================================================
+// Step 4 — active-ranker dispatch surface.
+//
+// The selector (`select.ts:selectActiveRanker`) picks an artifact
+// kind off `RankerRevision.artifactQuality` + persisted-state checks;
+// `loadActiveRanker` materializes whichever model state that kind
+// needs; `predictActive` does the per-row dispatch.
+//
+// Today's serving consumers (`mcp/explainRanking.ts`,
+// `sync/contract/connectionsMaterializer.ts`) still call
+// `loadRankerModel` + `predictRanker` directly — those paths keep
+// working unchanged. New callers should adopt `loadActiveRanker` so
+// scoring routes through whichever artifact passes its ship-gate.
+
+export interface ActiveRankerHandle {
+  readonly selection: ActiveRankerSelection;
+  readonly revisionId: string;
+  // Present only when `selection.selectedKind === 'lightgbm_lambdamart'`.
+  // Tracking the loaded booster on the handle keeps dispose() simple
+  // and means the LR / baseline paths pay zero LightGBM-WASM cost.
+  readonly lightgbm?: LightGBMModel;
+  // Present only when `selection.selectedKind === 'logistic_batch'`.
+  readonly logisticBatchWeights?: readonly number[];
+  readonly dispose: () => void;
+}
+
+const noopDispose = (): void => undefined;
+
+export const loadActiveRanker = async (revision: RankerRevision): Promise<ActiveRankerHandle> => {
+  const selection = selectActiveRanker(revision);
+  if (selection.selectedKind === 'lightgbm_lambdamart') {
+    const lightgbm = await loadRankerModel(revision);
+    return {
+      selection,
+      revisionId: revision.revisionId,
+      lightgbm,
+      dispose: () => {
+        lightgbm.dispose();
+      },
+    };
+  }
+  if (selection.selectedKind === 'logistic_batch') {
+    if (revision.logisticBatchWeights === undefined) {
+      // Defense-in-depth: the selector should never pick this kind
+      // without weights, but if a writer regression slipped through
+      // we degrade to the baseline rather than throwing on every
+      // request.
+      return {
+        selection: {
+          ...selection,
+          selectedKind: 'graph_baseline',
+          reason: 'fallback_graph_baseline',
+          reservedTestNdcgAt5: null,
+        },
+        revisionId: revision.revisionId,
+        dispose: noopDispose,
+      };
+    }
+    return {
+      selection,
+      revisionId: revision.revisionId,
+      logisticBatchWeights: revision.logisticBatchWeights,
+      dispose: noopDispose,
+    };
+  }
+  // graph_baseline (the deterministic fallback) — no state to load.
+  return {
+    selection,
+    revisionId: revision.revisionId,
+    dispose: noopDispose,
+  };
+};
+
+export interface ActivePredictionResult {
+  readonly score: number;
+  readonly kind: RankerArtifactKind;
+  // Feature contributions are only available for the LightGBM path
+  // (pred_contrib). The LR / baseline paths return undefined — callers
+  // that need an explanation must fall back to feature-value display.
+  readonly contributions?: RankerContributions;
+}
+
+export const predictActive = (
+  features: CandidatePairFeatures,
+  handle: ActiveRankerHandle,
+): ActivePredictionResult => {
+  const kind = handle.selection.selectedKind;
+  if (kind === 'lightgbm_lambdamart' && handle.lightgbm !== undefined) {
+    const { score, contributions } = predictRanker(features, handle.lightgbm);
+    return { score, kind, contributions };
+  }
+  if (kind === 'logistic_batch' && handle.logisticBatchWeights !== undefined) {
+    return { score: scoreLogisticBatch(features, handle.logisticBatchWeights), kind };
+  }
+  // graph_baseline OR a degraded fallback the loader emitted on
+  // missing state.
+  return { score: deterministicBaselineScore(features), kind: 'graph_baseline' };
+};
