@@ -149,6 +149,7 @@ import {
   gcEntries as gcEntriesRaw,
   readIndex,
   tombstoneByThread as tombstoneByThreadRaw,
+  upsertEntries as upsertEntriesRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
@@ -5027,34 +5028,45 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/recall\/index$/,
     authRequired: true,
     handle: async (request, _requestId, _match, context) => {
+      // FX2 — single batched write. Was: embed all → loop N times,
+      // each iteration `await recallLifecycle.appendEntry(entry)`.
+      // `appendEntry` → `upsertEntries(path, [entry])` → reads the
+      // full ~MB index, parses 7000+ items, adds one, writes back.
+      // 100 items = 100 full-file rewrites under the enqueueWrite
+      // mutex → 35 s POST /v1/recall/index → /v2/recall etc. cascade
+      // to 26 s+. Now: one upsertEntries call with the full array
+      // does one read+write regardless of batch size.
       const vaultRoot = requireVaultRoot(context);
       const input = recallIndexSchema.parse(await readBody(request));
       const vectors = await embed(input.items.map((item) => item.text));
-      let indexed = 0;
+      const entries: { id: string; threadId: string; capturedAt: string; embedding: Float32Array }[] = [];
       const indexedThreadIds: string[] = [];
       for (let index = 0; index < input.items.length; index += 1) {
         const item = input.items[index];
         const embedding = vectors[index];
         if (item === undefined || embedding === undefined) continue;
-        const entry = {
+        entries.push({
           id: item.id,
           threadId: item.threadId,
           capturedAt: item.capturedAt,
           embedding,
-        };
-        if (context.recallLifecycle !== undefined) {
-          await context.recallLifecycle.appendEntry(entry);
-        } else {
-          await appendEntryRaw(recallIndexPath(vaultRoot), entry, MODEL_ID);
-        }
-        indexed += 1;
+        });
         indexedThreadIds.push(item.threadId);
       }
+      if (entries.length > 0) {
+        if (context.recallLifecycle !== undefined) {
+          await context.recallLifecycle.appendEntries(entries);
+        } else {
+          // Legacy / test path with no lifecycle wrapper. Use the
+          // batched upsert too — same scale win.
+          await upsertEntriesRaw(recallIndexPath(vaultRoot), entries, MODEL_ID);
+        }
+      }
       context.recallActivity?.recordIncrementalIndex({
-        count: indexed,
+        count: entries.length,
         threadIds: indexedThreadIds,
       });
-      return [202, { data: { indexed } }];
+      return [202, { data: { indexed: entries.length } }];
     },
   },
   {

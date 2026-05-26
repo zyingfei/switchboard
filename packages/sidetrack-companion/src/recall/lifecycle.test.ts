@@ -293,6 +293,61 @@ describe('recall lifecycle', () => {
     }
   });
 
+  it('appendEntries batches N writes into a single mutex-serialised upsert (FX2)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-append-batch-'));
+    try {
+      const lifecycle = createRecallLifecycle({
+        vaultRoot: root,
+        companionVersion: '0.0.0-test',
+        currentModelId: 'fresh/model',
+        rebuilder: () => Promise.resolve({ indexed: 0 }),
+        embedder: () => Promise.resolve([]),
+        log: () => undefined,
+        warn: () => undefined,
+      });
+      const entries = Array.from({ length: 50 }, (_, i) => {
+        const embedding = new Float32Array(FAKE_DIM);
+        embedding[0] = (i + 1) / 100;
+        return {
+          id: `thread1:${String(i)}`,
+          threadId: 'thread1',
+          capturedAt: '2026-05-04T00:00:00.000Z',
+          embedding,
+        };
+      });
+      await lifecycle.appendEntries(entries);
+      const { readIndex } = await import('./indexFile.js');
+      const indexFile = await readIndex(join(root, '_BAC', 'recall', 'index.bin'));
+      expect(indexFile?.items.length).toBe(50);
+      const ids = new Set(indexFile?.items.map((item) => item.id));
+      expect(ids.has('thread1:0')).toBe(true);
+      expect(ids.has('thread1:49')).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('appendEntries with an empty array is a no-op (no index file created)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-append-batch-empty-'));
+    try {
+      const lifecycle = createRecallLifecycle({
+        vaultRoot: root,
+        companionVersion: '0.0.0-test',
+        currentModelId: 'fresh/model',
+        rebuilder: () => Promise.resolve({ indexed: 0 }),
+        embedder: () => Promise.resolve([]),
+        log: () => undefined,
+        warn: () => undefined,
+      });
+      await lifecycle.appendEntries([]);
+      const { readIndex } = await import('./indexFile.js');
+      const indexFile = await readIndex(join(root, '_BAC', 'recall', 'index.bin'));
+      expect(indexFile).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('appendEntry writes through the mutex (back-compat low-level path used by POST /v1/recall/index)', async () => {
     const root = await mkdtemp(join(tmpdir(), 'recall-lifecycle-append-'));
     try {
