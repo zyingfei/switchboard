@@ -667,6 +667,56 @@ describe('ranker retraining loop', () => {
     ]);
   });
 
+  it('persists the regularized LR batch weights as a first-class artifact', async () => {
+    // Step 3 of the incremental-ranker plan: the LR trainer at
+    // train.ts:trainRegularizedLogisticRegression already computes
+    // weights every retrain — the LightGBM-only serving path threw
+    // them away. Capture them on the revision + round-trip through the
+    // manifest so the selector (Step 4) can score with LR when
+    // LightGBM fails its ship-gate.
+    const fromA = 'https://example.test/from-a';
+    const fromB = 'https://example.test/from-b';
+    const posA = 'https://example.test/pos-a';
+    const negA = 'https://example.test/neg-a';
+    const posB = 'https://example.test/pos-b';
+    const negB = 'https://example.test/neg-b';
+    const feedback = projection(
+      [label(fromA, posA), label(fromB, posB)],
+      [label(fromA, negA), label(fromB, negB)],
+    );
+    const candidates = buildRankerTrainingCandidates({
+      feedback,
+      merged: [],
+      snapshot: snapshotWithVisits([fromA, fromB, posA, negA, posB, negB]),
+      randomNegativeCandidatesPerPositive: 0,
+    });
+
+    const revision = await trainRankerRevision({
+      feedback,
+      candidates,
+      options: { numRound: 5, trainedAt: observedAtMs },
+    });
+
+    expect(revision.logisticBatchWeights).toBeDefined();
+    // Bias + per-feature: RANKER_FEATURE_KEYS.length + 1 floats.
+    expect(revision.logisticBatchWeights).toHaveLength(RANKER_FEATURE_KEYS.length + 1);
+    for (const w of revision.logisticBatchWeights ?? []) {
+      expect(Number.isFinite(w)).toBe(true);
+    }
+    expect(revision.logisticBatchFeatureStatsVersion).toBe('no-normalization-v1');
+
+    // Manifest round-trip preserves the weights. The lenient reader
+    // drops BOTH `logisticBatchWeights` and
+    // `logisticBatchFeatureStatsVersion` together when either is
+    // malformed so the selector can't score with a partial artifact.
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-lr-weights-'));
+    tempRoots.push(vaultRoot);
+    await writeActiveClosestVisitRankerRevision(vaultRoot, revision);
+    const manifest = await readActiveClosestVisitRankerRevisionManifest(vaultRoot);
+    expect(manifest?.logisticBatchWeights).toEqual(revision.logisticBatchWeights);
+    expect(manifest?.logisticBatchFeatureStatsVersion).toBe('no-normalization-v1');
+  });
+
   it('keeps workstream identity out of the closest_visit scorer feature vector', () => {
     expect([...RANKER_FEATURE_KEYS]).not.toContain('same_workstream');
     expect([...RANKER_FEATURE_KEYS]).not.toContain('user_asserted_in_workstream');
