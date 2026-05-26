@@ -19,7 +19,15 @@ export type RecallSourceKind =
   | 'chat_turn'
   | 'semantic_query'
   | 'graph_neighbor'
-  | 'current_session';
+  | 'current_session'
+  // `focus` — direct graph lookup from `session.currentUrl`. Returns
+  // the page itself plus its 1-hop graph neighbors (related visits,
+  // threads attached to the URL, etc.). Distinct from
+  // `graph_neighbor`, which expands from candidates already found by
+  // OTHER sources. focus answers "what is THIS page connected to";
+  // graph_neighbor answers "what is connected to what I already
+  // found." Both can run in the same request.
+  | 'focus';
 
 /** The kinds of retrievers that can produce evidence on a candidate. */
 export type RecallRetriever =
@@ -123,13 +131,39 @@ export interface RecallStrategy {
   readonly debug?: boolean;
 }
 
+/** Named retrieval intents. Each intent picks a default source
+ *  profile + suppression posture; explicit `sources` / `suppression`
+ *  fields on the request still override. Intent is also recorded in
+ *  the response meta so consumers can attribute behaviour.
+ *
+ *  - `dejavu` — user selected text on a page; want prior captures of
+ *    the SAME topic. Default sources: all five (page_content,
+ *    timeline_visit, chat_turn, semantic_query, graph_neighbor).
+ *    Default suppression: suppress the current page + active-chat /
+ *    Ask-AI artifacts so the user doesn't see their own fresh chat
+ *    surface as déjà-vu.
+ *  - `search` — user typed a global query in the Search tab; no
+ *    current-page context. Default sources: page_content,
+ *    timeline_visit, chat_turn, semantic_query (graph_neighbor stays
+ *    a future opt-in). Default suppression: NONE (`suppressCurrentPage
+ *    = 'never'`) so the user can find what they're looking at.
+ *  - `focus` — Now card for the active page. Default sources:
+ *    focus, timeline_visit, graph_neighbor. Query string is usually
+ *    empty (`q: ''`); ranking blends graph distance + recency. */
+export type RecallIntent = 'dejavu' | 'search' | 'focus';
+
 /** Request body for POST /v2/recall. */
 export interface RecallRequest {
   readonly q: string;
   readonly limit?: number;
   readonly perSourceLimit?: number;
 
-  /** Which sources to query. Defaults to all. */
+  /** Intent profile — picks defaults for `sources` and `suppression`
+   *  when those fields are omitted. Defaults to `dejavu` for backwards
+   *  compatibility with the original Phase 2 contract. */
+  readonly intent?: RecallIntent;
+
+  /** Which sources to query. Defaults follow the chosen `intent`. */
   readonly sources?: readonly RecallSourceKind[];
 
   /** Session/context the server needs for suppression + current-page
@@ -165,6 +199,9 @@ export interface RecallResponse {
   readonly results: readonly RecallCandidate[];
 
   readonly meta: {
+    /** The intent the server resolved this request as — useful for the
+     *  extension's debug overlay and for shadow comparisons. */
+    readonly intent: RecallIntent;
     readonly fusion: {
       readonly strategy: string;
       readonly perSourceCounts: Readonly<Record<RecallSourceKind, number>>;
