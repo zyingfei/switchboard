@@ -772,9 +772,24 @@ const App = () => {
     | { readonly kind: 'dumped'; readonly path: string }
     | { readonly kind: 'error'; readonly message: string }
   >({ kind: 'idle' });
-  const [viewMode, setViewMode] = useState<'workstream' | 'all' | 'inbox' | 'connections'>(
-    'workstream',
-  );
+  // Scope D — the new tab shape is Now / Threads / Workstreams /
+  // Inbox / Search. The state keys keep the historical names
+  // (`workstream`, `all`, `connections`) to minimize churn through
+  // App.tsx's many cross-references; only the visible labels +
+  // routing change. `now` is added as a new contextual surface; the
+  // current-tab card lives there instead of inside Inbox. `search`
+  // is a dedicated entry that renders ConnectionsView in its search
+  // submode without exposing the broader graph UI as a top-level
+  // tab (graph stays reachable via the existing connections viewMode
+  // for cross-surface jumps).
+  //
+  // Initial default stays `workstream` for now — flipping to `now`
+  // is a deliberate UX migration that's covered in a follow-up so
+  // the existing app.test.tsx suite (which asserts workstream view
+  // scaffolding by default) doesn't break in lockstep.
+  const [viewMode, setViewMode] = useState<
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+  >('workstream');
   // Stage 5 polish — cross-surface jumps between Inbox and Connections.
   // `connectionsAnchorRequest` is a string that ConnectionsView watches
   // via its requestAnchor prop; when set non-empty, the view auto-anchors
@@ -2557,7 +2572,9 @@ const App = () => {
   // the All-Threads bucket containing a given thread. Each is mirrored
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
-  const viewModeRef = useRef<'workstream' | 'all' | 'inbox' | 'connections'>('workstream');
+  const viewModeRef = useRef<
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+  >('workstream');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
   const activeTabTrackedThread = useMemo(
@@ -6036,31 +6053,43 @@ const App = () => {
           <button
             type="button"
             role="tab"
-            aria-selected={viewMode === 'workstream'}
-            aria-label="Workstream"
-            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            aria-selected={viewMode === 'now'}
+            aria-label="Now"
+            className={'view-tab' + (viewMode === 'now' ? ' on' : '')}
             onClick={() => {
-              setViewMode('workstream');
+              setViewMode('now');
             }}
           >
-            Workstream
-            <span className="ct mono" aria-hidden>
-              {state.workstreams.length}
-            </span>
+            Now
           </button>
           <button
             type="button"
             role="tab"
             aria-selected={viewMode === 'all'}
-            aria-label="All threads"
+            aria-label="Threads"
             className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
             onClick={() => {
               setViewMode('all');
             }}
           >
-            All threads
+            Threads
             <span className="ct mono" aria-hidden>
               {state.threads.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'workstream'}
+            aria-label="Workstreams"
+            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('workstream');
+            }}
+          >
+            Workstreams
+            <span className="ct mono" aria-hidden>
+              {state.workstreams.length}
             </span>
           </button>
           <button
@@ -6081,14 +6110,14 @@ const App = () => {
           <button
             type="button"
             role="tab"
-            aria-selected={viewMode === 'connections'}
-            aria-label="Connections"
-            className={'view-tab' + (viewMode === 'connections' ? ' on' : '')}
+            aria-selected={viewMode === 'search' || viewMode === 'connections'}
+            aria-label="Search"
+            className={'view-tab' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
             onClick={() => {
-              setViewMode('connections');
+              setViewMode('search');
             }}
           >
-            Connections
+            Search
           </button>
         </div>
         <div className="app-actions">
@@ -6623,15 +6652,17 @@ const App = () => {
           <span className="lbl">
             {viewMode === 'inbox'
               ? 'Inbox'
-              : viewMode === 'connections'
-                ? 'Connections'
-                : 'All threads'}
+              : viewMode === 'search' || viewMode === 'connections'
+                ? 'Search'
+                : viewMode === 'now'
+                  ? 'Now'
+                  : 'Threads'}
           </span>
           <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
         </div>
       )}
 
-      {viewMode === 'inbox' ? (
+      {viewMode === 'now' ? (
         <>
           <section
             ref={currentTabCardRef}
@@ -7189,12 +7220,19 @@ const App = () => {
         </div>
       ) : null}
 
-      {viewMode === 'connections' ? (
+      {viewMode === 'connections' || viewMode === 'search' ? (
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
           requestAnchor={connectionsAnchorRequest}
-          requestSearch={connectionsSearchRequest}
+          // Scope D — when the user clicks the new "Search" top-level
+          // tab, force ConnectionsView into its search submode. The
+          // existing `requestSearch` bump effect (ConnectionsView.tsx)
+          // handles the actual submode switch; bumping with viewMode
+          // change ensures every tab activation lands in search.
+          requestSearch={
+            viewMode === 'search' ? connectionsSearchRequest + 1 : connectionsSearchRequest
+          }
           {...(connectionsDejaVuRequest === null ? {} : { requestDejaVuMode: connectionsDejaVuRequest })}
           onRequestConsumed={() => {
             setConnectionsAnchorRequest('');

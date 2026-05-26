@@ -299,9 +299,9 @@ describe('live side-panel App wiring', () => {
     // renders masked as `[private]` because the workstream is
     // private — find by that, not by the actual title string.
     await screen.findByRole('main', { name: 'Sidetrack workboard' });
-    fireEvent.click(screen.getByRole('tab', { name: 'All threads' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Threads' }));
 
-    // Wait for the thread bucket to render under All-threads view.
+    // Wait for the thread bucket to render under the Threads tab.
     const threadRow = (await screen.findByText('[private]')).closest('.thread');
     expect(threadRow).not.toBeNull();
     if (threadRow !== null) {
@@ -603,13 +603,15 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    // #4 — the current-tab attribution card is Inbox-only now, so
-    // switch to Inbox before asserting its contents.
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    // Scope D — current-tab card lives in Now, inbox list lives in
+    // Inbox. Assert the card under Now, then switch to Inbox to
+    // assert the per-URL inbox row.
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sidetrack');
     });
     expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Features only');
+    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
     // Stage 5 polish — flat 4-action layout aligned with Current Tab.
     // Both the Current Tab card and the Inbox card now render "Pick
@@ -634,9 +636,13 @@ describe('live side-panel App wiring', () => {
     // mounts on a graph anchor is now on the current-tab card, driven
     // against the live focused URL. Its actions must dispatch the
     // page-content messages.
-    const currentTabCard = within(screen.getByTestId('focused-tab-attribution')).getByTestId(
-      'current-tab-page-content-card',
-    );
+    //
+    // Scope D — the current-tab card moved from Inbox to Now; switch
+    // back to Now so the card is mounted before drilling in.
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    const currentTabCard = within(
+      await screen.findByTestId('focused-tab-attribution'),
+    ).getByTestId('current-tab-page-content-card');
     expect(currentTabCard).toHaveTextContent('Page text');
     // Coverage was fetched for the live focused URL (panel is wired to
     // the current tab, not a graph anchor).
@@ -790,9 +796,9 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     // The duplicate fallback SuggestionBanner was removed; the same
-    // resolver suggestion + confirm now lives on the CURRENT TAB
-    // attribution card (Inbox view), the single non-duplicated surface.
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    // Scope D — resolver suggestion + confirm now lives on the
+    // current-tab card under the Now tab.
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
     const banner = await screen.findByLabelText('Current tab attribution');
     // The card resolves its suggestion asynchronously ("Checking
     // signals…" → suggestion); wait for the confirm affordance.
@@ -932,7 +938,7 @@ describe('live side-panel App wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
 
     const card = await screen.findByLabelText('Current tab attribution');
     await waitFor(() => {
@@ -1073,7 +1079,7 @@ describe('live side-panel App wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
 
     const card = await screen.findByLabelText('Current tab attribution');
     await waitFor(
@@ -1194,8 +1200,8 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    // #4 — the current-tab attribution card is Inbox-only now.
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    // Scope D — the current-tab attribution card lives in Now now.
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sibling');
     });
@@ -1243,7 +1249,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
     fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
 
     expect(await screen.findByText(/waiting for Claude's reply/)).toBeInTheDocument();
@@ -1263,14 +1269,14 @@ describe('live side-panel App wiring', () => {
 
     const { unmount } = render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
     expect(await screen.findByText('Side-panel state machine review')).toBeInTheDocument();
 
     unmount();
     vi.unstubAllGlobals();
     installChromeMock({ ...sharedState, screenShareMode: true }, { [SETUP_COMPLETED_KEY]: true });
     render(<App />);
-    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
     expect(await screen.findByText('[private]')).toBeInTheDocument();
   });
 
@@ -1300,7 +1306,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
     const staleHeader = await screen.findByRole('button', { name: /Stale or closed/u });
     expect(staleHeader).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('Stale row')).not.toBeInTheDocument();
@@ -1347,7 +1353,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'All threads' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
     const threadRow = (await screen.findByText('[private]')).closest('.thread');
     expect(threadRow).not.toBeNull();
     if (threadRow === null) {
