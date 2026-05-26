@@ -7513,7 +7513,13 @@ const App = () => {
           }}
           isChatThreadCaptured={isChatThreadCapturedForRecord}
         />
-      ) : (
+      ) : viewMode === 'all' ? (
+        // Scope D — the all-threads feed used to be the ternary's
+        // catch-all branch, so a viewMode of 'now' / 'connections' /
+        // 'search' silently fell through and rendered ALL THREADS
+        // below the Now card. Gate explicitly to the Threads viewMode
+        // (the 'workstream' branch has its own surface above at line
+        // 7355 and never reaches this fallback).
         <>
           <div className="sec-head">
             <span>All threads</span>
@@ -7555,7 +7561,7 @@ const App = () => {
             );
           })}
         </>
-      )}
+      ) : null}
 
       {viewMode !== 'connections' ? (() => {
         // Recent Dispatches: chronological log of packets sent out of

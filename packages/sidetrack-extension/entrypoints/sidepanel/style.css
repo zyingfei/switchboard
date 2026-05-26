@@ -12217,3 +12217,72 @@ pre.diff {
   letter-spacing: 0.04em;
   cursor: pointer;
 }
+
+/* Scope D/E — Now context history breadcrumb. The strip sits above
+ * the Now card and shows up to 4 prior contexts the user has
+ * navigated through. Chips are horizontal, never wrap to multiple
+ * lines (overflow scrolls), and clearly separate kind / title /
+ * relative-time so the row reads as a single label not a glued
+ * string. */
+.cx-now-history {
+  display: flex;
+  flex-direction: row;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 12px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.cx-now-history-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 220px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+}
+.cx-now-history-chip:hover {
+  border-color: var(--signal);
+  background: var(--surface-2);
+}
+.cx-now-history-chip.is-current {
+  border-style: dashed;
+}
+.cx-now-history-chip.is-active {
+  border-color: var(--signal);
+  color: var(--ink-1);
+  background: var(--surface-2);
+}
+.cx-now-history-kind {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 0 5px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  flex: 0 0 auto;
+}
+.cx-now-history-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.cx-now-history-when {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  flex: 0 0 auto;
+}
