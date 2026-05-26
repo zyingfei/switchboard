@@ -186,4 +186,28 @@ describe('selectActiveRanker', () => {
     });
     expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
   });
+
+  it('never picks hierarchical_per_container_lr — algorithm is plan-deferred (Step 9)', () => {
+    // Step 9 lands the framework (the kind in the union, the
+    // manifest field, the selector awareness). The
+    // bias-computation training step is plan-deferred until
+    // replay-eval evidence justifies it. Until then the selector
+    // refuses the kind even if a future revision claims it passes.
+    const revision = baseRevision({
+      logisticBatchWeights: Array.from({ length: RANKER_FEATURE_KEYS.length + 1 }, () => 0),
+      logisticBatchFeatureStatsVersion: 'no-normalization-v1',
+      perContainerBiases: {
+        perWorkstream: { 'workstream:test-1': 0.05 },
+        perTopic: {},
+      },
+      artifactQuality: [
+        artifact('lightgbm_lambdamart', 'pass', 0.7),
+        artifact('hierarchical_per_container_lr', 'pass', 0.85),
+      ],
+    });
+    // Kind ranks first in KIND_ORDER but isServeable returns false
+    // for the hierarchical kind. Selector falls through to the
+    // next-best serveable artifact.
+    expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
+  });
 });
