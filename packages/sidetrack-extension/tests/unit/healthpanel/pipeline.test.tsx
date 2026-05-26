@@ -540,10 +540,10 @@ describe('HealthPanel pipeline strip', () => {
       const stage = screen.getByTestId('hp-pipeline-stage-ranker');
       // Labeled triple — positives / user-feedback negatives /
       // training negatives (null → "unknown", never 0).
-      expect(stage.textContent).toContain('+18');
-      expect(stage.textContent).toContain('uf-0');
-      expect(stage.textContent).toContain('neg-unknown');
-      expect(stage.textContent).not.toContain('neg-0');
+      expect(stage.textContent).toContain('18 pos');
+      expect(stage.textContent).toContain('0 user-neg');
+      expect(stage.textContent).toContain('unknown synth-neg');
+      expect(stage.textContent).not.toContain('0 synth-neg');
       // Behind-model surfaced with the skip reason explaining why.
       expect(stage.textContent).toContain('data changed since train');
       expect(stage.textContent).toContain('cooldown-active');
@@ -560,6 +560,178 @@ describe('HealthPanel pipeline strip', () => {
       expect(screen.getByText('User-feedback neg')).toBeInTheDocument();
       expect(screen.getByText('unknown')).toBeInTheDocument();
       expect(screen.getByText(/the active model is behind/)).toBeInTheDocument();
+    });
+  });
+
+  it('surfaces methodologySpine ship-gate fail + augmentation status in the Ranker drill', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'rev_42',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60_000,
+            retrainSkipReason: 'below-threshold',
+            retrainNewLabelCount: 0,
+            activeModelVersion: 'lightgbm-lambdamart-v4',
+            expectedModelVersion: 'lightgbm-lambdamart-v4',
+            activeFeatureSchemaVersion: 4,
+            expectedFeatureSchemaVersion: 4,
+            needsRetrain: false,
+            methodologySpine: {
+              servingGateEnforced: false,
+              shipGate: {
+                status: 'fail' as const,
+                candidate: 'lightgbm-lambdamart-v4',
+                reason: 'active-model-does-not-beat-comparison-baseline',
+              },
+            },
+            augmentation: {
+              status: 'skipped' as const,
+              reason: 'scopedTimelineDelta',
+              activeRevisionId: null,
+              activeModelVersion: null,
+              expectedModelVersion: 'lightgbm-lambdamart-v4',
+              needsRetrain: false,
+              modelFreshness: 'unknown' as const,
+              closestVisitEdgeCount: 3322,
+              rankerSourceEdgeCount: 3322,
+              asOf: '2026-05-26T10:22:27.318Z',
+            },
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-rev',
+            algorithmVersion: 'topic-revision:v3:leiden-cpm',
+            topicCount: 87,
+            lineageCount: 90,
+          },
+        },
+      }),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-ranker')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-ranker'));
+
+    await waitFor(() => {
+      // Ship-gate fail callout — visible warning, not buried in a receipt row.
+      const gate = screen.getByTestId('hp-ranker-shipgate-fail');
+      expect(gate.textContent).toMatch(/Ship gate · fail/);
+      expect(gate.textContent).toMatch(/active-model-does-not-beat-comparison-baseline/);
+      expect(gate.textContent).toMatch(/lightgbm-lambdamart-v4/);
+    });
+
+    // Augmentation receipt — closest-visit ranker edge counts, status, reason.
+    const aug = screen.getByTestId('hp-ranker-augmentation');
+    expect(aug.textContent).toMatch(/Skipped/);
+    expect(aug.textContent).toMatch(/scopedTimelineDelta/);
+    expect(aug.textContent).toMatch(/3322 \/ 3322/);
+  });
+
+  it('does not crash when shipGate.reason or augmentation.reason are null (live server emits null, not undefined)', async () => {
+    // Live CfT crash report: Cannot read properties of null (reading
+    // 'length'). The earlier `!== undefined && X.length > 0` guards
+    // missed null. The server returns null (not undefined) for
+    // unpopulated string IDs, so a fail-status shipGate with a null
+    // reason crashed the entire panel render. Cover with explicit
+    // null fixtures.
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'rev_42',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60_000,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+            methodologySpine: {
+              shipGate: {
+                status: 'fail' as const,
+                // Explicit null — earlier guards crashed here.
+                reason: null as unknown as string,
+              },
+            },
+            augmentation: {
+              status: 'skipped' as const,
+              // Explicit null — same shape on the augmentation path.
+              reason: null as unknown as string,
+              activeRevisionId: null,
+              activeModelVersion: null,
+              expectedModelVersion: 'lightgbm-lambdamart-v4',
+              needsRetrain: false,
+              modelFreshness: 'unknown' as const,
+              closestVisitEdgeCount: 0,
+              rankerSourceEdgeCount: 0,
+              asOf: null,
+            },
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-rev',
+            algorithmVersion: 'topic-revision:v3:leiden-cpm',
+            topicCount: 87,
+            lineageCount: 90,
+          },
+        },
+      }),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-ranker')).toBeInTheDocument();
+    });
+    // The Ranker drill must render without throwing — the actual
+    // content correctness is covered by the prior tests; the
+    // assertion here is just "no crash on null reasons".
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-ranker'));
+    await waitFor(() => {
+      const gate = screen.getByTestId('hp-ranker-shipgate-fail');
+      // Ship-gate callout still renders the candidate even without
+      // a reason string — fallback to `r?.activeModelVersion` or
+      // 'unknown'.
+      expect(gate.textContent).toMatch(/Ship gate · fail/);
+    });
+  });
+
+  it('warns when active vs expected ranker model/schema versions diverge', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'rev_old',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 60 * 60_000,
+            retrainSkipReason: null,
+            retrainNewLabelCount: 0,
+            activeModelVersion: 'lightgbm-lambdamart-v3',
+            expectedModelVersion: 'lightgbm-lambdamart-v4',
+            activeFeatureSchemaVersion: 3,
+            expectedFeatureSchemaVersion: 4,
+            needsRetrain: true,
+          },
+        },
+      }),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-ranker')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-ranker'));
+
+    await waitFor(() => {
+      const drift = screen.getByTestId('hp-ranker-model-drift');
+      expect(drift.textContent).toMatch(/lightgbm-lambdamart-v3/);
+      expect(drift.textContent).toMatch(/lightgbm-lambdamart-v4/);
+      expect(drift.textContent).toMatch(/Feature schema v3/);
+      expect(drift.textContent).toMatch(/expected v4/);
     });
   });
 

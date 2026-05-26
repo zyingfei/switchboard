@@ -109,6 +109,42 @@ interface SyncSummary {
   readonly materializers?: Record<string, MaterializerHealth>;
 }
 
+// Methodology spine — how the active ranker model was selected. The
+// `shipGate` substruct carries the pass/fail of the ship gate and the
+// reason. A `status: 'fail'` means the active model did NOT beat the
+// comparison baseline on the held-out test split; serving keeps the
+// fail-soft current artifact. Surfaced as a warning callout in the
+// Ranker drill so a silent-stale model is visible.
+interface WorkGraphRankerMethodologySpine {
+  readonly servingGateEnforced?: boolean;
+  readonly shipGate?: {
+    readonly status?: 'pass' | 'fail' | 'pending';
+    readonly candidate?: string;
+    readonly reason?: string;
+    readonly minValidationDeltaVsBaseline?: number;
+    readonly minReservedTestNdcg?: number;
+    readonly reservedTestUsedExactlyOnce?: boolean;
+  };
+}
+
+// Augmentation lane — the closest-visit-ranker augmentation produces
+// extra ranker edges on top of the base graph. `status: 'skipped'`
+// + `reason: 'scopedTimelineDelta'` is normal during incremental
+// rebuilds (the fast-path doesn't re-augment). `closestVisitEdgeCount`
+// reports how many edges the LAST successful augmentation produced.
+interface WorkGraphRankerAugmentationHealth {
+  readonly status?: 'ready' | 'skipped' | 'pending' | 'failed';
+  readonly reason?: string;
+  readonly activeRevisionId?: string | null;
+  readonly activeModelVersion?: string | null;
+  readonly expectedModelVersion?: string | null;
+  readonly needsRetrain?: boolean;
+  readonly modelFreshness?: 'fresh' | 'stale' | 'unknown';
+  readonly closestVisitEdgeCount?: number;
+  readonly rankerSourceEdgeCount?: number;
+  readonly asOf?: string | null;
+}
+
 interface WorkGraphRankerHealth {
   readonly activeRevisionId: string | null;
   readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
@@ -117,6 +153,15 @@ interface WorkGraphRankerHealth {
   readonly trainedAt: number | null;
   readonly retrainSkipReason: string | null;
   readonly retrainNewLabelCount: number;
+  // The actual model + feature-schema versions loaded vs what the
+  // companion build expects. A mismatch means the active artifact is
+  // older than the current code's training pipeline; the panel renders
+  // a "schema drift" warning so it isn't silent.
+  readonly activeModelVersion?: string | null;
+  readonly expectedModelVersion?: string | null;
+  readonly activeFeatureSchemaVersion?: number | null;
+  readonly expectedFeatureSchemaVersion?: number | null;
+  readonly needsRetrain?: boolean;
   // Honest training mix. Never show the negative count alone — the
   // labeled triple prevents reading "0 user negatives" as "trained on
   // no negatives". `trainingNegatives === null` renders as "unknown"
@@ -131,6 +176,8 @@ interface WorkGraphRankerHealth {
   // model trained on — "data changed, model is behind". Optional on
   // an older companion (treated as false / not surfaced).
   readonly datasetChangedSinceTrain?: boolean;
+  readonly methodologySpine?: WorkGraphRankerMethodologySpine | null;
+  readonly augmentation?: WorkGraphRankerAugmentationHealth | null;
 }
 
 interface WorkGraphTopicProducerHealth {
@@ -799,9 +846,11 @@ export function HealthPanel({
     const mixLine =
       mix === undefined || mix === null
         ? ''
-        : ` · +${String(mix.positivesAtTrain)} / uf-${String(
+        : ` · ${String(mix.positivesAtTrain)} pos / ${String(
             mix.userFeedbackNegativesAtTrain,
-          )} / neg-${mix.trainingNegatives === null ? 'unknown' : String(mix.trainingNegatives)}`;
+          )} user-neg / ${
+            mix.trainingNegatives === null ? 'unknown' : String(mix.trainingNegatives)
+          } synth-neg`;
     const staleLine =
       rankerHealth?.datasetChangedSinceTrain === true
         ? ` · data changed since train${
@@ -1073,7 +1122,6 @@ export function HealthPanel({
     const driftSidecar = candidates.find(
       (candidate) => candidate.id === 'diagnostic.drift-sidecar',
     );
-    const shadowHistory = focusHealth?.history ?? [];
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <h2 className="sx-drill-title">Experiments</h2>
@@ -1175,41 +1223,6 @@ export function HealthPanel({
             />
           </dl>
         </div>
-
-        <h3 className="sx-h">Shadow trend</h3>
-        {shadowHistory.length === 0 ? (
-          <div className="sx-callout">
-            No ring-buffer history yet. The panel reports <em>no signal yet</em> rather than drawing
-            a synthetic trend.
-          </div>
-        ) : (
-          <table className="sx-monotbl">
-            <thead>
-              <tr>
-                <th>Drain</th>
-                <th className="right">Shadow topics</th>
-                <th className="right">Max share</th>
-                <th className="right">Noise</th>
-                <th className="right">Adjacent churn</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shadowHistory
-                .slice()
-                .reverse()
-                .slice(0, 8)
-                .map((sample, index) => (
-                  <tr key={`${sample.at}-${String(index)}`}>
-                    <td>{formatWhen(sample.at)}</td>
-                    <td className="right">{sample.shadowTopicCount ?? '—'}</td>
-                    <td className="right">{fmtNum(sample.shadowMaxTopicShare, 3)}</td>
-                    <td className="right">{fmtNum(sample.noiseShare, 2)}</td>
-                    <td className="right">{fmtNum(sample.adjacentPerVisitChurn, 2)}</td>
-                  </tr>
-                ))}
-            </tbody>
-          </table>
-        )}
       </div>
     );
   };
@@ -1391,6 +1404,22 @@ export function HealthPanel({
   const renderRankerDrill = () => {
     const r = report?.workGraph?.ranker;
     const mix = r?.trainingMix;
+    const shipGate = r?.methodologySpine?.shipGate;
+    const aug = r?.augmentation;
+    const modelDrift =
+      r !== undefined &&
+      r.activeModelVersion !== undefined &&
+      r.activeModelVersion !== null &&
+      r.expectedModelVersion !== undefined &&
+      r.expectedModelVersion !== null &&
+      r.activeModelVersion !== r.expectedModelVersion;
+    const schemaDrift =
+      r !== undefined &&
+      r.activeFeatureSchemaVersion !== undefined &&
+      r.activeFeatureSchemaVersion !== null &&
+      r.expectedFeatureSchemaVersion !== undefined &&
+      r.expectedFeatureSchemaVersion !== null &&
+      r.activeFeatureSchemaVersion !== r.expectedFeatureSchemaVersion;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <h2 className="sx-drill-title">
@@ -1412,6 +1441,38 @@ export function HealthPanel({
             )}{' '}
             Retrain cadence is feedback-only — a model can silently freeze whenever positive
             feedback stalls.
+          </div>
+        ) : null}
+
+        {shipGate?.status === 'fail' ? (
+          <div className="sx-callout warn" data-testid="hp-ranker-shipgate-fail">
+            <strong>Ship gate · fail.</strong>{' '}
+            {typeof shipGate.reason === 'string' && shipGate.reason.length > 0 ? (
+              <>
+                Reason: <code>{shipGate.reason}</code>.{' '}
+              </>
+            ) : null}
+            The candidate <code>{shipGate.candidate ?? r?.activeModelVersion ?? 'unknown'}</code>{' '}
+            did not clear the held-out test gate. Serving fails soft to the previous artifact.
+          </div>
+        ) : null}
+
+        {modelDrift || schemaDrift ? (
+          <div className="sx-callout warn" data-testid="hp-ranker-model-drift">
+            <strong>Active artifact older than this build.</strong>{' '}
+            {modelDrift ? (
+              <>
+                Model <code>{r.activeModelVersion}</code> → expected{' '}
+                <code>{r.expectedModelVersion}</code>.{' '}
+              </>
+            ) : null}
+            {schemaDrift ? (
+              <>
+                Feature schema v{String(r.activeFeatureSchemaVersion)} → expected v
+                {String(r.expectedFeatureSchemaVersion)}.{' '}
+              </>
+            ) : null}
+            A retrain will load the newer version.
           </div>
         ) : null}
 
@@ -1509,6 +1570,45 @@ export function HealthPanel({
               dt="New labels since"
               dd={r === undefined ? 'no signal yet' : String(r.retrainNewLabelCount)}
             />
+            <ReceiptRow
+              dt="Active model"
+              dd={
+                <span className="sx-mono">
+                  {r?.activeModelVersion ?? 'no signal yet'}
+                  {r?.activeFeatureSchemaVersion !== undefined &&
+                  r.activeFeatureSchemaVersion !== null
+                    ? ` · features v${String(r.activeFeatureSchemaVersion)}`
+                    : ''}
+                </span>
+              }
+            />
+            <ReceiptRow
+              dt="Expected model"
+              dd={
+                <span className="sx-mono">
+                  {r?.expectedModelVersion ?? 'no signal yet'}
+                  {r?.expectedFeatureSchemaVersion !== undefined &&
+                  r.expectedFeatureSchemaVersion !== null
+                    ? ` · features v${String(r.expectedFeatureSchemaVersion)}`
+                    : ''}
+                </span>
+              }
+            />
+            <ReceiptRow
+              dt="Ship gate"
+              dd={
+                shipGate === undefined ? (
+                  <span className="sx-mono">no signal yet</span>
+                ) : (
+                  <span className="sx-mono">
+                    {shipGate.status ?? 'unknown'}
+                    {typeof shipGate.reason === 'string' && shipGate.reason.length > 0
+                      ? ` · ${shipGate.reason}`
+                      : ''}
+                  </span>
+                )
+              }
+            />
           </dl>
           <div className="sx-receipt-reason">
             A force retrain bypasses <em>policy</em> gates (threshold, cooldown). It still respects{' '}
@@ -1517,6 +1617,76 @@ export function HealthPanel({
             artifact than the data supports. The toast reports the decision verbatim.
           </div>
         </div>
+
+        {aug !== undefined && aug !== null ? (
+          <div className="sx-receipt" data-testid="hp-ranker-augmentation">
+            <div className="sx-receipt-head">
+              <span
+                className={`sx-stamp ${
+                  aug.status === 'ready'
+                    ? 'deterministic'
+                    : aug.status === 'failed'
+                      ? 'signal'
+                      : 'partial'
+                }`}
+              >
+                <span />
+                {aug.status === 'ready'
+                  ? 'Ready'
+                  : aug.status === 'skipped'
+                    ? 'Skipped'
+                    : aug.status === 'failed'
+                      ? 'Failed'
+                      : aug.status === 'pending'
+                        ? 'Pending'
+                        : 'No signal'}
+              </span>
+              <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+                workGraph.ranker.augmentation
+              </span>
+            </div>
+            <dl>
+              <ReceiptRow
+                dt="Augmentation"
+                dd={
+                  <span className="sx-mono">
+                    closest-visit ranker
+                    {typeof aug.reason === 'string' && aug.reason.length > 0
+                      ? ` · ${aug.reason}`
+                      : ''}
+                  </span>
+                }
+              />
+              <ReceiptRow
+                dt="Edges (closest / source)"
+                dd={
+                  <span className="sx-mono">
+                    {aug.closestVisitEdgeCount === undefined
+                      ? 'no signal yet'
+                      : String(aug.closestVisitEdgeCount)}
+                    {' / '}
+                    {aug.rankerSourceEdgeCount === undefined
+                      ? 'no signal yet'
+                      : String(aug.rankerSourceEdgeCount)}
+                  </span>
+                }
+              />
+              <ReceiptRow
+                dt="Model freshness"
+                dd={<span className="sx-mono">{aug.modelFreshness ?? 'unknown'}</span>}
+              />
+              <ReceiptRow
+                dt="As of"
+                dd={<span className="sx-mono">{formatWhen(aug.asOf)}</span>}
+              />
+            </dl>
+            <div className="sx-receipt-reason">
+              The augmentation lane adds closest-visit ranker edges on top of the base graph.
+              Status <code>skipped · scopedTimelineDelta</code> is normal during incremental
+              rebuilds (the fast-path doesn’t re-augment); a full base rebuild refreshes it.
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -1975,13 +2145,13 @@ export function HealthPanel({
     const tp = report?.workGraph?.topicProducer;
     if (tp === undefined) return null;
     const algo = tp.algorithmVersion ?? 'unknown';
-    const producer = algo.includes('leiden-cpm')
-      ? 'leiden-cpm @ 0.90'
-      : algo.includes('idf-rkn')
-        ? 'idf-rkn-split'
-        : algo.includes('union-find')
-          ? 'union-find'
-          : algo;
+    // Display the trailing algorithm-name segment of the canonical
+    // `topic-revision:<phase>:<algo>` revision key (or the raw value if
+    // it doesn't follow the pattern). Honest over a hardcoded alias —
+    // older retired branches (idf-rkn-split, union-find) used to be
+    // mapped explicitly here; the served threshold (e.g. 0.9 for
+    // leiden-cpm) lives in the Topics drill via focus-health.
+    const producer = algo === 'unknown' ? algo : (algo.split(':').pop() ?? algo);
     const tiles: ReadonlyArray<{ label: string; num: string; foot: string }> = [
       {
         label: 'Producer',
