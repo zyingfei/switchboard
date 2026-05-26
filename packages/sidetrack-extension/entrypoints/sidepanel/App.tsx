@@ -6865,7 +6865,14 @@ const App = () => {
                   {/* task #50 Stage 2 — Page-text / index controls for
               the LIVE current tab (same panel ConnectionsView mounts
               on a graph anchor). Renders nothing when the focused URL
-              has no canonical URL (workstream/topic focus). */}
+              has no canonical URL (workstream/topic focus).
+
+              Scope D / F3 — hidden for `unknown` (no canonical URL to
+              index, no point) and `chat` (chat threads are captured
+              through the dispatch path, not the page-text indexer).
+              The full per-kind layout split is otherwise CSS-driven
+              via the `now-kind-${kind}` class on the card root. */}
+                  {focusedPageKind === 'page' || focusedPageKind === 'workstream' ? (
                   <PageTextPanel
                     testIdPrefix="current-tab"
                     canonicalUrl={currentTabCanonicalUrl}
@@ -6893,6 +6900,7 @@ const App = () => {
                       setCurrentTabBulkPreview(null);
                     }}
                   />
+                  ) : null}
                 </div>
                 {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the
