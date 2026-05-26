@@ -157,9 +157,15 @@ const main = async () => {
     else fail('Search route did not surface search UI');
   }
 
-  // Type a query and assert the extension fires recallV2Query with intent='search'.
+  // Type a query and HARD-assert the extension fires recallV2Query
+  // with intent='search'. This is the load-bearing assertion that
+  // catches schema drift (the kind of regression the live CfT test
+  // surfaced when /v2/recall first 400'd on the new intent field);
+  // soft-skipping defeats the purpose.
   const searchInput = await page.$('[data-testid="connections-search-tab-input"]');
-  if (searchInput !== null) {
+  if (searchInput === null) {
+    fail('search input not surfaced — Search route did not mount its input field');
+  } else {
     // Hook chrome.runtime.sendMessage to capture outgoing recallV2Query.
     await page.evaluate(() => {
       const original = chrome.runtime.sendMessage;
@@ -173,21 +179,31 @@ const main = async () => {
       };
     });
     await searchInput.fill('sidetrack');
-    await page.waitForTimeout(800); // debounce window
-    const captured = await page.evaluate(() => window.__capturedRecallV2Reqs ?? []);
+    // The hook itself debounces (SEARCH_DEBOUNCE_MS = 300ms). Wait
+    // generously past that so the recallV2Query has time to fire.
+    // Poll for up to 3s — flake-resistant without inflating happy-
+    // path wall time.
+    let captured = [];
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      captured = await page.evaluate(() => window.__capturedRecallV2Reqs ?? []);
+      if (captured.length > 0) break;
+      await page.waitForTimeout(150);
+    }
     console.log(`[smoke] captured recallV2Query messages: ${captured.length}`);
-    if (captured.length > 0) {
-      ok(`extension fired recallV2Query`);
+    if (captured.length === 0) {
+      fail(
+        'extension did NOT fire recallV2Query within 3s of typing — schema, ' +
+          'background bridge, or useRecallSearch hook is broken',
+      );
+    } else {
+      ok('extension fired recallV2Query');
       const req = captured[0].req;
       if (req?.intent === 'search') ok(`request carries intent='search'`);
       else fail(`request missing/wrong intent: ${JSON.stringify(req?.intent)}`);
       if (typeof req?.q === 'string' && req.q.length > 0) ok(`request carries q='${req.q}'`);
       else fail(`request missing q`);
-    } else {
-      console.log('[smoke] (no captured messages; check /tmp/sidetrack-http-debug.log)');
     }
-  } else {
-    console.log('[smoke] (search input not surfaced; skipping query verification)');
   }
 
   // Screenshot the final state for visual inspection.
