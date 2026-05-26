@@ -961,6 +961,41 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       );
     }
   })();
+  // Pre-warm the cross-encoder rerank model. Cold-start cost was
+  // measured at ~4.5s (model + tokenizer load); warm calls drop to
+  // ~270ms p50. Without this pre-warm the first /v2/recall that
+  // sets `strategy.rerankTopK > 0` pays the cold cost in its user-
+  // facing latency window. Flag-gated for ops who want to skip it
+  // (saves ~50MB resident memory if rerank is intentionally off).
+  if (process.env['SIDETRACK_RECALL_RERANK_PREWARM'] !== '0') {
+    void (async () => {
+      try {
+        const { rerank: rerankFn } = await import('./recall-v2/rerank.js');
+        const warmStart = Date.now();
+        // Single dummy candidate exercises the full pipeline (load +
+        // tokenize + score) without depending on a real query.
+        await rerankFn('warmup', [
+          {
+            candidateId: 'warmup',
+            entityId: 'warmup',
+            sourceKind: 'page_content',
+            fusedScore: 0,
+            evidence: [],
+            title: 'warmup',
+          },
+        ], 1);
+        writeLine(
+          streams.stdout,
+          `[recall-v2] rerank pre-warm complete in ${String(Date.now() - warmStart)}ms`,
+        );
+      } catch (err) {
+        writeLine(
+          streams.stderr,
+          `[recall-v2] rerank pre-warm failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    })();
+  }
   writeLine(streams.stdout, `vault           ${runtime.vaultPath}`);
   writeLine(streams.stdout, `bridge key file ${runtime.bridgeKeyPath}`);
   writeLine(

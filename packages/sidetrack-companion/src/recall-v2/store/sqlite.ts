@@ -289,22 +289,31 @@ class SqliteRecallStore implements RecallStore {
     const ftsQuery = escapeFts5Query(opts.q);
     if (ftsQuery === '""') return [];
     const filter = sourceKindFilter(opts.sourceKind);
-    // bm25(table, w_title, w_body, w_url_tokens, w_host) — lower (more
-    // negative) is better; we negate so higher-is-better downstream.
-    // Title weight 2.0 mirrors the legacy MiniSearch config to keep
-    // ranking comparable across the migration; body 1.0; url 1.0;
-    // host 0.5.
+    // BM25F field weights: title 2x body, url 1x body, host 0.5x.
+    // Title is high-precision (short, intentional); body is noise-prone
+    // (long, opportunistic). The 2x is calibrated against the eval
+    // fixtures — bumping to 5x silently surfaces forbidden docs that
+    // weakly match a common token in title (e.g. "security" in kernel
+    // security docs vs CVE writeups). Source-quality differentiation
+    // belongs at fusion (smooth gate on semantic) + post-retrieval
+    // cross-encoder rerank, NOT at BM25 weights.
+    //
+    // `snippet(docs_fts, 1, '', '', '…', 64)` extracts the matched
+    // passage from the body column (index 1) with a 64-token budget.
+    // Fed to the cross-encoder rerank when enabled — the CE has a
+    // 512-token sequence limit, so passing snippet (matched paragraph)
+    // beats passing the raw body (silently truncated to the intro).
     const sql = `
       SELECT
         docs.entity_id    AS entityId,
         docs.source_kind  AS sourceKind,
         docs.canonical_url AS canonicalUrl,
         docs.title        AS title,
-        docs.body         AS body,
         docs.thread_id    AS threadId,
         docs.last_seen_at AS lastSeenAt,
         docs.first_seen_at AS firstSeenAt,
-        -bm25(docs_fts, 2.0, 1.0, 1.0, 0.5) AS bm25
+        -bm25(docs_fts, 2.0, 1.0, 1.0, 0.5) AS bm25,
+        snippet(docs_fts, 1, '', '', '…', 64) AS bodySnippet
       FROM docs
       JOIN docs_fts ON docs.rowid = docs_fts.rowid
       WHERE docs_fts MATCH ?
@@ -317,14 +326,17 @@ class SqliteRecallStore implements RecallStore {
       sourceKind: string;
       canonicalUrl: string | null;
       title: string | null;
-      body: string | null;
       threadId: string | null;
       lastSeenAt: number | null;
       firstSeenAt: number | null;
       bm25: number;
+      bodySnippet: string | null;
     }[];
     return rows.map((r): StoreFtsHit => {
-      const snippet = r.body !== null && r.body.length > 0 ? r.body.slice(0, 180) : undefined;
+      // Empty snippet (title-only docs with no body) → undefined so
+      // the cross-encoder rerank falls back to title alone.
+      const snippet =
+        r.bodySnippet !== null && r.bodySnippet.length > 0 ? r.bodySnippet : undefined;
       return {
         entityId: r.entityId,
         sourceKind: r.sourceKind as StoreSourceKind,
