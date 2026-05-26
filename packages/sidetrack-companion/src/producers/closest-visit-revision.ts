@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import {
   DETERMINISTIC_BASELINE_VERSION,
+  LOGISTIC_BATCH_FEATURE_STATS_VERSION,
+  RANKER_FEATURE_KEYS,
   RANKER_MODEL_VERSION,
   REGULARIZED_LOGISTIC_REGRESSION_VERSION,
   type RankerArtifactKind,
@@ -39,6 +41,17 @@ export interface ClosestVisitRankerRevisionManifest {
    * lenient parse so older manifests stay readable.
    */
   readonly artifactQuality?: readonly RankerArtifactQuality[];
+  /**
+   * Step 3 — the regularized LR's trained weights, persisted alongside
+   * the LightGBM bytes so the selector (Step 4) can route scoring to
+   * LR when LightGBM fails its ship-gate. Length = RANKER_FEATURE_KEYS
+   * + 1 (bias). `featureStatsVersion` records the normalization regime
+   * the weights expect; the loader refuses to score under a different
+   * regime (future-proof: the current trainer uses raw features /
+   * `'no-normalization-v1'`).
+   */
+  readonly logisticBatchWeights?: readonly number[];
+  readonly logisticBatchFeatureStatsVersion?: typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION;
 }
 
 export interface ClosestVisitRankerRevisionManifestProbe {
@@ -94,6 +107,12 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     ...(revision.artifactQuality === undefined
       ? {}
       : { artifactQuality: revision.artifactQuality }),
+    ...(revision.logisticBatchWeights === undefined
+      ? {}
+      : { logisticBatchWeights: revision.logisticBatchWeights }),
+    ...(revision.logisticBatchFeatureStatsVersion === undefined
+      ? {}
+      : { logisticBatchFeatureStatsVersion: revision.logisticBatchFeatureStatsVersion }),
   };
 };
 
@@ -606,9 +625,31 @@ const normalizeArtifactQuality = (
   return out.length === 0 ? undefined : out;
 };
 
+// Lenient parser for the LR weights. The expected length is
+// `RANKER_FEATURE_KEYS.length + 1` (bias + per-feature). A length
+// mismatch or any non-finite entry drops the whole vector so the
+// selector falls back to LightGBM or the baseline rather than
+// scoring with a stale-schema weight vector.
+const LOGISTIC_BATCH_WEIGHTS_LENGTH = RANKER_FEATURE_KEYS.length + 1;
+const normalizeLogisticBatchWeights = (value: unknown): readonly number[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length !== LOGISTIC_BATCH_WEIGHTS_LENGTH) return undefined;
+  const out: number[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'number' || !Number.isFinite(entry)) return undefined;
+    out.push(entry);
+  }
+  return out;
+};
+
+const normalizeLogisticBatchFeatureStatsVersion = (
+  value: unknown,
+): typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION | undefined =>
+  value === LOGISTIC_BATCH_FEATURE_STATS_VERSION ? value : undefined;
+
 // Coerce a validated manifest record into the typed shape, normalizing
-// the optional `trainQuality` + `artifactQuality` (drop if
-// malformed/absent — neither gates scoring).
+// the optional `trainQuality` + `artifactQuality` + LR weights (drop
+// if malformed/absent — none of these gate scoring on their own).
 const finalizeManifest = (
   value: ClosestVisitRankerRevisionManifest,
 ): ClosestVisitRankerRevisionManifest => {
@@ -618,6 +659,17 @@ const finalizeManifest = (
   const artifactQuality = normalizeArtifactQuality(
     (value as { readonly artifactQuality?: unknown }).artifactQuality,
   );
+  const logisticBatchWeights = normalizeLogisticBatchWeights(
+    (value as { readonly logisticBatchWeights?: unknown }).logisticBatchWeights,
+  );
+  const logisticBatchFeatureStatsVersion = normalizeLogisticBatchFeatureStatsVersion(
+    (value as { readonly logisticBatchFeatureStatsVersion?: unknown })
+      .logisticBatchFeatureStatsVersion,
+  );
+  // Weights without a recognized stats version are unusable — drop both
+  // so the selector treats LR as absent rather than mis-scoring.
+  const lrUsable =
+    logisticBatchWeights !== undefined && logisticBatchFeatureStatsVersion !== undefined;
   return {
     revisionId: value.revisionId,
     modelVersion: value.modelVersion,
@@ -628,6 +680,12 @@ const finalizeManifest = (
     modelSha256: value.modelSha256,
     ...(trainQuality === undefined ? {} : { trainQuality }),
     ...(artifactQuality === undefined ? {} : { artifactQuality }),
+    ...(lrUsable
+      ? {
+          logisticBatchWeights,
+          logisticBatchFeatureStatsVersion,
+        }
+      : {}),
   };
 };
 

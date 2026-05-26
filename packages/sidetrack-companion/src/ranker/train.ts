@@ -233,6 +233,13 @@ export interface RankerTrainQuality {
   };
 }
 
+// Step 3 — feature-stats version marker for the persisted LR weights.
+// The current LR trains on raw features (no per-feature normalization),
+// so this is `'no-normalization-v1'`. When real normalization stats
+// (mean/std) land alongside the weights, bump this string and the
+// loader refuses to score with mismatched normalization.
+export const LOGISTIC_BATCH_FEATURE_STATS_VERSION = 'no-normalization-v1' as const;
+
 export interface RankerRevision {
   readonly revisionId: string;
   readonly modelVersion: typeof RANKER_MODEL_VERSION;
@@ -247,6 +254,14 @@ export interface RankerRevision {
   // lightgbm_plus_online_lr land with later plan steps). Optional so
   // older manifests stay readable.
   readonly artifactQuality?: readonly RankerArtifactQuality[];
+  // Step 3 — the regularized LR's trained weights, persisted as a
+  // first-class peer artifact alongside the LightGBM model bytes.
+  // Length = RANKER_FEATURE_KEYS.length + 1 (bias + per-feature weight).
+  // Today `predict.ts` only consumes the LightGBM path; Step 4 wires
+  // the LR dispatch so the selector can route to whichever artifact
+  // passes its ship-gate. Optional so older manifests stay readable.
+  readonly logisticBatchWeights?: readonly number[];
+  readonly logisticBatchFeatureStatsVersion?: typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION;
 }
 
 export interface RankerTrainingCandidate {
@@ -1637,6 +1652,18 @@ export const trainRankerRevisionFromRows = async (
         modelBytes: toOwnedArrayBuffer(booster.saveModel()),
         trainQuality,
         artifactQuality,
+        // Step 3 — keep the regularized LR weights instead of letting
+        // `trainRegularizedLogisticRegression(rows)` discard them. The
+        // selector + dispatch (Step 4) will load these from the manifest
+        // so serving can route to LR when LightGBM fails its gate.
+        // `undefined` only when the training row set is empty (which
+        // already short-circuits earlier with an error).
+        ...(logisticWeights === undefined
+          ? {}
+          : {
+              logisticBatchWeights: [...logisticWeights],
+              logisticBatchFeatureStatsVersion: LOGISTIC_BATCH_FEATURE_STATS_VERSION,
+            }),
       };
     } finally {
       booster.dispose();
