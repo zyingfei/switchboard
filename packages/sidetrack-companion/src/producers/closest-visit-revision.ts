@@ -7,6 +7,9 @@ import {
   DETERMINISTIC_BASELINE_VERSION,
   RANKER_MODEL_VERSION,
   REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+  type RankerArtifactKind,
+  type RankerArtifactQuality,
+  type RankerArtifactShipGate,
   type RankerRevision,
   type RankerTrainQuality,
 } from '../ranker/train.js';
@@ -28,6 +31,14 @@ export interface ClosestVisitRankerRevisionManifest {
    * unchanged) so the refuse-to-score invariant is preserved.
    */
   readonly trainQuality?: RankerTrainQuality;
+  /**
+   * Per-artifact ship-gate records (Step 2 of the incremental-ranker
+   * plan). One entry per trained artifact (graph_baseline,
+   * logistic_batch, lightgbm_lambdamart today; logistic_online and
+   * lightgbm_plus_online_lr land with later steps). Optional with
+   * lenient parse so older manifests stay readable.
+   */
+  readonly artifactQuality?: readonly RankerArtifactQuality[];
 }
 
 export interface ClosestVisitRankerRevisionManifestProbe {
@@ -80,6 +91,9 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     modelByteLength: modelBytes.byteLength,
     modelSha256: sha256Hex(modelBytes),
     ...(revision.trainQuality === undefined ? {} : { trainQuality: revision.trainQuality }),
+    ...(revision.artifactQuality === undefined
+      ? {}
+      : { artifactQuality: revision.artifactQuality }),
   };
 };
 
@@ -540,26 +554,81 @@ const isManifest = (value: unknown): value is ClosestVisitRankerRevisionManifest
   );
 };
 
+const ARTIFACT_KINDS: readonly RankerArtifactKind[] = [
+  'graph_baseline',
+  'logistic_batch',
+  'logistic_online',
+  'lightgbm_lambdamart',
+  'lightgbm_plus_online_lr',
+];
+const isArtifactKind = (value: unknown): value is RankerArtifactKind =>
+  typeof value === 'string' && (ARTIFACT_KINDS as readonly string[]).includes(value);
+
+const SHIP_GATE_STATUSES: readonly RankerArtifactShipGate['status'][] = [
+  'pass',
+  'fail',
+  'unavailable',
+];
+const isShipGateStatus = (value: unknown): value is RankerArtifactShipGate['status'] =>
+  typeof value === 'string' && (SHIP_GATE_STATUSES as readonly string[]).includes(value);
+
+const normalizeMetric = (value: unknown): { kind: string; value: number } | undefined =>
+  isRecord(value) && typeof value['kind'] === 'string' && isFiniteNumber(value['value'])
+    ? { kind: value['kind'], value: value['value'] }
+    : undefined;
+
+// Lenient per-entry parser. A malformed entry is dropped; the rest of
+// the array stays. An entirely malformed/absent `artifactQuality`
+// returns undefined so older manifests stay valid.
+const normalizeArtifactQuality = (
+  value: unknown,
+): readonly RankerArtifactQuality[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const out: RankerArtifactQuality[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) continue;
+    if (!isArtifactKind(entry['kind'])) continue;
+    if (typeof entry['candidate'] !== 'string') continue;
+    const gate = entry['shipGate'];
+    if (!isRecord(gate)) continue;
+    if (!isShipGateStatus(gate['status'])) continue;
+    if (typeof gate['reason'] !== 'string') continue;
+    const validationMetric = normalizeMetric(entry['validationMetric']);
+    const reservedTestMetric = normalizeMetric(entry['reservedTestMetric']);
+    out.push({
+      kind: entry['kind'],
+      candidate: entry['candidate'],
+      shipGate: { status: gate['status'], reason: gate['reason'] },
+      ...(validationMetric === undefined ? {} : { validationMetric }),
+      ...(reservedTestMetric === undefined ? {} : { reservedTestMetric }),
+    });
+  }
+  return out.length === 0 ? undefined : out;
+};
+
 // Coerce a validated manifest record into the typed shape, normalizing
-// the optional `trainQuality` (drop if malformed/absent).
+// the optional `trainQuality` + `artifactQuality` (drop if
+// malformed/absent — neither gates scoring).
 const finalizeManifest = (
   value: ClosestVisitRankerRevisionManifest,
 ): ClosestVisitRankerRevisionManifest => {
   const trainQuality = normalizeTrainQuality(
     (value as { readonly trainQuality?: unknown }).trainQuality,
   );
-  if (trainQuality === undefined) {
-    return {
-      revisionId: value.revisionId,
-      modelVersion: value.modelVersion,
-      featureSchemaVersion: value.featureSchemaVersion,
-      trainingDatasetHash: value.trainingDatasetHash,
-      trainedAt: value.trainedAt,
-      modelByteLength: value.modelByteLength,
-      modelSha256: value.modelSha256,
-    };
-  }
-  return { ...value, trainQuality };
+  const artifactQuality = normalizeArtifactQuality(
+    (value as { readonly artifactQuality?: unknown }).artifactQuality,
+  );
+  return {
+    revisionId: value.revisionId,
+    modelVersion: value.modelVersion,
+    featureSchemaVersion: value.featureSchemaVersion,
+    trainingDatasetHash: value.trainingDatasetHash,
+    trainedAt: value.trainedAt,
+    modelByteLength: value.modelByteLength,
+    modelSha256: value.modelSha256,
+    ...(trainQuality === undefined ? {} : { trainQuality }),
+    ...(artifactQuality === undefined ? {} : { artifactQuality }),
+  };
 };
 
 export const readClosestVisitRankerRevisionManifest = async (

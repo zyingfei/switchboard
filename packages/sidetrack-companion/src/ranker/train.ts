@@ -19,6 +19,38 @@ import type { Candidate } from './types.js';
 // persisted under v2 fails to load and the retrain loop produces a
 // fresh non-leaky model instead of reusing leaked weights.
 export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v4' as const;
+
+// Step 2 of the incremental-ranker plan — every artifact the training
+// pipeline produces gets its own ship-gate, surfaced as one entry in
+// `RankerRevision.artifactQuality`. The selector (Step 4) reads this
+// list to pick the served artifact instead of hard-coding LightGBM.
+//
+// `logistic_online` + `lightgbm_plus_online_lr` are placeholders for
+// Steps 6+8 of the plan and won't appear in revisions until those
+// artifacts exist. The active-revision view stays correct when older
+// manifests omit the field entirely.
+export type RankerArtifactKind =
+  | 'graph_baseline'
+  | 'logistic_batch'
+  | 'logistic_online'
+  | 'lightgbm_lambdamart'
+  | 'lightgbm_plus_online_lr';
+
+export interface RankerArtifactShipGate {
+  readonly status: 'pass' | 'fail' | 'unavailable';
+  readonly reason: string;
+}
+
+export interface RankerArtifactQuality {
+  readonly kind: RankerArtifactKind;
+  // Echoes the canonical version string (e.g. `lightgbm-lambdamart-v4`)
+  // so the selector can cross-check against the manifest's modelVersion.
+  readonly candidate: string;
+  readonly validationMetric?: RankerMetric;
+  readonly reservedTestMetric?: RankerMetric;
+  readonly shipGate: RankerArtifactShipGate;
+}
+
 export const DEFAULT_RANKER_NUM_ROUND = 40;
 export const DEFAULT_RANKER_SEED = 20260508;
 // k for the in-sample NDCG@k offline metric captured at train time.
@@ -209,6 +241,12 @@ export interface RankerRevision {
   readonly trainedAt: number;
   readonly modelBytes: ArrayBuffer;
   readonly trainQuality?: RankerTrainQuality;
+  // Per-artifact quality + ship-gate records. One entry per artifact the
+  // training pipeline produced this revision (graph_baseline,
+  // logistic_batch, lightgbm_lambdamart today; logistic_online and
+  // lightgbm_plus_online_lr land with later plan steps). Optional so
+  // older manifests stay readable.
+  readonly artifactQuality?: readonly RankerArtifactQuality[];
 }
 
 export interface RankerTrainingCandidate {
@@ -1133,6 +1171,52 @@ const modelChoiceGraduation = (
   };
 };
 
+// Per-artifact ship-gate decision. Each artifact is judged on its own
+// merits — the existing single-shipGate code (below) bakes in the
+// LightGBM-vs-baseline assumption that the selector (Step 4) replaces.
+//
+// Gate semantics:
+// - `graph_baseline` always passes when its reservedTestMetric exists;
+//   it's the deterministic fallback the selector ships when nothing
+//   else clears. `unavailable` only when no test split could be built.
+// - `logistic_batch` / `lightgbm_lambdamart` must beat the baseline's
+//   reserved-test NDCG by `RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA`
+//   AND clear the absolute floor AND have novel-pair supervision.
+//   Same substance as the legacy shipGate, just keyed per-artifact so
+//   LR can independently pass when LightGBM fails (and vice versa).
+const artifactShipGate = (
+  kind: RankerArtifactKind,
+  reservedTest: RankerMetric | undefined,
+  baselineReservedTest: RankerMetric | undefined,
+  novelPositiveRows: number,
+): RankerArtifactShipGate => {
+  if (kind === 'graph_baseline') {
+    if (reservedTest === undefined) {
+      return { status: 'unavailable', reason: 'reserved-test-metric-unavailable' };
+    }
+    return { status: 'pass', reason: 'deterministic-baseline-available' };
+  }
+  // Trained artifacts: logistic_batch, lightgbm_lambdamart (others land
+  // with later steps).
+  if (reservedTest === undefined || baselineReservedTest === undefined) {
+    return { status: 'unavailable', reason: 'reserved-test-metric-unavailable' };
+  }
+  if (novelPositiveRows === 0) {
+    return { status: 'unavailable', reason: 'novel-pair-supervision-unavailable' };
+  }
+  const delta = reservedTest.value - baselineReservedTest.value;
+  if (delta < RANKER_MODEL_CHOICE_MIN_VALIDATION_DELTA) {
+    return {
+      status: 'fail',
+      reason: 'artifact-does-not-beat-baseline',
+    };
+  }
+  if (reservedTest.value < RANKER_SHIP_GATE_MIN_RESERVED_TEST_NDCG) {
+    return { status: 'fail', reason: 'reserved-test-below-floor' };
+  }
+  return { status: 'pass', reason: 'artifact-cleared-baseline-and-floor' };
+};
+
 const shipGate = (
   graduation: NonNullable<RankerTrainQuality['methodologySpine']>['modelChoice']['graduation'],
   activeReservedTest: RankerMetric | undefined,
@@ -1475,6 +1559,60 @@ export const trainRankerRevisionFromRows = async (
         },
         shipGate: shipGate(graduation, activeReservedTestMetric, novelCounts.positiveRows),
       };
+      // Per-artifact quality records — one per trained artifact. The
+      // selector (Step 4) reads this to dispatch serving without
+      // hard-coding LightGBM. Logistic-online + combiner kinds will
+      // join the list when Steps 6+8 implement them.
+      const artifactQuality: readonly RankerArtifactQuality[] = [
+        {
+          kind: 'graph_baseline',
+          candidate: DETERMINISTIC_BASELINE_VERSION,
+          ...(baselineValidationMetric === undefined
+            ? {}
+            : { validationMetric: baselineValidationMetric }),
+          ...(baselineReservedTestMetric === undefined
+            ? {}
+            : { reservedTestMetric: baselineReservedTestMetric }),
+          shipGate: artifactShipGate(
+            'graph_baseline',
+            baselineReservedTestMetric,
+            baselineReservedTestMetric,
+            novelCounts.positiveRows,
+          ),
+        },
+        {
+          kind: 'logistic_batch',
+          candidate: REGULARIZED_LOGISTIC_REGRESSION_VERSION,
+          ...(logisticValidationMetric === undefined
+            ? {}
+            : { validationMetric: logisticValidationMetric }),
+          ...(logisticReservedTestMetric === undefined
+            ? {}
+            : { reservedTestMetric: logisticReservedTestMetric }),
+          shipGate: artifactShipGate(
+            'logistic_batch',
+            logisticReservedTestMetric,
+            baselineReservedTestMetric,
+            novelCounts.positiveRows,
+          ),
+        },
+        {
+          kind: 'lightgbm_lambdamart',
+          candidate: RANKER_MODEL_VERSION,
+          ...(activeValidationMetric === undefined
+            ? {}
+            : { validationMetric: activeValidationMetric }),
+          ...(activeReservedTestMetric === undefined
+            ? {}
+            : { reservedTestMetric: activeReservedTestMetric }),
+          shipGate: artifactShipGate(
+            'lightgbm_lambdamart',
+            activeReservedTestMetric,
+            baselineReservedTestMetric,
+            novelCounts.positiveRows,
+          ),
+        },
+      ];
       const trainQuality: RankerTrainQuality = {
         gradeHistogram: gradeHistogramForRows(rows),
         candidateLabeling: labelingSummary,
@@ -1498,6 +1636,7 @@ export const trainRankerRevisionFromRows = async (
         trainedAt: options.trainedAt ?? maxGeneratedAt(rowsInput),
         modelBytes: toOwnedArrayBuffer(booster.saveModel()),
         trainQuality,
+        artifactQuality,
       };
     } finally {
       booster.dispose();
