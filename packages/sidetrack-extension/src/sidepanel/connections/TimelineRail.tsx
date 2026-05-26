@@ -21,15 +21,14 @@ export const TimelineRail = ({
 }): ReactElement => {
   const pct = (ms: number): number =>
     ((ms - data.startMs) / Math.max(1, data.endMs - data.startMs)) * 100;
-  const shortReplicaId = (replicaId: string): string => {
-    const cleaned = replicaId.replace(/^replica:/u, '');
-    return cleaned.length <= 8 ? cleaned : cleaned.slice(0, 8);
-  };
+  // Replica labels are alias-only — never expose the raw replica id
+  // (or a truncated form of it) in visible text. "This browser" /
+  // "Browser 2" etc. come from `ctx.replicaAlias`, with a generic
+  // placeholder while the alias map is still hydrating.
   const replicaLabel = (replicaId: string): string => {
     const alias = ctx.replicaAlias(replicaId);
-    const prefix = shortReplicaId(replicaId);
-    if (alias === 'This browser') return `${prefix} (current)`;
-    return alias === 'Browser' ? prefix : `${prefix} · ${alias}`;
+    if (alias === 'This browser') return 'This browser (current)';
+    return alias;
   };
   const markerTitle = (marker: TimelineRailData['markers'][number]): string => {
     const kind = marker.kind === 'anchor' ? 'Anchor' : 'Related';
@@ -81,7 +80,7 @@ export const TimelineRail = ({
       <div className="cx-timeline-rows">
         {data.rows.map((row, i) => (
           <div key={row.replicaId} className="cx-timeline-row">
-            <div className="device" title={row.replicaId}>
+            <div className="device">
               <span className="cx-replica-dot" />
               <span>{replicaLabel(row.replicaId)}</span>
             </div>

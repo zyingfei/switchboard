@@ -404,10 +404,7 @@ export const FlowPathView = ({
         const anchorIdx = tabVisits.findIndex((v) => v.isAnchor === true);
         return (
           <div className="cx-flow-row" key={tabGroup.key}>
-            <div
-              className="cx-flow-tab"
-              title={tabGroup.entries.map((entry) => entry.tabSessionIdHash).join('\n')}
-            >
+            <div className="cx-flow-tab">
               <div className="cx-flow-tab-name">{tabGroup.label}</div>
               {tabGroup.host !== undefined && tabGroup.host.length > 0 ? (
                 <div className="cx-flow-tab-host cx-dim">{tabGroup.host}</div>
@@ -469,7 +466,7 @@ export const FlowPathView = ({
                       <button
                         type="button"
                         className={cellClasses}
-                        title={visit.id}
+                        title={visit.url}
                         onClick={() => onNodeClick(visit.id)}
                         data-testid={`flow-visit-${visit.id}`}
                       >
@@ -547,7 +544,6 @@ export const FlowPathView = ({
               key={edge.id}
               className="cx-flow-edge cx-edge-cross-replica"
               data-testid={`flow-cross-replica-edge-${edge.id}`}
-              title={edge.replicaId}
             >
               also seen on {replicaName(edge.replicaId)}: {visitLabel(edge.fromVisitId)}
             </span>

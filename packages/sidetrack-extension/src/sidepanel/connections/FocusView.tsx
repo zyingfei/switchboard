@@ -1443,7 +1443,7 @@ export const FocusView = ({
                             onVisitClick(visit.id);
                           }}
                           data-testid={`focus-visit-${visit.id}`}
-                          title={visit.id}
+                          title={visit.url}
                         >
                           <span
                             className={`cx-engagement-dot ${

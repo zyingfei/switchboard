@@ -1,7 +1,11 @@
 import { useMemo, type ReactElement } from 'react';
 
 import { FeedbackButtons, type FeedbackChoice } from '../feedback/FeedbackButtons';
-import { formatNodeIdDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
+import {
+  formatNodeIdDisplay,
+  isInternalIdLike,
+  type EntityDisplayCtx,
+} from '../entityDisplay/format';
 import { feedbackRelationKindForEdgeKind } from './client';
 import { EDGE_KINDS, FAMILIES, type EdgeFamily } from './edgeKinds';
 import { CloseIcon } from './icons';
@@ -61,9 +65,7 @@ export const ProvenanceCard = ({
         {fromNode !== undefined ? (
           <NodeChip node={fromNode} ctx={ctx} />
         ) : (
-          <span className="cx-dim" title={edge.fromNodeId}>
-            {formatNodeIdDisplay(edge.fromNodeId, nodeByIdLocal, ctx).primary}
-          </span>
+          <FallbackEndpoint nodeId={edge.fromNodeId} nodeById={nodeByIdLocal} ctx={ctx} />
         )}
         <div className="cx-prov-arrow">
           <span
@@ -77,9 +79,7 @@ export const ProvenanceCard = ({
         {toNode !== undefined ? (
           <NodeChip node={toNode} ctx={ctx} />
         ) : (
-          <span className="cx-dim" title={edge.toNodeId}>
-            {formatNodeIdDisplay(edge.toNodeId, nodeByIdLocal, ctx).primary}
-          </span>
+          <FallbackEndpoint nodeId={edge.toNodeId} nodeById={nodeByIdLocal} ctx={ctx} />
         )}
       </div>
       <div className="cx-prov-reason">
@@ -125,6 +125,28 @@ export const ProvenanceCard = ({
         <ProvRow label="Confidence" value={edge.confidence} />
       </dl>
     </aside>
+  );
+};
+
+// Soft text fallback shown when the snapshot doesn't carry one side of
+// an edge yet. Tooltip surfaces URL-ish detail when available; raw ids
+// stay out of the user-visible hover text.
+const FallbackEndpoint = ({
+  nodeId,
+  nodeById,
+  ctx,
+}: {
+  readonly nodeId: string;
+  readonly nodeById: ReadonlyMap<string, ConnectionNode>;
+  readonly ctx: EntityDisplayCtx;
+}): ReactElement => {
+  const display = formatNodeIdDisplay(nodeId, nodeById, ctx);
+  const tip = display.tooltip;
+  const safeTip = tip !== undefined && !isInternalIdLike(tip) ? tip : undefined;
+  return (
+    <span className="cx-dim" title={safeTip}>
+      {display.primary}
+    </span>
   );
 };
 

@@ -219,6 +219,7 @@ type SubMode = 'linked' | 'orbital' | 'flow' | 'focus' | 'context' | 'search' | 
 
 const FILTERED_SUBMODES = new Set<SubMode>(['linked', 'orbital', 'flow']);
 const CONNECTIONS_NARROW_QUERY = '(max-width: 860px)';
+const EMPTY_NODE_MAP: ReadonlyMap<string, ConnectionNode> = new Map();
 
 const isNarrowConnectionsViewport = (): boolean =>
   typeof window !== 'undefined' &&
@@ -3518,8 +3519,8 @@ export const ConnectionsView = ({
           {loading && result === null ? (
             <div className="cx-loading-row" data-testid="connections-loading">
               <span className="cx-spinner-dot" aria-hidden />
-              <span className="cx-mono cx-dim">
-                Fetching neighbors of <code>{anchor}</code>…
+              <span className="cx-dim">
+                Fetching neighbors of {formatNodeIdDisplay(anchor, EMPTY_NODE_MAP, ctx).primary}…
               </span>
             </div>
           ) : null}

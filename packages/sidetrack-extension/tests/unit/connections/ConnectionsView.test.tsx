@@ -1521,4 +1521,211 @@ describe('ConnectionsView — engineering scaffold', () => {
     });
     expect(screen.getByText('8f0e2a1b3c4d')).toBeDefined();
   });
+
+  // T1-F — full-snapshot sweep: render a snapshot that exercises every
+  // kind whose raw id is forbidden as visible text (tab-session,
+  // visit-instance, replica, workstream without path), then assert the
+  // rendered text content carries none of the forbidden id patterns.
+  // Excludes attribute strings (data-testid carries raw ids by design)
+  // by sampling only `textContent` of the rendered tree.
+  it('never leaks raw entity ids into visible text', async () => {
+    const sweepAnchor = 'tab-session:tses_01KSWEEP00000000000000ANCH';
+    const sweepOpener = 'tab-session:tses_01KSWEEP00000000000000OPEN';
+    const sweepVisit =
+      'visit-instance:tses_01KSWEEP00000000000000ANCH:2026-05-20T10:00:00.000Z:https://example.test/article';
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return {
+          ok: true,
+          data: {
+            scope: 'companion-extended',
+            snapshot: {
+              scope: { nodeId: sweepAnchor, hops: 1 },
+              nodes: [
+                {
+                  id: sweepAnchor,
+                  kind: 'tab-session',
+                  label: 'Mullvad VPN blog',
+                  originReplicaIds: ['replica-A'],
+                  firstSeenAt: '2026-05-20T09:55:00.000Z',
+                  lastSeenAt: '2026-05-20T10:30:00.000Z',
+                  metadata: {
+                    latestTitle: 'Mullvad VPN blog',
+                    latestUrl: 'https://mullvad.net/en/blog/exit-ip-fingerprinting',
+                    canonicalUrl: 'https://mullvad.net/en/blog/exit-ip-fingerprinting',
+                    lastActivityAt: '2026-05-20T10:30:00.000Z',
+                  },
+                },
+                {
+                  id: sweepOpener,
+                  kind: 'tab-session',
+                  label: 'Hacker News',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    latestTitle: 'Hacker News',
+                    latestUrl: 'https://news.ycombinator.com/',
+                  },
+                },
+                {
+                  id: sweepVisit,
+                  kind: 'visit-instance',
+                  label: 'Mullvad article',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    title: 'Mullvad article',
+                    canonicalUrl: 'https://example.test/article',
+                  },
+                },
+                {
+                  id: 'timeline-visit:https://example.test/article',
+                  kind: 'timeline-visit',
+                  label: 'Mullvad article',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {
+                    title: 'Mullvad article',
+                    canonicalUrl: 'https://example.test/article',
+                    visitCount: 3,
+                  },
+                },
+                {
+                  id: 'workstream:bac_sweep_research',
+                  kind: 'workstream',
+                  label: 'bac_sweep_research',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+                {
+                  id: 'replica:replica-A',
+                  kind: 'replica',
+                  label: 'replica-A',
+                  originReplicaIds: ['replica-A'],
+                  metadata: {},
+                },
+                // Codex round-3 fixture — queue-item whose title field
+                // carries a raw bac_id (companion snapshot.ts stuffs
+                // p.bac_id into title when the user-typed text is
+                // empty). The formatter's annotation/queue-item branch
+                // must clean this out, otherwise PathFinder /
+                // NodeRow's tooltip + primary would leak.
+                {
+                  id: 'queue-item:bac_sweep_queue_x',
+                  kind: 'queue-item',
+                  label: 'bac_sweep_queue_x',
+                  originReplicaIds: ['replica-A'],
+                  metadata: { title: 'bac_sweep_queue_x' },
+                },
+              ],
+              edges: [
+                {
+                  id: 'edge:tab_session_opener_chain:opener',
+                  kind: 'tab_session_opener_chain',
+                  fromNodeId: sweepAnchor,
+                  toNodeId: sweepOpener,
+                  observedAt: '2026-05-20T09:55:00.000Z',
+                  producedBy: { source: 'timeline-projection' },
+                  confidence: 'observed',
+                },
+                {
+                  id: 'edge:visit_in_tab:visit',
+                  kind: 'visit_instance_in_tab_session',
+                  fromNodeId: sweepVisit,
+                  toNodeId: sweepAnchor,
+                  observedAt: '2026-05-20T10:00:00.000Z',
+                  producedBy: { source: 'timeline-projection' },
+                  confidence: 'observed',
+                },
+              ],
+              updatedAt: '2026-05-20T10:30:00.000Z',
+              nodeCount: 6,
+              edgeCount: 2,
+            },
+          },
+        };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    const { container } = render(<ConnectionsView initialAnchor={sweepAnchor} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-groups')).not.toBeNull();
+    });
+    // Both visible textContent AND user-visible attributes (title, aria-
+    // label) must stay clean — tooltips are visible-on-hover and the
+    // formatter's `display.tooltip` reaches users through NodeChip /
+    // NodeRow / PathFinder.
+    const forbidden: readonly { readonly name: string; readonly re: RegExp }[] = [
+      // Crockford-style ULID — uppercase letters + digits, 16-26 chars,
+      // word-bounded. Catches the bare workstream / replica ULIDs that
+      // get past the prefix-targeted patterns below (e.g. `ZYJFNMTB`).
+      // The bound is intentionally narrow so it doesn't match short
+      // all-caps acronyms (HTTP, JSON) or long sentence fragments.
+      { name: 'bare ULID', re: /\b[A-Z0-9]{16,26}\b/ },
+      { name: 'tses_*', re: /tses_[A-Z0-9]/ },
+      { name: 'visit-instance:', re: /visit-instance:/ },
+      { name: 'tab-session:', re: /tab-session:/ },
+      // Replica ids may contain dots, colons, slashes; widen past the
+      // narrower [A-Za-z0-9_-] character class so we catch real shapes.
+      { name: 'replica:<id>', re: /\breplica:[^\s"'<>]+/ },
+      // Bare or prefix-stripped replica ids ("replica-A", "replica-foo")
+      // — TimelineRail used to fall back to the trimmed form in its
+      // visible label, and that's exactly the shape we want to catch.
+      { name: 'replica-<id>', re: /\breplica-[A-Za-z0-9_]+\b/ },
+      // Any bare workstream bac_id leaking through (more general than
+      // the single fixture id), and the specific fixture for belt-and-
+      // suspenders coverage.
+      { name: 'bac_*', re: /\bbac_[A-Za-z0-9_-]+\b/ },
+    ];
+    const visible = container.textContent ?? '';
+    for (const { name, re } of forbidden) {
+      expect(visible, `visible text leaks ${name}`).not.toMatch(re);
+    }
+    // Attribute sweep — only check the attributes the user actually
+    // sees: `title` (hover tooltip) and `aria-label` (screen readers).
+    // `<option value>`, `data-testid`, `class`, `id`, `href` and similar
+    // functional attributes legitimately carry raw ids (action keys,
+    // form values, navigation targets) and are not surfaced as visible
+    // text.
+    const USER_VISIBLE_ATTRS: readonly string[] = ['title', 'aria-label'];
+    const all = container.querySelectorAll('*');
+    for (const el of all) {
+      for (const attrName of USER_VISIBLE_ATTRS) {
+        const value = el.getAttribute(attrName);
+        if (value === null || value.length === 0) continue;
+        for (const { name, re } of forbidden) {
+          expect(value, `<${el.tagName.toLowerCase()} ${attrName}> leaks ${name}`).not.toMatch(re);
+        }
+      }
+    }
+  });
+
+  // T1-F-loading — the loading row used to render `<code>{anchor}</code>`
+  // which leaks the raw nodeId for tab-session / visit-instance anchors.
+  // Capture the snapshot fetch in a never-resolving promise so the
+  // loading row stays visible, then assert the visible text contains
+  // no forbidden id patterns.
+  it('never leaks the anchor id in the loading row', async () => {
+    const loadingAnchor = 'tab-session:tses_01KSWEEPLOAD0000000000ANCH';
+    let neverResolve!: () => void;
+    const stuck = new Promise<{ readonly ok: boolean }>((resolve) => {
+      neverResolve = () => resolve({ ok: false });
+    });
+    setConnectionsClientTransportForTests(async (msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return stuck as unknown as { ok: boolean; data: unknown };
+      }
+      return { ok: false, error: 'unexpected' };
+    });
+    const { container } = render(<ConnectionsView initialAnchor={loadingAnchor} />);
+    await waitFor(() => {
+      expect(screen.queryByTestId('connections-loading')).not.toBeNull();
+    });
+    const loadingRow = container.querySelector('[data-testid="connections-loading"]');
+    const text = loadingRow?.textContent ?? '';
+    expect(text).not.toMatch(/tses_[A-Z0-9]/);
+    expect(text).not.toMatch(/tab-session:/);
+    expect(text).not.toMatch(/visit-instance:/);
+    expect(text).toMatch(/Fetching neighbors of/u);
+    neverResolve();
+  });
 });
