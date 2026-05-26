@@ -37,6 +37,9 @@ export interface ActiveRankerSelection {
 // Kind priority for tie-breaking. Earlier wins. `graph_baseline` is
 // last so it's only picked when nothing else clears.
 const KIND_ORDER: readonly RankerArtifactKind[] = [
+  // Step 9 — hierarchical wins ties over the combiner because it
+  // personalizes on top of it (when the algorithm lands).
+  'hierarchical_per_container_lr',
   'lightgbm_plus_online_lr',
   'lightgbm_lambdamart',
   'logistic_online',
@@ -76,6 +79,12 @@ const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolea
   // `logistic_online`: not yet served by the selector. Step 6 lands
   // the math; materializer-drain integration + ship-gate evaluation
   // are the follow-up.
+  //
+  // `hierarchical_per_container_lr`: type lives in the union (Step 9
+  // landed the framework) but the algorithm is plan-deferred until
+  // replay-eval shows container-level personalization adds NDCG.
+  // The selector never picks it currently; future work flips this
+  // case once `perContainerBiases` is populated by training.
   return false;
 };
 
