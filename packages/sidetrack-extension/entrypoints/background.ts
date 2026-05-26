@@ -3105,27 +3105,51 @@ const handleRequest = async (
           (req['session'] as Record<string, unknown> | undefined) ?? {};
         const userActive =
           (userSession['activeChatBacIds'] as readonly string[] | undefined) ?? [];
+        // Scope B — intent dictates the suppression posture. The
+        // server's per-intent defaults handle suppressCurrentPage +
+        // minHitAgeMs correctly (search/focus = 'never' + 0, dejavu =
+        // 'always' + 5min). The background should NOT bulldoze those
+        // defaults with dejavu-shaped values for every intent —
+        // doing so silently dropped the active page from Search
+        // results and silenced fresh chats from focus/Search alike.
+        //
+        // We still always inject the dispatch-cache derived
+        // activeChatBacIds (the SW knows recent dispatches the
+        // server can't see in its in-process state), but the rest
+        // of the suppression policy is intent-aware.
+        const intent = typeof req['intent'] === 'string' ? req['intent'] : 'dejavu';
+        const callerSuppression =
+          (req['suppression'] as Record<string, unknown> | undefined) ?? {};
+        const mergedActiveBacIds = [
+          ...new Set([...userActive, ...activeArtifactBacIds]),
+        ];
+        const suppression: Record<string, unknown> = {
+          // activeChatBacIds — always added; harmless for search
+          // (callers may pass [] or omit), useful for dejavu.
+          suppressActiveChatBacIds: mergedActiveBacIds,
+          // For dejavu, keep the historical dejavu-shaped defaults
+          // (10-min freshness floor + suppress current page) since
+          // the user just selected text on a page and the server
+          // hasn't necessarily seen the dispatch yet. For search /
+          // focus, leave suppressCurrentPage + minHitAgeMs UNSET so
+          // the server's intent profile (SEARCH = 'never' + 0) wins.
+          ...(intent === 'dejavu'
+            ? {
+                minHitAgeMs: ACTIVE_WINDOW_MS,
+                suppressCurrentPage: 'always' as const,
+              }
+            : {}),
+          // Caller can still override anything via req.suppression
+          // (highest priority).
+          ...callerSuppression,
+        };
         const enrichedReq = {
           ...req,
           session: {
             ...userSession,
-            activeChatBacIds: [
-              ...new Set([...userActive, ...activeArtifactBacIds]),
-            ],
+            activeChatBacIds: mergedActiveBacIds,
           },
-          suppression: {
-            // 10 min freshness floor — matches the ACTIVE_WINDOW_MS
-            // above so that even a JUST-created chat the user hasn't
-            // captured locally yet (race between dispatch + capture)
-            // still gets suppressed by the lastSeenAt floor.
-            minHitAgeMs: ACTIVE_WINDOW_MS,
-            suppressActiveChatBacIds: [
-              ...new Set([...userActive, ...activeArtifactBacIds]),
-            ],
-            suppressCurrentPage: 'always' as const,
-            // Caller can still override via req.suppression — let them.
-            ...((req['suppression'] as Record<string, unknown>) ?? {}),
-          },
+          suppression,
         };
         try {
           const data = await createPageContentClient(settings.companion).recallV2(enrichedReq);

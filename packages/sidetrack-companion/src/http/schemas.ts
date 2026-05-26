@@ -561,7 +561,14 @@ const recallV2SourceKindSchema = z.enum([
   'semantic_query',
   'graph_neighbor',
   'current_session',
+  'focus',
 ]);
+
+// Scope B — named retrieval intents. Each intent picks default
+// source profile + suppression posture inside the pipeline. The
+// schema validates the input string and rejects anything else
+// loudly (we'd rather a typo 400 than silently re-route to dejavu).
+const recallV2IntentSchema = z.enum(['dejavu', 'search', 'focus']);
 
 const recallV2RetrieverSchema = z.enum([
   'bm25',
@@ -619,16 +626,14 @@ const recallV2FiltersSchema = z
 
 export const recallV2RequestSchema = z
   .object({
-    // .refine catches whitespace-only `q` ("   "). Pre-Zod we did
-    // `q.trim().length === 0`; preserving that semantic so the 400
-    // surface is identical.
-    q: z
-      .string()
-      .min(1)
-      .max(8192)
-      .refine((s) => s.trim().length > 0, {
-        message: 'q must contain at least one non-whitespace character',
-      }),
+    // The `focus` intent (Now card) passes an empty q because the
+    // anchor is `session.currentUrl`, not a typed query. So accept
+    // the empty string here — pre-Zod behavior is preserved by the
+    // pipeline's `composeLexicalQuery` which itself returns "" for
+    // empty input and downstream lexical generators short-circuit
+    // on empty queries.
+    q: z.string().max(8192),
+    intent: recallV2IntentSchema.optional(),
     limit: z.number().int().positive().max(50).optional(),
     perSourceLimit: z.number().int().positive().max(50).optional(),
     sources: z.array(recallV2SourceKindSchema).max(8).optional(),

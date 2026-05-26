@@ -6,15 +6,18 @@ import { pageKindLabel } from './pageKind';
 // Lightweight breadcrumb above the Now card.
 //
 // Shows up to 4 chips (current + 3 prior contexts). Clicking a chip
-// "pins" that context so the auto-update from the live tab change
-// doesn't immediately replace it. Clicking the head chip (or the
-// pinned chip) unpins → back to live mode.
+// toggles a "pinned" highlight on it — feedback that the user
+// noticed the prior context — but does NOT yet drive the card body
+// to render that prior snapshot. The card stays bound to the live
+// active tab.
 //
-// This is NOT a navigation surface; chips never switch the browser
-// tab. They only change what Now renders. The spec is explicit
-// about this — "active browser tab changes only update Now; the
-// app must not auto-switch the user's selected tab" — so giving the
-// chips that power would defeat the rule.
+// This is intentional for the first cut: the spec rule "the app
+// must not auto-switch the user's selected tab" means chips must
+// never trigger a browser navigation. Restoring the prior render
+// without restoring the tab needs a synthetic focusedRecord
+// override upstream in App.tsx — left as a follow-up so this PR
+// stays bounded. The pin highlight at least confirms the click
+// landed and surfaces which context the user is asking about.
 
 export interface NowHistoryStripProps {
   readonly contexts: readonly NowContext[];
