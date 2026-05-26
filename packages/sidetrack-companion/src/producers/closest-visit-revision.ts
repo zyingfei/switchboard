@@ -804,6 +804,23 @@ export const readClosestVisitRankerRevision = async (
       trainedAt: manifest.trainedAt,
       modelBytes: toOwnedArrayBuffer(bytes),
       ...(manifest.trainQuality === undefined ? {} : { trainQuality: manifest.trainQuality }),
+      // Codex review of PR #229: the persisted manifest carries
+      // artifactQuality + LR weights through `finalizeManifest`, but
+      // this loader was dropping them on the way out, so the selector
+      // saw `artifactQuality === undefined` after restart and fell
+      // back to the baseline. Propagate every new manifest field so
+      // the persisted-reload path matches the in-memory write path.
+      ...(manifest.artifactQuality === undefined
+        ? {}
+        : { artifactQuality: manifest.artifactQuality }),
+      ...(manifest.logisticBatchWeights === undefined
+        ? {}
+        : { logisticBatchWeights: manifest.logisticBatchWeights }),
+      ...(manifest.logisticBatchFeatureStatsVersion === undefined
+        ? {}
+        : {
+            logisticBatchFeatureStatsVersion: manifest.logisticBatchFeatureStatsVersion,
+          }),
     };
   } catch {
     return null;
