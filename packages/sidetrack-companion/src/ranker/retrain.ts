@@ -494,8 +494,22 @@ export const planRankerRetrain = ({
     return { action: 'skip', reason: 'no-labels', fingerprint, newLabelCount: 0 };
   }
 
-  const previousLabelCount = state?.lastTrainedLabelCount ?? 0;
-  const newLabelCount = Math.max(0, fingerprint.labelCount - previousLabelCount);
+  // Threshold off the positive-label delta, not total. Negative-label
+  // count is post-`augmentFeedbackWithVisitPairLabels` Cartesian
+  // expansion (retrain.ts:192-250) — a snapshot topology change
+  // (workstream split, topic merge, engagement reclassification) can
+  // shrink the negative count without any new user signal, which made
+  // the prior `total - previousTotal` clamp to 0 even after hundreds
+  // of new positives, freezing the retrain loop. Positives are clean
+  // user signal: `deriveVisitPairLabelsFromSnapshot` is stubbed
+  // (retrain.ts:70-75) so positive labels come from user feedback
+  // only. Pure-negative-action sequences (only "ignore" gestures, no
+  // new positives) still flip `fingerprint.hash` so the `unchanged`
+  // check below skips correctly; they just won't trip the threshold
+  // gate until the next positive arrives. The per-label causal
+  // ledger work that closes this edge case is plan step 5.
+  const previousPositiveCount = state?.lastTrainedPositiveLabelCount ?? 0;
+  const newLabelCount = Math.max(0, fingerprint.positiveLabelCount - previousPositiveCount);
 
   // Force flag bypasses the policy checks entirely. It still respects
   // 'no-labels' above plus the later structural candidate gates.

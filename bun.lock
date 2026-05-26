@@ -261,6 +261,7 @@
     "sharp",
     "esbuild",
     "fsevents",
+    "hnswlib-node",
     "protobufjs",
     "onnxruntime-node",
     "usearch",

@@ -29,6 +29,7 @@ import {
   maybeRetrainClosestVisitRanker,
   planRankerRetrain,
   type RankerRetrainState,
+  type RankerTrainingLabelDatasetFingerprint,
   type TrainRankerRevisionFn,
   type WriteActiveRankerRevisionFn,
 } from './retrain.js';
@@ -297,6 +298,48 @@ describe('ranker retraining loop', () => {
       action: 'train',
       newLabelCount: 50,
     });
+  });
+
+  it('thresholds on positive-label delta even when total labels shrink via snapshot topology', () => {
+    // Regression for the retrain-gate clamp bug: snapshot topology
+    // changes (workstream split, topic merge) can shrink the
+    // post-Cartesian negative-label count without any new user
+    // signal. Pre-fix `Math.max(0, total - previousTotal)` clamped to
+    // 0 even after hundreds of new positives, freezing retrain. The
+    // gate must trip on the positive delta alone.
+    const base: RankerTrainingLabelDatasetFingerprint = {
+      hash: 'a'.repeat(64),
+      labelCount: 400, // 100 positives + 300 expanded negatives
+      positiveLabelCount: 100,
+      negativeLabelCount: 300,
+    };
+    const positivesGrewNegativesShrank: RankerTrainingLabelDatasetFingerprint = {
+      hash: 'b'.repeat(64), // hash differs — `unchanged` check passes
+      labelCount: 350, // total *dropped* by 50
+      positiveLabelCount: 200, // +100 positives since last train
+      negativeLabelCount: 150, // -150 from topology expansion shrinking
+    };
+    const state: RankerRetrainState = {
+      schemaVersion: 1,
+      lastTrainedLabelDatasetHash: base.hash,
+      lastTrainedLabelCount: base.labelCount,
+      lastTrainedPositiveLabelCount: base.positiveLabelCount,
+      lastTrainedNegativeLabelCount: base.negativeLabelCount,
+      activeRevisionId: 'old-revision',
+      rankerTrainingDatasetHash: '0'.repeat(64),
+      updatedAt: observedAtMs,
+    };
+
+    expect(
+      planRankerRetrain({
+        fingerprint: positivesGrewNegativesShrank,
+        state,
+        threshold: 50,
+        // Outside cooldown so the cooldown gate doesn't mask the
+        // threshold result.
+        cooldownMs: 0,
+      }),
+    ).toMatchObject({ action: 'train', newLabelCount: 100 });
   });
 
   it('skips with reason `cooldown` when threshold cleared but last train is too recent', () => {
