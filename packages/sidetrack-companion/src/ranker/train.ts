@@ -1024,6 +1024,12 @@ export const scoreLogisticBatch = (
   weights: readonly number[],
 ): number => sigmoid(dotWithBias(weights, logisticFeatureVector(features)));
 
+// Step 6 — exported so the online pairwise update (RankNet) module
+// can call into the same feature-vectorization the batch LR uses.
+// Keeping one definition keeps online and batch paths bytewise
+// comparable on the same input.
+export { logisticFeatureVector, sigmoid };
+
 const scoreEvaluationRowsWithFreshBooster = async (
   trainRows: readonly RankerTrainingRow[],
   trainGroupSizes: readonly number[],
