@@ -21,7 +21,7 @@ import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
-import { extractFeatures } from './features.js';
+import { extractFeatures, negativeContainerPairKey } from './features.js';
 import { randomUnrelated } from './negatives.js';
 import {
   trainRankerRevision,
@@ -951,7 +951,17 @@ export const buildRankerTrainingCandidates = ({
     generatedAt,
   );
 
-  const featureContext = { merged: [...merged], snapshot };
+  // Step 7 — precompute the (from\0to) pair set for the new
+  // `container_negative_match` feature. Reuses the existing
+  // Cartesian-expansion logic so the feature value is bit-exact
+  // with what the expansion path would have produced. Computed
+  // once per training pass, not per candidate.
+  const expandedNegativePairs = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot);
+  const negativeContainerPairs = new Set<string>();
+  for (const label of expandedNegativePairs) {
+    negativeContainerPairs.add(negativeContainerPairKey(label.fromId, label.toId));
+  }
+  const featureContext = { merged: [...merged], snapshot, negativeContainerPairs };
   return [...candidates.values()]
     .map((candidate) => restampTrainingCandidate(candidate, timestampContext))
     .sort(
