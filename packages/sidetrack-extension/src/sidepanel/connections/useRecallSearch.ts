@@ -36,6 +36,11 @@ interface RecallSearchState {
   readonly items: readonly RecallHit[];
   readonly loading: boolean;
   readonly error: string | null;
+  /** True when the response came from the extension's OPFS local
+   *  store because the companion was unreachable. Lets the SearchTab
+   *  show a "Local results only" banner so the user knows the
+   *  semantic / page-content sources are dark. */
+  readonly localFallback: boolean;
 }
 
 const EMPTY_ITEMS: readonly RecallHit[] = [];
@@ -115,6 +120,7 @@ export const useRecallSearch = (
     items: EMPTY_ITEMS,
     loading: false,
     error: null,
+    localFallback: false,
   });
   // Track the most recent in-flight query so a stale response can't
   // overwrite a newer one. Hit-rate guard against the user typing
@@ -125,13 +131,19 @@ export const useRecallSearch = (
     const trimmed = query.trim();
     if (trimmed.length === 0) {
       latestRef.current = '';
-      setState({ query: '', items: EMPTY_ITEMS, loading: false, error: null });
+      setState({ query: '', items: EMPTY_ITEMS, loading: false, error: null, localFallback: false });
       return;
     }
     if (trimmed.length < minLength) {
       // Below threshold — clear results but don't show error.
       latestRef.current = trimmed;
-      setState({ query: trimmed, items: EMPTY_ITEMS, loading: false, error: null });
+      setState({
+        query: trimmed,
+        items: EMPTY_ITEMS,
+        loading: false,
+        error: null,
+        localFallback: false,
+      });
       return;
     }
     latestRef.current = trimmed;
@@ -159,6 +171,7 @@ export const useRecallSearch = (
                 items: EMPTY_ITEMS,
                 loading: false,
                 error: lastError.message ?? 'Recall query failed',
+                localFallback: false,
               });
               return;
             }
@@ -167,7 +180,13 @@ export const useRecallSearch = (
             // `undefined` means the SW short-circuited (e.g. local-
             // fallback path with no hits).
             if (response == null) {
-              setState({ query: trimmed, items: EMPTY_ITEMS, loading: false, error: null });
+              setState({
+                query: trimmed,
+                items: EMPTY_ITEMS,
+                loading: false,
+                error: null,
+                localFallback: false,
+              });
               return;
             }
             if (typeof response !== 'object') {
@@ -176,6 +195,7 @@ export const useRecallSearch = (
                 items: EMPTY_ITEMS,
                 loading: false,
                 error: 'Unexpected recall response',
+                localFallback: false,
               });
               return;
             }
@@ -183,6 +203,9 @@ export const useRecallSearch = (
               readonly ok?: unknown;
               readonly results?: unknown;
               readonly error?: unknown;
+              readonly meta?: {
+                readonly flags?: { readonly localFallback?: unknown };
+              };
             };
             if (wrap.ok !== true) {
               setState({
@@ -190,6 +213,7 @@ export const useRecallSearch = (
                 items: EMPTY_ITEMS,
                 loading: false,
                 error: typeof wrap.error === 'string' ? wrap.error : 'Recall query failed',
+                localFallback: false,
               });
               return;
             }
@@ -197,11 +221,17 @@ export const useRecallSearch = (
             const parsed = rawResults
               .map(hitFromV2Candidate)
               .filter((h): h is RecallHit => h !== null);
+            // The companion sets meta.flags.localFallback when its SW
+            // tryLocalFallback path produced the results. Honest UX:
+            // surface this so the search tab can warn "Local results
+            // only — semantic + page-content sources are dark."
+            const localFallback = wrap.meta?.flags?.localFallback === true;
             setState({
               query: trimmed,
               items: parsed,
               loading: false,
               error: null,
+              localFallback,
             });
           },
         );
@@ -214,6 +244,7 @@ export const useRecallSearch = (
           items: EMPTY_ITEMS,
           loading: false,
           error: error instanceof Error ? error.message : String(error),
+          localFallback: false,
         });
       }
     }, debounceMs);

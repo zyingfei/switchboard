@@ -101,6 +101,9 @@ import {
 import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
 import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
+import { NowHistoryStrip } from '../../src/sidepanel/now/NowHistoryStrip';
+import { classifyPageKind, pageKindLabel } from '../../src/sidepanel/now/pageKind';
+import { useNowHistory } from '../../src/sidepanel/now/nowHistory';
 import { resolveFocusedUrlRecord } from '../../src/sidepanel/inbox/focusedUrlRecord';
 import { withEffectiveThreadWorkstream } from '../../src/sidepanel/inbox/effectiveThreadWorkstream';
 import {
@@ -4594,6 +4597,50 @@ const App = () => {
         : tabSessionRecordFromUrl(focusedRecordEffective),
     [focusedRecordEffective],
   );
+  // Scope D/E — Now page classifier + history strip. Classifier
+  // takes the live URL + whether it maps to a known thread + the
+  // workstream attribution; history hook tracks the last 4 Now
+  // contexts so the user has visual continuity when the active
+  // browser tab changes underneath them.
+  const focusedAttributedWorkstreamId =
+    focusedRecordEffective?.currentAttribution?.workstreamId ?? null;
+  const focusedUrl = focusedTabSession?.latestUrl ?? liveActiveTabUrl;
+  const focusedIsKnownThread = useMemo(() => {
+    if (focusedUrl === undefined || focusedUrl.length === 0) return false;
+    return state.threads.some((t) => t.threadUrl === focusedUrl);
+  }, [focusedUrl, state.threads]);
+  const focusedPageKind = useMemo(
+    () =>
+      classifyPageKind({
+        url: focusedUrl,
+        isKnownThread: focusedIsKnownThread,
+        attributedWorkstreamId: focusedAttributedWorkstreamId,
+      }),
+    [focusedUrl, focusedIsKnownThread, focusedAttributedWorkstreamId],
+  );
+  const nowHistory = useNowHistory();
+  useEffect(() => {
+    if (focusedUrl === undefined || focusedUrl.length === 0) return;
+    const title =
+      focusedTabSession?.latestTitle ??
+      liveActiveTabTitle ??
+      (() => {
+        try {
+          return new URL(focusedUrl).hostname;
+        } catch {
+          return focusedUrl;
+        }
+      })();
+    nowHistory.observe({
+      url: focusedUrl,
+      title,
+      kind: focusedPageKind,
+      enteredAt: new Date().toISOString(),
+    });
+    // observe is stable (useCallback); we only want to push when
+    // the URL or kind changes, not on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedUrl, focusedPageKind]);
 
   // ── task #50 Stage 2 — PageTextPanel on the current-tab card.
   // The SAME presentational <PageTextPanel> ConnectionsView mounts on
@@ -6664,10 +6711,16 @@ const App = () => {
 
       {viewMode === 'now' ? (
         <>
+          <NowHistoryStrip
+            contexts={nowHistory.contexts}
+            pinnedUrl={nowHistory.pinnedUrl}
+            onPin={nowHistory.pin}
+          />
           <section
             ref={currentTabCardRef}
             className={
               'tab-attribution-card' +
+              ` now-kind-${focusedPageKind}` +
               (focusedTabSession !== undefined
                 ? ' is-active'
                 : liveActiveTabUrl !== undefined
@@ -6679,7 +6732,9 @@ const App = () => {
             aria-label="Current tab attribution"
           >
             <div className="tab-attribution-card-head">
-              <span className="tab-attribution-card-eyebrow mono">Current tab</span>
+              <span className="tab-attribution-card-eyebrow mono" data-testid="now-page-kind">
+                {pageKindLabel[focusedPageKind]}
+              </span>
               {focusedTabSession !== undefined ? (
                 <>
                   <span

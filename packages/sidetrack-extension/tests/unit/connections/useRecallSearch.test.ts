@@ -177,5 +177,31 @@ describe('useRecallSearch', () => {
     });
     expect(result.current.items.length).toBe(0);
     expect(result.current.error).toBeNull();
+    expect(result.current.localFallback).toBe(false);
+  });
+
+  it('surfaces meta.flags.localFallback so the UI can warn "local results only"', () => {
+    stubChrome(() => ({
+      ok: true,
+      results: [
+        {
+          candidateId: 'local:0',
+          entityId: 'local:0',
+          sourceKind: 'timeline_visit',
+          canonicalUrl: 'https://example.com/cached',
+          title: 'Cached page',
+          fusedScore: 0.5,
+          lastSeenAt: '2026-05-20T00:00:00.000Z',
+          evidence: [{ retriever: 'fts5-local', sourceKind: 'timeline_visit' }],
+        },
+      ],
+      meta: { flags: { localFallback: true } },
+    }));
+    const { result } = renderHook(() => useRecallSearch('cached', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(result.current.items.length).toBe(1);
+    expect(result.current.localFallback).toBe(true);
   });
 });
