@@ -15,7 +15,6 @@ import type {
 } from './companion/model';
 import type { ReviewVerdict } from './review/types';
 import type {
-  ContentSearchHit,
   PageContentCoverage,
   PageContentExtractedPayload,
 } from './companion/pageContentClient';
@@ -145,7 +144,6 @@ export const messageTypes = {
   pageContentIndexOpenTabs: 'sidetrack.pageContent.indexOpenTabs',
   pageContentCoverage: 'sidetrack.pageContent.coverage',
   pageContentDelete: 'sidetrack.pageContent.delete',
-  contentQuery: 'sidetrack.content.query',
   // Side panel asks the chat tab to drop a margin annotation onto
   // a captured turn — without forcing the user to re-select text on
   // the live page or reload it. Background relays to the tab whose
@@ -660,12 +658,6 @@ export type WorkboardRequest =
       readonly canonicalUrl: string;
     }
   | {
-      readonly type: typeof messageTypes.contentQuery;
-      readonly q: string;
-      readonly limit?: number;
-      readonly sourceKind?: readonly ('page-content' | 'chat-turn' | 'semantic-recall-pool')[];
-    }
-  | {
       readonly type: typeof messageTypes.annotateTurn;
       readonly threadUrl: string;
       // First few hundred chars of the turn body. Used as the text
@@ -766,12 +758,6 @@ export interface PageContentBulkOperationResponse {
     readonly url?: string;
     readonly error: string;
   }[];
-  readonly error?: string;
-}
-
-export interface ContentQueryResponse {
-  readonly ok: boolean;
-  readonly items: readonly ContentSearchHit[];
   readonly error?: string;
 }
 
@@ -1068,19 +1054,6 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
     hasType(value, messageTypes.pageContentDelete)
   ) {
     return typeof value.canonicalUrl === 'string';
-  }
-
-  if (hasType(value, messageTypes.contentQuery)) {
-    return (
-      typeof value.q === 'string' &&
-      (value.limit === undefined || typeof value.limit === 'number') &&
-      (value.sourceKind === undefined ||
-        (Array.isArray(value.sourceKind) &&
-          value.sourceKind.every(
-            (kind) =>
-              kind === 'page-content' || kind === 'chat-turn' || kind === 'semantic-recall-pool',
-          )))
-    );
   }
 
   if (hasType(value, messageTypes.annotateTurn)) {
