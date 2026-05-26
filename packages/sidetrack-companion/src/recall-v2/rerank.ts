@@ -50,8 +50,10 @@ const scorePairs = async (
 };
 
 /** Rerank the top-N of `candidates` using the query string. Items
- *  without a snippet OR title are skipped (kept at their original
- *  position). Candidates beyond `topN` are appended unchanged. */
+ *  without a snippet OR title are scored against an empty string —
+ *  the cross-encoder produces a low (but nonzero) relevance for
+ *  empty inputs, so they fall toward the bottom of the reranked
+ *  head naturally. Candidates beyond `topN` are appended unchanged. */
 export const rerank = async (
   query: string,
   candidates: readonly RecallCandidate[],
@@ -60,9 +62,9 @@ export const rerank = async (
   if (topN <= 0 || candidates.length === 0) return candidates;
   const head = candidates.slice(0, topN);
   const tail = candidates.slice(topN);
-  // Build the text pairs from snippet | title. Missing both → skip
-  // (use a placeholder so indices align, then we keep its original
-  // position via the fusedScore fallback below).
+  // Build the text pairs from snippet | title. Missing both falls
+  // through to '' — the CE handles empty text gracefully (low score,
+  // sorts to bottom of head).
   const docs = head.map((c) => c.snippet ?? c.title ?? '');
   const scores = await scorePairs(query, docs).catch((err) => {
     console.warn('[recall-v2] rerank failed:', err);

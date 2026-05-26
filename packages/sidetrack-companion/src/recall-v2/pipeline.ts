@@ -28,6 +28,7 @@ import {
   readSemanticRecallVectorStore,
 } from '../recall/semanticRecallPool.js';
 import { embed, MODEL_ID } from '../recall/embedder.js';
+import { profileFor, semanticContributionMultiplier } from './model-registry.js';
 import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
@@ -517,18 +518,43 @@ const generateSemanticQuery = async (
     SEMANTIC_ABSOLUTE_MIN_COSINE,
     SEMANTIC_RELATIVE_FRACTION * topCosine,
   );
-  // Cosine filter is INSIDE the fan-out; cap to `limit` AFTER filtering
-  // so we honor the per-source contract. The vec query overfetches
-  // (limit*2) to absorb exclusions + low-cosine drops without
-  // shrinking the final pool below `limit`.
-  const hits = rawHits.filter((h) => h.cosine >= dynamicFloor).slice(0, limit);
+  const filtered = rawHits.filter((h) => h.cosine >= dynamicFloor);
+  // Score-modulated RRF (smooth gap-based gate). For the e5-small
+  // embedder, queries with `top - p50` gap < 0.03 are flat noise
+  // (every candidate at the noise floor); the gate mutes them.
+  // Thresholds live in model-registry.ts.
+  const filteredCosinesDesc = filtered.map((h) => h.cosine).sort((a, b) => b - a);
+  const p50Cosine =
+    filteredCosinesDesc.length > 0
+      ? filteredCosinesDesc[Math.floor(filteredCosinesDesc.length * 0.5)]!
+      : 0;
+  const minCosine =
+    filteredCosinesDesc.length > 0
+      ? filteredCosinesDesc[filteredCosinesDesc.length - 1]!
+      : 0;
+  const profile = profileFor(MODEL_ID);
+  const gateMultiplier = semanticContributionMultiplier(
+    profile,
+    topCosine,
+    p50Cosine,
+    minCosine,
+    filteredCosinesDesc.length,
+  );
+  if (gateMultiplier === 0) {
+    return {
+      sourceKind: 'semantic_query',
+      candidates: [],
+      elapsedMs: timeoutMs(start, deps.now ?? Date.now),
+    };
+  }
+  const hits = filtered.slice(0, limit);
   const candidates: RecallCandidate[] = hits.map((h, i) => ({
     candidateId: `semantic-query:${h.canonicalUrl}`,
     entityId: h.entityId ?? entityIdFor({ canonicalUrl: h.canonicalUrl }),
     sourceKind: 'semantic_query',
     canonicalUrl: h.canonicalUrl,
     ...(h.title === undefined ? {} : { title: h.title }),
-    fusedScore: 1 / (RRF_K + (i + 1)),
+    fusedScore: gateMultiplier / (RRF_K + (i + 1)),
     evidence: [
       {
         retriever: 'dense',
@@ -608,14 +634,22 @@ const fuseRrf = (
     for (let i = 0; i < group.candidates.length; i += 1) {
       const cand = group.candidates[i]!;
       const prev = fused.get(cand.entityId);
-      // Freshness-weighted RRF contribution. Freshness in [0.3, 1.0]
-      // multiplies the pure 1/(k+rank) signal so a 1-day-old doc at
-      // rank 1 contributes 1/61; a 2-year-old doc at rank 1
-      // contributes 0.5/61. Keeps RRF's scale-free fusion property
-      // while letting recency break the otherwise-deterministic
-      // URL-alphabetical ties in the lexical layer.
-      const rrf = 1 / (RRF_K + (i + 1));
-      const contribution = rrf * freshnessFactor(cand, now);
+      // Honor any per-candidate stream multiplier (e.g. the smooth
+      // gap-based gate in generateSemanticQuery emits
+      // `gateMultiplier / (RRF_K + rank)` into `cand.fusedScore`).
+      // Codex review of PR #215: the prior version recomputed pure
+      // RRF from list rank here and silently discarded the
+      // multiplier — only the hard-drop (multiplier=0 → empty
+      // candidates list) ever took effect. Fix: use the candidate's
+      // pre-computed contribution as the base, falling back to
+      // rank-only RRF when a source doesn't set one (covers all
+      // current generators except semantic_query).
+      const baseContribution = cand.fusedScore > 0 ? cand.fusedScore : 1 / (RRF_K + (i + 1));
+      // Freshness multiplier in [0.3, 1.0] — lets recency break the
+      // otherwise-deterministic URL-alphabetical ties in the lexical
+      // layer; stacks on top of any stream multiplier from the
+      // source generator.
+      const contribution = baseContribution * freshnessFactor(cand, now);
       if (prev === undefined) {
         fused.set(cand.entityId, { ...cand, fusedScore: contribution });
       } else {
@@ -635,72 +669,65 @@ const fuseRrf = (
     }
   }
   const entityDeduped = [...fused.values()].sort((a, b) => b.fusedScore - a.fusedScore);
-  return collapseByLocationKey(entityDeduped);
+  return collapseByCanonicalUrl(entityDeduped);
 };
 
-/** Second-pass dedupe: candidates whose canonicalUrls map to the same
- *  `locationKey` (e.g. `google.com/?zx=1`, `google.com/?zx=2`,
- *  `google.com/?zx=3` — all just the Google homepage with a cache-
- *  bust param) collapse into a single result. Without this the
- *  semantic-pool path can fill the top-N with bouncy-URL noise
- *  (every visit to a search engine root gets its own vector).
+/** Second-pass dedupe keyed on `canonical_url` verbatim.
  *
- *  Strategy: group by locationKey; within a group keep the
- *  highest-scoring candidate and merge evidence from the rest.
- *  Candidates whose URL doesn't yield a locationKey (chat turns,
- *  malformed URLs) pass through unchanged. */
-const collapseByLocationKey = (
+ *  The upstream page-evidence extraction already produces canonical
+ *  URLs that preserve structural query params (HN ?id=N, YouTube
+ *  ?v=N, etc.). Two candidates with different canonical_url are
+ *  different entities — no further transformation. Replaced the
+ *  prior `collapseByLocationKey` (2026-05-26 review): the
+ *  locationKey transformation stripped query params on paths NOT in
+ *  {'/', '/search'}, which silently destroyed HN/YouTube/Reddit
+ *  identity-bearing params. */
+const collapseByCanonicalUrl = (
   candidates: readonly RecallCandidate[],
 ): RecallCandidate[] => {
-  const byLoc = new Map<string, RecallCandidate>();
+  const byUrl = new Map<string, RecallCandidate>();
   const noKey: RecallCandidate[] = [];
   for (const c of candidates) {
-    const loc = locationKey(c.canonicalUrl);
-    if (loc === undefined) {
+    const key = c.canonicalUrl;
+    if (key === undefined || key.length === 0) {
       noKey.push(c);
       continue;
     }
-    const prev = byLoc.get(loc);
+    const prev = byUrl.get(key);
     if (prev === undefined) {
-      byLoc.set(loc, c);
+      byUrl.set(key, c);
       continue;
     }
     const winner = c.fusedScore > prev.fusedScore ? c : prev;
     const loser = winner === c ? prev : c;
-    byLoc.set(loc, {
+    byUrl.set(key, {
       ...winner,
       evidence: [...winner.evidence, ...loser.evidence],
-      // Surface the higher-quality title/snippet regardless of which
-      // candidate "won" on score.
       ...(winner.title === undefined && loser.title !== undefined ? { title: loser.title } : {}),
       ...(winner.snippet === undefined && loser.snippet !== undefined
         ? { snippet: loser.snippet }
         : {}),
     });
   }
-  return [...byLoc.values(), ...noKey].sort((a, b) => b.fusedScore - a.fusedScore);
+  return [...byUrl.values(), ...noKey].sort((a, b) => b.fusedScore - a.fusedScore);
 };
 
-/** Host + pathname location key (search-URL aware). Same logic as the
- *  extension's dejaVuModel.ts:locationKey; centralized server-side here. */
-const SEARCH_PATHS: ReadonlySet<string> = new Set<string>(['/', '/search']);
-const locationKey = (url: string | undefined): string | undefined => {
+/** Loose match used by the current-page suppression — strips hash +
+ *  trailing slash + `www.` but PRESERVES query params so HN/YouTube
+ *  /etc. structural identity stays distinct. For tracker-laden
+ *  current URLs the suppression will miss (acceptable trade-off:
+ *  false-negative suppression — own page surfaces in results — is
+ *  much less harmful than false-positive dedupe collapsing distinct
+ *  items). The parameter-cardinality profiler (D5) is the long-term
+ *  fix for that residual case. */
+const suppressionKey = (url: string | undefined): string | undefined => {
   if (url === undefined || url.length === 0) return undefined;
   try {
     const u = new URL(url);
-    const rawPath = u.pathname.toLowerCase();
-    const path = rawPath.length > 1 && rawPath.endsWith('/')
-      ? rawPath.replace(/\/+$/u, '')
-      : rawPath;
-    const norm = path.length === 0 ? '/' : path;
+    u.hash = '';
     const host = u.hostname.replace(/^www\./, '').toLowerCase();
-    if (SEARCH_PATHS.has(norm)) {
-      const q = u.searchParams.get('q');
-      if (q !== null && q.trim().length > 0) {
-        return `${host}${norm}?q=${q.trim().toLowerCase().replace(/\s+/g, ' ')}`;
-      }
-    }
-    return `${host}${norm}`;
+    const path = u.pathname.replace(/\/+$/u, '') || '/';
+    return `${u.protocol}//${host}${path}${u.search}`;
   } catch {
     return url.toLowerCase();
   }
@@ -713,7 +740,7 @@ const applySuppression = (
 ): { kept: readonly RecallCandidate[]; dropped: readonly RecallCandidate[] } => {
   const policy = req.suppression ?? {};
   const minAge = policy.minHitAgeMs ?? DEFAULT_MIN_HIT_AGE_MS;
-  const currentLoc = locationKey(req.session?.currentUrl);
+  const currentLoc = suppressionKey(req.session?.currentUrl);
   const currentMode = policy.suppressCurrentPage ?? 'always';
   const activeChats = new Set(policy.suppressActiveChatBacIds ?? []);
   const excluded = new Set([
@@ -727,7 +754,7 @@ const applySuppression = (
     const reasons: string[] = [];
     if (excluded.has(c.entityId)) reasons.push('explicit-exclude');
     if (currentMode === 'always' && currentLoc !== undefined) {
-      const candLoc = locationKey(c.canonicalUrl);
+      const candLoc = suppressionKey(c.canonicalUrl);
       if (candLoc !== undefined && candLoc === currentLoc) reasons.push('current-page');
     }
     if (c.threadId !== undefined && activeChats.has(c.threadId)) {
