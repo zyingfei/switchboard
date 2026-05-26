@@ -169,6 +169,50 @@ describe('useRecallSearch', () => {
     expect(result.current.error).toBe('companion unreachable');
   });
 
+  it('synthesizes anchorNodeId for non-chat hits so SearchTab renders them', () => {
+    // Repro for the post-Scope-A "No matches" bug: when the
+    // companion returned a timeline_visit hit for a typed URL,
+    // useRecallSearch dropped the anchorNodeId field, SearchTab's
+    // anchorIdForRecallHit returned undefined, and the hit was
+    // filtered out → user saw "No content matches" despite
+    // /v2/recall returning the row.
+    stubChrome(() => ({
+      ok: true,
+      results: [
+        {
+          candidateId: 'tv:promptarmor',
+          entityId: 'tv:promptarmor',
+          sourceKind: 'timeline_visit',
+          canonicalUrl: 'https://www.promptarmor.com/resources/x',
+          title: 'Microsoft Copilot Cowork',
+          fusedScore: 0.5,
+          lastSeenAt: '2026-05-26T00:00:00.000Z',
+          evidence: [{ retriever: 'fts5', sourceKind: 'timeline_visit', rank: 1 }],
+        },
+        {
+          candidateId: 'ct:chat',
+          entityId: 'ct:chat',
+          sourceKind: 'chat_turn',
+          threadId: 'T1',
+          canonicalUrl: 'https://chatgpt.com/c/abc',
+          title: 'A chat about Copilot',
+          fusedScore: 0.4,
+          lastSeenAt: '2026-05-25T00:00:00.000Z',
+          evidence: [{ retriever: 'fts5', sourceKind: 'chat_turn', rank: 2 }],
+        },
+      ],
+    }));
+    const { result } = renderHook(() => useRecallSearch('copilot', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(result.current.items.length).toBe(2);
+    expect(result.current.items[0]!.anchorNodeId).toBe(
+      'timeline-visit:https://www.promptarmor.com/resources/x',
+    );
+    expect(result.current.items[1]!.anchorNodeId).toBe('thread:T1');
+  });
+
   it('treats null response as a clean empty (SW short-circuited)', () => {
     stubChrome(() => null);
     const { result } = renderHook(() => useRecallSearch('whatever', { debounceMs: 100 }));
