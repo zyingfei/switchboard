@@ -368,6 +368,18 @@ const evidenceMetadataForNode = (
   };
 };
 
+// Spreadable wrapper: returns {} or { pageEvidence: ... } in one call so
+// the per-node loops don't pay for evidenceMetadataForNode TWICE (once for
+// the undefined check, once for the value). With ~6000 nodes per rebuild,
+// the duplication was a measurable share of buildConnectionsSnapshot.
+const pageEvidenceField = (
+  input: ConnectionsInput,
+  canonicalUrl: string,
+): { pageEvidence: Record<string, unknown> } | Record<string, never> => {
+  const meta = evidenceMetadataForNode(input, canonicalUrl);
+  return meta === undefined ? {} : { pageEvidence: meta };
+};
+
 const pageEvidenceSummaryForUrl = (evidence: PageEvidenceRecord): UrlPageEvidenceSummary => ({
   tier: evidence.evidenceTier,
   evidenceRevision: evidence.evidenceRevision,
@@ -1430,27 +1442,43 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   // queue.created, annotation.created. Each produces a node and may emit
   // edges that are derivable from the event payload alone.
   // -------------------------------------------------------------------
-  const threadIds = new Set<string>();
-  const workstreamIds = new Set<string>();
+  // Per-bacId event buckets. Without these, each projectThread /
+  // projectWorkstream call re-filters all of input.events — at ~160k
+  // events × ~100 aggregates that is 16M ops and was the dominant
+  // cost of buildConnectionsSnapshot (observed ~16s, blocking
+  // /v1/status). One pass populates both id sets and the per-bacId
+  // event slices so each projector receives only its relevant
+  // events (typically a handful).
+  const threadEventsByBacId = new Map<string, AcceptedEvent[]>();
+  const workstreamEventsByBacId = new Map<string, AcceptedEvent[]>();
+  const pushBucket = (
+    map: Map<string, AcceptedEvent[]>,
+    bacId: string,
+    event: AcceptedEvent,
+  ): void => {
+    const existing = map.get(bacId);
+    if (existing === undefined) map.set(bacId, [event]);
+    else existing.push(event);
+  };
   for (const event of input.events) {
     if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
-      threadIds.add(event.payload.bac_id);
+      pushBucket(threadEventsByBacId, event.payload.bac_id, event);
     } else if (
       (event.type === THREAD_ARCHIVED ||
         event.type === THREAD_UNARCHIVED ||
         event.type === THREAD_DELETED) &&
       isThreadStatusPayload(event.payload)
     ) {
-      threadIds.add(event.payload.bac_id);
+      pushBucket(threadEventsByBacId, event.payload.bac_id, event);
     } else if (event.type === WORKSTREAM_UPSERTED && isWorkstreamUpsertedPayload(event.payload)) {
-      workstreamIds.add(event.payload.bac_id);
+      pushBucket(workstreamEventsByBacId, event.payload.bac_id, event);
     } else if (event.type === WORKSTREAM_DELETED && isWorkstreamDeletedPayload(event.payload)) {
-      workstreamIds.add(event.payload.bac_id);
+      pushBucket(workstreamEventsByBacId, event.payload.bac_id, event);
     }
   }
 
-  for (const threadId of [...threadIds].sort()) {
-    const projection = projectThread(threadId, input.events);
+  for (const threadId of [...threadEventsByBacId.keys()].sort()) {
+    const projection = projectThread(threadId, threadEventsByBacId.get(threadId) ?? []);
     if (projection.deleted) continue;
     const observedAtIso = new Date(projection.updatedAtMs).toISOString();
     trackObservedAt(observedAtIso);
@@ -1529,8 +1557,11 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     }
   }
 
-  for (const workstreamId of [...workstreamIds].sort()) {
-    const projection = projectWorkstream(workstreamId, input.events);
+  for (const workstreamId of [...workstreamEventsByBacId.keys()].sort()) {
+    const projection = projectWorkstream(
+      workstreamId,
+      workstreamEventsByBacId.get(workstreamId) ?? [],
+    );
     if (projection.deleted) continue;
     const observedAtIso = new Date(projection.updatedAtMs).toISOString();
     trackObservedAt(observedAtIso);
@@ -2026,9 +2057,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
                   scrollEvents: engagementClass.scrollEvents,
                 },
               }),
-          ...(evidenceMetadataForNode(input, visitKey) === undefined
-            ? {}
-            : { pageEvidence: evidenceMetadataForNode(input, visitKey) }),
+          ...pageEvidenceField(input, visitKey),
         },
       });
       // 2026-05 fix: emit the `visit_in_workstream` edge that the
@@ -2180,9 +2209,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
         canonicalUrl: instance.canonicalUrl,
         title: instance.title,
         provider: instance.provider,
-        ...(evidenceMetadataForNode(input, instance.visitKey) === undefined
-          ? {}
-          : { pageEvidence: evidenceMetadataForNode(input, instance.visitKey) }),
+        ...pageEvidenceField(input, instance.visitKey),
       },
     });
     // Hydrate the tab-session node from the projection so frontend
@@ -3019,9 +3046,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           metadata: {
             canonicalUrl: memberCanonicalUrl,
-            ...(evidenceMetadataForNode(input, memberCanonicalUrl) === undefined
-              ? {}
-              : { pageEvidence: evidenceMetadataForNode(input, memberCanonicalUrl) }),
+            ...pageEvidenceField(input, memberCanonicalUrl),
           },
         });
         upsertEdge(edges, {
@@ -3045,9 +3070,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           observedAt: topic.metadata.lastObservedAt,
           metadata: {
             canonicalUrl: affiliation.canonicalUrl,
-            ...(evidenceMetadataForNode(input, affiliation.canonicalUrl) === undefined
-              ? {}
-              : { pageEvidence: evidenceMetadataForNode(input, affiliation.canonicalUrl) }),
+            ...pageEvidenceField(input, affiliation.canonicalUrl),
           },
         });
         upsertEdge(edges, {

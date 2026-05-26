@@ -5933,15 +5933,21 @@ const routes: readonly RouteDefinition[] = [
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
           const events = await context.eventLog!.readMerged();
-          const aggregateIds = new Set<string>();
+          // Bucket per-bacId once so each projectWorkstream call sees
+          // only its own events. Without bucketing this is
+          // O(aggregates × events) and stalls the route on large
+          // vaults — same fix as buildConnectionsSnapshot.
+          const eventsByBacId = new Map<string, typeof events[number][]>();
           for (const event of events) {
             if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
-              aggregateIds.add(event.aggregateId);
+              const existing = eventsByBacId.get(event.aggregateId);
+              if (existing === undefined) eventsByBacId.set(event.aggregateId, [event]);
+              else existing.push(event);
             }
           }
-          const projections = [...aggregateIds]
+          const projections = [...eventsByBacId.keys()]
             .sort()
-            .map((bacId) => projectWorkstream(bacId, events));
+            .map((bacId) => projectWorkstream(bacId, eventsByBacId.get(bacId) ?? []));
           return [200, { data: projections }];
         },
       );
