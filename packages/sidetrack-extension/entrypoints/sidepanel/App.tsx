@@ -6895,21 +6895,31 @@ const App = () => {
             {!currentTabCollapsed ? (
               <>
                 <div className="tab-attribution-card-body">
-                  <span className="tab-attribution-card-prefix mono">In workstream:</span>
-                  <AttributionBadge
-                    record={focusedTabSession}
-                    suggestion={
-                      focusedTabSuggestion === undefined
-                        ? undefined
-                        : tabSessionResolutionFromUrl(focusedTabSuggestion)
-                    }
-                    workstreams={tabSessionWorkstreams}
-                  />
+                  {/* FU3 / Spec D — `unknown` kind (chrome://, about:blank,
+                      file://, ephemeral surfaces) has no attribution to
+                      assert. Hide the workstream prefix + AttributionBadge
+                      + SuggestionStats; the user sees just title + URL +
+                      capture badge + (where eligible) actions. */}
+                  {focusedPageKind !== 'unknown' ? (
+                    <>
+                      <span className="tab-attribution-card-prefix mono">In workstream:</span>
+                      <AttributionBadge
+                        record={focusedTabSession}
+                        suggestion={
+                          focusedTabSuggestion === undefined
+                            ? undefined
+                            : tabSessionResolutionFromUrl(focusedTabSuggestion)
+                        }
+                        workstreams={tabSessionWorkstreams}
+                      />
+                    </>
+                  ) : null}
                   {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
               Renders for any unattributed/un-ignored focused URL — when
               the resolver has no candidates we still draw the empty
               placeholder so the user sees why the badge is "?". */}
-                  {focusedRecordEffective !== undefined &&
+                  {focusedPageKind !== 'unknown' &&
+                  focusedRecordEffective !== undefined &&
                   focusedRecordEffective.currentAttribution === undefined &&
                   focusedRecordEffective.currentIgnored === undefined ? (
                     <SuggestionStats
