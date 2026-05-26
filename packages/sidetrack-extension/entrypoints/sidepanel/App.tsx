@@ -7435,6 +7435,18 @@ const App = () => {
           onQueryConsumed={() => {
             setInboxSearchRequest('');
           }}
+          // RD2 — "Search globally for X" link in the Inbox
+          // empty-state. Routes the user to the Search top-tab
+          // and bumps requestSearch so ConnectionsView's SearchTab
+          // subMode auto-mounts. Doesn't pre-fill the query
+          // (ConnectionsView's SearchTab doesn't have an
+          // initialQuery prop yet — keeping scope tight); the
+          // empty-state already showed the term, so the user can
+          // re-type quickly.
+          onSearchGlobally={(_q) => {
+            setConnectionsSearchRequest((n) => n + 1);
+            setViewMode('search');
+          }}
           isChatThreadCaptured={isChatThreadCapturedForRecord}
         />
       ) : viewMode === 'all' ? (
@@ -7487,10 +7499,15 @@ const App = () => {
         </>
       ) : null}
 
-      {viewMode !== 'connections' ? (() => {
+      {viewMode === 'now' ? (() => {
         // Recent Dispatches: chronological log of packets sent out of
         // Sidetrack (review submit-backs, dispatch-out packets, coding
-        // agent packets). Only render when there's at least one.
+        // agent packets). RD1 — scoped to the Now tab per user
+        // direction: dispatches are "recent activity" adjacent to the
+        // current-tab card. Pre-scope it leaked to threads /
+        // workstreams / inbox / search since the only exclusion was
+        // `viewMode !== 'connections'`. Only render when there's at
+        // least one dispatch.
         const dispatches = state.recentDispatches.slice(0, 12);
         if (dispatches.length === 0) {
           return null;
