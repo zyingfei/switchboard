@@ -1636,11 +1636,42 @@ describe('ConnectionsView — engineering scaffold', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('connections-groups')).not.toBeNull();
     });
+    // Both visible textContent AND user-visible attributes (title, aria-
+    // label) must stay clean — tooltips are visible-on-hover and the
+    // formatter's `display.tooltip` reaches users through NodeChip /
+    // NodeRow / PathFinder.
+    const forbidden: readonly { readonly name: string; readonly re: RegExp }[] = [
+      { name: 'tses_*', re: /tses_[A-Z0-9]/ },
+      { name: 'visit-instance:', re: /visit-instance:/ },
+      { name: 'tab-session:', re: /tab-session:/ },
+      // Replica ids may contain dots, colons, slashes; widen past the
+      // narrower [A-Za-z0-9_-] character class so we catch real shapes.
+      { name: 'replica:<id>', re: /\breplica:[^\s"'<>]+/ },
+      // Any bare workstream bac_id leaking through (more general than
+      // the single fixture id), and the specific fixture for belt-and-
+      // suspenders coverage.
+      { name: 'bac_*', re: /\bbac_[A-Za-z0-9_-]+\b/ },
+    ];
     const visible = container.textContent ?? '';
-    expect(visible).not.toMatch(/tses_[A-Z0-9]/);
-    expect(visible).not.toMatch(/visit-instance:/);
-    expect(visible).not.toMatch(/tab-session:/);
-    expect(visible).not.toMatch(/\breplica:[A-Za-z0-9_-]/);
-    expect(visible).not.toMatch(/\bbac_sweep_research\b/);
+    for (const { name, re } of forbidden) {
+      expect(visible, `visible text leaks ${name}`).not.toMatch(re);
+    }
+    // Attribute sweep — only check the attributes the user actually
+    // sees: `title` (hover tooltip) and `aria-label` (screen readers).
+    // `<option value>`, `data-testid`, `class`, `id`, `href` and similar
+    // functional attributes legitimately carry raw ids (action keys,
+    // form values, navigation targets) and are not surfaced as visible
+    // text.
+    const USER_VISIBLE_ATTRS: readonly string[] = ['title', 'aria-label'];
+    const all = container.querySelectorAll('*');
+    for (const el of all) {
+      for (const attrName of USER_VISIBLE_ATTRS) {
+        const value = el.getAttribute(attrName);
+        if (value === null || value.length === 0) continue;
+        for (const { name, re } of forbidden) {
+          expect(value, `<${el.tagName.toLowerCase()} ${attrName}> leaks ${name}`).not.toMatch(re);
+        }
+      }
+    }
   });
 });

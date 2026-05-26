@@ -404,10 +404,7 @@ export const FlowPathView = ({
         const anchorIdx = tabVisits.findIndex((v) => v.isAnchor === true);
         return (
           <div className="cx-flow-row" key={tabGroup.key}>
-            <div
-              className="cx-flow-tab"
-              title={tabGroup.entries.map((entry) => entry.tabSessionIdHash).join('\n')}
-            >
+            <div className="cx-flow-tab">
               <div className="cx-flow-tab-name">{tabGroup.label}</div>
               {tabGroup.host !== undefined && tabGroup.host.length > 0 ? (
                 <div className="cx-flow-tab-host cx-dim">{tabGroup.host}</div>

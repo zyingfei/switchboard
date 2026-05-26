@@ -114,6 +114,18 @@ const cleanLabel = (label: string | undefined | null): string | undefined => {
   return isInternalIdLike(trimmed) ? undefined : trimmed;
 };
 
+// Tooltip values are rendered straight into `title=` attributes by
+// NodeChip / NodeRow / PathFinder. The goal forbids raw internal ids
+// from any visible text, including hover tooltips, so this helper
+// drops any value that matches our id-like patterns. Callers can
+// safely chain canonical-url / sourcePath etc. as the preferred
+// tooltip, with `safeTooltip` as the final filter.
+const safeTooltip = (value: string | undefined): string | undefined => {
+  const trimmed = safeStr(value);
+  if (trimmed === undefined) return undefined;
+  return isInternalIdLike(trimmed) ? undefined : trimmed;
+};
+
 const KIND_FROM_PREFIX: ReadonlyMap<string, ConnectionNodeKind> = new Map([
   ['tab-session', 'tab-session'],
   ['visit-instance', 'visit-instance'],
@@ -173,7 +185,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       const title = metaStr(metadata, ['title']);
       const labelClean = cleanLabel(node.label);
       const primary = path ?? title ?? labelClean ?? 'Unknown workstream';
-      return { primary, kindBadge, tooltip: bacId };
+      return { primary, kindBadge, tooltip: safeTooltip(bacId) };
     }
     case 'thread': {
       const title = metaStr(metadata, ['title']);
@@ -185,7 +197,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
         labelClean ??
         (provider !== undefined ? `${provider} thread` : '(untitled thread)');
       const secondary = composeSecondary([provider, formatRelOrUndef(node.lastSeenAt)]);
-      return { primary, secondary, kindBadge, tooltip: url ?? trimPrefix(node.id, 'thread:') };
+      return { primary, secondary, kindBadge, tooltip: safeTooltip(url) };
     }
     case 'tab-session': {
       const latestTitle = metaStr(metadata, ['latestTitle']);
@@ -200,7 +212,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
         secondary,
         kindBadge,
         // Canonical URL when present; never the raw tab-session node id.
-        tooltip: latestUrl ?? trimPrefix(node.id, 'tab-session:'),
+        tooltip: safeTooltip(latestUrl),
       };
     }
     case 'visit-instance': {
@@ -216,7 +228,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       const last = node.lastSeenAt ?? node.firstSeenAt;
       const secondary = composeSecondary([host, formatRelOrUndef(last)]);
       // Tooltip is canonical URL only — never the raw `visit-instance:tses_*:date:url` id.
-      return { primary, secondary, kindBadge, tooltip: canonicalUrl };
+      return { primary, secondary, kindBadge, tooltip: safeTooltip(canonicalUrl) };
     }
     case 'timeline-visit': {
       // The canonical aggregate. Secondary calls out the visitCount
@@ -236,7 +248,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
           ? `${String(visitCount)} visit${visitCount === 1 ? '' : 's'}`
           : undefined;
       const secondary = composeSecondary([host, visitsLabel]);
-      return { primary, secondary, kindBadge, tooltip: canonicalUrl };
+      return { primary, secondary, kindBadge, tooltip: safeTooltip(canonicalUrl) };
     }
     case 'dispatch': {
       const title = metaStr(metadata, ['title']);
@@ -245,7 +257,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       const primary =
         title ?? labelClean ?? (provider !== undefined ? `${provider} dispatch` : '(dispatch)');
       const secondary = composeSecondary([provider, formatRelOrUndef(node.lastSeenAt)]);
-      return { primary, secondary, kindBadge, tooltip: trimPrefix(node.id, 'dispatch:') };
+      return { primary, secondary, kindBadge, tooltip: undefined };
     }
     case 'coding-session': {
       const title = metaStr(metadata, ['title']);
@@ -260,7 +272,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
         primary,
         secondary,
         kindBadge,
-        tooltip: sourcePath ?? trimPrefix(node.id, 'coding-session:'),
+        tooltip: safeTooltip(sourcePath),
       };
     }
     case 'topic': {
@@ -276,11 +288,11 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       }
       const memberCount = metadata['memberCount'];
       const secondary = typeof memberCount === 'number' ? `${memberCount} members` : undefined;
-      return { primary, secondary, kindBadge, tooltip: trimPrefix(node.id, 'topic:') };
+      return { primary, secondary, kindBadge, tooltip: undefined };
     }
     case 'replica': {
       const replicaId = trimPrefix(node.id, 'replica:');
-      return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: replicaId };
+      return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: safeTooltip(replicaId) };
     }
     case 'inbound-reminder': {
       // Stage 5 polish — every inbound-reminder previously rendered as
@@ -308,7 +320,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
         primary = 'Reminder';
       }
       const secondary = composeSecondary([status, formatRelOrUndef(node.lastSeenAt)]);
-      return { primary, secondary, kindBadge, tooltip: node.id };
+      return { primary, secondary, kindBadge, tooltip: undefined };
     }
     case 'snippet': {
       // Stage 5 polish — hash-only snippet lineage means the raw text
@@ -325,7 +337,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       if (localPreview !== undefined && localPreview.length > 0) {
         const truncated =
           localPreview.length > 80 ? `${localPreview.slice(0, 80).trimEnd()}…` : localPreview;
-        const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+        const tooltip = safeTooltip(metaStr(metadata, ['canonicalUrl', 'url']));
         return { primary: truncated, kindBadge, tooltip };
       }
       const charCount =
@@ -348,7 +360,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       if (charCount !== undefined) parts.push(`${String(charCount)} chars`);
       const labelClean = cleanLabel(node.label);
       const primary = parts.length > 0 ? parts.join(' · ') : (labelClean ?? '(snippet)');
-      const tooltip = metaStr(metadata, ['canonicalUrl', 'url']) ?? node.id;
+      const tooltip = safeTooltip(metaStr(metadata, ['canonicalUrl', 'url']));
       return { primary, kindBadge, tooltip };
     }
     case 'annotation':
@@ -357,12 +369,12 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       const title = metaStr(metadata, ['title', 'text', 'note']);
       const labelClean = cleanLabel(node.label);
       const primary = title ?? labelClean ?? `(${kindBadge.toLowerCase()})`;
-      return { primary, kindBadge, tooltip: node.id };
+      return { primary, kindBadge, tooltip: undefined };
     }
     default: {
       const labelClean = cleanLabel(node.label);
       const primary = labelClean ?? `(${kindBadge.toLowerCase()})`;
-      return { primary, kindBadge, tooltip: node.id };
+      return { primary, kindBadge, tooltip: undefined };
     }
   }
 };
@@ -384,14 +396,14 @@ export const formatNodeIdDisplay = (
   if (kind === 'workstream') {
     const bacId = trimPrefix(nodeId, 'workstream:');
     const path = ctx.resolveWorkstreamPath(bacId);
-    return { primary: path ?? 'Unknown workstream', kindBadge, tooltip: bacId };
+    return { primary: path ?? 'Unknown workstream', kindBadge, tooltip: safeTooltip(bacId) };
   }
   if (kind === 'replica') {
     const replicaId = trimPrefix(nodeId, 'replica:');
-    return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: replicaId };
+    return { primary: ctx.replicaAlias(replicaId), kindBadge, tooltip: safeTooltip(replicaId) };
   }
   if (kind === 'tab-session') {
-    return { primary: 'Tab session', kindBadge, tooltip: trimPrefix(nodeId, 'tab-session:') };
+    return { primary: 'Tab session', kindBadge, tooltip: undefined };
   }
   if (kind === 'timeline-visit') {
     const url = trimPrefix(nodeId, 'timeline-visit:');
