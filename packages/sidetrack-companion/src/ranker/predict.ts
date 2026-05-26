@@ -3,10 +3,12 @@ import { Booster, loadLGB } from '@wlearn/lightgbm';
 import type { CandidatePairFeatures, FEATURE_SCHEMA_VERSION } from './feature-schema.js';
 import { selectActiveRanker, type ActiveRankerSelection } from './select.js';
 import {
+  COMBINER_FEATURE_KINDS,
   deterministicBaselineScore,
   encodeRankerFeatureMatrix,
   RANKER_FEATURE_KEYS,
   RANKER_MODEL_FEATURE_COUNT,
+  scoreCombiner,
   scoreLogisticBatch,
   type RankerArtifactKind,
   type RankerRevision,
@@ -155,12 +157,17 @@ export const topRankerContributions = (
 export interface ActiveRankerHandle {
   readonly selection: ActiveRankerSelection;
   readonly revisionId: string;
-  // Present only when `selection.selectedKind === 'lightgbm_lambdamart'`.
+  // Present when `selection.selectedKind === 'lightgbm_lambdamart'`
+  // OR when the combiner is selected (the combiner needs lgb scores).
   // Tracking the loaded booster on the handle keeps dispose() simple
   // and means the LR / baseline paths pay zero LightGBM-WASM cost.
   readonly lightgbm?: LightGBMModel;
-  // Present only when `selection.selectedKind === 'logistic_batch'`.
+  // Present when `selection.selectedKind === 'logistic_batch'` OR
+  // when the combiner is selected (the combiner needs LR scores).
   readonly logisticBatchWeights?: readonly number[];
+  // Step 8 — present only when the combiner is selected. Weights
+  // are bias + per-COMBINER_FEATURE_KIND.
+  readonly combinerWeights?: readonly number[];
   readonly dispose: () => void;
 }
 
@@ -203,6 +210,38 @@ export const loadActiveRanker = async (revision: RankerRevision): Promise<Active
       dispose: noopDispose,
     };
   }
+  if (selection.selectedKind === 'lightgbm_plus_online_lr') {
+    // Step 8 — combiner. Needs lgb + lr + combiner weights all
+    // present. Selector's isServeable guard should ensure this;
+    // the defensive checks fall back to graph_baseline on
+    // unexpected absence (same pattern as the LR path).
+    if (
+      revision.logisticBatchWeights === undefined ||
+      revision.combinerWeights === undefined
+    ) {
+      return {
+        selection: {
+          ...selection,
+          selectedKind: 'graph_baseline',
+          reason: 'fallback_graph_baseline',
+          reservedTestNdcgAt5: null,
+        },
+        revisionId: revision.revisionId,
+        dispose: noopDispose,
+      };
+    }
+    const lightgbm = await loadRankerModel(revision);
+    return {
+      selection,
+      revisionId: revision.revisionId,
+      lightgbm,
+      logisticBatchWeights: revision.logisticBatchWeights,
+      combinerWeights: revision.combinerWeights,
+      dispose: () => {
+        lightgbm.dispose();
+      },
+    };
+  }
   // graph_baseline (the deterministic fallback) — no state to load.
   return {
     selection,
@@ -231,6 +270,32 @@ export const predictActive = (
   }
   if (kind === 'logistic_batch' && handle.logisticBatchWeights !== undefined) {
     return { score: scoreLogisticBatch(features, handle.logisticBatchWeights), kind };
+  }
+  if (
+    kind === 'lightgbm_plus_online_lr' &&
+    handle.lightgbm !== undefined &&
+    handle.logisticBatchWeights !== undefined &&
+    handle.combinerWeights !== undefined
+  ) {
+    // Compose per-artifact scores in the SAME order the trainer
+    // built `COMBINER_FEATURE_KINDS`. Any reordering breaks the
+    // weight↔input alignment.
+    const inputs: number[] = [];
+    for (const inputKind of COMBINER_FEATURE_KINDS) {
+      if (inputKind === 'lightgbm_lambdamart') {
+        inputs.push(predictRanker(features, handle.lightgbm).score);
+      } else if (inputKind === 'logistic_batch') {
+        inputs.push(scoreLogisticBatch(features, handle.logisticBatchWeights));
+      } else if (inputKind === 'graph_baseline') {
+        inputs.push(deterministicBaselineScore(features));
+      }
+    }
+    const combined = scoreCombiner(inputs, handle.combinerWeights);
+    if (Number.isFinite(combined)) {
+      return { score: combined, kind };
+    }
+    // Shape mismatch — fall through to baseline rather than serve
+    // NaN. (scoreCombiner returns NaN on dimension mismatch.)
   }
   // graph_baseline OR a degraded fallback the loader emitted on
   // missing state.

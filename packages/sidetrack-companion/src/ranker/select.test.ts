@@ -143,4 +143,47 @@ describe('selectActiveRanker', () => {
     // breaks to LightGBM.
     expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
   });
+
+  it('picks the combiner (lightgbm_plus_online_lr) when it passes + beats other artifacts (Step 8)', () => {
+    const revision = baseRevision({
+      logisticBatchWeights: Array.from({ length: RANKER_FEATURE_KEYS.length + 1 }, () => 0),
+      logisticBatchFeatureStatsVersion: 'no-normalization-v1',
+      combinerWeights: [0.1, 0.5, 0.3, 0.2], // bias + 3 per-kind
+      artifactQuality: [
+        artifact('graph_baseline', 'pass', 0.55),
+        artifact('logistic_batch', 'pass', 0.6),
+        artifact('lightgbm_lambdamart', 'pass', 0.7),
+        artifact('lightgbm_plus_online_lr', 'pass', 0.78), // best
+      ],
+    });
+    expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_plus_online_lr');
+  });
+
+  it('refuses to pick the combiner when combinerWeights are absent', () => {
+    // Defensive: a pass-gate artifact without persisted state can't
+    // serve. Same shape as the LR-without-weights test, applied to
+    // the combiner.
+    const revision = baseRevision({
+      logisticBatchWeights: Array.from({ length: RANKER_FEATURE_KEYS.length + 1 }, () => 0),
+      logisticBatchFeatureStatsVersion: 'no-normalization-v1',
+      // no combinerWeights
+      artifactQuality: [
+        artifact('lightgbm_lambdamart', 'pass', 0.7),
+        artifact('lightgbm_plus_online_lr', 'pass', 0.78),
+      ],
+    });
+    expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
+  });
+
+  it('refuses to pick the combiner when LR weights are absent (combiner needs lgb + lr + weights)', () => {
+    const revision = baseRevision({
+      // no logisticBatchWeights → combiner can't compose its input scores
+      combinerWeights: [0.1, 0.5, 0.3, 0.2],
+      artifactQuality: [
+        artifact('lightgbm_lambdamart', 'pass', 0.7),
+        artifact('lightgbm_plus_online_lr', 'pass', 0.78),
+      ],
+    });
+    expect(selectActiveRanker(revision).selectedKind).toBe('lightgbm_lambdamart');
+  });
 });

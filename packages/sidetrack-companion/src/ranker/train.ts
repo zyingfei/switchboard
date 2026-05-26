@@ -247,6 +247,25 @@ export interface RankerTrainQuality {
 // loader refuses to score with mismatched normalization.
 export const LOGISTIC_BATCH_FEATURE_STATS_VERSION = 'no-normalization-v1' as const;
 
+// Step 8 — the combiner is a tiny logistic regression OVER per-artifact
+// scores. Inputs (in order): [lgb_score, logistic_batch_score,
+// graph_baseline_score]. Bias + 3 weights = 4 floats persisted on the
+// revision. The plan's broader combiner feature list includes
+// online_lr_score + container_negative_match, but online_lr is not yet
+// wired through the materializer (Steps 5-6 are pure modules), and
+// container_negative_match lives on the candidate row already (the
+// individual LightGBM/LR artifacts learn its weight). The 3-artifact
+// combiner is the minimum-viable cold-base + hot-head blend.
+export const COMBINER_FEATURE_KINDS = [
+  'lightgbm_lambdamart',
+  'logistic_batch',
+  'graph_baseline',
+] as const satisfies readonly RankerArtifactKind[];
+
+export type CombinerFeatureKind = (typeof COMBINER_FEATURE_KINDS)[number];
+
+export const COMBINER_FEATURE_COUNT = COMBINER_FEATURE_KINDS.length;
+
 export interface RankerRevision {
   readonly revisionId: string;
   readonly modelVersion: typeof RANKER_MODEL_VERSION;
@@ -269,6 +288,14 @@ export interface RankerRevision {
   // passes its ship-gate. Optional so older manifests stay readable.
   readonly logisticBatchWeights?: readonly number[];
   readonly logisticBatchFeatureStatsVersion?: typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION;
+  // Step 8 — combiner weights: bias + per-COMBINER_FEATURE_KIND
+  // (4 floats total). Fit on the held-out validation set via a tiny
+  // LR over [lgb_score, lr_batch_score, baseline_score, label]. At
+  // serve time, each input artifact's score is computed and dot-
+  // producted with these weights → final combiner score. Persisted
+  // only when the combiner trains (needs ≥1 valid validation row +
+  // both lgb and lr weights present).
+  readonly combinerWeights?: readonly number[];
 }
 
 export interface RankerTrainingCandidate {
@@ -1032,6 +1059,61 @@ export const scoreLogisticBatch = (
   weights: readonly number[],
 ): number => sigmoid(dotWithBias(weights, logisticFeatureVector(features)));
 
+// Step 8 — combiner. Tiny LR over per-artifact scores. The training
+// helper mirrors `trainRegularizedLogisticRegression` (same SGD +
+// L2 + iteration shape) but works on raw score vectors instead of
+// CandidatePairFeatures-keyed rows.
+const trainCombinerLogisticRegression = (
+  scoreVectors: readonly (readonly number[])[],
+  labels: readonly number[],
+): readonly number[] | undefined => {
+  if (scoreVectors.length === 0 || scoreVectors.length !== labels.length) return undefined;
+  const featureCount = scoreVectors[0]?.length ?? 0;
+  if (featureCount === 0) return undefined;
+  // Refuse-to-fit if any row's vector has the wrong shape (defensive
+  // — caller should pass uniform-length vectors).
+  for (const vector of scoreVectors) {
+    if (vector.length !== featureCount) return undefined;
+  }
+  const weights = new Array(featureCount + 1).fill(0) as number[];
+  const learningRate = 0.08;
+  const l2 = 0.01;
+  const iterations = 120;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const gradients = new Array(weights.length).fill(0) as number[];
+    for (let rowIndex = 0; rowIndex < scoreVectors.length; rowIndex += 1) {
+      const vector = scoreVectors[rowIndex];
+      const label = labels[rowIndex];
+      if (vector === undefined || label === undefined) continue;
+      const target = label > 0 ? 1 : 0;
+      const error = sigmoid(dotWithBias(weights, vector)) - target;
+      gradients[0] = (gradients[0] ?? 0) + error;
+      for (let f = 0; f < vector.length; f += 1) {
+        gradients[f + 1] = (gradients[f + 1] ?? 0) + error * (vector[f] ?? 0);
+      }
+    }
+    for (let i = 0; i < weights.length; i += 1) {
+      const reg = i === 0 ? 0 : l2 * (weights[i] ?? 0);
+      weights[i] = (weights[i] ?? 0) - learningRate * ((gradients[i] ?? 0) / scoreVectors.length + reg);
+    }
+  }
+  return weights;
+};
+
+// Step 8 — single-row combiner score. The serving dispatch composes
+// per-artifact scores then applies these weights. Vector layout
+// matches `COMBINER_FEATURE_KINDS`.
+export const scoreCombiner = (
+  combinerInputs: readonly number[],
+  weights: readonly number[],
+): number => {
+  if (weights.length !== combinerInputs.length + 1) {
+    // Shape mismatch — refuse to score (caller falls back per dispatch).
+    return Number.NaN;
+  }
+  return sigmoid(dotWithBias(weights, combinerInputs));
+};
+
 // Step 6 — exported so the online pairwise update (RankNet) module
 // can call into the same feature-vectorization the batch LR uses.
 // Keeping one definition keeps online and batch paths bytewise
@@ -1471,6 +1553,105 @@ export const trainRankerRevisionFromRows = async (
         `regularized logistic regression reserved-test ndcg@${String(RANKER_HELD_OUT_NDCG_K)}`,
         logisticReservedTestValue,
       );
+
+      // Step 8 — combiner artifact (lightgbm_plus_online_lr kind in
+      // the registry, named for the plan's eventual addition of
+      // online_lr inputs — for now the combiner mixes lgb + batch LR
+      // + baseline only).
+      //
+      // Fit weights on the validation split: per heldOut row, build
+      // [lgb_validation_score, lr_validation_score, baseline_validation_score]
+      // and label = row.label > 0 ? 1 : 0. Tiny LR (same shape as the
+      // batch LR's trainer, narrower input). Score the reserved-test
+      // split with the same shape to compute the combiner's
+      // reservedTestNdcg.
+      //
+      // The combiner only emits when the inputs all exist (lgb scored
+      // both splits, LR weights present, baseline always available).
+      // Missing inputs ⇒ no combiner weights, no entry in the
+      // artifactQuality array. The selector then can't pick the
+      // combiner kind; falls through to the next-best artifact.
+      let combinerWeights: readonly number[] | undefined;
+      let combinerValidationMetric: RankerMetric | undefined;
+      let combinerReservedTestMetric: RankerMetric | undefined;
+      const baselineValidationScores =
+        heldOutEval === null ? undefined : deterministicBaselineScores(heldOutEval.rows);
+      const baselineReservedTestScores =
+        testEval === null ? undefined : deterministicBaselineScores(testEval.rows);
+      const canTrainCombiner =
+        heldOutEval !== null &&
+        heldOutEval.scores.length === heldOutEval.rows.length &&
+        logisticValidationScores !== undefined &&
+        baselineValidationScores !== undefined &&
+        logisticWeights !== undefined;
+      if (canTrainCombiner && heldOutEval !== null) {
+        const lgbHeld = heldOutEval.scores;
+        const lrHeld = logisticValidationScores;
+        const baseHeld = baselineValidationScores;
+        const combinerScoreVectors: number[][] = [];
+        const combinerLabels: number[] = [];
+        for (let i = 0; i < heldOutEval.rows.length; i += 1) {
+          const lgb = lgbHeld?.[i];
+          const lr = lrHeld?.[i];
+          const base = baseHeld?.[i];
+          if (lgb === undefined || lr === undefined || base === undefined) continue;
+          const row = heldOutEval.rows[i];
+          if (row === undefined) continue;
+          combinerScoreVectors.push([lgb, lr, base]);
+          combinerLabels.push(row.label);
+        }
+        combinerWeights = trainCombinerLogisticRegression(combinerScoreVectors, combinerLabels);
+        if (combinerWeights !== undefined) {
+          const combinerHeldScores = combinerScoreVectors.map((vector) =>
+            scoreCombiner(vector, combinerWeights ?? []),
+          );
+          if (combinerHeldScores.every((value) => Number.isFinite(value))) {
+            combinerValidationMetric = metric(
+              `combiner validation ndcg@${String(RANKER_HELD_OUT_NDCG_K)}`,
+              ndcgForGroupedRows(
+                heldOutEval.rows,
+                heldOutEval.groupSizes,
+                combinerHeldScores,
+                RANKER_HELD_OUT_NDCG_K,
+              ),
+            );
+          }
+          if (
+            testEval !== null &&
+            logisticReservedTestScores !== undefined &&
+            baselineReservedTestScores !== undefined
+          ) {
+            const lgbTest = testEval.scores;
+            const lrTest = logisticReservedTestScores;
+            const baseTest = baselineReservedTestScores;
+            const combinerTestScoreVectors: number[][] = [];
+            for (let i = 0; i < testEval.rows.length; i += 1) {
+              const lgb = lgbTest?.[i];
+              const lr = lrTest?.[i];
+              const base = baseTest?.[i];
+              if (lgb === undefined || lr === undefined || base === undefined) continue;
+              combinerTestScoreVectors.push([lgb, lr, base]);
+            }
+            const combinerTestScores = combinerTestScoreVectors.map((vector) =>
+              scoreCombiner(vector, combinerWeights ?? []),
+            );
+            if (
+              combinerTestScores.every((value) => Number.isFinite(value)) &&
+              combinerTestScores.length === testEval.rows.length
+            ) {
+              combinerReservedTestMetric = metric(
+                `combiner reserved-test ndcg@${String(RANKER_HELD_OUT_NDCG_K)}`,
+                ndcgForGroupedRows(
+                  testEval.rows,
+                  testEval.groupSizes,
+                  combinerTestScores,
+                  RANKER_HELD_OUT_NDCG_K,
+                ),
+              );
+            }
+          }
+        }
+      }
       const novelSlice =
         heldOutEval === null
           ? { rows: [], groupSizes: [], scores: [] }
@@ -1673,6 +1854,31 @@ export const trainRankerRevisionFromRows = async (
             novelCounts.positiveRows,
           ),
         },
+        // Step 8 — combiner artifact. Only emit when training actually
+        // produced weights; without them the selector can't pick this
+        // kind anyway, and an entry with an undefined metric reads as
+        // unavailable rather than fail (which would mislead).
+        ...(combinerWeights === undefined
+          ? []
+          : ([
+              {
+                kind: 'lightgbm_plus_online_lr' as const,
+                candidate: 'combiner:lgb+lr_batch+graph_baseline',
+                ...(combinerValidationMetric === undefined
+                  ? {}
+                  : { validationMetric: combinerValidationMetric }),
+                ...(combinerReservedTestMetric === undefined
+                  ? {}
+                  : { reservedTestMetric: combinerReservedTestMetric }),
+                shipGate: artifactShipGate(
+                  'lightgbm_plus_online_lr',
+                  combinerValidationMetric,
+                  combinerReservedTestMetric,
+                  baselineValidationMetric,
+                  novelCounts.positiveRows,
+                ),
+              },
+            ] satisfies readonly RankerArtifactQuality[])),
       ];
       const trainQuality: RankerTrainQuality = {
         gradeHistogram: gradeHistogramForRows(rows),
@@ -1710,6 +1916,11 @@ export const trainRankerRevisionFromRows = async (
               logisticBatchWeights: [...logisticWeights],
               logisticBatchFeatureStatsVersion: LOGISTIC_BATCH_FEATURE_STATS_VERSION,
             }),
+        // Step 8 — persist combiner weights (4 floats: bias + per-
+        // COMBINER_FEATURE_KIND) so the selector + dispatch can
+        // route serving through the blend. Only present when the
+        // combiner trained successfully.
+        ...(combinerWeights === undefined ? {} : { combinerWeights: [...combinerWeights] }),
       };
     } finally {
       booster.dispose();

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import {
+  COMBINER_FEATURE_COUNT,
   DETERMINISTIC_BASELINE_VERSION,
   LOGISTIC_BATCH_FEATURE_STATS_VERSION,
   RANKER_FEATURE_KEYS,
@@ -52,6 +53,13 @@ export interface ClosestVisitRankerRevisionManifest {
    */
   readonly logisticBatchWeights?: readonly number[];
   readonly logisticBatchFeatureStatsVersion?: typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION;
+  /**
+   * Step 8 — combiner weights (bias + per-COMBINER_FEATURE_KIND, 4
+   * floats total). Serving applies these to per-artifact scores
+   * computed from the same revision's lgb + lr_batch + baseline.
+   * Optional with lenient parse so older manifests stay readable.
+   */
+  readonly combinerWeights?: readonly number[];
 }
 
 export interface ClosestVisitRankerRevisionManifestProbe {
@@ -113,6 +121,9 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     ...(revision.logisticBatchFeatureStatsVersion === undefined
       ? {}
       : { logisticBatchFeatureStatsVersion: revision.logisticBatchFeatureStatsVersion }),
+    ...(revision.combinerWeights === undefined
+      ? {}
+      : { combinerWeights: revision.combinerWeights }),
   };
 };
 
@@ -647,6 +658,22 @@ const normalizeLogisticBatchFeatureStatsVersion = (
 ): typeof LOGISTIC_BATCH_FEATURE_STATS_VERSION | undefined =>
   value === LOGISTIC_BATCH_FEATURE_STATS_VERSION ? value : undefined;
 
+// Combiner weights (Step 8) = bias + per-COMBINER_FEATURE_KIND
+// (4 floats total). Length mismatch or any non-finite entry drops
+// the whole vector so the selector falls back to a singleton
+// artifact rather than scoring against a stale-shape combiner.
+const COMBINER_WEIGHTS_LENGTH = COMBINER_FEATURE_COUNT + 1;
+const normalizeCombinerWeights = (value: unknown): readonly number[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length !== COMBINER_WEIGHTS_LENGTH) return undefined;
+  const out: number[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'number' || !Number.isFinite(entry)) return undefined;
+    out.push(entry);
+  }
+  return out;
+};
+
 // Coerce a validated manifest record into the typed shape, normalizing
 // the optional `trainQuality` + `artifactQuality` + LR weights (drop
 // if malformed/absent — none of these gate scoring on their own).
@@ -670,6 +697,9 @@ const finalizeManifest = (
   // so the selector treats LR as absent rather than mis-scoring.
   const lrUsable =
     logisticBatchWeights !== undefined && logisticBatchFeatureStatsVersion !== undefined;
+  const combinerWeights = normalizeCombinerWeights(
+    (value as { readonly combinerWeights?: unknown }).combinerWeights,
+  );
   return {
     revisionId: value.revisionId,
     modelVersion: value.modelVersion,
@@ -686,6 +716,7 @@ const finalizeManifest = (
           logisticBatchFeatureStatsVersion,
         }
       : {}),
+    ...(combinerWeights === undefined ? {} : { combinerWeights }),
   };
 };
 
@@ -821,6 +852,14 @@ export const readClosestVisitRankerRevision = async (
         : {
             logisticBatchFeatureStatsVersion: manifest.logisticBatchFeatureStatsVersion,
           }),
+      // Step 8 — propagate the combiner weights through the
+      // full-revision loader for the same reason the prior fields
+      // do (Codex review of #229). Without this the selector sees
+      // `combinerWeights === undefined` on reload and can't pick
+      // `lightgbm_plus_online_lr`.
+      ...(manifest.combinerWeights === undefined
+        ? {}
+        : { combinerWeights: manifest.combinerWeights }),
     };
   } catch {
     return null;
