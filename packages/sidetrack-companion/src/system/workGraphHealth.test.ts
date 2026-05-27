@@ -184,12 +184,11 @@ describe('work graph diagnostic candidates', () => {
           revisionId: 'topic-rev-active',
           asOf: '2026-05-16T12:00:00.000Z',
         }),
-        expect.objectContaining({
-          id: 'topic.hdbscan-standby',
-          lane: 'standby',
-          servingImpact: 'not-serving',
-          status: 'off',
-        }),
+        // Health-panel cleanup 2026-05-26: topic.hdbscan-standby is
+        // perpetually status=off + no-production-selector → filtered
+        // from the candidates response to reduce noise. Re-add to the
+        // unfiltered ID set in workGraphHealth.ts:isStaleDiagnostic if
+        // it ever becomes meaningful.
         expect.objectContaining({
           id: 'topic.shadow-idf-rkn-split',
           lane: 'shadow',
@@ -247,14 +246,18 @@ describe('work graph diagnostic candidates', () => {
           status: 'ok',
           reason: 'child-process',
         }),
-        expect.objectContaining({
-          id: 'quality.gray-zone-scorer',
-          family: 'quality',
-          status: 'off',
-          reason: 'no-runtime-model-injection',
-        }),
+        // Health-panel cleanup 2026-05-26: quality.gray-zone-scorer is
+        // perpetually status=off → filtered from the candidates response.
       ]),
     );
+  });
+
+  it('filters out perpetually-off diagnostic candidates from the response', async () => {
+    const filteredIds = ['topic.hdbscan-standby', 'topic.algorithm-comparison', 'quality.gray-zone-scorer'];
+    const health = await collectWorkGraphHealth({ vaultRoot, now: () => new Date('2026-05-16T13:00:00.000Z') });
+    for (const id of filteredIds) {
+      expect(health.candidates.some((c) => c.id === id)).toBe(false);
+    }
   });
 
   it('warns on content-lane backlog only when an age threshold is tripped', async () => {

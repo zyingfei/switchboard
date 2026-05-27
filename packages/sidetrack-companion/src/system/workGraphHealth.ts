@@ -548,7 +548,26 @@ const buildDiagnosticCandidates = (input: {
   const hotTop = hotPath !== null && isRecord(hotPath['topics']) ? hotPath['topics'] : null;
   const runnerMode = reconcileRunnerMode();
 
-  return [
+  // Health-panel cleanup (2026-05-26): filter out perpetually-off
+  // diagnostic candidates so the panel only renders meaningful state.
+  // Set ids stay defined here for telemetry; the array is filtered at
+  // the bottom of this function. Adding a new always-off candidate?
+  // Add it to the predicate below too.
+  const alwaysOffCandidateIds = new Set([
+    'topic.hdbscan-standby',          // status=off, no-production-selector
+    'topic.algorithm-comparison',      // status=off, no-runtime-route
+    'quality.gray-zone-scorer',        // status=off, no-runtime-model-injection
+  ]);
+  const isStaleDiagnostic = (cand: DiagnosticCandidate): boolean => {
+    if (alwaysOffCandidateIds.has(cand.id)) return true;
+    // Shadow producer that nobody enabled — pure noise.
+    if (cand.id === 'topic.shadow-idf-rkn-split' && cand.status === 'unavailable') return true;
+    // Legacy methodology spine when not populated (shipGateV2 owns this surface now).
+    if (cand.id === 'ranker.methodology-spine' && cand.status === 'unavailable') return true;
+    return false;
+  };
+
+  const allCandidates: readonly DiagnosticCandidate[] = [
     {
       id: 'topic.active-producer',
       family: 'topic',
@@ -856,6 +875,8 @@ const buildDiagnosticCandidates = (input: {
       metrics: metrics({ learnedModelLoaded: false }),
     },
   ];
+
+  return allCandidates.filter((c) => !isStaleDiagnostic(c));
 };
 
 export const collectWorkGraphHealth = async ({

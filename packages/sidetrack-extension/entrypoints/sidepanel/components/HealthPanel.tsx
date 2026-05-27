@@ -205,6 +205,20 @@ interface WorkGraphHealth {
   readonly ranker: WorkGraphRankerHealth;
   readonly topicProducer?: WorkGraphTopicProducerHealth;
   readonly candidates?: readonly DiagnosticCandidate[];
+  // PR A / Phase 4 — v2 retrieval stack canonical vector counts. The
+  // panel prefers these over legacy chat-turn entry count because
+  // /v2/recall actually serves from sqlite-vec (docs + chunks); the
+  // chat-turn index is one source among several.
+  readonly recall?: {
+    readonly retrievalBackend?: string;
+    readonly vectorStore?: string;
+    readonly fusionImplementation?: string;
+    readonly crossEncoder?: { readonly enabled: boolean; readonly rerankTopK: number };
+    readonly canonicalVectorCounts?: {
+      readonly documentVectorCount: number;
+      readonly chunkVectorCount: number;
+    };
+  };
 }
 
 interface HealthReport {
@@ -818,16 +832,33 @@ export function HealthPanel({
               ? 'ok'
               : 'idle';
     const rebuildPhaseTag = report.recall.rebuildPhase ? `[${report.recall.rebuildPhase}] ` : '';
+    // Health-panel cleanup 2026-05-26: prefer v2 canonical vector counts
+    // (what /v2/recall actually serves from) over the legacy chat-turn
+    // index entry count. The chat-turn count was previously the only
+    // number rendered ("9134 vectors") which misled — that's just one
+    // store; v2 also has document + chunk vectors in sqlite-vec.
+    const canonical = report.workGraph?.recall?.canonicalVectorCounts;
+    const docVec = canonical?.documentVectorCount ?? 0;
+    const chunkVec = canonical?.chunkVectorCount ?? 0;
+    const chatTurnCount = report.recall.entryCount ?? 0;
+    const v2Summary =
+      canonical !== undefined
+        ? `${formatCount(docVec)} docs · ${formatCount(chunkVec)} chunks · ${formatCount(chatTurnCount)} chat`
+        : `${formatCount(chatTurnCount)} chat turns`;
     const recallDetail =
       recallStatus === 'rebuilding'
         ? report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
           ? `rebuilding ${rebuildPhaseTag}${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
           : `rebuilding ${rebuildPhaseTag}…`
         : recallStatus === undefined
-          ? `${formatCount(report.recall.entryCount)} vectors`
-          : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
+          ? v2Summary
+          : `${recallStatus} · ${v2Summary}`;
     const recallHead =
-      recallStatus === 'rebuilding' ? 'Rebuilding' : `${formatCount(report.recall.entryCount)} vec`;
+      recallStatus === 'rebuilding'
+        ? 'Rebuilding'
+        : canonical !== undefined
+          ? `${formatCount(docVec + chunkVec)} vec`
+          : `${formatCount(chatTurnCount)} vec`;
 
     // Ranker — driven by workGraph.ranker. Honest training mix: never
     // the raw negative count alone; the labeled triple + dataset-
