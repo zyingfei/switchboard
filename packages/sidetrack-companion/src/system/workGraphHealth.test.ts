@@ -7,11 +7,13 @@ import { createConnectionsStore } from '../connections/snapshot.js';
 import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { projectFeedback } from '../feedback/projection.js';
+import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
 } from '../producers/topic-revision.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import { fingerprintFeedbackTrainingLabels } from '../ranker/retrain.js';
 import { RANKER_MODEL_VERSION } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -305,6 +307,37 @@ describe('work graph diagnostic candidates', () => {
             dirtySourceCount: 0,
             oldestDirtySourceAgeMs: 600_001,
           }),
+        }),
+      ]),
+    );
+  });
+
+  it('marks v6 legacy-trained ranker manifests invalid', async () => {
+    await writeActiveClosestVisitRankerRevision(vaultRoot, {
+      revisionId: 'legacy-v6',
+      modelVersion: RANKER_MODEL_VERSION,
+      featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      trainingDatasetHash: 'b'.repeat(64),
+      trainedAt: Date.parse('2026-05-16T13:10:00.000Z'),
+      trainedFromImpressions: false,
+      modelBytes: new ArrayBuffer(4),
+    });
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T13:15:00.000Z'),
+    });
+
+    expect(health.ranker).toMatchObject({
+      loadStatus: 'invalid-model',
+      loadReason: 'v6_from_legacy_blocked',
+    });
+    expect(health.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'ranker.active-model',
+          status: 'alarm',
+          reason: 'v6_from_legacy_blocked',
         }),
       ]),
     );

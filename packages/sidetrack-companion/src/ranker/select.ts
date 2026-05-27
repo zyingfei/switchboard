@@ -60,9 +60,15 @@ const kindRank = (kind: RankerArtifactKind): number => {
 // with this artifact. A ship-gate `pass` is necessary but not
 // sufficient — if the LR weights weren't persisted (older revision)
 // the selector can't pick `logistic_batch` even if its gate passed.
-const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolean => {
+export const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolean => {
   if (kind === 'graph_baseline') return true;
-  if (kind === 'lightgbm_lambdamart') return revision.modelBytes.byteLength > 0;
+  if (kind === 'lightgbm_lambdamart') {
+    const sourceAllowed =
+      revision.modelVersion === 'lightgbm-lambdamart-v6'
+        ? revision.trainedFromImpressions === true
+        : true;
+    return revision.modelBytes.byteLength > 0 && sourceAllowed;
+  }
   if (kind === 'logistic_batch') {
     return (
       revision.logisticBatchWeights !== undefined &&

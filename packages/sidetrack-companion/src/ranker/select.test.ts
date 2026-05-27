@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { FEATURE_SCHEMA_VERSION } from './feature-schema.js';
-import { selectActiveRanker } from './select.js';
+import { isServeable, selectActiveRanker } from './select.js';
 import {
   COMBINER_FEATURE_KINDS,
   composeCombinerVector,
@@ -22,6 +22,7 @@ const baseRevision = (overrides: Partial<RankerRevision> = {}): RankerRevision =
   featureSchemaVersion: FEATURE_SCHEMA_VERSION,
   trainingDatasetHash: 'a'.repeat(64),
   trainedAt: 1779000000000,
+  trainedFromImpressions: true,
   modelBytes: new ArrayBuffer(64), // non-zero so isServeable(lightgbm) holds
   ...overrides,
 });
@@ -120,6 +121,19 @@ describe('selectActiveRanker', () => {
     });
 
     expect(selectActiveRanker(revision).selectedKind).toBe('graph_baseline');
+  });
+
+  it('refuses v6 LightGBM revisions trained from legacy rows', () => {
+    const revision = baseRevision({
+      trainedFromImpressions: false,
+      artifactQuality: [artifact('lightgbm_lambdamart', 'pass', 0.8)],
+    });
+
+    expect(isServeable('lightgbm_lambdamart', revision)).toBe(false);
+    expect(selectActiveRanker(revision)).toMatchObject({
+      selectedKind: 'graph_baseline',
+      reason: 'fallback_graph_baseline',
+    });
   });
 
   it('falls back when artifactQuality is missing (legacy revision)', () => {

@@ -58,6 +58,7 @@ export interface WorkGraphHealthReport {
   readonly ranker: {
     readonly activeRevisionId: string | null;
     readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
+    readonly loadReason: string | null;
     readonly activeModelVersion: string | null;
     readonly expectedModelVersion: string;
     readonly activeFeatureSchemaVersion: number | null;
@@ -584,15 +585,17 @@ const buildDiagnosticCandidates = (input: {
       servingImpact: rankerActiveModelServingImpact(input.ranker),
       status: candidateStatusForRankerLoad(input.ranker.loadStatus),
       reason:
-        input.ranker.loadStatus === 'ready'
+        input.ranker.loadReason ??
+        (input.ranker.loadStatus === 'ready'
           ? null
           : input.ranker.loadStatus === 'missing'
             ? 'no-active-manifest'
-            : 'invalid-active-model',
+            : 'invalid-active-model'),
       revisionId: input.ranker.activeRevisionId,
       asOf: rankerObservedAt,
       metrics: metrics({
         loadStatus: input.ranker.loadStatus,
+        loadReason: input.ranker.loadReason,
         activeModelVersion: input.ranker.activeModelVersion,
         expectedModelVersion: input.ranker.expectedModelVersion,
         activeFeatureSchemaVersion: input.ranker.activeFeatureSchemaVersion,
@@ -814,6 +817,9 @@ export const collectWorkGraphHealth = async ({
     activeManifest === null
       ? null
       : await readClosestVisitRankerRevision(vaultRoot, activeManifest.revisionId);
+  const activeV6FromLegacy =
+    activeManifest?.modelVersion === 'lightgbm-lambdamart-v6' &&
+    activeManifest.trainedFromImpressions === false;
   const retrainPlan = planRankerRetrain({ fingerprint, state: retrainState });
   const gradeHistogram = (
     activeRevision as { trainQuality?: { gradeHistogram?: Record<string, number> } } | null
@@ -871,9 +877,19 @@ export const collectWorkGraphHealth = async ({
         ? activeManifestProbe === null
           ? 'missing'
           : 'invalid-model'
-        : activeRevision === null
+        : activeRevision === null || activeV6FromLegacy
           ? 'invalid-model'
           : 'ready',
+    loadReason:
+      activeManifest === null
+        ? activeManifestProbe === null
+          ? 'no-active-manifest'
+          : 'invalid-active-model'
+        : activeV6FromLegacy
+          ? 'v6_from_legacy_blocked'
+          : activeRevision === null
+            ? 'invalid-active-model'
+            : null,
     activeModelVersion:
       activeManifestProbe?.activeModelVersion ?? activeManifest?.modelVersion ?? null,
     expectedModelVersion:

@@ -203,6 +203,7 @@ const fakeRevision = (trainingDatasetHash: string): RankerRevision => ({
   featureSchemaVersion: FEATURE_SCHEMA_VERSION,
   trainingDatasetHash,
   trainedAt: observedAtMs,
+  trainedFromImpressions: false,
   modelBytes: new ArrayBuffer(4),
 });
 
@@ -613,6 +614,7 @@ describe('ranker retraining loop', () => {
     });
 
     expect(revision.trainQuality).toBeDefined();
+    expect(revision.trainedFromImpressions).toBe(false);
     const histogram = revision.trainQuality?.gradeHistogram;
     expect(histogram).toMatchObject({ '0': 2, '1': 2 });
     expect(revision.trainQuality?.candidateLabeling).toMatchObject({

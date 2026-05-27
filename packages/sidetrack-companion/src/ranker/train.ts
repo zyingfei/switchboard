@@ -290,6 +290,7 @@ export interface RankerRevision {
   readonly featureSchemaVersion: typeof FEATURE_SCHEMA_VERSION;
   readonly trainingDatasetHash: string;
   readonly trainedAt: number;
+  readonly trainedFromImpressions: boolean;
   readonly modelBytes: ArrayBuffer;
   readonly trainQuality?: RankerTrainQuality;
   // Per-artifact quality + ship-gate records. One entry per artifact the
@@ -1457,6 +1458,7 @@ export const trainRankerRevisionFromRows = async (
   options: TrainRankerOptions = {},
   labelingSummary: RankerTrainingLabelingSummary = defaultLabelingSummary(rowsInput),
   explicitGroups?: readonly UsableRankerRowGroup[],
+  trainedFromImpressions = false,
 ): Promise<RankerRevision> => {
   const allGroups = explicitGroups ?? usableRowGroups(rowsInput);
   if (allGroups.length === 0) {
@@ -1977,6 +1979,7 @@ export const trainRankerRevisionFromRows = async (
         featureSchemaVersion: FEATURE_SCHEMA_VERSION,
         trainingDatasetHash,
         trainedAt: options.trainedAt ?? maxGeneratedAt(rowsInput),
+        trainedFromImpressions,
         modelBytes: toOwnedArrayBuffer(booster.saveModel()),
         trainQuality,
         artifactQuality,
@@ -2021,7 +2024,7 @@ export const trainRankerRevisionFromGroups = async (
       generatedAt: group.generatedAt,
     }));
   const rows = internalGroups.flatMap((group) => group.rows);
-  return trainRankerRevisionFromRows(rows, options, labelingSummary, internalGroups);
+  return trainRankerRevisionFromRows(rows, options, labelingSummary, internalGroups, true);
 };
 
 export const trainRankerRevision = async (input: TrainRankerInput): Promise<RankerRevision> =>

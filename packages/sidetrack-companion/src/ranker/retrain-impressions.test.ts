@@ -275,6 +275,7 @@ describe('recall impression training groups', () => {
 
     expect(result.status).toBe('trained');
     if (result.status !== 'trained') throw new Error('expected trained result');
+    expect(result.revision.trainedFromImpressions).toBe(true);
     expect(result.revision.trainQuality?.methodologySpine?.shipGate).toMatchObject({
       reservedTestUsedExactlyOnce: true,
     });
