@@ -54,6 +54,18 @@ const positiveFeatures = (): CandidatePairFeatures => ({
   content_quality_pair_min: 3,
   chunk_support_count: 2,
   max_chunk_pair_score: 0.7,
+  max_chunk_pair_vector_cosine: 0.8,
+  top3_mean_chunk_pair_vector_cosine: 0.7,
+  chunk_pair_vector_support_count: 2,
+  bm25_score: 0,
+  bm25_rank: 0,
+  dense_doc_score: 0,
+  dense_doc_rank: 0,
+  rrf_score: 0,
+  rrf_rank: 0,
+  graph_similarity_rank: 0,
+  candidate_source_flags: 0,
+  served_position: 0,
 });
 
 const negativeFeatures = (): CandidatePairFeatures => ({
@@ -91,6 +103,18 @@ const negativeFeatures = (): CandidatePairFeatures => ({
   content_quality_pair_min: 1,
   chunk_support_count: 0,
   max_chunk_pair_score: 0.1,
+  max_chunk_pair_vector_cosine: 0.1,
+  top3_mean_chunk_pair_vector_cosine: 0.1,
+  chunk_pair_vector_support_count: 0,
+  bm25_score: 0,
+  bm25_rank: 0,
+  dense_doc_score: 0,
+  dense_doc_rank: 0,
+  rrf_score: 0,
+  rrf_rank: 0,
+  graph_similarity_rank: 0,
+  candidate_source_flags: 0,
+  served_position: 0,
 });
 
 describe('rankNetPairwiseGradient — pure pair-shaped gradient', () => {
@@ -164,7 +188,11 @@ describe('applyPairwiseUpdate — vanilla SGD with L2 on non-bias slots', () => 
   });
 
   it('produces strictly NON-zero weights after a non-degenerate update', () => {
-    const w = applyPairwiseUpdateFromFeatures(zeroWeights(), positiveFeatures(), negativeFeatures());
+    const w = applyPairwiseUpdateFromFeatures(
+      zeroWeights(),
+      positiveFeatures(),
+      negativeFeatures(),
+    );
     const someNonZero = w.some((value) => value !== 0);
     expect(someNonZero).toBe(true);
   });
@@ -184,14 +212,24 @@ describe('applyPairwiseUpdate — vanilla SGD with L2 on non-bias slots', () => 
   });
 
   it('higher learningRate moves weights further toward the gradient direction', () => {
-    const slow = applyPairwiseUpdateFromFeatures(zeroWeights(), positiveFeatures(), negativeFeatures(), {
-      learningRate: 0.01,
-      l2: 0,
-    });
-    const fast = applyPairwiseUpdateFromFeatures(zeroWeights(), positiveFeatures(), negativeFeatures(), {
-      learningRate: 0.1,
-      l2: 0,
-    });
+    const slow = applyPairwiseUpdateFromFeatures(
+      zeroWeights(),
+      positiveFeatures(),
+      negativeFeatures(),
+      {
+        learningRate: 0.01,
+        l2: 0,
+      },
+    );
+    const fast = applyPairwiseUpdateFromFeatures(
+      zeroWeights(),
+      positiveFeatures(),
+      negativeFeatures(),
+      {
+        learningRate: 0.1,
+        l2: 0,
+      },
+    );
     // Per-feature, the fast update's weight magnitude should
     // dominate the slow update's. Pick the feature with the
     // largest |δ| (cosine_similarity = 0.95 − 0.05 = 0.9) and

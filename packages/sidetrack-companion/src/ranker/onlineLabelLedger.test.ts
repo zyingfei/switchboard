@@ -91,11 +91,7 @@ const organizedMove = (
   acceptedAtMs: baseAt + seq,
 });
 
-const organizedIgnore = (
-  replicaId: string,
-  seq: number,
-  itemId: string,
-): AcceptedEvent => ({
+const organizedIgnore = (replicaId: string, seq: number, itemId: string): AcceptedEvent => ({
   clientEventId: `organized-ignore-${replicaId}-${String(seq)}`,
   dot: { replicaId, seq },
   deps: {},
@@ -151,9 +147,7 @@ describe('replayLabelLedger — deterministic projection of feedback events', ()
   });
 
   it('extracts a positive label from USER_ORGANIZED_ITEM move (the dogfood case)', () => {
-    const labels = replayLabelLedger([
-      organizedMove('a', 1, 'visit-x', 'workstream-y'),
-    ]);
+    const labels = replayLabelLedger([organizedMove('a', 1, 'visit-x', 'workstream-y')]);
     expect(labels).toHaveLength(1);
     expect(labels[0]).toMatchObject({
       polarity: 'positive',
@@ -162,10 +156,9 @@ describe('replayLabelLedger — deterministic projection of feedback events', ()
     });
   });
 
-  it('does NOT extract a label from USER_ORGANIZED_ITEM ignore (container-negative expansion is a batch concern)', () => {
-    // Step 7 of the plan replaces the batch path's Cartesian
-    // container-negative expansion with a feature predicate. The
-    // online ledger stays pair-shaped end-to-end.
+  it('does NOT extract a label from USER_ORGANIZED_ITEM ignore', () => {
+    // Container-level negatives remain event-scoped and are not
+    // expanded by the online ledger.
     expect(replayLabelLedger([organizedIgnore('a', 1, 'visit-x')])).toEqual([]);
   });
 
@@ -223,10 +216,7 @@ describe('advanceFrontier — exactly-once per labelKey, monotone frontier', () 
     const empty = EMPTY_ONLINE_RANKER_STATE(33);
     const result = advanceFrontier(
       empty,
-      [
-        flowConfirmed('r', 1, 'visit-1', 'visit-2'),
-        flowConfirmed('r', 2, 'visit-3', 'visit-4'),
-      ],
+      [flowConfirmed('r', 1, 'visit-1', 'visit-2'), flowConfirmed('r', 2, 'visit-3', 'visit-4')],
       baseAt,
     );
     expect(result.state.updateCount).toBe(2);
@@ -331,10 +321,7 @@ describe('OnlineRankerState persistence', () => {
     const empty = EMPTY_ONLINE_RANKER_STATE(33);
     const populated = advanceFrontier(
       empty,
-      [
-        flowConfirmed('r', 1, 'visit-1', 'visit-2'),
-        flowConfirmed('r', 2, 'visit-3', 'visit-4'),
-      ],
+      [flowConfirmed('r', 1, 'visit-1', 'visit-2'), flowConfirmed('r', 2, 'visit-3', 'visit-4')],
       baseAt,
     ).state;
     await writeOnlineRankerState(root, populated);

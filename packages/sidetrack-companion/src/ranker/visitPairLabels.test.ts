@@ -1,22 +1,33 @@
-// closest_visit ranker label shaping. Workstream membership is scope,
-// not pairwise evidence: it must never mint positive labels or pair
-// candidates without an independent source.
+// closest_visit ranker label shaping. Container membership is scope,
+// not pairwise supervision: snapshot churn must not mint or rewrite
+// labels.
 
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { projectFeedback, type FeedbackProjection } from '../feedback/projection.js';
+import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { createEventLog } from '../sync/eventLog.js';
 import type { ConnectionEdge, ConnectionNode, ConnectionsSnapshot } from '../connections/types.js';
 
-import type { FeedbackProjection } from '../feedback/projection.js';
-
 import {
-  augmentFeedbackWithVisitPairLabels,
   buildRankerTrainingCandidates,
-  deriveNegativeVisitPairLabelsFromSnapshot,
   deriveVisitPairLabelsFromSnapshot,
+  fingerprintFeedbackTrainingLabels,
 } from './retrain.js';
 
 const TIMESTAMP = '2026-05-10T10:00:00.000Z';
+const TIMESTAMP_MS = Date.parse(TIMESTAMP);
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 const visitInstance = (id: string, canonicalUrl: string | undefined): ConnectionNode => ({
   id,
@@ -26,6 +37,24 @@ const visitInstance = (id: string, canonicalUrl: string | undefined): Connection
   lastSeenAt: TIMESTAMP,
   originReplicaIds: ['rep-1'],
   metadata: canonicalUrl === undefined ? {} : { canonicalUrl },
+});
+
+const timelineVisitNode = (canonicalUrl: string): ConnectionNode => ({
+  id: `timeline-visit:${canonicalUrl}`,
+  kind: 'timeline-visit',
+  label: canonicalUrl,
+  firstSeenAt: TIMESTAMP,
+  lastSeenAt: TIMESTAMP,
+  originReplicaIds: ['rep-1'],
+  metadata: { canonicalUrl },
+});
+
+const topicNode = (topicId: string): ConnectionNode => ({
+  id: `topic:${topicId}`,
+  kind: 'topic',
+  label: topicId,
+  originReplicaIds: ['rep-1'],
+  metadata: {},
 });
 
 const workstreamNode = (key: string): ConnectionNode => ({
@@ -50,6 +79,20 @@ const userAssertedEdge = (fromNodeId: string, toNodeId: string): ConnectionEdge 
   confidence: 'asserted',
 });
 
+const visitInWorkstreamEdge = (canonicalUrl: string, workstreamId: string): ConnectionEdge => ({
+  id: `edge:visit_in_workstream:timeline-visit:${canonicalUrl}:workstream:${workstreamId}`,
+  kind: 'visit_in_workstream',
+  fromNodeId: `timeline-visit:${canonicalUrl}`,
+  toNodeId: `workstream:${workstreamId}`,
+  observedAt: TIMESTAMP,
+  producedBy: {
+    source: 'event-log',
+    eventType: USER_ORGANIZED_ITEM,
+    dot: { replicaId: 'rep-1', seq: 1 },
+  },
+  confidence: 'asserted',
+});
+
 const snapshot = (
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
@@ -62,10 +105,32 @@ const snapshot = (
   edgeCount: edges.length,
 });
 
-const sortLabels = (labels: readonly { fromId: string; toId: string }[]) =>
-  [...labels]
-    .map(({ fromId, toId }) => `${fromId}|${toId}`)
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+const ignoreFromContainerEvent = (
+  seq: number,
+  itemId: string,
+  fromContainer: string,
+): AcceptedEvent => ({
+  clientEventId: `ignore-${String(seq)}`,
+  dot: { replicaId: 'rep-1', seq },
+  deps: {},
+  aggregateId: `feedback:${itemId}`,
+  type: USER_ORGANIZED_ITEM,
+  payload: {
+    payloadVersion: 1,
+    itemKind: 'canonical-url',
+    itemId,
+    action: 'ignore',
+    fromContainer,
+  },
+  acceptedAtMs: TIMESTAMP_MS + seq,
+});
+
+const labelIdentitySet = (feedback: FeedbackProjection): readonly string[] =>
+  [...feedback.positiveLabels.map((label) => `+|${label.fromId}|${label.toId}|${label.weight}`)]
+    .concat(
+      feedback.negativeLabels.map((label) => `-|${label.fromId}|${label.toId}|${label.weight}`),
+    )
+    .sort();
 
 describe('deriveVisitPairLabelsFromSnapshot', () => {
   it('does not mint positives from user-asserted workstream closure', () => {
@@ -84,190 +149,80 @@ describe('deriveVisitPairLabelsFromSnapshot', () => {
   });
 });
 
-describe('augmentFeedbackWithVisitPairLabels', () => {
-  it('returns the original feedback unchanged when the snapshot yields no pairs', () => {
-    const feedback = {
-      schemaVersion: 1 as const,
-      perItem: {},
-      containerByItem: {},
-      organizedItemsByContainer: {},
-      positiveLabels: [{ fromId: 'x', toId: 'y', weight: 1 }],
-      negativeLabels: [],
-    };
-    const result = augmentFeedbackWithVisitPairLabels(feedback, snapshot([], []));
-    expect(result).toBe(feedback);
+describe('ranker feedback label stability', () => {
+  it('keeps the same label set when snapshot container membership changes', () => {
+    const event = ignoreFromContainerEvent(1, 'https://example.test/a', 'workstream:active-focus');
+    const firstSnapshot = snapshot(
+      [
+        timelineVisitNode('https://example.test/a'),
+        timelineVisitNode('https://example.test/b'),
+        workstreamNode('active-focus'),
+      ],
+      [visitInWorkstreamEdge('https://example.test/b', 'active-focus')],
+    );
+    const changedSnapshot = snapshot(
+      [
+        timelineVisitNode('https://example.test/a'),
+        timelineVisitNode('https://example.test/c'),
+        timelineVisitNode('https://example.test/d'),
+        workstreamNode('active-focus'),
+      ],
+      [
+        visitInWorkstreamEdge('https://example.test/c', 'active-focus'),
+        visitInWorkstreamEdge('https://example.test/d', 'active-focus'),
+      ],
+    );
+
+    expect(firstSnapshot.edgeCount).not.toBe(changedSnapshot.edgeCount);
+
+    const first = projectFeedback([event]);
+    const second = projectFeedback([event]);
+
+    expect(first.negativeLabels).toHaveLength(1);
+    expect(second.negativeLabels).toHaveLength(1);
+    expect(labelIdentitySet(first)).toEqual(labelIdentitySet(second));
+    expect(fingerprintFeedbackTrainingLabels(first)).toEqual(
+      fingerprintFeedbackTrainingLabels(second),
+    );
   });
 
-  it('leaves positive labels unchanged even when the snapshot has same-workstream visits', () => {
-    const visitA = visitInstance(
-      'visit-instance:tses-1:1:https://example.test/a',
-      'https://example.test/a',
-    );
-    const visitB = visitInstance(
-      'visit-instance:tses-1:1:https://example.test/b',
-      'https://example.test/b',
-    );
-    const ws = workstreamNode('ws-1');
+  it('does not generate pairwise negatives from a container-level ignore event', async () => {
+    const anchorUrl = 'https://example.test/a';
+    const memberUrl = 'https://example.test/b';
+    const event = ignoreFromContainerEvent(1, anchorUrl, 'workstream:w1');
+    const feedback = projectFeedback([event]);
     const snap = snapshot(
-      [visitA, visitB, ws],
-      [userAssertedEdge(visitA.id, ws.id), userAssertedEdge(visitB.id, ws.id)],
+      [timelineVisitNode(anchorUrl), timelineVisitNode(memberUrl), workstreamNode('w1')],
+      [visitInWorkstreamEdge(memberUrl, 'w1')],
     );
-    const feedback = {
-      schemaVersion: 1 as const,
-      perItem: {},
-      containerByItem: {},
-      organizedItemsByContainer: {},
-      positiveLabels: [{ fromId: 'pre-existing-from', toId: 'pre-existing-to', weight: 1 }],
-      negativeLabels: [],
-    };
-    const result = augmentFeedbackWithVisitPairLabels(feedback, snap);
-    expect(result.positiveLabels).toEqual(feedback.positiveLabels);
-  });
-});
 
-const timelineVisitNode = (canonicalUrl: string): ConnectionNode => ({
-  id: `timeline-visit:${canonicalUrl}`,
-  kind: 'timeline-visit',
-  label: canonicalUrl,
-  firstSeenAt: TIMESTAMP,
-  lastSeenAt: TIMESTAMP,
-  originReplicaIds: ['rep-1'],
-  metadata: { canonicalUrl },
-});
-
-const topicNode = (topicId: string): ConnectionNode => ({
-  id: `topic:${topicId}`,
-  kind: 'topic',
-  label: topicId,
-  originReplicaIds: ['rep-1'],
-  metadata: {},
-});
-
-const visitInTopicEdge = (canonicalUrl: string, topicId: string): ConnectionEdge => ({
-  id: `edge:visit_in_topic:timeline-visit:${canonicalUrl}:topic:${topicId}`,
-  kind: 'visit_in_topic',
-  fromNodeId: `timeline-visit:${canonicalUrl}`,
-  toNodeId: `topic:${topicId}`,
-  observedAt: TIMESTAMP,
-  producedBy: { source: 'topic-clusterer', revisionId: 'rev-1' },
-  confidence: 'inferred',
-});
-
-const feedbackWith = (
-  negativeLabels: readonly { fromId: string; toId: string; weight: number }[],
-): FeedbackProjection => ({
-  schemaVersion: 1,
-  perItem: {},
-  containerByItem: {},
-  organizedItemsByContainer: {},
-  positiveLabels: [],
-  negativeLabels,
-});
-
-describe('deriveNegativeVisitPairLabelsFromSnapshot', () => {
-  it('expands a (timeline-visit:A, topic:T) negative into A↔member pairs that survive the resolution gate', () => {
-    const a = 'https://example.test/a';
-    const b = 'https://example.test/b';
-    const c = 'https://example.test/c';
-    const snap = snapshot(
-      [timelineVisitNode(a), timelineVisitNode(b), timelineVisitNode(c), topicNode('T')],
-      [visitInTopicEdge(b, 'T'), visitInTopicEdge(c, 'T')],
-    );
-    const feedback = feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 }]);
-
-    const derived = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snap);
-    expect(sortLabels(derived)).toEqual([`${a}|${b}`, `${a}|${c}`]);
-
-    // The derived negatives must reach training: every one must survive
-    // `candidateResolvesToTimelineVisits` inside buildRankerTrainingCandidates.
-    // augment appends the 2 derived pairs alongside the 1 original
-    // container-shaped negative (the original is gate-dropped; the
-    // derived pairs are not).
-    const augmented = augmentFeedbackWithVisitPairLabels(feedback, snap);
-    expect(augmented.negativeLabels).toHaveLength(3);
-    expect(sortLabels(augmented.negativeLabels)).toEqual(
-      [`${a}|${b}`, `${a}|${c}`, `timeline-visit:${a}|topic:T`].sort(),
-    );
     const candidates = buildRankerTrainingCandidates({
-      feedback: augmented,
-      merged: [],
+      feedback,
+      merged: [event],
       snapshot: snap,
       randomNegativeCandidatesPerPositive: 0,
     });
-    const skippedPairs = candidates
-      .filter((entry) => entry.candidate.sources.includes('recently_skipped'))
-      .map((entry) => `${entry.candidate.fromVisitId}|${entry.candidate.toVisitId}`)
-      .sort();
-    expect(skippedPairs).toEqual([`${a}|${b}`, `${a}|${c}`]);
-  });
+    const pairwiseNegatives = candidates.filter((entry) =>
+      entry.candidate.sources.includes('recently_skipped'),
+    );
 
-  it('passes already-(visit, visit) negatives through unchanged', () => {
-    const feedback = feedbackWith([
-      { fromId: 'https://example.test/a', toId: 'https://example.test/b', weight: 1 },
+    expect(feedback.negativeLabels).toEqual([
+      { fromId: anchorUrl, toId: 'workstream:w1', weight: 1 },
     ]);
-    expect(deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot([], []))).toEqual([
-      { fromId: 'https://example.test/a', toId: 'https://example.test/b', weight: 1 },
-    ]);
-  });
+    expect(pairwiseNegatives).toHaveLength(0);
 
-  it('yields nothing for a container with no snapshot members (no crash)', () => {
-    const feedback = feedbackWith([
-      { fromId: 'timeline-visit:https://example.test/a', toId: 'topic:empty', weight: 1 },
-    ]);
-    expect(
-      deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot([topicNode('empty')], [])),
-    ).toEqual([]);
-  });
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-no-expansion-'));
+    tempRoots.push(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, {
+      replicaId: 'local-replica',
+      created: true,
+      nextSeq: async () => 1,
+      peekSeq: () => 1,
+      observeSeq: async () => {},
+    });
+    await eventLog.importPeerEvent(event);
+    const health = await collectWorkGraphHealth({ vaultRoot, eventLog });
 
-  it('does not create self-pairs and dedupes repeated expansions', () => {
-    const a = 'https://example.test/a';
-    const snap = snapshot([timelineVisitNode(a), topicNode('T')], [visitInTopicEdge(a, 'T')]);
-    // The visit endpoint is itself a member of the container → the only
-    // candidate pair would be A↔A, which must be dropped.
-    const selfOnly = deriveNegativeVisitPairLabelsFromSnapshot(
-      feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 }]),
-      snap,
-    );
-    expect(selfOnly).toEqual([]);
-
-    // Two identical negatives against the same container collapse to one.
-    const b = 'https://example.test/b';
-    const dupSnap = snapshot(
-      [timelineVisitNode(a), timelineVisitNode(b), topicNode('T')],
-      [visitInTopicEdge(b, 'T')],
-    );
-    const deduped = deriveNegativeVisitPairLabelsFromSnapshot(
-      feedbackWith([
-        { fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 },
-        { fromId: `timeline-visit:${a}`, toId: 'topic:T', weight: 1 },
-      ]),
-      dupSnap,
-    );
-    expect(deduped).toEqual([{ fromId: a, toId: b, weight: 1 }]);
-  });
-
-  it('resolves a workstream container transitively through topic_in_workstream', () => {
-    const a = 'https://example.test/a';
-    const b = 'https://example.test/b';
-    const snap = snapshot(
-      [timelineVisitNode(a), timelineVisitNode(b), topicNode('T'), workstreamNode('ws-1')],
-      [
-        visitInTopicEdge(b, 'T'),
-        {
-          id: 'edge:topic_in_workstream:topic:T:workstream:ws-1',
-          kind: 'topic_in_workstream',
-          fromNodeId: 'topic:T',
-          toNodeId: 'workstream:ws-1',
-          observedAt: TIMESTAMP,
-          producedBy: { source: 'topic-clusterer', revisionId: 'rev-1' },
-          confidence: 'inferred',
-        },
-      ],
-    );
-    const derived = deriveNegativeVisitPairLabelsFromSnapshot(
-      feedbackWith([{ fromId: `timeline-visit:${a}`, toId: 'workstream:ws-1', weight: 1 }]),
-      snap,
-    );
-    expect(sortLabels(derived)).toEqual([`${a}|${b}`]);
+    expect(health.ranker.expandedNegativeCount).toBe(0);
   });
 });
