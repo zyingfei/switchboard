@@ -1,3 +1,6 @@
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import {
   USER_FLOW_CONFIRMED,
@@ -22,9 +25,24 @@ import {
 import type { RecallCandidate, RecallRequest, RecallResponse } from '../recall-v2/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { extractFeatures } from './features.js';
-import type { CandidateRetrievalFeatureContext, RetrievalContext } from './feature-schema.js';
+import type {
+  CandidatePairFeatures,
+  CandidateRetrievalFeatureContext,
+  RetrievalContext,
+} from './feature-schema.js';
+import { loadRankerModel, predictRanker } from './predict.js';
 import {
+  computeImpressionMetrics,
+  shipGateV2Decide,
+  type ImpressionGroupForMetrics,
+  type ShipGateV2Decision,
+} from './shipGateV2.js';
+import {
+  DETERMINISTIC_BASELINE_VERSION,
+  RANKER_MODEL_VERSION,
+  deterministicBaselineScore,
   trainRankerRevisionFromGroups,
+  type RankerArtifactQuality,
   type RankerRevision,
   type RankerTrainingGroup,
   type RankerTrainingLabelingSummary,
@@ -49,6 +67,11 @@ const NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
 ]);
 
 export const MIN_RECALL_IMPRESSION_POSITIVE_GROUPS = 50;
+export const RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX = 'ship_gate_v2:';
+export const RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION = 1;
+
+const RECALL_IMPRESSION_RETRAIN_STATE_RELATIVE_PATH =
+  '_BAC/connections/closest-visit/retrain-impressions-state.json';
 
 const compareText = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
@@ -173,8 +196,21 @@ export interface RecallImpressionTrainingBuildInput {
   readonly reconstructFeedback?: RecallHistoricalFeedbackReconstructor | undefined;
 }
 
+export interface RecallImpressionScoringRow {
+  readonly candidate: Candidate;
+  readonly features: CandidatePairFeatures;
+  readonly label?: 'positive' | 'negative';
+}
+
+export interface RecallImpressionScoringGroup {
+  readonly groupId: string;
+  readonly rows: readonly RecallImpressionScoringRow[];
+  readonly generatedAt: number;
+}
+
 export interface RecallImpressionTrainingBuildResult {
   readonly groups: readonly RankerTrainingGroup[];
+  readonly scoringGroups: readonly RecallImpressionScoringGroup[];
   readonly rawPositiveCount: number;
   readonly rawNegativeCount: number;
   readonly totalCandidateCount: number;
@@ -192,7 +228,7 @@ export interface RecallHistoricalFeedbackReconstructionRequest {
 
 export type RecallHistoricalFeedbackReconstructor = (
   request: RecallHistoricalFeedbackReconstructionRequest,
-) => Promise<RecallResponse | null>;
+) => Promise<RecallResponse | null | undefined>;
 
 interface HistoricalFeedbackSpec {
   readonly actionKind: RecallActionKind;
@@ -330,6 +366,7 @@ export const buildRecallImpressionTrainingGroups = async ({
         compareText(left.clientEventId, right.clientEventId),
     );
   const groups: RankerTrainingGroup[] = [];
+  const scoringGroups: RecallImpressionScoringGroup[] = [];
   let rawPositiveCount = 0;
   let rawNegativeCount = 0;
   let totalCandidateCount = 0;
@@ -343,18 +380,12 @@ export const buildRecallImpressionTrainingGroups = async ({
     const actionsByEntity = latestActionByEntity(served.servedContextId, merged);
     const retrievalContext = retrievalContextForServed(anchorId, served);
     const rows: RankerTrainingRow[] = [];
+    const scoringRows: RecallImpressionScoringRow[] = [];
     for (const servedCandidate of served.results) {
       totalCandidateCount += 1;
       candidateSourceDistribution[servedCandidate.sourceKind] =
         (candidateSourceDistribution[servedCandidate.sourceKind] ?? 0) + 1;
       const action = actionsByEntity.get(servedCandidate.entityId);
-      if (action === undefined) {
-        unjudgedCandidateCount += 1;
-        continue;
-      }
-      const label = relevanceGradeForAction(action.actionKind);
-      if (label > 0) rawPositiveCount += 1;
-      else rawNegativeCount += 1;
       const toVisitId = servedCandidate.canonicalUrl ?? servedCandidate.entityId;
       const candidate: Candidate = {
         fromVisitId: anchorId,
@@ -362,14 +393,32 @@ export const buildRecallImpressionTrainingGroups = async ({
         sources: [candidateSourceFor(servedCandidate.sourceKind)],
         generatedAt: parseTime(served.servedAt) || servedEvent.acceptedAtMs,
       };
+      const features = extractFeatures(candidate, {
+        merged: [...merged],
+        snapshot,
+        retrievalContext,
+      });
+      if (action === undefined) {
+        unjudgedCandidateCount += 1;
+        scoringRows.push({ candidate, features });
+        continue;
+      }
+      const label = relevanceGradeForAction(action.actionKind);
+      const labelKind = label > 0 ? 'positive' : 'negative';
+      if (label > 0) rawPositiveCount += 1;
+      else rawNegativeCount += 1;
+      scoringRows.push({ candidate, features, label: labelKind });
       rows.push({
         candidate,
-        features: extractFeatures(candidate, {
-          merged: [...merged],
-          snapshot,
-          retrievalContext,
-        }),
+        features,
         label,
+      });
+    }
+    if (scoringRows.length > 0) {
+      scoringGroups.push({
+        groupId: served.servedContextId,
+        rows: scoringRows,
+        generatedAt: parseTime(served.servedAt) || servedEvent.acceptedAtMs,
       });
     }
     if (rows.length > 0) {
@@ -407,7 +456,7 @@ export const buildRecallImpressionTrainingGroups = async ({
         targetEntityId: spec.targetEntityId,
         recallRequest,
       });
-      if (response === null) continue;
+      if (response == null) continue;
       const servedCandidates = response.results.map(servedCandidateFromRecallCandidate);
       const retrievalContext = retrievalContextForCandidates(
         spec.anchorId,
@@ -415,6 +464,7 @@ export const buildRecallImpressionTrainingGroups = async ({
         rankDeltaByEntity(response),
       );
       const rows: RankerTrainingRow[] = [];
+      const scoringRows: RecallImpressionScoringRow[] = [];
       for (let index = 0; index < response.results.length; index += 1) {
         const candidateResult = response.results[index];
         const servedCandidate = servedCandidates[index];
@@ -422,13 +472,6 @@ export const buildRecallImpressionTrainingGroups = async ({
         totalCandidateCount += 1;
         candidateSourceDistribution[candidateResult.sourceKind] =
           (candidateSourceDistribution[candidateResult.sourceKind] ?? 0) + 1;
-        if (!candidateMatchesTarget(candidateResult, spec.targetEntityId)) {
-          unjudgedCandidateCount += 1;
-          continue;
-        }
-        const label = relevanceGradeForAction(spec.actionKind);
-        if (label > 0) rawPositiveCount += 1;
-        else rawNegativeCount += 1;
         const toVisitId = servedCandidate.canonicalUrl ?? servedCandidate.entityId;
         const candidate: Candidate = {
           fromVisitId: spec.anchorId,
@@ -436,14 +479,32 @@ export const buildRecallImpressionTrainingGroups = async ({
           sources: [candidateSourceFor(servedCandidate.sourceKind)],
           generatedAt: event.acceptedAtMs,
         };
+        const features = extractFeatures(candidate, {
+          merged: [...merged],
+          snapshot,
+          retrievalContext,
+        });
+        if (!candidateMatchesTarget(candidateResult, spec.targetEntityId)) {
+          unjudgedCandidateCount += 1;
+          scoringRows.push({ candidate, features });
+          continue;
+        }
+        const label = relevanceGradeForAction(spec.actionKind);
+        const labelKind = label > 0 ? 'positive' : 'negative';
+        if (label > 0) rawPositiveCount += 1;
+        else rawNegativeCount += 1;
+        scoringRows.push({ candidate, features, label: labelKind });
         rows.push({
           candidate,
-          features: extractFeatures(candidate, {
-            merged: [...merged],
-            snapshot,
-            retrievalContext,
-          }),
+          features,
           label,
+        });
+      }
+      if (scoringRows.length > 0) {
+        scoringGroups.push({
+          groupId: `reconstructed:${event.clientEventId}`,
+          rows: scoringRows,
+          generatedAt: event.acceptedAtMs,
         });
       }
       if (rows.length > 0) {
@@ -458,6 +519,7 @@ export const buildRecallImpressionTrainingGroups = async ({
 
   return {
     groups,
+    scoringGroups,
     rawPositiveCount,
     rawNegativeCount,
     totalCandidateCount,
@@ -471,6 +533,7 @@ export interface RecallImpressionTrainingStats {
   readonly rawNegativeCount: number;
   readonly groupCount: number;
   readonly positiveGroupCount: number;
+  readonly groupCountWithPositives: number;
   readonly avgCandidatesPerGroup: number;
   readonly positivesPerGroup: number;
   readonly explicitRejectsPerGroup: number;
@@ -487,6 +550,8 @@ export const summarizeRecallImpressionTraining = (
     rawNegativeCount: build.rawNegativeCount,
     groupCount,
     positiveGroupCount: build.groups.filter((group) => group.rows.some((row) => row.label > 0))
+      .length,
+    groupCountWithPositives: build.groups.filter((group) => group.rows.some((row) => row.label > 0))
       .length,
     avgCandidatesPerGroup: groupCount === 0 ? 0 : build.totalCandidateCount / groupCount,
     positivesPerGroup: groupCount === 0 ? 0 : build.rawPositiveCount / groupCount,
@@ -547,12 +612,253 @@ export const summarizeRecallImpressionEvents = (
     rawNegativeCount,
     groupCount,
     positiveGroupCount,
+    groupCountWithPositives: positiveGroupCount,
     avgCandidatesPerGroup: groupCount === 0 ? 0 : totalCandidateCount / groupCount,
     positivesPerGroup: groupCount === 0 ? 0 : rawPositiveCount / groupCount,
     explicitRejectsPerGroup: groupCount === 0 ? 0 : rawNegativeCount / groupCount,
     unjudgedCandidatesPerGroup: groupCount === 0 ? 0 : unjudgedCandidateCount / groupCount,
     candidateSourceDistribution,
   };
+};
+
+const reservedTestGroupIdsFor = (
+  groups: readonly RankerTrainingGroup[],
+): ReadonlySet<string> | null => {
+  const sorted = groups
+    .filter((group) => group.rows.length > 0)
+    .sort(
+      (left, right) =>
+        left.generatedAt - right.generatedAt || compareText(left.groupId, right.groupId),
+    );
+  if (sorted.length < 4) return null;
+  if (new Set(sorted.map((group) => group.generatedAt)).size < 2) return null;
+  const testCount = Math.max(1, Math.floor(sorted.length * 0.2));
+  const validationPool = sorted.slice(0, sorted.length - testCount);
+  const testGroups = sorted.slice(sorted.length - testCount);
+  const heldOutCount = Math.max(1, Math.floor(validationPool.length * 0.2));
+  const trainGroups = validationPool.slice(0, validationPool.length - heldOutCount);
+  const heldOutGroups = validationPool.slice(validationPool.length - heldOutCount);
+  if (trainGroups.length === 0 || heldOutGroups.length === 0 || testGroups.length === 0) {
+    return null;
+  }
+  const cutoffGeneratedAt = Math.max(...trainGroups.map((group) => group.generatedAt));
+  const earliestHeldOut = Math.min(...heldOutGroups.map((group) => group.generatedAt));
+  if (earliestHeldOut <= cutoffGeneratedAt) return null;
+  const testCutoffGeneratedAt = Math.max(...heldOutGroups.map((group) => group.generatedAt));
+  const earliestTest = Math.min(...testGroups.map((group) => group.generatedAt));
+  if (earliestTest <= testCutoffGeneratedAt) return null;
+  return new Set(testGroups.map((group) => group.groupId));
+};
+
+const labelMapForScoringRows = (
+  rows: readonly RecallImpressionScoringRow[],
+): ReadonlyMap<string, 'positive' | 'negative'> => {
+  const labels = new Map<string, 'positive' | 'negative'>();
+  for (const row of rows) {
+    if (row.label !== undefined) labels.set(row.candidate.toVisitId, row.label);
+  }
+  return labels;
+};
+
+const rankedMetricGroup = (
+  group: RecallImpressionScoringGroup,
+  scoreFor: (row: RecallImpressionScoringRow) => number,
+): ImpressionGroupForMetrics => ({
+  groupId: group.groupId,
+  rankedEntityIds: [...group.rows]
+    .sort((left, right) => {
+      const delta = scoreFor(right) - scoreFor(left);
+      return delta !== 0 ? delta : compareText(left.candidate.toVisitId, right.candidate.toVisitId);
+    })
+    .map((row) => row.candidate.toVisitId),
+  labels: labelMapForScoringRows(group.rows),
+});
+
+const baselineMetricGroupsFor = (
+  groups: readonly RecallImpressionScoringGroup[],
+): readonly ImpressionGroupForMetrics[] =>
+  groups.map((group) =>
+    rankedMetricGroup(group, (row) => deterministicBaselineScore(row.features)),
+  );
+
+const activeMetricGroupsFor = async (
+  revision: RankerRevision,
+  groups: readonly RecallImpressionScoringGroup[],
+): Promise<readonly ImpressionGroupForMetrics[]> => {
+  const model = await loadRankerModel(revision);
+  try {
+    return groups.map((group) =>
+      rankedMetricGroup(group, (row) => predictRanker(row.features, model).score),
+    );
+  } finally {
+    model.dispose();
+  }
+};
+
+export interface RecallImpressionShipGateEvaluation {
+  readonly decision: ShipGateV2Decision;
+  readonly reservedTestGroupCount: number;
+}
+
+export const evaluateRecallImpressionShipGateV2 = async (
+  revision: RankerRevision,
+  build: RecallImpressionTrainingBuildResult,
+): Promise<RecallImpressionShipGateEvaluation> => {
+  const reservedIds = reservedTestGroupIdsFor(build.groups);
+  const reservedScoringGroups =
+    reservedIds === null
+      ? []
+      : build.scoringGroups.filter((group) => reservedIds.has(group.groupId));
+  const [activeMetricGroups, baselineMetricGroups] = await Promise.all([
+    activeMetricGroupsFor(revision, reservedScoringGroups),
+    Promise.resolve(baselineMetricGroupsFor(reservedScoringGroups)),
+  ]);
+  const activeMetrics = computeImpressionMetrics(activeMetricGroups);
+  const baselineMetrics = computeImpressionMetrics(baselineMetricGroups);
+  return {
+    decision: shipGateV2Decide({
+      activeMetrics,
+      baselineMetrics,
+      expandedNegativeCount: 0,
+      labelDriftWithoutFeedback: 0,
+      reservedTestUsedExactlyOnce: true,
+    }),
+    reservedTestGroupCount: reservedScoringGroups.length,
+  };
+};
+
+const v2Reason = (decision: ShipGateV2Decision): string =>
+  `${RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX}${decision.reason}`;
+
+const reservedMetric = (kind: 'active' | 'baseline', value: number) => ({
+  kind: `ship-gate-v2 ${kind} reserved-test ndcg@10`,
+  value,
+});
+
+const v2ArtifactQualityFor = (
+  revision: RankerRevision,
+  kind: 'graph_baseline' | 'lightgbm_lambdamart',
+  decision: ShipGateV2Decision,
+): RankerArtifactQuality => {
+  const existing = revision.artifactQuality?.find((artifact) => artifact.kind === kind);
+  if (kind === 'graph_baseline') {
+    return {
+      kind,
+      candidate: existing?.candidate ?? DETERMINISTIC_BASELINE_VERSION,
+      ...(existing?.validationMetric === undefined
+        ? {}
+        : { validationMetric: existing.validationMetric }),
+      reservedTestMetric: reservedMetric('baseline', decision.baseline.nDcgAt10),
+      shipGate: { status: 'pass', reason: `${RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX}baseline` },
+    };
+  }
+  return {
+    kind,
+    candidate: existing?.candidate ?? RANKER_MODEL_VERSION,
+    ...(existing?.validationMetric === undefined
+      ? {}
+      : { validationMetric: existing.validationMetric }),
+    reservedTestMetric: reservedMetric('active', decision.active.nDcgAt10),
+    shipGate: { status: decision.status, reason: v2Reason(decision) },
+  };
+};
+
+export const applyRecallImpressionShipGateV2 = (
+  revision: RankerRevision,
+  decision: ShipGateV2Decision,
+): RankerRevision => {
+  const updated = new Map<RankerArtifactQuality['kind'], RankerArtifactQuality>();
+  for (const artifact of revision.artifactQuality ?? []) updated.set(artifact.kind, artifact);
+  updated.set('graph_baseline', v2ArtifactQualityFor(revision, 'graph_baseline', decision));
+  updated.set(
+    'lightgbm_lambdamart',
+    v2ArtifactQualityFor(revision, 'lightgbm_lambdamart', decision),
+  );
+  const orderedKinds: readonly RankerArtifactQuality['kind'][] = [
+    'graph_baseline',
+    'logistic_batch',
+    'lightgbm_lambdamart',
+    'lightgbm_plus_online_lr',
+    'logistic_online',
+    'hierarchical_per_container_lr',
+  ];
+  return {
+    ...revision,
+    artifactQuality: orderedKinds.flatMap((kind) => {
+      const artifact = updated.get(kind);
+      return artifact === undefined ? [] : [artifact];
+    }),
+  };
+};
+
+export interface RecallImpressionRetrainState {
+  readonly schemaVersion: typeof RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION;
+  readonly status: 'promoted' | 'ship_gate_failed';
+  readonly revisionId: string;
+  readonly updatedAt: number;
+  readonly stats: RecallImpressionTrainingStats;
+  readonly shipGateDecision: ShipGateV2Decision;
+}
+
+export const recallImpressionRetrainStatePath = (vaultRoot: string): string =>
+  join(vaultRoot, RECALL_IMPRESSION_RETRAIN_STATE_RELATIVE_PATH);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isShipGateV2Decision = (value: unknown): value is ShipGateV2Decision => {
+  if (!isRecord(value)) return false;
+  const status = value['status'];
+  return (
+    (status === 'pass' || status === 'fail' || status === 'unavailable') &&
+    typeof value['reason'] === 'string' &&
+    isRecord(value['active']) &&
+    isRecord(value['baseline']) &&
+    isRecord(value['deltas']) &&
+    typeof value['reservedTestUsedExactlyOnce'] === 'boolean'
+  );
+};
+
+const isRecallImpressionRetrainState = (value: unknown): value is RecallImpressionRetrainState => {
+  if (!isRecord(value)) return false;
+  return (
+    value['schemaVersion'] === RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION &&
+    (value['status'] === 'promoted' || value['status'] === 'ship_gate_failed') &&
+    typeof value['revisionId'] === 'string' &&
+    typeof value['updatedAt'] === 'number' &&
+    isRecord(value['stats']) &&
+    isShipGateV2Decision(value['shipGateDecision'])
+  );
+};
+
+export const readRecallImpressionRetrainState = async (
+  vaultRoot: string,
+): Promise<RecallImpressionRetrainState | null> => {
+  try {
+    const parsed = JSON.parse(
+      await readFile(recallImpressionRetrainStatePath(vaultRoot), 'utf8'),
+    ) as unknown;
+    return isRecallImpressionRetrainState(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeAtomic = async (path: string, body: string): Promise<void> => {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${String(process.pid)}.tmp`;
+  await writeFile(tmp, body, 'utf8');
+  await rename(tmp, path);
+};
+
+export const writeRecallImpressionRetrainState = async (
+  vaultRoot: string,
+  state: RecallImpressionRetrainState,
+): Promise<void> => {
+  await writeAtomic(
+    recallImpressionRetrainStatePath(vaultRoot),
+    `${JSON.stringify(state, null, 2)}\n`,
+  );
 };
 
 export type RecallImpressionRetrainResult =
@@ -565,6 +871,7 @@ export type RecallImpressionRetrainResult =
       readonly status: 'trained';
       readonly revision: RankerRevision;
       readonly stats: RecallImpressionTrainingStats;
+      readonly shipGateDecision: ShipGateV2Decision;
     };
 
 export const maybeRetrainRecallImpressionRanker = async (input: {
@@ -589,10 +896,12 @@ export const maybeRetrainRecallImpressionRanker = async (input: {
     implicitNegativeRows: 0,
     unlabeledCandidateCount: build.unjudgedCandidateCount,
   };
-  const revision = await trainRankerRevisionFromGroups(
+  const baseRevision = await trainRankerRevisionFromGroups(
     build.groups,
     input.trainOptions ?? {},
     labelingSummary,
   );
-  return { status: 'trained', revision, stats };
+  const gate = await evaluateRecallImpressionShipGateV2(baseRevision, build);
+  const revision = applyRecallImpressionShipGateV2(baseRevision, gate.decision);
+  return { status: 'trained', revision, stats, shipGateDecision: gate.decision };
 };

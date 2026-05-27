@@ -18,14 +18,29 @@ import {
 } from '../feedback/projection.js';
 import { readPageEvidenceMap, readPageEvidenceVectorMap } from '../page-evidence/store.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
-import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
+import {
+  writeActiveClosestVisitRankerRevision,
+  writeClosestVisitRankerRevision,
+} from '../producers/closest-visit-revision.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
 import { extractFeatures } from './features.js';
 import { randomUnrelated } from './negatives.js';
 import {
+  MIN_RECALL_IMPRESSION_POSITIVE_GROUPS,
+  RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION,
+  applyRecallImpressionShipGateV2,
+  buildRecallImpressionTrainingGroups,
+  evaluateRecallImpressionShipGateV2,
+  summarizeRecallImpressionEvents,
+  summarizeRecallImpressionTraining,
+  writeRecallImpressionRetrainState,
+} from './retrain-impressions.js';
+import {
+  trainRankerRevisionFromGroups,
   trainRankerRevision,
   type RankerRevision,
+  type RankerTrainingLabelingSummary,
   type RankerTrainingCandidate,
   type TrainRankerInput,
   type TrainRankerOptions,
@@ -102,7 +117,8 @@ export type RankerRetrainSkipReason =
   | 'cooldown'
   | 'no-training-candidates'
   | 'no-usable-query-groups'
-  | 'insufficient_groups';
+  | 'insufficient_groups'
+  | 'ship_gate_failed';
 
 export type RankerRetrainPlan =
   | {
@@ -191,6 +207,7 @@ export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContex
   readonly trainOptions?: TrainRankerOptions | undefined;
   readonly train?: TrainRankerRevisionFn | undefined;
   readonly writeActiveRevision?: WriteActiveRankerRevisionFn | undefined;
+  readonly writeCandidateRevision?: WriteActiveRankerRevisionFn | undefined;
   readonly readState?: ((vaultRoot: string) => Promise<RankerRetrainState | null>) | undefined;
   readonly writeState?:
     | ((vaultRoot: string, state: RankerRetrainState) => Promise<void>)
@@ -815,6 +832,21 @@ const readRankerPageEvidenceContext = async (
   };
 };
 
+const recallImpressionLabelingSummary = (build: {
+  readonly totalCandidateCount: number;
+  readonly groups: readonly { readonly rows: readonly { readonly label: number }[] }[];
+  readonly rawPositiveCount: number;
+  readonly rawNegativeCount: number;
+  readonly unjudgedCandidateCount: number;
+}): RankerTrainingLabelingSummary => ({
+  totalCandidates: build.totalCandidateCount,
+  labeledRows: build.groups.reduce((sum, group) => sum + group.rows.length, 0),
+  positiveRows: build.rawPositiveCount,
+  negativeRows: build.rawNegativeCount,
+  implicitNegativeRows: 0,
+  unlabeledCandidateCount: build.unjudgedCandidateCount,
+});
+
 export const maybeRetrainClosestVisitRanker = async ({
   vaultRoot,
   merged,
@@ -827,12 +859,81 @@ export const maybeRetrainClosestVisitRanker = async ({
   trainOptions,
   train = trainRankerRevision,
   writeActiveRevision = writeActiveClosestVisitRankerRevision,
+  writeCandidateRevision = writeClosestVisitRankerRevision,
   readState = readRankerRetrainState,
   writeState = writeRankerRetrainState,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
   const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
+  const impressionEventSummary = summarizeRecallImpressionEvents(merged);
+  if (impressionEventSummary.groupCountWithPositives >= MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
+    const newLabelCount = impressionEventSummary.groupCountWithPositives;
+    try {
+      const build = await buildRecallImpressionTrainingGroups({
+        merged,
+        snapshot,
+        // Follow-up: the real historical reconstructor should call
+        // /v2/recall. The production trigger only trusts durable
+        // recall.served snapshots for now.
+        reconstructFeedback: async () => undefined,
+      });
+      const stats = summarizeRecallImpressionTraining(build);
+      if (stats.groupCountWithPositives < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
+        return {
+          status: 'skipped',
+          reason: 'insufficient_groups',
+          fingerprint,
+          newLabelCount,
+          candidateCount: build.totalCandidateCount,
+        };
+      }
+      const baseRevision = await trainRankerRevisionFromGroups(
+        build.groups,
+        trainOptions ?? {},
+        recallImpressionLabelingSummary(build),
+      );
+      const gate = await evaluateRecallImpressionShipGateV2(baseRevision, build);
+      const revision = applyRecallImpressionShipGateV2(baseRevision, gate.decision);
+      const retrainStateStatus = gate.decision.status === 'pass' ? 'promoted' : 'ship_gate_failed';
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION,
+        status: retrainStateStatus,
+        revisionId: revision.revisionId,
+        updatedAt: revision.trainedAt,
+        stats,
+        shipGateDecision: gate.decision,
+      });
+      if (gate.decision.status !== 'pass') {
+        await writeCandidateRevision(vaultRoot, revision);
+        return {
+          status: 'skipped',
+          reason: 'ship_gate_failed',
+          fingerprint,
+          newLabelCount,
+          candidateCount: build.totalCandidateCount,
+        };
+      }
+      await writeActiveRevision(vaultRoot, revision);
+      await writeState(vaultRoot, stateFromRevision(fingerprint, revision));
+      return {
+        status: 'trained',
+        revisionId: revision.revisionId,
+        fingerprint,
+        newLabelCount,
+        candidateCount: build.totalCandidateCount,
+      };
+    } catch (error) {
+      return {
+        status: 'failed',
+        error: errorMessage(error),
+        fingerprint,
+        newLabelCount,
+        candidateCount:
+          impressionEventSummary.rawPositiveCount + impressionEventSummary.rawNegativeCount,
+      };
+    }
+  }
   const resolvedThreshold = threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
   const cooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
   const forceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];

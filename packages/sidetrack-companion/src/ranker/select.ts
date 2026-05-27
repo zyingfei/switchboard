@@ -27,11 +27,15 @@
 
 import type { RankerArtifactKind, RankerArtifactQuality, RankerRevision } from './train.js';
 
+const RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX = 'ship_gate_v2:';
+
 export interface ActiveRankerSelection {
   readonly selectedKind: RankerArtifactKind;
   readonly selectedRevisionId: string;
   readonly reservedTestNdcgAt5: number | null;
   readonly reason: 'best_passing' | 'fallback_graph_baseline';
+  readonly shipGateStatus: RankerArtifactQuality['shipGate']['status'] | null;
+  readonly shipGateReason: string | null;
 }
 
 // Kind priority for tie-breaking. Earlier wins. `graph_baseline` is
@@ -88,27 +92,49 @@ const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolea
   return false;
 };
 
-const passingArtifacts = (
-  revision: RankerRevision,
-): readonly RankerArtifactQuality[] => {
+const passingArtifacts = (revision: RankerRevision): readonly RankerArtifactQuality[] => {
   const quality = revision.artifactQuality ?? [];
   return quality.filter(
-    (artifact) =>
-      artifact.shipGate.status === 'pass' && isServeable(artifact.kind, revision),
+    (artifact) => artifact.shipGate.status === 'pass' && isServeable(artifact.kind, revision),
   );
 };
 
-const compareArtifacts = (
-  left: RankerArtifactQuality,
-  right: RankerArtifactQuality,
-): number => {
+const compareArtifacts = (left: RankerArtifactQuality, right: RankerArtifactQuality): number => {
   const leftNdcg = left.reservedTestMetric?.value ?? -Infinity;
   const rightNdcg = right.reservedTestMetric?.value ?? -Infinity;
   if (leftNdcg !== rightNdcg) return rightNdcg - leftNdcg; // desc
   return kindRank(left.kind) - kindRank(right.kind);
 };
 
+const artifactFor = (
+  revision: RankerRevision,
+  kind: RankerArtifactKind,
+): RankerArtifactQuality | undefined =>
+  revision.artifactQuality?.find((artifact) => artifact.kind === kind);
+
+const lightgbmV2GateFor = (revision: RankerRevision): RankerArtifactQuality | undefined => {
+  const artifact = artifactFor(revision, 'lightgbm_lambdamart');
+  return artifact?.shipGate.reason.startsWith(RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX) === true
+    ? artifact
+    : undefined;
+};
+
 export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelection => {
+  const v2Lightgbm = lightgbmV2GateFor(revision);
+  if (
+    v2Lightgbm !== undefined &&
+    v2Lightgbm.shipGate.status === 'pass' &&
+    isServeable('lightgbm_lambdamart', revision)
+  ) {
+    return {
+      selectedKind: 'lightgbm_lambdamart',
+      selectedRevisionId: revision.revisionId,
+      reservedTestNdcgAt5: v2Lightgbm.reservedTestMetric?.value ?? null,
+      reason: 'best_passing',
+      shipGateStatus: v2Lightgbm.shipGate.status,
+      shipGateReason: v2Lightgbm.shipGate.reason,
+    };
+  }
   const passing = [...passingArtifacts(revision)].sort(compareArtifacts);
   const winner = passing[0];
   if (winner === undefined) {
@@ -119,6 +145,8 @@ export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelect
       selectedRevisionId: revision.revisionId,
       reservedTestNdcgAt5: null,
       reason: 'fallback_graph_baseline',
+      shipGateStatus: v2Lightgbm?.shipGate.status ?? null,
+      shipGateReason: v2Lightgbm?.shipGate.reason ?? null,
     };
   }
   return {
@@ -126,5 +154,7 @@ export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelect
     selectedRevisionId: revision.revisionId,
     reservedTestNdcgAt5: winner.reservedTestMetric?.value ?? null,
     reason: 'best_passing',
+    shipGateStatus: v2Lightgbm?.shipGate.status ?? winner.shipGate.status,
+    shipGateReason: v2Lightgbm?.shipGate.reason ?? winner.shipGate.reason,
   };
 };

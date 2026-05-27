@@ -27,6 +27,8 @@ import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
   MIN_RECALL_IMPRESSION_POSITIVE_GROUPS,
+  RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX,
+  readRecallImpressionRetrainState,
   summarizeRecallImpressionEvents,
 } from '../ranker/retrain-impressions.js';
 import {
@@ -65,6 +67,17 @@ export interface WorkGraphHealthReport {
     readonly trainingDatasetHash: string | null;
     readonly retrainSkipReason: RankerRetrainSkipReason | null;
     readonly retrainNewLabelCount: number;
+    readonly shipGateV2: {
+      readonly status: 'pass' | 'fail' | 'unavailable';
+      readonly reason: string;
+      readonly revisionId: string;
+      readonly updatedAt: number;
+      readonly activeNdcgAt10: number;
+      readonly baselineNdcgAt10: number;
+      readonly activeMrr: number;
+      readonly baselineMrr: number;
+      readonly explicitRejectPrecisionDelta: number;
+    } | null;
     readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
     // Honest training mix (plan TODO-R5/X1). `negativeLabelCount`
     // alone is the misleading-metric trap: it counts only explicit
@@ -586,6 +599,8 @@ const buildDiagnosticCandidates = (input: {
         expectedFeatureSchemaVersion: input.ranker.expectedFeatureSchemaVersion,
         needsRetrain: input.ranker.needsRetrain,
         datasetChangedSinceTrain: input.ranker.datasetChangedSinceTrain,
+        shipGateV2Status: input.ranker.shipGateV2?.status ?? null,
+        shipGateV2Reason: input.ranker.shipGateV2?.reason ?? null,
       }),
     },
     {
@@ -620,6 +635,8 @@ const buildDiagnosticCandidates = (input: {
         splitStatus: methodologySpine?.split.status ?? null,
         shipGateStatus: methodologySpine?.shipGate.status ?? null,
         shipGateCandidate: methodologySpine?.shipGate.candidate ?? null,
+        shipGateV2Status: input.ranker.shipGateV2?.status ?? null,
+        shipGateV2Reason: input.ranker.shipGateV2?.reason ?? null,
       }),
     },
     {
@@ -775,15 +792,23 @@ export const collectWorkGraphHealth = async ({
   const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
   const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
-  const [activeManifest, activeManifestProbe, retrainState, ann, topicRevision, diagnostics] =
-    await Promise.all([
-      readActiveClosestVisitRankerRevisionManifest(vaultRoot),
-      readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
-      readRankerRetrainState(vaultRoot),
-      annStatus(),
-      createTopicRevisionStore(vaultRoot).readActiveRevision(),
-      readLatestConnectionsDiagnostics(vaultRoot),
-    ]);
+  const [
+    activeManifest,
+    activeManifestProbe,
+    retrainState,
+    impressionRetrainState,
+    ann,
+    topicRevision,
+    diagnostics,
+  ] = await Promise.all([
+    readActiveClosestVisitRankerRevisionManifest(vaultRoot),
+    readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
+    readRankerRetrainState(vaultRoot),
+    readRecallImpressionRetrainState(vaultRoot),
+    annStatus(),
+    createTopicRevisionStore(vaultRoot).readActiveRevision(),
+    readLatestConnectionsDiagnostics(vaultRoot),
+  ]);
   const augmentation = parseRankerAugmentationStatus(diagnostics);
   const activeRevision =
     activeManifest === null
@@ -809,9 +834,36 @@ export const collectWorkGraphHealth = async ({
     retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
   const impressionTraining = summarizeRecallImpressionEvents(merged);
   const v6ColdStartSkipReason: RankerRetrainSkipReason | null =
-    impressionTraining.positiveGroupCount < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS
+    impressionTraining.groupCountWithPositives < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS
       ? 'insufficient_groups'
       : null;
+  const activeLightgbmGate = activeManifest?.artifactQuality?.find(
+    (artifact) => artifact.kind === 'lightgbm_lambdamart',
+  )?.shipGate;
+  const activeLightgbmV2GateFailed =
+    activeLightgbmGate?.reason.startsWith(RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX) === true &&
+    activeLightgbmGate.status !== 'pass';
+  const v6ShipGateSkipReason: RankerRetrainSkipReason | null =
+    v6ColdStartSkipReason !== null
+      ? v6ColdStartSkipReason
+      : impressionRetrainState?.status === 'ship_gate_failed' || activeLightgbmV2GateFailed
+        ? 'ship_gate_failed'
+        : null;
+  const shipGateV2 =
+    impressionRetrainState === null
+      ? null
+      : {
+          status: impressionRetrainState.shipGateDecision.status,
+          reason: impressionRetrainState.shipGateDecision.reason,
+          revisionId: impressionRetrainState.revisionId,
+          updatedAt: impressionRetrainState.updatedAt,
+          activeNdcgAt10: impressionRetrainState.shipGateDecision.active.nDcgAt10,
+          baselineNdcgAt10: impressionRetrainState.shipGateDecision.baseline.nDcgAt10,
+          activeMrr: impressionRetrainState.shipGateDecision.active.mrr,
+          baselineMrr: impressionRetrainState.shipGateDecision.baseline.mrr,
+          explicitRejectPrecisionDelta:
+            impressionRetrainState.shipGateDecision.deltas.explicitRejectPrecision,
+        };
   const ranker: WorkGraphHealthReport['ranker'] = {
     activeRevisionId: activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null,
     loadStatus:
@@ -837,8 +889,9 @@ export const collectWorkGraphHealth = async ({
     trainedAt: activeManifest?.trainedAt ?? null,
     trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
     retrainSkipReason:
-      v6ColdStartSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null),
+      v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null),
     retrainNewLabelCount: retrainPlan.newLabelCount,
+    shipGateV2,
     methodologySpine: rankerMethodologySpineDiagnosticsFromTrainQuality(
       activeManifest?.trainQuality,
     ),
