@@ -155,6 +155,7 @@ const ANCHOR_KIND_BY_PREFIX: Partial<Record<string, ConnectionNodeKind>> = {
   thread: 'thread',
   'visit-instance': 'visit-instance',
   'timeline-visit': 'timeline-visit',
+  page: 'page',
   'tab-session': 'tab-session',
   snippet: 'snippet',
   annotation: 'annotation',
@@ -3803,9 +3804,14 @@ export const ConnectionsView = ({
                     setSelectedEdge(null);
                   }}
                   ctx={ctx}
+                  {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
                 />
               ) : (
-                <ProvenanceEmpty anchor={anchorDisplayNode} ctx={ctx} />
+                <ProvenanceEmpty
+                  anchor={anchorDisplayNode}
+                  ctx={ctx}
+                  {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+                />
               )}
             </div>
           </aside>

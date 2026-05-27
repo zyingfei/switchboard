@@ -331,6 +331,104 @@ export const LinkedCenter = ({
         const diagnostic = debugScores
           ? scoreDiagnostic(group.edgeEntries, visibleCount, expanded)
           : null;
+        const renderedNodeIds = new Set<string>();
+        const nodeRows = visibleNodeEntries.map((entry) => {
+          const edge = entry.edge;
+          renderedNodeIds.add(entry.node.id);
+          return (
+            <NodeRow
+              key={entry.node.id}
+              node={entry.node}
+              edge={edge ?? null}
+              direction={entry.direction}
+              selected={selectedEdge?.id === edge?.id && edge !== null}
+              highlighted={highlightedNodeId === entry.node.id}
+              onPromoteSnippet={onPromoteSnippet}
+              onUseAsAnchor={() => {
+                onUseNodeAsAnchor(entry.node.id);
+              }}
+              onClick={() => {
+                if (edge !== null) onSelectEdge(edge);
+              }}
+              ctx={ctx}
+              {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+            />
+          );
+        });
+        const edgeRows = visibleEdgeEntries.map(({ edge }) => {
+          const otherNode =
+            edge.fromNodeId === anchorId
+              ? nodeById.get(edge.toNodeId)
+              : nodeById.get(edge.fromNodeId);
+          if (otherNode !== undefined) {
+            if (renderedNodeIds.has(otherNode.id)) return null;
+            renderedNodeIds.add(otherNode.id);
+            const direction = edge.fromNodeId === anchorId ? 'out' : 'in';
+            return (
+              <NodeRow
+                key={`edge-node:${edge.id}:${otherNode.id}`}
+                node={otherNode}
+                edge={edge}
+                direction={direction}
+                selected={selectedEdge?.id === edge.id}
+                highlighted={highlightedNodeId === otherNode.id}
+                onPromoteSnippet={onPromoteSnippet}
+                onUseAsAnchor={() => {
+                  onUseNodeAsAnchor(otherNode.id);
+                }}
+                onClick={() => {
+                  onSelectEdge(edge);
+                }}
+                ctx={ctx}
+                {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+              />
+            );
+          }
+
+          const meta = EDGE_KINDS[edge.kind];
+          const fam: EdgeFamily = meta?.family ?? 'urlmatch';
+          const hint = contentDerivedHint(edge.kind);
+          const isSelected = selectedEdge?.id === edge.id;
+          const isTimelineHovered =
+            highlightedNodeId !== undefined &&
+            highlightedNodeId !== null &&
+            (edge.fromNodeId === highlightedNodeId || edge.toNodeId === highlightedNodeId);
+          return (
+            <button
+              key={edge.id}
+              type="button"
+              onClick={() => {
+                onSelectEdge(edge);
+              }}
+              data-testid={`edge-${edge.id}`}
+              className={[
+                'cx-edgelabel',
+                'cx-edge-summary',
+                isSelected ? 'is-selected' : '',
+                isTimelineHovered ? 'is-timeline-hovered' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+              title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
+            >
+              <span
+                className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
+                aria-hidden
+              >
+                <span className="cx-edge-line" />
+              </span>
+              <span className="cx-edge-summary-main">
+                {edgeEndpointLabel(edge, nodeById, ctx)}
+              </span>
+              <span className="bac-connections-edge-hint">{edgeKindLabel(edge)}</span>
+              {hint !== null ? (
+                <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge.id}`}>
+                  {hint}
+                </span>
+              ) : null}
+            </button>
+          );
+        });
         return (
           <section key={group.kind} data-testid={`group-${group.kind}`}>
             <header className="cx-group-head">
@@ -345,79 +443,9 @@ export const LinkedCenter = ({
             {nodeKindMarkers(group.nodeEntries).map((kind) => (
               <span key={kind} hidden data-testid={`group-${kind}`} />
             ))}
-            <div className="cx-grouplist">
-              {visibleNodeEntries.map((entry) => {
-                const edge = entry.edge;
-                return (
-                  <NodeRow
-                    key={entry.node.id}
-                    node={entry.node}
-                    edge={edge ?? null}
-                    direction={entry.direction}
-                    selected={selectedEdge?.id === edge?.id && edge !== null}
-                    highlighted={highlightedNodeId === entry.node.id}
-                    onPromoteSnippet={onPromoteSnippet}
-                    onUseAsAnchor={() => {
-                      onUseNodeAsAnchor(entry.node.id);
-                    }}
-                    onClick={() => {
-                      if (edge !== null) onSelectEdge(edge);
-                    }}
-                    ctx={ctx}
-                    {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
-                  />
-                );
-              })}
-            </div>
+            <div className="cx-grouplist">{nodeRows}</div>
             <div className="cx-edge-list">
-              {visibleEdgeEntries.map(({ edge }) => {
-                const meta = EDGE_KINDS[edge.kind];
-                const fam: EdgeFamily = meta?.family ?? 'urlmatch';
-                const hint = contentDerivedHint(edge.kind);
-                const isSelected = selectedEdge?.id === edge.id;
-                const isTimelineHovered =
-                  highlightedNodeId !== undefined &&
-                  highlightedNodeId !== null &&
-                  (edge.fromNodeId === highlightedNodeId || edge.toNodeId === highlightedNodeId);
-                return (
-                  <button
-                    key={edge.id}
-                    type="button"
-                    onClick={() => {
-                      onSelectEdge(edge);
-                    }}
-                    data-testid={`edge-${edge.id}`}
-                    className={[
-                      'cx-edgelabel',
-                      'cx-edge-summary',
-                      isSelected ? 'is-selected' : '',
-                      isTimelineHovered ? 'is-timeline-hovered' : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                    title={`${edgeEndpointLabel(edge, nodeById, ctx)} · ${edgeKindLabel(edge)}`}
-                  >
-                    <span
-                      className={`cx-edge fam-${fam} ${edgeConfidenceClass(edge.confidence)}`.trim()}
-                      aria-hidden
-                    >
-                      <span className="cx-edge-line" />
-                    </span>
-                    <span className="cx-edge-summary-main">
-                      {edgeEndpointLabel(edge, nodeById, ctx)}
-                    </span>
-                    <span className="bac-connections-edge-hint">{edgeKindLabel(edge)}</span>
-                    {hint !== null ? (
-                      <span
-                        className="bac-connections-edge-hint"
-                        data-testid={`edge-hint-${edge.id}`}
-                      >
-                        {hint}
-                      </span>
-                    ) : null}
-                  </button>
-                );
-              })}
+              {edgeRows}
             </div>
             {!expanded && hiddenCount > 0 ? (
               <button

@@ -2,7 +2,7 @@ import type { ReactElement } from 'react';
 
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import { nodeKindDisplayFor } from './edgeKinds';
-import { KindIcons } from './icons';
+import { ExternalLinkIcon, KindIcons } from './icons';
 import type { ConnectionNode } from './types';
 
 // Badge-style node display: icon + kind label + primary title.
@@ -14,15 +14,24 @@ export const NodeChip = ({
   node,
   state,
   size = 'md',
+  onOpenUrl,
   ctx,
 }: {
   readonly node: ConnectionNode;
   readonly state?: 'anchor' | 'selected';
   readonly size?: 'md' | 'lg';
+  readonly onOpenUrl?: (url: string) => void;
   readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   const display = nodeKindDisplayFor(node.kind);
   const entity = formatEntityDisplay(node, ctx);
+  const canonicalUrl =
+    (node.kind === 'timeline-visit' || node.kind === 'page') &&
+    typeof node.metadata['canonicalUrl'] === 'string' &&
+    node.metadata['canonicalUrl'].length > 0
+      ? node.metadata['canonicalUrl']
+      : undefined;
+  const canOpen = onOpenUrl !== undefined && canonicalUrl !== undefined;
   const cls =
     `cx-node ${display.tintClass}` +
     (size === 'lg' ? ' lg' : '') +
@@ -35,7 +44,24 @@ export const NodeChip = ({
       </span>
       <span className="cx-node-body">
         <span className="cx-node-kind">{display.label}</span>
-        <span className="cx-node-title">{entity.primary}</span>
+        <span className="cx-node-title-row">
+          <span className="cx-node-title">{entity.primary}</span>
+          {canOpen ? (
+            <button
+              type="button"
+              className="cx-node-open"
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenUrl(canonicalUrl);
+              }}
+              title={`Open ${canonicalUrl}`}
+              aria-label={`Open ${entity.primary}`}
+              data-testid={`node-open-${node.id}`}
+            >
+              {ExternalLinkIcon}
+            </button>
+          ) : null}
+        </span>
       </span>
     </div>
   );

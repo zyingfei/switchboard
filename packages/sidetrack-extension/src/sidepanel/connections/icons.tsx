@@ -52,6 +52,13 @@ export const KindIcons: Record<ConnectionNodeKind, ReactElement> = {
       <path d="m16 6 6 6-6 6" />
     </svg>
   ),
+  page: (
+    <svg {...baseProps}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3a13 13 0 0 1 0 18 13 13 0 0 1 0-18z" />
+    </svg>
+  ),
   'timeline-visit': (
     <svg {...baseProps}>
       <circle cx="12" cy="12" r="9" />

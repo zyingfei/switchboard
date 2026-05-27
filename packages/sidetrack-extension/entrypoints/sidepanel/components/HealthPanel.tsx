@@ -495,8 +495,14 @@ const isCandidateSignal = (candidate: DiagnosticCandidate): boolean =>
 // Honest naming: when the metric is missing (null/undefined), the
 // formatter omits it rather than rendering "—" so a half-populated
 // card stays readable.
-const m2 = (v: unknown): string =>
-  v === null || v === undefined ? '' : String(formatCandidateMetric(v));
+const m2 = (v: unknown): string => {
+  if (v === null || v === undefined) return '';
+  // Defensive cast: candidate metrics are JSON-serialized scalars in
+  // practice, but the formatter map types each field as unknown so
+  // typescript can't prove primitive-ness here. After the null/undef
+  // check, formatCandidateMetric handles string/number/boolean cleanly.
+  return String(formatCandidateMetric(v as string | number | boolean | null));
+};
 const compactMetricsByCandidateId: Record<string, (m: Record<string, unknown>) => string> = {
   'similarity.hot-incremental': (m) => {
     const parts: string[] = [];

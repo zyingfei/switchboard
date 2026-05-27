@@ -7855,6 +7855,35 @@ pre.diff {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.cx-node-title-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cx-node-open {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  border-radius: var(--rad-s);
+  background: transparent;
+  color: var(--ink-3);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.cx-node-open:hover {
+  border-color: var(--rule-soft);
+  background: var(--paper-tinted);
+  color: var(--ink);
+}
+.cx-node-open svg {
+  width: 12px;
+  height: 12px;
 }
 .cx-node.lg {
   padding: 10px 14px;
@@ -8076,8 +8105,9 @@ pre.diff {
   font-size: 12px;
 }
 .cx-edge-list {
-  display: grid;
-  gap: 5px;
+  display: flex;
+  flex-direction: column;
+  padding: 0 8px 6px;
 }
 .cx-edgelabel.cx-edge-summary {
   width: 100%;
