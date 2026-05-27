@@ -31,17 +31,19 @@ const artifact = (
   kind: RankerArtifactKind,
   status: 'pass' | 'fail' | 'unavailable',
   reservedTestNdcg: number | undefined,
+  reasonOverride?: string,
 ): RankerArtifactQuality => ({
   kind,
   candidate: `version-${kind}`,
   shipGate: {
     status,
     reason:
-      status === 'pass'
+      reasonOverride ??
+      (status === 'pass'
         ? 'artifact-cleared-baseline-and-floor'
         : status === 'fail'
           ? 'artifact-does-not-beat-baseline'
-          : 'reserved-test-metric-unavailable',
+          : 'reserved-test-metric-unavailable'),
   },
   ...(reservedTestNdcg === undefined
     ? {}
@@ -104,6 +106,25 @@ describe('selectActiveRanker', () => {
     });
 
     expect(selectActiveRanker(revision).selectedKind).toBe('logistic_batch');
+  });
+
+  it('does not prioritize v2 LightGBM over a higher-metric passing artifact', () => {
+    const revision = baseRevision({
+      logisticBatchWeights: Array.from({ length: RANKER_FEATURE_KEYS.length + 1 }, () => 0.1),
+      logisticBatchFeatureStatsVersion: 'no-normalization-v1',
+      artifactQuality: [
+        artifact('logistic_batch', 'pass', 0.72),
+        artifact('lightgbm_lambdamart', 'pass', 0.61, 'ship_gate_v2:active-cleared'),
+      ],
+    });
+
+    const selection = selectActiveRanker(revision);
+
+    expect(selection).toMatchObject({
+      selectedKind: 'logistic_batch',
+      reservedTestNdcgAt5: 0.72,
+      shipGateReason: 'artifact-cleared-baseline-and-floor',
+    });
   });
 
   it('refuses to pick logistic_batch when the persisted weights are absent', () => {

@@ -127,20 +127,6 @@ const lightgbmV2GateFor = (revision: RankerRevision): RankerArtifactQuality | un
 
 export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelection => {
   const v2Lightgbm = lightgbmV2GateFor(revision);
-  if (
-    v2Lightgbm !== undefined &&
-    v2Lightgbm.shipGate.status === 'pass' &&
-    isServeable('lightgbm_lambdamart', revision)
-  ) {
-    return {
-      selectedKind: 'lightgbm_lambdamart',
-      selectedRevisionId: revision.revisionId,
-      reservedTestNdcgAt5: v2Lightgbm.reservedTestMetric?.value ?? null,
-      reason: 'best_passing',
-      shipGateStatus: v2Lightgbm.shipGate.status,
-      shipGateReason: v2Lightgbm.shipGate.reason,
-    };
-  }
   const passing = [...passingArtifacts(revision)].sort(compareArtifacts);
   const winner = passing[0];
   if (winner === undefined) {
@@ -160,7 +146,7 @@ export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelect
     selectedRevisionId: revision.revisionId,
     reservedTestNdcgAt5: winner.reservedTestMetric?.value ?? null,
     reason: 'best_passing',
-    shipGateStatus: v2Lightgbm?.shipGate.status ?? winner.shipGate.status,
-    shipGateReason: v2Lightgbm?.shipGate.reason ?? winner.shipGate.reason,
+    shipGateStatus: winner.shipGate.status,
+    shipGateReason: winner.shipGate.reason,
   };
 };
