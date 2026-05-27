@@ -132,7 +132,11 @@ export const buildSimilarityEvidence = ({
           closestVisitRanker === undefined
             ? scoreForCandidateSources(candidate)
             : closestVisitRanker.predict(
-                extractFeatures(candidate, { merged: [...events], snapshot }),
+                extractFeatures(candidate, {
+                  merged: [...events],
+                  snapshot,
+                  retrievalContext: { missingRetrievalContext: true },
+                }),
                 candidate,
               ).score;
         return Number.isFinite(score) && score > 0 ? { candidate, score } : null;
