@@ -141,6 +141,10 @@ export interface WorkGraphHealthReport {
   // the cross-encoder rerank is firing on /v2/recall. These let the
   // CFT smoke test verify "the system is actually running the new
   // architecture" without reading internal config.
+  //
+  // Phase 4 added canonicalVectorCounts (documents_vec +
+  // documents_chunks_vec sizes) so the single-source-of-truth
+  // consistency contract is auditable end-to-end.
   readonly recall: {
     readonly retrievalBackend: 'v2';
     readonly vectorStore: 'sqlite' | 'sidecar';
@@ -148,6 +152,10 @@ export interface WorkGraphHealthReport {
     readonly crossEncoder: {
       readonly enabled: boolean;
       readonly rerankTopK: number;
+    };
+    readonly canonicalVectorCounts: {
+      readonly documentVectorCount: number;
+      readonly chunkVectorCount: number;
     };
   };
   readonly candidates: readonly DiagnosticCandidate[];
@@ -165,6 +173,14 @@ export interface WorkGraphHealthDeps {
   readonly eventLog?: EventLog;
   readonly connectionsDiagnostics?: () => ConnectionsDiagnosticSnapshot;
   readonly now?: () => Date;
+  // Phase 4 — when provided, health reports canonical vector counts
+  // from documents_vec + documents_chunks_vec. Optional because the
+  // SQLite store is lazily opened on first /v2/recall; absent →
+  // counts default to 0 with a comment in the report.
+  readonly canonicalRecallStore?: {
+    readonly allVectorEntityIds: () => ReadonlySet<string>;
+    readonly allChunkVectorIds: () => ReadonlySet<string>;
+  };
 }
 
 const emptyEvents: readonly AcceptedEvent[] = [];
@@ -752,6 +768,7 @@ export const collectWorkGraphHealth = async ({
   vaultRoot,
   eventLog,
   connectionsDiagnostics: readConnectionsDiagnostics,
+  canonicalRecallStore,
   now = () => new Date(),
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
@@ -872,9 +889,24 @@ export const collectWorkGraphHealth = async ({
   // Phase 5 — dogfood-config snapshot. Values are constants here
   // because the server-side wiring is the single source of truth
   // (http/server.ts sets DOGFOOD_RERANK_TOP_K on every /v2/recall).
-  // Phase 4 will compute `vectorStore` from a real probe; today
-  // recall-v2 already uses sqlite-vec for documents_vec.
+  //
+  // Phase 4 — canonicalVectorCounts default to 0 (the SQLite store
+  // is lazily opened on first /v2/recall; a health poll BEFORE that
+  // legitimately sees 0). Live counts populate when the store is
+  // injected via `canonicalRecallStore` dep — see WorkGraphHealthDeps.
+  // The runtime canonical truth lives in
+  // recall-v2/store/sqlite.ts (documents_vec + documents_chunks_vec).
   const DOGFOOD_RERANK_TOP_K = 20;
+  let documentVectorCount = 0;
+  let chunkVectorCount = 0;
+  if (canonicalRecallStore !== undefined) {
+    try {
+      documentVectorCount = canonicalRecallStore.allVectorEntityIds().size;
+      chunkVectorCount = canonicalRecallStore.allChunkVectorIds().size;
+    } catch {
+      // Store probe failures are non-fatal for health; counts stay 0.
+    }
+  }
   const recall: WorkGraphHealthReport['recall'] = {
     retrievalBackend: 'v2',
     vectorStore: 'sqlite',
@@ -882,6 +914,10 @@ export const collectWorkGraphHealth = async ({
     crossEncoder: {
       enabled: true,
       rerankTopK: DOGFOOD_RERANK_TOP_K,
+    },
+    canonicalVectorCounts: {
+      documentVectorCount,
+      chunkVectorCount,
     },
   };
   return {
