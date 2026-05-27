@@ -26,6 +26,10 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
+  MIN_RECALL_IMPRESSION_POSITIVE_GROUPS,
+  summarizeRecallImpressionEvents,
+} from '../ranker/retrain-impressions.js';
+import {
   fingerprintFeedbackTrainingLabels,
   planRankerRetrain,
   readRankerRetrainState,
@@ -67,13 +71,13 @@ export interface WorkGraphHealthReport {
     // user-feedback negatives at last train (historically 0, and even
     // those were dropped pre-fix). The model actually trains on
     // grade-0 rows — synthetic random_unrelated/recently_skipped plus
-    // the now-derived visit-pair negatives. Surface all three so a
+    // explicit user rejections. Surface all three so a
     // reader cannot mistake "0 user negatives" for "no negatives".
     readonly trainingMix: {
       readonly positivesAtTrain: number;
       readonly userFeedbackNegativesAtTrain: number;
-      // grade-0 training rows from the model manifest (synthetic +
-      // derived). null when the active manifest predates trainQuality
+      // grade-0 training rows from the model manifest. null when the
+      // active manifest predates trainQuality
       // capture — rendered as "unknown", never as 0.
       readonly trainingNegatives: number | null;
     } | null;
@@ -82,6 +86,14 @@ export interface WorkGraphHealthReport {
     readonly datasetChangedSinceTrain: boolean;
     readonly expandedNegativeCount: number;
     readonly labelDriftWithoutFeedback: number;
+    readonly rawPositiveCount: number;
+    readonly rawNegativeCount: number;
+    readonly groupCount: number;
+    readonly avgCandidatesPerGroup: number;
+    readonly positivesPerGroup: number;
+    readonly explicitRejectsPerGroup: number;
+    readonly unjudgedCandidatesPerGroup: number;
+    readonly candidateSourceDistribution: Readonly<Record<string, number>>;
     readonly augmentation: {
       readonly status: string;
       readonly reason: string | null;
@@ -428,8 +440,7 @@ const buildDiagnosticCandidates = (input: {
   const hotSimilarityEnabled = hotSimilarityModeEnabled();
   const hotTopicsEnabled = hotTopicsModeEnabled();
   const hotPath = raw !== null && isRecord(raw['hotPath']) ? raw['hotPath'] : null;
-  const hotSim =
-    hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
+  const hotSim = hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
   const hotTop = hotPath !== null && isRecord(hotPath['topics']) ? hotPath['topics'] : null;
   const runnerMode = reconcileRunnerMode();
 
@@ -640,7 +651,8 @@ const buildDiagnosticCandidates = (input: {
       metrics: metrics({
         envEnabled: hotSimilarityEnabled,
         envName: HOT_SIMILARITY_ENV,
-        shouldEmbedOnHotPath: hotSim === null ? null : booleanOrFalse(hotSim['shouldEmbedOnHotPath']),
+        shouldEmbedOnHotPath:
+          hotSim === null ? null : booleanOrFalse(hotSim['shouldEmbedOnHotPath']),
         usedHotPath: hotSim === null ? null : booleanOrFalse(hotSim['usedHotPath']),
         decisionReason: stringOrNull(hotSim?.['reason']),
         corpusSize: numberOrNull(hotSim?.['corpusSize']),
@@ -778,6 +790,11 @@ export const collectWorkGraphHealth = async ({
         };
   const datasetChangedSinceTrain =
     retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
+  const impressionTraining = summarizeRecallImpressionEvents(merged);
+  const v6ColdStartSkipReason: RankerRetrainSkipReason | null =
+    impressionTraining.positiveGroupCount < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS
+      ? 'insufficient_groups'
+      : null;
   const ranker: WorkGraphHealthReport['ranker'] = {
     activeRevisionId: activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null,
     loadStatus:
@@ -802,7 +819,8 @@ export const collectWorkGraphHealth = async ({
     needsRetrain: activeManifestProbe?.staleModelSchema ?? false,
     trainedAt: activeManifest?.trainedAt ?? null,
     trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
-    retrainSkipReason: retrainPlan.action === 'skip' ? retrainPlan.reason : null,
+    retrainSkipReason:
+      v6ColdStartSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null),
     retrainNewLabelCount: retrainPlan.newLabelCount,
     methodologySpine: rankerMethodologySpineDiagnosticsFromTrainQuality(
       activeManifest?.trainQuality,
@@ -811,6 +829,14 @@ export const collectWorkGraphHealth = async ({
     datasetChangedSinceTrain,
     expandedNegativeCount: 0,
     labelDriftWithoutFeedback: 0,
+    rawPositiveCount: impressionTraining.rawPositiveCount,
+    rawNegativeCount: impressionTraining.rawNegativeCount,
+    groupCount: impressionTraining.groupCount,
+    avgCandidatesPerGroup: impressionTraining.avgCandidatesPerGroup,
+    positivesPerGroup: impressionTraining.positivesPerGroup,
+    explicitRejectsPerGroup: impressionTraining.explicitRejectsPerGroup,
+    unjudgedCandidatesPerGroup: impressionTraining.unjudgedCandidatesPerGroup,
+    candidateSourceDistribution: impressionTraining.candidateSourceDistribution,
     augmentation,
   };
   const topicProducer: WorkGraphHealthReport['topicProducer'] = {

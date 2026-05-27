@@ -22,12 +22,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { RecallServedPayload } from '../recall/events.js';
 import { runRecall, type PipelineDeps } from './pipeline.js';
-import type {
-  RecallStore,
-  StoreDocument,
-  StoreFtsHit,
-  StoreSourceKind,
-} from './store/types.js';
+import type { RecallStore, StoreDocument, StoreFtsHit, StoreSourceKind } from './store/types.js';
 
 const stubEmbed = async (texts: readonly string[]): Promise<readonly Float32Array[]> =>
   texts.map(() => new Float32Array(384).fill(0));
@@ -63,9 +58,7 @@ const makeStubStore = (): RecallStore => {
       docs.set(doc.entityId, doc);
     },
     queryFts({ q, sourceKind, limit }) {
-      const kinds = new Set<StoreSourceKind>(
-        Array.isArray(sourceKind) ? sourceKind : [sourceKind],
-      );
+      const kinds = new Set<StoreSourceKind>(Array.isArray(sourceKind) ? sourceKind : [sourceKind]);
       return [...docs.values()]
         .filter((d) => kinds.has(d.sourceKind) && matches(q, d))
         .slice(0, limit)

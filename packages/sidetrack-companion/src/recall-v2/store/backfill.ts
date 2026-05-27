@@ -13,11 +13,11 @@ import { createHash } from 'node:crypto';
 
 import { listPageEvidenceRecords } from '../../page-evidence/store.js';
 import { readIndex } from '../../recall/indexFile.js';
-import {
-  readSemanticRecallVectorStore,
-} from '../../recall/semanticRecallPool.js';
-import { MODEL_ID } from '../../recall/embedder.js';
-import type { RecallStore, StoreDocument } from './types.js';
+import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
+import { embed as defaultEmbed, MODEL_ID } from '../../recall/embedder.js';
+import type { PageEvidenceEmbedder } from '../../page-evidence/embedding.js';
+import type { PageContentChunk } from '../../page-content/types.js';
+import type { RecallStore, StoreDocument, StoreDocumentChunk } from './types.js';
 
 // Local readJson — page-content/store.ts has the same shape internally
 // but doesn't export it. Inlined here to keep the SQLite backfill
@@ -34,8 +34,7 @@ const readJson = async <T>(path: string): Promise<T | null> => {
 // Mirrors page-content/store.ts:recordPathForCanonicalUrl + chunksDir.
 // Inlined so we don't import store internals (and to keep backfill
 // resilient to refactors in page-content/store.ts).
-const sha256Hex = (input: string): string =>
-  createHash('sha256').update(input).digest('hex');
+const sha256Hex = (input: string): string => createHash('sha256').update(input).digest('hex');
 const pageContentRecordPath = (vaultRoot: string, canonicalUrl: string): string =>
   join(vaultRoot, '_BAC', 'page-content', 'by-url', `${sha256Hex(canonicalUrl)}.json`);
 const pageContentChunksPath = (vaultRoot: string, contentHash: string): string =>
@@ -374,12 +373,139 @@ export const backfillVectors = async (
   };
 };
 
+interface ChunkBackfillRow {
+  readonly chunk: PageContentChunk;
+  readonly documentEntityId: string;
+  readonly embedText: string;
+}
+
+const chunkRowForStore = (item: ChunkBackfillRow): StoreDocumentChunk => ({
+  chunkId: item.chunk.id,
+  documentEntityId: item.documentEntityId,
+  chunkIndex: item.chunk.chunkIndex,
+  charStart: item.chunk.charStart,
+  charEnd: item.chunk.charEnd,
+  text: item.chunk.text,
+  evidenceTermsJson: JSON.stringify(item.chunk.terms ?? []),
+  quality: item.chunk.quality,
+});
+
+const chunkEmbedText = (chunk: PageContentChunk): string => {
+  const title = chunk.title?.trim();
+  return `passage: ${title === undefined || title.length === 0 ? chunk.text : `${title}\n\n${chunk.text}`}`;
+};
+
+/** Backfill canonical page-content chunk rows and per-chunk vectors.
+ *  This is idempotent: chunk rows are replaced per document, existing
+ *  chunk vectors are skipped, and stale chunk rows/vectors are swept at
+ *  the end. A killed process can resume without re-embedding chunks
+ *  already persisted in documents_chunks_vec. */
+export const backfillChunkVectors = async (
+  vaultRoot: string,
+  store: RecallStore,
+  embedder: PageEvidenceEmbedder = defaultEmbed,
+): Promise<{
+  chunks: number;
+  vectors: number;
+  deleted: number;
+  timingMs: Record<string, number>;
+}> => {
+  const t0 = Date.now();
+  const existingChunks = store.allDocumentChunkIds();
+  const existingVectors = store.allChunkVectorIds();
+  const tSnapshot = Date.now() - t0;
+  const upsertedChunkIds = new Set<string>();
+  const tReadStart = Date.now();
+  const records = await listPageEvidenceRecords(vaultRoot);
+  const items: ChunkBackfillRow[] = [];
+  for (const record of records) {
+    const contentHash = record.content?.contentHash;
+    if (contentHash === undefined) continue;
+    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
+      pageContentChunksPath(vaultRoot, contentHash),
+    );
+    const chunks = raw?.chunks ?? [];
+    const documentEntityId = entityIdForUrl(record.canonicalUrl);
+    for (const chunk of chunks) {
+      items.push({
+        chunk,
+        documentEntityId,
+        embedText: chunkEmbedText(chunk),
+      });
+      upsertedChunkIds.add(chunk.id);
+    }
+  }
+  const tRead = Date.now() - tReadStart;
+
+  const tRowsStart = Date.now();
+  const rowsByDocument = new Map<string, StoreDocumentChunk[]>();
+  for (const item of items) {
+    const rows = rowsByDocument.get(item.documentEntityId) ?? [];
+    rows.push(chunkRowForStore(item));
+    rowsByDocument.set(item.documentEntityId, rows);
+  }
+  store.runTransaction(() => {
+    for (const [documentEntityId, rows] of rowsByDocument) {
+      store.upsertDocumentChunks(
+        documentEntityId,
+        [...rows].sort((left, right) => left.chunkIndex - right.chunkIndex),
+      );
+    }
+  });
+  const tRows = Date.now() - tRowsStart;
+
+  let vectors = 0;
+  let tEmbed = 0;
+  if (store.vectorBackendAvailable) {
+    const tEmbedStart = Date.now();
+    const missing = items.filter((item) => !existingVectors.has(item.chunk.id));
+    const EMBED_BATCH_SIZE = 32;
+    for (let start = 0; start < missing.length; start += EMBED_BATCH_SIZE) {
+      const batch = missing.slice(start, start + EMBED_BATCH_SIZE);
+      const embedded = await embedder(batch.map((item) => item.embedText));
+      store.runTransaction(() => {
+        for (let index = 0; index < batch.length; index += 1) {
+          const item = batch[index];
+          const vector = embedded[index];
+          if (item === undefined || vector === undefined || vector.length === 0) continue;
+          store.upsertChunkVector(item.chunk.id, vector);
+          vectors += 1;
+        }
+      });
+      if (start + EMBED_BATCH_SIZE < missing.length) await yieldToEventLoop();
+    }
+    tEmbed = Date.now() - tEmbedStart;
+  }
+
+  const tSweepStart = Date.now();
+  let deleted = 0;
+  await runInChunks(store, existingChunks, (chunkId) => {
+    if (!upsertedChunkIds.has(chunkId)) {
+      store.deleteDocumentChunk(chunkId);
+      deleted += 1;
+    }
+  });
+  await runInChunks(store, existingVectors, (chunkId) => {
+    if (!upsertedChunkIds.has(chunkId)) {
+      store.deleteChunkVector(chunkId);
+    }
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    chunks: items.length,
+    vectors,
+    deleted,
+    timingMs: { snapshot: tSnapshot, read: tRead, rows: tRows, embed: tEmbed, sweep: tSweep },
+  };
+};
+
 /** Result type for backfillRecallStore. */
 export interface BackfillStats {
   readonly pageContent: number;
   readonly timelineVisit: number;
   readonly chatTurn: number;
   readonly vectors: number;
+  readonly chunkVectors: number;
   readonly deleted: number;
   /** Per-phase wall-clock ms. Surfaced via the [recall-v2] log line so
    *  /v1/status starvation regressions can be triaged without
@@ -397,18 +523,19 @@ export const backfillRecallStore = async (
   const evidence = await backfillFromPageEvidence(vaultRoot, store);
   const chat = await backfillFromRecallIndex(vaultRoot, store);
   const vec = await backfillVectors(vaultRoot, store);
+  const chunkVec = await backfillChunkVectors(vaultRoot, store);
   return {
     pageContent: evidence.pageContent,
     timelineVisit: evidence.timelineVisit,
     chatTurn: chat.chatTurn,
     vectors: vec.vectors,
-    deleted: evidence.deleted + chat.deleted + vec.deleted,
+    chunkVectors: chunkVec.vectors,
+    deleted: evidence.deleted + chat.deleted + vec.deleted + chunkVec.deleted,
     timingMs: {
+      ...Object.fromEntries(Object.entries(chat.timingMs).map(([k, v]) => [`chat.${k}`, v])),
+      ...Object.fromEntries(Object.entries(vec.timingMs).map(([k, v]) => [`vec.${k}`, v])),
       ...Object.fromEntries(
-        Object.entries(chat.timingMs).map(([k, v]) => [`chat.${k}`, v]),
-      ),
-      ...Object.fromEntries(
-        Object.entries(vec.timingMs).map(([k, v]) => [`vec.${k}`, v]),
+        Object.entries(chunkVec.timingMs).map(([k, v]) => [`chunkVec.${k}`, v]),
       ),
     },
   };
@@ -416,8 +543,7 @@ export const backfillRecallStore = async (
 
 /** Quick check: does the store have ANY rows? Used to skip backfill on
  *  warm starts. */
-export const recallStoreIsEmpty = (store: RecallStore): boolean =>
-  store.documentCount() === 0;
+export const recallStoreIsEmpty = (store: RecallStore): boolean => store.documentCount() === 0;
 
 /** Per-source freshness signatures.
  *
@@ -455,18 +581,14 @@ const sigForPaths = async (paths: readonly string[]): Promise<string> => {
   return createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 32);
 };
 
-export const computeSourceSignatures = async (
-  vaultRoot: string,
-): Promise<SourceSignatures> => ({
+export const computeSourceSignatures = async (vaultRoot: string): Promise<SourceSignatures> => ({
   pageEvidence: await sigForPaths([
     join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
     join(vaultRoot, '_BAC', 'page-content', 'by-url'),
     join(vaultRoot, '_BAC', 'page-content', 'chunks'),
   ]),
   chatTurn: await sigForPaths([join(vaultRoot, '_BAC', 'recall')]),
-  vectors: await sigForPaths([
-    join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json'),
-  ]),
+  vectors: await sigForPaths([join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json')]),
 });
 
 /** @deprecated kept for backward compat; prefer computeSourceSignatures.
@@ -481,4 +603,3 @@ export const computeSourceSignature = async (vaultRoot: string): Promise<string>
 };
 
 export const SOURCE_SIGNATURE_KEY = 'source_signature_v1';
-

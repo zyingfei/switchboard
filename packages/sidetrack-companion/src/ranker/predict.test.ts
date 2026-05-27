@@ -65,6 +65,18 @@ const featuresFor = (score: number, sameWorkstream: 0 | 1): CandidatePairFeature
   topic_lineage_merge_split_related: sameWorkstream,
   page_quality_tier_from: sameWorkstream === 1 ? 3 : 1,
   page_quality_tier_to: sameWorkstream === 1 ? 3 : 1,
+  max_chunk_pair_vector_cosine: 0,
+  top3_mean_chunk_pair_vector_cosine: 0,
+  chunk_pair_vector_support_count: 0,
+  bm25_score: 0,
+  bm25_rank: 0,
+  dense_doc_score: 0,
+  dense_doc_rank: 0,
+  rrf_score: 0,
+  rrf_rank: 0,
+  graph_similarity_rank: 0,
+  candidate_source_flags: 0,
+  served_position: 0,
 });
 
 const syntheticTrainingSet = (): {
@@ -269,8 +281,8 @@ describe('LightGBM LambdaMART ranker', () => {
 
 describe('ranker model version back-compat', () => {
   it('pins the bumped model + feature-schema versions for the expanded feature set', () => {
-    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v5');
-    expect(FEATURE_SCHEMA_VERSION).toBe(5);
+    expect(RANKER_MODEL_VERSION).toBe('lightgbm-lambdamart-v6');
+    expect(FEATURE_SCHEMA_VERSION).toBe(6);
   });
 
   it('rejects a persisted model whose manifest predates the feature-set bump', async () => {
@@ -320,8 +332,39 @@ describe('ranker model version back-compat', () => {
     await expect(readClosestVisitRankerRevision(root, staleRevisionId)).resolves.toBeNull();
   });
 
-  it('round-trips and predicts a freshly trained v4 model after the bump', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v4-'));
+  it('rejects a v5 feature-schema manifest after the v6 schema bump', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v5-backcompat-'));
+    tempRoots.push(root);
+
+    const staleModelBytes = Buffer.from('stale-v5-lightgbm-model-bytes');
+    const staleRevisionId = 'stale-v5-revision';
+    const staleManifest = {
+      revisionId: staleRevisionId,
+      modelVersion: 'lightgbm-lambdamart-v5',
+      featureSchemaVersion: 5,
+      trainingDatasetHash: 'b'.repeat(64),
+      trainedAt: generatedAt,
+      modelByteLength: staleModelBytes.byteLength,
+      modelSha256: createHash('sha256').update(staleModelBytes).digest('hex'),
+    };
+    await mkdir(closestVisitRevisionDir(root), { recursive: true });
+    await writeFile(
+      closestVisitRevisionManifestPath(root, staleRevisionId),
+      `${JSON.stringify(staleManifest, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      closestVisitRevisionModelPath(root, staleRevisionId),
+      `${staleModelBytes.toString('base64')}\n`,
+      'utf8',
+    );
+
+    await expect(readClosestVisitRankerRevisionManifest(root, staleRevisionId)).resolves.toBeNull();
+    await expect(readClosestVisitRankerRevision(root, staleRevisionId)).resolves.toBeNull();
+  });
+
+  it('round-trips and predicts a freshly trained schema-v6 model after the bump', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-v6-'));
     tempRoots.push(root);
     const input = syntheticTrainingSet();
     const revision = withPassingShipGate(
@@ -330,13 +373,13 @@ describe('ranker model version back-compat', () => {
         options: { seed: 41, numRound: 8, trainedAt: generatedAt },
       }),
     );
-    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v5');
-    expect(revision.featureSchemaVersion).toBe(5);
+    expect(revision.modelVersion).toBe('lightgbm-lambdamart-v6');
+    expect(revision.featureSchemaVersion).toBe(6);
 
     await writeActiveClosestVisitRankerRevision(root, revision);
     const reloaded = await readClosestVisitRankerRevision(root, revision.revisionId);
     expect(reloaded).not.toBeNull();
-    if (reloaded === null) throw new Error('expected reloaded v4 revision');
+    if (reloaded === null) throw new Error('expected reloaded v6 revision');
 
     const model = await loadRankerModel(reloaded);
     try {

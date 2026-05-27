@@ -94,6 +94,7 @@ const lexicalFallbackEnabled = (): boolean => {
 const PASSAGE_PREFIX = 'passage: ';
 const QUERY_PREFIX = 'query: ';
 const CHUNK_SUPPORT_THRESHOLD = 0.2;
+const CHUNK_VECTOR_SUPPORT_THRESHOLD = 0.75;
 
 interface NormalizedVisit {
   readonly visitKey: string;
@@ -106,6 +107,7 @@ interface NormalizedVisit {
 export interface VisitSimilarityChunkEvidence {
   readonly terms?: readonly WeightedTerm[];
   readonly qualityWeight?: number;
+  readonly embeddingVector?: Float32Array;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -503,7 +505,7 @@ const entityOverlap = (
   return overlap / Math.min(left.length, right.length);
 };
 
-const chunkSupportFor = (
+export const chunkSupportFor = (
   leftChunks: readonly VisitSimilarityChunkEvidence[] | undefined,
   rightChunks: readonly VisitSimilarityChunkEvidence[] | undefined,
 ):
@@ -512,15 +514,22 @@ const chunkSupportFor = (
       readonly supportCount: number;
       readonly maxPairScore: number;
       readonly meanTop3Score: number;
+      readonly maxVectorCosine: number;
+      readonly top3MeanVectorCosine: number;
+      readonly vectorSupportCount: number;
     }
   | undefined => {
   if (leftChunks === undefined || rightChunks === undefined) return undefined;
   if (leftChunks.length === 0 || rightChunks.length === 0) return undefined;
   const scores: number[] = [];
+  const vectorScores: number[] = [];
   for (const left of leftChunks) {
     const leftTerms = left.terms ?? [];
-    if (leftTerms.length === 0) continue;
     for (const right of rightChunks) {
+      const vectorScore = cosine(left.embeddingVector, right.embeddingVector);
+      if (vectorScore !== undefined) vectorScores.push(vectorScore);
+
+      if (leftTerms.length === 0) continue;
       const rightTerms = right.terms ?? [];
       if (rightTerms.length === 0) continue;
       const lexical = Math.max(
@@ -531,17 +540,31 @@ const chunkSupportFor = (
       scores.push(lexical);
     }
   }
-  if (scores.length === 0) return undefined;
+  if (scores.length === 0 && vectorScores.length === 0) return undefined;
   scores.sort((left, right) => right - left);
+  vectorScores.sort((left, right) => right - left);
   const top3 = scores.slice(0, 3);
-  const meanTop3Score = top3.reduce((sum, value) => sum + value, 0) / top3.length;
+  const top3Vector = vectorScores.slice(0, 3);
+  const meanTop3Score =
+    top3.length === 0 ? 0 : top3.reduce((sum, value) => sum + value, 0) / top3.length;
+  const top3MeanVectorCosine =
+    top3Vector.length === 0
+      ? 0
+      : top3Vector.reduce((sum, value) => sum + value, 0) / top3Vector.length;
   const maxPairScore = scores[0] ?? 0;
+  const maxVectorCosine = vectorScores[0] ?? 0;
   const supportCount = scores.filter((score) => score >= CHUNK_SUPPORT_THRESHOLD).length;
+  const vectorSupportCount = vectorScores.filter(
+    (score) => score >= CHUNK_VECTOR_SUPPORT_THRESHOLD,
+  ).length;
   return {
     score: Math.min(1, meanTop3Score),
     supportCount,
     maxPairScore,
     meanTop3Score,
+    maxVectorCosine,
+    top3MeanVectorCosine,
+    vectorSupportCount,
   };
 };
 
@@ -753,6 +776,9 @@ const evidenceMetadataForPair = (
         : {
             chunkSupportCount: chunkSupport.supportCount,
             maxChunkPairScore: roundedCosine(chunkSupport.maxPairScore),
+            maxChunkPairVectorCosine: roundedCosine(chunkSupport.maxVectorCosine),
+            top3MeanChunkPairVectorCosine: roundedCosine(chunkSupport.top3MeanVectorCosine),
+            chunkPairVectorSupportCount: chunkSupport.vectorSupportCount,
           }),
       featureSchemaVersion: 2,
     },

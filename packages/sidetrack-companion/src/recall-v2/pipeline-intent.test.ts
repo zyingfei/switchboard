@@ -55,9 +55,7 @@ const makeStubStore = (): RecallStore => {
       docs.set(doc.entityId, doc);
     },
     queryFts({ q, sourceKind, limit }) {
-      const kinds = new Set<StoreSourceKind>(
-        Array.isArray(sourceKind) ? sourceKind : [sourceKind],
-      );
+      const kinds = new Set<StoreSourceKind>(Array.isArray(sourceKind) ? sourceKind : [sourceKind]);
       return [...docs.values()]
         .filter((d) => kinds.has(d.sourceKind) && matches(q, d))
         .slice(0, limit)
@@ -77,10 +75,17 @@ const makeStubStore = (): RecallStore => {
       new Set([...docs.values()].filter((d) => d.sourceKind === kind).map((d) => d.entityId)),
     deleteVector: () => {},
     allVectorEntityIds: () => new Set(),
+    upsertDocumentChunks: () => {},
+    deleteDocumentChunks: () => {},
+    deleteDocumentChunk: () => {},
+    allDocumentChunkIds: () => new Set(),
+    deleteChunkVector: () => {},
+    allChunkVectorIds: () => new Set(),
     runTransaction: <T>(fn: () => T): T => fn(),
     getRecallMetadata: () => undefined,
     setRecallMetadata: () => {},
     upsertVector: () => {},
+    upsertChunkVector: () => {},
     queryVector: () => [],
     close: () => {},
   };

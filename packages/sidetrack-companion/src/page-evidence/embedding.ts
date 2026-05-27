@@ -1,16 +1,13 @@
 import { createEmbeddingCache } from '../recall/embeddingCache.js';
 import { embed as defaultEmbed } from '../recall/embedder.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
+import { splitPageContentIntoChunks } from '../page-content/store.js';
 import { vectorIdFor } from './vectorRef.js';
 import type { PageEvidenceExtractedRequest, VectorRef } from './types.js';
 
-export type PageEvidenceEmbedder = (
-  texts: readonly string[],
-) => Promise<readonly Float32Array[]>;
+export type PageEvidenceEmbedder = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
 
 const MAX_EMBED_TEXT_CHARS = 100_000;
-const TARGET_CHUNK_CHARS = 1_200;
-const MAX_DOC_EMBED_CHUNKS = 80;
 
 const embeddingDisabled = (): boolean => {
   const raw = process.env['SIDETRACK_PAGE_EVIDENCE_DOC_EMBEDDINGS'];
@@ -28,29 +25,33 @@ const qualityWeightFor = (quality: PageEvidenceExtractedRequest['quality']): num
   return 0.25;
 };
 
-const splitDocEmbeddingChunks = (input: {
-  readonly title?: string;
+export interface DocEmbeddingChunk {
+  readonly chunkId: string;
+  readonly chunkIndex: number;
   readonly text: string;
-}): readonly string[] => {
-  const text = input.text.slice(0, MAX_EMBED_TEXT_CHARS);
-  const paragraphs = text
-    .split(/\n{2,}/u)
-    .map(normalizeSpaces)
-    .filter((part) => part.length > 0);
-  const chunks: string[] = [];
-  let current = normalizeSpaces(input.title ?? '');
-  for (const paragraph of paragraphs) {
-    const next = current.length === 0 ? paragraph : `${current}\n\n${paragraph}`;
-    if (next.length <= TARGET_CHUNK_CHARS || current.length === 0) {
-      current = next;
-      continue;
-    }
-    chunks.push(current);
-    current = paragraph;
-    if (chunks.length >= MAX_DOC_EMBED_CHUNKS) break;
-  }
-  if (chunks.length < MAX_DOC_EMBED_CHUNKS && current.length > 0) chunks.push(current);
-  return chunks.slice(0, MAX_DOC_EMBED_CHUNKS).map((chunk) => `passage: ${chunk}`);
+}
+
+export const splitDocEmbeddingChunks = (
+  payload: PageEvidenceExtractedRequest,
+): readonly DocEmbeddingChunk[] => {
+  const title = normalizeSpaces(payload.title ?? '');
+  return splitPageContentIntoChunks({
+    canonicalUrl: payload.canonicalUrl,
+    url: payload.url,
+    ...(payload.title === undefined ? {} : { title: payload.title }),
+    contentHash: payload.content.contentHash,
+    text: payload.content.text.slice(0, MAX_EMBED_TEXT_CHARS),
+    extractedAt: payload.extractedAt,
+    quality: payload.quality,
+    extractionStrategy: payload.extractionSource,
+  }).map((chunk) => {
+    const text = title.length === 0 ? chunk.text : `${title}\n\n${chunk.text}`;
+    return {
+      chunkId: chunk.id,
+      chunkIndex: chunk.chunkIndex,
+      text: `passage: ${text}`,
+    };
+  });
 };
 
 const l2Normalize = (vector: Float32Array): Float32Array => {
@@ -69,7 +70,7 @@ const l2Normalize = (vector: Float32Array): Float32Array => {
 };
 
 const weightedMean = (
-  chunks: readonly string[],
+  chunks: readonly DocEmbeddingChunk[],
   vectors: readonly Float32Array[],
   quality: PageEvidenceExtractedRequest['quality'],
 ): Float32Array | null => {
@@ -83,7 +84,7 @@ const weightedMean = (
     const chunk = chunks[index];
     if (vector === undefined || chunk === undefined || vector.length !== out.length) continue;
     const chunkWeight =
-      qualityWeight * Math.min(1, Math.sqrt(Math.max(1, wordCount(chunk)) / 220));
+      qualityWeight * Math.min(1, Math.sqrt(Math.max(1, wordCount(chunk.text)) / 220));
     totalWeight += chunkWeight;
     for (let dim = 0; dim < out.length; dim += 1) {
       out[dim] = (out[dim] ?? 0) + (vector[dim] ?? 0) * chunkWeight;
@@ -134,12 +135,9 @@ export const writePageEvidenceDocEmbedding = async (
     embedTextHash: ref.vectorId,
   });
   if (existing !== null) return ref;
-  const chunks = splitDocEmbeddingChunks({
-    ...(payload.title === undefined ? {} : { title: payload.title }),
-    text: payload.content.text,
-  });
+  const chunks = splitDocEmbeddingChunks(payload);
   if (chunks.length === 0) return undefined;
-  const vectors = await embedder(chunks);
+  const vectors = await embedder(chunks.map((chunk) => chunk.text));
   const docVector = weightedMean(chunks, vectors, payload.quality);
   if (docVector === null || docVector.length !== ref.dimensions) return undefined;
   await cache.put(

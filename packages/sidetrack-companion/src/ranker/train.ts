@@ -14,18 +14,16 @@ import {
 import type { Candidate } from './types.js';
 
 // Bumped v4 → v5 alongside FEATURE_SCHEMA_VERSION 4 → 5: the
-// `container_negative_match` feature joined the input vector (Step 7
-// of the incremental-ranker plan). A v4 model trained without that
-// column would silently mis-score pairs that should now read the
-// new feature, so the manifest validator pins this exact string and
-// the retrain loop produces a fresh v5 model.
+// PageEvidence content and chunk lexical signals joined the input
+// vector. The manifest validator pins this exact string, so the
+// retrain loop produces a fresh v5 model.
 //
 // Bumped v2 → v3 alongside FEATURE_SCHEMA_VERSION 2 → 3: the
 // closest_visit scorer no longer consumes workstream-identity leakage
 // features. The manifest validator pins this exact string, so a model
 // persisted under v2 fails to load and the retrain loop produces a
 // fresh non-leaky model instead of reusing leaked weights.
-export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v5' as const;
+export const RANKER_MODEL_VERSION = 'lightgbm-lambdamart-v6' as const;
 
 // Step 2 of the incremental-ranker plan — every artifact the training
 // pipeline produces gets its own ship-gate, surfaced as one entry in
@@ -262,11 +260,9 @@ export const LOGISTIC_BATCH_FEATURE_STATS_VERSION = 'no-normalization-v1' as con
 // scores. Inputs (in order): [lgb_score, logistic_batch_score,
 // graph_baseline_score]. Bias + 3 weights = 4 floats persisted on the
 // revision. The plan's broader combiner feature list includes
-// online_lr_score + container_negative_match, but online_lr is not yet
-// wired through the materializer (Steps 5-6 are pure modules), and
-// container_negative_match lives on the candidate row already (the
-// individual LightGBM/LR artifacts learn its weight). The 3-artifact
-// combiner is the minimum-viable cold-base + hot-head blend.
+// online_lr_score, but online_lr is not yet wired through the
+// materializer (Steps 5-6 are pure modules). The 3-artifact combiner is
+// the minimum-viable cold-base + hot-head blend.
 export const COMBINER_FEATURE_KINDS = [
   'lightgbm_lambdamart',
   'logistic_batch',
@@ -345,6 +341,12 @@ export interface RankerTrainingRow extends RankerTrainingCandidate {
   readonly label: number;
 }
 
+export interface RankerTrainingGroup {
+  readonly groupId: string;
+  readonly rows: readonly RankerTrainingRow[];
+  readonly generatedAt: number;
+}
+
 export interface RankerTrainingLabelingSummary {
   readonly totalCandidates: number;
   readonly labeledRows: number;
@@ -408,6 +410,20 @@ export const RANKER_FEATURE_KEYS = [
   'content_quality_pair_min',
   'chunk_support_count',
   'max_chunk_pair_score',
+  'max_chunk_pair_vector_cosine',
+  'top3_mean_chunk_pair_vector_cosine',
+  'chunk_pair_vector_support_count',
+  'bm25_score',
+  'bm25_rank',
+  'dense_doc_score',
+  'dense_doc_rank',
+  'rrf_score',
+  'rrf_rank',
+  'graph_similarity_rank',
+  'candidate_source_flags',
+  'served_position',
+  'cross_encoder_score',
+  'cross_encoder_rank_delta',
 ] as const satisfies readonly RankerFeatureKey[];
 
 const PREDICT_CONTRIB_BIAS_SLOT_COUNT = 1;
@@ -1004,11 +1020,25 @@ const logisticFeatureValue = (features: CandidatePairFeatures, key: RankerFeatur
     case 'content_entity_overlap':
       return cappedPositive(value, 4);
     case 'chunk_support_count':
+    case 'chunk_pair_vector_support_count':
       return cappedPositive(value, 5);
+    case 'bm25_rank':
+    case 'dense_doc_rank':
+    case 'rrf_rank':
+    case 'graph_similarity_rank':
+    case 'served_position':
+    case 'cross_encoder_rank_delta':
+      return cappedPositive(value, 50);
     case 'cosine_similarity':
     case 'content_weighted_jaccard':
     case 'content_vector_cosine':
     case 'max_chunk_pair_score':
+    case 'max_chunk_pair_vector_cosine':
+    case 'top3_mean_chunk_pair_vector_cosine':
+    case 'bm25_score':
+    case 'dense_doc_score':
+    case 'rrf_score':
+    case 'cross_encoder_score':
     case 'recency_score_from':
     case 'recency_score_to':
       return clamp01(value);
@@ -1024,7 +1054,7 @@ const logisticFeatureValue = (features: CandidatePairFeatures, key: RankerFeatur
     case 'same_active_topic':
     case 'topic_lineage_merge_split_related':
     case 'content_both_available':
-    case 'container_negative_match':
+    case 'candidate_source_flags':
       return value;
   }
 };
@@ -1132,7 +1162,8 @@ const trainCombinerLogisticRegression = (
     }
     for (let i = 0; i < weights.length; i += 1) {
       const reg = i === 0 ? 0 : l2 * (weights[i] ?? 0);
-      weights[i] = (weights[i] ?? 0) - learningRate * ((gradients[i] ?? 0) / scoreVectors.length + reg);
+      weights[i] =
+        (weights[i] ?? 0) - learningRate * ((gradients[i] ?? 0) / scoreVectors.length + reg);
     }
   }
   return weights;
@@ -1372,11 +1403,7 @@ const artifactShipGate = (
   }
   // Trained artifacts: logistic_batch, lightgbm_lambdamart (others land
   // with later steps).
-  if (
-    validation === undefined ||
-    reservedTest === undefined ||
-    baselineValidation === undefined
-  ) {
+  if (validation === undefined || reservedTest === undefined || baselineValidation === undefined) {
     return { status: 'unavailable', reason: 'validation-or-test-metric-unavailable' };
   }
   if (novelPositiveRows === 0) {
@@ -1429,8 +1456,9 @@ export const trainRankerRevisionFromRows = async (
   rowsInput: readonly RankerTrainingRow[],
   options: TrainRankerOptions = {},
   labelingSummary: RankerTrainingLabelingSummary = defaultLabelingSummary(rowsInput),
+  explicitGroups?: readonly UsableRankerRowGroup[],
 ): Promise<RankerRevision> => {
-  const allGroups = usableRowGroups(rowsInput);
+  const allGroups = explicitGroups ?? usableRowGroups(rowsInput);
   if (allGroups.length === 0) {
     throw new Error(
       'ranker training requires at least one query group with positive and negative labels',
@@ -1976,6 +2004,24 @@ export const trainRankerRevisionFromRows = async (
   } finally {
     dataset.dispose();
   }
+};
+
+export const trainRankerRevisionFromGroups = async (
+  groups: readonly RankerTrainingGroup[],
+  options: TrainRankerOptions = {},
+  labelingSummary: RankerTrainingLabelingSummary = defaultLabelingSummary(
+    groups.flatMap((group) => group.rows),
+  ),
+): Promise<RankerRevision> => {
+  const internalGroups: UsableRankerRowGroup[] = groups
+    .filter((group) => group.rows.length > 0)
+    .map((group) => ({
+      fromId: group.groupId,
+      rows: [...group.rows].sort(compareTrainingRow),
+      generatedAt: group.generatedAt,
+    }));
+  const rows = internalGroups.flatMap((group) => group.rows);
+  return trainRankerRevisionFromRows(rows, options, labelingSummary, internalGroups);
 };
 
 export const trainRankerRevision = async (input: TrainRankerInput): Promise<RankerRevision> =>

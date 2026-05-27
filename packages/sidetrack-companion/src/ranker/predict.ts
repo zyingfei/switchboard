@@ -92,6 +92,20 @@ const emptyContributions = (): RankerContributions => ({
   content_quality_pair_min: 0,
   chunk_support_count: 0,
   max_chunk_pair_score: 0,
+  max_chunk_pair_vector_cosine: 0,
+  top3_mean_chunk_pair_vector_cosine: 0,
+  chunk_pair_vector_support_count: 0,
+  bm25_score: 0,
+  bm25_rank: 0,
+  dense_doc_score: 0,
+  dense_doc_rank: 0,
+  rrf_score: 0,
+  rrf_rank: 0,
+  graph_similarity_rank: 0,
+  candidate_source_flags: 0,
+  served_position: 0,
+  cross_encoder_score: 0,
+  cross_encoder_rank_delta: 0,
 });
 
 const contributionsFor = (rawContributions: Float64Array): RankerContributions => {
@@ -215,10 +229,7 @@ export const loadActiveRanker = async (revision: RankerRevision): Promise<Active
     // present. Selector's isServeable guard should ensure this;
     // the defensive checks fall back to graph_baseline on
     // unexpected absence (same pattern as the LR path).
-    if (
-      revision.logisticBatchWeights === undefined ||
-      revision.combinerWeights === undefined
-    ) {
+    if (revision.logisticBatchWeights === undefined || revision.combinerWeights === undefined) {
       return {
         selection: {
           ...selection,

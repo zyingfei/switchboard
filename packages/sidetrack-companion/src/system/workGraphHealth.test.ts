@@ -12,10 +12,7 @@ import {
   createTopicRevisionStore,
   type TopicRevision,
 } from '../producers/topic-revision.js';
-import {
-  augmentFeedbackWithVisitPairLabels,
-  fingerprintFeedbackTrainingLabels,
-} from '../ranker/retrain.js';
+import { fingerprintFeedbackTrainingLabels } from '../ranker/retrain.js';
 import { RANKER_MODEL_VERSION } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -313,7 +310,7 @@ describe('work graph diagnostic candidates', () => {
     );
   });
 
-  it('compares retrain freshness against the same augmented label dataset used by retrain', async () => {
+  it('compares retrain freshness against the unexpanded event-sourced label dataset', async () => {
     const replicaId = '11111111-1111-4111-8111-111111111111';
     const peerReplicaId = '22222222-2222-4222-8222-222222222222';
     let seq = 0;
@@ -375,10 +372,7 @@ describe('work graph diagnostic candidates', () => {
     };
     await createConnectionsStore(vaultRoot).putCurrent(snapshot);
 
-    const feedback = augmentFeedbackWithVisitPairLabels(
-      projectFeedback([rejectedAgainstWorkstream]),
-      snapshot,
-    );
+    const feedback = projectFeedback([rejectedAgainstWorkstream]);
     const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
     await mkdir(join(vaultRoot, '_BAC', 'connections', 'closest-visit'), { recursive: true });
     await writeFile(
@@ -404,10 +398,12 @@ describe('work graph diagnostic candidates', () => {
     });
 
     expect(health.ranker.datasetChangedSinceTrain).toBe(false);
-    expect(health.ranker.retrainSkipReason).toBe('unchanged');
+    expect(health.ranker.retrainSkipReason).toBe('insufficient_groups');
+    expect(health.ranker.expandedNegativeCount).toBe(0);
+    expect(health.ranker.labelDriftWithoutFeedback).toBe(0);
     expect(health.ranker.trainingMix).toMatchObject({
       positivesAtTrain: 0,
-      userFeedbackNegativesAtTrain: 2,
+      userFeedbackNegativesAtTrain: 1,
     });
   });
 });

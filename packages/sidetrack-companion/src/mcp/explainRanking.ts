@@ -292,6 +292,7 @@ export const explainRanking = async (
       extractFeatures(candidate, {
         merged: [...mergedEvents],
         snapshot,
+        retrievalContext: { missingRetrievalContext: true },
       }),
     );
     const prediction = loadedRanker.ranker.predict(features, candidate);

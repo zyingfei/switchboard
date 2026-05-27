@@ -1310,7 +1310,11 @@ export const closestVisitRankerEdgesForSnapshot = (
       ? {}
       : { evidenceVectorsByVectorId: input.evidenceVectorsByVectorId }),
   };
-  const rankerFeatureContext = { merged, snapshot: baseSnapshot };
+  const rankerFeatureContext = {
+    merged,
+    snapshot: baseSnapshot,
+    retrievalContext: { missingRetrievalContext: true },
+  };
   const rankerEdges = new Map<string, ConnectionEdge>();
 
   const observedAtForVisit = (visitKey: string): string => {
