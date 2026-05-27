@@ -371,7 +371,11 @@ describe('work graph diagnostic candidates', () => {
     });
   });
 
-  it('marks v6 legacy-trained ranker manifests invalid', async () => {
+  it('reports v6 legacy-trained ranker manifests as ready (softened 2026-05-26)', async () => {
+    // Round 1 #5 originally marked v6-from-legacy as invalid. Softened
+    // per dogfood: the model still carries ~27 real features from
+    // explicit feedback; the 5 retrieval features are zero-fills. Let
+    // it serve and compete via the ship-gate.
     await writeActiveClosestVisitRankerRevision(vaultRoot, {
       revisionId: 'legacy-v6',
       modelVersion: RANKER_MODEL_VERSION,
@@ -387,19 +391,8 @@ describe('work graph diagnostic candidates', () => {
       now: () => new Date('2026-05-16T13:15:00.000Z'),
     });
 
-    expect(health.ranker).toMatchObject({
-      loadStatus: 'invalid-model',
-      loadReason: 'v6_from_legacy_blocked',
-    });
-    expect(health.candidates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: 'ranker.active-model',
-          status: 'alarm',
-          reason: 'v6_from_legacy_blocked',
-        }),
-      ]),
-    );
+    expect(health.ranker.loadStatus).toBe('ready');
+    expect(health.ranker.loadReason).toBeNull();
   });
 
   it('compares retrain freshness against the unexpanded event-sourced label dataset', async () => {

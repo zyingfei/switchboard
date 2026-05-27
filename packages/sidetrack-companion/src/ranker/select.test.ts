@@ -144,16 +144,21 @@ describe('selectActiveRanker', () => {
     expect(selectActiveRanker(revision).selectedKind).toBe('graph_baseline');
   });
 
-  it('refuses v6 LightGBM revisions trained from legacy rows', () => {
+  it('allows v6 LightGBM trained from legacy ("sparse") to serve — softened on 2026-05-26', () => {
+    // Round 1 #5 originally blocked v6-from-legacy entirely. Softened
+    // per dogfood: the model still carries ~27 real features from
+    // explicit feedback; only the 5 retrieval features are zero-fills.
+    // Let it compete via the ship-gate; trainingOrigin remains
+    // surfaced in health for auditability.
     const revision = baseRevision({
       trainedFromImpressions: false,
       artifactQuality: [artifact('lightgbm_lambdamart', 'pass', 0.8)],
     });
 
-    expect(isServeable('lightgbm_lambdamart', revision)).toBe(false);
+    expect(isServeable('lightgbm_lambdamart', revision)).toBe(true);
     expect(selectActiveRanker(revision)).toMatchObject({
-      selectedKind: 'graph_baseline',
-      reason: 'fallback_graph_baseline',
+      selectedKind: 'lightgbm_lambdamart',
+      reason: 'best_passing',
     });
   });
 

@@ -63,11 +63,14 @@ const kindRank = (kind: RankerArtifactKind): number => {
 export const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolean => {
   if (kind === 'graph_baseline') return true;
   if (kind === 'lightgbm_lambdamart') {
-    const sourceAllowed =
-      revision.modelVersion === 'lightgbm-lambdamart-v6'
-        ? revision.trainedFromImpressions === true
-        : true;
-    return revision.modelBytes.byteLength > 0 && sourceAllowed;
+    // Round 1 #5 softening: v6 trained from legacy is "sparse"
+    // (retrieval features zero-filled with missingRetrievalContext)
+    // but still carries ~27 real features from explicit feedback.
+    // We surface trainingOrigin in health so it's auditable, but
+    // serveability is decided by the ship-gate over impression-level
+    // metrics — not by the training source per se. The reviewer's
+    // intent ("name it; let it compete") not "block entirely".
+    return revision.modelBytes.byteLength > 0;
   }
   if (kind === 'logistic_batch') {
     return (

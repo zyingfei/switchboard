@@ -74,9 +74,12 @@ const DEFAULT_RERANK_TOP_K = 0;
 
 // TODO(calibration): defaults from intuition; sweep + eval pending.
 // See docs/design/recall-ranker-v2-replacement.md "deferred" section.
+// maxStrong bumped 5 -> 10 on 2026-05-26 per dogfood feedback — user
+// expected to see rerank's top-20 in tier-1, not 5. 10 is a middle
+// ground until the calibration harness lands.
 const TIERING_DEFAULTS = {
   minStrong: 3,
-  maxStrong: 5,
+  maxStrong: 10,
   weakFloor: 0.3,
   gapThreshold: 0.15,
 } as const;

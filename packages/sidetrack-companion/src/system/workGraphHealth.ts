@@ -893,6 +893,10 @@ export const collectWorkGraphHealth = async ({
     activeManifest === null
       ? null
       : await readClosestVisitRankerRevision(vaultRoot, activeManifest.revisionId);
+  // Round 1 #5 softening (2026-05-26): v6-from-legacy ("sparse") is no
+  // longer marked invalid. The ship-gate decides serveability over
+  // impression-level metrics; training source is informational only.
+  // The flag is still surfaced as `trainingOrigin` for auditability.
   const activeV6FromLegacy =
     activeManifest?.modelVersion === 'lightgbm-lambdamart-v6' &&
     activeManifest.trainedFromImpressions === false;
@@ -953,7 +957,7 @@ export const collectWorkGraphHealth = async ({
         ? activeManifestProbe === null
           ? 'missing'
           : 'invalid-model'
-        : activeRevision === null || activeV6FromLegacy
+        : activeRevision === null
           ? 'invalid-model'
           : 'ready',
     loadReason:
@@ -961,11 +965,9 @@ export const collectWorkGraphHealth = async ({
         ? activeManifestProbe === null
           ? 'no-active-manifest'
           : 'invalid-active-model'
-        : activeV6FromLegacy
-          ? 'v6_from_legacy_blocked'
-          : activeRevision === null
-            ? 'invalid-active-model'
-            : null,
+        : activeRevision === null
+          ? 'invalid-active-model'
+          : null,
     activeModelVersion:
       activeManifestProbe?.activeModelVersion ?? activeManifest?.modelVersion ?? null,
     expectedModelVersion:

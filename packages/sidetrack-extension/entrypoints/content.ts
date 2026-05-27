@@ -1047,9 +1047,13 @@ export default defineContentScript({
         const v2Raw = (await chrome.runtime.sendMessage({
           type: messageTypes.recallV2Query,
           req: {
+            // limit bumped 12 -> 20 on 2026-05-26: user expected the
+            // popover to show the rerank's top-20 (rerankTopK=20),
+            // not the prior 12-cap. Tiering decides strong vs
+            // collapsed visibility within that 20.
             q: text,
-            limit: 12,
-            perSourceLimit: 20,
+            limit: 20,
+            perSourceLimit: 25,
             session: { currentUrl: window.location.href },
             strategy: { explain: true },
           },
