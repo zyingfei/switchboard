@@ -258,6 +258,7 @@ export interface ConnectionsInput {
 
 export interface ClosestVisitRankerPrediction {
   readonly score: number;
+  readonly rankerKind?: 'lightgbm_lambdamart' | 'graph_baseline' | string;
   readonly contributions: Readonly<Partial<Record<keyof CandidatePairFeatures, number>>>;
 }
 
@@ -1338,6 +1339,7 @@ export const closestVisitRankerEdgesForSnapshot = (
           candidate,
           toVisitKey,
           score: roundRankerMetric(prediction.score),
+          ...(prediction.rankerKind === undefined ? {} : { rankerKind: prediction.rankerKind }),
           topContributions: topClosestVisitContributions(prediction.contributions, 3),
         };
       })
@@ -1348,6 +1350,7 @@ export const closestVisitRankerEdgesForSnapshot = (
           readonly candidate: Candidate;
           readonly toVisitKey: string;
           readonly score: number;
+          readonly rankerKind?: string;
           readonly topContributions: readonly {
             readonly feature: string;
             readonly weight: number;
@@ -1378,7 +1381,10 @@ export const closestVisitRankerEdgesForSnapshot = (
         confidence: 'inferred',
         family: 'urlmatch',
         metadata: {
+          // PR C intentionally skips aggregate per-kind score histograms in
+          // focusHealth diagnostics; keep the per-edge score authoritative here.
           score: scored.score,
+          ...(scored.rankerKind === undefined ? {} : { rankerKind: scored.rankerKind }),
           featureSchemaVersion: FEATURE_SCHEMA_VERSION,
           candidateSources: [...scored.candidate.sources],
           primaryCandidateSource: primaryRankerCandidateSource(scored.candidate),

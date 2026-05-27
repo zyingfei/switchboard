@@ -1380,7 +1380,11 @@ describe('connections — content-derived edges', () => {
           topK: 2,
           predict: (_features, candidate) => {
             const score = scoreByToVisit.get(candidate.toVisitId) ?? 0.1;
-            return { score, contributions: rankerContributionsFor(score) };
+            return {
+              score,
+              rankerKind: 'graph_baseline',
+              contributions: rankerContributionsFor(score),
+            };
           },
         },
       }),
@@ -1395,6 +1399,7 @@ describe('connections — content-derived edges', () => {
       nodeIdFor('timeline-visit', 'https://ranker.test/b'),
       nodeIdFor('timeline-visit', 'https://ranker.test/c'),
     ]);
+    expect(fromA.map((edge) => edge.metadata?.['score'])).toEqual([0.91, 0.62]);
     expect(fromA[0]).toMatchObject({
       observedAt: '2026-05-07T09:01:30.000Z',
       producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
@@ -1402,6 +1407,7 @@ describe('connections — content-derived edges', () => {
       family: 'urlmatch',
       metadata: {
         score: 0.91,
+        rankerKind: 'graph_baseline',
         featureSchemaVersion: FEATURE_SCHEMA_VERSION,
         topContributions: [
           { feature: 'same_host', weight: 0.455 },
