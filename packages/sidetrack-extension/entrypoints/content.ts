@@ -1079,7 +1079,13 @@ export default defineContentScript({
               // Phase 0 — companion stamps a per-impression id on
               // every response so click / open-new-tab actions can be
               // joined back to the served context for ranker training.
-              readonly meta?: { readonly servedContextId?: string };
+              readonly meta?: {
+                readonly servedContextId?: string;
+                readonly activeSessionMarkers?: readonly {
+                  readonly entityId: string;
+                  readonly reason: 'current_chat' | 'open_tab' | 'recently_created';
+                }[];
+              };
             }
           | { readonly ok: false; readonly error?: string }
           | null
@@ -1098,6 +1104,10 @@ export default defineContentScript({
         const results = v2 != null && v2.ok === true ? v2.results : [];
         const servedContextId =
           v2 != null && v2.ok === true ? v2.meta?.servedContextId : undefined;
+        const activeSessionMarkers =
+          v2 != null && v2.ok === true ? v2.meta?.activeSessionMarkers ?? [] : [];
+        const markerByEntity = new Map<string, 'current_chat' | 'open_tab' | 'recently_created'>();
+        for (const m of activeSessionMarkers) markerByEntity.set(m.entityId, m.reason);
         if (results.length === 0 && !force) return;
         // Phase 0 — pre-build the lookup table for emitting recall.action
         // when the user clicks/opens a row. Maps the popover row id back
@@ -1139,12 +1149,14 @@ export default defineContentScript({
               const vectorDist = r.evidence.find((e) => e.vectorDistance !== undefined)
                 ?.vectorDistance;
               const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
+              const marker = markerByEntity.get(r.entityId);
               return {
                 id: r.candidateId ?? r.entityId,
                 title: r.title ?? r.canonicalUrl ?? '(no title)',
                 snippet: r.snippet ?? '',
                 score: r.fusedScore,
                 relativeWhen: r.lastSeenAt ?? r.firstSeenAt ?? '',
+                ...(marker === undefined ? {} : { marker }),
                 ...(facet === undefined ? {} : { facet }),
                 provider: detectProviderFromUrl(
                   r.canonicalUrl ?? window.location.href,

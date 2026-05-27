@@ -789,16 +789,34 @@ const suppressionKey = (url: string | undefined): string | undefined => {
   }
 };
 
+type ActiveSessionMarker = NonNullable<RecallResponse['meta']['activeSessionMarkers']>[number];
+
+const activeSessionReasonFor = (
+  candidate: RecallCandidate,
+  activeChats: ReadonlySet<string>,
+): ActiveSessionMarker['reason'] | undefined => {
+  if (activeChats.has(candidate.entityId)) return 'recently_created';
+  if (candidate.threadId !== undefined && activeChats.has(candidate.threadId)) {
+    return 'recently_created';
+  }
+  return undefined;
+};
+
 const applySuppression = (
   candidates: readonly RecallCandidate[],
   req: RecallRequest,
   now: number,
-): { kept: readonly RecallCandidate[]; dropped: readonly RecallCandidate[] } => {
+): {
+  kept: readonly RecallCandidate[];
+  dropped: readonly RecallCandidate[];
+  activeSessionMarkers: readonly ActiveSessionMarker[];
+} => {
   const policy = req.suppression ?? {};
   const minAge = policy.minHitAgeMs ?? DEFAULT_MIN_HIT_AGE_MS;
   const currentLoc = suppressionKey(req.session?.currentUrl);
   const currentMode = policy.suppressCurrentPage ?? 'always';
   const activeChats = new Set(policy.suppressActiveChatBacIds ?? []);
+  const markActiveSessions = policy.markActiveSessionsInsteadOfSuppress ?? true;
   const excluded = new Set([
     ...(policy.excludeEntityIds ?? []),
     ...(req.session?.excludeEntityIds ?? []),
@@ -806,6 +824,7 @@ const applySuppression = (
 
   const kept: RecallCandidate[] = [];
   const dropped: RecallCandidate[] = [];
+  const activeSessionMarkers: ActiveSessionMarker[] = [];
   for (const c of candidates) {
     const reasons: string[] = [];
     if (excluded.has(c.entityId)) reasons.push('explicit-exclude');
@@ -813,7 +832,10 @@ const applySuppression = (
       const candLoc = suppressionKey(c.canonicalUrl);
       if (candLoc !== undefined && candLoc === currentLoc) reasons.push('current-page');
     }
-    if (c.threadId !== undefined && activeChats.has(c.threadId)) {
+    const activeSessionReason = activeSessionReasonFor(c, activeChats);
+    if (activeSessionReason !== undefined && markActiveSessions) {
+      activeSessionMarkers.push({ entityId: c.entityId, reason: activeSessionReason });
+    } else if (activeSessionReason !== undefined) {
       reasons.push('active-chat');
     }
     if (minAge > 0 && c.lastSeenAt !== undefined) {
@@ -826,7 +848,7 @@ const applySuppression = (
       dropped.push({ ...c, suppressedReasons: reasons });
     }
   }
-  return { kept, dropped };
+  return { kept, dropped, activeSessionMarkers };
 };
 
 // Phase 4 — graph_neighbor is DEMOTED. The Similar tier is now
@@ -893,10 +915,15 @@ const resolveSources = (req: RecallRequest, intent: RecallIntent): Set<RecallSou
   new Set(req.sources ?? SOURCES_BY_INTENT[intent]);
 
 const resolveSuppression = (req: RecallRequest, intent: RecallIntent): RecallRequest => {
-  // When the caller passes an explicit `suppression` object, respect
-  // it verbatim. Otherwise merge intent defaults onto the request.
-  if (req.suppression !== undefined) return req;
-  return { ...req, suppression: SUPPRESSION_BY_INTENT[intent] };
+  const policy = req.suppression ?? SUPPRESSION_BY_INTENT[intent];
+  return {
+    ...req,
+    suppression: {
+      ...policy,
+      markActiveSessionsInsteadOfSuppress:
+        policy.markActiveSessionsInsteadOfSuppress ?? true,
+    },
+  };
 };
 
 /** `focus` candidate generator — direct canonical-URL lookup against
@@ -1067,7 +1094,7 @@ export const runRecall = async (
   timings['fuse'] = (deps.now ?? Date.now)() - fuseStart;
 
   const suppressStart = (deps.now ?? Date.now)();
-  const { kept, dropped } = applySuppression(fused, req, now);
+  const { kept, dropped, activeSessionMarkers } = applySuppression(fused, req, now);
   timings['suppress'] = (deps.now ?? Date.now)() - suppressStart;
 
   // P7 — optional cross-encoder rerank. Off by default; on when the
@@ -1097,6 +1124,10 @@ export const runRecall = async (
     rerankApplied = true;
   }
   const results = resultsAfterRerank.slice(0, limit);
+  const resultEntityIds = new Set(results.map((r) => r.entityId));
+  const responseActiveSessionMarkers = activeSessionMarkers.filter((m) =>
+    resultEntityIds.has(m.entityId),
+  );
   const perSourceCounts: Record<RecallSourceKind, number> = {
     page_content: 0,
     timeline_visit: 0,
@@ -1213,6 +1244,9 @@ export const runRecall = async (
         degradedToLexical,
       },
       servedContextId,
+      ...(responseActiveSessionMarkers.length > 0
+        ? { activeSessionMarkers: responseActiveSessionMarkers }
+        : {}),
       ...(rerankApplied
         ? {
             rerank: {

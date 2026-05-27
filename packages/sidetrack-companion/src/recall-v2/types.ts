@@ -106,8 +106,13 @@ export interface SuppressionPolicy {
    *     URL structure, NOT a hardcoded host list */
   readonly suppressCurrentPage?: 'always' | 'never' | 'unless-discussion';
   /** Bac_ids of chats the user is actively in / just created. These
-   *  never surface as "déjà-vu" (fixes the AI 不应做架构师 case). */
+   *  drive either active-session markers (default) or legacy filtering
+   *  when markActiveSessionsInsteadOfSuppress is explicitly false. */
   readonly suppressActiveChatBacIds?: readonly string[];
+  /** When true, active-chat bacIds are surfaced via
+   *  response.meta.activeSessionMarkers instead of being filtered out.
+   *  Defaults to true post-PR-B; suppression becomes opt-in. */
+  readonly markActiveSessionsInsteadOfSuppress?: boolean;
   /** Drop chats marked as Ask-AI artifacts (user typed in the popover
    *  and got an answer; not a "prior" by any meaningful definition). */
   readonly suppressAskAiArtifacts?: boolean;
@@ -214,6 +219,20 @@ export interface RecallResponse {
      *  it back in recall.action so the ranker trainer can join served ×
      *  action records by impression. */
     readonly servedContextId?: string;
+    /** Phase post-v6 — non-suppressive markers. The extension surfaces
+     *  these as badges ("current chat" / "open now") on candidates that
+     *  match an active session. PRESENTATION CONTEXT ONLY — NOT a
+     *  negative relevance signal. Replaces the prior 10-minute
+     *  suppressActiveChatBacIds rule which hid relevant results. */
+    readonly activeSessionMarkers?: readonly {
+      readonly entityId: string;
+      readonly reason:
+        | 'current_chat'
+        // Reserved for a follow-up SW addition that tracks open chat
+        // URLs in real time; only 'recently_created' is wired here.
+        | 'open_tab'
+        | 'recently_created';
+    }[];
     /** Cross-encoder rerank diagnostics. Present when rerank fired. */
     readonly rerank?: {
       readonly enabled: boolean;

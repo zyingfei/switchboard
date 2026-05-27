@@ -2991,17 +2991,14 @@ const handleRequest = async (
     // RecallResponse opaque to the extension; callers narrow as
     // needed. Companion does fusion/dedupe/suppression server-side.
     //
-    // P0 — active-chat suppression contract. The content script only
-    // knows `currentUrl`; the background SW knows the recent dispatches
-    // (Ask-AI artifacts, very recent thread creations). We ENRICH the
-    // request here by injecting:
+    // P0 / PR-B — active-session marker contract. The content script
+    // only knows `currentUrl`; the background SW knows the recent
+    // dispatches (Ask-AI artifacts, very recent thread creations). We
+    // ENRICH the request here by injecting:
     //   - activeChatBacIds: every dispatch within the last 10 minutes
-    //   - excludeEntityIds: every dispatch within the last 10 minutes
-    //     hashed the way pipeline.ts:entityIdFor would hash them
-    //   - sessionId: the SW startup timestamp as a coarse session id
-    // The server's SuppressionPolicy then strips these from results,
-    // closing the "I just created this chat 9 minutes ago — why is it
-    // surfacing as déjà-vu" leak (case-study residual).
+    // The server surfaces matching results with
+    // meta.activeSessionMarkers instead of hiding them, so rank order
+    // stays intact and the UI can render a presentation-only badge.
     const buildRecallV2Response = async (): Promise<unknown> => {
       try {
         const settings = await readSettings();
@@ -3051,15 +3048,12 @@ const handleRequest = async (
           // activeChatBacIds — always added; harmless for search
           // (callers may pass [] or omit), useful for dejavu.
           suppressActiveChatBacIds: mergedActiveBacIds,
-          // For dejavu, keep the historical dejavu-shaped defaults
-          // (10-min freshness floor + suppress current page) since
-          // the user just selected text on a page and the server
-          // hasn't necessarily seen the dispatch yet. For search /
-          // focus, leave suppressCurrentPage + minHitAgeMs UNSET so
-          // the server's intent profile (SEARCH = 'never' + 0) wins.
+          // For dejavu, keep suppress-current-page since the user
+          // just selected text on that page. Do not add the old
+          // 10-minute minHitAgeMs floor here: active chats are now
+          // marked for presentation, not filtered by age.
           ...(intent === 'dejavu'
             ? {
-                minHitAgeMs: ACTIVE_WINDOW_MS,
                 suppressCurrentPage: 'always' as const,
               }
             : {}),

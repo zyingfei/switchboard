@@ -271,6 +271,18 @@ const OVERLAY_CSS = `
   color: var(--ink-3);
   font-size: 12px;
 }
+.cx-deja-marker {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.4;
+  color: var(--ink-3);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
 .sidetrack-deja-row .score {
   font-family: var(--mono);
   font-size: 9.5px;
@@ -904,12 +916,27 @@ export const mountAnnotationNotePopover = (
   };
 };
 
+type DejaVuMarker =
+  | 'current_chat'
+  // 'open_tab' is reserved for a follow-up service-worker addition
+  // that tracks open chat URLs in real time; only 'recently_created'
+  // is wired in this commit.
+  | 'open_tab'
+  | 'recently_created';
+
+const dejaVuMarkerLabel = (marker: DejaVuMarker): string => {
+  if (marker === 'current_chat') return 'Current';
+  if (marker === 'open_tab') return 'Open';
+  return 'Recent';
+};
+
 export interface DejaVuItem {
   readonly id: string;
   readonly title: string;
   readonly snippet: string;
   readonly score: number;
   readonly relativeWhen: string;
+  readonly marker?: DejaVuMarker;
   readonly provider?: ProviderId;
   readonly threadUrl?: string;
   // Full thread bac_id + last-seen timestamp from the recall result.
@@ -1288,6 +1315,7 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
     row.innerHTML = `
       <div class="r1">
         <span class="title"></span>
+        <span class="cx-deja-marker"></span>
         <span class="sidetrack-deja-facet"></span>
         <span class="sidetrack-deja-provider"></span>
         <span class="sidetrack-deja-when"></span>
@@ -1316,6 +1344,11 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
         rawTitle === 'Untitled';
       titleEl.textContent = rawTitle.length === 0 ? '(no title)' : rawTitle;
       if (looksRedacted) titleEl.classList.add('is-redacted');
+    }
+    const markerEl = row.querySelector('.cx-deja-marker');
+    if (markerEl !== null) {
+      if (item.marker === undefined) markerEl.remove();
+      else markerEl.textContent = dejaVuMarkerLabel(item.marker);
     }
     const facetEl = row.querySelector('.sidetrack-deja-facet');
     if (facetEl !== null) {
