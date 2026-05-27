@@ -1925,29 +1925,19 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
       });
     }
   }
+  // Inbound-reminder projection (2026-05-27): suppressed by default.
+  // Every chatgpt capture writes a reminder record to `_BAC/reminders/`
+  // with status='new', and the prior projection promoted each one to
+  // a graph node + reminder_for_thread edge. Per user audit: on a
+  // mature vault this is 400+ vestigial "new" reminders polluting
+  // node and edge counts (~6% of nodes), and the follow-up UI flow
+  // these were meant to power was never wired. We KEEP the JSON
+  // records on disk (a future inbox feature can read them directly)
+  // but stop projecting them into the connections graph. To re-enable
+  // for a real reminder-inbox surface: filter to status !== 'new' OR
+  // gate on an explicit env / user-pref flag.
   for (const r of input.reminders) {
-    const reminderId = r.bac_id ?? `${r.threadId}@${r.detectedAt ?? ''}`;
-    trackObservedAt(r.detectedAt);
-    upsertNode(nodes, {
-      kind: 'inbound-reminder',
-      key: reminderId,
-      label: r.threadId,
-      ...(r.detectedAt === undefined ? {} : { observedAt: r.detectedAt }),
-      metadata: {
-        ...(r.provider === undefined ? {} : { provider: r.provider }),
-        ...(r.status === undefined ? {} : { status: r.status }),
-        threadId: r.threadId,
-      },
-    });
-    upsertNode(nodes, { kind: 'thread', key: r.threadId, label: r.threadId });
-    upsertEdge(edges, {
-      kind: 'reminder_for_thread',
-      fromNodeId: nodeIdFor('inbound-reminder', reminderId),
-      toNodeId: nodeIdFor('thread', r.threadId),
-      observedAt: r.detectedAt ?? '',
-      producedBy: { source: 'reminder-store', recordId: reminderId },
-      confidence: 'asserted',
-    });
+    void r;
   }
   for (const c of input.codingSessions) {
     const obs = c.lastSeenAt ?? c.attachedAt;
