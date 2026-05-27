@@ -53,7 +53,7 @@ type DiagnosticCandidateMetric = string | number | boolean | null;
 export interface DiagnosticCandidate {
   readonly id: string;
   readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
-  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic';
+  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
   readonly reason: string | null;
@@ -758,8 +758,10 @@ const buildDiagnosticCandidates = (input: {
       // U2 — now ON by default + the actual decision is surfaced (was
       // a perpetual 'last-fast-path-decision-unavailable' standby).
       // servingImpact reflects whether the incremental path actually
-      // ran this drain.
-      lane: 'standby',
+      // ran this drain. Lane renamed 'standby' → 'incremental' on
+      // 2026-05-27 (the IVM hot path IS the serving path in steady
+      // state; "standby" misled in the panel).
+      lane: 'incremental',
       servingImpact: booleanOrFalse(hotSim?.['usedHotPath']) ? 'serving' : 'not-serving',
       status: !hotSimilarityEnabled
         ? 'off'
@@ -793,7 +795,8 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'topic.hot-incremental',
       family: 'topic',
-      lane: 'standby',
+      // Lane: see similarity.hot-incremental note. Same rename.
+      lane: 'incremental',
       servingImpact: booleanOrFalse(hotTop?.['usedFastPath']) ? 'serving' : 'not-serving',
       status: !hotTopicsEnabled
         ? 'off'
@@ -826,7 +829,9 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'content-lane.dirty-source-queue',
       family: 'content-lane',
-      lane: 'standby',
+      // Queue health — not a standby alternative; rename per panel
+      // cleanup 2026-05-27.
+      lane: 'queue',
       servingImpact: 'not-serving',
       status: contentLaneStatus,
       reason:

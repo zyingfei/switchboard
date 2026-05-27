@@ -213,21 +213,23 @@ describe('work graph diagnostic candidates', () => {
         // U2 — hot paths default ON (topics unset ⇒ now enabled, was
         // 'off'/'env-off'); no hotPath diagnostics in this fixture ⇒
         // honest 'pending'/'fast-path-decision-pending'.
+        // Lane renames 2026-05-27: 'standby' → 'incremental' for
+        // hot-paths, 'queue' for content-lane queue health.
         expect.objectContaining({
           id: 'similarity.hot-incremental',
-          lane: 'standby',
+          lane: 'incremental',
           status: 'pending',
           reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'topic.hot-incremental',
-          lane: 'standby',
+          lane: 'incremental',
           status: 'pending',
           reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'content-lane.dirty-source-queue',
-          lane: 'standby',
+          lane: 'queue',
           status: 'pending',
           reason: 'dirty-source-pending',
           asOf: '2026-05-16T12:45:00.000Z',

@@ -192,7 +192,7 @@ type DiagnosticCandidateMetric = string | number | boolean | null;
 interface DiagnosticCandidate {
   readonly id: string;
   readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
-  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic';
+  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
   readonly reason: string | null;
@@ -488,11 +488,74 @@ const isCandidateSignal = (candidate: DiagnosticCandidate): boolean =>
   candidate.lane === 'active' &&
   (candidate.servingImpact === 'serving' || candidate.id === 'ranker.active-model');
 
-const metricSummary = (candidate: DiagnosticCandidate): string =>
-  Object.entries(candidate.metrics)
+// Per-candidate compact formatters. Renders 2-4 key statistics at-a-
+// glance instead of the verbose `key=value · key=value · …` dump.
+// Cards not listed here fall back to the generic dump.
+//
+// Honest naming: when the metric is missing (null/undefined), the
+// formatter omits it rather than rendering "—" so a half-populated
+// card stays readable.
+const m2 = (v: unknown): string =>
+  v === null || v === undefined ? '' : String(formatCandidateMetric(v));
+const compactMetricsByCandidateId: Record<string, (m: Record<string, unknown>) => string> = {
+  'similarity.hot-incremental': (m) => {
+    const parts: string[] = [];
+    if (m['edgeCount'] != null) parts.push(`${m2(m['edgeCount'])} edges`);
+    if (m['newEmbedded'] != null) parts.push(`${m2(m['newEmbedded'])} new embeds`);
+    if (m['runtimeMs'] != null) parts.push(`${m2(m['runtimeMs'])}ms`);
+    if (m['usedHotPath'] === false) parts.push('fallback');
+    return parts.join(' · ');
+  },
+  'topic.hot-incremental': (m) => {
+    const parts: string[] = [];
+    if (m['topicCount'] != null) parts.push(`${m2(m['topicCount'])} topics`);
+    if (m['componentCount'] != null) parts.push(`${m2(m['componentCount'])} components`);
+    if (m['cacheHit'] === true) parts.push('cache hit');
+    else if (m['cacheHit'] === false) parts.push('cache miss');
+    if (m['runtimeMs'] != null) parts.push(`${m2(m['runtimeMs'])}ms`);
+    return parts.join(' · ');
+  },
+  'content-lane.dirty-source-queue': (m) => {
+    const parts: string[] = [];
+    parts.push(`${m2(m['dirtySourceCount'] ?? 0)} pending`);
+    if (m['tombstonedSourceCount'] != null) parts.push(`${m2(m['tombstonedSourceCount'])} tombstoned`);
+    if (m['oldestDirtySourceAgeMs'] != null) parts.push(`oldest ${m2(m['oldestDirtySourceAgeMs'])}ms`);
+    return parts.join(' · ');
+  },
+  'topic.active-producer': (m) => {
+    const parts: string[] = [];
+    if (m['algorithmVersion'] != null) parts.push(m2(m['algorithmVersion']));
+    if (m['topicCount'] != null) parts.push(`${m2(m['topicCount'])} topics`);
+    if (m['lineageCount'] != null) parts.push(`${m2(m['lineageCount'])} lineage`);
+    return parts.join(' · ');
+  },
+  'ranker.active-model': (m) => {
+    const parts: string[] = [];
+    if (m['activeModelVersion'] != null) parts.push(m2(m['activeModelVersion']));
+    if (m['loadStatus'] != null) parts.push(m2(m['loadStatus']));
+    if (m['shipGateV2Status'] != null) parts.push(`gate ${m2(m['shipGateV2Status'])}`);
+    return parts.join(' · ');
+  },
+  'ranker.augmentation': (m) => {
+    const parts: string[] = [];
+    if (m['closestVisitEdgeCount'] != null) parts.push(`${m2(m['closestVisitEdgeCount'])} closest_visit edges`);
+    if (m['modelFreshness'] != null) parts.push(`freshness ${m2(m['modelFreshness'])}`);
+    return parts.join(' · ');
+  },
+  'reconcile.runner-mode': (m) => (m['mode'] != null ? m2(m['mode']) : ''),
+};
+
+const metricSummary = (candidate: DiagnosticCandidate): string => {
+  const compact = compactMetricsByCandidateId[candidate.id];
+  if (compact !== undefined) {
+    const text = compact(candidate.metrics);
+    if (text.length > 0) return text;
+  }
+  return Object.entries(candidate.metrics)
     .slice(0, 4)
     .map(([key, value]) => `${key}=${formatCandidateMetric(value)}`)
     .join(' · ');
+};
 
 type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle' | 'unavailable';
 interface PipelineStage {
