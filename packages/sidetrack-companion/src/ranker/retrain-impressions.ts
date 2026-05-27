@@ -51,20 +51,20 @@ import {
 } from './train.js';
 import type { Candidate, CandidateSource } from './types.js';
 
-const POSITIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
-  'click',
-  'open_new_tab',
-  'snippet_promote',
+const EXPLICIT_POSITIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
   'flow_confirm',
   'move',
   'promote',
+  'snippet_promote',
 ]);
 
-const NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
+const EXPLICIT_NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
   'flow_reject',
   'ignore',
   'reject',
 ]);
+
+const ENGAGEMENT_ACTIONS: ReadonlySet<RecallActionKind> = new Set(['click', 'open_new_tab']);
 
 export const MIN_RECALL_IMPRESSION_POSITIVE_GROUPS = 50;
 export const RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX = 'ship_gate_v2:';
@@ -87,9 +87,16 @@ const anchorIdForServed = (served: RecallServedPayload): string => {
   return `recall-query:${served.servedContextId}`;
 };
 
+const trainingLabelForAction = (kind: RecallActionKind): 3 | 0 | undefined => {
+  if (EXPLICIT_POSITIVE_ACTIONS.has(kind)) return 3;
+  if (EXPLICIT_NEGATIVE_ACTIONS.has(kind)) return 0;
+  if (ENGAGEMENT_ACTIONS.has(kind)) return undefined;
+  return undefined;
+};
+
 export const relevanceGradeForAction = (kind: RecallActionKind): 3 | 0 => {
-  if (POSITIVE_ACTIONS.has(kind)) return 3;
-  if (NEGATIVE_ACTIONS.has(kind)) return 0;
+  const label = trainingLabelForAction(kind);
+  if (label !== undefined) return label;
   return 0;
 };
 
@@ -403,7 +410,12 @@ export const buildRecallImpressionTrainingGroups = async ({
         scoringRows.push({ candidate, features });
         continue;
       }
-      const label = relevanceGradeForAction(action.actionKind);
+      const label = trainingLabelForAction(action.actionKind);
+      if (label === undefined) {
+        unjudgedCandidateCount += 1;
+        scoringRows.push({ candidate, features });
+        continue;
+      }
       const labelKind = label > 0 ? 'positive' : 'negative';
       if (label > 0) rawPositiveCount += 1;
       else rawNegativeCount += 1;
@@ -421,7 +433,7 @@ export const buildRecallImpressionTrainingGroups = async ({
         generatedAt: parseTime(served.servedAt) || servedEvent.acceptedAtMs,
       });
     }
-    if (rows.length > 0) {
+    if (rows.some((row) => row.label > 0)) {
       groups.push({
         groupId: served.servedContextId,
         rows,
@@ -489,7 +501,12 @@ export const buildRecallImpressionTrainingGroups = async ({
           scoringRows.push({ candidate, features });
           continue;
         }
-        const label = relevanceGradeForAction(spec.actionKind);
+        const label = trainingLabelForAction(spec.actionKind);
+        if (label === undefined) {
+          unjudgedCandidateCount += 1;
+          scoringRows.push({ candidate, features });
+          continue;
+        }
         const labelKind = label > 0 ? 'positive' : 'negative';
         if (label > 0) rawPositiveCount += 1;
         else rawNegativeCount += 1;
@@ -507,7 +524,7 @@ export const buildRecallImpressionTrainingGroups = async ({
           generatedAt: event.acceptedAtMs,
         });
       }
-      if (rows.length > 0) {
+      if (rows.some((row) => row.label > 0)) {
         groups.push({
           groupId: `reconstructed:${event.clientEventId}`,
           rows,
@@ -588,9 +605,12 @@ export const summarizeRecallImpressionEvents = (
     if (!isRecallServedPayload(event.payload)) continue;
     const servedPayload = event.payload;
     const contextActions = actionsByContext.get(servedPayload.servedContextId) ?? [];
-    const actionEntityIds = new Set(contextActions.map((action) => action.entityId));
+    const explicitActions = contextActions.filter(
+      (action) => trainingLabelForAction(action.actionKind) !== undefined,
+    );
+    const actionEntityIds = new Set(explicitActions.map((action) => action.entityId));
     if (actionEntityIds.size > 0) groupCount += 1;
-    if (contextActions.some((action) => relevanceGradeForAction(action.actionKind) > 0)) {
+    if (explicitActions.some((action) => trainingLabelForAction(action.actionKind) === 3)) {
       positiveGroupCount += 1;
     }
     for (const result of servedPayload.results) {
@@ -604,8 +624,9 @@ export const summarizeRecallImpressionEvents = (
   }
   for (const action of actions) {
     if (!isRecallActionPayload(action.payload)) continue;
-    if (relevanceGradeForAction(action.payload.actionKind) > 0) rawPositiveCount += 1;
-    else rawNegativeCount += 1;
+    const label = trainingLabelForAction(action.payload.actionKind);
+    if (label === 3) rawPositiveCount += 1;
+    else if (label === 0) rawNegativeCount += 1;
   }
   return {
     rawPositiveCount,

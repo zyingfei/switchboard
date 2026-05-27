@@ -173,7 +173,7 @@ describe('recall impression training groups', () => {
         servedCandidate('negative', 'semantic_query', 1),
         servedCandidate('unjudged', 'graph_neighbor', 2),
       ]),
-      action(2, 'ctx-1', 'positive', 'click'),
+      action(2, 'ctx-1', 'positive', 'flow_confirm'),
       action(3, 'ctx-1', 'negative', 'ignore'),
     ];
 
@@ -188,6 +188,26 @@ describe('recall impression training groups', () => {
     );
     expect(group?.rows.map((row) => row.label).sort()).toEqual([0, 3]);
     expect(result.unjudgedCandidateCount).toBe(1);
+  });
+
+  it('does not generate a training group from engagement-only clicks', async () => {
+    const merged = [
+      served(1, 'ctx-1', [
+        servedCandidate('clicked', 'page_content', 0),
+        servedCandidate('unjudged', 'semantic_query', 1),
+      ]),
+      action(2, 'ctx-1', 'clicked', 'click'),
+    ];
+
+    const result = await buildRecallImpressionTrainingGroups({ merged, snapshot });
+
+    expect(result.groups).toHaveLength(0);
+    expect(result.scoringGroups).toHaveLength(1);
+    expect(result.scoringGroups[0]?.rows).toHaveLength(2);
+    expect(result.scoringGroups[0]?.rows[0]?.label).toBeUndefined();
+    expect(result.rawPositiveCount).toBe(0);
+    expect(result.rawNegativeCount).toBe(0);
+    expect(result.unjudgedCandidateCount).toBe(2);
   });
 
   it('reconstructs historical feedback without treating unjudged candidates as negatives', async () => {
@@ -241,7 +261,7 @@ describe('recall impression training groups', () => {
         ]),
       );
       seq += 1;
-      merged.push(action(seq, contextId, `positive-${String(index)}`, 'click'));
+      merged.push(action(seq, contextId, `positive-${String(index)}`, 'flow_confirm'));
       seq += 1;
       merged.push(action(seq, contextId, `negative-${String(index)}`, 'reject'));
       seq += 1;
