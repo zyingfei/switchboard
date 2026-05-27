@@ -66,19 +66,19 @@ assert_field() {
   ok "$path = $expected"
 }
 
-assert_field '.data.recall.retrievalBackend' 'v2'
-assert_field '.data.recall.fusionImplementation' 'recall-v2'
-assert_field '.data.recall.crossEncoder.enabled' 'true'
-assert_field '.data.recall.crossEncoder.rerankTopK' '20'
+assert_field '.data.workGraph.recall.retrievalBackend' 'v2'
+assert_field '.data.workGraph.recall.fusionImplementation' 'recall-v2'
+assert_field '.data.workGraph.recall.crossEncoder.enabled' 'true'
+assert_field '.data.workGraph.recall.crossEncoder.rerankTopK' '20'
 
 # impressionLog must exist (counters may start at 0 on a fresh run)
-SERVED_BEFORE=$(echo "$HEALTH" | jq -r '.data.impressionLog.servedCount // 0')
-ACTION_BEFORE=$(echo "$HEALTH" | jq -r '.data.impressionLog.actionCount // 0')
+SERVED_BEFORE=$(echo "$HEALTH" | jq -r '.data.workGraph.impressionLog.servedCount // 0')
+ACTION_BEFORE=$(echo "$HEALTH" | jq -r '.data.workGraph.impressionLog.actionCount // 0')
 echo "smoke: starting state — servedCount=$SERVED_BEFORE actionCount=$ACTION_BEFORE"
 
 # Phase 1 invariants — must be 0 on a clean v6 system.
-EXPANDED=$(echo "$HEALTH" | jq -r '.data.ranker.expandedNegativeCount // 0')
-DRIFT=$(echo "$HEALTH" | jq -r '.data.ranker.labelDriftWithoutFeedback // 0')
+EXPANDED=$(echo "$HEALTH" | jq -r '.data.workGraph.ranker.expandedNegativeCount // 0')
+DRIFT=$(echo "$HEALTH" | jq -r '.data.workGraph.ranker.labelDriftWithoutFeedback // 0')
 if [[ "$EXPANDED" != "0" ]]; then
   fail "expandedNegativeCount = $EXPANDED (expected 0 after Phase 1)"
 fi
@@ -141,11 +141,25 @@ fi
 # ============================================================
 # Step 4 — re-poll health and confirm impression counters advanced.
 # ============================================================
-HEALTH_AFTER=$(curl_companion "/v1/system/health")
-SERVED_AFTER=$(echo "$HEALTH_AFTER" | jq -r '.data.impressionLog.servedCount // 0')
-ACTION_AFTER=$(echo "$HEALTH_AFTER" | jq -r '.data.impressionLog.actionCount // 0')
+# recall.served is appended fire-and-forget by the pipeline so the
+# /v2/recall response doesn't wait on event-log durability. The
+# materializer drain batches reconcile passes (~20s in practice) so
+# health.readMerged() doesn't pick up the latest events until the
+# next drain. Poll up to 30s.
+SERVED_AFTER="$SERVED_BEFORE"
+ACTION_AFTER="$ACTION_BEFORE"
+for attempt in 1 2 3 4 5 6; do
+  sleep 5
+  HEALTH_AFTER=$(curl_companion "/v1/system/health")
+  SERVED_AFTER=$(echo "$HEALTH_AFTER" | jq -r '.data.workGraph.impressionLog.servedCount // 0')
+  ACTION_AFTER=$(echo "$HEALTH_AFTER" | jq -r '.data.workGraph.impressionLog.actionCount // 0')
+  if [[ "$SERVED_AFTER" -gt "$SERVED_BEFORE" ]]; then
+    break
+  fi
+  echo "smoke: ... waiting for impression log drain (attempt $attempt, served=$SERVED_AFTER)"
+done
 if [[ "$SERVED_AFTER" -le "$SERVED_BEFORE" ]]; then
-  fail "servedCount did not advance: $SERVED_BEFORE → $SERVED_AFTER"
+  fail "servedCount did not advance after 30s: $SERVED_BEFORE → $SERVED_AFTER"
 fi
 ok "servedCount advanced: $SERVED_BEFORE → $SERVED_AFTER"
 
@@ -157,7 +171,7 @@ if [[ -n "$FIRST_ENTITY" ]]; then
 fi
 
 # actionsByKind should show 'click' tallied
-CLICK_COUNT=$(echo "$HEALTH_AFTER" | jq -r '.data.impressionLog.actionsByKind.click // 0')
+CLICK_COUNT=$(echo "$HEALTH_AFTER" | jq -r '.data.workGraph.impressionLog.actionsByKind.click // 0')
 if [[ -n "$FIRST_ENTITY" ]] && [[ "$CLICK_COUNT" == "0" ]]; then
   fail "actionsByKind.click = 0 after recording a click"
 fi
