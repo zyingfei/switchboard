@@ -3247,8 +3247,13 @@ const App = () => {
       viewMode,
       companionStatus: state.companionStatus,
       focused: {
-        canonicalUrl: focusedDisplayUrlRecord?.canonicalUrl,
-        record: focusedDisplayUrlRecord,
+        canonicalUrl: focusedRecordEffective?.canonicalUrl,
+        // Send the EFFECTIVE record (with pageEvidence joined +
+        // optimistic-attribution overlay) instead of the raw
+        // projection — the dump should reflect what the card actually
+        // sees, not just the URL-projection slice. Fixed 2026-05-27
+        // per debug-dump audit.
+        record: focusedRecordEffective,
         suggestion: focusedTabSuggestion,
       },
       urlInbox: {
@@ -6986,6 +6991,84 @@ const App = () => {
                       ⇄ Graph
                     </button>
                   </div>
+                ) : null}
+                {/* Related items — surfaced from the existing
+                    fusedCandidates' anchor labels so the focus card
+                    isn't an information desert after a visit. The data
+                    is already computed for the workstream suggestion;
+                    we just expose its anchor visit-instance labels
+                    (deduped by canonical URL) as a quick-jump list.
+                    Added 2026-05-27 per debug-dump audit. */}
+                {focusedTabSuggestion !== undefined &&
+                focusedTabSuggestion.fusedCandidates !== undefined &&
+                focusedTabSuggestion.fusedCandidates.length > 0 &&
+                !isCardPinned ? (
+                  (() => {
+                    const seen = new Set<string>();
+                    const items: { url: string; label: string }[] = [];
+                    for (const cand of focusedTabSuggestion.fusedCandidates) {
+                      for (const reason of cand.reasons ?? []) {
+                        for (const anchor of reason.anchors ?? []) {
+                          // anchor can be a string id or an object
+                          // {id, kind, label}. Narrow first.
+                          const id =
+                            typeof anchor === 'string'
+                              ? anchor
+                              : typeof anchor?.id === 'string'
+                                ? anchor.id
+                                : '';
+                          const label =
+                            typeof anchor === 'object' && typeof anchor?.label === 'string'
+                              ? anchor.label
+                              : '';
+                          // anchor.id shapes:
+                          //   visit-instance:<tabSessionId>:<iso>:<url>
+                          //   workstream:<wsId>
+                          //   topic:<topicId>
+                          // We only want pages here.
+                          if (!id.startsWith('visit-instance:')) continue;
+                          // Parse url tail (everything after the 3rd ':' after 'visit-instance:').
+                          const after = id.slice('visit-instance:'.length);
+                          const colon1 = after.indexOf(':');
+                          const colon2 = colon1 >= 0 ? after.indexOf(':', colon1 + 1) : -1;
+                          const url = colon2 >= 0 ? after.slice(colon2 + 1) : '';
+                          if (url.length === 0 || seen.has(url)) continue;
+                          // Don't surface the focused URL itself.
+                          if (focusedRecordEffective?.canonicalUrl === url) continue;
+                          seen.add(url);
+                          items.push({ url, label: label.length > 0 ? label : url });
+                          if (items.length >= 6) break;
+                        }
+                        if (items.length >= 6) break;
+                      }
+                      if (items.length >= 6) break;
+                    }
+                    if (items.length === 0) return null;
+                    return (
+                      <div
+                        className="tab-attribution-card-related"
+                        data-testid="focused-tab-related"
+                      >
+                        <div className="tab-attribution-card-related-head">
+                          Related ({String(items.length)})
+                        </div>
+                        <ul className="tab-attribution-card-related-list">
+                          {items.map((it) => (
+                            <li key={it.url}>
+                              <a
+                                href={it.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={it.url}
+                              >
+                                {it.label}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    );
+                  })()
                 ) : null}
               </>
             ) : null}

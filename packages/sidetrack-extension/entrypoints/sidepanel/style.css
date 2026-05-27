@@ -594,6 +594,51 @@ button:disabled {
   border-color: var(--green-tint);
   color: var(--green);
 }
+
+/* Related items below the current-tab card. Sources from the existing
+   workstream-suggestion's fusedCandidates' anchor labels (deduped by
+   canonical URL) — added 2026-05-27 so the focus card isn't an
+   information desert after a visit. */
+.tab-attribution-card-related {
+  padding: 8px 0 0 0;
+  border-top: 1px dashed var(--hair);
+  margin-top: 6px;
+}
+.tab-attribution-card-related-head {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3, var(--ink-2));
+  margin-bottom: 4px;
+}
+.tab-attribution-card-related-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tab-attribution-card-related-list li {
+  display: block;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.tab-attribution-card-related-list a {
+  color: var(--ink-2);
+  text-decoration: none;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 0;
+}
+.tab-attribution-card-related-list a:hover {
+  color: var(--accent, #0b57d0);
+  text-decoration: underline;
+}
 /* Explicit "Go to" affordance for tab-session cards (InboxCard) and the
    current-tab card. Mirrors `.thread-actions .thread-action-icon` from
    the workstream thread rows so the affordance reads identically across
