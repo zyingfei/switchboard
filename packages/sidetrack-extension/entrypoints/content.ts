@@ -1085,6 +1085,19 @@ export default defineContentScript({
                   readonly entityId: string;
                   readonly reason: 'current_chat' | 'open_tab' | 'recently_created';
                 }[];
+                readonly tiering?: {
+                  readonly policyVersion: 'v1';
+                  readonly scores: readonly number[];
+                  readonly scoreGaps: readonly number[];
+                  readonly suggestedStrongCount: number;
+                  readonly suggestedCollapsedCount: number;
+                  readonly confidenceStats: {
+                    readonly topScore: number;
+                    readonly medianScore: number;
+                    readonly minScore: number;
+                    readonly largestGap: { readonly index: number; readonly delta: number };
+                  };
+                };
               };
             }
           | { readonly ok: false; readonly error?: string }
@@ -1106,6 +1119,7 @@ export default defineContentScript({
           v2 != null && v2.ok === true ? v2.meta?.servedContextId : undefined;
         const activeSessionMarkers =
           v2 != null && v2.ok === true ? v2.meta?.activeSessionMarkers ?? [] : [];
+        const tiering = v2 != null && v2.ok === true ? v2.meta?.tiering : undefined;
         const markerByEntity = new Map<string, 'current_chat' | 'open_tab' | 'recently_created'>();
         for (const m of activeSessionMarkers) markerByEntity.set(m.entityId, m.reason);
         if (results.length === 0 && !force) return;
@@ -1171,6 +1185,16 @@ export default defineContentScript({
             },
           ),
           anchorRect,
+          ...(tiering != null
+            ? {
+                tiering: {
+                  strongCount: tiering.suggestedStrongCount,
+                  collapsedCount: tiering.suggestedCollapsedCount,
+                  scores: tiering.scores,
+                  largestGap: tiering.confidenceStats.largestGap,
+                },
+              }
+            : {}),
           onJump: (item) => {
             // Chat hits from /v1/content/query carry the conversation
             // URL as canonicalUrl (no threadUrl) — still focus it in

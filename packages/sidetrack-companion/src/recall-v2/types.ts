@@ -233,6 +233,24 @@ export interface RecallResponse {
         | 'open_tab'
         | 'recently_created';
     }[];
+    /** PR D — adaptive tiering metadata. Server emits scores +
+     *  suggested cutoffs; UI decides how to render. Defaults computed
+     *  from the simple partitionResultsByConfidence rule below; will
+     *  be eval-calibrated in a follow-up (see TODO comments in
+     *  pipeline.ts). */
+    readonly tiering?: {
+      readonly policyVersion: 'v1';
+      readonly scores: readonly number[];
+      readonly scoreGaps: readonly number[];
+      readonly suggestedStrongCount: number;
+      readonly suggestedCollapsedCount: number;
+      readonly confidenceStats: {
+        readonly topScore: number;
+        readonly medianScore: number;
+        readonly minScore: number;
+        readonly largestGap: { readonly index: number; readonly delta: number };
+      };
+    };
     /** Cross-encoder rerank diagnostics. Present when rerank fired. */
     readonly rerank?: {
       readonly enabled: boolean;

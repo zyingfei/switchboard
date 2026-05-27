@@ -72,6 +72,69 @@ const RRF_K = 60;
 // MiniLM precision layer. Callers can still override per-request.
 const DEFAULT_RERANK_TOP_K = 0;
 
+// TODO(calibration): defaults from intuition; sweep + eval pending.
+// See docs/design/recall-ranker-v2-replacement.md "deferred" section.
+const TIERING_DEFAULTS = {
+  minStrong: 3,
+  maxStrong: 5,
+  weakFloor: 0.3,
+  gapThreshold: 0.15,
+} as const;
+
+type RecallTiering = NonNullable<RecallResponse['meta']['tiering']>;
+
+export const partitionResultsByConfidence = (
+  results: readonly RecallCandidate[],
+): RecallTiering => {
+  const scores = results.map((r) => r.rerankScore ?? r.fusedScore);
+  const scoreGaps = scores.map((s, i) => (i === 0 ? 0 : (scores[i - 1] ?? 0) - s));
+  let strong = Math.min(results.length, TIERING_DEFAULTS.maxStrong);
+
+  // 1. Pull back if dropping below weak floor before maxStrong.
+  for (let i = TIERING_DEFAULTS.minStrong; i < strong; i += 1) {
+    if ((scores[i] ?? 0) < TIERING_DEFAULTS.weakFloor) {
+      strong = i;
+      break;
+    }
+  }
+
+  // 2. Pull back further if a large adjacent gap appears.
+  for (let i = TIERING_DEFAULTS.minStrong; i < strong; i += 1) {
+    if ((scoreGaps[i] ?? 0) >= TIERING_DEFAULTS.gapThreshold) {
+      strong = i;
+      break;
+    }
+  }
+
+  // 3. Floor: always >= minStrong (or all results if fewer than minStrong exist).
+  strong = Math.max(strong, Math.min(TIERING_DEFAULTS.minStrong, results.length));
+
+  // largestGap = pick the biggest adjacent jump.
+  let largestIdx = 0;
+  let largestDelta = 0;
+  for (let i = 1; i < scoreGaps.length; i += 1) {
+    const d = scoreGaps[i] ?? 0;
+    if (d > largestDelta) {
+      largestIdx = i;
+      largestDelta = d;
+    }
+  }
+
+  return {
+    policyVersion: 'v1',
+    scores,
+    scoreGaps,
+    suggestedStrongCount: strong,
+    suggestedCollapsedCount: Math.max(0, results.length - strong),
+    confidenceStats: {
+      topScore: scores[0] ?? 0,
+      medianScore: scores[Math.floor(scores.length / 2)] ?? 0,
+      minScore: scores[scores.length - 1] ?? 0,
+      largestGap: { index: largestIdx, delta: largestDelta },
+    },
+  };
+};
+
 /** Injectable embedder — tests can substitute a deterministic stub. */
 export type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
 
@@ -1123,7 +1186,11 @@ export const runRecall = async (
     timings['rerank'] = rerankLatencyMs;
     rerankApplied = true;
   }
+  // Tiering (PR D) operates on this sliced array — limit is still the hard cap on total
+  // results returned; suggestedStrongCount/collapsedCount decide how many the UI renders
+  // in the strong band vs expander. No change to DOGFOOD_RERANK_TOP_K.
   const results = resultsAfterRerank.slice(0, limit);
+  const tiering = partitionResultsByConfidence(results);
   const resultEntityIds = new Set(results.map((r) => r.entityId));
   const responseActiveSessionMarkers = activeSessionMarkers.filter((m) =>
     resultEntityIds.has(m.entityId),
@@ -1244,6 +1311,7 @@ export const runRecall = async (
         degradedToLexical,
       },
       servedContextId,
+      tiering,
       ...(responseActiveSessionMarkers.length > 0
         ? { activeSessionMarkers: responseActiveSessionMarkers }
         : {}),

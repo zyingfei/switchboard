@@ -231,6 +231,48 @@ const OVERLAY_CSS = `
   max-height: 280px;
   overflow: auto;
 }
+.cx-deja-tier-cut {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--paper);
+}
+.cx-deja-tier-cut::before,
+.cx-deja-tier-cut::after {
+  content: '';
+  height: 1px;
+  background: var(--rule);
+  flex: 1;
+}
+.cx-deja-tier-more {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  background: var(--paper-light);
+  border: 1px solid var(--rule);
+  border-radius: 99px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.cx-deja-tier-more:hover {
+  color: var(--signal);
+  border-color: var(--signal-tint);
+  background: var(--signal-bg);
+}
+.cx-deja-tier-debug {
+  padding: 7px 12px;
+  border-top: 1px dashed var(--rule);
+  background: var(--paper);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .sidetrack-deja-row {
   display: block;
   width: 100%;
@@ -969,6 +1011,12 @@ type AskAiProvider = 'chatgpt' | 'claude' | 'gemini';
 interface DejaVuMountOptions {
   readonly items: readonly DejaVuItem[];
   readonly anchorRect: DOMRect;
+  readonly tiering?: {
+    readonly strongCount: number;
+    readonly collapsedCount: number;
+    readonly scores?: readonly number[];
+    readonly largestGap?: { readonly index: number; readonly delta: number };
+  };
   readonly onJump?: (item: DejaVuItem) => void;
   readonly onMute?: () => void;
   readonly onDismiss?: () => void;
@@ -1179,6 +1227,32 @@ const providerLabel = (provider: ProviderId | undefined): string => {
   return 'Generic';
 };
 
+const tieringDebugEnabled = (): boolean => {
+  try {
+    return localStorage.getItem('sidetrack-debug') === 'tiering';
+  } catch {
+    return false;
+  }
+};
+
+const largestScoreGap = (
+  scores: readonly number[],
+): { readonly index: number; readonly delta: number } => {
+  let index = 0;
+  let delta = 0;
+  for (let i = 1; i < scores.length; i += 1) {
+    const gap = (scores[i - 1] ?? 0) - (scores[i] ?? 0);
+    if (gap > delta) {
+      index = i;
+      delta = gap;
+    }
+  }
+  return { index, delta };
+};
+
+const formatTierScore = (score: number): string =>
+  score.toFixed(3).replace(/0+$/u, '').replace(/\.$/u, '');
+
 // Mount the Déjà-vu popover anchored just above the selection's bounding
 // rect, clamped to the viewport with 8px padding. Empty items now
 // renders an explicit "no matches found" panel so the user sees
@@ -1206,6 +1280,16 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   const presentCategories = dejaVuCategoriesPresent(opts.items);
   const itemCategory = (i: DejaVuItem): string =>
     dejaVuCategoryOf(i.canonicalUrl ?? i.threadUrl);
+  const tierStrongCount =
+    opts.tiering === undefined
+      ? opts.items.length
+      : Math.min(opts.items.length, Math.max(0, opts.tiering.strongCount));
+  const rankByItemId = new Map(opts.items.map((item, index) => [item.id, index] as const));
+  const isStrongTier = (item: DejaVuItem): boolean => {
+    if (opts.tiering === undefined) return true;
+    const rank = rankByItemId.get(item.id);
+    return rank !== undefined && rank < tierStrongCount;
+  };
   // Show the Page/Chat + AI Chats/Google Services grouping whenever
   // there is more than one result — even if a dimension is
   // homogeneous (all-chat / all-web). The user wants the breakdown
@@ -1252,12 +1336,12 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   // actions so it's the first thing the eye lands on when the result
   // set is bigger than what fits in the popover.
   const seeAllSlot = pop.querySelector<HTMLSpanElement>('.sidetrack-deja-seeall-slot');
-  if (seeAllSlot !== null && opts.onSeeAll !== undefined && opts.items.length > 0) {
+  if (seeAllSlot !== null && opts.onSeeAll !== undefined) {
     const onSeeAll = opts.onSeeAll;
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'sidetrack-deja-seeall';
-    b.textContent = `⇄ See all (${String(opts.items.length)})`;
+    b.textContent = 'See all in sidepanel ↗';
     b.title = 'Open the full result set in the side panel';
     b.addEventListener('click', (e) => {
       e.preventDefault();
@@ -1432,13 +1516,47 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
   // AI Chats/Google Services) but one active selection keeps the UX
   // simple and consistent with the rest of the panel.
   let activeKey = 'all';
+  let collapsedExpanded = false;
+  let renderList = (): void => {};
   const matches = (i: DejaVuItem): boolean => {
     if (activeKey === 'all') return true;
     if (activeKey.startsWith('f:')) return i.facet === activeKey.slice(2);
     if (activeKey.startsWith('c:')) return itemCategory(i) === activeKey.slice(2);
     return true;
   };
-  const renderList = (): void => {
+  const appendTierDebug = (): void => {
+    if (list === null || !tieringDebugEnabled()) return;
+    const scores = opts.tiering?.scores ?? opts.items.map((i) => i.score);
+    const largestGap = opts.tiering?.largestGap ?? largestScoreGap(scores);
+    const debug = document.createElement('div');
+    debug.className = 'cx-deja-tier-debug';
+    debug.textContent = [
+      `scores=[${scores.map(formatTierScore).join(', ')}]`,
+      `strongCutoff=${String(tierStrongCount)}`,
+      `largestGap=index ${String(largestGap.index)}, delta ${formatTierScore(largestGap.delta)}`,
+    ].join(' · ');
+    list.appendChild(debug);
+  };
+  const appendTierCut = (collapsedCount: number): void => {
+    if (list === null) return;
+    const cut = document.createElement('div');
+    cut.className = 'cx-deja-tier-cut';
+    if (!collapsedExpanded) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'cx-deja-tier-more';
+      more.textContent = `▸ ${String(collapsedCount)} more related`;
+      more.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        collapsedExpanded = true;
+        renderList();
+      });
+      cut.appendChild(more);
+    }
+    list.appendChild(cut);
+  };
+  renderList = (): void => {
     if (list === null) return;
     list.textContent = '';
     const shown = opts.items.filter(matches);
@@ -1451,9 +1569,28 @@ export const mountDejaVuPopover = (opts: DejaVuMountOptions): { close: () => voi
         ? 'No similar prior pages or conversations found in your vault.'
         : 'No results of this type.';
       list.appendChild(empty);
+      appendTierDebug();
       return;
     }
-    for (const item of shown) list.appendChild(renderRow(item));
+    if (opts.tiering === undefined) {
+      for (const item of shown) list.appendChild(renderRow(item));
+      appendTierDebug();
+      return;
+    }
+    const strongItems = shown.filter(isStrongTier);
+    const collapsedItems = shown.filter((item) => !isStrongTier(item));
+    for (const item of strongItems) list.appendChild(renderRow(item));
+    if (collapsedItems.length > 0) {
+      const collapsedCount =
+        activeKey === 'all'
+          ? Math.min(collapsedItems.length, Math.max(0, opts.tiering.collapsedCount))
+          : collapsedItems.length;
+      appendTierCut(collapsedCount);
+      if (collapsedExpanded) {
+        for (const item of collapsedItems) list.appendChild(renderRow(item));
+      }
+    }
+    appendTierDebug();
   };
 
   if (chipsBar !== null && hasFilter) {
