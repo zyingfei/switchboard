@@ -2,6 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  getCanonicalCollisionSnapshot,
+  type CanonicalCollisionSamplePair,
+} from '../page-content/canonicalize-telemetry.js';
+import {
+  scanForOverCollapsedPageContent,
+  type OverCollapsedRecord,
+} from '../page-content/store.js';
+import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerRankerMethodologySpineDiagnostics,
 } from '../connections/materializerDiagnostics.js';
@@ -171,6 +179,22 @@ export interface WorkGraphHealthReport {
       readonly documentVectorCount: number;
       readonly chunkVectorCount: number;
     };
+    readonly canonicalizationTelemetry: {
+      readonly trackedHostCount: number;
+      readonly suspiciousHosts: readonly {
+        readonly host: string;
+        readonly canonicalCount: number;
+        readonly rawCount: number;
+        readonly collisionRatio: number;
+        readonly samplePairs: readonly CanonicalCollisionSamplePair[];
+      }[];
+    };
+  };
+  readonly hygiene: {
+    readonly overCollapsedRecords: {
+      readonly count: number;
+      readonly samples: readonly OverCollapsedRecord[];
+    };
   };
   readonly candidates: readonly DiagnosticCandidate[];
 }
@@ -228,6 +252,56 @@ const numberOrNull = (value: unknown): number | null =>
 const booleanOrFalse = (value: unknown): boolean => (typeof value === 'boolean' ? value : false);
 
 const CONTENT_LANE_BACKLOG_WARN_MS = 10 * 60 * 1000;
+const OVER_COLLAPSED_PAGE_CONTENT_CACHE_TTL_MS = 60_000;
+
+let overCollapsedPageContentCache: {
+  readonly vaultRoot: string;
+  readonly computedAtMs: number;
+  readonly records: readonly OverCollapsedRecord[];
+} | null = null;
+
+const scanForOverCollapsedPageContentCached = async (
+  vaultRoot: string,
+): Promise<readonly OverCollapsedRecord[]> => {
+  const now = Date.now();
+  if (
+    overCollapsedPageContentCache !== null &&
+    overCollapsedPageContentCache.vaultRoot === vaultRoot &&
+    now - overCollapsedPageContentCache.computedAtMs < OVER_COLLAPSED_PAGE_CONTENT_CACHE_TTL_MS
+  ) {
+    return overCollapsedPageContentCache.records;
+  }
+  const records = await scanForOverCollapsedPageContent(vaultRoot);
+  overCollapsedPageContentCache = { vaultRoot, computedAtMs: now, records };
+  return records;
+};
+
+const canonicalizationTelemetry = (): WorkGraphHealthReport['recall']['canonicalizationTelemetry'] => {
+  const snapshot = getCanonicalCollisionSnapshot();
+  const suspiciousHosts = Object.entries(snapshot.byHost)
+    .map(([host, hostSnapshot]) => ({
+      host,
+      canonicalCount: hostSnapshot.canonicalCount,
+      rawCount: hostSnapshot.rawCount,
+      collisionRatio:
+        hostSnapshot.canonicalCount === 0
+          ? 0
+          : hostSnapshot.rawCount / hostSnapshot.canonicalCount,
+      samplePairs: hostSnapshot.suspiciousPairs,
+    }))
+    .filter((host) => host.collisionRatio > 1.5)
+    .sort((left, right) => {
+      const ratioDelta = right.collisionRatio - left.collisionRatio;
+      if (ratioDelta !== 0) return ratioDelta;
+      const rawDelta = right.rawCount - left.rawCount;
+      return rawDelta !== 0 ? rawDelta : left.host.localeCompare(right.host);
+    })
+    .slice(0, 10);
+  return {
+    trackedHostCount: Object.keys(snapshot.byHost).length,
+    suspiciousHosts,
+  };
+};
 
 const metrics = (
   input: Readonly<Record<string, DiagnosticCandidateMetric>>,
@@ -803,6 +877,7 @@ export const collectWorkGraphHealth = async ({
     ann,
     topicRevision,
     diagnostics,
+    overCollapsedRecords,
   ] = await Promise.all([
     readActiveClosestVisitRankerRevisionManifest(vaultRoot),
     readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
@@ -811,6 +886,7 @@ export const collectWorkGraphHealth = async ({
     annStatus(),
     createTopicRevisionStore(vaultRoot).readActiveRevision(),
     readLatestConnectionsDiagnostics(vaultRoot),
+    scanForOverCollapsedPageContentCached(vaultRoot),
   ]);
   const augmentation = parseRankerAugmentationStatus(diagnostics);
   const activeRevision =
@@ -988,6 +1064,13 @@ export const collectWorkGraphHealth = async ({
       documentVectorCount,
       chunkVectorCount,
     },
+    canonicalizationTelemetry: canonicalizationTelemetry(),
+  };
+  const hygiene: WorkGraphHealthReport['hygiene'] = {
+    overCollapsedRecords: {
+      count: overCollapsedRecords.length,
+      samples: overCollapsedRecords.slice(0, 5),
+    },
   };
   return {
     ranker,
@@ -1000,6 +1083,7 @@ export const collectWorkGraphHealth = async ({
     topicProducer,
     impressionLog,
     recall,
+    hygiene,
     candidates: buildDiagnosticCandidates({
       ranker,
       topicProducer,

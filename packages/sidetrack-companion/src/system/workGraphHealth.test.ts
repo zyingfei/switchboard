@@ -7,6 +7,8 @@ import { createConnectionsStore } from '../connections/snapshot.js';
 import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { projectFeedback } from '../feedback/projection.js';
+import { recordCanonicalCollision } from '../page-content/canonicalize-telemetry.js';
+import { sha256Hex } from '../page-content/store.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
@@ -310,6 +312,63 @@ describe('work graph diagnostic candidates', () => {
         }),
       ]),
     );
+  });
+
+  it('surfaces canonicalization telemetry and over-collapsed page-content hygiene', async () => {
+    const canonicalUrl = 'https://health-collapse.example.test/thread';
+    for (const ref of ['one', 'two', 'three', 'four']) {
+      recordCanonicalCollision(
+        `https://health-collapse.example.test/thread?utm_source=${ref}`,
+        canonicalUrl,
+      );
+    }
+    const dir = join(vaultRoot, '_BAC', 'page-content', 'by-url');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, `${sha256Hex(canonicalUrl)}.json`),
+      `${JSON.stringify(
+        {
+          coverage: {
+            canonicalUrl,
+            state: 'indexed',
+            lastIndexedAt: '2026-05-26T12:30:00.000Z',
+            contentHash: 'hash-overcollapsed-health',
+            chunkCount: 67,
+          },
+          url: canonicalUrl,
+          updatedAt: '2026-05-26T12:30:00.000Z',
+          sourceEventType: 'page.content.extracted',
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({ vaultRoot });
+
+    expect(health.recall.canonicalizationTelemetry.suspiciousHosts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          host: 'health-collapse.example.test',
+          canonicalCount: 1,
+          rawCount: 4,
+          collisionRatio: 4,
+          samplePairs: [
+            expect.objectContaining({
+              canonicalUrl,
+              rawUrls: expect.arrayContaining([
+                'https://health-collapse.example.test/thread?utm_source=one',
+              ]),
+            }),
+          ],
+        }),
+      ]),
+    );
+    expect(health.hygiene.overCollapsedRecords).toMatchObject({
+      count: 1,
+      samples: [{ canonicalUrl, chunkCount: 67, contentHash: 'hash-overcollapsed-health' }],
+    });
   });
 
   it('marks v6 legacy-trained ranker manifests invalid', async () => {

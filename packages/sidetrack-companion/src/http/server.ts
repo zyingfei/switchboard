@@ -82,6 +82,8 @@ import {
   queryPageContent,
   readPageContentCoverage,
   readPageContentCoverageMap,
+  scanForOverCollapsedPageContent,
+  type OverCollapsedRecord,
   writePageContentExtracted,
   writePageContentTombstoned,
 } from '../page-content/store.js';
@@ -1576,6 +1578,30 @@ const cachedRoute = async (
   })();
   routeInFlight.set(key, compute);
   return compute;
+};
+
+const OVER_COLLAPSED_PAGE_CONTENT_HYGIENE_CACHE_TTL_MS = 60_000;
+let overCollapsedPageContentHygieneCache: {
+  readonly vaultRoot: string;
+  readonly computedAtMs: number;
+  readonly records: readonly OverCollapsedRecord[];
+} | null = null;
+
+const scanForOverCollapsedPageContentHygieneCached = async (
+  vaultRoot: string,
+): Promise<readonly OverCollapsedRecord[]> => {
+  const now = Date.now();
+  if (
+    overCollapsedPageContentHygieneCache !== null &&
+    overCollapsedPageContentHygieneCache.vaultRoot === vaultRoot &&
+    now - overCollapsedPageContentHygieneCache.computedAtMs <
+      OVER_COLLAPSED_PAGE_CONTENT_HYGIENE_CACHE_TTL_MS
+  ) {
+    return overCollapsedPageContentHygieneCache.records;
+  }
+  const records = await scanForOverCollapsedPageContent(vaultRoot);
+  overCollapsedPageContentHygieneCache = { vaultRoot, computedAtMs: now, records };
+  return records;
 };
 
 // Hard concurrency cap on the expensive resolve build (readCurrent
@@ -3830,9 +3856,10 @@ const routes: readonly RouteDefinition[] = [
           if (timer !== undefined) clearTimeout(timer);
         }
       };
-      const [gc, pageContent] = await Promise.all([
+      const [gc, pageContent, overCollapsedRecords] = await Promise.all([
         gcInventoryCached(vaultRoot),
         budget(() => pageContentCoverageCounts(vaultRoot), 4_000),
+        budget(() => scanForOverCollapsedPageContentHygieneCached(vaultRoot), 4_000),
       ]);
       return [
         200,
@@ -3840,10 +3867,21 @@ const routes: readonly RouteDefinition[] = [
           data: {
             ...(context.hygieneStatus ?? {}),
             asOf: new Date().toISOString(),
-            availability: { gc: gc.availability, pageContent: pageContent.availability },
+            availability: {
+              gc: gc.availability,
+              pageContent: pageContent.availability,
+              overCollapsedRecords: overCollapsedRecords.availability,
+            },
             gcAsOf: gc.asOf,
             gc: gc.value,
             pageContent: pageContent.value,
+            overCollapsedRecords:
+              overCollapsedRecords.value === null
+                ? null
+                : {
+                    count: overCollapsedRecords.value.length,
+                    samples: overCollapsedRecords.value.slice(0, 5),
+                  },
           },
         },
       ];
@@ -5454,6 +5492,38 @@ const routes: readonly RouteDefinition[] = [
         }
         return [202, { data: { coverage } }];
       });
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/v1\/page-content\/recanonicalize$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const body = await readBody(request);
+      const record = objectRecord(body);
+      const canonicalUrl =
+        typeof body === 'string'
+          ? body
+          : typeof record?.['canonicalUrl'] === 'string'
+            ? record['canonicalUrl']
+            : undefined;
+      if (canonicalUrl === undefined || canonicalUrl.trim().length === 0) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'canonicalUrl is required.',
+          'POST /v1/page-content/recanonicalize requires a canonicalUrl string body.',
+        );
+      }
+      const coverage = await writePageContentTombstoned(vaultRoot, {
+        payloadVersion: 1,
+        canonicalUrl,
+        tombstonedAt: new Date().toISOString(),
+        reason: 'user-delete',
+        dimensions: { source: 'recanonicalize' },
+      });
+      return [200, { data: { tombstoned: true, canonicalUrl: coverage.canonicalUrl } }];
     },
   },
   {

@@ -19,6 +19,7 @@ import {
   type PageContentRecord,
   type PageContentTombstonedPayload,
 } from './types.js';
+import { recordCanonicalCollision } from './canonicalize-telemetry.js';
 import { classifyPageContentQuality } from './quality.js';
 
 const MAX_RAW_TEXT_CHARS = 100_000;
@@ -59,6 +60,12 @@ export const canonicalizePageUrl = (raw: string): string => {
   for (const [k, v] of sorted) parsed.searchParams.append(k, v);
   const out = parsed.toString().replace(/\/$/u, '');
   return out.length > 0 ? out : parsed.toString();
+};
+
+const canonicalizePageUrlAndRecord = (raw: string): string => {
+  const canonicalUrl = canonicalizePageUrl(raw);
+  recordCanonicalCollision(raw, canonicalUrl);
+  return canonicalUrl;
 };
 
 export const sha256Hex = (input: string): string =>
@@ -202,6 +209,36 @@ const readAllRecords = async (vaultRoot: string): Promise<readonly PageContentRe
   );
 };
 
+export interface OverCollapsedRecord {
+  readonly canonicalUrl: string;
+  readonly chunkCount: number;
+  readonly lastIndexedAt: string | null;
+  readonly contentHash: string | null;
+}
+
+export const scanForOverCollapsedPageContent = async (
+  vaultRoot: string,
+): Promise<readonly OverCollapsedRecord[]> => {
+  const names = (await readdir(byUrlDir(vaultRoot)).catch(() => []))
+    .filter((candidate) => candidate.endsWith('.json'))
+    .sort()
+    .slice(0, 100);
+  const records: OverCollapsedRecord[] = [];
+  for (const name of names) {
+    const record = safeRecordFromUnknown(await readJson(join(byUrlDir(vaultRoot), name)));
+    const coverage = record?.coverage;
+    if (coverage === undefined || typeof coverage.chunkCount !== 'number') continue;
+    if (coverage.chunkCount <= 25) continue;
+    records.push({
+      canonicalUrl: coverage.canonicalUrl,
+      chunkCount: coverage.chunkCount,
+      lastIndexedAt: coverage.lastIndexedAt ?? null,
+      contentHash: coverage.contentHash ?? null,
+    });
+  }
+  return records.sort((left, right) => right.chunkCount - left.chunkCount);
+};
+
 const rebuildManifests = async (vaultRoot: string): Promise<void> => {
   const records = await readAllRecords(vaultRoot);
   const chunks = records
@@ -242,7 +279,7 @@ export const readPageContentCoverage = async (
   vaultRoot: string,
   rawCanonicalUrl: string,
 ): Promise<PageContentCoverage> => {
-  const canonicalUrl = canonicalizePageUrl(rawCanonicalUrl);
+  const canonicalUrl = canonicalizePageUrlAndRecord(rawCanonicalUrl);
   const record = safeRecordFromUnknown(
     await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
   );
@@ -271,7 +308,8 @@ export const writePageContentExtracted = async (
   vaultRoot: string,
   payload: PageContentExtractedPayload,
 ): Promise<PageContentCoverage> => {
-  const canonicalUrl = canonicalizePageUrl(payload.canonicalUrl);
+  const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
+  recordCanonicalCollision(payload.url, canonicalUrl);
   const contentHash = payload.content.contentHash || sha256Hex(payload.content.text);
   const quality = classifyPageContentQuality(payload.qualitySignals);
   if (quality.state === 'metadata_only_error') {
@@ -348,7 +386,7 @@ export const writePageContentTombstoned = async (
   vaultRoot: string,
   payload: PageContentTombstonedPayload,
 ): Promise<PageContentCoverage> => {
-  const canonicalUrl = canonicalizePageUrl(payload.canonicalUrl);
+  const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
   const previous = await readPageContentCoverage(vaultRoot, canonicalUrl);
   const contentHash = payload.contentHash ?? previous.contentHash;
   if (contentHash !== undefined) {
@@ -378,7 +416,7 @@ export const readPageContentExtractedPayloadForEvidence = async (
   vaultRoot: string,
   rawCanonicalUrl: string,
 ): Promise<PageContentExtractedPayload | null> => {
-  const canonicalUrl = canonicalizePageUrl(rawCanonicalUrl);
+  const canonicalUrl = canonicalizePageUrlAndRecord(rawCanonicalUrl);
   const record = safeRecordFromUnknown(
     await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
   );
@@ -436,7 +474,7 @@ export const readPageContentChunksForCanonicalUrls = async (
   rawCanonicalUrls: readonly string[],
 ): Promise<ReadonlyMap<string, readonly PageContentChunk[]>> => {
   const out = new Map<string, readonly PageContentChunk[]>();
-  const uniqueCanonicalUrls = [...new Set(rawCanonicalUrls.map(canonicalizePageUrl))].sort();
+  const uniqueCanonicalUrls = [...new Set(rawCanonicalUrls.map(canonicalizePageUrlAndRecord))].sort();
   for (const canonicalUrl of uniqueCanonicalUrls) {
     const record = safeRecordFromUnknown(
       await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
