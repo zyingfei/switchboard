@@ -33,6 +33,7 @@ import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
 import {
+  backfillChunkVectors,
   backfillFromPageEvidence,
   backfillFromRecallIndex,
   backfillVectors,
@@ -139,6 +140,27 @@ const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
   return store;
 };
 
+/** Phase 4 — non-blocking peek for the canonical SQLite store.
+ *  Returns undefined if the store hasn't been opened yet (e.g.
+ *  health is polled before the first /v2/recall). Health pollers
+ *  use this so they can report `canonicalVectorCounts` without
+ *  paying the open + backfill cost on every /v1/system/health hit. */
+export const peekRecallV2Store = async (
+  vaultRoot: string,
+): Promise<RecallStore | undefined> => {
+  const cached = storeCache.get(vaultRoot);
+  if (cached === undefined) return undefined;
+  // Await the cached promise so the caller gets a fully-opened
+  // handle on the second poll (when the open is in-flight from a
+  // concurrent /v2/recall). No backfill runs here — that's owned by
+  // getOrOpenStore.
+  try {
+    return await cached;
+  } catch {
+    return undefined;
+  }
+};
+
 /** Re-runs backfill phases whose source signature changed. Cheap
  *  (3 dir stats) when nothing's moved. Single-flight per vault so
  *  concurrent /v2/recall callers share one backfill pass instead of
@@ -183,14 +205,25 @@ const runFreshnessCheck = async (
   let chatTurnN = 0;
   let vectorsN = 0;
   let deletedN = 0;
+  let chunkVectorsN = 0;
   if (wasEmpty || storedPageEvidence !== current.pageEvidence) {
     const r = await backfillFromPageEvidence(vaultRoot, store);
     pageContentN = r.pageContent;
     timelineVisitN = r.timelineVisit;
     deletedN += r.deleted;
     for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`pageEv.${k}`] = v;
+    // Phase 2/4 — chunk vectors share the page-evidence signature
+    // (their source is the same _BAC/page-content/chunks dir). When
+    // page-evidence backfills, chunk vectors backfill too. Vector
+    // upsert is idempotent (existing chunk vectors are skipped) so
+    // a killed process can resume without re-embedding.
+    const cv = await backfillChunkVectors(vaultRoot, store);
+    chunkVectorsN = cv.vectors;
+    deletedN += cv.deleted;
+    for (const [k, v] of Object.entries(cv.timingMs)) phaseTimings[`chunkVec.${k}`] = v;
     store.setRecallMetadata(SIG_KEY_PAGE_EVIDENCE, current.pageEvidence);
     ran.push('page-evidence');
+    if (cv.vectors > 0) ran.push('chunk-vectors');
   }
   if (wasEmpty || storedChatTurn !== current.chatTurn) {
     const r = await backfillFromRecallIndex(vaultRoot, store);
@@ -218,7 +251,8 @@ const runFreshnessCheck = async (
       `pageContent=${String(pageContentN)} ` +
       `timelineVisit=${String(timelineVisitN)} ` +
       `chatTurn=${String(chatTurnN)} ` +
-      `vectors=${String(vectorsN)}` +
+      `vectors=${String(vectorsN)} ` +
+      `chunkVectors=${String(chunkVectorsN)}` +
       `${deletedN > 0 ? ` deleted=${String(deletedN)}` : ''}` +
       `${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
       `${wasEmpty ? ' (initial)' : ''}` +

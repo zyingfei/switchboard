@@ -3771,14 +3771,25 @@ const routes: readonly RouteDefinition[] = [
                 const status = await (context.serviceInstaller ?? pickInstaller()).status();
                 return { installed: status.installed, running: status.running };
               },
-              workGraphSummary: () =>
-                collectWorkGraphHealth({
+              workGraphSummary: async () => {
+                // Phase 4 — peek the canonical SQLite recall store so
+                // health reports live document/chunk vector counts.
+                // Non-blocking: returns undefined when the store
+                // hasn't been opened yet (no /v2/recall fired since
+                // companion start), in which case counts default to 0.
+                const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+                const canonicalRecallStore = await peekRecallV2Store(vaultRoot);
+                return collectWorkGraphHealth({
                   vaultRoot,
                   ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
                   ...(context.connectionsDiagnostics === undefined
                     ? {}
                     : { connectionsDiagnostics: context.connectionsDiagnostics }),
-                }),
+                  ...(canonicalRecallStore === undefined
+                    ? {}
+                    : { canonicalRecallStore }),
+                });
+              },
               ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
             }),
           ),
