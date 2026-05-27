@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  canonicalizePageUrl,
   pageContentCoverageCounts,
   queryPageContent,
   readPageContentCoverage,
@@ -12,6 +13,54 @@ import {
 } from './store.js';
 import { PAGE_CONTENT_COVERAGE_STATES } from './types.js';
 import type { PageContentExtractedPayload } from './types.js';
+
+describe('canonicalizePageUrl', () => {
+  it.each([
+    [
+      'preserves Hacker News item ids',
+      'https://news.ycombinator.com/item?id=48282814',
+      'https://news.ycombinator.com/item?id=48282814',
+    ],
+    [
+      'preserves YouTube video ids',
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    ],
+    [
+      'keeps arXiv URLs unchanged',
+      'https://arxiv.org/abs/2401.01234',
+      'https://arxiv.org/abs/2401.01234',
+    ],
+    [
+      'preserves Google query terms',
+      'https://www.google.com/search?q=hello+world',
+      'https://www.google.com/search?q=hello+world',
+    ],
+    [
+      'keeps X/Twitter status URLs unchanged',
+      'https://twitter.com/user/status/12345',
+      'https://twitter.com/user/status/12345',
+    ],
+    [
+      'strips trailing slashes',
+      'https://reddit.com/r/foo/comments/abc/title/',
+      'https://reddit.com/r/foo/comments/abc/title',
+    ],
+    [
+      'strips tracking params without dropping semantic params',
+      'https://example.com/page?id=1&utm_source=twitter&fbclid=xyz',
+      'https://example.com/page?id=1',
+    ],
+    [
+      'sorts query params',
+      'https://example.com/page?b=2&a=1',
+      'https://example.com/page?a=1&b=2',
+    ],
+    ['strips hashes', 'https://example.com/page#section', 'https://example.com/page'],
+  ])('%s', (_name, raw, expected) => {
+    expect(canonicalizePageUrl(raw)).toBe(expected);
+  });
+});
 
 describe('page-content store', () => {
   let root: string;

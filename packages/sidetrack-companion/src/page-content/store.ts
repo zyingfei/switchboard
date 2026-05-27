@@ -25,12 +25,40 @@ const MAX_RAW_TEXT_CHARS = 100_000;
 const MAX_CHUNKS_PER_PAGE = 80;
 const CHUNK_TARGET_CHARS = 1_200;
 
+const TRACKING_PARAMS = new Set([
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'utm_term',
+  'utm_content',
+  'fbclid',
+  'gclid',
+  'msclkid',
+  'mc_cid',
+  'mc_eid',
+  '_hsenc',
+  '_hsmi',
+  'igshid',
+  'ref_src',
+  'ref',
+  'share',
+]);
+
 export const canonicalizePageUrl = (raw: string): string => {
   const parsed = new URL(raw);
   parsed.hash = '';
+  for (const key of [...parsed.searchParams.keys()]) {
+    if (TRACKING_PARAMS.has(key.toLowerCase())) {
+      parsed.searchParams.delete(key);
+    }
+  }
+  const sorted = [...parsed.searchParams.entries()].sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
   parsed.search = '';
-  const normalized = parsed.toString().replace(/\/$/u, '');
-  return normalized.length > 0 ? normalized : parsed.toString();
+  for (const [k, v] of sorted) parsed.searchParams.append(k, v);
+  const out = parsed.toString().replace(/\/$/u, '');
+  return out.length > 0 ? out : parsed.toString();
 };
 
 export const sha256Hex = (input: string): string =>
