@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { AcceptedEvent } from '../sync/causal.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { chunkTurn, type RecallChunk } from './chunker.js';
 import { embed } from './embedder.js';
@@ -138,14 +139,18 @@ export const ingestIncremental = async (
   eventLog: EventLog,
 ): Promise<IngestSummary> => {
   const state = await readIngestState(vaultRoot);
-  const merged = await eventLog.readMerged();
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  const merged = store === null ? await eventLog.readMerged() : null;
 
   // Filter to events past the previous frontier per replica so a
   // long history doesn't get re-projected on every tick.
-  const fresh = merged.filter((event) => {
-    const lastSeq = state.processedEvents[event.dot.replicaId] ?? 0;
-    return event.dot.seq > lastSeq;
-  });
+  const fresh =
+    store === null
+      ? (merged ?? []).filter((event) => {
+          const lastSeq = state.processedEvents[event.dot.replicaId] ?? 0;
+          return event.dot.seq > lastSeq;
+        })
+      : store.readSince(state.processedEvents);
 
   // Tombstones are MONOTONIC over the merged log. A tombstone
   // emitted in a prior incremental pass (already past the
@@ -168,10 +173,20 @@ export const ingestIncremental = async (
   //     their sweep in prior passes, so re-running them would
   //     just be wasted I/O (no correctness impact, but pointless).
   const tombstonedThreads = new Set<string>();
-  for (const event of merged) {
-    if (event.type !== RECALL_TOMBSTONE_TARGET) continue;
-    if (!isRecallTombstonePayload(event.payload)) continue;
-    tombstonedThreads.add(event.payload.threadId);
+  if (store === null) {
+    for (const event of merged ?? []) {
+      if (event.type !== RECALL_TOMBSTONE_TARGET) continue;
+      if (!isRecallTombstonePayload(event.payload)) continue;
+      tombstonedThreads.add(event.payload.threadId);
+    }
+  } else {
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) {
+        if (event.type !== RECALL_TOMBSTONE_TARGET) continue;
+        if (!isRecallTombstonePayload(event.payload)) continue;
+        tombstonedThreads.add(event.payload.threadId);
+      }
+    }, 2000);
   }
   const freshTombstones = new Set<string>();
   for (const event of fresh) {
@@ -295,9 +310,13 @@ export const ingestIncremental = async (
   // log (NOT just `fresh`) so we capture every event we observed,
   // not just the ones we emitted entries for.
   const nextProcessed: Record<string, number> = { ...state.processedEvents };
-  for (const event of merged) {
-    const prev = nextProcessed[event.dot.replicaId] ?? 0;
-    if (event.dot.seq > prev) nextProcessed[event.dot.replicaId] = event.dot.seq;
+  if (store === null) {
+    for (const event of merged ?? []) {
+      const prev = nextProcessed[event.dot.replicaId] ?? 0;
+      if (event.dot.seq > prev) nextProcessed[event.dot.replicaId] = event.dot.seq;
+    }
+  } else {
+    Object.assign(nextProcessed, store.watermark());
   }
 
   await writeIngestState(vaultRoot, {

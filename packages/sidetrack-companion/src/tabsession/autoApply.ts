@@ -1,9 +1,16 @@
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from './events.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from './policy.js';
-import { projectTabSessions, type TabSessionProjection } from './projection.js';
+import {
+  createEmptyTabSessionProjectionAccumulator,
+  foldEventIntoTabSessionProjectionAccumulator,
+  projectTabSessions,
+  tabSessionProjectionFromAccumulator,
+  type TabSessionProjection,
+} from './projection.js';
 import {
   inferredAttributionPayloadFromResolution,
   resolveAttribution,
@@ -41,6 +48,8 @@ export interface AutoApplyTabSessionAttributionInput {
   readonly eventLog: EventLog;
   readonly snapshot: ConnectionsSnapshot;
   readonly tabSessionId: string;
+  readonly events?: readonly AcceptedEvent[];
+  readonly vaultRoot?: string;
   readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
@@ -58,11 +67,28 @@ const clientEventIdForResolution = (result: ResolutionResult): string =>
     result.reasons.dependencyKey,
   ].join(':');
 
+const projectTabSessionsFromStoreOrLog = async (
+  eventLog: EventLog,
+  vaultRoot: string | undefined,
+): Promise<TabSessionProjection> => {
+  if (vaultRoot === undefined) return projectTabSessions(await eventLog.readMerged());
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) return projectTabSessions(await eventLog.readMerged());
+  const accumulator = createEmptyTabSessionProjectionAccumulator();
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+  }, 2000);
+  return tabSessionProjectionFromAccumulator(accumulator);
+};
+
 export const autoApplyTabSessionAttribution = async (
   input: AutoApplyTabSessionAttributionInput,
 ): Promise<AutoApplyTabSessionAttributionResult> => {
-  const beforeEvents = await input.eventLog.readMerged();
-  const beforeProjection = projectTabSessions(beforeEvents);
+  const beforeEvents = input.events ?? (await input.eventLog.readMerged());
+  const beforeProjection =
+    input.events === undefined
+      ? await projectTabSessionsFromStoreOrLog(input.eventLog, input.vaultRoot)
+      : projectTabSessions(beforeEvents);
   const existing = beforeProjection.bySessionId.get(input.tabSessionId)?.currentAttribution;
   const resolution = resolveAttribution({
     tabSessionId: input.tabSessionId,
@@ -128,6 +154,6 @@ export const autoApplyTabSessionAttribution = async (
     status: 'applied',
     resolution,
     accepted,
-    projection: projectTabSessions(await input.eventLog.readMerged()),
+    projection: await projectTabSessionsFromStoreOrLog(input.eventLog, input.vaultRoot),
   };
 };

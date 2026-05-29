@@ -1,4 +1,5 @@
 import type { AcceptedEvent } from '../causal.js';
+import { getCaughtUpSharedEventStore } from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import { eventTypesForMaterializer } from './registry.js';
@@ -37,6 +38,7 @@ import {
 export interface CreateTimelineMaterializerDeps {
   readonly store: TimelineStore;
   readonly eventLog: EventLog;
+  readonly vaultRoot?: string;
 }
 
 // Reviewer-flagged: persistent rebuildDay failures (e.g. disk full)
@@ -62,8 +64,35 @@ export const createTimelineMaterializer = (deps: CreateTimelineMaterializerDeps)
   // observed in the merged log.
   let dirtyDays = new Set<string>();
 
+  const readTimelineEvents = async (eventLog: EventLog): Promise<readonly AcceptedEvent[]> => {
+    if (deps.vaultRoot === undefined) {
+      // Stream only timeline-observed events instead of materialising the
+      // full ~700MB merged log — boot must not warm the memo.
+      return await eventLog.streamFiltered(
+        (event) => event.type === BROWSER_TIMELINE_OBSERVED,
+        new Set([BROWSER_TIMELINE_OBSERVED]),
+      );
+    }
+    const store = await getCaughtUpSharedEventStore(deps.vaultRoot);
+    if (store === null) {
+      // Stream only timeline-observed events instead of materialising the
+      // full ~700MB merged log — boot must not warm the memo.
+      return await eventLog.streamFiltered(
+        (event) => event.type === BROWSER_TIMELINE_OBSERVED,
+        new Set([BROWSER_TIMELINE_OBSERVED]),
+      );
+    }
+    const events: AcceptedEvent[] = [];
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) {
+        if (event.type === BROWSER_TIMELINE_OBSERVED) events.push(event);
+      }
+    }, 2000);
+    return events;
+  };
+
   const rebuildDay = async (date: string): Promise<void> => {
-    const merged = await deps.eventLog.readMerged();
+    const merged = await readTimelineEvents(deps.eventLog);
     const payloads = collectTimelinePayloads(
       merged.filter(
         (e: AcceptedEvent) =>
@@ -131,7 +160,7 @@ export const createTimelineMaterializer = (deps: CreateTimelineMaterializerDeps)
   const catchUp: Materializer['catchUp'] = async (eventLog) => {
     pending = true;
     try {
-      const merged = await eventLog.readMerged();
+      const merged = await readTimelineEvents(eventLog);
       const payloads = collectTimelinePayloads(merged);
       const grouped = groupByDay(payloads);
       // Rebuild every day that has at least one event in the merged

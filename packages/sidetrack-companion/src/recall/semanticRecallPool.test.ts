@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,7 @@ import {
   expandSemanticRecallCandidates,
   getOrBuildSemanticRecallPool,
   readSemanticRecallPool,
+  readSemanticRecallVectorStore,
   SEMANTIC_RECALL_POOL_ENV,
   semanticRecallPoolEnabled,
   semanticRecallPoolSignature,
@@ -349,6 +350,44 @@ describe('getOrBuildSemanticRecallPool (lazy + cached, offline-safe)', () => {
       modelId: 'e5-test',
     });
     expect(stillGood?.signature).toBe(built?.signature);
+  });
+
+  it('memoizes sidecar vector reads until vectors.json changes', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'srp-'));
+    const vectorDir = join(dir, '_BAC', 'recall', 'semantic-pool');
+    const vectorPath = join(vectorDir, 'vectors.json');
+    await mkdir(vectorDir, { recursive: true });
+    await writeFile(
+      vectorPath,
+      `${JSON.stringify({
+        modelId: 'e5-test',
+        byUrl: {
+          'https://x/a': [1, 0],
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const first = await readSemanticRecallVectorStore(dir, 'e5-test');
+    const second = await readSemanticRecallVectorStore(dir, 'e5-test');
+    expect(second).toBe(first);
+    expect(second?.size).toBe(1);
+
+    await writeFile(
+      vectorPath,
+      `${JSON.stringify({
+        modelId: 'e5-test',
+        byUrl: {
+          'https://x/a': [1, 0],
+          'https://x/b': [0, 1],
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const third = await readSemanticRecallVectorStore(dir, 'e5-test');
+    expect(third).not.toBe(first);
+    expect(third?.size).toBe(2);
   });
 
   it('incremental delta: embeds ONLY the new item, neighbours stay EXACT, kept clusters preserved, new item joins a neighbour community', async () => {

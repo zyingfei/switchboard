@@ -1960,16 +1960,26 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   // back-to-back full connections rebuilds); it is reconstructed from
   // the page-evidence store inside every drain, so omitting it keeps
   // the snapshot correct.
-  it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
+  it('engagement.session.aggregated never triggers a per-event drain (deferred to next structural drain)', async () => {
+    // `m.handles` is the union of HANDLES + CONTENT_LANE_ONLY_HANDLES +
+    // PROJECTION_ONLY_HANDLES (so the runner dispatches all of those to
+    // onAccepted). What this test pins down is that these high-frequency
+    // event types do NOT enter the structural-drain-triggering HANDLES
+    // bucket — `page.evidence.extracted` rides in CONTENT_LANE_ONLY_HANDLES,
+    // and the others aren't handled at all.
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
     const store = createConnectionsStore(vaultRoot);
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
+    // Not handled at all — runner doesn't even deliver these.
     expect(m.handles.has('engagement.session.aggregated')).toBe(false);
     expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
-    expect(m.handles.has('page.evidence.extracted')).toBe(false);
+    // Handled (so the content-lane queue + progress can advance) but does
+    // not trigger a structural drain — the behavioural guarantee tested
+    // by the next case in this file.
+    expect(m.handles.has('page.evidence.extracted')).toBe(true);
   });
 
   it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {

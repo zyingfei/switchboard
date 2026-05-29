@@ -42,4 +42,4 @@ exec env \
   SIDETRACK_RECALL_PHASE_LOG=1 \
   SIDETRACK_CONNECTIONS_PHASE_LOG=1 \
   SIDETRACK_CONNECTIONS_CHILD=1 \
-  npx --yes bun@1.3.14 dist/cli.js --vault "$TEST_VAULT" --port "$TEST_PORT"
+  npx --yes bun@1.3.14 --smol dist/cli.js --vault "$TEST_VAULT" --port "$TEST_PORT"

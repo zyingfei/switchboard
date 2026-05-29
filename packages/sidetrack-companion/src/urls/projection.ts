@@ -281,7 +281,7 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Byte-equal output for any event-order permutation is the
 // load-bearing property — verified by the parity tests.
 
-interface UrlObservationCursor {
+export interface UrlObservationCursor {
   readonly acceptedAtMs: number;
   readonly replicaId: string;
   readonly seq: number;
@@ -298,6 +298,12 @@ export interface UrlProjectionAccumulator {
    * never overwrite a value contributed by a newer event.
    */
   readonly observationCursors: Map<string, UrlObservationCursor>;
+}
+
+export interface SerializedUrlProjectionAccumulator {
+  readonly schemaVersion: typeof URL_PROJECTION_SCHEMA_VERSION;
+  readonly byCanonicalUrl: Record<string, UrlVisitRecord>;
+  readonly observationCursors: Record<string, UrlObservationCursor>;
 }
 
 export const createEmptyUrlProjectionAccumulator = (): UrlProjectionAccumulator => ({
@@ -497,6 +503,35 @@ export const urlProjectionAccumulatorFromSerialized = (
     ),
   ),
   observationCursors: new Map(),
+});
+
+export const serializeUrlProjectionAccumulator = (
+  accumulator: UrlProjectionAccumulator,
+): SerializedUrlProjectionAccumulator => ({
+  schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
+  byCanonicalUrl: Object.fromEntries(
+    [...accumulator.records.entries()].sort(([left], [right]) => compareString(left, right)),
+  ),
+  observationCursors: Object.fromEntries(
+    [...accumulator.observationCursors.entries()].sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+});
+
+export const deserializeUrlProjectionAccumulator = (
+  serialized: SerializedUrlProjectionAccumulator,
+): UrlProjectionAccumulator => ({
+  records: new Map(
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  observationCursors: new Map(
+    Object.entries(serialized.observationCursors).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
 });
 
 // Apply PR #141's thread→URL attribution propagation to the

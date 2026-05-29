@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -31,10 +30,18 @@ import {
   type ClosestVisitRanker,
   type ConnectionsInput,
   type ConnectionsSnapshot,
-  SqliteConnectionsStore,
+  type ThreadVaultRecord,
 } from '../../connections/snapshot.js';
-import type { ConnectionsStore } from '../../connections/snapshot.js';
-import { recomputeScope, unionScopeOutputs } from '../../connections/scopeRecompute.js';
+import type {
+  ConnectionsProjectionAccumulatorState,
+  ConnectionsStore,
+} from '../../connections/snapshot.js';
+import {
+  recomputeScope,
+  unionScopeOutputs,
+  type ScopeRecomputeOutput,
+} from '../../connections/scopeRecompute.js';
+import { extractUrlsFromText } from '../../connections/urlExtractor.js';
 import {
   buildTopicRevision,
   type BuildTopicRevisionInput,
@@ -86,7 +93,12 @@ import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
 } from '../../engagement/events.js';
+import {
+  createEngagementFactsStore,
+  type EngagementFactsStore,
+} from '../../engagement/engagementFactsStore.js';
 import { isNavigationCommittedPayload, NAVIGATION_COMMITTED } from '../../navigation/events.js';
+import { requestBunMemoryRelease } from '../../process/bunMemory.js';
 import {
   buildEngagementClassifierInputs,
   createEngagementClassRevisionStore,
@@ -161,7 +173,11 @@ import {
   foldGroupBEventIntoQueue,
   type DirtySourceQueueSnapshot,
 } from '../../recall/content-lane.js';
-import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
+import {
+  CAPTURE_RECORDED,
+  isCaptureRecordedPayload,
+  RECALL_TOMBSTONE_TARGET,
+} from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
@@ -180,27 +196,43 @@ import {
   THREAD_DELETED,
   THREAD_UNARCHIVED,
   THREAD_UPSERTED,
+  isThreadStatusPayload,
+  isThreadUpsertedPayload,
 } from '../../threads/events.js';
+import { projectThread } from '../../threads/projection.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
   isBrowserTimelineObservedPayload,
 } from '../../timeline/events.js';
+import { type TimelineStore } from '../../timeline/projection.js';
 import {
-  buildDayProjection,
-  collectTimelinePayloads,
-  entryIdFor,
-  groupByDay,
-  type TimelineDayProjection,
-  type TimelineStore,
-} from '../../timeline/projection.js';
+  createTimelineFactsStore,
+  type TimelineFactsStore,
+} from '../../timeline/timelineFactsStore.js';
+import {
+  timelineDaysFromTimelineEvents,
+  type TimelineDayProjectionWithDimensions,
+  type TimelineEntryWithDimensions,
+} from '../../timeline/timelineDays.js';
 import { detectSearchUrl } from '../../timeline/sanitize.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { isMainThread } from 'node:worker_threads';
-import { sortAcceptedEvents, vectorFromEvents, type AcceptedEvent, type Dot } from '../causal.js';
+import {
+  sortAcceptedEvents,
+  vectorFromEvents,
+  type AcceptedEvent,
+  type Dot,
+  type VersionVector,
+} from '../causal.js';
+import { eventStoreEnabled, getSharedEventStore, type EventStore } from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
-import type { VisitSimilarityEdge, VisitSimilarityRevision } from '../../connections/types.js';
+import {
+  nodeIdFor,
+  type VisitSimilarityEdge,
+  type VisitSimilarityRevision,
+} from '../../connections/types.js';
 import {
   addDotsToIntervals,
   EMPTY_PROGRESS,
@@ -210,8 +242,10 @@ import {
 } from './materializerProgress.js';
 import {
   createEmptyTabSessionProjectionAccumulator,
+  deserializeTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
   seedTabSessionProjectionAccumulatorAsync,
+  serializeTabSessionProjectionAccumulator,
   serializeTabSessionProjection,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
@@ -219,8 +253,10 @@ import {
 import {
   applyThreadAttributionsToAccumulator,
   createEmptyUrlProjectionAccumulator,
+  deserializeUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   seedUrlProjectionAccumulatorAsync,
+  serializeUrlProjectionAccumulator,
   serializeUrlProjection,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
@@ -249,10 +285,10 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
-const DEFAULT_DRIFT_EVERY_DRAINS = 10;
-const DEFAULT_DRIFT_EVERY_MS = 3_600_000;
-const DRIFT_DISABLED_ENV = 'SIDETRACK_CONNECTIONS_DRIFT_DISABLED';
-const INCREMENTAL_SCOPES_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES';
+// Drift-check (shadow in-process rebuild) removed — it was costing 30s+
+// per cycle and a multi-GB memory spike on the parent process, defeating
+// IVM. Statistical drift via `attachDriftReport` (uses already-computed
+// diagnostic series, no rebuild) is kept.
 const PROJECTION_OVERLAY_RETRY_DELAYS_MS = [25, 75, 150, 300, 600, 1_200] as const;
 
 export interface DriftReport {
@@ -306,8 +342,6 @@ const resolveDrainMinIntervalMs = (): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DRAIN_MIN_INTERVAL_MS;
 };
 
-const INCREMENTAL_RANKER_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_RANKER';
-const INCREMENTAL_SIMILARITY_ENV = 'SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY';
 const TOPIC_EVERY_DRAINS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS';
 const TOPIC_EVERY_MS_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS';
 const DEFAULT_TOPIC_EVERY_DRAINS = 50;
@@ -355,9 +389,20 @@ export const classifyConnectionsMaterializerHealth = (input: {
   return ageMs <= BUSY_LAST_SUCCESS_WINDOW_MS ? 'busy' : 'degraded';
 };
 
-const incrementalRankerEnabled = (): boolean => process.env[INCREMENTAL_RANKER_ENV] !== '0';
-const incrementalSimilarityEnabled = (): boolean => process.env[INCREMENTAL_SIMILARITY_ENV] !== '0';
-
+// IVM is the only supported path — the env-opt-out (`=0`) was removed
+// to prevent accidental regression back to full-rebuild semantics.
+const incrementalRankerEnabled = (): boolean => true;
+const incrementalSimilarityEnabled = (): boolean => true;
+// Source engagement classifier inputs from the persistent SQLite fact
+// store instead of re-walking the full AcceptedEvent[] every drain.
+// Kill-switch to the legacy in-memory path (drift/replay) via env=0.
+// Default OFF: part of the off-heap-fact-store approach that measured
+// net-negative on memory (see eventStore.ts). Byte-equivalent + verified,
+// but no memory win + sqlite overhead. Opt-in via env=1 (experimental).
+const engagementFactsStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_ENGAGEMENT_FACTS_STORE'] === '1';
+const timelineFactsStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_TIMELINE_FACTS_STORE'] === '1';
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
   const parsed = raw === undefined ? Number.NaN : Number(raw);
@@ -419,25 +464,13 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   THREAD_DELETED,
   WORKSTREAM_UPSERTED,
   WORKSTREAM_DELETED,
-  DISPATCH_RECORDED,
-  DISPATCH_LINKED,
-  QUEUE_CREATED,
-  QUEUE_STATUS_SET,
-  ANNOTATION_CREATED,
-  ANNOTATION_NOTE_SET,
-  ANNOTATION_DELETED,
-  CAPTURE_RECORDED,
   NAVIGATION_COMMITTED,
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
   USER_FLOW_REJECTED,
   USER_ORGANIZED_ITEM,
-  USER_SNIPPET_PROMOTED,
-  USER_TOPIC_RENAMED,
   TAB_SESSION_ATTRIBUTION_INFERRED,
   URL_ATTRIBUTION_INFERRED,
-  SELECTION_COPIED,
-  SELECTION_PASTED,
   // Timeline observations indirectly contribute (timeline visits
   // become nodes; same canonicalUrl produces edges to threads).
   // Including the event type here keeps freshness bound to the
@@ -447,14 +480,55 @@ const HANDLES: ReadonlySet<string> = new Set<string>([
   BROWSER_TIMELINE_OBSERVED,
 ]);
 
+// Events that *participate* in the connections graph but do NOT need to
+// trigger a fresh structural rebuild on their own. Their effects bake
+// into the next regular drain (triggered by something in HANDLES), via
+// `readMerged()` of the full event log. Putting them here:
+//   1. Skips the drain trigger (only progress is advanced — see
+//      advanceProgressForContentOnlyEvent).
+//   2. Passes `isScopedTimelineDeltaEvent`, so when they arrive mixed
+//      with timeline-affecting events the gate doesn't collapse to a
+//      full rebuild.
+// Membership criteria: the event's invalidationsForEvent contributes
+// only content-lane keys (sourceUnit / recallIndex / contentSimilarity)
+// or an empty set — i.e., it does not invalidate any *graph* scope.
 const CONTENT_LANE_ONLY_HANDLES: ReadonlySet<string> = new Set<string>([
   CAPTURE_EXTRACTION_PRODUCED,
+  CAPTURE_RECORDED,
   ENGAGEMENT_INTERVAL_OBSERVED,
   PAGE_EVIDENCE_EXTRACTED,
   RECALL_TOMBSTONE_TARGET,
+  // No-graph-impact events. These previously rode in HANDLES which made
+  // every one of them trigger a full base rebuild; their invalidation
+  // rules emit empty sets, so the drain produced zero dirty scopes and
+  // burned ~20s of CPU recomputing nothing.
+  ANNOTATION_CREATED,
+  ANNOTATION_NOTE_SET,
+  ANNOTATION_DELETED,
+  DISPATCH_RECORDED,
+  DISPATCH_LINKED,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+  // Queue events invalidate `queue` keys only; `queue` is not a
+  // recomputable scope kind (see invalidationKeysToScopes in
+  // connectionsScopes.ts) so it contributes zero graph rows. Routing
+  // through CONTENT_LANE skips the no-op drain trigger.
+  QUEUE_CREATED,
+  QUEUE_STATUS_SET,
+  // Selection events have no entry in INVALIDATION_RULES → empty key
+  // set → no graph rows touched.
+  SELECTION_COPIED,
+  SELECTION_PASTED,
 ]);
 
 const PROJECTION_ONLY_HANDLES: ReadonlySet<string> = new Set<string>([URL_IGNORED]);
+
+const THREAD_SCOPED_DELTA_HANDLES: ReadonlySet<string> = new Set<string>([
+  THREAD_UPSERTED,
+  THREAD_ARCHIVED,
+  THREAD_UNARCHIVED,
+  THREAD_DELETED,
+]);
 
 const PROJECTION_OVERLAY_HANDLES: ReadonlySet<string> = new Set<string>([
   BROWSER_TIMELINE_OBSERVED,
@@ -489,6 +563,9 @@ export interface CreateConnectionsMaterializerDeps {
   readonly topicRevisionAlgorithm?: TopicAlgorithmVersion;
   readonly topicRevisionStore?: TopicRevisionStore;
   readonly engagementClassStore?: EngagementClassRevisionStore;
+  readonly engagementFactsStore?: EngagementFactsStore;
+  readonly timelineFactsStore?: TimelineFactsStore;
+  readonly eventStore?: EventStore;
   readonly rankerRetrainer?: RankerRetrainer;
   readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
   readonly diagnosticsStore?: MaterializerDiagnosticsStore;
@@ -576,13 +653,19 @@ export const collectTouchedVisits = (
   return new Set([...touched].filter((visitKey) => visitKey.length > 0).sort());
 };
 
-const hnswStoreCountDriftRequiresFullRebuild = (
+const hnswStoreRemovalDriftRequiresFullRebuild = (
   storeVisitCount: number,
   eligibleVisitCount: number,
 ): boolean => {
-  const drift = Math.abs(storeVisitCount - eligibleVisitCount);
+  if (storeVisitCount <= eligibleVisitCount) return false;
+  const drift = storeVisitCount - eligibleVisitCount;
   const denominator = Math.max(storeVisitCount, eligibleVisitCount, 1);
   return drift / denominator > 0.5;
+};
+
+const isHnswDimensionMismatchError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('HNSW dimension mismatch');
 };
 
 const writeShadowTopicRevision = async (
@@ -657,12 +740,6 @@ export interface ContentLaneSourceUnitReconciler {
   readonly reconcileTombstone: (sourceUnitId: string) => Promise<boolean>;
 }
 
-const resolvePositiveNumberEnv = (name: string, fallback: number): number => {
-  const raw = process.env[name];
-  const parsed = raw === undefined ? Number.NaN : Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-};
-
 const dotsFromIntervals = (
   intervals: MaterializerProgress['appliedDotIntervals'],
 ): readonly Dot[] => {
@@ -675,6 +752,59 @@ const dotsFromIntervals = (
   return dots.sort((a, b) =>
     a.replicaId === b.replicaId ? a.seq - b.seq : a.replicaId < b.replicaId ? -1 : 1,
   );
+};
+
+const dotIntervalsHaveGaps = (intervals: MaterializerProgress['appliedDotIntervals']): boolean => {
+  for (const replicaIntervals of Object.values(intervals)) {
+    if (replicaIntervals.length > 1) return true;
+    const [first] = replicaIntervals;
+    if (first !== undefined && first[0] > 1) return true;
+  }
+  return false;
+};
+
+const versionVectorsEqual = (left: VersionVector, right: VersionVector): boolean => {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if ((left[key] ?? 0) !== (right[key] ?? 0)) return false;
+  }
+  return true;
+};
+
+const compareString = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0;
+
+const compareAcceptedEventOrder = (left: AcceptedEvent, right: AcceptedEvent): number => {
+  if (left.acceptedAtMs !== right.acceptedAtMs) return left.acceptedAtMs - right.acceptedAtMs;
+  const replica = compareString(left.dot.replicaId, right.dot.replicaId);
+  if (replica !== 0) return replica;
+  if (left.dot.seq !== right.dot.seq) return left.dot.seq - right.dot.seq;
+  return compareString(left.type, right.type);
+};
+
+const dotIntervalsEqual = (
+  left: MaterializerProgress['appliedDotIntervals'],
+  right: MaterializerProgress['appliedDotIntervals'],
+): boolean => {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    const leftIntervals = left[key] ?? [];
+    const rightIntervals = right[key] ?? [];
+    if (leftIntervals.length !== rightIntervals.length) return false;
+    for (let index = 0; index < leftIntervals.length; index += 1) {
+      const leftInterval = leftIntervals[index];
+      const rightInterval = rightIntervals[index];
+      if (
+        leftInterval === undefined ||
+        rightInterval === undefined ||
+        leftInterval[0] !== rightInterval[0] ||
+        leftInterval[1] !== rightInterval[1]
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
 };
 
 const dotKey = (dot: Dot): string => `${dot.replicaId}\u0000${String(dot.seq)}`;
@@ -773,11 +903,108 @@ export const createConnectionsMaterializer = (
   let tabSessionAccumulator: TabSessionProjectionAccumulator =
     createEmptyTabSessionProjectionAccumulator();
   let projectionAccumulatorsInitialized = false;
+  const serializeProjectionAccumulatorState = (
+    progress: MaterializerProgress,
+  ): ConnectionsProjectionAccumulatorState => ({
+    materializerName: MATERIALIZER_NAME,
+    materializerVersion: MATERIALIZER_VERSION,
+    appliedDotIntervals: progress.appliedDotIntervals,
+    appliedFrontier: progress.appliedFrontier,
+    urlAccumulator: serializeUrlProjectionAccumulator(urlAccumulator),
+    tabSessionAccumulator: serializeTabSessionProjectionAccumulator(tabSessionAccumulator),
+  });
+  const tryLoadProjectionAccumulatorState = async (
+    progress: MaterializerProgress | null,
+  ): Promise<boolean> => {
+    if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return false;
+    const readState = deps.store.readProjectionAccumulatorState;
+    if (readState === undefined) return false;
+    const state = await readState(MATERIALIZER_NAME);
+    if (state === null) return false;
+    if (state.materializerVersion !== MATERIALIZER_VERSION) return false;
+    if (!versionVectorsEqual(state.appliedFrontier, progress.appliedFrontier)) return false;
+    if (!dotIntervalsEqual(state.appliedDotIntervals, progress.appliedDotIntervals)) return false;
+    urlAccumulator = deserializeUrlProjectionAccumulator(state.urlAccumulator);
+    tabSessionAccumulator = deserializeTabSessionProjectionAccumulator(state.tabSessionAccumulator);
+    projectionAccumulatorsInitialized = true;
+    return true;
+  };
   const incrementalGraphView = createIncrementalConnectionsGraphView();
   // Stage 5.2 W6 per-pass skip — cache the last engagement class
   // revision so a drain whose W6 key set contains no engagement-touching
   // keys can reuse it.
   let lastEngagementClassRevision: ReturnType<typeof buildEngagementClassRevision> | undefined;
+  let catchUpPendingEventWindow: readonly AcceptedEvent[] | null = null;
+  let requireScopedTimelineDeltaForDrain = false;
+  // Persistent engagement fact store (lazy-opened; survives restart).
+  // Sourced via deps for tests; defaults to the SQLite-backed store.
+  let engagementFactStore: EngagementFactsStore | null = null;
+  let engagementFactStoreInit: Promise<EngagementFactsStore> | null = null;
+  let engagementFactStoreUnavailable = false;
+  // Persistent timeline fact store (lazy-opened; survives restart).
+  // This is owned by the connections materializer: catch up from merged
+  // at drain start, then read within the same drain to avoid racing the
+  // shared TimelineStore written by the timeline materializer.
+  let timelineFactStore: TimelineFactsStore | null = null;
+  let timelineFactStoreInit: Promise<TimelineFactsStore> | null = null;
+  let timelineFactStoreUnavailable = false;
+  let eventStore: EventStore | null = null;
+  let eventStoreInit: Promise<EventStore> | null = null;
+  let eventStoreUnavailable = false;
+  // Returns null when the store cannot be opened (e.g. bun:sqlite is
+  // unavailable under the Node test runner) — callers fall back to the
+  // legacy in-memory derivation.
+  const ensureEngagementFactStore = async (): Promise<EngagementFactsStore | null> => {
+    if (engagementFactStore !== null) return engagementFactStore;
+    if (engagementFactStoreUnavailable) return null;
+    try {
+      engagementFactStoreInit ??=
+        deps.engagementFactsStore !== undefined
+          ? Promise.resolve(deps.engagementFactsStore)
+          : createEngagementFactsStore(deps.vaultRoot);
+      engagementFactStore = await engagementFactStoreInit;
+      return engagementFactStore;
+    } catch {
+      engagementFactStoreUnavailable = true;
+      engagementFactStoreInit = null;
+      return null;
+    }
+  };
+  const ensureTimelineFactStore = async (): Promise<TimelineFactsStore | null> => {
+    if (timelineFactStore !== null) return timelineFactStore;
+    if (timelineFactStoreUnavailable) return null;
+    try {
+      timelineFactStoreInit ??=
+        deps.timelineFactsStore !== undefined
+          ? Promise.resolve(deps.timelineFactsStore)
+          : createTimelineFactsStore(deps.vaultRoot);
+      timelineFactStore = await timelineFactStoreInit;
+      return timelineFactStore;
+    } catch {
+      timelineFactStoreUnavailable = true;
+      timelineFactStoreInit = null;
+      return null;
+    }
+  };
+  const ensureEventStore = async (): Promise<EventStore | null> => {
+    if (eventStore !== null) return eventStore;
+    if (eventStoreUnavailable) return null;
+    try {
+      eventStoreInit ??=
+        deps.eventStore !== undefined
+          ? Promise.resolve(deps.eventStore)
+          : getSharedEventStore(deps.vaultRoot).then((store) => {
+              if (store === null) throw new Error('Event store unavailable');
+              return store;
+            });
+      eventStore = await eventStoreInit;
+      return eventStore;
+    } catch {
+      eventStoreUnavailable = true;
+      eventStoreInit = null;
+      return null;
+    }
+  };
   // Stage 5.2 W3 wiring — embedder warmth tracker.
   const embedderWarmthTracker: EmbedderWarmthTracker = createEmbedderWarmthTracker();
   // Stage 5.2 W4 wiring — incremental topic accumulator maintained
@@ -812,13 +1039,6 @@ export const createConnectionsMaterializer = (
   let lastSuccessAt: string | null = null;
   let lastError: string | null = null;
   let lastFailureAtMs = 0;
-  let successfulDrainCount = 0;
-  // Start the wall-clock cadence from materializer construction. Child
-  // reconcile processes are single-use; initializing this to epoch made
-  // every child immediately run a shadow full rebuild, doubling normal
-  // drain CPU despite DEFAULT_DRIFT_EVERY_MS being one hour.
-  let lastDriftCheckAtMs = Date.now();
-  let lastDriftReport: DriftReport | null = null;
   let lastFrontier: Record<string, number> | undefined;
   // W1c — wall-clock of the last drain pass START. Reference for the
   // minimum interval between drain STARTS (not just the within-drain
@@ -833,13 +1053,24 @@ export const createConnectionsMaterializer = (
   // and race the writes (an earlier-started but slower task can land
   // AFTER a later one and overwrite the correct overlay state).
   let foregroundNavigationOverlayQueue: Promise<void> = Promise.resolve();
-  // Serialise advanceProgressForContentOnlyEvent calls so two
-  // back-to-back CONTENT_LANE_ONLY events don't both read the same
-  // starting progress, compute non-overlapping appliedDotIntervals
-  // patches, and lose one another's dot to a last-writer-wins
-  // overwrite. (writeMaterializerProgress / #writeProgressRows replaces
-  // the interval set rather than merging.)
-  let contentOnlyProgressQueue: Promise<void> = Promise.resolve();
+  // Coalesce foreground-navigation overlays. The overlay does a FULL
+  // readMerged() to optimistically resolve the newest nav chain for snappy
+  // UI; queuing one per NAVIGATION_COMMITTED floods the main thread under a
+  // tab-burst (each readMerged is O(whole log) and the mergedMemo is voided
+  // by concurrent ingestion), pinning the event loop for tens of seconds
+  // (the "wedge"). Keep at most one overlay in flight and only the newest
+  // pending nav events; the authoritative graph drain supersedes the overlay
+  // anyway, so we also skip entirely while a drain is pending/running.
+  let pendingForegroundNavEvents: AcceptedEvent[] = [];
+  let foregroundNavOverlayScheduled = false;
+  // Coalesce content-only progress advancement. appendClientObservedBatch
+  // dispatches accepted events synchronously; a per-event promise chain
+  // can monopolize the event loop with repeated progress read/write
+  // cycles. This batches those events into one macrotask and one
+  // progress write, with a macrotask yield before any follow-up batch.
+  let pendingContentOnlyProgressEvents: AcceptedEvent[] = [];
+  let contentOnlyProgressFlushScheduled = false;
+  let contentOnlyProgressFlushRunning = false;
   let progressOnlyDirty = false;
   let urgentDrainRequested = false;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
@@ -849,28 +1080,8 @@ export const createConnectionsMaterializer = (
   // alive at shutdown.
   let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-  type TimelineEntryWithDimensions = TimelineDayProjection['entries'][number] & {
-    readonly dimensions?: unknown;
-  };
-  type TimelineDayProjectionWithDimensions = Omit<TimelineDayProjection, 'entries'> & {
-    readonly entries: readonly TimelineEntryWithDimensions[];
-  };
-
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null && !Array.isArray(value);
-
-  const focusedWindowMsFromPayload = (
-    payload: BrowserTimelineObservedPayload,
-  ): number | undefined => {
-    if (!isRecord(payload.dimensions)) return undefined;
-    const engagement = payload.dimensions['engagement'];
-    if (!isRecord(engagement)) return undefined;
-    const focused = engagement['focusedWindowMs'];
-    if (typeof focused !== 'number' || !Number.isFinite(focused) || focused < 0) {
-      return undefined;
-    }
-    return focused;
-  };
 
   const focusedWindowMsFromEntry = (entry: TimelineEntryWithDimensions): number => {
     if (!isRecord(entry.dimensions)) return 0;
@@ -936,6 +1147,68 @@ export const createConnectionsMaterializer = (
     });
   };
 
+  const cosineDistance = (left: readonly number[], right: readonly number[]): number => {
+    let dot = 0;
+    let leftNorm = 0;
+    let rightNorm = 0;
+    const length = Math.min(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const l = left[index] ?? 0;
+      const r = right[index] ?? 0;
+      dot += l * r;
+      leftNorm += l * l;
+      rightNorm += r * r;
+    }
+    if (leftNorm <= 0 || rightNorm <= 0) return 1;
+    return 1 - dot / Math.sqrt(leftNorm * rightNorm);
+  };
+
+  const exactHnswSimilarityEdges = async (
+    store: LoadedSimilarityHnswStore,
+    activeVisitIds: ReadonlySet<string>,
+    threshold: number,
+  ): Promise<readonly VisitSimilarityEdge[]> => {
+    const embeddingsByVisitId = new Map<string, readonly number[]>();
+    for (const visitId of [...activeVisitIds].sort()) {
+      const embedding = await store.embedding(visitId);
+      if (embedding !== null) embeddingsByVisitId.set(visitId, embedding);
+    }
+    const edgeByPair = new Map<string, VisitSimilarityEdge>();
+    const visitIds = [...embeddingsByVisitId.keys()].sort();
+    for (const visitId of visitIds) {
+      const source = embeddingsByVisitId.get(visitId);
+      if (source === undefined) continue;
+      const ranked: { readonly visitId: string; readonly cosine: number }[] = [];
+      for (const candidateVisitId of visitIds) {
+        if (candidateVisitId === visitId) continue;
+        const candidate = embeddingsByVisitId.get(candidateVisitId);
+        if (candidate === undefined) continue;
+        const cosine = Number((1 - cosineDistance(source, candidate)).toFixed(6));
+        if (cosine < threshold) continue;
+        ranked.push({ visitId: candidateVisitId, cosine });
+      }
+      ranked.sort((left, right) => {
+        if (right.cosine !== left.cosine) return right.cosine - left.cosine;
+        return left.visitId < right.visitId ? -1 : left.visitId > right.visitId ? 1 : 0;
+      });
+      for (const neighbor of ranked.slice(0, 50)) {
+        const [fromVisitKey, toVisitKey] = orderedSimilarityPair(visitId, neighbor.visitId);
+        const key = similarityPairKey(fromVisitKey, toVisitKey);
+        const existing = edgeByPair.get(key);
+        if (existing === undefined || neighbor.cosine > existing.cosine) {
+          edgeByPair.set(key, { fromVisitKey, toVisitKey, cosine: neighbor.cosine });
+        }
+      }
+    }
+    return [...edgeByPair.values()].sort((left, right) => {
+      if (left.fromVisitKey !== right.fromVisitKey) {
+        return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+      }
+      if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
+      return left.cosine - right.cosine;
+    });
+  };
+
   const resetHnswSimilarityFiles = async (): Promise<void> => {
     await loadedHnswSimilarityStore?.close();
     loadedHnswSimilarityStore = null;
@@ -956,6 +1229,7 @@ export const createConnectionsMaterializer = (
     readonly config: EffectiveVisitSimilarityConfig;
     readonly touchedVisitIds: ReadonlySet<string>;
     readonly reconcileVisitIds: ReadonlySet<string>;
+    readonly removalCandidateVisitIds: ReadonlySet<string>;
     readonly fullRebuild: boolean;
     readonly previousSnapshot: ConnectionsSnapshot | null;
     readonly embed: VisitSimilarityEmbedder;
@@ -964,8 +1238,8 @@ export const createConnectionsMaterializer = (
     const activeEntries = input.entries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= input.config.engagementGateMs,
     );
-    const activeVisitIds = new Set(activeEntries.map(visitKeyForVisitEntry));
-    if (activeEntries.length === 0) {
+    const currentActiveEntryVisitIds = new Set(activeEntries.map(visitKeyForVisitEntry));
+    if (activeEntries.length === 0 && input.fullRebuild) {
       if (input.fullRebuild) await resetHnswSimilarityFiles();
       return {
         revisionId: input.revisionId,
@@ -978,6 +1252,31 @@ export const createConnectionsMaterializer = (
         producer: 'embedding',
       };
     }
+    if (input.fullRebuild) await resetHnswSimilarityFiles();
+    const loadedHnswStore = await hnswSimilarityStore.ensureLoaded(
+      deps.vaultRoot,
+      RECALL_MODEL.embeddingDim,
+    );
+    loadedHnswSimilarityStore = loadedHnswStore;
+    const knownVisitIdsBeforeMutation = input.fullRebuild
+      ? new Set<string>()
+      : await loadedHnswStore.knownLabels();
+    const staleKnownVisitIds = input.fullRebuild
+      ? new Set<string>()
+      : new Set(
+          [...knownVisitIdsBeforeMutation].filter(
+            (visitId) =>
+              input.removalCandidateVisitIds.has(visitId) &&
+              !currentActiveEntryVisitIds.has(visitId),
+          ),
+        );
+    const activeVisitIds = input.fullRebuild
+      ? currentActiveEntryVisitIds
+      : new Set(
+          [...knownVisitIdsBeforeMutation, ...currentActiveEntryVisitIds].filter(
+            (visitId) => !staleKnownVisitIds.has(visitId),
+          ),
+        );
     const touchedVisitIds = input.fullRebuild ? activeVisitIds : input.touchedVisitIds;
     const reconcileVisitIds = input.fullRebuild
       ? activeVisitIds
@@ -985,20 +1284,11 @@ export const createConnectionsMaterializer = (
     const entriesToEmbed = input.fullRebuild
       ? activeEntries
       : activeEntries.filter((entry) => reconcileVisitIds.has(visitKeyForVisitEntry(entry)));
-    if (input.fullRebuild) await resetHnswSimilarityFiles();
-    const loadedHnswStore = await hnswSimilarityStore.ensureLoaded(
-      deps.vaultRoot,
-      RECALL_MODEL.embeddingDim,
-    );
-    loadedHnswSimilarityStore = loadedHnswStore;
-    const staleKnownVisitIds = input.fullRebuild
-      ? new Set<string>()
-      : new Set(
-          [...(await loadedHnswStore.knownLabels())].filter(
-            (visitId) => !activeVisitIds.has(visitId),
-          ),
-        );
-    const edgeInvalidationVisitIds = new Set([...reconcileVisitIds, ...staleKnownVisitIds]);
+    const incrementalHnswMutationVisitIds = new Set([...reconcileVisitIds, ...staleKnownVisitIds]);
+    const edgeInvalidationVisitIds =
+      input.fullRebuild || incrementalHnswMutationVisitIds.size > 0
+        ? new Set([...activeVisitIds, ...staleKnownVisitIds])
+        : incrementalHnswMutationVisitIds;
 
     const embeddingsByVisitKey = new Map<string, Float32Array>();
     if (entriesToEmbed.length > 0) {
@@ -1020,12 +1310,19 @@ export const createConnectionsMaterializer = (
       }
     }
 
-    for (const visitId of staleKnownVisitIds) await loadedHnswStore.delete(visitId);
+    let hnswMutationCount = 0;
+    for (const visitId of staleKnownVisitIds) {
+      await loadedHnswStore.delete(visitId);
+      hnswMutationCount += 1;
+      if (hnswMutationCount % 100 === 0) await yieldToEventLoop();
+    }
 
     const firstEmbedding = embeddingsByVisitKey.values().next().value;
     if (firstEmbedding !== undefined) {
       for (const [visitId, embedding] of embeddingsByVisitKey) {
         await loadedHnswStore.insertOrUpdate(visitId, Array.from(embedding));
+        hnswMutationCount += 1;
+        if (hnswMutationCount % 100 === 0) await yieldToEventLoop();
       }
     } else if (input.fullRebuild) {
       return {
@@ -1040,30 +1337,14 @@ export const createConnectionsMaterializer = (
       };
     }
 
-    const edgeByPair = new Map<string, VisitSimilarityEdge>();
-    for (const edge of retainedSimilarityEdgesFromSnapshot(
-      input.previousSnapshot,
-      edgeInvalidationVisitIds,
-      activeVisitIds,
-    )) {
-      edgeByPair.set(similarityPairKey(edge.fromVisitKey, edge.toVisitKey), edge);
-    }
-
-    const queryVisitIds = input.fullRebuild ? activeVisitIds : reconcileVisitIds;
-    for (const visitId of [...queryVisitIds].sort()) {
-      if (!activeVisitIds.has(visitId)) continue;
-      for (const neighbor of await loadedHnswStore.queryTopK(visitId, 50)) {
-        if (!activeVisitIds.has(neighbor.neighborVisitId)) continue;
-        const cosine = Number((1 - neighbor.distance).toFixed(6));
-        if (cosine < input.config.threshold) continue;
-        const [fromVisitKey, toVisitKey] = orderedSimilarityPair(visitId, neighbor.neighborVisitId);
-        const key = similarityPairKey(fromVisitKey, toVisitKey);
-        const existing = edgeByPair.get(key);
-        if (existing === undefined || cosine > existing.cosine) {
-          edgeByPair.set(key, { fromVisitKey, toVisitKey, cosine });
-        }
-      }
-    }
+    const edges =
+      input.fullRebuild || incrementalHnswMutationVisitIds.size > 0
+        ? await exactHnswSimilarityEdges(loadedHnswStore, activeVisitIds, input.config.threshold)
+        : retainedSimilarityEdgesFromSnapshot(
+            input.previousSnapshot,
+            edgeInvalidationVisitIds,
+            activeVisitIds,
+          );
     await loadedHnswStore.persist();
     return {
       revisionId: input.revisionId,
@@ -1071,14 +1352,7 @@ export const createConnectionsMaterializer = (
       modelRevision: RECALL_MODEL.revision,
       featureSchemaVersion: VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION,
       threshold: input.config.threshold,
-      edges: [...edgeByPair.values()].sort((left, right) => {
-        if (left.fromVisitKey !== right.fromVisitKey) {
-          return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
-        }
-        if (left.toVisitKey !== right.toVisitKey)
-          return left.toVisitKey < right.toVisitKey ? -1 : 1;
-        return left.cosine - right.cosine;
-      }),
+      edges,
       producedAt: Date.now(),
       producer: 'embedding',
     };
@@ -1107,36 +1381,11 @@ export const createConnectionsMaterializer = (
   const buildTimelineDays = (
     merged: readonly AcceptedEvent[],
   ): readonly TimelineDayProjectionWithDimensions[] => {
-    const payloads = collectTimelinePayloads(
+    return timelineDaysFromTimelineEvents(
       merged.filter(
         (e) => e.type === BROWSER_TIMELINE_OBSERVED && isBrowserTimelineObservedPayload(e.payload),
       ),
     );
-    const grouped = groupByDay(payloads);
-    const out: TimelineDayProjectionWithDimensions[] = [];
-    for (const [date, dayPayloads] of grouped) {
-      const focusedByEntryId = new Map<string, number>();
-      for (const payload of dayPayloads) {
-        const focusedWindowMs = focusedWindowMsFromPayload(payload);
-        if (focusedWindowMs === undefined) continue;
-        const entryId = entryIdFor(payload);
-        focusedByEntryId.set(
-          entryId,
-          Math.max(focusedByEntryId.get(entryId) ?? 0, focusedWindowMs),
-        );
-      }
-      const projection = buildDayProjection(date, dayPayloads);
-      const entries: TimelineEntryWithDimensions[] = projection.entries.map((entry) => {
-        const focusedWindowMs = focusedByEntryId.get(entry.id);
-        if (focusedWindowMs === undefined) return entry;
-        return {
-          ...entry,
-          dimensions: { engagement: { focusedWindowMs } },
-        };
-      });
-      out.push({ ...projection, entries });
-    }
-    return out;
   };
 
   const dimensionsWithFocusedWindowMs = (
@@ -1192,47 +1441,186 @@ export const createConnectionsMaterializer = (
     isBrowserTimelineObservedPayload(event.payload) &&
     detectSearchUrl(event.payload.canonicalUrl ?? event.payload.url) !== null;
 
-  const isScopedTimelineDeltaEvent = (event: AcceptedEvent): boolean =>
-    event.type === BROWSER_TIMELINE_OBSERVED ||
-    event.type === NAVIGATION_COMMITTED ||
-    event.type === ENGAGEMENT_SESSION_AGGREGATED ||
-    event.type === URL_ATTRIBUTION_INFERRED ||
-    event.type === TAB_SESSION_ATTRIBUTION_INFERRED ||
-    CONTENT_LANE_ONLY_HANDLES.has(event.type) ||
-    PROJECTION_ONLY_HANDLES.has(event.type);
+  const threadIdFromScopedDeltaEvent = (event: AcceptedEvent): string | null => {
+    if (event.type === THREAD_UPSERTED && isThreadUpsertedPayload(event.payload)) {
+      return event.payload.bac_id;
+    }
+    if (
+      (event.type === THREAD_ARCHIVED ||
+        event.type === THREAD_UNARCHIVED ||
+        event.type === THREAD_DELETED) &&
+      isThreadStatusPayload(event.payload)
+    ) {
+      return event.payload.bac_id;
+    }
+    return null;
+  };
 
-  const collectScopedNavigationEventsForDelta = (
+  const captureThreadIdForScopedDelta = (event: AcceptedEvent): string | null => {
+    if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) return null;
+    if (typeof event.payload.threadId === 'string' && event.payload.threadId.length > 0) {
+      return event.payload.threadId;
+    }
+    if (event.aggregateId.length > 0) return event.aggregateId;
+    return event.payload.bac_id;
+  };
+
+  const captureEdgeThreadIdForScopedDelta = (event: AcceptedEvent): string | null => {
+    if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) return null;
+    return event.payload.threadId ?? event.payload.bac_id;
+  };
+
+  const captureReferencedUrlsForScopedDelta = (event: AcceptedEvent): readonly string[] => {
+    if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) return [];
+    const urls = new Set<string>();
+    for (const turn of event.payload.turns) {
+      for (const source of [turn.text, turn.markdown, turn.formattedText]) {
+        if (typeof source !== 'string' || source.length === 0) continue;
+        for (const url of extractUrlsFromText(source)) urls.add(normalizeVisitUrl(url));
+      }
+    }
+    return [...urls].sort();
+  };
+
+  const eventAfterFrontier = (
+    event: AcceptedEvent,
+    frontier: Record<string, number> | undefined,
+  ): boolean => frontier === undefined || event.dot.seq > (frontier[event.dot.replicaId] ?? 0);
+
+  const previousSnapshotHasThreadReferenceUrls = (input: {
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly event: AcceptedEvent;
+    readonly urls: readonly string[];
+  }): boolean => {
+    const threadId = captureEdgeThreadIdForScopedDelta(input.event);
+    if (threadId === null || input.urls.length === 0) return false;
+    const fromNodeId = nodeIdFor('thread', threadId);
+    const eventObservedAt = new Date(input.event.acceptedAtMs).toISOString();
+    const wantedToNodeIds = new Set(
+      input.urls.map((url) => nodeIdFor('timeline-visit', normalizeVisitUrl(url))),
+    );
+    const seenToNodeIds = new Set<string>();
+    for (const edge of input.previousSnapshot.edges) {
+      if (edge.kind !== 'thread_references_url') continue;
+      if (edge.fromNodeId !== fromNodeId) continue;
+      if (edge.observedAt > eventObservedAt) continue;
+      if (wantedToNodeIds.has(edge.toNodeId)) seenToNodeIds.add(edge.toNodeId);
+    }
+    return seenToNodeIds.size === wantedToNodeIds.size;
+  };
+
+  const isThreadScopedDeltaEvent = (event: AcceptedEvent): boolean =>
+    THREAD_SCOPED_DELTA_HANDLES.has(event.type);
+
+  const SCOPED_DELTA_HARMLESS_INVALIDATION_KINDS: ReadonlySet<InvalidationKey['kind']> = new Set([
+    'chunkerVersion',
+    'contentEvidence',
+    'contentSimilarity',
+    'embeddingModelRevision',
+    'extractionRevision',
+    'inboxFilter',
+    'queue',
+    'rankerLabels',
+    'recallIndex',
+    'sourceUnit',
+  ]);
+
+  const SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS: ReadonlySet<InvalidationKey['kind']> =
+    new Set(['workstreamTree']);
+
+  const isScopedTimelineDeltaEvent = (event: AcceptedEvent): boolean => {
+    const invalidationKeys = invalidationsForEvent(event);
+    if (
+      invalidationKeys.some((key) => SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS.has(key.kind))
+    ) {
+      return false;
+    }
+    if (invalidationKeysToScopes(invalidationKeys).length > 0) return true;
+    return invalidationKeys.every((key) => SCOPED_DELTA_HARMLESS_INVALIDATION_KINDS.has(key.kind));
+  };
+
+  const collectScopedEventsForDelta = (
     pendingEvents: readonly AcceptedEvent[],
     allEvents: readonly AcceptedEvent[],
     scopedVisitKeys: Set<string>,
+    options: {
+      readonly includeCaptures?: boolean;
+      readonly previousSnapshot?: ConnectionsSnapshot;
+      readonly priorFrontier?: Record<string, number>;
+    } = {},
   ): AcceptedEvent[] => {
     const visitIds = new Set<string>();
+    const threadIds = new Set<string>();
     for (const event of pendingEvents) {
-      if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
-        continue;
+      if (event.type === NAVIGATION_COMMITTED && isNavigationCommittedPayload(event.payload)) {
+        const canonicalUrl = normalizeVisitUrl(event.payload.canonicalUrl);
+        scopedVisitKeys.add(canonicalUrl);
+        visitIds.add(event.payload.visitId);
+        for (const relatedVisitId of [event.payload.previousVisitId, event.payload.openerVisitId]) {
+          if (relatedVisitId === null) continue;
+          visitIds.add(relatedVisitId);
+          scopedVisitKeys.add(relatedVisitId);
+        }
       }
-      const canonicalUrl = normalizeVisitUrl(event.payload.canonicalUrl);
-      scopedVisitKeys.add(canonicalUrl);
-      visitIds.add(event.payload.visitId);
-      for (const relatedVisitId of [event.payload.previousVisitId, event.payload.openerVisitId]) {
-        if (relatedVisitId === null) continue;
-        visitIds.add(relatedVisitId);
-        scopedVisitKeys.add(relatedVisitId);
+      const threadId = threadIdFromScopedDeltaEvent(event);
+      if (threadId !== null) {
+        threadIds.add(threadId);
       }
     }
-    if (visitIds.size === 0) return [];
+    if (
+      visitIds.size === 0 &&
+      threadIds.size === 0 &&
+      !(options.includeCaptures === true && scopedVisitKeys.size > 0)
+    ) {
+      return [];
+    }
     const out: AcceptedEvent[] = [];
     const seen = new Set<string>();
     for (const event of allEvents) {
-      if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
-        continue;
-      }
-      if (!visitIds.has(event.payload.visitId)) continue;
       const sig = `${event.dot.replicaId}:${String(event.dot.seq)}`;
       if (seen.has(sig)) continue;
+      if (event.type === NAVIGATION_COMMITTED && isNavigationCommittedPayload(event.payload)) {
+        if (!visitIds.has(event.payload.visitId)) continue;
+        seen.add(sig);
+        scopedVisitKeys.add(normalizeVisitUrl(event.payload.canonicalUrl));
+        out.push(event);
+        continue;
+      }
+      const threadId = threadIdFromScopedDeltaEvent(event);
+      if (threadId === null || !threadIds.has(threadId)) continue;
       seen.add(sig);
-      scopedVisitKeys.add(normalizeVisitUrl(event.payload.canonicalUrl));
       out.push(event);
+    }
+    if (options.includeCaptures === true) {
+      const visitKeysForCaptureMatch = new Set(scopedVisitKeys);
+      for (const event of allEvents) {
+        if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) continue;
+        const sig = `${event.dot.replicaId}:${String(event.dot.seq)}`;
+        if (seen.has(sig)) continue;
+        const referencedUrls = captureReferencedUrlsForScopedDelta(event);
+        const captureThreadId = captureThreadIdForScopedDelta(event);
+        const threadInScope =
+          threadIds.has(event.aggregateId) ||
+          (captureThreadId !== null && threadIds.has(captureThreadId));
+        const urlInScope = referencedUrls.some((url) => visitKeysForCaptureMatch.has(url));
+        if (!threadInScope && !urlInScope) continue;
+        if (!eventAfterFrontier(event, options.priorFrontier)) {
+          if (
+            referencedUrls.length === 0 ||
+            options.previousSnapshot === undefined ||
+            previousSnapshotHasThreadReferenceUrls({
+              previousSnapshot: options.previousSnapshot,
+              event,
+              urls: referencedUrls,
+            })
+          ) {
+            continue;
+          }
+        }
+        seen.add(sig);
+        for (const url of referencedUrls) scopedVisitKeys.add(url);
+        out.push(event);
+      }
     }
     return out;
   };
@@ -1254,6 +1642,7 @@ export const createConnectionsMaterializer = (
     const considerPair = (fromVisitKey: string, toVisitKey: string): void => {
       if (!input.seedVisitKeys.has(fromVisitKey) && !input.seedVisitKeys.has(toVisitKey)) return;
       input.scopedVisitKeys.add(fromVisitKey);
+      input.scopedVisitKeys.add(toVisitKey);
       input.requiredTimelineVisitKeys.add(fromVisitKey);
       input.requiredTimelineVisitKeys.add(toVisitKey);
     };
@@ -1324,15 +1713,146 @@ export const createConnectionsMaterializer = (
     return scopes;
   };
 
-  const scopesOwnGraphRows = (
-    snapshot: ConnectionsSnapshot,
-    scopes: readonly Scope[],
-  ): boolean => {
+  const scopesOwnGraphRows = (snapshot: ConnectionsSnapshot, scopes: readonly Scope[]): boolean => {
     for (const scope of scopes) {
       const scoped = recomputeScope(scope, snapshot);
       if (scoped.nodes.length > 0 || scoped.edges.length > 0) return true;
     }
     return false;
+  };
+
+  const threadNodeFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+    threadId: string,
+  ): ConnectionsSnapshot['nodes'][number] | undefined =>
+    snapshot.nodes.find((node) => node.id === nodeIdFor('thread', threadId));
+
+  const normalizedThreadUrlFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+    threadId: string,
+  ): string | null => {
+    const node = threadNodeFromSnapshot(snapshot, threadId);
+    const canonicalUrl = node?.metadata['canonicalUrl'];
+    if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
+      return normalizeVisitUrl(canonicalUrl);
+    }
+    const url = node?.metadata['url'];
+    return typeof url === 'string' && url.length > 0 ? normalizeVisitUrl(url) : null;
+  };
+
+  const threadWorkstreamIdsFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+    threadId: string,
+  ): ReadonlySet<string> => {
+    const threadNodeId = nodeIdFor('thread', threadId);
+    return new Set(
+      snapshot.edges
+        .filter((edge) => edge.kind === 'thread_in_workstream' && edge.fromNodeId === threadNodeId)
+        .map((edge) => {
+          const prefix = 'workstream:';
+          return edge.toNodeId.startsWith(prefix) ? edge.toNodeId.slice(prefix.length) : '';
+        })
+        .filter((id) => id.length > 0),
+    );
+  };
+
+  const setsEqual = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean => {
+    if (left.size !== right.size) return false;
+    for (const item of left) {
+      if (!right.has(item)) return false;
+    }
+    return true;
+  };
+
+  const threadDeltaFullBuildReason = (input: {
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly scopedSnapshot: ConnectionsSnapshot;
+    readonly threadScopes: readonly Scope[];
+    readonly deletedThreadIds: ReadonlySet<string>;
+  }): string | null => {
+    for (const scope of input.threadScopes) {
+      if (scope.kind !== 'thread' || input.deletedThreadIds.has(scope.id)) continue;
+      const previousUrl = normalizedThreadUrlFromSnapshot(input.previousSnapshot, scope.id);
+      const scopedUrl = normalizedThreadUrlFromSnapshot(input.scopedSnapshot, scope.id);
+      if (previousUrl !== null && scopedUrl !== null && previousUrl !== scopedUrl) {
+        return 'thread-url-changed';
+      }
+      const previousWorkstreams = threadWorkstreamIdsFromSnapshot(input.previousSnapshot, scope.id);
+      const scopedWorkstreams = threadWorkstreamIdsFromSnapshot(input.scopedSnapshot, scope.id);
+      if (previousWorkstreams.size > 0 && !setsEqual(previousWorkstreams, scopedWorkstreams)) {
+        return 'thread-workstream-membership-changed';
+      }
+    }
+    return null;
+  };
+
+  const filterDeletedThreadsForScopedDelta = (
+    threads: readonly ThreadVaultRecord[],
+    deletedThreadIds: ReadonlySet<string>,
+  ): readonly ThreadVaultRecord[] =>
+    deletedThreadIds.size === 0
+      ? threads
+      : threads.filter((thread) => !deletedThreadIds.has(thread.bac_id));
+
+  const addEndpointNodesForScopedDelta = (input: {
+    readonly output: ScopeRecomputeOutput;
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly scopedSnapshot: ConnectionsSnapshot;
+  }): ScopeRecomputeOutput => {
+    const nodes = new Map(input.output.nodes.map((node) => [node.id, node]));
+    const previousNodes = new Map(input.previousSnapshot.nodes.map((node) => [node.id, node]));
+    const scopedNodes = new Map(input.scopedSnapshot.nodes.map((node) => [node.id, node]));
+    for (const edge of input.output.edges) {
+      for (const nodeId of [edge.fromNodeId, edge.toNodeId]) {
+        if (nodes.has(nodeId)) continue;
+        const node = previousNodes.get(nodeId) ?? scopedNodes.get(nodeId);
+        if (node !== undefined) nodes.set(nodeId, node);
+      }
+    }
+    return {
+      nodes: [...nodes.values()].sort((a, b) => a.id.localeCompare(b.id)),
+      edges: [...input.output.edges].sort((a, b) => a.id.localeCompare(b.id)),
+    };
+  };
+
+  const preserveThreadRowsForScopedDelta = (input: {
+    readonly output: ScopeRecomputeOutput;
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly scopedSnapshot: ConnectionsSnapshot;
+    readonly threadScopes: readonly Scope[];
+    readonly deletedThreadIds: ReadonlySet<string>;
+  }): ScopeRecomputeOutput => {
+    if (input.threadScopes.length === 0) {
+      return addEndpointNodesForScopedDelta({
+        output: input.output,
+        previousSnapshot: input.previousSnapshot,
+        scopedSnapshot: input.scopedSnapshot,
+      });
+    }
+    const nodes = new Map(input.output.nodes.map((node) => [node.id, node]));
+    const edges = new Map(input.output.edges.map((edge) => [edge.id, edge]));
+    const scopesToPreserve = input.threadScopes.filter(
+      (scope) => scope.kind === 'thread' && !input.deletedThreadIds.has(scope.id),
+    );
+    const previousRows = unionScopeOutputs(
+      scopesToPreserve.map((scope) => recomputeScope(scope, input.previousSnapshot)),
+    );
+    for (const node of previousRows.nodes) {
+      if (!nodes.has(node.id)) nodes.set(node.id, node);
+    }
+    for (const edge of previousRows.edges) {
+      if (edge.kind === 'thread_in_workstream') continue;
+      const existing = edges.get(edge.id);
+      if (existing === undefined || edge.observedAt < existing.observedAt) edges.set(edge.id, edge);
+    }
+    return addEndpointNodesForScopedDelta({
+      output: {
+        nodes: [...nodes.values()].sort((a, b) => a.id.localeCompare(b.id)),
+        edges: [...edges.values()].sort((a, b) => a.id.localeCompare(b.id)),
+      },
+      previousSnapshot: input.previousSnapshot,
+      scopedSnapshot: input.scopedSnapshot,
+    });
   };
 
   const newestNavigationCommittedEvents = (
@@ -1411,7 +1931,7 @@ export const createConnectionsMaterializer = (
 
     const scopedVisitKeys = new Set<string>();
     const currentVisitKeys = new Set<string>();
-    const scopedNavigationEvents = collectScopedNavigationEventsForDelta(
+    const scopedNavigationEvents = collectScopedEventsForDelta(
       foregroundNavigationEvents,
       input.merged,
       scopedVisitKeys,
@@ -1669,24 +2189,17 @@ export const createConnectionsMaterializer = (
   const progressForSnapshot = (
     events: readonly AcceptedEvent[],
     snapshot: ConnectionsSnapshot,
-  ): MaterializerProgress => ({
-    ...EMPTY_PROGRESS(MATERIALIZER_NAME, MATERIALIZER_VERSION),
-    appliedDotIntervals: addDotsToIntervals(
+  ): MaterializerProgress => {
+    const appliedDotIntervals = addDotsToIntervals(
       {},
       events.map((event) => event.dot),
-    ),
-    appliedFrontier: vectorFromEvents(events),
-    snapshotRevisionId: snapshot.snapshotRevision ?? null,
-  });
-
-  const writeSnapshotWithProgress = async (
-    snapshot: ConnectionsSnapshot,
-    events: readonly AcceptedEvent[],
-    dirtyScopes?: ReadonlySet<Scope>,
-  ): Promise<void> => {
-    const progress = progressForSnapshot(events, snapshot);
-    await deps.store.writeSnapshotAndProgress(snapshot, progress, dirtyScopes);
-    lastFrontier = progress.appliedFrontier;
+    );
+    return {
+      ...EMPTY_PROGRESS(MATERIALIZER_NAME, MATERIALIZER_VERSION),
+      appliedDotIntervals,
+      appliedFrontier: frontierFromIntervals(appliedDotIntervals),
+      snapshotRevisionId: snapshot.snapshotRevision ?? null,
+    };
   };
 
   const buildAndWrite = async (): Promise<ConnectionsSnapshot> => {
@@ -1714,16 +2227,137 @@ export const createConnectionsMaterializer = (
     lastBuildInvalidations = buildKeys;
     const incrementalGraphPlan = incrementalGraphView.drainPlan();
     mark(`w6 keys=${String(buildKeys.length)}`);
-    const merged = await deps.eventLog.readMerged();
     const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+    const storeBackedEvents = eventStoreEnabled() ? await ensureEventStore() : null;
     const effectiveLastFrontier = lastFrontier ?? existingProgress?.appliedFrontier ?? undefined;
-    const pendingEventsForDrain =
-      effectiveLastFrontier === undefined
-        ? merged
-        : merged.filter(
-            (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
-          );
-    mark(`readMerged events=${String(merged.length)}`);
+    let merged: readonly AcceptedEvent[];
+    let pendingEventsForDrain: readonly AcceptedEvent[];
+    let maxAcceptedAtMsForDrain: number;
+    let drainFrontier: VersionVector;
+    let drainProgressDotIntervals: MaterializerProgress['appliedDotIntervals'] | null = null;
+    let loadedProjectionAccumulatorState = false;
+    const existingProgressMatches =
+      existingProgress !== null && existingProgress.materializerVersion === MATERIALIZER_VERSION;
+    const forcedPendingEventWindow = catchUpPendingEventWindow;
+    if (forcedPendingEventWindow !== null) {
+      if (!existingProgressMatches) {
+        throw new Error('connections catchUp chunk requires current materializer progress');
+      }
+      pendingEventsForDrain = forcedPendingEventWindow;
+      merged = forcedPendingEventWindow;
+      maxAcceptedAtMsForDrain = maxAcceptedAtMs(forcedPendingEventWindow);
+      drainProgressDotIntervals = addDotsToIntervals(
+        existingProgress.appliedDotIntervals,
+        forcedPendingEventWindow.map((event) => event.dot),
+      );
+      drainFrontier = frontierFromIntervals(drainProgressDotIntervals);
+      mark(`catchUp.chunk scopedWindow events=${String(forcedPendingEventWindow.length)}`);
+    } else if (storeBackedEvents !== null) {
+      const ingested = await storeBackedEvents.catchUpFromJsonl(
+        join(deps.vaultRoot, '_BAC', 'log'),
+      );
+      if (
+        existingProgress !== null &&
+        existingProgress.materializerVersion === MATERIALIZER_VERSION &&
+        dotIntervalsHaveGaps(existingProgress.appliedDotIntervals)
+      ) {
+        for (const event of await deps.eventLog.readMerged()) {
+          if (!intervalsContainDot(existingProgress.appliedDotIntervals, event.dot)) {
+            storeBackedEvents.ingest(event);
+          }
+        }
+      }
+      pendingEventsForDrain = storeBackedEvents.readSince(effectiveLastFrontier ?? {});
+      merged = pendingEventsForDrain;
+      maxAcceptedAtMsForDrain = storeBackedEvents.maxAcceptedAtMs();
+      drainProgressDotIntervals = addDotsToIntervals(
+        existingProgress?.appliedDotIntervals ?? {},
+        pendingEventsForDrain.map((event) => event.dot),
+      );
+      drainFrontier = frontierFromIntervals(drainProgressDotIntervals);
+      mark(
+        `eventStore.catchUp ingested=${String(ingested)} pending=${String(
+          pendingEventsForDrain.length,
+        )} total=${String(storeBackedEvents.count())}`,
+      );
+      if (process.env['SIDETRACK_EVENT_STORE_VERIFY'] === '1') {
+        const legacy = await deps.eventLog.readMerged();
+        const legacyPending =
+          effectiveLastFrontier === undefined
+            ? legacy
+            : legacy.filter(
+                (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
+              );
+        const pendingMatches =
+          JSON.stringify(pendingEventsForDrain) === JSON.stringify(legacyPending);
+        const maxMatches = maxAcceptedAtMsForDrain === maxAcceptedAtMs(legacy);
+        console.warn(
+          `[event-store] verify pendingMatch=${String(pendingMatches)} maxMatch=${String(
+            maxMatches,
+          )} storePending=${String(pendingEventsForDrain.length)} legacyPending=${String(
+            legacyPending.length,
+          )} storeMax=${String(maxAcceptedAtMsForDrain)} legacyMax=${String(
+            maxAcceptedAtMs(legacy),
+          )}`,
+        );
+      }
+    } else {
+      loadedProjectionAccumulatorState =
+        !projectionAccumulatorsInitialized &&
+        (await tryLoadProjectionAccumulatorState(existingProgress));
+      if (loadedProjectionAccumulatorState && existingProgressMatches) {
+        const readFrontier = dotIntervalsHaveGaps(existingProgress.appliedDotIntervals)
+          ? frontierFromIntervals(existingProgress.appliedDotIntervals)
+          : existingProgress.appliedFrontier;
+        const tail = await deps.eventLog.readMergedSince(readFrontier);
+        pendingEventsForDrain = sortAcceptedEvents(
+          tail.filter(
+            (event) => !intervalsContainDot(existingProgress.appliedDotIntervals, event.dot),
+          ),
+        );
+        merged = pendingEventsForDrain;
+        maxAcceptedAtMsForDrain = maxAcceptedAtMs(pendingEventsForDrain);
+        drainProgressDotIntervals = addDotsToIntervals(
+          existingProgress.appliedDotIntervals,
+          pendingEventsForDrain.map((event) => event.dot),
+        );
+        drainFrontier = frontierFromIntervals(drainProgressDotIntervals);
+        mark(`readMergedSince events=${String(pendingEventsForDrain.length)}`);
+      } else {
+        merged = await deps.eventLog.readMerged();
+        pendingEventsForDrain =
+          effectiveLastFrontier === undefined
+            ? merged
+            : merged.filter(
+                (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
+              );
+        maxAcceptedAtMsForDrain = maxAcceptedAtMs(merged);
+        drainFrontier = vectorFromEvents(merged);
+        mark(`readMerged events=${String(merged.length)}`);
+      }
+    }
+    const progressForDrainSnapshot = (snapshot: ConnectionsSnapshot): MaterializerProgress =>
+      storeBackedEvents === null && drainProgressDotIntervals === null
+        ? progressForSnapshot(merged, snapshot)
+        : {
+            ...EMPTY_PROGRESS(MATERIALIZER_NAME, MATERIALIZER_VERSION),
+            appliedDotIntervals: drainProgressDotIntervals ?? {},
+            appliedFrontier: drainFrontier,
+            snapshotRevisionId: snapshot.snapshotRevision ?? null,
+          };
+    const writeSnapshotWithDrainProgress = async (
+      snapshot: ConnectionsSnapshot,
+      dirtyScopesForWrite?: ReadonlySet<Scope>,
+    ): Promise<void> => {
+      const progress = progressForDrainSnapshot(snapshot);
+      await deps.store.writeSnapshotAndProgress(
+        snapshot,
+        progress,
+        dirtyScopesForWrite,
+        serializeProjectionAccumulatorState(progress),
+      );
+      lastFrontier = progress.appliedFrontier;
+    };
     await writeForegroundNavigationDelta({
       pendingEventsForDrain,
       merged,
@@ -1740,38 +2374,114 @@ export const createConnectionsMaterializer = (
       // other HTTP request) interleaves with the cold-start fold over
       // 10k+ events. Switching to the sync versions reintroduces the
       // 30-second main-thread stall observed against real prod vaults.
-      urlAccumulator = await seedUrlProjectionAccumulatorAsync(merged);
-      tabSessionAccumulator = await seedTabSessionProjectionAccumulatorAsync(merged);
+      if (storeBackedEvents !== null) {
+        urlAccumulator = createEmptyUrlProjectionAccumulator();
+        tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+        await storeBackedEvents.forEachChunk((chunk) => {
+          for (const event of chunk) {
+            foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
+            foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+          }
+        }, 2000);
+      } else {
+        urlAccumulator = await seedUrlProjectionAccumulatorAsync(merged);
+        tabSessionAccumulator = await seedTabSessionProjectionAccumulatorAsync(merged);
+      }
       projectionAccumulatorsInitialized = true;
       mark('projectionAccumulators.seed');
+    }
+    if (loadedProjectionAccumulatorState || forcedPendingEventWindow !== null) {
+      for (const event of [...pendingEventsForDrain].sort(compareAcceptedEventOrder)) {
+        foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
+        foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+      }
+      mark(`projectionAccumulators.resumeFold events=${String(pendingEventsForDrain.length)}`);
     }
     const vault = await readVaultStores(deps.vaultRoot);
     mark('readVaultStores');
     await yieldToEventLoop();
-    const rawTimelineDays = buildTimelineDays(merged);
-    mark(`buildTimelineDays days=${String(rawTimelineDays.length)}`);
+    // Timeline days. Default: read from the connections materializer's
+    // own persistent SQLite fact store after catching it up from this
+    // drain's merged log. This deliberately does NOT read the shared
+    // TimelineStore, whose writer can race this materializer's drain.
+    const timelineFactStore = timelineFactsStoreEnabled() ? await ensureTimelineFactStore() : null;
+    let rawTimelineDays: readonly TimelineDayProjectionWithDimensions[];
+    if (timelineFactStore !== null) {
+      await timelineFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(timelineFactStore.watermark()),
+      );
+      rawTimelineDays = timelineFactStore.readTimelineDays();
+      mark(`timelineFactStore.readTimelineDays days=${String(rawTimelineDays.length)}`);
+      if (process.env['SIDETRACK_TIMELINE_FACTS_VERIFY'] === '1') {
+        const legacy = buildTimelineDays(merged);
+        const matches = JSON.stringify(legacy) === JSON.stringify(rawTimelineDays);
+        console.warn(
+          `[timeline-facts] verify match=${String(matches)} store=${String(
+            rawTimelineDays.length,
+          )} legacy=${String(legacy.length)}`,
+        );
+      }
+    } else {
+      rawTimelineDays = buildTimelineDays(merged);
+      mark(`buildTimelineDays days=${String(rawTimelineDays.length)}`);
+    }
     await yieldToEventLoop();
+    // Engagement classifier inputs. Default: read from the persistent
+    // SQLite fact store (byte-equivalent to the legacy full-walk; see
+    // engagementFactsStore.test.ts), keeping the store current via an
+    // idempotent, watermark-gated catchUp over the IVM delta. The store
+    // decouples this derivation from the full AcceptedEvent[] retained in
+    // mergedMemo. Kill-switch falls back to the legacy in-memory walk.
+    let engagementInputs: ReturnType<typeof buildEngagementClassifierInputs>;
+    const factStore = engagementFactsStoreEnabled() ? await ensureEngagementFactStore() : null;
+    if (factStore !== null) {
+      // Always catch up from the full merged set, filtered by the fact
+      // store's OWN persisted watermark (not the materializer frontier).
+      // pendingEventsForDrain is frontier-based and can permanently omit
+      // SELECTION_* / ENGAGEMENT_SESSION_AGGREGATED events that advanced
+      // progress without a drain (content-only / non-graph-handle paths).
+      // The seq-filter over merged is O(n) integer compares + idempotent
+      // inserts (~0 on a warm store) — cheap vs the legacy 3x object walk.
+      await factStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(factStore.watermark()),
+      );
+      engagementInputs = factStore.readClassifierInputs(rawTimelineDays);
+      mark(`engagementFactStore.readClassifierInputs inputs=${String(engagementInputs.length)}`);
+      // Drift check: compare against the legacy full-walk on real data
+      // (off by default; opt-in for verification / ongoing drift alerts).
+      if (process.env['SIDETRACK_ENGAGEMENT_FACTS_VERIFY'] === '1') {
+        const legacy = buildEngagementClassifierInputs(merged, rawTimelineDays);
+        const matches = JSON.stringify(legacy) === JSON.stringify(engagementInputs);
+        console.warn(
+          `[engagement-facts] verify match=${String(matches)} store=${String(
+            engagementInputs.length,
+          )} legacy=${String(legacy.length)}`,
+        );
+      }
+    } else {
+      engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
+      mark(`engagementClassifier (legacy) inputs=${String(engagementInputs.length)}`);
+    }
     // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
-    // arrived since last drain AND a cached revision exists, reuse it.
+    // arrived since last drain AND a cached revision exists, reuse it
+    // (skips the classifier + putRevision; inputs are still needed for
+    // enrichTimelineDaysWithEngagement below).
     const engagementTouchingKey = buildKeys.some(
       (k) => k.kind === 'engagementVisit' || k.kind === 'rankerLabels',
     );
-    let engagementInputs: ReturnType<typeof buildEngagementClassifierInputs>;
     let engagementClassRevision: ReturnType<typeof buildEngagementClassRevision>;
     if (!engagementTouchingKey && lastEngagementClassRevision !== undefined) {
-      // Reuse cached revision; we still need the inputs for downstream
-      // enrichTimelineDaysWithEngagement(...) which reads engagement
-      // dimensions per visit. Recomputing inputs alone is cheaper than
-      // re-running the classifier + putRevision.
-      engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
       engagementClassRevision = lastEngagementClassRevision;
       mark(`engagementClassifier skip (w6 reuse) inputs=${String(engagementInputs.length)}`);
     } else {
-      engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
       engagementClassRevision = buildEngagementClassRevision(engagementInputs, {
-        producedAt: maxAcceptedAtMs(merged),
+        producedAt: maxAcceptedAtMsForDrain,
       });
-      mark(`engagementClassifier inputs=${String(engagementInputs.length)}`);
+      mark(`engagementClassifier revision inputs=${String(engagementInputs.length)}`);
       await engagementClassStore.putRevision(engagementClassRevision);
       mark('engagementClassStore.putRevision');
       lastEngagementClassRevision = engagementClassRevision;
@@ -1797,34 +2507,12 @@ export const createConnectionsMaterializer = (
     const activeSimilarityEntries = similarityEntries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= similarityConfig.engagementGateMs,
     );
-    const similarityEligibleVisitIds = new Set(
-      activeSimilarityEntries.map(visitKeyForVisitEntry),
-    );
+    const similarityEligibleVisitIds = new Set(activeSimilarityEntries.map(visitKeyForVisitEntry));
     const similarityEligibleCount = similarityEligibleVisitIds.size;
     const similarityPairBudget = Math.max(
       0,
       (similarityEligibleCount * (similarityEligibleCount - 1)) / 2,
     );
-    const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
-    const loadedHnswStoreForGate = persistentHnswSimilarityMode
-      ? await hnswSimilarityStore.ensureLoaded(deps.vaultRoot, RECALL_MODEL.embeddingDim)
-      : null;
-    if (loadedHnswStoreForGate !== null) loadedHnswSimilarityStore = loadedHnswStoreForGate;
-    const hnswStoreVisitCount = loadedHnswStoreForGate?.elementCount() ?? 0;
-    const hnswFullRebuild =
-      persistentHnswSimilarityMode &&
-      (existingProgress === null ||
-        existingProgress.materializerVersion !== MATERIALIZER_VERSION ||
-        hnswStoreVisitCount === 0 ||
-        (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
-        hnswStoreCountDriftRequiresFullRebuild(hnswStoreVisitCount, similarityEligibleCount));
-    const knownHnswVisitIds = persistentHnswSimilarityMode
-      ? (await loadedHnswStoreForGate?.knownLabels()) ?? new Set<string>()
-      : new Set<string>();
-    const fullPageEvidenceEnsure =
-      previousSnapshotForRanker === null ||
-      existingProgress === null ||
-      existingProgress.materializerVersion !== MATERIALIZER_VERSION;
     const pendingTimelineVisitIds = new Set(
       pendingEventsForDrain
         .filter(
@@ -1840,6 +2528,59 @@ export const createConnectionsMaterializer = (
         )
         .filter((visitKey) => visitKey.length > 0),
     );
+    const persistentHnswSimilarityMode = incrementalSimilarityEnabled();
+    let hnswDimensionMismatchRequiresFullRebuild = false;
+    let loadedHnswStoreForGate: LoadedSimilarityHnswStore | null = null;
+    if (persistentHnswSimilarityMode) {
+      try {
+        loadedHnswStoreForGate = await hnswSimilarityStore.ensureLoaded(
+          deps.vaultRoot,
+          RECALL_MODEL.embeddingDim,
+        );
+      } catch (err) {
+        if (!isHnswDimensionMismatchError(err)) throw err;
+        hnswDimensionMismatchRequiresFullRebuild = true;
+        await resetHnswSimilarityFiles();
+        loadedHnswStoreForGate = await hnswSimilarityStore.ensureLoaded(
+          deps.vaultRoot,
+          RECALL_MODEL.embeddingDim,
+        );
+      }
+    }
+    if (loadedHnswStoreForGate !== null) loadedHnswSimilarityStore = loadedHnswStoreForGate;
+    const knownHnswVisitIds = persistentHnswSimilarityMode
+      ? ((await loadedHnswStoreForGate?.knownLabels()) ?? new Set<string>())
+      : new Set<string>();
+    const staleHnswVisitIds = persistentHnswSimilarityMode
+      ? new Set(
+          [...knownHnswVisitIds].filter(
+            (visitId) =>
+              pendingTimelineVisitIds.has(visitId) && !similarityEligibleVisitIds.has(visitId),
+          ),
+        )
+      : new Set<string>();
+    const hnswActiveVisitIdsForGate = persistentHnswSimilarityMode
+      ? new Set(
+          [...knownHnswVisitIds, ...similarityEligibleVisitIds].filter(
+            (visitId) => !staleHnswVisitIds.has(visitId),
+          ),
+        )
+      : new Set<string>();
+    const hnswStoreVisitCount = loadedHnswStoreForGate?.elementCount() ?? 0;
+    const hnswFullRebuild =
+      persistentHnswSimilarityMode &&
+      (hnswDimensionMismatchRequiresFullRebuild ||
+        (existingProgress !== null &&
+          existingProgress.materializerVersion !== MATERIALIZER_VERSION) ||
+        (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
+        hnswStoreRemovalDriftRequiresFullRebuild(
+          hnswStoreVisitCount,
+          hnswActiveVisitIdsForGate.size,
+        ));
+    const fullPageEvidenceEnsure =
+      previousSnapshotForRanker === null ||
+      existingProgress === null ||
+      existingProgress.materializerVersion !== MATERIALIZER_VERSION;
     const hnswTouchedVisitIds = persistentHnswSimilarityMode
       ? new Set(
           [...similarityEligibleVisitIds].filter((visitId) => !knownHnswVisitIds.has(visitId)),
@@ -1847,13 +2588,20 @@ export const createConnectionsMaterializer = (
       : new Set<string>();
     const hnswReconcileVisitIds = persistentHnswSimilarityMode
       ? new Set(
-          [...pendingTimelineVisitIds].filter((visitId) =>
-            similarityEligibleVisitIds.has(visitId),
-          ),
+          [...pendingTimelineVisitIds].filter((visitId) => similarityEligibleVisitIds.has(visitId)),
         )
       : new Set<string>();
+    const hnswRequiresFullCorpusEdgeRequery =
+      persistentHnswSimilarityMode &&
+      !hnswFullRebuild &&
+      hnswActiveVisitIdsForGate.size === similarityEligibleVisitIds.size &&
+      (hnswTouchedVisitIds.size > 0 ||
+        hnswReconcileVisitIds.size > 0 ||
+        staleHnswVisitIds.size > 0);
     const hnswScopedDeltaVisitIds = persistentHnswSimilarityMode
-      ? new Set([...hnswTouchedVisitIds, ...hnswReconcileVisitIds])
+      ? hnswRequiresFullCorpusEdgeRequery
+        ? new Set([...hnswActiveVisitIdsForGate, ...staleHnswVisitIds])
+        : new Set([...hnswTouchedVisitIds, ...hnswReconcileVisitIds])
       : new Set<string>();
     const entriesToEnsureForPageEvidence = fullPageEvidenceEnsure
       ? similarityEntries
@@ -1864,8 +2612,6 @@ export const createConnectionsMaterializer = (
     const canAttemptBoundedScopedDelta =
       !fullPageEvidenceEnsure &&
       persistentHnswSimilarityMode &&
-      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
-      process.env['SIDETRACK_CONNECTIONS_SCOPED_TIMELINE_DELTA'] !== '0' &&
       previousSnapshotForRanker !== null &&
       existingProgress !== null &&
       existingProgress.materializerVersion === MATERIALIZER_VERSION &&
@@ -1903,10 +2649,7 @@ export const createConnectionsMaterializer = (
       const urlsToRead = uniqueRawUrls.filter(
         (rawUrl) => !pageEvidenceRecordCache.has(canonicalizeEvidenceUrl(rawUrl)),
       );
-      for (const [canonicalUrl, record] of await readPageEvidenceMap(
-        deps.vaultRoot,
-        urlsToRead,
-      )) {
+      for (const [canonicalUrl, record] of await readPageEvidenceMap(deps.vaultRoot, urlsToRead)) {
         pageEvidenceRecordCache.set(canonicalUrl, record);
       }
       for (const rawUrl of uniqueRawUrls) {
@@ -1921,10 +2664,7 @@ export const createConnectionsMaterializer = (
     ): Promise<number> =>
       loadPageEvidenceForRawUrls(entries.map((entry) => entry.canonicalUrl ?? entry.url));
     if (fullPageEvidenceEnsure) {
-      const ensured = await ensurePageEvidenceForTimelineEntries(
-        deps.vaultRoot,
-        similarityEntries,
-      );
+      const ensured = await ensurePageEvidenceForTimelineEntries(deps.vaultRoot, similarityEntries);
       pageEvidenceRecordCache.clear();
       for (const [canonicalUrl, record] of ensured) {
         pageEvidenceRecordCache.set(canonicalUrl, record);
@@ -1937,9 +2677,7 @@ export const createConnectionsMaterializer = (
               ...pendingTimelineVisitIds,
               ...hnswTouchedVisitIds,
               ...hnswReconcileVisitIds,
-              ...dirtyScopes
-                .filter((scope) => scope.kind === 'url')
-                .map((scope) => scope.id),
+              ...dirtyScopes.filter((scope) => scope.kind === 'url').map((scope) => scope.id),
             ]),
           )
         : similarityEntries;
@@ -2040,6 +2778,7 @@ export const createConnectionsMaterializer = (
           config: similarityConfig,
           touchedVisitIds,
           reconcileVisitIds,
+          removalCandidateVisitIds: pendingTimelineVisitIds,
           fullRebuild: hnswFullRebuild,
           previousSnapshot: previousSnapshotForRanker,
           embed: deps.embed ?? defaultEmbed,
@@ -2536,9 +3275,7 @@ export const createConnectionsMaterializer = (
     mark('projectionAccumulators.derive');
     await yieldToEventLoop();
     const dirtyScopeWrites =
-      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
-      previousSnapshotForRanker !== null &&
-      dirtyScopes.length > 0
+      previousSnapshotForRanker !== null && dirtyScopes.length > 0
         ? new Set(dirtyScopes)
         : undefined;
     let scopedTimelineDeltaApplied = false;
@@ -2549,8 +3286,8 @@ export const createConnectionsMaterializer = (
     const replaceScopeRowsForScopedDelta = deps.store.replaceScopeRows;
     let scopedTimelineDeltaSkipDetail = 'gate';
     const scopedTimelineDeltaGate = {
-      incrementalScopes: process.env[INCREMENTAL_SCOPES_ENV] !== '0',
-      feature: process.env['SIDETRACK_CONNECTIONS_SCOPED_TIMELINE_DELTA'] !== '0',
+      incrementalScopes: true,
+      feature: true,
       hasPrevious: previousSnapshotForRanker !== null,
       hasProgress: existingProgress !== null,
       version:
@@ -2573,17 +3310,45 @@ export const createConnectionsMaterializer = (
       scopedTimelineDeltaGate.topicSame &&
       scopedTimelineDeltaGate.hnswNotFull
     ) {
+      const timelineVisitKeys = new Set(
+        similarityEntries.map((entry) => timelineEntryVisitKey(entry)),
+      );
+      for (const node of previousSnapshotForScopedDelta.nodes) {
+        const visitKey = visitKeyFromTimelineNodeIdForDelta(node.id);
+        if (visitKey !== null) timelineVisitKeys.add(visitKey);
+      }
       const scopedVisitKeys = new Set(
-        dirtyScopes.filter((scope) => scope.kind === 'url').map((scope) => scope.id),
+        dirtyScopes
+          .filter((scope) => scope.kind === 'url' && timelineVisitKeys.has(scope.id))
+          .map((scope) => scope.id),
       );
       const tabSessionIds = new Set(
         dirtyScopes.filter((scope) => scope.kind === 'tab-session').map((scope) => scope.id),
       );
-      const scopedNavigationEvents = collectScopedNavigationEventsForDelta(
+      const scopedDeltaEvents = collectScopedEventsForDelta(
         pendingEventsForDrain,
         merged,
         scopedVisitKeys,
+        {
+          includeCaptures: true,
+          previousSnapshot: previousSnapshotForScopedDelta,
+          ...(existingProgress === null ? {} : { priorFrontier: existingProgress.appliedFrontier }),
+        },
       );
+      const dirtyThreadScopes = dirtyScopes.filter((scope) => scope.kind === 'thread');
+      const deletedThreadIdsForScopedDelta = new Set<string>();
+      for (const scope of dirtyThreadScopes) {
+        if (projectThread(scope.id, scopedDeltaEvents).deleted) {
+          deletedThreadIdsForScopedDelta.add(scope.id);
+        }
+      }
+      for (const threadId of deletedThreadIdsForScopedDelta) {
+        const previousUrl = normalizedThreadUrlFromSnapshot(
+          previousSnapshotForScopedDelta,
+          threadId,
+        );
+        if (previousUrl !== null) scopedVisitKeys.add(previousUrl);
+      }
       for (const event of pendingEventsForDrain) {
         if (
           event.type === BROWSER_TIMELINE_OBSERVED &&
@@ -2604,16 +3369,51 @@ export const createConnectionsMaterializer = (
         previousSnapshot: previousSnapshotForScopedDelta,
         visitSimilarity,
       });
-      const scopedTimelineDays = filterTimelineDaysForScopedDelta(timelineDays, {
+      const scopedTimelineDayFilter = {
         requiredTimelineVisitKeys,
         tabSessionIds,
         includeTabSessionHistory: pendingEventsForDrain.some(
           (event) => event.type === TAB_SESSION_ATTRIBUTION_INFERRED,
         ),
-      });
+      };
+      let scopedTimelineDays = filterTimelineDaysForScopedDelta(timelineDays, scopedTimelineDayFilter);
+      const missingRequiredTimelineVisitKeys = (): Set<string> => {
+        const present = new Set(
+          scopedTimelineDays
+            .flatMap((day) => day.entries)
+            .map((entry) => timelineEntryVisitKey(entry)),
+        );
+        return new Set([...requiredTimelineVisitKeys].filter((visitKey) => !present.has(visitKey)));
+      };
+      let missingRequiredVisitKeys = missingRequiredTimelineVisitKeys();
+      if (missingRequiredVisitKeys.size > 0 && hnswScopedDeltaVisitIds.size > 0) {
+        const fullRawTimelineDays =
+          timelineFactStore === null
+            ? buildTimelineDays(await deps.eventLog.readMerged())
+            : timelineFactStore.readTimelineDays();
+        scopedTimelineDays = filterTimelineDaysForScopedDelta(
+          enrichTimelineDaysWithEngagement(fullRawTimelineDays, engagementInputs),
+          scopedTimelineDayFilter,
+        );
+        mark(
+          `scopedTimelineDelta.fullTimelineRead missing=${String(
+            missingRequiredVisitKeys.size,
+          )} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
+        );
+        missingRequiredVisitKeys = missingRequiredTimelineVisitKeys();
+      }
+      const hasRequiredTimelineRows = missingRequiredVisitKeys.size === 0;
+      if (!hasRequiredTimelineRows) {
+        scopedTimelineDeltaSkipDetail = `missing-required-timeline-entries:${String(
+          missingRequiredVisitKeys.size,
+        )}`;
+      }
       if (
-        (scopedTimelineDays.length > 0 || scopedNavigationEvents.length > 0) &&
-        !pendingHasSearchVisit
+        (scopedTimelineDays.length > 0 ||
+          scopedDeltaEvents.length > 0 ||
+          dirtyThreadScopes.length > 0) &&
+        !pendingHasSearchVisit &&
+        hasRequiredTimelineRows
       ) {
         if (canAttemptBoundedScopedDelta && scopedTimelineDays.length > 0) {
           const beforeScopedEvidenceRecords = pageEvidenceByCanonicalUrl.size;
@@ -2639,7 +3439,11 @@ export const createConnectionsMaterializer = (
         void _crossReplica;
         const scopedSnapshot = buildConnectionsSnapshot({
           ...scopedInputBase,
-          events: scopedNavigationEvents,
+          events: scopedDeltaEvents,
+          threads: filterDeletedThreadsForScopedDelta(
+            scopedInputBase.threads,
+            deletedThreadIdsForScopedDelta,
+          ),
           workstreams: [],
           dispatches: [],
           queueItems: [],
@@ -2647,48 +3451,75 @@ export const createConnectionsMaterializer = (
           codingSessions: [],
           timelineDays: scopedTimelineDays,
         });
-        const rowLocalScopes = dedupeScopeList([
-          ...[...scopedVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
-          ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
-          ...visitInstanceScopesFromSnapshot(scopedSnapshot, {
-            visitKeys: scopedVisitKeys,
-            tabSessionIds,
-          }),
-        ]);
-        const scoped = unionScopeOutputs(
-          rowLocalScopes.map((scope) => recomputeScope(scope, scopedSnapshot)),
-        );
-        const progress = progressForSnapshot(merged, scopedSnapshot);
-        await replaceScopeRowsForScopedDelta({
-          scopes: rowLocalScopes,
-          nodes: scoped.nodes,
-          edges: scoped.edges,
-          progress,
-          metadata: {
-            ...(scopedSnapshot.urlProjection === undefined
-              ? {}
-              : { urlProjection: scopedSnapshot.urlProjection }),
-            tabSessionProjection: scopedSnapshot.tabSessionProjection,
-          },
+        const threadFullBuildReason = threadDeltaFullBuildReason({
+          previousSnapshot: previousSnapshotForScopedDelta,
+          scopedSnapshot,
+          threadScopes: dirtyThreadScopes,
+          deletedThreadIds: deletedThreadIdsForScopedDelta,
         });
-        lastFrontier = progress.appliedFrontier;
-        baseSnapshot = (await deps.store.readCurrent()) ?? scopedSnapshot;
-        incrementalGraphView.seed(baseSnapshot);
-        scopedTimelineDeltaApplied = true;
-        mark(
-          `replaceScopeRows scopedTimelineDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEvents.length)}`,
-        );
+        if (threadFullBuildReason !== null) {
+          scopedTimelineDeltaSkipDetail = threadFullBuildReason;
+        } else {
+          const rowLocalScopes = dedupeScopeList([
+            ...[...scopedVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
+            ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
+            ...visitInstanceScopesFromSnapshot(scopedSnapshot, {
+              visitKeys: scopedVisitKeys,
+              tabSessionIds,
+            }),
+            ...dirtyThreadScopes,
+          ]);
+          const rawScoped = unionScopeOutputs(
+            rowLocalScopes.map((scope) => recomputeScope(scope, scopedSnapshot)),
+          );
+          const scoped = preserveThreadRowsForScopedDelta({
+            output: rawScoped,
+            previousSnapshot: previousSnapshotForScopedDelta,
+            scopedSnapshot,
+            threadScopes: dirtyThreadScopes,
+            deletedThreadIds: deletedThreadIdsForScopedDelta,
+          });
+          const progress = progressForDrainSnapshot(scopedSnapshot);
+          await replaceScopeRowsForScopedDelta({
+            scopes: rowLocalScopes,
+            nodes: scoped.nodes,
+            edges: scoped.edges,
+            progress,
+            projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+            metadata: {
+              ...(scopedSnapshot.urlProjection === undefined
+                ? {}
+                : { urlProjection: scopedSnapshot.urlProjection }),
+              tabSessionProjection: scopedSnapshot.tabSessionProjection,
+            },
+          });
+          lastFrontier = progress.appliedFrontier;
+          baseSnapshot = (await deps.store.readCurrent()) ?? scopedSnapshot;
+          incrementalGraphView.seed(baseSnapshot);
+          scopedTimelineDeltaApplied = true;
+          const scopedNavigationEventCount = scopedDeltaEvents.filter(
+            (event) => event.type === NAVIGATION_COMMITTED,
+          ).length;
+          const scopedThreadEventCount = scopedDeltaEvents.filter(isThreadScopedDeltaEvent).length;
+          const scopedCaptureEventCount = scopedDeltaEvents.filter(
+            (event) => event.type === CAPTURE_RECORDED,
+          ).length;
+          mark(
+            `replaceScopeRows scopedTimelineDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEventCount)} thread=${String(scopedThreadEventCount)} capture=${String(scopedCaptureEventCount)} events=${String(scopedDeltaEvents.length)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)}`,
+          );
+        }
       } else if (
         scopedTimelineDays.length === 0 &&
         dirtyScopes.length > 0 &&
         !scopesOwnGraphRows(previousSnapshotForScopedDelta, dirtyScopes)
       ) {
-        const progress = progressForSnapshot(merged, previousSnapshotForScopedDelta);
+        const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
         await replaceScopeRowsForScopedDelta({
           scopes: dirtyScopes,
           nodes: [],
           edges: [],
           progress,
+          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
           metadata: {
             urlProjection: serializeUrlProjection(urlProjection),
             tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
@@ -2714,6 +3545,11 @@ export const createConnectionsMaterializer = (
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
       );
+      if (requireScopedTimelineDeltaForDrain) {
+        throw new Error(
+          `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
+        );
+      }
       if (canAttemptBoundedScopedDelta) {
         const readCount = await loadPageEvidenceForEntries(similarityEntries);
         mark(
@@ -2733,7 +3569,6 @@ export const createConnectionsMaterializer = (
     }
     const scopeIncrementalEnabled =
       !scopedTimelineDeltaApplied &&
-      process.env[INCREMENTAL_SCOPES_ENV] !== '0' &&
       process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] === '1' &&
       deps.store.replaceScopeRows !== undefined &&
       previousSnapshotForRanker !== null;
@@ -2748,12 +3583,13 @@ export const createConnectionsMaterializer = (
         const scoped = unionScopeOutputs(
           dirtyScopes.map((scope) => recomputeScope(scope, baseSnapshot)),
         );
-        const progress = progressForSnapshot(merged, baseSnapshot);
+        const progress = progressForDrainSnapshot(baseSnapshot);
         await deps.store.replaceScopeRows!({
           scopes: dirtyScopes,
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
+          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
           metadata: {
             ...(baseSnapshot.urlProjection === undefined
               ? {}
@@ -2769,7 +3605,7 @@ export const createConnectionsMaterializer = (
       }
     }
     if (!wroteScopeIncremental) {
-      await writeSnapshotWithProgress(baseSnapshot, merged, dirtyScopeWrites);
+      await writeSnapshotWithDrainProgress(baseSnapshot, dirtyScopeWrites);
       mark('writeSnapshotAndProgress baseSnapshot');
     }
     await yieldToEventLoop();
@@ -2801,11 +3637,12 @@ export const createConnectionsMaterializer = (
     try {
       // Stage 5.2 W3b/c — gate the ranker-augmented build behind
       // SIDETRACK_SKIP_RANKER_SNAPSHOT for HTTP-latency-sensitive
-      // consumers (recorder).
+      // consumers (recorder). The `RANKER_ON_SCOPED_DELTA=1` opt-in
+      // (run the ranker on every scoped delta = slow) was removed —
+      // the ranker is always deferred when a scoped delta applies
+      // and the loader is absent, matching the IVM contract.
       const deferRankerForScopedTimelineDelta =
-        scopedTimelineDeltaApplied &&
-        deps.closestVisitRankerLoader === undefined &&
-        process.env['SIDETRACK_CONNECTIONS_RANKER_ON_SCOPED_DELTA'] !== '1';
+        scopedTimelineDeltaApplied && deps.closestVisitRankerLoader === undefined;
       if (deferRankerForScopedTimelineDelta) {
         mark('ranker-augmented skipped (scopedTimelineDelta)');
         rankerAugmentation = rankerAugmentationCounters({
@@ -2865,7 +3702,7 @@ export const createConnectionsMaterializer = (
                 evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId,
                 closestVisitRanker: closestVisitRanker.ranker,
                 rankerFrontier,
-                inputFrontier: vectorFromEvents(merged),
+                inputFrontier: drainFrontier,
               },
               currentSnapshot,
             );
@@ -2886,7 +3723,7 @@ export const createConnectionsMaterializer = (
             );
           }
           lastRankerProducerRevision = producerRevision;
-          await writeSnapshotWithProgress(finalSnapshot, merged, dirtyScopeWrites);
+          await writeSnapshotWithDrainProgress(finalSnapshot, dirtyScopeWrites);
           mark('writeSnapshotAndProgress ranker-augmented');
           rankerAugmentation = rankerAugmentationCounters({
             status: 'emitted',
@@ -2939,7 +3776,7 @@ export const createConnectionsMaterializer = (
     // HTTP routes will see.
     const diagnostics = collectMaterializerDiagnostics({
       producedAt: diagnosticsNow().toISOString(),
-      maxAcceptedAtMs: maxAcceptedAtMs(merged),
+      maxAcceptedAtMs: maxAcceptedAtMsForDrain,
       engagementGateMs: similarityConfig.engagementGateMs,
       similarityEffectiveConfig: similarityConfig,
       timelineEntries: timelineDays.flatMap((day) => day.entries),
@@ -2979,7 +3816,6 @@ export const createConnectionsMaterializer = (
       console.warn(`[materializer-diag] write failed: ${message}`);
     }
     diagnosticsLogger(diagnosticsWithDrift);
-    await maybeRunShadowDriftCheck(finalSnapshot);
     return finalSnapshot;
   };
 
@@ -3085,100 +3921,23 @@ export const createConnectionsMaterializer = (
     return false;
   };
 
-  const runShadowRebuildAndCompare = async (
-    eventLog: EventLog,
-    currentSnapshot: ConnectionsSnapshot,
-    currentProgress: MaterializerProgress,
-  ): Promise<DriftReport> => {
-    const shadowRoot = await mkdtemp(join(tmpdir(), 'sidetrack-connections-shadow-'));
-    const shadowStore = new SqliteConnectionsStore(deps.vaultRoot, {
-      databasePath: join(shadowRoot, 'current.shadow.db'),
-    });
-    const previousDriftDisabled = process.env[DRIFT_DISABLED_ENV];
-    const previousInprocess = process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
-    process.env[DRIFT_DISABLED_ENV] = '1';
-    process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
-    try {
-      const shadowMaterializer = createConnectionsMaterializer({
-        ...deps,
-        store: shadowStore,
-        diagnosticsStore: { write: async () => undefined },
-        diagnosticsLogger: () => {},
-      });
-      await shadowMaterializer.catchUp(eventLog);
-      const shadowSnapshot = await shadowStore.readCurrent();
-      if (shadowSnapshot === null) {
-        throw new Error('shadow rebuild did not write a snapshot');
-      }
-      const shadowEvents = await eventLog.readMerged();
-      return compareConnectionsDrift({
-        checkedAt: diagnosticsNow().toISOString(),
-        materializerVersion: MATERIALIZER_VERSION,
-        liveSnapshot: currentSnapshot,
-        shadowSnapshot,
-        liveProgress: currentProgress,
-        shadowEvents,
-      });
-    } finally {
-      if (previousDriftDisabled === undefined) delete process.env[DRIFT_DISABLED_ENV];
-      else process.env[DRIFT_DISABLED_ENV] = previousDriftDisabled;
-      if (previousInprocess === undefined) delete process.env['SIDETRACK_CONNECTIONS_INPROCESS'];
-      else process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = previousInprocess;
-      shadowStore.close();
-      await rm(shadowRoot, { recursive: true, force: true });
-    }
-  };
-
-  const maybeRunShadowDriftCheck = async (currentSnapshot: ConnectionsSnapshot): Promise<void> => {
-    if (process.env[DRIFT_DISABLED_ENV] === '1') return;
-    successfulDrainCount += 1;
-    const everyDrains = resolvePositiveNumberEnv(
-      'SIDETRACK_CONNECTIONS_DRIFT_EVERY_DRAINS',
-      DEFAULT_DRIFT_EVERY_DRAINS,
-    );
-    const everyMs = resolvePositiveNumberEnv(
-      'SIDETRACK_CONNECTIONS_DRIFT_EVERY_MS',
-      DEFAULT_DRIFT_EVERY_MS,
-    );
-    const nowMs = Date.now();
-    if (successfulDrainCount % everyDrains !== 0 && nowMs - lastDriftCheckAtMs < everyMs) {
-      return;
-    }
-    const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-    if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
-    try {
-      const report = await runShadowRebuildAndCompare(deps.eventLog, currentSnapshot, progress);
-      lastDriftReport = report;
-      lastDriftCheckAtMs = nowMs;
-      if (report.conclusion === 'drift') {
-        console.warn(
-          `[connections] materializer drift detected nodes=${JSON.stringify(
-            report.nodeDiff,
-          )} edges=${JSON.stringify(report.edgeDiff)} missingDots=${String(
-            report.missingDots.length,
-          )} extraDots=${String(report.extraDots.length)}`,
-        );
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[connections] materializer drift check failed: ${message}`);
-    }
-  };
-
   const drain = async (): Promise<void> => {
     while (dirty) {
       const passStartedAtMs = Date.now();
       lastDrainStartedAtMs = passStartedAtMs;
       urgentDrainRequested = false;
       dirty = false;
+      let releaseMemoryAfterPass = false;
       try {
         if (progressOnlyDirty && (await tryAdvanceNoGraphBacklog())) {
           progressOnlyDirty = false;
         } else if (shouldUseWorker()) {
           progressOnlyDirty = false;
+          releaseMemoryAfterPass = true;
           await drainViaWorker();
         } else {
           progressOnlyDirty = false;
+          releaseMemoryAfterPass = true;
           await buildAndWrite();
         }
         lastSuccessAt = new Date().toISOString();
@@ -3190,6 +3949,8 @@ export const createConnectionsMaterializer = (
         // avoid tight-retry on persistent failures.
         dirty = true;
         return;
+      } finally {
+        if (releaseMemoryAfterPass) requestBunMemoryRelease();
       }
       // Stage 5.2 W1b — coalesce at the DRAIN level. Only relevant when
       // `dirty` was re-set DURING the rebuild (a HANDLES event arrived
@@ -3251,43 +4012,85 @@ export const createConnectionsMaterializer = (
     startDrain();
   };
 
-  const advanceProgressForContentOnlyEvent = (event: AcceptedEvent): void => {
+  const flushContentOnlyProgressEvents = async (): Promise<void> => {
     const writeProgress = deps.store.writeMaterializerProgress;
-    if (writeProgress === undefined) return;
-    // Chain on contentOnlyProgressQueue so the read → modify → write is
-    // serialised across concurrent invocations. Without this, two
-    // back-to-back CAPTURE_EXTRACTION_PRODUCED / PAGE_EVIDENCE_EXTRACTED /
-    // RECALL_TOMBSTONE_TARGET / ENGAGEMENT_INTERVAL_OBSERVED events would
-    // both read the same progress P, both compute P + their own dot, and
-    // both writeMaterializerProgress — the second write overwrites the
-    // first and silently drops one dot from appliedDotIntervals.
-    contentOnlyProgressQueue = contentOnlyProgressQueue
-      .catch(() => undefined)
-      .then(async () => {
-        const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-        if (running || dirty) return;
-        if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
-        if (intervalsContainDot(progress.appliedDotIntervals, event.dot)) return;
-        const appliedDotIntervals = addDotsToIntervals(progress.appliedDotIntervals, [event.dot]);
+    const batch = pendingContentOnlyProgressEvents;
+    pendingContentOnlyProgressEvents = [];
+    if (writeProgress === undefined || batch.length === 0) return;
+    const requeueBatch = (): void => {
+      pendingContentOnlyProgressEvents = [...batch, ...pendingContentOnlyProgressEvents];
+      if (contentOnlyProgressFlushScheduled) return;
+      contentOnlyProgressFlushScheduled = true;
+      const timer = setTimeout(() => {
+        contentOnlyProgressFlushScheduled = false;
+        void flushContentOnlyProgressEvents();
+      }, 25);
+      timer.unref?.();
+    };
+    contentOnlyProgressFlushRunning = true;
+    const startedAtMs = Date.now();
+    try {
+      if (running || dirty) {
+        requeueBatch();
+        return;
+      }
+      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      if (running || dirty) {
+        requeueBatch();
+        return;
+      }
+      if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return;
+      const unapplied = batch.filter(
+        (event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot),
+      );
+      if (unapplied.length > 0) {
+        const appliedDotIntervals = addDotsToIntervals(
+          progress.appliedDotIntervals,
+          unapplied.map((event) => event.dot),
+        );
         const nextProgress: MaterializerProgress = {
           ...progress,
           appliedDotIntervals,
           appliedFrontier: frontierFromIntervals(appliedDotIntervals),
         };
-        if (running || dirty) return;
+        if (running || dirty) {
+          requeueBatch();
+          return;
+        }
         await writeProgress(nextProgress);
         lastFrontier = nextProgress.appliedFrontier;
         lastSuccessAt = new Date().toISOString();
         lastError = null;
-      })
-      .catch((error: unknown) => {
+      }
+      const durationMs = Date.now() - startedAtMs;
+      if (batch.length >= 25 || durationMs >= 250) {
         console.warn(
-          `[connections] content-only progress advance failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+          `[connections] content-only progress batch events=${String(batch.length)} advanced=${String(unapplied.length)} dt=${String(durationMs)}ms pending=${String(pendingContentOnlyProgressEvents.length)}`,
         );
-      });
+      }
+    } catch (error: unknown) {
+      console.warn(
+        `[connections] content-only progress advance failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      contentOnlyProgressFlushRunning = false;
+      if (pendingContentOnlyProgressEvents.length > 0) {
+        scheduleContentOnlyProgressAdvance();
+      }
+    }
   };
+
+  function scheduleContentOnlyProgressAdvance(event?: AcceptedEvent): void {
+    if (event !== undefined) pendingContentOnlyProgressEvents.push(event);
+    if (contentOnlyProgressFlushScheduled || contentOnlyProgressFlushRunning) return;
+    contentOnlyProgressFlushScheduled = true;
+    setImmediate(() => {
+      contentOnlyProgressFlushScheduled = false;
+      void flushContentOnlyProgressEvents();
+    });
+  }
 
   const applyProjectionOverlayWithRetry = async (
     applyProjectionEventOverlay: (event: AcceptedEvent) => Promise<string | null>,
@@ -3358,7 +4161,13 @@ export const createConnectionsMaterializer = (
     const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
     if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return false;
     lastFrontier = progress.appliedFrontier;
-    const merged = await deps.eventLog.readMerged();
+    // Watermark-resume: read only events past the applied frontier instead of
+    // materializing the whole ~190k-event log on the main thread. The
+    // subsequent intervalsContainDot filter still drops any already-applied
+    // (e.g. gapped) dot, so this stays byte-equivalent to the full-log path:
+    // every UNapplied dot is by definition past the contiguous frontier, and
+    // applied-but-gapped dots are filtered out either way.
+    const merged = await deps.eventLog.readMergedSince(progress.appliedFrontier);
     const ordered = sortAcceptedEvents(
       merged.filter((event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot)),
     );
@@ -3385,10 +4194,13 @@ export const createConnectionsMaterializer = (
     // stream of events triggers exactly one drain after the burst
     // settles (or at debounceMs after the latest arrival).
     if (drainDebounceTimer !== null) clearTimeout(drainDebounceTimer);
-    drainDebounceTimer = setTimeout(() => {
-      drainDebounceTimer = null;
-      startDrainWhenIntervalElapsed();
-    }, urgentDrainRequested ? URGENT_DRAIN_DEBOUNCE_MS : DRAIN_DEBOUNCE_MS);
+    drainDebounceTimer = setTimeout(
+      () => {
+        drainDebounceTimer = null;
+        startDrainWhenIntervalElapsed();
+      },
+      urgentDrainRequested ? URGENT_DRAIN_DEBOUNCE_MS : DRAIN_DEBOUNCE_MS,
+    );
     drainDebounceTimer.unref();
   };
 
@@ -3415,9 +4227,28 @@ export const createConnectionsMaterializer = (
       return;
     }
     if (deps.store.replaceScopeRows === undefined) return;
+    // Coalesce: a tab-burst fires many NAVIGATION_COMMITTED events in quick
+    // succession. Queuing one overlay (one full readMerged) per event chains
+    // dozens of O(whole-log) merges in the microtask queue, starving the
+    // event-loop timer for tens of seconds (the "wedge"). Instead keep only
+    // the newest few nav events pending and at most one overlay in flight;
+    // writeForegroundNavigationDelta already resolves only the newest chain
+    // (newestNavigationCommittedEvents(..., 4)), and the authoritative graph
+    // drain reconciles everything regardless, so collapsing the burst into a
+    // single overlay pass is behaviour-preserving for the UI.
+    pendingForegroundNavEvents.push(event);
+    if (pendingForegroundNavEvents.length > 4) {
+      pendingForegroundNavEvents = pendingForegroundNavEvents.slice(-4);
+    }
+    if (foregroundNavOverlayScheduled) return;
+    foregroundNavOverlayScheduled = true;
     foregroundNavigationOverlayQueue = foregroundNavigationOverlayQueue
       .catch(() => undefined)
       .then(async () => {
+        foregroundNavOverlayScheduled = false;
+        const events = pendingForegroundNavEvents;
+        pendingForegroundNavEvents = [];
+        if (events.length === 0) return;
         const existingProgress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
         if (
           existingProgress === null ||
@@ -3428,7 +4259,7 @@ export const createConnectionsMaterializer = (
         const merged = await deps.eventLog.readMerged();
         const startedAtMs = Date.now();
         await writeForegroundNavigationDelta({
-          pendingEventsForDrain: [event],
+          pendingEventsForDrain: events,
           merged,
           existingProgress,
           mark: (label) => {
@@ -3440,6 +4271,7 @@ export const createConnectionsMaterializer = (
         });
       })
       .catch((error: unknown) => {
+        foregroundNavOverlayScheduled = false;
         console.warn(
           `[connections] foreground navigation overlay failed: ${
             error instanceof Error ? error.message : String(error)
@@ -3484,8 +4316,8 @@ export const createConnectionsMaterializer = (
         foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
         foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
       }
-      if (handlesContentLaneOnly && !running && !dirty) {
-        advanceProgressForContentOnlyEvent(event);
+      if (handlesContentLaneOnly) {
+        scheduleContentOnlyProgressAdvance(event);
         return;
       }
       progressOnlyDirty = true;
@@ -3527,6 +4359,51 @@ export const createConnectionsMaterializer = (
     lastRankerProducerRevision = undefined;
   };
 
+  const catchUpInScopedChunks = async (
+    ordered: readonly AcceptedEvent[],
+  ): Promise<{ readonly applied: boolean; readonly reason: string }> => {
+    const previousSnapshot = await deps.store.readCurrent();
+    if (previousSnapshot === null) return { applied: false, reason: 'no-current-snapshot' };
+    if (deps.store.replaceScopeRows === undefined) {
+      return { applied: false, reason: 'replaceScopeRows-unavailable' };
+    }
+    if (!ordered.every(isScopedTimelineDeltaEvent)) {
+      return { applied: false, reason: 'non-scoped-events' };
+    }
+    if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+      console.warn(
+        `[connections-phase] catchUp.chunkedScoped start events=${String(
+          ordered.length,
+        )} chunkSize=${String(BACKLOG_FALLBACK_THRESHOLD)}`,
+      );
+    }
+    for (let offset = 0; offset < ordered.length; offset += BACKLOG_FALLBACK_THRESHOLD) {
+      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) {
+        return { applied: false, reason: 'progress-version-mismatch' };
+      }
+      const chunk = ordered
+        .slice(offset, offset + BACKLOG_FALLBACK_THRESHOLD)
+        .filter((event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot));
+      if (chunk.length === 0) continue;
+      for (const event of chunk) {
+        for (const key of invalidationsForEvent(event)) accumulatedInvalidations.push(key);
+      }
+      catchUpPendingEventWindow = chunk;
+      requireScopedTimelineDeltaForDrain = true;
+      try {
+        await buildAndWrite();
+      } finally {
+        catchUpPendingEventWindow = null;
+        requireScopedTimelineDeltaForDrain = false;
+        requestBunMemoryRelease();
+      }
+      lastSuccessAt = new Date().toISOString();
+      lastError = null;
+    }
+    return { applied: true, reason: 'chunked-scoped' };
+  };
+
   const catchUp: Materializer['catchUp'] = async () => {
     pending = true;
     if (running) {
@@ -3540,16 +4417,21 @@ export const createConnectionsMaterializer = (
     // pass) seeds.
     resetInMemoryProjectionState();
     dirty = false;
+    let releaseMemoryAfterCatchUp = false;
     try {
       progressOnlyDirty = false;
       const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
-      const merged = await deps.eventLog.readMerged();
       const versionMatches = progress?.materializerVersion === MATERIALIZER_VERSION;
+      const useWorkerForCatchUp = shouldUseWorker();
       if (progress !== null && versionMatches) {
         lastFrontier = progress.appliedFrontier;
-        const pendingEvents = merged.filter(
-          (event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot),
-        );
+        const pendingEvents = (
+          await deps.eventLog.readMergedSince(
+            dotIntervalsHaveGaps(progress.appliedDotIntervals)
+              ? frontierFromIntervals(progress.appliedDotIntervals)
+              : progress.appliedFrontier,
+          )
+        ).filter((event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot));
         const ordered = sortAcceptedEvents(pendingEvents);
         if (ordered.length === 0) {
           lastBuildInvalidations = [];
@@ -3568,14 +4450,24 @@ export const createConnectionsMaterializer = (
             if (await tryAdvanceNoGraphEvents(progress, ordered)) return;
           }
         }
+        if (ordered.length > BACKLOG_FALLBACK_THRESHOLD && !useWorkerForCatchUp) {
+          const chunked = await catchUpInScopedChunks(ordered);
+          if (chunked.applied) {
+            lastBuildInvalidations = [];
+            lastSuccessAt = new Date().toISOString();
+            lastError = null;
+            return;
+          }
+          if (chunked.reason !== 'no-current-snapshot') {
+            throw new Error(`connections catchUp large backlog cannot chunk: ${chunked.reason}`);
+          }
+        }
         if (ordered.length <= BACKLOG_FALLBACK_THRESHOLD) {
           // Phase 1 intentionally keeps the apply path as a full rebuild.
           // The durable dot-interval filter is the safety foundation for
           // Phase 2's scoped recompute.
-          if (process.env[INCREMENTAL_SCOPES_ENV] !== '0') {
-            for (const event of ordered) {
-              for (const key of invalidationsForEvent(event)) accumulatedInvalidations.push(key);
-            }
+          for (const event of ordered) {
+            for (const key of invalidationsForEvent(event)) accumulatedInvalidations.push(key);
           }
         }
       }
@@ -3585,9 +4477,11 @@ export const createConnectionsMaterializer = (
       // 12 k-event prod vault), which queued /status and every other
       // HTTP request behind it. shouldUseWorker() respects the env
       // opt-out AND skips itself when we're already inside a worker.
-      if (shouldUseWorker()) {
+      if (useWorkerForCatchUp) {
+        releaseMemoryAfterCatchUp = true;
         await drainViaWorker();
       } else {
+        releaseMemoryAfterCatchUp = true;
         await buildAndWrite();
       }
       lastSuccessAt = new Date().toISOString();
@@ -3598,6 +4492,7 @@ export const createConnectionsMaterializer = (
       // event trigger (after cooldown) retries.
       dirty = true;
     } finally {
+      if (releaseMemoryAfterCatchUp) requestBunMemoryRelease();
       running = false;
       pending = dirty || running;
       if (dirty && lastError === null) startDrain();
@@ -3631,16 +4526,6 @@ export const createConnectionsMaterializer = (
       lastError,
       pending,
       ...(lastFrontier === undefined ? {} : { frontier: lastFrontier }),
-      ...(lastDriftReport === null
-        ? {}
-        : {
-            lastDriftCheck: {
-              at: lastDriftReport.checkedAt,
-              conclusion: lastDriftReport.conclusion,
-              nodeDiffSummary: lastDriftReport.nodeDiff,
-              edgeDiffSummary: lastDriftReport.edgeDiff,
-            },
-          }),
     };
   };
 
@@ -3686,9 +4571,19 @@ export const createConnectionsMaterializer = (
     return processed.length;
   };
 
+  // The runner gates event dispatch on `m.handles.has(event.type)`. The
+  // materializer ALSO accepts content-lane-only and projection-only events
+  // (see onAccepted's three-way classification), so `handles` must report
+  // the union — otherwise the runner silently swallows those event types
+  // and onAccepted never runs for them.
+  const allHandles: ReadonlySet<string> = new Set<string>([
+    ...HANDLES,
+    ...CONTENT_LANE_ONLY_HANDLES,
+    ...PROJECTION_ONLY_HANDLES,
+  ]);
   return {
     name: MATERIALIZER_NAME,
-    handles: HANDLES,
+    handles: allHandles,
     onAccepted,
     catchUp,
     awaitIdle,

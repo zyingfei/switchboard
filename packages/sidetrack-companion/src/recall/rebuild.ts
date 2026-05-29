@@ -1,7 +1,15 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import {
+  CAPTURE_RECORDED,
+  isCaptureRecordedPayload,
+  isRecallTombstonePayload,
+  RECALL_TOMBSTONE_TARGET,
+} from './events.js';
+import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import { chunkTurn, type RecallChunk } from './chunker.js';
 import { embed, MODEL_ID } from './embedder.js';
 import { upsertEntries } from './indexFile.js';
@@ -116,6 +124,112 @@ const metadataFromChunk = (chunk: RecallChunk): ChunkMetadata => ({
   ...(chunk.quality === undefined ? {} : { quality: chunk.quality }),
 });
 
+const rawItemFromCaptureEvent = (
+  event: AcceptedEvent,
+  tombstonedThreads: ReadonlySet<string>,
+): readonly RawCaptureItem[] => {
+  if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) return [];
+  const payload = event.payload;
+  const threadId = payload.threadId ?? payload.bac_id;
+  const items: RawCaptureItem[] = [];
+  let fallbackOrdinal = 0;
+  for (const turn of payload.turns) {
+    if (typeof turn.text !== 'string' || turn.text.trim().length === 0) {
+      fallbackOrdinal += 1;
+      continue;
+    }
+    const ordinal = typeof turn.ordinal === 'number' ? turn.ordinal : fallbackOrdinal;
+    fallbackOrdinal = Math.max(fallbackOrdinal + 1, ordinal + 1);
+    items.push({
+      id: `${threadId}:${String(ordinal)}`,
+      threadId,
+      capturedAt: turn.capturedAt ?? payload.capturedAt,
+      text: turn.text,
+      replicaId: event.dot.replicaId,
+      lamport: event.dot.seq,
+      tombstoned: tombstonedThreads.has(threadId),
+      sourceBacId: payload.bac_id,
+      turnOrdinal: ordinal,
+      ...(turn.markdown === undefined ? {} : { markdown: turn.markdown }),
+      ...(turn.formattedText === undefined ? {} : { formattedText: turn.formattedText }),
+      ...(turn.role === undefined ? {} : { role: turn.role }),
+      ...(turn.modelName === undefined ? {} : { modelName: turn.modelName }),
+      ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+      ...(payload.threadUrl === undefined ? {} : { threadUrl: payload.threadUrl }),
+      ...(payload.title === undefined ? {} : { title: payload.title }),
+    });
+  }
+  return items;
+};
+
+const readRecallLogProjection = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<{
+  readonly rawItems: RawCaptureItem[];
+  readonly logBacIds: ReadonlySet<string>;
+  readonly source: 'event-store' | 'readMerged' | 'none';
+  readonly eventCount: number;
+}> => {
+  if (eventLog === undefined) {
+    return { rawItems: [], logBacIds: new Set(), source: 'none', eventCount: 0 };
+  }
+
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store !== null) {
+    const tombstonedThreads = new Set<string>();
+    const logBacIds = new Set<string>();
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) {
+        if (event.type === RECALL_TOMBSTONE_TARGET && isRecallTombstonePayload(event.payload)) {
+          tombstonedThreads.add(event.payload.threadId);
+        } else if (event.type === CAPTURE_RECORDED && isCaptureRecordedPayload(event.payload)) {
+          logBacIds.add(event.payload.bac_id);
+        }
+      }
+    }, 2000);
+    const rawItems: RawCaptureItem[] = [];
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) {
+        rawItems.push(...rawItemFromCaptureEvent(event, tombstonedThreads));
+      }
+    }, 2000);
+    return { rawItems, logBacIds, source: 'event-store', eventCount: store.count() };
+  }
+
+  // projectRecallFromLog only consumes capture + tombstone events, so
+  // stream just those instead of materialising the full ~700MB merged
+  // log (which would warm the memo + set the boot high-water).
+  const logEvents = await eventLog.streamFiltered(
+    (e) => e.type === CAPTURE_RECORDED || e.type === RECALL_TOMBSTONE_TARGET,
+    new Set([CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET]),
+  );
+  const fromLog = projectRecallFromLog(logEvents);
+  return {
+    rawItems: fromLog.map((item) => ({
+      id: item.id,
+      threadId: item.threadId,
+      capturedAt: item.capturedAt,
+      text: item.text,
+      replicaId: item.replicaId,
+      lamport: item.lamport,
+      tombstoned: item.tombstoned,
+      sourceBacId: item.sourceBacId,
+      turnOrdinal: item.turnOrdinal,
+      ...(item.markdown === undefined ? {} : { markdown: item.markdown }),
+      ...(item.formattedText === undefined ? {} : { formattedText: item.formattedText }),
+      ...(item.role === undefined ? {} : { role: item.role }),
+      ...(item.modelName === undefined ? {} : { modelName: item.modelName }),
+      ...(item.provider === undefined ? {} : { provider: item.provider }),
+      ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
+      ...(item.title === undefined ? {} : { title: item.title }),
+    })),
+    logBacIds: collectLogBacIds(logEvents),
+    source: 'readMerged',
+    eventCount: logEvents.length,
+  };
+};
+
 export const rebuildFromEventLog = async (
   vaultRoot: string,
   eventLogPath: string,
@@ -139,34 +253,16 @@ export const rebuildFromEventLog = async (
   //    captures whose bac_id already appears as a `capture.recorded`
   //    event.
   options.onPhase?.('read-log');
-  const logEvents = options.eventLog === undefined ? [] : await options.eventLog.readMerged();
-  phase(`readMerged events=${String(logEvents.length)}`);
+  const logProjection = await readRecallLogProjection(vaultRoot, options.eventLog);
+  phase(`${logProjection.source} events=${String(logProjection.eventCount)}`);
   options.onPhase?.('project');
-  const fromLog = projectRecallFromLog(logEvents);
-  phase(`projectRecallFromLog rawItems=${String(fromLog.length)}`);
+  phase(`projectRecallFromLog rawItems=${String(logProjection.rawItems.length)}`);
   options.onPhase?.('collect-ids');
-  const logBacIds = collectLogBacIds(logEvents);
+  const logBacIds = logProjection.logBacIds;
   phase(`collectLogBacIds bacIds=${String(logBacIds.size)}`);
   options.onPhase?.('chunk');
 
-  const rawItems: RawCaptureItem[] = fromLog.map((item) => ({
-    id: item.id,
-    threadId: item.threadId,
-    capturedAt: item.capturedAt,
-    text: item.text,
-    replicaId: item.replicaId,
-    lamport: item.lamport,
-    tombstoned: item.tombstoned,
-    sourceBacId: item.sourceBacId,
-    turnOrdinal: item.turnOrdinal,
-    ...(item.markdown === undefined ? {} : { markdown: item.markdown }),
-    ...(item.formattedText === undefined ? {} : { formattedText: item.formattedText }),
-    ...(item.role === undefined ? {} : { role: item.role }),
-    ...(item.modelName === undefined ? {} : { modelName: item.modelName }),
-    ...(item.provider === undefined ? {} : { provider: item.provider }),
-    ...(item.threadUrl === undefined ? {} : { threadUrl: item.threadUrl }),
-    ...(item.title === undefined ? {} : { title: item.title }),
-  }));
+  const rawItems: RawCaptureItem[] = [...logProjection.rawItems];
 
   // Cooperative yield helper. The rebuild walks 13 k+ JSONL events,
   // parses each, chunks each turn, encodes the index file — all

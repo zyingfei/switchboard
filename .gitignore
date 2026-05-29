@@ -42,3 +42,9 @@ sidetrack-vault*/
 
 # Screen session logs
 screenlog.*
+
+# Build artifacts + diagnostics (auto-generated, never commit)
+packages/*/.wxt/
+.diag-heap/
+*.log
+error.log

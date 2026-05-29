@@ -54,8 +54,7 @@ const appendVisit = async (
   },
 ): ReturnType<EventLog['appendClientObserved']> => {
   const eventId = `hnsw-visit-${String(input.index)}`;
-  const clientEventId =
-    input.variant === undefined ? eventId : `${eventId}-${input.variant}`;
+  const clientEventId = input.variant === undefined ? eventId : `${eventId}-${input.variant}`;
   return eventLog.appendClientObserved({
     clientEventId,
     aggregateId: clientEventId,
@@ -125,7 +124,8 @@ const rowTouchesVisit = (
 ): boolean => {
   const [fromNodeId, toNodeId] = row.pair.split('\u0000');
   const prefix = 'timeline-visit:';
-  const fromVisitKey = fromNodeId?.startsWith(prefix) === true ? fromNodeId.slice(prefix.length) : '';
+  const fromVisitKey =
+    fromNodeId?.startsWith(prefix) === true ? fromNodeId.slice(prefix.length) : '';
   const toVisitKey = toNodeId?.startsWith(prefix) === true ? toNodeId.slice(prefix.length) : '';
   return visitKeys.has(fromVisitKey) || visitKeys.has(toVisitKey);
 };
@@ -200,7 +200,9 @@ describe('HNSW reconcile child integration', () => {
 
     const snapshot = await createConnectionsStore(vaultRoot).readCurrent();
     expect(snapshot).not.toBeNull();
-    expect(Date.parse(snapshot!.updatedAt)).toBeGreaterThan(Date.parse(baselineSnapshot!.updatedAt));
+    expect(Date.parse(snapshot!.updatedAt)).toBeGreaterThan(
+      Date.parse(baselineSnapshot!.updatedAt),
+    );
 
     eventNowMs = Date.parse('2026-05-22T12:00:00.000Z');
     await appendVisit(eventLog, {
@@ -257,22 +259,43 @@ describe('HNSW reconcile child integration', () => {
       writeSpy.mockRestore();
     }
 
-    expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=0');
+    // A dispatch is a no-graph event: it routes to the progress-only path,
+    // which skips the HNSW pass entirely (so there's no buildVisitSimilarityHnsw
+    // line at all). The invariant is simply that it NEVER triggers a full
+    // HNSW rebuild when no visits changed.
+    expect(output.join('')).not.toContain('buildVisitSimilarityHnsw full=true');
   });
 
-  it(
-    'incrementally inserts new visits without full-rebuilding the child HNSW store',
-    async () => {
-      process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
-      process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
-      const replica = await loadOrCreateReplica(vaultRoot);
-      const eventLog = createEventLog(vaultRoot, replica);
+  it('incrementally inserts new visits without full-rebuilding the child HNSW store', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    const fullRebuildRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hnsw-child-full-'));
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const observedAtForIndex = (index: number): string =>
+      index < 100
+        ? new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000).toISOString()
+        : `2026-05-22T11:${String(index - 100).padStart(2, '0')}:00.000Z`;
+    const appendRangeWithoutDrain = async (
+      root: string,
+      start: number,
+      end: number,
+    ): Promise<void> => {
+      const rangeReplica = await loadOrCreateReplica(root);
+      const rangeEventLog = createEventLog(root, rangeReplica);
+      for (let index = start; index < end; index += 1) {
+        await appendVisit(rangeEventLog, {
+          index,
+          observedAt: observedAtForIndex(index),
+        });
+      }
+    };
+
+    try {
       for (let index = 0; index < 100; index += 1) {
-        const observedAt = new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000)
-          .toISOString();
         await appendVisit(eventLog, {
           index,
-          observedAt,
+          observedAt: observedAtForIndex(index),
         });
       }
       expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({
@@ -289,7 +312,7 @@ describe('HNSW reconcile child integration', () => {
         newVisitKeys.add(visitKey);
         await appendVisit(eventLog, {
           index,
-          observedAt: `2026-05-22T11:${String(index - 100).padStart(2, '0')}:00.000Z`,
+          observedAt: observedAtForIndex(index),
         });
       }
 
@@ -309,26 +332,129 @@ describe('HNSW reconcile child integration', () => {
 
       const phaseOutput = output.join('');
       expect(phaseOutput).toContain('buildVisitSimilarityHnsw full=false touched=5');
-      const hnswBuildMs =
-        /buildVisitSimilarityHnsw full=false touched=5 edges=\d+ dt=(\d+)ms/u.exec(
-          phaseOutput,
-        )?.[1];
+      const hnswBuildMs = /buildVisitSimilarityHnsw full=false touched=5 edges=\d+ dt=(\d+)ms/u.exec(
+        phaseOutput,
+      )?.[1];
       expect(hnswBuildMs).toBeDefined();
       expect(Number(hnswBuildMs)).toBeLessThan(500);
 
       const after = await createConnectionsStore(vaultRoot).readCurrent();
       if (after === null) throw new Error('expected incremental HNSW snapshot');
       const afterRows = similarityRows(after);
-      const afterByPair = new Map(afterRows.map((row) => [row.pair, row]));
-      for (const row of beforeRows) {
-        expect(afterByPair.get(row.pair)).toEqual(row);
-      }
       const newRows = afterRows.filter((row) => rowTouchesVisit(row, newVisitKeys));
       expect(newRows.length).toBeGreaterThan(0);
-      expect(afterRows.length).toBe(beforeRows.length + newRows.length);
-    },
-    15_000,
-  );
+      expect(afterRows.length).toBeGreaterThan(beforeRows.length);
+
+      await appendRangeWithoutDrain(fullRebuildRoot, 0, 105);
+      expect(await runReconcileInChild({ vaultRoot: fullRebuildRoot, seq: 3 })).toMatchObject({
+        seq: 3,
+        ok: true,
+      });
+      const fullRebuildSnapshot = await createConnectionsStore(fullRebuildRoot).readCurrent();
+      if (fullRebuildSnapshot === null) throw new Error('expected full-rebuild HNSW snapshot');
+      const fullRows = similarityRows(fullRebuildSnapshot);
+      expect(afterRows.length, phaseOutput).toBe(fullRows.length);
+      expect(afterRows).toEqual(fullRows);
+    } finally {
+      await rm(fullRebuildRoot, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it('keeps large additive HNSW drift incremental and byte-equivalent to a full rebuild', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    const fullRebuildRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hnsw-child-full-'));
+    const baselineCount = 8;
+    const additiveCount = 20;
+    const appendRange = async (
+      root: string,
+      start: number,
+      end: number,
+      seq: number,
+    ): Promise<void> => {
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      for (let index = start; index < end; index += 1) {
+        const observedAt = new Date(
+          Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000,
+        ).toISOString();
+        await appendVisit(eventLog, {
+          index,
+          observedAt,
+          title:
+            index < baselineCount
+              ? `sidetrack_eval_postgres baseline visit ${String(index)}`
+              : `sidetrack_eval_kubernetes additive visit ${String(index)}`,
+        });
+      }
+      expect(await runReconcileInChild({ vaultRoot: root, seq })).toMatchObject({
+        seq,
+        ok: true,
+      });
+    };
+    const appendRangeWithoutDrain = async (
+      root: string,
+      start: number,
+      end: number,
+    ): Promise<void> => {
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      for (let index = start; index < end; index += 1) {
+        const observedAt = new Date(
+          Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000,
+        ).toISOString();
+        await appendVisit(eventLog, {
+          index,
+          observedAt,
+          title:
+            index < baselineCount
+              ? `sidetrack_eval_postgres baseline visit ${String(index)}`
+              : `sidetrack_eval_kubernetes additive visit ${String(index)}`,
+        });
+      }
+    };
+
+    try {
+      await appendRange(vaultRoot, 0, baselineCount, 1);
+      await appendRangeWithoutDrain(vaultRoot, baselineCount, baselineCount + additiveCount);
+
+      const incrementalOutput: string[] = [];
+      const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+        incrementalOutput.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+        return true;
+      });
+      try {
+        expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({
+          seq: 2,
+          ok: true,
+        });
+      } finally {
+        writeSpy.mockRestore();
+      }
+
+      const phaseOutput = incrementalOutput.join('');
+      expect(phaseOutput).toContain(
+        `buildVisitSimilarityHnsw full=false touched=${String(additiveCount)}`,
+      );
+      expect(phaseOutput).toContain('replaceScopeRows scopedTimelineDelta');
+      expect(phaseOutput).toContain('hnswNotFull=true');
+      expect(phaseOutput).not.toContain('buildConnectionsSnapshot base');
+
+      await appendRangeWithoutDrain(fullRebuildRoot, 0, baselineCount + additiveCount);
+      expect(await runReconcileInChild({ vaultRoot: fullRebuildRoot, seq: 1 })).toMatchObject({
+        seq: 1,
+        ok: true,
+      });
+
+      const incrementalSnapshot = await createConnectionsStore(vaultRoot).readCurrent();
+      const fullRebuildSnapshot = await createConnectionsStore(fullRebuildRoot).readCurrent();
+      if (incrementalSnapshot === null || fullRebuildSnapshot === null) {
+        throw new Error('expected incremental and full-rebuild snapshots');
+      }
+      expect(similarityRows(incrementalSnapshot)).toEqual(similarityRows(fullRebuildSnapshot));
+    } finally {
+      await rm(fullRebuildRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('reuses existing HNSW labels — touched is the set difference, not dirty-scopes', async () => {
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
@@ -336,8 +462,9 @@ describe('HNSW reconcile child integration', () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     for (let index = 0; index < 50; index += 1) {
-      const observedAt = new Date(Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000)
-        .toISOString();
+      const observedAt = new Date(
+        Date.parse('2026-05-22T10:00:00.000Z') + index * 60_000,
+      ).toISOString();
       await appendVisit(eventLog, {
         index,
         observedAt,
@@ -474,8 +601,9 @@ describe('HNSW reconcile child integration', () => {
             observedAt: `2026-05-22T10:${String(index).padStart(2, '0')}:00.000Z`,
           });
         }
-        expect(await runReconcileInChild({ vaultRoot: root, seq: incremental === '1' ? 1 : 2 }))
-          .toMatchObject({ ok: true });
+        expect(
+          await runReconcileInChild({ vaultRoot: root, seq: incremental === '1' ? 1 : 2 }),
+        ).toMatchObject({ ok: true });
       }
 
       const hnswSnapshot = await createConnectionsStore(vaultRoot).readCurrent();

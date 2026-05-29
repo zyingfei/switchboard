@@ -34,6 +34,7 @@ import {
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEmbedderClient } from '../recall/embedderClient.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
@@ -397,6 +398,7 @@ export const startCompanion = async (
       createExtractionMaterializer({
         store: extractionStore,
         eventLog: baseEventLog,
+        vaultRoot: options.vaultPath,
       }),
     );
     // First future surface — Class B timeline projection. Reduces
@@ -409,6 +411,7 @@ export const startCompanion = async (
       createTimelineMaterializer({
         store: timelineStore,
         eventLog: baseEventLog,
+        vaultRoot: options.vaultPath,
       }),
     );
     // Class B Connections — consumer-only materializer that joins
@@ -618,15 +621,40 @@ export const startCompanion = async (
     let cachedPrivacyProjection: PrivacyProjection = projectPrivacy([]);
     const refreshPrivacyProjectionFromLog = async (): Promise<void> => {
       try {
-        const all = await baseEventLog.readMerged();
-        cachedPrivacyProjection = projectPrivacy(
-          all.filter(
-            (e) =>
-              e.type === PRIVACY_GATE_FLIPPED ||
-              e.type === PRIVACY_PERMISSION_GRANTED ||
-              e.type === PRIVACY_PERMISSION_REVOKED,
-          ),
-        );
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        const events: AcceptedEvent[] = [];
+        if (store === null) {
+          // Stream + collect only the 3 privacy event types instead of
+          // materialising the full ~700MB merged log just to filter them.
+          // This is the FIRST boot caller, so warming the memo here set
+          // the libpas high-water for the whole process.
+          events.push(
+            ...(await baseEventLog.streamFiltered(
+              (e) =>
+                e.type === PRIVACY_GATE_FLIPPED ||
+                e.type === PRIVACY_PERMISSION_GRANTED ||
+                e.type === PRIVACY_PERMISSION_REVOKED,
+              new Set([
+                PRIVACY_GATE_FLIPPED,
+                PRIVACY_PERMISSION_GRANTED,
+                PRIVACY_PERMISSION_REVOKED,
+              ]),
+            )),
+          );
+        } else {
+          await store.forEachChunk((chunk) => {
+            for (const event of chunk) {
+              if (
+                event.type === PRIVACY_GATE_FLIPPED ||
+                event.type === PRIVACY_PERMISSION_GRANTED ||
+                event.type === PRIVACY_PERMISSION_REVOKED
+              ) {
+                events.push(event);
+              }
+            }
+          }, 2000);
+        }
+        cachedPrivacyProjection = projectPrivacy(events);
       } catch {
         // Initial empty projection is the safe default.
       }
@@ -738,6 +766,34 @@ export const startCompanion = async (
     }
     // ────────────────────────────────────────────────────────────────
 
+    // Embedder sidecar — owns ONNX + transformers.js in a child process
+    // so the main thread isn't blocked by inference. Opt-out with
+    // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
+    // diagnostic) wants the legacy in-process path. The test embedder
+    // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
+    // deterministic test embedder is sync and the child overhead is
+    // pure waste.
+    //
+    // MUST be installed BEFORE the recall catchUp/rebuild IIFE below: that
+    // background task embeds (recall ingest + visit similarity), and if the
+    // override isn't set yet those calls fall through to the in-process
+    // ONNX/CoreML path, faulting ~200MB of IOAccelerator (Metal) surfaces
+    // into the MAIN process. Setting the override first routes every embed
+    // to the child, so the main never links the GPU surfaces.
+    const inProcessEmbedder = !useChildProcesses;
+    const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
+    if (embedderClient !== null) {
+      teardown.push(async () => {
+        await embedderClient.stop();
+      });
+      // Install the sidecar as the global embed implementation so all
+      // call sites (recall rebuild, recall ingestor, visit similarity)
+      // dispatch through the child process automatically. The override
+      // is module-scoped in `recall/embedder.ts`.
+      const { setEmbedderOverride } = await import('../recall/embedder.js');
+      setEmbedderOverride(embedderClient.embed);
+    }
+
     // Don't block startup on the rebuild — health endpoint will report
     // status: 'rebuilding' until the background task completes.
     // The fresh-check + incremental ingest BOTH run through the
@@ -779,26 +835,6 @@ export const startCompanion = async (
       eventLoopMonitor.stop();
     });
 
-    // Embedder sidecar — owns ONNX + transformers.js in a child process
-    // so the main thread isn't blocked by inference. Opt-out with
-    // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
-    // diagnostic) wants the legacy in-process path. The test embedder
-    // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
-    // deterministic test embedder is sync and the child overhead is
-    // pure waste.
-    const inProcessEmbedder = !useChildProcesses;
-    const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
-    if (embedderClient !== null) {
-      teardown.push(async () => {
-        await embedderClient.stop();
-      });
-      // Install the sidecar as the global embed implementation so all
-      // call sites (recall rebuild, recall ingestor, visit similarity)
-      // dispatch through the child process automatically. The override
-      // is module-scoped in `recall/embedder.ts`.
-      const { setEmbedderOverride } = await import('../recall/embedder.js');
-      setEmbedderOverride(embedderClient.embed);
-    }
     const getEmbedderStatus = (): {
       readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
       readonly lastError?: string;

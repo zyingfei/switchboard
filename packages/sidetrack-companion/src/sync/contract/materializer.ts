@@ -55,20 +55,6 @@ export interface MaterializerHealth {
   // Optional per-replica progress bound. Populated by materializers
   // that track a frontier (e.g., recall ingestor).
   readonly frontier?: VersionVector;
-  readonly lastDriftCheck?: {
-    readonly at: string;
-    readonly conclusion: 'clean' | 'drift';
-    readonly nodeDiffSummary: {
-      readonly added: number;
-      readonly removed: number;
-      readonly changed: number;
-    };
-    readonly edgeDiffSummary: {
-      readonly added: number;
-      readonly removed: number;
-      readonly changed: number;
-    };
-  };
 }
 
 export interface AcceptedEventContext {

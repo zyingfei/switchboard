@@ -9,7 +9,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
-  createConnectionsStore,
   type ConnectionsSnapshot,
   type ConnectionsStore,
 } from '../../connections/snapshot.js';
@@ -58,9 +57,19 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       readonly store?: ConnectionsStore;
       readonly events?: readonly AcceptedEvent[];
       readonly topicRevisionStore?: TopicRevisionStore;
+      readonly onReadMerged?: () => void;
     } = {},
-  ): ReturnType<typeof createConnectionsMaterializer> =>
-    createConnectionsMaterializer({
+  ): ReturnType<typeof createConnectionsMaterializer> => {
+    const unusedStore: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async () => {},
+      readMaterializerProgress: async () => null,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    return createConnectionsMaterializer({
       vaultRoot,
       // The dirty-queue wiring lives in onAccepted before any I/O —
       // tests only need the materializer surface, not a working
@@ -70,17 +79,22 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
         appendClient: () => {
           throw new Error('unused');
         },
-        readMerged: () => Promise.resolve([...(input.events ?? [])]),
+        readMerged: () => {
+          input.onReadMerged?.();
+          return Promise.resolve([...(input.events ?? [])]);
+        },
+        readMergedSince: () => Promise.resolve([...(input.events ?? [])]),
         append: () => {
           throw new Error('unused');
         },
       } as any,
       timelineStore: createTimelineStore(vaultRoot),
-      store: input.store ?? createConnectionsStore(vaultRoot),
+      store: input.store ?? unusedStore,
       ...(input.topicRevisionStore === undefined
         ? {}
         : { topicRevisionStore: input.topicRevisionStore }),
     });
+  };
 
   it('capture.recorded accumulates the sourceUnitId into the dirty set', () => {
     const mat = createMat();
@@ -218,6 +232,109 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     expect(snapshotWrites).toBe(0);
     expect(latestProgress.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
     expect(latestProgress.appliedFrontier).toEqual({ 'replica-A': 2 });
+  });
+
+  it('coalesces idle content-lane progress into one progress write', async () => {
+    const baseProgress: MaterializerProgress = {
+      ...EMPTY_PROGRESS('connections', MATERIALIZER_VERSION),
+      appliedDotIntervals: { 'replica-A': [[1, 1] as const] },
+      appliedFrontier: { 'replica-A': 1 },
+      snapshotRevisionId: 'rev-base',
+    };
+    let latestProgress: MaterializerProgress = baseProgress;
+    let progressWrites = 0;
+    const store: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async () => {},
+      writeMaterializerProgress: async (progress) => {
+        progressWrites += 1;
+        latestProgress = progress;
+      },
+      readMaterializerProgress: async () => latestProgress,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const mat = createMat({ store });
+
+    for (const seq of [2, 3, 4]) {
+      mat.onAccepted(
+        buildEvent({
+          seq,
+          type: PAGE_EVIDENCE_EXTRACTED,
+          payload: {
+            payloadVersion: 1,
+            canonicalUrl: `https://example.test/${String(seq)}`,
+            extractedAt: '2026-05-23T23:00:00.000Z',
+          },
+        }),
+        { origin: 'local' },
+      );
+    }
+
+    expect(mat.health().pending).toBe(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(progressWrites).toBe(1);
+    expect(latestProgress.appliedDotIntervals['replica-A']).toEqual([[1, 4]]);
+    expect(latestProgress.appliedFrontier).toEqual({ 'replica-A': 4 });
+  });
+
+  it('defers content-lane progress accepted during a graph drain without a backlog scan', async () => {
+    let mat: ReturnType<typeof createConnectionsMaterializer> | null = null;
+    let readMergedCalls = 0;
+    let latestProgress: MaterializerProgress | null = null;
+    const graphEvent = buildEvent({
+      seq: 1,
+      type: NAVIGATION_COMMITTED,
+      payload: {
+        payloadVersion: 1,
+        tabId: 1,
+        windowId: 1,
+        url: 'https://example.test/article',
+        committedAt: '2026-05-23T23:00:00.000Z',
+      },
+    });
+    const contentEvent = buildEvent({
+      seq: 2,
+      type: PAGE_EVIDENCE_EXTRACTED,
+      payload: {
+        payloadVersion: 1,
+        canonicalUrl: 'https://example.test/article',
+        extractedAt: '2026-05-23T23:00:01.000Z',
+      },
+    });
+    const store: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async (_snapshot, progress) => {
+        latestProgress = progress;
+        mat?.onAccepted(contentEvent, { origin: 'local' });
+      },
+      writeMaterializerProgress: async (progress) => {
+        latestProgress = progress;
+      },
+      readMaterializerProgress: async () => latestProgress,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    mat = createMat({
+      store,
+      events: [graphEvent],
+      onReadMerged: () => {
+        readMergedCalls += 1;
+      },
+    });
+
+    await mat.catchUp({} as any);
+    await mat.awaitIdle();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(readMergedCalls).toBe(1);
+    expect(latestProgress?.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
+    expect(latestProgress?.appliedFrontier).toEqual({ 'replica-A': 2 });
+    expect(mat.health().pending).toBe(false);
   });
 
   it('catchUp advances a content-lane-only backlog without rebuilding graph rows', async () => {

@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { pickInstaller } from './install/index.js';
 import { ensurePageContentLexicalIndex } from './page-content/store.js';
+import { withBunSmolCommand } from './process/bunMemory.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
 import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
@@ -325,7 +326,8 @@ const spawnMcpServer = (input: {
     '--mcp-auth-key',
     input.mcpAuthKey,
   ];
-  const child = spawn(process.execPath, args, {
+  const command = withBunSmolCommand([process.execPath, ...args]);
+  const child = spawn(command[0] ?? process.execPath, command.slice(1), {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (chunk: Buffer) => {
@@ -352,7 +354,9 @@ const resolveDefaultMcpBin = (): string => {
 
 const currentCompanionCommand = (): readonly string[] => {
   const entrypoint = process.argv[1];
-  return entrypoint === undefined ? [process.execPath] : [process.execPath, resolve(entrypoint)];
+  return withBunSmolCommand(
+    entrypoint === undefined ? [process.execPath] : [process.execPath, resolve(entrypoint)],
+  );
 };
 
 const relayUrl = (relay: StartedRelayServer): string => `ws://${relay.host}:${String(relay.port)}/`;

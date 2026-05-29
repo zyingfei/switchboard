@@ -1,4 +1,5 @@
 import type { AcceptedEvent } from './causal.js';
+import { getCaughtUpSharedEventStore } from './eventStore.js';
 import type { EventLog } from './eventLog.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
 import { runImportProjectors } from './projectors.js';
@@ -54,6 +55,24 @@ const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly Accepted
   return [...byId.values()];
 };
 
+const latestPerAggregateFromLog = async (
+  vaultRoot: string,
+  eventLog: EventLog,
+): Promise<readonly AcceptedEvent[]> => {
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) return latestPerAggregate(await eventLog.readMerged());
+  const byId = new Map<string, AcceptedEvent>();
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) {
+      const prior = byId.get(event.aggregateId);
+      if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
+        byId.set(event.aggregateId, event);
+      }
+    }
+  }, 2000);
+  return [...byId.values()];
+};
+
 export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHandle => {
   const intervalMs = deps.intervalMs ?? 30 * 60 * 1000;
   let stopped = false;
@@ -61,8 +80,7 @@ export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHan
   const scanOnce = async (): Promise<number> => {
     if (stopped) return 0;
     try {
-      const merged = await deps.eventLog.readMerged();
-      const latest = latestPerAggregate(merged);
+      const latest = await latestPerAggregateFromLog(deps.vaultRoot, deps.eventLog);
       for (const event of latest) {
         if (stopped) break;
         await runImportProjectors(

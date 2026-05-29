@@ -46,7 +46,16 @@ import {
   type RankerRetrainSkipReason,
 } from '../ranker/retrain.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+} from '../feedback/events.js';
 
 type DiagnosticCandidateMetric = string | number | boolean | null;
 
@@ -222,6 +231,39 @@ export interface WorkGraphHealthDeps {
 }
 
 const emptyEvents: readonly AcceptedEvent[] = [];
+const feedbackEventTypes = new Set<string>([
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+]);
+
+const readEventsForHealth = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+  predicate: (event: AcceptedEvent) => boolean,
+): Promise<readonly AcceptedEvent[]> => {
+  if (eventLog === undefined) return emptyEvents;
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) {
+    return (await eventLog.readMerged()).filter(predicate);
+  }
+  const events: AcceptedEvent[] = [];
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) {
+      if (predicate(event)) events.push(event);
+    }
+  }, 2000);
+  return events;
+};
+
+const readFeedbackEvents = (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<readonly AcceptedEvent[]> =>
+  readEventsForHealth(vaultRoot, eventLog, (event) => feedbackEventTypes.has(event.type));
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
@@ -892,8 +934,12 @@ export const collectWorkGraphHealth = async ({
   now = () => new Date(),
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
-  const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
-  const feedback = projectFeedback(merged);
+  const feedback = projectFeedback(await readFeedbackEvents(vaultRoot, eventLog));
+  const merged = await readEventsForHealth(
+    vaultRoot,
+    eventLog,
+    (event) => event.type === 'recall.served' || event.type === 'recall.action',
+  );
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [
     activeManifest,

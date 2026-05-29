@@ -34,7 +34,7 @@
     "format": "bunx --bun --no-install prettier --write .",
     "format:check": "bunx --bun --no-install prettier --check .",
     "lint:openapi": "bunx --bun --no-install spectral lint openapi.yaml --ruleset ../../configs/openapi/api-style-rules.yaml",
-    "start": "bun dist/cli.js",
+    "start": "bun --smol dist/cli.js",
     "test": "bunx --no-install vitest run",
     "test:watch": "bunx --no-install vitest",
     "eval:recall": "bunx --no-install vitest run src/recall-v2/eval/index.test.ts"

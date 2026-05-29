@@ -1,5 +1,7 @@
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { mkdir, open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 
 import {
   type AcceptedEvent,
@@ -185,6 +187,43 @@ export interface EventLog {
     input: AppendInput<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
   readonly readMerged: () => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Watermark-resume read: events strictly past `frontier`, read
+   * directly from shard tails (newest shard first, short-circuiting
+   * whole shards whose tail seq is already covered). Independent of
+   * the readMerged memo — the connections materializer advances its
+   * frontier with this without materializing the full log.
+   */
+  readonly readMergedSince: (frontier: VersionVector) => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Stream every event one at a time (O(1) memory) — never materialises
+   * the merged array. For boot consumers that only need a small subset.
+   * Shard order, not merged order.
+   */
+  readonly streamEvents: (
+    onEvent: (event: AcceptedEvent) => void,
+    typeHints?: ReadonlySet<string>,
+  ) => Promise<void>;
+  /**
+   * Streamed `(await readMerged()).filter(predicate)` — collects only the
+   * matching subset, then sorts it identically to the merged array. Use
+   * when the subset is small (filter callers) to avoid warming the memo.
+   * Pass `typeHints` (the event types the predicate accepts) to skip
+   * JSON.parse on non-matching lines — avoids parsing the high-volume
+   * engagement.interval bulk entirely.
+   */
+  readonly streamFiltered: (
+    predicate: (event: AcceptedEvent) => boolean,
+    typeHints?: ReadonlySet<string>,
+  ) => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Cheap content signature of the durable log (shard mtimes + sizes).
+   * Changes iff any shard was appended/added. Lets callers cache derived
+   * projections and serve them on an unchanged log WITHOUT calling
+   * readMerged() — so the full-log memo can idle out instead of being
+   * re-warmed by every poll.
+   */
+  readonly logSignature: () => Promise<string>;
   readonly readReplica: (replicaId: string) => Promise<readonly AcceptedEvent[]>;
   readonly readByAggregate: (aggregateId: string) => Promise<readonly AcceptedEvent[]>;
   readonly findByClientEventId: (clientEventId: string) => Promise<AcceptedEvent | null>;
@@ -295,6 +334,103 @@ const readLogFile = async (path: string): Promise<AcceptedEvent[]> => {
   return events;
 };
 
+// Streaming tail-read helpers for `readMergedSince` — the watermark-resume
+// path the connections materializer uses to advance its frontier without
+// materializing the full merged log. Reads only past the frontier and
+// short-circuits whole shards via their last-line seq.
+const readLogFileSince = async (
+  path: string,
+  frontier: VersionVector,
+  expectedReplicaId?: string,
+): Promise<{ readonly events: AcceptedEvent[]; readonly maxSeq: number | null }> => {
+  const events: AcceptedEvent[] = [];
+  let maxSeq: number | null = null;
+  let stream: ReturnType<typeof createReadStream>;
+  try {
+    stream = createReadStream(path, { encoding: 'utf8' });
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return { events, maxSeq };
+    }
+    throw error;
+  }
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  let processed = 0;
+  try {
+    for await (const line of lines) {
+      const event = parseLine(line);
+      if (
+        event !== null &&
+        (expectedReplicaId === undefined || event.dot.replicaId === expectedReplicaId)
+      ) {
+        maxSeq = Math.max(maxSeq ?? 0, event.dot.seq);
+        if (event.dot.seq > (frontier[event.dot.replicaId] ?? 0)) {
+          events.push(event);
+        }
+      }
+      processed += 1;
+      if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+    }
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return { events, maxSeq };
+    }
+    throw error;
+  }
+  return { events, maxSeq };
+};
+
+const TAIL_READ_CHUNK_BYTES = 64 * 1024;
+
+const readLastNonEmptyLine = async (path: string): Promise<string | null> => {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, 'r');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+
+  try {
+    const { size } = await handle.stat();
+    let position = size;
+    let suffix = '';
+    while (position > 0) {
+      const readLength = Math.min(TAIL_READ_CHUNK_BYTES, position);
+      position -= readLength;
+      const buffer = Buffer.allocUnsafe(readLength);
+      const { bytesRead } = await handle.read(buffer, 0, readLength, position);
+      suffix = `${buffer.subarray(0, bytesRead).toString('utf8')}${suffix}`;
+      const withoutTrailingBreaks = suffix.replace(/[\r\n]+$/u, '');
+      if (withoutTrailingBreaks.length === 0) continue;
+      const lineBreak = withoutTrailingBreaks.lastIndexOf('\n');
+      if (lineBreak >= 0 || position === 0) {
+        return withoutTrailingBreaks.slice(lineBreak + 1);
+      }
+    }
+    return null;
+  } finally {
+    await handle.close();
+  }
+};
+
+const readShardTailSeq = async (
+  path: string,
+  expectedReplicaId: string,
+): Promise<number | null> => {
+  const line = await readLastNonEmptyLine(path);
+  if (line === null) return null;
+  const event = parseLine(line);
+  if (event === null || event.dot.replicaId !== expectedReplicaId) return null;
+  return event.dot.seq;
+};
+
 const listJsonlFiles = async (dir: string): Promise<string[]> => {
   let entries;
   try {
@@ -374,6 +510,40 @@ export const createEventLog = (
   let mergedInFlight: { signature: string; promise: Promise<readonly AcceptedEvent[]> } | null =
     null;
 
+  // Idle TTL eviction for the full-log memo. The memo holds every
+  // AcceptedEvent as a JS object; on an active vault that is hundreds
+  // of MB. Without eviction it lives for the whole process lifetime
+  // even when nothing reads it. The sweep drops it after the log has
+  // been idle (no readMerged access) for MERGED_MEMO_IDLE_MS; the next
+  // reader rebuilds from disk. One unref'd timer slot, clear-before-rearm,
+  // and it bails while a miss is in flight (the resolution re-installs +
+  // re-schedules).
+  const MERGED_MEMO_IDLE_MS = 60_000;
+  let mergedMemoLastAccessMs = 0;
+  let mergedMemoSweepTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelMergedSweep = (): void => {
+    if (mergedMemoSweepTimer !== null) {
+      clearTimeout(mergedMemoSweepTimer);
+      mergedMemoSweepTimer = null;
+    }
+  };
+  const scheduleMergedSweep = (delayMs: number): void => {
+    cancelMergedSweep();
+    const t = setTimeout(() => {
+      mergedMemoSweepTimer = null;
+      if (mergedInFlight !== null) return;
+      if (mergedMemo === null) return;
+      const idleMs = Date.now() - mergedMemoLastAccessMs;
+      if (idleMs >= MERGED_MEMO_IDLE_MS) {
+        mergedMemo = null;
+      } else {
+        scheduleMergedSweep(MERGED_MEMO_IDLE_MS - idleMs);
+      }
+    }, delayMs);
+    t.unref?.();
+    mergedMemoSweepTimer = t;
+  };
+
   const computeLogSignature = async (): Promise<string> => {
     const ids = await listReplicaIds();
     const parts: string[] = [];
@@ -403,6 +573,7 @@ export const createEventLog = (
   const readMerged = async (): Promise<readonly AcceptedEvent[]> => {
     const signature = await computeLogSignature();
     if (mergedMemo !== null && mergedMemo.signature === signature) {
+      mergedMemoLastAccessMs = Date.now();
       return mergedMemo.value;
     }
     if (mergedInFlight !== null && mergedInFlight.signature === signature) {
@@ -412,6 +583,10 @@ export const createEventLog = (
       try {
         const value = await readMergedUncached();
         mergedMemo = { signature, value };
+        // Anchor the eviction timer to install time, not the prior
+        // last-access, so the sweep can't fire against a stale memo.
+        mergedMemoLastAccessMs = Date.now();
+        scheduleMergedSweep(MERGED_MEMO_IDLE_MS);
         return value;
       } finally {
         if (mergedInFlight !== null && mergedInFlight.signature === signature) {
@@ -421,6 +596,100 @@ export const createEventLog = (
     })();
     mergedInFlight = { signature, promise };
     return promise;
+  };
+
+  const readMergedSince = async (frontier: VersionVector): Promise<readonly AcceptedEvent[]> => {
+    const ids = await listReplicaIds();
+    const out: AcceptedEvent[] = [];
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort().reverse();
+      const frontierSeq = frontier[id] ?? 0;
+      let parseBeforeTailCheck = true;
+      for (const file of files) {
+        if (!parseBeforeTailCheck) {
+          const shardTailSeq = await readShardTailSeq(file, id);
+          if (shardTailSeq !== null && shardTailSeq <= frontierSeq) break;
+        }
+        const shard = await readLogFileSince(file, frontier, id);
+        for (const event of shard.events) {
+          out.push(event);
+        }
+        if (shard.maxSeq !== null && shard.maxSeq <= frontierSeq) break;
+        parseBeforeTailCheck = false;
+      }
+    }
+    return sortAcceptedEvents(out);
+  };
+
+  // Stream every event through `onEvent` one at a time, O(1) memory —
+  // never materialises the full merged array. The boot consumers that
+  // only need a small subset (privacy: 3 types; recall freshness: a
+  // count; projection: structural types) use this instead of
+  // readMerged() so they don't each warm the ~700MB full-log memo.
+  // Shard order (per-replica seq, replicas concatenated); callers that
+  // need merged order use streamFiltered (which sorts the subset).
+  const streamEvents = async (
+    onEvent: (event: AcceptedEvent) => void,
+    typeHints?: ReadonlySet<string>,
+  ): Promise<void> => {
+    // Pre-parse type skip: when the caller only wants specific event
+    // types, test the raw line for `"type":"<t>"` BEFORE JSON.parse.
+    // The ~173k engagement.interval lines (88% of the log) then never
+    // get parsed, so the transient parse garbage that sets the libpas
+    // high-water is never allocated. Safe: the type field is always
+    // serialised as `"type":"value"` with the closing quote, so there
+    // are no false negatives (and a substring type can't false-match a
+    // longer type); a stray match inside a payload only costs one wasted
+    // parse, which the caller's predicate still filters out.
+    const needles = typeHints === undefined ? null : [...typeHints].map((t) => `"type":"${t}"`);
+    const ids = await listReplicaIds();
+    let processed = 0;
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort();
+      for (const file of files) {
+        let stream: ReturnType<typeof createReadStream>;
+        try {
+          stream = createReadStream(file, { encoding: 'utf8' });
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+          throw error;
+        }
+        const lines = createInterface({ input: stream, crlfDelay: Infinity });
+        try {
+          for await (const line of lines) {
+            if (needles === null || needles.some((n) => line.includes(n))) {
+              const event = parseLine(line);
+              if (event !== null) onEvent(event);
+            }
+            processed += 1;
+            if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+              await new Promise<void>((resolve) => {
+                setImmediate(resolve);
+              });
+            }
+          }
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+          throw error;
+        }
+      }
+    }
+  };
+
+  // Streamed equivalent of `(await readMerged()).filter(predicate)`:
+  // collects only the matching subset (bounded), then sorts it the same
+  // way readMerged does. Byte-identical ordering to filtering the merged
+  // array, because a total order is stable under subsetting — so callers
+  // that fold/last-write-wins over the result are unaffected.
+  const streamFiltered = async (
+    predicate: (event: AcceptedEvent) => boolean,
+    typeHints?: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    const out: AcceptedEvent[] = [];
+    await streamEvents((event) => {
+      if (predicate(event)) out.push(event);
+    }, typeHints);
+    return sortAcceptedEvents(out);
   };
 
   const readByAggregate = async (aggregateId: string): Promise<readonly AcceptedEvent[]> => {
@@ -611,6 +880,10 @@ export const createEventLog = (
     appendClientObservedBatch,
     appendServerObserved,
     readMerged,
+    readMergedSince,
+    streamEvents,
+    streamFiltered,
+    logSignature: computeLogSignature,
     readReplica,
     readByAggregate,
     findByClientEventId,

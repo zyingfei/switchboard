@@ -49,6 +49,7 @@ import {
   serializeTabSessionProjection,
   tabSessionProjectionAccumulatorFromSerialized,
   tabSessionProjectionFromAccumulator,
+  type SerializedTabSessionProjectionAccumulator,
   type SerializedTabSessionProjection,
   type TabSessionRecord,
   type TabSessionProjection,
@@ -56,6 +57,7 @@ import {
 import {
   foldEventIntoUrlProjectionAccumulator,
   serializeUrlProjection,
+  type SerializedUrlProjectionAccumulator,
   type SerializedUrlProjection,
   type UrlAttribution,
   type UrlPageEvidenceSummary,
@@ -3617,7 +3619,11 @@ export interface ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     dirtyScopes?: ReadonlySet<Scope>,
+    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ) => Promise<void>;
+  readonly readProjectionAccumulatorState?: (
+    name: string,
+  ) => Promise<ConnectionsProjectionAccumulatorState | null>;
   readonly applyProjectionEventOverlay?: (event: AcceptedEvent) => Promise<string | null>;
   readonly writeMaterializerProgress?: (progress: MaterializerProgress) => Promise<void>;
   readonly readMaterializerProgress: (name: string) => Promise<MaterializerProgress | null>;
@@ -3637,6 +3643,7 @@ export interface ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
+    readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
     // 'replace' (default): persist input.progress verbatim, advancing
     // both applied dot intervals and snapshotRevisionId. Used by the
     // deterministic drain path that has freshly-computed progress.
@@ -3658,6 +3665,8 @@ export interface ConnectionsStore {
 
 const SNAPSHOTS_DIR = 'snapshots';
 const CONNECTIONS_STORE_JSON_FLAG = 'json';
+const projectionAccumulatorMetadataKey = (name: string): string =>
+  `projection_accumulators:${name}`;
 
 interface SqliteStatement {
   readonly run: (...params: readonly unknown[]) => unknown;
@@ -3706,6 +3715,15 @@ export interface StoredConnectionsMetadata {
   readonly snapshotRevision?: string;
 }
 
+export interface ConnectionsProjectionAccumulatorState {
+  readonly materializerName: string;
+  readonly materializerVersion: string;
+  readonly appliedDotIntervals: MaterializerProgress['appliedDotIntervals'];
+  readonly appliedFrontier: MaterializerProgress['appliedFrontier'];
+  readonly urlAccumulator: SerializedUrlProjectionAccumulator;
+  readonly tabSessionAccumulator: SerializedTabSessionProjectionAccumulator;
+}
+
 const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMetadata => ({
   scope: snapshot.scope,
   updatedAt: snapshot.updatedAt,
@@ -3742,8 +3760,8 @@ const snapshotFromParts = (
 });
 
 const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
-const incrementalScopesEnabled = (): boolean =>
-  process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] !== '0';
+// IVM is the only supported path — env-opt-out removed.
+const incrementalScopesEnabled = (): boolean => true;
 const SQLITE_IN_CLAUSE_CHUNK_SIZE = 400;
 const RESOLVER_SUBGRAPH_HOPS = 4;
 const RESOLVER_URL_SUBGRAPH_HOPS = 2;
@@ -4042,6 +4060,43 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   // a single bulk read. Invalidated when any readCurrent-input writer
   // commits (see #bumpWriteSeq).
   #cachedSnapshot: { readonly revision: string; readonly value: ConnectionsSnapshot } | null = null;
+  // Idle eviction. The cached snapshot is the second-largest JS-heap
+  // holder (~150 MB inflated for 6700 nodes + 25k edges). Drains read
+  // it back-to-back during a burst, but it's referenced rarely
+  // between bursts. Evict after CACHED_SNAPSHOT_IDLE_MS of no access
+  // so the GC can reclaim during idle stretches; the next reader pays
+  // the paged-read cost again (sub-100ms per page). Eviction is
+  // independent of the H6 writer-interleave retry — that loop already
+  // re-enters the paged-read path on stale.
+  static readonly #CACHED_SNAPSHOT_IDLE_MS = 60_000;
+  #cachedSnapshotLastAccessMs = 0;
+  #cachedSnapshotSweepTimer: ReturnType<typeof setTimeout> | null = null;
+  #dropCachedSnapshot = (): void => {
+    this.#cachedSnapshot = null;
+    this.#cachedSnapshotLastAccessMs = 0;
+    this.#cancelCachedSnapshotSweep();
+  };
+  #cancelCachedSnapshotSweep = (): void => {
+    if (this.#cachedSnapshotSweepTimer !== null) {
+      clearTimeout(this.#cachedSnapshotSweepTimer);
+      this.#cachedSnapshotSweepTimer = null;
+    }
+  };
+  #scheduleCachedSnapshotSweep = (delayMs: number): void => {
+    this.#cancelCachedSnapshotSweep();
+    const t = setTimeout(() => {
+      this.#cachedSnapshotSweepTimer = null;
+      if (this.#cachedSnapshot === null) return;
+      const idleMs = Date.now() - this.#cachedSnapshotLastAccessMs;
+      if (idleMs >= SqliteConnectionsStore.#CACHED_SNAPSHOT_IDLE_MS) {
+        this.#cachedSnapshot = null;
+      } else {
+        this.#scheduleCachedSnapshotSweep(SqliteConnectionsStore.#CACHED_SNAPSHOT_IDLE_MS - idleMs);
+      }
+    }, delayMs);
+    t.unref?.();
+    this.#cachedSnapshotSweepTimer = t;
+  };
 
   constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
     this.#root = join(vaultRoot, '_BAC', 'connections');
@@ -4074,6 +4129,37 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+        -- Queryable edge index (P3): edge_id -> (src, dst, kind). Lets
+        -- readEdge do an O(1) bucket lookup instead of a full-table scan, and
+        -- enables server-side edgeKind filtering. It is NEVER read during
+        -- snapshot reconstruction (readCurrent/readSubgraph), so it is
+        -- byte-invisible to the served graph and to snapshotRevision (a
+        -- metadata-only hash). Auto-maintained by triggers off the edges
+        -- bucket JSON, so EVERY writer (writeCurrentRows, replaceScopeRows,
+        -- future) keeps it in sync without per-site code. Edge IDs encode
+        -- (kind, from, to) and the bucket key is (from, to), so each edge_id
+        -- maps to a fixed (src, dst) — it can never move buckets.
+        CREATE TABLE IF NOT EXISTS edges_index (
+          edge_id TEXT PRIMARY KEY,
+          src TEXT NOT NULL,
+          dst TEXT NOT NULL,
+          kind TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_index_kind ON edges_index(kind);
+        CREATE TRIGGER IF NOT EXISTS trg_edges_index_ai AFTER INSERT ON edges BEGIN
+          INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
+          SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
+          FROM json_each(NEW.data) e;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_edges_index_au AFTER UPDATE ON edges BEGIN
+          DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst;
+          INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
+          SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
+          FROM json_each(NEW.data) e;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_edges_index_ad AFTER DELETE ON edges BEGIN
+          DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst;
+        END;
         CREATE TABLE IF NOT EXISTS connections_scope_nodes (
           scope_kind TEXT NOT NULL,
           scope_id TEXT NOT NULL,
@@ -4119,6 +4205,25 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           PRIMARY KEY (visit_id, snapshot_revision)
         );
       `);
+      // One-time backfill of edges_index for DBs created before it existed;
+      // the triggers maintain it on every subsequent edge write. Gated to run
+      // at most once (index empty while edges exist) so steady-state boots
+      // skip the json_each scan.
+      const edgesIndexNeedsBackfill =
+        (
+          this.#db
+            .query(
+              'SELECT ((SELECT COUNT(*) FROM edges) > 0 AND (SELECT COUNT(*) FROM edges_index) = 0) AS need',
+            )
+            .get() as { need: number } | undefined
+        )?.need === 1;
+      if (edgesIndexNeedsBackfill) {
+        this.#db.exec(`
+          INSERT OR IGNORE INTO edges_index (edge_id, src, dst, kind)
+          SELECT json_extract(e.value, '$.id'), edges.src, edges.dst, json_extract(e.value, '$.kind')
+          FROM edges, json_each(edges.data) e;
+        `);
+      }
       this.#initialized = true;
     }
     return this.#db;
@@ -4297,6 +4402,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     return await this.#readMetadata(db);
   };
 
+  readonly readProjectionAccumulatorState = async (
+    name: string,
+  ): Promise<ConnectionsProjectionAccumulatorState | null> => {
+    const db = await this.#database();
+    const row = db
+      .query('SELECT data FROM metadata WHERE key = ?')
+      .get(projectionAccumulatorMetadataKey(name));
+    if (row === null || row === undefined) return null;
+    return JSON.parse(textField(row, 'data')) as ConnectionsProjectionAccumulatorState;
+  };
+
   readonly vacuum = async (): Promise<void> => {
     const db = await this.#database();
     db.exec('VACUUM');
@@ -4379,6 +4495,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     dirtyScopes?: ReadonlySet<Scope>,
+    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ): Promise<void> => {
     const db = await this.#database();
     const shouldBootstrapScopeMembership = this.#writeCurrentRows(
@@ -4386,6 +4503,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       snapshot,
       progress,
       dirtyScopes,
+      projectionAccumulatorState,
     );
     if (shouldBootstrapScopeMembership) {
       setImmediate(() => {
@@ -4463,7 +4581,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // this commit.
       this.#bumpWriteSeq(db);
       db.exec('COMMIT');
-      this.#cachedSnapshot = null;
+      this.#dropCachedSnapshot();
       return snapshotRevision;
     } catch (error) {
       db.exec('ROLLBACK');
@@ -4552,6 +4670,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
+    readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
     readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
     const db = await this.#database();
@@ -4822,6 +4941,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       upsertMetadata.run('current', JSON.stringify(metadata));
       upsertMetadata.run('node_order', JSON.stringify(nodeOrder));
       upsertMetadata.run('edge_order', JSON.stringify(edgeOrder));
+      if (input.projectionAccumulatorState !== undefined) {
+        upsertMetadata.run(
+          projectionAccumulatorMetadataKey(input.projectionAccumulatorState.materializerName),
+          JSON.stringify(input.projectionAccumulatorState),
+        );
+      }
       const baseProgress =
         input.progressMode === 'snapshot-revision-only'
           ? // Read persisted progress INSIDE this transaction so we don't
@@ -4841,7 +4966,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // token so the pre/post check fires.
       this.#bumpWriteSeq(db);
       db.exec('COMMIT');
-      this.#cachedSnapshot = null;
+      this.#dropCachedSnapshot();
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
@@ -4910,6 +5035,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress | null,
     dirtyScopes?: ReadonlySet<Scope>,
+    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ): boolean {
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
@@ -5060,6 +5186,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      if (projectionAccumulatorState !== undefined) {
+        upsertMetadata.run(
+          projectionAccumulatorMetadataKey(projectionAccumulatorState.materializerName),
+          JSON.stringify(projectionAccumulatorState),
+        );
+      }
       // H6: writeCurrentRows mutates nodes/edges/current/node_order/
       // edge_order — all readCurrent inputs. Bump the commit token.
       this.#bumpWriteSeq(db);
@@ -5067,7 +5199,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.exec('COMMIT');
       // Invalidate the readCurrent memo — the next read will see the
       // new snapshotRevision and rebuild.
-      this.#cachedSnapshot = null;
+      this.#dropCachedSnapshot();
       return progress !== null && scopeMembershipEmpty;
     } catch (error) {
       db.exec('ROLLBACK');
@@ -5258,8 +5390,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
     const revisionKey = metadata.snapshotRevision ?? '';
-    const cached = this.#cachedSnapshot;
-    if (cached !== null && cached.revision === revisionKey) return cached.value;
+    if (this.#cachedSnapshot !== null && this.#cachedSnapshot.revision === revisionKey) {
+      this.#cachedSnapshotLastAccessMs = Date.now();
+      return this.#cachedSnapshot.value;
+    }
+    if (this.#cachedSnapshot !== null) {
+      // The fork-per-drain child writes new current.db revisions without
+      // touching this main-process memo. Release the stale full graph
+      // before paging the replacement into JS objects so the allocator can
+      // reuse those freed pages instead of growing for old + new graphs.
+      this.#dropCachedSnapshot();
+    }
     // H6: capture write_seq BEFORE any paged read. We compare the
     // post-read value with this to detect a writer that committed
     // between our reads. snapshotRevision alone isn't sufficient —
@@ -5354,6 +5495,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
     const result = snapshotFromParts(metadata, nodes, edges);
     this.#cachedSnapshot = { revision: revisionKey, value: result };
+    this.#cachedSnapshotLastAccessMs = Date.now();
+    // Anchor the eviction timer to install time, not last-access.
+    // Same race avoidance as the eventLog mergedMemo sweep.
+    this.#scheduleCachedSnapshotSweep(SqliteConnectionsStore.#CACHED_SNAPSHOT_IDLE_MS);
     return result;
   };
 
@@ -5440,6 +5585,23 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
     const db = await this.#database();
+    // O(1) path: edges_index maps edge_id -> (src, dst), so we read only that
+    // one bucket via the (src, dst) primary key instead of scanning every
+    // edge bucket. The index is auto-maintained by triggers (see #database).
+    const idxRow = db.query('SELECT src, dst FROM edges_index WHERE edge_id = ?').get(edgeId);
+    if (idxRow !== null && idxRow !== undefined) {
+      const bucketRow = db
+        .query('SELECT data FROM edges WHERE src = ? AND dst = ?')
+        .get(textField(idxRow, 'src'), textField(idxRow, 'dst'));
+      if (bucketRow !== null && bucketRow !== undefined) {
+        const match = (JSON.parse(textField(bucketRow, 'data')) as ConnectionEdge[]).find(
+          (edge) => edge.id === edgeId,
+        );
+        if (match !== undefined) return match;
+      }
+    }
+    // Fallback full scan: covers an index miss (e.g. an edge written in the
+    // same tick a pre-index DB is being backfilled). Correctness over speed.
     for (const row of db.query('SELECT data FROM edges').all()) {
       const match = (JSON.parse(textField(row, 'data')) as ConnectionEdge[]).find(
         (edge) => edge.id === edgeId,
@@ -5527,9 +5689,19 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     _dirtyScopes?: ReadonlySet<Scope>,
+    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ): Promise<void> => {
     await putCurrent(snapshot);
-    await writeAtomic(progressPath, JSON.stringify(progress, null, 2));
+    await writeAtomic(
+      progressPath,
+      JSON.stringify(
+        projectionAccumulatorState === undefined
+          ? progress
+          : { ...progress, projectionAccumulatorState },
+        null,
+        2,
+      ),
+    );
   };
 
   const writeMaterializerProgress = async (progress: MaterializerProgress): Promise<void> => {
@@ -5540,6 +5712,21 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     try {
       const progress = JSON.parse(await readFile(progressPath, 'utf8')) as MaterializerProgress;
       return progress.materializerName === name ? progress : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const readProjectionAccumulatorState = async (
+    name: string,
+  ): Promise<ConnectionsProjectionAccumulatorState | null> => {
+    try {
+      const progress = JSON.parse(await readFile(progressPath, 'utf8')) as {
+        readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
+      };
+      const state = progress.projectionAccumulatorState;
+      if (state === undefined) return null;
+      return state.materializerName === name ? state : null;
     } catch {
       return null;
     }
@@ -5622,6 +5809,7 @@ export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
     writeSnapshotAndProgress,
     writeMaterializerProgress,
     readMaterializerProgress,
+    readProjectionAccumulatorState,
     readCurrent,
     putDay,
     readDay,

@@ -128,9 +128,12 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
+  createEmptyTabSessionProjectionAccumulator,
   deserializeTabSessionProjection,
+  foldEventIntoTabSessionProjectionAccumulator,
   projectTabSessions,
   serializeTabSessionProjection,
+  tabSessionProjectionFromAccumulator,
   tabSessionInbox,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
@@ -144,10 +147,13 @@ import {
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import {
+  createEmptyUrlProjectionAccumulator,
   deserializeUrlProjection,
+  foldEventIntoUrlProjectionAccumulator,
   projectUrls,
   serializeUrlProjection,
   urlInbox,
+  urlProjectionFromAccumulator,
   type UrlProjection,
 } from '../urls/projection.js';
 import { autoApplyUrlAttribution } from '../urls/autoApply.js';
@@ -170,6 +176,7 @@ import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.j
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import {
@@ -659,15 +666,86 @@ const readBody = async (request: IncomingMessage): Promise<unknown> => {
 };
 
 const responseHeaders = {
-  'access-control-allow-headers': 'content-type,x-bac-bridge-key,idempotency-key',
+  'access-control-allow-headers': 'content-type,x-bac-bridge-key,idempotency-key,if-none-match',
   'access-control-allow-methods': 'GET,POST,PATCH,PUT,DELETE,OPTIONS',
   'access-control-allow-origin': '*',
+  'access-control-expose-headers': 'etag',
   'content-type': 'application/json; charset=utf-8',
 };
 
 const sendJson = (response: ServerResponse, status: number, value: unknown): void => {
   response.writeHead(status, responseHeaders);
   response.end(status === 204 ? '' : `${JSON.stringify(value)}\n`);
+};
+
+// Conditional-GET helper: hash the response body, compare against
+// `If-None-Match`, return a body-less 304 if it matches. The companion
+// still computes the response (existing in-memory memos / cachedRoute
+// keep the work cheap), but skips wire-format JSON serialisation cost
+// for the extension AND lets the extension's `loadX` cycle short-circuit
+// without re-decoding + re-setting React state. Wired in the GET dispatch
+// path below; non-GET methods pass straight through.
+const ETAG_OK_STATUSES = new Set<number>([200]);
+// `requestId` is generated per-request (used for log correlation), so
+// it differs even when the underlying response state is unchanged.
+// Strip it from the hash input so polled endpoints that embed it
+// (e.g. /v1/version, /v1/status) still produce a stable ETag.
+// Pattern handles both leading/trailing comma positions.
+const REQUEST_ID_HASH_STRIP_RE = /,?"requestId":"[^"]*"|"requestId":"[^"]*",?/g;
+// Body hash via FNV-1a 64-bit, computed inline. We deliberately do NOT
+// use `node:crypto` here — `createHash('sha256')` on Bun's polyfill
+// allocates a SubtleCrypto wrapper + a chain of helpers (TextEncoder,
+// WeakMap, RegExp, MIMEParams) per call that JSC retains stubbornly.
+// At hot-poll rates (~2 req/s × ~75% reaching this path) those wrappers
+// accumulate into the millions before GC catches up — heap snapshots
+// showed 1.18M SubtleCrypto instances after a few minutes, driving the
+// physical footprint from ~1 GB → 4+ GB. ETag doesn't need crypto-grade
+// collision resistance, just stable digesting; FNV-1a is allocation-free
+// and produces a 16-hex-char fingerprint that's plenty for cache validation.
+const FNV_OFFSET_64_LOW = 0xe6546b64 | 0;
+const FNV_OFFSET_64_HIGH = 0xcbf29ce4 | 0;
+const fnv1a64Hex = (input: string): string => {
+  let lo = FNV_OFFSET_64_LOW;
+  let hi = FNV_OFFSET_64_HIGH;
+  for (let i = 0; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    // XOR low half with current byte.
+    lo = (lo ^ code) | 0;
+    // Multiply [hi:lo] by 1099511628211 = 0x100000001b3. Decompose into
+    // two 32-bit chunks so we can stay in safe-integer arithmetic.
+    // h * 0x100000001b3 = h * 0x1 0000 0000 + h * 0x1b3
+    // Carry through both halves; mask to 32 bits each.
+    const newLo = Math.imul(lo, 0x1b3) | 0;
+    const carry = Math.floor(((lo >>> 0) * 0x1b3) / 0x100000000);
+    const newHi = (Math.imul(hi, 0x1b3) + carry + (lo | 0)) | 0;
+    lo = newLo;
+    hi = newHi;
+  }
+  // 16 hex chars: 8 from high half, 8 from low half. Right-shift then
+  // zero-pad to keep the same width regardless of leading zeros.
+  const hiHex = ((hi >>> 0).toString(16)).padStart(8, '0');
+  const loHex = ((lo >>> 0).toString(16)).padStart(8, '0');
+  return `${hiHex}${loHex}`;
+};
+const computeBodyEtag = (status: number, value: unknown): string | null => {
+  if (!ETAG_OK_STATUSES.has(status)) return null;
+  const serialised = JSON.stringify(value).replace(REQUEST_ID_HASH_STRIP_RE, '');
+  return `"b-${fnv1a64Hex(serialised)}"`;
+};
+const sendJsonWithEtag = (
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+  etag: string,
+): void => {
+  response.writeHead(status, { ...responseHeaders, etag });
+  response.end(status === 204 ? '' : `${JSON.stringify(value)}\n`);
+};
+const send304 = (response: ServerResponse, etag: string): void => {
+  // 304 MUST NOT include a body. Surface ETag so the client can still
+  // refresh its cached copy's validator if it doesn't already store it.
+  response.writeHead(304, { ...responseHeaders, etag });
+  response.end();
 };
 
 const mutationResponse = (
@@ -1365,6 +1443,15 @@ interface ConnectionsResponseCacheEntry {
 }
 const connectionsResponseCache = new Map<string, ConnectionsResponseCacheEntry>();
 const connectionsResponseInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const connectionsResponseGraphKey = (key: string): string => key.split('|q=', 1)[0] ?? key;
+const pruneConnectionsResponseCacheForGraph = (key: string): void => {
+  const graphKey = connectionsResponseGraphKey(key);
+  for (const cachedKey of connectionsResponseCache.keys()) {
+    if (connectionsResponseGraphKey(cachedKey) !== graphKey) {
+      connectionsResponseCache.delete(cachedKey);
+    }
+  }
+};
 const statSig = async (path: string): Promise<string> => {
   try {
     const s = await stat(path);
@@ -1447,6 +1534,11 @@ const cachedConnectionsResponse = async (
   if (inFlight !== undefined) {
     return { result: await inFlight, etag: connectionsResponseEtag(key) };
   }
+  // Each cached /v1/connections response holds its nodes/edges arrays,
+  // which in turn keep that revision's materialized graph alive. Once a
+  // newer graph key is requested, drop older revision responses before
+  // build() calls readCurrent() and allocates the replacement snapshot.
+  pruneConnectionsResponseCacheForGraph(key);
   const compute = (async (): Promise<readonly [number, unknown]> => {
     try {
       const result = await build();
@@ -1458,12 +1550,27 @@ const cachedConnectionsResponse = async (
           etag: connectionsResponseEtag(key),
           computedAtMs: Date.now(),
         });
-        // Bound memory: the key changes every flush, so prune expired
-        // entries when the map grows (each entry can be ~14MB).
-        if (connectionsResponseCache.size > 16) {
-          const now = Date.now();
-          for (const [k, v] of connectionsResponseCache) {
-            if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+        // Bound resident memory: each cached response pins that revision's
+        // full filtered nodes/edges arrays (~14MB). First drop expired
+        // entries, then HARD-cap the count by evicting the oldest (by
+        // compute time). The cache is a pure memo keyed on revision+query,
+        // so a re-computed variant returns byte-identical output — eviction
+        // can only change hit rate, never bytes. Caps the worst-case
+        // resident set at ~N×fullGraph instead of 16×.
+        const MAX_CONNECTIONS_RESPONSE_CACHE = 4;
+        const now = Date.now();
+        for (const [k, v] of connectionsResponseCache) {
+          if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+        }
+        if (connectionsResponseCache.size > MAX_CONNECTIONS_RESPONSE_CACHE) {
+          const oldestFirst = [...connectionsResponseCache.entries()].sort(
+            (a, b) => a[1].computedAtMs - b[1].computedAtMs,
+          );
+          for (const [k] of oldestFirst.slice(
+            0,
+            oldestFirst.length - MAX_CONNECTIONS_RESPONSE_CACHE,
+          )) {
+            connectionsResponseCache.delete(k);
           }
         }
       }
@@ -2100,6 +2207,92 @@ const isPrivacyPayloadForType = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+const readEventsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+  predicate: (event: AcceptedEvent) => boolean,
+): Promise<readonly AcceptedEvent[]> => {
+  if (context.vaultRoot === undefined) {
+    return (await eventLog.readMerged()).filter(predicate);
+  }
+  const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+  if (store === null) return (await eventLog.readMerged()).filter(predicate);
+  const events: AcceptedEvent[] = [];
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) {
+      if (predicate(event)) events.push(event);
+    }
+  }, 2000);
+  return events;
+};
+
+// Signature-keyed projection caches. The /v1/visits and /v1/tabsessions
+// endpoints are polled frequently; without this each poll re-projected
+// ~every event (full readMerged() materialization + a full fold), which
+// (measured) churned ~860MB of RSS and kept the readMerged memo warm so
+// its idle TTL never fired. Keyed by the cheap log signature: on an
+// unchanged log we return the cached projection WITHOUT touching
+// readMerged()/the store, so the memo idles out and no garbage is
+// produced. Any shard append/add changes the signature → recompute.
+// Bounded: one entry per vaultRoot, holding the aggregated projection
+// (far smaller than the raw log).
+const urlProjectionCache = new Map<string, { sig: string; proj: UrlProjection }>();
+const tabSessionProjectionCache = new Map<string, { sig: string; proj: TabSessionProjection }>();
+
+const projectUrlsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<UrlProjection> => {
+  const key = context.vaultRoot ?? '<none>';
+  const sig = await eventLog.logSignature();
+  const cached = urlProjectionCache.get(key);
+  if (cached !== undefined && cached.sig === sig) return cached.proj;
+  let proj: UrlProjection;
+  if (context.vaultRoot === undefined) {
+    proj = projectUrls(await eventLog.readMerged());
+  } else {
+    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+    if (store === null) {
+      proj = projectUrls(await eventLog.readMerged());
+    } else {
+      const accumulator = createEmptyUrlProjectionAccumulator();
+      await store.forEachChunk((chunk) => {
+        for (const event of chunk) foldEventIntoUrlProjectionAccumulator(accumulator, event);
+      }, 2000);
+      proj = urlProjectionFromAccumulator(accumulator);
+    }
+  }
+  urlProjectionCache.set(key, { sig, proj });
+  return proj;
+};
+
+const projectTabSessionsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<TabSessionProjection> => {
+  const key = context.vaultRoot ?? '<none>';
+  const sig = await eventLog.logSignature();
+  const cached = tabSessionProjectionCache.get(key);
+  if (cached !== undefined && cached.sig === sig) return cached.proj;
+  let proj: TabSessionProjection;
+  if (context.vaultRoot === undefined) {
+    proj = projectTabSessions(await eventLog.readMerged());
+  } else {
+    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+    if (store === null) {
+      proj = projectTabSessions(await eventLog.readMerged());
+    } else {
+      const accumulator = createEmptyTabSessionProjectionAccumulator();
+      await store.forEachChunk((chunk) => {
+        for (const event of chunk) foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+      }, 2000);
+      proj = tabSessionProjectionFromAccumulator(accumulator);
+    }
+  }
+  tabSessionProjectionCache.set(key, { sig, proj });
+  return proj;
+};
+
 const isFeedbackEventType = (
   value: unknown,
 ): value is
@@ -2212,7 +2405,7 @@ const loadUrlProjection = async (
     };
   }
   return {
-    projection: projectUrls(await eventLog.readMerged()),
+    projection: await projectUrlsFromStoreOrLog(context, eventLog),
     snapshotRevision: snapshot?.snapshotRevision ?? null,
   };
 };
@@ -2235,16 +2428,10 @@ const loadTabSessionProjection = async (
   }
   const snapshot = await context.connectionsStore?.readCurrent();
   const snapshotRevision = snapshot?.snapshotRevision ?? null;
-  // Re-fold from the event log at most once (cold start / pre-R1
-  // snapshot) and reuse it for BOTH projections.
-  type Merged = Awaited<ReturnType<EventLog['readMerged']>>;
-  let merged: Merged | undefined;
-  const ensureMerged = async (): Promise<Merged> =>
-    merged ?? (merged = await eventLog.readMerged());
   const tab =
     snapshot?.tabSessionProjection !== undefined
       ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
-      : projectTabSessions(await ensureMerged());
+      : await projectTabSessionsFromStoreOrLog(context, eventLog);
   // Same snapshot's URL projection (no extra re-fold in steady state) —
   // a chat thread the user filed via the Current-tab card is a URL
   // attribution; overlay it so All-threads / inbox / the resolver stop
@@ -2252,7 +2439,7 @@ const loadTabSessionProjection = async (
   const url =
     snapshot?.urlProjection !== undefined
       ? deserializeUrlProjection(snapshot.urlProjection)
-      : projectUrls(await ensureMerged());
+      : await projectUrlsFromStoreOrLog(context, eventLog);
   return {
     projection: overlayUrlAttributionOntoTabSessions(tab, url),
     snapshotRevision,
@@ -2645,7 +2832,13 @@ const routes: readonly RouteDefinition[] = [
       }
       return [
         200,
-        { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) },
+        {
+          data: projectPrivacy(
+            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
+              isPrivacyEventType(event.type),
+            ),
+          ),
+        },
       ];
     },
   },
@@ -2687,7 +2880,11 @@ const routes: readonly RouteDefinition[] = [
           {
             data: {
               accepted,
-              projection: projectPrivacy(privacyEventsFrom(await eventLog.readMerged())),
+              projection: projectPrivacy(
+                await readEventsFromStoreOrLog(context, eventLog, (event) =>
+                  isPrivacyEventType(event.type),
+                ),
+              ),
             },
           },
         ];
@@ -2744,7 +2941,16 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      return [200, { data: projectFeedback(await context.eventLog.readMerged()) }];
+      return [
+        200,
+        {
+          data: projectFeedback(
+            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
+              isFeedbackEventType(event.type),
+            ),
+          ),
+        },
+      ];
     },
   },
   {
@@ -2858,10 +3064,11 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const merged = await context.eventLog!.readMerged();
           const resolverEvents = usesSqliteSubgraph
-            ? resolverSignalEventsForTabSession(merged, tabSessionId)
-            : merged;
+            ? await readEventsFromStoreOrLog(context, context.eventLog!, (event) =>
+                resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+              )
+            : await context.eventLog!.readMerged();
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
           const { projection } = await loadTabSessionProjection(context, context.eventLog!);
           if (!projection.bySessionId.has(tabSessionId)) {
@@ -2956,6 +3163,11 @@ const routes: readonly RouteDefinition[] = [
           if (!projection.bySessionId.has(tabSessionId)) {
             throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
           }
+          const resolverEvents = usesSqliteSubgraph
+            ? await readEventsFromStoreOrLog(context, eventLog, (event) =>
+                resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+              )
+            : await eventLog.readMerged();
           const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
           const policyTelemetry = optionalAttributionPolicyTelemetry(
             body['policyTelemetry'],
@@ -2965,6 +3177,8 @@ const routes: readonly RouteDefinition[] = [
             eventLog,
             snapshot,
             tabSessionId,
+            events: resolverEvents,
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
             ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
             ...(policyMode === undefined ? {} : { policyMode }),
             ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
@@ -3171,7 +3385,16 @@ const routes: readonly RouteDefinition[] = [
               : null;
           const usesSqliteSubgraph = sqliteStore !== null;
           const preloadedMerged =
-            usesSqliteSubgraph && expandEventCandidates ? await context.eventLog!.readMerged() : null;
+            usesSqliteSubgraph && expandEventCandidates
+              ? await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog!,
+                  (event) =>
+                    event.type === BROWSER_TIMELINE_OBSERVED ||
+                    event.type === USER_FLOW_REJECTED ||
+                    event.type === USER_ORGANIZED_ITEM,
+                )
+              : null;
           const expandedCandidateUrls =
             preloadedMerged === null
               ? []
@@ -3217,7 +3440,16 @@ const routes: readonly RouteDefinition[] = [
               ];
             }
           }
-          const merged = preloadedMerged ?? (await context.eventLog!.readMerged());
+          const merged =
+            preloadedMerged ??
+            (usesSqliteSubgraph
+              ? await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog!,
+                  (event) =>
+                    event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+                )
+              : await context.eventLog!.readMerged());
           const resolverEvents =
             usesSqliteSubgraph && expandEventCandidates
               ? [
@@ -3341,7 +3573,17 @@ const routes: readonly RouteDefinition[] = [
           }
           misses.push(canonicalUrl);
         }
-        const merged = misses.length === 0 ? [] : await context.eventLog.readMerged();
+        const merged =
+          misses.length === 0
+            ? []
+            : await readEventsFromStoreOrLog(
+                context,
+                context.eventLog,
+                (event) =>
+                  event.type === BROWSER_TIMELINE_OBSERVED ||
+                  event.type === USER_FLOW_REJECTED ||
+                  event.type === USER_ORGANIZED_ITEM,
+              );
         const expandedCandidateUrlsByTarget =
           eventCandidateTargetSet.size === 0
             ? new Map<string, readonly string[]>()
@@ -3492,15 +3734,17 @@ const routes: readonly RouteDefinition[] = [
           body['policyTelemetry'],
           'policyTelemetry',
         );
-        const merged = await eventLog.readMerged();
         const resolverEvents = usesSqliteSubgraph
-          ? resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl])
-          : merged;
+          ? await readEventsFromStoreOrLog(context, eventLog, (event) =>
+              resolverSignalEventsForCanonicalUrls([event], [canonicalUrl]).length > 0,
+            )
+          : await eventLog.readMerged();
         const result = await autoApplyUrlAttribution({
           eventLog,
           snapshot,
           canonicalUrl,
           events: resolverEvents,
+          ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
           ...(snapshotProjection === undefined ? {} : { urlProjection: snapshotProjection }),
           ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
           ...(policyMode === undefined ? {} : { policyMode }),
@@ -4267,8 +4511,9 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readMerged();
-      const dispatchEvents = merged.filter(
+      const dispatchEvents = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
         (event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
       );
       return [200, { data: projectDispatches(dispatchEvents) }];
@@ -5002,8 +5247,9 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readMerged();
-      const annotationEvents = merged.filter(
+      const annotationEvents = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
         (event) =>
           event.type === ANNOTATION_CREATED ||
           event.type === ANNOTATION_NOTE_SET ||
@@ -6110,18 +6356,20 @@ const routes: readonly RouteDefinition[] = [
         'wsproj',
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
-          const events = await context.eventLog!.readMerged();
+          const events = await readEventsFromStoreOrLog(
+            context,
+            context.eventLog!,
+            (event) => event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED,
+          );
           // Bucket per-bacId once so each projectWorkstream call sees
           // only its own events. Without bucketing this is
           // O(aggregates × events) and stalls the route on large
           // vaults — same fix as buildConnectionsSnapshot.
           const eventsByBacId = new Map<string, typeof events[number][]>();
           for (const event of events) {
-            if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
-              const existing = eventsByBacId.get(event.aggregateId);
-              if (existing === undefined) eventsByBacId.set(event.aggregateId, [event]);
-              else existing.push(event);
-            }
+            const existing = eventsByBacId.get(event.aggregateId);
+            if (existing === undefined) eventsByBacId.set(event.aggregateId, [event]);
+            else existing.push(event);
           }
           const projections = [...eventsByBacId.keys()]
             .sort()
@@ -6997,7 +7245,11 @@ const routes: readonly RouteDefinition[] = [
           if (context.eventLog !== undefined) {
             snap = applyFeedbackOverlayToSnapshot(
               snap,
-              projectFeedback(await context.eventLog.readMerged()),
+              projectFeedback(
+                await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
+                  isFeedbackEventType(event.type),
+                ),
+              ),
             );
           }
           snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
@@ -7089,7 +7341,11 @@ const routes: readonly RouteDefinition[] = [
           if (context.eventLog !== undefined) {
             sub = applyFeedbackOverlayToSnapshot(
               sub,
-              projectFeedback(await context.eventLog.readMerged()),
+              projectFeedback(
+                await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
+                  isFeedbackEventType(event.type),
+                ),
+              ),
             );
           }
           sub = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), sub);
@@ -7118,7 +7374,11 @@ const routes: readonly RouteDefinition[] = [
       if (context.eventLog !== undefined) {
         snap = applyFeedbackOverlayToSnapshot(
           snap,
-          projectFeedback(await context.eventLog.readMerged()),
+          projectFeedback(
+            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
+              isFeedbackEventType(event.type),
+            ),
+          ),
         );
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
@@ -7332,12 +7592,33 @@ export const handleRequest = async (
     const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
     const httpLogStartedMs = httpLog ? Date.now() : 0;
     const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
-    if (httpLog) {
+    const logHttp = (statusForLog: number): void => {
+      if (!httpLog) return;
       void appendFile(
         '/tmp/sidetrack-http-debug.log',
-        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(status)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
       ).catch(() => undefined);
+    };
+    // Conditional GET / response ETag. Restricted to GET because
+    // mutations (POST/PATCH/PUT/DELETE) have side effects we can't
+    // skip even if a duplicate request's response matches; the
+    // idempotency-key path already covers replay safety for those.
+    if (method === 'GET') {
+      const etag = computeBodyEtag(status, body);
+      if (etag !== null) {
+        const ifNoneMatch = request.headers['if-none-match'];
+        const incoming = Array.isArray(ifNoneMatch) ? ifNoneMatch[0] : ifNoneMatch;
+        if (typeof incoming === 'string' && incoming === etag) {
+          logHttp(304);
+          send304(response, etag);
+          return;
+        }
+        logHttp(status);
+        sendJsonWithEtag(response, status, body, etag);
+        return;
+      }
     }
+    logHttp(status);
     sendJson(response, status, body);
   } catch (error) {
     const issues = getValidationIssues(error);

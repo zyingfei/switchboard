@@ -13,6 +13,7 @@ import {
   type ConnectionsStore,
 } from '../../connections/snapshot.js';
 import { nodeIdFor } from '../../connections/types.js';
+import { RECALL_ACTION, RECALL_SERVED } from '../../recall/events.js';
 import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
@@ -44,6 +45,7 @@ const envKeys = [
   'SIDETRACK_SIMILARITY_THRESHOLD',
   'SIDETRACK_SIMILARITY_TOP_K',
   'SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS',
+  'SIDETRACK_CONNECTIONS_PHASE_LOG',
 ] as const;
 
 const at = (seq: number): number => Date.parse('2026-05-22T10:00:00.000Z') + seq;
@@ -254,6 +256,47 @@ const timelineObserved = (input: {
       transition: 'activated',
       payloadVersion: 1,
       dimensions: { engagement: { focusedWindowMs: 10_000 } },
+    },
+  });
+
+const recallServed = (input: {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly servedContextId: string;
+}): AcceptedEvent =>
+  event({
+    type: RECALL_SERVED,
+    replicaId: input.replicaId,
+    seq: input.seq,
+    aggregateId: input.servedContextId,
+    payload: {
+      payloadVersion: 1,
+      servedContextId: input.servedContextId,
+      query: 'planning',
+      intent: 'focus',
+      results: [],
+      rerankApplied: false,
+      sequenceNumber: input.seq,
+      servedAt: new Date(at(input.seq)).toISOString(),
+    },
+  });
+
+const recallAction = (input: {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly servedContextId: string;
+}): AcceptedEvent =>
+  event({
+    type: RECALL_ACTION,
+    replicaId: input.replicaId,
+    seq: input.seq,
+    aggregateId: input.servedContextId,
+    payload: {
+      payloadVersion: 1,
+      servedContextId: input.servedContextId,
+      entityId: 'url:https://example.test/planning',
+      actionKind: 'click',
+      actionAt: new Date(at(input.seq)).toISOString(),
     },
   });
 
@@ -671,6 +714,129 @@ describe('connections Class B integration invariants', () => {
     expect(replaceCount).toBe(1);
     expect(normalizeGeneratedSnapshot(incremental)).toEqual(
       normalizeGeneratedSnapshot(fullSnapshotFor(events)),
+    );
+  });
+
+  it('large warm catchUp chunks scoped drains without a base rebuild', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const store = createConnectionsStore(vaultRoot);
+    let replaceCount = 0;
+    const recordingStore: ConnectionsStore = {
+      ...store,
+      replaceScopeRows:
+        store.replaceScopeRows === undefined
+          ? undefined
+          : async (...args) => {
+              replaceCount += 1;
+              await store.replaceScopeRows!(...args);
+            },
+    };
+    const materializer = createNoisyFreeMaterializer({
+      vaultRoot,
+      eventLog,
+      store: recordingStore,
+    });
+    const events = Array.from({ length: 6001 }, (_, index) =>
+      threadUpserted({
+        replicaId: 'large-scope-eq',
+        seq: index + 1,
+        bacId: `T${String(index + 1)}`,
+        title: `Thread ${String(index + 1)}`,
+      }),
+    );
+    await importEvents(eventLog, events.slice(0, 1));
+    await materializer.catchUp(eventLog);
+    await importEvents(eventLog, events.slice(1));
+
+    const output: string[] = [];
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation((message?: unknown) => {
+      output.push(String(message ?? ''));
+    });
+    try {
+      await materializer.catchUp(eventLog);
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    const phaseOutput = output.join('');
+    expect(materializer.health()).toMatchObject({ status: 'healthy', pending: false });
+    expect(replaceCount).toBeGreaterThanOrEqual(2);
+    expect(phaseOutput).toContain('catchUp.chunkedScoped start events=6000');
+    expect(phaseOutput).toContain('catchUp.chunk scopedWindow events=5000');
+    expect(phaseOutput).toContain('catchUp.chunk scopedWindow events=1000');
+    expect(phaseOutput).toContain('replaceScopeRows scopedTimelineDelta');
+    expect(phaseOutput).not.toContain('buildConnectionsSnapshot base');
+
+    const incremental = await store.readCurrent();
+    if (incremental === null) throw new Error('expected chunked scoped snapshot');
+    expect(normalizeGeneratedSnapshot(incremental)).toEqual(
+      normalizeGeneratedSnapshot(fullSnapshotFor(events)),
+    );
+  }, 30_000);
+
+  it('scoped incremental drain tolerates recall impression events in the pending tail', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const store = createConnectionsStore(vaultRoot);
+    let replaceCount = 0;
+    let fullWriteCount = 0;
+    const recordingStore: ConnectionsStore =
+      store.replaceScopeRows === undefined
+        ? {
+            ...store,
+            writeSnapshotAndProgress: async (...args) => {
+              fullWriteCount += 1;
+              await store.writeSnapshotAndProgress(...args);
+            },
+          }
+        : {
+            ...store,
+            writeSnapshotAndProgress: async (...args) => {
+              fullWriteCount += 1;
+              await store.writeSnapshotAndProgress(...args);
+            },
+            replaceScopeRows: async (...args) => {
+              replaceCount += 1;
+              await store.replaceScopeRows!(...args);
+            },
+          };
+    const materializer = createNoisyFreeMaterializer({
+      vaultRoot,
+      eventLog,
+      store: recordingStore,
+    });
+    const initial = threadUpserted({
+      replicaId: 'scope-recall',
+      seq: 1,
+      bacId: 'T1',
+      title: 'Initial thread',
+    });
+    const pending = [
+      threadUpserted({
+        replicaId: 'scope-recall',
+        seq: 2,
+        bacId: 'T2',
+        title: 'Follow-up thread',
+      }),
+      recallServed({ replicaId: 'scope-recall', seq: 3, servedContextId: 'served-1' }),
+      recallAction({ replicaId: 'scope-recall', seq: 4, servedContextId: 'served-1' }),
+    ];
+    await importEvents(eventLog, [initial]);
+    await materializer.catchUp(eventLog);
+    fullWriteCount = 0;
+    replaceCount = 0;
+    await importEvents(eventLog, pending);
+
+    await materializer.catchUp(eventLog);
+
+    const incremental = await store.readCurrent();
+    if (incremental === null) throw new Error('expected scoped incremental snapshot');
+    expect(replaceCount).toBe(1);
+    expect(fullWriteCount).toBe(0);
+    expect(normalizeGeneratedSnapshot(incremental)).toEqual(
+      normalizeGeneratedSnapshot(fullSnapshotFor([initial, ...pending])),
     );
   });
 

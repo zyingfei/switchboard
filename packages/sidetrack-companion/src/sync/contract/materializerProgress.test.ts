@@ -38,9 +38,9 @@ describe('materializerProgress', () => {
     expect(intervals).toEqual({ A: [[1, 3]] });
   });
 
-  it('derives frontier from intervals', () => {
+  it('derives contiguous frontier from intervals', () => {
     const intervals = addDotsToIntervals({}, [dot('A', 1), dot('A', 2), dot('B', 1), dot('A', 4)]);
 
-    expect(frontierFromIntervals(intervals)).toEqual({ A: 4, B: 1 });
+    expect(frontierFromIntervals(intervals)).toEqual({ A: 2, B: 1 });
   });
 });
