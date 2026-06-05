@@ -3988,18 +3988,32 @@ const routes: readonly RouteDefinition[] = [
               vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
               captureSummary: () => captureHealthSummary(vaultRoot),
               recallSummary: async () => {
-                const [index, info, lifecycleReport, modelStatus] = await Promise.all([
-                  readIndex(indexPath),
+                // Recall serves from recall-v2 (sqlite-vec). The legacy
+                // index.bin is deprecated; reading + parsing it here (24MB)
+                // was both wrong and SLOW — it timed out this probe under
+                // load, surfacing as a permanent false "degraded". Use a
+                // cheap v2 sqlite stat + (when the store is already open)
+                // its doc count, so the probe is fast and reflects the
+                // actually-served backend.
+                const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+                const v2SqlitePath = join(vaultRoot, '_BAC', 'recall', 'v2', 'index.sqlite');
+                const [info, lifecycleReport, modelStatus, v2Store, v2Stat] = await Promise.all([
                   stat(indexPath).catch(() => undefined),
                   context.recallLifecycle?.report() ?? Promise.resolve(undefined),
                   getModelCacheStatus().catch(() => undefined),
+                  peekRecallV2Store(vaultRoot).catch(() => undefined),
+                  stat(v2SqlitePath).catch(() => undefined),
                 ]);
-                const indexExists = index !== null;
+                const v2DocCount = v2Store !== undefined ? v2Store.documentCount() : null;
+                const v2Present =
+                  (v2DocCount !== null && v2DocCount > 0) ||
+                  (v2Stat !== undefined && v2Stat.size > 0);
+                const indexExists = v2Present;
                 return {
                   indexExists,
-                  entryCount: index?.items.length ?? null,
-                  modelId: index?.modelId ?? null,
-                  sizeBytes: info?.size ?? null,
+                  entryCount: v2DocCount,
+                  modelId: modelStatus?.modelId ?? null,
+                  sizeBytes: v2Stat?.size ?? info?.size ?? null,
                   semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
                   // Lifecycle fields are optional so legacy callers
                   // (no recallLifecycle injected) keep the old shape.
@@ -4020,6 +4034,11 @@ const routes: readonly RouteDefinition[] = [
                         embedderAccelerator: lifecycleReport.embedderAccelerator,
                         drift: lifecycleReport.drift,
                       }),
+                  // recall-v2 is the served backend; when it's present,
+                  // recall is ready regardless of the deprecated legacy
+                  // lifecycle's status (which would otherwise force a false
+                  // "degraded" on a v2-only vault).
+                  ...(v2Present ? { status: 'ready' as const } : {}),
                   ...(context.recallActivity === undefined
                     ? {}
                     : { activity: context.recallActivity.report() }),
