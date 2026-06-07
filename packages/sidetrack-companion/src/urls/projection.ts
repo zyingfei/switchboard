@@ -179,7 +179,14 @@ const upsertAttribution = (
     lastSeenAt: existing?.lastSeenAt ?? fallbackObservedAt,
     visitCount: existing?.visitCount ?? 0,
     tabSessionIds: existing?.tabSessionIds ?? [],
-    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    // A URL filed into a workstream before it was ever visited has no
+    // `existing` observation, so latestUrl/latestTitle would be absent
+    // and every UI surface renders it as "(untracked tab)". Seed
+    // latestUrl from the canonical URL so the record is self-describing
+    // (the display layer derives the host from it). latestTitle stays
+    // the captured page title (or, for the focused tab, the live-tab
+    // overlay) — the companion never fabricates a title.
+    latestUrl: existing?.latestUrl ?? attribution.canonicalUrl,
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
@@ -228,7 +235,11 @@ const upsertIgnored = (
     lastSeenAt: existing?.lastSeenAt ?? fallbackObservedAt,
     visitCount: existing?.visitCount ?? 0,
     tabSessionIds: existing?.tabSessionIds ?? [],
-    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    // Symmetric with upsertAttribution: seed latestUrl so a URL ignored
+    // straight from the address bar (no prior observation) is still
+    // self-describing if it ever surfaces (e.g. a pinned card) rather
+    // than rendering "(untracked tab)".
+    latestUrl: existing?.latestUrl ?? input.canonicalUrl,
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),

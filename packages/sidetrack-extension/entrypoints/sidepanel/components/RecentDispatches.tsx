@@ -118,7 +118,9 @@ export function RecentDispatches({
               title="Jump to the source thread this packet came from"
             >
               <span className="mono dispatch-kind">{KIND_LABEL[dispatch.dispatchKind]}</span>
-              <span className="dispatch-source-title">{dispatch.sourceTitle}</span>
+              <span className="dispatch-source-title" title={dispatch.sourceTitle}>
+                {dispatch.sourceTitle}
+              </span>
             </button>
             <span className="icon-12 dispatch-arrow">{Icons.arrowR}</span>
             <button
@@ -132,7 +134,7 @@ export function RecentDispatches({
               }
             >
               <span className="chip">{dispatch.targetProviderLabel}</span>
-              <span className="dispatch-target-title">
+              <span className="dispatch-target-title" title={dispatch.targetThreadTitle ?? undefined}>
                 {dispatch.targetThreadTitle ??
                   (dispatch.mode === 'auto-send' ? 'send to new thread' : 'open new thread')}
               </span>

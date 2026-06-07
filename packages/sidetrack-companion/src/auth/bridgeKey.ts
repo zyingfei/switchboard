@@ -7,6 +7,31 @@ export const bridgeKeyPath = (vaultPath: string): string =>
 
 export const createBridgeKey = (): string => randomBytes(32).toString('base64url');
 
+export const pairTokenPath = (vaultPath: string): string =>
+  join(vaultPath, '_BAC', '.config', 'pair.txt');
+
+// Single-paste pairing token bundling port + bridge key, so the user
+// copies ONE thing into the extension instead of separately hunting the
+// port and catting the key. Format: st-pair://<port>/<base64url-key>.
+// The key charset is base64url ([A-Za-z0-9_-], no '/'), so the LAST '/'
+// unambiguously splits port from key.
+export const pairingToken = (port: number, key: string): string =>
+  `st-pair://${String(port)}/${key}`;
+
+// Write the pairing token to <vault>/_BAC/.config/pair.txt so the user
+// can grab it from the file (or "Load from file" in the panel) without
+// re-reading the companion's startup output.
+export const writePairToken = async (
+  vaultPath: string,
+  port: number,
+  key: string,
+): Promise<string> => {
+  const path = pairTokenPath(vaultPath);
+  await mkdir(join(vaultPath, '_BAC', '.config'), { recursive: true });
+  await writeFile(path, `${pairingToken(port, key)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return path;
+};
+
 const ROTATION_GRACE_MS = 60_000;
 const graceKeys = new Map<string, number>();
 

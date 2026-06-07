@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SuggestionStats } from '../../../src/sidepanel/tabsession/SuggestionStats';
 import type {
@@ -116,6 +116,49 @@ describe('SuggestionStats', () => {
       fusedCandidates: [],
     };
     render(<SuggestionStats suggestion={empty} workstreams={workstreams} showEmptyPlaceholder />);
+    expect(screen.getByText('No signal yet')).toBeInTheDocument();
+  });
+
+  it('shows an actionable page-access prompt when access is off (not the generic first-seen copy)', () => {
+    const empty: TabSessionResolutionResult = {
+      tabSessionId: 'https://cold-start.example/page',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    const onGrantAccess = vi.fn();
+    render(
+      <SuggestionStats
+        suggestion={empty}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted={false}
+        onGrantAccess={onGrantAccess}
+      />,
+    );
+    // When access is off the resolver can't produce signal for ANY page,
+    // so the placeholder names the real reason + offers the fix.
+    expect(screen.getByText('No signal — page access off')).toBeInTheDocument();
+    expect(screen.queryByText('No signal yet')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Grant access' }));
+    expect(onGrantAccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the generic empty placeholder when page access IS granted', () => {
+    const empty: TabSessionResolutionResult = {
+      tabSessionId: 'https://cold-start.example/page',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    render(
+      <SuggestionStats
+        suggestion={empty}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
     expect(screen.getByText('No signal yet')).toBeInTheDocument();
   });
 

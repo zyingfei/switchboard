@@ -132,6 +132,13 @@ export const saveAutoTrack = async (autoTrack: boolean): Promise<UiSettings> => 
   return next;
 };
 
+export const saveCaptureEnabled = async (captureEnabled: boolean): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, captureEnabled };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
 export const saveNotifyOnQueueComplete = async (
   notifyOnQueueComplete: boolean,
 ): Promise<UiSettings> => {

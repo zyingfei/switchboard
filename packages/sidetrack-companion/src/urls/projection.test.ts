@@ -118,6 +118,42 @@ describe('url projection', () => {
     expect(record?.currentAttribution?.source).toBe('user_asserted');
   });
 
+  it('seeds latestUrl from the canonical URL when a URL is filed without any prior visit', () => {
+    // Regression: a user_asserted attribution with NO prior
+    // BROWSER_TIMELINE_OBSERVED produced a record with no latestUrl/
+    // latestTitle, which the side panel rendered as "(untracked tab)".
+    const url = 'https://github.com/microsoft/pg_durable';
+    const projection = projectUrls([userMove({ seq: 1, canonicalUrl: url, workstreamId: 'ws_db' })]);
+    const record = projection.byCanonicalUrl.get(url);
+    expect(record?.currentAttribution?.workstreamId).toBe('ws_db');
+    expect(record?.visitCount).toBe(0);
+    // Self-describing: latestUrl falls back to the canonical URL so the
+    // display layer derives the host instead of "(untracked tab)".
+    expect(record?.latestUrl).toBe(url);
+    // The companion never fabricates a title.
+    expect(record?.latestTitle).toBeUndefined();
+  });
+
+  it('does not clobber an observed latestUrl/latestTitle when a later attribution arrives', () => {
+    const events: AcceptedEvent[] = [
+      observed({ seq: 1, canonicalUrl: 'https://x/a', title: 'Real Title' }),
+      userMove({ seq: 2, canonicalUrl: 'https://x/a', workstreamId: 'ws_sec' }),
+    ];
+    const projection = projectUrls(events);
+    const record = projection.byCanonicalUrl.get('https://x/a');
+    expect(record?.latestTitle).toBe('Real Title');
+    expect(record?.latestUrl).toBe('https://x/a');
+  });
+
+  it('seeds latestUrl for an inferred attribution on a never-visited URL too (source-agnostic)', () => {
+    const url = 'https://example.test/inferred-no-visit';
+    const projection = projectUrls([inferredMove({ seq: 1, canonicalUrl: url, workstreamId: 'ws_x' })]);
+    const record = projection.byCanonicalUrl.get(url);
+    expect(record?.currentAttribution?.source).toBe('inferred');
+    expect(record?.visitCount).toBe(0);
+    expect(record?.latestUrl).toBe(url);
+  });
+
   it('user-asserted attribution beats inferred regardless of order', () => {
     const events: AcceptedEvent[] = [
       observed({ seq: 1, canonicalUrl: 'https://x/a' }),

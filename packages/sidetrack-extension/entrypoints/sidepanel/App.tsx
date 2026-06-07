@@ -56,6 +56,7 @@ import {
   HealthPanel,
   Icons,
   DesignPreview,
+  ToolbarOverflowMenu,
   WorkstreamDetailPanel,
   TurnText,
   NeedsOrganizeSuggestion,
@@ -852,6 +853,14 @@ const App = () => {
   >(() => new Map<string, readonly CapturedTurnRecord[]>());
   const [settings, setSettings] = useState<SettingsDocument | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // When a banner/CTA opens Settings to fix something specific (e.g. the
+  // companion connection), this names the section to scroll into view so
+  // the user lands on the right field instead of hunting for it.
+  const [settingsScrollTarget, setSettingsScrollTarget] = useState<string | null>(null);
+  const openSettingsAt = useCallback((sectionId: string | null) => {
+    setSettingsScrollTarget(sectionId);
+    setSettingsOpen(true);
+  }, []);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
   // Deeper-page-access banner: engagement + future content-extraction
   // subsystems need `https://*/*` host permission. Default `true` so the
@@ -2583,6 +2592,11 @@ const App = () => {
     activeTabTrackedThread !== undefined &&
     focusingThreadId !== activeTabTrackedThread.bac_id &&
     state.activeTabUrl !== findPulseDismissedUrl;
+  // Master capture switch (the side-panel "eye"). Off = nothing is
+  // captured anywhere; the capture-oriented toolbar icons go inert so
+  // the paused state reads at a glance.
+  const captureEnabled = state.settings.captureEnabled !== false;
+  const captureOff = !captureEnabled;
   useEffect(() => {
     if (
       composeThread === undefined ||
@@ -4280,6 +4294,18 @@ const App = () => {
       ? 'down'
       : 'up';
   const vaultUnreachable = state.companionStatus === 'vault-error';
+  // #1 — make the disconnect actionable. Classify WHY the companion is
+  // unreachable (bridge key rejected vs no response on the port) from the
+  // last error, so the banner can say which knob to turn and send the
+  // user straight to the connection fields instead of the whole wizard.
+  const companionDisconnectReason: 'bad-key' | 'no-response' =
+    state.lastError !== undefined && /bridge key|unauthorized|401/iu.test(state.lastError)
+      ? 'bad-key'
+      : 'no-response';
+  const companionDisconnectDetail =
+    companionDisconnectReason === 'bad-key'
+      ? 'bridge key rejected — update the key in Settings'
+      : `no response on :${String(state.settings.companion.port)} — start the companion or fix the port`;
   const providerHealth = state.selectorHealth.find((entry) => entry.latestStatus !== 'ok');
   const workstreamOptions = useMemo(
     () => buildWorkstreamOptions(state.workstreams),
@@ -4481,6 +4507,9 @@ const App = () => {
               undefined,
             pageEvidence: livePageEvidenceByUrl[displayedFocusedTabUrl ?? ''],
           }),
+        // Overlay the live-tab title only for the LIVE focused tab —
+        // never when pinned to a prior read-only context.
+        isLiveFocus: !isCardPinned,
       }),
     [
       displayedFocusedTabUrl,
@@ -4493,6 +4522,7 @@ const App = () => {
       state.currentTab?.tabSnapshot?.url,
       state.currentTab?.threadUrl,
       state.currentTab?.title,
+      isCardPinned,
     ],
   );
   // Stable, display-only timestamp for optimistic overlays (the value
@@ -6106,6 +6136,41 @@ const App = () => {
           </button>
         </div>
         <div className="app-actions">
+          {/* Master capture switch — the privacy "eye". Default on; when
+              off, every capture path is gated in the background and the
+              capture-oriented icons below go disabled. Eye-open =
+              watching, slashed eye = paused. */}
+          <button
+            className={'icon-btn capture-eye' + (captureOff ? ' off' : '')}
+            title={
+              captureEnabled
+                ? 'Capture is ON — Sidetrack is observing this browser. Click to pause all capture.'
+                : 'Capture is PAUSED — nothing is being recorded anywhere. Click to resume.'
+            }
+            onClick={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.saveLocalPreferences,
+                  preferences: { captureEnabled: captureOff },
+                }),
+              );
+            }}
+            type="button"
+            aria-label={
+              captureEnabled
+                ? 'Capture is on — click to pause all capture'
+                : 'Capture is paused — click to resume capture'
+            }
+            aria-pressed={captureEnabled}
+            data-testid="capture-toggle"
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+              {captureEnabled ? Icons.eye : Icons.eyeOff}
+            </span>
+          </button>
+          {/* Screenshare-mask toggle. Re-glyphed from the old eye to a
+              cast/monitor icon so the eye unambiguously means capture.
+              Inert while capture is paused (nothing to mask). */}
           <button
             className={'icon-btn' + (state.screenShareMode ? ' on' : '')}
             title="Screenshare mode — mask sensitive workstreams"
@@ -6120,11 +6185,9 @@ const App = () => {
             type="button"
             aria-label="Toggle screenshare mode"
             aria-pressed={state.screenShareMode}
+            disabled={captureOff}
           >
-            <svg viewBox="0 0 24 24">
-              <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.cast}</span>
           </button>
           <button
             className={'icon-btn' + (findIconPulsing ? ' pulsing' : '')}
@@ -6132,6 +6195,7 @@ const App = () => {
             onClick={findActiveTabThread}
             type="button"
             aria-label="Find active tab in side panel"
+            disabled={captureOff}
           >
             {/* Crosshair / locator. Visually distinct from the
                 magnifier in "Search indexed threads" — this one
@@ -6191,6 +6255,7 @@ const App = () => {
               }}
               type="button"
               aria-label="Capture current tab"
+              disabled={captureOff}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -6234,6 +6299,7 @@ const App = () => {
                 : 'Capture mode is Manual — switch to Auto'
             }
             aria-pressed={state.settings.autoTrack}
+            disabled={captureOff}
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
               {state.settings.autoTrack ? Icons.autoCycle : Icons.manualTap}
@@ -6260,6 +6326,7 @@ const App = () => {
             }}
             type="button"
             aria-label="Attach coding session"
+            disabled={captureOff}
           >
             <svg viewBox="0 0 24 24">
               <rect x="2" y="4" width="20" height="16" rx="2" />
@@ -6267,93 +6334,20 @@ const App = () => {
               <line x1="13" y1="16" x2="18" y2="16" />
             </svg>
           </button>
-          <button
-            className="icon-btn"
-            title="Capture health diagnostics"
-            onClick={() => {
+          {/* Diagnostics collapsed into an overflow menu so the
+              steady-state toolbar stays lean — capture health, dump
+              panel state, design preview. The dump-result chip still
+              lives in the status row below. */}
+          <ToolbarOverflowMenu
+            onOpenHealth={() => {
               setHealthPanelOpen(true);
             }}
-            type="button"
-            aria-label="Open capture health diagnostics"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-            </svg>
-          </button>
-          {/* Stage 5 polish — "Dump panel state" button. POSTs every
-              user-facing piece of panel state to the companion, which
-              writes `${vault}/_BAC/debug-dumps/latest.json`. The user
-              hands me the path and I read it instead of asking for
-              another screenshot. */}
-          <button
-            className={
-              'icon-btn' +
-              (dumpStatus.kind === 'dumping' ? ' pulsing' : '') +
-              (dumpStatus.kind === 'dumped' ? ' on' : '') +
-              (dumpStatus.kind === 'error' ? ' warn' : '')
-            }
-            title={
-              dumpStatus.kind === 'dumped'
-                ? `Dumped: ${dumpStatus.path} — click again to refresh`
-                : dumpStatus.kind === 'error'
-                  ? dumpStatus.message
-                  : 'Dump panel state to a JSON file for review'
-            }
-            onClick={handleDumpPanelState}
-            type="button"
-            aria-label="Dump panel state"
-            data-testid="dump-panel-state"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-          </button>
-          {/* Design preview — always-on for now (was gated by __DEV__).
-              Re-gate once the surfaces it shows are wired into
-              production rendering. */}
-          <button
-            className="icon-btn"
-            title="Design preview — v2 surfaces"
-            onClick={() => {
+            onDumpState={handleDumpPanelState}
+            onOpenDesignPreview={() => {
               setDesignPreviewOpen(true);
             }}
-            type="button"
-            aria-label="Open design preview"
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <circle cx="13" cy="6" r="2" />
-              <circle cx="6" cy="13" r="2" />
-              <circle cx="13" cy="20" r="2" />
-              <circle cx="20" cy="13" r="2" />
-              <line x1="11.6" y1="7.4" x2="7.4" y2="11.6" />
-              <line x1="14.4" y1="7.4" x2="18.6" y2="11.6" />
-              <line x1="11.6" y1="18.6" x2="7.4" y2="14.4" />
-              <line x1="14.4" y1="18.6" x2="18.6" y2="14.4" />
-            </svg>
-          </button>
+            dumpStatus={dumpStatus.kind}
+          />
           <button
             className="icon-btn"
             title="Settings"
@@ -6647,7 +6641,13 @@ const App = () => {
                   ? 'Now'
                   : 'Threads'}
           </span>
-          <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
+          {/* The "vault connected" / "companion running" pills already signal
+              the healthy state; only surface this status label when something
+              is off, so it doesn't redundantly repeat "vault: synced" in
+              every view's header. */}
+          {state.companionStatus !== 'connected' ? (
+            <span className="ws-status mono">{companionStatusLabel(state.companionStatus)}</span>
+          ) : null}
         </div>
       )}
 
@@ -6837,12 +6837,18 @@ const App = () => {
                       workstreams={tabSessionWorkstreams}
                       showAlternatives
                       showEmptyPlaceholder
+                      // When page access is off the resolver can produce
+                      // no signal at all, so the empty placeholder points
+                      // at the real fix instead of "first time seeing".
+                      pageAccessGranted={hasDeeperPagePermission}
+                      onGrantAccess={() => {
+                        void handleGrantDeeperPageAccess();
+                      }}
                       // UX4 — Now-card variant tucks the signal/alts
                       // rows into a "Why" disclosure so the headline
                       // reads cleanly. Inbox triage keeps the full
                       // breakdown (no compact prop there).
                       compact
-
                     />
                   ) : null}
                   {/* Stage 5 polish — the legacy "Change…" button used to live
@@ -6904,6 +6910,19 @@ const App = () => {
                       Pinned · read-only · click the active chip in the history strip to return to
                       the live tab
                     </span>
+                    {focusedDisplayUrlRecord !== undefined ? (
+                      <button
+                        type="button"
+                        className="tab-attribution-card-pinned-unpin"
+                        onClick={() => {
+                          requestSwitchToConnections(focusedDisplayUrlRecord.canonicalUrl);
+                        }}
+                        title="Open this URL's neighborhood in the Connections graph"
+                        data-testid="focused-tab-open-in-connections-pinned"
+                      >
+                        ⇄ Graph
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       className="tab-attribution-card-pinned-unpin"
@@ -7105,9 +7124,19 @@ const App = () => {
                 (workstream.bac_id === currentWsId ? ' current' : '') +
                 (dropWorkstreamId === workstream.bac_id ? ' drop-target' : '')
               }
-              onClick={() => {
-                setCurrentWs(workstream.bac_id);
-              }}
+              onClick={
+                // In the Threads ('all') view the list ignores the selected
+                // workstream, so a click here has no visible effect yet
+                // silently persists activeWorkstreamId — which the background
+                // SW then stamps as attribution on future visits. Only allow
+                // selection in the workstream-scoped views; drag-drop (below)
+                // stays active in both.
+                viewMode === 'all'
+                  ? undefined
+                  : () => {
+                      setCurrentWs(workstream.bac_id);
+                    }
+              }
               onDragOver={(event) => {
                 allowThreadDrop(event, workstream.bac_id);
               }}
@@ -7239,8 +7268,9 @@ const App = () => {
         <div className="banner-stack">
           <SystemBannersStack
             captureSuccessHost={captureToastHost ?? undefined}
-            companionActionLabel="Open setup"
+            companionActionLabel="Fix connection"
             companionStatus={companionDisconnected ? 'down' : 'running'}
+            {...(companionDisconnected ? { companionDetail: companionDisconnectDetail } : {})}
             relayStatus={relayStatusForBanner}
             vaultStatus={vaultUnreachable ? 'unreachable' : 'connected'}
             providerHealth={providerHealth ? 'degraded' : 'ok'}
@@ -7257,7 +7287,7 @@ const App = () => {
               setWizardOpen(true);
             }}
             onRetryCompanion={() => {
-              setWizardOpen(true);
+              openSettingsAt('companion-connection');
             }}
             onRetryFailedCaptures={() => {
               void runAction(async () => sendRequest({ type: messageTypes.retryFailedCaptures }));
@@ -7295,6 +7325,11 @@ const App = () => {
         <ConnectionsView
           {...(currentWsId === null ? {} : { initialAnchor: `workstream:${currentWsId}` })}
           displayCtx={displayCtx}
+          {...(state.currentTab?.tabSnapshot?.url === undefined
+            ? state.currentTab?.threadUrl === undefined
+              ? {}
+              : { currentTabUrl: state.currentTab.threadUrl }
+            : { currentTabUrl: state.currentTab.tabSnapshot.url })}
           requestAnchor={connectionsAnchorRequest}
           // Scope D — when the user clicks the new "Search" top-level
           // tab, force ConnectionsView into its search submode. The
@@ -7503,6 +7538,10 @@ const App = () => {
             void loadTabSessions();
           }}
           onAttribute={handleUrlAttribute}
+          pageAccessGranted={hasDeeperPagePermission}
+          onGrantAccess={() => {
+            void handleGrantDeeperPageAccess();
+          }}
           onOpenTab={openTabForSession}
           onPickAnother={(canonicalUrl) => {
             setTabSessionMoveId(canonicalUrl);
@@ -7911,8 +7950,10 @@ const App = () => {
           actually load?"). Sourced from the vite-define inject in
           wxt.config.ts. */}
       <div className="build-version mono" title="Sidetrack build identity">
-        v{__BUILD_INFO__.version} · {__BUILD_INFO__.sha} · built{' '}
-        {formatBuildTimestamp(__BUILD_INFO__.builtAt)}
+        {/* version is intentionally never bumped (always 0.0.0) — lead with
+            the git sha, which is the useful "did my build load?" signal. */}
+        {__BUILD_INFO__.version !== '0.0.0' ? <>v{__BUILD_INFO__.version} · </> : null}
+        {__BUILD_INFO__.sha} · built {formatBuildTimestamp(__BUILD_INFO__.builtAt)}
       </div>
 
       {moveThread ? (
@@ -8454,12 +8495,16 @@ const App = () => {
           }
           busy={settingsBusy}
           error={settingsError}
+          scrollToId={settingsScrollTarget}
+          companionVaultRoot={state.companionIdentity?.vaultRoot ?? null}
           onClose={() => {
             setSettingsOpen(false);
             setSettingsError(null);
+            setSettingsScrollTarget(null);
           }}
           onSave={handleSettingsSave}
           localPreferences={{
+            captureEnabled: state.settings.captureEnabled,
             autoTrack: state.settings.autoTrack,
             vaultPath: state.vaultPath ?? '',
             notifyOnQueueComplete: state.settings.notifyOnQueueComplete,

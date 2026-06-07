@@ -162,6 +162,12 @@ export interface SelectorHealth {
 
 export interface UiSettings {
   readonly companion: CompanionSettings;
+  // Master capture kill-switch — the side-panel "eye". Default on.
+  // When false, EVERY capture path is gated off: AI-thread auto +
+  // explicit capture, page-text / page-evidence extraction, ambient
+  // timeline visits, engagement, and visual-fingerprint observation.
+  // Nothing is recorded anywhere until it's flipped back on.
+  readonly captureEnabled: boolean;
   readonly autoTrack: boolean;
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
   // Fire a chrome.notifications toast when the auto-send drain
@@ -403,6 +409,9 @@ export const defaultSettings: UiSettings = {
     port: 17_373,
     bridgeKey: '',
   },
+  // Capture is on by default — observing is the whole point of the
+  // tool. The side-panel eye flips this; off = nothing captured.
+  captureEnabled: true,
   // Default = manual per spec. Known-provider captures still land in
   // Open threads, but the user owns the choice to keep tracking them.
   // Toggle on in Settings to auto-track every detected AI thread.

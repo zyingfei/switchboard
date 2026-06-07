@@ -80,6 +80,24 @@ export const Icons = {
       <circle cx="12" cy="12" r="3" />
     </svg>
   ),
+  // Struck-through eye — capture paused. Pairs with `eye` for the
+  // side-panel master capture toggle (open = watching, slashed = blind).
+  eyeOff: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <path d="M10.6 5.1A10.8 10.8 0 0 1 12 5c7 0 10 7 10 7a13.4 13.4 0 0 1-2.2 3" />
+      <path d="M6.6 6.6A13.3 13.3 0 0 0 2 12s3 7 10 7a10.4 10.4 0 0 0 4.4-1" />
+      <path d="M10.6 10.6a3 3 0 0 0 4.2 4.2" />
+      <path d="M2 2l20 20" />
+    </svg>
+  ),
+  // Vertical kebab — toolbar overflow ("more").
+  more: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <circle cx="12" cy="5" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="19" r="1.4" fill="currentColor" stroke="none" />
+    </svg>
+  ),
   cast: (
     <svg viewBox="0 0 24 24" {...sw}>
       <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />

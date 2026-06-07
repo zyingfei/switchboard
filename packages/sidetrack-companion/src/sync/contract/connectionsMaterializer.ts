@@ -1,4 +1,4 @@
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -67,6 +67,7 @@ import {
   buildLeidenCpmTopicRevision,
   LEIDEN_CPM_COSINE_THRESHOLD,
 } from '../../connections/leidenCpmTopicRevision.js';
+import { assignIncrementalMembership } from '../../connections/incrementalTopicMembership.js';
 import {
   buildServedTopicProducerReport,
   resolveServedTopicProducer,
@@ -285,6 +286,27 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
+
+// Permanent-gap sealing (default OFF). A "permanent gap" is a per-replica
+// event seq the log/store skip forever (a rejected/never-emitted seq). It
+// freezes frontierFromIntervals just below it, so readSince re-returns the
+// whole post-gap window every drain → perpetual catch-up → the event-store
+// stops ingesting → topics freeze. The seal pass advances the frontier PAST
+// such a gap, but ONLY after proving the seq is absent from BOTH the log and
+// the store AND aging it across consecutive drains (so a not-yet-arrived
+// out-of-order dot is never skipped). Gated behind an env flag for safe
+// rollout / instant rollback.
+const GAP_SEAL_ENABLED = (): boolean => process.env['SIDETRACK_CONNECTIONS_GAP_SEAL'] === '1';
+// A gap seq must be PROVEN absent (store streamed past it, absent from the
+// log, never applied) for this many CONSECUTIVE drains before it is sealed.
+// Reset to 0 the instant the seq reappears (out-of-order CRDT arrival).
+const GAP_SEAL_MIN_AGING_DRAINS = ((): number => {
+  const n = Number.parseInt(process.env['SIDETRACK_GAP_SEAL_MIN_AGING_DRAINS'] ?? '8', 10);
+  return Number.isFinite(n) && n > 0 ? n : 8;
+})();
+// Hard cap on gap seqs probed per drain so a pathological interval set can
+// never turn the seal pass into an O(gaps) scan storm.
+const GAP_SEAL_MAX_CANDIDATES_PER_DRAIN = 256;
 // Drift-check (shadow in-process rebuild) removed — it was costing 30s+
 // per cycle and a multi-GB memory spike on the parent process, defeating
 // IVM. Statistical drift via `attachDriftReport` (uses already-computed
@@ -403,6 +425,12 @@ const engagementFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_ENGAGEMENT_FACTS_STORE'] === '1';
 const timelineFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_TIMELINE_FACTS_STORE'] === '1';
+// Incremental topic membership (default OFF): between full leiden
+// re-clusters, overlay newly-eligible visits onto their nearest existing
+// cluster as secondary affiliations so topics stay responsive to browsing
+// without an O(N) leiden pass. Instant rollback via env unset + restart.
+const incrementalTopicMembershipEnabled = (): boolean =>
+  process.env['SIDETRACK_CONNECTIONS_TOPIC_INCREMENTAL_MEMBERSHIP'] === '1';
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
   const parsed = raw === undefined ? Number.NaN : Number(raw);
@@ -763,6 +791,130 @@ const dotIntervalsHaveGaps = (intervals: MaterializerProgress['appliedDotInterva
   return false;
 };
 
+// --- Permanent-gap sealing helpers (see GAP_SEAL_* constants) ---
+
+// Enumerate seqs that sit in a hole STRICTLY BELOW the store watermark for a
+// replica. Only seqs the store has streamed PAST (watermark moved above them)
+// yet never ingested are skip candidates; seqs at/above the watermark are
+// simply not-yet-arrived and are never enumerated (the core data-loss guard).
+export const enumerateGapCandidates = (
+  intervals: MaterializerProgress['appliedDotIntervals'],
+  watermark: VersionVector,
+  cap: number,
+): readonly Dot[] => {
+  const out: Dot[] = [];
+  for (const [replicaId, replicaIntervals] of Object.entries(intervals)) {
+    const wm = watermark[replicaId] ?? 0;
+    const first = replicaIntervals[0];
+    if (first !== undefined && first[0] > 1) {
+      for (let g = 1; g < first[0] && g < wm; g++) {
+        out.push({ replicaId, seq: g });
+        if (out.length >= cap) return out;
+      }
+    }
+    for (let i = 0; i + 1 < replicaIntervals.length; i++) {
+      const current = replicaIntervals[i];
+      const next = replicaIntervals[i + 1];
+      if (current === undefined || next === undefined) continue;
+      const end = current[1];
+      const nextStart = next[0];
+      for (let g = end + 1; g < nextStart && g < wm; g++) {
+        out.push({ replicaId, seq: g });
+        if (out.length >= cap) return out;
+      }
+    }
+  }
+  return out;
+};
+
+// key = `${replicaId}#${seq}` → consecutive-absent drain count.
+type GapAging = Record<string, number>;
+const gapAgingKey = (dot: Dot): string => `${dot.replicaId}#${String(dot.seq)}`;
+const gapAgingPath = (vaultRoot: string): string =>
+  join(vaultRoot, '_BAC', 'connections', 'current.gap-aging.json');
+const readGapAging = async (vaultRoot: string): Promise<GapAging> => {
+  try {
+    return JSON.parse(await readFile(gapAgingPath(vaultRoot), 'utf8')) as GapAging;
+  } catch {
+    return {};
+  }
+};
+// The aging counter lives in its OWN sibling file — NOT on MaterializerProgress,
+// whose drain snapshot copies only its typed fields (any extra field would be
+// wiped every drain). Atomic tmp+rename; removed when empty so it never leaks.
+const writeGapAging = async (vaultRoot: string, aging: GapAging): Promise<void> => {
+  const path = gapAgingPath(vaultRoot);
+  if (Object.keys(aging).length === 0) {
+    await rm(path, { force: true });
+    return;
+  }
+  await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, JSON.stringify(aging), 'utf8');
+  await rename(tmp, path);
+};
+
+// Returns the dots to SEAL this drain (proven absent AND aged past threshold)
+// and the next aging map to persist. proveAbsent(dot) MUST hold for store+log.
+// Any candidate whose absence cannot be re-proven this drain is dropped from
+// the map (counter reset to 0), so a single reappearance restarts the aging.
+export const computeGapSeals = (
+  candidates: readonly Dot[],
+  prior: GapAging,
+  proveAbsent: (dot: Dot) => boolean,
+  minAging: number,
+): { seals: readonly Dot[]; nextAging: GapAging } => {
+  const seals: Dot[] = [];
+  const nextAging: GapAging = {};
+  for (const dot of candidates) {
+    if (!proveAbsent(dot)) continue; // reappeared / unprovable → reset to 0
+    const count = (prior[gapAgingKey(dot)] ?? 0) + 1;
+    if (count >= minAging) seals.push(dot); // sealed → drop from aging map
+    else nextAging[gapAgingKey(dot)] = count;
+  }
+  return { seals, nextAging };
+};
+
+// Shared seal pass used by BOTH the store-backed and legacy eventLog drain
+// paths. Returns the (possibly gap-sealed) intervals to use for this drain's
+// frontier. `watermark` is the per-replica max seq the source has streamed
+// past (store watermark, or the log's max seq for the legacy path), and
+// `logEvents` is the canonical log used to prove a candidate seq absent. No-op
+// (returns the input intervals unchanged) when there are no proven, aged gaps —
+// so on a healthy vault this is a cheap set build over the log read the caller
+// already performs. Callers gate on GAP_SEAL_ENABLED() + dotIntervalsHaveGaps.
+const computeSealedIntervals = async (
+  vaultRoot: string,
+  appliedIntervals: MaterializerProgress['appliedDotIntervals'],
+  watermark: VersionVector,
+  logEvents: readonly AcceptedEvent[],
+  mark: (message: string) => void,
+): Promise<MaterializerProgress['appliedDotIntervals']> => {
+  const candidates = enumerateGapCandidates(
+    appliedIntervals,
+    watermark,
+    GAP_SEAL_MAX_CANDIDATES_PER_DRAIN,
+  );
+  if (candidates.length === 0) return appliedIntervals;
+  const logPresent = new Set<string>();
+  for (const event of logEvents) logPresent.add(gapAgingKey(event.dot));
+  const proveAbsent = (dot: Dot): boolean =>
+    (watermark[dot.replicaId] ?? 0) > dot.seq && // source streamed past it
+    !logPresent.has(gapAgingKey(dot)) && // absent from the canonical log
+    !intervalsContainDot(appliedIntervals, dot); // never applied
+  const priorAging = await readGapAging(vaultRoot);
+  const { seals, nextAging } = computeGapSeals(
+    candidates,
+    priorAging,
+    proveAbsent,
+    GAP_SEAL_MIN_AGING_DRAINS,
+  );
+  await writeGapAging(vaultRoot, nextAging);
+  if (seals.length === 0) return appliedIntervals;
+  mark(`gap-seal sealed=${String(seals.length)} aging=${String(Object.keys(nextAging).length)}`);
+  return addDotsToIntervals(appliedIntervals, seals);
+};
+
 const versionVectorsEqual = (left: VersionVector, right: VersionVector): boolean => {
   const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
   for (const key of keys) {
@@ -1018,6 +1170,13 @@ export const createConnectionsMaterializer = (
   let topicDrainsSinceLastRun = 0;
   let lastTopicRunSimilarityRevisionId: string | undefined;
   let pendingTopicRecompute = false;
+  // Tracks the topic-revision id the persisted connections snapshot
+  // currently reflects. An incremental-membership overlay mutates the topic
+  // revision (adds secondaryAffiliations) but not the timeline scopes, so the
+  // scoped-delta/identity snapshot paths would otherwise leave the served
+  // snapshot stale (and a restart would resurface a stale snapshot). When the
+  // served revision differs from this, we force a full snapshot rebuild.
+  let lastSnapshotTopicRevisionId: string | undefined;
   let lastRankerProducerRevision: string | undefined;
   // Stage 5.2 W3 fast-path — incremental visit similarity index used
   // when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1 AND the embedder
@@ -2267,11 +2426,45 @@ export const createConnectionsMaterializer = (
           }
         }
       }
-      pendingEventsForDrain = storeBackedEvents.readSince(effectiveLastFrontier ?? {});
+      // Permanent-gap seal pass (default OFF). Runs once per normal drain,
+      // AFTER catchUpFromJsonl + the gaps-backfill above (so the store mirrors
+      // the log when we probe), BEFORE readSince consumes the frontier.
+      let baseIntervalsForDrain = existingProgress?.appliedDotIntervals ?? {};
+      if (
+        GAP_SEAL_ENABLED() &&
+        existingProgress !== null &&
+        existingProgress.materializerVersion === MATERIALIZER_VERSION &&
+        dotIntervalsHaveGaps(existingProgress.appliedDotIntervals)
+      ) {
+        baseIntervalsForDrain = await computeSealedIntervals(
+          deps.vaultRoot,
+          existingProgress.appliedDotIntervals,
+          storeBackedEvents.watermark(),
+          await deps.eventLog.readMerged(),
+          mark,
+        );
+      }
+      // readSince advances by the per-replica FRONTIER (a dense seq
+      // watermark). When appliedDotIntervals has a PERMANENT gap (a seq the
+      // log skips forever — e.g. a recall-domain seq the connections store
+      // never ingests), frontierFromIntervals freezes just below that gap, so
+      // readSince re-returns every already-applied event above it on every
+      // drain — a runaway full rebuild. Filter by the dot intervals (exactly
+      // as the loadedProjectionAccumulatorState sibling path below does) so
+      // already-applied events are dropped regardless of where the frontier
+      // sits. With no/mismatched progress (cold build) keep everything.
+      const storeBackedPending = storeBackedEvents.readSince(effectiveLastFrontier ?? {});
+      pendingEventsForDrain =
+        existingProgress !== null &&
+        existingProgress.materializerVersion === MATERIALIZER_VERSION
+          ? storeBackedPending.filter(
+              (event) => !intervalsContainDot(existingProgress.appliedDotIntervals, event.dot),
+            )
+          : storeBackedPending;
       merged = pendingEventsForDrain;
       maxAcceptedAtMsForDrain = storeBackedEvents.maxAcceptedAtMs();
       drainProgressDotIntervals = addDotsToIntervals(
-        existingProgress?.appliedDotIntervals ?? {},
+        baseIntervalsForDrain,
         pendingEventsForDrain.map((event) => event.dot),
       );
       drainFrontier = frontierFromIntervals(drainProgressDotIntervals);
@@ -2282,12 +2475,21 @@ export const createConnectionsMaterializer = (
       );
       if (process.env['SIDETRACK_EVENT_STORE_VERIFY'] === '1') {
         const legacy = await deps.eventLog.readMerged();
-        const legacyPending =
+        const legacySinceFrontier =
           effectiveLastFrontier === undefined
             ? legacy
             : legacy.filter(
                 (event) => event.dot.seq > (effectiveLastFrontier[event.dot.replicaId] ?? 0),
               );
+        // Mirror the dot-interval filter applied to pendingEventsForDrain so
+        // the byte-equivalence check stays meaningful across permanent gaps.
+        const legacyPending =
+          existingProgress !== null &&
+          existingProgress.materializerVersion === MATERIALIZER_VERSION
+            ? legacySinceFrontier.filter(
+                (event) => !intervalsContainDot(existingProgress.appliedDotIntervals, event.dot),
+              )
+            : legacySinceFrontier;
         const pendingMatches =
           JSON.stringify(pendingEventsForDrain) === JSON.stringify(legacyPending);
         const maxMatches = maxAcceptedAtMsForDrain === maxAcceptedAtMs(legacy);
@@ -3017,20 +3219,96 @@ export const createConnectionsMaterializer = (
       topicDrainsSinceLastRun >= resolveTopicEveryDrains() ||
       Date.now() - lastTopicRunAtMs >= resolveTopicEveryMs();
     const forcePendingTopicRecompute = pendingTopicRecompute && topicSimilarityChanged;
+    // Never recompute topics during the catch-up drain when a revision already
+    // exists to preserve. The catch-up serves a SCOPED window — timelineDays is
+    // empty (buildTimelineDays days=0), so `topicVisits` is empty and any
+    // leiden/union-find build would produce 0 topics and overwrite the active
+    // revision via putActiveRevision (a topic wipe). Each catch-up chunk also
+    // writes a fresh visitSimilarity revision (touched=0 but new id), so
+    // topicSimilarityChanged stays true and the cadence eventually fires
+    // mid-catch-up — exactly the path that corrupts. Full topic recompute
+    // belongs to a real (non-catch-up) drain that has the whole timeline. When
+    // there is NO previous revision, building from whatever is available is
+    // harmless (0 → 0) and the next real drain produces the real clusters.
     const shouldRunTopicRevision =
       previousTopicRevision === null ||
-      (topicSimilarityChanged && (topicCadenceDue || forcePendingTopicRecompute));
+      (!requireScopedTimelineDeltaForDrain &&
+        topicSimilarityChanged &&
+        (topicCadenceDue || forcePendingTopicRecompute));
     let topicRevision;
     if (!shouldRunTopicRevision && previousTopicRevision !== null) {
       // Topic clustering (especially leiden-cpm) is global rather than
       // cheaply IVM-able. During heavy ingest we accept topics being a
       // few minutes stale; repeatedly freezing the graph for ~30 seconds
       // is worse UX than serving the previous topic revision.
-      topicRevision = previousTopicRevision;
       mark(
         `topicRevision cadenceSkip drains=${String(topicDrainsSinceLastRun)} similarityChanged=${String(topicSimilarityChanged)}`,
       );
-      if (topicSimilarityChanged) pendingTopicRecompute = true;
+      // Incremental topic membership (default OFF): instead of serving the
+      // frozen revision verbatim, overlay newly-eligible visits onto their
+      // nearest existing leiden cluster as SECONDARY affiliations (no leiden
+      // pass). The overlay accumulates onto the previous served revision; the
+      // next full leiden (on cadence) overwrites the active slot and
+      // re-converges with zero churn.
+      const useIncremental =
+        incrementalTopicMembershipEnabled() &&
+        topicSimilarityChanged &&
+        resolveServedTopicProducer() === 'leiden-cpm' &&
+        previousTopicRevision.algorithmVersion === TOPIC_LEIDEN_CPM_REVISION_KEY;
+      if (!useIncremental) {
+        topicRevision = previousTopicRevision;
+        // Force a full recompute on the next similarity-changing drain so
+        // topics don't stay frozen for the whole cadence window — but ONLY
+        // when the overlay feature is OFF. With the overlay on, it provides
+        // responsiveness and the natural cadence handles the full rebuild;
+        // forcing here would pre-empt/wipe the overlay on the next drain.
+        if (topicSimilarityChanged && !incrementalTopicMembershipEnabled()) {
+          pendingTopicRecompute = true;
+        }
+      } else {
+        // Candidate pool = every embedded (similarity-eligible) visit, read
+        // from the persisted HNSW labels — available on EVERY drain, unlike
+        // the full topicVisits list which is empty on scoped/engagement-only
+        // drains. assignIncrementalMembership filters out visits already
+        // clustered (primary OR secondary in the accumulated previous
+        // revision), so the work is O(unclustered·k): a one-time catch-up
+        // after each full leiden, then only the per-drain-new embeds. The
+        // augmented revision accumulates onto previousTopicRevision; the next
+        // full leiden resets the active slot (re-converges, no churn).
+        const candidateCanonicalUrls =
+          loadedHnswSimilarityStore !== null
+            ? [...(await loadedHnswSimilarityStore.knownLabels())]
+            : [];
+        const augmented = await assignIncrementalMembership({
+          baseRevision: previousTopicRevision,
+          candidateCanonicalUrls,
+          edges: visitSimilarity.edges,
+          hnswStore: loadedHnswSimilarityStore,
+          cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+        });
+        const sumSecondaries = (rev: typeof augmented): number =>
+          rev.topics.reduce((sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0), 0);
+        const placed = sumSecondaries(augmented) - sumSecondaries(previousTopicRevision);
+        mark(
+          `incrementalTopicMembership candidates=${String(candidateCanonicalUrls.length)} placed=${String(placed)} edges=${String(visitSimilarity.edges.length)}`,
+        );
+        if (augmented.revisionId === previousTopicRevision.revisionId) {
+          // Unchanged overlay — preserve object identity so topicSame stays
+          // true and the cheap scoped-delta snapshot path is not disabled.
+          topicRevision = previousTopicRevision;
+        } else {
+          // Persist the overlay to the active slot always. During the boot
+          // catch-up the scoped delta is REQUIRED (serving a changed revision
+          // flips topicSame=false and throws), so serve the previous revision
+          // THIS drain; the first post-catch-up drain then detects the active
+          // overlay via topicSnapshotStale and full-rebuilds to render it.
+          await topicRevisionStore.putActiveRevision(augmented);
+          topicRevision = requireScopedTimelineDeltaForDrain ? previousTopicRevision : augmented;
+        }
+        // Do NOT set pendingTopicRecompute here: the overlay already provides
+        // responsiveness, so the next full leiden fires on the natural cadence
+        // rather than the very next drain (which would immediately wipe it).
+      }
     } else if (
       previousTopicRevision !== null &&
       previousTopicRevision.revisionId === expectedTopicRevisionId
@@ -3285,6 +3563,20 @@ export const createConnectionsMaterializer = (
     const previousSnapshotForScopedDelta = previousSnapshotForRanker;
     const replaceScopeRowsForScopedDelta = deps.store.replaceScopeRows;
     let scopedTimelineDeltaSkipDetail = 'gate';
+    // The served snapshot is stale w.r.t. topics when the served revision id
+    // differs from what the snapshot last reflected (an incremental overlay
+    // changed it within this process). Then the cheap scoped-delta path (which
+    // never touches topic edges) must be skipped so the full rebuild below
+    // re-renders visit_in_topic edges. Never force this during the catch-up (it
+    // requires the scoped path). `undefined` means we have not published a
+    // snapshot yet this process — the persisted snapshot was written from the
+    // same revision readActiveRevision() now returns, so it is NOT stale; only
+    // a drift we caused this process (lastSnapshotTopicRevisionId set, then the
+    // served revision changed) marks it stale.
+    const topicSnapshotStale =
+      !requireScopedTimelineDeltaForDrain &&
+      lastSnapshotTopicRevisionId !== undefined &&
+      servedTopicRevision.revisionId !== lastSnapshotTopicRevisionId;
     const scopedTimelineDeltaGate = {
       incrementalScopes: true,
       feature: true,
@@ -3296,6 +3588,7 @@ export const createConnectionsMaterializer = (
       pending: pendingEventsForDrain.length > 0,
       allScopedEvents: pendingEventsForDrain.every(isScopedTimelineDeltaEvent),
       topicSame: servedTopicRevision === previousTopicRevision,
+      topicSnapshotFresh: !topicSnapshotStale,
       hnswNotFull: !hnswFullRebuild,
     };
     if (
@@ -3308,6 +3601,7 @@ export const createConnectionsMaterializer = (
       scopedTimelineDeltaGate.pending &&
       scopedTimelineDeltaGate.allScopedEvents &&
       scopedTimelineDeltaGate.topicSame &&
+      scopedTimelineDeltaGate.topicSnapshotFresh &&
       scopedTimelineDeltaGate.hnswNotFull
     ) {
       const timelineVisitKeys = new Set(
@@ -3532,6 +3826,40 @@ export const createConnectionsMaterializer = (
         mark(
           `replaceScopeRows scopedTimelineDeltaMetadataOnly scopes=${String(dirtyScopes.length)} entries=0`,
         );
+      } else if (
+        requireScopedTimelineDeltaForDrain &&
+        scopedTimelineDays.length === 0 &&
+        dirtyScopes.length === 0
+      ) {
+        // Catch-up content-lane-only chunk (e.g. a backlog of
+        // ENGAGEMENT_INTERVAL_OBSERVED). These events invalidate no graph
+        // scope (CONTENT_LANE_ONLY_HANDLES → empty graph-scope set), so the
+        // served graph is byte-identical; only the frontier must move. Without
+        // this branch the chunk falls through to the throw below
+        // (requireScopedTimelineDeltaForDrain), the frontier never advances,
+        // and the next catchUp re-reads the same chunk forever — a runaway
+        // that freezes the snapshot. Advance progress with an empty-scope
+        // write (no node/edge rows change; #writeProgressRows persists the
+        // chunk's dots + frontier) and serve the prior snapshot unchanged.
+        const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        await replaceScopeRowsForScopedDelta({
+          scopes: [],
+          nodes: [],
+          edges: [],
+          progress,
+          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          metadata: {
+            urlProjection: serializeUrlProjection(urlProjection),
+            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        mark(
+          `replaceScopeRows scopedTimelineDeltaContentLaneOnly entries=0 pending=${String(pendingEventsForDrain.length)}`,
+        );
       } else {
         scopedTimelineDeltaSkipDetail =
           scopedTimelineDays.length === 0
@@ -3543,7 +3871,7 @@ export const createConnectionsMaterializer = (
     }
     if (!scopedTimelineDeltaApplied) {
       mark(
-        `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
+        `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
       );
       if (requireScopedTimelineDeltaForDrain) {
         throw new Error(
@@ -3556,7 +3884,28 @@ export const createConnectionsMaterializer = (
           `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
         );
       }
-      if (!baseSnapshotPrebuilt) baseSnapshot = buildConnectionsSnapshot(input);
+      if (!baseSnapshotPrebuilt) {
+        // Full-rebuild fallback (scoped-delta could not apply; NOT a catch-up,
+        // which threw above). In the store-backed path `input.events` (= merged)
+        // is only the pending WINDOW, so buildConnectionsSnapshot would yield a
+        // window-only graph that then OVERWRITES the full snapshot — a shrink
+        // (e.g. a search-visit drain on a small window collapsing ~9k nodes to a
+        // few hundred). The non-store-backed path already rebuilds from the full
+        // log (merged = eventLog.readMerged()); mirror that here so the fallback
+        // produces the COMPLETE graph. Every other input field (timelineDays,
+        // projections, similarity, topics) is already full-scope, so only the
+        // event set needs widening. The view is seeded from this base and is not
+        // re-folded with `merged` in this path, so there is no double-apply.
+        // Use storeBackedEvents.readSince({}) — the SAME full-event source the
+        // cold build uses (proven to yield the complete graph) — not
+        // deps.eventLog.readMerged(), which is partial in the store-backed setup.
+        const fullBuildEvents =
+          storeBackedEvents !== null ? storeBackedEvents.readSince({}) : merged;
+        baseSnapshot =
+          fullBuildEvents === merged
+            ? buildConnectionsSnapshot(input)
+            : buildConnectionsSnapshot({ ...input, events: fullBuildEvents });
+      }
       incrementalGraphView.seed(baseSnapshot);
       if (incrementalGraphPlan.pendingEventCount > 0) {
         mark(
@@ -3607,6 +3956,13 @@ export const createConnectionsMaterializer = (
     if (!wroteScopeIncremental) {
       await writeSnapshotWithDrainProgress(baseSnapshot, dirtyScopeWrites);
       mark('writeSnapshotAndProgress baseSnapshot');
+    }
+    // Record which topic revision the freshly-published snapshot reflects, so
+    // a later overlay change (or restart) can detect drift and force a rebuild
+    // (topicSnapshotStale above). The catch-up serves the prior snapshot and
+    // must not claim freshness, so only record outside the catch-up.
+    if (!requireScopedTimelineDeltaForDrain) {
+      lastSnapshotTopicRevisionId = servedTopicRevision.revisionId;
     }
     await yieldToEventLoop();
     const rankerRetrainResult = await rankerRetrainer({

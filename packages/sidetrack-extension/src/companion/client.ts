@@ -270,6 +270,16 @@ const parseWorkstreamProjections = (value: unknown): readonly WorkstreamProjecti
 
 export class HttpCompanionClient implements CompanionClient {
   private readonly baseUrl: string;
+  // Conditional-GET cache. Keyed on the request path (incl. querystring),
+  // because the same logical endpoint with different query args is a
+  // different cache entry. Stores the ETag the companion last gave us
+  // plus the last successful parsed body. On 304 we return the cached
+  // body verbatim — saves the wire-format JSON parse + the React state
+  // update churn that would otherwise fire on every 15s poll cycle.
+  // Bounded by the set of distinct GET endpoints the extension polls
+  // (~20 today); old entries are evicted on the LRU schedule below.
+  private readonly etagCache = new Map<string, { etag: string; value: unknown }>();
+  private static readonly ETAG_CACHE_MAX = 64;
 
   constructor(private readonly settings: CompanionSettings) {
     this.baseUrl = `http://127.0.0.1:${String(settings.port)}/v1`;
@@ -443,6 +453,17 @@ export class HttpCompanionClient implements CompanionClient {
     headers.set('content-type', 'application/json');
     headers.set('x-bac-bridge-key', this.settings.bridgeKey);
 
+    // GET-only conditional fetch: replay the last ETag the companion
+    // gave us for this path so the companion can short-circuit with a
+    // 304 (empty body) when nothing changed. Mutations (POST/PATCH/...)
+    // intentionally don't participate: they have side-effects, and the
+    // idempotency-key path handles dedupe for those instead.
+    const isGet = (init.method ?? 'GET').toUpperCase() === 'GET';
+    const cached = isGet ? this.etagCache.get(path) : undefined;
+    if (cached !== undefined) {
+      headers.set('if-none-match', cached.etag);
+    }
+
     // Fixes: side panel stuck on "Companion: disconnected" even when the
     // full tab is fine. Root cause: no fetch timeout here meant a slow
     // companion (catchUp on a 5K-event vault) would hang the SW's
@@ -466,9 +487,31 @@ export class HttpCompanionClient implements CompanionClient {
         headers,
         signal: controller.signal,
       });
+      // 304 Not Modified: the companion confirmed our cached body is
+      // still current. Return the cached value verbatim — callers see
+      // referentially-identical data, so React's reconciliation skips
+      // the re-render. Saves the wire-format JSON parse + state churn.
+      if (response.status === 304 && cached !== undefined) {
+        return cached.value;
+      }
       const value = (await response.json()) as unknown;
       if (!response.ok) {
         throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+      }
+      // Store the fresh ETag for next time. Bounded LRU: when the
+      // map grows past the cap, drop the oldest entry. Map iteration
+      // order is insertion order, so the first key is the eldest.
+      if (isGet) {
+        const etag = response.headers.get('etag');
+        if (etag !== null && etag.length > 0) {
+          if (this.etagCache.size >= HttpCompanionClient.ETAG_CACHE_MAX) {
+            const eldest = this.etagCache.keys().next().value;
+            if (eldest !== undefined) this.etagCache.delete(eldest);
+          }
+          // Re-insert to mark as most-recently-used.
+          this.etagCache.delete(path);
+          this.etagCache.set(path, { etag, value });
+        }
       }
       return value;
     } catch (error) {

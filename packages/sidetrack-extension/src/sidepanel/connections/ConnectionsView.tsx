@@ -209,6 +209,11 @@ type Props = {
   // switch viewMode + pre-fill the Inbox search.
   readonly onOpenInInbox?: (canonicalUrl: string) => void;
   readonly onSaveFocusGroup?: (input: FocusGroupSaveInput) => Promise<void> | void;
+  // The browser tab the user is looking at right now, plumbed from
+  // App.tsx (state.currentTab). When present, the SearchTab header
+  // offers a one-click "Anchor to current tab" affordance that pivots
+  // the graph onto this URL without retyping the title.
+  readonly currentTabUrl?: string;
 };
 
 const DEFAULT_DISPLAY_CTX: EntityDisplayCtx = {
@@ -1821,6 +1826,7 @@ export const ConnectionsView = ({
   onRequestConsumed,
   onOpenInInbox,
   onSaveFocusGroup,
+  currentTabUrl,
 }: Props): ReactElement => {
   const baseCtx: EntityDisplayCtx = displayCtx ?? DEFAULT_DISPLAY_CTX;
   // Anchor history — back/forward stack so drilling into a neighbor
@@ -2919,6 +2925,10 @@ export const ConnectionsView = ({
         setSubMode('linked');
       }}
       {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+      {...(currentTabUrl === undefined || currentTabUrl.length === 0
+        ? {}
+        : { currentTabUrl })}
+      {...(anchorCanonicalUrl === null ? {} : { currentAnchorUrl: anchorCanonicalUrl })}
       onDejaVuPivot={(text) => {
         // E: Search → Déjà-vu pivot. Hand the query as the selection
         // text into the submode; items come from `recallResults`
@@ -3156,7 +3166,7 @@ export const ConnectionsView = ({
           title={modeAvailability.focus.reason}
           data-testid="connections-mode-focus"
         >
-          Focus
+          Related
         </button>
         {modeAvailability.context.hidden === true ? null : (
           <button

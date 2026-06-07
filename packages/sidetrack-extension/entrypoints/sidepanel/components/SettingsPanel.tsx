@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { WorkstreamNode } from '../../../src/workboard';
+import { parsePairingString } from '../../../src/companion/pairingString';
 import { CollectorsSection } from './CollectorsSection';
 import type { CollectorStatus } from './CollectorsSection';
 import { Modal } from './Modal';
@@ -48,6 +49,7 @@ export interface SettingsValue {
 }
 
 export interface LocalPreferences {
+  readonly captureEnabled: boolean;
   readonly autoTrack: boolean;
   readonly vaultPath: string;
   readonly notifyOnQueueComplete: boolean;
@@ -79,6 +81,7 @@ export interface SettingsPanelProps {
     readonly screenShareSafeMode: boolean;
   }) => void;
   readonly onSaveLocalPreferences: (next: {
+    readonly captureEnabled?: boolean;
     readonly autoTrack?: boolean;
     readonly vaultPath?: string;
     readonly notifyOnQueueComplete?: boolean;
@@ -116,6 +119,14 @@ export interface SettingsPanelProps {
     readonly port: number;
     readonly bridgeKey: string;
   }) => void;
+  // Scroll a named section into view when the panel opens — e.g. a
+  // "Fix connection" banner deep-links to 'companion-connection' so the
+  // user lands on the field to change instead of hunting for it.
+  readonly scrollToId?: string | null;
+  // Vault root the connected companion reports via /v1/version — the
+  // source of truth for "where am I actually writing", distinct from the
+  // editable next-launch path. null/undefined when not connected.
+  readonly companionVaultRoot?: string | null;
 }
 
 const PROVIDER_LABELS: Record<keyof SettingsValue['autoSendOptIn'], string> = {
@@ -178,7 +189,30 @@ export function SettingsPanel({
   collectors = [],
   onCollectorReplay = async () => undefined,
   onSaveCompanionConnection,
+  scrollToId,
+  companionVaultRoot,
 }: SettingsPanelProps) {
+  // Deep-link scroll: when opened with a target section id, bring it
+  // into view once it has mounted. Guard with a ref so we scroll once
+  // per target, not on every re-render.
+  const scrolledForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (scrollToId === undefined || scrollToId === null) {
+      scrolledForRef.current = null;
+      return undefined;
+    }
+    if (scrolledForRef.current === scrollToId) return undefined;
+    const handle = window.setTimeout(() => {
+      const el = document.getElementById(scrollToId);
+      if (el !== null) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        scrolledForRef.current = scrollToId;
+      }
+    }, 60);
+    return () => {
+      window.clearTimeout(handle);
+    };
+  }, [scrollToId]);
   // Helper for companion-backed sections. Returns null on missing
   // config so callers can fall back gracefully.
   const callCompanion = async (path: string, init?: RequestInit): Promise<Response | null> => {
@@ -414,6 +448,38 @@ export function SettingsPanel({
     onSaveCompanionConnection?.({ port: portNum, bridgeKey: draftBridgeKey });
   };
 
+  // #2 — let the user load the bridge key from the file instead of
+  // catting it in a terminal. The file-select IS the user gesture, so
+  // it stays secure (no auto-served key over loopback).
+  const bridgeKeyFileRef = useRef<HTMLInputElement | null>(null);
+  const handleBridgeKeyFile = async (file: File): Promise<void> => {
+    // bridge.key is a single-line text file; trim the trailing newline so
+    // the value matches exactly what the companion compares against.
+    const text = (await file.text()).trim();
+    if (text.length === 0) return;
+    setDraftBridgeKey(text);
+    setCompanionTestState('idle');
+  };
+
+  // #3 — one-paste pairing. The companion prints st-pair://<port>/<key>
+  // (and writes pair.txt); parsing it fills BOTH fields and saves, so the
+  // user never separately hunts the port and cats the key.
+  const [pairingDraft, setPairingDraft] = useState('');
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const handlePairingApply = (): void => {
+    const parsed = parsePairingString(pairingDraft);
+    if (parsed === null) {
+      setPairingError('Not a pairing string — expected st-pair://<port>/<key>.');
+      return;
+    }
+    setPairingError(null);
+    setDraftCompanionPort(String(parsed.port));
+    setDraftBridgeKey(parsed.bridgeKey);
+    setCompanionTestState('idle');
+    onSaveCompanionConnection?.({ port: parsed.port, bridgeKey: parsed.bridgeKey });
+    setPairingDraft('');
+  };
+
   const handleCompanionTest = async (): Promise<void> => {
     const portNum = Number.parseInt(draftCompanionPort, 10);
     if (!Number.isFinite(portNum) || portNum <= 0 || portNum > 65_535) {
@@ -532,14 +598,67 @@ export function SettingsPanel({
       footer={footer}
     >
       {onSaveCompanionConnection !== undefined ? (
-        <div className="settings-section">
-          <h3 className="settings-section-title">Companion connection</h3>
+        <div className="settings-section" id="companion-connection">
+          <h3 className="settings-section-title">Connection</h3>
+          <div className="settings-conn-status">
+            <span
+              className={
+                'sp-status-dot ' +
+                (companionVaultRoot !== null && companionVaultRoot !== undefined
+                  ? 'green'
+                  : companionConfigured
+                    ? 'red'
+                    : 'amber')
+              }
+              aria-hidden
+            />
+            <span className="mono">
+              {companionVaultRoot !== null && companionVaultRoot !== undefined
+                ? `connected · ${companionVaultRoot}`
+                : companionConfigured
+                  ? 'configured, but the companion isn’t responding on this port'
+                  : 'local-only — no companion paired yet'}
+            </span>
+          </div>
           <p className="settings-section-lede ai-italic">
-            The side panel reaches the companion over loopback. Default port is{' '}
-            <span className="mono">17373</span>; change it here if you launched the companion with{' '}
-            <span className="mono">--port</span> or are pointing at a sandbox vault. Edits save
-            automatically once you blur the field or click Save.
+            Pair in one paste: start the companion, then paste the{' '}
+            <span className="mono">st-pair://…</span> string it prints (also saved to{' '}
+            <span className="mono">_BAC/.config/pair.txt</span>). Or set the port + key by hand below.
           </p>
+          <label className="settings-text-row">
+            <span>Pairing string</span>
+            <input
+              type="text"
+              className="mono"
+              placeholder="st-pair://17373/…"
+              value={pairingDraft}
+              disabled={busy}
+              onChange={(event) => {
+                setPairingDraft(event.target.value);
+                setPairingError(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') handlePairingApply();
+              }}
+              aria-label="Pairing string"
+            />
+          </label>
+          <div className="settings-keyfile-row">
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={busy || pairingDraft.trim().length === 0}
+              onClick={handlePairingApply}
+            >
+              Pair
+            </button>
+            {pairingError !== null ? (
+              <span className="settings-companion-status red mono">{pairingError}</span>
+            ) : (
+              <span className="settings-hint mono">fills the port + key below and connects</span>
+            )}
+          </div>
+          <div className="settings-conn-divider" aria-hidden />
           <label className="settings-text-row">
             <span>Port</span>
             <input
@@ -578,6 +697,31 @@ export function SettingsPanel({
               aria-label="Bridge key"
             />
           </label>
+          <div className="settings-keyfile-row">
+            <button
+              type="button"
+              className="btn btn-ghost"
+              disabled={busy}
+              onClick={() => {
+                bridgeKeyFileRef.current?.click();
+              }}
+            >
+              Load key from file…
+            </button>
+            <input
+              ref={bridgeKeyFileRef}
+              type="file"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (file !== undefined) void handleBridgeKeyFile(file);
+              }}
+            />
+            <span className="settings-hint mono">
+              pick <span className="mono">_BAC/.config/bridge.key</span> — no terminal needed
+            </span>
+          </div>
           <div className="settings-cta-row">
             <span
               className={
@@ -626,7 +770,7 @@ export function SettingsPanel({
       ) : null}
 
       <div className="settings-section">
-        <h3 className="settings-section-title">Vault &amp; tracking</h3>
+        <h3 className="settings-section-title">Vault</h3>
         {companionConfigured ? (
           <>
             <p className="settings-section-lede ai-italic">
@@ -638,22 +782,37 @@ export function SettingsPanel({
               <div className="settings-vault-status-row">
                 <span className="settings-vault-status-label mono">vault</span>
                 <code className="settings-vault-status-value">
-                  {draftVaultPath.length > 0 ? draftVaultPath : '(unknown — restart companion)'}
+                  {companionVaultRoot ?? (draftVaultPath.length > 0 ? draftVaultPath : '—')}
                 </code>
+                {companionVaultRoot !== null && companionVaultRoot !== undefined ? (
+                  <span className="settings-hint mono">live · reported by companion</span>
+                ) : null}
               </div>
-              {draftVaultPath.length > 0 ? (
+              {(companionVaultRoot ?? draftVaultPath).length > 0 ? (
                 <div className="settings-vault-status-row">
                   <span className="settings-vault-status-label mono">bridge key</span>
                   <code className="settings-vault-status-value">
-                    {draftVaultPath.replace(/\/$/, '')}/_BAC/.config/bridge.key
+                    {(companionVaultRoot ?? draftVaultPath).replace(/\/$/u, '')}/_BAC/.config/bridge.key
                   </code>
+                  <button
+                    type="button"
+                    className="btn-link sp-status-pill-btn"
+                    title="Copy the bridge-key file path"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(
+                        `${(companionVaultRoot ?? draftVaultPath).replace(/\/$/u, '')}/_BAC/.config/bridge.key`,
+                      );
+                    }}
+                  >
+                    copy path
+                  </button>
                 </div>
               ) : null}
             </div>
             <p className="settings-hint mono">
-              Lost the key? Run <code>cat &lt;bridge key path&gt;</code> in your terminal — the file
-              is the canonical store. The vault path can be edited below for the NEXT companion
-              launch (the running process keeps its current path).
+              Need the key? Use “Load key from file…” under Companion connection above, or open the
+              path shown here — no terminal required. The editable vault path below sets the vault for
+              the NEXT companion launch; the running process keeps its current path.
             </p>
           </>
         ) : (
@@ -691,13 +850,55 @@ export function SettingsPanel({
             </button>
           </div>
         ) : null}
+      </div>
+
+      <div className="settings-section">
+        <h3 className="settings-section-title">Capture</h3>
         <p className="settings-section-lede ai-italic">
-          Capture mode lives in the side-panel toolbar: the icon between{' '}
-          <span className="mono">+</span> (capture current tab) and <span className="mono">›_</span>{' '}
-          (attach coding session) toggles between <span className="mono">auto</span> (Sidetrack
-          refreshes every new turn) and <span className="mono">manual</span> (capture-on-demand per
-          row).
+          What Sidetrack records. These mirror the toolbar controls — the{' '}
+          <span className="mono">eye</span> (capture on/off) and the auto/manual toggle.
         </p>
+        <label className={'switch ' + (localPreferences.captureEnabled ? 'on' : '')}>
+          <input
+            type="checkbox"
+            checked={localPreferences.captureEnabled}
+            disabled={busy}
+            onChange={() => {
+              onSaveLocalPreferences({ captureEnabled: !localPreferences.captureEnabled });
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Capture
+            <span className="desc mono">
+              {localPreferences.captureEnabled
+                ? 'on — recording chat threads, page text, timeline, engagement'
+                : 'paused — nothing is recorded anywhere'}
+            </span>
+          </span>
+        </label>
+        <label
+          className={'switch ' + (localPreferences.autoTrack ? 'on' : '')}
+          style={{ marginTop: 8 }}
+        >
+          <input
+            type="checkbox"
+            checked={localPreferences.autoTrack}
+            disabled={busy || !localPreferences.captureEnabled}
+            onChange={() => {
+              onSaveLocalPreferences({ autoTrack: !localPreferences.autoTrack });
+            }}
+          />
+          <span className="knob" />
+          <span className="lbl">
+            Auto-track new threads
+            <span className="desc mono">
+              {localPreferences.autoTrack
+                ? 'on — refresh tracked threads on every new turn'
+                : 'off — capture only when you click a row'}
+            </span>
+          </span>
+        </label>
       </div>
 
       <div className="settings-section">

@@ -6,6 +6,7 @@ import { SettingsPanel, Wizard } from '../../entrypoints/sidepanel/components';
 const STUB_PROPS = {
   settings: null,
   localPreferences: {
+    captureEnabled: true,
     autoTrack: false,
     vaultPath: '',
     notifyOnQueueComplete: false,
@@ -36,14 +37,14 @@ describe('SettingsPanel — Companion connection section', () => {
         onSaveCompanionConnection={() => undefined}
       />,
     );
-    expect(screen.getByText('Companion connection')).toBeTruthy();
+    expect(screen.getByText('Connection')).toBeTruthy();
     expect((screen.getByLabelText('Companion port') as HTMLInputElement).value).toBe('27373');
     expect((screen.getByLabelText('Bridge key') as HTMLInputElement).value).toBe('seeded-key');
   });
 
   it('omits the section entirely in legacy embeddings (no save callback)', () => {
     render(<SettingsPanel {...STUB_PROPS} companionPort={17_373} bridgeKey="x" />);
-    expect(screen.queryByText('Companion connection')).toBeNull();
+    expect(screen.queryByText('Connection')).toBeNull();
   });
 
   it('fires onSaveCompanionConnection with the edited port + key when Save connection clicked', () => {

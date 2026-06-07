@@ -104,3 +104,5 @@ export type {
 } from './SettingsV2Sections';
 export { DesignPreview } from './DesignPreview';
 export { TurnText } from './TurnText';
+export { ToolbarOverflowMenu } from './ToolbarOverflowMenu';
+export type { ToolbarOverflowMenuProps, DumpStatusKind } from './ToolbarOverflowMenu';

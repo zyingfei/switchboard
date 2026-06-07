@@ -36,10 +36,19 @@ if [ ! -d "$TEST_VAULT" ]; then
 fi
 
 cd "$COMPANION_DIR"
+# SIDETRACK_EVENT_STORE=1        — use the incremental store-backed drain path
+#                                  (the efficient steady state; the legacy
+#                                  full-log path shrinks the snapshot).
+# SIDETRACK_CONNECTIONS_GAP_SEAL=1 — seal provably-permanent event-sequence gaps
+#                                  so the frontier can't freeze (and refreeze the
+#                                  whole materializer → topics). Default OFF; the
+#                                  seal only fires on the store-backed path.
 exec env \
   SIDETRACK_INSTANCE_LABEL=test \
   SIDETRACK_HTTP_LOG=1 \
   SIDETRACK_RECALL_PHASE_LOG=1 \
   SIDETRACK_CONNECTIONS_PHASE_LOG=1 \
   SIDETRACK_CONNECTIONS_CHILD=1 \
+  SIDETRACK_EVENT_STORE=1 \
+  SIDETRACK_CONNECTIONS_GAP_SEAL=1 \
   npx --yes bun@1.3.14 --smol dist/cli.js --vault "$TEST_VAULT" --port "$TEST_PORT"

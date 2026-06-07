@@ -22,6 +22,7 @@ import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
+import { pairingToken, writePairToken } from './auth/bridgeKey.js';
 import { pickInstaller } from './install/index.js';
 import { ensurePageContentLexicalIndex } from './page-content/store.js';
 import { withBunSmolCommand } from './process/bunMemory.js';
@@ -1034,6 +1035,25 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       streams.stdout,
       `(Reusing the existing key. Run \`cat ${runtime.bridgeKeyPath}\` to copy it again.)`,
     );
+  }
+
+  // Pairing token — one paste covers port + key. Written next to the key
+  // and printed every run so the user can grab a single string instead
+  // of separately hunting the port and catting the key.
+  let pairPath: string | undefined;
+  try {
+    pairPath = await writePairToken(runtime.vaultPath, args.port, runtime.bridgeKey);
+  } catch {
+    // Non-fatal — the key file + printed token below still pair fine.
+  }
+  writeLine(streams.stdout, '');
+  writeLine(
+    streams.stdout,
+    'Pair the extension in one paste — Settings → Companion connection → "Paste pairing string":',
+  );
+  writeLine(streams.stdout, `  ${pairingToken(args.port, runtime.bridgeKey)}`);
+  if (pairPath !== undefined) {
+    writeLine(streams.stdout, `  (also saved to ${pairPath})`);
   }
 
   // Track an optional MCP child + close hook on a single object so

@@ -2260,8 +2260,12 @@ export function HealthPanel({
       },
       {
         label: 'Topics',
-        num: tp.topicCount > 0 ? `${String(tp.topicCount)} topics` : 'no clusters yet',
-        foot: 'served to inbox + suggestions',
+        num: tp.topicCount > 0 ? `${String(tp.topicCount)} clusters` : 'no clusters yet',
+        // Diagnostic only: these are connections-graph clusters that
+        // feed the suggestion resolver as ONE signal — they are NOT
+        // items shown in the Inbox. The old "served to inbox +
+        // suggestions" copy was misread as "the Inbox shows 93 topics".
+        foot: 'cluster signal for suggestions',
       },
       {
         label: 'Lineage',

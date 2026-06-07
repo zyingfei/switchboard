@@ -59,6 +59,15 @@ export interface SuggestionStatsProps {
   // confidence). When `compact` is true, the signal row and
   // alternatives row are tucked behind a "details" disclosure.
   readonly compact?: boolean;
+  // When page-access (engagement) isn't granted, visit-similarity — the
+  // resolver's dominant signal — can never fire, because a visit is only
+  // similarity-eligible after ≥5s of focused engagement (which needs the
+  // engagement content script). In that state the empty placeholder
+  // explains *that's* why and offers the one-click grant, instead of the
+  // misleading "first time seeing this URL". `undefined` = unknown
+  // (older callers) → keep the original placeholder.
+  readonly pageAccessGranted?: boolean;
+  readonly onGrantAccess?: () => void;
 }
 
 export function SuggestionStats({
@@ -67,6 +76,8 @@ export function SuggestionStats({
   showAlternatives = false,
   showEmptyPlaceholder = false,
   compact = false,
+  pageAccessGranted,
+  onGrantAccess,
 }: SuggestionStatsProps) {
   if (suggestion === undefined) {
     // Distinct from "fetched but empty" below — the suggestion has not
@@ -87,6 +98,41 @@ export function SuggestionStats({
   }
   if (suggestion.fusedCandidates.length === 0) {
     if (!showEmptyPlaceholder) return null;
+    // Page access off → the similarity signal can't fire at all (every
+    // visit fails the ≥5s engagement gate), so the resolver returns
+    // empty for *everything*, not just brand-new URLs. Surface the real
+    // reason + the fix instead of the generic first-seen copy.
+    if (pageAccessGranted === false) {
+      return (
+        <div className="suggestion-stats is-empty needs-access">
+          <span className="suggestion-stats-row">
+            <span className="suggestion-stats-target subtle">No signal — page access off</span>
+            <span
+              className="suggestion-stats-info"
+              title={
+                'Attribution leans on page engagement: Sidetrack relates a page to your ' +
+                'workstreams from how its content + dwell resemble pages you’ve worked in. ' +
+                'Without page access it only sees the URL + title, so it can’t relate new pages ' +
+                '— every page reads "no signal". Grant access (focus / scroll / copy stay local) ' +
+                'to turn this on for pages you read going forward.'
+              }
+            >
+              ⓘ
+            </span>
+          </span>
+          <span className="suggestion-stats-source mono subtle">
+            Attribution needs page engagement.{' '}
+            {onGrantAccess !== undefined ? (
+              <button type="button" className="btn-link suggestion-stats-grant" onClick={onGrantAccess}>
+                Grant access
+              </button>
+            ) : (
+              <>Enable it in the “Deeper page access” banner.</>
+            )}
+          </span>
+        </div>
+      );
+    }
     // The resolver needs ≥1 of these three to fire for a URL:
     //   - PPR adjacency to a workstream (related visit edges exist)
     //   - Visit similarity score above threshold (a workstream page

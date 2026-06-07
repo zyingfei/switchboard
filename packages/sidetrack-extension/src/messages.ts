@@ -580,6 +580,7 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.saveLocalPreferences;
       readonly preferences: {
+        readonly captureEnabled?: boolean;
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
         readonly notifyOnQueueComplete?: boolean;

@@ -146,6 +146,7 @@ import {
   readSettings,
   recordSelectorCanary,
   saveAutoTrack,
+  saveCaptureEnabled,
   saveCompanionSettings,
   saveCollapsedBuckets,
   saveCollapsedSections,
@@ -504,7 +505,19 @@ const invalidateTimelineGateCache = (): void => {
   cachedPrivacyProjection = null;
 };
 
+// Master capture kill-switch — the side-panel "eye". Read fresh (not
+// cached) so a flip takes effect immediately on every gated path.
+// `!== false` treats a missing flag as on, matching readSettings'
+// default-merge (captureEnabled defaults to true).
+const isCaptureEnabled = async (): Promise<boolean> =>
+  (await readSettings()).captureEnabled !== false;
+
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  // The master switch overrides the per-feature gate: capture off means
+  // no ambient timeline ingestion, full stop. Checked before the cache
+  // so a flip is honored immediately (the captureEnabled read is cheap
+  // and the gate cache only memoizes the companion-side projection).
+  if (!(await isCaptureEnabled())) return false;
   const now = Date.now();
   if (cachedTimelineGateState !== null && cachedTimelineGateState.expiresAtMs > now) {
     return cachedTimelineGateState.value;
@@ -635,7 +648,10 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   await ensureEngagementGateDefaultOpen().catch(() => undefined);
   const gateOpen = await isEngagementPrivacyGateOpen();
   const hasPermission = await hasEngagementHostPermission();
-  const shouldRegister = gateOpen && hasPermission;
+  // Master capture switch gates engagement observation too — off means
+  // the content script unregisters and stops emitting intervals.
+  const captureOn = await isCaptureEnabled();
+  const shouldRegister = gateOpen && hasPermission && captureOn;
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
   });
@@ -643,6 +659,7 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   await recordEngagementSyncDiag('sync.invoked', {
     gateOpen,
     hasPermission,
+    captureOn,
     shouldRegister,
     alreadyRegistered,
   });
@@ -684,7 +701,8 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
 };
 
 const syncVisualFingerprintContentScriptRegistration = async (): Promise<void> => {
-  const shouldRegister = await isVisualFingerprintPrivacyGateOpen();
+  const shouldRegister =
+    (await isVisualFingerprintPrivacyGateOpen()) && (await isCaptureEnabled());
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID],
   });
@@ -1034,6 +1052,9 @@ const extractPageContentFromTab = async (
   if (typeof tab.id !== 'number') {
     throw new Error('Current tab has no tab id.');
   }
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to index page content.');
+  }
   if (tab.incognito === true) {
     throw new Error('Page-content indexing is disabled in incognito tabs.');
   }
@@ -1088,6 +1109,9 @@ const extractPageEvidenceFromTab = async (
   if (typeof tab.id !== 'number') {
     throw new Error('Current tab has no tab id.');
   }
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to extract page evidence.');
+  }
   if (tab.incognito === true) {
     throw new Error('Page-evidence extraction is disabled in incognito tabs.');
   }
@@ -1139,6 +1163,7 @@ const maybeExtractAutoPageEvidence = async (
   detail: Record<string, unknown> = {},
 ): Promise<void> => {
   const settings = await readSettings();
+  if (settings.captureEnabled === false) return;
   if (settings.pageEvidenceAutoExtractEnabled !== true) return;
   if (typeof tab.id !== 'number') return;
   if (tab.incognito === true) return;
@@ -1370,6 +1395,12 @@ const storeCaptureEvent = async (
 };
 
 const captureTab = async (): Promise<void> => {
+  // Master capture switch off — refuse the explicit "+" capture too.
+  // The toolbar disables the button when capture is off, so this is
+  // defense-in-depth; the thrown message surfaces in the panel banner.
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to capture this tab.');
+  }
   const tab = await activeTab();
   if (!tab) {
     throw new Error('No active tab is available.');
@@ -2702,6 +2733,12 @@ const handleRequest = async (
   }
 
   if (request.type === messageTypes.autoCapture) {
+    // Master capture switch (the side-panel eye) is off — drop silently,
+    // capture nothing. content.ts is statically registered so we can't
+    // unregister it; this handler gate is the stop for AI-thread auto.
+    if (!(await isCaptureEnabled())) {
+      return { ok: true, state: await buildState('connected') };
+    }
     // Defense-in-depth gate: even if a content script (or test) injects
     // an autoCapture for a non-thread URL on a known provider, drop it
     // silently rather than create a junk thread row.
@@ -3471,6 +3508,14 @@ const handleRequest = async (
 
   if (request.type === messageTypes.saveLocalPreferences) {
     return await withCompanionStatus(async () => {
+      if (typeof request.preferences.captureEnabled === 'boolean') {
+        await saveCaptureEnabled(request.preferences.captureEnabled);
+        // The master switch gates the dynamically-registered observation
+        // scripts (engagement, visual-fingerprint). Re-sync so they
+        // unregister immediately when capture is turned off and come
+        // back when it's turned on — don't wait for the next nav/poll.
+        void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
+      }
       if (typeof request.preferences.autoTrack === 'boolean') {
         await saveAutoTrack(request.preferences.autoTrack);
       }
@@ -3830,6 +3875,13 @@ export default defineBackground(() => {
       });
       return;
     }
+    // Master capture switch off — drop in-flight intervals. The script
+    // is unregistered when capture is off, but a message can still be in
+    // transit at the instant of the flip; this is belt-and-suspenders.
+    if (!(await isCaptureEnabled())) {
+      await recordEngagementSyncDiag('interval.dropped', { reason: 'capture-disabled', tabId });
+      return;
+    }
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
     const payloads: {
@@ -3860,6 +3912,8 @@ export default defineBackground(() => {
 
   const handleSelectionLineage = async (message: unknown): Promise<void> => {
     if (!isSelectionLineageMessage(message)) return;
+    // Master capture switch off — don't record copy/paste lineage.
+    if (!(await isCaptureEnabled())) return;
     const allocated = await allocateNextSeq(1);
     const streamName =
       message.type === 'sidetrack.selection.copied' ? 'selection.copied' : 'selection.pasted';
@@ -4310,14 +4364,19 @@ export default defineBackground(() => {
       });
       // Phase 10 — also ingest into OPFS local recall so the visit is
       // findable offline. Cheap upsert; fire-and-forget; never blocks.
+      // Gated by the master capture switch (off = no ambient visits).
       if (typeof tab.url === 'string' && /^https?:\/\//u.test(tab.url)) {
-        void ingestVisit({
-          canonicalUrl: tab.url,
-          ...(typeof tab.title === 'string' && tab.title.length > 0
-            ? { title: tab.title }
-            : {}),
-          seenAtMs: Date.now(),
-        });
+        const visitUrl = tab.url;
+        const visitTitle =
+          typeof tab.title === 'string' && tab.title.length > 0 ? tab.title : undefined;
+        void (async () => {
+          if (!(await isCaptureEnabled())) return;
+          await ingestVisit({
+            canonicalUrl: visitUrl,
+            ...(visitTitle !== undefined ? { title: visitTitle } : {}),
+            seenAtMs: Date.now(),
+          });
+        })();
       }
     }
   });
@@ -4574,6 +4633,8 @@ export default defineBackground(() => {
         if (typeof tabId !== 'number') {
           throw new Error('navigation link click has no sender tab');
         }
+        // Master capture switch off — drop the link-click signal.
+        if (!(await isCaptureEnabled())) return;
         await webNavigationRuntime.recordLinkClick({
           tabId,
           sourceUrl: message.sourceUrl,
