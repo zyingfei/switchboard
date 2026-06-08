@@ -297,6 +297,13 @@ const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 // out-of-order dot is never skipped). Gated behind an env flag for safe
 // rollout / instant rollback.
 const GAP_SEAL_ENABLED = (): boolean => process.env['SIDETRACK_CONNECTIONS_GAP_SEAL'] === '1';
+// Source the topic build from the FULL timeline + FULL engagement (default OFF).
+// Without it, an incremental/settled drain clusters only the per-drain window
+// (and older visits lack engagement -> eligibleVisits filters them), so a topic
+// recompute shrinks or wipes. When on, a recompute re-derives the visit set from
+// the full event log, so topics re-cluster correctly over the whole graph.
+const topicFullTimelineSourceEnabled = (): boolean =>
+  process.env['SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE'] === '1';
 // A gap seq must be PROVEN absent (store streamed past it, absent from the
 // log, never applied) for this many CONSECUTIVE drains before it is sealed.
 // Reset to 0 the instant the seq reappears (out-of-order CRDT arrival).
@@ -3219,6 +3226,35 @@ export const createConnectionsMaterializer = (
       topicDrainsSinceLastRun >= resolveTopicEveryDrains() ||
       Date.now() - lastTopicRunAtMs >= resolveTopicEveryMs();
     const forcePendingTopicRecompute = pendingTopicRecompute && topicSimilarityChanged;
+    // Full-timeline topic source (default OFF; see topicFullTimelineSourceEnabled).
+    // `topicVisits` above is derived from this drain's window — on a settled/
+    // incremental drain that is a tiny slice (and older visits carry no
+    // engagement), so a recompute would shrink/wipe the revision. When enabled
+    // and a recompute is imminent (non-catch-up cadence), re-derive the visit set
+    // from the FULL event log WITH FULL engagement (so eligibleVisits' focused-
+    // window gate sees every engaged visit), exactly like the cold boot. Cadence-
+    // gated so normal scoped drains pay nothing.
+    const topicRecomputeImminent =
+      previousTopicRevision === null ||
+      (!requireScopedTimelineDeltaForDrain &&
+        topicSimilarityChanged &&
+        (topicCadenceDue || forcePendingTopicRecompute));
+    let topicVisitsForBuild = topicVisits;
+    if (topicFullTimelineSourceEnabled() && topicRecomputeImminent) {
+      const fullTopicEvents = await deps.eventLog.readMerged();
+      const fullTopicTimeline = buildTimelineDays(fullTopicEvents);
+      const fullTopicEngagement = buildEngagementClassifierInputs(
+        fullTopicEvents,
+        fullTopicTimeline,
+      );
+      topicVisitsForBuild = enrichTimelineDaysWithEngagement(
+        fullTopicTimeline,
+        fullTopicEngagement,
+      ).flatMap((day) => day.entries.map(topicVisitFromEntry));
+      mark(
+        `topicVisitsForBuild full=${String(topicVisitsForBuild.length)} window=${String(topicVisits.length)}`,
+      );
+    }
     // Never recompute topics during the catch-up drain when a revision already
     // exists to preserve. The catch-up serves a SCOPED window — timelineDays is
     // empty (buildTimelineDays days=0), so `topicVisits` is empty and any
@@ -3233,6 +3269,7 @@ export const createConnectionsMaterializer = (
     const shouldRunTopicRevision =
       previousTopicRevision === null ||
       (!requireScopedTimelineDeltaForDrain &&
+        (!topicFullTimelineSourceEnabled() || topicVisitsForBuild.length > 0) &&
         topicSimilarityChanged &&
         (topicCadenceDue || forcePendingTopicRecompute));
     let topicRevision;
@@ -3317,14 +3354,14 @@ export const createConnectionsMaterializer = (
     } else if (useTopicAccumulatorFastPath) {
       topicRevision = await buildTopicRevisionFromAccumulator({
         accumulator: topicAccumulator,
-        visits: topicVisits,
+        visits: topicVisitsForBuild,
         visitSimilarity,
         ...(previousTopicRevision === null ? {} : { previousRevision: previousTopicRevision }),
       });
       mark('buildTopicRevisionFromAccumulator (w4 fast path)');
     } else {
       topicRevision = await buildSelectedTopicRevision({
-        visits: topicVisits,
+        visits: topicVisitsForBuild,
         visitSimilarity,
         options: { cosineThreshold: topicCosineThreshold },
         ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
@@ -3405,7 +3442,7 @@ export const createConnectionsMaterializer = (
         mark(`servedProducer=leiden-cpm cacheHit topics=${String(leidenRevision.topics.length)}`);
       } else {
         leidenRevision = await buildLeidenCpmTopicRevision({
-          visits: topicVisits,
+          visits: topicVisitsForBuild,
           visitSimilarity,
           ...(userAssertedRelations.length === 0 ? {} : { userAssertedRelations }),
           ...(prevLeiden === null ? {} : { previousRevision: prevLeiden }),
@@ -3449,7 +3486,7 @@ export const createConnectionsMaterializer = (
       // drain (unconditionally, even on baseline cache-hit) was the
       // dominant per-drain CPU cost behind the constant-CPU runaway.
       const expectedShadowId = await expectedShadowRevisionId({
-        visits: topicVisits,
+        visits: topicVisitsForBuild,
         visitSimilarity,
         evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
         cosineThreshold: DEFAULT_TOPIC_COSINE_THRESHOLD,
@@ -3473,7 +3510,7 @@ export const createConnectionsMaterializer = (
         // union-find baseline as the persisted active revision.
         await topicRevisionStore.putActiveRevision(previousShadowRevision);
         topicShadowDiagnostics = buildReusedShadowDiagnostics({
-          visits: topicVisits,
+          visits: topicVisitsForBuild,
           visitSimilarity,
           userAssertedRelations,
           baselineRevision: topicRevision,
@@ -3493,7 +3530,7 @@ export const createConnectionsMaterializer = (
         );
       } else {
         const shadow = await buildTopicShadowCandidate({
-          visits: topicVisits,
+          visits: topicVisitsForBuild,
           visitSimilarity,
           userAssertedRelations,
           baselineRevision: topicRevision,
