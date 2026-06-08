@@ -4776,18 +4776,57 @@ export const createConnectionsMaterializer = (
     let releaseMemoryAfterCatchUp = false;
     try {
       progressOnlyDirty = false;
-      const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
+      let progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);
       const versionMatches = progress?.materializerVersion === MATERIALIZER_VERSION;
       const useWorkerForCatchUp = shouldUseWorker();
       if (progress !== null && versionMatches) {
         lastFrontier = progress.appliedFrontier;
+        // Pre-seal permanent gaps BEFORE computing the pending backlog. A frozen
+        // frontier here (frontierFromIntervals stalled below a permanent hole)
+        // makes readMergedSince re-return the whole post-gap window, which trips
+        // the chunked catch-up path below — and the chunked path (by design)
+        // skips the per-drain seal. So without this a frozen vault can never
+        // self-heal in worker/child mode. Sealing advances the frontier so the
+        // backlog collapses to the genuinely-new tail and the normal drain runs.
+        // Watermark + absence are derived from the canonical log (vectorFromEvents
+        // is the log's per-replica max). Aged + persisted exactly like the
+        // store-backed seal; no-op when the flag is off.
+        if (
+          GAP_SEAL_ENABLED() &&
+          dotIntervalsHaveGaps(progress.appliedDotIntervals) &&
+          deps.store.writeMaterializerProgress !== undefined
+        ) {
+          const fullLogForSeal = await deps.eventLog.readMerged();
+          const sealMark = (message: string): void => {
+            if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+              console.log(`[connections-phase] ${message}`);
+            }
+          };
+          const sealed = await computeSealedIntervals(
+            deps.vaultRoot,
+            progress.appliedDotIntervals,
+            vectorFromEvents(fullLogForSeal),
+            fullLogForSeal,
+            sealMark,
+          );
+          if (sealed !== progress.appliedDotIntervals) {
+            progress = {
+              ...progress,
+              appliedDotIntervals: sealed,
+              appliedFrontier: frontierFromIntervals(sealed),
+            };
+            await deps.store.writeMaterializerProgress(progress);
+            lastFrontier = progress.appliedFrontier;
+          }
+        }
+        const sealedAppliedIntervals = progress.appliedDotIntervals;
         const pendingEvents = (
           await deps.eventLog.readMergedSince(
-            dotIntervalsHaveGaps(progress.appliedDotIntervals)
-              ? frontierFromIntervals(progress.appliedDotIntervals)
+            dotIntervalsHaveGaps(sealedAppliedIntervals)
+              ? frontierFromIntervals(sealedAppliedIntervals)
               : progress.appliedFrontier,
           )
-        ).filter((event) => !intervalsContainDot(progress.appliedDotIntervals, event.dot));
+        ).filter((event) => !intervalsContainDot(sealedAppliedIntervals, event.dot));
         const ordered = sortAcceptedEvents(pendingEvents);
         if (ordered.length === 0) {
           lastBuildInvalidations = [];
