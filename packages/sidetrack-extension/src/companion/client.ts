@@ -20,6 +20,9 @@ import { parseCompanionIdentity, type CompanionIdentity } from './identity';
 
 export interface CompanionClient {
   readonly status: () => Promise<CompanionStatus>;
+  /** /v1/status with a short (4 s) budget — for post-failure
+   *  down-vs-busy classification only; see CompanionRequestError. */
+  readonly statusQuick: () => Promise<CompanionStatus>;
   /** Fetch /v1/version — companion identity (vault + code path).
    *  Returns null if the payload is unrecognizable. */
   readonly version: () => Promise<CompanionIdentity | null>;
@@ -268,6 +271,22 @@ const parseWorkstreamProjections = (value: unknown): readonly WorkstreamProjecti
   });
 };
 
+// Typed transport failure so the SW can tell "nothing is listening on
+// the port" (network → the companion is down) apart from "the request
+// outlived its budget" (timeout → the companion is up but chewing;
+// observed live: 46-69 s timeline / page-evidence writes while
+// /v1/status stays ~40 ms). The connection banner must only go red for
+// the former.
+export class CompanionRequestError extends Error {
+  constructor(
+    message: string,
+    readonly kind: 'timeout' | 'network',
+  ) {
+    super(message);
+    this.name = 'CompanionRequestError';
+  }
+}
+
 export class HttpCompanionClient implements CompanionClient {
   private readonly baseUrl: string;
   // Conditional-GET cache. Keyed on the request path (incl. querystring),
@@ -297,6 +316,16 @@ export class HttpCompanionClient implements CompanionClient {
     // 45-second timeout still bounds the worst case to one extra
     // poll window.
     return parseStatus(await this.request('/status', { method: 'GET' }, 45_000));
+  }
+
+  async statusQuick(): Promise<CompanionStatus> {
+    // Short-budget variant for POST-FAILURE classification only. After
+    // a heavy endpoint fails, the SW needs to know "down or merely
+    // busy?" without inheriting status()'s 45 s worst case on the
+    // error path. 4 s is comfortably above the observed healthy
+    // /v1/status latency (~40 ms even at full CPU) and far below the
+    // user's patience for a wrong red banner.
+    return parseStatus(await this.request('/status', { method: 'GET' }, 4_000));
   }
 
   async appendEvent(event: CaptureEvent, idempotencyKey: string): Promise<MutationResult> {
@@ -482,11 +511,30 @@ export class HttpCompanionClient implements CompanionClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${this.baseUrl}${path}`, {
-        ...init,
-        headers,
-        signal: controller.signal,
-      });
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}${path}`, {
+          ...init,
+          headers,
+          signal: controller.signal,
+        });
+      } catch (fetchError) {
+        // Re-thrown below with a kind the SW can classify on: an
+        // aborted fetch means the companion is (still) processing —
+        // busy, not down; a refused/failed fetch means nothing is
+        // listening on the port.
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          const seconds = Math.round(timeoutMs / 1000);
+          throw new CompanionRequestError(
+            `Companion did not respond within ${String(seconds)}s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
+            'timeout',
+          );
+        }
+        throw new CompanionRequestError(
+          fetchError instanceof Error ? fetchError.message : 'Companion fetch failed.',
+          'network',
+        );
+      }
       // 304 Not Modified: the companion confirmed our cached body is
       // still current. Return the cached value verbatim — callers see
       // referentially-identical data, so React's reconciliation skips
@@ -515,12 +563,13 @@ export class HttpCompanionClient implements CompanionClient {
       }
       return value;
     } catch (error) {
-      // Translate AbortError into something users can act on; otherwise
-      // surface the underlying network error.
+      // The abort can also fire mid-body (between headers and
+      // response.json()) — same meaning as a fetch abort: busy.
       if (error instanceof Error && error.name === 'AbortError') {
         const seconds = Math.round(timeoutMs / 1000);
-        throw new Error(
+        throw new CompanionRequestError(
           `Companion did not respond within ${String(seconds)}s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
+          'timeout',
         );
       }
       throw error;

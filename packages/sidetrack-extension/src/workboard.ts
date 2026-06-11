@@ -16,9 +16,15 @@ import type { ReviewDraft } from './review/types';
 // landed — even when the companion was responsive. Treat 'unknown'
 // as "still checking" and don't surface the red banner until we've
 // actually heard back with a failure.
+// 'busy' = the companion process answered (or recently answered) the
+// cheap /v1/status probe but a request outlived its budget — alive,
+// chewing through heavy work. Render soft ("responding slowly"), never
+// the red "start the companion" banner: that banner is reserved for a
+// port nobody is listening on.
 export type CompanionStatus =
   | 'unknown'
   | 'connected'
+  | 'busy'
   | 'disconnected'
   | 'vault-error'
   | 'local-only';
@@ -385,6 +391,10 @@ export const companionStatusLabel = (status: CompanionStatus): string => {
     // hasn't completed yet. "Connecting…" is honest; "disconnected"
     // would be a lie because we haven't tried yet.
     return 'vault: connecting…';
+  }
+
+  if (status === 'busy') {
+    return 'vault: busy — responding slowly';
   }
 
   return 'vault: disconnected';

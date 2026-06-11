@@ -14,7 +14,7 @@ import {
   bridgeKeyValidationCopy,
   validateBridgeKeyCandidate,
 } from '../src/companion/bridgeKeyValidation';
-import { createCompanionClient } from '../src/companion/client';
+import { CompanionRequestError, createCompanionClient } from '../src/companion/client';
 import {
   compareCompanionIdentity,
   identityWarningFor,
@@ -1691,6 +1691,36 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
 
+// Post-failure classification. A failed companion call must not, by
+// itself, repaint the panel "disconnected — start the companion":
+// heavy endpoints time out at their 5 s budget while the companion
+// chews (observed live: 46-69 s timeline / page-evidence writes) even
+// though the process is up and /v1/status answers in ~40 ms. So after
+// ANY companion-path error, ask the cheap probe what's actually true:
+//   probe ok      → 'connected' / 'vault-error' (the action's own
+//                    error still surfaces via the response envelope)
+//   probe timeout → 'busy' (alive, saturated — soft pill, no red banner)
+//   probe refused → 'disconnected' (nothing listening — red banner)
+const classifyCompanionFailure = async (): Promise<
+  'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
+> => {
+  try {
+    const settings = await readSettings();
+    if (settings.companion.bridgeKey.length === 0) {
+      return 'local-only';
+    }
+    const client = createCompanionClient(settings.companion);
+    const status = await client.statusQuick();
+    cachedRelayStatus = status.sync?.relay ?? null;
+    cachedSnapshotRevision = status.snapshotRevision ?? null;
+    return status.vault === 'connected' ? 'connected' : 'vault-error';
+  } catch (probeError) {
+    return probeError instanceof CompanionRequestError && probeError.kind === 'timeout'
+      ? 'busy'
+      : 'disconnected';
+  }
+};
+
 // Find the live tab that hosts a tracked thread. Try the snapshot's
 // tabId first (covers the common case where the user keeps the tab
 // open), then fall back to a URL match. chrome.tabs.query treats
@@ -2408,7 +2438,13 @@ const withCompanionStatus = async (
     if (work !== undefined) {
       await work();
     }
-    await replayQueuedCaptures();
+    // Replay failures must not abort the refresh or poison the
+    // connection state: the captures stay queued (queuedCaptureCount
+    // still surfaces them) and the next poll retries. Before this
+    // isolation, one slow replay POST timing out re-painted the panel
+    // "disconnected" on every 15 s poll for as long as the companion
+    // stayed busy.
+    await replayQueuedCaptures().catch(() => undefined);
     const status = await assertCompanionReachable();
     if (status === 'connected') {
       await refreshCachedWorkstreams();
@@ -2434,7 +2470,7 @@ const withCompanionStatus = async (
       ok: false,
       error: error instanceof Error ? error.message : 'Sidetrack background action failed.',
       state: await buildState(
-        'disconnected',
+        await classifyCompanionFailure(),
         error instanceof Error ? error.message : 'Action failed.',
       ),
     };
@@ -3475,7 +3511,7 @@ const handleRequest = async (
         ok: false,
         error: error instanceof Error ? error.message : 'Could not create attach token.',
         state: await buildState(
-          'disconnected',
+          await classifyCompanionFailure(),
           error instanceof Error ? error.message : 'Action failed.',
         ),
       };
@@ -5158,7 +5194,7 @@ export default defineBackground(() => {
           ok: false,
           error: error instanceof Error ? error.message : 'Sidetrack request failed.',
           state: await buildState(
-            'disconnected',
+            await classifyCompanionFailure(),
             error instanceof Error ? error.message : 'Request failed.',
           ),
         });

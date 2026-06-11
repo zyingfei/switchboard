@@ -692,6 +692,7 @@ const dispatchDiagnosticReasonText = (
 const COMPANION_STATUS_CACHE_KEY = 'sidetrack.lastCompanionStatus';
 const COMPANION_STATUS_VALUES: ReadonlySet<string> = new Set([
   'connected',
+  'busy',
   'disconnected',
   'vault-error',
   'local-only',
@@ -2135,17 +2136,32 @@ const App = () => {
       .catch(() => {
         setSetupCompleted(false);
       });
-    // Periodic state refresh — keeps the header status pills (vault +
-    // companion) in sync with reality. Without this, companion going
-    // down between user actions wasn't detected and the pill stayed
-    // green until the next user action.
-    const id = window.setInterval(() => {
-      void refresh().catch(() => undefined);
-    }, 15_000);
+    return undefined;
+  }, []);
+
+  // Periodic state refresh — keeps the header status pills (vault +
+  // companion) in sync with reality. Without this, companion going
+  // down between user actions wasn't detected and the pill stayed
+  // green until the next user action. Adaptive cadence (same pattern
+  // as the recall pill below): while degraded — disconnected or busy —
+  // poll at 4 s so a restarted / recovered companion clears the banner
+  // in seconds instead of riding out the full 15 s window.
+  const companionStatusDegraded =
+    state.companionStatus === 'disconnected' || state.companionStatus === 'busy';
+  useEffect(() => {
+    const id = window.setInterval(
+      () => {
+        void refresh().catch(() => undefined);
+      },
+      companionStatusDegraded ? 4_000 : 15_000,
+    );
     return () => {
       window.clearInterval(id);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh is
+    // stable for the panel's lifetime (same omission as the mount effect
+    // above); re-arm only when the cadence tier changes.
+  }, [companionStatusDegraded]);
 
   // Recall lifecycle poll — only runs when companion is reachable
   // and we have a bridge key. Surfaces 'rebuilding' as an amber
@@ -6399,7 +6415,7 @@ const App = () => {
             'sp-status-pill mono ' +
             (state.companionStatus === 'connected'
               ? 'ok'
-              : state.companionStatus === 'local-only'
+              : state.companionStatus === 'local-only' || state.companionStatus === 'busy'
                 ? 'warn'
                 : 'err')
           }
@@ -6410,7 +6426,7 @@ const App = () => {
               'sp-status-dot ' +
               (state.companionStatus === 'connected'
                 ? 'green'
-                : state.companionStatus === 'local-only'
+                : state.companionStatus === 'local-only' || state.companionStatus === 'busy'
                   ? 'amber'
                   : 'red')
             }
@@ -6421,7 +6437,9 @@ const App = () => {
             ? 'running'
             : state.companionStatus === 'local-only'
               ? 'local-only'
-              : 'down'}
+              : state.companionStatus === 'busy'
+                ? 'busy'
+                : 'down'}
         </span>
         {/* Recall pill — only shown when status is non-ready, so the
             steady state stays clean. Lets the user see "indexing…"
