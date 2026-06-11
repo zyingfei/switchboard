@@ -152,6 +152,58 @@ export const readPageEvidenceMap = async (
   return out;
 };
 
+/** File-level listing for incremental consumers (recall-v2 backfill
+ *  delta): one readdir + one stat per record file, NO JSON reads.
+ *  Lets a caller diff (name, mtimeMs, size) against a persisted
+ *  manifest and read only the records that actually changed. */
+export interface PageEvidenceRecordFileStat {
+  readonly name: string;
+  readonly mtimeMs: number;
+  readonly size: number;
+}
+
+export const listPageEvidenceRecordFiles = async (
+  vaultRoot: string,
+): Promise<readonly PageEvidenceRecordFileStat[]> => {
+  const dir = byUrlDir(vaultRoot);
+  const names = (await readdir(dir).catch(() => [] as string[])).filter((name) =>
+    name.endsWith('.json'),
+  );
+  const out: PageEvidenceRecordFileStat[] = [];
+  // Chunked PARALLEL stats — a sequential await-per-file loop over
+  // ~1800 records measured 36.9 s when the boot catch-up was hogging
+  // the loop (each await re-queues behind it); batched stats finish in
+  // a handful of loop turns regardless of contention.
+  const STAT_CHUNK_SIZE = 100;
+  for (let start = 0; start < names.length; start += STAT_CHUNK_SIZE) {
+    const chunk = names.slice(start, start + STAT_CHUNK_SIZE);
+    const stats = await Promise.all(
+      chunk.map(async (name) => {
+        try {
+          const s = await stat(join(dir, name));
+          return { name, mtimeMs: Math.trunc(s.mtimeMs), size: s.size };
+        } catch {
+          // Raced with a delete — treat as absent.
+          return null;
+        }
+      }),
+    );
+    for (const entry of stats) {
+      if (entry !== null) out.push(entry);
+    }
+  }
+  return out.sort((left, right) => compareText(left.name, right.name));
+};
+
+/** Read + validate one record by its by-url/ file name. Null when the
+ *  file is missing or fails the schema check (same tolerance as
+ *  listPageEvidenceRecords). */
+export const readPageEvidenceRecordByFileName = async (
+  vaultRoot: string,
+  name: string,
+): Promise<PageEvidenceRecord | null> =>
+  safePageEvidenceRecord(await readJson(join(byUrlDir(vaultRoot), name)));
+
 export const listPageEvidenceRecords = async (
   vaultRoot: string,
 ): Promise<readonly PageEvidenceRecord[]> => {

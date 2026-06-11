@@ -245,6 +245,14 @@ export interface EventLog {
   //   3. Byte-identical re-imports (same dot AND same content) are
   //      no-ops — Syncthing redelivery, relay replay, etc.
   readonly importPeerEvent: (event: AcceptedEvent) => Promise<{ readonly imported: boolean }>;
+  /**
+   * Warm the append-path indexes off the request path (idempotent,
+   * single-flighted; appends issued meanwhile join the in-flight
+   * warm). Long-lived processes call this at boot so the FIRST user
+   * write doesn't pay the one-time streaming pass over the log;
+   * short-lived CLI invocations skip it and pay only if they append.
+   */
+  readonly prewarmAppendIndexes: () => Promise<void>;
 }
 
 export interface EventLogOptions {
@@ -1014,6 +1022,9 @@ export const createEventLog = (
     findByDot,
     listReplicaIds,
     importPeerEvent,
+    prewarmAppendIndexes: async (): Promise<void> => {
+      await warmAppendIndexes();
+    },
   };
 };
 

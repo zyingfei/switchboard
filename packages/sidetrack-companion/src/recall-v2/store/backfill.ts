@@ -11,7 +11,12 @@ import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { listPageEvidenceRecords } from '../../page-evidence/store.js';
+import {
+  listPageEvidenceRecordFiles,
+  listPageEvidenceRecords,
+  readPageEvidenceRecordByFileName,
+} from '../../page-evidence/store.js';
+import type { PageEvidenceRecord } from '../../page-evidence/types.js';
 import { readIndex } from '../../recall/indexFile.js';
 import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
 import { embed as defaultEmbed, MODEL_ID } from '../../recall/embedder.js';
@@ -140,30 +145,60 @@ export const backfillFromPageEvidence = async (
     ...store.allEntityIdsByKind('timeline_visit'),
   ]);
   const tSnapshot = Date.now() - t0;
-  const upserted = new Set<string>();
   const tListStart = Date.now();
   const records = await listPageEvidenceRecords(vaultRoot);
   const tList = Date.now() - tListStart;
+  const tIngestStart = Date.now();
+  const { pageContent, timelineVisit, upserted } = await ingestEvidenceRecords(
+    vaultRoot,
+    store,
+    records,
+  );
+  const tIngest = Date.now() - tIngestStart;
+  // Sweep stale rows — entity_ids in `existing` but not `upserted`
+  // had their JSON source disappear (file removed, tombstoned, etc.).
+  const tSweepStart = Date.now();
+  let deleted = 0;
+  await runInChunks(store, existing, (id) => {
+    if (!upserted.has(id)) {
+      store.deleteDocument(id);
+      deleted += 1;
+    }
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    pageContent,
+    timelineVisit,
+    deleted,
+    timingMs: {
+      snapshot: tSnapshot,
+      list: tList,
+      ingest: tIngest,
+      sweep: tSweep,
+    },
+  };
+};
+
+/** Upsert one batch of page-evidence records as docs rows. Shared by
+ *  the full pass (all records) and the manifest-delta pass (changed
+ *  records only). FU2 — chunked PARALLEL reads: each chunk fires its
+ *  readJson() calls concurrently, then upsertDocument runs
+ *  synchronously over the resolved data; yields per chunk keep the
+ *  event loop responsive. Chunk size 50 ≈ 100 concurrent fds, plenty
+ *  to saturate the page cache without thrashing. */
+const ingestEvidenceRecords = async (
+  vaultRoot: string,
+  store: RecallStore,
+  records: readonly PageEvidenceRecord[],
+): Promise<{ pageContent: number; timelineVisit: number; upserted: Set<string> }> => {
+  const upserted = new Set<string>();
   let pageContent = 0;
   let timelineVisit = 0;
-  const root = join(vaultRoot, '_BAC', 'page-content', 'by-url');
-  const tIngestStart = Date.now();
-  // FU2 — chunked PARALLEL reads. Was: sequential await readJson()
-  // per record (2 reads per record = N×2 serial filesystem ops).
-  // For 1000 URLs on SSD that's ~2-4s of I/O wall-clock; on slower
-  // disks it's much worse. Now each chunk fires all its readJson()
-  // calls concurrently via Promise.all, then upsertDocument runs
-  // synchronously over the resolved data. Yields still happen
-  // per-chunk so the event loop stays responsive.
-  //
-  // Chunk size kept small (50) for the parallel-reads pass because
-  // ~100 concurrent file descriptors is plenty to saturate the OS
-  // page cache without thrashing.
   const READ_CHUNK_SIZE = 50;
   for (let start = 0; start < records.length; start += READ_CHUNK_SIZE) {
     const chunk = records.slice(start, start + READ_CHUNK_SIZE);
     type Enriched = {
-      readonly record: (typeof records)[number];
+      readonly record: PageEvidenceRecord;
       readonly contentHash: string | undefined;
       readonly body: string | undefined;
     };
@@ -226,32 +261,7 @@ export const backfillFromPageEvidence = async (
     }
     await yieldToEventLoop();
   }
-  const tIngest = Date.now() - tIngestStart;
-  // Sweep stale rows — entity_ids in `existing` but not `upserted`
-  // had their JSON source disappear (file removed, tombstoned, etc.).
-  const tSweepStart = Date.now();
-  let deleted = 0;
-  await runInChunks(store, existing, (id) => {
-    if (!upserted.has(id)) {
-      store.deleteDocument(id);
-      deleted += 1;
-    }
-  });
-  const tSweep = Date.now() - tSweepStart;
-  // Mark unused `root` var so the linter is happy (kept the join for
-  // future expansion when we read chunks lazily).
-  void root;
-  return {
-    pageContent,
-    timelineVisit,
-    deleted,
-    timingMs: {
-      snapshot: tSnapshot,
-      list: tList,
-      ingest: tIngest,
-      sweep: tSweep,
-    },
-  };
+  return { pageContent, timelineVisit, upserted };
 };
 
 /** Backfill chat-turn rows from the recall index. Each turn becomes
@@ -496,6 +506,250 @@ export const backfillChunkVectors = async (
     vectors,
     deleted,
     timingMs: { snapshot: tSnapshot, read: tRead, rows: tRows, embed: tEmbed, sweep: tSweep },
+  };
+};
+
+// ── Record-level page-evidence delta ────────────────────────────
+// The signature gate in pipeline.ts is all-or-nothing per phase: ONE
+// changed page-evidence record re-ran the FULL pass — every record
+// JSON re-read (observed live: pageEv.list 16.6 s) plus every chunk
+// JSON re-read sequentially (chunkVec.read 10.7 s) on the main loop
+// at boot. The manifest below makes the re-run O(changed): a
+// readdir+stat pass diffs (name, mtimeMs, size) against the manifest
+// persisted in the store, and only changed records are read/upserted;
+// removed files delete their rows via the urls the manifest carries.
+// The manifest lives in recall_metadata, so a recreated store has no
+// manifest and self-heals with a full pass.
+
+export const PAGE_EVIDENCE_MANIFEST_KEY = 'manifest_v1_page_evidence';
+
+// name → `${mtimeMs}:${size}:${canonicalUrl}` (url may contain ':').
+type EvidenceManifest = Record<string, string>;
+
+const parseEvidenceManifest = (raw: string | undefined): EvidenceManifest | null => {
+  if (raw === undefined) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === 'object' && value !== null ? (value as EvidenceManifest) : null;
+  } catch {
+    return null;
+  }
+};
+
+const manifestUrlOf = (entry: string): string => entry.split(':').slice(2).join(':');
+
+/** Scoped chunk + chunk-vector ingest for a set of changed records.
+ *  Per-doc chunk rows are replaced; orphaned chunk vectors (ids whose
+ *  rows disappeared in the replace) are pruned by a global id diff —
+ *  two SELECTs over ~1k ids, NOT a re-read of any JSON. */
+const ingestChunksForRecords = async (
+  vaultRoot: string,
+  store: RecallStore,
+  records: readonly PageEvidenceRecord[],
+  embedder: PageEvidenceEmbedder,
+): Promise<{ chunks: number; vectors: number }> => {
+  const withHash = records.filter((r) => r.content?.contentHash !== undefined);
+  if (withHash.length === 0) return { chunks: 0, vectors: 0 };
+  // Snapshot BEFORE replacing rows: vectors for unchanged chunk ids
+  // must survive (re-embedding them would waste the embedder budget).
+  const existingVectors = store.vectorBackendAvailable
+    ? store.allChunkVectorIds()
+    : new Set<string>();
+  const toEmbed: ChunkBackfillRow[] = [];
+  let chunksN = 0;
+  for (const record of withHash) {
+    const contentHash = record.content?.contentHash;
+    if (contentHash === undefined) continue;
+    const documentEntityId = entityIdForUrl(record.canonicalUrl);
+    // eslint-disable-next-line no-await-in-loop -- bounded by |changed records|
+    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
+      pageContentChunksPath(vaultRoot, contentHash),
+    );
+    const chunks = raw?.chunks ?? [];
+    const rows = chunks
+      .map((chunk) => chunkRowForStore({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) }))
+      .sort((left, right) => left.chunkIndex - right.chunkIndex);
+    store.runTransaction(() => {
+      // upsertDocumentChunks replaces this doc's rows (vectors are
+      // pruned by the orphan diff below, so unchanged ids keep theirs).
+      store.upsertDocumentChunks(documentEntityId, rows);
+    });
+    chunksN += chunks.length;
+    for (const chunk of chunks) {
+      if (!existingVectors.has(chunk.id)) {
+        toEmbed.push({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) });
+      }
+    }
+  }
+  // Prune orphaned vectors: ids that had a vector but no longer have
+  // a chunk row anywhere (their doc's chunk set changed).
+  if (store.vectorBackendAvailable) {
+    const liveChunkIds = store.allDocumentChunkIds();
+    for (const id of existingVectors) {
+      if (!liveChunkIds.has(id)) store.deleteChunkVector(id);
+    }
+  }
+  let vectors = 0;
+  if (store.vectorBackendAvailable && toEmbed.length > 0) {
+    const EMBED_BATCH_SIZE = 32;
+    for (let start = 0; start < toEmbed.length; start += EMBED_BATCH_SIZE) {
+      const batch = toEmbed.slice(start, start + EMBED_BATCH_SIZE);
+      // eslint-disable-next-line no-await-in-loop -- embedder is batched
+      const embedded = await embedder(batch.map((item) => item.embedText));
+      store.runTransaction(() => {
+        for (let index = 0; index < batch.length; index += 1) {
+          const item = batch[index];
+          const vector = embedded[index];
+          if (item === undefined || vector === undefined || vector.length === 0) continue;
+          store.upsertChunkVector(item.chunk.id, vector);
+          vectors += 1;
+        }
+      });
+      // eslint-disable-next-line no-await-in-loop -- yield between embed batches
+      if (start + EMBED_BATCH_SIZE < toEmbed.length) await yieldToEventLoop();
+    }
+  }
+  return { chunks: chunksN, vectors };
+};
+
+/** Stats for the manifest-delta pass. */
+export interface PageEvidenceDeltaStats {
+  readonly mode: 'full' | 'delta';
+  readonly changed: number;
+  readonly removed: number;
+  readonly pageContent: number;
+  readonly timelineVisit: number;
+  readonly chunkVectors: number;
+  readonly deleted: number;
+  readonly timingMs: Record<string, number>;
+}
+
+/** Manifest-diffed page-evidence + chunk-vector backfill.
+ *
+ *  delta mode (manifest present): stat pass → read ONLY changed
+ *  records → upsert docs + their chunks/vectors → delete docs of
+ *  removed files. O(changed) JSON reads.
+ *
+ *  full mode (no manifest — fresh store or first run after this code
+ *  lands): existing full passes run (including their global sweeps),
+ *  then the manifest is seeded so every later run is a delta.
+ *
+ *  The manifest persists LAST: a crash mid-pass re-runs the same
+ *  delta next time (all writes are idempotent upserts/deletes). */
+export const backfillPageEvidenceDelta = async (
+  vaultRoot: string,
+  store: RecallStore,
+  embedder: PageEvidenceEmbedder = defaultEmbed,
+): Promise<PageEvidenceDeltaStats> => {
+  const timingMs: Record<string, number> = {};
+  let t = Date.now();
+  const files = await listPageEvidenceRecordFiles(vaultRoot);
+  timingMs['stat'] = Date.now() - t;
+  const stored = parseEvidenceManifest(store.getRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY));
+
+  if (stored === null) {
+    // Full mode — delegate to the global-reconcile passes (doc sweep +
+    // chunk/vector sweeps included), then seed the manifest. Reading
+    // every record one extra time here happens once per store
+    // lifetime; not worth a parallel code path.
+    const evidence = await backfillFromPageEvidence(vaultRoot, store);
+    for (const [k, v] of Object.entries(evidence.timingMs)) timingMs[`pageEv.${k}`] = v;
+    const chunkVec = await backfillChunkVectors(vaultRoot, store, embedder);
+    for (const [k, v] of Object.entries(chunkVec.timingMs)) timingMs[`chunkVec.${k}`] = v;
+    t = Date.now();
+    const seeded: EvidenceManifest = {};
+    for (const f of files) {
+      // eslint-disable-next-line no-await-in-loop -- one read per record, seed-only
+      const record = await readPageEvidenceRecordByFileName(vaultRoot, f.name);
+      seeded[f.name] = `${String(f.mtimeMs)}:${String(f.size)}:${record?.canonicalUrl ?? ''}`;
+    }
+    store.setRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY, JSON.stringify(seeded));
+    timingMs['manifestSeed'] = Date.now() - t;
+    return {
+      mode: 'full',
+      changed: files.length,
+      removed: 0,
+      pageContent: evidence.pageContent,
+      timelineVisit: evidence.timelineVisit,
+      chunkVectors: chunkVec.vectors,
+      deleted: evidence.deleted + chunkVec.deleted,
+      timingMs,
+    };
+  }
+
+  // Delta mode.
+  const next: EvidenceManifest = {};
+  const changedNames: string[] = [];
+  for (const f of files) {
+    const prior = stored[f.name];
+    const statKey = `${String(f.mtimeMs)}:${String(f.size)}:`;
+    if (prior !== undefined && prior.startsWith(statKey)) {
+      next[f.name] = prior;
+    } else {
+      changedNames.push(f.name);
+    }
+  }
+  const liveNames = new Set(files.map((f) => f.name));
+  const removedUrls: string[] = [];
+  for (const [name, entry] of Object.entries(stored)) {
+    if (liveNames.has(name)) continue;
+    const url = manifestUrlOf(entry);
+    if (url.length > 0) removedUrls.push(url);
+  }
+
+  t = Date.now();
+  const statByName = new Map(files.map((f) => [f.name, f]));
+  const changedRecords: PageEvidenceRecord[] = [];
+  const READ_CHUNK_SIZE = 50;
+  for (let start = 0; start < changedNames.length; start += READ_CHUNK_SIZE) {
+    const chunk = changedNames.slice(start, start + READ_CHUNK_SIZE);
+    // eslint-disable-next-line no-await-in-loop -- chunked parallel reads
+    const loaded = await Promise.all(
+      chunk.map(async (name) => ({
+        name,
+        record: await readPageEvidenceRecordByFileName(vaultRoot, name),
+      })),
+    );
+    for (const { name, record } of loaded) {
+      const f = statByName.get(name);
+      if (f === undefined) continue;
+      next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${record?.canonicalUrl ?? ''}`;
+      if (record !== null) changedRecords.push(record);
+    }
+  }
+  timingMs['read'] = Date.now() - t;
+
+  t = Date.now();
+  const { pageContent, timelineVisit } = await ingestEvidenceRecords(
+    vaultRoot,
+    store,
+    changedRecords,
+  );
+  timingMs['ingest'] = Date.now() - t;
+
+  t = Date.now();
+  let deleted = 0;
+  await runInChunks(store, removedUrls, (url) => {
+    // deleteDocument cascades the doc's chunks + vectors.
+    store.deleteDocument(entityIdForUrl(url));
+    deleted += 1;
+  });
+  timingMs['remove'] = Date.now() - t;
+
+  t = Date.now();
+  const chunkVec = await ingestChunksForRecords(vaultRoot, store, changedRecords, embedder);
+  timingMs['chunks'] = Date.now() - t;
+
+  store.setRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY, JSON.stringify(next));
+  return {
+    mode: 'delta',
+    changed: changedNames.length,
+    removed: removedUrls.length,
+    pageContent,
+    timelineVisit,
+    chunkVectors: chunkVec.vectors,
+    deleted,
+    timingMs,
   };
 };
 

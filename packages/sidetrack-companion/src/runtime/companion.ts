@@ -556,6 +556,12 @@ export const startCompanion = async (
         return accepted;
       },
     };
+    // Warm the append-path indexes off the request path: the first
+    // write after boot otherwise pays the one-time streaming pass over
+    // the log (tens of seconds on a 333k-event vault). Fire-and-forget
+    // — appends issued while the warm runs join the in-flight pass
+    // (single-flight) instead of triggering their own.
+    void baseEventLog.prewarmAppendIndexes().catch(() => undefined);
     // Recall indexer client — runs full rebuilds in a separate OS
     // process so the main thread is never pinned by the recall
     // pipeline (read merged log + project + scan legacy JSONL +

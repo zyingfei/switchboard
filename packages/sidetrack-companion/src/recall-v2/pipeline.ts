@@ -33,9 +33,8 @@ import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
 import {
-  backfillChunkVectors,
-  backfillFromPageEvidence,
   backfillFromRecallIndex,
+  backfillPageEvidenceDelta,
   backfillVectors,
   computeSourceSignatures,
   recallStoreIsEmpty,
@@ -273,23 +272,25 @@ const runFreshnessCheck = async (
   let deletedN = 0;
   let chunkVectorsN = 0;
   if (wasEmpty || storedPageEvidence !== current.pageEvidence) {
-    const r = await backfillFromPageEvidence(vaultRoot, store);
+    // Record-level delta (manifest in the store): the signature only
+    // says "something under page-evidence moved"; the delta pass reads
+    // just the records that actually changed instead of re-reading
+    // every record + chunk JSON (observed: 16.6 s + 10.7 s on the
+    // main loop at every post-browsing boot). Chunk vectors ride the
+    // same delta — their source is the changed records' chunk files.
+    const r = await backfillPageEvidenceDelta(vaultRoot, store);
     pageContentN = r.pageContent;
     timelineVisitN = r.timelineVisit;
     deletedN += r.deleted;
+    chunkVectorsN = r.chunkVectors;
     for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`pageEv.${k}`] = v;
-    // Phase 2/4 — chunk vectors share the page-evidence signature
-    // (their source is the same _BAC/page-content/chunks dir). When
-    // page-evidence backfills, chunk vectors backfill too. Vector
-    // upsert is idempotent (existing chunk vectors are skipped) so
-    // a killed process can resume without re-embedding.
-    const cv = await backfillChunkVectors(vaultRoot, store);
-    chunkVectorsN = cv.vectors;
-    deletedN += cv.deleted;
-    for (const [k, v] of Object.entries(cv.timingMs)) phaseTimings[`chunkVec.${k}`] = v;
     store.setRecallMetadata(SIG_KEY_PAGE_EVIDENCE, current.pageEvidence);
-    ran.push('page-evidence');
-    if (cv.vectors > 0) ran.push('chunk-vectors');
+    ran.push(
+      r.mode === 'full'
+        ? 'page-evidence'
+        : `page-evidence-delta(${String(r.changed)}c/${String(r.removed)}r)`,
+    );
+    if (r.chunkVectors > 0) ran.push('chunk-vectors');
   }
   if (wasEmpty || storedChatTurn !== current.chatTurn) {
     const r = await backfillFromRecallIndex(vaultRoot, store);
