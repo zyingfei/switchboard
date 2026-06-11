@@ -696,6 +696,7 @@ const generateGraphNeighbor = async (
   anchorUrls: readonly string[],
   limit: number,
   excludeUrls: ReadonlySet<string>,
+  store: RecallStore | undefined,
 ): Promise<CandidateGeneratorOutput> => {
   const start = (deps.now ?? Date.now)();
   if (anchorUrls.length === 0) {
@@ -715,23 +716,34 @@ const generateGraphNeighbor = async (
   // graph-neighbor evidence (cosine > 0 from cluster-mates that ARE
   // similar) intact.
   const hits = rawHits.filter((h) => h.cosine >= SEMANTIC_ABSOLUTE_MIN_COSINE);
-  const candidates: RecallCandidate[] = hits.map((h, i) => ({
-    candidateId: `graph-neighbor:${h.canonicalUrl}`,
-    entityId: entityIdFor({ canonicalUrl: h.canonicalUrl }),
-    sourceKind: 'graph_neighbor',
-    canonicalUrl: h.canonicalUrl,
-    fusedScore: 1 / (RRF_K + (i + 1)),
-    evidence: [
-      {
-        retriever: 'dense',
-        sourceKind: 'graph_neighbor',
-        rawScore: h.cosine,
-        vectorDistance: 1 - h.cosine,
-        rank: i + 1,
-        explain: `via ${h.via}; cluster ${h.clusterId}`,
-      },
-    ],
-  }));
+  const candidates: RecallCandidate[] = hits.map((h, i) => {
+    // The semantic pool carries urls only — hydrate the title from
+    // the docs table so consumers (Now-card Related strip, search
+    // rows) can label the link. Exact-match indexed lookup, ≤limit
+    // rows per request. Some same-url rows are title-less (e.g. a
+    // chat_turn doc); take the first row that has one.
+    const title = store
+      ?.queryByCanonicalUrl({ canonicalUrl: h.canonicalUrl, limit: 3 })
+      .find((row) => row.title !== undefined)?.title;
+    return {
+      candidateId: `graph-neighbor:${h.canonicalUrl}`,
+      entityId: entityIdFor({ canonicalUrl: h.canonicalUrl }),
+      sourceKind: 'graph_neighbor',
+      canonicalUrl: h.canonicalUrl,
+      ...(title === undefined ? {} : { title }),
+      fusedScore: 1 / (RRF_K + (i + 1)),
+      evidence: [
+        {
+          retriever: 'dense',
+          sourceKind: 'graph_neighbor',
+          rawScore: h.cosine,
+          vectorDistance: 1 - h.cosine,
+          rank: i + 1,
+          explain: `via ${h.via}; cluster ${h.clusterId}`,
+        },
+      ],
+    };
+  });
   return { sourceKind: 'graph_neighbor', candidates, elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
 };
 
@@ -842,6 +854,20 @@ const collapseByCanonicalUrl = (
  *  much less harmful than false-positive dedupe collapsing distinct
  *  items). The parameter-cardinality profiler (D5) is the long-term
  *  fix for that residual case. */
+/** Slash-variant tolerant lookup set. Canonicalization drift between
+ *  the visit projection, the recall docs table, and the semantic pool
+ *  means the same page can be keyed with or without a trailing slash
+ *  (observed live: bun.com/ and openfeature.dev/ resolve to zero
+ *  candidates while their bare forms hit). Every exact url-keyed
+ *  lookup in this pipeline should try both forms. */
+const urlSlashVariants = (url: string): readonly string[] => {
+  if (url.endsWith('/')) {
+    const bare = url.slice(0, -1);
+    return bare.length > 0 ? [url, bare] : [url];
+  }
+  return [url, `${url}/`];
+};
+
 const suppressionKey = (url: string | undefined): string | undefined => {
   if (url === undefined || url.length === 0) return undefined;
   try {
@@ -1006,7 +1032,9 @@ const generateFocus = async (
   if (currentUrl === undefined || currentUrl.length === 0 || store === undefined) {
     return { sourceKind: 'focus', candidates: [], elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
   }
-  const hits = store.queryByCanonicalUrl({ canonicalUrl: currentUrl, limit });
+  const hits = urlSlashVariants(currentUrl)
+    .flatMap((variant) => store.queryByCanonicalUrl({ canonicalUrl: variant, limit }))
+    .slice(0, limit);
   const candidates = hits.map((h, i): RecallCandidate => candidateFromStoreHit(h, 'fts5', i + 1));
   // Tag the source kind so the UI can render a "this page" badge.
   // candidateFromStoreHit emits the hit's own sourceKind on the
@@ -1123,7 +1151,9 @@ export const runRecall = async (
   // in our docs table (page not indexed yet). Use it as a fallback
   // anchor so graph_neighbor still has something to expand from.
   if (focusAnchors.size === 0 && req.session?.currentUrl !== undefined) {
-    focusAnchors.add(req.session.currentUrl);
+    for (const variant of urlSlashVariants(req.session.currentUrl)) {
+      focusAnchors.add(variant);
+    }
   }
   if (sources.has('semantic_query')) {
     const lexicalAnchors = new Set([
@@ -1147,8 +1177,12 @@ export const runRecall = async (
     // focusAnchors (the current page) instead of the lexical-anchor
     // pool. When focus is empty, fall back to anchorUrls (the same
     // set semantic_query used) for backward compatibility.
-    const seedAnchors = focusAnchors.size > 0 ? [...focusAnchors] : anchorUrls;
-    groups.push(await generateGraphNeighbor(deps, seedAnchors, perSource, excludeUrls));
+    // Expand seeds to slash variants — the semantic pool may key the
+    // same page differently than the anchor's source (docs table /
+    // visit projection). A variant that misses the pool is harmless.
+    const seedBase = focusAnchors.size > 0 ? [...focusAnchors] : anchorUrls;
+    const seedAnchors = [...new Set(seedBase.flatMap(urlSlashVariants))];
+    groups.push(await generateGraphNeighbor(deps, seedAnchors, perSource, excludeUrls, store));
   }
 
   for (const g of groups) {

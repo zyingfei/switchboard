@@ -90,6 +90,7 @@ import { createSettingsClient } from '../../src/settings/client';
 import { isProviderWithOptIn, type SettingsDocument } from '../../src/settings/types';
 import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/client';
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
+import { useFocusedRelatedPages } from '../../src/sidepanel/focusedRelated';
 import { formatRelative } from '../../src/util/time';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
@@ -4781,6 +4782,12 @@ const App = () => {
     hasOptimisticDecision(optimisticDecisions, focusedDisplayUrlRecord.canonicalUrl)
       ? undefined
       : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
+  // Related strip data — /v2/recall intent='focus' (graph-neighbor
+  // expansion from the focused page), debounced + cached in the hook.
+  // Idle while a historical card is pinned; the strip is live-tab UI.
+  const focusedRelatedItems = useFocusedRelatedPages(
+    isCardPinned ? undefined : focusedRecordEffective?.canonicalUrl,
+  );
   useEffect(() => {
     const canonicalUrl = focusedDisplayUrlRecord?.canonicalUrl;
     if (
@@ -7011,92 +7018,26 @@ const App = () => {
                     </button>
                   </div>
                 ) : null}
-                {/* Related items — surfaced from the existing
-                    fusedCandidates' anchor labels so the focus card
-                    isn't an information desert after a visit. The data
-                    is already computed for the workstream suggestion;
-                    we just expose its anchor visit-instance labels
-                    (deduped by canonical URL) as a quick-jump list.
-                    Added 2026-05-27 per debug-dump audit. */}
-                {focusedTabSuggestion !== undefined &&
-                focusedTabSuggestion.fusedCandidates !== undefined &&
-                focusedTabSuggestion.fusedCandidates.length > 0 &&
-                !isCardPinned ? (
-                  (() => {
-                    const seen = new Set<string>();
-                    const items: { url: string; label: string }[] = [];
-                    for (const cand of focusedTabSuggestion.fusedCandidates) {
-                      for (const reason of cand.reasons ?? []) {
-                        for (const anchor of reason.anchors ?? []) {
-                          // anchor can be a string id or an object
-                          // {id, kind, label}. Narrow first.
-                          const id =
-                            typeof anchor === 'string'
-                              ? anchor
-                              : typeof anchor?.id === 'string'
-                                ? anchor.id
-                                : '';
-                          const label =
-                            typeof anchor === 'object' && typeof anchor?.label === 'string'
-                              ? anchor.label
-                              : '';
-                          // anchor.id shapes:
-                          //   visit-instance:<tabSessionId>:<iso>:<url>
-                          //   workstream:<wsId>
-                          //   topic:<topicId>
-                          // We only want pages here.
-                          if (!id.startsWith('visit-instance:')) continue;
-                          // Parse url tail. The ISO timestamp between the
-                          // session id and the url contains colons itself,
-                          // so split on the timestamp's trailing "Z:" rather
-                          // than counting colons from the left.
-                          const after = id.slice('visit-instance:'.length);
-                          const colon1 = after.indexOf(':');
-                          const zColon = colon1 >= 0 ? after.indexOf('Z:', colon1 + 1) : -1;
-                          const url = zColon >= 0 ? after.slice(zColon + 2) : '';
-                          // Anchor urls may differ from the canonical url by
-                          // a trailing slash only (e.g. host roots) — treat
-                          // those as the same page for dedupe/self-suppression.
-                          const urlKey = url.endsWith('/') ? url.slice(0, -1) : url;
-                          if (url.length === 0 || seen.has(urlKey)) continue;
-                          // Don't surface the focused URL itself.
-                          const selfUrl = focusedRecordEffective?.canonicalUrl ?? '';
-                          const selfKey = selfUrl.endsWith('/') ? selfUrl.slice(0, -1) : selfUrl;
-                          if (selfKey === urlKey) continue;
-                          seen.add(urlKey);
-                          items.push({ url, label: label.length > 0 ? label : url });
-                          if (items.length >= 6) break;
-                        }
-                        if (items.length >= 6) break;
-                      }
-                      if (items.length >= 6) break;
-                    }
-                    if (items.length === 0) return null;
-                    return (
-                      <div
-                        className="tab-attribution-card-related"
-                        data-testid="focused-tab-related"
-                      >
-                        <div className="tab-attribution-card-related-head">
-                          Related ({String(items.length)})
-                        </div>
-                        <ul className="tab-attribution-card-related-list">
-                          {items.map((it) => (
-                            <li key={it.url}>
-                              <a
-                                href={it.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                title={it.url}
-                              >
-                                {it.label}
-                              </a>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    );
-                  })()
+                {/* Related items — server-owned: /v2/recall
+                    intent='focus' expands graph neighbors from the
+                    focused page (useFocusedRelatedPages). Replaces the
+                    earlier attribution-anchor scrape, whose anchors
+                    only ever pointed at the focused visit itself. */}
+                {!isCardPinned && focusedRelatedItems.length > 0 ? (
+                  <div className="tab-attribution-card-related" data-testid="focused-tab-related">
+                    <div className="tab-attribution-card-related-head">
+                      Related ({String(focusedRelatedItems.length)})
+                    </div>
+                    <ul className="tab-attribution-card-related-list">
+                      {focusedRelatedItems.map((it) => (
+                        <li key={it.url}>
+                          <a href={it.url} target="_blank" rel="noopener noreferrer" title={it.url}>
+                            {it.label}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 ) : null}
               </>
             ) : null}
