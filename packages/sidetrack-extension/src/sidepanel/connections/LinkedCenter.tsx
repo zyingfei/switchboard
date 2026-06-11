@@ -429,6 +429,21 @@ export const LinkedCenter = ({
             </button>
           );
         });
+        // Header count = what actually renders when expanded: distinct
+        // entities across node entries AND edge-promoted cards (other
+        // endpoints resolved in the subgraph), plus flat rows for
+        // unresolvable endpoints. `max(nodeEntries, edgeEntries)`
+        // understated this — a group headed "32" rendered 54 cards
+        // because edge-promoted cards stack on top of node entries.
+        const renderableIds = new Set<string>();
+        let unresolvableEdgeCount = 0;
+        for (const entry of group.nodeEntries) renderableIds.add(entry.node.id);
+        for (const { edge } of group.edgeEntries) {
+          const otherId = edge.fromNodeId === anchorId ? edge.toNodeId : edge.fromNodeId;
+          if (nodeById.has(otherId)) renderableIds.add(otherId);
+          else unresolvableEdgeCount += 1;
+        }
+        const groupTotal = renderableIds.size + unresolvableEdgeCount;
         return (
           <section key={group.kind} data-testid={`group-${group.kind}`}>
             <header className="cx-group-head">
@@ -436,9 +451,7 @@ export const LinkedCenter = ({
                 <span className="cx-edge-line" />
               </span>
               <h3>{edgeKindLabelForKind(group.kind)}</h3>
-              <span className="cx-count">
-                {Math.max(group.nodeEntries.length, group.edgeEntries.length)}
-              </span>
+              <span className="cx-count">{groupTotal}</span>
             </header>
             {nodeKindMarkers(group.nodeEntries).map((kind) => (
               <span key={kind} hidden data-testid={`group-${kind}`} />

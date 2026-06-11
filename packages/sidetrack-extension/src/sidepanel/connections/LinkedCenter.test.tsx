@@ -169,4 +169,43 @@ describe('LinkedCenter filtering', () => {
 
     expect(within(closestGroup).queryByTestId('edge-closest-weak')).not.toBeNull();
   });
+
+  it('group header count equals the rendered entries (cards + flat rows), not max(nodes, edges)', () => {
+    // X's primary edge is opener_visit (anchor→X); W's primary is
+    // closest_visit (anchor→W); a second opener edge X→W targets a
+    // node the render DEDUPES into X's card path. The old
+    // max(nodeEntries, edgeEntries) header said 2 for the opener
+    // group; only 1 card renders. Live this skewed both ways (a
+    // "previous visit" group headed 32 rendered 54 cards).
+    const anchor = node('timeline-visit:anchor', 'Anchor page');
+    const x = node('timeline-visit:x', 'X page');
+    const w = node('timeline-visit:w', 'W page');
+    const edges = [
+      edge('open-x', 'opener_visit', anchor.id, x.id),
+      edge('closest-w', 'closest_visit', anchor.id, w.id, 0.9),
+      edge('open-xw', 'opener_visit', x.id, w.id),
+    ];
+
+    render(
+      <LinkedCenter
+        result={resultFor([anchor, x, w], edges)}
+        anchorId={anchor.id}
+        selectedEdge={null}
+        onSelectEdge={() => undefined}
+        onUseNodeAsAnchor={() => undefined}
+        onPromoteSnippet={() => Promise.resolve()}
+        ctx={ctx}
+      />,
+    );
+
+    for (const kind of ['opener_visit', 'closest_visit']) {
+      const group = screen.getByTestId(`group-${kind}`);
+      const headerCount = Number(group.querySelector('.cx-count')?.textContent ?? '-1');
+      const cardCount = within(group).queryAllByTestId(/^node-timeline/u).length;
+      const flatCount = group.querySelectorAll('.cx-edge-summary').length;
+      expect(headerCount, `${kind} cards=${String(cardCount)} flat=${String(flatCount)}`).toBe(
+        cardCount + flatCount,
+      );
+    }
+  });
 });
