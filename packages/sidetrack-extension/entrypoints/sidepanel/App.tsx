@@ -7046,15 +7046,24 @@ const App = () => {
                           //   topic:<topicId>
                           // We only want pages here.
                           if (!id.startsWith('visit-instance:')) continue;
-                          // Parse url tail (everything after the 3rd ':' after 'visit-instance:').
+                          // Parse url tail. The ISO timestamp between the
+                          // session id and the url contains colons itself,
+                          // so split on the timestamp's trailing "Z:" rather
+                          // than counting colons from the left.
                           const after = id.slice('visit-instance:'.length);
                           const colon1 = after.indexOf(':');
-                          const colon2 = colon1 >= 0 ? after.indexOf(':', colon1 + 1) : -1;
-                          const url = colon2 >= 0 ? after.slice(colon2 + 1) : '';
-                          if (url.length === 0 || seen.has(url)) continue;
+                          const zColon = colon1 >= 0 ? after.indexOf('Z:', colon1 + 1) : -1;
+                          const url = zColon >= 0 ? after.slice(zColon + 2) : '';
+                          // Anchor urls may differ from the canonical url by
+                          // a trailing slash only (e.g. host roots) — treat
+                          // those as the same page for dedupe/self-suppression.
+                          const urlKey = url.endsWith('/') ? url.slice(0, -1) : url;
+                          if (url.length === 0 || seen.has(urlKey)) continue;
                           // Don't surface the focused URL itself.
-                          if (focusedRecordEffective?.canonicalUrl === url) continue;
-                          seen.add(url);
+                          const selfUrl = focusedRecordEffective?.canonicalUrl ?? '';
+                          const selfKey = selfUrl.endsWith('/') ? selfUrl.slice(0, -1) : selfUrl;
+                          if (selfKey === urlKey) continue;
+                          seen.add(urlKey);
                           items.push({ url, label: label.length > 0 ? label : url });
                           if (items.length >= 6) break;
                         }
