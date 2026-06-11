@@ -698,6 +698,14 @@ export const createEventLog = (
   };
 
   const findByClientEventId = async (clientEventId: string): Promise<AcceptedEvent | null> => {
+    // Negative fast-path: when the append indexes are warm they are
+    // authoritative for membership — absent there means absent in the
+    // log, no need to warm the full-log memo. (The positive case still
+    // needs the merged log; callers want the event, the index only
+    // carries its dot.)
+    if (appendIndexes !== null && !appendIndexes.clientIdToDot.has(clientEventId)) {
+      return null;
+    }
     const merged = await readMerged();
     return merged.find((event) => event.clientEventId === clientEventId) ?? null;
   };
@@ -710,18 +718,119 @@ export const createEventLog = (
     );
   };
 
+  // ── Append-path indexes ─────────────────────────────────────────
+  // clientEventId → dot, dot-key set, aggregateId → deps vector.
+  // Warmed ONCE via streamEvents (O(1) memory during the pass; the
+  // retained maps hold ids/dots only, never payloads), then maintained
+  // by every append/import — which all run under the enqueueAppend
+  // mutex, so warm + reads + writes never race.
+  //
+  // Why: every append used to call readMerged() for dedupe + deps, and
+  // the append itself invalidates the memo's file signature — so each
+  // write re-read + re-parsed the ENTIRE log (333k events ≈ tens of
+  // seconds under --smol), serialized behind the append mutex. Live
+  // symptom: 46-69 s POST /v1/timeline/events / page-evidence writes
+  // cascading every other write (incl. recall.served appends), panel
+  // flapping to "busy". With the indexes, appends are O(batch) plus
+  // one file append, and the ~700MB full-log memo can idle out instead
+  // of being re-warmed per write.
+  //
+  // Indexes are add-only: rewriting/compacting shard files while the
+  // process runs is not supported (the readMerged memo tolerates it
+  // via its signature; these indexes would go stale — there is no such
+  // writer in-tree today).
+  interface AppendIndexes {
+    readonly clientIdToDot: Map<string, Dot>;
+    readonly dotKeys: Set<string>;
+    readonly aggregateVectors: Map<string, VersionVector>;
+  }
+  let appendIndexes: AppendIndexes | null = null;
+  let appendIndexesWarming: Promise<AppendIndexes> | null = null;
+
+  const dotKeyOf = (dot: Dot): string => `${dot.replicaId}:${String(dot.seq)}`;
+
+  const registerInAppendIndexes = (idx: AppendIndexes, event: AcceptedEvent): void => {
+    idx.clientIdToDot.set(event.clientEventId, event.dot);
+    idx.dotKeys.add(dotKeyOf(event.dot));
+    const prior = idx.aggregateVectors.get(event.aggregateId) ?? {};
+    idx.aggregateVectors.set(
+      event.aggregateId,
+      maxVector(prior, { [event.dot.replicaId]: event.dot.seq }),
+    );
+  };
+
+  const warmAppendIndexes = (): Promise<AppendIndexes> => {
+    if (appendIndexes !== null) return Promise.resolve(appendIndexes);
+    appendIndexesWarming ??= (async () => {
+      const idx: AppendIndexes = {
+        clientIdToDot: new Map(),
+        dotKeys: new Set(),
+        aggregateVectors: new Map(),
+      };
+      await streamEvents((event) => {
+        registerInAppendIndexes(idx, event);
+      });
+      appendIndexes = idx;
+      appendIndexesWarming = null;
+      return idx;
+    })();
+    return appendIndexesWarming;
+  };
+
+  // Critical correctness rule: deps must reflect the editor's observed
+  // state at edit time, NOT the companion's current frontier. Otherwise
+  // an outbox replay arriving after peer events would falsely claim to
+  // have observed those peer events and silently win conflicts.
+  //
+  // Sync Contract v1, served from the maintained indexes instead of
+  // the merged log:
+  //   - Browser-observed (appendClientObserved): baseVector present
+  //     (possibly `{}`) → deps stamped EXACTLY from it. Empty means
+  //     "browser observed nothing" — legitimate; never replaced with
+  //     the companion's own frontier.
+  //   - Server-observed (appendServerObserved): baseVector omitted →
+  //     deps = union vector of the aggregate's prior events (the fold
+  //     registerInAppendIndexes maintains is vectorFromEvents of
+  //     exactly that subset).
+  //   - clientDeps → resolved id→dot via the index, so events that
+  //     depend on a sibling event in the SAME POST batch get the right
+  //     dot; unresolved deps drop (not yet in our log — reconstructed
+  //     when the missing events arrive).
+  const computeDepsIndexed = <TPayload extends Record<string, unknown>>(
+    input: AppendInput<TPayload>,
+    idx: AppendIndexes,
+  ): VersionVector => {
+    let deps: VersionVector =
+      input.baseVector !== undefined
+        ? input.baseVector
+        : (idx.aggregateVectors.get(input.aggregateId) ?? {});
+    if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
+      for (const dep of input.clientDeps) {
+        const resolved = idx.clientIdToDot.get(dep);
+        if (resolved !== undefined) {
+          deps = maxVector(deps, { [resolved.replicaId]: resolved.seq });
+        }
+      }
+    }
+    return deps;
+  };
+
   const appendClient = <TPayload extends Record<string, unknown>>(
     input: AppendInput<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
     enqueueAppend(async () => {
-      const existing = await findByClientEventId(input.clientEventId);
-      if (existing !== null) {
-        return existing as AcceptedEvent<TPayload>;
+      const idx = await warmAppendIndexes();
+      if (idx.clientIdToDot.has(input.clientEventId)) {
+        // Duplicate replay (rare) — the index proves presence; fetch
+        // the full event from the merged log for the return contract.
+        const existing = await findByClientEventId(input.clientEventId);
+        if (existing !== null) {
+          return existing as AcceptedEvent<TPayload>;
+        }
       }
-      // Resolve clientDeps to dots so deps reflects "everything the
-      // editor caused or observed at edit time."
-      const merged = await readMerged();
-      const deps = computeDepsFromInput(input, merged);
+      // Resolve deps from the maintained indexes — same Sync Contract
+      // v1 stamping as computeDepsFromInput without re-reading the log.
+      const deps = computeDepsIndexed(input, idx);
       const seq = await replica.nextSeq();
       const event: AcceptedEvent<TPayload> = {
         clientEventId: input.clientEventId,
@@ -745,6 +854,10 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
+      // Register only after the durable write — a failed write must
+      // not leave the index claiming presence (it would silently drop
+      // the retry as a duplicate).
+      registerInAppendIndexes(idx, event);
       return event;
     });
 
@@ -754,22 +867,22 @@ export const createEventLog = (
   ): Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]> =>
     enqueueAppend(async () => {
       if (inputs.length === 0) return [];
-      // ONE readMerged for the whole batch (vs findByClientEventId +
-      // deps readMerged PER event). Edge-event deps are `{}` (explicit
-      // baseVector, no clientDeps) so this single snapshot is exact.
-      const merged = await readMerged();
-      const present = new Set(merged.map((event) => event.clientEventId));
+      // Index-backed dedupe + deps (was: ONE readMerged per batch —
+      // which still re-read the whole log every time, because the
+      // previous batch's append invalidates the memo).
+      const idx = await warmAppendIndexes();
+      const presentInBatch = new Set<string>();
       const events: AcceptedEvent<TPayload>[] = [];
       const results: { clientEventId: string; imported: boolean }[] = [];
       const at = now();
       for (const input of inputs) {
-        if (present.has(input.clientEventId)) {
+        if (idx.clientIdToDot.has(input.clientEventId) || presentInBatch.has(input.clientEventId)) {
           // Already in the log OR earlier in this batch — dedupe,
-          // exactly like appendClient's findByClientEventId guard.
+          // exactly like appendClient's index guard.
           results.push({ clientEventId: input.clientEventId, imported: false });
           continue;
         }
-        const deps = computeDepsFromInput(input, merged);
+        const deps = computeDepsIndexed(input, idx);
         // eslint-disable-next-line no-await-in-loop -- nextSeq is a cheap monotonic counter
         const seq = await replica.nextSeq();
         const event: AcceptedEvent<TPayload> = {
@@ -787,7 +900,7 @@ export const createEventLog = (
               : {}
             : { hlc: input.hlc }),
         };
-        present.add(input.clientEventId);
+        presentInBatch.add(input.clientEventId);
         events.push(event);
         results.push({ clientEventId: input.clientEventId, imported: true });
       }
@@ -800,6 +913,11 @@ export const createEventLog = (
           `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
           { encoding: 'utf8', flag: 'a' },
         );
+        // Index registration only after the durable write (see
+        // appendClient) — and after, not during, the input loop, so a
+        // mid-batch write failure can't strand half a batch as
+        // phantom duplicates.
+        for (const event of events) registerInAppendIndexes(idx, event);
       }
       // Dispatch AFTER the durable write so a hook only ever sees
       // events that are on disk — same ordering guarantee as the
@@ -817,18 +935,23 @@ export const createEventLog = (
       if (event.dot.replicaId === replica.replicaId) {
         return { imported: false } as const;
       }
-      const byDot = await findByDot(event.dot);
-      if (byDot !== null) {
-        if (canonicalEquals(byDot, event)) {
-          return { imported: false } as const;
+      const idx = await warmAppendIndexes();
+      if (idx.dotKeys.has(dotKeyOf(event.dot))) {
+        // Dot already present — the collision/equality verdict needs
+        // the full stored event; this (rare) path may warm the memo.
+        const byDot = await findByDot(event.dot);
+        if (byDot !== null) {
+          if (canonicalEquals(byDot, event)) {
+            return { imported: false } as const;
+          }
+          throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
         }
-        throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
       }
-      const byClient = await findByClientEventId(event.clientEventId);
-      if (byClient !== null) {
+      const knownDot = idx.clientIdToDot.get(event.clientEventId);
+      if (knownDot !== undefined) {
         // Same clientEventId arriving under a different dot: a peer
         // is reusing the id under different identities. Reject.
-        throw new ClientEventIdReuseError(event.clientEventId, byClient.dot, event.dot);
+        throw new ClientEventIdReuseError(event.clientEventId, knownDot, event.dot);
       }
       const dir = replicaLogDir(vaultPath, event.dot.replicaId);
       await mkdir(dir, { recursive: true });
@@ -838,6 +961,7 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
+      registerInAppendIndexes(idx, event);
       // Each replica's seq counter is independent; we don't bump our
       // own seq when ingesting a peer event (that would corrupt our
       // local namespace). Causal ordering across replicas is handled
@@ -902,59 +1026,5 @@ export const createEventLog = (
 // stay in lockstep.
 const canonicalEquals = (a: AcceptedEvent, b: AcceptedEvent): boolean =>
   canonicalEventString(a) === canonicalEventString(b);
-
-// Critical correctness rule: deps must reflect the editor's observed
-// state at edit time, NOT the companion's current frontier. Otherwise
-// an outbox replay arriving after peer events would falsely claim to
-// have observed those peer events and silently win conflicts.
-//
-// We resolve `clientDeps` against the merged log so events that
-// depend on a sibling event in the SAME POST batch (e.g. a comment.set
-// after a span.added) get the right dot. clientDeps that don't
-// resolve are dropped (they refer to events not yet in our log;
-// they'll be reconstructed when the missing events arrive).
-const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
-  input: AppendInput<TPayload>,
-  merged: readonly AcceptedEvent[],
-): VersionVector => {
-  // Sync Contract v1: two semantics, expressed by presence of
-  // `baseVector`:
-  //
-  //   - Browser-observed (appendClientObserved): baseVector is
-  //     present (possibly `{}`). Deps stamped EXACTLY from
-  //     baseVector. Empty `{}` means "browser observed nothing"
-  //     and is a legitimate state — a stale outbox arriving after
-  //     peer events drained is accepted as concurrent (does not
-  //     dominate). The companion does NOT replace the explicit
-  //     vector with its own frontier.
-  //
-  //   - Server-observed (appendServerObserved): baseVector is
-  //     omitted. Deps stamped from the union of every prior event
-  //     for the SAME aggregate. The caller asserts they ARE the
-  //     latest server-observed state.
-  //
-  // Tests that simulate concurrent first-writes call this method
-  // (or appendClient) with `baseVector: {}` directly — that's
-  // the legitimate empty-observation case. There is no escape
-  // hatch field; empty is just a legal arg.
-  const explicit = input.baseVector;
-  let deps: VersionVector;
-  if (explicit !== undefined) {
-    deps = explicit;
-  } else {
-    deps = vectorFromEvents(merged.filter((event) => event.aggregateId === input.aggregateId));
-  }
-  if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
-    const byClientId = new Map<string, AcceptedEvent>();
-    for (const event of merged) byClientId.set(event.clientEventId, event);
-    for (const dep of input.clientDeps) {
-      const resolved = byClientId.get(dep);
-      if (resolved !== undefined) {
-        deps = maxVector(deps, { [resolved.dot.replicaId]: resolved.dot.seq });
-      }
-    }
-  }
-  return deps;
-};
 
 const maybeAttachHlc = (hlc: Hlc | undefined): { hlc?: Hlc } => (hlc === undefined ? {} : { hlc });
