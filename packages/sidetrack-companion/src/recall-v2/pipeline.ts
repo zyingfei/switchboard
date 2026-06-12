@@ -27,7 +27,7 @@ import {
   readSemanticRecallPool,
   readSemanticRecallVectorStore,
 } from '../recall/semanticRecallPool.js';
-import { embed, MODEL_ID } from '../recall/embedder.js';
+import { RECALL_MODEL_ID as MODEL_ID } from '../recall/modelManifest.js';
 import { profileFor, semanticContributionMultiplier } from './model-registry.js';
 import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
@@ -278,7 +278,12 @@ const runFreshnessCheck = async (
     // every record + chunk JSON (observed: 16.6 s + 10.7 s on the
     // main loop at every post-browsing boot). Chunk vectors ride the
     // same delta — their source is the changed records' chunk files.
-    const r = await backfillPageEvidenceDelta(vaultRoot, store);
+    // fullOnEmptyDelta: this branch only runs when the page-evidence
+    // signature moved; an empty record-file delta means the change was
+    // body/chunk JSON only, which the record diff can't see.
+    const r = await backfillPageEvidenceDelta(vaultRoot, store, undefined, {
+      fullOnEmptyDelta: true,
+    });
     pageContentN = r.pageContent;
     timelineVisitN = r.timelineVisit;
     deletedN += r.deleted;
@@ -720,12 +725,16 @@ const generateGraphNeighbor = async (
   const candidates: RecallCandidate[] = hits.map((h, i) => {
     // The semantic pool carries urls only — hydrate the title from
     // the docs table so consumers (Now-card Related strip, search
-    // rows) can label the link. Exact-match indexed lookup, ≤limit
-    // rows per request. Some same-url rows are title-less (e.g. a
-    // chat_turn doc); take the first row that has one.
-    const title = store
-      ?.queryByCanonicalUrl({ canonicalUrl: h.canonicalUrl, limit: 3 })
-      .find((row) => row.title !== undefined)?.title;
+    // rows) can label the link; ≤limit lookups per request against
+    // docs(canonical_url). Some same-url rows are title-less (e.g. a
+    // chat_turn doc); take the first row that has one. Try both slash
+    // forms — pool keys and docs keys drift on trailing slashes.
+    const title =
+      store === undefined
+        ? undefined
+        : urlSlashVariants(h.canonicalUrl)
+            .flatMap((variant) => store.queryByCanonicalUrl({ canonicalUrl: variant, limit: 3 }))
+            .find((row) => row.title !== undefined)?.title;
     return {
       candidateId: `graph-neighbor:${h.canonicalUrl}`,
       entityId: entityIdFor({ canonicalUrl: h.canonicalUrl }),
@@ -1033,8 +1042,20 @@ const generateFocus = async (
   if (currentUrl === undefined || currentUrl.length === 0 || store === undefined) {
     return { sourceKind: 'focus', candidates: [], elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
   }
-  const hits = urlSlashVariants(currentUrl)
-    .flatMap((variant) => store.queryByCanonicalUrl({ canonicalUrl: variant, limit }))
+  const rawHits = urlSlashVariants(currentUrl).flatMap((variant) =>
+    store.queryByCanonicalUrl({ canonicalUrl: variant, limit }),
+  );
+  // The variants can surface the SAME page stored under both slash
+  // forms; downstream dedupe keys verbatim canonicalUrl, so collapse
+  // here or the focused page occupies two result slots.
+  const seenFocusKeys = new Set<string>();
+  const hits = rawHits
+    .filter((h) => {
+      const key = `${h.sourceKind}|${(h.canonicalUrl ?? '').replace(/\/+$/u, '')}`;
+      if (seenFocusKeys.has(key)) return false;
+      seenFocusKeys.add(key);
+      return true;
+    })
     .slice(0, limit);
   const candidates = hits.map((h, i): RecallCandidate => candidateFromStoreHit(h, 'fts5', i + 1));
   // Tag the source kind so the UI can render a "this page" badge.
@@ -1086,7 +1107,12 @@ export const runRecall = async (
   if (wantsEmbedding && embedderUsable) {
     const embedStart = (deps.now ?? Date.now)();
     try {
-      const embedder = deps.embed ?? embed;
+      // Lazy: recall/embedder.ts must stay out of this module's static
+      // import graph — http/server.ts imports the pipeline statically and
+      // /v1/status bans transitive ONNX/transformers loading
+      // (statusContract.test.ts). The model loads on first real embed.
+      const embedder =
+        deps.embed ?? (async (texts: readonly string[]) => (await import('../recall/embedder.js')).embed(texts));
       const [vec] = await embedder([req.q]);
       queryEmbedding = vec;
     } catch (err) {

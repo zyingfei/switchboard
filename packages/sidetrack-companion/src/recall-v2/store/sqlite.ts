@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 CREATE INDEX IF NOT EXISTS docs_source ON docs(source_kind);
 CREATE INDEX IF NOT EXISTS docs_last_seen ON docs(last_seen_at);
+-- queryByCanonicalUrl is on the hot /v2/recall focus path (focus
+-- lookup + graph-neighbor title hydration, several calls per request)
+-- — without this index each call full-scans the docs table.
+CREATE INDEX IF NOT EXISTS docs_canonical_url ON docs(canonical_url);
 
 CREATE TABLE IF NOT EXISTS documents_chunks (
   chunk_id           TEXT PRIMARY KEY,

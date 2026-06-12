@@ -519,16 +519,11 @@ export class HttpCompanionClient implements CompanionClient {
           signal: controller.signal,
         });
       } catch (fetchError) {
-        // Re-thrown below with a kind the SW can classify on: an
-        // aborted fetch means the companion is (still) processing —
-        // busy, not down; a refused/failed fetch means nothing is
-        // listening on the port.
+        // Aborts fall through to the single timeout translation in the
+        // outer catch; everything else here is a transport failure —
+        // nothing listening on the port.
         if (fetchError instanceof Error && fetchError.name === 'AbortError') {
-          const seconds = Math.round(timeoutMs / 1000);
-          throw new CompanionRequestError(
-            `Companion did not respond within ${String(seconds)}s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
-            'timeout',
-          );
+          throw fetchError;
         }
         throw new CompanionRequestError(
           fetchError instanceof Error ? fetchError.message : 'Companion fetch failed.',
@@ -563,8 +558,10 @@ export class HttpCompanionClient implements CompanionClient {
       }
       return value;
     } catch (error) {
-      // The abort can also fire mid-body (between headers and
-      // response.json()) — same meaning as a fetch abort: busy.
+      // Single translation point for the abort timer — whether it
+      // fired during the fetch or mid-body (between headers and
+      // response.json()), the meaning is the same: the companion is
+      // processing, not gone.
       if (error instanceof Error && error.name === 'AbortError') {
         const seconds = Math.round(timeoutMs / 1000);
         throw new CompanionRequestError(

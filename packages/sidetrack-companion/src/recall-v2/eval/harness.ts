@@ -282,10 +282,15 @@ export const runFixture = async (fixture: Fixture): Promise<FixtureReport> => {
       await writeFixtureDoc(vaultRoot, doc, defaultFirstSeen);
     }
     // The MODEL_ID used by readSemanticRecallVectorStore must match
-    // what we write to vectors.json. Use the production MODEL_ID so
-    // the pipeline reads the store back.
-    const { MODEL_ID } = await import('../../recall/embedder.js');
-    await writeFixturePool(vaultRoot, fixture.docs, dim, MODEL_ID);
+    // what we write to vectors.json — and it must come from the model
+    // MANIFEST, not recall/embedder.js: several suites vi.mock the
+    // embedder (MODEL_ID: 'test/model') and bun keeps module mocks
+    // process-global, so in a full-suite run an embedder import here
+    // would stamp the mock id while the pipeline reads the manifest id
+    // and the sidecar never matches (semantic lane silently empty).
+    // embedder.MODEL_ID === RECALL_MODEL_ID by definition.
+    const { RECALL_MODEL_ID } = await import('../../recall/modelManifest.js');
+    await writeFixturePool(vaultRoot, fixture.docs, dim, RECALL_MODEL_ID);
 
     // Build the embedder lookup: selection text → its vector; each
     // chat first-user-turn → its vector (so the chat-turn vector

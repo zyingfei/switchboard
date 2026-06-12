@@ -7040,8 +7040,10 @@ const App = () => {
                     intent='focus' expands graph neighbors from the
                     focused page (useFocusedRelatedPages). Replaces the
                     earlier attribution-anchor scrape, whose anchors
-                    only ever pointed at the focused visit itself. */}
-                {!isCardPinned && focusedRelatedItems.length > 0 ? (
+                    only ever pointed at the focused visit itself.
+                    Pinned-card gating lives at the hook input (the
+                    hook idles → items is empty); no second gate here. */}
+                {focusedRelatedItems.length > 0 ? (
                   <div className="tab-attribution-card-related" data-testid="focused-tab-related">
                     <div className="tab-attribution-card-related-head">
                       Related ({String(focusedRelatedItems.length)})

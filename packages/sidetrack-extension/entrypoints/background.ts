@@ -1695,13 +1695,27 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
 // itself, repaint the panel "disconnected — start the companion":
 // heavy endpoints time out at their 5 s budget while the companion
 // chews (observed live: 46-69 s timeline / page-evidence writes) even
-// though the process is up and /v1/status answers in ~40 ms. So after
-// ANY companion-path error, ask the cheap probe what's actually true:
-//   probe ok      → 'connected' / 'vault-error' (the action's own
-//                    error still surfaces via the response envelope)
-//   probe timeout → 'busy' (alive, saturated — soft pill, no red banner)
-//   probe refused → 'disconnected' (nothing listening — red banner)
-const classifyCompanionFailure = async (): Promise<
+// though the process is up and /v1/status answers in ~40 ms.
+//
+// Fast path: when the failure is a typed transport error, its kind
+// already IS the classification — no probe round-trip:
+//   timeout → 'busy' (alive, saturated — soft pill, no red banner)
+//   network → 'disconnected' (nothing listening — red banner)
+// Anything else (handler/logic errors, HTTP-shaped failures) asks the
+// cheap /status probe what's actually true. The probe is single-flight
+// and memoized for a few seconds: every failing call while the
+// companion is saturated would otherwise spawn its own 4 s probe at
+// the exact process that's overloaded.
+const CLASSIFY_MEMO_MS = 3_000;
+let classifyMemo: {
+  readonly at: number;
+  readonly status: 'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only';
+} | null = null;
+let classifyInFlight: Promise<
+  'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
+> | null = null;
+
+const probeCompanionStatus = async (): Promise<
   'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
 > => {
   try {
@@ -1719,6 +1733,27 @@ const classifyCompanionFailure = async (): Promise<
       ? 'busy'
       : 'disconnected';
   }
+};
+
+const classifyCompanionFailure = async (
+  error?: unknown,
+): Promise<'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'> => {
+  if (error instanceof CompanionRequestError) {
+    return error.kind === 'timeout' ? 'busy' : 'disconnected';
+  }
+  const now = Date.now();
+  if (classifyMemo !== null && now - classifyMemo.at < CLASSIFY_MEMO_MS) {
+    return classifyMemo.status;
+  }
+  classifyInFlight ??= probeCompanionStatus()
+    .then((status) => {
+      classifyMemo = { at: Date.now(), status };
+      return status;
+    })
+    .finally(() => {
+      classifyInFlight = null;
+    });
+  return classifyInFlight;
 };
 
 // Find the live tab that hosts a tracked thread. Try the snapshot's
@@ -2470,7 +2505,7 @@ const withCompanionStatus = async (
       ok: false,
       error: error instanceof Error ? error.message : 'Sidetrack background action failed.',
       state: await buildState(
-        await classifyCompanionFailure(),
+        await classifyCompanionFailure(error),
         error instanceof Error ? error.message : 'Action failed.',
       ),
     };
@@ -3511,7 +3546,7 @@ const handleRequest = async (
         ok: false,
         error: error instanceof Error ? error.message : 'Could not create attach token.',
         state: await buildState(
-          await classifyCompanionFailure(),
+          await classifyCompanionFailure(error),
           error instanceof Error ? error.message : 'Action failed.',
         ),
       };
@@ -5194,7 +5229,7 @@ export default defineBackground(() => {
           ok: false,
           error: error instanceof Error ? error.message : 'Sidetrack request failed.',
           state: await buildState(
-            await classifyCompanionFailure(),
+            await classifyCompanionFailure(error),
             error instanceof Error ? error.message : 'Request failed.',
           ),
         });

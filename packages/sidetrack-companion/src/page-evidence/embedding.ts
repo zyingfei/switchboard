@@ -1,11 +1,18 @@
 import { createEmbeddingCache } from '../recall/embeddingCache.js';
-import { embed as defaultEmbed } from '../recall/embedder.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { splitPageContentIntoChunks } from '../page-content/store.js';
 import { vectorIdFor } from './vectorRef.js';
 import type { PageEvidenceExtractedRequest, VectorRef } from './types.js';
 
 export type PageEvidenceEmbedder = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
+
+// Lazy embedder: this module sits in the static import graph of
+// page-evidence/store.ts and, through it, http/server.ts — which must
+// not pull recall/embedder.js (transformers/ONNX init) at import time
+// per the /v1/status availability contract (statusContract.test.ts).
+// The model loads on the first actual embedding call instead.
+const defaultEmbed: PageEvidenceEmbedder = async (texts) =>
+  (await import('../recall/embedder.js')).embed(texts);
 
 const MAX_EMBED_TEXT_CHARS = 100_000;
 

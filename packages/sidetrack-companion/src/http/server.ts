@@ -37,7 +37,15 @@ import { pickInstaller, type Installer, type InstallOptions } from '../install/i
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
-import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
+// /v1/status availability contract (statusContract.test.ts): the
+// embedder module must NOT be in this file's static import graph —
+// even its import cost is unbounded (transformers/ONNX init), and
+// /status has to answer during cold start. Recall call sites load it
+// lazily through this memoized dynamic import instead.
+type EmbedderModule = typeof import('../recall/embedder.js');
+let embedderModulePromise: Promise<EmbedderModule> | null = null;
+const loadEmbedderModule = (): Promise<EmbedderModule> =>
+  (embedderModulePromise ??= import('../recall/embedder.js'));
 import {
   expandSemanticByQuery,
   expandSemanticRecallCandidates,
@@ -167,7 +175,6 @@ import {
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
-import { rebuildFromEventLog } from '../recall/rebuild.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -1162,6 +1169,7 @@ const kickSemanticRecallPoolRefresh = (vaultRoot: string, embedderUsable: boolea
         })
         .filter((i) => i.text.length > 0);
       if (items.length >= 2) {
+        const { embed, MODEL_ID } = await loadEmbedderModule();
         await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
       }
     } catch {
@@ -5358,6 +5366,7 @@ const routes: readonly RouteDefinition[] = [
       // does one read+write regardless of batch size.
       const vaultRoot = requireVaultRoot(context);
       const input = recallIndexSchema.parse(await readBody(request));
+      const { embed, MODEL_ID } = await loadEmbedderModule();
       const vectors = await embed(input.items.map((item) => item.text));
       const entries: { id: string; threadId: string; capturedAt: string; embedding: Float32Array }[] = [];
       const indexedThreadIds: string[] = [];
@@ -5467,6 +5476,7 @@ const routes: readonly RouteDefinition[] = [
       if (!isVectorUsable(vectorStateAtQuery)) {
         vectorMode = vectorStateAtQuery === 'failed' ? 'skipped-failed' : 'skipped-warming';
       } else {
+        const { embed, MODEL_ID, RecallModelMissingError } = await loadEmbedderModule();
         try {
           [queryEmbedding] = await embed([query.q]);
         } catch (error) {
@@ -5978,7 +5988,14 @@ const routes: readonly RouteDefinition[] = [
       }
       return [
         202,
-        { data: await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')) },
+        // Lazy: recall/rebuild.ts is on the /v1/status forbidden-import
+          // list (statusContract.test.ts) — load it when the rebuild route
+          // actually fires.
+          {
+            data: await (
+              await import('../recall/rebuild.js')
+            ).rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')),
+          },
       ];
     },
   },
