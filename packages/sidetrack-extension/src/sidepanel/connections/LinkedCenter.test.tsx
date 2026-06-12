@@ -165,6 +165,12 @@ describe('LinkedCenter filtering', () => {
     ).toEqual(['edge-closest-strong', 'edge-closest-mid', 'edge-closest-cut', 'edge-closest-hidden']);
     expect(within(closestGroup).queryByTestId('edge-closest-weak')).toBeNull();
 
+    // "Show N more" must equal the rows the expansion actually adds —
+    // it derives from renderableCount − rendered-now, not from
+    // max(nodeEntries, edgeEntries).
+    expect(within(closestGroup).getByTestId('linked-show-more-closest_visit').textContent).toBe(
+      'Show 1 more',
+    );
     fireEvent.click(within(closestGroup).getByTestId('linked-show-more-closest_visit'));
 
     expect(within(closestGroup).queryByTestId('edge-closest-weak')).not.toBeNull();

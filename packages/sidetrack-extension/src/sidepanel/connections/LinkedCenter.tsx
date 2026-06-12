@@ -79,6 +79,13 @@ type LinkedKindGroup = {
   readonly nodeEntries: readonly LinkedNodeEntry[];
   readonly edgeEntries: readonly LinkedEdgeEntry[];
   readonly firstIndex: number;
+  /** What the group renders when fully expanded: distinct entities
+   *  across node entries and resolvable edge endpoints, plus one flat
+   *  row per unresolvable edge. The header count and the show-more
+   *  math both derive from this — `max(nodeEntries, edgeEntries)`
+   *  skewed both ways once edges promoted to cards (a group headed
+   *  32 rendered 54 cards; another headed 90 rendered 45). */
+  readonly renderableCount: number;
 };
 
 type MutableLinkedKindGroup = {
@@ -204,12 +211,25 @@ const groupLinkedEntries = (
     });
   });
 
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const renderableCountOf = (group: MutableLinkedKindGroup): number => {
+    const ids = new Set<string>();
+    let unresolvable = 0;
+    for (const entry of group.nodeEntries) ids.add(entry.node.id);
+    for (const { edge } of group.edgeEntries) {
+      const otherId = edge.fromNodeId === anchorId ? edge.toNodeId : edge.fromNodeId;
+      if (nodeIds.has(otherId)) ids.add(otherId);
+      else unresolvable += 1;
+    }
+    return ids.size + unresolvable;
+  };
   return [...groups.entries()]
     .map(([kind, group]) => ({
       kind,
       nodeEntries: group.nodeEntries.sort(compareNodeEntries),
       edgeEntries: group.edgeEntries.sort(compareEdgeEntries),
       firstIndex: group.firstIndex,
+      renderableCount: renderableCountOf(group),
     }))
     .sort(
       (left, right) =>
@@ -324,10 +344,6 @@ export const LinkedCenter = ({
           : visibleCountForGroup(group);
         const visibleNodeEntries = group.nodeEntries.slice(0, visibleCount);
         const visibleEdgeEntries = group.edgeEntries.slice(0, visibleCount);
-        const hiddenCount = Math.max(
-          0,
-          Math.max(group.nodeEntries.length, group.edgeEntries.length) - visibleCount,
-        );
         const diagnostic = debugScores
           ? scoreDiagnostic(group.edgeEntries, visibleCount, expanded)
           : null;
@@ -429,21 +445,14 @@ export const LinkedCenter = ({
             </button>
           );
         });
-        // Header count = what actually renders when expanded: distinct
-        // entities across node entries AND edge-promoted cards (other
-        // endpoints resolved in the subgraph), plus flat rows for
-        // unresolvable endpoints. `max(nodeEntries, edgeEntries)`
-        // understated this — a group headed "32" rendered 54 cards
-        // because edge-promoted cards stack on top of node entries.
-        const renderableIds = new Set<string>();
-        let unresolvableEdgeCount = 0;
-        for (const entry of group.nodeEntries) renderableIds.add(entry.node.id);
-        for (const { edge } of group.edgeEntries) {
-          const otherId = edge.fromNodeId === anchorId ? edge.toNodeId : edge.fromNodeId;
-          if (nodeById.has(otherId)) renderableIds.add(otherId);
-          else unresolvableEdgeCount += 1;
-        }
-        const groupTotal = renderableIds.size + unresolvableEdgeCount;
+        // Both the header and "Show N more" derive from what actually
+        // renders: the group-level renderableCount (computed once at
+        // group construction) minus the rows on screen right now.
+        // Counting rendered rows directly keeps the math exact under
+        // the slice + dedupe interplay above.
+        const renderedNow =
+          nodeRows.length + edgeRows.reduce((n, row) => (row === null ? n : n + 1), 0);
+        const hiddenCount = Math.max(0, group.renderableCount - renderedNow);
         return (
           <section key={group.kind} data-testid={`group-${group.kind}`}>
             <header className="cx-group-head">
@@ -451,7 +460,7 @@ export const LinkedCenter = ({
                 <span className="cx-edge-line" />
               </span>
               <h3>{edgeKindLabelForKind(group.kind)}</h3>
-              <span className="cx-count">{groupTotal}</span>
+              <span className="cx-count">{group.renderableCount}</span>
             </header>
             {nodeKindMarkers(group.nodeEntries).map((kind) => (
               <span key={kind} hidden data-testid={`group-${kind}`} />

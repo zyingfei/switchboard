@@ -1669,7 +1669,14 @@ export const peekCachedCompanionIdentity = (): typeof cachedCompanionIdentity =>
   cachedCompanionIdentity;
 export const peekCachedIdentityWarning = (): typeof cachedIdentityWarning => cachedIdentityWarning;
 
-const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
+// Single probe body shared by the regular reachability check and the
+// post-failure classifier. `quick` swaps the 45 s cold-start-tolerant
+// status budget for the 4 s classification budget and skips the
+// /v1/version identity refresh (an extra round-trip the classifier
+// doesn't need — identity re-verifies on the next healthy poll).
+const probeCompanion = async (opts: {
+  readonly quick: boolean;
+}): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
     cachedRelayStatus = null;
@@ -1679,17 +1686,22 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
     return 'local-only';
   }
   const client = createCompanionClient(settings.companion);
-  const status = await client.status();
+  const status = await (opts.quick ? client.statusQuick() : client.status());
   // Capture the live relay block (if any) so the workboard-state
   // builder can route a relay-disconnected banner without a
   // second round-trip.
   cachedRelayStatus = status.sync?.relay ?? null;
   cachedSnapshotRevision = status.snapshotRevision ?? null;
-  // Connection identity check — detects a different companion (test
-  // vs daily, stale build) silently owning the configured port.
-  await refreshCompanionIdentity(client, settings.companion.port);
+  if (!opts.quick) {
+    // Connection identity check — detects a different companion (test
+    // vs daily, stale build) silently owning the configured port.
+    await refreshCompanionIdentity(client, settings.companion.port);
+  }
   return status.vault === 'connected' ? 'connected' : 'vault-error';
 };
+
+const assertCompanionReachable = (): Promise<'connected' | 'vault-error' | 'local-only'> =>
+  probeCompanion({ quick: false });
 
 // Post-failure classification. A failed companion call must not, by
 // itself, repaint the panel "disconnected — start the companion":
@@ -1719,15 +1731,7 @@ const probeCompanionStatus = async (): Promise<
   'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
 > => {
   try {
-    const settings = await readSettings();
-    if (settings.companion.bridgeKey.length === 0) {
-      return 'local-only';
-    }
-    const client = createCompanionClient(settings.companion);
-    const status = await client.statusQuick();
-    cachedRelayStatus = status.sync?.relay ?? null;
-    cachedSnapshotRevision = status.snapshotRevision ?? null;
-    return status.vault === 'connected' ? 'connected' : 'vault-error';
+    return await probeCompanion({ quick: true });
   } catch (probeError) {
     return probeError instanceof CompanionRequestError && probeError.kind === 'timeout'
       ? 'busy'
