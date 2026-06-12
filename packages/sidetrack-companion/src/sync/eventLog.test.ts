@@ -373,6 +373,50 @@ describe('event log', () => {
     expect(seen2).toEqual(['b-3']);
   });
 
+  it('detects shard files written by another process and dedupes against them', async () => {
+    // The append indexes are in-process; events can land in the vault
+    // from OUTSIDE (CLI `import` against the same vault, file-level
+    // sync dropping a peer shard in). The signature guard must rebuild
+    // the indexes before any dedupe decision.
+    const log = createEventLog(vaultRoot, replica);
+    // Warm the indexes via a first append.
+    await log.appendClient({
+      clientEventId: 'local-1',
+      aggregateId: 'agg-1',
+      type: 'review-draft.span.added',
+      payload: {},
+      baseVector: {},
+    });
+    // External process writes a peer shard directly.
+    const peerEvent: AcceptedEvent = {
+      clientEventId: 'ext-1',
+      dot: { replicaId: 'replica-ext', seq: 7 },
+      deps: {},
+      aggregateId: 'agg-ext',
+      type: 'review-draft.span.added',
+      payload: {},
+      acceptedAtMs: Date.parse('2026-05-05T12:00:00.000Z'),
+    };
+    const dir = join(vaultRoot, '_BAC', 'log', 'replica-ext');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, '2026-05-05.jsonl'), `${JSON.stringify(peerEvent)}\n`, 'utf8');
+
+    // Relay redelivery of the SAME event must be a no-op, not a
+    // duplicate shard line.
+    expect(await log.importPeerEvent(peerEvent)).toEqual({ imported: false });
+
+    // A local append reusing the externally-synced clientEventId must
+    // dedupe to the existing event instead of minting a new dot.
+    const deduped = await log.appendClientObserved({
+      clientEventId: 'ext-1',
+      aggregateId: 'agg-ext',
+      type: 'review-draft.span.added',
+      payload: {},
+      baseVector: {},
+    });
+    expect(deduped.dot).toEqual({ replicaId: 'replica-ext', seq: 7 });
+  });
+
   it('appendClientObservedBatch with no hook still appends + dedupes (edge-event path)', async () => {
     const log = createEventLog(vaultRoot, replica);
     const input = {

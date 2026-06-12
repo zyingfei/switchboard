@@ -708,22 +708,28 @@ export const createEventLog = (
   const findByClientEventId = async (clientEventId: string): Promise<AcceptedEvent | null> => {
     // Negative fast-path: when the append indexes are warm they are
     // authoritative for membership — absent there means absent in the
-    // log, no need to warm the full-log memo. (The positive case still
-    // needs the merged log; callers want the event, the index only
-    // carries its dot.)
+    // log, no need to read anything. (A stale-index false negative
+    // self-corrects at the guarded append: freshAppendIndexes rebuilds
+    // on a foreign signature change before any dedupe decision.)
     if (appendIndexes !== null && !appendIndexes.clientIdToDot.has(clientEventId)) {
       return null;
     }
-    const merged = await readMerged();
-    return merged.find((event) => event.clientEventId === clientEventId) ?? null;
+    // Positive / cold path: stream-scan instead of readMerged. The
+    // duplicate-replay case fires exactly when the companion is busy
+    // (a write succeeded server-side but timed out client-side and
+    // got replayed) — warming the ~700MB full-log memo there would
+    // re-pin the memory the indexes exist to release.
+    const matches = await streamFiltered((event) => event.clientEventId === clientEventId);
+    return matches[0] ?? null;
   };
 
   const findByDot = async (dot: Dot): Promise<AcceptedEvent | null> => {
-    const merged = await readMerged();
-    return (
-      merged.find((event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq) ??
-      null
+    // Stream-scan for the single event — see findByClientEventId for
+    // why this avoids readMerged (memo pinning on the busy path).
+    const matches = await streamFiltered(
+      (event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq,
     );
+    return matches[0] ?? null;
   };
 
   // ── Append-path indexes ─────────────────────────────────────────
@@ -781,8 +787,45 @@ export const createEventLog = (
       appendIndexes = idx;
       appendIndexesWarming = null;
       return idx;
-    })();
+    })().catch((error: unknown) => {
+      // A failed warm (transient read error mid-stream) must not pin a
+      // rejected promise here forever — that would fail EVERY later
+      // append until restart. Clear the slot so the next append
+      // retries the warm from scratch.
+      appendIndexesWarming = null;
+      throw error;
+    });
     return appendIndexesWarming;
+  };
+
+  // Log signature the indexes were last reconciled against. The
+  // indexes are in-process state, but the shard files can gain events
+  // from OUTSIDE this process (a CLI `import` run against the same
+  // vault, file-level sync dropping a peer shard in). The old
+  // readMerged-per-append path picked those up via the memo's file
+  // signature; the indexes must do the same or dedupe/deps run against
+  // stale data and mint duplicate identities. Every guarded append
+  // compares the live signature first (one stat pass over the shard
+  // files, single-digit ms) and rebuilds the indexes when something
+  // else moved the log; after its own write it re-records the
+  // signature so the next check doesn't self-trigger.
+  let appendIndexesSignature: string | null = null;
+
+  const freshAppendIndexes = async (): Promise<AppendIndexes> => {
+    let idx = await warmAppendIndexes();
+    const sig = await computeLogSignature();
+    if (appendIndexesSignature !== null && appendIndexesSignature !== sig) {
+      appendIndexes = null;
+      idx = await warmAppendIndexes();
+      appendIndexesSignature = await computeLogSignature();
+      return idx;
+    }
+    appendIndexesSignature = sig;
+    return idx;
+  };
+
+  const recordAppendIndexesSignature = async (): Promise<void> => {
+    appendIndexesSignature = await computeLogSignature();
   };
 
   // Critical correctness rule: deps must reflect the editor's observed
@@ -827,7 +870,7 @@ export const createEventLog = (
     input: AppendInput<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
     enqueueAppend(async () => {
-      const idx = await warmAppendIndexes();
+      const idx = await freshAppendIndexes();
       if (idx.clientIdToDot.has(input.clientEventId)) {
         // Duplicate replay (rare) — the index proves presence; fetch
         // the full event from the merged log for the return contract.
@@ -835,6 +878,13 @@ export const createEventLog = (
         if (existing !== null) {
           return existing as AcceptedEvent<TPayload>;
         }
+        // Index and merged log disagree (corrupt/unreadable line).
+        // Minting a fresh dot for an id the log already carries would
+        // poison sync with a ClientEventIdReuse on every peer — fail
+        // the append loudly instead.
+        throw new Error(
+          `Event log inconsistent: clientEventId ${input.clientEventId} is indexed but unreadable from the shards.`,
+        );
       }
       // Resolve deps from the maintained indexes — same Sync Contract
       // v1 stamping as computeDepsFromInput without re-reading the log.
@@ -866,6 +916,7 @@ export const createEventLog = (
       // not leave the index claiming presence (it would silently drop
       // the retry as a duplicate).
       registerInAppendIndexes(idx, event);
+      await recordAppendIndexesSignature();
       return event;
     });
 
@@ -878,7 +929,7 @@ export const createEventLog = (
       // Index-backed dedupe + deps (was: ONE readMerged per batch —
       // which still re-read the whole log every time, because the
       // previous batch's append invalidates the memo).
-      const idx = await warmAppendIndexes();
+      const idx = await freshAppendIndexes();
       const presentInBatch = new Set<string>();
       const events: AcceptedEvent<TPayload>[] = [];
       const results: { clientEventId: string; imported: boolean }[] = [];
@@ -926,6 +977,7 @@ export const createEventLog = (
         // mid-batch write failure can't strand half a batch as
         // phantom duplicates.
         for (const event of events) registerInAppendIndexes(idx, event);
+        await recordAppendIndexesSignature();
       }
       // Dispatch AFTER the durable write so a hook only ever sees
       // events that are on disk — same ordering guarantee as the
@@ -943,7 +995,7 @@ export const createEventLog = (
       if (event.dot.replicaId === replica.replicaId) {
         return { imported: false } as const;
       }
-      const idx = await warmAppendIndexes();
+      const idx = await freshAppendIndexes();
       if (idx.dotKeys.has(dotKeyOf(event.dot))) {
         // Dot already present — the collision/equality verdict needs
         // the full stored event; this (rare) path may warm the memo.
@@ -954,6 +1006,11 @@ export const createEventLog = (
           }
           throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
         }
+        // Index claims the dot exists but the merged read can't
+        // surface it (transient shard-read failure). Appending on top
+        // of a claimed dot would write a duplicate identity — treat
+        // as a benign redelivery instead; the peer retries if needed.
+        return { imported: false } as const;
       }
       const knownDot = idx.clientIdToDot.get(event.clientEventId);
       if (knownDot !== undefined) {
@@ -970,6 +1027,7 @@ export const createEventLog = (
         { encoding: 'utf8', flag: 'a' },
       );
       registerInAppendIndexes(idx, event);
+      await recordAppendIndexesSignature();
       // Each replica's seq counter is independent; we don't bump our
       // own seq when ingesting a peer event (that would corrupt our
       // local namespace). Causal ordering across replicas is handled
