@@ -47,7 +47,12 @@ import {
 } from '../../privacy/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
 import { QUEUE_CREATED, QUEUE_STATUS_SET } from '../../queue/events.js';
-import { CAPTURE_RECORDED, RECALL_TOMBSTONE_TARGET } from '../../recall/events.js';
+import {
+  CAPTURE_RECORDED,
+  RECALL_ACTION,
+  RECALL_SERVED,
+  RECALL_TOMBSTONE_TARGET,
+} from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { REVIEW_DRAFT_EVENT_TYPES } from '../../review/projection.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../../snippets/events.js';
@@ -300,6 +305,40 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         class: 'derived-cache',
         materializer: 'recall',
         peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Recall+ranker v2 Phase 0 — impression logging. recall.served is
+  // written by /v2/recall on every response (the served context);
+  // recall.action records explicit user actions tied back by
+  // servedContextId. Their derived surface is the ranker's
+  // impression-grouped training-label set, built BATCH-style at
+  // retrain time (ranker/retrain-impressions.ts reads the raw events
+  // inside the connections drain's rankerRetrainer step) — a
+  // deterministic, replayable projection of raw events, per the v2
+  // alignment doc's event-sourced-labels requirement. No live
+  // materializer reacts per event; freshness is retrain-cadence.
+  {
+    eventType: RECALL_SERVED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'ranker-training-labels',
+        class: 'derived-cache',
+        materializer: 'connections',
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  {
+    eventType: RECALL_ACTION,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'ranker-training-labels',
+        class: 'derived-cache',
+        materializer: 'connections',
         recovery: 'replay-event-log',
       },
     ],

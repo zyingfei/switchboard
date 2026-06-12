@@ -17,6 +17,7 @@ import {
   readPageEvidenceRecordByFileName,
 } from '../../page-evidence/store.js';
 import type { PageEvidenceRecord } from '../../page-evidence/types.js';
+import { mapInChunks } from '../../domain/asyncChunks.js';
 import { readIndex } from '../../recall/indexFile.js';
 import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
 import { RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
@@ -764,34 +765,27 @@ export const backfillPageEvidenceDelta = async (
   t = Date.now();
   const statByName = new Map(files.map((f) => [f.name, f]));
   const changedRecords: PageEvidenceRecord[] = [];
-  const READ_CHUNK_SIZE = 50;
-  for (let start = 0; start < changedNames.length; start += READ_CHUNK_SIZE) {
-    const chunk = changedNames.slice(start, start + READ_CHUNK_SIZE);
-    // eslint-disable-next-line no-await-in-loop -- chunked parallel reads
-    const loaded = await Promise.all(
-      chunk.map(async (name) => ({
-        name,
-        record: await readPageEvidenceRecordByFileName(vaultRoot, name),
-      })),
-    );
-    for (const { name, record } of loaded) {
-      const f = statByName.get(name);
-      if (f === undefined) continue;
-      if (record !== null) {
-        next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${record.canonicalUrl}`;
-        changedRecords.push(record);
-        continue;
-      }
-      // Read failed schema validation (corrupted rewrite) or raced
-      // with a delete. The full pass drops such records and its sweep
-      // removes their rows; mirror that — delete the doc via the url
-      // the manifest knew, and CARRY that url forward so a later file
-      // deletion can still resolve the entity. Recording '' here
-      // would leak the row forever.
-      const priorUrl = manifestUrlOf(stored[name] ?? '');
-      if (priorUrl.length > 0) removedUrls.push(priorUrl);
-      next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${priorUrl}`;
+  const loaded = await mapInChunks(changedNames, 50, async (name) => ({
+    name,
+    record: await readPageEvidenceRecordByFileName(vaultRoot, name),
+  }));
+  for (const { name, record } of loaded) {
+    const f = statByName.get(name);
+    if (f === undefined) continue;
+    if (record !== null) {
+      next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${record.canonicalUrl}`;
+      changedRecords.push(record);
+      continue;
     }
+    // Read failed schema validation (corrupted rewrite) or raced
+    // with a delete. The full pass drops such records and its sweep
+    // removes their rows; mirror that — delete the doc via the url
+    // the manifest knew, and CARRY that url forward so a later file
+    // deletion can still resolve the entity. Recording '' here
+    // would leak the row forever.
+    const priorUrl = manifestUrlOf(stored[name] ?? '');
+    if (priorUrl.length > 0) removedUrls.push(priorUrl);
+    next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${priorUrl}`;
   }
   timingMs['read'] = Date.now() - t;
 

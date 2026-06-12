@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
+import { mapInChunks } from '../domain/asyncChunks.js';
 import { createRevision } from '../domain/ids.js';
 import { classifyPageContentQuality } from '../page-content/quality.js';
 import { readPageContentExtractedPayloadForEvidence } from '../page-content/store.js';
@@ -169,30 +170,21 @@ export const listPageEvidenceRecordFiles = async (
   const names = (await readdir(dir).catch(() => [] as string[])).filter((name) =>
     name.endsWith('.json'),
   );
-  const out: PageEvidenceRecordFileStat[] = [];
-  // Chunked PARALLEL stats — a sequential await-per-file loop over
-  // ~1800 records measured 36.9 s when the boot catch-up was hogging
-  // the loop (each await re-queues behind it); batched stats finish in
-  // a handful of loop turns regardless of contention.
-  const STAT_CHUNK_SIZE = 100;
-  for (let start = 0; start < names.length; start += STAT_CHUNK_SIZE) {
-    const chunk = names.slice(start, start + STAT_CHUNK_SIZE);
-    const stats = await Promise.all(
-      chunk.map(async (name) => {
-        try {
-          const s = await stat(join(dir, name));
-          return { name, mtimeMs: Math.trunc(s.mtimeMs), size: s.size };
-        } catch {
-          // Raced with a delete — treat as absent.
-          return null;
-        }
-      }),
-    );
-    for (const entry of stats) {
-      if (entry !== null) out.push(entry);
+  // Chunked PARALLEL stats — see mapInChunks: a sequential
+  // await-per-file loop over ~1800 records measured 36.9 s under
+  // boot catch-up contention.
+  const stats = await mapInChunks(names, 100, async (name) => {
+    try {
+      const s = await stat(join(dir, name));
+      return { name, mtimeMs: Math.trunc(s.mtimeMs), size: s.size };
+    } catch {
+      // Raced with a delete — treat as absent.
+      return null;
     }
-  }
-  return out.sort((left, right) => compareText(left.name, right.name));
+  });
+  return stats
+    .filter((entry): entry is PageEvidenceRecordFileStat => entry !== null)
+    .sort((left, right) => compareText(left.name, right.name));
 };
 
 /** Read + validate one record by its by-url/ file name. Null when the
