@@ -2235,10 +2235,19 @@ const isPrivacyPayloadForType = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+// `types`, when provided, restricts the store scan to those event types
+// at the SQL level (events_type_idx via forEachChunkOfTypes) — O(matching
+// rows) instead of O(all 370K events). The predicate still runs to refine
+// (e.g. by canonicalUrl / tabSession). EVERY type the predicate can
+// accept MUST be in `types` or matching events are missed. Without a hint
+// this falls back to a full forEachChunk scan (legacy callers). This
+// scan was ~4s per fresh /resolve on a real vault and, serialized across
+// a burst of fresh navigations, starved /v1/status past its 45s budget.
 const readEventsFromStoreOrLog = async (
   context: CompanionHttpConfig,
   eventLog: EventLog,
   predicate: (event: AcceptedEvent) => boolean,
+  types?: readonly string[],
 ): Promise<readonly AcceptedEvent[]> => {
   if (context.vaultRoot === undefined) {
     return (await eventLog.readMerged()).filter(predicate);
@@ -2246,13 +2255,40 @@ const readEventsFromStoreOrLog = async (
   const store = await getCaughtUpSharedEventStore(context.vaultRoot);
   if (store === null) return (await eventLog.readMerged()).filter(predicate);
   const events: AcceptedEvent[] = [];
-  await store.forEachChunk((chunk) => {
+  const collect = (chunk: readonly AcceptedEvent[]): void => {
     for (const event of chunk) {
       if (predicate(event)) events.push(event);
     }
-  }, 2000);
+  };
+  if (types !== undefined && types.length > 0) {
+    await store.forEachChunkOfTypes(types, collect, 2000);
+  } else {
+    await store.forEachChunk(collect, 2000);
+  }
   return events;
 };
+
+// Type hints for the readEventsFromStoreOrLog callers (must list every
+// type the corresponding predicate can match).
+const RESOLVER_SIGNAL_EVENT_TYPES = [USER_FLOW_REJECTED, USER_ORGANIZED_ITEM] as const;
+const RESOLVER_EXPAND_EVENT_TYPES = [
+  BROWSER_TIMELINE_OBSERVED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+] as const;
+const PRIVACY_EVENT_TYPES = [
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+] as const;
+const FEEDBACK_EVENT_TYPE_LIST = [
+  USER_ORGANIZED_ITEM,
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_TOPIC_RENAMED,
+  USER_SNIPPET_PROMOTED,
+] as const;
 
 // Signature-keyed projection caches. The /v1/visits and /v1/tabsessions
 // endpoints are polled frequently; without this each poll re-projected
@@ -2862,8 +2898,11 @@ const routes: readonly RouteDefinition[] = [
         200,
         {
           data: projectPrivacy(
-            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
-              isPrivacyEventType(event.type),
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isPrivacyEventType(event.type),
+              PRIVACY_EVENT_TYPES,
             ),
           ),
         },
@@ -2909,8 +2948,11 @@ const routes: readonly RouteDefinition[] = [
             data: {
               accepted,
               projection: projectPrivacy(
-                await readEventsFromStoreOrLog(context, eventLog, (event) =>
-                  isPrivacyEventType(event.type),
+                await readEventsFromStoreOrLog(
+                  context,
+                  eventLog,
+                  (event) => isPrivacyEventType(event.type),
+                  PRIVACY_EVENT_TYPES,
                 ),
               ),
             },
@@ -2973,8 +3015,11 @@ const routes: readonly RouteDefinition[] = [
         200,
         {
           data: projectFeedback(
-            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
-              isFeedbackEventType(event.type),
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isFeedbackEventType(event.type),
+              FEEDBACK_EVENT_TYPE_LIST,
             ),
           ),
         },
@@ -3093,8 +3138,11 @@ const routes: readonly RouteDefinition[] = [
             );
           }
           const resolverEvents = usesSqliteSubgraph
-            ? await readEventsFromStoreOrLog(context, context.eventLog!, (event) =>
-                resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+            ? await readEventsFromStoreOrLog(
+                context,
+                context.eventLog!,
+                (event) => resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+                RESOLVER_SIGNAL_EVENT_TYPES,
               )
             : await context.eventLog!.readMerged();
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
@@ -3192,8 +3240,11 @@ const routes: readonly RouteDefinition[] = [
             throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
           }
           const resolverEvents = usesSqliteSubgraph
-            ? await readEventsFromStoreOrLog(context, eventLog, (event) =>
-                resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+            ? await readEventsFromStoreOrLog(
+                context,
+                eventLog,
+                (event) => resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+                RESOLVER_SIGNAL_EVENT_TYPES,
               )
             : await eventLog.readMerged();
           const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
@@ -3421,6 +3472,7 @@ const routes: readonly RouteDefinition[] = [
                     event.type === BROWSER_TIMELINE_OBSERVED ||
                     event.type === USER_FLOW_REJECTED ||
                     event.type === USER_ORGANIZED_ITEM,
+                  RESOLVER_EXPAND_EVENT_TYPES,
                 )
               : null;
           const expandedCandidateUrls =
@@ -3476,6 +3528,7 @@ const routes: readonly RouteDefinition[] = [
                   context.eventLog!,
                   (event) =>
                     event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+                  RESOLVER_SIGNAL_EVENT_TYPES,
                 )
               : await context.eventLog!.readMerged());
           const resolverEvents =
@@ -3611,6 +3664,7 @@ const routes: readonly RouteDefinition[] = [
                   event.type === BROWSER_TIMELINE_OBSERVED ||
                   event.type === USER_FLOW_REJECTED ||
                   event.type === USER_ORGANIZED_ITEM,
+                RESOLVER_EXPAND_EVENT_TYPES,
               );
         const expandedCandidateUrlsByTarget =
           eventCandidateTargetSet.size === 0
@@ -3763,8 +3817,11 @@ const routes: readonly RouteDefinition[] = [
           'policyTelemetry',
         );
         const resolverEvents = usesSqliteSubgraph
-          ? await readEventsFromStoreOrLog(context, eventLog, (event) =>
-              resolverSignalEventsForCanonicalUrls([event], [canonicalUrl]).length > 0,
+          ? await readEventsFromStoreOrLog(
+              context,
+              eventLog,
+              (event) => resolverSignalEventsForCanonicalUrls([event], [canonicalUrl]).length > 0,
+              RESOLVER_SIGNAL_EVENT_TYPES,
             )
           : await eventLog.readMerged();
         const result = await autoApplyUrlAttribution({
@@ -7440,8 +7497,11 @@ const routes: readonly RouteDefinition[] = [
         snap = applyFeedbackOverlayToSnapshot(
           snap,
           projectFeedback(
-            await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
-              isFeedbackEventType(event.type),
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isFeedbackEventType(event.type),
+              FEEDBACK_EVENT_TYPE_LIST,
             ),
           ),
         );
