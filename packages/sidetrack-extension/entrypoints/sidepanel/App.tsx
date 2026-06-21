@@ -2007,6 +2007,13 @@ const App = () => {
   // explicit user Refresh + user-mutation cache invalidation, where it
   // is correct.
   const lastSnapshotRevisionRef = useRef<string | null>(null);
+  const snapshotRefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (snapshotRefetchTimerRef.current !== null) clearTimeout(snapshotRefetchTimerRef.current);
+    },
+    [],
+  );
   useEffect(() => {
     if (state.companionStatus !== 'connected') return;
     const rev = state.snapshotRevision;
@@ -2016,7 +2023,17 @@ const App = () => {
     const previous = lastSnapshotRevisionRef.current;
     lastSnapshotRevisionRef.current = rev;
     if (previous === null) return;
-    void loadTabSessions({ background: true });
+    // Trailing debounce: the companion bumps the snapshot revision every
+    // drain, and a burst of drains would otherwise fire an inbox-page
+    // resolve sweep per revision — the resolve-flood amplifier. Coalesce
+    // a burst into ONE refetch ~2.5s after the last bump. Ref-based (not
+    // an effect-cleanup timer) so an unrelated same-revision re-render
+    // can't cancel a pending refetch.
+    if (snapshotRefetchTimerRef.current !== null) clearTimeout(snapshotRefetchTimerRef.current);
+    snapshotRefetchTimerRef.current = setTimeout(() => {
+      snapshotRefetchTimerRef.current = null;
+      void loadTabSessions({ background: true });
+    }, 2500);
   }, [loadTabSessions, state.companionStatus, state.snapshotRevision]);
 
   // 2026-05 cleanup: dropped the 4 s background poll. It was firing
