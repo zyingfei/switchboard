@@ -444,6 +444,16 @@ const timelineFactsStoreEnabled = (): boolean =>
 // metadata-only and content-lane-only scoped branches.
 const scopedRevisitNoOpEnabled = (): boolean =>
   process.env['SIDETRACK_SCOPED_REVISIT_NOOP'] !== '0';
+// Scoped timeline sourcing (default ON; disable with =0 + restart). The
+// store-backed drain derives scopedTimelineDays from the WINDOW only, so
+// a re-visit (whose timeline entry isn't in the window) leaves the
+// scoped-apply branch with missing required timeline rows and falls into
+// a ~16s full base rebuild. When required rows are missing, source them
+// from the full timeline — cheaply, via a typed BROWSER_TIMELINE_OBSERVED
+// read (events_type_idx) rather than a full readMerged — so the scoped
+// apply branch fires instead of full-rebuilding on every navigation.
+const scopedTimelineSourcingEnabled = (): boolean =>
+  process.env['SIDETRACK_SCOPED_TIMELINE_SOURCING'] !== '0';
 // Incremental topic membership (default OFF): between full leiden
 // re-clusters, overlay newly-eligible visits onto their nearest existing
 // cluster as secondary affiliations so topics stay responsive to browsing
@@ -3729,17 +3739,41 @@ export const createConnectionsMaterializer = (
         return new Set([...requiredTimelineVisitKeys].filter((visitKey) => !present.has(visitKey)));
       };
       let missingRequiredVisitKeys = missingRequiredTimelineVisitKeys();
-      if (missingRequiredVisitKeys.size > 0 && hnswScopedDeltaVisitIds.size > 0) {
-        const fullRawTimelineDays =
-          timelineFactStore === null
-            ? buildTimelineDays(await deps.eventLog.readMerged())
-            : timelineFactStore.readTimelineDays();
+      if (
+        missingRequiredVisitKeys.size > 0 &&
+        (hnswScopedDeltaVisitIds.size > 0 || scopedTimelineSourcingEnabled())
+      ) {
+        // Source the missing required timeline rows from the full
+        // timeline so the scoped-apply branch can fire instead of a full
+        // rebuild. buildTimelineDays consumes only BROWSER_TIMELINE_OBSERVED,
+        // so a typed store read of that type is identical output to
+        // readMerged() but O(timeline events) instead of O(all events).
+        let fullRawTimelineDays: readonly TimelineDayProjectionWithDimensions[];
+        let timelineSource: string;
+        if (timelineFactStore !== null) {
+          fullRawTimelineDays = timelineFactStore.readTimelineDays();
+          timelineSource = 'factstore';
+        } else if (storeBackedEvents !== null) {
+          const timelineEvents: AcceptedEvent[] = [];
+          await storeBackedEvents.forEachChunkOfTypes(
+            [BROWSER_TIMELINE_OBSERVED],
+            (chunk) => {
+              for (const event of chunk) timelineEvents.push(event);
+            },
+            2000,
+          );
+          fullRawTimelineDays = buildTimelineDays(timelineEvents);
+          timelineSource = 'typed-store';
+        } else {
+          fullRawTimelineDays = buildTimelineDays(await deps.eventLog.readMerged());
+          timelineSource = 'merged';
+        }
         scopedTimelineDays = filterTimelineDaysForScopedDelta(
           enrichTimelineDaysWithEngagement(fullRawTimelineDays, engagementInputs),
           scopedTimelineDayFilter,
         );
         mark(
-          `scopedTimelineDelta.fullTimelineRead missing=${String(
+          `scopedTimelineDelta.timelineSourced src=${timelineSource} missing=${String(
             missingRequiredVisitKeys.size,
           )} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
         );
