@@ -371,7 +371,16 @@ export const startCompanion = async (
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : 6 * 60 * 60 * 1000;
     })();
     const recallActivity = createRecallActivityTracker();
-    const baseEventLog = createEventLog(options.vaultPath, replica);
+    // The append-path signature guard (re-stat the whole log per write to
+    // detect external shard writers) is only needed when another process
+    // can write shards: a configured sync relay, or an operator running a
+    // concurrent CLI `import` (force via SIDETRACK_EXTERNAL_WRITERS=1).
+    // The default single-companion vault is the sole writer, so the guard
+    // is skipped and writes don't pay ~222 syscalls × 2 per append.
+    const externalWritersPossible =
+      (options.relay !== undefined && options.relay.rendezvousSecret.trim().length > 0) ||
+      process.env['SIDETRACK_EXTERNAL_WRITERS'] === '1';
+    const baseEventLog = createEventLog(options.vaultPath, replica, { externalWritersPossible });
     const projectionChanges = createProjectionChangeFeed(options.vaultPath);
 
     // Sync Contract v1 — runner. Single dispatch point for every

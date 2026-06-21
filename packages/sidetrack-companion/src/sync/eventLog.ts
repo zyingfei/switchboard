@@ -258,6 +258,16 @@ export interface EventLog {
 export interface EventLogOptions {
   readonly now?: () => Date;
   readonly hlcStamper?: () => Hlc | undefined;
+  /** True when shard files can be written by ANOTHER process (a sync
+   *  transport dropping peer shards in, or a concurrent CLI `import`).
+   *  Only then does the append path need to re-check the on-disk log
+   *  signature before each dedupe/deps decision. In the common
+   *  single-companion case (default false) the in-memory append indexes
+   *  are the sole authority — this process is the only writer and
+   *  maintains them incrementally — so the per-append signature scan
+   *  (readdir of every replica dir + stat of every shard file, twice
+   *  per write) is pure overhead and is skipped. */
+  readonly externalWritersPossible?: boolean;
 }
 
 const LOG_ROOT_SEGMENTS = ['_BAC', 'log'] as const;
@@ -460,6 +470,7 @@ export const createEventLog = (
   options: EventLogOptions = {},
 ): EventLog => {
   const now = options.now ?? (() => new Date());
+  const externalWritersPossible = options.externalWritersPossible ?? false;
 
   let writeChain: Promise<unknown> = Promise.resolve();
   const enqueueAppend = <T>(task: () => Promise<T>): Promise<T> => {
@@ -812,6 +823,11 @@ export const createEventLog = (
   let appendIndexesSignature: string | null = null;
 
   const freshAppendIndexes = async (): Promise<AppendIndexes> => {
+    // Single-writer (default): the in-memory indexes are authoritative —
+    // no other process mutates the log, so skip the on-disk signature
+    // scan entirely (the indexes are warmed once and maintained by our
+    // own appends).
+    if (!externalWritersPossible) return warmAppendIndexes();
     let idx = await warmAppendIndexes();
     const sig = await computeLogSignature();
     if (appendIndexesSignature !== null && appendIndexesSignature !== sig) {
@@ -825,6 +841,8 @@ export const createEventLog = (
   };
 
   const recordAppendIndexesSignature = async (): Promise<void> => {
+    // Only meaningful when freshAppendIndexes is signature-checking.
+    if (!externalWritersPossible) return;
     appendIndexesSignature = await computeLogSignature();
   };
 

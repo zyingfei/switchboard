@@ -377,8 +377,9 @@ describe('event log', () => {
     // The append indexes are in-process; events can land in the vault
     // from OUTSIDE (CLI `import` against the same vault, file-level
     // sync dropping a peer shard in). The signature guard must rebuild
-    // the indexes before any dedupe decision.
-    const log = createEventLog(vaultRoot, replica);
+    // the indexes before any dedupe decision — but ONLY in the
+    // external-writers mode (single-companion default skips the scan).
+    const log = createEventLog(vaultRoot, replica, { externalWritersPossible: true });
     // Warm the indexes via a first append.
     await log.appendClient({
       clientEventId: 'local-1',
