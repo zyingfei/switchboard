@@ -432,6 +432,18 @@ const engagementFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_ENGAGEMENT_FACTS_STORE'] === '1';
 const timelineFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_TIMELINE_FACTS_STORE'] === '1';
+// Scoped re-visit no-op fast path (default ON; disable with =0 + restart
+// for instant rollback). When a drain window touches scopes that own
+// graph rows but carries NO graph-row-affecting event (no
+// NAVIGATION_COMMITTED → scopedDeltaEvents empty, no thread event →
+// dirtyThreadScopes empty, no new timeline entry → scopedTimelineDays
+// empty), the scopes' graph rows are unchanged. Re-assert them from the
+// previous snapshot (+ write current projections, advance frontier)
+// instead of falling into the ~18s full base rebuild that pegged the
+// companion on every re-visit. Same correctness basis as the existing
+// metadata-only and content-lane-only scoped branches.
+const scopedRevisitNoOpEnabled = (): boolean =>
+  process.env['SIDETRACK_SCOPED_REVISIT_NOOP'] !== '0';
 // Incremental topic membership (default OFF): between full leiden
 // re-clusters, overlay newly-eligible visits onto their nearest existing
 // cluster as secondary affiliations so topics stay responsive to browsing
@@ -3862,6 +3874,50 @@ export const createConnectionsMaterializer = (
         scopedTimelineDeltaApplied = true;
         mark(
           `replaceScopeRows scopedTimelineDeltaMetadataOnly scopes=${String(dirtyScopes.length)} entries=0`,
+        );
+      } else if (
+        scopedRevisitNoOpEnabled() &&
+        scopedTimelineDays.length === 0 &&
+        scopedDeltaEvents.length === 0 &&
+        dirtyThreadScopes.length === 0 &&
+        dirtyScopes.length > 0 &&
+        !pendingHasSearchVisit &&
+        scopesOwnGraphRows(previousSnapshotForScopedDelta, dirtyScopes)
+      ) {
+        // Re-visit / graph-inert window. The window's events marked these
+        // scopes dirty but NONE affect graph rows: no NAVIGATION_COMMITTED
+        // (scopedDeltaEvents===0), no thread event (dirtyThreadScopes===0),
+        // no new timeline entry (scopedTimelineDays===0). The graph-row
+        // work (navigation edges, thread membership) arrives on its own
+        // drain via the main apply branch; projection-overlay effects
+        // (BROWSER_TIMELINE_OBSERVED lastSeen, attribution) are captured by
+        // the projection write below. So the dirty scopes' graph rows are
+        // unchanged — re-assert them from the previous snapshot (a no-op
+        // row rewrite that KEEPS the rows the !scopesOwnGraphRows branch
+        // above would wrongly clear) and advance the frontier, instead of
+        // the ~18s full base rebuild this case used to fall into on every
+        // re-visit.
+        const scoped = unionScopeOutputs(
+          dirtyScopes.map((scope) => recomputeScope(scope, previousSnapshotForScopedDelta)),
+        );
+        const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        await replaceScopeRowsForScopedDelta({
+          scopes: dirtyScopes,
+          nodes: scoped.nodes,
+          edges: scoped.edges,
+          progress,
+          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          metadata: {
+            urlProjection: serializeUrlProjection(urlProjection),
+            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        mark(
+          `replaceScopeRows scopedTimelineDeltaRevisitNoOp scopes=${String(dirtyScopes.length)} nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)} pending=${String(pendingEventsForDrain.length)}`,
         );
       } else if (
         requireScopedTimelineDeltaForDrain &&
