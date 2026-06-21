@@ -1498,8 +1498,28 @@ const resolveSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
-const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> =>
-  (await store.readSnapshotMetadata())?.snapshotRevision ?? 'none';
+const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> => {
+  // Mirror resolveSig's mtime bucketing for the SQLite path. Keying on
+  // the RAW snapshotRevision (a hash of updatedAt+counts that advances on
+  // EVERY drain) busted the resolve-cache on every drain, so the panel's
+  // per-revision re-resolves never hit cache and turned into a
+  // self-perpetuating flood that pegged the companion under live
+  // browsing. Bucket `updatedAt` so a burst of drains within one bucket
+  // collapses to a single key (the documented "≤bucket dry-run-preview
+  // staleness acceptable" tradeoff); nodeCount/edgeCount still rotate the
+  // key on a real graph change, and user mutations call
+  // invalidateResolveCaches() for immediate freshness.
+  const m = await store.readSnapshotMetadata();
+  if (m === null) return 'none';
+  const updatedMs = Date.parse(m.updatedAt);
+  const bucket =
+    RESOLVE_SIG_BUCKET_MS > 0 && Number.isFinite(updatedMs)
+      ? Math.floor(updatedMs / RESOLVE_SIG_BUCKET_MS)
+      : Number.isFinite(updatedMs)
+        ? updatedMs
+        : (m.snapshotRevision ?? 'none');
+  return `${String(bucket)}:${String(m.nodeCount)}:${String(m.edgeCount)}`;
+};
 const connectionsGraphSig = async (store: ConnectionsStore, jsonPath: string): Promise<string> =>
   store instanceof SqliteConnectionsStore ? await sqliteSig(store) : await resolveSig(jsonPath);
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
@@ -4005,9 +4025,8 @@ const routes: readonly RouteDefinition[] = [
                 // actually-served backend.
                 const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
                 const v2SqlitePath = join(vaultRoot, '_BAC', 'recall', 'v2', 'index.sqlite');
-                const [info, lifecycleReport, modelStatus, v2Store, v2Stat] = await Promise.all([
+                const [info, modelStatus, v2Store, v2Stat] = await Promise.all([
                   stat(indexPath).catch(() => undefined),
-                  context.recallLifecycle?.report() ?? Promise.resolve(undefined),
                   getModelCacheStatus().catch(() => undefined),
                   peekRecallV2Store(vaultRoot).catch(() => undefined),
                   stat(v2SqlitePath).catch(() => undefined),
@@ -4016,6 +4035,16 @@ const routes: readonly RouteDefinition[] = [
                 const v2Present =
                   (v2DocCount !== null && v2DocCount > 0) ||
                   (v2Stat !== undefined && v2Stat.size > 0);
+                // The legacy recall-lifecycle report runs countTurnsInEventLog
+                // — a FULL scan of the entire event store that blew the 5s
+                // health budget on a real-size vault (the ~5.0s /v1/system/health
+                // wall). It's vestigial once v2 (sqlite-vec) is the served
+                // backend (status is already reported 'ready' from v2 below),
+                // so only pay the scan on a legacy non-v2 vault that still
+                // depends on those drift fields.
+                const lifecycleReport = v2Present
+                  ? undefined
+                  : await (context.recallLifecycle?.report() ?? Promise.resolve(undefined));
                 const indexExists = v2Present;
                 return {
                   indexExists,

@@ -28,6 +28,16 @@ export interface EventStore {
     cb: (chunk: readonly AcceptedEvent[]) => void | Promise<void>,
     chunkSize: number,
   ) => Promise<void>;
+  /** Like forEachChunk but filtered to the given event types at the SQL
+   *  level (events_type_idx). O(matching rows) instead of O(all events)
+   *  — health/feedback probes want a tiny typed subset of a log that is
+   *  ~92% engagement.interval, so a full forEachChunk scan dominated the
+   *  5s health budget. */
+  readonly forEachChunkOfTypes: (
+    types: readonly string[],
+    cb: (chunk: readonly AcceptedEvent[]) => void | Promise<void>,
+    chunkSize: number,
+  ) => Promise<void>;
   readonly watermark: () => VersionVector;
   readonly close: () => void;
 }
@@ -96,6 +106,7 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS events_accepted_at_ms_idx ON events(accepted_at_ms);
   CREATE INDEX IF NOT EXISTS events_replica_seq_idx ON events(replica_id, seq);
+  CREATE INDEX IF NOT EXISTS events_type_idx ON events(type, replica_id, seq);
   CREATE TABLE IF NOT EXISTS ingest_watermark (
     replica_id TEXT PRIMARY KEY,
     max_seq INTEGER NOT NULL
@@ -429,6 +440,39 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     }
   };
 
+  const forEachChunkOfTypes = async (
+    types: readonly string[],
+    cb: (chunk: readonly AcceptedEvent[]) => void | Promise<void>,
+    chunkSize: number,
+  ): Promise<void> => {
+    if (types.length === 0) return;
+    const size = Math.max(1, Math.floor(chunkSize));
+    const placeholders = types.map(() => '?').join(', ');
+    let lastReplicaId = '';
+    let lastSeq = 0;
+    while (true) {
+      const rows = db
+        .query(
+          `SELECT ${SELECT_COLUMNS}
+           FROM events
+           WHERE type IN (${placeholders})
+             AND (replica_id > ? OR (replica_id = ? AND seq > ?))
+           ORDER BY replica_id, seq
+           LIMIT ?`,
+        )
+        .all(...types, lastReplicaId, lastReplicaId, lastSeq, size);
+      const chunk = rowsToEvents(rows);
+      if (chunk.length === 0) return;
+      await cb(chunk);
+      const last = chunk[chunk.length - 1];
+      if (last === undefined) return;
+      lastReplicaId = last.dot.replicaId;
+      lastSeq = last.dot.seq;
+      if (chunk.length < size) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+
   return {
     ingest: (event) => {
       ingest(event);
@@ -441,6 +485,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     maxAcceptedAtMs,
     count,
     forEachChunk,
+    forEachChunkOfTypes,
     watermark,
     close: () => {
       db.close?.();

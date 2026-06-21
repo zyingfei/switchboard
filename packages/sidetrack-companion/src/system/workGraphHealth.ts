@@ -240,22 +240,30 @@ const feedbackEventTypes = new Set<string>([
   USER_TOPIC_RENAMED,
 ]);
 
+// Type-filtered read: the health/feedback probes want a tiny typed
+// subset (a few hundred feedback / recall.served / recall.action events)
+// of a log that is ~92% engagement.interval. A full forEachChunk scan of
+// the 370K-event store dominated the 5s health budget, so use the
+// SQL-level type filter (events_type_idx) when the store is available.
 const readEventsForHealth = async (
   vaultRoot: string,
   eventLog: EventLog | undefined,
-  predicate: (event: AcceptedEvent) => boolean,
+  types: readonly string[],
 ): Promise<readonly AcceptedEvent[]> => {
   if (eventLog === undefined) return emptyEvents;
+  const typeSet = new Set(types);
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) {
-    return (await eventLog.readMerged()).filter(predicate);
+    return (await eventLog.readMerged()).filter((event) => typeSet.has(event.type));
   }
   const events: AcceptedEvent[] = [];
-  await store.forEachChunk((chunk) => {
-    for (const event of chunk) {
-      if (predicate(event)) events.push(event);
-    }
-  }, 2000);
+  await store.forEachChunkOfTypes(
+    types,
+    (chunk) => {
+      for (const event of chunk) events.push(event);
+    },
+    2000,
+  );
   return events;
 };
 
@@ -263,7 +271,7 @@ const readFeedbackEvents = (
   vaultRoot: string,
   eventLog: EventLog | undefined,
 ): Promise<readonly AcceptedEvent[]> =>
-  readEventsForHealth(vaultRoot, eventLog, (event) => feedbackEventTypes.has(event.type));
+  readEventsForHealth(vaultRoot, eventLog, [...feedbackEventTypes]);
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
@@ -935,11 +943,7 @@ export const collectWorkGraphHealth = async ({
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
   const feedback = projectFeedback(await readFeedbackEvents(vaultRoot, eventLog));
-  const merged = await readEventsForHealth(
-    vaultRoot,
-    eventLog,
-    (event) => event.type === 'recall.served' || event.type === 'recall.action',
-  );
+  const merged = await readEventsForHealth(vaultRoot, eventLog, ['recall.served', 'recall.action']);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [
     activeManifest,
