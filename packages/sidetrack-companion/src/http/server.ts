@@ -2281,6 +2281,7 @@ const PRIVACY_EVENT_TYPES = [
   PRIVACY_PERMISSION_GRANTED,
   PRIVACY_PERMISSION_REVOKED,
 ] as const;
+const WORKSTREAM_PROJECTION_EVENT_TYPES = [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED] as const;
 const FEEDBACK_EVENT_TYPE_LIST = [
   USER_ORGANIZED_ITEM,
   USER_ENGAGEMENT_RELABELED,
@@ -6147,7 +6148,17 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const merged = await eventLog.readMerged();
+          // resolveThreadAttribution only consumes USER_FLOW_REJECTED /
+          // USER_ORGANIZED_ITEM from `events` (same as the URL/tab-session
+          // resolver), so read just those via the events_type_idx instead of
+          // the whole log — this was the dominant cost of the per-thread
+          // suggestion fan-out (readMerged whole log, 7-22s under load).
+          const merged = await readEventsFromStoreOrLog(
+            context,
+            eventLog,
+            (event) => event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+            RESOLVER_SIGNAL_EVENT_TYPES,
+          );
           const resolution = resolveThreadAttribution({
             threadId: target.threadId,
             ...(target.providerThreadId === undefined
@@ -6482,6 +6493,7 @@ const routes: readonly RouteDefinition[] = [
             context,
             context.eventLog!,
             (event) => event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED,
+            WORKSTREAM_PROJECTION_EVENT_TYPES,
           );
           // Bucket per-bacId once so each projectWorkstream call sees
           // only its own events. Without bucketing this is
