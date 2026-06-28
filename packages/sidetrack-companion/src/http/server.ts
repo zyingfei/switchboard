@@ -7380,8 +7380,11 @@ const routes: readonly RouteDefinition[] = [
             snap = applyFeedbackOverlayToSnapshot(
               snap,
               projectFeedback(
-                await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
-                  isFeedbackEventType(event.type),
+                await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog,
+                  (event) => isFeedbackEventType(event.type),
+                  FEEDBACK_EVENT_TYPE_LIST,
                 ),
               ),
             );
