@@ -2282,6 +2282,12 @@ const PRIVACY_EVENT_TYPES = [
   PRIVACY_PERMISSION_REVOKED,
 ] as const;
 const WORKSTREAM_PROJECTION_EVENT_TYPES = [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED] as const;
+const DISPATCH_PROJECTION_EVENT_TYPES = [DISPATCH_RECORDED, DISPATCH_LINKED] as const;
+const ANNOTATION_PROJECTION_EVENT_TYPES = [
+  ANNOTATION_CREATED,
+  ANNOTATION_NOTE_SET,
+  ANNOTATION_DELETED,
+] as const;
 const FEEDBACK_EVENT_TYPE_LIST = [
   USER_ORGANIZED_ITEM,
   USER_ENGAGEMENT_RELABELED,
@@ -4629,6 +4635,7 @@ const routes: readonly RouteDefinition[] = [
         context,
         context.eventLog,
         (event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
+        DISPATCH_PROJECTION_EVENT_TYPES,
       );
       return [200, { data: projectDispatches(dispatchEvents) }];
     },
@@ -5368,6 +5375,7 @@ const routes: readonly RouteDefinition[] = [
           event.type === ANNOTATION_CREATED ||
           event.type === ANNOTATION_NOTE_SET ||
           event.type === ANNOTATION_DELETED,
+        ANNOTATION_PROJECTION_EVENT_TYPES,
       );
       return [200, { data: projectAnnotations(annotationEvents) }];
     },
@@ -7479,8 +7487,11 @@ const routes: readonly RouteDefinition[] = [
             sub = applyFeedbackOverlayToSnapshot(
               sub,
               projectFeedback(
-                await readEventsFromStoreOrLog(context, context.eventLog, (event) =>
-                  isFeedbackEventType(event.type),
+                await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog,
+                  (event) => isFeedbackEventType(event.type),
+                  FEEDBACK_EVENT_TYPE_LIST,
                 ),
               ),
             );
