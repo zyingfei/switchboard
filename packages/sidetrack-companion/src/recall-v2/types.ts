@@ -260,6 +260,12 @@ export interface RecallResponse {
       /** Per-candidate rank movement (pre-rerank rank − post-rerank rank). */
       readonly rankMovement?: readonly { readonly entityId: string; readonly delta: number }[];
     };
+    /** P3 — present only when the learned re-rank actually re-ordered
+     *  results (active impression-trained, ship-gate-passed model). */
+    readonly learnedRerank?: {
+      readonly applied: true;
+      readonly revisionId: string | null;
+    };
     readonly debug?: {
       readonly droppedExplanations?: readonly RecallCandidate[];
     };

@@ -63,7 +63,7 @@ interface ReturnSession {
   readonly seq: number;
 }
 
-interface FeatureModel {
+export interface FeatureModel {
   readonly recordsById: ReadonlyMap<string, VisitRecord>;
   readonly idsByCanonical: ReadonlyMap<string, ReadonlySet<string>>;
   readonly timelineNodesByVisitKey: ReadonlyMap<string, ConnectionNode>;
@@ -856,7 +856,7 @@ const referenceMsFor = (
   return maxMs;
 };
 
-const buildFeatureModel = (
+export const buildFeatureModel = (
   events: readonly AcceptedEvent[],
   snapshot: ConnectionsSnapshot,
 ): FeatureModel => {
@@ -1300,10 +1300,9 @@ const finiteOrZero = (value: number | undefined): number =>
 
 const retrievalFeaturesFor = (
   candidate: Candidate,
-  context: Parameters<ExtractFeatures>[1],
+  retrievalContext: Parameters<ExtractFeatures>[1]['retrievalContext'],
 ): Required<Omit<CandidateRetrievalFeatureContext, 'crossEncoderScore' | 'crossEncoderRankDelta'>> &
   Pick<CandidateRetrievalFeatureContext, 'crossEncoderScore' | 'crossEncoderRankDelta'> => {
-  const retrievalContext = context.retrievalContext;
   if (retrievalContext.missingRetrievalContext === true) {
     return {
       bm25Score: 0,
@@ -1341,8 +1340,20 @@ const retrievalFeaturesFor = (
   };
 };
 
-export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
-  const model = featureModelFor(context);
+export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures =>
+  extractFeaturesWithModel(candidate, featureModelFor(context), context.retrievalContext);
+
+// P3 — same feature extraction, but against a PRE-BUILT FeatureModel.
+// The /v2 learned-rerank serve path builds the (expensive) model once
+// per TTL in the background and reuses it across requests, supplying a
+// fresh per-request `retrievalContext` (the only per-request input).
+// Train/serve parity stays exact because this is the identical body
+// `extractFeatures` runs.
+export const extractFeaturesWithModel = (
+  candidate: Candidate,
+  model: FeatureModel,
+  retrievalContext: Parameters<ExtractFeatures>[1]['retrievalContext'],
+): CandidatePairFeatures => {
   const contentEdge = bestSimilarityEdgeForCandidate(candidate, model);
   const contentMetadata = contentEdge?.metadata;
   const sharedContentTerms = metadataStringArray(contentMetadata, 'matchedTerms').length;
@@ -1350,7 +1361,7 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
   const sharedContentEntities = metadataStringArray(contentMetadata, 'matchedEntities').length;
   const contentTierFrom = evidenceTierValue(contentMetadata?.['evidenceTierFrom']);
   const contentTierTo = evidenceTierValue(contentMetadata?.['evidenceTierTo']);
-  const retrieval = retrievalFeaturesFor(candidate, context);
+  const retrieval = retrievalFeaturesFor(candidate, retrievalContext);
 
   return {
     schemaVersion: FEATURE_SCHEMA_VERSION,

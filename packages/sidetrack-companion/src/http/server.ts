@@ -5985,11 +5985,38 @@ const routes: readonly RouteDefinition[] = [
           rerankTopK: req.strategy?.rerankTopK ?? DOGFOOD_RERANK_TOP_K,
         },
       };
+      // P3 — learned-rerank context loader. Reads the CURRENT connections
+      // snapshot + the feedback-only event window (the SAME merged the
+      // impression trainer used: RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+      // indexed) so serve features match train features exactly. Invoked
+      // only on the background TTL refresh AND only after the serve gate
+      // passes (active impression-trained ship-gate-passed model) — never
+      // inline on the request path. Omitted (→ feature off) without a
+      // connections store / event log.
+      const connectionsStore = context.connectionsStore;
+      const learnedRerankContext =
+        connectionsStore === undefined || eventLog === undefined
+          ? undefined
+          : async (): Promise<
+              import('../recall-v2/learnedRerank.js').LearnedRerankContext | null
+            > => {
+              const snapshot = await connectionsStore.readCurrent();
+              if (snapshot === null) return null;
+              const feedbackTypes = RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES as readonly string[];
+              const merged = await readEventsFromStoreOrLog(
+                context,
+                eventLog,
+                (event) => feedbackTypes.includes(event.type),
+                RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+              );
+              return { snapshot, merged };
+            };
       const response = await runRecallV2(
         {
           vaultRoot,
           ...(embedderState === undefined ? {} : { embedderState }),
           ...(appendImpression === undefined ? {} : { appendImpression }),
+          ...(learnedRerankContext === undefined ? {} : { learnedRerankContext }),
         },
         reqWithDefaultRerank,
       );

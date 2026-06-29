@@ -119,7 +119,10 @@ const sourceFlag = (sourceKind: string): number => {
   return 0;
 };
 
-const candidateSourceFor = (sourceKind: string): CandidateSource => {
+// Exported for the P3 /v2 learned-rerank serve path so train and serve
+// derive the candidate `sources` / retrieval features from the IDENTICAL
+// builders (no parity drift).
+export const candidateSourceFor = (sourceKind: string): CandidateSource => {
   if (sourceKind === 'semantic_query') return 'content_embedding_neighborhood';
   if (sourceKind === 'graph_neighbor') return 'embedding_neighborhood';
   if (sourceKind === 'timeline_visit') return 'same_title_path_tokens';
@@ -164,7 +167,7 @@ const retrievalFeatureForServedCandidate = (
   };
 };
 
-const retrievalContextForCandidates = (
+export const retrievalContextForCandidates = (
   anchorId: string,
   candidates: readonly RecallServedCandidateSnapshot[],
   rankDeltaByEntity: ReadonlyMap<string, number> = new Map(),
@@ -318,7 +321,7 @@ const betterRank = (left: number | undefined, right: number): number =>
 const betterScore = (left: number | undefined, right: number): number =>
   left === undefined || right > left ? right : left;
 
-const servedCandidateFromRecallCandidate = (
+export const servedCandidateFromRecallCandidate = (
   candidate: RecallCandidate,
   servedPosition: number,
 ): RecallServedCandidateSnapshot => {

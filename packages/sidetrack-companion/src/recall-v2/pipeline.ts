@@ -33,6 +33,11 @@ import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
 import {
+  applyLearnedRerank,
+  type LearnedRerankContext,
+  recallLearnedRerankEnabled,
+} from './learnedRerank.js';
+import {
   backfillFromRecallIndex,
   backfillPageEvidenceDelta,
   backfillVectors,
@@ -168,6 +173,14 @@ export interface PipelineDeps {
    *  recall.served vs recall.action records. Production wires through
    *  the event log's HLC; tests inject a counter. Default: now(). */
   readonly nextSequenceNumber?: () => number;
+  /** P3 — /v2 learned re-rank. When provided AND
+   *  `SIDETRACK_RECALL_LEARNED_RERANK` is on, the pipeline applies the
+   *  impression-trained, ship-gate-passed ranker as a re-rank stage
+   *  after the cross-encoder (serve-on-PASS-only). This reads the
+   *  connections snapshot + a feature-relevant merged window for the
+   *  background FeatureModel build; it is invoked at most once per TTL,
+   *  never inline on the request path. Omit to disable entirely. */
+  readonly learnedRerankContext?: () => Promise<LearnedRerankContext | null>;
 }
 
 // Per-vault SQLite store cache. Opened lazily on first /v2/recall;
@@ -1250,6 +1263,48 @@ export const runRecall = async (
     timings['rerank'] = rerankLatencyMs;
     rerankApplied = true;
   }
+  // P3 — learned re-rank AFTER the cross-encoder (so it consumes
+  // cross_encoder_score / cross_encoder_rank_delta). Serve-on-PASS-only +
+  // background-built model (never blocks this request). A no-op unless
+  // the active ranker is an impression-trained, ship-gate-passed model.
+  let learnedRerankApplied = false;
+  let learnedRerankRevisionId: string | null = null;
+  if (
+    recallLearnedRerankEnabled() &&
+    deps.learnedRerankContext !== undefined &&
+    resultsAfterRerank.length > 1
+  ) {
+    const learnedStart = (deps.now ?? Date.now)();
+    // cross_encoder_rank_delta = pre-rerank rank − post-rerank rank.
+    const rankDeltaByEntity = new Map<string, number>();
+    for (let postRank = 0; postRank < resultsAfterRerank.length; postRank += 1) {
+      const cand = resultsAfterRerank[postRank];
+      if (cand === undefined) continue;
+      const preRank = preRerankRankByEntity.get(cand.entityId);
+      if (preRank !== undefined) rankDeltaByEntity.set(cand.entityId, preRank - postRank);
+    }
+    const sessionCurrentUrl = req.session?.['currentUrl'];
+    const anchorId =
+      typeof sessionCurrentUrl === 'string' && sessionCurrentUrl.length > 0
+        ? sessionCurrentUrl
+        : req.q;
+    const learned = await applyLearnedRerank(
+      {
+        vaultRoot: deps.vaultRoot,
+        loadContext: deps.learnedRerankContext,
+        now: deps.now ?? Date.now,
+      },
+      anchorId,
+      resultsAfterRerank,
+      rankDeltaByEntity,
+    );
+    timings['learnedRerank'] = (deps.now ?? Date.now)() - learnedStart;
+    if (learned.applied) {
+      resultsAfterRerank = learned.results;
+      learnedRerankApplied = true;
+      learnedRerankRevisionId = learned.revisionId;
+    }
+  }
   // Tiering (PR D) operates on this sliced array — limit is still the hard cap on total
   // results returned; suggestedStrongCount/collapsedCount decide how many the UI renders
   // in the strong band vs expander. No change to DOGFOOD_RERANK_TOP_K.
@@ -1373,6 +1428,7 @@ export const runRecall = async (
         queryEmbedded: queryEmbedding !== undefined,
         rerankApplied,
         degradedToLexical,
+        ...(learnedRerankApplied ? { learnedRerankApplied } : {}),
       },
       servedContextId,
       tiering,
@@ -1389,6 +1445,9 @@ export const runRecall = async (
               ...(rankMovement !== undefined ? { rankMovement } : {}),
             },
           }
+        : {}),
+      ...(learnedRerankApplied
+        ? { learnedRerank: { applied: true, revisionId: learnedRerankRevisionId } }
         : {}),
       ...(strategy.debug === true ? { debug: { droppedExplanations: dropped } } : {}),
     },
