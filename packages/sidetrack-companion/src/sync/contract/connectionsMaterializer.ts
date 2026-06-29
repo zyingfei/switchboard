@@ -142,6 +142,11 @@ import {
   type TopicRevision,
   type TopicRevisionStore,
 } from '../../producers/topic-revision.js';
+import {
+  applyOnlineHeadDrainStep,
+  onlineDelta,
+  onlineDeltaClamp,
+} from '../../ranker/onlineHead.js';
 import { loadRankerModel, predictRanker, type LightGBMModel } from '../../ranker/predict.js';
 import {
   maybeRetrainClosestVisitRanker,
@@ -4189,6 +4194,45 @@ export const createConnectionsMaterializer = (
         if (closestVisitRanker.status === 'ready') {
           await yieldToEventLoop();
           const rankerEvidenceVectorsByVectorId = await readPageEvidenceVectorsForDrain();
+          // P4 — online head. Read ONLY the drain tail; apply a clamped
+          // pairwise nudge per new visit↔visit feedback label against the
+          // active batch model, then blend the resulting delta into the
+          // closest-visit predictions this drain serves. Flag-gated
+          // (returns null + no I/O when off); baseRevisionId-gated so the
+          // delta never crosses a batch model swap.
+          let servingRanker = closestVisitRanker.ranker;
+          const onlineHeadResult = await applyOnlineHeadDrainStep({
+            vaultRoot: deps.vaultRoot,
+            events: pendingEventsForDrain,
+            snapshot: baseSnapshot,
+            merged,
+            modelRevisionId: closestVisitRanker.ranker.revisionId,
+            nowMs: Date.now(),
+            pageEvidenceByCanonicalUrl,
+            ...(rankerEvidenceVectorsByVectorId === undefined
+              ? {}
+              : { evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId }),
+          });
+          if (onlineHeadResult !== null) {
+            mark(
+              `onlineHead applied=${String(onlineHeadResult.appliedUpdates)} updates=${String(onlineHeadResult.state.updateCount)} base=${onlineHeadResult.state.baseRevisionId ?? 'none'}`,
+            );
+            if (onlineHeadResult.state.baseRevisionId === closestVisitRanker.ranker.revisionId) {
+              const onlineWeights = onlineHeadResult.state.weights;
+              const onlineClamp = onlineDeltaClamp();
+              const baseRanker = closestVisitRanker.ranker;
+              servingRanker = {
+                ...baseRanker,
+                predict: (features, candidate) => {
+                  const prediction = baseRanker.predict(features, candidate);
+                  return {
+                    ...prediction,
+                    score: prediction.score + onlineDelta(features, onlineWeights, onlineClamp),
+                  };
+                },
+              };
+            }
+          }
           const previousClosestVisitEdges =
             previousSnapshotForRanker?.edges.filter((edge) => edge.kind === 'closest_visit') ?? [];
           const currentSnapshot =
@@ -4227,7 +4271,7 @@ export const createConnectionsMaterializer = (
               {
                 ...input,
                 evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId,
-                closestVisitRanker: closestVisitRanker.ranker,
+                closestVisitRanker: servingRanker,
                 rankerFrontier,
                 inputFrontier: drainFrontier,
               },
@@ -4241,7 +4285,7 @@ export const createConnectionsMaterializer = (
               {
                 ...input,
                 evidenceVectorsByVectorId: rankerEvidenceVectorsByVectorId,
-                closestVisitRanker: closestVisitRanker.ranker,
+                closestVisitRanker: servingRanker,
               },
               baseSnapshot,
             );

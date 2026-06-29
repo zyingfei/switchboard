@@ -682,7 +682,7 @@ interface VisitInstanceAccumulator {
   replicaIds: Set<string>;
 }
 
-const visitKeyFromNodeOrRaw = (value: string): string =>
+export const visitKeyFromNodeOrRaw = (value: string): string =>
   value.startsWith(TIMELINE_VISIT_NODE_PREFIX)
     ? value.slice(TIMELINE_VISIT_NODE_PREFIX.length)
     : stripFragmentAndTrailingSlash(value);
