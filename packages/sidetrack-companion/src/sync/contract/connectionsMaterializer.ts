@@ -90,6 +90,24 @@ import {
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
 } from '../../feedback/events.js';
+import { RECALL_ACTION, RECALL_SERVED } from '../../recall/events.js';
+
+/**
+ * P1: the event types the impression ranker trainer consumes. Read via the
+ * event-store TYPE INDEX (forEachChunkOfTypes → events_type_idx, ms-scale),
+ * never a full-log scan — a per-drain readMerged/streamFiltered over the whole
+ * log would be the I/O waste this work is guarding against.
+ */
+const RANKER_TRAINING_EVENT_TYPES: readonly string[] = [
+  RECALL_SERVED,
+  RECALL_ACTION,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+];
+const rankerTrainFullLogEnabled = (): boolean =>
+  process.env['SIDETRACK_RANKER_TRAIN_FULL_LOG'] !== '0';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
@@ -4099,6 +4117,32 @@ export const createConnectionsMaterializer = (
       ...(pageEvidenceVectorsByVectorId === undefined
         ? {}
         : { evidenceVectorsByVectorId: pageEvidenceVectorsByVectorId }),
+      ...(rankerTrainFullLogEnabled()
+        ? {
+            // P1: hand the trainer the FULL training-event history, read via
+            // the event-store type index (ms-scale) so the impression gate can
+            // actually accumulate positive groups — the drain-tail `merged`
+            // never can. Falls back to the memo-free streamed log filter only
+            // when the event-store is off (non-dogfood).
+            readTrainingEvents: async (): Promise<readonly AcceptedEvent[]> => {
+              if (storeBackedEvents !== null) {
+                const collected: AcceptedEvent[] = [];
+                await storeBackedEvents.forEachChunkOfTypes(
+                  RANKER_TRAINING_EVENT_TYPES,
+                  (chunk) => {
+                    for (const event of chunk) collected.push(event);
+                  },
+                  2000,
+                );
+                return sortAcceptedEvents(collected);
+              }
+              return deps.eventLog.streamFiltered(
+                (event) => RANKER_TRAINING_EVENT_TYPES.includes(event.type),
+                new Set(RANKER_TRAINING_EVENT_TYPES),
+              );
+            },
+          }
+        : {}),
     });
     mark('rankerRetrainer');
     // Track the snapshot we ultimately wrote so diagnostics see the

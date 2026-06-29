@@ -161,6 +161,15 @@ export interface RankerRetrainContext {
   readonly snapshot: ConnectionsSnapshot;
   readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
   readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
+  /**
+   * Full training-event history (recall.served + recall.action + explicit
+   * feedback), read I/O-safely by the caller (event-store type index — NOT a
+   * full-log scan). When provided, the impression-trainer gate + group build
+   * use THIS instead of the drain-tail `merged`, which can never accumulate the
+   * 50 positive groups the gate requires. Omitted ⇒ falls back to `merged`
+   * (today's tail-only, structurally-starved behaviour).
+   */
+  readonly readTrainingEvents?: () => Promise<readonly AcceptedEvent[]>;
 }
 
 export type RankerRetrainer = (context: RankerRetrainContext) => Promise<RankerRetrainResult>;
@@ -862,20 +871,25 @@ export const maybeRetrainClosestVisitRanker = async ({
   writeCandidateRevision = writeClosestVisitRankerRevision,
   readState = readRankerRetrainState,
   writeState = writeRankerRetrainState,
+  readTrainingEvents,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
   const feedback = projectFeedback(merged);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
-  const impressionEventSummary = summarizeRecallImpressionEvents(merged);
+  // P1: feed the impression trainer the full training-event history
+  // (read I/O-safely upstream via the event-store type index), NOT the drain
+  // tail — the tail can never accumulate the gate's 50-positive-group floor.
+  const impressionEvents = readTrainingEvents ? await readTrainingEvents() : merged;
+  const impressionEventSummary = summarizeRecallImpressionEvents(impressionEvents);
   if (impressionEventSummary.groupCountWithPositives >= MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
     const newLabelCount = impressionEventSummary.groupCountWithPositives;
     try {
       const build = await buildRecallImpressionTrainingGroups({
-        merged,
+        merged: impressionEvents,
         snapshot,
-        // Follow-up: the real historical reconstructor should call
-        // /v2/recall. The production trigger only trusts durable
-        // recall.served snapshots for now.
+        // The real /v2 reconstructor is supplied by the main-process bootstrap
+        // (P1b); the per-drain reconcile child has no recall pipeline, so
+        // reconstruction is intentionally a no-op on this path.
         reconstructFeedback: async () => undefined,
       });
       const stats = summarizeRecallImpressionTraining(build);
