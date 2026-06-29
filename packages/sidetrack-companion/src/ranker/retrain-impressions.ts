@@ -67,6 +67,16 @@ const EXPLICIT_NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
 const ENGAGEMENT_ACTIONS: ReadonlySet<RecallActionKind> = new Set(['click', 'open_new_tab']);
 
 export const MIN_RECALL_IMPRESSION_POSITIVE_GROUPS = 50;
+/**
+ * Runtime floor for how many positive groups are required before the impression
+ * ranker trains. Tunable via SIDETRACK_RANKER_IMPRESSION_MIN_GROUPS so operators
+ * (and the bootstrap on smaller vaults with limited reconstructable signal) can
+ * lower it; defaults to MIN_RECALL_IMPRESSION_POSITIVE_GROUPS.
+ */
+export const minRecallImpressionPositiveGroups = (): number => {
+  const raw = Number(process.env['SIDETRACK_RANKER_IMPRESSION_MIN_GROUPS']);
+  return Number.isFinite(raw) && raw > 0 ? raw : MIN_RECALL_IMPRESSION_POSITIVE_GROUPS;
+};
 export const RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX = 'ship_gate_v2:';
 export const RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION = 1;
 
@@ -900,13 +910,23 @@ export const maybeRetrainRecallImpressionRanker = async (input: {
   readonly snapshot: ConnectionsSnapshot;
   readonly reconstructFeedback?: RecallHistoricalFeedbackReconstructor | undefined;
   readonly trainOptions?: TrainRankerOptions;
+  /**
+   * Off-thread trainer injection (P1b bootstrap). Defaults to the inline
+   * `trainRankerRevisionFromGroups`; the bootstrap passes a worker-backed
+   * trainer so the LightGBM CPU never blocks the request loop / `/v1/status`.
+   */
+  readonly train?: (
+    groups: readonly RankerTrainingGroup[],
+    options: TrainRankerOptions,
+    labelingSummary: RankerTrainingLabelingSummary,
+  ) => Promise<RankerRevision>;
 }): Promise<RecallImpressionRetrainResult> => {
   const build = await buildRecallImpressionTrainingGroups(input);
   const stats = summarizeRecallImpressionTraining(build);
   const positiveGroupCount = build.groups.filter((group) =>
     group.rows.some((row) => row.label > 0),
   ).length;
-  if (positiveGroupCount < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
+  if (positiveGroupCount < minRecallImpressionPositiveGroups()) {
     return { status: 'skipped', reason: 'insufficient_groups', stats };
   }
   const labelingSummary: RankerTrainingLabelingSummary = {
@@ -917,7 +937,7 @@ export const maybeRetrainRecallImpressionRanker = async (input: {
     implicitNegativeRows: 0,
     unlabeledCandidateCount: build.unjudgedCandidateCount,
   };
-  const baseRevision = await trainRankerRevisionFromGroups(
+  const baseRevision = await (input.train ?? trainRankerRevisionFromGroups)(
     build.groups,
     input.trainOptions ?? {},
     labelingSummary,

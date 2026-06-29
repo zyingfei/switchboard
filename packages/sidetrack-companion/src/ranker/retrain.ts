@@ -27,7 +27,7 @@ import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
 import { extractFeatures } from './features.js';
 import { randomUnrelated } from './negatives.js';
 import {
-  MIN_RECALL_IMPRESSION_POSITIVE_GROUPS,
+  minRecallImpressionPositiveGroups,
   RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION,
   applyRecallImpressionShipGateV2,
   buildRecallImpressionTrainingGroups,
@@ -881,7 +881,7 @@ export const maybeRetrainClosestVisitRanker = async ({
   // tail — the tail can never accumulate the gate's 50-positive-group floor.
   const impressionEvents = readTrainingEvents ? await readTrainingEvents() : merged;
   const impressionEventSummary = summarizeRecallImpressionEvents(impressionEvents);
-  if (impressionEventSummary.groupCountWithPositives >= MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
+  if (impressionEventSummary.groupCountWithPositives >= minRecallImpressionPositiveGroups()) {
     const newLabelCount = impressionEventSummary.groupCountWithPositives;
     try {
       const build = await buildRecallImpressionTrainingGroups({
@@ -893,7 +893,7 @@ export const maybeRetrainClosestVisitRanker = async ({
         reconstructFeedback: async () => undefined,
       });
       const stats = summarizeRecallImpressionTraining(build);
-      if (stats.groupCountWithPositives < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS) {
+      if (stats.groupCountWithPositives < minRecallImpressionPositiveGroups()) {
         return {
           status: 'skipped',
           reason: 'insufficient_groups',

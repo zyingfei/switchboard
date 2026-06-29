@@ -330,6 +330,7 @@ import {
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
+import { runRecallImpressionBootstrap } from '../ranker/impressionBootstrap.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -2282,6 +2283,18 @@ const PRIVACY_EVENT_TYPES = [
   PRIVACY_PERMISSION_REVOKED,
 ] as const;
 const WORKSTREAM_PROJECTION_EVENT_TYPES = [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED] as const;
+// The bootstrap RECONSTRUCTS positives from historical explicit feedback only.
+// It deliberately does NOT read recall.served/recall.action: the served+action
+// snapshot-join path is the per-drain child's job (P1a), and feeding the
+// thousands of historical recall.served impressions into the build here is both
+// wasted work (their only actions are non-trainable click/open) and a ~44s
+// single-tick freeze (synchronous feature extraction over every served set).
+const RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES = [
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+] as const;
 const DISPATCH_PROJECTION_EVENT_TYPES = [DISPATCH_RECORDED, DISPATCH_LINKED] as const;
 const ANNOTATION_PROJECTION_EVENT_TYPES = [
   ANNOTATION_CREATED,
@@ -7288,6 +7301,79 @@ const routes: readonly RouteDefinition[] = [
         await context.refreshConnections?.();
       }
       return [200, { data: result }];
+    },
+  },
+  {
+    // P1b — main-process impression-bootstrap. Reconstructs LightGBM training
+    // groups from historical explicit feedback by re-running /v2 recall here
+    // (warm pipeline, I/O-bound → interleaves with /v1/status), trains
+    // OFF-THREAD via the train-groups worker, ship-gates, and promotes the
+    // active closest-visit revision on PASS. Manual + idempotent (the trainer
+    // dedupes already-referenced feedback). Gated by
+    // SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK; reconstruction capped by
+    // SIDETRACK_RANKER_RECONSTRUCT_CAP (default 200, oldest-first).
+    method: 'POST',
+    pattern: /^\/v1\/ranker\/impression-bootstrap$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (process.env['SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK'] === '0') {
+        throw new HttpRouteError(403, 'BOOTSTRAP_DISABLED', 'Impression bootstrap is disabled.');
+      }
+      if (context.eventLog === undefined || context.connectionsStore === undefined) {
+        throw new HttpRouteError(
+          503,
+          'CONNECTIONS_NOT_WIRED',
+          'Event log / connections is not configured.',
+        );
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const embedderState = context.getEmbedderStatus?.()?.state;
+      const history = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
+        (event) =>
+          event.type === USER_FLOW_CONFIRMED ||
+          event.type === USER_FLOW_REJECTED ||
+          event.type === USER_ORGANIZED_ITEM ||
+          event.type === USER_SNIPPET_PROMOTED,
+        RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+      );
+      const capRaw = Number(process.env['SIDETRACK_RANKER_RECONSTRUCT_CAP']);
+      const reconstructCap = Number.isFinite(capRaw) && capRaw > 0 ? capRaw : 200;
+      let reconstructed = 0;
+      const result = await runRecallImpressionBootstrap({
+        vaultRoot,
+        history,
+        snapshot,
+        reconstructFeedback: async (req) => {
+          if (reconstructed >= reconstructCap) {
+            return null;
+          }
+          reconstructed += 1;
+          // Yield a macrotask before each (CPU-heavy) reconstruction so
+          // /v1/status and other warm-path requests interleave. Back-to-back
+          // runRecall calls otherwise saturate the event loop — measured a
+          // ~42s /status freeze without this. With the yield the bootstrap
+          // takes the same wall-clock but /status stays responsive.
+          await new Promise((resolve) => setImmediate(resolve));
+          return runRecallV2(
+            { vaultRoot, ...(embedderState === undefined ? {} : { embedderState }) },
+            req.recallRequest,
+          );
+        },
+      });
+      if (result.status === 'trained') {
+        await context.refreshConnections?.();
+      }
+      return [200, { data: { ...result, reconstructed, historyEventCount: history.length } }];
     },
   },
   // Sync Contract v1 — Connections (Class B evidence graph) routes.
