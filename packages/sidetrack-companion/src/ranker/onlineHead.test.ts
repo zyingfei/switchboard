@@ -190,6 +190,24 @@ describe('applyOnlineHeadDrainStep', () => {
     expect(persisted?.weights).toEqual(result?.state.weights);
   });
 
+  it('still applies on a feedback-ONLY drain (no nav events → random-unrelated negative)', async () => {
+    // Regression for the gap found in practice: a real feedback drain's
+    // merged window holds ONLY the flow-confirmed event, so the serving
+    // candidate generator produces no competitor. The snapshot-visit
+    // fallback must still yield a negative and move the weights.
+    process.env['SIDETRACK_ONLINE_RANKER'] = '1';
+    const result = await applyOnlineHeadDrainStep({
+      vaultRoot: root,
+      events: [flowConfirmed(10, 'visit-a', 'visit-b')],
+      snapshot: snapshot(),
+      merged: [flowConfirmed(10, 'visit-a', 'visit-b')], // no repo/nav events
+      modelRevisionId: 'rev-1',
+      nowMs: BASE_TIME,
+    });
+    expect(result?.appliedUpdates).toBe(1);
+    expect(result?.state.weights.some((w) => w !== 0)).toBe(true);
+  });
+
   it('is idempotent — re-running the same tail applies nothing new', async () => {
     process.env['SIDETRACK_ONLINE_RANKER'] = '1';
     const events = [flowConfirmed(10, 'visit-a', 'visit-b')];

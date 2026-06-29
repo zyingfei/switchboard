@@ -154,6 +154,9 @@ export const applyOnlineHeadDrainStep = async (
       .map((node) => visitKeyFromNodeOrRaw(node.id))
       .filter((visitKey) => visitKey.length > 0),
   );
+  // Sorted view for the deterministic random-unrelated negative fallback
+  // (mirrors the batch trainer's `randomUnrelated` from `visitKeys`).
+  const sortedVisitKeys = [...visitKeys].sort();
 
   const candidateContext: {
     merged: AcceptedEvent[];
@@ -200,7 +203,17 @@ export const applyOnlineHeadDrainStep = async (
     if (!visitKeys.has(fromKey) || !visitKeys.has(toKey)) continue;
 
     const blockedTo = positiveToByFrom.get(fromKey) ?? new Set<string>();
-    const competitor = sampleCompetitor(fromKey, toKey, blockedTo, visitKeys, candidateContext);
+    // Prefer a HARD negative from the serving generator (same-domain /
+    // nav-chain competitor). On a feedback-only drain the generator's
+    // pool is empty (its merged window holds only the feedback event),
+    // so fall back to a deterministic random-unrelated visit from the
+    // snapshot — always available, replay-stable, and the same negative
+    // distribution the batch trainer's `randomUnrelated` uses. Without
+    // this fallback the online head silently no-ops on the very feedback
+    // drains it exists to learn from.
+    const competitor =
+      sampleCompetitor(fromKey, toKey, blockedTo, visitKeys, candidateContext) ??
+      unrelatedVisitCandidate(fromKey, toKey, blockedTo, sortedVisitKeys);
     if (competitor === null) continue;
 
     const labeledCandidate: Candidate = {
@@ -247,4 +260,43 @@ const sampleCompetitor = (
     }
   }
   return best?.candidate ?? null;
+};
+
+// Deterministic string hash (djb2) — pure, replay-stable, no crypto cost
+// per call. Used only to spread the random-unrelated negative across the
+// visit-key list so it isn't always the alphabetically-first visit.
+const hashString = (value: string): number => {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 33) ^ value.charCodeAt(index);
+  }
+  return hash >>> 0;
+};
+
+// Deterministic random-unrelated negative: a visit key from the snapshot
+// that is distinct from `from`, the labeled `to`, and any positive `to`
+// for this `from`. Seeded by (from, to) so it is replay-stable. Returns
+// null only when the snapshot has no other visit to contrast against.
+const unrelatedVisitCandidate = (
+  fromKey: string,
+  labeledToKey: string,
+  blockedTo: ReadonlySet<string>,
+  sortedVisitKeys: readonly string[],
+): Candidate | null => {
+  const total = sortedVisitKeys.length;
+  if (total === 0) return null;
+  const start = hashString(`${fromKey} ${labeledToKey}`) % total;
+  for (let step = 0; step < total; step += 1) {
+    const candToKey = sortedVisitKeys[(start + step) % total];
+    if (candToKey === undefined || candToKey.length === 0) continue;
+    if (candToKey === fromKey || candToKey === labeledToKey) continue;
+    if (blockedTo.has(candToKey)) continue;
+    return {
+      fromVisitId: fromKey,
+      toVisitId: candToKey,
+      sources: ['random_unrelated'],
+      generatedAt: 0,
+    };
+  }
+  return null;
 };
