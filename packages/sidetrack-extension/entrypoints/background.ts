@@ -356,7 +356,15 @@ const dismissRemindersForActiveTab = async (): Promise<boolean> => {
     if (url === undefined) {
       return false;
     }
-    const thread = (await readThreads()).find((t) => t.threadUrl === url);
+    // Match canonically, like `userIsViewingThreadUrl` — the live tab
+    // URL carries provider query/fragment (?model= / ?session= / #…)
+    // that the stored `threadUrl` has stripped. A strict `===` here made
+    // the dismiss silently miss, so the "Unread reply" pill never
+    // cleared even while the user was reading the chat.
+    const canonicalActive = canonicalThreadUrl(url);
+    const thread = (await readThreads()).find(
+      (t) => t.threadUrl === url || canonicalThreadUrl(t.threadUrl) === canonicalActive,
+    );
     if (thread === undefined) {
       return false;
     }
