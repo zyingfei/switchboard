@@ -12282,6 +12282,43 @@ pre.diff {
   border-bottom: 1px dotted var(--ink-3);
 }
 
+/* Meter — retrain-gate progress bar (fills sage when the gate is met,
+   amber while short). The "current / required" number sits alongside. */
+.sx-health .sx-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.sx-health .sx-meter-track {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  min-width: 60px;
+  background: var(--rule-soft);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.sx-health .sx-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.sx-health .sx-meter-fill.ok {
+  background: var(--sage);
+}
+.sx-health .sx-meter-fill.warn {
+  background: var(--amber);
+}
+.sx-health .sx-meter-num {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
 /* Inventory table */
 .sx-health .sx-inv {
   width: 100%;

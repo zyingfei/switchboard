@@ -178,6 +178,28 @@ interface WorkGraphRankerHealth {
   readonly datasetChangedSinceTrain?: boolean;
   readonly methodologySpine?: WorkGraphRankerMethodologySpine | null;
   readonly augmentation?: WorkGraphRankerAugmentationHealth | null;
+  // What has to happen before the trained date can move. Both gates the
+  // trainer checks: the v6 impression path (positive groups → floor) and
+  // the legacy label path (new positive labels → threshold). Optional:
+  // an older companion omits it.
+  readonly nextRetrain?: {
+    readonly eligible: boolean;
+    readonly positiveGroups: { readonly current: number; readonly required: number };
+    readonly newLabels: { readonly current: number; readonly required: number };
+    readonly cooldownMs: number;
+  } | null;
+  // Online-adaptation head. The trained date does NOT move when this
+  // nudges weights — it's a serving-time delta on `activeRevisionId`,
+  // live only while `inUse` (baseRevisionId matches the served model).
+  readonly onlineHead?: {
+    readonly enabled: boolean;
+    readonly present: boolean;
+    readonly inUse: boolean;
+    readonly baseRevisionId: string | null;
+    readonly updateCount: number;
+    readonly activeWeightCount: number;
+    readonly updatedAtMs: number | null;
+  } | null;
 }
 
 interface WorkGraphTopicProducerHealth {
@@ -624,6 +646,24 @@ function ReceiptRow({ dt, dd, mono }: { dt: string; dd: React.ReactNode; mono?: 
   );
 }
 
+// Meter — a progress bar toward a threshold (e.g. retrain gate progress).
+// Fills sage once `current >= required`, amber while short. The numeric
+// "current / required" always shows alongside so it's never just a bar.
+function Meter({ current, required }: { current: number; required: number }) {
+  const met = required <= 0 || current >= required;
+  const pct = required <= 0 ? 100 : Math.min(100, Math.max(0, Math.round((current / required) * 100)));
+  return (
+    <span className="sx-meter">
+      <span className="sx-meter-track">
+        <span className={`sx-meter-fill ${met ? 'ok' : 'warn'}`} style={{ width: `${String(pct)}%` }} />
+      </span>
+      <span className="sx-meter-num sx-mono">
+        {String(current)} / {String(required)}
+      </span>
+    </span>
+  );
+}
+
 export function HealthPanel({
   onClose,
   companionPort,
@@ -957,6 +997,16 @@ export function HealthPanel({
             rankerHealth.retrainSkipReason === null ? '' : ` (${rankerHealth.retrainSkipReason})`
           }`
         : '';
+    // Surface online adaptation at a glance — "live" when its delta is
+    // actually blending into serving, "armed" when the flag is on but not
+    // yet applied. Makes the dynamic layer visible without opening the drill.
+    const online = rankerHealth?.onlineHead;
+    const onlineLine =
+      online === undefined || online === null || !online.enabled
+        ? ''
+        : online.inUse
+          ? ` · online live (${String(online.updateCount)} nudges)`
+          : ' · online armed';
     const rankerDetail = workGraphUnavailable
       ? 'unavailable — metrics didn’t load'
       : rankerHealth === undefined
@@ -964,7 +1014,7 @@ export function HealthPanel({
         : rankerHealth.loadStatus === 'ready' && rankerHealth.trainedAt !== null
           ? `snapshot ${formatRelative(
               new Date(rankerHealth.trainedAt).toISOString(),
-            )}${mixLine}${staleLine}`
+            )}${mixLine}${staleLine}${onlineLine}`
           : rankerHealth.loadStatus === 'missing'
             ? `${
                 rankerHealth.retrainSkipReason === null
@@ -973,7 +1023,7 @@ export function HealthPanel({
               }${mixLine}`
             : rankerHealth.loadStatus === 'invalid-model'
               ? 'snapshot invalid'
-              : `ready${mixLine}${staleLine}`;
+              : `ready${mixLine}${staleLine}${onlineLine}`;
     const rankerHead = workGraphUnavailable
       ? 'Unavailable'
       : rankerHealth === undefined
@@ -1717,6 +1767,103 @@ export function HealthPanel({
             artifact than the data supports. The toast reports the decision verbatim.
           </div>
         </div>
+
+        {r?.nextRetrain !== undefined && r.nextRetrain !== null ? (
+          <div className="sx-receipt" data-testid="hp-ranker-next-retrain">
+            <div className="sx-receipt-head">
+              <span className={`sx-stamp ${r.nextRetrain.eligible ? 'deterministic' : 'partial'}`}>
+                <span />
+                {r.nextRetrain.eligible ? 'Retrain eligible' : 'Retrain blocked'}
+              </span>
+              <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+                next batch retrain
+              </span>
+            </div>
+            <dl>
+              <ReceiptRow
+                dt="Impression groups"
+                dd={
+                  <Meter
+                    current={r.nextRetrain.positiveGroups.current}
+                    required={r.nextRetrain.positiveGroups.required}
+                  />
+                }
+              />
+              <ReceiptRow
+                dt="New positive labels"
+                dd={
+                  <Meter
+                    current={r.nextRetrain.newLabels.current}
+                    required={r.nextRetrain.newLabels.required}
+                  />
+                }
+              />
+              {r.retrainSkipReason !== null && r.retrainSkipReason !== undefined ? (
+                <ReceiptRow
+                  dt="Blocked by"
+                  dd={<span className="sx-mono">{r.retrainSkipReason}</span>}
+                />
+              ) : null}
+            </dl>
+            <div className="sx-receipt-reason">
+              The batch model retrains — and its <em>trained date</em> moves — only when one of
+              these gates clears (either path suffices). Until then the date stays put even as you
+              keep browsing; the online head below is what adapts ranking in the meantime.
+            </div>
+          </div>
+        ) : null}
+
+        {r?.onlineHead !== undefined && r.onlineHead !== null ? (
+          <div className="sx-receipt" data-testid="hp-ranker-online-head">
+            <div className="sx-receipt-head">
+              <span
+                className={`sx-stamp ${
+                  r.onlineHead.inUse ? 'signal' : r.onlineHead.enabled ? 'partial' : ''
+                }`}
+              >
+                <span />
+                {r.onlineHead.inUse ? 'Live' : r.onlineHead.enabled ? 'Armed' : 'Off'}
+              </span>
+              <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+                online adaptation
+              </span>
+            </div>
+            <dl>
+              <ReceiptRow
+                dt="Status"
+                dd={
+                  <span className="sx-mono">
+                    {!r.onlineHead.enabled
+                      ? 'disabled'
+                      : r.onlineHead.inUse
+                        ? 'blending into serving'
+                        : r.onlineHead.present
+                          ? 'enabled · base mismatch (rebasing)'
+                          : 'enabled · no updates yet'}
+                  </span>
+                }
+              />
+              <ReceiptRow dt="Feedback nudges" dd={String(r.onlineHead.updateCount)} />
+              <ReceiptRow dt="Active weights" dd={String(r.onlineHead.activeWeightCount)} />
+              <ReceiptRow
+                dt="Last nudge"
+                dd={
+                  r.onlineHead.updatedAtMs === null
+                    ? '—'
+                    : formatRelative(new Date(r.onlineHead.updatedAtMs).toISOString())
+                }
+              />
+              {r.onlineHead.baseRevisionId !== null ? (
+                <ReceiptRow dt="Based on" dd={r.onlineHead.baseRevisionId} mono />
+              ) : null}
+            </dl>
+            <div className="sx-receipt-reason">
+              A per-feedback weight nudge layered on the active model — it adapts ranking between
+              batch retrains, but does <em>not</em> change the model revision or its trained date.
+              It needs confirm/reject feedback to move; plain browsing alone does not feed it.
+            </div>
+          </div>
+        ) : null}
 
         {aug !== undefined && aug !== null ? (
           <div className="sx-receipt" data-testid="hp-ranker-augmentation">

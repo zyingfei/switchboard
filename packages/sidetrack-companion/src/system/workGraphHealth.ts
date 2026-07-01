@@ -34,17 +34,25 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
-  MIN_RECALL_IMPRESSION_POSITIVE_GROUPS,
   RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX,
+  minRecallImpressionPositiveGroups,
   readRecallImpressionRetrainState,
   summarizeRecallImpressionEvents,
 } from '../ranker/retrain-impressions.js';
 import {
+  DEFAULT_RANKER_RETRAIN_COOLDOWN_MS,
+  DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD,
+  RANKER_RETRAIN_LABEL_THRESHOLD_ENV,
   fingerprintFeedbackTrainingLabels,
   planRankerRetrain,
   readRankerRetrainState,
   type RankerRetrainSkipReason,
 } from '../ranker/retrain.js';
+// Light import: onlineLabelLedger only pulls train.js (already in this
+// module's graph via retrain). The SIDETRACK_ONLINE_RANKER flag is read
+// from process.env directly so we do NOT static-import the heavy
+// onlineHead.ts (predict/snapshot) into this status-reachable module.
+import { readOnlineRankerState } from '../ranker/onlineLabelLedger.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -140,6 +148,32 @@ export interface WorkGraphHealthReport {
       readonly rankerSourceEdgeCount: number;
       readonly asOf: string | null;
     } | null;
+    // Progress toward the next batch retrain — what has to happen before
+    // the trained date can move. Both gates surfaced: the v6 impression
+    // path (positive groups toward the floor) and the legacy label path
+    // (new positive labels toward the threshold). `eligible` is true when
+    // either gate is already satisfied; otherwise `retrainSkipReason`
+    // carries the binding reason.
+    readonly nextRetrain: {
+      readonly eligible: boolean;
+      readonly positiveGroups: { readonly current: number; readonly required: number };
+      readonly newLabels: { readonly current: number; readonly required: number };
+      readonly cooldownMs: number;
+    };
+    // Online-adaptation head. The batch model's trained date does NOT move
+    // when this nudges weights — it is a serving-time delta layered on
+    // `activeRevisionId`, live only while `baseRevisionId` matches the
+    // served model (`inUse`). `enabled` reflects the SIDETRACK_ONLINE_RANKER
+    // flag; `present` whether a persisted state exists.
+    readonly onlineHead: {
+      readonly enabled: boolean;
+      readonly present: boolean;
+      readonly inUse: boolean;
+      readonly baseRevisionId: string | null;
+      readonly updateCount: number;
+      readonly activeWeightCount: number;
+      readonly updatedAtMs: number | null;
+    };
   };
   readonly ann: {
     readonly backend: 'hnsw' | 'flat';
@@ -950,6 +984,7 @@ export const collectWorkGraphHealth = async ({
     activeManifestProbe,
     retrainState,
     impressionRetrainState,
+    onlineRankerState,
     ann,
     topicRevision,
     diagnostics,
@@ -959,6 +994,7 @@ export const collectWorkGraphHealth = async ({
     readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
     readRankerRetrainState(vaultRoot),
     readRecallImpressionRetrainState(vaultRoot),
+    readOnlineRankerState(vaultRoot),
     annStatus(),
     createTopicRevisionStore(vaultRoot).readActiveRevision(),
     readLatestConnectionsDiagnostics(vaultRoot),
@@ -995,8 +1031,13 @@ export const collectWorkGraphHealth = async ({
   const datasetChangedSinceTrain =
     retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
   const impressionTraining = summarizeRecallImpressionEvents(merged);
+  // Env-aware floor — MUST match the real gate (`minRecallImpressionPositiveGroups`,
+  // which honors SIDETRACK_RANKER_IMPRESSION_MIN_GROUPS). The old hardcoded
+  // MIN_RECALL_IMPRESSION_POSITIVE_GROUPS diverged from the actual retrain
+  // decision on dogfood companions that override the floor.
+  const impressionGroupsRequired = minRecallImpressionPositiveGroups();
   const v6ColdStartSkipReason: RankerRetrainSkipReason | null =
-    impressionTraining.groupCountWithPositives < MIN_RECALL_IMPRESSION_POSITIVE_GROUPS
+    impressionTraining.groupCountWithPositives < impressionGroupsRequired
       ? 'insufficient_groups'
       : null;
   const activeLightgbmGate = activeManifest?.artifactQuality?.find(
@@ -1026,8 +1067,60 @@ export const collectWorkGraphHealth = async ({
           explicitRejectPrecisionDelta:
             impressionRetrainState.shipGateDecision.deltas.explicitRejectPrecision,
         };
+  const activeRevisionId =
+    activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null;
+  // Single source of truth for "would a retrain run right now" — the same
+  // value surfaced as `retrainSkipReason`. `nextRetrain.eligible` is its
+  // exact negation so the two never disagree.
+  const retrainSkipReason: RankerRetrainSkipReason | null =
+    v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null);
+  // Next-retrain progress — surface BOTH gates the trainer checks so the
+  // UI can show "what has to happen before the model retrains": the v6
+  // impression path (positive groups toward the floor) and the legacy
+  // label path (new positive labels toward the threshold).
+  const rawNewLabelThreshold = Number(process.env[RANKER_RETRAIN_LABEL_THRESHOLD_ENV]);
+  const newLabelsRequired = Math.max(
+    1,
+    Math.floor(
+      Number.isFinite(rawNewLabelThreshold)
+        ? rawNewLabelThreshold
+        : DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD,
+    ),
+  );
+  const nextRetrain = {
+    eligible: retrainSkipReason === null,
+    positiveGroups: {
+      current: impressionTraining.groupCountWithPositives,
+      required: impressionGroupsRequired,
+    },
+    newLabels: { current: retrainPlan.newLabelCount, required: newLabelsRequired },
+    cooldownMs: DEFAULT_RANKER_RETRAIN_COOLDOWN_MS,
+  };
+  // Online-adaptation head. `enabled` = SIDETRACK_ONLINE_RANKER flag;
+  // `inUse` = enabled AND a persisted state exists AND its base matches
+  // the served model (so its clamped delta is actually blended). Read
+  // from env directly to avoid a heavy onlineHead.ts import here.
+  const onlineRankerFlag = process.env['SIDETRACK_ONLINE_RANKER'] === '1';
+  const onlineHead = {
+    enabled: onlineRankerFlag,
+    present: onlineRankerState !== null,
+    inUse:
+      onlineRankerFlag &&
+      onlineRankerState !== null &&
+      onlineRankerState.baseRevisionId === activeRevisionId,
+    baseRevisionId: onlineRankerState?.baseRevisionId ?? null,
+    updateCount: onlineRankerState?.updateCount ?? 0,
+    activeWeightCount:
+      onlineRankerState === null
+        ? 0
+        : onlineRankerState.weights.filter((weight) => weight !== 0).length,
+    updatedAtMs:
+      onlineRankerState !== null && onlineRankerState.updatedAtMs > 0
+        ? onlineRankerState.updatedAtMs
+        : null,
+  };
   const ranker: WorkGraphHealthReport['ranker'] = {
-    activeRevisionId: activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null,
+    activeRevisionId,
     loadStatus:
       activeManifest === null
         ? activeManifestProbe === null
@@ -1058,8 +1151,7 @@ export const collectWorkGraphHealth = async ({
     needsRetrain: activeManifestProbe?.staleModelSchema ?? false,
     trainedAt: activeManifest?.trainedAt ?? null,
     trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
-    retrainSkipReason:
-      v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null),
+    retrainSkipReason,
     retrainNewLabelCount: retrainPlan.newLabelCount,
     shipGateV2,
     methodologySpine: rankerMethodologySpineDiagnosticsFromTrainQuality(
@@ -1078,6 +1170,8 @@ export const collectWorkGraphHealth = async ({
     unjudgedCandidatesPerGroup: impressionTraining.unjudgedCandidatesPerGroup,
     candidateSourceDistribution: impressionTraining.candidateSourceDistribution,
     augmentation,
+    nextRetrain,
+    onlineHead,
   };
   const topicProducer: WorkGraphHealthReport['topicProducer'] = {
     activeRevisionId: topicRevision?.revisionId ?? null,
