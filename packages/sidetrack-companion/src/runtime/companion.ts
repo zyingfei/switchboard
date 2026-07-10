@@ -34,7 +34,12 @@ import {
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEmbedderClient } from '../recall/embedderClient.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventStoreEnabled, getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import {
+  collectWorkGraphHealth,
+  type ConnectionsDiagnosticSnapshot,
+} from '../system/workGraphHealth.js';
+import { writeWorkGraphHealthArtifact } from '../system/workGraphHealthArtifact.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
@@ -119,6 +124,102 @@ export const scheduleSqliteVacuumGc = (
   return () => {
     clearInterval(sqliteVacuumGc);
     clearTimeout(sqliteVacuumGcKickoff);
+  };
+};
+
+// Debounce so a drain burst coalesces into one artifact collect.
+export const WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS = 2_000;
+// Min-interval floor between successful collects. The artifact feeds
+// the extension's health panel, which polls /v1/system/health on a
+// ~30s cadence, and each collect materializes ALL recall.served /
+// recall.action events — a cost that grows with history. Refreshing
+// at drain cadence (every few seconds under active browsing) is
+// precision no reader can observe: pure wasted work.
+export const WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS = 30_000;
+
+// Scheduler for the drain-time workGraph health artifact. Exported as
+// a factory (same testing seam as scheduleSqliteVacuumGc above) so the
+// debounce / floor / trailing-rerun semantics are unit-testable
+// without booting a companion.
+export const createWorkGraphHealthArtifactScheduler = (options: {
+  // Collects + writes one artifact. Resolves true only when the
+  // artifact was actually written — failures and skips (event store
+  // absent) must not advance the floor, so the next drain retries.
+  readonly materialize: () => Promise<boolean>;
+  // Cheap outer gate (SIDETRACK_EVENT_STORE): without the shared
+  // event store, collectWorkGraphHealth degrades to TWO full
+  // eventLog.readMerged() passes — that cost must not move to drain
+  // time on default configs. The route's live fallback
+  // (budget-guarded) still serves those installs.
+  readonly enabled: () => boolean;
+  readonly now?: () => number;
+}): { readonly schedule: () => void; readonly teardown: () => void } => {
+  const now = options.now ?? Date.now;
+  let inFlight = false;
+  let rerunRequested = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let lastSuccessAtMs: number | null = null;
+
+  const run = async (): Promise<void> => {
+    if (inFlight) {
+      // A drain landed while a collect was mid-read, so its changes
+      // are not in the in-flight pass. Request one trailing rerun
+      // instead of dropping it: on a quiet vault the next drain may
+      // never come, which would freeze the artifact on pre-drain
+      // state indefinitely. Single flag = single trailing collect,
+      // so single-flight is preserved.
+      rerunRequested = true;
+      return;
+    }
+    inFlight = true;
+    try {
+      if (await options.materialize()) lastSuccessAtMs = now();
+    } finally {
+      inFlight = false;
+      if (rerunRequested) {
+        rerunRequested = false;
+        schedule({ trailingRerun: true });
+      }
+    }
+  };
+
+  const schedule = (opts?: { readonly trailingRerun?: boolean }): void => {
+    if (!options.enabled()) return;
+    if (timer !== null) return;
+    const sinceSuccessMs =
+      lastSuccessAtMs === null ? Number.POSITIVE_INFINITY : now() - lastSuccessAtMs;
+    const floorRemainingMs = WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - sinceSuccessMs;
+    // Min-interval floor: a fresh-enough artifact already exists, and
+    // the next drain (or the trailing rerun below) re-schedules, so a
+    // plain skip is enough here.
+    if (opts?.trailingRerun !== true && floorRemainingMs > 0) return;
+    // The trailing rerun waits out the floor instead of bypassing it:
+    // bypassing would re-enable back-to-back collects whenever a
+    // collect overlaps a drain — exactly the busy periods the floor
+    // exists for. Scheduling at floor expiry keeps ≤1 collect per
+    // interval while still guaranteeing the missed drain's changes
+    // land without waiting for another drain.
+    const delayMs =
+      opts?.trailingRerun === true
+        ? Math.max(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS, floorRemainingMs)
+        : WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS;
+    timer = setTimeout(() => {
+      timer = null;
+      void run();
+    }, delayMs);
+    // A pending refresh must never hold the process open (mirrors
+    // the materializer's own drainDebounceTimer).
+    timer.unref();
+  };
+
+  return {
+    schedule: () => {
+      schedule();
+    },
+    teardown: () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
   };
 };
 
@@ -437,6 +538,14 @@ export const startCompanion = async (
       eventLog: baseEventLog,
       timelineStore,
       store: connectionsStore,
+      // Drain-time workGraph health artifact. The scheduler is defined
+      // below (next to the server wiring — it shares the route's dep
+      // set); referencing it through this closure is safe because the
+      // hook can only fire after a drain completes, long past this
+      // startup frame, and the materializer swallows hook errors.
+      onDrainSuccess: () => {
+        scheduleWorkGraphHealthArtifact();
+      },
     });
     syncContractRunner.register(connectionsMaterializer);
 
@@ -863,6 +972,66 @@ export const startCompanion = async (
         ...(err === undefined ? {} : { lastError: err }),
       };
     };
+    // Server-shaped view of the connections dirty queue. Shared by the
+    // /v1/system/health route context below AND the drain-time
+    // workGraph health artifact so both surfaces report the same
+    // numbers.
+    const connectionsDiagnostics = (): ConnectionsDiagnosticSnapshot => {
+      const dirty = connectionsMaterializer.getDirtySources();
+      return {
+        dirtySourceCount: dirty.dirtySourceUnitIds.length,
+        tombstonedSourceCount: dirty.tombstonedSourceUnitIds.length,
+        latestExtractionCount: dirty.latestExtractionFor.size,
+        oldestDirtySourceAgeMs: null,
+      };
+    };
+    // Drain-time workGraph health artifact (system/workGraphHealthArtifact.ts).
+    // collectWorkGraphHealth is too heavy for the request path on a
+    // cold process (typed event reads + a usearch native load blow the
+    // /v1/system/health 5s budget → the workGraph section pins
+    // 'unavailable' for the whole-report TTL after every boot), so
+    // materialize it after each successful connections drain and let
+    // the route serve the report from disk. Debounce / min-interval
+    // floor / single-flight + trailing rerun live in
+    // createWorkGraphHealthArtifactScheduler above; errors swallowed —
+    // observability must never surface as a drain failure.
+    const materializeWorkGraphHealthArtifact = async (): Promise<boolean> => {
+      try {
+        // The scheduler's env gate proves the flag, not the store:
+        // sync/eventStore.ts caches a FAILED open as a forever-null
+        // promise, and with a broken store collectWorkGraphHealth's
+        // readEventsForHealth silently degrades to TWO full
+        // eventLog.readMerged() passes per collect — the exact cost
+        // this artifact exists to avoid. Resolve the shared store
+        // first and bail (false → floor does not advance) when it is
+        // actually unavailable.
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        if (store === null) return false;
+        // Same dep set the route's live fallback builds (server.ts
+        // workGraphSummary): peek — never open — the canonical recall
+        // store; absent pre-first-/v2/recall ⇒ counts default to 0.
+        const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+        const canonicalRecallStore = await peekRecallV2Store(options.vaultPath);
+        const report = await collectWorkGraphHealth({
+          vaultRoot: options.vaultPath,
+          eventLog,
+          connectionsDiagnostics,
+          ...(canonicalRecallStore === undefined ? {} : { canonicalRecallStore }),
+        });
+        await writeWorkGraphHealthArtifact(options.vaultPath, report);
+        return true;
+      } catch {
+        // Best-effort: the serve side falls back to live compute when
+        // no (fresh) artifact exists.
+        return false;
+      }
+    };
+    const workGraphArtifactScheduler = createWorkGraphHealthArtifactScheduler({
+      materialize: materializeWorkGraphHealthArtifact,
+      enabled: eventStoreEnabled,
+    });
+    const scheduleWorkGraphHealthArtifact = workGraphArtifactScheduler.schedule;
+    teardown.push(workGraphArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
       vaultWriter,
@@ -896,15 +1065,7 @@ export const startCompanion = async (
       eventLog,
       projectionChanges,
       syncMaterializerHealth: () => syncContractRunner.health(),
-      connectionsDiagnostics: () => {
-        const dirty = connectionsMaterializer.getDirtySources();
-        return {
-          dirtySourceCount: dirty.dirtySourceUnitIds.length,
-          tombstonedSourceCount: dirty.tombstonedSourceUnitIds.length,
-          latestExtractionCount: dirty.latestExtractionFor.size,
-          oldestDirtySourceAgeMs: null,
-        };
-      },
+      connectionsDiagnostics,
       // Class F edge-event import path: plugin-originated events
       // (e.g. browser.timeline.observed) arrive pre-shaped with an
       // edge dot allocated by the plugin. Earlier turns relayed those

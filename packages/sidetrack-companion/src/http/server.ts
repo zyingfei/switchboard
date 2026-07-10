@@ -183,7 +183,7 @@ import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.j
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventStoreEnabled, getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import {
@@ -327,6 +327,10 @@ import {
   collectWorkGraphHealth,
   type ConnectionsDiagnosticSnapshot,
 } from '../system/workGraphHealth.js';
+import {
+  isWorkGraphHealthArtifactFresh,
+  readWorkGraphHealthArtifact,
+} from '../system/workGraphHealthArtifact.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
@@ -1374,8 +1378,10 @@ const directorySize = async (path: string): Promise<number> => {
 // ~15-30s, HealthPanel ~30s) with NO in-flight dedupe across its
 // (observed: 6) stacked sockets. Each call is ~0.85s and fully
 // UNCACHED: directorySize() recurses the entire multi-GB _BAC tree,
-// collectWorkGraphHealth re-reads the 15MB connections snapshot +
-// re-merges the event log + fingerprints every training label.
+// and the workGraph section's LIVE fallback (drain-time artifact
+// missing — see system/workGraphHealthArtifact.ts) re-reads the typed
+// event subsets (two FULL eventLog.readMerged passes when
+// SIDETRACK_EVENT_STORE is off) + fingerprints every training label.
 // Concurrent/rapid polls pile up into N overlapping full-tree walks
 // ⇒ a pinned core (the second, non-connections CPU runaway). Mirror
 // the /v1/system/hygiene-status fix (gcInventoryCached): a short TTL
@@ -4175,6 +4181,26 @@ const routes: readonly RouteDefinition[] = [
                 return { installed: status.installed, running: status.running };
               },
               workGraphSummary: async () => {
+                // Drain-time artifact first: the connections drain
+                // materializes workgraph-health.json after every
+                // successful pass (runtime/companion.ts onDrainSuccess),
+                // keeping the cold-boot path off the heavy live collect
+                // that used to blow the 5s budget and pin the section
+                // on 'unavailable'. The serve gate is symmetric with
+                // the writer's (eventStoreEnabled) AND age-bounded:
+                // the writer only refreshes while the event store is
+                // on, so a restart without SIDETRACK_EVENT_STORE=1
+                // would otherwise serve a frozen snapshot forever —
+                // drains succeed, the hook no-ops, sync.materializers
+                // stays green, and nothing surfaces the staleness.
+                // Missing/corrupt/schema-mismatched/stale ⇒ live
+                // compute below, unchanged.
+                if (eventStoreEnabled()) {
+                  const artifact = await readWorkGraphHealthArtifact(vaultRoot);
+                  if (artifact !== null && isWorkGraphHealthArtifactFresh(artifact)) {
+                    return artifact.report;
+                  }
+                }
                 // Phase 4 — peek the canonical SQLite recall store so
                 // health reports live document/chunk vector counts.
                 // Non-blocking: returns undefined when the store

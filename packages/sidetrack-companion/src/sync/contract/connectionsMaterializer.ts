@@ -651,6 +651,16 @@ export interface CreateConnectionsMaterializerDeps {
   readonly diagnosticsStore?: MaterializerDiagnosticsStore;
   readonly diagnosticsLogger?: (diagnostics: MaterializerDiagnostics) => void;
   readonly diagnosticsNow?: () => Date;
+  // Post-success observability hook (e.g. the drain-time workGraph
+  // health artifact). Invoked fire-and-forget — never awaited, and a
+  // throwing hook must never fail an otherwise-successful pass — at
+  // the MAIN-process success sites only (drain() tail + catchUp), not
+  // inside buildAndWrite (which runs in the reconcile CHILD in
+  // production). Wired from runtime/companion.ts: the materializer
+  // must not import workGraphHealth.ts itself — that module statically
+  // pulls recall/ann-index, a forbidden import direction for this
+  // child-loaded graph.
+  readonly onDrainSuccess?: () => void;
 }
 
 type TopicRevisionBuilder = (input: BuildTopicRevisionInput) => Promise<TopicRevision>;
@@ -4498,6 +4508,19 @@ export const createConnectionsMaterializer = (
     return false;
   };
 
+  // Post-drain-success observability hook. Sync-signature by design
+  // (any async work is the callee's problem to schedule); exceptions
+  // are swallowed here — mirrors the diagnosticsStore.write stance
+  // ("observability must never fail the drain").
+  const notifyDrainSuccess = (): void => {
+    if (deps.onDrainSuccess === undefined) return;
+    try {
+      deps.onDrainSuccess();
+    } catch {
+      // Observability must never fail the drain.
+    }
+  };
+
   const drain = async (): Promise<void> => {
     while (dirty) {
       const passStartedAtMs = Date.now();
@@ -4519,6 +4542,10 @@ export const createConnectionsMaterializer = (
         }
         lastSuccessAt = new Date().toISOString();
         lastError = null;
+        // Covers both the drainViaWorker and in-process paths — this
+        // tail always runs in the MAIN process, after the child's IPC
+        // result on the subprocess path.
+        notifyDrainSuccess();
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
         lastFailureAtMs = Date.now();
@@ -5072,6 +5099,7 @@ export const createConnectionsMaterializer = (
             lastBuildInvalidations = [];
             lastSuccessAt = new Date().toISOString();
             lastError = null;
+            notifyDrainSuccess();
             return;
           }
           if (chunked.reason !== 'no-current-snapshot') {
@@ -5102,6 +5130,7 @@ export const createConnectionsMaterializer = (
       }
       lastSuccessAt = new Date().toISOString();
       lastError = null;
+      notifyDrainSuccess();
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       // Don't spin during catchUp — leave dirty=true so the next

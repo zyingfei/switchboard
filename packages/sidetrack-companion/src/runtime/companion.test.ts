@@ -26,8 +26,11 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import type { AppendInputObserved } from '../sync/eventLog.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import {
+  WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS,
+  WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS,
   appendObservedEdgeEventsBatch,
   createPageEvidenceWriteQueue,
+  createWorkGraphHealthArtifactScheduler,
   scheduleSqliteVacuumGc,
   startCompanion,
 } from './companion.js';
@@ -165,6 +168,141 @@ describe('startCompanion SQLite VACUUM hygiene task', () => {
     expect(vacuum).toHaveBeenCalledTimes(2);
 
     teardown();
+  });
+});
+
+describe('createWorkGraphHealthArtifactScheduler', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does nothing when the env gate is off', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => false,
+    });
+
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS * 2);
+
+    expect(materialize).not.toHaveBeenCalled();
+    scheduler.teardown();
+  });
+
+  it('debounces a drain burst into one collect', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    scheduler.schedule();
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+
+    expect(materialize).toHaveBeenCalledTimes(1);
+    scheduler.teardown();
+  });
+
+  it('enforces the min-interval floor after a SUCCESSFUL collect (FIX 3)', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Drain right after the success: inside the floor → skipped, even
+    // well past the debounce window.
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - 1);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Once the floor has elapsed a new drain schedules normally.
+    await vi.advanceTimersByTimeAsync(1);
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
+  });
+
+  it('does not advance the floor on a failed collect', async () => {
+    // First collect fails (e.g. the shared event store never opened);
+    // the very next drain must retry immediately instead of being
+    // floor-blocked behind a success that never happened.
+    const materialize = vi
+      .fn<() => Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
+  });
+
+  it('runs one trailing collect at floor expiry when a drain lands mid-collect (FIX 4)', async () => {
+    // Hold the first collect open so a drain can land while it is in
+    // flight. Without the trailing rerun that drain's changes would
+    // wait for the NEXT drain — indefinitely on a quiet vault.
+    let resolveFirst: (value: boolean) => void = () => undefined;
+    const firstCollect = new Promise<boolean>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const materialize = vi
+      .fn<() => Promise<boolean>>()
+      .mockImplementationOnce(() => firstCollect)
+      .mockResolvedValue(true);
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Drain during the in-flight collect: single-flight holds (no
+    // second materialize) but the rerun request is recorded.
+    scheduler.schedule();
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    resolveFirst(true);
+    // Flush the finally block; the trailing collect is scheduled at
+    // floor expiry (not immediately — the floor is not bypassed).
+    await vi.advanceTimersByTimeAsync(0);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - 1);
+    expect(materialize).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    // One trailing collect exactly — the rerun flag does not loop.
+    await vi.advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS * 2);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
   });
 });
 

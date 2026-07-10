@@ -7,7 +7,7 @@ import {
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -19,6 +19,11 @@ import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
+import {
+  workGraphHealthArtifactPath,
+  writeWorkGraphHealthArtifact,
+} from '../system/workGraphHealthArtifact.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -2078,7 +2083,10 @@ describe('companion HTTP server', () => {
           ranker: {
             activeRevisionId: null,
             loadStatus: 'missing',
-            retrainSkipReason: 'no-labels',
+            // Empty vault: the v6 impression floor (insufficient_groups)
+            // now takes precedence over the legacy no-labels reason
+            // (a2c4c930 — next-retrain criteria).
+            retrainSkipReason: 'insufficient_groups',
           },
           feedback: {
             positiveLabelCount: 0,
@@ -2097,6 +2105,105 @@ describe('companion HTTP server', () => {
     expect(health.body).toMatchObject({
       data: { workGraph: { ann: { backend: expect.stringMatching(/^(hnsw|flat)$/u) } } },
     });
+  });
+
+  it('serves the drain-time workGraph health artifact instead of the live compute', async () => {
+    // Sentinel revision id: live compute on this empty vault would
+    // report activeRevisionId=null (asserted by the sibling test
+    // above), so seeing the sentinel proves the artifact
+    // short-circuited the live collectWorkGraphHealth path.
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(vaultPath, {
+      ...report,
+      ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+    });
+
+    // The serve gate mirrors the writer's SIDETRACK_EVENT_STORE gate.
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: 'artifact-sentinel-rev' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
+  });
+
+  it('ignores the workGraph artifact when the event-store gate is off (live fallback)', async () => {
+    // The writer only refreshes the artifact while SIDETRACK_EVENT_STORE=1;
+    // serving it with the gate off would freeze the panel on whatever a
+    // previous (gated-on) run last wrote. Same sentinel trick as above:
+    // seeing null proves the live compute ran instead.
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(vaultPath, {
+      ...report,
+      ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+    });
+
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(health.status).toBe(200);
+    expect(health.body).toMatchObject({
+      data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+    });
+  });
+
+  it('treats a workGraph artifact older than the max age as absent (live fallback)', async () => {
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(
+      vaultPath,
+      {
+        ...report,
+        ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+      },
+      // 25h old — past WORKGRAPH_HEALTH_ARTIFACT_MAX_AGE_MS (24h).
+      () => new Date(Date.now() - 25 * 60 * 60 * 1000),
+    );
+
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
+  });
+
+  it('falls back to live workGraph compute when the artifact is unreadable', async () => {
+    const artifactPath = workGraphHealthArtifactPath(vaultPath);
+    await mkdir(dirname(artifactPath), { recursive: true });
+    await writeFile(artifactPath, '{ not json', 'utf8');
+
+    // Gate on so the corrupt file exercises the artifact read path
+    // rather than being skipped by the env gate.
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      // Live-computed values for an empty vault — the corrupt artifact
+      // was treated as absent, not served and not fatal.
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
   });
 
   it('GET /v1/recall/query uses hybrid lexical + vector ranking with chunk metadata', async () => {
