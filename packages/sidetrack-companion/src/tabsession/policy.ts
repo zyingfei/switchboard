@@ -21,6 +21,10 @@ const POLICY = {
   aggressive: { suggest: 0.6, auto: 2.0, margin: 0.2, corroboration: 1 },
 } as const;
 
+// simAgreement = min(1, supportingScores / 10). At or below this, the pick is
+// backed by only 1–2 similar neighbors — too thin to trust on its own.
+const SIMILARITY_LONE_AGREEMENT_MAX = 0.2;
+
 export const decideAttribution = (
   candidates: readonly FusedCandidate[],
   mode: AttributionPolicyMode = 'balanced',
@@ -37,10 +41,19 @@ export const decideAttribution = (
       : (telemetry.regretRateBySource?.[dominantSource] ?? 0);
   const regretBudget =
     dominantSource === 'ppr' ? 0.08 : dominantSource === 'similarity' ? 0.05 : 0.12;
+  // Defense-in-depth: a similarity-dominant pick with weak agreement and no
+  // corroborating signal (no graph path, no topic cluster) is frequently a
+  // lexical/site-skeleton false-friend — e.g. two unrelated items sharing an
+  // aggregator platform's URL skeleton. Demand a second corroborating source
+  // before surfacing such a pick, regardless of raw score.
+  const requiredCorroboration =
+    top.dominantSource === 'similarity' && top.simAgreement <= SIMILARITY_LONE_AGREEMENT_MAX
+      ? Math.max(policy.corroboration, 2)
+      : policy.corroboration;
   if (
     top.rawFusionLogit >= policy.auto &&
     margin >= policy.margin &&
-    top.corroborationCount >= policy.corroboration &&
+    top.corroborationCount >= requiredCorroboration &&
     regretRate <= regretBudget
   ) {
     return { action: 'auto-apply', workstreamId: top.workstreamId, margin };
@@ -48,7 +61,7 @@ export const decideAttribution = (
   if (
     top.rawFusionLogit >= policy.suggest &&
     margin >= policy.margin &&
-    top.corroborationCount >= policy.corroboration
+    top.corroborationCount >= requiredCorroboration
   ) {
     return { action: 'suggest', workstreamId: top.workstreamId, margin };
   }
