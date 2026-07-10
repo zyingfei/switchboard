@@ -233,7 +233,15 @@ export const applyOnlineHeadDrainStep = async (
     appliedUpdates += 1;
   }
 
-  state = { ...state, weights, updatedAtMs: input.nowMs };
+  state = {
+    ...state,
+    weights,
+    updatedAtMs: input.nowMs,
+    // Stamp the nudge time only when a pairwise update actually applied —
+    // `updatedAtMs` alone refreshes on every frontier write and cannot
+    // answer "when did feedback last move the weights".
+    ...(appliedUpdates > 0 ? { lastNudgeAtMs: input.nowMs } : {}),
+  };
   await writeOnlineRankerState(input.vaultRoot, state);
   return { state, appliedUpdates };
 };

@@ -4149,7 +4149,13 @@ export const createConnectionsMaterializer = (
           }
         : {}),
     });
-    mark('rankerRetrainer');
+    mark(
+      `rankerRetrainer status=${rankerRetrainResult.status}${
+        'reason' in rankerRetrainResult ? `:${String(rankerRetrainResult.reason)}` : ''
+      } labels=${String(rankerRetrainResult.fingerprint?.labelCount ?? -1)} fullLog=${String(
+        rankerTrainFullLogEnabled(),
+      )} store=${String(storeBackedEvents !== null)}`,
+    );
     // Track the snapshot we ultimately wrote so diagnostics see the
     // ranker-augmented form when it was produced, the base form when
     // the ranker pass was skipped.

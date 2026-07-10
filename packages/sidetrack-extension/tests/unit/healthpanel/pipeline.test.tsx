@@ -659,6 +659,7 @@ describe('HealthPanel pipeline strip', () => {
               updateCount: 5,
               activeWeightCount: 4,
               updatedAtMs: Date.now() - 30_000,
+              lastNudgeAtMs: Date.now() - 30_000,
             },
           },
           topicProducer: {

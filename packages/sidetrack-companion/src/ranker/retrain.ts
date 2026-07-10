@@ -873,13 +873,19 @@ export const maybeRetrainClosestVisitRanker = async ({
   writeState = writeRankerRetrainState,
   readTrainingEvents,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
-  const feedback = projectFeedback(merged);
+  // P1: feed the trainer the full training-event history (read I/O-safely
+  // upstream via the event-store type index), NOT the drain tail — the tail
+  // can never accumulate the gate's positive-group floor. The SAME applies
+  // to the legacy label path below: `merged` on a store-backed scoped drain
+  // is only the pending window, so projecting feedback from it made the
+  // legacy gate report `no-labels` on every drain while dozens of labels
+  // accumulated in history and the trained date silently froze. The
+  // training-event set already includes the feedback types, so both paths
+  // share one indexed read.
+  const impressionEvents = readTrainingEvents ? await readTrainingEvents() : merged;
+  const feedback = projectFeedback(impressionEvents);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
-  // P1: feed the impression trainer the full training-event history
-  // (read I/O-safely upstream via the event-store type index), NOT the drain
-  // tail — the tail can never accumulate the gate's 50-positive-group floor.
-  const impressionEvents = readTrainingEvents ? await readTrainingEvents() : merged;
   const impressionEventSummary = summarizeRecallImpressionEvents(impressionEvents);
   if (impressionEventSummary.groupCountWithPositives >= minRecallImpressionPositiveGroups()) {
     const newLabelCount = impressionEventSummary.groupCountWithPositives;

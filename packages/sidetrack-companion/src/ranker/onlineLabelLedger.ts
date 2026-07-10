@@ -100,6 +100,11 @@ export interface OnlineRankerState {
   readonly appliedLabelFrontier: VersionVector;
   readonly updateCount: number;
   readonly updatedAtMs: number;
+  // When a pairwise weight update last APPLIED. `updatedAtMs` refreshes on
+  // every frontier-advance write (each drain observes new events), so it
+  // cannot answer "when did feedback last move the weights" — this can.
+  // Optional: absent on states persisted before the field existed.
+  readonly lastNudgeAtMs?: number;
 }
 
 export const EMPTY_ONLINE_RANKER_STATE = (featureCount: number): OnlineRankerState => ({
@@ -383,6 +388,9 @@ export const readOnlineRankerState = async (
     if (!isFiniteNumber(parsed['updatedAtMs'])) return null;
     const baseRevisionId = parsed['baseRevisionId'];
     if (baseRevisionId !== null && typeof baseRevisionId !== 'string') return null;
+    // Optional (pre-existing states omit it); malformed ⇒ treat as absent
+    // rather than dropping the whole state.
+    const lastNudgeAtMs = parsed['lastNudgeAtMs'];
     return {
       schemaVersion: ONLINE_RANKER_STATE_SCHEMA_VERSION,
       baseRevisionId,
@@ -394,6 +402,7 @@ export const readOnlineRankerState = async (
       appliedLabelFrontier: parsed['appliedLabelFrontier'],
       updateCount: parsed['updateCount'],
       updatedAtMs: parsed['updatedAtMs'],
+      ...(isFiniteNumber(lastNudgeAtMs) ? { lastNudgeAtMs } : {}),
     };
   } catch {
     return null;

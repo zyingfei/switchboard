@@ -185,9 +185,12 @@ describe('applyOnlineHeadDrainStep', () => {
     expect(result?.state.baseRevisionId).toBe('rev-1');
     // Weights moved off zero.
     expect(result?.state.weights.some((w) => w !== 0)).toBe(true);
-    // Persisted.
+    // Nudge timestamp stamped only because an update actually applied.
+    expect(result?.state.lastNudgeAtMs).toBe(BASE_TIME);
+    // Persisted (incl. the nudge stamp).
     const persisted = await readOnlineRankerState(root);
     expect(persisted?.weights).toEqual(result?.state.weights);
+    expect(persisted?.lastNudgeAtMs).toBe(BASE_TIME);
   });
 
   it('still applies on a feedback-ONLY drain (no nav events → random-unrelated negative)', async () => {
@@ -229,6 +232,8 @@ describe('applyOnlineHeadDrainStep', () => {
     });
     expect(second?.appliedUpdates).toBe(0);
     expect(second?.state.weights).toEqual(first?.state.weights);
+    // No new nudge ⇒ the nudge stamp does NOT refresh (updatedAtMs may).
+    expect(second?.state.lastNudgeAtMs).toBe(BASE_TIME);
   });
 
   it('re-bases on a model swap: zeroes weights, keeps the ledger', async () => {

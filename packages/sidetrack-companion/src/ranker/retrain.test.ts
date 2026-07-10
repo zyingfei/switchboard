@@ -552,6 +552,49 @@ describe('ranker retraining loop', () => {
     });
   });
 
+  it('sees historical feedback via readTrainingEvents even when the drain tail is empty (starvation regression)', async () => {
+    // Live-vault regression: on a store-backed scoped drain `merged` is only
+    // the pending window, so projecting feedback from it made every drain
+    // report `no-labels` while dozens of labels sat in history — the trained
+    // date froze for a month. The legacy path must project feedback from the
+    // full training-event history (same indexed read the impression gate uses).
+    const from = 'https://example.test/a';
+    const to = 'https://example.test/b';
+    const negative = 'https://example.test/c';
+    const trainInputs: TrainRankerInput[] = [];
+    const writtenRevisions: RankerRevision[] = [];
+    const train: TrainRankerRevisionFn = (input) => {
+      trainInputs.push(input);
+      return Promise.resolve(fakeRevision('2'.repeat(64)));
+    };
+    const writeActiveRevision: WriteActiveRankerRevisionFn = (_vaultRoot, revision) => {
+      writtenRevisions.push(revision);
+      return Promise.resolve();
+    };
+
+    const result = await maybeRetrainClosestVisitRanker({
+      vaultRoot: '/tmp/sidetrack-ranker-retrain-test',
+      // The drain tail carries NO feedback events — history does.
+      merged: [],
+      snapshot: snapshotWithVisits([from, to, negative]),
+      threshold: 1,
+      randomNegativeCandidatesPerPositive: 1,
+      readTrainingEvents: () => Promise.resolve([feedbackEvent(1, from, to)]),
+      train,
+      writeActiveRevision,
+      readState: () => Promise.resolve(emptyState()),
+      writeState: () => Promise.resolve(),
+    });
+
+    expect(result).toMatchObject({
+      status: 'trained',
+      revisionId: 'revision-s25',
+      newLabelCount: 1,
+    });
+    expect(trainInputs[0]?.feedback.positiveLabels).toHaveLength(1);
+    expect(writtenRevisions).toHaveLength(1);
+  });
+
   it('skips before candidate generation when labels cannot form a usable query group', async () => {
     const trainInputs: TrainRankerInput[] = [];
     const train: TrainRankerRevisionFn = (input) => {

@@ -198,7 +198,10 @@ interface WorkGraphRankerHealth {
     readonly baseRevisionId: string | null;
     readonly updateCount: number;
     readonly activeWeightCount: number;
+    // Last state write — refreshes every drain (frontier advance), so it
+    // is NOT "when did feedback last move the weights"; lastNudgeAtMs is.
     readonly updatedAtMs: number | null;
+    readonly lastNudgeAtMs?: number | null;
   } | null;
 }
 
@@ -1848,9 +1851,12 @@ export function HealthPanel({
               <ReceiptRow
                 dt="Last nudge"
                 dd={
-                  r.onlineHead.updatedAtMs === null
+                  // Only the true nudge timestamp — updatedAtMs refreshes on
+                  // every drain (frontier writes) and would fake freshness.
+                  r.onlineHead.lastNudgeAtMs === null ||
+                  r.onlineHead.lastNudgeAtMs === undefined
                     ? '—'
-                    : formatRelative(new Date(r.onlineHead.updatedAtMs).toISOString())
+                    : formatRelative(new Date(r.onlineHead.lastNudgeAtMs).toISOString())
                 }
               />
               {r.onlineHead.baseRevisionId !== null ? (

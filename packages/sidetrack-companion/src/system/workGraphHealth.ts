@@ -172,7 +172,10 @@ export interface WorkGraphHealthReport {
       readonly baseRevisionId: string | null;
       readonly updateCount: number;
       readonly activeWeightCount: number;
+      // Last state write (frontier advances refresh this every drain).
       readonly updatedAtMs: number | null;
+      // Last time a pairwise update actually moved the weights.
+      readonly lastNudgeAtMs: number | null;
     };
   };
   readonly ann: {
@@ -1072,8 +1075,17 @@ export const collectWorkGraphHealth = async ({
   // Single source of truth for "would a retrain run right now" — the same
   // value surfaced as `retrainSkipReason`. `nextRetrain.eligible` is its
   // exact negation so the two never disagree.
+  //
+  // Precedence mirrors the DRAIN's control flow, not a fixed ranking:
+  // when the impression path is cold (groups below the floor) the drain
+  // falls through to the legacy label path, and that path trains AND
+  // promotes unconditionally — so a train-ready legacy plan means there
+  // is no skip reason, and `insufficient_groups` must not mask it (it
+  // did: the panel showed "blocked" while the next drain would train).
   const retrainSkipReason: RankerRetrainSkipReason | null =
-    v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null);
+    v6ColdStartSkipReason !== null && retrainPlan.action === 'train'
+      ? null
+      : (v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null));
   // Next-retrain progress — surface BOTH gates the trainer checks so the
   // UI can show "what has to happen before the model retrains": the v6
   // impression path (positive groups toward the floor) and the legacy
@@ -1118,6 +1130,7 @@ export const collectWorkGraphHealth = async ({
       onlineRankerState !== null && onlineRankerState.updatedAtMs > 0
         ? onlineRankerState.updatedAtMs
         : null,
+    lastNudgeAtMs: onlineRankerState?.lastNudgeAtMs ?? null,
   };
   const ranker: WorkGraphHealthReport['ranker'] = {
     activeRevisionId,
