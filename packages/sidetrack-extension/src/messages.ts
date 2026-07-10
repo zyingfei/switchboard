@@ -271,6 +271,14 @@ export interface OpenConnectionsDejaVuItem {
   // graph neighborhood. Optional because some sources (raw vector
   // hits without a derived node) won't have one.
   readonly anchorNodeId?: string;
+  // P2 — impression join for the trainable recall.action mirror.
+  // The déjà-vu popover's /v2 batch stamps both so the sidepanel can
+  // seed its impression registry: entityId is the SERVED
+  // results[].entityId byte-exact (`id` above may be candidateId),
+  // servedContextId the response's meta.servedContextId. Optional so
+  // old payloads still parse.
+  readonly entityId?: string;
+  readonly servedContextId?: string;
 }
 
 // Per-dispatch context recorded locally when the user fires an
@@ -307,12 +315,22 @@ export const isFocusThreadInSidePanelMessage = (
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
 
+// P2 — per-item guard for the impression-join fields. The rest of the
+// item shape stays unvalidated (as before — the sender is our own
+// content script), but these two feed the impression registry and a
+// non-string value would poison the recall.action join.
+const hasValidDejaVuImpressionFields = (item: unknown): boolean =>
+  isRecord(item) &&
+  (item.entityId === undefined || typeof item.entityId === 'string') &&
+  (item.servedContextId === undefined || typeof item.servedContextId === 'string');
+
 export const isOpenConnectionsDejaVuMessage = (
   value: unknown,
 ): value is OpenConnectionsDejaVuMessage =>
   isRecord(value) &&
   value.type === messageTypes.openConnectionsDejaVu &&
   Array.isArray(value.items) &&
+  value.items.every(hasValidDejaVuImpressionFields) &&
   typeof value.selectionText === 'string' &&
   typeof value.sourceUrl === 'string';
 
@@ -585,6 +603,10 @@ export type WorkboardRequest =
         readonly vaultPath?: string;
         readonly notifyOnQueueComplete?: boolean;
         readonly pageEvidenceAutoExtractEnabled?: boolean;
+        // P2 — kill-switch for the sidepanel's trainable recall.action
+        // mirror (src/sidepanel/recall/emitTrainableAction.ts). Absent
+        // = on; persist `false` to silence emission.
+        readonly recallEmitTrainableActions?: boolean;
       };
     }
   | {
@@ -908,6 +930,7 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
   if (hasType(value, messageTypes.openConnectionsDejaVu)) {
     return (
       Array.isArray(value.items) &&
+      value.items.every(hasValidDejaVuImpressionFields) &&
       typeof value.selectionText === 'string' &&
       typeof value.sourceUrl === 'string'
     );

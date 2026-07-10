@@ -265,7 +265,11 @@ export class PageContentClient {
   /** Phase 0 — POST /v1/recall/action. The companion appends a
    *  `recall.action` event tied to the parent `recall.served` by
    *  `servedContextId`. Idempotent: duplicate clicks with the same
-   *  (servedContextId, entityId, actionKind) collapse server-side. */
+   *  (servedContextId, entityId, actionKind) collapse server-side;
+   *  actions mirroring a feedback event additionally carry
+   *  referencesEventId in the fingerprint so REPEAT gestures on the
+   *  same served candidate (each a distinct feedback event) are not
+   *  collapsed as replays. */
   async recallAction(payload: {
     readonly payloadVersion: 1;
     readonly servedContextId: string;
@@ -274,8 +278,13 @@ export class PageContentClient {
     readonly actionAt: string;
     readonly referencesEventId?: string;
   }): Promise<void> {
+    // When referencesEventId is absent (engagement clicks) the
+    // fingerprint input stays byte-for-byte the legacy string so
+    // existing keys don't change.
     const fingerprint = await sha256Hex(
-      `${payload.servedContextId}:${payload.entityId}:${payload.actionKind}`,
+      payload.referencesEventId === undefined
+        ? `${payload.servedContextId}:${payload.entityId}:${payload.actionKind}`
+        : `${payload.servedContextId}:${payload.entityId}:${payload.actionKind}:${payload.referencesEventId}`,
     );
     const idempotencyKey = `recall-action-${fingerprint.slice(0, 40)}`;
     const response = await fetch(`${this.baseUrl}/recall/action`, {

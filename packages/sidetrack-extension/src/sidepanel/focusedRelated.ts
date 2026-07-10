@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { messageTypes } from '../messages';
+import {
+  recordImpression,
+  recordImpressionFromRecallResults,
+} from './recall/impressionRegistry';
 
 // Now-card "Related" strip — data source.
 //
@@ -20,6 +24,10 @@ import { messageTypes } from '../messages';
 export interface FocusedRelatedItem {
   readonly url: string;
   readonly label: string;
+  // P2 — the SERVED entityId, byte-exact from the /v2 response. Kept
+  // so cache-served items can refresh the impression registry (the
+  // companion joins recall.action to recall.served on this string).
+  readonly entityId?: string;
 }
 
 const EMPTY_RELATED: readonly FocusedRelatedItem[] = [];
@@ -42,7 +50,11 @@ export const buildFocusedRelatedItems = (
   const items: FocusedRelatedItem[] = [];
   for (const raw of results) {
     if (typeof raw !== 'object' || raw === null) continue;
-    const r = raw as { readonly canonicalUrl?: unknown; readonly title?: unknown };
+    const r = raw as {
+      readonly canonicalUrl?: unknown;
+      readonly title?: unknown;
+      readonly entityId?: unknown;
+    };
     const url = typeof r.canonicalUrl === 'string' ? r.canonicalUrl : '';
     if (!/^https?:\/\//u.test(url)) continue;
     const key = urlKeyOf(url);
@@ -51,7 +63,13 @@ export const buildFocusedRelatedItems = (
     if (key === selfKey || seen.has(key)) continue;
     seen.add(key);
     const title = typeof r.title === 'string' && r.title.trim().length > 0 ? r.title : url;
-    items.push({ url, label: title });
+    items.push({
+      url,
+      label: title,
+      ...(typeof r.entityId === 'string' && r.entityId.length > 0
+        ? { entityId: r.entityId }
+        : {}),
+    });
     if (items.length >= max) break;
   }
   return items;
@@ -63,10 +81,17 @@ const RELATED_DEBOUNCE_MS = 700;
 
 // Module-level so panel remounts reuse it. Empty results are cached
 // too (negative cache) — a page with no neighbors or a dark companion
-// must not turn focus changes into a retry storm.
+// must not turn focus changes into a retry storm. servedContextId is
+// the impression the batch was served under; cache hits re-record it
+// so a gesture on a cache-served item still joins the ORIGINAL
+// recall.served.
 const relatedCache = new Map<
   string,
-  { readonly items: readonly FocusedRelatedItem[]; readonly atMs: number }
+  {
+    readonly items: readonly FocusedRelatedItem[];
+    readonly atMs: number;
+    readonly servedContextId?: string;
+  }
 >();
 
 /** Related pages for the focused tab via /v2/recall intent='focus'.
@@ -92,6 +117,20 @@ export const useFocusedRelatedPages = (
     latestRef.current = url;
     const cached = relatedCache.get(url);
     if (cached !== undefined && Date.now() - cached.atMs < RELATED_CACHE_TTL_MS) {
+      // P2 — a cache hit re-shows the ORIGINAL impression; refresh the
+      // registry with that servedContextId so a gesture after a panel
+      // remount still joins the recall.served that actually ranked it.
+      if (cached.servedContextId !== undefined) {
+        recordImpression(
+          cached.servedContextId,
+          cached.items
+            .filter(
+              (item): item is FocusedRelatedItem & { readonly entityId: string } =>
+                item.entityId !== undefined,
+            )
+            .map((item) => ({ entityId: item.entityId, canonicalUrl: item.url })),
+        );
+      }
       setState({ url, items: cached.items });
       return undefined;
     }
@@ -117,13 +156,30 @@ export const useFocusedRelatedPages = (
             const lastError = chrome.runtime.lastError;
             if (latestRef.current !== url) return;
             let items: readonly FocusedRelatedItem[] = EMPTY_RELATED;
+            let servedContextId: string | undefined;
             if (lastError === undefined && typeof response === 'object' && response !== null) {
-              const wrap = response as { readonly ok?: unknown; readonly results?: unknown };
+              const wrap = response as {
+                readonly ok?: unknown;
+                readonly results?: unknown;
+                readonly meta?: { readonly servedContextId?: unknown };
+              };
               if (wrap.ok === true && Array.isArray(wrap.results)) {
                 items = buildFocusedRelatedItems(wrap.results, url);
+                servedContextId =
+                  typeof wrap.meta?.servedContextId === 'string'
+                    ? wrap.meta.servedContextId
+                    : undefined;
+                // P2 — seed the impression registry with the FULL
+                // served set (not just the rendered strip) so any
+                // feedback gesture on a served entity can join back.
+                recordImpressionFromRecallResults(servedContextId, wrap.results);
               }
             }
-            relatedCache.set(url, { items, atMs: Date.now() });
+            relatedCache.set(url, {
+              items,
+              atMs: Date.now(),
+              ...(servedContextId === undefined ? {} : { servedContextId }),
+            });
             if (relatedCache.size > RELATED_CACHE_CAP) {
               const oldest = relatedCache.keys().next().value;
               if (oldest !== undefined) relatedCache.delete(oldest);

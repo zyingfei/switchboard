@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { messageTypes } from '../../messages';
+import { recordImpressionFromRecallResults } from '../recall/impressionRegistry';
 import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 // Scope A — Search migrates from /v1/content/query → /v2/recall with
@@ -20,6 +21,11 @@ import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants'
 
 export interface RecallHit {
   readonly id: string;
+  // P2 — the SERVED entityId, byte-exact from the /v2 response. `id`
+  // prefers candidateId (row identity for the renderers), so anything
+  // joining back to the recall.served impression must use this field,
+  // never `id`.
+  readonly entityId?: string;
   readonly sourceKind?: 'page-content' | 'chat-turn';
   readonly anchorNodeId?: string;
   readonly threadId?: string;
@@ -118,6 +124,7 @@ const hitFromV2Candidate = (
         : undefined;
   return {
     id,
+    ...(typeof r.entityId === 'string' ? { entityId: r.entityId } : {}),
     sourceKind,
     capturedAt,
     score: typeof r.fusedScore === 'number' ? r.fusedScore : 0,
@@ -229,6 +236,7 @@ export const useRecallSearch = (
               readonly results?: unknown;
               readonly error?: unknown;
               readonly meta?: {
+                readonly servedContextId?: unknown;
                 readonly flags?: { readonly localFallback?: unknown };
               };
             };
@@ -243,6 +251,10 @@ export const useRecallSearch = (
               return;
             }
             const rawResults = Array.isArray(wrap.results) ? wrap.results : [];
+            // P2 — remember which impression served these hits so an
+            // organize/flow gesture on one of them can be emitted as
+            // an impression-joined trainable recall.action.
+            recordImpressionFromRecallResults(wrap.meta?.servedContextId, rawResults);
             const parsed = rawResults
               .map(hitFromV2Candidate)
               .filter((h): h is RecallHit => h !== null);

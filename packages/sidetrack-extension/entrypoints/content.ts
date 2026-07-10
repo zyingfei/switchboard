@@ -88,7 +88,10 @@ const mapResultToPersistedItem = (r: {
     readonly rawScore?: number;
     readonly vectorDistance?: number;
   }[];
-}): OpenConnectionsDejaVuItem => {
+// P2 — servedContextId (the batch's meta.servedContextId) rides each
+// item so the sidepanel can seed its impression registry and emit
+// impression-joined recall.action for gestures on See-all rows.
+}, servedContextId?: string): OpenConnectionsDejaVuItem => {
   const url = r.canonicalUrl ?? window.location.href;
   const provider = detectProviderFromUrl(url);
   const providerKey = mapDejaVuProviderKey(provider);
@@ -97,6 +100,10 @@ const mapResultToPersistedItem = (r: {
   const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
   return {
     id: r.candidateId ?? r.entityId,
+    // The SERVED entityId, byte-exact — the companion joins actions to
+    // impressions on this string (id above may be the candidateId).
+    entityId: r.entityId,
+    ...(servedContextId === undefined ? {} : { servedContextId }),
     providerKey,
     providerLabel: mapDejaVuProviderLabel(providerKey),
     title: r.title ?? '',
@@ -1251,7 +1258,7 @@ export default defineContentScript({
               type: messageTypes.openConnectionsDejaVu,
               selectionText: text,
               sourceUrl: window.location.href,
-              items: results.map((r) => mapResultToPersistedItem(r)),
+              items: results.map((r) => mapResultToPersistedItem(r, servedContextId)),
             });
             closeDejaVu();
           },
@@ -1299,7 +1306,7 @@ export default defineContentScript({
               recallContext: {
                 selectionText: text,
                 sourceUrl: window.location.href,
-                hits: results.map((r) => mapResultToPersistedItem(r)),
+                hits: results.map((r) => mapResultToPersistedItem(r, servedContextId)),
               },
             });
           },

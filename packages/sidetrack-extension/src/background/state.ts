@@ -157,6 +157,15 @@ export const savePageEvidenceAutoExtractEnabled = async (
   return next;
 };
 
+export const saveRecallEmitTrainableActions = async (
+  recallEmitTrainableActions: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, recallEmitTrainableActions };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
 export const readVaultPath = async (): Promise<string | undefined> => {
   const value = await storageGet<string | undefined>(VAULT_PATH_KEY, undefined);
   return value === undefined || value.length === 0 ? undefined : value;

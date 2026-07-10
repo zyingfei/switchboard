@@ -10,6 +10,7 @@ import {
   TrashIcon,
 } from './icons';
 import { messageTypes } from '../../messages';
+import { recordImpressionFromRecallResults } from '../recall/impressionRegistry';
 import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 export const ENGAGEMENT_CLASSES = [
@@ -569,6 +570,7 @@ export const FocusView = ({
             readonly ok?: unknown;
             readonly results?: unknown;
             readonly error?: unknown;
+            readonly meta?: { readonly servedContextId?: unknown };
           };
           if (wrap.ok !== true) {
             setSearchItems(EMPTY_SEARCH_ITEMS);
@@ -577,6 +579,10 @@ export const FocusView = ({
             return;
           }
           const raws = Array.isArray(wrap.results) ? wrap.results : [];
+          // P2 — the add-drawer candidates are recall-served; remember
+          // the impression so a subsequent group-save/promote of one of
+          // them emits an impression-joined trainable recall.action.
+          recordImpressionFromRecallResults(wrap.meta?.servedContextId, raws);
           const items = raws
             .map(recallCandidateToFocusCandidate)
             .filter((item): item is FocusCandidate => item !== null);
@@ -1374,9 +1380,14 @@ export const FocusView = ({
                         value={searchQueryByTopic[topic.id] ?? ''}
                         placeholder="Search pages by title or URL…"
                         onChange={(event) => {
+                          // Read before the updater runs — React nulls
+                          // currentTarget once the synthetic event's
+                          // dispatch finishes, and state updaters may
+                          // run after that.
+                          const { value } = event.currentTarget;
                           setSearchQueryByTopic((current) => ({
                             ...current,
-                            [topic.id]: event.currentTarget.value,
+                            [topic.id]: value,
                           }));
                         }}
                         data-testid={`focus-search-${topic.id}`}

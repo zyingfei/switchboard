@@ -42,4 +42,41 @@ describe('runtime message validation', () => {
       }),
     ).toBe(false);
   });
+
+  // P2 — the See-all handoff items may carry entityId/servedContextId
+  // (impression join). Optional (old payloads parse), but when present
+  // they must be strings — a non-string would poison the recall.action
+  // join downstream.
+  it('accepts openConnectionsDejaVu items with and without impression fields', () => {
+    expect(
+      isRuntimeRequest({
+        type: messageTypes.openConnectionsDejaVu,
+        selectionText: 'query',
+        sourceUrl: 'https://example.com/page',
+        items: [
+          { id: 'cand:1', entityId: 'entity:1', servedContextId: 'ctx-1' },
+          { id: 'old-item-without-impression-fields' },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects openConnectionsDejaVu items with non-string impression fields', () => {
+    expect(
+      isRuntimeRequest({
+        type: messageTypes.openConnectionsDejaVu,
+        selectionText: 'query',
+        sourceUrl: 'https://example.com/page',
+        items: [{ id: 'cand:1', entityId: 42, servedContextId: 'ctx-1' }],
+      }),
+    ).toBe(false);
+    expect(
+      isRuntimeRequest({
+        type: messageTypes.openConnectionsDejaVu,
+        selectionText: 'query',
+        sourceUrl: 'https://example.com/page',
+        items: [{ id: 'cand:1', servedContextId: { nested: true } }],
+      }),
+    ).toBe(false);
+  });
 });

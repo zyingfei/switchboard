@@ -149,6 +149,12 @@ import {
   type FeedbackEventEnvelope,
   type UserOrganizedItemPayload,
 } from '../../src/sidepanel/connections/client';
+import {
+  maybeEmitTrainableRecallAction,
+  maybeEmitTrainableRecallActionForUrlAttribute,
+} from '../../src/sidepanel/recall/emitTrainableAction';
+import { recordImpressionFromServedItems } from '../../src/sidepanel/recall/impressionRegistry';
+import { idempotencyKey } from '../../src/idempotencyKey';
 import './style.css';
 
 const TARGET_PROVIDER_LABEL: Record<string, string> = {
@@ -2349,6 +2355,11 @@ const App = () => {
         // all three: items for the list, selectionText for the action
         // bar (Google/Translate/AskAI), sourceUrl for the "from
         // <host>" header pill.
+        //
+        // P2 — the batch is a recall impression re-surfaced in the
+        // sidepanel; seed the registry so organize/flow gestures on
+        // these rows emit impression-joined trainable recall.action.
+        recordImpressionFromServedItems(message.items);
         setConnectionsDejaVuRequest({
           items: message.items as readonly ConnectionsDejaVuItem[],
           selectionText: message.selectionText,
@@ -2888,11 +2899,18 @@ const App = () => {
       type: USER_ORGANIZED_ITEM,
       payload: { payloadVersion: 1, ...payload },
     };
+    const clientEventId = feedbackClientEventId(event);
+    // P2 — mirror the gesture as an impression-joined recall.action
+    // when the moved/ignored item was recently recall-served (registry
+    // miss = common case = silent no-op). Same envelope + clientEventId
+    // as the POST below so referencesEventId dedupes against the
+    // trainer's historical reconstruction of this event.
+    maybeEmitTrainableRecallAction(event, clientEventId);
     try {
       const response = (await chrome.runtime.sendMessage({
         type: messageTypes.postConnectionsFeedbackEvent,
         event,
-        clientEventId: feedbackClientEventId(event),
+        clientEventId,
       })) as unknown;
       if (isRecord(response) && response.ok === false) {
         console.warn(
@@ -3017,20 +3035,28 @@ const App = () => {
   const attributeUrlToWorkstream = async (
     canonicalUrl: string,
     workstreamId: string | null,
-    idempotencyKey?: string,
+    idempotencyKeyOverride?: string,
   ): Promise<WorkboardState> => {
     if (port.length === 0 || bridgeKey.length === 0) {
       throw new Error('Companion is not configured.');
     }
+    // Computed ONCE per gesture and reused for the header AND the
+    // trainable-action mirror below: the companion stores this header
+    // verbatim as the accepted user.organized.item's clientEventId,
+    // so referencesEventId must be this exact string for the trainer's
+    // dedupe to skip its own reconstruction of the gesture. Date.now()
+    // keeps distinct gestures on the same (url, workstream) distinct
+    // while retries within one call still collapse server-side.
+    const attributeIdempotencyKey =
+      idempotencyKeyOverride ??
+      idempotencyKey('url', `${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`);
     const response = await fetch(
       `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
       {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'idempotency-key':
-            idempotencyKey ??
-            `url-${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`,
+          'idempotency-key': attributeIdempotencyKey,
           'x-bac-bridge-key': bridgeKey,
         },
         body: JSON.stringify({ workstreamId }),
@@ -3039,6 +3065,10 @@ const App = () => {
     if (!response.ok) {
       throw new Error(`URL attribution failed (${String(response.status)}).`);
     }
+    // P2 — the organized event for this gesture is created SERVER-side
+    // by the route above, so it never passes the feedback choke points;
+    // mirror it here on success (assign and unassign both record 'move').
+    maybeEmitTrainableRecallActionForUrlAttribute(canonicalUrl, attributeIdempotencyKey);
     await applyUrlDecisionResponse(response, canonicalUrl);
     // User mutation — refetch resolver suggestions (cache is stale).
     await loadTabSessions({ forceRefetchSuggestions: true });

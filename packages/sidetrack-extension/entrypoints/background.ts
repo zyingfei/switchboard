@@ -88,6 +88,7 @@ import {
   type VisualFingerprintObservedPayload,
 } from '../src/content/visual/dom-hash';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
+import { idempotencyKey } from '../src/idempotencyKey';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { indexTurnsCoalesced } from '../src/companion/recallClient';
 import {
@@ -158,6 +159,7 @@ import {
   reorderLocalQueueItems,
   saveNotifyOnQueueComplete,
   savePageEvidenceAutoExtractEnabled,
+  saveRecallEmitTrainableActions,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -386,9 +388,6 @@ const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
     capturedAt,
   };
 };
-
-const idempotencyKey = (prefix: string, value: string): string =>
-  `${prefix}-${value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 160)}`;
 
 const hostFromUrl = (url: string): string => {
   try {
@@ -3620,6 +3619,9 @@ const handleRequest = async (
             });
           }
         }
+      }
+      if (typeof request.preferences.recallEmitTrainableActions === 'boolean') {
+        await saveRecallEmitTrainableActions(request.preferences.recallEmitTrainableActions);
       }
     }, 'settings');
   }

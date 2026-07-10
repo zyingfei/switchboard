@@ -182,6 +182,12 @@ export interface UiSettings {
   // away and come back when it's done.
   readonly notifyOnQueueComplete: boolean;
   readonly pageEvidenceAutoExtractEnabled: boolean;
+  // P2 — kill-switch for the sidepanel's trainable recall.action
+  // mirror (src/sidepanel/recall/emitTrainableAction.ts). Optional
+  // with absent = ON so existing installs pick the feature up without
+  // a settings migration; only an explicit `false` (persisted via
+  // saveLocalPreferences) silences emission.
+  readonly recallEmitTrainableActions?: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /
