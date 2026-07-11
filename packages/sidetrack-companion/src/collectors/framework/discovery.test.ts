@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it } from 'vitest';
 
 import { createMaterializerRegistry } from './materializer.js';
 import { startDiscovery, type DiscoveryHandle, type DiscoveryOpts } from './discovery.js';
+import { pollUntil } from '../../test-helpers/bunTestTimers.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -196,6 +197,8 @@ it('manifest with process.managed-by = launchd → load-failed, manifest-spawn-p
   expect(audits.some((a) => a.route === 'collector:manifest-parse-failed')).toBe(true);
 });
 
+// Allow up to 12 s: under full-suite CPU load (embedding model init in sibling
+// files) the fs.watch debounce may fire much later than its nominal 200 ms.
 it('mid-run manifest change → re-evaluation fires collector:manifest-reloaded', async () => {
   await writeCollectorToml(tmpDir, 'sidetrack.test', VALID_TOML);
 
@@ -209,11 +212,29 @@ it('mid-run manifest change → re-evaluation fires collector:manifest-reloaded'
   // Verify initial load.
   expect(handle.loadedCollectors()[0]?.status).toBe('loaded');
 
+  // Bun's kqueue watcher fires a spurious `rename <dir>` event immediately
+  // after watcher setup (~10ms). If we write the new file before that event
+  // is flushed, kqueue coalesces the write event into the initial rename and
+  // we only see the directory-level event (parts.length===1), which
+  // handleChange ignores. A 100ms pause lets the initial burst settle so
+  // the overwrite appears as a distinct `rename <dir>/collector.toml` event.
+  await sleep(100);
+
   // Overwrite with a manifest that will fail the companion version check.
   await writeCollectorToml(tmpDir, 'sidetrack.test', REQUIRES_COMPANION_FUTURE_TOML);
 
-  // Wait for debounce (200ms) + some headroom.
-  await sleep(500);
+  // Poll until the fs.watch debounce (200ms) + re-evaluation fires. A
+  // fixed sleep is unreliable: Bun's kqueue watcher can coalesce events
+  // when the watcher is set up close to the write, delaying the
+  // collector:manifest-reloaded audit by more than 200ms under load.
+  // 10 s is generous; normal delivery is 200–400 ms.
+  await pollUntil(
+    () => {
+      const reloaded = audits.filter((a) => a.route === 'collector:manifest-reloaded');
+      expect(reloaded.length).toBeGreaterThanOrEqual(1);
+    },
+    { timeoutMs: 10_000, intervalMs: 50 },
+  );
 
   // The status should have changed → reloaded audit fired.
   const reloaded = audits.filter((a) => a.route === 'collector:manifest-reloaded');
@@ -224,4 +245,4 @@ it('mid-run manifest change → re-evaluation fires collector:manifest-reloaded'
   const collectors = handle.loadedCollectors();
   expect(collectors).toHaveLength(1);
   expect(collectors[0]?.status).toBe('load-failed');
-});
+}, 12_000);

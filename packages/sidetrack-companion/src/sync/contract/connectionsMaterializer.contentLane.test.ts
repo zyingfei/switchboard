@@ -7,6 +7,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { pollUntil } from '../../test-helpers/bunTestTimers.js';
 
 import {
   type ConnectionsSnapshot,
@@ -84,6 +85,9 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
           return Promise.resolve([...(input.events ?? [])]);
         },
         readMergedSince: () => Promise.resolve([...(input.events ?? [])]),
+        // streamFiltered is used by the ranker trainer; return empty so
+        // the drain succeeds without actual training data in the test stub.
+        streamFiltered: () => Promise.resolve([]),
         append: () => {
           throw new Error('unused');
         },
@@ -329,7 +333,18 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
 
     await mat.catchUp({} as any);
     await mat.awaitIdle();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // The content-only progress write goes through a 25ms requeue timer
+    // (flushContentOnlyProgressEvents backs off when running=true and
+    // retries after 25ms). Under load the graph drain itself takes longer
+    // than 50ms, so a fixed wait is too tight. Poll until the deferred
+    // write lands; 2 s is generous for a 25ms nominal delay.
+    await pollUntil(
+      () => {
+        expect(latestProgress?.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
+      },
+      { timeoutMs: 2000, intervalMs: 10 },
+    );
 
     expect(readMergedCalls).toBe(1);
     expect(latestProgress?.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
