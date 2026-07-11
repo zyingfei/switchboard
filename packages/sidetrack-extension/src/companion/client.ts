@@ -51,6 +51,15 @@ export interface CompanionClient {
     readonly workstreamId?: string;
   }) => Promise<readonly CodingSession[]>;
   readonly detachCodingSession: (codingSessionId: string) => Promise<CodingSession>;
+  /** §13 step 13 — export a workstream to the vault via the tree-path
+   *  route. Returns the vault-relative paths of the written files. */
+  readonly exportWorkstream: (
+    workstreamId: string,
+    options?: { readonly includeThreads?: boolean },
+  ) => Promise<readonly string[]>;
+  /** §13 step 13 — export a single thread to the vault. Same response
+   *  shape as exportWorkstream (an array of written file paths). */
+  readonly exportThread: (threadId: string) => Promise<readonly string[]>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -178,6 +187,29 @@ const parseMutationResult = (value: unknown): MutationResult => {
 const parseStringArray = (value: unknown): readonly string[] => {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === 'string');
+};
+
+// §13 step 13 — export routes return { data: { files: [{ path }] } }.
+// We surface just the vault-relative paths (the caller renders them as
+// a success confirmation). Parse defensively; a malformed shape is a
+// hard error the panel surfaces rather than a silent empty success.
+const parseExportPaths = (value: unknown): readonly string[] => {
+  if (!isRecord(value)) {
+    throw new Error('Companion export response was not an object.');
+  }
+  const data = (value as { readonly data?: unknown }).data;
+  if (!isRecord(data)) {
+    throw new Error('Companion export response missing data.');
+  }
+  const files = (data as { readonly files?: unknown }).files;
+  if (!Array.isArray(files)) {
+    throw new Error('Companion export response missing files array.');
+  }
+  return files.flatMap((file) => {
+    if (!isRecord(file)) return [];
+    const path = (file as { readonly path?: unknown }).path;
+    return typeof path === 'string' && path.length > 0 ? [path] : [];
+  });
 };
 
 const parseChecklist = (value: unknown): WorkstreamProjectionRecord['checklist'] => {
@@ -464,6 +496,29 @@ export class HttpCompanionClient implements CompanionClient {
       throw new Error('Companion detach response missing data.');
     }
     return (value as { data: CodingSession }).data;
+  }
+
+  async exportWorkstream(
+    workstreamId: string,
+    options?: { readonly includeThreads?: boolean },
+  ): Promise<readonly string[]> {
+    return parseExportPaths(
+      await this.request(`/workstreams/${encodeURIComponent(workstreamId)}/export`, {
+        method: 'POST',
+        body: JSON.stringify(
+          options?.includeThreads === undefined ? {} : { includeThreads: options.includeThreads },
+        ),
+      }),
+    );
+  }
+
+  async exportThread(threadId: string): Promise<readonly string[]> {
+    return parseExportPaths(
+      await this.request(`/threads/${encodeURIComponent(threadId)}/export`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    );
   }
 
   async version(): Promise<CompanionIdentity | null> {

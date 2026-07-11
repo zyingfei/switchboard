@@ -71,6 +71,15 @@ export interface PacketComposerScope {
   readonly reviewDraft?: ReviewDraft;
 }
 
+// §13 step 11 — queue-item selection. Each entry is one pending "ask"
+// stacked on the source thread/workstream; the user ticks the ones
+// they want folded into the packet's Questions section. Kept minimal
+// (id + text) — the composer doesn't need the full QueueItem shape.
+export interface PacketComposerQueueItem {
+  readonly bac_id: string;
+  readonly text: string;
+}
+
 export interface PacketComposerProps {
   readonly defaultKind?: PacketKind;
   readonly defaultTemplate?: ResearchTemplate;
@@ -80,6 +89,9 @@ export interface PacketComposerProps {
   readonly tokenLimit?: number;
   readonly redactedItems?: readonly { readonly kind: string; readonly count: number }[];
   readonly scopeSuggestions?: readonly ScopeSuggestion[];
+  // §13 step 11 — pending queue items the user can fold into the
+  // packet as a Questions section. Omit/empty = the picker is hidden.
+  readonly queueItems?: readonly PacketComposerQueueItem[];
   readonly onScopeChange?: (workstreamId: string) => void;
   readonly onCancel: () => void;
   readonly onCopy: (packet: ComposedPacket) => void;
@@ -359,6 +371,14 @@ provider: ${scope.providerLabel ?? '(unknown)'}
 ${turnsMd}`;
 };
 
+// §13 step 11 — render the selected queue asks as a Questions section.
+// Mirrors the MCP context_pack shape (one `- <text>` bullet per ask
+// under a section header).
+const renderQuestionsSection = (questions: readonly string[]): string =>
+  questions.length === 0
+    ? ''
+    : `## Questions\n${questions.map((q) => `- ${q}`).join('\n')}`;
+
 const buildBody = (
   kind: PacketKind,
   template: ResearchTemplate,
@@ -366,6 +386,7 @@ const buildBody = (
   title: string,
   includeTurnCount: number,
   includeReviewDraft: boolean,
+  questions: readonly string[],
 ): string => {
   const turnsMd = renderTurnsMarkdown(scope.availableTurns ?? [], includeTurnCount);
   let body: string;
@@ -373,6 +394,16 @@ const buildBody = (
   else if (kind === 'coding_agent_packet') body = buildCodingAgentPacket(title, scope);
   else if (kind === 'notebook_export') body = buildNotebookExport(title, scope, turnsMd);
   else body = buildResearchPacket(title, template, scope, turnsMd);
+  // Selected queue asks fold in as a Questions section. Only research
+  // packets carry a "questions to ask another AI" surface — for coding
+  // handoffs / exports the section would be noise, so gate it on the
+  // research kind.
+  if (kind === 'research_packet') {
+    const questionsMd = renderQuestionsSection(questions);
+    if (questionsMd.length > 0) {
+      body = `${body.replace(/\s+$/u, '')}\n\n${questionsMd}`;
+    }
+  }
   if (
     includeReviewDraft &&
     scope.reviewDraft !== undefined &&
@@ -399,6 +430,7 @@ export function PacketComposer({
   tokenLimit = 200_000,
   redactedItems = [],
   scopeSuggestions = [],
+  queueItems = [],
   onScopeChange,
   onCancel,
   onCopy,
@@ -443,6 +475,16 @@ export function PacketComposer({
     (reviewDraft.spans.length > 0 ||
       (reviewDraft.overall !== undefined && reviewDraft.overall.trim().length > 0));
   const [includeReviewDraft, setIncludeReviewDraft] = useState(hasReviewDraft);
+  // §13 step 11 — which queue asks the user folded into the Questions
+  // section. Set of bac_ids; the ordered text list is derived from
+  // queueItems so the section preserves queue order.
+  const [selectedQueueIds, setSelectedQueueIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  const selectedQuestions = useMemo(
+    () => queueItems.filter((item) => selectedQueueIds.has(item.bac_id)).map((item) => item.text),
+    [queueItems, selectedQueueIds],
+  );
   const [body, setBody] = useState(
     defaultBody ??
       (maxTurns > 0
@@ -453,6 +495,7 @@ export function PacketComposer({
             initialTitle,
             Math.min(maxTurns, 4),
             hasReviewDraft,
+            [],
           )
         : FALLBACK_BODY),
   );
@@ -471,6 +514,9 @@ export function PacketComposer({
   // depend on flattened scope fields (not the scope object itself) since
   // its identity churns every render.
   const scopeKey = `${scope.threadUrl ?? ''}::${scope.providerLabel ?? ''}::${scope.label}::${String(maxTurns)}`;
+  // Flattened dep proxy for the selected questions — the array identity
+  // churns every render, so key the rebuild effect on the joined text.
+  const questionsKey = selectedQuestions.join(' ');
   const bodyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     if (bodyManuallyEdited) return;
@@ -482,6 +528,7 @@ export function PacketComposer({
         title.trim() || initialTitle,
         includeTurnCount,
         includeReviewDraft,
+        selectedQuestions,
       ),
     );
     // Reset scroll to the top of the textarea so the user sees the
@@ -508,6 +555,7 @@ export function PacketComposer({
     includeTurnCount,
     includeReviewDraft,
     scopeKey,
+    questionsKey,
   ]);
 
   const tokenEstimate = useMemo(() => estimateTokens(body), [body]);
@@ -699,6 +747,47 @@ export function PacketComposer({
           />
         </div>
       </div>
+
+      {/* §13 step 11 — queue asks. Tick the pending follow-ups to fold
+          into the packet's Questions section. Only shown in the
+          "Ask another AI" intent (Questions is a research surface) and
+          when the caller passed queue items. Disabled once the body is
+          hand-edited so re-ticking doesn't clobber the user's text. */}
+      {intent === 'ask-ai' && queueItems.length > 0 ? (
+        <div className="composer-row">
+          <label>Queued asks</label>
+          <div className="composer-queue-picker">
+            {queueItems.map((item) => {
+              const checked = selectedQueueIds.has(item.bac_id);
+              return (
+                <label key={item.bac_id} className="composer-queue-item">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={bodyManuallyEdited}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setSelectedQueueIds((prev) => {
+                        const updated = new Set(prev);
+                        if (next) updated.add(item.bac_id);
+                        else updated.delete(item.bac_id);
+                        return updated;
+                      });
+                    }}
+                  />
+                  <span className="composer-queue-text">{item.text}</span>
+                </label>
+              );
+            })}
+          </div>
+          {selectedQuestions.length > 0 ? (
+            <p className="composer-help mono">
+              {String(selectedQuestions.length)} ask
+              {selectedQuestions.length === 1 ? '' : 's'} → Questions section
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Target row is intent-scoped so the user can't pick
           (intent: ask-ai, target: codex). Each intent shows ONLY

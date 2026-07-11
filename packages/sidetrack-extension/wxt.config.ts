@@ -90,6 +90,11 @@ export default defineConfig({
       'notifications',
       'tabGroups',
       'webNavigation',
+      // §13 step 8 — restore a closed AI-thread tab from Chrome's
+      // recently-closed session history (chrome.sessions). Match by
+      // URL/title; restoring via chrome.sessions.restore(sessionId)
+      // preserves scroll + form state that a plain reopen-URL loses.
+      'sessions',
       // Phase 4 — read tab URL/title across all tabs so the timeline
       // observer can see ambient browsing (HN, blog posts, search,
       // GitHub, YouTube, …). Production observation stays gated by

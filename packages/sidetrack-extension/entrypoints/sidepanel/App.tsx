@@ -66,6 +66,8 @@ import {
   type ThemeMode,
   type DensityMode,
   TabRecovery,
+  InboundView,
+  QueuedView,
   Wizard,
   type RestoreStrategy,
   type ReviewVerdict,
@@ -73,6 +75,11 @@ import {
   type WorkstreamOption,
 } from './components';
 import { createDispatchClient } from '../../src/dispatch/client';
+import {
+  outboundTokenThreshold,
+  preflightCompanionBody,
+  preflightOutbound,
+} from '../../src/dispatch/outboundPreflight';
 import {
   bridgeKeyValidationCopy,
   validateBridgeKeyCandidate,
@@ -118,6 +125,12 @@ import {
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import {
+  findSessionRestoreMatch,
+  type ClosedSession,
+} from '../../src/sidepanel/tabsession/sessionRestore';
+import { mapInboundReminders } from '../../src/sidepanel/inbound/mapInboundReminder';
+import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
 import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
@@ -463,6 +476,29 @@ const providerLabel = (provider: TrackedThread['provider']): string => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
+// §13 step 13 — pull the written vault-relative paths out of an export
+// response ({ data: { files: [{ path }] } }). Defensive: a malformed
+// body throws so the panel surfaces an error rather than a fake
+// success with zero paths.
+export const extractExportPaths = (body: unknown): readonly string[] => {
+  if (!isRecord(body)) {
+    throw new Error('Export response was not an object.');
+  }
+  const data = body.data;
+  if (!isRecord(data)) {
+    throw new Error('Export response missing data.');
+  }
+  const files = data.files;
+  if (!Array.isArray(files)) {
+    throw new Error('Export response missing files array.');
+  }
+  return files.flatMap((file) => {
+    if (!isRecord(file)) return [];
+    const path = file.path;
+    return typeof path === 'string' && path.length > 0 ? [path] : [];
+  });
+};
+
 export const formatBuildTimestamp = (iso: string): string => {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) {
@@ -739,6 +775,11 @@ const App = () => {
   const [draggingTabSessionId, setDraggingTabSessionId] = useState<string | null>(null);
   const [dropWorkstreamId, setDropWorkstreamId] = useState<string | null>(null);
   const [recoveryThreadId, setRecoveryThreadId] = useState<string | null>(null);
+  // §13 step 8 — sessionId of a recently-closed Chrome tab that matches
+  // the recovery thread's URL/title. Populated async when the recovery
+  // modal opens; null means either no match or the lookup hasn't run,
+  // in which case TabRecovery falls back to reopen-URL.
+  const [recoverySessionId, setRecoverySessionId] = useState<string | null>(null);
   // Bac_id of a dispatch the user clicked to inspect — used by the
   // External viewer modal (and as a fallback "show me the body" for
   // any dispatch the user wants to see again). Null = closed.
@@ -777,7 +818,7 @@ const App = () => {
   // user, so once they navigate to another panel tab they stay
   // there until they explicitly choose Now again.
   const [viewMode, setViewMode] = useState<
-    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search' | 'inbound' | 'queued'
   >('now');
   // Stage 5 polish — cross-surface jumps between Inbox and Connections.
   // `connectionsAnchorRequest` is a string that ConnectionsView watches
@@ -1391,6 +1432,45 @@ const App = () => {
     () => threads.find((thread) => thread.bac_id === recoveryThreadId),
     [recoveryThreadId, threads],
   );
+  // §13 step 8 — when the recovery modal opens for a thread, look up
+  // Chrome's recently-closed session history for a tab matching the
+  // thread's URL/title. A hit unlocks the "Restore from session
+  // history" branch (preserves scroll + form state); a miss leaves it
+  // hidden and the modal falls back to reopen-URL. Cancelled on close
+  // or thread change so a stale lookup can't set a wrong sessionId.
+  useEffect(() => {
+    setRecoverySessionId(null);
+    if (recoveryThread === undefined) return undefined;
+    const sessions = (chrome as { sessions?: typeof chrome.sessions }).sessions;
+    if (sessions?.getRecentlyClosed === undefined) return undefined;
+    let cancelled = false;
+    const { threadUrl, title } = recoveryThread;
+    void (async () => {
+      try {
+        const recent = (await sessions.getRecentlyClosed({})) as readonly ClosedSession[];
+        if (cancelled) return;
+        const match = findSessionRestoreMatch(recent, { url: threadUrl, title });
+        if (match !== null) setRecoverySessionId(match.sessionId);
+      } catch {
+        // sessions API may be unavailable (permission not yet granted
+        // after a reload); silently fall back to reopen-URL.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [recoveryThread]);
+  // Restore a closed tab from Chrome's session history, then close the
+  // recovery modal. Best-effort: any failure leaves the modal's other
+  // branches available.
+  const restoreThreadSession = useCallback((sessionId: string): void => {
+    const sessions = (chrome as { sessions?: typeof chrome.sessions }).sessions;
+    if (sessions?.restore === undefined) return;
+    void sessions.restore(sessionId).catch(() => {
+      // Session may have aged out of Chrome's history between lookup
+      // and click; the modal stays open so the user can reopen-URL.
+    });
+  }, []);
   const composeThread = useMemo(
     () => threads.find((thread) => thread.bac_id === composeThreadId),
     [composeThreadId, threads],
@@ -2602,7 +2682,7 @@ const App = () => {
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
   const viewModeRef = useRef<
-    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search'
+    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search' | 'inbound' | 'queued'
   >('now');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
@@ -3225,7 +3305,8 @@ const App = () => {
           type: messageTypes.createWorkstream,
           workstream: {
             title: input.title,
-            privacy: 'shared',
+            // F04 — no hardcoded privacy: let the companion default
+            // to 'private' (privacy-first). Was 'shared'.
             description: `Created from Focus ${input.mode}.`,
           },
         });
@@ -3412,7 +3493,9 @@ const App = () => {
       if ('create' in target) {
         const afterCreate = await sendRequest({
           type: messageTypes.createWorkstream,
-          workstream: { title: target.create, privacy: 'shared' },
+          // F04 — drop hardcoded privacy: 'shared'; the companion
+          // defaults new workstreams to 'private'.
+          workstream: { title: target.create },
         });
         const created = afterCreate.workstreams.find(
           (workstream) => workstream.title === target.create && workstream.parentId === undefined,
@@ -3473,6 +3556,29 @@ const App = () => {
     event.preventDefault();
     event.dataTransfer.dropEffect = 'move';
     setDropWorkstreamId(workstreamId);
+  };
+
+  // §13 step 13 — export a workstream to the vault via the tree-path
+  // route a parallel agent owns: POST /v1/workstreams/:id/export ->
+  // { data: { files: [{ path }] } }. Direct companion fetch (matches
+  // the trust-PUT pattern); returns the written vault-relative paths.
+  const exportWorkstreamToVault = async (workstreamId: string): Promise<readonly string[]> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not connected.');
+    }
+    const response = await fetch(
+      `http://127.0.0.1:${port}/v1/workstreams/${encodeURIComponent(workstreamId)}/export`,
+      {
+        method: 'POST',
+        headers: { 'x-bac-bridge-key': bridgeKey, 'content-type': 'application/json' },
+        body: JSON.stringify({ includeThreads: true }),
+      },
+    );
+    const body = (await response.json()) as unknown;
+    if (!response.ok) {
+      throw new Error(`Export failed (HTTP ${String(response.status)}).`);
+    }
+    return extractExportPaths(body);
   };
 
   const restoreThread = (threadId: string) => {
@@ -4044,15 +4150,22 @@ const App = () => {
   const handlePacketSave = (packet: ComposedPacket) => {
     // Save-to-vault: copy body to clipboard for the user's
     // convenience, record the dispatch event with status:'noted'.
-    void navigator.clipboard.writeText(packet.body).catch(() => undefined);
+    // F01 — ship the SAFE (locally-scrubbed) body, not the raw packet.
+    // This is a local compose path (no companion round-trip yet), so
+    // the local scrub is the source of truth.
+    const safe = preflightOutbound(packet.body, mapUiTarget(packet.target)).safeText;
+    void navigator.clipboard.writeText(safe).catch(() => undefined);
     setPendingDispatch({ ...packet });
     setComposeThreadId(null);
     setError('Packet saved to vault and copied to clipboard.');
   };
 
   const handlePacketCopy = (packet: ComposedPacket) => {
+    // F01 — copy the SAFE body (redaction + injection scrub applied),
+    // never the raw packet.
+    const safe = preflightOutbound(packet.body, mapUiTarget(packet.target)).safeText;
     void navigator.clipboard
-      .writeText(packet.body)
+      .writeText(safe)
       .then(() => {
         setError(`Packet copied to clipboard (${packet.tokenEstimate.toLocaleString()} tokens).`);
       })
@@ -4096,11 +4209,15 @@ const App = () => {
         },
         idempotencyKey,
       );
-      // Cache the unredacted body locally — the companion stored a
-      // redacted form, but the user pastes the original into the
-      // chat, and the auto-link matcher needs to compare against
-      // what the user actually pasted. Fire-and-forget; failures
-      // shouldn't block the dispatch flow.
+      // F01 — the redacted-clipboard flag (default ON). When ON, the
+      // user pastes the SAFE (companion-redacted) body, so the
+      // auto-link matcher compares against the redacted text (see
+      // background.ts tryAutoLinkCapturedThread). When OFF (dogfood
+      // escape hatch), the user pastes the raw original and the matcher
+      // needs the cached original. We KEEP caching the original either
+      // way while the flag exists — the recorded plan requires >=1 week
+      // of dogfood before the original-cache mechanism is deleted.
+      const redactedClipboard = state.settings.redactedClipboard !== false;
       void sendRequest({
         type: messageTypes.cacheDispatchOriginal,
         dispatchId: submitResult.bac_id,
@@ -4123,7 +4240,18 @@ const App = () => {
       // chat to open.
       const targetUrl = TARGET_CHAT_URL[pendingDispatch.target];
       if (targetUrl !== undefined) {
-        await navigator.clipboard.writeText(pendingDispatch.body).catch(() => undefined);
+        // F01 — copy the SAFE body. With the flag ON (default) that's
+        // the companion-returned redacted body (preferred) run through
+        // the preflight (injection scrub + token check). With the flag
+        // OFF (dogfood escape hatch) fall back to the raw original the
+        // way the pre-F01 path did.
+        const clipboardBody = redactedClipboard
+          ? preflightCompanionBody(
+              submitResult.redactedBody ?? pendingDispatch.body,
+              provider,
+            ).safeText
+          : pendingDispatch.body;
+        await navigator.clipboard.writeText(clipboardBody).catch(() => undefined);
         window.open(targetUrl, '_blank', 'noopener,noreferrer');
         setError(
           `Opened ${TARGET_PROVIDER_LABEL[provider] ?? provider} in a new tab. Packet copied to your clipboard — paste to send.`,
@@ -4424,6 +4552,32 @@ const App = () => {
     currentWsId === null ? null : (state.workstreams.find((w) => w.bac_id === currentWsId) ?? null);
   const currentWsLabel =
     currentWs === null ? 'not set' : workstreamPath(currentWs.bac_id, state.workstreams);
+  // §13 steps 3/9 — inbound reminders (joined to their threads) for the
+  // Inbound view, and pending queue items grouped by target for the
+  // Queued view. Both derive off the same workboard state the rest of
+  // the panel already consumes.
+  const inboundReminders = useMemo(
+    () =>
+      mapInboundReminders(
+        state.reminders,
+        state.threads.map((t) => ({
+          bac_id: t.bac_id,
+          title: t.title,
+          ...(t.lastTurnRole === undefined ? {} : { lastTurnRole: t.lastTurnRole }),
+        })),
+        formatRelative,
+      ),
+    [state.reminders, state.threads],
+  );
+  const queueGroups = useMemo(
+    () =>
+      groupQueueItems(
+        state.queueItems,
+        state.threads.map((t) => ({ bac_id: t.bac_id, title: t.title, provider: t.provider })),
+        state.workstreams.map((w) => ({ bac_id: w.bac_id, title: w.title })),
+      ),
+    [state.queueItems, state.threads, state.workstreams],
+  );
   const tabSessionWorkstreams = useMemo<readonly TabSessionWorkstreamOption[]>(
     () => workstreamOptions.map((workstream) => ({ ...workstream })),
     [workstreamOptions],
@@ -6195,6 +6349,40 @@ const App = () => {
           <button
             type="button"
             role="tab"
+            aria-selected={viewMode === 'inbound'}
+            aria-label="Inbound replies"
+            className={'view-tab' + (viewMode === 'inbound' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('inbound');
+            }}
+          >
+            Inbound
+            {inboundReminders.length > 0 ? (
+              <span className="ct mono" aria-hidden>
+                {inboundReminders.length}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'queued'}
+            aria-label="Queued follow-ups"
+            className={'view-tab' + (viewMode === 'queued' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('queued');
+            }}
+          >
+            Queued
+            {queueGroups.length > 0 ? (
+              <span className="ct mono" aria-hidden>
+                {queueGroups.reduce((sum, g) => sum + g.items.length, 0)}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={viewMode === 'search' || viewMode === 'connections'}
             aria-label="Search"
             className={'view-tab' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
@@ -6707,11 +6895,15 @@ const App = () => {
           <span className="lbl">
             {viewMode === 'inbox'
               ? 'Inbox'
-              : viewMode === 'search' || viewMode === 'connections'
-                ? 'Search'
-                : viewMode === 'now'
-                  ? 'Now'
-                  : 'Threads'}
+              : viewMode === 'inbound'
+                ? 'Inbound'
+                : viewMode === 'queued'
+                  ? 'Queued'
+                  : viewMode === 'search' || viewMode === 'connections'
+                    ? 'Search'
+                    : viewMode === 'now'
+                      ? 'Now'
+                      : 'Threads'}
           </span>
           {/* The "vault connected" / "companion running" pills already signal
               the healthy state; only surface this status label when something
@@ -7636,6 +7828,57 @@ const App = () => {
             );
           })}
         </>
+      ) : viewMode === 'inbound' ? (
+        <InboundView
+          reminders={inboundReminders}
+          onOpen={(reminderId) => {
+            // Opening a reply focuses its thread's tab and marks the
+            // reminder seen. threadId is carried on the workboard
+            // record; look it up by the reminder's bac_id.
+            const record = state.reminders.find((r) => r.bac_id === reminderId);
+            if (record !== undefined) {
+              const thread = state.threads.find((t) => t.bac_id === record.threadId);
+              if (thread !== undefined) openTabForThread(thread);
+            }
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.updateReminder,
+                reminderId,
+                update: { status: 'seen' },
+              }),
+            );
+          }}
+          onMarkRelevant={(reminderId) => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.updateReminder,
+                reminderId,
+                update: { status: 'relevant' },
+              }),
+            );
+          }}
+          onDismiss={(reminderId) => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.updateReminder,
+                reminderId,
+                update: { status: 'dismissed' },
+              }),
+            );
+          }}
+        />
+      ) : viewMode === 'queued' ? (
+        <QueuedView
+          groups={queueGroups}
+          onDismiss={(queueItemId) => {
+            dismissQueueItem(queueItemId);
+          }}
+          onRetry={(queueItemId) => {
+            void runAction(() =>
+              sendRequest({ type: messageTypes.retryAutoSend, queueItemId }),
+            );
+          }}
+        />
       ) : null}
 
       {viewMode === 'now' ? (() => {
@@ -7673,6 +7916,10 @@ const App = () => {
             dispatchKind: DISPATCH_KIND_TO_DISPLAY[d.kind] ?? 'dispatch_out',
             dispatchedAt: formatRelative(d.createdAt),
             status: DISPATCH_STATUS_TO_DISPLAY(d.status),
+            // F31 — surface the per-provider token-budget warning on
+            // the row so a packet that won't fit the target model's
+            // context window is visible without opening the viewer.
+            tokenBudgetExceeded: d.tokenEstimate > outboundTokenThreshold(d.target.provider),
           };
         });
         // Helper: map companion target.provider → ComposedPacket
@@ -7744,16 +7991,20 @@ const App = () => {
                 setViewingDispatchId(id);
               }}
               onCopy={(id) => {
-                // Paste-mode action: re-copy + open new chat. Use the
-                // unredacted body (cached locally on submit) so the
-                // user pastes the same text the matcher will compare
-                // against — see dispatchLinking.ts and the viewer
-                // modal below.
+                // Paste-mode action: re-copy + open new chat.
+                // F01 — with the redacted-clipboard flag ON (default)
+                // ship the SAFE stored body (dispatch.body is already
+                // companion-redacted) run through the preflight; the
+                // matcher compares against the redacted paste. With the
+                // flag OFF, fall back to the cached unredacted original.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
-                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
+                const redactedClipboard = state.settings.redactedClipboard !== false;
+                const bodyToShip = redactedClipboard
+                  ? preflightOutbound(dispatch.body, dispatch.target.provider).safeText
+                  : (state.dispatchOriginals[id] ?? dispatch.body);
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   // Export / external target → open viewer instead.
@@ -7779,11 +8030,18 @@ const App = () => {
                 // auto-send via the orchestrator. Background owns the
                 // "wait for tab to load → inject content script →
                 // autoSendItem" flow.
+                // F01 — auto-send is ALWAYS preflighted (no flag): it
+                // was the zero-gate path the audit flagged. Ship the
+                // SAFE stored body (companion-redacted) through the
+                // preflight; never the cached unredacted original.
                 const dispatch = state.recentDispatches.find((d) => d.bac_id === id);
                 if (dispatch === undefined) {
                   return;
                 }
-                const bodyToShip = state.dispatchOriginals[id] ?? dispatch.body;
+                const bodyToShip = preflightOutbound(
+                  dispatch.body,
+                  dispatch.target.provider,
+                ).safeText;
                 const url = lookupChatUrl(dispatch.target.provider);
                 if (url === undefined) {
                   setViewingDispatchId(id);
@@ -8013,6 +8271,19 @@ const App = () => {
               : {}),
           }}
           scopeSuggestions={composeScopeSuggestionsByThread.get(composeThread.bac_id) ?? []}
+          // §13 step 11 — pending queue asks for this thread (and its
+          // workstream) become selectable Questions in the packet. Same
+          // projection the per-thread queue list consumes.
+          queueItems={state.queueItems
+            .filter(
+              (q) =>
+                q.status === 'pending' &&
+                (q.targetId === composeThread.bac_id ||
+                  (composeWorkstream !== undefined && q.targetId === composeWorkstream.bac_id)),
+            )
+            .slice()
+            .sort(compareQueueItems)
+            .map((q) => ({ bac_id: q.bac_id, text: q.text }))}
           onScopeChange={(workstreamId) => {
             setComposeWorkstreamOverrideId(workstreamId);
           }}
@@ -8074,6 +8345,16 @@ const App = () => {
             return autoOn ? ('chat-auto' as const) : ('chat-paste' as const);
           })()}
           tokenEstimate={pendingDispatch.tokenEstimate}
+          // F31 — per-provider context-window threshold replaces the
+          // hardcoded 8000. Export/coding targets fall to the
+          // conservative "other" floor via outboundTokenThreshold.
+          tokenLimit={outboundTokenThreshold(mapUiTarget(pendingDispatch.target))}
+          // F01 — surface the captured-page injection verdict in the
+          // confirm modal's safety chain (previously never wired).
+          injectionDetected={
+            preflightOutbound(pendingDispatch.body, mapUiTarget(pendingDispatch.target))
+              .injectionDetected
+          }
           redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
           {...(pendingDispatch.redactedItems.length > 0
             ? {
@@ -8278,6 +8559,14 @@ const App = () => {
             restoreThread(recoveryThread.bac_id);
             setRecoveryThreadId(null);
           }}
+          {...(recoverySessionId !== null
+            ? {
+                onRestoreSession: () => {
+                  restoreThreadSession(recoverySessionId);
+                  setRecoveryThreadId(null);
+                },
+              }
+            : {})}
           onReopenUrl={() => {
             restoreThread(recoveryThread.bac_id);
             setRecoveryThreadId(null);
@@ -8289,7 +8578,13 @@ const App = () => {
             favIconUrl: recoveryThread.tabSnapshot?.favIconUrl,
             capturedAt: recoveryThread.tabSnapshot?.capturedAt ?? recoveryThread.lastSeenAt,
             lastActiveAt: formatRelative(recoveryThread.lastSeenAt),
-            restoreStrategy: restoreStrategyForThread(recoveryThread),
+            // A matched closed session takes priority — it restores
+            // scroll + form state. Else fall back to focus-open (tab
+            // still alive) / reopen-URL (tab gone).
+            restoreStrategy:
+              recoverySessionId !== null
+                ? 'restore_session'
+                : restoreStrategyForThread(recoveryThread),
           }}
         />
       ) : null}
@@ -8300,14 +8595,16 @@ const App = () => {
             if (dispatch === undefined) {
               return null;
             }
-            // The companion stores a redacted body (PII / API keys
-            // → [category] tokens). The matcher in dispatchLinking.ts
-            // matches against the *unredacted* body cached locally on
-            // submit — so the viewer must show + copy the unredacted
-            // form too. Otherwise the user pastes the redacted text,
-            // the matcher's needle (unredacted) never substring-hits
-            // the captured turn, and the dispatch never links.
-            const displayBody = state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body;
+            // F01 — with the redacted-clipboard flag ON (default) the
+            // viewer shows + copies the SAFE (redacted) body, which is
+            // also what the user pastes and the matcher now compares
+            // against. With the flag OFF, show the cached unredacted
+            // original so the matcher (fed the raw original) still
+            // substring-hits the captured turn.
+            const displayBody =
+              state.settings.redactedClipboard !== false
+                ? preflightOutbound(dispatch.body, dispatch.target.provider).safeText
+                : (state.dispatchOriginals[dispatch.bac_id] ?? dispatch.body);
             const targetLabel =
               TARGET_PROVIDER_LABEL[dispatch.target.provider] ?? dispatch.target.provider;
             const linkedThreadId = state.dispatchLinks[dispatch.bac_id];
@@ -8701,6 +8998,64 @@ const App = () => {
                 },
                 threadCount: threads.filter((t) => t.primaryWorkstreamId === currentWs.bac_id)
                   .length,
+                // §13 step 7 — checklist. The full array is sent on
+                // every mutation (add/toggle/remove) so the companion
+                // register holds the authoritative list; ids +
+                // timestamps are minted here.
+                checklist: currentWs.checklist.map((item) => ({
+                  id: item.id,
+                  text: item.text,
+                  checked: item.checked,
+                })),
+                checklistBusy: busy,
+                onChecklistAdd: (text: string) => {
+                  const now = new Date().toISOString();
+                  const nextChecklist = [
+                    ...currentWs.checklist,
+                    {
+                      id: crypto.randomUUID(),
+                      text,
+                      checked: false,
+                      createdAt: now,
+                      updatedAt: now,
+                    },
+                  ];
+                  void runAction(() =>
+                    sendRequest({
+                      type: messageTypes.updateWorkstream,
+                      workstreamId: currentWs.bac_id,
+                      update: { revision: currentWs.revision, checklist: nextChecklist },
+                    }),
+                  );
+                },
+                onChecklistToggle: (id: string, checked: boolean) => {
+                  const now = new Date().toISOString();
+                  const nextChecklist = currentWs.checklist.map((item) =>
+                    item.id === id ? { ...item, checked, updatedAt: now } : item,
+                  );
+                  void runAction(() =>
+                    sendRequest({
+                      type: messageTypes.updateWorkstream,
+                      workstreamId: currentWs.bac_id,
+                      update: { revision: currentWs.revision, checklist: nextChecklist },
+                    }),
+                  );
+                },
+                onChecklistRemove: (id: string) => {
+                  const nextChecklist = currentWs.checklist.filter((item) => item.id !== id);
+                  void runAction(() =>
+                    sendRequest({
+                      type: messageTypes.updateWorkstream,
+                      workstreamId: currentWs.bac_id,
+                      update: { revision: currentWs.revision, checklist: nextChecklist },
+                    }),
+                  );
+                },
+                // §13 step 13 — export to vault. Direct companion fetch
+                // (the message layer doesn't carry the new route yet);
+                // mirrors the trust-PUT pattern below. Returns the
+                // written vault-relative paths for the inline confirm.
+                onExport: () => exportWorkstreamToVault(currentWs.bac_id),
               })}
           linkedNotes={workstreamDetailLinkedNotes}
           trustEntries={workstreamDetailTrust}
