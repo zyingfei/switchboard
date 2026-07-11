@@ -30,6 +30,11 @@ interface ParsedArgs {
   readonly mcpAuthKey?: string;
   readonly host: string;
   readonly port: number;
+  // F02 — the client name sent in x-sidetrack-mcp-client on every write
+  // call so the companion's audit log renders 'mcp:<name>' (e.g.
+  // 'mcp:codex', 'mcp:claude_code', 'mcp:cursor'). Defaults to 'mcp'
+  // when omitted. Sourced from --client-name CLI arg.
+  readonly clientName: string;
 }
 
 export const renderHelp = (): string =>
@@ -65,6 +70,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let transport: 'stdio' | 'streamable-http' = 'stdio';
   let host = '127.0.0.1';
   let port = sidetrackMcpHttpPort;
+  let clientName = 'mcp';
 
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--vault') {
@@ -97,6 +103,12 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
       }
       port = parsedPort;
       index += 1;
+    } else if (argv[index] === '--client-name') {
+      const value = argv[index + 1];
+      if (value !== undefined && value.length > 0) {
+        clientName = value;
+      }
+      index += 1;
     }
   }
 
@@ -107,6 +119,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     transport,
     host,
     port,
+    clientName,
     ...(vaultPath === undefined ? {} : { vaultPath }),
     ...(companionUrl === undefined ? {} : { companionUrl }),
     ...(bridgeKey === undefined ? {} : { bridgeKey }),
@@ -117,8 +130,18 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
 const createCompanionWriteClient = (
   companionUrl: string,
   bridgeKey: string,
+  // F02 — client name sent as x-sidetrack-mcp-client on every write call so
+  // the companion audit log renders 'mcp:<clientName>'. Defaults to 'mcp'.
+  clientName: string = 'mcp',
 ): CompanionWriteClient => {
   const base = companionUrl.replace(/\/$/, '');
+  // Base headers shared by all write calls: bridge key + client identity.
+  // The client header seeds audit provenance ('mcp:<name>') without
+  // influencing the trust decision (derived from the authenticating key).
+  const writeHeaders: Record<string, string> = {
+    'x-bac-bridge-key': bridgeKey,
+    'x-sidetrack-mcp-client': clientName,
+  };
   const post = async <TResult>(
     path: string,
     body: unknown,
@@ -128,7 +151,7 @@ const createCompanionWriteClient = (
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-bac-bridge-key': bridgeKey,
+        ...writeHeaders,
         ...extraHeaders,
       },
       body: JSON.stringify(body),
@@ -144,7 +167,7 @@ const createCompanionWriteClient = (
       method: 'PATCH',
       headers: {
         'content-type': 'application/json',
-        'x-bac-bridge-key': bridgeKey,
+        ...writeHeaders,
       },
       body: JSON.stringify(body),
     });
@@ -157,7 +180,7 @@ const createCompanionWriteClient = (
   const del = async <TResult>(path: string): Promise<TResult> => {
     const response = await fetch(`${base}${path}`, {
       method: 'DELETE',
-      headers: { 'x-bac-bridge-key': bridgeKey },
+      headers: { ...writeHeaders },
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -172,9 +195,7 @@ const createCompanionWriteClient = (
     const suffix = params.toString().length === 0 ? '' : `?${params.toString()}`;
     const response = await fetch(`${base}${path}${suffix}`, {
       method: 'GET',
-      headers: {
-        'x-bac-bridge-key': bridgeKey,
-      },
+      headers: { ...writeHeaders },
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -194,7 +215,7 @@ const createCompanionWriteClient = (
   const getObject = async (path: string): Promise<Record<string, unknown>> => {
     const response = await fetch(`${base}${path}`, {
       method: 'GET',
-      headers: { 'x-bac-bridge-key': bridgeKey },
+      headers: { ...writeHeaders },
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -579,9 +600,7 @@ const createCompanionWriteClient = (
         `${base}/v1/workstreams/${encodeURIComponent(input.workstreamId)}/linked-notes`,
         {
           method: 'GET',
-          headers: {
-            'x-bac-bridge-key': bridgeKey,
-          },
+          headers: { ...writeHeaders },
         },
       );
       if (!response.ok) {
@@ -620,7 +639,7 @@ const createCompanionWriteClient = (
       try {
         const response = await fetch(url, {
           method: 'GET',
-          headers: { 'x-bac-bridge-key': bridgeKey },
+          headers: { ...writeHeaders },
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -676,7 +695,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
 
   const companionClient =
     args.companionUrl !== undefined && args.bridgeKey !== undefined
-      ? createCompanionWriteClient(args.companionUrl, args.bridgeKey)
+      ? createCompanionWriteClient(args.companionUrl, args.bridgeKey, args.clientName)
       : undefined;
   const vaultPath = args.vaultPath;
   const createServer = () =>

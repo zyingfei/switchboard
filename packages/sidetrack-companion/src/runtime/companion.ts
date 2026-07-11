@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
+import { ensureMcpKey } from '../auth/mcpKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
@@ -315,6 +316,11 @@ export interface CompanionRuntime {
   readonly bridgeKey: string;
   readonly bridgeKeyPath: string;
   readonly bridgeKeyCreated: boolean;
+  // F02 — MCP-scoped auth key. The companion spawner must pass this to the
+  // MCP child as its --bridge-key argument so the companion server can
+  // classify MCP callers separately from the extension surface.
+  readonly mcpKey: string;
+  readonly mcpKeyPath: string;
   readonly replicaId: string;
   readonly replicaIdCreated: boolean;
   readonly close: () => Promise<void>;
@@ -350,6 +356,12 @@ export const startCompanion = async (
   };
   try {
     const ensured = await ensureBridgeKey(options.vaultPath);
+    // Generate the MCP-scoped auth key alongside bridge.key. The companion
+    // passes this key to the MCP child process (as its --bridge-key arg) so
+    // the server can distinguish MCP callers from the extension surface and
+    // apply workstream-trust enforcement (F02). Stable across boots — the
+    // same file is reused if it already exists (same pattern as bridge.key).
+    const ensuredMcpKey = await ensureMcpKey(options.vaultPath);
     const replica = await loadOrCreateReplica(options.vaultPath);
     // Refuse startup if another live process owns the recall index
     // for this vault — concurrent writers would corrupt the binary.
@@ -1034,6 +1046,9 @@ export const startCompanion = async (
     teardown.push(workGraphArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
+      // F02: classify MCP callers by this key so the auth gate can apply
+      // workstream-trust enforcement. Always set (generated at boot).
+      mcpBridgeKey: ensuredMcpKey.key,
       vaultWriter,
       vaultRoot: options.vaultPath,
       serviceInstaller: pickInstaller(),
@@ -1228,6 +1243,8 @@ export const startCompanion = async (
       bridgeKey: ensured.key,
       bridgeKeyPath: ensured.path,
       bridgeKeyCreated: ensured.created,
+      mcpKey: ensuredMcpKey.key,
+      mcpKeyPath: ensuredMcpKey.path,
       replicaId: replica.replicaId,
       replicaIdCreated: replica.created,
       close: async () => {

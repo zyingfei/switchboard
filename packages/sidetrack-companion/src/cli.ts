@@ -308,7 +308,11 @@ const spawnMcpServer = (input: {
   readonly mcpAuthKey: string;
   readonly vaultPath: string;
   readonly companionUrl: string;
-  readonly bridgeKey: string;
+  // F02: pass the MCP-scoped key (mcp.key) as the child's --bridge-key so
+  // the companion server classifies the MCP caller separately from the
+  // extension surface. The extension's bridge.key is never given to the
+  // MCP child.
+  readonly mcpKey: string;
   readonly stdout: Writable;
   readonly stderr: Writable;
 }): ChildProcess => {
@@ -323,7 +327,7 @@ const spawnMcpServer = (input: {
     '--companion-url',
     input.companionUrl,
     '--bridge-key',
-    input.bridgeKey,
+    input.mcpKey,
     '--mcp-auth-key',
     input.mcpAuthKey,
   ];
@@ -1081,7 +1085,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       mcpAuthKey: resolvedMcpAuthKey,
       vaultPath: args.vaultPath,
       companionUrl: runtime.url,
-      bridgeKey: runtime.bridgeKey,
+      // F02: use the MCP-scoped key so the companion classifies this
+      // child's requests as `mcp` (trust-gated) not `extension`.
+      mcpKey: runtime.mcpKey,
       stdout: streams.stdout,
       stderr: streams.stderr,
     });
