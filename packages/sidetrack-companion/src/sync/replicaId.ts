@@ -3,6 +3,7 @@ import { mkdir, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { writeFileAtomic } from '../vault/atomic.js';
+import { maxShardTailSeqForReplica } from './eventLog.js';
 
 // Per-replica identity + per-replica monotonic seq.
 //
@@ -100,8 +101,16 @@ export const loadOrCreateReplica = async (vaultPath: string): Promise<ReplicaCon
     readSeqFile(seqPath),
     readSeqFile(legacyPath),
   ]);
-  let highWaterMark = Math.max(seqFromCanonical, seqFromLegacy);
-  if (seqFromLegacy > 0 && seqFromCanonical < seqFromLegacy) {
+  // Reconcile the seq counter against the durable shard tails before
+  // trusting the seq file. A lost, regressed, or garbled `replica-seq`
+  // file would otherwise let nextSeq() reissue a (replicaId, seq) dot
+  // that already exists on disk — a duplicate causal-log primary key
+  // that appendClient's clientEventId-only dedupe cannot catch. The
+  // shard high-water mark is bounded work (this replica's own shard
+  // tails only) and is the source of truth for what we have committed.
+  const seqFromShards = await maxShardTailSeqForReplica(vaultPath, replicaId);
+  let highWaterMark = Math.max(seqFromCanonical, seqFromLegacy, seqFromShards);
+  if (highWaterMark > seqFromCanonical) {
     await writeFileAtomic(seqPath, `${String(highWaterMark)}\n`);
   }
   if (seqFromLegacy > 0) {

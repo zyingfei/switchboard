@@ -464,6 +464,34 @@ const listJsonlFiles = async (dir: string): Promise<string[]> => {
     .map((entry) => join(dir, entry.name));
 };
 
+// Boot reconciliation for the replica seq high-water-mark. A lost,
+// regressed, or garbled `replica-seq` file would otherwise hand out a
+// seq that ALREADY appears on disk, minting a duplicate (replicaId,
+// seq) dot — the causal event log's primary key. Because appendClient
+// dedupes on clientEventId only, that reissued dot appends unchecked
+// and poisons every downstream causal reader (deps, conflict verdicts,
+// vector frontiers). Reconcile the counter against the durable truth:
+// the highest seq this replica ever committed to its OWN shards.
+//
+// Bounded work: reads ONLY this replica's shard directory and tail-reads
+// each shard file (last non-empty line), never a full-log scan. Within
+// a replica's own shard, appendClient allocates strictly increasing
+// seqs, so the tail line carries that file's max; the max across the
+// replica's shards is its committed high-water mark. Returns 0 when the
+// replica has no shards yet (fresh replica).
+export const maxShardTailSeqForReplica = async (
+  vaultPath: string,
+  replicaId: string,
+): Promise<number> => {
+  const files = await listJsonlFiles(replicaLogDir(vaultPath, replicaId));
+  let max = 0;
+  for (const file of files) {
+    const tailSeq = await readShardTailSeq(file, replicaId);
+    if (tailSeq !== null && tailSeq > max) max = tailSeq;
+  }
+  return max;
+};
+
 export const createEventLog = (
   vaultPath: string,
   replica: ReplicaContext,
@@ -908,9 +936,23 @@ export const createEventLog = (
       // v1 stamping as computeDepsFromInput without re-reading the log.
       const deps = computeDepsIndexed(input, idx);
       const seq = await replica.nextSeq();
+      const dot: Dot = { replicaId: replica.replicaId, seq };
+      // Defense-in-depth against dot reuse: the boot reconciliation
+      // (loadOrCreateReplica ← maxShardTailSeqForReplica) already lifts
+      // the seq counter past every committed shard tail, so a fresh seq
+      // must not collide. But if the seq counter were ever corrupted at
+      // runtime, appending on a dot the index already carries would mint
+      // a duplicate causal primary key. The index is already in hand
+      // here (freshAppendIndexes above) — no extra scan — so reject
+      // loudly instead of poisoning the log.
+      if (idx.dotKeys.has(dotKeyOf(dot))) {
+        throw new Error(
+          `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
+        );
+      }
       const event: AcceptedEvent<TPayload> = {
         clientEventId: input.clientEventId,
-        dot: { replicaId: replica.replicaId, seq },
+        dot,
         deps,
         aggregateId: input.aggregateId,
         type: input.type,
