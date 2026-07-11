@@ -48,9 +48,19 @@ jobs:
         working-directory: packages/sidetrack-companion
         run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.build.json
 
-      - name: Test (bun test)
+      # bun 1.3.14 reproducibly panics during post-suite teardown on this
+      # suite (exit 133) AFTER printing the complete summary — the exit code
+      # is unreliable as a pass signal. Parse the summary strictly instead:
+      # green requires an explicit " 0 fail" line; anything else (failures,
+      # missing summary, truncated output) stays red.
+      # TODO: drop this wrapper once a bun upgrade exits cleanly here.
+      - name: Test (bun test — summary-parsed, see bun exit-panic note)
         working-directory: packages/sidetrack-companion
-        run: bun test
+        run: |
+          set -o pipefail
+          bun test 2>&1 | tee bun-test.log || true
+          grep -Eq '^ *[1-9][0-9]* pass$' bun-test.log
+          grep -Eq '^ *0 fail$' bun-test.log
 
   # ---------------------------------------------------------------------------
   # Extension (@sidetrack/extension)
@@ -84,13 +94,10 @@ jobs:
         working-directory: packages/sidetrack-extension
         run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
 
-      # TODO(F16): flip continue-on-error to false once the 13 pre-existing unit
-      # test failures are triaged and resolved. Until then CI reports a warning
-      # rather than blocking, to keep the pipeline honest about what is actually
-      # broken vs what is new regressions.
+      # F16 triage complete (2026-07-11): the 13-fail baseline was cleared
+      # (all stale tests — suite is 994/994 green), so this step is BLOCKING.
       - name: Unit tests (vitest — excludes e2e/)
         working-directory: packages/sidetrack-extension
-        continue-on-error: true  # TODO(F16): set to false after pre-existing failures fixed
         run: ../../node_modules/.bin/vitest run
 
   # ---------------------------------------------------------------------------
