@@ -18,6 +18,10 @@ describe('engagement content script wiring', () => {
     });
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: {
+        // safeSendRuntimeMessage no-ops when chrome.runtime.id is
+        // undefined (orphaned-content-script guard added in 527ce473);
+        // a live content script always has an id, so the mock must too.
+        id: 'test-extension-id',
         sendMessage: vi.fn((message: unknown) => {
           sent.push(message);
           return Promise.resolve();

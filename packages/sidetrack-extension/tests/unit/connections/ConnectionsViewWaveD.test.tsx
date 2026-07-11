@@ -89,7 +89,7 @@ describe('ConnectionsView — Wave D modes', () => {
     setConnectionsClientTransportForTests(null);
   });
 
-  it('routes Flow Path, Focus, Why Related, and Context Pack inside ConnectionsView', async () => {
+  it('routes Flow Path, Focus, and Why Related inside ConnectionsView', async () => {
     render(<ConnectionsView initialAnchor="workstream:ws_a" />);
 
     await waitFor(() => {
@@ -105,8 +105,11 @@ describe('ConnectionsView — Wave D modes', () => {
     expect(screen.getByTestId('focus-view')).toBeDefined();
     expect(screen.getByTestId('focus-topic-topic:topic_a')).toBeDefined();
 
-    fireEvent.click(screen.getByTestId('connections-mode-context'));
-    expect(screen.getByTestId('context-pack-composer')).toBeDefined();
+    // Context Pack is intentionally gated off (modeAvailability.context
+    // .hidden === true — "Hidden until Context Pack is implemented" in
+    // ConnectionsView.tsx). The tab must not render; if someone flips
+    // the gate without wiring the composer route, this fails loud.
+    expect(screen.queryByTestId('connections-mode-context')).toBeNull();
   });
 
   it('posts engagement relabel feedback from Focus mode', async () => {

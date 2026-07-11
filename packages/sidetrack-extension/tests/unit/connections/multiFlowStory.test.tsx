@@ -77,17 +77,21 @@ describe('connections — multi-flow render integration', () => {
       expect(screen.queryByTestId('connections-groups')).not.toBeNull();
     });
     // Every neighbor node in the subgraph (excluding the anchor
-    // itself) renders a row with data-testid="node-{id}".
+    // itself) renders at least one row with data-testid="node-{id}".
+    // Post-"card-everywhere" (6e661770) a node that participates in
+    // several edge kinds renders once per kind group, so a node id can
+    // legitimately appear multiple times — assert presence via
+    // queryAllByTestId, not the singular query which throws on >1.
     for (const id of expected) {
       if (id === 'workstream:ws_security') continue;
       expect(
-        screen.queryByTestId(`node-${id}`),
+        screen.queryAllByTestId(`node-${id}`).length,
         `expected ${id} to render in Flow A panel`,
-      ).not.toBeNull();
+      ).toBeGreaterThan(0);
     }
     // No Flow B or Flow C exclusive thread leaks in.
-    expect(screen.queryByTestId('node-thread:t_pg_claude')).toBeNull();
-    expect(screen.queryByTestId('node-thread:t_sb_claude')).toBeNull();
+    expect(screen.queryAllByTestId('node-thread:t_pg_claude')).toHaveLength(0);
+    expect(screen.queryAllByTestId('node-thread:t_sb_claude')).toHaveLength(0);
   });
 
   it('Flow B anchor (ws_postgres): linked panel renders only Flow B nodes', async () => {
@@ -100,12 +104,12 @@ describe('connections — multi-flow render integration', () => {
     for (const id of expected) {
       if (id === 'workstream:ws_postgres') continue;
       expect(
-        screen.queryByTestId(`node-${id}`),
+        screen.queryAllByTestId(`node-${id}`).length,
         `expected ${id} to render in Flow B panel`,
-      ).not.toBeNull();
+      ).toBeGreaterThan(0);
     }
-    expect(screen.queryByTestId('node-thread:t_cve_claude')).toBeNull();
-    expect(screen.queryByTestId('node-thread:t_sb_claude')).toBeNull();
+    expect(screen.queryAllByTestId('node-thread:t_cve_claude')).toHaveLength(0);
+    expect(screen.queryAllByTestId('node-thread:t_sb_claude')).toHaveLength(0);
   });
 
   it('Flow C anchor (ws_sidetrack): linked panel renders only Flow C nodes', async () => {
@@ -118,12 +122,12 @@ describe('connections — multi-flow render integration', () => {
     for (const id of expected) {
       if (id === 'workstream:ws_sidetrack') continue;
       expect(
-        screen.queryByTestId(`node-${id}`),
+        screen.queryAllByTestId(`node-${id}`).length,
         `expected ${id} to render in Flow C panel`,
-      ).not.toBeNull();
+      ).toBeGreaterThan(0);
     }
-    expect(screen.queryByTestId('node-thread:t_cve_claude')).toBeNull();
-    expect(screen.queryByTestId('node-thread:t_pg_claude')).toBeNull();
+    expect(screen.queryAllByTestId('node-thread:t_cve_claude')).toHaveLength(0);
+    expect(screen.queryAllByTestId('node-thread:t_pg_claude')).toHaveLength(0);
   });
 
   it('cross-flow HN URL anchor reveals both Postgres and Sidetrack Claude threads', async () => {
@@ -133,8 +137,8 @@ describe('connections — multi-flow render integration', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('connections-groups')).not.toBeNull();
     });
-    expect(screen.queryByTestId('node-thread:t_pg_claude')).not.toBeNull();
-    expect(screen.queryByTestId('node-thread:t_sb_claude')).not.toBeNull();
+    expect(screen.queryAllByTestId('node-thread:t_pg_claude').length).toBeGreaterThan(0);
+    expect(screen.queryAllByTestId('node-thread:t_sb_claude').length).toBeGreaterThan(0);
   });
 
   it('Orbital sub-mode places every Flow A neighbor on the canvas at 2-hop', async () => {

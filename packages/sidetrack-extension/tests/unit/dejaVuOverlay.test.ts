@@ -31,7 +31,7 @@ describe('Déjà-vu content overlay', () => {
 
     expect(screen.getByText('Claude')).toBeInTheDocument();
     expect(screen.getByText(/min ago|sec ago/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Jump' }));
+    fireEvent.click(screen.getByRole('button', { name: /↗ open/i }));
     expect(onJump).toHaveBeenCalledWith(
       expect.objectContaining({ threadUrl: 'https://claude.ai/chat/thread-1' }),
     );

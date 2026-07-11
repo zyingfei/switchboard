@@ -395,7 +395,16 @@ describe('connections — full-snapshot render covers every emitted edge kind', 
       const matchingEdges = EDGE_FIXTURES.filter((f) => f.kind === kind);
       for (const f of matchingEdges) {
         const id = `edge:${f.kind}:${f.from.id}:${f.to.id}`;
-        expect(screen.queryByTestId(`edge-${id}`), `edge button missing for ${id}`).not.toBeNull();
+        // Card-everywhere (6e661770): an edge whose endpoints both
+        // resolve renders as a NodeRow card, and the same edge shows
+        // on BOTH endpoint cards (once as an endpoint's primary edge,
+        // once via the edge-list otherNode row) — so `edge-{id}` can
+        // legitimately appear more than once. Assert presence via the
+        // plural query which does not throw on duplicates.
+        expect(
+          screen.queryAllByTestId(`edge-${id}`).length,
+          `edge button missing for ${id}`,
+        ).toBeGreaterThan(0);
       }
     }
   });
@@ -408,12 +417,15 @@ describe('connections — full-snapshot render covers every emitted edge kind', 
     for (const f of EDGE_FIXTURES) {
       const id = `edge:${f.kind}:${f.from.id}:${f.to.id}`;
       const hint = contentDerivedHint(f.kind);
-      const hintEl = screen.queryByTestId(`edge-hint-${id}`);
+      // As above: with card-everywhere, a hint-bearing edge can render
+      // its chip on more than one card. Use the plural query and treat
+      // "at least one" as present / "none" as absent.
+      const hintEls = screen.queryAllByTestId(`edge-hint-${id}`);
       if (hint === null) {
-        expect(hintEl, `unexpected hint for ${f.kind}`).toBeNull();
+        expect(hintEls, `unexpected hint for ${f.kind}`).toHaveLength(0);
       } else {
-        expect(hintEl, `hint chip missing for ${f.kind}`).not.toBeNull();
-        expect(hintEl!.textContent).toBe(hint);
+        expect(hintEls.length, `hint chip missing for ${f.kind}`).toBeGreaterThan(0);
+        expect(hintEls[0]!.textContent).toBe(hint);
       }
     }
   });

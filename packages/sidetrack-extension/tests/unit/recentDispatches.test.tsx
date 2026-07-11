@@ -26,7 +26,7 @@ describe('RecentDispatches — mode-aware actions', () => {
         onOpenTarget={onOpenTarget}
       />,
     );
-    const open = screen.getByRole('button', { name: /↗ open/ });
+    const open = screen.getByRole('button', { name: /↗ open/i });
     expect(open).toBeInTheDocument();
     fireEvent.click(open);
     expect(onOpenTarget).toHaveBeenCalledWith('d1');
