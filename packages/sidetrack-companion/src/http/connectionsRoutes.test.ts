@@ -134,6 +134,7 @@ describe('connections HTTP routes', () => {
       data: { snapshot: { nodes: { id: string }[]; snapshotRevision?: string } };
     };
     expect(firstBody.data.snapshot.nodes.map((n) => n.id)).toContain('thread:thread_a');
+    const firstRevision = firstBody.data.snapshot.snapshotRevision;
 
     const replacementNode: ConnectionNode = {
       id: 'thread:thread_b',
@@ -142,6 +143,13 @@ describe('connections HTTP routes', () => {
       originReplicaIds: [],
       metadata: { provider: 'chatgpt', threadId: 'provider-thread-b' },
     };
+    // NOTE: the caller-supplied snapshotRevision is a hint only — the
+    // SqliteConnectionsStore content-addresses the revision on write
+    // (computeSnapshotRevision over updatedAt+counts+projection keys),
+    // so the persisted/served revision is the store's recomputed hash,
+    // NOT this literal. What this test guards is invalidation: a fresh
+    // putCurrent must rotate the cache key so the second GET reflects
+    // the new graph + a new revision (never a stale cached response).
     const replacement: ConnectionsSnapshot = {
       scope: {},
       nodes: [replacementNode],
@@ -149,17 +157,22 @@ describe('connections HTTP routes', () => {
       updatedAt: '2026-05-07T10:02:00.000Z',
       nodeCount: 1,
       edgeCount: 0,
-      snapshotRevision: 'sqlite-cache-revision-b',
     };
     await connectionsStore.putCurrent(replacement);
+    const storedRevision = (await connectionsStore.readCurrent())?.snapshotRevision;
+    expect(storedRevision).toBeDefined();
 
     const second = await get('/v1/connections');
     expect(second.status).toBe(200);
     const secondBody = second.data as {
       data: { snapshot: { nodes: { id: string }[]; snapshotRevision?: string } };
     };
-    expect(secondBody.data.snapshot.snapshotRevision).toBe('sqlite-cache-revision-b');
+    // Cache invalidated: content is the replacement graph, and the
+    // served revision is the store's freshly-computed hash (distinct
+    // from the first response's) — proving the key rotated.
     expect(secondBody.data.snapshot.nodes.map((n) => n.id)).toEqual(['thread:thread_b']);
+    expect(secondBody.data.snapshot.snapshotRevision).toBe(storedRevision);
+    expect(secondBody.data.snapshot.snapshotRevision).not.toBe(firstRevision);
   });
 
   it('GET /v1/connections?workstreamId= filters to the workstream subgraph', async () => {

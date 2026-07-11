@@ -697,20 +697,28 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   });
 
   it('POST /v1/visits/batch-resolve can expand focused URL event candidates', async () => {
-    const targetUrl = 'https://news.ycombinator.com/item?id=48178692';
-    const anchorUrl = 'https://news.ycombinator.com/item?id=48112042';
+    // Two pages on the SAME single-topic domain so the same_repo_or_domain
+    // candidate source (domain:docs.kernel.org) links the focused URL to the
+    // workstream-bearing anchor. Deliberately NOT an aggregator domain
+    // (news.ycombinator.com / reddit.com / …): those are suppressed by the
+    // COARSE_MULTI_TOPIC_DOMAINS guard in ranker/candidates.ts, which drops
+    // bare-domain + title/path grouping precisely because two same-domain
+    // items there are NOT topically related. This test exercises the
+    // event-candidate-expansion path, not that guard.
+    const targetUrl = 'https://docs.kernel.org/security/self-protection.html';
+    const anchorUrl = 'https://docs.kernel.org/security/lsm.html';
     await connectionsStore.putCurrent(
       snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates'),
     );
     await appendObservation({
       seq: 1,
       url: targetUrl,
-      title: 'Linux security mailing list almost unmanageable',
+      title: 'Kernel Self-Protection',
     });
     await appendObservation({
       seq: 2,
       url: anchorUrl,
-      title: 'Linux security follow-up',
+      title: 'Linux Security Module framework',
     });
 
     const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
