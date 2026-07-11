@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   createServer as createNodeHttpServer,
   type IncomingMessage,
@@ -14,11 +14,16 @@ export const sidetrackMcpHttpPath = '/mcp';
 export const sidetrackMcpHttpPort = 8721;
 export const mcpAuthenticationRequiredCode = -32001;
 
+export const BRIDGE_KEY_GUIDANCE =
+  'The bridge key lives at ~/.sidetrack-vault/_BAC/.config/bridge.key. ' +
+  'Pass it via --mcp-auth-key <key> (or set SIDETRACK_MCP_AUTH_KEY in the environment).';
+
 export interface StreamableHttpMcpServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly path?: string;
-  readonly authKey?: string;
+  /** Required. The streamable-HTTP transport refuses to start without a non-empty auth key. */
+  readonly authKey: string;
   readonly createServer: () => McpServer;
 }
 
@@ -91,16 +96,39 @@ const isLoopbackOrigin = (origin: string): boolean => {
   }
 };
 
-const isAuthorized = (request: IncomingMessage, authKey: string | undefined): boolean => {
-  if (authKey === undefined || authKey.length === 0) {
-    return true;
+// DNS-rebinding defense: only accept Host headers that resolve to a loopback
+// address. Absent/empty Host is also rejected so curl-style headerless
+// requests from a remote machine cannot reach the server.
+const LOOPBACK_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/i;
+
+const isLoopbackHost = (hostHeader: string | undefined): boolean => {
+  if (typeof hostHeader !== 'string' || hostHeader.length === 0) {
+    return false;
   }
+  return LOOPBACK_HOST_RE.test(hostHeader.trim());
+};
+
+// Timing-safe token comparison. If the two values differ in length, we hash
+// both with SHA-256 first so the buffers are always equal length — this
+// avoids early exit while still comparing the actual secrets.
+const timingSafeStringEqual = (a: string, b: string): boolean => {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length === bufB.length) {
+    return timingSafeEqual(bufA, bufB);
+  }
+  const hashA = createHash('sha256').update(bufA).digest();
+  const hashB = createHash('sha256').update(bufB).digest();
+  return timingSafeEqual(hashA, hashB);
+};
+
+const isAuthorized = (request: IncomingMessage, authKey: string): boolean => {
   const header = request.headers.authorization;
   if (typeof header !== 'string') {
     return false;
   }
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match !== null && match[1] === authKey;
+  return match !== null && timingSafeStringEqual(match[1] ?? '', authKey);
 };
 
 const sendJson = (response: ServerResponse, status: number, body: unknown): void => {
@@ -125,6 +153,13 @@ const closeHttpServer = (server: HttpServer): Promise<void> =>
 export const startStreamableHttpMcpServer = async (
   options: StreamableHttpMcpServerOptions,
 ): Promise<StartedStreamableHttpMcpServer> => {
+  // No insecure-by-default escape hatch: refuse to bind without a key.
+  if (options.authKey.trim().length === 0) {
+    throw new Error(
+      `sidetrack-mcp streamable-HTTP transport requires an auth key. ${BRIDGE_KEY_GUIDANCE}`,
+    );
+  }
+
   const host = options.host ?? '127.0.0.1';
   const port = options.port ?? sidetrackMcpHttpPort;
   const path = options.path ?? sidetrackMcpHttpPath;
@@ -144,6 +179,18 @@ export const startStreamableHttpMcpServer = async (
     const url = new URL(request.url ?? '/', `http://${host}:${String(port)}`);
     if (url.pathname !== path) {
       sendJson(response, 404, { error: `MCP endpoint is available at ${path}.` });
+      return;
+    }
+
+    // DNS-rebinding defense: enforce that the Host header names a loopback
+    // address. This prevents a page served from the internet from using
+    // fetch() to reach the locally-bound server by guessing its port.
+    if (!isLoopbackHost(request.headers.host)) {
+      sendJson(response, 403, {
+        jsonrpc: '2.0',
+        error: { code: -32002, message: 'Host not allowed. Only loopback addresses are accepted.' },
+        id: null,
+      });
       return;
     }
 

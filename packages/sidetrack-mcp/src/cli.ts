@@ -45,11 +45,12 @@ export const renderHelp = (): string =>
     '  sidetrack-mcp --version',
     '  sidetrack-mcp --list-tools',
     '  sidetrack-mcp --vault <path> [--companion-url <url> --bridge-key <key>]',
-    '  sidetrack-mcp --transport streamable-http --vault <path> [--port 8721]',
-    '                [--companion-url <url> --bridge-key <key>] [--mcp-auth-key <key>]',
+    '  sidetrack-mcp --transport streamable-http --vault <path> --mcp-auth-key <key>',
+    '                [--port 8721] [--companion-url <url> --bridge-key <key>]',
     '',
-    'Streamable HTTP endpoint defaults to http://127.0.0.1:8721/mcp. When an',
-    'auth key is configured, send Authorization: Bearer <key> on every request.',
+    'Streamable HTTP transport requires --mcp-auth-key (or --bridge-key as fallback).',
+    'The key is at ~/.sidetrack-vault/_BAC/.config/bridge.key.',
+    'Send Authorization: Bearer <key> on every request.',
   ].join('\n');
 
 const writeLine = (stream: Writable, text: string): void => {
@@ -663,11 +664,13 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient);
 
   if (args.transport === 'streamable-http') {
-    const authKey = args.mcpAuthKey ?? args.bridgeKey;
+    const authKey = args.mcpAuthKey ?? args.bridgeKey ?? '';
+    // startStreamableHttpMcpServer enforces a non-empty key; the thrown
+    // error includes bridge.key guidance. No need to duplicate the check here.
     const started = await startStreamableHttpMcpServer({
       host: args.host,
       port: args.port,
-      ...(authKey === undefined ? {} : { authKey }),
+      authKey,
       createServer,
     });
     writeLine(streams.stderr, `sidetrack-mcp streamable-http listening on ${started.url}`);

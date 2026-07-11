@@ -385,9 +385,14 @@ afterEach(async () => {
   writeClient.recordedCalls.splice(0);
 });
 
+// The streamable-HTTP transport now requires a non-empty auth key.
+// Use a stable test-only constant so all connections in this file agree.
+const E2E_TEST_AUTH_KEY = 'e2e-test-bridge-key';
+
 const startServer = async (): Promise<StartedStreamableHttpMcpServer> => {
   const started = await startStreamableHttpMcpServer({
     port: 0,
+    authKey: E2E_TEST_AUTH_KEY,
     createServer: () => createSidetrackMcpServer(reader, writeClient),
   });
   startedServers.push(started);
@@ -448,9 +453,9 @@ describe('codex handoff over MCP', () => {
 
     const client = new Client({ name: 'codex-handoff-e2e', version: '0.0.0' });
     await client.connect(
-      new StreamableHTTPClientTransport(new URL(mcpEndpoint)) as unknown as Parameters<
-        typeof client.connect
-      >[0],
+      new StreamableHTTPClientTransport(new URL(mcpEndpoint), {
+        requestInit: { headers: { Authorization: `Bearer ${E2E_TEST_AUTH_KEY}` } },
+      }) as unknown as Parameters<typeof client.connect>[0],
     );
     try {
       // Step 2 — discover available tools (the prompt says to do this).
@@ -560,9 +565,9 @@ describe('codex handoff over MCP', () => {
     const parsed = parseAttachPrompt(prompt);
     const client = new Client({ name: 'codex-inbound-e2e', version: '0.0.0' });
     await client.connect(
-      new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint)) as unknown as Parameters<
-        typeof client.connect
-      >[0],
+      new StreamableHTTPClientTransport(new URL(parsed.mcpEndpoint), {
+        requestInit: { headers: { Authorization: `Bearer ${E2E_TEST_AUTH_KEY}` } },
+      }) as unknown as Parameters<typeof client.connect>[0],
     );
     try {
       const tools = await client.listTools();
