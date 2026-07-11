@@ -44,9 +44,12 @@ jobs:
       # tsconfig.build.json is the repo's declared typecheck gate (matches the
       # local convention). The full tsconfig.json includes test files that
       # carry pre-existing type drift — tracked backlog, not a CI gate yet.
-      - name: Typecheck
+      # This emits dist/ (not --noEmit) because the HNSW reconcile child
+      # integration suite spawns a child from
+      # dist/sync/contract/connectionsReconcileChild.entry.js.
+      - name: Typecheck + build dist (child-process tests need it)
         working-directory: packages/sidetrack-companion
-        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.build.json
+        run: ../../node_modules/.bin/tsc -p tsconfig.build.json
 
       # bun 1.3.14 reproducibly panics during post-suite teardown on this
       # suite (exit 133) AFTER printing the complete summary — the exit code
