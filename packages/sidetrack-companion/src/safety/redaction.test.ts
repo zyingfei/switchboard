@@ -51,6 +51,39 @@ describe('redact', () => {
     expect(result.matched).toBe(1);
   });
 
+  it('redacts AWS access key ids', () => {
+    const result = redact('key AKIAIOSFODNN7EXAMPLE end');
+
+    expect(result.output).toBe('key [aws-access-key] end');
+    expect(result.categories).toEqual(['aws-access-key']);
+    expect(result.matched).toBe(1);
+  });
+
+  it('redacts labelled AWS secret access keys', () => {
+    const secret = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+    const result = redact(`aws_secret_access_key=${secret}`);
+
+    expect(result.output).toBe('aws_secret_access_key=[aws-secret-key]');
+    expect(result.categories).toEqual(['aws-secret-key']);
+    expect(result.matched).toBe(1);
+  });
+
+  it('redacts US social security numbers', () => {
+    const result = redact('SSN 123-45-6789 on file');
+
+    expect(result.output).toBe('SSN [ssn] on file');
+    expect(result.categories).toEqual(['ssn']);
+    expect(result.matched).toBe(1);
+  });
+
+  it('redacts phone numbers', () => {
+    const result = redact('call (415) 555-0134 today');
+
+    expect(result.output).toBe('call [phone] today');
+    expect(result.categories).toEqual(['phone']);
+    expect(result.matched).toBe(1);
+  });
+
   it('returns no matches for ordinary text', () => {
     expect(redact('No secrets in this dispatch.')).toEqual({
       output: 'No secrets in this dispatch.',

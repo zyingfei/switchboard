@@ -16,6 +16,7 @@ export const sidetrackToolNames = [
   'sidetrack.threads.move',
   'sidetrack.queue.create',
   'sidetrack.workstreams.bump',
+  'sidetrack.workstreams.create',
   'sidetrack.threads.archive',
   'sidetrack.threads.unarchive',
   'sidetrack.audit.list',

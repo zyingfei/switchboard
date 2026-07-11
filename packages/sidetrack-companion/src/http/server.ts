@@ -14,7 +14,13 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
-import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
+import { bridgeKeysMatch, isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
+import {
+  boundArgsSummary,
+  currentAuditContext as currentAuditContextMut,
+  runWithAuditContext,
+  type AuditContext,
+} from '../vault/auditContext.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
@@ -187,7 +193,7 @@ import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '..
 import { generateCandidates } from '../ranker/candidates.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
-import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
+import { estimateTokens, tokenThresholdForProvider } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
@@ -397,6 +403,7 @@ import {
   turnsQuerySchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
+  workstreamExportSchema,
   autoUpdateSchema,
   bucketsPutSchema,
   workstreamTrustPutSchema,
@@ -404,6 +411,15 @@ import {
 
 export interface CompanionHttpConfig {
   readonly bridgeKey: string;
+  // F02 — the MCP-scoped bridge key (mcp.key). When set, the sidetrack-mcp
+  // process authenticates its companion calls with THIS key instead of the
+  // extension bridge key. The auth gate accepts both keys but classifies
+  // the caller by which one matched: an mcpBridgeKey match is an `mcp`
+  // caller (subject to workstream-trust enforcement on every write route);
+  // a bridgeKey match is the `extension` surface (exempt). Optional so
+  // legacy runtimes / tests that never wire an MCP key keep working — when
+  // unset, every caller is classified `extension` (pre-F02 behaviour).
+  readonly mcpBridgeKey?: string;
   readonly vaultWriter: VaultWriter;
   readonly vaultRoot?: string;
   readonly serviceInstaller?: Installer;
@@ -1376,11 +1392,62 @@ const writerForBucket = async (
     : createVaultWriter(bucket.vaultRoot);
 };
 
+// F02 — server-derived caller identity. The auth gate classifies each
+// request by WHICH key authenticated (extension bridge key vs MCP key)
+// and stashes the verdict here, keyed by the request object. Trust
+// enforcement + audit provenance read this — never the voluntary
+// `x-sidetrack-mcp-tool` header, which a caller could simply omit to
+// slip past the gate. A WeakMap so entries are collected with the
+// request and never leak across requests.
+type CallerClass = 'extension' | 'mcp';
+
+interface CallerIdentity {
+  readonly callerClass: CallerClass;
+  // Best-effort client name for `mcp:<client-name>` audit provenance,
+  // sourced from the (still-honoured, LOGGING-only) tool header's
+  // namespace or a client hint. Undefined ⇒ 'mcp' with no sub-name.
+  readonly clientName?: string;
+}
+
+const callerIdentities = new WeakMap<IncomingMessage, CallerIdentity>();
+
+const setCallerIdentity = (request: IncomingMessage, identity: CallerIdentity): void => {
+  callerIdentities.set(request, identity);
+};
+
+// Default to `extension` when unclassified: legacy runtimes / tests that
+// never wire an MCP key see the pre-F02 exempt behaviour, and a request
+// that somehow reached a handler without passing the auth gate is treated
+// as the least-privileged-surprise (extension) rather than crashing.
+const callerIdentityFor = (request: IncomingMessage): CallerIdentity =>
+  callerIdentities.get(request) ?? { callerClass: 'extension' };
+
+const auditAgentLabel = (identity: CallerIdentity): string =>
+  identity.callerClass === 'mcp'
+    ? identity.clientName === undefined
+      ? 'mcp'
+      : `mcp:${identity.clientName}`
+    : 'extension';
+
+// Enforce per-workstream MCP write trust. Enforcement is driven by the
+// SERVER-DERIVED caller class, NOT the voluntary tool header: an MCP-key
+// caller is gated on every write route it can reach, header or no header.
+// The extension surface (user's own bridge key) is exempt. Also refines
+// the ambient audit context so the resulting audit line records the tool
+// + workstream scope + that trust mode was active.
 const requireWorkstreamTrust = async (
   context: CompanionHttpConfig,
+  request: IncomingMessage,
   workstreamId: string | undefined,
   tool: WorkstreamWriteTool,
 ): Promise<void> => {
+  const identity = callerIdentityFor(request);
+  recordAuditTool(tool, workstreamId ?? null);
+  if (identity.callerClass !== 'mcp') {
+    // Extension surface: exempt from the trust gate.
+    return;
+  }
+  recordAuditTrustModeActive();
   if (workstreamId === undefined || context.vaultRoot === undefined) {
     return;
   }
@@ -1388,12 +1455,32 @@ const requireWorkstreamTrust = async (
     throw new HttpRouteError(
       403,
       'WORKSTREAM_NOT_TRUSTED',
-      'Workstream has not trusted this MCP write tool.',
-      `${tool} is not allowed for workstream ${workstreamId}.`,
+      'Workstream has not granted this MCP write tool.',
+      `${tool} is not trusted for workstream ${workstreamId}. Grant it via the workstream's ` +
+        `Trust panel in the side panel, or PUT /v1/workstreams/${workstreamId}/trust with ` +
+        `allowedTools including "${tool}". (Per-call approval prompts are planned for P2.)`,
     );
   }
 };
 
+// Refine the ambient audit context with the tool + scope for the
+// current write. No-op when no context is bound (direct writer use).
+const recordAuditTool = (tool: string, scope: string | null): void => {
+  const ctx = currentAuditContextMut();
+  if (ctx === undefined) return;
+  ctx.tool = tool;
+  ctx.scope = scope;
+};
+
+const recordAuditTrustModeActive = (): void => {
+  const ctx = currentAuditContextMut();
+  if (ctx !== undefined) ctx.trustModeActive = true;
+};
+
+// The tool header is retained for LOGGING during the deprecation window
+// only — enforcement no longer depends on it. Kept as a best-effort
+// provenance hint (which tool a caller CLAIMS to be) even though the
+// server derives the actual trust decision from the authenticating key.
 const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefined => {
   const value = request.headers['x-sidetrack-mcp-tool'];
   if (typeof value !== 'string') {
@@ -4586,6 +4673,11 @@ const routes: readonly RouteDefinition[] = [
           });
           const redaction = redact(input.body);
           const tokenEstimate = estimateTokens(redaction.output);
+          // Provider-aware warning threshold. The chat surface for each
+          // provider caps context well below the raw API window; see
+          // safety/tokenBudget.ts for the (approximate) per-provider map.
+          const tokenThreshold = tokenThresholdForProvider(input.target.provider);
+          const tokenBudgetExceeded = tokenEstimate > tokenThreshold;
           const dispatchEvent = {
             ...input,
             bac_id: input.bac_id ?? createDispatchId(),
@@ -4637,10 +4729,26 @@ const routes: readonly RouteDefinition[] = [
           return [
             201,
             {
-              data: result,
-              ...(tokenEstimate > tokenBudgetWarningThreshold
-                ? { warnings: ['token-budget-exceeded'] }
-                : {}),
+              data: {
+                ...result,
+                // F01: return the SAFE text the companion stored so the
+                // extension can render/copy exactly that instead of the
+                // caller's pre-redaction original. `body` is redacted;
+                // `redaction.rules` are the applied rule ids.
+                body: dispatchEvent.body,
+                redactionSummary: dispatchEvent.redactionSummary,
+                redaction: {
+                  applied: redaction.matched > 0,
+                  rules: [...redaction.categories],
+                },
+                tokenEstimate,
+                tokenWarning: {
+                  provider: input.target.provider,
+                  threshold: tokenThreshold,
+                  exceeded: tokenBudgetExceeded,
+                },
+              },
+              ...(tokenBudgetExceeded ? { warnings: ['token-budget-exceeded'] } : {}),
             },
           ];
         },
@@ -6410,10 +6518,15 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
-      const tool = mcpToolHeader(request);
-      if (tool === 'sidetrack.threads.move') {
-        await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
-      }
+      // Enforce trust for MCP-key callers regardless of the (voluntary,
+      // now logging-only) tool header. A thread upsert that sets a
+      // primaryWorkstreamId is a move; gate it on that workstream.
+      await requireWorkstreamTrust(
+        context,
+        request,
+        input.primaryWorkstreamId,
+        'sidetrack.threads.move',
+      );
       const result = await context.vaultWriter.upsertThread(input, requestId);
       // Mirror the upsert as a `thread.upserted` AcceptedEvent so
       // peers see thread state via sync. The legacy thread.json
@@ -6481,6 +6594,22 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // §13 step 13 — user-facing Markdown export of a single thread.
+    // Same shape + atomic-write path as the workstream export. Normal
+    // bridge-key route.
+    method: 'POST',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/export$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      requireVaultRoot(context);
+      const result = await context.vaultWriter.exportThread(match.bacId);
+      return [200, { data: { files: [...result.files] } }];
+    },
+  },
+  {
     method: 'POST',
     pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/archive$/,
     authRequired: true,
@@ -6489,13 +6618,12 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing bacId path parameter.');
       }
       const vaultRoot = requireVaultRoot(context);
-      if (mcpToolHeader(_request) === 'sidetrack.threads.archive') {
-        await requireWorkstreamTrust(
-          context,
-          await readThreadWorkstreamId(vaultRoot, match.bacId),
-          'sidetrack.threads.archive',
-        );
-      }
+      await requireWorkstreamTrust(
+        context,
+        _request,
+        await readThreadWorkstreamId(vaultRoot, match.bacId),
+        'sidetrack.threads.archive',
+      );
       const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
       // Mirror as a thread.archived event so peers see the status
       // change via sync. clientEventId is deterministic per
@@ -6536,13 +6664,12 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'sidetrack.threads.unarchive') {
-        await requireWorkstreamTrust(
-          context,
-          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
-          'sidetrack.threads.unarchive',
-        );
-      }
+      await requireWorkstreamTrust(
+        context,
+        _request,
+        await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+        'sidetrack.threads.unarchive',
+      );
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
@@ -6567,6 +6694,15 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       const input = workstreamCreateSchema.parse(await readBody(request));
+      // F32 — creating a CHILD workstream is trust-gated on the parent
+      // for MCP-key callers; a top-level create (no parentId) has no
+      // scope to check and passes. Extension surface is exempt.
+      await requireWorkstreamTrust(
+        context,
+        request,
+        input.parentId,
+        'sidetrack.workstreams.create',
+      );
       const result = await context.vaultWriter.createWorkstream(input, requestId);
       if (context.eventLog !== undefined) {
         await context.eventLog
@@ -6578,7 +6714,10 @@ const routes: readonly RouteDefinition[] = [
               bac_id: result.bac_id,
               title: input.title,
               ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
-              ...(input.privacy === undefined ? {} : { privacy: input.privacy }),
+              // Match the writer's default (createWorkstream stamps
+              // `privacy: input.privacy ?? 'private'`) so the event log
+              // never disagrees with the persisted record.
+              privacy: input.privacy ?? 'private',
               ...(input.screenShareSensitive === undefined
                 ? {}
                 : { screenShareSensitive: input.screenShareSensitive }),
@@ -6671,6 +6810,27 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // §13 step 13 — user-facing Markdown export of a workstream (and,
+    // when includeThreads is set, its threads). Writes tree-path report
+    // files OUTSIDE _BAC/ via the writer's atomic primitive, returning
+    // vault-root-relative paths. Normal bridge-key route.
+    method: 'POST',
+    pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/export$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      requireVaultRoot(context);
+      // readBody returns {} for an empty POST, so includeThreads defaults off.
+      const input = workstreamExportSchema.parse(await readBody(request));
+      const result = await context.vaultWriter.exportWorkstream(match.bacId, {
+        ...(input.includeThreads === undefined ? {} : { includeThreads: input.includeThreads }),
+      });
+      return [200, { data: { files: [...result.files] } }];
+    },
+  },
+  {
     method: 'GET',
     pattern: /^\/v1\/workstreams\/(?<workstreamId>[A-Za-z0-9_-]+)\/trust$/,
     authRequired: true,
@@ -6687,9 +6847,9 @@ const routes: readonly RouteDefinition[] = [
           data: {
             workstreamId: match.workstreamId,
             // Fresh workstreams (no explicit record on disk) default
-            // to allowing every write tool — matches isAllowed's
-            // allow-by-default semantic so the side panel renders
-            // all toggles ON before the user has touched the section.
+            // to NO allowed write tools — matches isAllowed's
+            // deny-by-default semantic (PRD §6.1.14, re-recorded
+            // 2026-07-11): MCP write trust is opt-in per workstream.
             allowedTools:
               record === undefined ? [...defaultAllowedTools()] : [...record.allowedTools],
           },
@@ -6726,9 +6886,7 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'sidetrack.workstreams.bump') {
-        await requireWorkstreamTrust(context, match.bacId, 'sidetrack.workstreams.bump');
-      }
+      await requireWorkstreamTrust(context, _request, match.bacId, 'sidetrack.workstreams.bump');
       return [
         200,
         mutationResponse(
@@ -6860,9 +7018,11 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'createQueueItem', idempotencyKey, async () => {
         const input = queueCreateSchema.parse(await readBody(request));
-        const tool = mcpToolHeader(request);
-        if (tool === 'sidetrack.queue.create' && input.scope === 'workstream') {
-          await requireWorkstreamTrust(context, input.targetId, tool);
+        // Only a workstream-scoped queue item is trust-gated; a thread /
+        // global item has no workstream to check. MCP-key callers are
+        // gated on that workstream; the extension surface is exempt.
+        if (input.scope === 'workstream') {
+          await requireWorkstreamTrust(context, request, input.targetId, 'sidetrack.queue.create');
         }
         const result = await context.vaultWriter.createQueueItem(input, requestId);
         if (context.eventLog !== undefined) {
@@ -7883,12 +8043,26 @@ export const handleRequest = async (
   // caller can't enumerate the route table by probing status codes.
   // Debug/diagnostic routes are NOT in the allowlist, so they now
   // require auth like every other route.
+  //
+  // F02 — the companion accepts TWO keys and classifies the caller by
+  // which one authenticated:
+  //   - the extension bridge key  → `extension` (the user's surface, exempt
+  //     from workstream-trust enforcement).
+  //   - the MCP key (mcpBridgeKey) → `mcp` (subject to trust enforcement on
+  //     every write route). The MCP key is checked FIRST so an mcp-key
+  //     caller is never mis-classified as the extension. When no MCP key is
+  //     wired, only the bridge-key path exists (pre-F02 behaviour).
   if (!isPublicUnauthenticatedPath(method, url.pathname)) {
     const actualKey = request.headers['x-bac-bridge-key'];
-    if (
-      typeof actualKey !== 'string' ||
-      !(await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey))
-    ) {
+    const isMcpKey =
+      typeof actualKey === 'string' &&
+      context.mcpBridgeKey !== undefined &&
+      bridgeKeysMatch(context.mcpBridgeKey, actualKey);
+    const accepted =
+      typeof actualKey === 'string' &&
+      (isMcpKey ||
+        (await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey)));
+    if (!accepted) {
       sendJson(
         response,
         401,
@@ -7901,6 +8075,25 @@ export const handleRequest = async (
       );
       return;
     }
+    // The tool header is honoured for LOGGING only (deprecation window):
+    // it seeds the audit `tool` hint + the mcp client-name, but the trust
+    // decision is derived from the authenticating key above, never here.
+    // Honoured for LOGGING only: `x-sidetrack-mcp-client` names the MCP
+    // client (e.g. 'codex', 'claude_code') for `mcp:<client-name>` audit
+    // provenance; `x-sidetrack-mcp-tool` is the legacy tool hint. Neither
+    // influences the trust decision (derived from the key above).
+    const clientHeader = request.headers['x-sidetrack-mcp-client'];
+    const clientName =
+      typeof clientHeader === 'string' && clientHeader.length > 0 ? clientHeader : undefined;
+    // Touch the tool header so it stays a live (logging-only) surface
+    // during the deprecation window; the value is not load-bearing.
+    void mcpToolHeader(request);
+    setCallerIdentity(
+      request,
+      isMcpKey
+        ? { callerClass: 'mcp', ...(clientName === undefined ? {} : { clientName }) }
+        : { callerClass: 'extension' },
+    );
   }
 
   const route = routes.find((candidate) => {
@@ -7955,7 +8148,22 @@ export const handleRequest = async (
     // Fire-and-forget; zero overhead when the env is unset.
     const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
     const httpLogStartedMs = httpLog ? Date.now() : 0;
-    const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
+    // F02 — bind the base audit provenance for the request so any vault
+    // write it triggers records the caller class. The trust gate refines
+    // this (tool / scope / trustModeActive) when it runs. Only mutating
+    // methods write audit lines, so reads skip the wrapper. argsSummary
+    // is the method + pathname (never query/body — no full payloads).
+    const auditBase: AuditContext = {
+      agent: auditAgentLabel(callerIdentityFor(request)),
+      tool: null,
+      scope: null,
+      trustModeActive: false,
+      argsSummary: boundArgsSummary(`${method ?? 'UNKNOWN'} ${url.pathname}`),
+    };
+    const runHandler = (): Promise<readonly [number, unknown]> =>
+      route.handle(request, requestId, match?.groups ?? {}, context);
+    const [status, body] =
+      method === 'GET' ? await runHandler() : await runWithAuditContext(auditBase, runHandler);
     const logHttp = (statusForLog: number): void => {
       if (!httpLog) return;
       // pathname ONLY — url.search is deliberately omitted (PII).

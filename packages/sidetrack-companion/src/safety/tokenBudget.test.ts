@@ -1,6 +1,25 @@
 import { describe, expect, it } from 'vitest';
 
-import { estimateTokens, tokenBudgetWarningThreshold } from './tokenBudget.js';
+import {
+  estimateTokens,
+  providerTokenThresholds,
+  tokenBudgetWarningThreshold,
+  tokenThresholdForProvider,
+} from './tokenBudget.js';
+
+describe('tokenThresholdForProvider', () => {
+  it('returns the per-provider threshold for known providers', () => {
+    expect(tokenThresholdForProvider('chatgpt')).toBe(providerTokenThresholds.chatgpt);
+    expect(tokenThresholdForProvider('claude')).toBe(providerTokenThresholds.claude);
+    expect(tokenThresholdForProvider('gemini')).toBe(providerTokenThresholds.gemini);
+  });
+
+  it('falls back to the conservative "other" default for unknown providers', () => {
+    expect(tokenThresholdForProvider('codex')).toBe(providerTokenThresholds.other);
+    expect(tokenThresholdForProvider('nonsense')).toBe(providerTokenThresholds.other);
+    expect(tokenBudgetWarningThreshold).toBe(providerTokenThresholds.other);
+  });
+});
 
 describe('estimateTokens', () => {
   it('returns 0 for empty input', () => {

@@ -454,6 +454,25 @@ const createCompanionWriteClient = (
       }
       return { bac_id: body.data.bac_id, revision: body.data.revision };
     },
+    async createWorkstream(input) {
+      const body = await post<{
+        readonly data?: { readonly bac_id?: string; readonly revision?: string };
+      }>(
+        '/v1/workstreams',
+        {
+          title: input.title,
+          ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+          // `kind` has no first-class field on the workstream record yet;
+          // carry it as a tag so it survives without a schema change.
+          ...(input.kind === undefined ? {} : { tags: [input.kind] }),
+        },
+        { 'x-sidetrack-mcp-tool': 'sidetrack.workstreams.create' },
+      );
+      if (typeof body.data?.bac_id !== 'string' || typeof body.data.revision !== 'string') {
+        throw new Error('Companion did not return bac_id + revision for the created workstream.');
+      }
+      return { bac_id: body.data.bac_id, revision: body.data.revision };
+    },
     async archiveThread(input) {
       const body = await post<{
         readonly data?: { readonly bac_id?: string; readonly revision?: string };

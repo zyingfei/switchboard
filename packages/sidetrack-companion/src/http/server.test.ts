@@ -832,9 +832,27 @@ describe('companion HTTP server', () => {
     );
 
     expect(result.status).toBe(201);
+    // F01: the POST response returns the SAFE (redacted) body the
+    // companion stored, plus the applied rule ids and the token
+    // warning — so the extension copies THAT, not the raw original.
     expect(result.body).toMatchObject({
-      data: { bac_id: expect.stringMatching(/^disp_/u), status: 'recorded' },
+      data: {
+        bac_id: expect.stringMatching(/^disp_/u),
+        status: 'recorded',
+        body: 'Email [email] and token [github-token]',
+        redactionSummary: { matched: 2, categories: ['github-token', 'email'] },
+        redaction: {
+          applied: true,
+          rules: ['github-token', 'email'],
+        },
+        tokenEstimate: 10,
+        tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: false },
+      },
     });
+    // The returned body must never contain the raw secret.
+    const responseData = (result.body as { readonly data: { readonly body: string } }).data;
+    expect(responseData.body).not.toContain(githubToken);
+    expect(responseData.body).not.toContain('owner@example.com');
     expect(list.status).toBe(200);
     expect(list.body).toMatchObject({
       data: [
@@ -1273,11 +1291,11 @@ describe('companion HTTP server', () => {
     expect(dispatchLog.match(/Only one dispatch line/g)).toHaveLength(1);
   });
 
-  it('returns a token budget warning for oversized dispatches', async () => {
-    // ~9000 distinct lowercase ASCII words — each is ≈1 cl100k token,
-    // putting us comfortably above the 8000 warning threshold without
-    // depending on the heuristic's quirks.
-    const body = Array.from({ length: 9_000 }, (_, i) => `tok${String(i)}`).join(' ');
+  it('returns a token budget warning when a dispatch crosses the provider threshold', async () => {
+    // ` tok` tokenizes to ≈1 cl100k token each; 130K of them is ~520KB
+    // (under the 1 MiB body cap) yet clears chatgpt's 128K window — the
+    // smallest per-provider threshold — without heuristic quirks.
+    const body = Array.from({ length: 130_000 }, () => 'tok').join(' ');
     const result = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
       method: 'POST',
       headers: {
@@ -1287,7 +1305,7 @@ describe('companion HTTP server', () => {
       },
       body: JSON.stringify({
         kind: 'other',
-        target: { provider: 'other', mode: 'paste' },
+        target: { provider: 'chatgpt', mode: 'paste' },
         title: 'Large dispatch',
         body,
       }),
@@ -1295,6 +1313,35 @@ describe('companion HTTP server', () => {
 
     expect(result.status).toBe(201);
     expect(result.body).toMatchObject({ warnings: ['token-budget-exceeded'] });
+    expect(result.body).toMatchObject({
+      data: { tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: true } },
+    });
+  });
+
+  it('does not warn when a dispatch fits the provider threshold', async () => {
+    // ~9000 tokens is well under every per-provider window (128K+), so
+    // no warning fires — the old flat 8000 threshold no longer applies.
+    const body = Array.from({ length: 9_000 }, (_, i) => `tok${String(i)}`).join(' ');
+    const result = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-test-token-under-budget',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'other',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Fits the budget',
+        body,
+      }),
+    });
+
+    expect(result.status).toBe(201);
+    expect(result.body).not.toMatchObject({ warnings: ['token-budget-exceeded'] });
+    expect(result.body).toMatchObject({
+      data: { tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: false } },
+    });
   });
 
   it('returns vault-unreachable for dispatch writes when the vault is missing', async () => {
@@ -1731,7 +1778,7 @@ describe('companion HTTP server', () => {
     });
   });
 
-  it('GET /trust returns all write tools by default for an unseen workstream', async () => {
+  it('GET /trust returns no write tools by default for an unseen workstream', async () => {
     const ws = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -1747,13 +1794,9 @@ describe('companion HTTP server', () => {
         readonly data: { readonly allowedTools: readonly string[] };
       }
     ).data.allowedTools;
-    // Mirror the workstreamWriteTools constant — every tool is on
-    // by default. PUT can later persist a deny-list.
-    expect(tools).toContain('sidetrack.threads.move');
-    expect(tools).toContain('sidetrack.threads.archive');
-    expect(tools).toContain('sidetrack.threads.unarchive');
-    expect(tools).toContain('sidetrack.queue.create');
-    expect(tools).toContain('sidetrack.workstreams.bump');
+    // Deny-by-default (PRD §6.1.14, re-recorded 2026-07-11): a fresh
+    // workstream grants no MCP write tools until the user opts in via PUT.
+    expect(tools).toEqual([]);
   });
 
   it('renames a workstream and reparents to a new group, then detaches back to top-level', async () => {
@@ -1927,14 +1970,14 @@ describe('companion HTTP server', () => {
     expect(missing.body).toMatchObject({ code: 'INTERNAL_ERROR' });
   });
 
-  it('defaults new workstreams to shared and supports screenshare-sensitive metadata', async () => {
+  it('defaults new workstreams to private and supports screenshare-sensitive metadata', async () => {
     const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-bac-bridge-key': bridgeKey,
       },
-      body: JSON.stringify({ title: 'Default shared' }),
+      body: JSON.stringify({ title: 'Default private' }),
     });
     expect(workstreamResult.status).toBe(201);
     const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
@@ -1942,7 +1985,8 @@ describe('companion HTTP server', () => {
     const json = JSON.parse(
       await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
-    expect(json.privacy).toBe('shared');
+    // Privacy defaults closed (PRD §6.1.13: new workstreams are 'private').
+    expect(json.privacy).toBe('private');
     expect(json.screenShareSensitive).toBe(false);
 
     const updateResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}`, {
@@ -1961,7 +2005,8 @@ describe('companion HTTP server', () => {
     const updated = JSON.parse(
       await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
-    expect(updated.privacy).toBe('shared');
+    // A metadata-only PATCH must not disturb the privacy value.
+    expect(updated.privacy).toBe('private');
     expect(updated.screenShareSensitive).toBe(true);
   });
 
@@ -2854,7 +2899,7 @@ describe('companion HTTP server', () => {
     }
   });
 
-  it('manages workstream trust — allow-by-default; explicit empty list denies', async () => {
+  it('manages workstream trust — records persist; bridge-key callers are exempt from gating', async () => {
     const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -2862,10 +2907,11 @@ describe('companion HTTP server', () => {
     });
     const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
-    // Fresh workstream — no trust record on disk. The default flips
-    // from deny-by-default to allow-by-default so the MCP write call
-    // succeeds without the user pre-toggling anything.
-    const allowedByDefault = await jsonFetch(
+    // Bridge-key callers are the user surface: trust gating never applies
+    // to them, regardless of the (logging-only) x-sidetrack-mcp-tool
+    // header. MCP-key caller enforcement is covered in
+    // mcpTrustAndExport.test.ts.
+    const allowedAsExtension = await jsonFetch(
       context,
       `${baseUrl}/v1/workstreams/${workstreamId}/bump`,
       {
@@ -2876,24 +2922,24 @@ describe('companion HTTP server', () => {
         },
       },
     );
-    expect(allowedByDefault.status).toBe(200);
+    expect(allowedAsExtension.status).toBe(200);
 
-    // Persist an explicit empty allow-list to deny everything.
+    // Persist an explicit empty allow-list; the record round-trips but the
+    // bridge-key caller stays exempt.
     const putEmpty = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
       body: JSON.stringify({ allowedTools: [] }),
     });
     expect(putEmpty.status).toBe(200);
-    const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
+    const stillAllowed = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
       headers: {
         'x-bac-bridge-key': bridgeKey,
         'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
       },
     });
-    expect(denied.status).toBe(403);
-    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+    expect(stillAllowed.status).toBe(200);
 
     // Re-allow only the bump tool.
     const putAllow = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {

@@ -82,6 +82,11 @@ describe('renderWorkstreamMarkdown', () => {
     expect(md).toContain('title: bac_no_title');
     expect(md).toMatch(/# bac_no_title/);
   });
+
+  it("defaults absent privacy to 'private' (symmetry with the writer default)", () => {
+    const md = renderWorkstreamMarkdown({ bac_id: 'bac_default_priv', revision: 'rev' });
+    expect(md).toContain('privacy: private');
+  });
 });
 
 describe('renderThreadMarkdown', () => {

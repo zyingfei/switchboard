@@ -1,6 +1,6 @@
 import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
@@ -21,7 +21,9 @@ import {
   reviewEventRecordSchema,
   settingsDocumentSchema,
 } from '../http/schemas.js';
-import { writeJsonAtomic } from './atomic.js';
+import { writeFileAtomic, writeJsonAtomic } from './atomic.js';
+import { currentAuditContext } from './auditContext.js';
+import { VaultUnavailableError } from '../http/errors.js';
 import type {
   AuditEventRecord,
   AuditListQuery,
@@ -176,6 +178,21 @@ export interface VaultWriter {
   readonly bumpWorkstream: (bac_id: string, requestId: string) => Promise<MutationResult>;
   readonly archiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
   readonly unarchiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
+  // §13 step 13 — user-facing Markdown export. Projects the workstream
+  // (and optionally its threads) / the thread to Markdown and writes it
+  // at the tree-derived path <ancestor titles…>/<safe-title>-report<N>.md
+  // relative to the vault root (OUTSIDE _BAC/ — distinct from the flat
+  // _BAC/<type>/<bac_id>.md sidecars, which stay). report<N> increments
+  // when the target already exists so an export never overwrites a
+  // prior one. bac_id lives in frontmatter, so a later reorg that moves
+  // the file never breaks linkage. Returns vault-root-relative paths.
+  readonly exportWorkstream: (
+    workstreamId: string,
+    options: { readonly includeThreads?: boolean },
+  ) => Promise<{ readonly files: readonly { readonly path: string }[] }>;
+  readonly exportThread: (
+    threadId: string,
+  ) => Promise<{ readonly files: readonly { readonly path: string }[] }>;
 }
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
@@ -217,6 +234,48 @@ const writeMarkdownProjection = async (path: string, body: string): Promise<void
 const appendJsonLine = async (path: string, value: unknown): Promise<void> => {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, `${JSON.stringify(value)}\n`, { encoding: 'utf8', flag: 'a' });
+};
+
+// §13 export — sanitize a workstream/thread title into a single safe
+// path segment. Strips filesystem-reserved characters, collapses
+// whitespace, and caps length so a pathological title can't blow past
+// filesystem limits. Falls back to the bac_id (passed by the caller as
+// `fallback`) when the title reduces to nothing.
+const sanitizePathSegment = (value: string, fallback: string): string => {
+  const cleaned = Array.from(value)
+    .map((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      // Strip ASCII control characters (0x00-0x1F, 0x7F) and path /
+      // Windows-reserved characters, mapping each to a space so word
+      // boundaries survive.
+      if (code < 0x20 || code === 0x7f || '/\\:*?"<>|'.includes(char)) {
+        return ' ';
+      }
+      return char;
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Leading dots would make hidden / relative-looking segments.
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 120)
+    .trim();
+  return cleaned.length > 0 ? cleaned : fallback;
+};
+
+// Return the first `<baseName>-report<N>.md` path under `directory`
+// that does not already exist, starting at N=1. Never overwrites a
+// prior export.
+const nextReportPath = async (directory: string, baseName: string): Promise<string> => {
+  for (let n = 1; ; n += 1) {
+    const candidate = join(directory, `${baseName}-report${String(n)}.md`);
+    try {
+      await access(candidate);
+    } catch {
+      return candidate;
+    }
+  }
 };
 
 const readJsonRecord = async (path: string): Promise<Record<string, unknown>> => {
@@ -420,14 +479,39 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
     try {
       await access(vaultPath);
     } catch {
-      throw new Error('Vault path is unavailable.');
+      throw new VaultUnavailableError();
     }
   };
 
   const audit = async (event: AuditEvent): Promise<void> => {
+    // Merge the ambient request-scoped provenance (agent / tool /
+    // argsSummary / scope / trustModeActive) set by the HTTP layer. When
+    // no context is bound (direct writer use, legacy paths) the line is
+    // written with the base fields only — still schema-valid.
+    const provenance = currentAuditContext();
+    const enriched: AuditEvent &
+      Partial<{
+        agent: string;
+        tool: string | null;
+        argsSummary: string;
+        scope: string | null;
+        trustModeActive: boolean;
+      }> =
+      provenance === undefined
+        ? event
+        : {
+            ...event,
+            agent: provenance.agent,
+            tool: provenance.tool,
+            ...(provenance.argsSummary === undefined
+              ? {}
+              : { argsSummary: provenance.argsSummary }),
+            scope: provenance.scope,
+            trustModeActive: provenance.trustModeActive,
+          };
     await appendJsonLine(
       join(bacRoot, 'audit', `${dateStamp(new Date(event.timestamp))}.jsonl`),
-      event,
+      enriched,
     );
   };
 
@@ -1341,6 +1425,105 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       await writeJson(path, updated);
       await audit({ requestId, route: 'unarchiveThread', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
+    },
+
+    async exportWorkstream(workstreamId, options) {
+      await ensureVaultPresent();
+      const record = await readJsonRecord(
+        join(bacRoot, 'workstreams', `${workstreamId}.json`),
+      );
+      // Walk the parent chain (root → self) to build the on-disk tree
+      // that mirrors the workstream hierarchy. A cycle guard caps the
+      // walk so a corrupt parent loop can't spin forever.
+      const chain: Record<string, unknown>[] = [record];
+      const seen = new Set<string>([workstreamId]);
+      let cursor = typeof record['parentId'] === 'string' ? record['parentId'] : undefined;
+      while (cursor !== undefined && !seen.has(cursor)) {
+        seen.add(cursor);
+        try {
+          const parent = await readJsonRecord(join(bacRoot, 'workstreams', `${cursor}.json`));
+          chain.unshift(parent);
+          cursor = typeof parent['parentId'] === 'string' ? parent['parentId'] : undefined;
+        } catch {
+          break;
+        }
+      }
+      const segments = chain.map((entry) => {
+        const id = typeof entry['bac_id'] === 'string' ? entry['bac_id'] : workstreamId;
+        const title = typeof entry['title'] === 'string' ? entry['title'] : id;
+        return sanitizePathSegment(title, id);
+      });
+      // Export tree lives OUTSIDE _BAC/ — this is the user-facing
+      // report, distinct from the flat _BAC/workstreams/<id>.md sidecar.
+      const directory = join(vaultPath, ...segments);
+      const selfTitle =
+        typeof record['title'] === 'string' ? record['title'] : workstreamId;
+      const reportPath = await nextReportPath(
+        directory,
+        sanitizePathSegment(selfTitle, workstreamId),
+      );
+      const body = renderWorkstreamMarkdown(record as unknown as WorkstreamProjectionInput);
+      await writeFileAtomic(reportPath, body);
+      const files: { readonly path: string }[] = [{ path: relative(vaultPath, reportPath) }];
+
+      if (options.includeThreads === true) {
+        const threadsRoot = join(bacRoot, 'threads');
+        try {
+          const threadFiles = await readdir(threadsRoot);
+          for (const file of threadFiles.filter((name) => name.endsWith('.json')).sort()) {
+            const thread = await readJsonRecord(join(threadsRoot, file));
+            if (thread['primaryWorkstreamId'] !== workstreamId) continue;
+            const threadId =
+              typeof thread['bac_id'] === 'string' ? thread['bac_id'] : undefined;
+            if (threadId === undefined) continue;
+            const threadTitle =
+              typeof thread['title'] === 'string' ? thread['title'] : threadId;
+            const threadReportPath = await nextReportPath(
+              directory,
+              sanitizePathSegment(threadTitle, threadId),
+            );
+            await writeFileAtomic(
+              threadReportPath,
+              renderThreadMarkdown(thread as unknown as ThreadProjectionInput),
+            );
+            files.push({ path: relative(vaultPath, threadReportPath) });
+          }
+        } catch (error) {
+          if (!isMissingPathError(error)) throw error;
+        }
+      }
+      return { files };
+    },
+
+    async exportThread(threadId) {
+      await ensureVaultPresent();
+      const record = await readJsonRecord(join(bacRoot, 'threads', `${threadId}.json`));
+      // Place the thread report under its workstream's tree when it has
+      // one, else at the vault root. Only the immediate workstream title
+      // is used as the parent segment; the full ancestor chain is a
+      // workstream-export concern.
+      const workstreamId =
+        typeof record['primaryWorkstreamId'] === 'string'
+          ? record['primaryWorkstreamId']
+          : undefined;
+      const parentSegments: string[] = [];
+      if (workstreamId !== undefined) {
+        try {
+          const ws = await readJsonRecord(join(bacRoot, 'workstreams', `${workstreamId}.json`));
+          const wsTitle = typeof ws['title'] === 'string' ? ws['title'] : workstreamId;
+          parentSegments.push(sanitizePathSegment(wsTitle, workstreamId));
+        } catch {
+          // Missing workstream record → export at the vault root.
+        }
+      }
+      const directory = join(vaultPath, ...parentSegments);
+      const title = typeof record['title'] === 'string' ? record['title'] : threadId;
+      const reportPath = await nextReportPath(directory, sanitizePathSegment(title, threadId));
+      await writeFileAtomic(
+        reportPath,
+        renderThreadMarkdown(record as unknown as ThreadProjectionInput),
+      );
+      return { files: [{ path: relative(vaultPath, reportPath) }] };
     },
   };
 };
