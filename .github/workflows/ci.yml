@@ -6,11 +6,16 @@
 #   - eval suites (eval:recall — cost-gated, needs model downloads)
 #   - build step (requires native binaries / wxt — out-of-scope for unit CI)
 #
+# Layout note: this is a Bun workspace — ALL binaries (tsc, vitest, wxt) are
+# hoisted to the repo-root node_modules/.bin. Steps that run from a package
+# working-directory must use ../../node_modules/.bin/<tool>.
+# Each job runs its own `bun install --frozen-lockfile` (fast, deterministic)
+# instead of a cross-job cache dance — reliability over seconds saved.
+#
 # Extension unit tests use continue-on-error because there are 13 pre-existing
 # failures on this branch that have not been triaged yet.
 # TODO(F16): once the F16 triage wave resolves those failures, flip
 #   continue-on-error to false so the extension test step is blocking.
-#   Track this at: https://github.com/zyingfei/browser-ai-companion/issues
 
 name: CI
 
@@ -20,10 +25,11 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Install shared node_modules once; cache for subsequent jobs.
+  # Companion (@sidetrack/companion)
+  # test runner: bun test (NOT vitest — see companion package.json)
   # ---------------------------------------------------------------------------
-  install:
-    name: Install dependencies
+  companion:
+    name: Companion — typecheck + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,45 +41,9 @@ jobs:
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
 
-      # Cache the node_modules so sibling jobs don't re-install.
-      - name: Cache node_modules
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            node_modules
-            packages/sidetrack-companion/node_modules
-            packages/sidetrack-extension/node_modules
-            packages/sidetrack-mcp/node_modules
-          key: bun-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-
-  # ---------------------------------------------------------------------------
-  # Companion (@sidetrack/companion)
-  # test runner: bun test (NOT vitest — see companion package.json)
-  # ---------------------------------------------------------------------------
-  companion:
-    name: Companion — typecheck + test
-    runs-on: ubuntu-latest
-    needs: install
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.14"
-
-      - name: Restore node_modules
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            node_modules
-            packages/sidetrack-companion/node_modules
-            packages/sidetrack-extension/node_modules
-            packages/sidetrack-mcp/node_modules
-          key: bun-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-
       - name: Typecheck
         working-directory: packages/sidetrack-companion
-        run: ./node_modules/.bin/tsc --noEmit -p tsconfig.json
+        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
 
       - name: Test (bun test)
         working-directory: packages/sidetrack-companion
@@ -84,15 +54,14 @@ jobs:
   # Unit tests only — vitest.config.ts includes only tests/unit/**/*.test.{ts,tsx}
   # and src/**/*.test.{ts,tsx}; e2e specs live in tests/e2e/ and are excluded.
   #
-  # WARNING: continue-on-error is set to TRUE because there are 13 pre-existing
-  # test failures on this branch. This means CI will NOT block on red extension
-  # tests until those are triaged.
+  # WARNING: continue-on-error is TRUE because of the 13 pre-existing unit
+  # failures on this branch. CI will NOT block on red extension tests until
+  # those are triaged.
   # TODO(F16): set continue-on-error to false once pre-existing failures are resolved.
   # ---------------------------------------------------------------------------
   extension:
     name: Extension — typecheck + unit tests
     runs-on: ubuntu-latest
-    needs: install
     steps:
       - uses: actions/checkout@v4
 
@@ -100,24 +69,17 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-      - name: Restore node_modules
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            node_modules
-            packages/sidetrack-companion/node_modules
-            packages/sidetrack-extension/node_modules
-            packages/sidetrack-mcp/node_modules
-          key: bun-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
 
       # wxt prepare generates .wxt/tsconfig.json which the extension tsconfig extends.
       - name: Prepare WXT (generates .wxt/ types)
         working-directory: packages/sidetrack-extension
-        run: ./node_modules/.bin/wxt prepare
+        run: ../../node_modules/.bin/wxt prepare
 
       - name: Typecheck
         working-directory: packages/sidetrack-extension
-        run: ./node_modules/.bin/tsc --noEmit -p tsconfig.json
+        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
 
       # TODO(F16): flip continue-on-error to false once the 13 pre-existing unit
       # test failures are triaged and resolved. Until then CI reports a warning
@@ -126,7 +88,7 @@ jobs:
       - name: Unit tests (vitest — excludes e2e/)
         working-directory: packages/sidetrack-extension
         continue-on-error: true  # TODO(F16): set to false after pre-existing failures fixed
-        run: ./node_modules/.bin/vitest run
+        run: ../../node_modules/.bin/vitest run
 
   # ---------------------------------------------------------------------------
   # MCP (@sidetrack/mcp)
@@ -134,7 +96,6 @@ jobs:
   mcp:
     name: MCP — typecheck + test
     runs-on: ubuntu-latest
-    needs: install
     steps:
       - uses: actions/checkout@v4
 
@@ -142,20 +103,13 @@ jobs:
         with:
           bun-version: "1.3.14"
 
-      - name: Restore node_modules
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            node_modules
-            packages/sidetrack-companion/node_modules
-            packages/sidetrack-extension/node_modules
-            packages/sidetrack-mcp/node_modules
-          key: bun-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
 
       - name: Typecheck
         working-directory: packages/sidetrack-mcp
-        run: ./node_modules/.bin/tsc --noEmit -p tsconfig.json
+        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
 
       - name: Test (vitest)
         working-directory: packages/sidetrack-mcp
-        run: ./node_modules/.bin/vitest run
+        run: ../../node_modules/.bin/vitest run
