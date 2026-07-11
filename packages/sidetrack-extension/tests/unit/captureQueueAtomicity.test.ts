@@ -1,0 +1,296 @@
+import { describe, expect, it } from 'vitest';
+
+import type { CaptureEvent } from '../../src/companion/model';
+import {
+  drainQueue,
+  enqueueCapture,
+  enqueueCaptureInternal,
+  readQueue,
+  type StoragePort,
+} from '../../src/companion/queue';
+import { singleFlight, withQueueLock } from '../../src/companion/captureQueueMutex';
+
+const event = (threadUrl: string): CaptureEvent => ({
+  provider: 'unknown',
+  threadUrl,
+  title: threadUrl,
+  capturedAt: '2026-04-26T21:30:00.000Z',
+  turns: [],
+});
+
+// Memory storage with an optional per-key set() gate so a test can
+// suspend a write mid-flight and force an interleaving. `snapshot`
+// exposes the raw stored values for assertions.
+interface ControllableStorage extends StoragePort {
+  readonly snapshot: () => Record<string, unknown>;
+  readonly raw: (key: string) => unknown;
+}
+
+const createMemoryStorage = (): ControllableStorage => {
+  const values = new Map<string, unknown>();
+  return {
+    get(key, fallback) {
+      return Promise.resolve((values.has(key) ? values.get(key) : fallback) as typeof fallback);
+    },
+    set(nextValues) {
+      Object.entries(nextValues).forEach(([key, value]) => {
+        values.set(key, value);
+      });
+      return Promise.resolve();
+    },
+    snapshot() {
+      return Object.fromEntries(values.entries());
+    },
+    raw(key) {
+      return values.get(key);
+    },
+  };
+};
+
+const deferred = <T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+};
+
+const QUEUE_KEY = 'sidetrack.captureQueue';
+const SCRATCH_KEY = 'sidetrack.captureQueue.evicting';
+
+describe('capture queue atomicity (F12)', () => {
+  it('a write that lands in the queue key while a drain awaits the network is not clobbered by the end-of-drain persist', async () => {
+    // Requirement (b): the end-of-drain persist merges per-item against
+    // a FRESH read, so an item that appeared in the queue key after the
+    // drain's pre-send snapshot survives. This is the belt-and-suspenders
+    // guard for any writer that reaches the key concurrently (a second
+    // SW context, or a mutex-bypassing path); the mutex alone would
+    // serialize an in-process enqueue, but the merge is what makes the
+    // persist itself safe against a concurrent write.
+    const storage = createMemoryStorage();
+    await enqueueCapture(event('https://e.test/to-send'), storage, 10, 'passive');
+
+    let injected = false;
+    const drainResult = await drainQueue(
+      async () => {
+        // Simulate a concurrent writer landing a fresh item into the
+        // queue key DURING the send await — after the drain read its
+        // pre-send snapshot.
+        if (!injected) {
+          injected = true;
+          const current = (await storage.get<unknown[]>(QUEUE_KEY, [])) as unknown[];
+          await storage.set({
+            [QUEUE_KEY]: [
+              ...current,
+              {
+                id: crypto.randomUUID(),
+                queuedAt: '2030-01-01T00:00:00.000Z',
+                attempts: 0,
+                nextAttemptAt: '2030-01-01T00:00:00.000Z',
+                payload: { intent: 'passive', event: event('https://e.test/raced-in') },
+              },
+            ],
+          });
+        }
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    expect(drainResult.sent).toBe(1);
+    const remaining = (await readQueue(storage)).map((q) => q.event.threadUrl);
+    // The sent item is gone; the concurrently-written item survived the
+    // persist instead of being overwritten by the pre-drain snapshot.
+    expect(remaining).toContain('https://e.test/raced-in');
+    expect(remaining).not.toContain('https://e.test/to-send');
+  });
+
+  it('eviction interrupted between staging and commit loses no survivor', async () => {
+    const storage = createMemoryStorage();
+    // Fill a cap-2 queue with two passive items.
+    await enqueueCapture(event('https://e.test/p1'), storage, 2, 'passive');
+    await enqueueCapture(event('https://e.test/p2'), storage, 2, 'passive');
+
+    // Explicit capture at capacity triggers eviction. Throw in the gap
+    // between "stage to scratch" and "commit to primary" — the window
+    // that used to leave the primary key empty.
+    await expect(
+      enqueueCaptureInternal(event('https://e.test/explicit'), storage, 2, 'explicit', () => {
+        throw new Error('service worker terminated mid-eviction');
+      }),
+    ).rejects.toThrow('service worker terminated mid-eviction');
+
+    // The primary key was never emptied: both original passives remain.
+    const rawQueue = storage.raw(QUEUE_KEY) as { payload: { event: CaptureEvent } }[];
+    const urls = rawQueue.map((i) => i.payload.event.threadUrl);
+    expect(urls).toContain('https://e.test/p1');
+    expect(urls).toContain('https://e.test/p2');
+    expect(urls).toHaveLength(2);
+
+    // A leftover scratch record is reconciled on the next read and the
+    // queue reads back exactly the two survivors.
+    const readBack = (await readQueue(storage)).map((q) => q.event.threadUrl);
+    expect(readBack.sort()).toEqual(['https://e.test/p1', 'https://e.test/p2']);
+    expect(storage.raw(SCRATCH_KEY)).toEqual([]);
+  });
+
+  it('concurrent drain calls coalesce into a single drain (each item sent once)', async () => {
+    const storage = createMemoryStorage();
+    await enqueueCapture(event('https://e.test/a'), storage, 10, 'passive');
+    await enqueueCapture(event('https://e.test/b'), storage, 10, 'passive');
+
+    const sent: string[] = [];
+    // Each send yields to the microtask queue so the second drain call
+    // (fired in the same tick, before the first resolves) has a live
+    // in-flight drain to coalesce onto.
+    const send = async (e: CaptureEvent): Promise<void> => {
+      sent.push(e.threadUrl);
+      await Promise.resolve();
+    };
+
+    const drainA = drainQueue(send, storage, new Date('2030-01-01T00:00:00.000Z'), () => 0.5, {
+      ignoreBackoff: true,
+    });
+    // Fire the second drain synchronously (same tick) so it coalesces
+    // onto the in-flight drainA promise rather than starting its own.
+    const drainB = drainQueue(send, storage, new Date('2030-01-01T00:00:00.000Z'), () => 0.5, {
+      ignoreBackoff: true,
+    });
+
+    const [resultA, resultB] = await Promise.all([drainA, drainB]);
+
+    // Both callers observe the same coalesced drain result.
+    expect(resultA).toEqual(resultB);
+    // Each queued item was sent exactly once despite two drain calls.
+    expect(sent.sort()).toEqual(['https://e.test/a', 'https://e.test/b']);
+    expect(await readQueue(storage)).toEqual([]);
+  });
+
+  it('full-queue explicit capture preserves the newest explicit item (evicting one passive)', async () => {
+    const storage = createMemoryStorage();
+    await enqueueCapture(event('https://e.test/p1'), storage, 2, 'passive');
+    await enqueueCapture(event('https://e.test/p2'), storage, 2, 'passive');
+
+    const result = await enqueueCapture(event('https://e.test/newest'), storage, 2, 'explicit');
+    expect(result.accepted).toBe(true);
+    expect(result.evicted).toBe(1);
+
+    const queue = await readQueue(storage);
+    expect(queue).toHaveLength(2);
+    // The newest explicit item is present and is the tail.
+    expect(queue[queue.length - 1]?.event.threadUrl).toBe('https://e.test/newest');
+    expect(queue[queue.length - 1]?.intent).toBe('explicit');
+    // The oldest passive was the one evicted.
+    expect(queue.map((q) => q.event.threadUrl)).not.toContain('https://e.test/p1');
+    expect(queue.map((q) => q.event.threadUrl)).toContain('https://e.test/p2');
+    expect(storage.raw(SCRATCH_KEY)).toEqual([]);
+  });
+
+  it('an explicit capture is never lost across an eviction crash on the newest item', async () => {
+    // Companion of the "loses at most the intended evictees" invariant:
+    // with a fully-passive queue at cap, an interrupted eviction leaves
+    // every passive survivor in place (zero unintended loss).
+    const storage = createMemoryStorage();
+    for (let i = 0; i < 5; i += 1) {
+      await enqueueCapture(event(`https://e.test/fill-${String(i)}`), storage, 5, 'passive');
+    }
+    await expect(
+      enqueueCaptureInternal(event('https://e.test/x'), storage, 5, 'explicit', () => {
+        throw new Error('crash');
+      }),
+    ).rejects.toThrow('crash');
+    const readBack = (await readQueue(storage)).map((q) => q.event.threadUrl).sort();
+    expect(readBack).toEqual([
+      'https://e.test/fill-0',
+      'https://e.test/fill-1',
+      'https://e.test/fill-2',
+      'https://e.test/fill-3',
+      'https://e.test/fill-4',
+    ]);
+  });
+});
+
+describe('capture queue mutex primitives', () => {
+  it('withQueueLock serializes tasks in call order on the same key', async () => {
+    const key = {};
+    const order: number[] = [];
+    const gate = deferred();
+
+    const first = withQueueLock(key, async () => {
+      await gate.promise;
+      order.push(1);
+    });
+    const second = withQueueLock(key, async () => {
+      order.push(2);
+    });
+
+    // `second` must not run until `first` completes even though `first`
+    // is blocked on the gate.
+    await Promise.resolve();
+    expect(order).toEqual([]);
+    gate.resolve();
+    await Promise.all([first, second]);
+    expect(order).toEqual([1, 2]);
+  });
+
+  it('withQueueLock does not wedge the chain when a task rejects', async () => {
+    const key = {};
+    await expect(
+      withQueueLock(key, () => Promise.reject(new Error('boom'))),
+    ).rejects.toThrow('boom');
+    // The next task on the same key still runs.
+    const ran = await withQueueLock(key, () => Promise.resolve('ok'));
+    expect(ran).toBe('ok');
+  });
+
+  it('withQueueLock keys independently — different keys run concurrently', async () => {
+    const keyA = {};
+    const keyB = {};
+    const gate = deferred();
+    const order: string[] = [];
+
+    const a = withQueueLock(keyA, async () => {
+      await gate.promise;
+      order.push('a');
+    });
+    const b = withQueueLock(keyB, async () => {
+      order.push('b');
+    });
+
+    // keyB is not blocked by keyA's gate.
+    await b;
+    expect(order).toEqual(['b']);
+    gate.resolve();
+    await a;
+    expect(order).toEqual(['b', 'a']);
+  });
+
+  it('singleFlight coalesces concurrent calls and re-runs after settle', async () => {
+    const key = {};
+    let calls = 0;
+    const gate = deferred();
+
+    const task = async () => {
+      calls += 1;
+      await gate.promise;
+      return calls;
+    };
+
+    const p1 = singleFlight(key, task);
+    const p2 = singleFlight(key, task);
+    gate.resolve();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1).toBe(1);
+    expect(r2).toBe(1);
+    expect(calls).toBe(1);
+
+    // After the in-flight run settles a fresh call starts a new run.
+    const p3 = await singleFlight(key, () => Promise.resolve(calls + 1));
+    expect(p3).toBe(2);
+  });
+});

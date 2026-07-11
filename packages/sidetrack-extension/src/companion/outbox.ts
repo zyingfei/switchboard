@@ -89,6 +89,17 @@ export interface OutboxConfig<TPayload> {
   readonly overflowPolicy?: OverflowPolicy;
   readonly retryExhaustionPolicy?: RetryExhaustionPolicy;
   readonly drainOrder?: DrainOrder;
+  // When true, the end-of-drain persist merges the drain's per-item
+  // outcomes against a FRESH read of the storage key (remove sent
+  // items by id, replace retried items by id, keep any item that
+  // appeared AFTER the pre-drain snapshot was taken). The default
+  // (false) rewrites the whole key from the pre-drain snapshot, which
+  // silently overwrites an item enqueued while the drain awaited the
+  // network. Opt in for queues that accept concurrent enqueues during
+  // a drain (the capture queue); user-authored FIFO queues that
+  // serialize their own writes leave it off to keep byte-identical
+  // behaviour.
+  readonly atomicDrainMerge?: boolean;
 }
 
 export interface Outbox<TPayload> {
@@ -107,6 +118,12 @@ export interface Outbox<TPayload> {
   readonly read: (storage?: OutboxStorage) => Promise<readonly OutboxItem<TPayload>[]>;
   readonly readDropped: (storage?: OutboxStorage) => Promise<number>;
   readonly clear: (storage?: OutboxStorage) => Promise<void>;
+  // Overwrite the queue key with exactly `items`, verbatim. No eviction
+  // and no dropped-count bump — the caller owns the item set. Used by
+  // crash-safe eviction paths that stage survivors under a scratch key
+  // then swap. Callers must serialize their own writes (see the queue
+  // mutex) since this is an unconditional overwrite.
+  readonly write: (items: readonly OutboxItem<TPayload>[], storage?: OutboxStorage) => Promise<void>;
   readonly computeNextAttempt: (attempts: number, now: Date, random?: () => number) => string;
 }
 
@@ -191,9 +208,17 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
     await storage.set({ [config.storageKey]: [] });
   };
 
+  const write = async (
+    items: readonly OutboxItem<TPayload>[],
+    storage: OutboxStorage = defaultStorage,
+  ): Promise<void> => {
+    await storage.set({ [config.storageKey]: items });
+  };
+
   const overflowPolicy = config.overflowPolicy ?? { kind: 'drop-oldest' };
   const retryExhaustionPolicy = config.retryExhaustionPolicy ?? { kind: 'drop' };
   const drainOrder = config.drainOrder ?? 'independent';
+  const atomicDrainMerge = config.atomicDrainMerge ?? false;
 
   const enqueue = async (
     payload: TPayload,
@@ -237,11 +262,22 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
     let dropped = 0;
     let changed = false;
     const nextQueue: OutboxItem<TPayload>[] = [];
+    // For the atomic-merge persist path we record each pre-drain item's
+    // outcome by id: `undefined` value = remove it (sent or dropped);
+    // a value = replace it in place with the new (retried/backed-off)
+    // item. Items enqueued AFTER this snapshot are not in the map, so
+    // the merge preserves them.
+    const outcomeById = new Map<string, OutboxItem<TPayload> | undefined>();
+    const recordOutcome = (id: string, value: OutboxItem<TPayload> | undefined): void => {
+      outcomeById.set(id, value);
+    };
 
     for (const [index, item] of queue.entries()) {
       const preserveRestIfFifo = (): boolean => {
         if (drainOrder !== 'fifo') return false;
         nextQueue.push(...queue.slice(index + 1));
+        // The rest are untouched — leave them absent from outcomeById
+        // so the merge keeps their current stored value verbatim.
         return true;
       };
 
@@ -254,12 +290,14 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
         await send(item);
         sent += 1;
         changed = true;
+        recordOutcome(item.id, undefined);
       } catch {
         const attempts = item.attempts + 1;
         changed = true;
         if (attempts > maxAttempts) {
           if (retryExhaustionPolicy.kind === 'drop') {
             dropped += 1;
+            recordOutcome(item.id, undefined);
           } else {
             // 'retain': cap attempts at maxAttempts so backoff stays
             // bounded (computeNextAttempt clamps to maxBackoffMs at
@@ -267,18 +305,22 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
             // user-authored content because the network was down for
             // a week is not acceptable. UI surfaces it as "n unsynced
             // (last error …)".
-            nextQueue.push({
+            const retained = {
               ...item,
               attempts: maxAttempts,
               nextAttemptAt: computeNextAttempt(maxAttempts, now, random),
-            });
+            };
+            nextQueue.push(retained);
+            recordOutcome(item.id, retained);
           }
         } else {
-          nextQueue.push({
+          const retried = {
             ...item,
             attempts,
             nextAttemptAt: computeNextAttempt(attempts, now, random),
-          });
+          };
+          nextQueue.push(retried);
+          recordOutcome(item.id, retried);
         }
         if (preserveRestIfFifo()) break;
       }
@@ -288,6 +330,29 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
       await storage.set({ [config.droppedKey]: (await readDropped(storage)) + dropped });
     }
     if (changed) {
+      if (atomicDrainMerge) {
+        // Re-read at write time and apply outcomes by id so an enqueue
+        // that landed while we awaited the network is not clobbered by
+        // a stale whole-key rewrite. Items unknown to outcomeById
+        // (enqueued during the drain, or untouched FIFO tail) keep
+        // their fresh stored value and stay in their stored order.
+        const fresh = await read(storage);
+        const merged: OutboxItem<TPayload>[] = [];
+        for (const current of fresh) {
+          if (!outcomeById.has(current.id)) {
+            merged.push(current);
+            continue;
+          }
+          const replacement = outcomeById.get(current.id);
+          if (replacement !== undefined) {
+            merged.push(replacement);
+          }
+          // replacement === undefined → the item was sent/dropped;
+          // omit it from the merged queue.
+        }
+        await storage.set({ [config.storageKey]: merged });
+        return { sent, remaining: merged.length };
+      }
       await storage.set({ [config.storageKey]: nextQueue });
     }
     return { sent, remaining: nextQueue.length };
@@ -299,6 +364,7 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
     read,
     readDropped,
     clear,
+    write,
     computeNextAttempt,
   };
 };
