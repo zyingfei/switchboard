@@ -7,7 +7,7 @@ import {
   type OutboxItem,
   type OutboxStorage,
 } from './outbox';
-import { singleFlight, withQueueLock } from './captureQueueMutex';
+import { singleFlight, withFailedLock, withQueueLock } from './captureQueueMutex';
 
 import type { CaptureEvent } from './model';
 
@@ -324,22 +324,44 @@ export const clearFailedCaptures = async (
 export const retryFailedCaptures = async (
   storage: StoragePort = chromeStoragePort,
 ): Promise<{ readonly requeued: number }> => {
-  const failed = await readFailedCaptures(storage);
+  // Phase 1: atomically read and clear FAILED_KEY under withFailedLock so
+  // a concurrent drainQueueInner cannot race between the read and clear.
+  // We release the lock before calling enqueueCapture to avoid a deadlock:
+  // enqueueCapture acquires withQueueLock, and drainQueueInner holds
+  // withQueueLock while it tries to acquire withFailedLock — holding both
+  // locks in opposite orders would produce AB/BA deadlock.
+  let failed: readonly FailedCapture[] = [];
+  await withFailedLock(storage, async () => {
+    failed = await readFailedCaptures(storage);
+    if (failed.length > 0) {
+      await clearFailedCaptures(storage);
+    }
+  });
   if (failed.length === 0) return { requeued: 0 };
-  await clearFailedCaptures(storage);
+
+  // Phase 2: re-enqueue each failed item outside of withFailedLock.
+  // enqueueCapture serializes on withQueueLock internally; no lock held
+  // here so no deadlock is possible.
   let requeued = 0;
   for (const record of failed) {
     const result = await enqueueCapture(record.event, storage, QUEUE_LIMIT, 'explicit');
-    if (result.accepted) requeued += 1;
-    else {
-      // The queue is full of explicit items again — keep the rest
-      // in the failed list rather than losing them.
+    if (result.accepted) {
+      requeued += 1;
+    } else {
+      // The main queue is full of explicit items — put the unqueued
+      // items back into FAILED_KEY. We merge with any entries that a
+      // concurrent drain may have appended since our Phase-1 clear,
+      // so no drain-failed entry is clobbered by this write-back.
       const stillFailed = failed.slice(failed.indexOf(record));
       const now = new Date().toISOString();
-      await writeFailedCaptures(
-        storage,
-        stillFailed.map((r) => ({ ...r, failedAt: now })),
-      );
+      await withFailedLock(storage, async () => {
+        const current = await readFailedCaptures(storage);
+        const currentIds = new Set(current.map((f) => f.id));
+        const toRestore = stillFailed
+          .filter((r) => !currentIds.has(r.id))
+          .map((r) => ({ ...r, failedAt: now }));
+        await writeFailedCaptures(storage, [...current, ...toRestore]);
+      });
       break;
     }
   }
@@ -402,10 +424,17 @@ const drainQueueInner = async (
     opts,
   );
   if (newlyFailed.length > 0) {
-    const existing = await readFailedCaptures(storage);
-    const existingIds = new Set(existing.map((e) => e.id));
-    const merged = [...existing, ...newlyFailed.filter((f) => !existingIds.has(f.id))];
-    await writeFailedCaptures(storage, merged);
+    // Route through withFailedLock to serialize against retryFailedCaptures
+    // which does its own read-clear-write on the same key. The two locks
+    // (withQueueLock for the main queue, withFailedLock for the failed
+    // queue) are independent chains so this call cannot deadlock with the
+    // outer withQueueLock that wraps drainQueueInner.
+    await withFailedLock(storage, async () => {
+      const existing = await readFailedCaptures(storage);
+      const existingIds = new Set(existing.map((e) => e.id));
+      const merged = [...existing, ...newlyFailed.filter((f) => !existingIds.has(f.id))];
+      await writeFailedCaptures(storage, merged);
+    });
   }
   return result;
 };

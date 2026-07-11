@@ -5,7 +5,9 @@ import {
   drainQueue,
   enqueueCapture,
   enqueueCaptureInternal,
+  readFailedCaptures,
   readQueue,
+  retryFailedCaptures,
   type StoragePort,
 } from '../../src/companion/queue';
 import { singleFlight, withQueueLock } from '../../src/companion/captureQueueMutex';
@@ -212,6 +214,154 @@ describe('capture queue atomicity (F12)', () => {
       'https://e.test/fill-3',
       'https://e.test/fill-4',
     ]);
+  });
+});
+
+// Seed a FailedCapture directly into FAILED_KEY so tests don't need 13
+// drain loops just to get an item into the failed list.
+const FAILED_KEY = 'sidetrack.captureQueue.failed';
+const seedFailedCapture = async (
+  storage: StoragePort,
+  threadUrl: string,
+): Promise<void> => {
+  const current = (await storage.get<unknown[]>(FAILED_KEY, [])) as unknown[];
+  await storage.set({
+    [FAILED_KEY]: [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        queuedAt: '2026-01-01T00:00:00.000Z',
+        failedAt: '2026-01-01T00:00:00.000Z',
+        event: event(threadUrl),
+        lastErrorMessage: 'offline',
+      },
+    ],
+  });
+};
+
+// Seed a capture item in the CORRECT internal storage format so that
+// intent: 'explicit' survives the queue.ts migration round-trip.
+const QUEUE_KEY_INTERNAL = 'sidetrack.captureQueue';
+const seedQueueItem = async (
+  storage: StoragePort,
+  threadUrl: string,
+  attempts: number,
+  intent: 'explicit' | 'passive' = 'explicit',
+): Promise<void> => {
+  const current = (await storage.get<unknown[]>(QUEUE_KEY_INTERNAL, [])) as unknown[];
+  await storage.set({
+    [QUEUE_KEY_INTERNAL]: [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        queuedAt: '2026-01-01T00:00:00.000Z',
+        attempts,
+        nextAttemptAt: '2026-01-01T00:00:00.000Z',
+        payload: { intent, event: event(threadUrl) },
+      },
+    ],
+  });
+};
+
+describe('FAILED_KEY concurrent safety (F12-residual)', () => {
+  it('concurrent retryFailedCaptures and drainQueue do not lose failed entries', async () => {
+    // Scenario: retryFailedCaptures reads, clears, and re-enqueues while a
+    // concurrent drain that produces newly-failed items tries to append to
+    // FAILED_KEY. Without withFailedLock the two operations race on a
+    // read-modify-write of the same key and one side's update is lost.
+    //
+    // The test verifies that: after both settle, each operation's intended
+    // FAILED_KEY outcome is preserved — re-enqueued items are gone from
+    // the failed list (they moved back into the main queue), and any item
+    // that fails during the concurrent drain lands in FAILED_KEY.
+    const storage = createMemoryStorage();
+
+    // Seed FAILED_KEY directly: one pre-existing failed capture.
+    await seedFailedCapture(storage, 'https://e.test/pre-existing');
+    // Seed the main queue with an at-budget explicit item so the
+    // concurrent drain produces a newly-failed entry to merge.
+    await seedQueueItem(storage, 'https://e.test/drain-fail', 12, 'explicit');
+
+    // Run retry and a failing drain concurrently (same tick so they
+    // interleave at every await boundary).
+    const retryPromise = retryFailedCaptures(storage);
+    const drainPromise = drainQueue(
+      async () => {
+        throw new Error('still-offline');
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    const [retryResult] = await Promise.all([retryPromise, drainPromise]);
+
+    // The pre-existing failed item was re-enqueued.
+    expect(retryResult.requeued).toBe(1);
+
+    // The item that the drain failed (after exhausting its budget) must
+    // appear in FAILED_KEY — it must not have been clobbered by retry's
+    // clear, and retry's re-enqueue must not have been clobbered by the
+    // drain's failed-write.
+    const failed = await readFailedCaptures(storage);
+    const failedUrls = failed.map((f) => f.event.threadUrl);
+    expect(failedUrls).toContain('https://e.test/drain-fail');
+    // The pre-existing item was re-enqueued, not left in failed list.
+    expect(failedUrls).not.toContain('https://e.test/pre-existing');
+  });
+
+  it('retryFailedCaptures then drain-that-fails correctly populates FAILED_KEY', async () => {
+    // Verifies sequential (non-concurrent) correctness: retry clears the
+    // failed list, subsequent drain exhausts an item, withFailedLock
+    // ensures the write lands without being lost.
+    const storage = createMemoryStorage();
+
+    // Seed a failed capture and an at-budget queue item.
+    await seedFailedCapture(storage, 'https://e.test/retry-then-fail');
+    await seedQueueItem(storage, 'https://e.test/queue-item', 12, 'explicit');
+
+    const retryResult = await retryFailedCaptures(storage);
+    expect(retryResult.requeued).toBe(1);
+    // Failed list cleared by retry.
+    expect(await readFailedCaptures(storage)).toEqual([]);
+
+    // Now drain — the at-budget item exhausts and must land in FAILED_KEY.
+    await drainQueue(
+      async () => {
+        throw new Error('offline');
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    const failed = await readFailedCaptures(storage);
+    // At-budget drain-fail item must be in FAILED_KEY (not silently dropped).
+    expect(failed.length).toBeGreaterThanOrEqual(1);
+    const failedUrls = failed.map((f) => f.event.threadUrl);
+    expect(failedUrls).toContain('https://e.test/queue-item');
+  });
+
+  it('sequential retry then drain leaves failed queue in a consistent state', async () => {
+    const storage = createMemoryStorage();
+    // No failed items: retry is a no-op, drain should not corrupt state.
+    const retryResult = await retryFailedCaptures(storage);
+    expect(retryResult.requeued).toBe(0);
+
+    await enqueueCapture(event('https://e.test/seq'), storage, 5, 'passive');
+    const drainResult = await drainQueue(
+      async () => {
+        /* success */
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+    expect(drainResult.sent).toBe(1);
+    expect(await readFailedCaptures(storage)).toEqual([]);
   });
 });
 
