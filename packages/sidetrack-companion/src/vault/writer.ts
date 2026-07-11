@@ -836,7 +836,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         children: input.children ?? [],
         checklist: input.checklist ?? [],
         tags: input.tags ?? [],
-        privacy: input.privacy ?? 'shared',
+        privacy: input.privacy ?? 'private',
         screenShareSensitive: input.screenShareSensitive ?? false,
         createdAt: timestamp,
         updatedAt: timestamp,
