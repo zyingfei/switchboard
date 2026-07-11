@@ -188,6 +188,16 @@ export interface UiSettings {
   // a settings migration; only an explicit `false` (persisted via
   // saveLocalPreferences) silences emission.
   readonly recallEmitTrainableActions?: boolean;
+  // F01 — when ON (default), the clipboard/redispatch paths ship the
+  // companion-redacted SAFE body instead of the unredacted original.
+  // The flag exists so the redacted-clipboard behaviour can be
+  // dogfooded for >=1 week before the original-cache mechanism
+  // (cacheDispatchOriginal / dispatchOriginals) is deleted. Optional
+  // with absent = ON so existing installs get the safe behaviour with
+  // no migration; only an explicit `false` restores the raw-original
+  // clipboard. Auto-send is NEVER gated on this — it is always
+  // preflighted (it was the zero-gate path the audit flagged).
+  readonly redactedClipboard?: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /

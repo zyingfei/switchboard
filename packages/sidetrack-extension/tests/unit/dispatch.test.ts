@@ -101,6 +101,49 @@ describe('HttpDispatchClient', () => {
     expect(result.tokenEstimate).toBe(9001);
   });
 
+  it('parses the redacted body, rule ids, and token warning from the response', async () => {
+    // F01 — the companion now returns the SAFE (redacted) body + the
+    // applied rule ids + the per-provider token-budget verdict. The
+    // client must surface all three so the extension copies the
+    // redacted form and renders the warning.
+    fetchSpy.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            bac_id: 'disp_safe',
+            status: 'recorded',
+            body: 'Email [email] and token [github-token]',
+            redactionSummary: { matched: 2, categories: ['github-token', 'email'] },
+            redaction: { applied: true, rules: ['github-token', 'email'] },
+            tokenEstimate: 12,
+            tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: false },
+          },
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+
+    const client = new HttpDispatchClient(settings);
+    const result = await client.submit(
+      {
+        kind: 'research',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Has secrets',
+        body: 'Email owner@example.com and token ghp_x',
+      },
+      'idem-key-safe',
+    );
+
+    expect(result.redactedBody).toBe('Email [email] and token [github-token]');
+    expect(result.redactedBody).not.toContain('owner@example.com');
+    expect(result.redactionRules).toEqual(['github-token', 'email']);
+    expect(result.tokenWarning).toEqual({
+      provider: 'chatgpt',
+      threshold: 128_000,
+      exceeded: false,
+    });
+  });
+
   it('throws with the problem detail message on non-2xx responses', async () => {
     fetchSpy.mockResolvedValue(
       new Response(

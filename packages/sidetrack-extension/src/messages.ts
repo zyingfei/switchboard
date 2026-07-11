@@ -607,6 +607,11 @@ export type WorkboardRequest =
         // mirror (src/sidepanel/recall/emitTrainableAction.ts). Absent
         // = on; persist `false` to silence emission.
         readonly recallEmitTrainableActions?: boolean;
+        // F01 — redacted-clipboard flag (default ON). Absent = on;
+        // persist `false` to restore the raw-original clipboard while
+        // the original-cache mechanism is dogfooded. Auto-send is never
+        // gated on this.
+        readonly redactedClipboard?: boolean;
       };
     }
   | {

@@ -160,6 +160,7 @@ import {
   saveNotifyOnQueueComplete,
   savePageEvidenceAutoExtractEnabled,
   saveRecallEmitTrainableActions,
+  saveRedactedClipboard,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -183,6 +184,7 @@ import {
   setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
+import { preflightOutbound } from '../src/dispatch/outboundPreflight';
 import { localRecallStore } from '../src/local-recall/store';
 import { ingestVisit } from '../src/local-recall/ingestion';
 
@@ -271,15 +273,27 @@ const tryAutoLinkCapturedThread = async (
   userTurnTexts: readonly string[],
   capturedAtMs: number,
 ): Promise<void> => {
-  const [recentDispatches, existingLinks, originalBodiesById, allThreads] = await Promise.all([
-    readCachedDispatches(),
-    readDispatchLinks(),
-    readDispatchOriginals(),
-    readThreads(),
-  ]);
+  const [recentDispatches, existingLinks, rawOriginalBodiesById, allThreads, settings] =
+    await Promise.all([
+      readCachedDispatches(),
+      readDispatchLinks(),
+      readDispatchOriginals(),
+      readThreads(),
+      readSettings(),
+    ]);
   if (recentDispatches.length === 0) {
     return;
   }
+  // F01 — reconcile the matcher against what the user actually pasted.
+  // With the redacted-clipboard flag ON (default), the clipboard ships
+  // the SAFE (redacted) body, so the captured turn contains the
+  // redacted text — the matcher must compare against `dispatch.body`
+  // (redacted), NOT the cached unredacted original. Passing the raw
+  // originals here would make the redacted prefix fail to substring-
+  // match the pasted redacted turn. Only feed the raw originals when
+  // the flag is explicitly OFF (raw-clipboard dogfood escape hatch).
+  const originalBodiesById =
+    settings.redactedClipboard === false ? rawOriginalBodiesById : {};
   // Pass the live set so the matcher can ignore "already-linked"
   // entries that point at threads no longer in storage. Without
   // this, a wiped/reassigned destination thread leaves the dispatch
@@ -1844,7 +1858,15 @@ const isAutoSendResult = (
   'ok' in value &&
   typeof (value as { readonly ok?: unknown }).ok === 'boolean';
 
-const autoSendOnceTabReady = (tabId: number, body: string): void => {
+const autoSendOnceTabReady = (tabId: number, body: string, provider: string): void => {
+  // F01 — auto-send is ALWAYS preflighted (no flag): this is the
+  // zero-gate path the audit flagged, where the body was typed
+  // verbatim into a provider tab. Every caller passes an
+  // already-preflighted body, but we scrub again here as the single
+  // choke point so a future caller can't reintroduce the gap. The
+  // scrub is idempotent — redaction placeholders don't re-match and
+  // already-wrapped injection context isn't double-wrapped.
+  const safeBody = preflightOutbound(body, provider).safeText;
   let cleared = false;
   const fire = (): void => {
     if (cleared) {
@@ -1861,7 +1883,7 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
       for (;;) {
         const dispatch = await sendToContentScriptWithRecovery(tabId, {
           type: messageTypes.autoSendItem,
-          text: body,
+          text: safeBody,
           perItemTimeoutMs: 90_000,
         });
         if (!dispatch.ok) {
@@ -2377,7 +2399,7 @@ const openAutoApprovedMcpDispatchesInner = async (
       const created = await chrome.tabs.create({ url, active: true });
       if (typeof created.id === 'number') {
         await writeMcpDispatchTab(created.id, dispatch.bac_id);
-        autoSendOnceTabReady(created.id, dispatch.body);
+        autoSendOnceTabReady(created.id, dispatch.body, dispatch.target.provider);
         openedThisTick += 1;
         await writeLastMcpDispatchOpenedMs(Date.now());
       }
@@ -3422,7 +3444,10 @@ const handleRequest = async (
           console.warn('[dispatchAutoSendInNewTab] tab create returned no tabId');
           return;
         }
-        autoSendOnceTabReady(tabId, body);
+        // F01 — provider derived from the destination URL for the
+        // preflight's token gate; the redaction + injection scrub are
+        // provider-agnostic and run regardless.
+        autoSendOnceTabReady(tabId, body, detectProviderFromUrl(url));
       } catch (error) {
         console.warn('[dispatchAutoSendInNewTab] open failed:', error);
       }
@@ -3449,8 +3474,10 @@ const handleRequest = async (
             { kind: 'research', target: { provider, mode: 'auto-send' }, title, body },
             idempotencyKey,
           );
-          // Feeds the auto-link matcher (it compares the UNREDACTED
-          // body against the captured chat's first user turn).
+          // Keep caching the unredacted body while the redacted-
+          // clipboard flag exists — the matcher gating in
+          // tryAutoLinkCapturedThread decides which body to compare
+          // against based on the flag (redacted paste vs raw paste).
           await writeDispatchOriginal(result.bac_id, body);
           // Persist the Déjà-vu breadcrumb if the caller shipped one
           // (Ask AI from a popover selection). Stays local-only — the
@@ -3460,13 +3487,15 @@ const handleRequest = async (
             await writeDispatchRecallContext(result.bac_id, request.recallContext);
           }
           // Optimistic local row so it shows immediately; the next
-          // companion poll merge is idempotent by bac_id.
+          // companion poll merge is idempotent by bac_id. F01 — store
+          // the SAFE (companion-redacted) body on the row so the
+          // sidepanel renders/re-copies the redacted form.
           const record: DispatchEventRecord = {
             bac_id: result.bac_id,
             kind: 'research',
             target: { provider, mode: 'auto-send' },
             title,
-            body,
+            body: result.redactedBody ?? body,
             createdAt: new Date().toISOString(),
             redactionSummary: result.redactionSummary ?? { matched: 0, categories: [] },
             tokenEstimate: result.tokenEstimate ?? 0,
@@ -3486,7 +3515,10 @@ const handleRequest = async (
           console.warn('[submitSelectionDispatch] tab create returned no tabId');
           return;
         }
-        autoSendOnceTabReady(tabId, body);
+        // F01 — auto-send is always preflighted inside
+        // autoSendOnceTabReady; pass the request provider for the
+        // token gate.
+        autoSendOnceTabReady(tabId, body, provider);
       } catch (error) {
         console.warn('[submitSelectionDispatch] open failed:', error);
       }
@@ -3622,6 +3654,9 @@ const handleRequest = async (
       }
       if (typeof request.preferences.recallEmitTrainableActions === 'boolean') {
         await saveRecallEmitTrainableActions(request.preferences.recallEmitTrainableActions);
+      }
+      if (typeof request.preferences.redactedClipboard === 'boolean') {
+        await saveRedactedClipboard(request.preferences.redactedClipboard);
       }
     }, 'settings');
   }

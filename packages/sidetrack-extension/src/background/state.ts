@@ -166,6 +166,17 @@ export const saveRecallEmitTrainableActions = async (
   return next;
 };
 
+// F01 — persist the redacted-clipboard flag (absent = ON). Only an
+// explicit `false` restores the raw-original clipboard behaviour.
+export const saveRedactedClipboard = async (
+  redactedClipboard: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, redactedClipboard };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
 export const readVaultPath = async (): Promise<string | undefined> => {
   const value = await storageGet<string | undefined>(VAULT_PATH_KEY, undefined);
   return value === undefined || value.length === 0 ? undefined : value;

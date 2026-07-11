@@ -80,12 +80,25 @@ export interface DispatchEventRecord {
   };
 }
 
+export interface DispatchTokenWarning {
+  readonly provider: string;
+  readonly threshold: number;
+  readonly exceeded: boolean;
+}
+
 export interface DispatchSubmitResult {
   readonly bac_id: string;
   readonly status: 'recorded';
   readonly warnings?: readonly string[];
   readonly tokenEstimate?: number;
   readonly redactionSummary?: DispatchRedactionSummary;
+  // F01 — the SAFE (redacted) body the companion stored + returned.
+  // When present, callers copy/auto-send THIS, not the raw original.
+  readonly redactedBody?: string;
+  // F01 — applied redaction rule ids (mirrors companion `redaction.rules`).
+  readonly redactionRules?: readonly string[];
+  // F01 — per-provider token-budget verdict for the confirm/pending UI.
+  readonly tokenWarning?: DispatchTokenWarning;
 }
 
 const PACKET_KIND_MAP: Record<UiPacketKind, DispatchKind> = {
