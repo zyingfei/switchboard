@@ -860,6 +860,12 @@ export const FLOW_NODES = {
     dispatches: [nodeIdFor('dispatch', D_CVE_CODEX)],
     codingSessions: [nodeIdFor('coding-session', CS_CVE_VM)],
     queueItems: [nodeIdFor('queue-item', Q_CVE_WS)],
+    // The reminder record is a valid builder input, but its graph
+    // projection was suppressed on 2026-05-27 (26bdcbce): reminders are
+    // consumed and NOT emitted as inbound-reminder nodes /
+    // reminder_for_thread edges. This id therefore never appears in the
+    // snapshot — the Flow A test asserts it absent. Kept for the
+    // re-enable path (gate on r.status !== 'new' OR a flag).
     reminders: [nodeIdFor('inbound-reminder', R_CVE_T)],
     annotations: [nodeIdFor('annotation', A_CVE_KERNEL), nodeIdFor('annotation', A_CVE_THREAD)],
     visits: [
@@ -919,7 +925,9 @@ export const flowExclusiveNodes = (flow: 'A' | 'B' | 'C'): readonly string[] => 
     ...f.dispatches,
     ...f.codingSessions,
     ...f.queueItems,
-    ...('reminders' in f ? f.reminders : []),
+    // Reminder nodes are intentionally NOT projected into the graph
+    // (26bdcbce), so they are never present to leak between flows —
+    // excluded from the exclusive set to keep it graph-truthful.
     ...f.annotations,
     ...f.visits,
   ];
