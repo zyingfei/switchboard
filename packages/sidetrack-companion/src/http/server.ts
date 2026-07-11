@@ -1,5 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import {
+  access,
+  appendFile,
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -351,6 +360,7 @@ import {
   createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
+import { VaultUnavailableError } from './errors.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
@@ -596,6 +606,11 @@ interface RouteMatch {
 interface RouteDefinition {
   readonly method: HttpMethod;
   readonly pattern: RegExp;
+  // Documents intent only. The request handler enforces auth BEFORE
+  // route matching against PUBLIC_UNAUTHENTICATED_PATHS, not this flag —
+  // so an unauthenticated caller can't enumerate routes by status code.
+  // Keep it accurate (true for anything not on that allowlist) so it
+  // stays a reliable audit reference.
   readonly authRequired: boolean;
   readonly handle: (
     request: IncomingMessage,
@@ -647,6 +662,23 @@ const writeDebugHeapSnapshot = async (): Promise<string> => {
   const path = join(tmpdir(), `heap-${String(process.pid)}-${ts}.heapsnapshot`);
   await writeFile(path, JSON.stringify(generateHeapSnapshot()), 'utf8');
   return path;
+};
+
+// SIDETRACK_HTTP_LOG=1 debug log. Records method + pathname + status +
+// duration ONLY — never the query string, which carries PII (search
+// terms, visited URLs). The file is created/kept at 0600 so a
+// co-located user on the box can't read it. chmod runs once per process
+// (best-effort): `appendFile`'s mode option only applies when it
+// creates the file, so an existing 0644 log would otherwise stay
+// world-readable.
+const HTTP_DEBUG_LOG_PATH = '/tmp/sidetrack-http-debug.log';
+let httpDebugLogModeEnsured = false;
+const appendHttpDebugLine = async (line: string): Promise<void> => {
+  await appendFile(HTTP_DEBUG_LOG_PATH, line, { mode: 0o600 });
+  if (!httpDebugLogModeEnsured) {
+    httpDebugLogModeEnsured = true;
+    await chmod(HTTP_DEBUG_LOG_PATH, 0o600).catch(() => undefined);
+  }
 };
 
 const readBody = async (request: IncomingMessage): Promise<unknown> => {
@@ -811,6 +843,22 @@ const isAllowedOrigin = (origin: string | undefined): boolean => {
 
 const isLocalHost = (host: string | undefined): boolean =>
   Boolean(host && /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/u.test(host));
+
+// Explicitly-public paths: reachable without the bridge key. Auth is
+// evaluated BEFORE route matching (so an unauthenticated caller can't
+// enumerate routes via 404-vs-401), which means this allowlist — not
+// the per-route `authRequired: false` flag — is the source of truth for
+// what an unauthenticated caller may reach. It MUST stay in sync with
+// the pre-auth surface the extension relies on:
+//   - /v1/version — the attach/identity probe pinned on first connect
+//                   and compared on every poll (port-reuse detection).
+//   - /v1/health  — the bare liveness probe.
+// The debug/diagnostic routes (/debug/heap-snapshot, /debug/gc) are
+// deliberately absent: they now require auth like every other route.
+const PUBLIC_UNAUTHENTICATED_PATHS: ReadonlySet<string> = new Set(['/v1/version', '/v1/health']);
+
+const isPublicUnauthenticatedPath = (method: string | undefined, pathname: string): boolean =>
+  method === 'GET' && PUBLIC_UNAUTHENTICATED_PATHS.has(pathname);
 
 const requireIdempotencyKey = (request: IncomingMessage): string => {
   const key = request.headers['idempotency-key'];
@@ -2542,7 +2590,10 @@ const routes: readonly RouteDefinition[] = [
         {
           method: 'POST' as const,
           pattern: /^\/debug\/heap-snapshot$/,
-          authRequired: false,
+          // Diagnostic route: dumps a full heap snapshot to disk. Auth
+          // required — it must never be an unauthenticated data-leak
+          // vector even when DEBUG_HEAP_SNAPSHOT=1 is set.
+          authRequired: true,
           handle: async () => {
             const path = await writeDebugHeapSnapshot();
             return [201, { data: { path } }] as const;
@@ -2551,7 +2602,8 @@ const routes: readonly RouteDefinition[] = [
         {
           method: 'POST' as const,
           pattern: /^\/debug\/gc$/,
-          authRequired: false,
+          // Diagnostic route: forces a GC. Auth required.
+          authRequired: true,
           handle: async () => {
             const before = process.memoryUsage().rss;
             (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc?.(true);
@@ -7794,28 +7846,8 @@ export const handleRequest = async (
     return;
   }
 
-  const url = request.url === undefined ? undefined : new URL(request.url, 'http://127.0.0.1');
-  const route = routes.find((candidate) => {
-    if (candidate.method !== method || url === undefined) {
-      return false;
-    }
-    return candidate.pattern.test(url.pathname);
-  });
-
-  if (url === undefined || route === undefined) {
-    sendJson(
-      response,
-      404,
-      createProblem({
-        status: 404,
-        code: 'NOT_FOUND',
-        title: 'Not found',
-        correlationId: requestId,
-      }),
-    );
-    return;
-  }
-
+  // Host/origin loopback gate FIRST — before any route work or auth,
+  // so an off-loopback caller learns nothing about the surface.
   if (!isLocalHost(request.headers.host) || !isAllowedOrigin(request.headers.origin)) {
     sendJson(
       response,
@@ -7830,7 +7862,28 @@ export const handleRequest = async (
     return;
   }
 
-  if (route.authRequired) {
+  const url = request.url === undefined ? undefined : new URL(request.url, 'http://127.0.0.1');
+  if (url === undefined) {
+    sendJson(
+      response,
+      404,
+      createProblem({
+        status: 404,
+        code: 'NOT_FOUND',
+        title: 'Not found',
+        correlationId: requestId,
+      }),
+    );
+    return;
+  }
+
+  // Auth gate BEFORE route matching. Everything except the explicit
+  // public allowlist requires the bridge key — including unknown paths,
+  // which return the auth error (not a 404), so an unauthenticated
+  // caller can't enumerate the route table by probing status codes.
+  // Debug/diagnostic routes are NOT in the allowlist, so they now
+  // require auth like every other route.
+  if (!isPublicUnauthenticatedPath(method, url.pathname)) {
     const actualKey = request.headers['x-bac-bridge-key'];
     if (
       typeof actualKey !== 'string' ||
@@ -7848,6 +7901,27 @@ export const handleRequest = async (
       );
       return;
     }
+  }
+
+  const route = routes.find((candidate) => {
+    if (candidate.method !== method) {
+      return false;
+    }
+    return candidate.pattern.test(url.pathname);
+  });
+
+  if (route === undefined) {
+    sendJson(
+      response,
+      404,
+      createProblem({
+        status: 404,
+        code: 'NOT_FOUND',
+        title: 'Not found',
+        correlationId: requestId,
+      }),
+    );
+    return;
   }
 
   if (method === 'GET' && url.pathname === '/v1/vault/changes') {
@@ -7884,9 +7958,9 @@ export const handleRequest = async (
     const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
     const logHttp = (statusForLog: number): void => {
       if (!httpLog) return;
-      void appendFile(
-        '/tmp/sidetrack-http-debug.log',
-        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+      // pathname ONLY — url.search is deliberately omitted (PII).
+      void appendHttpDebugLine(
+        `${new Date().toISOString()} ${method ?? 'UNKNOWN'} ${url.pathname} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
       ).catch(() => undefined);
     };
     // Conditional GET / response ETag. Restricted to GET because
@@ -7916,8 +7990,7 @@ export const handleRequest = async (
     const settingsRevisionConflict = error instanceof SettingsRevisionConflictError;
     const codingTokenInvalid = error instanceof CodingAttachTokenInvalidError;
     const codingSessionNotFound = error instanceof CodingSessionNotFoundError;
-    const vaultUnavailable =
-      error instanceof Error && error.message === 'Vault path is unavailable.';
+    const vaultUnavailable = VaultUnavailableError.matches(error);
     const status =
       routeError?.status ??
       (settingsRevisionConflict
