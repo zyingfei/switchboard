@@ -213,9 +213,11 @@ describe('companion HTTP server hardening (F30/F29)', () => {
     });
   });
 
-  it('VaultUnavailableError.matches recognises both the typed error and the legacy message', () => {
+  it('VaultUnavailableError.matches is typed-only now that the writer throws the class', () => {
     expect(VaultUnavailableError.matches(new VaultUnavailableError())).toBe(true);
-    expect(VaultUnavailableError.matches(new Error('Vault path is unavailable.'))).toBe(true);
+    // ensureVaultPresent throws the typed error since 2026-07-11; the
+    // legacy string-compare branch was deliberately removed with it.
+    expect(VaultUnavailableError.matches(new Error('Vault path is unavailable.'))).toBe(false);
     expect(VaultUnavailableError.matches(new Error('something else'))).toBe(false);
     expect(VaultUnavailableError.matches('not an error')).toBe(false);
     // The typed error's default message matches the legacy detail field,
