@@ -7385,7 +7385,6 @@ const App = () => {
                 workstream: {
                   title,
                   ...(parentId === null ? {} : { parentId }),
-                  privacy: 'shared',
                   ...(description !== undefined && description.length > 0 ? { description } : {}),
                 },
               });
@@ -7422,7 +7421,6 @@ const App = () => {
                 workstream: {
                   title,
                   ...(parentId === null ? {} : { parentId }),
-                  privacy: 'shared',
                   ...(description !== undefined && description.length > 0 ? { description } : {}),
                 },
               });
