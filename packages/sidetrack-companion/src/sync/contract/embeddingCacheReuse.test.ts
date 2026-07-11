@@ -1,30 +1,16 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 // Stub the embedder + count its calls. The cache reuse claim is
 // "metadata-only extractor upgrade reuses vectors keyed by
 // embedTextHash — embedder is NOT called again." This test makes
-// the embedder counter the primary assertion.
-const embedCalls: { texts: string[] }[] = [];
-vi.mock('../../recall/embedder.js', async () => {
-  const real = await vi.importActual<typeof import('../../recall/embedder.js')>(
-    '../../recall/embedder.js',
-  );
-  return {
-    ...real,
-    embed: async (texts: readonly string[]) => {
-      embedCalls.push({ texts: [...texts] });
-      return texts.map(() => {
-        const v = new Float32Array(384);
-        v[0] = 1;
-        return v;
-      });
-    },
-  };
-});
-
+// the embedder counter the primary assertion. The stub is installed
+// through the production `setEmbedderOverride` seam (installStubEmbedder)
+// which records every call — `bun test` lacks `vi.importActual` and
+// `vi.mock` leaks process-globally in this repo.
+import { installStubEmbedder, type StubEmbedderHandle } from '../../test-helpers/stubEmbedder.js';
 import { createRecallActivityTracker } from '../../recall/activity.js';
 import { createEmbeddingCache } from '../../recall/embeddingCache.js';
 import { createExtractionStore } from '../../recall/extraction/store.js';
@@ -41,11 +27,13 @@ import { createSyncContractRunner } from './runner.js';
 
 describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
   let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
   beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-l2-cache-'));
-    embedCalls.length = 0;
   });
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
@@ -134,13 +122,13 @@ describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
     };
     await store.putSourceState(baseState);
     await runner.catchUpAll(eventLog);
-    const firstReconcileEmbedCalls = embedCalls.length;
-    const firstReconcileEmbedTexts = embedCalls.flatMap((c) => c.texts);
+    const firstReconcileEmbedCalls = stubEmbedder.calls.length;
+    const firstReconcileEmbedTexts = stubEmbedder.calls.flatMap((c) => c.texts);
     expect(firstReconcileEmbedCalls).toBeGreaterThan(0);
     expect(firstReconcileEmbedTexts.length).toBeGreaterThan(0);
 
     // Reset the per-test counter.
-    embedCalls.length = 0;
+    stubEmbedder.reset();
 
     // v2: same text T (metadata-only upgrade). Bumps schema /
     // version, but the chunker output (textHash) is identical.
@@ -171,7 +159,7 @@ describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
     // The cache hit: embedder NOT called again for the same text
     // (textHash identical → cache returns the prior vector).
     expect(
-      embedCalls.length,
+      stubEmbedder.calls.length,
       'embedder must not be called when text is unchanged across the upgrade',
     ).toBe(0);
   });
@@ -202,7 +190,7 @@ describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
       ],
     });
     await runner.catchUpAll(eventLog);
-    embedCalls.length = 0;
+    stubEmbedder.reset();
 
     const v2 = makeRev({
       sourceUnitId: 'src:thread-x:0',
@@ -234,6 +222,6 @@ describe('Lane 2 / L2-G2 — embedding cache reuse', () => {
     });
     await runner.catchUpAll(eventLog);
 
-    expect(embedCalls.length, 'embedder is called when text changes').toBeGreaterThan(0);
+    expect(stubEmbedder.calls.length, 'embedder is called when text changes').toBeGreaterThan(0);
   });
 });

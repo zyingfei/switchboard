@@ -1,23 +1,12 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-vi.mock('../../recall/embedder.js', async () => {
-  const real = await vi.importActual<typeof import('../../recall/embedder.js')>(
-    '../../recall/embedder.js',
-  );
-  return {
-    ...real,
-    embed: async (texts: readonly string[]) =>
-      texts.map(() => {
-        const v = new Float32Array(384);
-        v[0] = 1;
-        return v;
-      }),
-  };
-});
-
+// Embedder stubbed via the production `setEmbedderOverride` seam — see
+// installStubEmbedder. `bun test` lacks `vi.importActual` and `vi.mock`
+// leaks process-globally in this repo.
+import { installStubEmbedder, type StubEmbedderHandle } from '../../test-helpers/stubEmbedder.js';
 import { createRecallActivityTracker } from '../../recall/activity.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
 import { createExtractionStore } from '../../recall/extraction/store.js';
@@ -47,11 +36,14 @@ import { createSyncContractRunner } from './runner.js';
 describe('Lane 2 cross-replica extraction', () => {
   let vaultA: string;
   let vaultB: string;
+  let stubEmbedder: StubEmbedderHandle;
   beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
     vaultA = await mkdtemp(join(tmpdir(), 'sidetrack-l2-cross-A-'));
     vaultB = await mkdtemp(join(tmpdir(), 'sidetrack-l2-cross-B-'));
   });
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultA, { recursive: true, force: true });
     await rm(vaultB, { recursive: true, force: true });
   });

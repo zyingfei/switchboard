@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
@@ -31,49 +31,20 @@ import {
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { VaultChangeEvent } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
+import { RecallModelMissingError } from '../recall/embedder.js';
+import { installStubEmbedder, type StubEmbedderHandle } from '../test-helpers/stubEmbedder.js';
+import { pollUntil } from '../test-helpers/bunTestTimers.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
 
-// Embedder mock with a swappable `nextEmbedError` so individual tests
-// can simulate the offline + empty-cache failure mode (the 503
-// RECALL_MODEL_MISSING path) without touching a real model. The
-// factory builds a stand-in for RecallModelMissingError that
-// matches the production class shape — server.ts uses `instanceof`
-// against the import from '../recall/embedder.js', which inside
-// vitest resolves through this mock so the identity matches.
-vi.mock('../recall/embedder.js', () => {
-  class RecallModelMissingError extends Error {
-    readonly code = 'RECALL_MODEL_MISSING' as const;
-    constructor(
-      message: string,
-      readonly offline: boolean,
-      readonly cacheDir: string,
-    ) {
-      super(message);
-      this.name = 'RecallModelMissingError';
-    }
-  }
-  const state: { nextEmbedError: Error | null } = { nextEmbedError: null };
-  return {
-    MODEL_ID: 'test/model',
-    RecallModelMissingError,
-    __embedderState: state,
-    embed: (texts: readonly string[]) => {
-      if (state.nextEmbedError !== null) {
-        const err = state.nextEmbedError;
-        state.nextEmbedError = null;
-        return Promise.reject(err);
-      }
-      return Promise.resolve(
-        texts.map((_text, index) => {
-          const vector = new Float32Array(384);
-          vector[index % 384] = 1;
-          return vector;
-        }),
-      );
-    },
-  };
-});
+// The embedder is stubbed through the production `setEmbedderOverride`
+// seam (installStubEmbedder), NOT a module mock. `vi.mock` replaces the
+// module process-globally under `bun test` — a single mock here
+// poisons the real embedder every other test file relies on. The seam
+// swaps only `embed` and is torn down per-test. Tests that need the
+// offline/empty-cache failure mode arm `stubEmbedder.nextEmbedError`
+// with the REAL `RecallModelMissingError` (imported above), so the
+// route's `instanceof` check matches natively.
 
 const jsonFetch = async (
   context: CompanionHttpConfig,
@@ -181,9 +152,14 @@ describe('companion HTTP server', () => {
   let vaultPath: string;
   let bridgeKey: string;
   let context: CompanionHttpConfig;
+  let stubEmbedder: StubEmbedderHandle;
   const baseUrl = 'http://127.0.0.1';
 
   beforeEach(async () => {
+    // per-text-axis vectors: the i-th query text embeds along axis
+    // i % 384, so hybrid-ranking tests can steer which entry wins on
+    // the vector side vs. the lexical side.
+    stubEmbedder = installStubEmbedder({ shape: 'per-text-axis' });
     vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-companion-test-'));
     bridgeKey = (await ensureBridgeKey(vaultPath)).key;
     context = {
@@ -195,6 +171,7 @@ describe('companion HTTP server', () => {
   });
 
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultPath, { recursive: true, force: true });
   });
 
@@ -2356,15 +2333,7 @@ describe('companion HTTP server', () => {
       ],
       'test/model',
     );
-    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
-      readonly RecallModelMissingError: new (
-        message: string,
-        offline: boolean,
-        cacheDir: string,
-      ) => Error;
-      readonly __embedderState: { nextEmbedError: Error | null };
-    };
-    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+    stubEmbedder.nextEmbedError = new RecallModelMissingError(
       'cache empty',
       true,
       '/tmp/empty-models',
@@ -2392,18 +2361,10 @@ describe('companion HTTP server', () => {
     const { writeIndex } = await import('../recall/indexFile.js');
     const { join } = await import('node:path');
     await writeIndex(join(vaultPath, '_BAC', 'recall', 'index.bin'), [], 'test/model');
-    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
-      readonly RecallModelMissingError: new (
-        message: string,
-        offline: boolean,
-        cacheDir: string,
-      ) => Error;
-      readonly __embedderState: { nextEmbedError: Error | null };
-    };
     // Arm the embedder with a model-missing error so the assertion
     // would fail with 503 if the route tried to embed. The
     // short-circuit must skip past it.
-    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+    stubEmbedder.nextEmbedError = new RecallModelMissingError(
       'cache empty',
       true,
       '/tmp/empty-models',
@@ -2415,9 +2376,9 @@ describe('companion HTTP server', () => {
     expect(response.body).toEqual({ data: [] });
     // The error we armed should still be loaded for the next call —
     // the short-circuit must not have consumed it.
-    expect(embedderModule.__embedderState.nextEmbedError).not.toBeNull();
+    expect(stubEmbedder.nextEmbedError).not.toBeNull();
     // Clear it so later tests aren't affected.
-    embedderModule.__embedderState.nextEmbedError = null;
+    stubEmbedder.nextEmbedError = null;
   });
 
   it('reports recall activity after incremental indexing', async () => {
@@ -2877,17 +2838,17 @@ describe('companion HTTP server', () => {
         headers: { 'x-bac-bridge-key': bridgeKey },
         signal: controller.signal,
       });
-      await vi.waitFor(() => {
+      await pollUntil(() => {
         expect(subscribers.size).toBe(1);
       });
       // Abrupt client disconnect — the companion MUST release the
       // subscription (and clear the heartbeat) within a few seconds.
       controller.abort();
-      await vi.waitFor(
+      await pollUntil(
         () => {
           expect(subscribers.size).toBe(0);
         },
-        { timeout: 4000 },
+        { timeoutMs: 4000 },
       );
       await streamed.catch(() => undefined);
     } finally {
