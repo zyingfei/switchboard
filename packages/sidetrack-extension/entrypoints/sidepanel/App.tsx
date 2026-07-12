@@ -3822,12 +3822,30 @@ const App = () => {
       scopeLabel: thread.title,
       sourceThreadId: thread.bac_id,
       tokenEstimate: Math.ceil(body.length / 4),
+      // The redaction verdict is NOT precomputed here: it is derived live
+      // from the outbound preflight at DispatchConfirm render / export
+      // time (see the pendingDispatch modal + exportBodyForPacket), so the
+      // shown count/kinds always reflect what actually ships. A hardcoded
+      // value here used to drive a fake "no PII detected" chip.
       redactedItems: [],
       ...(thread.primaryWorkstreamId === undefined
         ? {}
         : { workstreamId: thread.primaryWorkstreamId }),
     };
   };
+
+  // F01 — the export (.md/notebook) file-write is an outbound path just
+  // like copy/save/auto-send. It must flow through the same preflight so
+  // a Send-to → Markdown download never drops a secret-bearing .md into
+  // Downloads while the copy path (identical packet) strips it. Mirrors
+  // the dispatch-viewer download's flag check: with redactedClipboard ON
+  // (default) ship the SAFE scrubbed body; with the documented dogfood
+  // opt-out OFF, ship the raw body (same escape hatch the other paths
+  // honour).
+  const exportBodyForPacket = (packet: ComposedPacket): string =>
+    state.settings.redactedClipboard !== false
+      ? preflightOutbound(packet.body, mapUiTarget(packet.target)).safeText
+      : packet.body;
 
   const handleSendToPick = (thread: TrackedThread, target: SendToTarget): void => {
     setSendToOpenFor(null);
@@ -3844,7 +3862,7 @@ const App = () => {
       // immediately and record the dispatch event so it shows up in
       // Recent Dispatches.
       const safeTitle = thread.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
-      downloadAsFile(`${safeTitle || 'sidetrack-packet'}.md`, packet.body);
+      downloadAsFile(`${safeTitle || 'sidetrack-packet'}.md`, exportBodyForPacket(packet));
       setError(`Downloaded ${safeTitle || 'sidetrack-packet'}.md.`);
       setPendingDispatch(packet);
       return;
@@ -4136,7 +4154,7 @@ const App = () => {
     if (packet.target === 'notebook' || packet.target === 'markdown') {
       const safeTitle = packet.title.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 80);
       const filename = `${safeTitle || 'sidetrack-packet'}.md`;
-      downloadAsFile(filename, packet.body);
+      downloadAsFile(filename, exportBodyForPacket(packet));
       setError(`Downloaded ${filename}.`);
       // Still record the dispatch so Recent Dispatches has the row.
       setPendingDispatch(packet);
@@ -8294,87 +8312,105 @@ const App = () => {
         />
       ) : null}
 
-      {pendingDispatch ? (
-        <DispatchConfirm
-          target={
-            TARGET_PROVIDER_LABEL[mapUiTarget(pendingDispatch.target)] ??
-            mapUiTarget(pendingDispatch.target)
-          }
-          sourceLabel={(() => {
-            // Surface the source thread's provider + model in the
-            // confirm modal subtitle so the user sees which chat the
-            // context came from. Display-only.
-            if (pendingDispatch.sourceThreadId === undefined) return undefined;
-            const sourceThread = state.threads.find(
-              (t) => t.bac_id === pendingDispatch.sourceThreadId,
-            );
-            if (sourceThread === undefined) return undefined;
-            const provLabel =
-              TARGET_PROVIDER_LABEL[providerIdToDispatchProvider(sourceThread.provider)] ??
-              sourceThread.provider;
-            const model = sourceThread.selectedModel;
-            return model === undefined || model.length === 0
-              ? provLabel
-              : `${provLabel} · ${model}`;
-          })()}
-          body={pendingDispatch.body}
-          autoSendOptedIn={(() => {
-            const t = pendingDispatch.target;
-            if (t === 'markdown' || t === 'notebook') return false;
-            if (t === 'codex' || t === 'claude_code' || t === 'cursor') return false;
-            const provider = mapUiTarget(t);
+      {pendingDispatch
+        ? (() => {
+            // F01 — one preflight, one source of truth for the confirm
+            // modal's safety verdict AND its preview. Previously the
+            // redaction chip read pendingDispatch.redactedItems (always
+            // hardcoded []), so a body that WILL be redacted downstream
+            // rendered "no PII / API-key patterns detected" — the safety
+            // UI actively misinformed. Compute the real verdict from the
+            // preflight (redaction.matched + redaction.rules) here so the
+            // shown count/kinds reflect exactly what ships.
+            const dispatchProvider = mapUiTarget(pendingDispatch.target);
+            const verdict = preflightOutbound(pendingDispatch.body, dispatchProvider);
+            // Preview must equal what ships (DispatchConfirm's contract).
+            // With redactedClipboard ON (default) that's the scrubbed
+            // safeText; with the documented dogfood opt-out OFF the raw
+            // body ships, so show it raw. The verdict below still reports
+            // the true detected spans either way — an opt-out user sees
+            // "N spans detected" next to a raw preview, which is honest,
+            // not a weakening of the OFF escape hatch.
+            const redactedClipboard = state.settings.redactedClipboard !== false;
+            const previewBody = redactedClipboard ? verdict.safeText : pendingDispatch.body;
             return (
-              settings !== null && isProviderWithOptIn(provider) && settings.autoSendOptIn[provider]
+              <DispatchConfirm
+                target={TARGET_PROVIDER_LABEL[dispatchProvider] ?? dispatchProvider}
+                sourceLabel={(() => {
+                  // Surface the source thread's provider + model in the
+                  // confirm modal subtitle so the user sees which chat the
+                  // context came from. Display-only.
+                  if (pendingDispatch.sourceThreadId === undefined) return undefined;
+                  const sourceThread = state.threads.find(
+                    (t) => t.bac_id === pendingDispatch.sourceThreadId,
+                  );
+                  if (sourceThread === undefined) return undefined;
+                  const provLabel =
+                    TARGET_PROVIDER_LABEL[providerIdToDispatchProvider(sourceThread.provider)] ??
+                    sourceThread.provider;
+                  const model = sourceThread.selectedModel;
+                  return model === undefined || model.length === 0
+                    ? provLabel
+                    : `${provLabel} · ${model}`;
+                })()}
+                body={previewBody}
+                autoSendOptedIn={(() => {
+                  const t = pendingDispatch.target;
+                  if (t === 'markdown' || t === 'notebook') return false;
+                  if (t === 'codex' || t === 'claude_code' || t === 'cursor') return false;
+                  return (
+                    settings !== null &&
+                    isProviderWithOptIn(dispatchProvider) &&
+                    settings.autoSendOptIn[dispatchProvider]
+                  );
+                })()}
+                dispatchKind={(() => {
+                  // Map the packet target → side-effect lane the modal
+                  // uses for its "Will ..." header.
+                  const t = pendingDispatch.target;
+                  if (t === 'markdown' || t === 'notebook') return 'export' as const;
+                  if (t === 'codex' || t === 'claude_code' || t === 'cursor')
+                    return 'coding' as const;
+                  // AI providers: paste vs auto-send depends on the user's
+                  // settings + the thread's autoSendEnabled toggle.
+                  const autoOn =
+                    settings !== null &&
+                    isProviderWithOptIn(dispatchProvider) &&
+                    settings.autoSendOptIn[dispatchProvider];
+                  return autoOn ? ('chat-auto' as const) : ('chat-paste' as const);
+                })()}
+                tokenEstimate={pendingDispatch.tokenEstimate}
+                // F31 — per-provider context-window threshold replaces the
+                // hardcoded 8000. Export/coding targets fall to the
+                // conservative "other" floor via outboundTokenThreshold.
+                tokenLimit={outboundTokenThreshold(dispatchProvider)}
+                // F01 — surface the captured-page injection verdict in the
+                // confirm modal's safety chain (previously never wired).
+                injectionDetected={verdict.injectionDetected}
+                // F01 — real redaction verdict from the preflight, not the
+                // hardcoded-[] packet field. matched = true masked-span
+                // count; rules = the categories present (anthropic-key,
+                // email, …). Both reflect what actually ships.
+                redactedCount={verdict.redaction.matched}
+                {...(verdict.redaction.rules.length > 0
+                  ? { redactedKinds: verdict.redaction.rules }
+                  : {})}
+                onCancel={() => {
+                  setPendingDispatch(null);
+                }}
+                onEdit={() => {
+                  setComposeThreadId(pendingDispatch.sourceThreadId ?? composeThreadId);
+                  setPendingDispatch(null);
+                }}
+                onConfirm={() => {
+                  if (!dispatchInFlight) {
+                    void submitPendingDispatch();
+                  }
+                }}
+              />
             );
-          })()}
-          dispatchKind={(() => {
-            // Map the packet target → side-effect lane the modal
-            // uses for its "Will ..." header.
-            const t = pendingDispatch.target;
-            if (t === 'markdown' || t === 'notebook') return 'export' as const;
-            if (t === 'codex' || t === 'claude_code' || t === 'cursor') return 'coding' as const;
-            // AI providers: paste vs auto-send depends on the user's
-            // settings + the thread's autoSendEnabled toggle.
-            const provider = mapUiTarget(t);
-            const autoOn =
-              settings !== null &&
-              isProviderWithOptIn(provider) &&
-              settings.autoSendOptIn[provider];
-            return autoOn ? ('chat-auto' as const) : ('chat-paste' as const);
-          })()}
-          tokenEstimate={pendingDispatch.tokenEstimate}
-          // F31 — per-provider context-window threshold replaces the
-          // hardcoded 8000. Export/coding targets fall to the
-          // conservative "other" floor via outboundTokenThreshold.
-          tokenLimit={outboundTokenThreshold(mapUiTarget(pendingDispatch.target))}
-          // F01 — surface the captured-page injection verdict in the
-          // confirm modal's safety chain (previously never wired).
-          injectionDetected={
-            preflightOutbound(pendingDispatch.body, mapUiTarget(pendingDispatch.target))
-              .injectionDetected
-          }
-          redactedCount={pendingDispatch.redactedItems.reduce((sum, r) => sum + r.count, 0)}
-          {...(pendingDispatch.redactedItems.length > 0
-            ? {
-                redactedKinds: pendingDispatch.redactedItems.map(
-                  (r) => `${String(r.count)} ${r.kind}`,
-                ),
-              }
-            : {})}
-          onCancel={() => {
-            setPendingDispatch(null);
-          }}
-          onEdit={() => {
-            setComposeThreadId(pendingDispatch.sourceThreadId ?? composeThreadId);
-            setPendingDispatch(null);
-          }}
-          onConfirm={() => {
-            if (!dispatchInFlight) {
-              void submitPendingDispatch();
-            }
-          }}
-        />
-      ) : null}
+          })()
+        : null}
 
       {reviewThread
         ? (() => {
