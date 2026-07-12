@@ -20,13 +20,29 @@
 // warmer is O(labels) per TTL off the hot path, so it respects the CPU
 // regime regardless of whether the reranker serves.
 //
-// Env: SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE — collection defaults ON;
-// set to "0" or "off" to disable (explicit-disable convention, matching
-// recallEmitTrainableActions). When off, peek always returns null and the
-// snapshot carries no features (legacy reconstruction path).
+// buildFeatureModel is this codebase's documented CPU-runaway cause, so it
+// must run AT MOST ONCE per TTL across all consumers. When the learned
+// reranker IS active it already builds this exact model over the SAME
+// LearnedRerankContext; this warmer REUSES that model via
+// peekLearnedRerankFeatureModel instead of building a second byte-identical
+// copy — one build per TTL whether one or both consumers are on. When the
+// reranker is off (the default) nothing is cached there and this warmer
+// owns the single build.
+//
+// Env:
+// - SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE — collection defaults ON; set
+//   to "0" or "off" to disable (explicit-disable convention, matching
+//   recallEmitTrainableActions). When off, peek always returns null and the
+//   snapshot carries no features (legacy reconstruction path).
+// - SIDETRACK_RECALL_SERVED_FEATURE_TTL_MS — background rebuild cadence in
+//   ms (default 120000); shared as the max-age both for our own cache and
+//   for accepting a learned-rerank model to reuse.
 
 import { buildFeatureModel, type FeatureModel } from '../ranker/features.js';
-import type { LearnedRerankContext } from './learnedRerank.js';
+import {
+  type LearnedRerankContext,
+  peekLearnedRerankFeatureModel,
+} from './learnedRerank.js';
 
 const DEFAULT_TTL_MS = 120_000;
 
@@ -73,6 +89,16 @@ const refresh = async (deps: ServedFeatureModelDeps, nowMs: number): Promise<voi
   if (refreshing.has(deps.vaultRoot)) return;
   refreshing.add(deps.vaultRoot);
   try {
+    // Reuse the learned reranker's warm model when it built one this TTL —
+    // it is buildFeatureModel over the SAME LearnedRerankContext, so a
+    // second build here would be pure redundant CPU. Skips loadContext +
+    // buildFeatureModel entirely in that case. Null when the reranker is
+    // off (default) or its model is cold/stale, in which case we build.
+    const shared = peekLearnedRerankFeatureModel(deps.vaultRoot, nowMs, ttlMs());
+    if (shared !== null) {
+      modelByVault.set(deps.vaultRoot, { model: shared, builtAtMs: nowMs });
+      return;
+    }
     const context = await deps.loadContext();
     if (context === null) return; // keep any prior good model; retry next TTL
     const model = buildFeatureModel(context.merged, context.snapshot);

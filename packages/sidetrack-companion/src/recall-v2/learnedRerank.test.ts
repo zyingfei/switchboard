@@ -12,6 +12,7 @@ import type { RecallCandidate } from './types.js';
 import {
   __resetLearnedRerankCacheForTests,
   applyLearnedRerank,
+  peekLearnedRerankFeatureModel,
   recallLearnedRerankEnabled,
   reorderByLearnedScore,
 } from './learnedRerank.js';
@@ -84,6 +85,22 @@ describe('reorderByLearnedScore', () => {
     const input = [hit('a', 0.5), hit('b', 0.5), hit('c', 0.5)];
     const out = reorderByLearnedScore('anchor', input, new Map(), model, handle, 0);
     expect(out.map((c) => c.entityId)).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('peekLearnedRerankFeatureModel (served-feature warmer reuse seam)', () => {
+  beforeEach(() => {
+    __resetLearnedRerankCacheForTests();
+  });
+  afterEach(() => {
+    __resetLearnedRerankCacheForTests();
+  });
+
+  it('returns null when no reranker model is cached (the default flag-off case)', () => {
+    // The served-feature warmer only reuses a model the learned reranker
+    // already built; with nothing cached it must build its own — so peek
+    // returns null and never throws.
+    expect(peekLearnedRerankFeatureModel('any-vault', 0, 120_000)).toBeNull();
   });
 });
 
