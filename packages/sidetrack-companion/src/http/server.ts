@@ -49,6 +49,7 @@ import {
 } from '../auth/workstreamTrust.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
 import { pickInstaller, type Installer, type InstallOptions } from '../install/index.js';
+import { probeServiceLiveness } from '../install/launchd.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
@@ -198,7 +199,12 @@ import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.j
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
-import { eventStoreEnabled, getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import {
+  eventStoreEnabled,
+  getCaughtUpSharedEventStore,
+  getSharedEventStore,
+} from '../sync/eventStore.js';
+import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import {
@@ -337,7 +343,12 @@ import {
   writeReviewDraft,
 } from '../vault/reviewDrafts.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
-import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
+import {
+  collectHealth,
+  resolveServiceRunning,
+  type CaptureWarningHealth,
+  type HealthReport,
+} from '../system/health.js';
 import {
   collectWorkGraphHealth,
   type ConnectionsDiagnosticSnapshot,
@@ -425,6 +436,17 @@ export interface CompanionHttpConfig {
   readonly vaultRoot?: string;
   readonly serviceInstaller?: Installer;
   readonly serviceInstallDefaults?: Omit<InstallOptions, 'vaultPath'>;
+  // Real service liveness probe (F28 health honesty). When wired, the
+  // health surface reports `service.running` from actual process
+  // liveness (launchctl / systemctl) instead of inferring it from plist
+  // existence. Optional so legacy/test call-sites fall back to the
+  // installer's plist-existence heuristic. Must be bounded + never throw.
+  readonly serviceLiveness?: () => Promise<'running' | 'not-running' | 'unknown'>;
+  // Liveness edges (F28). Synchronous, side-effect-free getters wired by
+  // the runtime when it manages the corresponding subsystem; the health
+  // surface surfaces a silently-dead ranker refresh / MCP child.
+  readonly rankerHealth?: () => import('../system/health.js').RankerRefreshHealth;
+  readonly mcpChildHealth?: () => import('../system/health.js').McpChildHealth;
   readonly sync?: {
     readonly relay?: {
       readonly mode: 'local' | 'remote';
@@ -4414,9 +4436,55 @@ const routes: readonly RouteDefinition[] = [
                 };
               },
               serviceStatus: async () => {
+                // `installed` still comes from the installer (plist/unit
+                // existence), which is what "installed" honestly means.
+                // `running`, however, must reflect ACTUAL process
+                // liveness — the installer inferred it from plist
+                // existence, so a crashed-but-installed service read as
+                // "running" forever. Probe real liveness (launchctl /
+                // systemctl); only when the probe is `unknown` (tool
+                // absent / timed out) do we fall back to the installer's
+                // heuristic rather than claim a false negative.
                 const status = await (context.serviceInstaller ?? pickInstaller()).status();
-                return { installed: status.installed, running: status.running };
+                const liveness = await (
+                  context.serviceLiveness ?? (() => probeServiceLiveness(process.platform))
+                )();
+                return {
+                  installed: status.installed,
+                  running: resolveServiceRunning(status.running, liveness),
+                };
               },
+              eventLaneHealth: getEventLaneHealth,
+              storeReconciliation: async () => {
+                // Cheap store-vs-JSONL reconciliation the store ALREADY
+                // knows: its physical row count vs the sum of its
+                // per-replica watermarks (the count it believes it
+                // accepted). A non-zero delta ⇒ committed events the
+                // store thinks it holds are missing, or seqs are sparse —
+                // either way a durability red flag. Never a full JSONL
+                // scan: getSharedEventStore returns the already-open store
+                // (or null when the event store is off) and count() /
+                // watermark() are single indexed queries.
+                const store = await getSharedEventStore(vaultRoot);
+                if (store === null) return null;
+                const storeRowCount = store.count();
+                const watermark = store.watermark();
+                const expectedFromWatermark = Object.values(watermark).reduce(
+                  (sum, seq) => sum + seq,
+                  0,
+                );
+                return {
+                  storeRowCount,
+                  expectedFromWatermark,
+                  delta: expectedFromWatermark - storeRowCount,
+                };
+              },
+              ...(context.rankerHealth === undefined
+                ? {}
+                : { rankerHealth: context.rankerHealth }),
+              ...(context.mcpChildHealth === undefined
+                ? {}
+                : { mcpChildHealth: context.mcpChildHealth }),
               workGraphSummary: async () => {
                 // Drain-time artifact first: the connections drain
                 // materializes workgraph-health.json after every
