@@ -68,6 +68,31 @@ const EXPLICIT_NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
 
 const ENGAGEMENT_ACTIONS: ReadonlySet<RecallActionKind> = new Set(['click', 'open_new_tab']);
 
+/**
+ * Move 2(a) — instance weight applied to shown-but-unjudged candidates that
+ * are emitted as WEAK negatives (label 0). Kept strictly BELOW the explicit
+ * reject weight so an explicit "not this one" outweighs a mere non-click.
+ * These are TRAINING-DATA-only rows (label 0, LightGBM row weight): the model
+ * still cannot serve until it clears the ship gate, which is why the judge
+ * ruled densifying negatives freeze-safe.
+ */
+export const WEAK_NEGATIVE_INSTANCE_WEIGHT = 0.2;
+/** Explicit rejects keep the LightGBM default weight of 1.0. */
+export const EXPLICIT_REJECT_INSTANCE_WEIGHT = 1;
+
+/**
+ * Whether shown-but-unjudged candidates are emitted as weak-negative training
+ * rows. Collection defaults ON (repo convention: opt-IN behaviours use =1, but
+ * default-ON collection uses an explicit-DISABLE env). Set
+ * SIDETRACK_RANKER_WEAK_NEGATIVES=0 (or =off/false) to restore the legacy
+ * one-positive-plus-explicit-rejects grouping. Read here so the disable knob is
+ * documented at its read site.
+ */
+export const weakNegativesEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_RANKER_WEAK_NEGATIVES'];
+  return raw !== '0' && raw !== 'off' && raw !== 'false';
+};
+
 export const MIN_RECALL_IMPRESSION_POSITIVE_GROUPS = 50;
 /**
  * Runtime floor for how many positive groups are required before the impression
@@ -328,6 +353,12 @@ export interface RecallImpressionTrainingBuildResult {
   readonly rawNegativeCount: number;
   readonly totalCandidateCount: number;
   readonly unjudgedCandidateCount: number;
+  /**
+   * Move 2(a) — count of shown-but-unjudged candidates promoted to
+   * weak-negative TRAINING rows (0 when SIDETRACK_RANKER_WEAK_NEGATIVES is
+   * disabled). Explicit rejects are counted in rawNegativeCount, not here.
+   */
+  readonly weakNegativeCount: number;
   readonly candidateSourceDistribution: Readonly<Record<string, number>>;
 }
 
@@ -485,6 +516,12 @@ export const buildRecallImpressionTrainingGroups = async ({
   let rawNegativeCount = 0;
   let totalCandidateCount = 0;
   let unjudgedCandidateCount = 0;
+  let weakNegativeCount = 0;
+  // Move 2(a) — densify labels: unjudged-but-shown candidates become
+  // weak-negative rows (label 0, low instance weight) instead of being
+  // dropped, so a group is no longer one-positive-plus-explicit-rejects.
+  // Default ON; SIDETRACK_RANKER_WEAK_NEGATIVES=0 restores the legacy path.
+  const emitWeakNegatives = weakNegativesEnabled();
   const candidateSourceDistribution: Record<string, number> = {};
 
   for (const servedEvent of servedEvents) {
@@ -521,12 +558,22 @@ export const buildRecallImpressionTrainingGroups = async ({
       if (action === undefined) {
         unjudgedCandidateCount += 1;
         scoringRows.push({ candidate, features });
+        if (emitWeakNegatives) {
+          weakNegativeCount += 1;
+          rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+        }
         continue;
       }
       const label = trainingLabelForAction(action.actionKind);
       if (label === undefined) {
+        // Engagement-only action (click / open) — no explicit label, so it is
+        // still an unjudged row; treat as a weak negative like a non-click.
         unjudgedCandidateCount += 1;
         scoringRows.push({ candidate, features });
+        if (emitWeakNegatives) {
+          weakNegativeCount += 1;
+          rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+        }
         continue;
       }
       const labelKind = label > 0 ? 'positive' : 'negative';
@@ -537,6 +584,12 @@ export const buildRecallImpressionTrainingGroups = async ({
         candidate,
         features,
         label,
+        // Explicit rejects keep full weight (1.0) so they outrank weak
+        // negatives; only stamped when weak negatives are active, otherwise
+        // `weight` stays undefined and the unweighted path is unchanged.
+        ...(emitWeakNegatives && label === 0
+          ? { weight: EXPLICIT_REJECT_INSTANCE_WEIGHT }
+          : {}),
       });
     }
     if (scoringRows.length > 0) {
@@ -612,14 +665,25 @@ export const buildRecallImpressionTrainingGroups = async ({
           retrievalContext,
         });
         if (!candidateMatchesTarget(candidateResult, spec.targetEntityId)) {
+          // Reconstructed impression: every non-target candidate is unjudged
+          // (only the feedback target carries a label), so it becomes a weak
+          // negative under the same gate as the served path.
           unjudgedCandidateCount += 1;
           scoringRows.push({ candidate, features });
+          if (emitWeakNegatives) {
+            weakNegativeCount += 1;
+            rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+          }
           continue;
         }
         const label = trainingLabelForAction(spec.actionKind);
         if (label === undefined) {
           unjudgedCandidateCount += 1;
           scoringRows.push({ candidate, features });
+          if (emitWeakNegatives) {
+            weakNegativeCount += 1;
+            rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+          }
           continue;
         }
         const labelKind = label > 0 ? 'positive' : 'negative';
@@ -630,6 +694,9 @@ export const buildRecallImpressionTrainingGroups = async ({
           candidate,
           features,
           label,
+          ...(emitWeakNegatives && label === 0
+            ? { weight: EXPLICIT_REJECT_INSTANCE_WEIGHT }
+            : {}),
         });
       }
       if (scoringRows.length > 0) {
@@ -656,6 +723,7 @@ export const buildRecallImpressionTrainingGroups = async ({
     rawNegativeCount,
     totalCandidateCount,
     unjudgedCandidateCount,
+    weakNegativeCount,
     candidateSourceDistribution,
   };
 };
@@ -1039,7 +1107,9 @@ export const maybeRetrainRecallImpressionRanker = async (input: {
     labeledRows: build.groups.reduce((sum, group) => sum + group.rows.length, 0),
     positiveRows: build.rawPositiveCount,
     negativeRows: build.rawNegativeCount,
-    implicitNegativeRows: 0,
+    // Weak negatives (shown-but-unjudged rows) are the implicit-negative
+    // population; explicit rejects are counted in negativeRows above.
+    implicitNegativeRows: build.weakNegativeCount,
     unlabeledCandidateCount: build.unjudgedCandidateCount,
   };
   const baseRevision = await (input.train ?? trainRankerRevisionFromGroups)(

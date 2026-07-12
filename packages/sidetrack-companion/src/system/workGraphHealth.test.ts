@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../connections/snapshot.js';
 import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
-import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { USER_ORGANIZED_ITEM, USER_REJECTED_RELATION } from '../feedback/events.js';
 import { projectFeedback } from '../feedback/projection.js';
 import { recordCanonicalCollision } from '../page-content/canonicalize-telemetry.js';
 import { sha256Hex } from '../page-content/store.js';
@@ -495,5 +495,49 @@ describe('work graph diagnostic candidates', () => {
       positivesAtTrain: 0,
       userFeedbackNegativesAtTrain: 1,
     });
+  });
+
+  it('surfaces the rejected-relation count in the label-channels diagnostics (Move 2b)', async () => {
+    const peerReplicaId = '33333333-3333-4333-8333-333333333333';
+    let seq = 0;
+    const eventLog = createEventLog(vaultRoot, {
+      replicaId: '44444444-4444-4444-8444-444444444444',
+      created: true,
+      nextSeq: async () => {
+        seq += 1;
+        return seq;
+      },
+      peekSeq: () => seq,
+      observeSeq: async (incoming: number) => {
+        seq = Math.max(seq, incoming);
+      },
+    });
+    const rejectedRelation: AcceptedEvent = {
+      clientEventId: 'client-rejected-relation-1',
+      dot: { replicaId: peerReplicaId, seq: 1 },
+      deps: {},
+      aggregateId: 'feedback:rejected-relation:https://example.test/a:https://example.test/b',
+      type: USER_REJECTED_RELATION,
+      payload: {
+        payloadVersion: 1,
+        fromRef: 'https://example.test/a',
+        toRef: 'https://example.test/b',
+        surface: 'connections',
+        reason: 'not-related',
+      },
+      acceptedAtMs: Date.parse('2026-05-16T14:00:00.000Z'),
+    };
+    await eventLog.importPeerEvent(rejectedRelation);
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      eventLog,
+      now: () => new Date('2026-05-16T14:02:00.000Z'),
+    });
+
+    expect(health.labelChannels.rejectedRelations.count).toBe(1);
+    expect(health.labelChannels.rejectedRelations.bySurface).toEqual({ connections: 1 });
+    // Weak-negative densification defaults ON (SIDETRACK_RANKER_WEAK_NEGATIVES).
+    expect(health.labelChannels.weakNegativesEnabled).toBe(true);
   });
 });

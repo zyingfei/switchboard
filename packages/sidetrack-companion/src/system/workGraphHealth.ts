@@ -38,6 +38,7 @@ import {
   minRecallImpressionPositiveGroups,
   readRecallImpressionRetrainState,
   summarizeRecallImpressionEvents,
+  weakNegativesEnabled,
 } from '../ranker/retrain-impressions.js';
 import {
   DEFAULT_RANKER_RETRAIN_COOLDOWN_MS,
@@ -61,8 +62,10 @@ import {
   USER_FLOW_CONFIRMED,
   USER_FLOW_REJECTED,
   USER_ORGANIZED_ITEM,
+  USER_REJECTED_RELATION,
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
+  isUserRejectedRelationPayload,
 } from '../feedback/events.js';
 
 type DiagnosticCandidateMetric = string | number | boolean | null;
@@ -202,6 +205,20 @@ export interface WorkGraphHealthReport {
     readonly servedCount: number;
     readonly actionCount: number;
     readonly actionsByKind: Readonly<Record<string, number>>;
+  };
+  // Move 2 label-density diagnostics (collect/store only — no serving
+  // consumer applies either yet). `weakNegativesEnabled` reflects whether
+  // shown-but-unjudged impression candidates are being densified into
+  // weak-negative training rows (SIDETRACK_RANKER_WEAK_NEGATIVES). `rejected`
+  // is the running count of persisted USER_REJECTED_RELATION assertions ("these
+  // two pages are NOT related"); suppression of the pair is deferred behind the
+  // freeze, so this is a visibility counter only.
+  readonly labelChannels: {
+    readonly weakNegativesEnabled: boolean;
+    readonly rejectedRelations: {
+      readonly count: number;
+      readonly bySurface: Readonly<Record<string, number>>;
+    };
   };
   // Phase 5 of the recall+ranker v2 hard-replacement. Dogfood-config
   // visibility on the health panel: what retrieval backend the
@@ -980,7 +997,13 @@ export const collectWorkGraphHealth = async ({
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
   const feedback = projectFeedback(await readFeedbackEvents(vaultRoot, eventLog));
-  const merged = await readEventsForHealth(vaultRoot, eventLog, ['recall.served', 'recall.action']);
+  const merged = await readEventsForHealth(vaultRoot, eventLog, [
+    'recall.served',
+    'recall.action',
+    // Move 2(b) — typed-index read so the rejected-relation diagnostics count
+    // stays O(matching events), never a full-log scan.
+    USER_REJECTED_RELATION,
+  ]);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [
     activeManifest,
@@ -1200,6 +1223,11 @@ export const collectWorkGraphHealth = async ({
   let servedCount = 0;
   let actionCount = 0;
   const actionsByKind: Record<string, number> = {};
+  // Move 2(b) — count persisted USER_REJECTED_RELATION assertions for the
+  // ranker/health diagnostics. Collect-store-only: this is a visibility
+  // counter; no consumer applies the rejection to serving/edges yet.
+  let rejectedRelationCount = 0;
+  const rejectedRelationsBySurface: Record<string, number> = {};
   for (const event of merged) {
     if (event.type === 'recall.served') {
       servedCount += 1;
@@ -1209,12 +1237,23 @@ export const collectWorkGraphHealth = async ({
       if (typeof kind === 'string') {
         actionsByKind[kind] = (actionsByKind[kind] ?? 0) + 1;
       }
+    } else if (event.type === USER_REJECTED_RELATION && isUserRejectedRelationPayload(event.payload)) {
+      rejectedRelationCount += 1;
+      const surface = event.payload.surface;
+      rejectedRelationsBySurface[surface] = (rejectedRelationsBySurface[surface] ?? 0) + 1;
     }
   }
   const impressionLog: WorkGraphHealthReport['impressionLog'] = {
     servedCount,
     actionCount,
     actionsByKind,
+  };
+  const labelChannels: WorkGraphHealthReport['labelChannels'] = {
+    weakNegativesEnabled: weakNegativesEnabled(),
+    rejectedRelations: {
+      count: rejectedRelationCount,
+      bySurface: rejectedRelationsBySurface,
+    },
   };
   // Phase 5 — dogfood-config snapshot. Values are constants here
   // because the server-side wiring is the single source of truth
@@ -1267,6 +1306,7 @@ export const collectWorkGraphHealth = async ({
     },
     topicProducer,
     impressionLog,
+    labelChannels,
     recall,
     hygiene,
     candidates: buildDiagnosticCandidates({

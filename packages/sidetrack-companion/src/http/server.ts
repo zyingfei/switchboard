@@ -140,12 +140,14 @@ import {
   USER_FLOW_CONFIRMED,
   USER_FLOW_REJECTED,
   USER_ORGANIZED_ITEM,
+  USER_REJECTED_RELATION,
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
   isUserEngagementRelabeledPayload,
   isUserFlowConfirmedPayload,
   isUserFlowRejectedPayload,
   isUserOrganizedItemPayload,
+  isUserRejectedRelationPayload,
   isUserSnippetPromotedPayload,
   isUserTopicRenamedPayload,
 } from '../feedback/events.js';
@@ -2569,6 +2571,10 @@ const FEEDBACK_EVENT_TYPE_LIST = [
   USER_FLOW_REJECTED,
   USER_TOPIC_RENAMED,
   USER_SNIPPET_PROMOTED,
+  // Collect-store-only: included so the typed feedback read is complete
+  // (the event-store index filters by type). projectFeedback ignores it —
+  // no serving consumer applies it yet (Move 2b, deferred behind the freeze).
+  USER_REJECTED_RELATION,
 ] as const;
 
 // Signature-keyed projection caches. The /v1/visits and /v1/tabsessions
@@ -2646,13 +2652,15 @@ const isFeedbackEventType = (
   | typeof USER_FLOW_CONFIRMED
   | typeof USER_FLOW_REJECTED
   | typeof USER_TOPIC_RENAMED
-  | typeof USER_SNIPPET_PROMOTED =>
+  | typeof USER_SNIPPET_PROMOTED
+  | typeof USER_REJECTED_RELATION =>
   value === USER_ORGANIZED_ITEM ||
   value === USER_ENGAGEMENT_RELABELED ||
   value === USER_FLOW_CONFIRMED ||
   value === USER_FLOW_REJECTED ||
   value === USER_TOPIC_RENAMED ||
-  value === USER_SNIPPET_PROMOTED;
+  value === USER_SNIPPET_PROMOTED ||
+  value === USER_REJECTED_RELATION;
 
 const isFeedbackPayloadForType = (
   type: string,
@@ -2664,6 +2672,7 @@ const isFeedbackPayloadForType = (
   if (type === USER_FLOW_REJECTED) return isUserFlowRejectedPayload(payload);
   if (type === USER_TOPIC_RENAMED) return isUserTopicRenamedPayload(payload);
   if (type === USER_SNIPPET_PROMOTED) return isUserSnippetPromotedPayload(payload);
+  if (type === USER_REJECTED_RELATION) return isUserRejectedRelationPayload(payload);
   return false;
 };
 
@@ -2684,6 +2693,13 @@ const aggregateIdForFeedbackEvent = (type: string, payload: Record<string, unkno
   }
   if (type === USER_SNIPPET_PROMOTED) {
     return `feedback:snippet:${String(payload['snippetId'])}`;
+  }
+  if (type === USER_REJECTED_RELATION) {
+    // Keyed on the unordered page pair so repeated rejections of the same two
+    // pages collapse to one aggregate (last-write-wins), independent of which
+    // page was the anchor when the assertion was made.
+    const [a, b] = [String(payload['fromRef']), String(payload['toRef'])].sort();
+    return `feedback:rejected-relation:${a}:${b}`;
   }
   return 'feedback:unknown';
 };

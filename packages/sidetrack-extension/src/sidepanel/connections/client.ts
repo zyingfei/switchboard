@@ -28,6 +28,10 @@ export const USER_FLOW_CONFIRMED = 'user.flow.confirmed' as const;
 export const USER_FLOW_REJECTED = 'user.flow.rejected' as const;
 export const USER_TOPIC_RENAMED = 'user.topic.renamed' as const;
 export const USER_SNIPPET_PROMOTED = 'user.snippet.promoted' as const;
+// Move 2(b) — persisted "these two pages are NOT related" channel. Mirrors the
+// companion's USER_REJECTED_RELATION. Collect-store-only on the companion; no
+// serving consumer applies it yet (deferred behind the P1 freeze).
+export const USER_REJECTED_RELATION = 'user.rejected.relation' as const;
 
 export type UserOrganizedItemKind =
   | 'thread'
@@ -109,6 +113,21 @@ export interface UserSnippetPromotedPayload {
   readonly sourceVisitId?: string;
 }
 
+export type UserRejectedRelationSurface = 'related-strip' | 'connections' | 'dejavu';
+export type UserRejectedRelationReason =
+  | 'not-related'
+  | 'different-topic'
+  | 'coincidental'
+  | 'other';
+
+export interface UserRejectedRelationPayload {
+  readonly payloadVersion: 1;
+  readonly fromRef: string;
+  readonly toRef: string;
+  readonly surface: UserRejectedRelationSurface;
+  readonly reason?: UserRejectedRelationReason;
+}
+
 export type FeedbackEventEnvelope =
   | { readonly type: typeof USER_ORGANIZED_ITEM; readonly payload: UserOrganizedItemPayload }
   | {
@@ -118,7 +137,11 @@ export type FeedbackEventEnvelope =
   | { readonly type: typeof USER_FLOW_CONFIRMED; readonly payload: UserFlowConfirmedPayload }
   | { readonly type: typeof USER_FLOW_REJECTED; readonly payload: UserFlowRejectedPayload }
   | { readonly type: typeof USER_TOPIC_RENAMED; readonly payload: UserTopicRenamedPayload }
-  | { readonly type: typeof USER_SNIPPET_PROMOTED; readonly payload: UserSnippetPromotedPayload };
+  | { readonly type: typeof USER_SNIPPET_PROMOTED; readonly payload: UserSnippetPromotedPayload }
+  | {
+      readonly type: typeof USER_REJECTED_RELATION;
+      readonly payload: UserRejectedRelationPayload;
+    };
 
 export interface FeedbackPostResult {
   readonly accepted?: unknown;
@@ -212,6 +235,18 @@ export const postUserFlowRejected = (
 ): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
   postFeedbackEvent({
     type: USER_FLOW_REJECTED,
+    payload: { payloadVersion: 1, ...payload },
+  });
+
+// Move 2(b) — persist a "these two pages are NOT related" assertion. Emitted
+// alongside the existing flow-reject gesture; the companion stores it as a
+// stand-alone negative-relation channel (collect-store-only, no serving
+// consumer yet). Fire-and-forget from the caller's perspective.
+export const postUserRejectedRelation = (
+  payload: Omit<UserRejectedRelationPayload, 'payloadVersion'>,
+): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
+  postFeedbackEvent({
+    type: USER_REJECTED_RELATION,
     payload: { payloadVersion: 1, ...payload },
   });
 

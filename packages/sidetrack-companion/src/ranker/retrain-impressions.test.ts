@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import { USER_FLOW_CONFIRMED, type UserFlowConfirmedPayload } from '../feedback/events.js';
@@ -19,6 +19,8 @@ import {
 } from './feature-schema.js';
 import type { extractFeatures } from './features.js';
 import {
+  EXPLICIT_REJECT_INSTANCE_WEIGHT,
+  WEAK_NEGATIVE_INSTANCE_WEIGHT,
   buildRecallImpressionTrainingGroups,
   maybeRetrainRecallImpressionRanker,
 } from './retrain-impressions.js';
@@ -327,13 +329,20 @@ describe('recall impression training groups', () => {
 
     expect(result.groups).toHaveLength(1);
     const group = result.groups[0];
-    expect(group?.rows).toHaveLength(2);
+    // Move 2a default-ON: the unjudged candidate is now a weak-negative row,
+    // so the group carries all THREE shown candidates (was two pre-Move-2).
+    expect(group?.rows).toHaveLength(3);
     const candidateIds = new Set(group?.rows.map((row) => row.candidate.toVisitId));
     expect(candidateIds).toEqual(
-      new Set(['https://example.test/positive', 'https://example.test/negative']),
+      new Set([
+        'https://example.test/positive',
+        'https://example.test/negative',
+        'https://example.test/unjudged',
+      ]),
     );
-    expect(group?.rows.map((row) => row.label).sort()).toEqual([0, 3]);
+    expect(group?.rows.map((row) => row.label).sort()).toEqual([0, 0, 3]);
     expect(result.unjudgedCandidateCount).toBe(1);
+    expect(result.weakNegativeCount).toBe(1);
   });
 
   it('does not generate a training group from engagement-only clicks', async () => {
@@ -356,7 +365,7 @@ describe('recall impression training groups', () => {
     expect(result.unjudgedCandidateCount).toBe(2);
   });
 
-  it('reconstructs historical feedback without treating unjudged candidates as negatives', async () => {
+  it('reconstructs historical feedback, treating unjudged candidates as weak negatives (Move 2a)', async () => {
     const legacyFeedback = flowConfirmed(
       1,
       'https://example.test/anchor',
@@ -377,11 +386,23 @@ describe('recall impression training groups', () => {
 
     expect(result.groups).toHaveLength(1);
     expect(result.groups[0]?.groupId).toBe('reconstructed:evt-1');
-    expect(result.groups[0]?.rows).toHaveLength(1);
-    expect(result.groups[0]?.rows[0]?.label).toBe(3);
-    expect(result.groups[0]?.rows[0]?.candidate.toVisitId).toBe('https://example.test/target');
+    // Default-ON: the non-target reconstruction candidate is a weak negative,
+    // so the group now has the positive PLUS one weak-negative row.
+    expect(result.groups[0]?.rows).toHaveLength(2);
+    const rows = result.groups[0]?.rows ?? [];
+    const target = rows.find((row) => row.candidate.toVisitId === 'https://example.test/target');
+    const unjudged = rows.find(
+      (row) => row.candidate.toVisitId === 'https://example.test/unjudged',
+    );
+    expect(target?.label).toBe(3);
+    expect(target?.weight).toBeUndefined();
+    expect(unjudged?.label).toBe(0);
+    expect(unjudged?.weight).toBe(WEAK_NEGATIVE_INSTANCE_WEIGHT);
+    // Positive/explicit-negative counts are unchanged — a weak negative is NOT
+    // an explicit reject, so rawNegativeCount stays 0.
     expect(result.rawPositiveCount).toBe(1);
     expect(result.rawNegativeCount).toBe(0);
+    expect(result.weakNegativeCount).toBe(1);
     expect(result.unjudgedCandidateCount).toBe(1);
   });
 
@@ -431,5 +452,116 @@ describe('recall impression training groups', () => {
       validationGroupCount: 9,
       testGroupCount: 12,
     });
+  });
+});
+
+describe('recall impression training — weak negatives (Move 2a)', () => {
+  const ENV = 'SIDETRACK_RANKER_WEAK_NEGATIVES';
+  afterEach(() => {
+    delete process.env[ENV];
+  });
+
+  // A group shown with 1 positive + 2 unjudged + 1 explicit reject. Default
+  // (env unset) should densify to FOUR training rows; disabling restores the
+  // legacy one-positive-plus-explicit-rejects grouping (two rows).
+  const groupMerged = (): readonly AcceptedEvent[] => [
+    served(1, 'ctx-1', [
+      servedCandidate('positive', 'page_content', 0),
+      servedCandidate('unjudged-a', 'semantic_query', 1),
+      servedCandidate('unjudged-b', 'timeline_visit', 2),
+      servedCandidate('reject', 'graph_neighbor', 3),
+    ]),
+    action(2, 'ctx-1', 'positive', 'flow_confirm'),
+    action(3, 'ctx-1', 'reject', 'reject'),
+  ];
+
+  it('emits weak-negative rows for shown-but-unjudged candidates (default ON)', async () => {
+    delete process.env[ENV];
+    const result = await buildRecallImpressionTrainingGroups({
+      merged: groupMerged(),
+      snapshot,
+    });
+    const group = result.groups[0];
+    expect(group).toBeDefined();
+    // All four shown candidates become training rows.
+    expect(group?.rows).toHaveLength(4);
+    const byTarget = new Map(
+      (group?.rows ?? []).map((row) => [row.candidate.toVisitId, row] as const),
+    );
+    const rowFor = (entityId: string) => byTarget.get(`https://example.test/${entityId}`);
+
+    // Positive: label 3, no explicit weight (positives keep the default 1.0).
+    expect(rowFor('positive')?.label).toBe(3);
+    expect(rowFor('positive')?.weight).toBeUndefined();
+
+    // Explicit reject: label 0 at FULL weight so it outranks weak negatives.
+    expect(rowFor('reject')?.label).toBe(0);
+    expect(rowFor('reject')?.weight).toBe(EXPLICIT_REJECT_INSTANCE_WEIGHT);
+
+    // Unjudged: label 0 at the LOWER weak-negative weight.
+    for (const id of ['unjudged-a', 'unjudged-b']) {
+      expect(rowFor(id)?.label).toBe(0);
+      expect(rowFor(id)?.weight).toBe(WEAK_NEGATIVE_INSTANCE_WEIGHT);
+    }
+    // Weak negatives are strictly below explicit rejects.
+    expect(WEAK_NEGATIVE_INSTANCE_WEIGHT).toBeLessThan(EXPLICIT_REJECT_INSTANCE_WEIGHT);
+
+    expect(result.weakNegativeCount).toBe(2);
+    // Unjudged count is unchanged — a weak negative is still user-unjudged.
+    expect(result.unjudgedCandidateCount).toBe(2);
+  });
+
+  it('restores legacy grouping when the disable env is set', async () => {
+    process.env[ENV] = '0';
+    const result = await buildRecallImpressionTrainingGroups({
+      merged: groupMerged(),
+      snapshot,
+    });
+    const group = result.groups[0];
+    // Legacy behaviour: only the explicitly-judged rows (positive + reject).
+    expect(group?.rows).toHaveLength(2);
+    for (const row of group?.rows ?? []) {
+      // No weights are stamped, so training is byte-identical to pre-Move-2.
+      expect(row.weight).toBeUndefined();
+    }
+    expect(result.weakNegativeCount).toBe(0);
+    // Unjudged still counted; they are just not promoted to training rows.
+    expect(result.unjudgedCandidateCount).toBe(2);
+  });
+
+  it('trains a real LightGBM model through the weighted-row path', async () => {
+    // Each impression carries an unjudged candidate → weak-negative rows, so
+    // the LightGBM `weight` field is actually set on the dataset. This proves
+    // the WASM weight plumbing runs end-to-end without crashing.
+    delete process.env[ENV];
+    const merged: AcceptedEvent[] = [];
+    let seq = 1;
+    for (let index = 0; index < 60; index += 1) {
+      const contextId = `ctx-${String(index)}`;
+      merged.push(
+        served(seq, contextId, [
+          servedCandidate(`positive-${String(index)}`, 'page_content', 0),
+          servedCandidate(`negative-${String(index)}`, 'semantic_query', 1),
+          servedCandidate(`unjudged-${String(index)}`, 'timeline_visit', 2),
+        ]),
+      );
+      seq += 1;
+      merged.push(action(seq, contextId, `positive-${String(index)}`, 'flow_confirm'));
+      seq += 1;
+      merged.push(action(seq, contextId, `negative-${String(index)}`, 'reject'));
+      seq += 1;
+    }
+
+    const result = await maybeRetrainRecallImpressionRanker({
+      merged,
+      snapshot,
+      trainOptions: { seed: 7, numRound: 2, trainedAt: BASE_TIME },
+    });
+
+    expect(result.status).toBe('trained');
+    if (result.status !== 'trained') throw new Error('expected trained result');
+    // 60 impressions × 1 unjudged each = 60 weak-negative rows fed to LightGBM.
+    expect(result.stats.rawPositiveCount).toBe(60);
+    expect(result.stats.rawNegativeCount).toBe(60);
   });
 });

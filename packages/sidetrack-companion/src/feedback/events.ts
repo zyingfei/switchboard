@@ -6,6 +6,16 @@ export const USER_FLOW_CONFIRMED = 'user.flow.confirmed' as const;
 export const USER_FLOW_REJECTED = 'user.flow.rejected' as const;
 export const USER_TOPIC_RENAMED = 'user.topic.renamed' as const;
 export const USER_SNIPPET_PROMOTED = 'user.snippet.promoted' as const;
+// Move 2(b) — the user asserting that two pages are NOT related. This is the
+// persisted negative-relation channel that mirrors the positive
+// `user.flow.confirmed` channel (same fromRef/toRef string ref shapes). It is
+// COLLECT-AND-STORE ONLY: no consumer applies it to serving/edges yet —
+// suppression on the specific pair is deferred behind the P1 freeze (see the
+// recsys data-architecture review, roadmap move 2, and ADR-0011). Distinct from
+// `user.flow.rejected`, which is a graph-relation-kind flow correction the
+// ranker already consumes as a negative label; this channel is a free-standing
+// "these two pages are not related" assertion carrying its own surface.
+export const USER_REJECTED_RELATION = 'user.rejected.relation' as const;
 
 export const FEEDBACK_EVENT_TYPES = [
   USER_ORGANIZED_ITEM,
@@ -14,6 +24,7 @@ export const FEEDBACK_EVENT_TYPES = [
   USER_FLOW_REJECTED,
   USER_TOPIC_RENAMED,
   USER_SNIPPET_PROMOTED,
+  USER_REJECTED_RELATION,
 ] as const;
 
 export type FeedbackEventType = (typeof FEEDBACK_EVENT_TYPES)[number];
@@ -139,13 +150,45 @@ export interface UserSnippetPromotedPayload {
   readonly sourceVisitId?: string;
 }
 
+// The surfaces from which a "not related" assertion can originate. Mirrors the
+// affordance placement: the related-pages strip and the connections view are
+// where two pages are shown as related and can be rejected.
+export const USER_REJECTED_RELATION_SURFACES = [
+  'related-strip',
+  'connections',
+  'dejavu',
+] as const;
+
+export type UserRejectedRelationSurface = (typeof USER_REJECTED_RELATION_SURFACES)[number];
+
+export const USER_REJECTED_RELATION_REASONS = [
+  'not-related',
+  'different-topic',
+  'coincidental',
+  'other',
+] as const;
+
+export type UserRejectedRelationReason = (typeof USER_REJECTED_RELATION_REASONS)[number];
+
+export interface UserRejectedRelationPayload {
+  readonly payloadVersion: 1;
+  // Same string-ref shape as the positive `user.flow.confirmed` channel
+  // (fromId/toId): a canonical URL or visit id. `fromRef` is the anchor page,
+  // `toRef` the page the user says is NOT related to it.
+  readonly fromRef: string;
+  readonly toRef: string;
+  readonly surface: UserRejectedRelationSurface;
+  readonly reason?: UserRejectedRelationReason;
+}
+
 export type FeedbackPayload =
   | UserOrganizedItemPayload
   | UserEngagementRelabeledPayload
   | UserFlowConfirmedPayload
   | UserFlowRejectedPayload
   | UserTopicRenamedPayload
-  | UserSnippetPromotedPayload;
+  | UserSnippetPromotedPayload
+  | UserRejectedRelationPayload;
 
 const ORGANIZED_ITEM_KINDS: ReadonlySet<string> = new Set<string>(USER_ORGANIZED_ITEM_KINDS);
 const ORGANIZED_ITEM_ACTIONS: ReadonlySet<string> = new Set<string>(USER_ORGANIZED_ITEM_ACTIONS);
@@ -155,6 +198,12 @@ const FLOW_REJECTION_REASONS: ReadonlySet<string> = new Set<string>(USER_FLOW_RE
 const TOPIC_RENAME_SOURCES: ReadonlySet<string> = new Set<string>(USER_TOPIC_RENAME_SOURCES);
 const SNIPPET_PROMOTION_TARGET_KINDS: ReadonlySet<string> = new Set<string>(
   USER_SNIPPET_PROMOTION_TARGET_KINDS,
+);
+const REJECTED_RELATION_SURFACES: ReadonlySet<string> = new Set<string>(
+  USER_REJECTED_RELATION_SURFACES,
+);
+const REJECTED_RELATION_REASONS: ReadonlySet<string> = new Set<string>(
+  USER_REJECTED_RELATION_REASONS,
 );
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -290,3 +339,21 @@ export const isUserSnippetPromotedPayload = (value: unknown): value is UserSnipp
   isSnippetPromotionTargetKind(value['targetKind']) &&
   isNonEmptyString(value['targetId']) &&
   isOptionalString(value['sourceVisitId']);
+
+const isRejectedRelationSurface = (value: unknown): value is UserRejectedRelationSurface =>
+  typeof value === 'string' && REJECTED_RELATION_SURFACES.has(value);
+
+const isOptionalRejectedRelationReason = (
+  value: unknown,
+): value is UserRejectedRelationReason | undefined =>
+  value === undefined || (typeof value === 'string' && REJECTED_RELATION_REASONS.has(value));
+
+export const isUserRejectedRelationPayload = (
+  value: unknown,
+): value is UserRejectedRelationPayload =>
+  isRecord(value) &&
+  hasPayloadVersionAndNoDimensions(value) &&
+  isNonEmptyString(value['fromRef']) &&
+  isNonEmptyString(value['toRef']) &&
+  isRejectedRelationSurface(value['surface']) &&
+  isOptionalRejectedRelationReason(value['reason']);
