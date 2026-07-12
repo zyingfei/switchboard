@@ -1,6 +1,5 @@
-import type { AcceptedEvent } from './causal.js';
-import { getCaughtUpSharedEventStore } from './eventStore.js';
 import type { EventLog } from './eventLog.js';
+import { latestPerAggregateFromLog } from './latestPerAggregate.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
 import { runImportProjectors } from './projectors.js';
 
@@ -44,34 +43,8 @@ export interface AntiEntropyHandle {
   readonly scanNow: () => Promise<number>;
 }
 
-const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly AcceptedEvent[] => {
-  const byId = new Map<string, AcceptedEvent>();
-  for (const event of events) {
-    const prior = byId.get(event.aggregateId);
-    if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-      byId.set(event.aggregateId, event);
-    }
-  }
-  return [...byId.values()];
-};
-
-const latestPerAggregateFromLog = async (
-  vaultRoot: string,
-  eventLog: EventLog,
-): Promise<readonly AcceptedEvent[]> => {
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
-  if (store === null) return latestPerAggregate(await eventLog.readMerged());
-  const byId = new Map<string, AcceptedEvent>();
-  await store.forEachChunk((chunk) => {
-    for (const event of chunk) {
-      const prior = byId.get(event.aggregateId);
-      if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-        byId.set(event.aggregateId, event);
-      }
-    }
-  }, 2000);
-  return [...byId.values()];
-};
+// Anti-entropy re-projects the LATEST event of EVERY aggregate (all
+// types) — see latestPerAggregateFromLog (no `handles` filter).
 
 export const startAntiEntropyTask = (deps: StartAntiEntropyDeps): AntiEntropyHandle => {
   const intervalMs = deps.intervalMs ?? 30 * 60 * 1000;

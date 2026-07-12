@@ -100,6 +100,49 @@ describe('derived-data GC plan', () => {
     );
   });
 
+  it('keeps the newest N daily connections snapshots and prunes the rest in plan+apply', async () => {
+    const now = new Date('2026-05-15T12:00:00.000Z');
+    // Five date-named snapshots. mtimes are deliberately INVERTED vs the
+    // date order (oldest date written most recently) to prove retention
+    // keys on the filename date, not mtime.
+    const dates = ['2026-05-11', '2026-05-12', '2026-05-13', '2026-05-14', '2026-05-15'];
+    for (let index = 0; index < dates.length; index += 1) {
+      await writeFixture(
+        `_BAC/connections/snapshots/${dates[index] as string}.json`,
+        `{"day":"${dates[index] as string}"}\n`,
+        now.getTime() - (dates.length - index) * 1_000,
+      );
+    }
+    // A stray non-date file must be ignored by the retention selector.
+    await writeFixture('_BAC/connections/snapshots/current.json', '{}\n', now.getTime());
+
+    const plan = await buildGcPlan(root, { now, keepConnectionsSnapshots: 3 });
+    const snapshotEntries = plan.entries.filter(
+      (entry) => entry.group === 'connections-snapshots',
+    );
+    // Newest 3 DATES kept (05-15/14/13); oldest 2 pruned (05-12/11).
+    expect(snapshotEntries.map((entry) => entry.path.split('/').at(-1)).sort()).toEqual([
+      '2026-05-11.json',
+      '2026-05-12.json',
+    ]);
+    expect(snapshotEntries[0]?.reason).toBe('daily connections snapshot outside newest 3');
+    // current.json (non-date) never selected.
+    expect(snapshotEntries.some((entry) => entry.path.endsWith('current.json'))).toBe(false);
+
+    const result = await applyGcPlan(plan);
+    expect(result.errors).toEqual([]);
+    // Pruned files gone; kept dates + current.json still present.
+    await expect(
+      readFile(join(root, '_BAC/connections/snapshots/2026-05-11.json'), 'utf8'),
+    ).rejects.toBeInstanceOf(Error);
+    await expect(
+      readFile(join(root, '_BAC/connections/snapshots/2026-05-13.json'), 'utf8'),
+    ).resolves.toContain('2026-05-13');
+    await expect(
+      readFile(join(root, '_BAC/connections/snapshots/current.json'), 'utf8'),
+    ).resolves.toBe('{}\n');
+  });
+
   it('applies the planned deletes only when requested', async () => {
     const now = new Date('2026-05-15T12:00:00.000Z');
     const stale = await writeFixture(

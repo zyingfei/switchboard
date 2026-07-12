@@ -66,6 +66,59 @@ describe('projection change feed', () => {
     expect(tail.cursor).toBe(5);
   });
 
+  it('cursor resume parses only newly appended lines on a steady-state poll', async () => {
+    const feed = createProjectionChangeFeed(vaultRoot);
+    const append = (i: number) =>
+      feed.appendChange({
+        aggregate: 'review-draft',
+        aggregateId: `t-${String(i)}`,
+        relPath: `_BAC/review-drafts/t-${String(i)}.json`,
+        vector: { A: i },
+        kind: 'upsert',
+      });
+
+    // Seed 4 changes, poll from 0 (full scan of 4 lines).
+    for (let i = 1; i <= 4; i += 1) await append(i);
+    const first = await feed.readSince(0);
+    expect(first.cursor).toBe(4);
+    expect(first.changed.map((c) => c.seq)).toEqual([1, 2, 3, 4]);
+    const afterFirst = feed.__parsedLineCount();
+    expect(afterFirst).toBe(4);
+
+    // Append 2 more, poll resuming from the cursor we were just handed.
+    // Only the 2 appended lines should be parsed — NOT the whole history.
+    await append(5);
+    await append(6);
+    const second = await feed.readSince(first.cursor);
+    expect(second.cursor).toBe(6);
+    expect(second.changed.map((c) => c.seq)).toEqual([5, 6]);
+    expect(feed.__parsedLineCount() - afterFirst).toBe(2);
+
+    // A no-op poll from the latest cursor parses nothing at all.
+    const third = await feed.readSince(second.cursor);
+    expect(third.changed).toEqual([]);
+    expect(feed.__parsedLineCount() - afterFirst).toBe(2);
+  });
+
+  it('cursor resume still serves an OLDER cursor via a full re-scan', async () => {
+    const feed = createProjectionChangeFeed(vaultRoot);
+    for (let i = 1; i <= 3; i += 1) {
+      await feed.appendChange({
+        aggregate: 'review-draft',
+        aggregateId: `t-${String(i)}`,
+        relPath: `_BAC/review-drafts/t-${String(i)}.json`,
+        vector: { A: i },
+        kind: 'upsert',
+      });
+    }
+    // Advance the checkpoint to seq 3.
+    await feed.readSince(0);
+    // A resume from an OLDER cursor (below maxScannedSeq) must fall back
+    // to a full scan and still return the correct tail.
+    const older = await feed.readSince(1);
+    expect(older.changed.map((c) => c.seq)).toEqual([2, 3]);
+  });
+
   it('readSince on a missing log returns the current cursor and empty list', async () => {
     const feed = createProjectionChangeFeed(vaultRoot);
     const result = await feed.readSince(0);

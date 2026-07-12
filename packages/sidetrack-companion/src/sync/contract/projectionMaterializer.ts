@@ -1,6 +1,6 @@
 import type { AcceptedEvent } from '../causal.js';
-import { getCaughtUpSharedEventStore } from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
+import { latestPerAggregateFromLog } from '../latestPerAggregate.js';
 import type { ProjectionChangeFeed } from '../projectionChanges.js';
 import { runImportProjectors } from '../projectors.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -78,33 +78,13 @@ export const createProjectionMaterializer = (
   const catchUp: Materializer['catchUp'] = async (eventLog) => {
     pending = true;
     try {
-      // Process each aggregate's latest event. Same logic as
-      // antiEntropy + reproject, here unified.
-      const latest = new Map<string, AcceptedEvent>();
-      const store = await getCaughtUpSharedEventStore(deps.vaultRoot);
-      if (store === null) {
-        // Stream only the handled (structural, low-volume) types instead
-        // of materialising the full ~700MB merged log. streamFiltered
-        // returns the same sorted order as readMerged().filter(handles),
-        // so the latest-per-aggregate fold is byte-identical.
-        for (const event of await eventLog.streamFiltered((e) => handles.has(e.type), handles)) {
-          const prior = latest.get(event.aggregateId);
-          if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-            latest.set(event.aggregateId, event);
-          }
-        }
-      } else {
-        await store.forEachChunk((chunk) => {
-          for (const event of chunk) {
-            if (!handles.has(event.type)) continue;
-            const prior = latest.get(event.aggregateId);
-            if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-              latest.set(event.aggregateId, event);
-            }
-          }
-        }, 2000);
-      }
-      for (const event of latest.values()) {
+      // Process each aggregate's latest event. Same fold as antiEntropy
+      // + reproject (now the shared latestPerAggregateFromLog), but this
+      // materializer passes `handles` so only the handled (structural,
+      // low-volume) types are read — never materialising the full ~700MB
+      // / ~92%-engagement.interval merged log.
+      const latest = await latestPerAggregateFromLog(deps.vaultRoot, eventLog, handles);
+      for (const event of latest) {
         try {
           await runImportProjectors(
             {
