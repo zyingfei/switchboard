@@ -158,6 +158,36 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// Navigate to an old flat-tab destination through the redesigned chrome
+// (lamp → primary section nav → contextual sub-tab). The flat 7-tab bar
+// was retired: each section now reveals only its own sub-tabs, so a
+// destination is reached by first selecting its owning section, then the
+// sub-tab. Every sub-tab keeps its exact role=tab accessible name, so
+// callers still assert against `getByRole('tab', { name })` after this.
+//   Now             → Now section (single surface, no sub-tab)
+//   Threads/Workstreams/Queued follow-ups → Work section
+//   Search/Explore  → Memory section
+//   Inbound replies/Inbox → Trust section
+const SECTION_OF_TAB: Record<string, string> = {
+  Now: 'now',
+  Threads: 'work',
+  Workstreams: 'work',
+  'Queued follow-ups': 'work',
+  Search: 'memory',
+  Explore: 'memory',
+  'Inbound replies': 'trust',
+  Inbox: 'trust',
+};
+const goToTab = async (name: string): Promise<void> => {
+  const section = SECTION_OF_TAB[name];
+  if (section !== undefined) {
+    const navBtn = await screen.findByTestId(`section-nav-${section}`);
+    fireEvent.click(navBtn);
+  }
+  if (name === 'Now') return;
+  fireEvent.click(await screen.findByRole('tab', { name }));
+};
+
 describe('live side-panel App wiring', () => {
   it('keys in-flight companion GETs by bridge key as well as port and path', () => {
     const oldKey = companionGetInFlightKey('17373', 'old-bridge-key', '/v1/visits/projection');
@@ -207,7 +237,7 @@ describe('live side-panel App wiring', () => {
     expect(screen.queryByText('Set up Sidetrack')).not.toBeInTheDocument();
     // Scope D — default view is Now; the workstream scaffolding
     // (Open threads / Captures / ws-bar) lives under Workstreams now.
-    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
+    await goToTab('Workstreams');
     expect(await screen.findByText('Open threads')).toBeInTheDocument();
     expect(screen.getByText('Captures')).toBeInTheDocument();
     // ws-bar shows the current workstream label (default: "not set")
@@ -254,7 +284,7 @@ describe('live side-panel App wiring', () => {
     // renders masked as `[private]` because the workstream is
     // private — find by that, not by the actual title string.
     await screen.findByRole('main', { name: 'Sidetrack workboard' });
-    fireEvent.click(screen.getByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
 
     // Wait for the thread bucket to render under the Threads tab.
     const threadRow = (await screen.findByText('[private]')).closest('.thread');
@@ -292,7 +322,7 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     // Scope D — Workstream picker lives under the Workstreams tab.
-    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
+    await goToTab('Workstreams');
     // Switch to the workstream that contains the test thread via the ws picker.
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
@@ -350,7 +380,7 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     // Scope D — Workstream pills + picker live under Workstreams.
-    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
+    await goToTab('Workstreams');
     fireEvent.click(await screen.findByRole('button', { name: /not set/ }));
     const wsRows = await screen.findAllByRole('button');
     const sidetrackPickerRow = wsRows.find(
@@ -399,7 +429,7 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     // Scope D — Workstream pills (drop targets) live under Workstreams.
-    fireEvent.click(await screen.findByRole('tab', { name: 'Workstreams' }));
+    await goToTab('Workstreams');
     const dataTransfer = {
       dropEffect: 'none',
       effectAllowed: 'move',
@@ -567,12 +597,12 @@ describe('live side-panel App wiring', () => {
     // Scope D — current-tab card lives in Now, inbox list lives in
     // Inbox. Assert the card under Now, then switch to Inbox to
     // assert the per-URL inbox row.
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sidetrack');
     });
     expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Features only');
-    fireEvent.click(screen.getByRole('tab', { name: 'Inbox' }));
+    await goToTab('Inbox');
     expect(await screen.findByText('Copy fail')).toBeInTheDocument();
     // Stage 5 polish — flat 4-action layout aligned with Current Tab.
     // Both the Current Tab card and the Inbox card now render "Pick
@@ -600,7 +630,7 @@ describe('live side-panel App wiring', () => {
     //
     // Scope D — the current-tab card moved from Inbox to Now; switch
     // back to Now so the card is mounted before drilling in.
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     const currentTabCard = within(
       await screen.findByTestId('focused-tab-attribution'),
     ).getByTestId('current-tab-page-content-card');
@@ -759,7 +789,7 @@ describe('live side-panel App wiring', () => {
     // The duplicate fallback SuggestionBanner was removed; the same
     // Scope D — resolver suggestion + confirm now lives on the
     // current-tab card under the Now tab.
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     const banner = await screen.findByLabelText('Current tab attribution');
     // The card resolves its suggestion asynchronously ("Checking
     // signals…" → suggestion); wait for the confirm affordance.
@@ -899,7 +929,7 @@ describe('live side-panel App wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
 
     const card = await screen.findByLabelText('Current tab attribution');
     await waitFor(() => {
@@ -1040,7 +1070,7 @@ describe('live side-panel App wiring', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(<App />);
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
 
     const card = await screen.findByLabelText('Current tab attribution');
     await waitFor(
@@ -1162,14 +1192,17 @@ describe('live side-panel App wiring', () => {
     render(<App />);
 
     // Scope D — the current-tab attribution card lives in Now now.
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     await waitFor(() => {
       expect(screen.getByTestId('focused-tab-attribution')).toHaveTextContent('Sibling');
     });
     expect(screen.getByTestId('focused-tab-attribution')).not.toHaveTextContent('Sidetrack');
   });
 
-  it('pulses the find icon when the active tab matches an unfocused tracked thread', async () => {
+  it('exposes find-active-tab in the overflow menu when the active tab matches a tracked thread', async () => {
+    // The standalone pulsing find icon was retired into the ⋯ overflow
+    // (R1.1 streamline); the capability stays reachable there with its
+    // pinned aria-label.
     const state = liveState();
     installChromeMock(
       {
@@ -1181,10 +1214,11 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    const findButton = await screen.findByRole('button', {
+    fireEvent.click(await screen.findByTestId('toolbar-overflow'));
+    const findButton = await screen.findByRole('menuitem', {
       name: 'Find active tab in side panel',
     });
-    expect(findButton.className).toContain('pulsing');
+    expect(findButton).toBeInTheDocument();
   });
 
   it('renders queue-item progress chips for auto-send state', async () => {
@@ -1210,7 +1244,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
 
     expect(await screen.findByText(/waiting for Claude's reply/)).toBeInTheDocument();
@@ -1230,14 +1264,14 @@ describe('live side-panel App wiring', () => {
 
     const { unmount } = render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     expect(await screen.findByText('Side-panel state machine review')).toBeInTheDocument();
 
     unmount();
     vi.unstubAllGlobals();
     installChromeMock({ ...sharedState, screenShareMode: true }, { [SETUP_COMPLETED_KEY]: true });
     render(<App />);
-    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     expect(await screen.findByText('[private]')).toBeInTheDocument();
   });
 
@@ -1267,7 +1301,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     const staleHeader = await screen.findByRole('button', { name: /Stale or closed/u });
     expect(staleHeader).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('Stale row')).not.toBeInTheDocument();
@@ -1296,7 +1330,10 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    const findButton = await screen.findByRole('button', {
+    // Find-active-tab relocated into the ⋯ overflow (R1.1) — open the
+    // menu, then pick it. Same aria-label + behaviour.
+    fireEvent.click(await screen.findByTestId('toolbar-overflow'));
+    const findButton = await screen.findByRole('menuitem', {
       name: 'Find active tab in side panel',
     });
     fireEvent.click(findButton);
@@ -1314,7 +1351,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     const threadRow = (await screen.findByText('[private]')).closest('.thread');
     expect(threadRow).not.toBeNull();
     if (threadRow === null) {
@@ -1500,7 +1537,7 @@ describe('current-tab capture-state indicator', () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     const card = await screen.findByTestId('focused-tab-attribution');
     // Wait for the projection (which carries an indexed_chunks tier) to
     // load, so the tier-suppression assertions below are meaningful: a
@@ -1527,7 +1564,7 @@ describe('current-tab capture-state indicator', () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     const card = await screen.findByTestId('focused-tab-attribution');
     await within(card).findByText('Account billing');
     fireEvent.click(within(card).getByTestId('current-tab-summary-toggle'));
@@ -1541,7 +1578,7 @@ describe('current-tab capture-state indicator', () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     const card = await screen.findByTestId('focused-tab-attribution');
     // Wait for the indexed_chunks projection so tier-suppression is real.
     await within(card).findByText('Account billing');
@@ -1564,7 +1601,7 @@ describe('current-tab capture-state indicator', () => {
 
     render(<App />);
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    await goToTab('Now');
     // Wait for the projection to populate the card (title appears once
     // focusedTabSession is loaded), then assert the tier badge renders
     // and a coverage lookup fired — the un-gated normal path.
@@ -1637,7 +1674,7 @@ describe('capture lamp strip', () => {
     expect(verdict).toHaveAttribute('aria-live', 'polite');
 
     // Still present after switching away from Now — it's the spine.
-    fireEvent.click(screen.getByRole('tab', { name: 'Threads' }));
+    await goToTab('Threads');
     expect(screen.getByTestId('capture-lamp-strip')).toBeInTheDocument();
   });
 
@@ -1695,7 +1732,7 @@ describe('capture lamp strip', () => {
     expect(eye).toHaveAttribute('aria-pressed', 'true');
   });
 
-  it('reads "— no active tab" + "No page in focus" (never "Recording") with no focused/active tab', async () => {
+  it('reads a quiet composed idle state ("No page in focus", never "Recording") with no focused/active tab', async () => {
     const base = liveState();
     installChromeMock(
       { ...base, companionStatus: 'connected' },
@@ -1704,7 +1741,10 @@ describe('capture lamp strip', () => {
     render(<App />);
 
     const strip = await screen.findByTestId('capture-lamp-strip');
-    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('no active tab');
+    // With no page in focus the domain slot collapses (empty) so the
+    // verdict isn't crowded by a placeholder that reads like a second
+    // verdict — the verdict alone carries the meaning.
+    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('');
     // The verdict must NOT over-claim a recording state with no page —
     // it reads the 'none' state and the accent bus goes neutral (idle),
     // not the warm 'capturing' tint.
@@ -1729,8 +1769,9 @@ describe('capture lamp strip', () => {
     const verdict = within(strip).getByTestId('capture-lamp-verdict');
     expect(verdict).toHaveTextContent('Nothing to record here');
     expect(verdict).not.toHaveTextContent('Recording this page');
-    // A chrome:// page has no registrable domain to show.
-    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('no active tab');
+    // A chrome:// page has no registrable domain to show — the domain
+    // slot collapses so the verdict carries the meaning uncrowded.
+    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('');
     expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
       'data-capture-state',
       'idle',

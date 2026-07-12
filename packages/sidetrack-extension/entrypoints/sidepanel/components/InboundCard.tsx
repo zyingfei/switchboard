@@ -16,6 +16,13 @@ export interface InboundCardProps {
   readonly onDismiss: () => void;
 }
 
+// Inbound reply row — rebuilt on the token system (R1.1). Clear anatomy:
+//   Row 1  · unread dot (static; unseen only) + provider chip + title + age
+//   Row 2  · one aligned action row (Open / Mark relevant / Dismiss)
+// Unseen replies are accented (a left rail + a static unread dot) because
+// an unread AI reply is the highest-value actionable-now signal; seen
+// replies fall back to a quiet paper card. No muddy amber wash, no
+// infinite pulse — the idle panel does not paint (CPU-runaway history).
 export function InboundCard({
   reminder,
   masked = false,
@@ -24,10 +31,11 @@ export function InboundCard({
   onDismiss,
 }: InboundCardProps) {
   const title = masked ? '[private — workstream item]' : reminder.threadTitle;
+  const unread = reminder.status === 'unseen';
   return (
     <div className={'inbound-card status-' + reminder.status}>
       <div className="inbound-row1">
-        <span className={'pulse pulse-signal'} aria-hidden />
+        {unread ? <span className="inbound-unread-dot" aria-hidden /> : null}
         <span className={'chip chip-' + reminder.provider}>{reminder.providerLabel}</span>
         <span
           className={
@@ -38,20 +46,22 @@ export function InboundCard({
         >
           {title}
         </span>
-      </div>
-      <div className="inbound-row2 mono">
-        <span>
-          {reminder.providerLabel} replied {reminder.inboundTurnAt}
-        </span>
+        <span className="inbound-age mono">{reminder.inboundTurnAt}</span>
       </div>
       <div className="inbound-actions">
-        <button type="button" className="btn-link" onClick={onOpen}>
+        {/* Screen-reader / test-stable provenance sentence. Visually
+            folded into the age chip above; kept for the pinned
+            "{provider} replied {age}" assertion + a11y. */}
+        <span className="inbound-provenance-sr">
+          {reminder.providerLabel} replied {reminder.inboundTurnAt}
+        </span>
+        <button type="button" className="inbound-btn inbound-btn-primary" onClick={onOpen}>
           Open
         </button>
-        <button type="button" className="btn-link" onClick={onMarkRelevant}>
+        <button type="button" className="inbound-btn" onClick={onMarkRelevant}>
           Mark relevant
         </button>
-        <button type="button" className="btn-link btn-muted" onClick={onDismiss}>
+        <button type="button" className="inbound-btn inbound-btn-muted" onClick={onDismiss}>
           Dismiss
         </button>
       </div>
