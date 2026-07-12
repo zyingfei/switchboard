@@ -885,6 +885,40 @@ button:disabled {
   border-style: dashed;
 }
 
+/* Master switch OFF — capture paused everywhere. Amber = reversible
+   (click the eye to resume). */
+.tab-session-capture-badge.is-paused {
+  background: var(--amber-bg, #fffbeb);
+  color: var(--amber, #a16207);
+  border-color: var(--amber-tint, #fef3c7);
+}
+
+/* This site matches a no-capture rule. Rose = actively suppressed;
+   rendered as a <button> that jumps to Settings → Capture, so it needs
+   pointer affordances but must keep the badge's inline metrics. */
+.tab-session-capture-badge.is-blocked {
+  max-width: 220px;
+  cursor: pointer;
+  background: var(--rose-bg, #f6e3df);
+  color: var(--rose, #8e2e2e);
+  border-color: var(--rose-tint, rgba(142, 46, 46, 0.28));
+}
+
+.tab-session-capture-badge.is-blocked:hover,
+.tab-session-capture-badge.is-blocked:focus-visible {
+  filter: brightness(0.97);
+  text-decoration: underline;
+}
+
+/* Optimistic-branch suffix reflecting the same tri-state. */
+.tab-attribution-card-pending.is-paused {
+  color: var(--amber, #a16207);
+}
+
+.tab-attribution-card-pending.is-blocked {
+  color: var(--rose, #8e2e2e);
+}
+
 .tab-session-suggestion-banner {
   display: grid;
   gap: 8px;
@@ -8558,6 +8592,11 @@ pre.diff {
   flex-basis: 100%;
   font-size: 11px;
   color: #7a2e1d;
+}
+/* Not an error — an informational "this page won't be indexed" note
+   when capture is paused/blocked. Muted rather than alarming. */
+.cx-page-content-error.is-capture-disabled {
+  color: var(--ink-3, #7a7269);
 }
 .cx-page-content-bulk {
   flex-basis: 100%;

@@ -1417,3 +1417,167 @@ describe('master capture switch (the side-panel eye)', () => {
     expect(screen.getByRole('menuitem', { name: 'Design preview' })).toBeInTheDocument();
   });
 });
+
+// ── Per-page capture-state indicator on the current-tab card. When the
+// master switch is paused OR the current site matches a no-capture
+// rule, the card must say so explicitly instead of implying "Indexing…"
+// / a stale tier, and must NOT round-trip the companion for coverage.
+describe('current-tab capture-state indicator', () => {
+  const BLOCKED_URL = 'https://www.pge.com/en/account/billing';
+
+  // Mount the current-tab (Now) card against BLOCKED_URL with a fully
+  // indexed page-evidence tier already present — so a NAIVE card would
+  // show the green "Indexed chunks" tier and fire a coverage lookup. The
+  // capture-state gate must override both.
+  const renderNowCardFor = (
+    settingsOverride: Partial<WorkboardState['settings']>,
+  ): ReturnType<typeof installChromeMock> => {
+    const base = liveState();
+    const sendMessage = installChromeMock(
+      {
+        ...base,
+        companionStatus: 'connected',
+        activeTabUrl: BLOCKED_URL,
+        settings: { ...base.settings, ...settingsOverride },
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [BLOCKED_URL]: {
+          canonicalUrl: BLOCKED_URL,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_blocked'],
+          latestUrl: BLOCKED_URL,
+          latestTitle: 'Account billing',
+          attributionHistory: [],
+          pageEvidence: {
+            tier: 'indexed_chunks',
+            evidenceRevision: 'evidence-blocked',
+            semanticFeatureRevision: 'semantic-blocked',
+            updatedAt: NOW,
+            termCount: 48,
+            keyphraseCount: 24,
+            entityCount: 8,
+            quality: 'medium',
+          },
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return sendMessage;
+  };
+
+  const pgeDomainRule = [
+    {
+      id: 'r_pge',
+      kind: 'domain' as const,
+      domain: 'pge.com',
+      label: 'pge.com',
+      createdAt: NOW,
+    },
+  ];
+
+  it('shows a "Not captured — rule" badge for a blocklisted site and hides the tier / Indexing copy', async () => {
+    const sendMessage = renderNowCardFor({ noCaptureRules: pgeDomainRule });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    const card = await screen.findByTestId('focused-tab-attribution');
+    // Wait for the projection (which carries an indexed_chunks tier) to
+    // load, so the tier-suppression assertions below are meaningful: a
+    // naive card WOULD now show the green "Indexed chunks" tier.
+    await within(card).findByText('Account billing');
+    const blockedBadge = await within(card).findByTestId('capture-blocked-badge');
+    // Names the rule so the user knows WHY.
+    expect(blockedBadge).toHaveTextContent('Not captured — rule: pge.com');
+    // The stale "Indexed chunks" tier badge is suppressed…
+    expect(within(card).queryByTestId('page-evidence-capture-badge')).not.toBeInTheDocument();
+    expect(card).not.toHaveTextContent('Indexed chunks');
+    // …and no "Indexing" progress copy leaks in.
+    expect(card).not.toHaveTextContent('Indexing');
+
+    // Leak regression: no read-only coverage round-trip for a blocked page.
+    expect(sendMessage).not.toHaveBeenCalledWith(
+      { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
+      expect.any(Function),
+    );
+  });
+
+  it('disables the "Index page" action for a blocklisted site', async () => {
+    renderNowCardFor({ noCaptureRules: pgeDomainRule });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Account billing');
+    fireEvent.click(within(card).getByTestId('current-tab-summary-toggle'));
+    expect(within(card).getByTestId('current-tab-index-page')).toBeDisabled();
+    expect(within(card).getByTestId('current-tab-index-selection')).toBeDisabled();
+    expect(within(card).getByTestId('current-tab-index-open-tabs')).toBeDisabled();
+  });
+
+  it('shows a "Capture paused" badge when the master switch is off and hides the tier / Indexing copy', async () => {
+    const sendMessage = renderNowCardFor({ captureEnabled: false });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    const card = await screen.findByTestId('focused-tab-attribution');
+    // Wait for the indexed_chunks projection so tier-suppression is real.
+    await within(card).findByText('Account billing');
+    const pausedBadge = await within(card).findByTestId('capture-paused-badge');
+    expect(pausedBadge).toHaveTextContent('Capture paused');
+    // No tier, no Indexing copy.
+    expect(within(card).queryByTestId('page-evidence-capture-badge')).not.toBeInTheDocument();
+    expect(card).not.toHaveTextContent('Indexed chunks');
+    expect(card).not.toHaveTextContent('Indexing');
+
+    // Leak regression: paused ⇒ no coverage round-trip either.
+    expect(sendMessage).not.toHaveBeenCalledWith(
+      { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
+      expect.any(Function),
+    );
+  });
+
+  it('renders the normal tier badge when the site is neither paused nor blocked', async () => {
+    const sendMessage = renderNowCardFor({ noCaptureRules: [] });
+
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Now' }));
+    // Wait for the projection to populate the card (title appears once
+    // focusedTabSession is loaded), then assert the tier badge renders
+    // and a coverage lookup fired — the un-gated normal path.
+    await screen.findByText('Account billing');
+    expect(await screen.findByTestId('page-evidence-capture-badge')).toBeInTheDocument();
+    const card = screen.getByTestId('focused-tab-attribution');
+    expect(within(card).queryByTestId('capture-blocked-badge')).not.toBeInTheDocument();
+    expect(within(card).queryByTestId('capture-paused-badge')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
+        expect.any(Function),
+      );
+    });
+  });
+});

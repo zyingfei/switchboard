@@ -38,6 +38,16 @@ export interface PageTextPanelProps {
   readonly onBulkCancel: () => void;
   /** data-testid namespace; default keeps the Connections ids stable. */
   readonly testIdPrefix?: string;
+  /**
+   * When set, indexing this page is disallowed (master pause or a
+   * no-capture rule). The index/bulk actions go inert with this string
+   * as the tooltip, and the state label reads "not captured" instead of
+   * a coverage tier — the background gate would throw for these anyway,
+   * so this removes a dead-end click. Delete stays enabled (removing
+   * already-captured data is legitimate even when capture is off).
+   * Default undefined ⇒ current behavior (ConnectionsView mount).
+   */
+  readonly captureDisabledReason?: string;
 }
 
 export const PageTextPanel = ({
@@ -56,8 +66,11 @@ export const PageTextPanel = ({
   onBulkIndex,
   onBulkCancel,
   testIdPrefix = 'connections',
+  captureDisabledReason,
 }: PageTextPanelProps): ReactElement | null => {
   if (canonicalUrl === null) return null;
+  const captureDisabled =
+    typeof captureDisabledReason === 'string' && captureDisabledReason.length > 0;
   const canDelete =
     coverage?.state === 'indexed' ||
     coverage?.state === 'indexed_low_quality' ||
@@ -78,8 +91,10 @@ export const PageTextPanel = ({
       </button>
       <div className="cx-page-content-main">
         <span className="cx-page-content-label">Page text</span>
-        <span className="cx-page-content-state">{pageContentStatusLabel(coverage)}</span>
-        {coverage?.chunkCount !== undefined ? (
+        <span className="cx-page-content-state">
+          {captureDisabled ? 'not captured' : pageContentStatusLabel(coverage)}
+        </span>
+        {!captureDisabled && coverage?.chunkCount !== undefined ? (
           <span className="cx-page-content-meta">{String(coverage.chunkCount)} chunks</span>
         ) : null}
       </div>
@@ -88,8 +103,9 @@ export const PageTextPanel = ({
           type="button"
           className="cx-mini-btn"
           onClick={onIndexPage}
-          disabled={busy !== null}
-          title="Index readable text from the active page"
+          disabled={busy !== null || captureDisabled}
+          title={captureDisabled ? captureDisabledReason : 'Index readable text from the active page'}
+          data-testid={`${testIdPrefix}-index-page`}
         >
           {busy === 'index' ? 'Indexing' : 'Index page'}
         </button>
@@ -97,8 +113,13 @@ export const PageTextPanel = ({
           type="button"
           className="cx-mini-btn"
           onClick={onIndexSelection}
-          disabled={busy !== null}
-          title="Index the currently selected text on the active page"
+          disabled={busy !== null || captureDisabled}
+          title={
+            captureDisabled
+              ? captureDisabledReason
+              : 'Index the currently selected text on the active page'
+          }
+          data-testid={`${testIdPrefix}-index-selection`}
         >
           {busy === 'selection' ? 'Indexing' : 'Index selection'}
         </button>
@@ -106,8 +127,13 @@ export const PageTextPanel = ({
           type="button"
           className="cx-mini-btn"
           onClick={onBulkPreview}
-          disabled={busy !== null || bulkBusy !== null}
-          title="Preview currently open tabs before indexing their page text"
+          disabled={busy !== null || bulkBusy !== null || captureDisabled}
+          title={
+            captureDisabled
+              ? captureDisabledReason
+              : 'Preview currently open tabs before indexing their page text'
+          }
+          data-testid={`${testIdPrefix}-index-open-tabs`}
         >
           {bulkBusy === 'preview' ? 'Checking' : 'Index open tabs'}
         </button>
@@ -123,6 +149,14 @@ export const PageTextPanel = ({
           </button>
         ) : null}
       </div>
+      {captureDisabled ? (
+        <div
+          className="cx-page-content-error is-capture-disabled"
+          data-testid={`${testIdPrefix}-capture-disabled-note`}
+        >
+          {captureDisabledReason}
+        </div>
+      ) : null}
       {error !== null ? <div className="cx-page-content-error">{error}</div> : null}
       {bulkPreview !== null ? (
         <div className="cx-page-content-bulk" data-testid={`${testIdPrefix}-page-content-bulk`}>
