@@ -14,7 +14,11 @@ import {
   bridgeKeyValidationCopy,
   validateBridgeKeyCandidate,
 } from '../src/companion/bridgeKeyValidation';
-import { CompanionRequestError, createCompanionClient } from '../src/companion/client';
+import {
+  CompanionHttpError,
+  CompanionRequestError,
+  createCompanionClient,
+} from '../src/companion/client';
 import {
   compareCompanionIdentity,
   identityWarningFor,
@@ -2588,7 +2592,18 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
   try {
     const result = await client.updateWorkstream(workstreamId, update);
     await updateLocalWorkstream(workstreamId, update, result);
-  } catch {
+  } catch (error) {
+    // A deliberate server rejection — most importantly a 409 revision
+    // conflict (a concurrent panel/API caller wrote a fresher workstream
+    // between this panel's read and its PATCH) — must NOT be mirrored
+    // locally: doing so forks the panel past the conflict and silently
+    // drops the other writer's edits. Re-throw so withCompanionStatus
+    // surfaces ok:false and the next poll re-reads the true state. The
+    // optimistic local write is only correct when the companion is
+    // genuinely unreachable (timeout/network/down).
+    if (error instanceof CompanionHttpError) {
+      throw error;
+    }
     await updateLocalWorkstream(workstreamId, update);
   }
 };

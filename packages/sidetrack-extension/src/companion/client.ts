@@ -78,6 +78,14 @@ const parseProblemMessage = (value: unknown): string | undefined => {
       : undefined;
 };
 
+const parseProblemCode = (value: unknown): string | undefined => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const code = (value as Partial<Problem>).code;
+  return typeof code === 'string' ? code : undefined;
+};
+
 const parseStatus = (value: unknown): CompanionStatus => {
   if (!isRecord(value)) {
     throw new Error('Companion status response was not an object.');
@@ -316,6 +324,23 @@ export class CompanionRequestError extends Error {
   ) {
     super(message);
     this.name = 'CompanionRequestError';
+  }
+}
+
+/**
+ * The companion answered with a non-2xx status — a deliberate rejection
+ * (validation, revision conflict, trust denial, …), NOT a connectivity
+ * failure. Callers use this to distinguish "companion said no" (do not
+ * fork local state) from "companion unreachable" (optimistic local write).
+ */
+export class CompanionHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | undefined,
+  ) {
+    super(message);
+    this.name = 'CompanionHttpError';
   }
 }
 
@@ -594,7 +619,11 @@ export class HttpCompanionClient implements CompanionClient {
       }
       const value = (await response.json()) as unknown;
       if (!response.ok) {
-        throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+        throw new CompanionHttpError(
+          parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`,
+          response.status,
+          parseProblemCode(value),
+        );
       }
       // Store the fresh ETag for next time. Bounded LRU: when the
       // map grows past the cap, drop the oldest entry. Map iteration
