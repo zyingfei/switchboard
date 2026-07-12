@@ -5060,15 +5060,48 @@ const App = () => {
       return null;
     }
   }, [focusedUrl, currentSiteUrl]);
+  // Is there an actual capturable web page in focus? The tri-state
+  // above (currentTabCaptureState) only distinguishes paused/blocked vs
+  // capturing — it says nothing about whether a page even EXISTS to
+  // record. With no active tab (focusedUrl/currentSiteUrl undefined) or a
+  // non-http surface (chrome://, about:, the New Tab page) the background
+  // gate captures NOTHING, yet the naive fall-through would still read
+  // "Recording this page" on the always-visible spine — the exact
+  // over-claim the privacy spec forbids. 'web' = a real http(s) page;
+  // 'non-web' = a URL the gate never records; 'none' = no tab in focus.
+  const lampPageStatus: 'web' | 'non-web' | 'none' = ((): 'web' | 'non-web' | 'none' => {
+    const url = focusedUrl ?? currentSiteUrl;
+    if (typeof url !== 'string' || url.length === 0) return 'none';
+    try {
+      const { protocol } = new URL(url);
+      return protocol === 'http:' || protocol === 'https:' ? 'web' : 'non-web';
+    } catch {
+      return 'none';
+    }
+  })();
   const lampVerdict: { readonly glyph: string; readonly text: string } =
+    // Master pause is global, so it wins even with no page in focus.
     currentTabCaptureState === 'paused'
       ? { glyph: '⏸', text: 'Capture paused — everywhere' }
-      : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null
-        ? {
-            glyph: '⊘',
-            text: `Not captured — rule: ${noCaptureRuleDisplayLabel(currentTabBlockingRule)}`,
-          }
-        : { glyph: '●', text: 'Recording this page' };
+      : // No capturable page → never claim we're recording one.
+        lampPageStatus === 'none'
+        ? { glyph: '○', text: 'No page in focus' }
+        : lampPageStatus === 'non-web'
+          ? { glyph: '○', text: 'Nothing to record here' }
+          : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null
+            ? {
+                glyph: '⊘',
+                text: `Not captured — rule: ${noCaptureRuleDisplayLabel(currentTabBlockingRule)}`,
+              }
+            : { glyph: '●', text: 'Recording this page' };
+  // Accent bus for the panel root. Reuse the tri-state, but demote the
+  // 'capturing' tint to a neutral 'idle' when there is no capturable page
+  // (and we're not paused) — the warm recording accent must not paint
+  // when nothing is being recorded.
+  const lampAccentState: 'capturing' | 'paused' | 'blocked' | 'idle' =
+    currentTabCaptureState === 'capturing' && lampPageStatus !== 'web'
+      ? 'idle'
+      : currentTabCaptureState;
 
   // Which of the 5 primary sections owns the active viewMode. The
   // sub-tab tablist keeps every old viewMode tab (with its exact ARIA
@@ -6554,7 +6587,7 @@ const App = () => {
     <main
       className="bac-app"
       aria-label="Sidetrack workboard"
-      data-capture-state={currentTabCaptureState}
+      data-capture-state={lampAccentState}
     >
       {/* ── Persistent header: the SPINE. Row A = the capture lamp
           strip (privacy verdict, always visible + announced). Row B =
@@ -6564,7 +6597,7 @@ const App = () => {
           (aria-live) + the master eye. Retints the whole panel via the
           [data-capture-state] accent bus set on <main> above. */}
       <div
-        className={'capture-lamp-strip lamp-' + currentTabCaptureState}
+        className={'capture-lamp-strip lamp-' + lampAccentState}
         data-testid="capture-lamp-strip"
       >
         <span className="lamp-glyph mono" aria-hidden>
@@ -7087,10 +7120,11 @@ const App = () => {
               className="b-ghost"
               onClick={() => {
                 dismissThemeAutoHint();
-                setSettingsOpen(true);
+                openSettingsAt('sec-appearance');
               }}
+              aria-label="Open Appearance preferences"
             >
-              Settings
+              Appearance
             </button>
             <button
               type="button"

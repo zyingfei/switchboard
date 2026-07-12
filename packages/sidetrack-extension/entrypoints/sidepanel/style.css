@@ -174,6 +174,17 @@
   --accent-bg: var(--rose-bg);
   --accent-on: var(--paper-light);
 }
+/* Idle — capture is on, but there is no capturable web page in focus
+   (no active tab, or a non-http surface like chrome://). Quiet neutral
+   ink tones so the warm "recording" accent never paints when nothing is
+   actually being recorded. */
+[data-capture-state='idle'] {
+  --accent: var(--ink-3);
+  --accent-2: var(--ink-2);
+  --accent-tint: var(--rule);
+  --accent-bg: var(--paper-light);
+  --accent-on: var(--paper-light);
+}
 
 * {
   box-sizing: border-box;

@@ -1695,7 +1695,7 @@ describe('capture lamp strip', () => {
     expect(eye).toHaveAttribute('aria-pressed', 'true');
   });
 
-  it('reads "— no active tab" when there is no focused/active tab', async () => {
+  it('reads "— no active tab" + "No page in focus" (never "Recording") with no focused/active tab', async () => {
     const base = liveState();
     installChromeMock(
       { ...base, companionStatus: 'connected' },
@@ -1705,6 +1705,36 @@ describe('capture lamp strip', () => {
 
     const strip = await screen.findByTestId('capture-lamp-strip');
     expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('no active tab');
+    // The verdict must NOT over-claim a recording state with no page —
+    // it reads the 'none' state and the accent bus goes neutral (idle),
+    // not the warm 'capturing' tint.
+    const verdict = within(strip).getByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveTextContent('No page in focus');
+    expect(verdict).not.toHaveTextContent('Recording this page');
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'idle',
+    );
+  });
+
+  it('reads "Nothing to record here" on a non-http surface (chrome://)', async () => {
+    const base = liveState();
+    installChromeMock(
+      { ...base, companionStatus: 'connected', activeTabUrl: 'chrome://settings/' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+
+    const strip = await screen.findByTestId('capture-lamp-strip');
+    const verdict = within(strip).getByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveTextContent('Nothing to record here');
+    expect(verdict).not.toHaveTextContent('Recording this page');
+    // A chrome:// page has no registrable domain to show.
+    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('no active tab');
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'idle',
+    );
   });
 });
 
