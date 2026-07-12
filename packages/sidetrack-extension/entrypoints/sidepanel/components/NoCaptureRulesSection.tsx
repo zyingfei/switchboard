@@ -94,7 +94,7 @@ export function NoCaptureRulesSection({ busy = false }: { readonly busy?: boolea
           ruleId,
           ok,
           message: ok
-            ? 'Purged — captured data for this site is now hidden.'
+            ? 'Purged — captured data for this site is hidden and dropped from search/recall (raw log scrub pending).'
             : `Purge failed${
                 typeof response === 'object' &&
                 response !== null &&
