@@ -13,6 +13,7 @@ import type {
 } from '../vault/liveVaultReader.js';
 import { searchIndex } from '../vault/searchIndex.js';
 import { registerAnnotationTools } from './annotationTools.js';
+import type { ContextPackAuditSink } from './contextPackAudit.js';
 import { registerDispatchTools } from './dispatchTools.js';
 import { registerPrompts } from './prompts.js';
 import { registerResources } from './resources.js';
@@ -311,9 +312,20 @@ const buildContextPack = (
   ].join('\n');
 };
 
+export interface SidetrackMcpServerOptions {
+  // PRD §15 criterion 5. When set, each context_pack call appends an
+  // audit line (tool=sidetrack.workstreams.context_pack) to the vault's
+  // _BAC/audit log so the freeze-lift counter can observe it. Best-effort:
+  // the tool never fails on an audit-write error. Omitted for stdio/test
+  // wiring that has no vault-write surface. FREEZE-SAFE (ADR-0011):
+  // observability only — no serving consumer reads this line.
+  readonly contextPackAuditSink?: ContextPackAuditSink;
+}
+
 export const createSidetrackMcpServer = (
   reader: SidetrackMcpReader,
   companionClient?: CompanionWriteClient,
+  options: SidetrackMcpServerOptions = {},
 ): McpServer => {
   const server = new McpServer({
     name: 'sidetrack-mcp',
@@ -381,6 +393,15 @@ export const createSidetrackMcpServer = (
     async ({ workstreamId, includeQueueItems }) => {
       const snapshot = await reader.readSnapshot();
       const markdown = buildContextPack(snapshot, workstreamId, includeQueueItems ?? true);
+      // PRD §15 criterion 5 emit site. A context_pack is a pure read, so
+      // it writes nothing to the vault on its own — this is the one place
+      // it leaves an observable trace for the freeze-lift counter. Fully
+      // best-effort: an audit-write failure must never fail the read.
+      if (options.contextPackAuditSink !== undefined) {
+        await options
+          .contextPackAuditSink({ workstreamId: workstreamId ?? null })
+          .catch(() => undefined);
+      }
       return {
         content: [{ type: 'text' as const, text: markdown }],
         structuredContent: { pack: { markdown, generatedAt: snapshot.generatedAt } },

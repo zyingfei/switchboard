@@ -47,6 +47,15 @@ export const SECTION15_EVENT_TYPES = [
 // Matches PRD §15 ("sidetrack.workstreams.context_pack call via
 // streamable-HTTP") and the tool id registered in
 // packages/sidetrack-mcp/src/server/mcpServer.ts.
+//
+// The EMIT SITE that makes this counter falsifiable lives in the MCP
+// package: packages/sidetrack-mcp/src/server/contextPackAudit.ts writes
+// an `_BAC/audit/<day>.jsonl` line with `tool` set to this exact value
+// each time the streamable-HTTP server serves a context_pack call.
+// context_pack is a pure READ, so it never flows through the companion's
+// vault-writer audit() closure — without that dedicated emit this filter
+// could never match and criterion 5 would permanently block the freeze
+// lift. Keep this constant in lockstep with MCP_CONTEXT_PACK_TOOL there.
 export const MCP_CONTEXT_PACK_TOOL = 'sidetrack.workstreams.context_pack';
 
 // Rolling window for criterion 1. 30d matches the §15 dogfood window.
