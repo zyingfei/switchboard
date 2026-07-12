@@ -31,6 +31,15 @@ jobs:
   companion:
     name: Companion — typecheck + test
     runs-on: ubuntu-latest
+    # Ubuntu ships a vec-capable /usr/lib/.../libsqlite3.so on the sqlite-vec
+    # probe path (setup-sqlite.ts). That enforces strict vec column
+    # dimensions and, order-dependently, rejects the low-dimension fixtures
+    # some recall/connections tests feed — a moving test flake, not a
+    # product issue. Opt out so CI matches the local dev default (no
+    # system libsqlite3 → Bun built-in SQLite). Followup: a vec integration
+    # lane with dimension-matched (384) fixtures.
+    env:
+      SIDETRACK_SQLITE_LIB: "off"
     steps:
       - uses: actions/checkout@v4
 
