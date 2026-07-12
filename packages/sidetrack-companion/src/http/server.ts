@@ -8169,13 +8169,21 @@ const routes: readonly RouteDefinition[] = [
     // (warm pipeline, I/O-bound → interleaves with /v1/status), trains
     // OFF-THREAD via the train-groups worker, ship-gates, and promotes the
     // active closest-visit revision on PASS. Manual + idempotent (the trainer
-    // dedupes already-referenced feedback). Gated by
-    // SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK; reconstruction capped by
-    // SIDETRACK_RANKER_RECONSTRUCT_CAP (default 200, oldest-first).
+    // dedupes already-referenced feedback).
+    //
+    // Two envs gate this route (both read at the handler below):
+    //   SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK — INVERTED opt-out, NOT an
+    //     opt-in. The bootstrap is ON by default (env absent or any value
+    //     other than '0' ⇒ enabled); only the literal '0' disables it and
+    //     returns 403. There is no "=1 to enable" — do not add one.
+    //   SIDETRACK_RANKER_RECONSTRUCT_CAP — positive integer cap on how many
+    //     historical feedback events are reconstructed per run, oldest-first;
+    //     non-finite / non-positive / absent falls back to the default 200.
     method: 'POST',
     pattern: /^\/v1\/ranker\/impression-bootstrap$/u,
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => {
+      // Inverted opt-out: only '0' disables; absence/anything-else = enabled.
       if (process.env['SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK'] === '0') {
         throw new HttpRouteError(403, 'BOOTSTRAP_DISABLED', 'Impression bootstrap is disabled.');
       }

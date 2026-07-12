@@ -387,7 +387,14 @@ export const rankHybrid = (
         item,
         similarity: cosine(queryEmbedding, item.embedding),
       }))
-      .sort((a, b) => b.similarity - a.similarity)
+      // Total comparator: score desc, then id asc. The id tiebreak only
+      // orders score-equal candidates, so it cannot change any served
+      // ordering where scores are untied; it makes the FUSION_WINDOW cut
+      // over a tied block deterministic instead of relying on Array.sort's
+      // (uncontracted) ordering of equal keys. Mirrors the fused tiebreak
+      // below and ann-index's `bySimilarity`. Fallback flat-scan path only
+      // (the ANN index arm above is already total).
+      .sort((a, b) => b.similarity - a.similarity || (a.item.id < b.item.id ? -1 : a.item.id > b.item.id ? 1 : 0))
       .slice(0, FUSION_WINDOW);
 
   // 2. Lexical list from minisearch over the live chunks.
