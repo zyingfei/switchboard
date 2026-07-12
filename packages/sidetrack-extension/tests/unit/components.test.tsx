@@ -553,7 +553,7 @@ describe('UX skeleton components — render-without-crash + key text present', (
     render(<RecentDispatches dispatches={[STUB_DISPATCH]} />);
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('GPT Pro')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /↗ open/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /↗ open/i })).toBeInTheDocument();
   });
 
   it('RecentDispatches empty state renders helper text', () => {

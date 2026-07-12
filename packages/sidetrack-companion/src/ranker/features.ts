@@ -29,6 +29,7 @@ import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../
 import { detectSearchUrl } from '../timeline/sanitize.js';
 import {
   FEATURE_SCHEMA_VERSION,
+  type CandidateRetrievalFeatureContext,
   type CandidatePairFeatures,
   type ExtractFeatures,
 } from './feature-schema.js';
@@ -62,7 +63,7 @@ interface ReturnSession {
   readonly seq: number;
 }
 
-interface FeatureModel {
+export interface FeatureModel {
   readonly recordsById: ReadonlyMap<string, VisitRecord>;
   readonly idsByCanonical: ReadonlyMap<string, ReadonlySet<string>>;
   readonly timelineNodesByVisitKey: ReadonlyMap<string, ConnectionNode>;
@@ -855,7 +856,7 @@ const referenceMsFor = (
   return maxMs;
 };
 
-const buildFeatureModel = (
+export const buildFeatureModel = (
   events: readonly AcceptedEvent[],
   snapshot: ConnectionsSnapshot,
 ): FeatureModel => {
@@ -1100,7 +1101,9 @@ const metadataStringArray = (
   key: string,
 ): readonly string[] => {
   const value = metadata?.[key];
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
 };
 
 const metadataNumberFeature = (
@@ -1289,16 +1292,68 @@ const pageQualityTierFromFeature = (candidate: Candidate, model: FeatureModel): 
 const pageQualityTierToFeature = (candidate: Candidate, model: FeatureModel): number =>
   pageQualityTierForVisit(candidate.toVisitId, model);
 
-// Step 7 — composite key for the (fromVisitId, toVisitId) lookup
-// in the negativeContainerPairs set. Same NUL-separator convention
-// the rest of the codebase uses for compound keys (kept as
-// `\u0000` escape syntax — see commit 1082982a for the source-file
-// NUL-byte footgun the Codex review of #231 caught).
-export const negativeContainerPairKey = (fromVisitId: string, toVisitId: string): string =>
+const retrievalPairKey = (fromVisitId: string, toVisitId: string): string =>
   `${fromVisitId}\u0000${toVisitId}`;
 
-export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures => {
-  const model = featureModelFor(context);
+const finiteOrZero = (value: number | undefined): number =>
+  typeof value === 'number' && Number.isFinite(value) ? value : 0;
+
+const retrievalFeaturesFor = (
+  candidate: Candidate,
+  retrievalContext: Parameters<ExtractFeatures>[1]['retrievalContext'],
+): Required<Omit<CandidateRetrievalFeatureContext, 'crossEncoderScore' | 'crossEncoderRankDelta'>> &
+  Pick<CandidateRetrievalFeatureContext, 'crossEncoderScore' | 'crossEncoderRankDelta'> => {
+  if (retrievalContext.missingRetrievalContext === true) {
+    return {
+      bm25Score: 0,
+      bm25Rank: 0,
+      denseDocScore: 0,
+      denseDocRank: 0,
+      rrfScore: 0,
+      rrfRank: 0,
+      graphSimilarityRank: 0,
+      candidateSourceFlags: 0,
+      servedPosition: 0,
+    };
+  }
+  const pair = retrievalContext.byPairKey?.get(
+    retrievalPairKey(candidate.fromVisitId, candidate.toVisitId),
+  );
+  const toVisit = retrievalContext.byToVisitId?.get(candidate.toVisitId);
+  const value = pair ?? toVisit;
+  return {
+    bm25Score: finiteOrZero(value?.bm25Score),
+    bm25Rank: finiteOrZero(value?.bm25Rank),
+    denseDocScore: finiteOrZero(value?.denseDocScore),
+    denseDocRank: finiteOrZero(value?.denseDocRank),
+    rrfScore: finiteOrZero(value?.rrfScore),
+    rrfRank: finiteOrZero(value?.rrfRank),
+    graphSimilarityRank: finiteOrZero(value?.graphSimilarityRank),
+    candidateSourceFlags: finiteOrZero(value?.candidateSourceFlags),
+    servedPosition: finiteOrZero(value?.servedPosition),
+    ...(value?.crossEncoderScore === undefined
+      ? {}
+      : { crossEncoderScore: finiteOrZero(value.crossEncoderScore) }),
+    ...(value?.crossEncoderRankDelta === undefined
+      ? {}
+      : { crossEncoderRankDelta: finiteOrZero(value.crossEncoderRankDelta) }),
+  };
+};
+
+export const extractFeatures: ExtractFeatures = (candidate, context): CandidatePairFeatures =>
+  extractFeaturesWithModel(candidate, featureModelFor(context), context.retrievalContext);
+
+// P3 — same feature extraction, but against a PRE-BUILT FeatureModel.
+// The /v2 learned-rerank serve path builds the (expensive) model once
+// per TTL in the background and reuses it across requests, supplying a
+// fresh per-request `retrievalContext` (the only per-request input).
+// Train/serve parity stays exact because this is the identical body
+// `extractFeatures` runs.
+export const extractFeaturesWithModel = (
+  candidate: Candidate,
+  model: FeatureModel,
+  retrievalContext: Parameters<ExtractFeatures>[1]['retrievalContext'],
+): CandidatePairFeatures => {
   const contentEdge = bestSimilarityEdgeForCandidate(candidate, model);
   const contentMetadata = contentEdge?.metadata;
   const sharedContentTerms = metadataStringArray(contentMetadata, 'matchedTerms').length;
@@ -1306,16 +1361,7 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
   const sharedContentEntities = metadataStringArray(contentMetadata, 'matchedEntities').length;
   const contentTierFrom = evidenceTierValue(contentMetadata?.['evidenceTierFrom']);
   const contentTierTo = evidenceTierValue(contentMetadata?.['evidenceTierTo']);
-  // Step 7 — container_negative_match: 1 iff the (from, to) pair
-  // would be in the Cartesian expansion of an explicit
-  // container-shaped user negative. Set is precomputed in the
-  // training-time caller; absence ⇒ default 0 (model
-  // under-penalizes, but doesn't crash).
-  const containerNegativeMatch: 0 | 1 = context.negativeContainerPairs?.has(
-    negativeContainerPairKey(candidate.fromVisitId, candidate.toVisitId),
-  )
-    ? 1
-    : 0;
+  const retrieval = retrievalFeaturesFor(candidate, retrievalContext);
 
   return {
     schemaVersion: FEATURE_SCHEMA_VERSION,
@@ -1348,13 +1394,42 @@ export const extractFeatures: ExtractFeatures = (candidate, context): CandidateP
       channelNumber(contentMetadata, 'keyphrases'),
     ),
     content_vector_cosine: channelNumber(contentMetadata, 'contentVector'),
-    content_entity_overlap: Math.max(channelNumber(contentMetadata, 'entities'), sharedContentEntities),
+    content_entity_overlap: Math.max(
+      channelNumber(contentMetadata, 'entities'),
+      sharedContentEntities,
+    ),
     content_evidence_tier_from: contentTierFrom,
     content_evidence_tier_to: contentTierTo,
     content_both_available: toBinary(contentTierFrom > 0 && contentTierTo > 0),
     content_quality_pair_min: contentQualityPairMinFeature(candidate, model, contentEdge),
     chunk_support_count: metadataNumberFeature(contentMetadata, 'chunkSupportCount'),
     max_chunk_pair_score: metadataNumberFeature(contentMetadata, 'maxChunkPairScore'),
-    container_negative_match: containerNegativeMatch,
+    max_chunk_pair_vector_cosine: metadataNumberFeature(
+      contentMetadata,
+      'maxChunkPairVectorCosine',
+    ),
+    top3_mean_chunk_pair_vector_cosine: metadataNumberFeature(
+      contentMetadata,
+      'top3MeanChunkPairVectorCosine',
+    ),
+    chunk_pair_vector_support_count: metadataNumberFeature(
+      contentMetadata,
+      'chunkPairVectorSupportCount',
+    ),
+    bm25_score: retrieval.bm25Score,
+    bm25_rank: retrieval.bm25Rank,
+    dense_doc_score: retrieval.denseDocScore,
+    dense_doc_rank: retrieval.denseDocRank,
+    rrf_score: retrieval.rrfScore,
+    rrf_rank: retrieval.rrfRank,
+    graph_similarity_rank: retrieval.graphSimilarityRank,
+    candidate_source_flags: retrieval.candidateSourceFlags,
+    served_position: retrieval.servedPosition,
+    ...(retrieval.crossEncoderScore === undefined
+      ? {}
+      : { cross_encoder_score: retrieval.crossEncoderScore }),
+    ...(retrieval.crossEncoderRankDelta === undefined
+      ? {}
+      : { cross_encoder_rank_delta: retrieval.crossEncoderRankDelta }),
   };
 };

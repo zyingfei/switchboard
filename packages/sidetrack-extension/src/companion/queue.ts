@@ -7,6 +7,7 @@ import {
   type OutboxItem,
   type OutboxStorage,
 } from './outbox';
+import { singleFlight, withFailedLock, withQueueLock } from './captureQueueMutex';
 
 import type { CaptureEvent } from './model';
 
@@ -26,6 +27,11 @@ import type { CaptureEvent } from './model';
 
 const QUEUE_KEY = 'sidetrack.captureQueue';
 const DROPPED_KEY = 'sidetrack.captureQueue.droppedCount';
+// Scratch key for crash-safe eviction: survivors + the new explicit
+// item are staged here, then swapped into QUEUE_KEY, then this is
+// cleared. A crash between phases never leaves QUEUE_KEY empty (see
+// evictAndEnqueueExplicit).
+const EVICTION_SCRATCH_KEY = 'sidetrack.captureQueue.evicting';
 // Retry-exhausted explicit captures land here instead of being
 // silently dropped. The side panel surfaces them in the
 // QueueRejectionBanner with a Retry action that re-enqueues them
@@ -92,6 +98,11 @@ const captureOutbox = createOutbox<CapturePayload>({
   droppedKey: DROPPED_KEY,
   defaultLimit: QUEUE_LIMIT,
   migrate: migrateQueuedCapture,
+  // The capture queue accepts enqueues while a drain awaits the
+  // network (nav captures fire independent of the workboard-poll
+  // drain). Merge drain outcomes against a fresh read so a concurrent
+  // enqueue is never clobbered by the end-of-drain rewrite.
+  atomicDrainMerge: true,
 });
 
 const toQueuedCapture = (item: OutboxItem<CapturePayload>): QueuedCapture => ({
@@ -103,6 +114,34 @@ const toQueuedCapture = (item: OutboxItem<CapturePayload>): QueuedCapture => ({
   intent: item.payload.intent,
 });
 
+// Best-effort cleanup of a leftover eviction scratch record. MUST run
+// under withQueueLock (its read+clear is a read-modify-write on the same
+// key domain as eviction). A non-empty scratch means a prior
+// evictAndEnqueueExplicit crashed AFTER the primary-key commit but before
+// the scratch clear (Phase 3): the primary QUEUE_KEY already holds the
+// correct post-eviction queue, so the scratch is inert and we just drop
+// it. It is never READ for recovery — the atomicity of eviction comes
+// entirely from the single atomic captureOutbox.write, not from the
+// scratch (a crash BEFORE the commit leaves the original full queue; a
+// crash AFTER it leaves the correct post-eviction queue). The scratch
+// remains only as a forensic marker of an interrupted eviction and to
+// keep the on-disk key clean across upgrades. Best-effort — never throws.
+const clearStaleEvictionScratchLocked = async (storage: StoragePort): Promise<void> => {
+  try {
+    const scratch = await storage.get<readonly unknown[]>(EVICTION_SCRATCH_KEY, []);
+    if (Array.isArray(scratch) && scratch.length > 0) {
+      await storage.set({ [EVICTION_SCRATCH_KEY]: [] });
+    }
+  } catch {
+    // A failed cleanup must never block the caller; the scratch is inert.
+  }
+};
+
+// readQueue is a pure read: it must NOT mutate storage. The prior version
+// cleared the eviction scratch from here, which was an unsynchronized
+// write from a read path racing an in-flight eviction's scratch stage.
+// Scratch cleanup now happens only inside lock-held write paths
+// (enqueue/clear), where it cannot race.
 export const readQueue = async (
   storage: StoragePort = chromeStoragePort,
 ): Promise<readonly QueuedCapture[]> => {
@@ -114,7 +153,10 @@ export const readDroppedCount = async (storage: StoragePort = chromeStoragePort)
   await captureOutbox.readDropped(storage);
 
 export const clearQueue = async (storage: StoragePort = chromeStoragePort): Promise<void> => {
-  await captureOutbox.clear(storage);
+  await withQueueLock(storage, async () => {
+    await captureOutbox.clear(storage);
+    await storage.set({ [EVICTION_SCRATCH_KEY]: [] });
+  });
 };
 
 export const computeNextAttempt = (
@@ -130,64 +172,122 @@ export interface EnqueueResult {
   readonly evicted: number;
 }
 
+const mintItem = (payload: CapturePayload): OutboxItem<CapturePayload> => {
+  const queuedAt = new Date().toISOString();
+  return {
+    id: crypto.randomUUID(),
+    queuedAt,
+    attempts: 0,
+    nextAttemptAt: queuedAt,
+    payload,
+  };
+};
+
+// Test-only seam: injected between the "stage to scratch" and "commit
+// to primary" phases of eviction so a test can simulate an SW death in
+// the exact gap that used to lose up to 999 captures. Production leaves
+// it undefined (a no-op).
+type EvictionFaultHook = (() => Promise<void>) | undefined;
+
+// Crash-safe replacement for the old clear()+re-enqueue loop. Instead
+// of ever writing QUEUE_KEY empty, we compute the full desired next
+// array (survivors with the oldest passive dropped, plus the new
+// explicit item) and land it via a scratch-key stage → primary-key
+// commit → scratch clear. At no point is QUEUE_KEY left empty: a crash
+// before the commit leaves the ORIGINAL full queue intact; a crash
+// after it leaves the CORRECT post-eviction queue. Either way the only
+// item that can be lost is the not-yet-committed new explicit capture
+// (the caller's storeCaptureEvent still wrote it to the local mirror),
+// never a survivor.
+const evictAndEnqueueExplicit = async (
+  storage: StoragePort,
+  survivors: readonly OutboxItem<CapturePayload>[],
+  newItem: OutboxItem<CapturePayload>,
+  faultHook: EvictionFaultHook,
+): Promise<readonly OutboxItem<CapturePayload>[]> => {
+  const nextArray = [...survivors, newItem];
+  // Phase 1: stage the full next state under the scratch key.
+  await storage.set({ [EVICTION_SCRATCH_KEY]: nextArray });
+  if (faultHook !== undefined) {
+    await faultHook();
+  }
+  // Phase 2: commit to the primary key. captureOutbox.write is a single
+  // atomic set of QUEUE_KEY — the key is never empty in between (it
+  // still holds the original full queue right up to this write).
+  await captureOutbox.write(nextArray, storage);
+  // Phase 3: drop the now-redundant scratch.
+  await storage.set({ [EVICTION_SCRATCH_KEY]: [] });
+  return nextArray;
+};
+
 export const enqueueCapture = async (
   event: CaptureEvent,
   storage: StoragePort = chromeStoragePort,
   limit = QUEUE_LIMIT,
   intent: CaptureIntent = 'passive',
-): Promise<EnqueueResult> => {
-  // For passive captures the original drop-oldest semantics still
-  // hold — an auto-track session that's been offline for weeks can
-  // safely lose its oldest snapshots. createOutbox.enqueue caps at
-  // `limit` and evicts the head.
-  if (intent === 'passive') {
-    const result = await captureOutbox.enqueue({ intent, event }, storage, limit);
-    return { accepted: true, queue: result.queue.map(toQueuedCapture), evicted: result.evicted };
-  }
+): Promise<EnqueueResult> => enqueueCaptureInternal(event, storage, limit, intent, undefined);
 
-  // Explicit captures get protective handling. Read first, then
-  // decide.
-  const current = await captureOutbox.read(storage);
-  if (current.length < limit) {
-    const result = await captureOutbox.enqueue({ intent, event }, storage, limit);
-    return { accepted: true, queue: result.queue.map(toQueuedCapture), evicted: result.evicted };
-  }
-  // Queue is at capacity. Try to evict the oldest passive item to
-  // make room. If everyone is explicit, reject the new arrival so
-  // the side panel can surface a banner.
-  const oldestPassiveIndex = current.findIndex((item) => item.payload.intent === 'passive');
-  if (oldestPassiveIndex === -1) {
+// Internal entry point with the eviction fault hook exposed for tests.
+export const enqueueCaptureInternal = async (
+  event: CaptureEvent,
+  storage: StoragePort,
+  limit: number,
+  intent: CaptureIntent,
+  evictionFaultHook: EvictionFaultHook,
+): Promise<EnqueueResult> =>
+  await withQueueLock(storage, async () => {
+    // Reconcile any leftover eviction scratch under the lock. A prior
+    // eviction that crashed after its atomic primary commit but before
+    // the Phase-3 scratch clear leaves a stale (inert) scratch record;
+    // drop it here now that we hold the lock, so it never accumulates.
+    await clearStaleEvictionScratchLocked(storage);
+    // For passive captures the original drop-oldest semantics still
+    // hold — an auto-track session that's been offline for weeks can
+    // safely lose its oldest snapshots. createOutbox.enqueue caps at
+    // `limit` and evicts the head.
+    if (intent === 'passive') {
+      const result = await captureOutbox.enqueue({ intent, event }, storage, limit);
+      return { accepted: true, queue: result.queue.map(toQueuedCapture), evicted: result.evicted };
+    }
+
+    // Explicit captures get protective handling. Read first, then
+    // decide.
+    const current = await captureOutbox.read(storage);
+    if (current.length < limit) {
+      const result = await captureOutbox.enqueue({ intent, event }, storage, limit);
+      return { accepted: true, queue: result.queue.map(toQueuedCapture), evicted: result.evicted };
+    }
+    // Queue is at capacity. Try to evict the oldest passive item to
+    // make room. If everyone is explicit, reject the new arrival so
+    // the side panel can surface a banner.
+    const oldestPassiveIndex = current.findIndex((item) => item.payload.intent === 'passive');
+    if (oldestPassiveIndex === -1) {
+      return {
+        accepted: false,
+        reason: 'queue-full-explicit',
+        queue: current.map(toQueuedCapture),
+        evicted: 0,
+      };
+    }
+    // Drop the oldest passive item and add the new explicit item in a
+    // single crash-safe swap (no intermediate empty queue).
+    const survivors = [
+      ...current.slice(0, oldestPassiveIndex),
+      ...current.slice(oldestPassiveIndex + 1),
+    ];
+    const newItem = mintItem({ intent, event });
+    const nextArray = await evictAndEnqueueExplicit(
+      storage,
+      survivors,
+      newItem,
+      evictionFaultHook,
+    );
     return {
-      accepted: false,
-      reason: 'queue-full-explicit',
-      queue: current.map(toQueuedCapture),
-      evicted: 0,
+      accepted: true,
+      queue: nextArray.map(toQueuedCapture),
+      evicted: 1,
     };
-  }
-  // Drop the oldest passive item, then enqueue. createOutbox doesn't
-  // expose a "drop at index" primitive; use clear+rewrite to keep
-  // the implementation small.
-  const survivors = [
-    ...current.slice(0, oldestPassiveIndex),
-    ...current.slice(oldestPassiveIndex + 1),
-  ];
-  // Re-seed the storage with the survivors then enqueue the new
-  // explicit item. The enqueue path bumps droppedCount internally
-  // when it evicts, but here we're hand-evicting one passive item
-  // ourselves, so we do not bump.
-  await captureOutbox.clear(storage);
-  for (const item of survivors) {
-    // Direct re-add via enqueue. Limit doesn't matter (we're under
-    // it after the clear) but we pass it for safety.
-    await captureOutbox.enqueue(item.payload, storage, limit);
-  }
-  const result = await captureOutbox.enqueue({ intent, event }, storage, limit);
-  return {
-    accepted: true,
-    queue: result.queue.map(toQueuedCapture),
-    evicted: 1,
-  };
-};
+  });
 
 // Failed-capture storage record. We keep enough context for the
 // side panel to render a meaningful "n unsynced after 12 retries"
@@ -239,22 +339,44 @@ export const clearFailedCaptures = async (
 export const retryFailedCaptures = async (
   storage: StoragePort = chromeStoragePort,
 ): Promise<{ readonly requeued: number }> => {
-  const failed = await readFailedCaptures(storage);
+  // Phase 1: atomically read and clear FAILED_KEY under withFailedLock so
+  // a concurrent drainQueueInner cannot race between the read and clear.
+  // We release the FAILED lock before calling enqueueCapture (which takes
+  // the QUEUE lock): never hold both chains at once, so no lock-ordering
+  // (AB/BA) deadlock is possible even if the two lock domains ever became
+  // nested elsewhere.
+  let failed: readonly FailedCapture[] = [];
+  await withFailedLock(storage, async () => {
+    failed = await readFailedCaptures(storage);
+    if (failed.length > 0) {
+      await clearFailedCaptures(storage);
+    }
+  });
   if (failed.length === 0) return { requeued: 0 };
-  await clearFailedCaptures(storage);
+
+  // Phase 2: re-enqueue each failed item outside of withFailedLock.
+  // enqueueCapture serializes on withQueueLock internally; no lock held
+  // here so no deadlock is possible.
   let requeued = 0;
   for (const record of failed) {
     const result = await enqueueCapture(record.event, storage, QUEUE_LIMIT, 'explicit');
-    if (result.accepted) requeued += 1;
-    else {
-      // The queue is full of explicit items again — keep the rest
-      // in the failed list rather than losing them.
+    if (result.accepted) {
+      requeued += 1;
+    } else {
+      // The main queue is full of explicit items — put the unqueued
+      // items back into FAILED_KEY. We merge with any entries that a
+      // concurrent drain may have appended since our Phase-1 clear,
+      // so no drain-failed entry is clobbered by this write-back.
       const stillFailed = failed.slice(failed.indexOf(record));
       const now = new Date().toISOString();
-      await writeFailedCaptures(
-        storage,
-        stillFailed.map((r) => ({ ...r, failedAt: now })),
-      );
+      await withFailedLock(storage, async () => {
+        const current = await readFailedCaptures(storage);
+        const currentIds = new Set(current.map((f) => f.id));
+        const toRestore = stillFailed
+          .filter((r) => !currentIds.has(r.id))
+          .map((r) => ({ ...r, failedAt: now }));
+        await writeFailedCaptures(storage, [...current, ...toRestore]);
+      });
       break;
     }
   }
@@ -267,6 +389,35 @@ export const drainQueue = async (
   now: Date = new Date(),
   random: () => number = Math.random,
   opts: DrainOptions = {},
+): Promise<DrainResult> =>
+  // Coalesce concurrent replayQueuedCaptures calls onto one in-flight
+  // drain so two overlapping workboard polls don't each read the same
+  // queue and double-send items.
+  //
+  // Crucially the queue mutex is NOT held across the network sends. A
+  // full drain awaits send() (≤5s each) for up to QUEUE_LIMIT items; if
+  // the whole loop held withQueueLock, a concurrent nav/explicit
+  // enqueueCapture would block on the same chain for minutes — and if
+  // the MV3 service worker were idle-killed mid-drain the blocked
+  // enqueue would never run, silently losing the explicit capture.
+  // Instead the drain sends lock-free and takes withQueueLock only for
+  // its terminal persist (via DrainOptions.persistLock). atomicDrainMerge
+  // makes that persist re-read + merge by id, so an enqueue that landed
+  // during the send window survives. Enqueue latency is bounded to the
+  // sub-millisecond persist, never a whole backlog drain.
+  await singleFlight(storage, () =>
+    drainQueueInner(send, storage, now, random, {
+      ...opts,
+      persistLock: (task) => withQueueLock(storage, task),
+    }),
+  );
+
+const drainQueueInner = async (
+  send: (event: CaptureEvent) => Promise<void>,
+  storage: StoragePort,
+  now: Date,
+  random: () => number,
+  opts: DrainOptions,
 ): Promise<DrainResult> => {
   // Accumulate explicit captures that exhaust their retry budget
   // during this drain pass. They get persisted to the failed-queue
@@ -301,10 +452,18 @@ export const drainQueue = async (
     opts,
   );
   if (newlyFailed.length > 0) {
-    const existing = await readFailedCaptures(storage);
-    const existingIds = new Set(existing.map((e) => e.id));
-    const merged = [...existing, ...newlyFailed.filter((f) => !existingIds.has(f.id))];
-    await writeFailedCaptures(storage, merged);
+    // Route through withFailedLock to serialize against retryFailedCaptures
+    // which does its own read-clear-write on the same key. This runs after
+    // captureOutbox.drain has already returned (its persistLock/withQueueLock
+    // is released by now), so no queue-lock is held here and no AB/BA
+    // deadlock with the main-queue chain is possible — the two chains are
+    // independent regardless.
+    await withFailedLock(storage, async () => {
+      const existing = await readFailedCaptures(storage);
+      const existingIds = new Set(existing.map((e) => e.id));
+      const merged = [...existing, ...newlyFailed.filter((f) => !existingIds.has(f.id))];
+      await writeFailedCaptures(storage, merged);
+    });
   }
   return result;
 };

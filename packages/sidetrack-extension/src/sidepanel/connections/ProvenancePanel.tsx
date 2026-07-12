@@ -33,12 +33,14 @@ export const ProvenanceCard = ({
   allNodes,
   onFlowFeedback,
   onClose,
+  onOpenUrl,
   ctx,
 }: {
   readonly edge: ConnectionEdge;
   readonly allNodes: readonly ConnectionNode[];
   readonly onFlowFeedback: (edge: ConnectionEdge, choice: FeedbackChoice) => Promise<void>;
   readonly onClose: () => void;
+  readonly onOpenUrl?: (url: string) => void;
   readonly ctx: EntityDisplayCtx;
 }): ReactElement => {
   const meta = EDGE_KINDS[edge.kind];
@@ -63,7 +65,11 @@ export const ProvenanceCard = ({
       </header>
       <div className="cx-prov-pair">
         {fromNode !== undefined ? (
-          <NodeChip node={fromNode} ctx={ctx} />
+          <NodeChip
+            node={fromNode}
+            ctx={ctx}
+            {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+          />
         ) : (
           <FallbackEndpoint nodeId={edge.fromNodeId} nodeById={nodeByIdLocal} ctx={ctx} />
         )}
@@ -77,7 +83,11 @@ export const ProvenanceCard = ({
           <span className="cx-prov-arrow-label">{meta?.label ?? edge.kind}</span>
         </div>
         {toNode !== undefined ? (
-          <NodeChip node={toNode} ctx={ctx} />
+          <NodeChip
+            node={toNode}
+            ctx={ctx}
+            {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+          />
         ) : (
           <FallbackEndpoint nodeId={edge.toNodeId} nodeById={nodeByIdLocal} ctx={ctx} />
         )}
@@ -174,14 +184,24 @@ const ProvRow = ({
 // anchor chip + a hint; otherwise prompts them to pick one.
 export const ProvenanceEmpty = ({
   anchor,
+  onOpenUrl,
   ctx,
 }: {
   readonly anchor: ConnectionNode | null;
+  readonly onOpenUrl?: (url: string) => void;
   readonly ctx: EntityDisplayCtx;
 }): ReactElement => (
   <div className="cx-prov-empty">
     <div className="cx-prov-empty-head">{anchor !== null ? 'Anchor summary' : 'No anchor'}</div>
-    {anchor !== null ? <NodeChip node={anchor} state="anchor" size="lg" ctx={ctx} /> : null}
+    {anchor !== null ? (
+      <NodeChip
+        node={anchor}
+        state="anchor"
+        size="lg"
+        ctx={ctx}
+        {...(onOpenUrl === undefined ? {} : { onOpenUrl })}
+      />
+    ) : null}
     <div className="cx-prov-empty-body">
       {anchor !== null
         ? 'Click an edge or neighbor row to see why each connection exists.'

@@ -30,6 +30,7 @@ import {
   generateSameSearchQueryCandidates,
   generateSameTitlePathTokensCandidates,
   generateUserConfirmedCandidates,
+  isCoarseMultiTopicDomain,
 } from './candidates.js';
 import type { CandidateSource, GenerateCandidates } from './types.js';
 
@@ -401,6 +402,235 @@ describe('ranker candidate generation', () => {
       'visit-b',
       ctx,
     );
+  });
+
+  it('still groups same_repo_or_domain for a non-aggregator domain', () => {
+    const ctx = context([
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://blog.example.test/posts/one',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://blog.example.test/posts/two',
+        }),
+      }),
+    ]);
+
+    expectSingleSourceCandidate(
+      generateSameRepoOrDomainCandidates,
+      'same_repo_or_domain',
+      'visit-a',
+      'visit-b',
+      ctx,
+    );
+  });
+
+  it('does NOT group two unrelated items on a multi-topic platform', () => {
+    // Regression: two Hacker News items share host + "item" path + "| Hacker
+    // News" title chrome. Grouping them (same_repo_or_domain 0.65,
+    // same_title_path_tokens 0.45) put an AI-video post in a linux-security
+    // workstream at 82%. Structural grouping must not fire; content signals do.
+    const ctx = context([
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://news.ycombinator.com/item?id=48856904',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://news.ycombinator.com/item?id=48173708',
+        }),
+      }),
+    ]);
+
+    expect(generateSameRepoOrDomainCandidates('visit-a', ctx)).toEqual([]);
+    expect(generateSameTitlePathTokensCandidates('visit-a', ctx)).toEqual([]);
+  });
+
+  it('groups aggregator pages by sub-community when the URL encodes one', () => {
+    const sameSub = context([
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://www.reddit.com/r/rust/comments/aaa/one_post/',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://old.reddit.com/r/rust/comments/bbb/another_post/',
+        }),
+      }),
+    ]);
+    // Same subreddit → grouped via forum: key (recovers legitimate signal).
+    expectSingleSourceCandidate(
+      generateSameRepoOrDomainCandidates,
+      'same_repo_or_domain',
+      'visit-a',
+      'visit-b',
+      sameSub,
+    );
+
+    const diffSub = context([
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://www.reddit.com/r/rust/comments/aaa/one_post/',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://www.reddit.com/r/gardening/comments/ccc/other/',
+        }),
+      }),
+    ]);
+    // Different subreddits → not grouped (bare reddit.com stays suppressed).
+    expect(generateSameRepoOrDomainCandidates('visit-a', diffSub)).toEqual([]);
+  });
+
+  it('groups Medium articles by author', () => {
+    const ctx = context([
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-a',
+          canonicalUrl: 'https://medium.com/@jane/first-essay-abc',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-b',
+          canonicalUrl: 'https://medium.com/@jane/second-essay-def',
+        }),
+      }),
+    ]);
+    expectSingleSourceCandidate(
+      generateSameRepoOrDomainCandidates,
+      'same_repo_or_domain',
+      'visit-a',
+      'visit-b',
+      ctx,
+    );
+  });
+
+  it('classifies coarse multi-topic domains by registrable domain', () => {
+    for (const host of [
+      'news.ycombinator.com',
+      'ycombinator.com',
+      'old.reddit.com',
+      'm.youtube.com',
+      'gemini.google.com',
+      'www.google.com',
+      'x.com',
+      'lobste.rs', // multi-label registrable domain
+      'foo.lobste.rs', // subdomain of a multi-label registrable domain
+      'news.ycombinator.com.', // trailing-dot FQDN form
+      'stackoverflow.com',
+      'claude.ai',
+    ]) {
+      expect(isCoarseMultiTopicDomain(host)).toBe(true);
+    }
+    for (const host of [
+      'github.com',
+      'blog.example.test',
+      'kernel.org',
+      'en.wikipedia.org',
+      'notreddit.com', // look-alike: suffix-anchored, not substring
+      'reddit.com.evil.example', // look-alike: registrable domain is evil.example
+      '',
+      'com',
+    ]) {
+      expect(isCoarseMultiTopicDomain(host)).toBe(false);
+    }
+  });
+
+  it('restores structural grouping when the guard is disabled', () => {
+    const previous = process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD'];
+    process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD'] = '0';
+    try {
+      const ctx = context([
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-a',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48856904',
+          }),
+        }),
+        event({
+          seq: 3,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-b',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48173708',
+          }),
+        }),
+      ]);
+      // With the kill-switch off, aggregator pages group by bare domain again.
+      expectSingleSourceCandidate(
+        generateSameRepoOrDomainCandidates,
+        'same_repo_or_domain',
+        'visit-a',
+        'visit-b',
+        ctx,
+      );
+    } finally {
+      if (previous === undefined) delete process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD'];
+      else process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD'] = previous;
+    }
+  });
+
+  it('suppresses title-chrome grouping between two titled aggregator pages', () => {
+    // Both pages carry the "| Hacker News" title chrome + "item" path stub; the
+    // only shared tokens are chrome, which must not produce a grouping key.
+    const ctx = context([
+      event({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({
+          url: 'https://news.ycombinator.com/item?id=1',
+          title: 'A great post about otters | Hacker News',
+        }),
+      }),
+      event({
+        seq: 3,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({
+          url: 'https://news.ycombinator.com/item?id=2',
+          title: 'An unrelated post about compilers | Hacker News',
+        }),
+      }),
+    ]);
+
+    expect(
+      generateSameTitlePathTokensCandidates('https://news.ycombinator.com/item?id=1', ctx),
+    ).toEqual([]);
   });
 
   it('generates same_search_query candidates', () => {

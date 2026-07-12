@@ -27,14 +27,19 @@ import {
   readSemanticRecallPool,
   readSemanticRecallVectorStore,
 } from '../recall/semanticRecallPool.js';
-import { embed, MODEL_ID } from '../recall/embedder.js';
+import { RECALL_MODEL_ID as MODEL_ID } from '../recall/modelManifest.js';
 import { profileFor, semanticContributionMultiplier } from './model-registry.js';
 import { freshnessDecay } from '../recall/ranker.js';
 import type { ContentSearchHit } from '../page-content/types.js';
 import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-analysis.js';
 import {
-  backfillFromPageEvidence,
+  applyLearnedRerank,
+  type LearnedRerankContext,
+  recallLearnedRerankEnabled,
+} from './learnedRerank.js';
+import {
   backfillFromRecallIndex,
+  backfillPageEvidenceDelta,
   backfillVectors,
   computeSourceSignatures,
   recallStoreIsEmpty,
@@ -44,6 +49,7 @@ import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
 import { logShadowDiff, shadowQueryEnabled, shadowVariantsFromEnv } from './shadow.js';
 import { rerank } from './rerank.js';
+import type { RecallServedPayload } from '../recall/events.js';
 import type {
   CandidateGeneratorOutput,
   RecallCandidate,
@@ -60,6 +66,81 @@ const DEFAULT_LIMIT = 12;
 const DEFAULT_PER_SOURCE_LIMIT = 20;
 const DEFAULT_MIN_HIT_AGE_MS = 5 * 60 * 1000;
 const RRF_K = 60;
+// Phase 5 of the recall+ranker v2 hard-replacement.
+//
+// The pipeline library default stays 0 (off) so unit tests don't pay
+// the cost of loading the cross-encoder model (loading the ONNX
+// runtime under Bun can crash; the eval harness opts in explicitly).
+// The PRODUCTION /v2/recall endpoint in http/server.ts overrides this
+// to DOGFOOD_RERANK_TOP_K so every served impression goes through the
+// MiniLM precision layer. Callers can still override per-request.
+const DEFAULT_RERANK_TOP_K = 0;
+
+// TODO(calibration): defaults from intuition; sweep + eval pending.
+// See docs/design/recall-ranker-v2-replacement.md "deferred" section.
+// maxStrong bumped 5 -> 10 on 2026-05-26 per dogfood feedback — user
+// expected to see rerank's top-20 in tier-1, not 5. 10 is a middle
+// ground until the calibration harness lands.
+const TIERING_DEFAULTS = {
+  minStrong: 3,
+  maxStrong: 10,
+  weakFloor: 0.3,
+  gapThreshold: 0.15,
+} as const;
+
+type RecallTiering = NonNullable<RecallResponse['meta']['tiering']>;
+
+export const partitionResultsByConfidence = (
+  results: readonly RecallCandidate[],
+): RecallTiering => {
+  const scores = results.map((r) => r.rerankScore ?? r.fusedScore);
+  const scoreGaps = scores.map((s, i) => (i === 0 ? 0 : (scores[i - 1] ?? 0) - s));
+  let strong = Math.min(results.length, TIERING_DEFAULTS.maxStrong);
+
+  // 1. Pull back if dropping below weak floor before maxStrong.
+  for (let i = TIERING_DEFAULTS.minStrong; i < strong; i += 1) {
+    if ((scores[i] ?? 0) < TIERING_DEFAULTS.weakFloor) {
+      strong = i;
+      break;
+    }
+  }
+
+  // 2. Pull back further if a large adjacent gap appears.
+  for (let i = TIERING_DEFAULTS.minStrong; i < strong; i += 1) {
+    if ((scoreGaps[i] ?? 0) >= TIERING_DEFAULTS.gapThreshold) {
+      strong = i;
+      break;
+    }
+  }
+
+  // 3. Floor: always >= minStrong (or all results if fewer than minStrong exist).
+  strong = Math.max(strong, Math.min(TIERING_DEFAULTS.minStrong, results.length));
+
+  // largestGap = pick the biggest adjacent jump.
+  let largestIdx = 0;
+  let largestDelta = 0;
+  for (let i = 1; i < scoreGaps.length; i += 1) {
+    const d = scoreGaps[i] ?? 0;
+    if (d > largestDelta) {
+      largestIdx = i;
+      largestDelta = d;
+    }
+  }
+
+  return {
+    policyVersion: 'v1',
+    scores,
+    scoreGaps,
+    suggestedStrongCount: strong,
+    suggestedCollapsedCount: Math.max(0, results.length - strong),
+    confidenceStats: {
+      topScore: scores[0] ?? 0,
+      medianScore: scores[Math.floor(scores.length / 2)] ?? 0,
+      minScore: scores[scores.length - 1] ?? 0,
+      largestGap: { index: largestIdx, delta: largestDelta },
+    },
+  };
+};
 
 /** Injectable embedder — tests can substitute a deterministic stub. */
 export type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
@@ -82,6 +163,24 @@ export interface PipelineDeps {
    *  on-disk store and caches it. When omitted the legacy MiniSearch
    *  path is used (safe fallback during the SQLite rollout). */
   readonly store?: RecallStore;
+  /** Phase 0 — impression logging. When provided, every successful
+   *  /v2/recall response writes a `recall.served` event for the
+   *  group-level ranker trainer. Fire-and-forget; errors are logged
+   *  but never block the response. Tests can omit; production wires
+   *  through eventLog.appendServerObserved. */
+  readonly appendImpression?: (payload: RecallServedPayload) => Promise<void>;
+  /** Phase 0 — monotonic per-replica sequence emitter for ordering
+   *  recall.served vs recall.action records. Production wires through
+   *  the event log's HLC; tests inject a counter. Default: now(). */
+  readonly nextSequenceNumber?: () => number;
+  /** P3 — /v2 learned re-rank. When provided AND
+   *  `SIDETRACK_RECALL_LEARNED_RERANK` is on, the pipeline applies the
+   *  impression-trained, ship-gate-passed ranker as a re-rank stage
+   *  after the cross-encoder (serve-on-PASS-only). This reads the
+   *  connections snapshot + a feature-relevant merged window for the
+   *  background FeatureModel build; it is invoked at most once per TTL,
+   *  never inline on the request path. Omit to disable entirely. */
+  readonly learnedRerankContext?: () => Promise<LearnedRerankContext | null>;
 }
 
 // Per-vault SQLite store cache. Opened lazily on first /v2/recall;
@@ -117,6 +216,27 @@ const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
   const store = await openPromise;
   await ensureFreshBackfill(vaultRoot, store);
   return store;
+};
+
+/** Phase 4 — non-blocking peek for the canonical SQLite store.
+ *  Returns undefined if the store hasn't been opened yet (e.g.
+ *  health is polled before the first /v2/recall). Health pollers
+ *  use this so they can report `canonicalVectorCounts` without
+ *  paying the open + backfill cost on every /v1/system/health hit. */
+export const peekRecallV2Store = async (
+  vaultRoot: string,
+): Promise<RecallStore | undefined> => {
+  const cached = storeCache.get(vaultRoot);
+  if (cached === undefined) return undefined;
+  // Await the cached promise so the caller gets a fully-opened
+  // handle on the second poll (when the open is in-flight from a
+  // concurrent /v2/recall). No backfill runs here — that's owned by
+  // getOrOpenStore.
+  try {
+    return await cached;
+  } catch {
+    return undefined;
+  }
 };
 
 /** Re-runs backfill phases whose source signature changed. Cheap
@@ -163,14 +283,32 @@ const runFreshnessCheck = async (
   let chatTurnN = 0;
   let vectorsN = 0;
   let deletedN = 0;
+  let chunkVectorsN = 0;
   if (wasEmpty || storedPageEvidence !== current.pageEvidence) {
-    const r = await backfillFromPageEvidence(vaultRoot, store);
+    // Record-level delta (manifest in the store): the signature only
+    // says "something under page-evidence moved"; the delta pass reads
+    // just the records that actually changed instead of re-reading
+    // every record + chunk JSON (observed: 16.6 s + 10.7 s on the
+    // main loop at every post-browsing boot). Chunk vectors ride the
+    // same delta — their source is the changed records' chunk files.
+    // fullOnEmptyDelta: this branch only runs when the page-evidence
+    // signature moved; an empty record-file delta means the change was
+    // body/chunk JSON only, which the record diff can't see.
+    const r = await backfillPageEvidenceDelta(vaultRoot, store, undefined, {
+      fullOnEmptyDelta: true,
+    });
     pageContentN = r.pageContent;
     timelineVisitN = r.timelineVisit;
     deletedN += r.deleted;
+    chunkVectorsN = r.chunkVectors;
     for (const [k, v] of Object.entries(r.timingMs)) phaseTimings[`pageEv.${k}`] = v;
     store.setRecallMetadata(SIG_KEY_PAGE_EVIDENCE, current.pageEvidence);
-    ran.push('page-evidence');
+    ran.push(
+      r.mode === 'full'
+        ? 'page-evidence'
+        : `page-evidence-delta(${String(r.changed)}c/${String(r.removed)}r)`,
+    );
+    if (r.chunkVectors > 0) ran.push('chunk-vectors');
   }
   if (wasEmpty || storedChatTurn !== current.chatTurn) {
     const r = await backfillFromRecallIndex(vaultRoot, store);
@@ -198,7 +336,8 @@ const runFreshnessCheck = async (
       `pageContent=${String(pageContentN)} ` +
       `timelineVisit=${String(timelineVisitN)} ` +
       `chatTurn=${String(chatTurnN)} ` +
-      `vectors=${String(vectorsN)}` +
+      `vectors=${String(vectorsN)} ` +
+      `chunkVectors=${String(chunkVectorsN)}` +
       `${deletedN > 0 ? ` deleted=${String(deletedN)}` : ''}` +
       `${store.vectorBackendAvailable ? '' : ' (vec disabled)'}` +
       `${wasEmpty ? ' (initial)' : ''}` +
@@ -576,6 +715,7 @@ const generateGraphNeighbor = async (
   anchorUrls: readonly string[],
   limit: number,
   excludeUrls: ReadonlySet<string>,
+  store: RecallStore | undefined,
 ): Promise<CandidateGeneratorOutput> => {
   const start = (deps.now ?? Date.now)();
   if (anchorUrls.length === 0) {
@@ -595,23 +735,38 @@ const generateGraphNeighbor = async (
   // graph-neighbor evidence (cosine > 0 from cluster-mates that ARE
   // similar) intact.
   const hits = rawHits.filter((h) => h.cosine >= SEMANTIC_ABSOLUTE_MIN_COSINE);
-  const candidates: RecallCandidate[] = hits.map((h, i) => ({
-    candidateId: `graph-neighbor:${h.canonicalUrl}`,
-    entityId: entityIdFor({ canonicalUrl: h.canonicalUrl }),
-    sourceKind: 'graph_neighbor',
-    canonicalUrl: h.canonicalUrl,
-    fusedScore: 1 / (RRF_K + (i + 1)),
-    evidence: [
-      {
-        retriever: 'dense',
-        sourceKind: 'graph_neighbor',
-        rawScore: h.cosine,
-        vectorDistance: 1 - h.cosine,
-        rank: i + 1,
-        explain: `via ${h.via}; cluster ${h.clusterId}`,
-      },
-    ],
-  }));
+  const candidates: RecallCandidate[] = hits.map((h, i) => {
+    // The semantic pool carries urls only — hydrate the title from
+    // the docs table so consumers (Now-card Related strip, search
+    // rows) can label the link; ≤limit lookups per request against
+    // docs(canonical_url). Some same-url rows are title-less (e.g. a
+    // chat_turn doc); take the first row that has one. Try both slash
+    // forms — pool keys and docs keys drift on trailing slashes.
+    const title =
+      store === undefined
+        ? undefined
+        : urlSlashVariants(h.canonicalUrl)
+            .flatMap((variant) => store.queryByCanonicalUrl({ canonicalUrl: variant, limit: 3 }))
+            .find((row) => row.title !== undefined)?.title;
+    return {
+      candidateId: `graph-neighbor:${h.canonicalUrl}`,
+      entityId: entityIdFor({ canonicalUrl: h.canonicalUrl }),
+      sourceKind: 'graph_neighbor',
+      canonicalUrl: h.canonicalUrl,
+      ...(title === undefined ? {} : { title }),
+      fusedScore: 1 / (RRF_K + (i + 1)),
+      evidence: [
+        {
+          retriever: 'dense',
+          sourceKind: 'graph_neighbor',
+          rawScore: h.cosine,
+          vectorDistance: 1 - h.cosine,
+          rank: i + 1,
+          explain: `via ${h.via}; cluster ${h.clusterId}`,
+        },
+      ],
+    };
+  });
   return { sourceKind: 'graph_neighbor', candidates, elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
 };
 
@@ -722,6 +877,20 @@ const collapseByCanonicalUrl = (
  *  much less harmful than false-positive dedupe collapsing distinct
  *  items). The parameter-cardinality profiler (D5) is the long-term
  *  fix for that residual case. */
+/** Slash-variant tolerant lookup set. Canonicalization drift between
+ *  the visit projection, the recall docs table, and the semantic pool
+ *  means the same page can be keyed with or without a trailing slash
+ *  (observed live: bun.com/ and openfeature.dev/ resolve to zero
+ *  candidates while their bare forms hit). Every exact url-keyed
+ *  lookup in this pipeline should try both forms. */
+const urlSlashVariants = (url: string): readonly string[] => {
+  if (url.endsWith('/')) {
+    const bare = url.slice(0, -1);
+    return bare.length > 0 ? [url, bare] : [url];
+  }
+  return [url, `${url}/`];
+};
+
 const suppressionKey = (url: string | undefined): string | undefined => {
   if (url === undefined || url.length === 0) return undefined;
   try {
@@ -735,16 +904,34 @@ const suppressionKey = (url: string | undefined): string | undefined => {
   }
 };
 
+type ActiveSessionMarker = NonNullable<RecallResponse['meta']['activeSessionMarkers']>[number];
+
+const activeSessionReasonFor = (
+  candidate: RecallCandidate,
+  activeChats: ReadonlySet<string>,
+): ActiveSessionMarker['reason'] | undefined => {
+  if (activeChats.has(candidate.entityId)) return 'recently_created';
+  if (candidate.threadId !== undefined && activeChats.has(candidate.threadId)) {
+    return 'recently_created';
+  }
+  return undefined;
+};
+
 const applySuppression = (
   candidates: readonly RecallCandidate[],
   req: RecallRequest,
   now: number,
-): { kept: readonly RecallCandidate[]; dropped: readonly RecallCandidate[] } => {
+): {
+  kept: readonly RecallCandidate[];
+  dropped: readonly RecallCandidate[];
+  activeSessionMarkers: readonly ActiveSessionMarker[];
+} => {
   const policy = req.suppression ?? {};
   const minAge = policy.minHitAgeMs ?? DEFAULT_MIN_HIT_AGE_MS;
   const currentLoc = suppressionKey(req.session?.currentUrl);
   const currentMode = policy.suppressCurrentPage ?? 'always';
   const activeChats = new Set(policy.suppressActiveChatBacIds ?? []);
+  const markActiveSessions = policy.markActiveSessionsInsteadOfSuppress ?? true;
   const excluded = new Set([
     ...(policy.excludeEntityIds ?? []),
     ...(req.session?.excludeEntityIds ?? []),
@@ -752,6 +939,7 @@ const applySuppression = (
 
   const kept: RecallCandidate[] = [];
   const dropped: RecallCandidate[] = [];
+  const activeSessionMarkers: ActiveSessionMarker[] = [];
   for (const c of candidates) {
     const reasons: string[] = [];
     if (excluded.has(c.entityId)) reasons.push('explicit-exclude');
@@ -759,7 +947,10 @@ const applySuppression = (
       const candLoc = suppressionKey(c.canonicalUrl);
       if (candLoc !== undefined && candLoc === currentLoc) reasons.push('current-page');
     }
-    if (c.threadId !== undefined && activeChats.has(c.threadId)) {
+    const activeSessionReason = activeSessionReasonFor(c, activeChats);
+    if (activeSessionReason !== undefined && markActiveSessions) {
+      activeSessionMarkers.push({ entityId: c.entityId, reason: activeSessionReason });
+    } else if (activeSessionReason !== undefined) {
       reasons.push('active-chat');
     }
     if (minAge > 0 && c.lastSeenAt !== undefined) {
@@ -772,7 +963,7 @@ const applySuppression = (
       dropped.push({ ...c, suppressedReasons: reasons });
     }
   }
-  return { kept, dropped };
+  return { kept, dropped, activeSessionMarkers };
 };
 
 // Phase 4 — graph_neighbor is DEMOTED. The Similar tier is now
@@ -839,10 +1030,15 @@ const resolveSources = (req: RecallRequest, intent: RecallIntent): Set<RecallSou
   new Set(req.sources ?? SOURCES_BY_INTENT[intent]);
 
 const resolveSuppression = (req: RecallRequest, intent: RecallIntent): RecallRequest => {
-  // When the caller passes an explicit `suppression` object, respect
-  // it verbatim. Otherwise merge intent defaults onto the request.
-  if (req.suppression !== undefined) return req;
-  return { ...req, suppression: SUPPRESSION_BY_INTENT[intent] };
+  const policy = req.suppression ?? SUPPRESSION_BY_INTENT[intent];
+  return {
+    ...req,
+    suppression: {
+      ...policy,
+      markActiveSessionsInsteadOfSuppress:
+        policy.markActiveSessionsInsteadOfSuppress ?? true,
+    },
+  };
 };
 
 /** `focus` candidate generator — direct canonical-URL lookup against
@@ -859,7 +1055,21 @@ const generateFocus = async (
   if (currentUrl === undefined || currentUrl.length === 0 || store === undefined) {
     return { sourceKind: 'focus', candidates: [], elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
   }
-  const hits = store.queryByCanonicalUrl({ canonicalUrl: currentUrl, limit });
+  const rawHits = urlSlashVariants(currentUrl).flatMap((variant) =>
+    store.queryByCanonicalUrl({ canonicalUrl: variant, limit }),
+  );
+  // The variants can surface the SAME page stored under both slash
+  // forms; downstream dedupe keys verbatim canonicalUrl, so collapse
+  // here or the focused page occupies two result slots.
+  const seenFocusKeys = new Set<string>();
+  const hits = rawHits
+    .filter((h) => {
+      const key = `${h.sourceKind}|${(h.canonicalUrl ?? '').replace(/\/+$/u, '')}`;
+      if (seenFocusKeys.has(key)) return false;
+      seenFocusKeys.add(key);
+      return true;
+    })
+    .slice(0, limit);
   const candidates = hits.map((h, i): RecallCandidate => candidateFromStoreHit(h, 'fts5', i + 1));
   // Tag the source kind so the UI can render a "this page" badge.
   // candidateFromStoreHit emits the hit's own sourceKind on the
@@ -910,7 +1120,12 @@ export const runRecall = async (
   if (wantsEmbedding && embedderUsable) {
     const embedStart = (deps.now ?? Date.now)();
     try {
-      const embedder = deps.embed ?? embed;
+      // Lazy: recall/embedder.ts must stay out of this module's static
+      // import graph — http/server.ts imports the pipeline statically and
+      // /v1/status bans transitive ONNX/transformers loading
+      // (statusContract.test.ts). The model loads on first real embed.
+      const embedder =
+        deps.embed ?? (async (texts: readonly string[]) => (await import('../recall/embedder.js')).embed(texts));
       const [vec] = await embedder([req.q]);
       queryEmbedding = vec;
     } catch (err) {
@@ -976,7 +1191,9 @@ export const runRecall = async (
   // in our docs table (page not indexed yet). Use it as a fallback
   // anchor so graph_neighbor still has something to expand from.
   if (focusAnchors.size === 0 && req.session?.currentUrl !== undefined) {
-    focusAnchors.add(req.session.currentUrl);
+    for (const variant of urlSlashVariants(req.session.currentUrl)) {
+      focusAnchors.add(variant);
+    }
   }
   if (sources.has('semantic_query')) {
     const lexicalAnchors = new Set([
@@ -1000,8 +1217,12 @@ export const runRecall = async (
     // focusAnchors (the current page) instead of the lexical-anchor
     // pool. When focus is empty, fall back to anchorUrls (the same
     // set semantic_query used) for backward compatibility.
-    const seedAnchors = focusAnchors.size > 0 ? [...focusAnchors] : anchorUrls;
-    groups.push(await generateGraphNeighbor(deps, seedAnchors, perSource, excludeUrls));
+    // Expand seeds to slash variants — the semantic pool may key the
+    // same page differently than the anchor's source (docs table /
+    // visit projection). A variant that misses the pool is harmless.
+    const seedBase = focusAnchors.size > 0 ? [...focusAnchors] : anchorUrls;
+    const seedAnchors = [...new Set(seedBase.flatMap(urlSlashVariants))];
+    groups.push(await generateGraphNeighbor(deps, seedAnchors, perSource, excludeUrls, store));
   }
 
   for (const g of groups) {
@@ -1013,22 +1234,86 @@ export const runRecall = async (
   timings['fuse'] = (deps.now ?? Date.now)() - fuseStart;
 
   const suppressStart = (deps.now ?? Date.now)();
-  const { kept, dropped } = applySuppression(fused, req, now);
+  const { kept, dropped, activeSessionMarkers } = applySuppression(fused, req, now);
   timings['suppress'] = (deps.now ?? Date.now)() - suppressStart;
 
   // P7 — optional cross-encoder rerank. Off by default; on when the
   // caller sets `strategy.rerankTopK > 0`. Reranks the top-N+buffer
   // and re-orders by the cross-encoder relevance score.
+  //
+  // Phase 0 — capture pre-rerank ranks so meta.rerank.rankMovement can
+  // surface "how far did each candidate move." Snapshot is cheap (one
+  // pass over kept); used only when rerank fires.
+  const preRerankRankByEntity = new Map<string, number>();
+  for (let i = 0; i < kept.length; i += 1) {
+    const e = kept[i]?.entityId;
+    if (e !== undefined) preRerankRankByEntity.set(e, i);
+  }
   let resultsAfterRerank = kept;
   let rerankApplied = false;
-  const rerankTopK = strategy.rerankTopK ?? 0;
+  let rerankLatencyMs = 0;
+  // Pipeline default = 0 (off). Production /v2 endpoint overrides via
+  // `strategy.rerankTopK = DOGFOOD_RERANK_TOP_K` so dogfood always
+  // exercises the cross-encoder; unit tests stay deterministic.
+  const rerankTopK = strategy.rerankTopK ?? DEFAULT_RERANK_TOP_K;
   if (rerankTopK > 0 && kept.length > 0) {
     const rerankStart = (deps.now ?? Date.now)();
     resultsAfterRerank = await rerank(req.q, kept, Math.min(rerankTopK, kept.length));
-    timings['rerank'] = (deps.now ?? Date.now)() - rerankStart;
+    rerankLatencyMs = (deps.now ?? Date.now)() - rerankStart;
+    timings['rerank'] = rerankLatencyMs;
     rerankApplied = true;
   }
+  // P3 — learned re-rank AFTER the cross-encoder (so it consumes
+  // cross_encoder_score / cross_encoder_rank_delta). Serve-on-PASS-only +
+  // background-built model (never blocks this request). A no-op unless
+  // the active ranker is an impression-trained, ship-gate-passed model.
+  let learnedRerankApplied = false;
+  let learnedRerankRevisionId: string | null = null;
+  if (
+    recallLearnedRerankEnabled() &&
+    deps.learnedRerankContext !== undefined &&
+    resultsAfterRerank.length > 1
+  ) {
+    const learnedStart = (deps.now ?? Date.now)();
+    // cross_encoder_rank_delta = pre-rerank rank − post-rerank rank.
+    const rankDeltaByEntity = new Map<string, number>();
+    for (let postRank = 0; postRank < resultsAfterRerank.length; postRank += 1) {
+      const cand = resultsAfterRerank[postRank];
+      if (cand === undefined) continue;
+      const preRank = preRerankRankByEntity.get(cand.entityId);
+      if (preRank !== undefined) rankDeltaByEntity.set(cand.entityId, preRank - postRank);
+    }
+    const sessionCurrentUrl = req.session?.['currentUrl'];
+    const anchorId =
+      typeof sessionCurrentUrl === 'string' && sessionCurrentUrl.length > 0
+        ? sessionCurrentUrl
+        : req.q;
+    const learned = await applyLearnedRerank(
+      {
+        vaultRoot: deps.vaultRoot,
+        loadContext: deps.learnedRerankContext,
+        now: deps.now ?? Date.now,
+      },
+      anchorId,
+      resultsAfterRerank,
+      rankDeltaByEntity,
+    );
+    timings['learnedRerank'] = (deps.now ?? Date.now)() - learnedStart;
+    if (learned.applied) {
+      resultsAfterRerank = learned.results;
+      learnedRerankApplied = true;
+      learnedRerankRevisionId = learned.revisionId;
+    }
+  }
+  // Tiering (PR D) operates on this sliced array — limit is still the hard cap on total
+  // results returned; suggestedStrongCount/collapsedCount decide how many the UI renders
+  // in the strong band vs expander. No change to DOGFOOD_RERANK_TOP_K.
   const results = resultsAfterRerank.slice(0, limit);
+  const tiering = partitionResultsByConfidence(results);
+  const resultEntityIds = new Set(results.map((r) => r.entityId));
+  const responseActiveSessionMarkers = activeSessionMarkers.filter((m) =>
+    resultEntityIds.has(m.entityId),
+  );
   const perSourceCounts: Record<RecallSourceKind, number> = {
     page_content: 0,
     timeline_visit: 0,
@@ -1039,6 +1324,90 @@ export const runRecall = async (
     focus: 0,
   };
   for (const g of groups) perSourceCounts[g.sourceKind] = g.candidates.length;
+
+  // Phase 0 — assemble + emit the impression record. Fire-and-forget
+  // so /v2/recall latency stays unchanged on slow appenders; errors
+  // go to console and the response still completes. servedContextId
+  // is sha256 of (query + sessionContext + now + RRF count) so two
+  // identical-looking requests at different times get distinct ids.
+  const servedAt = new Date((deps.now ?? Date.now)()).toISOString();
+  const servedContextId = createHash('sha256')
+    .update(
+      [
+        req.q,
+        JSON.stringify(req.session ?? {}),
+        servedAt,
+        String(results.length),
+        String((deps.now ?? Date.now)()),
+      ].join(' '),
+    )
+    .digest('hex')
+    .slice(0, 24);
+
+  let rankMovement: readonly { readonly entityId: string; readonly delta: number }[] | undefined;
+  if (rerankApplied) {
+    const moves: { entityId: string; delta: number }[] = [];
+    for (let postRank = 0; postRank < resultsAfterRerank.length; postRank += 1) {
+      const cand = resultsAfterRerank[postRank];
+      if (cand === undefined) continue;
+      const preRank = preRerankRankByEntity.get(cand.entityId);
+      if (preRank === undefined) continue;
+      const delta = preRank - postRank;
+      if (delta !== 0) moves.push({ entityId: cand.entityId, delta });
+    }
+    rankMovement = moves;
+  }
+
+  // Snapshot of the served candidates the trainer will read. We
+  // intentionally store ONLY what survives suppression (POST-suppression
+  // results) so labels can never reference a hidden candidate. Per-lane
+  // ranks come from each candidate's evidence trail.
+  const servedCandidatesSnapshot = results.map((cand, position) => {
+    const perLaneRanks: Record<string, number> = {};
+    const perLaneScores: Record<string, number> = {};
+    for (const ev of cand.evidence ?? []) {
+      if (ev.rank !== undefined) perLaneRanks[ev.sourceKind] = ev.rank;
+      if (ev.rawScore !== undefined) perLaneScores[ev.sourceKind] = ev.rawScore;
+    }
+    return {
+      entityId: cand.entityId,
+      sourceKind: cand.sourceKind,
+      ...(Object.keys(perLaneRanks).length > 0 ? { perLaneRanks } : {}),
+      ...(Object.keys(perLaneScores).length > 0 ? { perLaneScores } : {}),
+      fusedScore: cand.fusedScore,
+      ...(cand.rerankScore !== undefined ? { rerankScore: cand.rerankScore } : {}),
+      servedPosition: position,
+      ...(cand.canonicalUrl !== undefined ? { canonicalUrl: cand.canonicalUrl } : {}),
+    };
+  });
+
+  const suppressedEntityIds = dropped
+    .map((c) => c.entityId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+  if (deps.appendImpression !== undefined) {
+    const payload: RecallServedPayload = {
+      payloadVersion: 1,
+      servedContextId,
+      query: req.q,
+      intent,
+      ...(req.session !== undefined
+        ? { sessionContext: req.session as Readonly<Record<string, unknown>> }
+        : {}),
+      results: servedCandidatesSnapshot,
+      perSourceCounts: perSourceCounts as Readonly<Record<string, number>>,
+      rerankApplied,
+      ...(rerankApplied ? { rerankTopK } : {}),
+      ...(suppressedEntityIds.length > 0 ? { suppressedEntityIds } : {}),
+      sequenceNumber: (deps.nextSequenceNumber ?? (deps.now ?? Date.now))(),
+      servedAt,
+    };
+    // Fire-and-forget; impression durability must not gate the
+    // response. Failures are diagnostic, not user-visible.
+    void deps.appendImpression(payload).catch((err) => {
+      console.warn('[recall-v2] impression append failed:', err);
+    });
+  }
 
   return {
     query: {
@@ -1059,7 +1428,27 @@ export const runRecall = async (
         queryEmbedded: queryEmbedding !== undefined,
         rerankApplied,
         degradedToLexical,
+        ...(learnedRerankApplied ? { learnedRerankApplied } : {}),
       },
+      servedContextId,
+      tiering,
+      ...(responseActiveSessionMarkers.length > 0
+        ? { activeSessionMarkers: responseActiveSessionMarkers }
+        : {}),
+      ...(rerankApplied
+        ? {
+            rerank: {
+              enabled: true,
+              rerankTopK,
+              rerankedCount: Math.min(rerankTopK, kept.length),
+              latencyMs: rerankLatencyMs,
+              ...(rankMovement !== undefined ? { rankMovement } : {}),
+            },
+          }
+        : {}),
+      ...(learnedRerankApplied
+        ? { learnedRerank: { applied: true, revisionId: learnedRerankRevisionId } }
+        : {}),
       ...(strategy.debug === true ? { debug: { droppedExplanations: dropped } } : {}),
     },
   };

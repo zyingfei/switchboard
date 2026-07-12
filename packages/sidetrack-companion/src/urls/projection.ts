@@ -179,7 +179,14 @@ const upsertAttribution = (
     lastSeenAt: existing?.lastSeenAt ?? fallbackObservedAt,
     visitCount: existing?.visitCount ?? 0,
     tabSessionIds: existing?.tabSessionIds ?? [],
-    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    // A URL filed into a workstream before it was ever visited has no
+    // `existing` observation, so latestUrl/latestTitle would be absent
+    // and every UI surface renders it as "(untracked tab)". Seed
+    // latestUrl from the canonical URL so the record is self-describing
+    // (the display layer derives the host from it). latestTitle stays
+    // the captured page title (or, for the focused tab, the live-tab
+    // overlay) — the companion never fabricates a title.
+    latestUrl: existing?.latestUrl ?? attribution.canonicalUrl,
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
@@ -228,7 +235,11 @@ const upsertIgnored = (
     lastSeenAt: existing?.lastSeenAt ?? fallbackObservedAt,
     visitCount: existing?.visitCount ?? 0,
     tabSessionIds: existing?.tabSessionIds ?? [],
-    ...(existing?.latestUrl === undefined ? {} : { latestUrl: existing.latestUrl }),
+    // Symmetric with upsertAttribution: seed latestUrl so a URL ignored
+    // straight from the address bar (no prior observation) is still
+    // self-describing if it ever surfaces (e.g. a pinned card) rather
+    // than rendering "(untracked tab)".
+    latestUrl: existing?.latestUrl ?? input.canonicalUrl,
     ...(existing?.latestTitle === undefined ? {} : { latestTitle: existing.latestTitle }),
     ...(existing?.provider === undefined ? {} : { provider: existing.provider }),
     ...(existing?.host === undefined ? {} : { host: existing.host }),
@@ -281,7 +292,7 @@ const stripFragmentAndTrailingSlash = (url: string): string =>
 // Byte-equal output for any event-order permutation is the
 // load-bearing property — verified by the parity tests.
 
-interface UrlObservationCursor {
+export interface UrlObservationCursor {
   readonly acceptedAtMs: number;
   readonly replicaId: string;
   readonly seq: number;
@@ -298,6 +309,12 @@ export interface UrlProjectionAccumulator {
    * never overwrite a value contributed by a newer event.
    */
   readonly observationCursors: Map<string, UrlObservationCursor>;
+}
+
+export interface SerializedUrlProjectionAccumulator {
+  readonly schemaVersion: typeof URL_PROJECTION_SCHEMA_VERSION;
+  readonly byCanonicalUrl: Record<string, UrlVisitRecord>;
+  readonly observationCursors: Record<string, UrlObservationCursor>;
 }
 
 export const createEmptyUrlProjectionAccumulator = (): UrlProjectionAccumulator => ({
@@ -497,6 +514,35 @@ export const urlProjectionAccumulatorFromSerialized = (
     ),
   ),
   observationCursors: new Map(),
+});
+
+export const serializeUrlProjectionAccumulator = (
+  accumulator: UrlProjectionAccumulator,
+): SerializedUrlProjectionAccumulator => ({
+  schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
+  byCanonicalUrl: Object.fromEntries(
+    [...accumulator.records.entries()].sort(([left], [right]) => compareString(left, right)),
+  ),
+  observationCursors: Object.fromEntries(
+    [...accumulator.observationCursors.entries()].sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+});
+
+export const deserializeUrlProjectionAccumulator = (
+  serialized: SerializedUrlProjectionAccumulator,
+): UrlProjectionAccumulator => ({
+  records: new Map(
+    Object.entries(serialized.byCanonicalUrl).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
+  observationCursors: new Map(
+    Object.entries(serialized.observationCursors).sort(([left], [right]) =>
+      compareString(left, right),
+    ),
+  ),
 });
 
 // Apply PR #141's thread→URL attribution propagation to the

@@ -698,3 +698,60 @@ describe('sidetrack.dispatch.await_capture', () => {
 // `bac.create_annotation` was deleted in Phase 1.4a. The typed
 // replacement `sidetrack.annotations.create_batch` (covered above)
 // supersedes both single-create and the four-call-per-page pattern.
+
+describe('sidetrack.workstreams.create (F32 new_cluster)', () => {
+  it('reports unavailable when no companion client is wired', async () => {
+    const client = await startInProcessServer();
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.workstreams.create',
+        arguments: { title: 'New cluster' },
+      });
+      expect(errorText(result)).toContain('sidetrack.workstreams.create is unavailable');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('forwards title + parentId + kind to the companion and returns the new bac_id', async () => {
+    const writeClient = buildFakeWriteClient({
+      createWorkstream: vi.fn(() =>
+        Promise.resolve({ bac_id: 'bac_ws_new', revision: 'rev_ws_new' }),
+      ),
+    });
+    const client = await startInProcessServer(writeClient);
+    try {
+      const result = await client.callTool({
+        name: 'sidetrack.workstreams.create',
+        arguments: { title: 'Migrations', parentId: 'bac_ws_parent', kind: 'project' },
+      });
+      expect(writeClient.createWorkstream).toHaveBeenCalledWith({
+        title: 'Migrations',
+        parentId: 'bac_ws_parent',
+        kind: 'project',
+      });
+      const structured = result.structuredContent as { readonly bac_id?: string };
+      expect(structured.bac_id).toBe('bac_ws_new');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('omits parentId + kind when not supplied (top-level create)', async () => {
+    const writeClient = buildFakeWriteClient({
+      createWorkstream: vi.fn(() =>
+        Promise.resolve({ bac_id: 'bac_ws_top', revision: 'rev_ws_top' }),
+      ),
+    });
+    const client = await startInProcessServer(writeClient);
+    try {
+      await client.callTool({
+        name: 'sidetrack.workstreams.create',
+        arguments: { title: 'Top level' },
+      });
+      expect(writeClient.createWorkstream).toHaveBeenCalledWith({ title: 'Top level' });
+    } finally {
+      await client.close();
+    }
+  });
+});

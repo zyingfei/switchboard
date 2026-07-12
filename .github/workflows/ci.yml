@@ -1,0 +1,137 @@
+# Minimal honest CI for the Sidetrack Bun monorepo.
+# Runs on every push and pull request.
+#
+# What is NOT here:
+#   - e2e / Playwright (needs a live browser + companion vault)
+#   - eval suites (eval:recall — cost-gated, needs model downloads)
+#   - build step (requires native binaries / wxt — out-of-scope for unit CI)
+#
+# Layout note: this is a Bun workspace — ALL binaries (tsc, vitest, wxt) are
+# hoisted to the repo-root node_modules/.bin. Steps that run from a package
+# working-directory must use ../../node_modules/.bin/<tool>.
+# Each job runs its own `bun install --frozen-lockfile` (fast, deterministic)
+# instead of a cross-job cache dance — reliability over seconds saved.
+#
+# Extension unit tests use continue-on-error because there are 13 pre-existing
+# failures on this branch that have not been triaged yet.
+# TODO(F16): once the F16 triage wave resolves those failures, flip
+#   continue-on-error to false so the extension test step is blocking.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Companion (@sidetrack/companion)
+  # test runner: bun test (NOT vitest — see companion package.json)
+  # ---------------------------------------------------------------------------
+  companion:
+    name: Companion — typecheck + test
+    runs-on: ubuntu-latest
+    # Ubuntu ships a vec-capable /usr/lib/.../libsqlite3.so on the sqlite-vec
+    # probe path (setup-sqlite.ts). That enforces strict vec column
+    # dimensions and, order-dependently, rejects the low-dimension fixtures
+    # some recall/connections tests feed — a moving test flake, not a
+    # product issue. Opt out so CI matches the local dev default (no
+    # system libsqlite3 → Bun built-in SQLite). Followup: a vec integration
+    # lane with dimension-matched (384) fixtures.
+    env:
+      SIDETRACK_SQLITE_LIB: "off"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # tsconfig.build.json is the repo's declared typecheck gate (matches the
+      # local convention). The full tsconfig.json includes test files that
+      # carry pre-existing type drift — tracked backlog, not a CI gate yet.
+      # This emits dist/ (not --noEmit) because the HNSW reconcile child
+      # integration suite spawns a child from
+      # dist/sync/contract/connectionsReconcileChild.entry.js.
+      - name: Typecheck + build dist (child-process tests need it)
+        working-directory: packages/sidetrack-companion
+        run: ../../node_modules/.bin/tsc -p tsconfig.build.json
+
+      # bun 1.3.14 reproducibly panics during post-suite teardown on this
+      # suite (exit 133) AFTER printing the complete summary — the exit code
+      # is unreliable as a pass signal. Parse the summary strictly instead:
+      # green requires an explicit " 0 fail" line; anything else (failures,
+      # missing summary, truncated output) stays red.
+      # TODO: drop this wrapper once a bun upgrade exits cleanly here.
+      - name: Test (bun test — summary-parsed, see bun exit-panic note)
+        working-directory: packages/sidetrack-companion
+        run: |
+          set -o pipefail
+          bun test 2>&1 | tee bun-test.log || true
+          grep -Eq '^ *[1-9][0-9]* pass$' bun-test.log
+          grep -Eq '^ *0 fail$' bun-test.log
+
+  # ---------------------------------------------------------------------------
+  # Extension (@sidetrack/extension)
+  # Unit tests only — vitest.config.ts includes only tests/unit/**/*.test.{ts,tsx}
+  # and src/**/*.test.{ts,tsx}; e2e specs live in tests/e2e/ and are excluded.
+  #
+  # WARNING: continue-on-error is TRUE because of the 13 pre-existing unit
+  # failures on this branch. CI will NOT block on red extension tests until
+  # those are triaged.
+  # TODO(F16): set continue-on-error to false once pre-existing failures are resolved.
+  # ---------------------------------------------------------------------------
+  extension:
+    name: Extension — typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # wxt prepare generates .wxt/tsconfig.json which the extension tsconfig extends.
+      - name: Prepare WXT (generates .wxt/ types)
+        working-directory: packages/sidetrack-extension
+        run: ../../node_modules/.bin/wxt prepare
+
+      - name: Typecheck
+        working-directory: packages/sidetrack-extension
+        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
+
+      # F16 triage complete (2026-07-11): the 13-fail baseline was cleared
+      # (all stale tests — suite is 994/994 green), so this step is BLOCKING.
+      - name: Unit tests (vitest — excludes e2e/)
+        working-directory: packages/sidetrack-extension
+        run: ../../node_modules/.bin/vitest run
+
+  # ---------------------------------------------------------------------------
+  # MCP (@sidetrack/mcp)
+  # ---------------------------------------------------------------------------
+  mcp:
+    name: MCP — typecheck + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: packages/sidetrack-mcp
+        run: ../../node_modules/.bin/tsc --noEmit -p tsconfig.json
+
+      - name: Test (vitest)
+        working-directory: packages/sidetrack-mcp
+        run: ../../node_modules/.bin/vitest run

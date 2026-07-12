@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   contextPackInputFromConnections,
@@ -14,7 +14,12 @@ import {
   topicLabelFromConnections,
   whyRelatedReasonsFromConnections,
 } from './client';
+import { idempotencyKey } from '../../idempotencyKey';
 import { messageTypes } from '../../messages';
+import {
+  recordImpression,
+  resetImpressionRegistryForTests,
+} from '../recall/impressionRegistry';
 import type { ConnectionsScopedResult } from './types';
 
 const result: ConnectionsScopedResult = {
@@ -90,6 +95,7 @@ const result: ConnectionsScopedResult = {
 describe('connections client helpers', () => {
   afterEach(() => {
     setConnectionsClientTransportForTests(null);
+    resetImpressionRegistryForTests();
   });
 
   it('derives topic labels, why-related reasons, and context-pack input from snapshots', () => {
@@ -293,5 +299,76 @@ describe('connections client helpers', () => {
         clientEventId: expect.stringMatching(/^feedback-user\.organized\.item-/u),
       }),
     ]);
+  });
+
+  // P2 — the feedback choke point also mirrors the gesture as an
+  // impression-joined recall.action when the judged subject was
+  // recently recall-served, with referencesEventId set to the SAME
+  // clientEventId the feedback POST carries (that's the companion's
+  // double-count dedupe key).
+  it('emits an impression-joined recall.action alongside the feedback POST on registry hit', async () => {
+    const posted: { clientEventId?: string }[] = [];
+    setConnectionsClientTransportForTests((message) => {
+      posted.push(message as { clientEventId?: string });
+      return Promise.resolve({ ok: true, data: { accepted: true } });
+    });
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    globalThis.chrome = {
+      runtime: { sendMessage: send },
+      storage: { local: { get: vi.fn(() => Promise.resolve({})) } },
+    } as unknown as typeof chrome;
+    try {
+      recordImpression('ctx-live-1', [{ entityId: 'visit:served-b' }]);
+      await postUserFlowConfirmed({
+        relationKind: 'visit_resembles_visit',
+        fromId: 'visit:a',
+        toId: 'visit:served-b',
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledTimes(1);
+      });
+      expect(send).toHaveBeenCalledWith({
+        type: messageTypes.recallActionEmit,
+        payload: {
+          payloadVersion: 1,
+          servedContextId: 'ctx-live-1',
+          entityId: 'visit:served-b',
+          actionKind: 'flow_confirm',
+          actionAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/u),
+          // The id the feedback POST carried, run through the SAME
+          // transform background.ts applies to the idempotency-key
+          // header — that header is what the companion stores as the
+          // event's clientEventId, so it is the dedupe join key.
+          referencesEventId: idempotencyKey('feedback', posted[0]?.clientEventId ?? ''),
+        },
+      });
+    } finally {
+      // @ts-expect-error — restore default
+      delete globalThis.chrome;
+    }
+  });
+
+  it('does not emit a recall.action when the subject was never recall-served', async () => {
+    setConnectionsClientTransportForTests(() =>
+      Promise.resolve({ ok: true, data: { accepted: true } }),
+    );
+    const send = vi.fn(() => Promise.resolve({ ok: true }));
+    globalThis.chrome = {
+      runtime: { sendMessage: send },
+      storage: { local: { get: vi.fn(() => Promise.resolve({})) } },
+    } as unknown as typeof chrome;
+    try {
+      await postUserFlowRejected({
+        relationKind: 'closest_visit',
+        fromId: 'visit:a',
+        toId: 'visit:never-served',
+        reason: 'not-related',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      // @ts-expect-error — restore default
+      delete globalThis.chrome;
+    }
   });
 });

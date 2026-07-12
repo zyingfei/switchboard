@@ -27,11 +27,15 @@
 
 import type { RankerArtifactKind, RankerArtifactQuality, RankerRevision } from './train.js';
 
+const RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX = 'ship_gate_v2:';
+
 export interface ActiveRankerSelection {
   readonly selectedKind: RankerArtifactKind;
   readonly selectedRevisionId: string;
   readonly reservedTestNdcgAt5: number | null;
   readonly reason: 'best_passing' | 'fallback_graph_baseline';
+  readonly shipGateStatus: RankerArtifactQuality['shipGate']['status'] | null;
+  readonly shipGateReason: string | null;
 }
 
 // Kind priority for tie-breaking. Earlier wins. `graph_baseline` is
@@ -56,9 +60,18 @@ const kindRank = (kind: RankerArtifactKind): number => {
 // with this artifact. A ship-gate `pass` is necessary but not
 // sufficient — if the LR weights weren't persisted (older revision)
 // the selector can't pick `logistic_batch` even if its gate passed.
-const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolean => {
+export const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolean => {
   if (kind === 'graph_baseline') return true;
-  if (kind === 'lightgbm_lambdamart') return revision.modelBytes.byteLength > 0;
+  if (kind === 'lightgbm_lambdamart') {
+    // Round 1 #5 softening: v6 trained from legacy is "sparse"
+    // (retrieval features zero-filled with missingRetrievalContext)
+    // but still carries ~27 real features from explicit feedback.
+    // We surface trainingOrigin in health so it's auditable, but
+    // serveability is decided by the ship-gate over impression-level
+    // metrics — not by the training source per se. The reviewer's
+    // intent ("name it; let it compete") not "block entirely".
+    return revision.modelBytes.byteLength > 0;
+  }
   if (kind === 'logistic_batch') {
     return (
       revision.logisticBatchWeights !== undefined &&
@@ -88,27 +101,35 @@ const isServeable = (kind: RankerArtifactKind, revision: RankerRevision): boolea
   return false;
 };
 
-const passingArtifacts = (
-  revision: RankerRevision,
-): readonly RankerArtifactQuality[] => {
+const passingArtifacts = (revision: RankerRevision): readonly RankerArtifactQuality[] => {
   const quality = revision.artifactQuality ?? [];
   return quality.filter(
-    (artifact) =>
-      artifact.shipGate.status === 'pass' && isServeable(artifact.kind, revision),
+    (artifact) => artifact.shipGate.status === 'pass' && isServeable(artifact.kind, revision),
   );
 };
 
-const compareArtifacts = (
-  left: RankerArtifactQuality,
-  right: RankerArtifactQuality,
-): number => {
+const compareArtifacts = (left: RankerArtifactQuality, right: RankerArtifactQuality): number => {
   const leftNdcg = left.reservedTestMetric?.value ?? -Infinity;
   const rightNdcg = right.reservedTestMetric?.value ?? -Infinity;
   if (leftNdcg !== rightNdcg) return rightNdcg - leftNdcg; // desc
   return kindRank(left.kind) - kindRank(right.kind);
 };
 
+const artifactFor = (
+  revision: RankerRevision,
+  kind: RankerArtifactKind,
+): RankerArtifactQuality | undefined =>
+  revision.artifactQuality?.find((artifact) => artifact.kind === kind);
+
+const lightgbmV2GateFor = (revision: RankerRevision): RankerArtifactQuality | undefined => {
+  const artifact = artifactFor(revision, 'lightgbm_lambdamart');
+  return artifact?.shipGate.reason.startsWith(RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX) === true
+    ? artifact
+    : undefined;
+};
+
 export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelection => {
+  const v2Lightgbm = lightgbmV2GateFor(revision);
   const passing = [...passingArtifacts(revision)].sort(compareArtifacts);
   const winner = passing[0];
   if (winner === undefined) {
@@ -119,6 +140,8 @@ export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelect
       selectedRevisionId: revision.revisionId,
       reservedTestNdcgAt5: null,
       reason: 'fallback_graph_baseline',
+      shipGateStatus: v2Lightgbm?.shipGate.status ?? null,
+      shipGateReason: v2Lightgbm?.shipGate.reason ?? null,
     };
   }
   return {
@@ -126,5 +149,7 @@ export const selectActiveRanker = (revision: RankerRevision): ActiveRankerSelect
     selectedRevisionId: revision.revisionId,
     reservedTestNdcgAt5: winner.reservedTestMetric?.value ?? null,
     reason: 'best_passing',
+    shipGateStatus: winner.shipGate.status,
+    shipGateReason: winner.shipGate.reason,
   };
 };

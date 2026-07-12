@@ -594,6 +594,51 @@ button:disabled {
   border-color: var(--green-tint);
   color: var(--green);
 }
+
+/* Related items below the current-tab card. Sources from the existing
+   workstream-suggestion's fusedCandidates' anchor labels (deduped by
+   canonical URL) — added 2026-05-27 so the focus card isn't an
+   information desert after a visit. */
+.tab-attribution-card-related {
+  padding: 8px 0 0 0;
+  border-top: 1px dashed var(--hair);
+  margin-top: 6px;
+}
+.tab-attribution-card-related-head {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3, var(--ink-2));
+  margin-bottom: 4px;
+}
+.tab-attribution-card-related-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tab-attribution-card-related-list li {
+  display: block;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.tab-attribution-card-related-list a {
+  color: var(--ink-2);
+  text-decoration: none;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 0;
+}
+.tab-attribution-card-related-list a:hover {
+  color: var(--accent, #0b57d0);
+  text-decoration: underline;
+}
 /* Explicit "Go to" affordance for tab-session cards (InboxCard) and the
    current-tab card. Mirrors `.thread-actions .thread-action-icon` from
    the workstream thread rows so the affordance reads identically across
@@ -2621,6 +2666,23 @@ textarea.preview-body:focus {
 .dispatch-arrow {
   color: var(--ink-3);
 }
+/* At docked-panel width the 5-column grid crushes the source/target titles
+   to a few characters ("Some…"). Stack the row so each title gets the full
+   panel width; hide the now-redundant inline arrow (row order already
+   implies source → target). */
+@media (max-width: 440px) {
+  .dispatch-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .dispatch-row .dispatch-arrow {
+    display: none;
+  }
+  .dispatch-source-title,
+  .dispatch-target-title {
+    max-width: none;
+  }
+}
 .dispatch-time {
   color: var(--ink-3);
 }
@@ -3277,6 +3339,35 @@ textarea.preview-body:focus {
   border-radius: var(--rad-s);
   background: var(--paper-light);
 }
+/* "Load key from file…" row — button + hint, left-aligned under the
+   bridge-key input so the no-terminal path is right where you'd paste. */
+.settings-keyfile-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+/* Connection card — one-glance live status line + a divider between the
+   one-paste pairing field and the manual port/key fields. */
+.settings-conn-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  margin-bottom: 8px;
+  min-width: 0;
+}
+.settings-conn-status .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-conn-divider {
+  height: 1px;
+  background: var(--rule-soft, #e5ddc9);
+  margin: 12px 0 10px;
+}
 
 /* ── Switch (used in Wizard providers + Settings) ── */
 .switch {
@@ -3597,6 +3688,89 @@ textarea.preview-body:focus {
   stroke-width: 1.6;
   stroke: currentColor;
   fill: none;
+}
+/* Disabled toolbar icons — set when the master capture switch (the eye)
+   is off: the capture-oriented controls go inert so the paused state
+   reads clearly. */
+.icon-btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+/* Master capture switch (the "eye"). On = neutral (capturing is the
+   normal state, so the toolbar doesn't stay lit). Off = a clear red
+   "paused / blind" treatment so the user can't miss that nothing is
+   being recorded anywhere. */
+.icon-btn.capture-eye.off {
+  color: #b91c1c;
+  border-color: #e7b3b3;
+  background: #fdf0f0;
+}
+.icon-btn.capture-eye.off:hover {
+  background: #fbe6e6;
+  border-color: #d98b8b;
+}
+/* Toolbar overflow ("⋯") menu — collapses the diagnostic actions
+   (capture health, dump panel state, design preview). */
+.toolbar-overflow {
+  position: relative;
+  display: inline-flex;
+}
+.toolbar-overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: 184px;
+  display: grid;
+  gap: 1px;
+  padding: 4px;
+  background: var(--paper, #f6f0e0);
+  border: 1px solid var(--rule, #d4cdb8);
+  border-radius: var(--rad-m, 8px);
+  box-shadow: 0 6px 20px rgba(40, 33, 20, 0.18);
+}
+.toolbar-overflow-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--rad-s, 6px);
+  background: transparent;
+  color: var(--ink, #2b2620);
+  font: 12px var(--body);
+  text-align: left;
+  cursor: pointer;
+}
+.toolbar-overflow-item:hover {
+  background: var(--paper-deep, #e8dfc8);
+}
+.toolbar-overflow-item:focus-visible {
+  outline: none;
+  border-color: var(--signal, #c2410c);
+}
+.toolbar-overflow-item-on {
+  color: var(--signal, #c2410c);
+}
+.toolbar-overflow-item-icon {
+  display: inline-flex;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  color: var(--ink-2, #4a453d);
+}
+.toolbar-overflow-item-icon svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+}
+.toolbar-overflow-item-label {
+  flex: 1;
+  min-width: 0;
 }
 
 .ws-bar {
@@ -7855,6 +8029,35 @@ pre.diff {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+.cx-node-title-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.cx-node-open {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid transparent;
+  border-radius: var(--rad-s);
+  background: transparent;
+  color: var(--ink-3);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.cx-node-open:hover {
+  border-color: var(--rule-soft);
+  background: var(--paper-tinted);
+  color: var(--ink);
+}
+.cx-node-open svg {
+  width: 12px;
+  height: 12px;
 }
 .cx-node.lg {
   padding: 10px 14px;
@@ -8076,8 +8279,9 @@ pre.diff {
   font-size: 12px;
 }
 .cx-edge-list {
-  display: grid;
-  gap: 5px;
+  display: flex;
+  flex-direction: column;
+  padding: 0 8px 6px;
 }
 .cx-edgelabel.cx-edge-summary {
   width: 100%;
@@ -10471,12 +10675,33 @@ pre.diff {
   font: 12px var(--body);
   padding: 5px 7px;
 }
-.cx-focus-name-suggestions,
 .cx-focus-selected-tray,
 .cx-focus-add-drawer {
   display: grid;
   gap: 7px;
   min-width: 0;
+}
+/* Collapsible name-suggestions section. <details> keeps native
+   disclosure behaviour; the summary is the toggle label. */
+.cx-focus-name-suggestions {
+  display: block;
+  min-width: 0;
+}
+.cx-focus-name-suggestions > summary {
+  cursor: pointer;
+  list-style: revert;
+  padding: 2px 0;
+}
+.cx-focus-name-suggestions > summary:hover {
+  color: var(--ink);
+}
+.cx-focus-name-suggestions[open] > .cx-focus-chip-row {
+  margin-top: 7px;
+}
+.cx-focus-compose-helper {
+  margin-top: 4px;
+  font-size: 10.5px;
+  line-height: 1.4;
 }
 .cx-focus-chip-row {
   display: flex;
@@ -12055,6 +12280,43 @@ pre.diff {
   font-size: 11.5px;
   color: var(--ink);
   border-bottom: 1px dotted var(--ink-3);
+}
+
+/* Meter — retrain-gate progress bar (fills sage when the gate is met,
+   amber while short). The "current / required" number sits alongside. */
+.sx-health .sx-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.sx-health .sx-meter-track {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  min-width: 60px;
+  background: var(--rule-soft);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.sx-health .sx-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.sx-health .sx-meter-fill.ok {
+  background: var(--sage);
+}
+.sx-health .sx-meter-fill.warn {
+  background: var(--amber);
+}
+.sx-health .sx-meter-num {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
 }
 
 /* Inventory table */

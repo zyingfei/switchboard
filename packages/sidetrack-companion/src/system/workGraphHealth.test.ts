@@ -7,15 +7,16 @@ import { createConnectionsStore } from '../connections/snapshot.js';
 import { edgeIdFor, type ConnectionsSnapshot } from '../connections/types.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { projectFeedback } from '../feedback/projection.js';
+import { recordCanonicalCollision } from '../page-content/canonicalize-telemetry.js';
+import { sha256Hex } from '../page-content/store.js';
+import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import {
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
 } from '../producers/topic-revision.js';
-import {
-  augmentFeedbackWithVisitPairLabels,
-  fingerprintFeedbackTrainingLabels,
-} from '../ranker/retrain.js';
+import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
+import { fingerprintFeedbackTrainingLabels } from '../ranker/retrain.js';
 import { RANKER_MODEL_VERSION } from '../ranker/train.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog } from '../sync/eventLog.js';
@@ -183,12 +184,11 @@ describe('work graph diagnostic candidates', () => {
           revisionId: 'topic-rev-active',
           asOf: '2026-05-16T12:00:00.000Z',
         }),
-        expect.objectContaining({
-          id: 'topic.hdbscan-standby',
-          lane: 'standby',
-          servingImpact: 'not-serving',
-          status: 'off',
-        }),
+        // Health-panel cleanup 2026-05-26: topic.hdbscan-standby is
+        // perpetually status=off + no-production-selector → filtered
+        // from the candidates response to reduce noise. Re-add to the
+        // unfiltered ID set in workGraphHealth.ts:isStaleDiagnostic if
+        // it ever becomes meaningful.
         expect.objectContaining({
           id: 'topic.shadow-idf-rkn-split',
           lane: 'shadow',
@@ -213,21 +213,23 @@ describe('work graph diagnostic candidates', () => {
         // U2 — hot paths default ON (topics unset ⇒ now enabled, was
         // 'off'/'env-off'); no hotPath diagnostics in this fixture ⇒
         // honest 'pending'/'fast-path-decision-pending'.
+        // Lane renames 2026-05-27: 'standby' → 'incremental' for
+        // hot-paths, 'queue' for content-lane queue health.
         expect.objectContaining({
           id: 'similarity.hot-incremental',
-          lane: 'standby',
+          lane: 'incremental',
           status: 'pending',
           reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'topic.hot-incremental',
-          lane: 'standby',
+          lane: 'incremental',
           status: 'pending',
           reason: 'fast-path-decision-pending',
         }),
         expect.objectContaining({
           id: 'content-lane.dirty-source-queue',
-          lane: 'standby',
+          lane: 'queue',
           status: 'pending',
           reason: 'dirty-source-pending',
           asOf: '2026-05-16T12:45:00.000Z',
@@ -246,14 +248,18 @@ describe('work graph diagnostic candidates', () => {
           status: 'ok',
           reason: 'child-process',
         }),
-        expect.objectContaining({
-          id: 'quality.gray-zone-scorer',
-          family: 'quality',
-          status: 'off',
-          reason: 'no-runtime-model-injection',
-        }),
+        // Health-panel cleanup 2026-05-26: quality.gray-zone-scorer is
+        // perpetually status=off → filtered from the candidates response.
       ]),
     );
+  });
+
+  it('filters out perpetually-off diagnostic candidates from the response', async () => {
+    const filteredIds = ['topic.hdbscan-standby', 'topic.algorithm-comparison', 'quality.gray-zone-scorer'];
+    const health = await collectWorkGraphHealth({ vaultRoot, now: () => new Date('2026-05-16T13:00:00.000Z') });
+    for (const id of filteredIds) {
+      expect(health.candidates.some((c) => c.id === id)).toBe(false);
+    }
   });
 
   it('warns on content-lane backlog only when an age threshold is tripped', async () => {
@@ -313,7 +319,88 @@ describe('work graph diagnostic candidates', () => {
     );
   });
 
-  it('compares retrain freshness against the same augmented label dataset used by retrain', async () => {
+  it('surfaces canonicalization telemetry and over-collapsed page-content hygiene', async () => {
+    const canonicalUrl = 'https://health-collapse.example.test/thread';
+    for (const ref of ['one', 'two', 'three', 'four']) {
+      recordCanonicalCollision(
+        `https://health-collapse.example.test/thread?utm_source=${ref}`,
+        canonicalUrl,
+      );
+    }
+    const dir = join(vaultRoot, '_BAC', 'page-content', 'by-url');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, `${sha256Hex(canonicalUrl)}.json`),
+      `${JSON.stringify(
+        {
+          coverage: {
+            canonicalUrl,
+            state: 'indexed',
+            lastIndexedAt: '2026-05-26T12:30:00.000Z',
+            contentHash: 'hash-overcollapsed-health',
+            chunkCount: 67,
+          },
+          url: canonicalUrl,
+          updatedAt: '2026-05-26T12:30:00.000Z',
+          sourceEventType: 'page.content.extracted',
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({ vaultRoot });
+
+    expect(health.recall.canonicalizationTelemetry.suspiciousHosts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          host: 'health-collapse.example.test',
+          canonicalCount: 1,
+          rawCount: 4,
+          collisionRatio: 4,
+          samplePairs: [
+            expect.objectContaining({
+              canonicalUrl,
+              rawUrls: expect.arrayContaining([
+                'https://health-collapse.example.test/thread?utm_source=one',
+              ]),
+            }),
+          ],
+        }),
+      ]),
+    );
+    expect(health.hygiene.overCollapsedRecords).toMatchObject({
+      count: 1,
+      samples: [{ canonicalUrl, chunkCount: 67, contentHash: 'hash-overcollapsed-health' }],
+    });
+  });
+
+  it('reports v6 legacy-trained ranker manifests as ready (softened 2026-05-26)', async () => {
+    // Round 1 #5 originally marked v6-from-legacy as invalid. Softened
+    // per dogfood: the model still carries ~27 real features from
+    // explicit feedback; the 5 retrieval features are zero-fills. Let
+    // it serve and compete via the ship-gate.
+    await writeActiveClosestVisitRankerRevision(vaultRoot, {
+      revisionId: 'legacy-v6',
+      modelVersion: RANKER_MODEL_VERSION,
+      featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+      trainingDatasetHash: 'b'.repeat(64),
+      trainedAt: Date.parse('2026-05-16T13:10:00.000Z'),
+      trainedFromImpressions: false,
+      modelBytes: new ArrayBuffer(4),
+    });
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T13:15:00.000Z'),
+    });
+
+    expect(health.ranker.loadStatus).toBe('ready');
+    expect(health.ranker.loadReason).toBeNull();
+  });
+
+  it('compares retrain freshness against the unexpanded event-sourced label dataset', async () => {
     const replicaId = '11111111-1111-4111-8111-111111111111';
     const peerReplicaId = '22222222-2222-4222-8222-222222222222';
     let seq = 0;
@@ -375,10 +462,7 @@ describe('work graph diagnostic candidates', () => {
     };
     await createConnectionsStore(vaultRoot).putCurrent(snapshot);
 
-    const feedback = augmentFeedbackWithVisitPairLabels(
-      projectFeedback([rejectedAgainstWorkstream]),
-      snapshot,
-    );
+    const feedback = projectFeedback([rejectedAgainstWorkstream]);
     const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
     await mkdir(join(vaultRoot, '_BAC', 'connections', 'closest-visit'), { recursive: true });
     await writeFile(
@@ -404,10 +488,12 @@ describe('work graph diagnostic candidates', () => {
     });
 
     expect(health.ranker.datasetChangedSinceTrain).toBe(false);
-    expect(health.ranker.retrainSkipReason).toBe('unchanged');
+    expect(health.ranker.retrainSkipReason).toBe('insufficient_groups');
+    expect(health.ranker.expandedNegativeCount).toBe(0);
+    expect(health.ranker.labelDriftWithoutFeedback).toBe(0);
     expect(health.ranker.trainingMix).toMatchObject({
       positivesAtTrain: 0,
-      userFeedbackNegativesAtTrain: 2,
+      userFeedbackNegativesAtTrain: 1,
     });
   });
 });

@@ -29,7 +29,11 @@ const COMPANION_EMITTED_KINDS: readonly string[] = [
   'dispatch_requested_coding_session',
   'queue_targets_thread',
   'queue_targets_workstream',
-  'reminder_for_thread',
+  // 'reminder_for_thread' was emitted per chatgpt capture; filtered
+  // from the snapshot projection on 2026-05-27 (26bdcbce) — the records
+  // were vestigial (never wired to an inbox UI). See snapshot.ts and the
+  // dedicated regression test in snapshot.test.ts. Re-add here if the
+  // projection is re-enabled (gate: r.status !== 'new' OR a flag).
   'coding_session_in_workstream',
   'timeline_same_url_as_thread',
   'annotation_targets_thread',
@@ -59,7 +63,9 @@ describe('connections — multi-flow user-story integration', () => {
     for (const did of FLOW_NODES.A.dispatches) expect(ids.has(did)).toBe(true);
     for (const cid of FLOW_NODES.A.codingSessions) expect(ids.has(cid)).toBe(true);
     for (const qid of FLOW_NODES.A.queueItems) expect(ids.has(qid)).toBe(true);
-    for (const rid of FLOW_NODES.A.reminders) expect(ids.has(rid)).toBe(true);
+    // reminder_for_thread projection is suppressed (26bdcbce) so the
+    // reminder node never enters the graph — asserted absent below.
+    for (const rid of FLOW_NODES.A.reminders) expect(ids.has(rid)).toBe(false);
     // No Flow-B-exclusive node should leak in.
     for (const id of flowExclusiveNodes('B')) {
       expect(ids.has(id), `B-exclusive ${id} leaked into A`).toBe(false);

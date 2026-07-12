@@ -7,9 +7,9 @@ import {
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
@@ -19,6 +19,11 @@ import { createBucketRegistry } from '../routing/registry.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { collectWorkGraphHealth } from '../system/workGraphHealth.js';
+import {
+  workGraphHealthArtifactPath,
+  writeWorkGraphHealthArtifact,
+} from '../system/workGraphHealthArtifact.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -26,49 +31,20 @@ import {
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { VaultChangeEvent } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
+import { RecallModelMissingError } from '../recall/embedder.js';
+import { installStubEmbedder, type StubEmbedderHandle } from '../test-helpers/stubEmbedder.js';
+import { pollUntil } from '../test-helpers/bunTestTimers.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
 
-// Embedder mock with a swappable `nextEmbedError` so individual tests
-// can simulate the offline + empty-cache failure mode (the 503
-// RECALL_MODEL_MISSING path) without touching a real model. The
-// factory builds a stand-in for RecallModelMissingError that
-// matches the production class shape — server.ts uses `instanceof`
-// against the import from '../recall/embedder.js', which inside
-// vitest resolves through this mock so the identity matches.
-vi.mock('../recall/embedder.js', () => {
-  class RecallModelMissingError extends Error {
-    readonly code = 'RECALL_MODEL_MISSING' as const;
-    constructor(
-      message: string,
-      readonly offline: boolean,
-      readonly cacheDir: string,
-    ) {
-      super(message);
-      this.name = 'RecallModelMissingError';
-    }
-  }
-  const state: { nextEmbedError: Error | null } = { nextEmbedError: null };
-  return {
-    MODEL_ID: 'test/model',
-    RecallModelMissingError,
-    __embedderState: state,
-    embed: (texts: readonly string[]) => {
-      if (state.nextEmbedError !== null) {
-        const err = state.nextEmbedError;
-        state.nextEmbedError = null;
-        return Promise.reject(err);
-      }
-      return Promise.resolve(
-        texts.map((_text, index) => {
-          const vector = new Float32Array(384);
-          vector[index % 384] = 1;
-          return vector;
-        }),
-      );
-    },
-  };
-});
+// The embedder is stubbed through the production `setEmbedderOverride`
+// seam (installStubEmbedder), NOT a module mock. `vi.mock` replaces the
+// module process-globally under `bun test` — a single mock here
+// poisons the real embedder every other test file relies on. The seam
+// swaps only `embed` and is torn down per-test. Tests that need the
+// offline/empty-cache failure mode arm `stubEmbedder.nextEmbedError`
+// with the REAL `RecallModelMissingError` (imported above), so the
+// route's `instanceof` check matches natively.
 
 const jsonFetch = async (
   context: CompanionHttpConfig,
@@ -176,9 +152,14 @@ describe('companion HTTP server', () => {
   let vaultPath: string;
   let bridgeKey: string;
   let context: CompanionHttpConfig;
+  let stubEmbedder: StubEmbedderHandle;
   const baseUrl = 'http://127.0.0.1';
 
   beforeEach(async () => {
+    // per-text-axis vectors: the i-th query text embeds along axis
+    // i % 384, so hybrid-ranking tests can steer which entry wins on
+    // the vector side vs. the lexical side.
+    stubEmbedder = installStubEmbedder({ shape: 'per-text-axis' });
     vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-companion-test-'));
     bridgeKey = (await ensureBridgeKey(vaultPath)).key;
     context = {
@@ -190,6 +171,7 @@ describe('companion HTTP server', () => {
   });
 
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultPath, { recursive: true, force: true });
   });
 
@@ -827,9 +809,27 @@ describe('companion HTTP server', () => {
     );
 
     expect(result.status).toBe(201);
+    // F01: the POST response returns the SAFE (redacted) body the
+    // companion stored, plus the applied rule ids and the token
+    // warning — so the extension copies THAT, not the raw original.
     expect(result.body).toMatchObject({
-      data: { bac_id: expect.stringMatching(/^disp_/u), status: 'recorded' },
+      data: {
+        bac_id: expect.stringMatching(/^disp_/u),
+        status: 'recorded',
+        body: 'Email [email] and token [github-token]',
+        redactionSummary: { matched: 2, categories: ['github-token', 'email'] },
+        redaction: {
+          applied: true,
+          rules: ['github-token', 'email'],
+        },
+        tokenEstimate: 10,
+        tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: false },
+      },
     });
+    // The returned body must never contain the raw secret.
+    const responseData = (result.body as { readonly data: { readonly body: string } }).data;
+    expect(responseData.body).not.toContain(githubToken);
+    expect(responseData.body).not.toContain('owner@example.com');
     expect(list.status).toBe(200);
     expect(list.body).toMatchObject({
       data: [
@@ -1268,11 +1268,11 @@ describe('companion HTTP server', () => {
     expect(dispatchLog.match(/Only one dispatch line/g)).toHaveLength(1);
   });
 
-  it('returns a token budget warning for oversized dispatches', async () => {
-    // ~9000 distinct lowercase ASCII words — each is ≈1 cl100k token,
-    // putting us comfortably above the 8000 warning threshold without
-    // depending on the heuristic's quirks.
-    const body = Array.from({ length: 9_000 }, (_, i) => `tok${String(i)}`).join(' ');
+  it('returns a token budget warning when a dispatch crosses the provider threshold', async () => {
+    // ` tok` tokenizes to ≈1 cl100k token each; 130K of them is ~520KB
+    // (under the 1 MiB body cap) yet clears chatgpt's 128K window — the
+    // smallest per-provider threshold — without heuristic quirks.
+    const body = Array.from({ length: 130_000 }, () => 'tok').join(' ');
     const result = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
       method: 'POST',
       headers: {
@@ -1282,7 +1282,7 @@ describe('companion HTTP server', () => {
       },
       body: JSON.stringify({
         kind: 'other',
-        target: { provider: 'other', mode: 'paste' },
+        target: { provider: 'chatgpt', mode: 'paste' },
         title: 'Large dispatch',
         body,
       }),
@@ -1290,6 +1290,35 @@ describe('companion HTTP server', () => {
 
     expect(result.status).toBe(201);
     expect(result.body).toMatchObject({ warnings: ['token-budget-exceeded'] });
+    expect(result.body).toMatchObject({
+      data: { tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: true } },
+    });
+  });
+
+  it('does not warn when a dispatch fits the provider threshold', async () => {
+    // ~9000 tokens is well under every per-provider window (128K+), so
+    // no warning fires — the old flat 8000 threshold no longer applies.
+    const body = Array.from({ length: 9_000 }, (_, i) => `tok${String(i)}`).join(' ');
+    const result = await jsonFetch(context, `${baseUrl}/v1/dispatches`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'dispatch-test-token-under-budget',
+        'x-bac-bridge-key': bridgeKey,
+      },
+      body: JSON.stringify({
+        kind: 'other',
+        target: { provider: 'chatgpt', mode: 'paste' },
+        title: 'Fits the budget',
+        body,
+      }),
+    });
+
+    expect(result.status).toBe(201);
+    expect(result.body).not.toMatchObject({ warnings: ['token-budget-exceeded'] });
+    expect(result.body).toMatchObject({
+      data: { tokenWarning: { provider: 'chatgpt', threshold: 128_000, exceeded: false } },
+    });
   });
 
   it('returns vault-unreachable for dispatch writes when the vault is missing', async () => {
@@ -1726,7 +1755,7 @@ describe('companion HTTP server', () => {
     });
   });
 
-  it('GET /trust returns all write tools by default for an unseen workstream', async () => {
+  it('GET /trust returns no write tools by default for an unseen workstream', async () => {
     const ws = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -1742,13 +1771,9 @@ describe('companion HTTP server', () => {
         readonly data: { readonly allowedTools: readonly string[] };
       }
     ).data.allowedTools;
-    // Mirror the workstreamWriteTools constant — every tool is on
-    // by default. PUT can later persist a deny-list.
-    expect(tools).toContain('sidetrack.threads.move');
-    expect(tools).toContain('sidetrack.threads.archive');
-    expect(tools).toContain('sidetrack.threads.unarchive');
-    expect(tools).toContain('sidetrack.queue.create');
-    expect(tools).toContain('sidetrack.workstreams.bump');
+    // Deny-by-default (PRD §6.1.14, re-recorded 2026-07-11): a fresh
+    // workstream grants no MCP write tools until the user opts in via PUT.
+    expect(tools).toEqual([]);
   });
 
   it('renames a workstream and reparents to a new group, then detaches back to top-level', async () => {
@@ -1922,14 +1947,14 @@ describe('companion HTTP server', () => {
     expect(missing.body).toMatchObject({ code: 'INTERNAL_ERROR' });
   });
 
-  it('defaults new workstreams to shared and supports screenshare-sensitive metadata', async () => {
+  it('defaults new workstreams to private and supports screenshare-sensitive metadata', async () => {
     const workstreamResult = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-bac-bridge-key': bridgeKey,
       },
-      body: JSON.stringify({ title: 'Default shared' }),
+      body: JSON.stringify({ title: 'Default private' }),
     });
     expect(workstreamResult.status).toBe(201);
     const workstreamId = (workstreamResult.body as { readonly data: { readonly bac_id: string } })
@@ -1937,7 +1962,8 @@ describe('companion HTTP server', () => {
     const json = JSON.parse(
       await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
-    expect(json.privacy).toBe('shared');
+    // Privacy defaults closed (PRD §6.1.13: new workstreams are 'private').
+    expect(json.privacy).toBe('private');
     expect(json.screenShareSensitive).toBe(false);
 
     const updateResult = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}`, {
@@ -1956,7 +1982,8 @@ describe('companion HTTP server', () => {
     const updated = JSON.parse(
       await readFile(join(vaultPath, '_BAC', 'workstreams', `${workstreamId}.json`), 'utf8'),
     ) as { readonly privacy?: string; readonly screenShareSensitive?: boolean };
-    expect(updated.privacy).toBe('shared');
+    // A metadata-only PATCH must not disturb the privacy value.
+    expect(updated.privacy).toBe('private');
     expect(updated.screenShareSensitive).toBe(true);
   });
 
@@ -2078,7 +2105,10 @@ describe('companion HTTP server', () => {
           ranker: {
             activeRevisionId: null,
             loadStatus: 'missing',
-            retrainSkipReason: 'no-labels',
+            // Empty vault: the v6 impression floor (insufficient_groups)
+            // now takes precedence over the legacy no-labels reason
+            // (a2c4c930 — next-retrain criteria).
+            retrainSkipReason: 'insufficient_groups',
           },
           feedback: {
             positiveLabelCount: 0,
@@ -2097,6 +2127,105 @@ describe('companion HTTP server', () => {
     expect(health.body).toMatchObject({
       data: { workGraph: { ann: { backend: expect.stringMatching(/^(hnsw|flat)$/u) } } },
     });
+  });
+
+  it('serves the drain-time workGraph health artifact instead of the live compute', async () => {
+    // Sentinel revision id: live compute on this empty vault would
+    // report activeRevisionId=null (asserted by the sibling test
+    // above), so seeing the sentinel proves the artifact
+    // short-circuited the live collectWorkGraphHealth path.
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(vaultPath, {
+      ...report,
+      ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+    });
+
+    // The serve gate mirrors the writer's SIDETRACK_EVENT_STORE gate.
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: 'artifact-sentinel-rev' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
+  });
+
+  it('ignores the workGraph artifact when the event-store gate is off (live fallback)', async () => {
+    // The writer only refreshes the artifact while SIDETRACK_EVENT_STORE=1;
+    // serving it with the gate off would freeze the panel on whatever a
+    // previous (gated-on) run last wrote. Same sentinel trick as above:
+    // seeing null proves the live compute ran instead.
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(vaultPath, {
+      ...report,
+      ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+    });
+
+    const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+
+    expect(health.status).toBe(200);
+    expect(health.body).toMatchObject({
+      data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+    });
+  });
+
+  it('treats a workGraph artifact older than the max age as absent (live fallback)', async () => {
+    const report = await collectWorkGraphHealth({ vaultRoot: vaultPath });
+    await writeWorkGraphHealthArtifact(
+      vaultPath,
+      {
+        ...report,
+        ranker: { ...report.ranker, activeRevisionId: 'artifact-sentinel-rev' },
+      },
+      // 25h old — past WORKGRAPH_HEALTH_ARTIFACT_MAX_AGE_MS (24h).
+      () => new Date(Date.now() - 25 * 60 * 60 * 1000),
+    );
+
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
+  });
+
+  it('falls back to live workGraph compute when the artifact is unreadable', async () => {
+    const artifactPath = workGraphHealthArtifactPath(vaultPath);
+    await mkdir(dirname(artifactPath), { recursive: true });
+    await writeFile(artifactPath, '{ not json', 'utf8');
+
+    // Gate on so the corrupt file exercises the artifact read path
+    // rather than being skipped by the env gate.
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const health = await jsonFetch(context, `${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+
+      expect(health.status).toBe(200);
+      // Live-computed values for an empty vault — the corrupt artifact
+      // was treated as absent, not served and not fatal.
+      expect(health.body).toMatchObject({
+        data: { workGraph: { ranker: { activeRevisionId: null, loadStatus: 'missing' } } },
+      });
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+    }
   });
 
   it('GET /v1/recall/query uses hybrid lexical + vector ranking with chunk metadata', async () => {
@@ -2204,15 +2333,7 @@ describe('companion HTTP server', () => {
       ],
       'test/model',
     );
-    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
-      readonly RecallModelMissingError: new (
-        message: string,
-        offline: boolean,
-        cacheDir: string,
-      ) => Error;
-      readonly __embedderState: { nextEmbedError: Error | null };
-    };
-    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+    stubEmbedder.nextEmbedError = new RecallModelMissingError(
       'cache empty',
       true,
       '/tmp/empty-models',
@@ -2240,18 +2361,10 @@ describe('companion HTTP server', () => {
     const { writeIndex } = await import('../recall/indexFile.js');
     const { join } = await import('node:path');
     await writeIndex(join(vaultPath, '_BAC', 'recall', 'index.bin'), [], 'test/model');
-    const embedderModule = (await import('../recall/embedder.js')) as unknown as {
-      readonly RecallModelMissingError: new (
-        message: string,
-        offline: boolean,
-        cacheDir: string,
-      ) => Error;
-      readonly __embedderState: { nextEmbedError: Error | null };
-    };
     // Arm the embedder with a model-missing error so the assertion
     // would fail with 503 if the route tried to embed. The
     // short-circuit must skip past it.
-    embedderModule.__embedderState.nextEmbedError = new embedderModule.RecallModelMissingError(
+    stubEmbedder.nextEmbedError = new RecallModelMissingError(
       'cache empty',
       true,
       '/tmp/empty-models',
@@ -2263,9 +2376,9 @@ describe('companion HTTP server', () => {
     expect(response.body).toEqual({ data: [] });
     // The error we armed should still be loaded for the next call —
     // the short-circuit must not have consumed it.
-    expect(embedderModule.__embedderState.nextEmbedError).not.toBeNull();
+    expect(stubEmbedder.nextEmbedError).not.toBeNull();
     // Clear it so later tests aren't affected.
-    embedderModule.__embedderState.nextEmbedError = null;
+    stubEmbedder.nextEmbedError = null;
   });
 
   it('reports recall activity after incremental indexing', async () => {
@@ -2725,17 +2838,17 @@ describe('companion HTTP server', () => {
         headers: { 'x-bac-bridge-key': bridgeKey },
         signal: controller.signal,
       });
-      await vi.waitFor(() => {
+      await pollUntil(() => {
         expect(subscribers.size).toBe(1);
       });
       // Abrupt client disconnect — the companion MUST release the
       // subscription (and clear the heartbeat) within a few seconds.
       controller.abort();
-      await vi.waitFor(
+      await pollUntil(
         () => {
           expect(subscribers.size).toBe(0);
         },
-        { timeout: 4000 },
+        { timeoutMs: 4000 },
       );
       await streamed.catch(() => undefined);
     } finally {
@@ -2747,7 +2860,7 @@ describe('companion HTTP server', () => {
     }
   });
 
-  it('manages workstream trust — allow-by-default; explicit empty list denies', async () => {
+  it('manages workstream trust — records persist; bridge-key callers are exempt from gating', async () => {
     const workstream = await jsonFetch(context, `${baseUrl}/v1/workstreams`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
@@ -2755,10 +2868,11 @@ describe('companion HTTP server', () => {
     });
     const workstreamId = (workstream.body as { readonly data: { readonly bac_id: string } }).data
       .bac_id;
-    // Fresh workstream — no trust record on disk. The default flips
-    // from deny-by-default to allow-by-default so the MCP write call
-    // succeeds without the user pre-toggling anything.
-    const allowedByDefault = await jsonFetch(
+    // Bridge-key callers are the user surface: trust gating never applies
+    // to them, regardless of the (logging-only) x-sidetrack-mcp-tool
+    // header. MCP-key caller enforcement is covered in
+    // mcpTrustAndExport.test.ts.
+    const allowedAsExtension = await jsonFetch(
       context,
       `${baseUrl}/v1/workstreams/${workstreamId}/bump`,
       {
@@ -2769,24 +2883,24 @@ describe('companion HTTP server', () => {
         },
       },
     );
-    expect(allowedByDefault.status).toBe(200);
+    expect(allowedAsExtension.status).toBe(200);
 
-    // Persist an explicit empty allow-list to deny everything.
+    // Persist an explicit empty allow-list; the record round-trips but the
+    // bridge-key caller stays exempt.
     const putEmpty = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
       body: JSON.stringify({ allowedTools: [] }),
     });
     expect(putEmpty.status).toBe(200);
-    const denied = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
+    const stillAllowed = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/bump`, {
       method: 'POST',
       headers: {
         'x-bac-bridge-key': bridgeKey,
         'x-sidetrack-mcp-tool': 'sidetrack.workstreams.bump',
       },
     });
-    expect(denied.status).toBe(403);
-    expect(denied.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+    expect(stillAllowed.status).toBe(200);
 
     // Re-allow only the bump tool.
     const putAllow = await jsonFetch(context, `${baseUrl}/v1/workstreams/${workstreamId}/trust`, {

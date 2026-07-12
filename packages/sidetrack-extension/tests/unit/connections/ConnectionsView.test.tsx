@@ -195,8 +195,17 @@ describe('ConnectionsView — engineering scaffold', () => {
       expect(screen.queryByTestId('connections-groups')).not.toBeNull();
     });
 
-    expect(screen.getByTitle('Tax flow → Tax automation · in workstream')).toBeDefined();
-    expect(screen.getByText('Tax flow → Tax automation')).toBeDefined();
+    // Card-everywhere (6e661770): an edge whose endpoints both resolve
+    // renders as a NodeRow card keyed by the edge id — it shows the
+    // readable OTHER-endpoint title plus the readable kind-label badge
+    // ("→ in workstream"), never the raw `thread_in_workstream`. The
+    // card carries the edge testid so the relationship stays selectable.
+    const edgeCard = screen.getByTestId(
+      'edge-edge:thread_in_workstream:thread:thread_a:workstream:ws_x',
+    );
+    expect(within(edgeCard).getByText('Tax automation')).toBeDefined();
+    expect(within(edgeCard).getByText('→ in workstream')).toBeDefined();
+    expect(edgeCard.textContent).not.toContain('thread_in_workstream');
   });
 
   it('uses a workstream selector as the primary anchor control', async () => {

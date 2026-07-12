@@ -24,6 +24,11 @@ export interface DispatchEvent {
     | 'coding_agent_packet';
   readonly dispatchedAt: string; // relative
   readonly status: DispatchStatus;
+  // F31 — when set, the packet's token estimate exceeded the target
+  // provider's context-window threshold. Renders a small "over budget"
+  // pill so the user sees the warning on pending/unlinked rows without
+  // opening the viewer. Optional so older callers still typecheck.
+  readonly tokenBudgetExceeded?: boolean;
 }
 
 const KIND_LABEL: Record<DispatchEvent['dispatchKind'], string> = {
@@ -118,7 +123,9 @@ export function RecentDispatches({
               title="Jump to the source thread this packet came from"
             >
               <span className="mono dispatch-kind">{KIND_LABEL[dispatch.dispatchKind]}</span>
-              <span className="dispatch-source-title">{dispatch.sourceTitle}</span>
+              <span className="dispatch-source-title" title={dispatch.sourceTitle}>
+                {dispatch.sourceTitle}
+              </span>
             </button>
             <span className="icon-12 dispatch-arrow">{Icons.arrowR}</span>
             <button
@@ -132,11 +139,19 @@ export function RecentDispatches({
               }
             >
               <span className="chip">{dispatch.targetProviderLabel}</span>
-              <span className="dispatch-target-title">
+              <span className="dispatch-target-title" title={dispatch.targetThreadTitle ?? undefined}>
                 {dispatch.targetThreadTitle ??
                   (dispatch.mode === 'auto-send' ? 'send to new thread' : 'open new thread')}
               </span>
             </button>
+            {dispatch.tokenBudgetExceeded === true ? (
+              <span
+                className="chip dispatch-token-warning mono"
+                title="Packet exceeds the target model's context window — it may be truncated."
+              >
+                over budget
+              </span>
+            ) : null}
             {/* Action area: replaces the static status pill with a
                 button keyed off mode + linked state.
                   - linked        → "↗ open" (jump to dest thread)

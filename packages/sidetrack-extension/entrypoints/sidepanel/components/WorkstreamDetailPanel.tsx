@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import { ChecklistPanel, type ChecklistPanelItem } from './ChecklistPanel';
 import { Icons } from './icons';
 import type { LinkedNote } from './LinkedNotes';
 import { LinkedNotes } from './LinkedNotes';
@@ -44,6 +45,19 @@ interface WorkstreamDetailPanelProps {
   // Number of threads currently pointing at this workstream — shown
   // in the confirm copy so the user knows what'll be detached.
   readonly threadCount?: number;
+  // §13 step 7 — checklist. When these are wired the panel renders the
+  // add/tick/untick/remove editor; the caller owns the companion PATCH
+  // (updateWorkstream with the new checklist array) and id minting.
+  readonly checklist?: readonly ChecklistPanelItem[];
+  readonly onChecklistAdd?: (text: string) => void;
+  readonly onChecklistToggle?: (id: string, checked: boolean) => void;
+  readonly onChecklistRemove?: (id: string) => void;
+  readonly checklistBusy?: boolean;
+  // §13 step 13 — export the workstream to the vault. When set, the
+  // panel renders an "Export to vault" action; the caller calls the
+  // companion export route and reports the written file paths back so
+  // the panel can confirm inline. Undefined = action hidden.
+  readonly onExport?: () => Promise<readonly string[]>;
 }
 
 const collectDescendantIds = (
@@ -77,6 +91,12 @@ export function WorkstreamDetailPanel({
   onMove,
   onDelete,
   threadCount,
+  checklist,
+  onChecklistAdd,
+  onChecklistToggle,
+  onChecklistRemove,
+  checklistBusy = false,
+  onExport,
 }: WorkstreamDetailPanelProps) {
   const renameEnabled = onRename !== undefined && workstream !== undefined;
   const moveEnabled = onMove !== undefined && workstream !== undefined;
@@ -87,7 +107,17 @@ export function WorkstreamDetailPanel({
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // §13 step 13 — export state. `exporting` gates the button; on
+  // success we surface the written vault paths inline, on failure the
+  // error message.
+  const [exporting, setExporting] = useState(false);
+  const [exportedPaths, setExportedPaths] = useState<readonly string[] | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const checklistEnabled =
+    onChecklistAdd !== undefined &&
+    onChecklistToggle !== undefined &&
+    onChecklistRemove !== undefined;
   const childCount = useMemo(() => {
     if (workstream === undefined) return 0;
     return workstreams.filter((w) => w.parentId === workstream.bac_id).length;
@@ -207,6 +237,67 @@ export function WorkstreamDetailPanel({
         <div className="detail-sec-head">Linked notes · from your vault ({linkedNotes.length})</div>
         <LinkedNotes notes={linkedNotes} onAddLink={onAddLink} />
       </div>
+
+      {checklistEnabled ? (
+        <div className="detail-sec">
+          <div className="detail-sec-head">Checklist ({(checklist ?? []).length})</div>
+          <ChecklistPanel
+            items={checklist ?? []}
+            onAdd={onChecklistAdd}
+            onToggle={onChecklistToggle}
+            onRemove={onChecklistRemove}
+            busy={checklistBusy}
+          />
+        </div>
+      ) : null}
+
+      {onExport !== undefined ? (
+        <div className="detail-sec">
+          <div className="detail-sec-head">Export</div>
+          <div className="ws-detail-hierarchy">
+            <span className="ws-detail-hierarchy-label">
+              <em className="subtle">Write this workstream to your vault as a report.</em>
+            </span>
+            <button
+              type="button"
+              className="btn-link ws-detail-export-btn"
+              disabled={exporting}
+              onClick={() => {
+                setExporting(true);
+                setExportError(null);
+                setExportedPaths(null);
+                void onExport()
+                  .then((paths) => {
+                    setExportedPaths(paths);
+                  })
+                  .catch((error: unknown) => {
+                    setExportError(error instanceof Error ? error.message : 'Export failed.');
+                  })
+                  .finally(() => {
+                    setExporting(false);
+                  });
+              }}
+            >
+              {exporting ? 'Exporting…' : 'Export to vault'}
+            </button>
+          </div>
+          {exportedPaths !== null && exportedPaths.length > 0 ? (
+            <div className="ws-detail-export-ok mono" role="status">
+              Exported to:
+              <ul className="ws-detail-export-paths">
+                {exportedPaths.map((path) => (
+                  <li key={path}>{path}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {exportError !== null ? (
+            <div className="ws-detail-export-error mono" role="alert">
+              {exportError}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="detail-sec">
         <div className="detail-sec-head">MCP write tools · trust</div>

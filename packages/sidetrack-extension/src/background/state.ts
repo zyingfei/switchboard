@@ -132,6 +132,13 @@ export const saveAutoTrack = async (autoTrack: boolean): Promise<UiSettings> => 
   return next;
 };
 
+export const saveCaptureEnabled = async (captureEnabled: boolean): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, captureEnabled };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
 export const saveNotifyOnQueueComplete = async (
   notifyOnQueueComplete: boolean,
 ): Promise<UiSettings> => {
@@ -146,6 +153,26 @@ export const savePageEvidenceAutoExtractEnabled = async (
 ): Promise<UiSettings> => {
   const current = await readSettings();
   const next: UiSettings = { ...current, pageEvidenceAutoExtractEnabled };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+export const saveRecallEmitTrainableActions = async (
+  recallEmitTrainableActions: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, recallEmitTrainableActions };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+// F01 — persist the redacted-clipboard flag (absent = ON). Only an
+// explicit `false` restores the raw-original clipboard behaviour.
+export const saveRedactedClipboard = async (
+  redactedClipboard: boolean,
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, redactedClipboard };
   await storageSet({ [SETTINGS_KEY]: next });
   return next;
 };

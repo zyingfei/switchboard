@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { AcceptedEvent } from './causal.js';
+import { getCaughtUpSharedEventStore } from './eventStore.js';
 import type { EventLog } from './eventLog.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
 import { runImportProjectors } from './projectors.js';
@@ -63,6 +64,24 @@ const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly Accepted
   return [...byId.values()];
 };
 
+const latestPerAggregateFromLog = async (
+  vaultRoot: string,
+  eventLog: EventLog,
+): Promise<readonly AcceptedEvent[]> => {
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) return latestPerAggregate(await eventLog.readMerged());
+  const byId = new Map<string, AcceptedEvent>();
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) {
+      const prior = byId.get(event.aggregateId);
+      if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
+        byId.set(event.aggregateId, event);
+      }
+    }
+  }, 2000);
+  return [...byId.values()];
+};
+
 export interface ReprojectOnVersionMismatchDeps {
   readonly vaultRoot: string;
   readonly eventLog: EventLog;
@@ -92,8 +111,7 @@ export const reprojectOnVersionMismatch = async (
       aggregateCount: 0,
     };
   }
-  const merged = await deps.eventLog.readMerged();
-  const latest = latestPerAggregate(merged);
+  const latest = await latestPerAggregateFromLog(deps.vaultRoot, deps.eventLog);
   for (const event of latest) {
     await runImportProjectors(
       {

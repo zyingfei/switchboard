@@ -117,3 +117,85 @@ describe('InboxView search', () => {
     expect(screen.getByText('Only page')).toBeInTheDocument();
   });
 });
+
+describe('InboxView page-access banner', () => {
+  const items = [
+    record({
+      tabSessionId: 'https://example.test/page',
+      latestTitle: 'Only page',
+      latestUrl: 'https://example.test/page',
+    }),
+  ];
+
+  it('surfaces an actionable banner when page access is off and the inbox has items', () => {
+    // The user's "none of my inbox has attributions" symptom: access off
+    // → no engagement → resolver returns no candidates → every row reads
+    // "No attribution". Name the cause + offer the one-click fix.
+    const onGrantAccess = vi.fn();
+    render(
+      <InboxView
+        inbox={inbox(items)}
+        loading={false}
+        error={null}
+        workstreams={workstreams}
+        suggestions={{}}
+        onRefresh={vi.fn()}
+        onAttribute={vi.fn()}
+        pageAccessGranted={false}
+        onGrantAccess={onGrantAccess}
+      />,
+    );
+    expect(screen.getByTestId('inbox-page-access-banner')).toBeInTheDocument();
+    expect(screen.getByText(/No attributions yet — page access is off/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('inbox-grant-access'));
+    expect(onGrantAccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('hides the banner when page access is granted', () => {
+    render(
+      <InboxView
+        inbox={inbox(items)}
+        loading={false}
+        error={null}
+        workstreams={workstreams}
+        suggestions={{}}
+        onRefresh={vi.fn()}
+        onAttribute={vi.fn()}
+        pageAccessGranted
+      />,
+    );
+    expect(screen.queryByTestId('inbox-page-access-banner')).toBeNull();
+  });
+
+  it('hides the banner when the inbox is empty even with access off', () => {
+    render(
+      <InboxView
+        inbox={inbox([])}
+        loading={false}
+        error={null}
+        workstreams={workstreams}
+        suggestions={{}}
+        onRefresh={vi.fn()}
+        onAttribute={vi.fn()}
+        pageAccessGranted={false}
+        onGrantAccess={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId('inbox-page-access-banner')).toBeNull();
+  });
+
+  it('does not assume access state when pageAccessGranted is undefined', () => {
+    render(
+      <InboxView
+        inbox={inbox(items)}
+        loading={false}
+        error={null}
+        workstreams={workstreams}
+        suggestions={{}}
+        onRefresh={vi.fn()}
+        onAttribute={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId('inbox-page-access-banner')).toBeNull();
+  });
+});

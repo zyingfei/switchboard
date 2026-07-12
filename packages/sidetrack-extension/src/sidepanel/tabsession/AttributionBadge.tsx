@@ -84,13 +84,24 @@ export interface AttributionBadgeProps {
 export function AttributionBadge({ record, suggestion, workstreams }: AttributionBadgeProps) {
   const attribution = record?.currentAttribution;
   const ignored = record?.currentIgnored;
-  const suggestedWorkstreamId = suggestion?.decision.workstreamId;
-  const label =
-    ignored !== undefined
-      ? 'ignored'
-      : workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
-  const variant = variantFor(attribution, ignored, suggestedWorkstreamId !== undefined);
+  // The resolver's guess lives in decision.workstreamId for an apply/confirm
+  // decision, but for an action:'inbox' decision that field is null — the top
+  // fused candidate is the only place the guess lives. Fall back to it so the
+  // badge shows the guess (like the InboxCard / provenance row) instead of a
+  // bare "?".
+  const suggestedWorkstreamId =
+    suggestion?.decision.workstreamId ?? suggestion?.fusedCandidates?.[0]?.workstreamId;
+  const hasGuess = suggestedWorkstreamId !== null && suggestedWorkstreamId !== undefined;
+  const variant = variantFor(attribution, ignored, hasGuess);
   const marker = markerFor(variant);
+  // No attribution and no guess: show a muted dash, not a confusing "?" — the
+  // tooltip and the provenance row already say "No attribution".
+  const label =
+    variant === 'empty'
+      ? '—'
+      : ignored !== undefined
+        ? 'ignored'
+        : workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
   return (
     <span
       className={`tab-session-badge is-${variant}`}

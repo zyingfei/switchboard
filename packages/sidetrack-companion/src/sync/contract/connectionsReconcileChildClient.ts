@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 
+import { withBunSmolExecArgv } from '../../process/bunMemory.js';
 import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 
 let childScriptPath: string | undefined;
@@ -65,6 +66,7 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
     }
     const child: ChildProcess = fork(entry, [], {
       env: buildReconcileChildEnv(),
+      execArgv: withBunSmolExecArgv(process.execArgv),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     let settled = false;

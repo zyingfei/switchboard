@@ -1,6 +1,7 @@
-import { access, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import { createHash, randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { createBacId, createRevision } from '../domain/ids.js';
 import {
@@ -21,7 +22,9 @@ import {
   reviewEventRecordSchema,
   settingsDocumentSchema,
 } from '../http/schemas.js';
-import { writeJsonAtomic } from './atomic.js';
+import { writeFileAtomic, writeJsonAtomic } from './atomic.js';
+import { currentAuditContext } from './auditContext.js';
+import { VaultExportConfinementError, VaultUnavailableError } from '../http/errors.js';
 import type {
   AuditEventRecord,
   AuditListQuery,
@@ -57,6 +60,24 @@ export class SettingsRevisionConflictError extends Error {
   constructor() {
     super('Settings revision does not match current settings revision.');
     this.name = 'SettingsRevisionConflictError';
+  }
+}
+
+// Thrown when a workstream PATCH carries a revision that no longer
+// matches the on-disk record — a concurrent writer (a second panel /
+// MCP caller) has already advanced it. Without this check a full-array
+// checklist PATCH is silent last-writer-wins: the second caller's write
+// drops the ticked items the first caller added, with no 409.
+//
+// Extends `SettingsRevisionConflictError` so the HTTP layer's existing
+// `instanceof SettingsRevisionConflictError` branch maps it to
+// 409 REVISION_CONFLICT with no server.ts change; the overridden
+// message surfaces in the problem `detail`.
+export class WorkstreamRevisionConflictError extends SettingsRevisionConflictError {
+  constructor() {
+    super();
+    this.message = 'Workstream revision does not match the current workstream revision.';
+    this.name = 'WorkstreamRevisionConflictError';
   }
 }
 
@@ -176,6 +197,21 @@ export interface VaultWriter {
   readonly bumpWorkstream: (bac_id: string, requestId: string) => Promise<MutationResult>;
   readonly archiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
   readonly unarchiveThread: (bac_id: string, requestId: string) => Promise<MutationResult>;
+  // §13 step 13 — user-facing Markdown export. Projects the workstream
+  // (and optionally its threads) / the thread to Markdown and writes it
+  // at the tree-derived path <ancestor titles…>/<safe-title>-report<N>.md
+  // relative to the vault root (OUTSIDE _BAC/ — distinct from the flat
+  // _BAC/<type>/<bac_id>.md sidecars, which stay). report<N> increments
+  // when the target already exists so an export never overwrites a
+  // prior one. bac_id lives in frontmatter, so a later reorg that moves
+  // the file never breaks linkage. Returns vault-root-relative paths.
+  readonly exportWorkstream: (
+    workstreamId: string,
+    options: { readonly includeThreads?: boolean },
+  ) => Promise<{ readonly files: readonly { readonly path: string }[] }>;
+  readonly exportThread: (
+    threadId: string,
+  ) => Promise<{ readonly files: readonly { readonly path: string }[] }>;
 }
 
 const dateStamp = (value: Date): string => value.toISOString().slice(0, 10);
@@ -195,19 +231,22 @@ const createDefaultSettings = (revision = '0'): SettingsDocument =>
     revision,
   });
 
+// Canonical record write. Routed through the atomic primitive so a
+// crash mid-write can never publish a torn/half-written JSON record
+// (writeFileAtomic writes+fsyncs a temp file, then renames+fsyncs the
+// dir). writeJsonAtomic mkdirs the parent itself.
 const writeJson = async (path: string, value: unknown): Promise<void> => {
-  await mkdir(join(path, '..'), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await writeJsonAtomic(path, value);
 };
 
 // Markdown sidecar for a vault record. Lives next to the .json with
 // the same bac_id stem. Failures here are best-effort — the JSON is
 // the canonical store, the .md is for human browsing. We swallow
-// errors so a flaky filesystem can't take down a write.
+// errors so a flaky filesystem can't take down a write. Routed through
+// the atomic primitive so a crash never leaves a torn sidecar on disk.
 const writeMarkdownProjection = async (path: string, body: string): Promise<void> => {
   try {
-    await mkdir(join(path, '..'), { recursive: true });
-    await writeFile(path, body, 'utf8');
+    await writeFileAtomic(path, body);
   } catch {
     // Vault write failures are surfaced via audit elsewhere; the
     // markdown sidecar is non-critical, do not fail the upsert.
@@ -217,6 +256,106 @@ const writeMarkdownProjection = async (path: string, body: string): Promise<void
 const appendJsonLine = async (path: string, value: unknown): Promise<void> => {
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, `${JSON.stringify(value)}\n`, { encoding: 'utf8', flag: 'a' });
+};
+
+// The machine-managed root under the vault. Exports must never land
+// inside it (that tree holds the canonical JSON records + sidecars), so
+// a `_BAC`-titled workstream/thread is remapped to its fallback id.
+const BAC_ROOT_NAME = '_BAC';
+
+// §13 export — sanitize a workstream/thread title into a single safe
+// path segment. Strips filesystem-reserved characters, collapses
+// whitespace, and caps length so a pathological title can't blow past
+// filesystem limits. Falls back to the bac_id (passed by the caller as
+// `fallback`) when the title reduces to nothing.
+const sanitizePathSegment = (value: string, fallback: string): string => {
+  const cleaned = Array.from(value)
+    .map((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      // Strip ASCII control characters (0x00-0x1F, 0x7F) and path /
+      // Windows-reserved characters, mapping each to a space so word
+      // boundaries survive.
+      if (code < 0x20 || code === 0x7f || '/\\:*?"<>|'.includes(char)) {
+        return ' ';
+      }
+      return char;
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim()
+    // Leading dots would make hidden / relative-looking segments.
+    // Loop until stable: a single pass leaves `.. ..` → `..` because
+    // the interior space defeated a one-shot leading-dot strip, and a
+    // bare `..`/`.` is a directory-traversal segment.
+    .replace(/^[.\s]+/, '')
+    .trim()
+    .slice(0, 120)
+    .trim();
+  // Belt-and-suspenders: after every transform, a segment that is still
+  // `.`, `..`, empty, or the machine-managed `_BAC` root is unsafe as a
+  // path component — fall back to the caller's id (a bac_id, which is
+  // never any of those). This is what makes join()-based tree building
+  // traversal-proof at the source.
+  if (
+    cleaned.length === 0 ||
+    cleaned === '.' ||
+    cleaned === '..' ||
+    cleaned === BAC_ROOT_NAME
+  ) {
+    return fallback;
+  }
+  return cleaned;
+};
+
+// Belt-and-suspenders confinement for user-facing exports. `directory`
+// (and every report path under it) is derived from user-controlled
+// titles; even with `sanitizePathSegment` neutering traversal segments,
+// we resolve the absolute target and refuse anything that escapes the
+// vault root or lands inside the machine-managed `_BAC/` tree. Throws a
+// typed 4xx error so a malicious/corrupt title can never write outside
+// the boundary.
+const assertExportPathConfined = (vaultRoot: string, targetPath: string): void => {
+  const resolvedRoot = resolve(vaultRoot);
+  const resolvedTarget = resolve(targetPath);
+  const rel = relative(resolvedRoot, resolvedTarget);
+  // A leading `..` segment or an absolute result means the target sits
+  // outside the vault root.
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new VaultExportConfinementError();
+  }
+  // Reject anything at or under vaultRoot/_BAC — that tree is the
+  // canonical record store, off-limits to user-facing reports.
+  const bacRel = relative(join(resolvedRoot, BAC_ROOT_NAME), resolvedTarget);
+  if (bacRel === '' || (!bacRel.startsWith(`..${sep}`) && bacRel !== '..' && !isAbsolute(bacRel))) {
+    throw new VaultExportConfinementError();
+  }
+};
+
+// Reserve the first free `<baseName>-report<N>.md` path under
+// `directory`, starting at N=1, and return it. Never overwrites a prior
+// export. To close the check-then-write race between two concurrent
+// exports of the same workstream (both would compute the same N with a
+// plain `access` probe), we atomically CLAIM the slot with an
+// exclusive-create open (`wx`): the loser gets EEXIST and advances to
+// N+1. The caller then rewrites the claimed placeholder via
+// writeFileAtomic (rename replaces the empty file in place).
+const nextReportPath = async (directory: string, baseName: string): Promise<string> => {
+  await mkdir(directory, { recursive: true });
+  for (let n = 1; ; n += 1) {
+    const candidate = join(directory, `${baseName}-report${String(n)}.md`);
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(candidate, 'wx');
+      return candidate;
+    } catch (error) {
+      if (isExistsError(error)) {
+        continue;
+      }
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  }
 };
 
 const readJsonRecord = async (path: string): Promise<Record<string, unknown>> => {
@@ -247,6 +386,15 @@ const isMissingPathError = (error: unknown): boolean =>
   error !== null &&
   'code' in error &&
   (error as { readonly code?: unknown }).code === 'ENOENT';
+
+// EEXIST from an exclusive-create open — the report slot was claimed by
+// a concurrent export between our probe and our open. The caller retries
+// at the next N.
+const isExistsError = (error: unknown): boolean =>
+  typeof error === 'object' &&
+  error !== null &&
+  'code' in error &&
+  (error as { readonly code?: unknown }).code === 'EEXIST';
 
 const readMarkdownLockSentinel = async (path: string): Promise<boolean> => {
   try {
@@ -420,14 +568,39 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
     try {
       await access(vaultPath);
     } catch {
-      throw new Error('Vault path is unavailable.');
+      throw new VaultUnavailableError();
     }
   };
 
   const audit = async (event: AuditEvent): Promise<void> => {
+    // Merge the ambient request-scoped provenance (agent / tool /
+    // argsSummary / scope / trustModeActive) set by the HTTP layer. When
+    // no context is bound (direct writer use, legacy paths) the line is
+    // written with the base fields only — still schema-valid.
+    const provenance = currentAuditContext();
+    const enriched: AuditEvent &
+      Partial<{
+        agent: string;
+        tool: string | null;
+        argsSummary: string;
+        scope: string | null;
+        trustModeActive: boolean;
+      }> =
+      provenance === undefined
+        ? event
+        : {
+            ...event,
+            agent: provenance.agent,
+            tool: provenance.tool,
+            ...(provenance.argsSummary === undefined
+              ? {}
+              : { argsSummary: provenance.argsSummary }),
+            scope: provenance.scope,
+            trustModeActive: provenance.trustModeActive,
+          };
     await appendJsonLine(
       join(bacRoot, 'audit', `${dateStamp(new Date(event.timestamp))}.jsonl`),
-      event,
+      enriched,
     );
   };
 
@@ -836,7 +1009,7 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
         children: input.children ?? [],
         checklist: input.checklist ?? [],
         tags: input.tags ?? [],
-        privacy: input.privacy ?? 'shared',
+        privacy: input.privacy ?? 'private',
         screenShareSensitive: input.screenShareSensitive ?? false,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -872,6 +1045,14 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       await ensureVaultPresent();
       const path = join(bacRoot, 'workstreams', `${workstreamId}.json`);
       const existing = await readJsonRecord(path);
+      // Optimistic concurrency: the PATCH body carries the revision the
+      // caller read. If it no longer matches the on-disk record, a
+      // concurrent writer has moved on — reject with a 409 (same shape
+      // as updateSettings) rather than silently last-writer-wins, which
+      // would drop the other caller's ticked checklist items.
+      if (existing['revision'] !== input.revision) {
+        throw new WorkstreamRevisionConflictError();
+      }
       const previousParentId =
         typeof existing['parentId'] === 'string' ? existing['parentId'] : undefined;
       const revision = createRevision();
@@ -882,10 +1063,11 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       //   undefined → leave parent unchanged.
       // Spread `...input` would persist a literal `parentId: null` on
       // disk; strip it out and re-set explicitly so the JSON stays
-      // clean.
+      // clean. `revision` is stripped too — the caller's read-revision
+      // must never land on disk; the freshly minted one below wins.
       const wantsDetach = input.parentId === null;
       const wantsReparent = typeof input.parentId === 'string';
-      const { parentId: _omitParentId, ...inputWithoutParent } = input;
+      const { parentId: _omitParentId, revision: _omitRevision, ...inputWithoutParent } = input;
       const updated: Record<string, unknown> = {
         ...existing,
         ...inputWithoutParent,
@@ -1341,6 +1523,114 @@ export const createVaultWriter = (vaultPath: string): VaultWriter => {
       await writeJson(path, updated);
       await audit({ requestId, route: 'unarchiveThread', outcome: 'success', bac_id, timestamp });
       return { bac_id, revision };
+    },
+
+    async exportWorkstream(workstreamId, options) {
+      await ensureVaultPresent();
+      const record = await readJsonRecord(
+        join(bacRoot, 'workstreams', `${workstreamId}.json`),
+      );
+      // Walk the parent chain (root → self) to build the on-disk tree
+      // that mirrors the workstream hierarchy. A cycle guard caps the
+      // walk so a corrupt parent loop can't spin forever.
+      const chain: Record<string, unknown>[] = [record];
+      const seen = new Set<string>([workstreamId]);
+      let cursor = typeof record['parentId'] === 'string' ? record['parentId'] : undefined;
+      while (cursor !== undefined && !seen.has(cursor)) {
+        seen.add(cursor);
+        try {
+          const parent = await readJsonRecord(join(bacRoot, 'workstreams', `${cursor}.json`));
+          chain.unshift(parent);
+          cursor = typeof parent['parentId'] === 'string' ? parent['parentId'] : undefined;
+        } catch {
+          break;
+        }
+      }
+      const segments = chain.map((entry) => {
+        const id = typeof entry['bac_id'] === 'string' ? entry['bac_id'] : workstreamId;
+        const title = typeof entry['title'] === 'string' ? entry['title'] : id;
+        return sanitizePathSegment(title, id);
+      });
+      // Export tree lives OUTSIDE _BAC/ — this is the user-facing
+      // report, distinct from the flat _BAC/workstreams/<id>.md sidecar.
+      const directory = join(vaultPath, ...segments);
+      // Confine BEFORE nextReportPath, which mkdirs the directory and
+      // claims a placeholder file — nothing on disk may be created
+      // outside the vault boundary or inside _BAC/.
+      assertExportPathConfined(vaultPath, directory);
+      const selfTitle =
+        typeof record['title'] === 'string' ? record['title'] : workstreamId;
+      const reportPath = await nextReportPath(
+        directory,
+        sanitizePathSegment(selfTitle, workstreamId),
+      );
+      assertExportPathConfined(vaultPath, reportPath);
+      const body = renderWorkstreamMarkdown(record as unknown as WorkstreamProjectionInput);
+      await writeFileAtomic(reportPath, body);
+      const files: { readonly path: string }[] = [{ path: relative(vaultPath, reportPath) }];
+
+      if (options.includeThreads === true) {
+        const threadsRoot = join(bacRoot, 'threads');
+        try {
+          const threadFiles = await readdir(threadsRoot);
+          for (const file of threadFiles.filter((name) => name.endsWith('.json')).sort()) {
+            const thread = await readJsonRecord(join(threadsRoot, file));
+            if (thread['primaryWorkstreamId'] !== workstreamId) continue;
+            const threadId =
+              typeof thread['bac_id'] === 'string' ? thread['bac_id'] : undefined;
+            if (threadId === undefined) continue;
+            const threadTitle =
+              typeof thread['title'] === 'string' ? thread['title'] : threadId;
+            const threadReportPath = await nextReportPath(
+              directory,
+              sanitizePathSegment(threadTitle, threadId),
+            );
+            assertExportPathConfined(vaultPath, threadReportPath);
+            await writeFileAtomic(
+              threadReportPath,
+              renderThreadMarkdown(thread as unknown as ThreadProjectionInput),
+            );
+            files.push({ path: relative(vaultPath, threadReportPath) });
+          }
+        } catch (error) {
+          if (!isMissingPathError(error)) throw error;
+        }
+      }
+      return { files };
+    },
+
+    async exportThread(threadId) {
+      await ensureVaultPresent();
+      const record = await readJsonRecord(join(bacRoot, 'threads', `${threadId}.json`));
+      // Place the thread report under its workstream's tree when it has
+      // one, else at the vault root. Only the immediate workstream title
+      // is used as the parent segment; the full ancestor chain is a
+      // workstream-export concern.
+      const workstreamId =
+        typeof record['primaryWorkstreamId'] === 'string'
+          ? record['primaryWorkstreamId']
+          : undefined;
+      const parentSegments: string[] = [];
+      if (workstreamId !== undefined) {
+        try {
+          const ws = await readJsonRecord(join(bacRoot, 'workstreams', `${workstreamId}.json`));
+          const wsTitle = typeof ws['title'] === 'string' ? ws['title'] : workstreamId;
+          parentSegments.push(sanitizePathSegment(wsTitle, workstreamId));
+        } catch {
+          // Missing workstream record → export at the vault root.
+        }
+      }
+      const directory = join(vaultPath, ...parentSegments);
+      // Confine BEFORE nextReportPath mkdirs / claims a placeholder.
+      assertExportPathConfined(vaultPath, directory);
+      const title = typeof record['title'] === 'string' ? record['title'] : threadId;
+      const reportPath = await nextReportPath(directory, sanitizePathSegment(title, threadId));
+      assertExportPathConfined(vaultPath, reportPath);
+      await writeFileAtomic(
+        reportPath,
+        renderThreadMarkdown(record as unknown as ThreadProjectionInput),
+      );
+      return { files: [{ path: relative(vaultPath, reportPath) }] };
     },
   };
 };

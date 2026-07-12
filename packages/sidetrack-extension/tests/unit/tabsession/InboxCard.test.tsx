@@ -108,7 +108,7 @@ describe('InboxCard', () => {
       />,
     );
 
-    expect(screen.getByTitle('No attribution')).toHaveTextContent('?');
+    expect(screen.getByTitle('No attribution')).toHaveTextContent('—');
     fireEvent.click(screen.getByRole('button', { name: 'Pick another…' }));
 
     expect(onPickAnother).toHaveBeenCalledWith('tses_test');

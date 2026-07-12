@@ -27,7 +27,7 @@ describe('IncrementalConnectionsGraphView', () => {
     view.seed(snapshot);
 
     view.fold(event('browser.timeline.observed', 1));
-    view.fold(event('threads.upserted', 2));
+    view.fold(event('thread.upserted', 2));
 
     expect(view.drainPlan()).toMatchObject({
       initialized: true,

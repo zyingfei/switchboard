@@ -1,25 +1,13 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// Stub the embedder BEFORE importing anything that loads it. Same
-// pattern as src/recall/ingestor.test.ts.
-vi.mock('../../recall/embedder.js', async () => {
-  const real = await vi.importActual<typeof import('../../recall/embedder.js')>(
-    '../../recall/embedder.js',
-  );
-  return {
-    ...real,
-    embed: async (texts: readonly string[]) =>
-      texts.map(() => {
-        const v = new Float32Array(384);
-        v[0] = 1;
-        return v;
-      }),
-  };
-});
-
+// Stub the embedder through the production `setEmbedderOverride` seam
+// (installStubEmbedder). Same pattern as src/recall/ingestor.test.ts —
+// `bun test` has no `vi.importActual` and `vi.mock` leaks
+// process-globally in this repo.
+import { installStubEmbedder, type StubEmbedderHandle } from '../../test-helpers/stubEmbedder.js';
 import { createRecallActivityTracker } from '../../recall/activity.js';
 import { readIndex } from '../../recall/indexFile.js';
 import { createRecallLifecycle } from '../../recall/lifecycle.js';
@@ -52,10 +40,13 @@ import { createSyncContractRunner } from './runner.js';
 
 describe('Lane 1 recall freshness — capture-then-recall, tombstone, crash recovery', () => {
   let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
   beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-l1-recall-fresh-'));
   });
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultRoot, { recursive: true, force: true });
   });
 

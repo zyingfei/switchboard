@@ -5,29 +5,24 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Embedder is unused for the bind-failure path but the runtime
-// imports it transitively through the recall lifecycle. Mock it so
-// the test doesn't try to load real ONNX bindings.
-vi.mock('../recall/embedder.js', () => ({
-  MODEL_ID: 'test/model',
-  embed: () => Promise.resolve([]),
-  setEmbedderOverride: () => undefined,
-  RecallModelMissingError: class extends Error {
-    readonly code = 'RECALL_MODEL_MISSING' as const;
-  },
-}));
-
-vi.mock('../collectors/framework/runtime.js', () => ({
-  bootCollectorFramework: () => null,
-}));
+// `bun test` supports the synchronous fake-timer surface
+// (useFakeTimers / advanceTimersByTime / useRealTimers) but not
+// vitest's `vi.advanceTimersByTimeAsync`. advanceTimersByTimeAsync
+// below rebuilds that async variant on top of the supported
+// primitives (advance the fake clock, then drain microtasks).
+import { advanceTimersByTimeAsync } from '../test-helpers/bunTestTimers.js';
+import { installStubEmbedder, type StubEmbedderHandle } from '../test-helpers/stubEmbedder.js';
 
 import { readPageEvidence } from '../page-evidence/store.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { AppendInputObserved } from '../sync/eventLog.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import {
+  WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS,
+  WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS,
   appendObservedEdgeEventsBatch,
   createPageEvidenceWriteQueue,
+  createWorkGraphHealthArtifactScheduler,
   scheduleSqliteVacuumGc,
   startCompanion,
 } from './companion.js';
@@ -67,8 +62,15 @@ describe('startCompanion bind-failure rollback', () => {
   let vaultRoot: string;
   let busyServer: Server;
   let busyPort: number;
+  let stubEmbedder: StubEmbedderHandle;
 
   beforeEach(async () => {
+    // Route embedding through the deterministic override so the recall
+    // lifecycle's startup rebuild never loads real ONNX bindings. This
+    // replaces a former `vi.mock('../recall/embedder.js')`, which under
+    // `bun test` leaked process-globally and poisoned the real embedder
+    // for every other suite.
+    stubEmbedder = installStubEmbedder();
     vaultRoot = await mkdtemp(join(tmpdir(), 'startcompanion-bind-fail-'));
     busyServer = createServer();
     await new Promise<void>((resolve, reject) => {
@@ -85,6 +87,7 @@ describe('startCompanion bind-failure rollback', () => {
   });
 
   afterEach(async () => {
+    stubEmbedder.restore();
     await new Promise<void>((resolve) =>
       busyServer.close(() => {
         resolve();
@@ -96,13 +99,21 @@ describe('startCompanion bind-failure rollback', () => {
   it('rolls back on EADDRINUSE: lock released, intervals cleared, no zombie handles', async () => {
     // 1. The startup MUST reject. Without F2 the rejection still
     //    fires, but the side-effects below were not rolled back.
-    await expect(
-      startCompanion({
-        vaultPath: vaultRoot,
-        port: busyPort,
-        allowAutoUpdate: false,
-      }),
-    ).rejects.toThrow(/EADDRINUSE/);
+    //    Assert on error.code, not the message: Node surfaces
+    //    "listen EADDRINUSE ..." while bun surfaces "Failed to start
+    //    server. Is port X in use?" — both carry code EADDRINUSE, so
+    //    the code is the runtime-agnostic contract this test asserts.
+    const rejection = await startCompanion({
+      vaultPath: vaultRoot,
+      port: busyPort,
+      allowAutoUpdate: false,
+    }).then(
+      () => {
+        throw new Error('startCompanion resolved on a busy port — expected EADDRINUSE');
+      },
+      (error: unknown) => error,
+    );
+    expect((rejection as { readonly code?: string }).code).toBe('EADDRINUSE');
 
     // 2. The recall process-lock must be released. Without this,
     //    the next launch falls back to the stale-pid takeover path
@@ -155,16 +166,151 @@ describe('startCompanion SQLite VACUUM hygiene task', () => {
       startupDelayMs: 60_000,
     });
 
-    await vi.advanceTimersByTimeAsync(59_999);
+    await advanceTimersByTimeAsync(59_999);
     expect(vacuum).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
+    await advanceTimersByTimeAsync(1);
     expect(vacuum).toHaveBeenCalledTimes(1);
     expect(hygieneStatus.lastVacuumAt).toBeDefined();
     expect(hygieneStatus.lastVacuumDurationMs).toBeGreaterThanOrEqual(0);
-    await vi.advanceTimersByTimeAsync(3_540_000);
+    await advanceTimersByTimeAsync(3_540_000);
     expect(vacuum).toHaveBeenCalledTimes(2);
 
     teardown();
+  });
+});
+
+describe('createWorkGraphHealthArtifactScheduler', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does nothing when the env gate is off', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => false,
+    });
+
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS * 2);
+
+    expect(materialize).not.toHaveBeenCalled();
+    scheduler.teardown();
+  });
+
+  it('debounces a drain burst into one collect', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    scheduler.schedule();
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+
+    expect(materialize).toHaveBeenCalledTimes(1);
+    scheduler.teardown();
+  });
+
+  it('enforces the min-interval floor after a SUCCESSFUL collect (FIX 3)', async () => {
+    const materialize = vi.fn(() => Promise.resolve(true));
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Drain right after the success: inside the floor → skipped, even
+    // well past the debounce window.
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - 1);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Once the floor has elapsed a new drain schedules normally.
+    await advanceTimersByTimeAsync(1);
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
+  });
+
+  it('does not advance the floor on a failed collect', async () => {
+    // First collect fails (e.g. the shared event store never opened);
+    // the very next drain must retry immediately instead of being
+    // floor-blocked behind a success that never happened.
+    const materialize = vi
+      .fn<() => Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
+  });
+
+  it('runs one trailing collect at floor expiry when a drain lands mid-collect (FIX 4)', async () => {
+    // Hold the first collect open so a drain can land while it is in
+    // flight. Without the trailing rerun that drain's changes would
+    // wait for the NEXT drain — indefinitely on a quiet vault.
+    let resolveFirst: (value: boolean) => void = () => undefined;
+    const firstCollect = new Promise<boolean>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const materialize = vi
+      .fn<() => Promise<boolean>>()
+      .mockImplementationOnce(() => firstCollect)
+      .mockResolvedValue(true);
+    const scheduler = createWorkGraphHealthArtifactScheduler({
+      materialize,
+      enabled: () => true,
+    });
+
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    // Drain during the in-flight collect: single-flight holds (no
+    // second materialize) but the rerun request is recorded.
+    scheduler.schedule();
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    resolveFirst(true);
+    // Flush the finally block; the trailing collect is scheduled at
+    // floor expiry (not immediately — the floor is not bypassed).
+    await advanceTimersByTimeAsync(0);
+    expect(materialize).toHaveBeenCalledTimes(1);
+
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - 1);
+    expect(materialize).toHaveBeenCalledTimes(1);
+    await advanceTimersByTimeAsync(1);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    // One trailing collect exactly — the rerun flag does not loop.
+    await advanceTimersByTimeAsync(WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS * 2);
+    expect(materialize).toHaveBeenCalledTimes(2);
+
+    scheduler.teardown();
   });
 });
 

@@ -81,11 +81,8 @@ export const frontierFromIntervals = (
 ): VersionVector => {
   const out: Record<ReplicaId, number> = {};
   for (const [replicaId, replicaIntervals] of Object.entries(intervals)) {
-    let max = 0;
-    for (const [, end] of replicaIntervals) {
-      if (end > max) max = end;
-    }
-    if (max > 0) out[replicaId] = max;
+    const [start, end] = replicaIntervals[0] ?? [];
+    if (start === 1 && end !== undefined && end > 0) out[replicaId] = end;
   }
   return out;
 };

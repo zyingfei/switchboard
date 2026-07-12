@@ -18,14 +18,29 @@ import {
 } from '../feedback/projection.js';
 import { readPageEvidenceMap, readPageEvidenceVectorMap } from '../page-evidence/store.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
-import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
+import {
+  writeActiveClosestVisitRankerRevision,
+  writeClosestVisitRankerRevision,
+} from '../producers/closest-visit-revision.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
-import { extractFeatures, negativeContainerPairKey } from './features.js';
+import { extractFeatures } from './features.js';
 import { randomUnrelated } from './negatives.js';
 import {
+  minRecallImpressionPositiveGroups,
+  RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION,
+  applyRecallImpressionShipGateV2,
+  buildRecallImpressionTrainingGroups,
+  evaluateRecallImpressionShipGateV2,
+  summarizeRecallImpressionEvents,
+  summarizeRecallImpressionTraining,
+  writeRecallImpressionRetrainState,
+} from './retrain-impressions.js';
+import {
+  trainRankerRevisionFromGroups,
   trainRankerRevision,
   type RankerRevision,
+  type RankerTrainingLabelingSummary,
   type RankerTrainingCandidate,
   type TrainRankerInput,
   type TrainRankerOptions,
@@ -76,199 +91,6 @@ export const deriveVisitPairLabelsFromSnapshot = (
 
 const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
-const TOPIC_PREFIX = 'topic:';
-const WORKSTREAM_PREFIX = 'workstream:';
-
-const stripTimelineVisitPrefix = (value: string): string =>
-  value.startsWith(TIMELINE_VISIT_PREFIX) ? value.slice(TIMELINE_VISIT_PREFIX.length) : value;
-
-// Map each `topic:`/`workstream:` container node id to the set of
-// member timeline-visit canonical URLs the snapshot attributes to it.
-//
-//   - `topic:<id>`     ← `visit_in_topic` edges
-//                        (from = `timeline-visit:<url>`, to = `topic:<id>`)
-//   - `workstream:<id>` ← direct `visit_in_workstream` /
-//                          `visit_instance_in_workstream` edges PLUS
-//                          transitive membership through
-//                          `topic_in_workstream` (every member of a
-//                          topic that lives in the workstream).
-//
-// `visit-instance` edges carry their canonical URL on the source node's
-// `metadata.canonicalUrl` (same convention the positive derivation
-// consumes); every other membership edge already references the
-// `timeline-visit:<url>` node directly.
-const containerMembersFromSnapshot = (
-  snapshot: ConnectionsSnapshot,
-): ReadonlyMap<string, ReadonlySet<string>> => {
-  const canonicalUrlByVisitInstance = new Map<string, string>();
-  for (const node of snapshot.nodes) {
-    if (node.kind !== 'visit-instance') continue;
-    const canonicalUrl = node.metadata.canonicalUrl;
-    if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) {
-      canonicalUrlByVisitInstance.set(node.id, canonicalUrl);
-    }
-  }
-
-  const topicMembers = new Map<string, Set<string>>();
-  const workstreamMembers = new Map<string, Set<string>>();
-  const topicsByWorkstream = new Map<string, Set<string>>();
-
-  const addMember = (
-    target: Map<string, Set<string>>,
-    containerId: string,
-    canonicalUrl: string,
-  ): void => {
-    const set = target.get(containerId) ?? new Set<string>();
-    set.add(canonicalUrl);
-    target.set(containerId, set);
-  };
-
-  for (const edge of snapshot.edges) {
-    if (edge.kind === 'visit_in_topic' && edge.toNodeId.startsWith(TOPIC_PREFIX)) {
-      const url = stripTimelineVisitPrefix(edge.fromNodeId);
-      if (url.length > 0 && url !== edge.fromNodeId) addMember(topicMembers, edge.toNodeId, url);
-      continue;
-    }
-    if (edge.kind === 'visit_in_workstream' && edge.toNodeId.startsWith(WORKSTREAM_PREFIX)) {
-      const url = stripTimelineVisitPrefix(edge.fromNodeId);
-      if (url.length > 0 && url !== edge.fromNodeId) {
-        addMember(workstreamMembers, edge.toNodeId, url);
-      }
-      continue;
-    }
-    if (
-      edge.kind === 'visit_instance_in_workstream' &&
-      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
-    ) {
-      const url = canonicalUrlByVisitInstance.get(edge.fromNodeId);
-      if (url !== undefined) addMember(workstreamMembers, edge.toNodeId, url);
-      continue;
-    }
-    if (
-      edge.kind === 'topic_in_workstream' &&
-      edge.fromNodeId.startsWith(TOPIC_PREFIX) &&
-      edge.toNodeId.startsWith(WORKSTREAM_PREFIX)
-    ) {
-      const set = topicsByWorkstream.get(edge.toNodeId) ?? new Set<string>();
-      set.add(edge.fromNodeId);
-      topicsByWorkstream.set(edge.toNodeId, set);
-    }
-  }
-
-  // Fold each workstream's topic members into the workstream itself so a
-  // negative against a workstream covers the visits the snapshot only
-  // attributes to it transitively (via its topics).
-  for (const [workstreamId, topicIds] of topicsByWorkstream) {
-    for (const topicId of topicIds) {
-      for (const url of topicMembers.get(topicId) ?? []) {
-        addMember(workstreamMembers, workstreamId, url);
-      }
-    }
-  }
-
-  const merged = new Map<string, ReadonlySet<string>>();
-  for (const [containerId, urls] of topicMembers) merged.set(containerId, urls);
-  for (const [containerId, urls] of workstreamMembers) merged.set(containerId, urls);
-  return merged;
-};
-
-const isContainerId = (value: string): boolean =>
-  value.startsWith(TOPIC_PREFIX) || value.startsWith(WORKSTREAM_PREFIX);
-
-// Step 7 helper, exported via a stable name for the
-// `buildRankerTrainingCandidates` filter that keeps only
-// container-endpoint negatives before expansion. Mirrors
-// `isContainerId` but with the name disambiguated from any
-// caller's local import context.
-const isContainerLabelId = isContainerId;
-
-// Mirror `deriveVisitPairLabelsFromSnapshot` for the negative side.
-// Projection emits `ignore` / `split` / `user.flow.rejected` negatives
-// shaped `(timeline-visit:<url>, topic:<id>)` or `(…, workstream:<id>)`
-// (or the container on `fromId`). The container endpoint is not a
-// timeline-visit key, so `candidateResolvesToTimelineVisits` silently
-// drops the whole negative before training. Resolve each container
-// endpoint to its member timeline-visit URLs (from the snapshot) and
-// emit a correctly-shaped negative visit↔visit pair per member.
-//
-// Already-(visit, visit) negatives pass through unchanged. Containers
-// with no snapshot members yield nothing. Self-pairs are skipped and
-// the result is deduped + deterministically ordered. The resolution
-// gate is NOT weakened — this only reshapes containers into the visit
-// pairs the gate already accepts.
-export const deriveNegativeVisitPairLabelsFromSnapshot = (
-  feedback: FeedbackProjection,
-  snapshot: ConnectionsSnapshot,
-): readonly FeedbackTrainingLabel[] => {
-  if (feedback.negativeLabels.length === 0) return [];
-  const membersByContainer = containerMembersFromSnapshot(snapshot);
-
-  const seen = new Set<string>();
-  const labels: FeedbackTrainingLabel[] = [];
-  const emit = (fromId: string, toId: string, weight: number): void => {
-    if (fromId.length === 0 || toId.length === 0) return;
-    if (fromId === toId) return;
-    const key = `${fromId}\u0000${toId}\u0000${String(weight)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    labels.push({ fromId, toId, weight });
-  };
-
-  for (const label of feedback.negativeLabels) {
-    const fromIsContainer = isContainerId(label.fromId);
-    const toIsContainer = isContainerId(label.toId);
-
-    // Already a visit↔visit (or otherwise non-container) negative —
-    // leave the resolution gate to accept/reject it as-is.
-    if (!fromIsContainer && !toIsContainer) {
-      emit(label.fromId, label.toId, label.weight);
-      continue;
-    }
-
-    if (toIsContainer && !fromIsContainer) {
-      const visitUrl = stripTimelineVisitPrefix(label.fromId);
-      for (const memberUrl of [...(membersByContainer.get(label.toId) ?? [])].sort(compareText)) {
-        emit(visitUrl, memberUrl, label.weight);
-      }
-      continue;
-    }
-
-    if (fromIsContainer && !toIsContainer) {
-      const visitUrl = stripTimelineVisitPrefix(label.toId);
-      for (const memberUrl of [...(membersByContainer.get(label.fromId) ?? [])].sort(compareText)) {
-        emit(memberUrl, visitUrl, label.weight);
-      }
-      continue;
-    }
-
-    // Both endpoints are containers (e.g. topic-into-workstream split):
-    // expand to the Cartesian product of their members so every
-    // cross-container visit pair becomes a negative.
-    const fromMembers = [...(membersByContainer.get(label.fromId) ?? [])].sort(compareText);
-    const toMembers = [...(membersByContainer.get(label.toId) ?? [])].sort(compareText);
-    for (const fromUrl of fromMembers) {
-      for (const toUrl of toMembers) {
-        emit(fromUrl, toUrl, label.weight);
-      }
-    }
-  }
-
-  return labels;
-};
-
-export const augmentFeedbackWithVisitPairLabels = (
-  feedback: FeedbackProjection,
-  snapshot: ConnectionsSnapshot,
-): FeedbackProjection => {
-  const visitPairLabels = deriveVisitPairLabelsFromSnapshot(snapshot);
-  const negativeVisitPairLabels = deriveNegativeVisitPairLabelsFromSnapshot(feedback, snapshot);
-  if (visitPairLabels.length === 0 && negativeVisitPairLabels.length === 0) return feedback;
-  return {
-    ...feedback,
-    positiveLabels: [...feedback.positiveLabels, ...visitPairLabels],
-    negativeLabels: [...feedback.negativeLabels, ...negativeVisitPairLabels],
-  };
-};
 
 export interface RankerTrainingLabelDatasetFingerprint {
   readonly hash: string;
@@ -294,7 +116,9 @@ export type RankerRetrainSkipReason =
   | 'below-threshold'
   | 'cooldown'
   | 'no-training-candidates'
-  | 'no-usable-query-groups';
+  | 'no-usable-query-groups'
+  | 'insufficient_groups'
+  | 'ship_gate_failed';
 
 export type RankerRetrainPlan =
   | {
@@ -337,6 +161,15 @@ export interface RankerRetrainContext {
   readonly snapshot: ConnectionsSnapshot;
   readonly pageEvidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
   readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
+  /**
+   * Full training-event history (recall.served + recall.action + explicit
+   * feedback), read I/O-safely by the caller (event-store type index — NOT a
+   * full-log scan). When provided, the impression-trainer gate + group build
+   * use THIS instead of the drain-tail `merged`, which can never accumulate the
+   * 50 positive groups the gate requires. Omitted ⇒ falls back to `merged`
+   * (today's tail-only, structurally-starved behaviour).
+   */
+  readonly readTrainingEvents?: () => Promise<readonly AcceptedEvent[]>;
 }
 
 export type RankerRetrainer = (context: RankerRetrainContext) => Promise<RankerRetrainResult>;
@@ -383,6 +216,7 @@ export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContex
   readonly trainOptions?: TrainRankerOptions | undefined;
   readonly train?: TrainRankerRevisionFn | undefined;
   readonly writeActiveRevision?: WriteActiveRankerRevisionFn | undefined;
+  readonly writeCandidateRevision?: WriteActiveRankerRevisionFn | undefined;
   readonly readState?: ((vaultRoot: string) => Promise<RankerRetrainState | null>) | undefined;
   readonly writeState?:
     | ((vaultRoot: string, state: RankerRetrainState) => Promise<void>)
@@ -501,20 +335,11 @@ export const planRankerRetrain = ({
     return { action: 'skip', reason: 'no-labels', fingerprint, newLabelCount: 0 };
   }
 
-  // Threshold off the positive-label delta, not total. Negative-label
-  // count is post-`augmentFeedbackWithVisitPairLabels` Cartesian
-  // expansion (retrain.ts:192-250) — a snapshot topology change
-  // (workstream split, topic merge, engagement reclassification) can
-  // shrink the negative count without any new user signal, which made
-  // the prior `total - previousTotal` clamp to 0 even after hundreds
-  // of new positives, freezing the retrain loop. Positives are clean
-  // user signal: `deriveVisitPairLabelsFromSnapshot` is stubbed
-  // (retrain.ts:70-75) so positive labels come from user feedback
-  // only. Pure-negative-action sequences (only "ignore" gestures, no
-  // new positives) still flip `fingerprint.hash` so the `unchanged`
-  // check below skips correctly; they just won't trip the threshold
-  // gate until the next positive arrives. The per-label causal
-  // ledger work that closes this edge case is plan step 5.
+  // Threshold off the positive-label delta, not total. Pure-negative
+  // action sequences (only "ignore" gestures, no new positives) still
+  // flip `fingerprint.hash` so the `unchanged` check below skips
+  // correctly; they just won't trip the threshold gate until the next
+  // positive arrives.
   const previousPositiveCount = state?.lastTrainedPositiveLabelCount ?? 0;
   const newLabelCount = Math.max(0, fingerprint.positiveLabelCount - previousPositiveCount);
 
@@ -958,37 +783,14 @@ export const buildRankerTrainingCandidates = ({
     generatedAt,
   );
 
-  // Step 7 — precompute the (from, to) pair set for the new
-  // `container_negative_match` feature. Reuses the existing
-  // Cartesian-expansion logic so the feature value is bit-exact
-  // with what the expansion path would have produced for
-  // container-shaped user negatives. Computed once per training
-  // pass, not per candidate.
-  //
-  // Codex review of #236 caught: `feedback` here is already
-  // augmented (caller did `augmentFeedbackWithVisitPairLabels`)
-  // so `negativeLabels` includes the EXPANDED visit↔visit pairs
-  // alongside the original container-shaped negatives.
-  // `deriveNegativeVisitPairLabelsFromSnapshot` passes those
-  // visit-pair entries through unchanged, which would
-  // (incorrectly) mark them as `container_negative_match=1`
-  // even though they're not from container expansion. Filter
-  // upstream to container-endpoint negatives only.
-  const containerOnlyFeedback: FeedbackProjection = {
-    ...feedback,
-    negativeLabels: feedback.negativeLabels.filter(
-      (label) => isContainerLabelId(label.fromId) || isContainerLabelId(label.toId),
-    ),
-  };
-  const expandedNegativePairs = deriveNegativeVisitPairLabelsFromSnapshot(
-    containerOnlyFeedback,
+  const featureContext = {
+    merged: [...merged],
     snapshot,
-  );
-  const negativeContainerPairs = new Set<string>();
-  for (const label of expandedNegativePairs) {
-    negativeContainerPairs.add(negativeContainerPairKey(label.fromId, label.toId));
-  }
-  const featureContext = { merged: [...merged], snapshot, negativeContainerPairs };
+    // Legacy feedback-only training has no served impression. Keep the
+    // missing retrieval context explicit so v6 zero-filled retrieval
+    // features are auditable at the call site.
+    retrievalContext: { missingRetrievalContext: true },
+  };
   return [...candidates.values()]
     .map((candidate) => restampTrainingCandidate(candidate, timestampContext))
     .sort(
@@ -1039,6 +841,21 @@ const readRankerPageEvidenceContext = async (
   };
 };
 
+const recallImpressionLabelingSummary = (build: {
+  readonly totalCandidateCount: number;
+  readonly groups: readonly { readonly rows: readonly { readonly label: number }[] }[];
+  readonly rawPositiveCount: number;
+  readonly rawNegativeCount: number;
+  readonly unjudgedCandidateCount: number;
+}): RankerTrainingLabelingSummary => ({
+  totalCandidates: build.totalCandidateCount,
+  labeledRows: build.groups.reduce((sum, group) => sum + group.rows.length, 0),
+  positiveRows: build.rawPositiveCount,
+  negativeRows: build.rawNegativeCount,
+  implicitNegativeRows: 0,
+  unlabeledCandidateCount: build.unjudgedCandidateCount,
+});
+
 export const maybeRetrainClosestVisitRanker = async ({
   vaultRoot,
   merged,
@@ -1051,13 +868,92 @@ export const maybeRetrainClosestVisitRanker = async ({
   trainOptions,
   train = trainRankerRevision,
   writeActiveRevision = writeActiveClosestVisitRankerRevision,
+  writeCandidateRevision = writeClosestVisitRankerRevision,
   readState = readRankerRetrainState,
   writeState = writeRankerRetrainState,
+  readTrainingEvents,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
-  const baseFeedback = projectFeedback(merged);
-  const feedback = augmentFeedbackWithVisitPairLabels(baseFeedback, snapshot);
+  // P1: feed the trainer the full training-event history (read I/O-safely
+  // upstream via the event-store type index), NOT the drain tail — the tail
+  // can never accumulate the gate's positive-group floor. The SAME applies
+  // to the legacy label path below: `merged` on a store-backed scoped drain
+  // is only the pending window, so projecting feedback from it made the
+  // legacy gate report `no-labels` on every drain while dozens of labels
+  // accumulated in history and the trained date silently froze. The
+  // training-event set already includes the feedback types, so both paths
+  // share one indexed read.
+  const impressionEvents = readTrainingEvents ? await readTrainingEvents() : merged;
+  const feedback = projectFeedback(impressionEvents);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const state = await readState(vaultRoot);
+  const impressionEventSummary = summarizeRecallImpressionEvents(impressionEvents);
+  if (impressionEventSummary.groupCountWithPositives >= minRecallImpressionPositiveGroups()) {
+    const newLabelCount = impressionEventSummary.groupCountWithPositives;
+    try {
+      const build = await buildRecallImpressionTrainingGroups({
+        merged: impressionEvents,
+        snapshot,
+        // The real /v2 reconstructor is supplied by the main-process bootstrap
+        // (P1b); the per-drain reconcile child has no recall pipeline, so
+        // reconstruction is intentionally a no-op on this path.
+        reconstructFeedback: async () => undefined,
+      });
+      const stats = summarizeRecallImpressionTraining(build);
+      if (stats.groupCountWithPositives < minRecallImpressionPositiveGroups()) {
+        return {
+          status: 'skipped',
+          reason: 'insufficient_groups',
+          fingerprint,
+          newLabelCount,
+          candidateCount: build.totalCandidateCount,
+        };
+      }
+      const baseRevision = await trainRankerRevisionFromGroups(
+        build.groups,
+        trainOptions ?? {},
+        recallImpressionLabelingSummary(build),
+      );
+      const gate = await evaluateRecallImpressionShipGateV2(baseRevision, build);
+      const revision = applyRecallImpressionShipGateV2(baseRevision, gate.decision);
+      const retrainStateStatus = gate.decision.status === 'pass' ? 'promoted' : 'ship_gate_failed';
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: RECALL_IMPRESSION_RETRAIN_STATE_SCHEMA_VERSION,
+        status: retrainStateStatus,
+        revisionId: revision.revisionId,
+        updatedAt: revision.trainedAt,
+        stats,
+        shipGateDecision: gate.decision,
+      });
+      if (gate.decision.status !== 'pass') {
+        await writeCandidateRevision(vaultRoot, revision);
+        return {
+          status: 'skipped',
+          reason: 'ship_gate_failed',
+          fingerprint,
+          newLabelCount,
+          candidateCount: build.totalCandidateCount,
+        };
+      }
+      await writeActiveRevision(vaultRoot, revision);
+      await writeState(vaultRoot, stateFromRevision(fingerprint, revision));
+      return {
+        status: 'trained',
+        revisionId: revision.revisionId,
+        fingerprint,
+        newLabelCount,
+        candidateCount: build.totalCandidateCount,
+      };
+    } catch (error) {
+      return {
+        status: 'failed',
+        error: errorMessage(error),
+        fingerprint,
+        newLabelCount,
+        candidateCount:
+          impressionEventSummary.rawPositiveCount + impressionEventSummary.rawNegativeCount,
+      };
+    }
+  }
   const resolvedThreshold = threshold ?? readEnvNumber(RANKER_RETRAIN_LABEL_THRESHOLD_ENV);
   const cooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
   const forceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];

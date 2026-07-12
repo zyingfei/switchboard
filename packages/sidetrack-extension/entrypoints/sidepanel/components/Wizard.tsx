@@ -401,26 +401,28 @@ function CompanionStep({
       {synced ? null : (
         <div className="wizard-card-row single">
           <div className="wizard-card primary">
-            <div className="wizard-card-title">HTTP loopback</div>
+            <div className="wizard-card-title">Start the companion</div>
             <code className="wizard-card-cmd mono">
-              bunx @sidetrack/companion --vault {commandPath}
+              bash scripts/install-companion.sh --vault {commandPath}
             </code>
-            <div className="wizard-card-meta mono">Bridge key file: {bridgeKeyPath}</div>
+            <div className="wizard-card-meta mono">
+              Run from the repo root — builds the companion if needed, then starts it. Bridge key
+              file: {bridgeKeyPath} (paste it below, or use “Load key from file…” in Settings).
+            </div>
           </div>
         </div>
       )}
       {!synced && __DEV__ ? (
         <div className="wizard-card-row single">
           <div className="wizard-card">
-            <div className="wizard-card-title">Dev build — run from local worktree</div>
+            <div className="wizard-card-title">Or run the built CLI directly</div>
             <code className="wizard-card-cmd mono">
-              bun
-              ~/Documents/playground/browser-ai-companion/.claude/worktrees/m1+foundation/packages/sidetrack-companion/dist/cli.js
-              --vault {commandPath}
+              bun packages/sidetrack-companion/dist/cli.js --vault {commandPath} --port 17373
             </code>
             <div className="wizard-card-meta mono">
-              The Bun package isn&apos;t published yet, so the bunx command above won&apos;t
-              resolve. Run this directly against the built CLI.
+              The npm package isn&apos;t published yet, so a global{' '}
+              <span className="mono">bunx @sidetrack/companion</span> won&apos;t resolve — run from
+              the repo for now.
             </div>
           </div>
         </div>
@@ -437,6 +439,19 @@ function CompanionStep({
           {pingState === 'testing' ? 'Testing…' : 'Test connection'}
         </button>
       </div>
+      {synced && pingState === 'unreachable' ? (
+        <div className="wizard-card">
+          <div className="wizard-card-title">No companion running?</div>
+          <code className="wizard-card-cmd mono">
+            bash scripts/install-companion.sh --vault ~/Documents/Sidetrack-vault
+          </code>
+          <div className="wizard-card-meta mono">
+            Synced mode connects to a companion that&apos;s already up. If you don&apos;t have one,
+            start a local companion with the command above (run from the repo root), then Test
+            connection again.
+          </div>
+        </div>
+      ) : null}
       {synced && resolvedVaultRoot !== null ? (
         <div className="wizard-card">
           <div className="wizard-card-title">Vault</div>

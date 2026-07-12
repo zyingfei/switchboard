@@ -106,8 +106,13 @@ export interface SuppressionPolicy {
    *     URL structure, NOT a hardcoded host list */
   readonly suppressCurrentPage?: 'always' | 'never' | 'unless-discussion';
   /** Bac_ids of chats the user is actively in / just created. These
-   *  never surface as "déjà-vu" (fixes the AI 不应做架构师 case). */
+   *  drive either active-session markers (default) or legacy filtering
+   *  when markActiveSessionsInsteadOfSuppress is explicitly false. */
   readonly suppressActiveChatBacIds?: readonly string[];
+  /** When true, active-chat bacIds are surfaced via
+   *  response.meta.activeSessionMarkers instead of being filtered out.
+   *  Defaults to true post-PR-B; suppression becomes opt-in. */
+  readonly markActiveSessionsInsteadOfSuppress?: boolean;
   /** Drop chats marked as Ask-AI artifacts (user typed in the popover
    *  and got an answer; not a "prior" by any meaningful definition). */
   readonly suppressAskAiArtifacts?: boolean;
@@ -209,6 +214,58 @@ export interface RecallResponse {
     };
     readonly timingsMs: Readonly<Record<string, number>>;
     readonly flags: Readonly<Record<string, boolean>>;
+    /** Stable impression identity — present when the server appended a
+     *  `recall.served` event for this response. The extension echoes
+     *  it back in recall.action so the ranker trainer can join served ×
+     *  action records by impression. */
+    readonly servedContextId?: string;
+    /** Phase post-v6 — non-suppressive markers. The extension surfaces
+     *  these as badges ("current chat" / "open now") on candidates that
+     *  match an active session. PRESENTATION CONTEXT ONLY — NOT a
+     *  negative relevance signal. Replaces the prior 10-minute
+     *  suppressActiveChatBacIds rule which hid relevant results. */
+    readonly activeSessionMarkers?: readonly {
+      readonly entityId: string;
+      readonly reason:
+        | 'current_chat'
+        // Reserved for a follow-up SW addition that tracks open chat
+        // URLs in real time; only 'recently_created' is wired here.
+        | 'open_tab'
+        | 'recently_created';
+    }[];
+    /** PR D — adaptive tiering metadata. Server emits scores +
+     *  suggested cutoffs; UI decides how to render. Defaults computed
+     *  from the simple partitionResultsByConfidence rule below; will
+     *  be eval-calibrated in a follow-up (see TODO comments in
+     *  pipeline.ts). */
+    readonly tiering?: {
+      readonly policyVersion: 'v1';
+      readonly scores: readonly number[];
+      readonly scoreGaps: readonly number[];
+      readonly suggestedStrongCount: number;
+      readonly suggestedCollapsedCount: number;
+      readonly confidenceStats: {
+        readonly topScore: number;
+        readonly medianScore: number;
+        readonly minScore: number;
+        readonly largestGap: { readonly index: number; readonly delta: number };
+      };
+    };
+    /** Cross-encoder rerank diagnostics. Present when rerank fired. */
+    readonly rerank?: {
+      readonly enabled: boolean;
+      readonly rerankTopK: number;
+      readonly rerankedCount: number;
+      readonly latencyMs: number;
+      /** Per-candidate rank movement (pre-rerank rank − post-rerank rank). */
+      readonly rankMovement?: readonly { readonly entityId: string; readonly delta: number }[];
+    };
+    /** P3 — present only when the learned re-rank actually re-ordered
+     *  results (active impression-trained, ship-gate-passed model). */
+    readonly learnedRerank?: {
+      readonly applied: true;
+      readonly revisionId: string | null;
+    };
     readonly debug?: {
       readonly droppedExplanations?: readonly RecallCandidate[];
     };

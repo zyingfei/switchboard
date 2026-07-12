@@ -79,4 +79,47 @@ describe('projectWorkstream', () => {
     const projection = projectWorkstream('ws-1', events);
     expect(projection.vector).toEqual({ A: 1 });
   });
+
+  describe('privacy field handling', () => {
+    it("propagates explicit 'private' from the upsert payload", () => {
+      const events = [upsert('A', 1, { privacy: 'private' })];
+      const projection = projectWorkstream('ws-1', events);
+      expect(projection.record.status).toBe('resolved');
+      if (projection.record.status === 'resolved') {
+        expect(projection.record.value?.privacy).toBe('private');
+      }
+    });
+
+    it("propagates explicit 'shared' from the upsert payload", () => {
+      const events = [upsert('A', 1, { privacy: 'shared' })];
+      const projection = projectWorkstream('ws-1', events);
+      expect(projection.record.status).toBe('resolved');
+      if (projection.record.status === 'resolved') {
+        expect(projection.record.value?.privacy).toBe('shared');
+      }
+    });
+
+    it('leaves privacy absent when the upsert payload omits it — existing records are not defaulted', () => {
+      // Records stored before the 'private' default was introduced may have no
+      // privacy field in their WORKSTREAM_UPSERTED event. Projection must not
+      // inject a default so their rendered value stays unchanged.
+      const events = [upsert('A', 1)]; // no privacy override
+      const projection = projectWorkstream('ws-1', events);
+      expect(projection.record.status).toBe('resolved');
+      if (projection.record.status === 'resolved') {
+        expect(projection.record.value?.privacy).toBeUndefined();
+      }
+    });
+
+    it("propagates 'private' from a new-style upsert event (as produced by createWorkstream after PRD default flip)", () => {
+      // writer.ts now writes privacy:'private' by default; server.ts emits the
+      // field when present, so new WORKSTREAM_UPSERTED events carry it.
+      const events = [upsert('A', 1, { privacy: 'private' })];
+      const projection = projectWorkstream('ws-1', events);
+      expect(projection.record.status).toBe('resolved');
+      if (projection.record.status === 'resolved') {
+        expect(projection.record.value?.privacy).toBe('private');
+      }
+    });
+  });
 });

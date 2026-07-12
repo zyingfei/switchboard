@@ -1,11 +1,26 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { access, appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import {
+  access,
+  appendFile,
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
-import { isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
+import { bridgeKeysMatch, isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
+import {
+  boundArgsSummary,
+  currentAuditContext as currentAuditContextMut,
+  runWithAuditContext,
+  type AuditContext,
+} from '../vault/auditContext.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
@@ -34,10 +49,19 @@ import {
 } from '../auth/workstreamTrust.js';
 import { createDispatchId, createRequestId, createReviewId } from '../domain/ids.js';
 import { pickInstaller, type Installer, type InstallOptions } from '../install/index.js';
+import { probeServiceLiveness } from '../install/launchd.js';
 import { exportSettings } from '../portability/exportBundle.js';
 import { importSettings } from '../portability/importBundle.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
-import { embed, MODEL_ID, RecallModelMissingError } from '../recall/embedder.js';
+// /v1/status availability contract (statusContract.test.ts): the
+// embedder module must NOT be in this file's static import graph —
+// even its import cost is unbounded (transformers/ONNX init), and
+// /status has to answer during cold start. Recall call sites load it
+// lazily through this memoized dynamic import instead.
+type EmbedderModule = typeof import('../recall/embedder.js');
+let embedderModulePromise: Promise<EmbedderModule> | null = null;
+const loadEmbedderModule = (): Promise<EmbedderModule> =>
+  (embedderModulePromise ??= import('../recall/embedder.js'));
 import {
   expandSemanticByQuery,
   expandSemanticRecallCandidates,
@@ -46,7 +70,13 @@ import {
   readSemanticRecallPool,
   readSemanticRecallVectorStore,
 } from '../recall/semanticRecallPool.js';
-import { CAPTURE_RECORDED } from '../recall/events.js';
+import {
+  CAPTURE_RECORDED,
+  RECALL_ACTION,
+  RECALL_SERVED,
+  isRecallActionPayload,
+  type RecallServedPayload,
+} from '../recall/events.js';
 import { getModelCacheStatus } from '../recall/modelCache.js';
 import {
   PAGE_CONTENT_EXTRACTED,
@@ -76,6 +106,8 @@ import {
   queryPageContent,
   readPageContentCoverage,
   readPageContentCoverageMap,
+  scanForOverCollapsedPageContent,
+  type OverCollapsedRecord,
   writePageContentExtracted,
   writePageContentTombstoned,
 } from '../page-content/store.js';
@@ -120,9 +152,12 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { projectPrivacy } from '../privacy/projection.js';
 import {
+  createEmptyTabSessionProjectionAccumulator,
   deserializeTabSessionProjection,
+  foldEventIntoTabSessionProjectionAccumulator,
   projectTabSessions,
   serializeTabSessionProjection,
+  tabSessionProjectionFromAccumulator,
   tabSessionInbox,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
@@ -136,10 +171,13 @@ import {
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import {
+  createEmptyUrlProjectionAccumulator,
   deserializeUrlProjection,
+  foldEventIntoUrlProjectionAccumulator,
   projectUrls,
   serializeUrlProjection,
   urlInbox,
+  urlProjectionFromAccumulator,
   type UrlProjection,
 } from '../urls/projection.js';
 import { autoApplyUrlAttribution } from '../urls/autoApply.js';
@@ -153,15 +191,20 @@ import {
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
 import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
-import { rebuildFromEventLog } from '../recall/rebuild.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
-import { estimateTokens, tokenBudgetWarningThreshold } from '../safety/tokenBudget.js';
+import { estimateTokens, tokenThresholdForProvider } from '../safety/tokenBudget.js';
 import { applyFeedbackOverlayToSnapshot } from '../connections/feedbackOverlay.js';
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import { overlayTopicRevisionOnSnapshot } from '../connections/topicSnapshotOverlay.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
+import {
+  eventStoreEnabled,
+  getCaughtUpSharedEventStore,
+  getSharedEventStore,
+} from '../sync/eventStore.js';
+import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import {
@@ -300,14 +343,24 @@ import {
   writeReviewDraft,
 } from '../vault/reviewDrafts.js';
 import { runAutoUpdate } from '../system/autoUpdate.js';
-import { collectHealth, type CaptureWarningHealth, type HealthReport } from '../system/health.js';
+import {
+  collectHealth,
+  resolveServiceRunning,
+  type CaptureWarningHealth,
+  type HealthReport,
+} from '../system/health.js';
 import {
   collectWorkGraphHealth,
   type ConnectionsDiagnosticSnapshot,
 } from '../system/workGraphHealth.js';
+import {
+  isWorkGraphHealthArtifactFresh,
+  readWorkGraphHealthArtifact,
+} from '../system/workGraphHealthArtifact.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
+import { runRecallImpressionBootstrap } from '../ranker/impressionBootstrap.js';
 import {
   listAnnotations,
   softDeleteAnnotation,
@@ -324,6 +377,7 @@ import {
   createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
+import { VaultExportConfinementError, VaultUnavailableError } from './errors.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
@@ -331,6 +385,7 @@ import {
   annotationCreateSchema,
   annotationListQuerySchema,
   annotationUpdateSchema,
+  auditEventSchema,
   auditListQuerySchema,
   captureEventSchema,
   codingAttachTokenCreateSchema,
@@ -360,6 +415,7 @@ import {
   turnsQuerySchema,
   workstreamCreateSchema,
   workstreamUpdateSchema,
+  workstreamExportSchema,
   autoUpdateSchema,
   bucketsPutSchema,
   workstreamTrustPutSchema,
@@ -367,10 +423,30 @@ import {
 
 export interface CompanionHttpConfig {
   readonly bridgeKey: string;
+  // F02 — the MCP-scoped bridge key (mcp.key). When set, the sidetrack-mcp
+  // process authenticates its companion calls with THIS key instead of the
+  // extension bridge key. The auth gate accepts both keys but classifies
+  // the caller by which one matched: an mcpBridgeKey match is an `mcp`
+  // caller (subject to workstream-trust enforcement on every write route);
+  // a bridgeKey match is the `extension` surface (exempt). Optional so
+  // legacy runtimes / tests that never wire an MCP key keep working — when
+  // unset, every caller is classified `extension` (pre-F02 behaviour).
+  readonly mcpBridgeKey?: string;
   readonly vaultWriter: VaultWriter;
   readonly vaultRoot?: string;
   readonly serviceInstaller?: Installer;
   readonly serviceInstallDefaults?: Omit<InstallOptions, 'vaultPath'>;
+  // Real service liveness probe (F28 health honesty). When wired, the
+  // health surface reports `service.running` from actual process
+  // liveness (launchctl / systemctl) instead of inferring it from plist
+  // existence. Optional so legacy/test call-sites fall back to the
+  // installer's plist-existence heuristic. Must be bounded + never throw.
+  readonly serviceLiveness?: () => Promise<'running' | 'not-running' | 'unknown'>;
+  // Liveness edges (F28). Synchronous, side-effect-free getters wired by
+  // the runtime when it manages the corresponding subsystem; the health
+  // surface surfaces a silently-dead ranker refresh / MCP child.
+  readonly rankerHealth?: () => import('../system/health.js').RankerRefreshHealth;
+  readonly mcpChildHealth?: () => import('../system/health.js').McpChildHealth;
   readonly sync?: {
     readonly relay?: {
       readonly mode: 'local' | 'remote';
@@ -569,6 +645,11 @@ interface RouteMatch {
 interface RouteDefinition {
   readonly method: HttpMethod;
   readonly pattern: RegExp;
+  // Documents intent only. The request handler enforces auth BEFORE
+  // route matching against PUBLIC_UNAUTHENTICATED_PATHS, not this flag —
+  // so an unauthenticated caller can't enumerate routes by status code.
+  // Keep it accurate (true for anything not on that allowlist) so it
+  // stays a reliable audit reference.
   readonly authRequired: boolean;
   readonly handle: (
     request: IncomingMessage,
@@ -622,6 +703,23 @@ const writeDebugHeapSnapshot = async (): Promise<string> => {
   return path;
 };
 
+// SIDETRACK_HTTP_LOG=1 debug log. Records method + pathname + status +
+// duration ONLY — never the query string, which carries PII (search
+// terms, visited URLs). The file is created/kept at 0600 so a
+// co-located user on the box can't read it. chmod runs once per process
+// (best-effort): `appendFile`'s mode option only applies when it
+// creates the file, so an existing 0644 log would otherwise stay
+// world-readable.
+const HTTP_DEBUG_LOG_PATH = '/tmp/sidetrack-http-debug.log';
+let httpDebugLogModeEnsured = false;
+const appendHttpDebugLine = async (line: string): Promise<void> => {
+  await appendFile(HTTP_DEBUG_LOG_PATH, line, { mode: 0o600 });
+  if (!httpDebugLogModeEnsured) {
+    httpDebugLogModeEnsured = true;
+    await chmod(HTTP_DEBUG_LOG_PATH, 0o600).catch(() => undefined);
+  }
+};
+
 const readBody = async (request: IncomingMessage): Promise<unknown> => {
   const raw = await new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -651,15 +749,86 @@ const readBody = async (request: IncomingMessage): Promise<unknown> => {
 };
 
 const responseHeaders = {
-  'access-control-allow-headers': 'content-type,x-bac-bridge-key,idempotency-key',
+  'access-control-allow-headers': 'content-type,x-bac-bridge-key,idempotency-key,if-none-match',
   'access-control-allow-methods': 'GET,POST,PATCH,PUT,DELETE,OPTIONS',
   'access-control-allow-origin': '*',
+  'access-control-expose-headers': 'etag',
   'content-type': 'application/json; charset=utf-8',
 };
 
 const sendJson = (response: ServerResponse, status: number, value: unknown): void => {
   response.writeHead(status, responseHeaders);
   response.end(status === 204 ? '' : `${JSON.stringify(value)}\n`);
+};
+
+// Conditional-GET helper: hash the response body, compare against
+// `If-None-Match`, return a body-less 304 if it matches. The companion
+// still computes the response (existing in-memory memos / cachedRoute
+// keep the work cheap), but skips wire-format JSON serialisation cost
+// for the extension AND lets the extension's `loadX` cycle short-circuit
+// without re-decoding + re-setting React state. Wired in the GET dispatch
+// path below; non-GET methods pass straight through.
+const ETAG_OK_STATUSES = new Set<number>([200]);
+// `requestId` is generated per-request (used for log correlation), so
+// it differs even when the underlying response state is unchanged.
+// Strip it from the hash input so polled endpoints that embed it
+// (e.g. /v1/version, /v1/status) still produce a stable ETag.
+// Pattern handles both leading/trailing comma positions.
+const REQUEST_ID_HASH_STRIP_RE = /,?"requestId":"[^"]*"|"requestId":"[^"]*",?/g;
+// Body hash via FNV-1a 64-bit, computed inline. We deliberately do NOT
+// use `node:crypto` here — `createHash('sha256')` on Bun's polyfill
+// allocates a SubtleCrypto wrapper + a chain of helpers (TextEncoder,
+// WeakMap, RegExp, MIMEParams) per call that JSC retains stubbornly.
+// At hot-poll rates (~2 req/s × ~75% reaching this path) those wrappers
+// accumulate into the millions before GC catches up — heap snapshots
+// showed 1.18M SubtleCrypto instances after a few minutes, driving the
+// physical footprint from ~1 GB → 4+ GB. ETag doesn't need crypto-grade
+// collision resistance, just stable digesting; FNV-1a is allocation-free
+// and produces a 16-hex-char fingerprint that's plenty for cache validation.
+const FNV_OFFSET_64_LOW = 0xe6546b64 | 0;
+const FNV_OFFSET_64_HIGH = 0xcbf29ce4 | 0;
+const fnv1a64Hex = (input: string): string => {
+  let lo = FNV_OFFSET_64_LOW;
+  let hi = FNV_OFFSET_64_HIGH;
+  for (let i = 0; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    // XOR low half with current byte.
+    lo = (lo ^ code) | 0;
+    // Multiply [hi:lo] by 1099511628211 = 0x100000001b3. Decompose into
+    // two 32-bit chunks so we can stay in safe-integer arithmetic.
+    // h * 0x100000001b3 = h * 0x1 0000 0000 + h * 0x1b3
+    // Carry through both halves; mask to 32 bits each.
+    const newLo = Math.imul(lo, 0x1b3) | 0;
+    const carry = Math.floor(((lo >>> 0) * 0x1b3) / 0x100000000);
+    const newHi = (Math.imul(hi, 0x1b3) + carry + (lo | 0)) | 0;
+    lo = newLo;
+    hi = newHi;
+  }
+  // 16 hex chars: 8 from high half, 8 from low half. Right-shift then
+  // zero-pad to keep the same width regardless of leading zeros.
+  const hiHex = ((hi >>> 0).toString(16)).padStart(8, '0');
+  const loHex = ((lo >>> 0).toString(16)).padStart(8, '0');
+  return `${hiHex}${loHex}`;
+};
+const computeBodyEtag = (status: number, value: unknown): string | null => {
+  if (!ETAG_OK_STATUSES.has(status)) return null;
+  const serialised = JSON.stringify(value).replace(REQUEST_ID_HASH_STRIP_RE, '');
+  return `"b-${fnv1a64Hex(serialised)}"`;
+};
+const sendJsonWithEtag = (
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+  etag: string,
+): void => {
+  response.writeHead(status, { ...responseHeaders, etag });
+  response.end(status === 204 ? '' : `${JSON.stringify(value)}\n`);
+};
+const send304 = (response: ServerResponse, etag: string): void => {
+  // 304 MUST NOT include a body. Surface ETag so the client can still
+  // refresh its cached copy's validator if it doesn't already store it.
+  response.writeHead(304, { ...responseHeaders, etag });
+  response.end();
 };
 
 const mutationResponse = (
@@ -713,6 +882,22 @@ const isAllowedOrigin = (origin: string | undefined): boolean => {
 
 const isLocalHost = (host: string | undefined): boolean =>
   Boolean(host && /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/u.test(host));
+
+// Explicitly-public paths: reachable without the bridge key. Auth is
+// evaluated BEFORE route matching (so an unauthenticated caller can't
+// enumerate routes via 404-vs-401), which means this allowlist — not
+// the per-route `authRequired: false` flag — is the source of truth for
+// what an unauthenticated caller may reach. It MUST stay in sync with
+// the pre-auth surface the extension relies on:
+//   - /v1/version — the attach/identity probe pinned on first connect
+//                   and compared on every poll (port-reuse detection).
+//   - /v1/health  — the bare liveness probe.
+// The debug/diagnostic routes (/debug/heap-snapshot, /debug/gc) are
+// deliberately absent: they now require auth like every other route.
+const PUBLIC_UNAUTHENTICATED_PATHS: ReadonlySet<string> = new Set(['/v1/version', '/v1/health']);
+
+const isPublicUnauthenticatedPath = (method: string | undefined, pathname: string): boolean =>
+  method === 'GET' && PUBLIC_UNAUTHENTICATED_PATHS.has(pathname);
 
 const requireIdempotencyKey = (request: IncomingMessage): string => {
   const key = request.headers['idempotency-key'];
@@ -1076,6 +1261,7 @@ const kickSemanticRecallPoolRefresh = (vaultRoot: string, embedderUsable: boolea
         })
         .filter((i) => i.text.length > 0);
       if (items.length >= 2) {
+        const { embed, MODEL_ID } = await loadEmbedderModule();
         await getOrBuildSemanticRecallPool(vaultRoot, { items, embed, modelId: MODEL_ID });
       }
     } catch {
@@ -1229,11 +1415,118 @@ const writerForBucket = async (
     : createVaultWriter(bucket.vaultRoot);
 };
 
+// F02 — server-derived caller identity. The auth gate classifies each
+// request by WHICH key authenticated (extension bridge key vs MCP key)
+// and stashes the verdict here, keyed by the request object. Trust
+// enforcement + audit provenance read this — never the voluntary
+// `x-sidetrack-mcp-tool` header, which a caller could simply omit to
+// slip past the gate. A WeakMap so entries are collected with the
+// request and never leak across requests.
+type CallerClass = 'extension' | 'mcp';
+
+interface CallerIdentity {
+  readonly callerClass: CallerClass;
+  // Best-effort client name for `mcp:<client-name>` audit provenance,
+  // sourced from the (still-honoured, LOGGING-only) tool header's
+  // namespace or a client hint. Undefined ⇒ 'mcp' with no sub-name.
+  readonly clientName?: string;
+}
+
+const callerIdentities = new WeakMap<IncomingMessage, CallerIdentity>();
+
+const setCallerIdentity = (request: IncomingMessage, identity: CallerIdentity): void => {
+  callerIdentities.set(request, identity);
+};
+
+// Default to `extension` when unclassified: legacy runtimes / tests that
+// never wire an MCP key see the pre-F02 exempt behaviour, and a request
+// that somehow reached a handler without passing the auth gate is treated
+// as the least-privileged-surprise (extension) rather than crashing.
+const callerIdentityFor = (request: IncomingMessage): CallerIdentity =>
+  callerIdentities.get(request) ?? { callerClass: 'extension' };
+
+// F02 systemic default-deny for MCP-key callers. Trust enforcement is
+// per-tool-per-workstream, but only a HANDFUL of mutating routes call
+// requireWorkstreamTrust — every OTHER mutating route was reachable by an
+// mcp-key caller with zero trust check (self-granting via PUT /trust,
+// deleting/renaming workstreams, mutating settings, writing annotations).
+// The route-dispatch layer now DENIES any mutating method (POST/PUT/PATCH/
+// DELETE) for an mcp caller UNLESS the route is in this explicit allowlist.
+// GET/read routes stay open. Allowed routes STILL run their own
+// requireWorkstreamTrust gate — the allowlist only decides which mutating
+// routes an mcp caller may attempt at all; per-workstream trust is enforced
+// inside the handler as before.
+//
+// The set is derived from the sanctioned workstream write tools
+// (workstreamWriteTools): threads.move (POST /v1/threads + the thread
+// archive/unarchive sub-routes), queue.create (POST /v1/queue),
+// workstreams.bump (POST /v1/workstreams/:id/bump), workstreams.create
+// (POST /v1/workstreams). Trust management (PUT/GET /trust), DELETE/PATCH
+// workstream, PATCH settings, export, and annotation writes are NOT
+// sanctioned MCP operations → they fall through to the default-deny.
+const MCP_ALLOWED_MUTATING_ROUTES: readonly { readonly method: HttpMethod; readonly pattern: RegExp }[] =
+  [
+    // threads.move — a thread upsert that (re)assigns primaryWorkstreamId.
+    { method: 'POST', pattern: /^\/v1\/threads$/ },
+    // threads.archive / threads.unarchive.
+    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/archive$/ },
+    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/unarchive$/ },
+    // queue.create.
+    { method: 'POST', pattern: /^\/v1\/queue$/ },
+    // workstreams.bump.
+    { method: 'POST', pattern: /^\/v1\/workstreams\/[A-Za-z0-9_-]+\/bump$/ },
+    // workstreams.create (child create is trust-gated on the parent inside
+    // the handler; a top-level create passes trust but is still a
+    // sanctioned tool, so it is allowed here).
+    { method: 'POST', pattern: /^\/v1\/workstreams$/ },
+  ];
+
+const MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+// Whether an mcp-key caller may attempt this route at all. Reads (and any
+// non-mutating method) are always permitted; a mutating route is permitted
+// only when it appears in the sanctioned allowlist above.
+const isMcpAllowedRoute = (method: string | undefined, pathname: string): boolean => {
+  if (method === undefined || !MUTATING_METHODS.has(method)) {
+    return true;
+  }
+  return MCP_ALLOWED_MUTATING_ROUTES.some(
+    (route) => route.method === method && route.pattern.test(pathname),
+  );
+};
+
+const auditAgentLabel = (identity: CallerIdentity): string =>
+  identity.callerClass === 'mcp'
+    ? identity.clientName === undefined
+      ? 'mcp'
+      : `mcp:${identity.clientName}`
+    : 'extension';
+
+// Enforce per-workstream MCP write trust. Enforcement is driven by the
+// SERVER-DERIVED caller class, NOT the voluntary tool header. The full
+// model is TWO layers: (1) the route-dispatch layer default-denies any
+// mutating route for an mcp caller unless it is on the sanctioned
+// MCP_ALLOWED_MUTATING_ROUTES allowlist (isMcpAllowedRoute); (2) this
+// function is the second layer, called INSIDE each allowlisted write
+// handler to gate the specific workstream on its granted tool set. An
+// mcp caller that reaches this function has already passed the allowlist;
+// here it still needs explicit per-workstream trust for the tool. The
+// extension surface (user's own bridge key) is exempt from both layers.
+// Also refines the ambient audit context so the resulting audit line
+// records the tool + workstream scope + that trust mode was active.
 const requireWorkstreamTrust = async (
   context: CompanionHttpConfig,
+  request: IncomingMessage,
   workstreamId: string | undefined,
   tool: WorkstreamWriteTool,
 ): Promise<void> => {
+  const identity = callerIdentityFor(request);
+  recordAuditTool(tool, workstreamId ?? null);
+  if (identity.callerClass !== 'mcp') {
+    // Extension surface: exempt from the trust gate.
+    return;
+  }
+  recordAuditTrustModeActive();
   if (workstreamId === undefined || context.vaultRoot === undefined) {
     return;
   }
@@ -1241,12 +1534,73 @@ const requireWorkstreamTrust = async (
     throw new HttpRouteError(
       403,
       'WORKSTREAM_NOT_TRUSTED',
-      'Workstream has not trusted this MCP write tool.',
-      `${tool} is not allowed for workstream ${workstreamId}.`,
+      'Workstream has not granted this MCP write tool.',
+      `${tool} is not trusted for workstream ${workstreamId}. Grant it via the workstream's ` +
+        `Trust panel in the side panel, or PUT /v1/workstreams/${workstreamId}/trust with ` +
+        `allowedTools including "${tool}". (Per-call approval prompts are planned for P2.)`,
     );
   }
 };
 
+// Refine the ambient audit context with the tool + scope for the
+// current write. No-op when no context is bound (direct writer use).
+const recordAuditTool = (tool: string, scope: string | null): void => {
+  const ctx = currentAuditContextMut();
+  if (ctx === undefined) return;
+  ctx.tool = tool;
+  ctx.scope = scope;
+};
+
+const recordAuditTrustModeActive = (): void => {
+  const ctx = currentAuditContextMut();
+  if (ctx !== undefined) ctx.trustModeActive = true;
+};
+
+// Write an audit row for an HTTP write that does NOT flow through the
+// vault writer's own audit() closure (annotation edits/deletes go straight
+// to annotationStore, so they never recorded a provenance line). Mirrors
+// the writer's audit format + on-disk layout (_BAC/audit/<YYYY-MM-DD>.jsonl,
+// one JSON object per line) and merges the ambient request-scoped
+// AuditContext (agent / tool / argsSummary / scope / trustModeActive) so
+// the caller identity is on the line. Best-effort: an audit-write failure
+// must never fail the mutation it records.
+const appendHttpAuditLine = async (
+  vaultRoot: string,
+  event: { readonly requestId: string; readonly route: string; readonly bac_id?: string },
+): Promise<void> => {
+  const timestamp = new Date().toISOString();
+  const provenance = currentAuditContextMut();
+  const base = {
+    requestId: event.requestId,
+    route: event.route,
+    outcome: 'success' as const,
+    ...(event.bac_id === undefined ? {} : { bac_id: event.bac_id }),
+    timestamp,
+  };
+  const enriched =
+    provenance === undefined
+      ? base
+      : {
+          ...base,
+          agent: provenance.agent,
+          tool: provenance.tool,
+          ...(provenance.argsSummary === undefined ? {} : { argsSummary: provenance.argsSummary }),
+          scope: provenance.scope,
+          trustModeActive: provenance.trustModeActive,
+        };
+  // Validate against the shared schema so an invalid line can never reach
+  // disk (the audit reader parses with the same schema).
+  const parsed = auditEventSchema.safeParse(enriched);
+  if (!parsed.success) return;
+  const auditPath = join(vaultRoot, '_BAC', 'audit', `${timestamp.slice(0, 10)}.jsonl`);
+  await mkdir(join(vaultRoot, '_BAC', 'audit'), { recursive: true }).catch(() => undefined);
+  await appendFile(auditPath, `${JSON.stringify(parsed.data)}\n`, 'utf8').catch(() => undefined);
+};
+
+// The tool header is retained for LOGGING during the deprecation window
+// only — enforcement no longer depends on it. Kept as a best-effort
+// provenance hint (which tool a caller CLAIMS to be) even though the
+// server derives the actual trust decision from the authenticating key.
 const mcpToolHeader = (request: IncomingMessage): WorkstreamWriteTool | undefined => {
   const value = request.headers['x-sidetrack-mcp-tool'];
   if (typeof value !== 'string') {
@@ -1279,8 +1633,10 @@ const directorySize = async (path: string): Promise<number> => {
 // ~15-30s, HealthPanel ~30s) with NO in-flight dedupe across its
 // (observed: 6) stacked sockets. Each call is ~0.85s and fully
 // UNCACHED: directorySize() recurses the entire multi-GB _BAC tree,
-// collectWorkGraphHealth re-reads the 15MB connections snapshot +
-// re-merges the event log + fingerprints every training label.
+// and the workGraph section's LIVE fallback (drain-time artifact
+// missing — see system/workGraphHealthArtifact.ts) re-reads the typed
+// event subsets (two FULL eventLog.readMerged passes when
+// SIDETRACK_EVENT_STORE is off) + fingerprints every training label.
 // Concurrent/rapid polls pile up into N overlapping full-tree walks
 // ⇒ a pinned core (the second, non-connections CPU runaway). Mirror
 // the /v1/system/hygiene-status fix (gcInventoryCached): a short TTL
@@ -1357,6 +1713,15 @@ interface ConnectionsResponseCacheEntry {
 }
 const connectionsResponseCache = new Map<string, ConnectionsResponseCacheEntry>();
 const connectionsResponseInFlight = new Map<string, Promise<readonly [number, unknown]>>();
+const connectionsResponseGraphKey = (key: string): string => key.split('|q=', 1)[0] ?? key;
+const pruneConnectionsResponseCacheForGraph = (key: string): void => {
+  const graphKey = connectionsResponseGraphKey(key);
+  for (const cachedKey of connectionsResponseCache.keys()) {
+    if (connectionsResponseGraphKey(cachedKey) !== graphKey) {
+      connectionsResponseCache.delete(cachedKey);
+    }
+  }
+};
 const statSig = async (path: string): Promise<string> => {
   try {
     const s = await stat(path);
@@ -1395,8 +1760,28 @@ const resolveSig = async (path: string): Promise<string> => {
     return 'absent';
   }
 };
-const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> =>
-  (await store.readSnapshotMetadata())?.snapshotRevision ?? 'none';
+const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> => {
+  // Mirror resolveSig's mtime bucketing for the SQLite path. Keying on
+  // the RAW snapshotRevision (a hash of updatedAt+counts that advances on
+  // EVERY drain) busted the resolve-cache on every drain, so the panel's
+  // per-revision re-resolves never hit cache and turned into a
+  // self-perpetuating flood that pegged the companion under live
+  // browsing. Bucket `updatedAt` so a burst of drains within one bucket
+  // collapses to a single key (the documented "≤bucket dry-run-preview
+  // staleness acceptable" tradeoff); nodeCount/edgeCount still rotate the
+  // key on a real graph change, and user mutations call
+  // invalidateResolveCaches() for immediate freshness.
+  const m = await store.readSnapshotMetadata();
+  if (m === null) return 'none';
+  const updatedMs = Date.parse(m.updatedAt);
+  const bucket =
+    RESOLVE_SIG_BUCKET_MS > 0 && Number.isFinite(updatedMs)
+      ? Math.floor(updatedMs / RESOLVE_SIG_BUCKET_MS)
+      : Number.isFinite(updatedMs)
+        ? updatedMs
+        : (m.snapshotRevision ?? 'none');
+  return `${String(bucket)}:${String(m.nodeCount)}:${String(m.edgeCount)}`;
+};
 const connectionsGraphSig = async (store: ConnectionsStore, jsonPath: string): Promise<string> =>
   store instanceof SqliteConnectionsStore ? await sqliteSig(store) : await resolveSig(jsonPath);
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
@@ -1439,6 +1824,11 @@ const cachedConnectionsResponse = async (
   if (inFlight !== undefined) {
     return { result: await inFlight, etag: connectionsResponseEtag(key) };
   }
+  // Each cached /v1/connections response holds its nodes/edges arrays,
+  // which in turn keep that revision's materialized graph alive. Once a
+  // newer graph key is requested, drop older revision responses before
+  // build() calls readCurrent() and allocates the replacement snapshot.
+  pruneConnectionsResponseCacheForGraph(key);
   const compute = (async (): Promise<readonly [number, unknown]> => {
     try {
       const result = await build();
@@ -1450,12 +1840,27 @@ const cachedConnectionsResponse = async (
           etag: connectionsResponseEtag(key),
           computedAtMs: Date.now(),
         });
-        // Bound memory: the key changes every flush, so prune expired
-        // entries when the map grows (each entry can be ~14MB).
-        if (connectionsResponseCache.size > 16) {
-          const now = Date.now();
-          for (const [k, v] of connectionsResponseCache) {
-            if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+        // Bound resident memory: each cached response pins that revision's
+        // full filtered nodes/edges arrays (~14MB). First drop expired
+        // entries, then HARD-cap the count by evicting the oldest (by
+        // compute time). The cache is a pure memo keyed on revision+query,
+        // so a re-computed variant returns byte-identical output — eviction
+        // can only change hit rate, never bytes. Caps the worst-case
+        // resident set at ~N×fullGraph instead of 16×.
+        const MAX_CONNECTIONS_RESPONSE_CACHE = 4;
+        const now = Date.now();
+        for (const [k, v] of connectionsResponseCache) {
+          if (now - v.computedAtMs >= ttlMs) connectionsResponseCache.delete(k);
+        }
+        if (connectionsResponseCache.size > MAX_CONNECTIONS_RESPONSE_CACHE) {
+          const oldestFirst = [...connectionsResponseCache.entries()].sort(
+            (a, b) => a[1].computedAtMs - b[1].computedAtMs,
+          );
+          for (const [k] of oldestFirst.slice(
+            0,
+            oldestFirst.length - MAX_CONNECTIONS_RESPONSE_CACHE,
+          )) {
+            connectionsResponseCache.delete(k);
           }
         }
       }
@@ -1570,6 +1975,30 @@ const cachedRoute = async (
   })();
   routeInFlight.set(key, compute);
   return compute;
+};
+
+const OVER_COLLAPSED_PAGE_CONTENT_HYGIENE_CACHE_TTL_MS = 60_000;
+let overCollapsedPageContentHygieneCache: {
+  readonly vaultRoot: string;
+  readonly computedAtMs: number;
+  readonly records: readonly OverCollapsedRecord[];
+} | null = null;
+
+const scanForOverCollapsedPageContentHygieneCached = async (
+  vaultRoot: string,
+): Promise<readonly OverCollapsedRecord[]> => {
+  const now = Date.now();
+  if (
+    overCollapsedPageContentHygieneCache !== null &&
+    overCollapsedPageContentHygieneCache.vaultRoot === vaultRoot &&
+    now - overCollapsedPageContentHygieneCache.computedAtMs <
+      OVER_COLLAPSED_PAGE_CONTENT_HYGIENE_CACHE_TTL_MS
+  ) {
+    return overCollapsedPageContentHygieneCache.records;
+  }
+  const records = await scanForOverCollapsedPageContent(vaultRoot);
+  overCollapsedPageContentHygieneCache = { vaultRoot, computedAtMs: now, records };
+  return records;
 };
 
 // Hard concurrency cap on the expensive resolve build (readCurrent
@@ -2068,6 +2497,147 @@ const isPrivacyPayloadForType = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+// `types`, when provided, restricts the store scan to those event types
+// at the SQL level (events_type_idx via forEachChunkOfTypes) — O(matching
+// rows) instead of O(all 370K events). The predicate still runs to refine
+// (e.g. by canonicalUrl / tabSession). EVERY type the predicate can
+// accept MUST be in `types` or matching events are missed. Without a hint
+// this falls back to a full forEachChunk scan (legacy callers). This
+// scan was ~4s per fresh /resolve on a real vault and, serialized across
+// a burst of fresh navigations, starved /v1/status past its 45s budget.
+const readEventsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+  predicate: (event: AcceptedEvent) => boolean,
+  types?: readonly string[],
+): Promise<readonly AcceptedEvent[]> => {
+  if (context.vaultRoot === undefined) {
+    return (await eventLog.readMerged()).filter(predicate);
+  }
+  const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+  if (store === null) return (await eventLog.readMerged()).filter(predicate);
+  const events: AcceptedEvent[] = [];
+  const collect = (chunk: readonly AcceptedEvent[]): void => {
+    for (const event of chunk) {
+      if (predicate(event)) events.push(event);
+    }
+  };
+  if (types !== undefined && types.length > 0) {
+    await store.forEachChunkOfTypes(types, collect, 2000);
+  } else {
+    await store.forEachChunk(collect, 2000);
+  }
+  return events;
+};
+
+// Type hints for the readEventsFromStoreOrLog callers (must list every
+// type the corresponding predicate can match).
+const RESOLVER_SIGNAL_EVENT_TYPES = [USER_FLOW_REJECTED, USER_ORGANIZED_ITEM] as const;
+const RESOLVER_EXPAND_EVENT_TYPES = [
+  BROWSER_TIMELINE_OBSERVED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+] as const;
+const PRIVACY_EVENT_TYPES = [
+  PRIVACY_GATE_FLIPPED,
+  PRIVACY_PERMISSION_GRANTED,
+  PRIVACY_PERMISSION_REVOKED,
+] as const;
+const WORKSTREAM_PROJECTION_EVENT_TYPES = [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED] as const;
+// The bootstrap RECONSTRUCTS positives from historical explicit feedback only.
+// It deliberately does NOT read recall.served/recall.action: the served+action
+// snapshot-join path is the per-drain child's job (P1a), and feeding the
+// thousands of historical recall.served impressions into the build here is both
+// wasted work (their only actions are non-trainable click/open) and a ~44s
+// single-tick freeze (synchronous feature extraction over every served set).
+const RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES = [
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+] as const;
+const DISPATCH_PROJECTION_EVENT_TYPES = [DISPATCH_RECORDED, DISPATCH_LINKED] as const;
+const ANNOTATION_PROJECTION_EVENT_TYPES = [
+  ANNOTATION_CREATED,
+  ANNOTATION_NOTE_SET,
+  ANNOTATION_DELETED,
+] as const;
+const FEEDBACK_EVENT_TYPE_LIST = [
+  USER_ORGANIZED_ITEM,
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_TOPIC_RENAMED,
+  USER_SNIPPET_PROMOTED,
+] as const;
+
+// Signature-keyed projection caches. The /v1/visits and /v1/tabsessions
+// endpoints are polled frequently; without this each poll re-projected
+// ~every event (full readMerged() materialization + a full fold), which
+// (measured) churned ~860MB of RSS and kept the readMerged memo warm so
+// its idle TTL never fired. Keyed by the cheap log signature: on an
+// unchanged log we return the cached projection WITHOUT touching
+// readMerged()/the store, so the memo idles out and no garbage is
+// produced. Any shard append/add changes the signature → recompute.
+// Bounded: one entry per vaultRoot, holding the aggregated projection
+// (far smaller than the raw log).
+const urlProjectionCache = new Map<string, { sig: string; proj: UrlProjection }>();
+const tabSessionProjectionCache = new Map<string, { sig: string; proj: TabSessionProjection }>();
+
+const projectUrlsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<UrlProjection> => {
+  const key = context.vaultRoot ?? '<none>';
+  const sig = await eventLog.logSignature();
+  const cached = urlProjectionCache.get(key);
+  if (cached !== undefined && cached.sig === sig) return cached.proj;
+  let proj: UrlProjection;
+  if (context.vaultRoot === undefined) {
+    proj = projectUrls(await eventLog.readMerged());
+  } else {
+    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+    if (store === null) {
+      proj = projectUrls(await eventLog.readMerged());
+    } else {
+      const accumulator = createEmptyUrlProjectionAccumulator();
+      await store.forEachChunk((chunk) => {
+        for (const event of chunk) foldEventIntoUrlProjectionAccumulator(accumulator, event);
+      }, 2000);
+      proj = urlProjectionFromAccumulator(accumulator);
+    }
+  }
+  urlProjectionCache.set(key, { sig, proj });
+  return proj;
+};
+
+const projectTabSessionsFromStoreOrLog = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<TabSessionProjection> => {
+  const key = context.vaultRoot ?? '<none>';
+  const sig = await eventLog.logSignature();
+  const cached = tabSessionProjectionCache.get(key);
+  if (cached !== undefined && cached.sig === sig) return cached.proj;
+  let proj: TabSessionProjection;
+  if (context.vaultRoot === undefined) {
+    proj = projectTabSessions(await eventLog.readMerged());
+  } else {
+    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+    if (store === null) {
+      proj = projectTabSessions(await eventLog.readMerged());
+    } else {
+      const accumulator = createEmptyTabSessionProjectionAccumulator();
+      await store.forEachChunk((chunk) => {
+        for (const event of chunk) foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+      }, 2000);
+      proj = tabSessionProjectionFromAccumulator(accumulator);
+    }
+  }
+  tabSessionProjectionCache.set(key, { sig, proj });
+  return proj;
+};
+
 const isFeedbackEventType = (
   value: unknown,
 ): value is
@@ -2180,7 +2750,7 @@ const loadUrlProjection = async (
     };
   }
   return {
-    projection: projectUrls(await eventLog.readMerged()),
+    projection: await projectUrlsFromStoreOrLog(context, eventLog),
     snapshotRevision: snapshot?.snapshotRevision ?? null,
   };
 };
@@ -2203,16 +2773,10 @@ const loadTabSessionProjection = async (
   }
   const snapshot = await context.connectionsStore?.readCurrent();
   const snapshotRevision = snapshot?.snapshotRevision ?? null;
-  // Re-fold from the event log at most once (cold start / pre-R1
-  // snapshot) and reuse it for BOTH projections.
-  type Merged = Awaited<ReturnType<EventLog['readMerged']>>;
-  let merged: Merged | undefined;
-  const ensureMerged = async (): Promise<Merged> =>
-    merged ?? (merged = await eventLog.readMerged());
   const tab =
     snapshot?.tabSessionProjection !== undefined
       ? deserializeTabSessionProjection(snapshot.tabSessionProjection)
-      : projectTabSessions(await ensureMerged());
+      : await projectTabSessionsFromStoreOrLog(context, eventLog);
   // Same snapshot's URL projection (no extra re-fold in steady state) —
   // a chat thread the user filed via the Current-tab card is a URL
   // attribution; overlay it so All-threads / inbox / the resolver stop
@@ -2220,7 +2784,7 @@ const loadTabSessionProjection = async (
   const url =
     snapshot?.urlProjection !== undefined
       ? deserializeUrlProjection(snapshot.urlProjection)
-      : projectUrls(await ensureMerged());
+      : await projectUrlsFromStoreOrLog(context, eventLog);
   return {
     projection: overlayUrlAttributionOntoTabSessions(tab, url),
     snapshotRevision,
@@ -2233,7 +2797,10 @@ const routes: readonly RouteDefinition[] = [
         {
           method: 'POST' as const,
           pattern: /^\/debug\/heap-snapshot$/,
-          authRequired: false,
+          // Diagnostic route: dumps a full heap snapshot to disk. Auth
+          // required — it must never be an unauthenticated data-leak
+          // vector even when DEBUG_HEAP_SNAPSHOT=1 is set.
+          authRequired: true,
           handle: async () => {
             const path = await writeDebugHeapSnapshot();
             return [201, { data: { path } }] as const;
@@ -2242,7 +2809,8 @@ const routes: readonly RouteDefinition[] = [
         {
           method: 'POST' as const,
           pattern: /^\/debug\/gc$/,
-          authRequired: false,
+          // Diagnostic route: forces a GC. Auth required.
+          authRequired: true,
           handle: async () => {
             const before = process.memoryUsage().rss;
             (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc?.(true);
@@ -2613,7 +3181,16 @@ const routes: readonly RouteDefinition[] = [
       }
       return [
         200,
-        { data: projectPrivacy(privacyEventsFrom(await context.eventLog.readMerged())) },
+        {
+          data: projectPrivacy(
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isPrivacyEventType(event.type),
+              PRIVACY_EVENT_TYPES,
+            ),
+          ),
+        },
       ];
     },
   },
@@ -2655,7 +3232,14 @@ const routes: readonly RouteDefinition[] = [
           {
             data: {
               accepted,
-              projection: projectPrivacy(privacyEventsFrom(await eventLog.readMerged())),
+              projection: projectPrivacy(
+                await readEventsFromStoreOrLog(
+                  context,
+                  eventLog,
+                  (event) => isPrivacyEventType(event.type),
+                  PRIVACY_EVENT_TYPES,
+                ),
+              ),
             },
           },
         ];
@@ -2712,7 +3296,19 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      return [200, { data: projectFeedback(await context.eventLog.readMerged()) }];
+      return [
+        200,
+        {
+          data: projectFeedback(
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isFeedbackEventType(event.type),
+              FEEDBACK_EVENT_TYPE_LIST,
+            ),
+          ),
+        },
+      ];
     },
   },
   {
@@ -2826,10 +3422,14 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const merged = await context.eventLog!.readMerged();
           const resolverEvents = usesSqliteSubgraph
-            ? resolverSignalEventsForTabSession(merged, tabSessionId)
-            : merged;
+            ? await readEventsFromStoreOrLog(
+                context,
+                context.eventLog!,
+                (event) => resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+                RESOLVER_SIGNAL_EVENT_TYPES,
+              )
+            : await context.eventLog!.readMerged();
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
           const { projection } = await loadTabSessionProjection(context, context.eventLog!);
           if (!projection.bySessionId.has(tabSessionId)) {
@@ -2924,6 +3524,14 @@ const routes: readonly RouteDefinition[] = [
           if (!projection.bySessionId.has(tabSessionId)) {
             throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
           }
+          const resolverEvents = usesSqliteSubgraph
+            ? await readEventsFromStoreOrLog(
+                context,
+                eventLog,
+                (event) => resolverSignalEventsForTabSession([event], tabSessionId).length > 0,
+                RESOLVER_SIGNAL_EVENT_TYPES,
+              )
+            : await eventLog.readMerged();
           const policyMode = optionalAttributionPolicyMode(body['policyMode'], 'policyMode');
           const policyTelemetry = optionalAttributionPolicyTelemetry(
             body['policyTelemetry'],
@@ -2933,6 +3541,8 @@ const routes: readonly RouteDefinition[] = [
             eventLog,
             snapshot,
             tabSessionId,
+            events: resolverEvents,
+            ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
             ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
             ...(policyMode === undefined ? {} : { policyMode }),
             ...(policyTelemetry === undefined ? {} : { policyTelemetry }),
@@ -3139,7 +3749,17 @@ const routes: readonly RouteDefinition[] = [
               : null;
           const usesSqliteSubgraph = sqliteStore !== null;
           const preloadedMerged =
-            usesSqliteSubgraph && expandEventCandidates ? await context.eventLog!.readMerged() : null;
+            usesSqliteSubgraph && expandEventCandidates
+              ? await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog!,
+                  (event) =>
+                    event.type === BROWSER_TIMELINE_OBSERVED ||
+                    event.type === USER_FLOW_REJECTED ||
+                    event.type === USER_ORGANIZED_ITEM,
+                  RESOLVER_EXPAND_EVENT_TYPES,
+                )
+              : null;
           const expandedCandidateUrls =
             preloadedMerged === null
               ? []
@@ -3185,7 +3805,17 @@ const routes: readonly RouteDefinition[] = [
               ];
             }
           }
-          const merged = preloadedMerged ?? (await context.eventLog!.readMerged());
+          const merged =
+            preloadedMerged ??
+            (usesSqliteSubgraph
+              ? await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog!,
+                  (event) =>
+                    event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+                  RESOLVER_SIGNAL_EVENT_TYPES,
+                )
+              : await context.eventLog!.readMerged());
           const resolverEvents =
             usesSqliteSubgraph && expandEventCandidates
               ? [
@@ -3309,7 +3939,18 @@ const routes: readonly RouteDefinition[] = [
           }
           misses.push(canonicalUrl);
         }
-        const merged = misses.length === 0 ? [] : await context.eventLog.readMerged();
+        const merged =
+          misses.length === 0
+            ? []
+            : await readEventsFromStoreOrLog(
+                context,
+                context.eventLog,
+                (event) =>
+                  event.type === BROWSER_TIMELINE_OBSERVED ||
+                  event.type === USER_FLOW_REJECTED ||
+                  event.type === USER_ORGANIZED_ITEM,
+                RESOLVER_EXPAND_EVENT_TYPES,
+              );
         const expandedCandidateUrlsByTarget =
           eventCandidateTargetSet.size === 0
             ? new Map<string, readonly string[]>()
@@ -3460,15 +4101,20 @@ const routes: readonly RouteDefinition[] = [
           body['policyTelemetry'],
           'policyTelemetry',
         );
-        const merged = await eventLog.readMerged();
         const resolverEvents = usesSqliteSubgraph
-          ? resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl])
-          : merged;
+          ? await readEventsFromStoreOrLog(
+              context,
+              eventLog,
+              (event) => resolverSignalEventsForCanonicalUrls([event], [canonicalUrl]).length > 0,
+              RESOLVER_SIGNAL_EVENT_TYPES,
+            )
+          : await eventLog.readMerged();
         const result = await autoApplyUrlAttribution({
           eventLog,
           snapshot,
           canonicalUrl,
           events: resolverEvents,
+          ...(context.vaultRoot === undefined ? {} : { vaultRoot: context.vaultRoot }),
           ...(snapshotProjection === undefined ? {} : { urlProjection: snapshotProjection }),
           ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
           ...(policyMode === undefined ? {} : { policyMode }),
@@ -3712,18 +4358,41 @@ const routes: readonly RouteDefinition[] = [
               vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
               captureSummary: () => captureHealthSummary(vaultRoot),
               recallSummary: async () => {
-                const [index, info, lifecycleReport, modelStatus] = await Promise.all([
-                  readIndex(indexPath),
+                // Recall serves from recall-v2 (sqlite-vec). The legacy
+                // index.bin is deprecated; reading + parsing it here (24MB)
+                // was both wrong and SLOW — it timed out this probe under
+                // load, surfacing as a permanent false "degraded". Use a
+                // cheap v2 sqlite stat + (when the store is already open)
+                // its doc count, so the probe is fast and reflects the
+                // actually-served backend.
+                const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+                const v2SqlitePath = join(vaultRoot, '_BAC', 'recall', 'v2', 'index.sqlite');
+                const [info, modelStatus, v2Store, v2Stat] = await Promise.all([
                   stat(indexPath).catch(() => undefined),
-                  context.recallLifecycle?.report() ?? Promise.resolve(undefined),
                   getModelCacheStatus().catch(() => undefined),
+                  peekRecallV2Store(vaultRoot).catch(() => undefined),
+                  stat(v2SqlitePath).catch(() => undefined),
                 ]);
-                const indexExists = index !== null;
+                const v2DocCount = v2Store !== undefined ? v2Store.documentCount() : null;
+                const v2Present =
+                  (v2DocCount !== null && v2DocCount > 0) ||
+                  (v2Stat !== undefined && v2Stat.size > 0);
+                // The legacy recall-lifecycle report runs countTurnsInEventLog
+                // — a FULL scan of the entire event store that blew the 5s
+                // health budget on a real-size vault (the ~5.0s /v1/system/health
+                // wall). It's vestigial once v2 (sqlite-vec) is the served
+                // backend (status is already reported 'ready' from v2 below),
+                // so only pay the scan on a legacy non-v2 vault that still
+                // depends on those drift fields.
+                const lifecycleReport = v2Present
+                  ? undefined
+                  : await (context.recallLifecycle?.report() ?? Promise.resolve(undefined));
+                const indexExists = v2Present;
                 return {
                   indexExists,
-                  entryCount: index?.items.length ?? null,
-                  modelId: index?.modelId ?? null,
-                  sizeBytes: info?.size ?? null,
+                  entryCount: v2DocCount,
+                  modelId: modelStatus?.modelId ?? null,
+                  sizeBytes: v2Stat?.size ?? info?.size ?? null,
                   semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
                   // Lifecycle fields are optional so legacy callers
                   // (no recallLifecycle injected) keep the old shape.
@@ -3744,6 +4413,11 @@ const routes: readonly RouteDefinition[] = [
                         embedderAccelerator: lifecycleReport.embedderAccelerator,
                         drift: lifecycleReport.drift,
                       }),
+                  // recall-v2 is the served backend; when it's present,
+                  // recall is ready regardless of the deprecated legacy
+                  // lifecycle's status (which would otherwise force a false
+                  // "degraded" on a v2-only vault).
+                  ...(v2Present ? { status: 'ready' as const } : {}),
                   ...(context.recallActivity === undefined
                     ? {}
                     : { activity: context.recallActivity.report() }),
@@ -3762,17 +4436,94 @@ const routes: readonly RouteDefinition[] = [
                 };
               },
               serviceStatus: async () => {
+                // `installed` still comes from the installer (plist/unit
+                // existence), which is what "installed" honestly means.
+                // `running`, however, must reflect ACTUAL process
+                // liveness — the installer inferred it from plist
+                // existence, so a crashed-but-installed service read as
+                // "running" forever. Probe real liveness (launchctl /
+                // systemctl); only when the probe is `unknown` (tool
+                // absent / timed out) do we fall back to the installer's
+                // heuristic rather than claim a false negative.
                 const status = await (context.serviceInstaller ?? pickInstaller()).status();
-                return { installed: status.installed, running: status.running };
+                const liveness = await (
+                  context.serviceLiveness ?? (() => probeServiceLiveness(process.platform))
+                )();
+                return {
+                  installed: status.installed,
+                  running: resolveServiceRunning(status.running, liveness),
+                };
               },
-              workGraphSummary: () =>
-                collectWorkGraphHealth({
+              eventLaneHealth: getEventLaneHealth,
+              storeReconciliation: async () => {
+                // Cheap store-vs-JSONL reconciliation the store ALREADY
+                // knows: its physical row count vs the sum of its
+                // per-replica watermarks (the count it believes it
+                // accepted). A non-zero delta ⇒ committed events the
+                // store thinks it holds are missing, or seqs are sparse —
+                // either way a durability red flag. Never a full JSONL
+                // scan: getSharedEventStore returns the already-open store
+                // (or null when the event store is off) and count() /
+                // watermark() are single indexed queries.
+                const store = await getSharedEventStore(vaultRoot);
+                if (store === null) return null;
+                const storeRowCount = store.count();
+                const watermark = store.watermark();
+                const expectedFromWatermark = Object.values(watermark).reduce(
+                  (sum, seq) => sum + seq,
+                  0,
+                );
+                return {
+                  storeRowCount,
+                  expectedFromWatermark,
+                  delta: expectedFromWatermark - storeRowCount,
+                };
+              },
+              ...(context.rankerHealth === undefined
+                ? {}
+                : { rankerHealth: context.rankerHealth }),
+              ...(context.mcpChildHealth === undefined
+                ? {}
+                : { mcpChildHealth: context.mcpChildHealth }),
+              workGraphSummary: async () => {
+                // Drain-time artifact first: the connections drain
+                // materializes workgraph-health.json after every
+                // successful pass (runtime/companion.ts onDrainSuccess),
+                // keeping the cold-boot path off the heavy live collect
+                // that used to blow the 5s budget and pin the section
+                // on 'unavailable'. The serve gate is symmetric with
+                // the writer's (eventStoreEnabled) AND age-bounded:
+                // the writer only refreshes while the event store is
+                // on, so a restart without SIDETRACK_EVENT_STORE=1
+                // would otherwise serve a frozen snapshot forever —
+                // drains succeed, the hook no-ops, sync.materializers
+                // stays green, and nothing surfaces the staleness.
+                // Missing/corrupt/schema-mismatched/stale ⇒ live
+                // compute below, unchanged.
+                if (eventStoreEnabled()) {
+                  const artifact = await readWorkGraphHealthArtifact(vaultRoot);
+                  if (artifact !== null && isWorkGraphHealthArtifactFresh(artifact)) {
+                    return artifact.report;
+                  }
+                }
+                // Phase 4 — peek the canonical SQLite recall store so
+                // health reports live document/chunk vector counts.
+                // Non-blocking: returns undefined when the store
+                // hasn't been opened yet (no /v2/recall fired since
+                // companion start), in which case counts default to 0.
+                const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+                const canonicalRecallStore = await peekRecallV2Store(vaultRoot);
+                return collectWorkGraphHealth({
                   vaultRoot,
                   ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
                   ...(context.connectionsDiagnostics === undefined
                     ? {}
                     : { connectionsDiagnostics: context.connectionsDiagnostics }),
-                }),
+                  ...(canonicalRecallStore === undefined
+                    ? {}
+                    : { canonicalRecallStore }),
+                });
+              },
               ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
             }),
           ),
@@ -3813,9 +4564,10 @@ const routes: readonly RouteDefinition[] = [
           if (timer !== undefined) clearTimeout(timer);
         }
       };
-      const [gc, pageContent] = await Promise.all([
+      const [gc, pageContent, overCollapsedRecords] = await Promise.all([
         gcInventoryCached(vaultRoot),
         budget(() => pageContentCoverageCounts(vaultRoot), 4_000),
+        budget(() => scanForOverCollapsedPageContentHygieneCached(vaultRoot), 4_000),
       ]);
       return [
         200,
@@ -3823,10 +4575,21 @@ const routes: readonly RouteDefinition[] = [
           data: {
             ...(context.hygieneStatus ?? {}),
             asOf: new Date().toISOString(),
-            availability: { gc: gc.availability, pageContent: pageContent.availability },
+            availability: {
+              gc: gc.availability,
+              pageContent: pageContent.availability,
+              overCollapsedRecords: overCollapsedRecords.availability,
+            },
             gcAsOf: gc.asOf,
             gc: gc.value,
             pageContent: pageContent.value,
+            overCollapsedRecords:
+              overCollapsedRecords.value === null
+                ? null
+                : {
+                    count: overCollapsedRecords.value.length,
+                    samples: overCollapsedRecords.value.slice(0, 5),
+                  },
           },
         },
       ];
@@ -4076,6 +4839,11 @@ const routes: readonly RouteDefinition[] = [
           });
           const redaction = redact(input.body);
           const tokenEstimate = estimateTokens(redaction.output);
+          // Provider-aware warning threshold. The chat surface for each
+          // provider caps context well below the raw API window; see
+          // safety/tokenBudget.ts for the (approximate) per-provider map.
+          const tokenThreshold = tokenThresholdForProvider(input.target.provider);
+          const tokenBudgetExceeded = tokenEstimate > tokenThreshold;
           const dispatchEvent = {
             ...input,
             bac_id: input.bac_id ?? createDispatchId(),
@@ -4127,10 +4895,26 @@ const routes: readonly RouteDefinition[] = [
           return [
             201,
             {
-              data: result,
-              ...(tokenEstimate > tokenBudgetWarningThreshold
-                ? { warnings: ['token-budget-exceeded'] }
-                : {}),
+              data: {
+                ...result,
+                // F01: return the SAFE text the companion stored so the
+                // extension can render/copy exactly that instead of the
+                // caller's pre-redaction original. `body` is redacted;
+                // `redaction.rules` are the applied rule ids.
+                body: dispatchEvent.body,
+                redactionSummary: dispatchEvent.redactionSummary,
+                redaction: {
+                  applied: redaction.matched > 0,
+                  rules: [...redaction.categories],
+                },
+                tokenEstimate,
+                tokenWarning: {
+                  provider: input.target.provider,
+                  threshold: tokenThreshold,
+                  exceeded: tokenBudgetExceeded,
+                },
+              },
+              ...(tokenBudgetExceeded ? { warnings: ['token-budget-exceeded'] } : {}),
             },
           ];
         },
@@ -4212,9 +4996,11 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readMerged();
-      const dispatchEvents = merged.filter(
+      const dispatchEvents = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
         (event) => event.type === DISPATCH_RECORDED || event.type === DISPATCH_LINKED,
+        DISPATCH_PROJECTION_EVENT_TYPES,
       );
       return [200, { data: projectDispatches(dispatchEvents) }];
     },
@@ -4898,8 +5684,17 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
+      const vaultRoot = requireVaultRoot(context);
       const input = annotationUpdateSchema.parse(await readBody(request));
-      const updated = await updateAnnotation(requireVaultRoot(context), match.annotationId, input);
+      const updated = await updateAnnotation(vaultRoot, match.annotationId, input);
+      // Annotation edits go straight to annotationStore, bypassing the vault
+      // writer's audit() closure — record a provenance line here so an mcp
+      // (or extension) caller's edit is attributable in the audit log.
+      await appendHttpAuditLine(vaultRoot, {
+        requestId,
+        route: 'updateAnnotation',
+        bac_id: match.annotationId,
+      });
       if (context.eventLog !== undefined && typeof input.note === 'string') {
         await context.eventLog
           .appendServerObserved({
@@ -4921,11 +5716,26 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
-      const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
-      if (context.eventLog !== undefined && context.replica !== undefined) {
+      const vaultRoot = requireVaultRoot(context);
+      const result = await softDeleteAnnotation(vaultRoot, match.annotationId);
+      // Annotation deletes bypass the vault writer's audit() closure —
+      // record a provenance line here so a delete is attributable.
+      await appendHttpAuditLine(vaultRoot, {
+        requestId,
+        route: 'deleteAnnotation',
+        bac_id: match.annotationId,
+      });
+      // Emit ANNOTATION_DELETED whenever an event log is configured. The
+      // clientEventId falls back to a stable 'local' replica placeholder
+      // when no replica is bound — previously the whole event was SKIPPED
+      // if replica was undefined, so a delete could vanish from the log
+      // (and from peers) on any companion without a replica context.
+      // requestId already makes the key unique per call.
+      if (context.eventLog !== undefined) {
+        const replicaId = context.replica?.replicaId ?? 'local';
         await context.eventLog
           .appendServerObserved({
-            clientEventId: `annotation-delete:${context.replica.replicaId}:${match.annotationId}:${requestId}`,
+            clientEventId: `annotation-delete:${replicaId}:${match.annotationId}:${requestId}`,
             aggregateId: match.annotationId,
             type: ANNOTATION_DELETED,
             payload: { bac_id: match.annotationId },
@@ -4947,12 +5757,14 @@ const routes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readMerged();
-      const annotationEvents = merged.filter(
+      const annotationEvents = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
         (event) =>
           event.type === ANNOTATION_CREATED ||
           event.type === ANNOTATION_NOTE_SET ||
           event.type === ANNOTATION_DELETED,
+        ANNOTATION_PROJECTION_EVENT_TYPES,
       );
       return [200, { data: projectAnnotations(annotationEvents) }];
     },
@@ -5038,6 +5850,7 @@ const routes: readonly RouteDefinition[] = [
       // does one read+write regardless of batch size.
       const vaultRoot = requireVaultRoot(context);
       const input = recallIndexSchema.parse(await readBody(request));
+      const { embed, MODEL_ID } = await loadEmbedderModule();
       const vectors = await embed(input.items.map((item) => item.text));
       const entries: { id: string; threadId: string; capturedAt: string; embedding: Float32Array }[] = [];
       const indexedThreadIds: string[] = [];
@@ -5147,6 +5960,7 @@ const routes: readonly RouteDefinition[] = [
       if (!isVectorUsable(vectorStateAtQuery)) {
         vectorMode = vectorStateAtQuery === 'failed' ? 'skipped-failed' : 'skipped-warming';
       } else {
+        const { embed, MODEL_ID, RecallModelMissingError } = await loadEmbedderModule();
         try {
           [queryEmbedding] = await embed([query.q]);
         } catch (error) {
@@ -5440,6 +6254,38 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    method: 'POST',
+    pattern: /^\/v1\/page-content\/recanonicalize$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const body = await readBody(request);
+      const record = objectRecord(body);
+      const canonicalUrl =
+        typeof body === 'string'
+          ? body
+          : typeof record?.['canonicalUrl'] === 'string'
+            ? record['canonicalUrl']
+            : undefined;
+      if (canonicalUrl === undefined || canonicalUrl.trim().length === 0) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'canonicalUrl is required.',
+          'POST /v1/page-content/recanonicalize requires a canonicalUrl string body.',
+        );
+      }
+      const coverage = await writePageContentTombstoned(vaultRoot, {
+        payloadVersion: 1,
+        canonicalUrl,
+        tombstonedAt: new Date().toISOString(),
+        reason: 'user-delete',
+        dimensions: { source: 'recanonicalize' },
+      });
+      return [200, { data: { tombstoned: true, canonicalUrl: coverage.canonicalUrl } }];
+    },
+  },
+  {
     method: 'GET',
     pattern: /^\/v1\/page-content\/coverage(?:\?.*)?$/,
     authRequired: true,
@@ -5486,14 +6332,132 @@ const routes: readonly RouteDefinition[] = [
       // degrade gracefully when the model is still warming up. Same
       // status the /v1/status endpoint exposes.
       const embedderState = context.getEmbedderStatus?.()?.state;
+      // Phase 0 — wire impression logging. When the event log is
+      // configured, every /v2/recall response writes a
+      // `recall.served` event the trainer (Phase 3) can read. Append
+      // is fire-and-forget inside the pipeline.
+      const eventLog = context.eventLog;
+      const appendImpression = eventLog === undefined
+        ? undefined
+        : async (payload: RecallServedPayload): Promise<void> => {
+            await eventLog.appendServerObserved({
+              clientEventId: `recall.served:${payload.servedContextId}:${String(payload.sequenceNumber)}`,
+              aggregateId: payload.servedContextId,
+              type: RECALL_SERVED,
+              payload: payload as unknown as Record<string, unknown>,
+            });
+          };
+      // Phase 5 — cross-encoder rerank ON by default in the dogfood
+      // serving path. The pipeline library's default is 0 (off) for
+      // test determinism; production /v2 endpoint applies
+      // DOGFOOD_RERANK_TOP_K unless the caller overrides explicitly.
+      // 20 candidates × ~5ms/pair on MiniLM-L-6-v2 ≈ ~100ms added per
+      // request. Tune via the eval harness; calibration follow-up.
+      const DOGFOOD_RERANK_TOP_K = 20;
+      const reqWithDefaultRerank: import('../recall-v2/types.js').RecallRequest = {
+        ...req,
+        strategy: {
+          ...(req.strategy ?? {}),
+          rerankTopK: req.strategy?.rerankTopK ?? DOGFOOD_RERANK_TOP_K,
+        },
+      };
+      // P3 — learned-rerank context loader. Reads the CURRENT connections
+      // snapshot + the feedback-only event window (the SAME merged the
+      // impression trainer used: RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+      // indexed) so serve features match train features exactly. Invoked
+      // only on the background TTL refresh AND only after the serve gate
+      // passes (active impression-trained ship-gate-passed model) — never
+      // inline on the request path. Omitted (→ feature off) without a
+      // connections store / event log.
+      const connectionsStore = context.connectionsStore;
+      const learnedRerankContext =
+        connectionsStore === undefined || eventLog === undefined
+          ? undefined
+          : async (): Promise<
+              import('../recall-v2/learnedRerank.js').LearnedRerankContext | null
+            > => {
+              const snapshot = await connectionsStore.readCurrent();
+              if (snapshot === null) return null;
+              const feedbackTypes = RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES as readonly string[];
+              const merged = await readEventsFromStoreOrLog(
+                context,
+                eventLog,
+                (event) => feedbackTypes.includes(event.type),
+                RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+              );
+              return { snapshot, merged };
+            };
       const response = await runRecallV2(
-        { vaultRoot, ...(embedderState === undefined ? {} : { embedderState }) },
-        req,
+        {
+          vaultRoot,
+          ...(embedderState === undefined ? {} : { embedderState }),
+          ...(appendImpression === undefined ? {} : { appendImpression }),
+          ...(learnedRerankContext === undefined ? {} : { learnedRerankContext }),
+        },
+        reqWithDefaultRerank,
       );
       // Wrap in { data } to match the rest of the v1 API convention so
       // the bridge clients (recallV2 in pageContentClient.ts) can
       // unwrap consistently with the other endpoints.
       return [200, { data: response }];
+    },
+  },
+  {
+    // Phase 0 — POST /v1/recall/action. The extension echoes a user
+    // action (click / open-new-tab / explicit feedback) on a served
+    // candidate back to the companion. The companion appends a
+    // `recall.action` event tied to the parent `recall.served` by
+    // servedContextId. The group-level ranker trainer (Phase 3)
+    // joins the two to build training groups.
+    //
+    // Body shape: RecallActionPayload (see recall/events.ts).
+    // Idempotency: the X-Idempotency-Key header is the clientEventId,
+    // so duplicate POSTs collapse to one event.
+    method: 'POST',
+    pattern: /^\/v1\/recall\/action$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'event log not configured for this companion',
+        );
+      }
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'recallAction', idempotencyKey, async () => {
+        const body = await readBody(request);
+        if (!isRecallActionPayload(body)) {
+          throw new HttpRouteError(
+            400,
+            'INVALID_REQUEST',
+            'body did not match RecallActionPayload',
+            'POST /v1/recall/action body failed payload validation.',
+          );
+        }
+        const accepted = await eventLog.appendClientObserved({
+          clientEventId: idempotencyKey,
+          aggregateId: body.servedContextId,
+          type: RECALL_ACTION,
+          payload: body as unknown as Record<string, unknown>,
+          // {} = "browser observed nothing"; the parent recall.served
+          // already lives on the same aggregate, and the deps the
+          // system stamps from frontier will pick it up automatically.
+          baseVector: {},
+        });
+        return [
+          201,
+          {
+            data: {
+              accepted: true,
+              clientEventId: accepted.clientEventId,
+              servedContextId: body.servedContextId,
+              actionKind: body.actionKind,
+            },
+          },
+        ];
+      });
     },
   },
   {
@@ -5535,7 +6499,14 @@ const routes: readonly RouteDefinition[] = [
       }
       return [
         202,
-        { data: await rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')) },
+        // Lazy: recall/rebuild.ts is on the /v1/status forbidden-import
+          // list (statusContract.test.ts) — load it when the rebuild route
+          // actually fires.
+          {
+            data: await (
+              await import('../recall/rebuild.js')
+            ).rebuildFromEventLog(vaultRoot, join(vaultRoot, '_BAC', 'events')),
+          },
       ];
     },
   },
@@ -5601,7 +6572,17 @@ const routes: readonly RouteDefinition[] = [
               'Connections snapshot is not ready.',
             );
           }
-          const merged = await eventLog.readMerged();
+          // resolveThreadAttribution only consumes USER_FLOW_REJECTED /
+          // USER_ORGANIZED_ITEM from `events` (same as the URL/tab-session
+          // resolver), so read just those via the events_type_idx instead of
+          // the whole log — this was the dominant cost of the per-thread
+          // suggestion fan-out (readMerged whole log, 7-22s under load).
+          const merged = await readEventsFromStoreOrLog(
+            context,
+            eventLog,
+            (event) => event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+            RESOLVER_SIGNAL_EVENT_TYPES,
+          );
           const resolution = resolveThreadAttribution({
             threadId: target.threadId,
             ...(target.providerThreadId === undefined
@@ -5726,10 +6707,36 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/threads$/,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
-      const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
-      const tool = mcpToolHeader(request);
-      if (tool === 'sidetrack.threads.move') {
-        await requireWorkstreamTrust(context, input.primaryWorkstreamId, tool);
+      const vaultRoot = requireVaultRoot(context);
+      const input = await parseThreadUpsertBody(vaultRoot, await readBody(request));
+      // Enforce trust for MCP-key callers regardless of the (voluntary,
+      // now logging-only) tool header. A thread upsert that sets a
+      // primaryWorkstreamId is a move; gate it on the DESTINATION
+      // workstream.
+      await requireWorkstreamTrust(
+        context,
+        request,
+        input.primaryWorkstreamId,
+        'sidetrack.threads.move',
+      );
+      // ALSO gate on the SOURCE workstream — the thread's CURRENT
+      // primaryWorkstreamId — mirroring archive/unarchive which gate on
+      // readThreadWorkstreamId. Without this, an mcp caller could steal a
+      // thread OUT of an untrusted workstream (destination-only checks let
+      // "move untrusted A → trusted B" and detach-to-null slip through with
+      // zero source trust). A brand-new thread (no bac_id, nothing on disk)
+      // has no source scope, so this is a no-op create. Detach (destination
+      // null/absent) is still gated on the source here.
+      if (input.bac_id !== undefined) {
+        const sourceWorkstreamId = await readThreadWorkstreamId(vaultRoot, input.bac_id);
+        if (sourceWorkstreamId !== undefined && sourceWorkstreamId !== input.primaryWorkstreamId) {
+          await requireWorkstreamTrust(
+            context,
+            request,
+            sourceWorkstreamId,
+            'sidetrack.threads.move',
+          );
+        }
       }
       const result = await context.vaultWriter.upsertThread(input, requestId);
       // Mirror the upsert as a `thread.upserted` AcceptedEvent so
@@ -5798,6 +6805,22 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // §13 step 13 — user-facing Markdown export of a single thread.
+    // Same shape + atomic-write path as the workstream export. Normal
+    // bridge-key route.
+    method: 'POST',
+    pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/export$/,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      requireVaultRoot(context);
+      const result = await context.vaultWriter.exportThread(match.bacId);
+      return [200, { data: { files: [...result.files] } }];
+    },
+  },
+  {
     method: 'POST',
     pattern: /^\/v1\/threads\/(?<bacId>[A-Za-z0-9_-]+)\/archive$/,
     authRequired: true,
@@ -5806,13 +6829,12 @@ const routes: readonly RouteDefinition[] = [
         throw new Error('Missing bacId path parameter.');
       }
       const vaultRoot = requireVaultRoot(context);
-      if (mcpToolHeader(_request) === 'sidetrack.threads.archive') {
-        await requireWorkstreamTrust(
-          context,
-          await readThreadWorkstreamId(vaultRoot, match.bacId),
-          'sidetrack.threads.archive',
-        );
-      }
+      await requireWorkstreamTrust(
+        context,
+        _request,
+        await readThreadWorkstreamId(vaultRoot, match.bacId),
+        'sidetrack.threads.archive',
+      );
       const result = await context.vaultWriter.archiveThread(match.bacId, requestId);
       // Mirror as a thread.archived event so peers see the status
       // change via sync. clientEventId is deterministic per
@@ -5853,13 +6875,12 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'sidetrack.threads.unarchive') {
-        await requireWorkstreamTrust(
-          context,
-          await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
-          'sidetrack.threads.unarchive',
-        );
-      }
+      await requireWorkstreamTrust(
+        context,
+        _request,
+        await readThreadWorkstreamId(requireVaultRoot(context), match.bacId),
+        'sidetrack.threads.unarchive',
+      );
       const result = await context.vaultWriter.unarchiveThread(match.bacId, requestId);
       if (context.eventLog !== undefined && context.replica !== undefined) {
         await context.eventLog
@@ -5884,6 +6905,15 @@ const routes: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
       const input = workstreamCreateSchema.parse(await readBody(request));
+      // F32 — creating a CHILD workstream is trust-gated on the parent
+      // for MCP-key callers; a top-level create (no parentId) has no
+      // scope to check and passes. Extension surface is exempt.
+      await requireWorkstreamTrust(
+        context,
+        request,
+        input.parentId,
+        'sidetrack.workstreams.create',
+      );
       const result = await context.vaultWriter.createWorkstream(input, requestId);
       if (context.eventLog !== undefined) {
         await context.eventLog
@@ -5895,7 +6925,10 @@ const routes: readonly RouteDefinition[] = [
               bac_id: result.bac_id,
               title: input.title,
               ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
-              ...(input.privacy === undefined ? {} : { privacy: input.privacy }),
+              // Match the writer's default (createWorkstream stamps
+              // `privacy: input.privacy ?? 'private'`) so the event log
+              // never disagrees with the persisted record.
+              privacy: input.privacy ?? 'private',
               ...(input.screenShareSensitive === undefined
                 ? {}
                 : { screenShareSensitive: input.screenShareSensitive }),
@@ -5932,18 +6965,21 @@ const routes: readonly RouteDefinition[] = [
         'wsproj',
         ROUTE_CACHE_TTL_MS,
         async (): Promise<readonly [number, unknown]> => {
-          const events = await context.eventLog!.readMerged();
+          const events = await readEventsFromStoreOrLog(
+            context,
+            context.eventLog!,
+            (event) => event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED,
+            WORKSTREAM_PROJECTION_EVENT_TYPES,
+          );
           // Bucket per-bacId once so each projectWorkstream call sees
           // only its own events. Without bucketing this is
           // O(aggregates × events) and stalls the route on large
           // vaults — same fix as buildConnectionsSnapshot.
           const eventsByBacId = new Map<string, typeof events[number][]>();
           for (const event of events) {
-            if (event.type === WORKSTREAM_UPSERTED || event.type === WORKSTREAM_DELETED) {
-              const existing = eventsByBacId.get(event.aggregateId);
-              if (existing === undefined) eventsByBacId.set(event.aggregateId, [event]);
-              else existing.push(event);
-            }
+            const existing = eventsByBacId.get(event.aggregateId);
+            if (existing === undefined) eventsByBacId.set(event.aggregateId, [event]);
+            else existing.push(event);
           }
           const projections = [...eventsByBacId.keys()]
             .sort()
@@ -5985,6 +7021,27 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // §13 step 13 — user-facing Markdown export of a workstream (and,
+    // when includeThreads is set, its threads). Writes tree-path report
+    // files OUTSIDE _BAC/ via the writer's atomic primitive, returning
+    // vault-root-relative paths. Normal bridge-key route.
+    method: 'POST',
+    pattern: /^\/v1\/workstreams\/(?<bacId>[A-Za-z0-9_-]+)\/export$/,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (match.bacId === undefined) {
+        throw new Error('Missing bacId path parameter.');
+      }
+      requireVaultRoot(context);
+      // readBody returns {} for an empty POST, so includeThreads defaults off.
+      const input = workstreamExportSchema.parse(await readBody(request));
+      const result = await context.vaultWriter.exportWorkstream(match.bacId, {
+        ...(input.includeThreads === undefined ? {} : { includeThreads: input.includeThreads }),
+      });
+      return [200, { data: { files: [...result.files] } }];
+    },
+  },
+  {
     method: 'GET',
     pattern: /^\/v1\/workstreams\/(?<workstreamId>[A-Za-z0-9_-]+)\/trust$/,
     authRequired: true,
@@ -6001,9 +7058,9 @@ const routes: readonly RouteDefinition[] = [
           data: {
             workstreamId: match.workstreamId,
             // Fresh workstreams (no explicit record on disk) default
-            // to allowing every write tool — matches isAllowed's
-            // allow-by-default semantic so the side panel renders
-            // all toggles ON before the user has touched the section.
+            // to NO allowed write tools — matches isAllowed's
+            // deny-by-default semantic (PRD §6.1.14, re-recorded
+            // 2026-07-11): MCP write trust is opt-in per workstream.
             allowedTools:
               record === undefined ? [...defaultAllowedTools()] : [...record.allowedTools],
           },
@@ -6040,9 +7097,7 @@ const routes: readonly RouteDefinition[] = [
       if (match.bacId === undefined) {
         throw new Error('Missing bacId path parameter.');
       }
-      if (mcpToolHeader(_request) === 'sidetrack.workstreams.bump') {
-        await requireWorkstreamTrust(context, match.bacId, 'sidetrack.workstreams.bump');
-      }
+      await requireWorkstreamTrust(context, _request, match.bacId, 'sidetrack.workstreams.bump');
       return [
         200,
         mutationResponse(
@@ -6174,9 +7229,11 @@ const routes: readonly RouteDefinition[] = [
       const idempotencyKey = requireIdempotencyKey(request);
       return await runIdempotent(context, 'createQueueItem', idempotencyKey, async () => {
         const input = queueCreateSchema.parse(await readBody(request));
-        const tool = mcpToolHeader(request);
-        if (tool === 'sidetrack.queue.create' && input.scope === 'workstream') {
-          await requireWorkstreamTrust(context, input.targetId, tool);
+        // Only a workstream-scoped queue item is trust-gated; a thread /
+        // global item has no workstream to check. MCP-key callers are
+        // gated on that workstream; the extension surface is exempt.
+        if (input.scope === 'workstream') {
+          await requireWorkstreamTrust(context, request, input.targetId, 'sidetrack.queue.create');
         }
         const result = await context.vaultWriter.createQueueItem(input, requestId);
         if (context.eventLog !== undefined) {
@@ -6722,6 +7779,79 @@ const routes: readonly RouteDefinition[] = [
       return [200, { data: result }];
     },
   },
+  {
+    // P1b — main-process impression-bootstrap. Reconstructs LightGBM training
+    // groups from historical explicit feedback by re-running /v2 recall here
+    // (warm pipeline, I/O-bound → interleaves with /v1/status), trains
+    // OFF-THREAD via the train-groups worker, ship-gates, and promotes the
+    // active closest-visit revision on PASS. Manual + idempotent (the trainer
+    // dedupes already-referenced feedback). Gated by
+    // SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK; reconstruction capped by
+    // SIDETRACK_RANKER_RECONSTRUCT_CAP (default 200, oldest-first).
+    method: 'POST',
+    pattern: /^\/v1\/ranker\/impression-bootstrap$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (process.env['SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK'] === '0') {
+        throw new HttpRouteError(403, 'BOOTSTRAP_DISABLED', 'Impression bootstrap is disabled.');
+      }
+      if (context.eventLog === undefined || context.connectionsStore === undefined) {
+        throw new HttpRouteError(
+          503,
+          'CONNECTIONS_NOT_WIRED',
+          'Event log / connections is not configured.',
+        );
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const snapshot = await context.connectionsStore.readCurrent();
+      if (snapshot === null) {
+        throw new HttpRouteError(
+          409,
+          'CONNECTIONS_SNAPSHOT_MISSING',
+          'Connections snapshot is not ready.',
+        );
+      }
+      const embedderState = context.getEmbedderStatus?.()?.state;
+      const history = await readEventsFromStoreOrLog(
+        context,
+        context.eventLog,
+        (event) =>
+          event.type === USER_FLOW_CONFIRMED ||
+          event.type === USER_FLOW_REJECTED ||
+          event.type === USER_ORGANIZED_ITEM ||
+          event.type === USER_SNIPPET_PROMOTED,
+        RANKER_BOOTSTRAP_FEEDBACK_EVENT_TYPES,
+      );
+      const capRaw = Number(process.env['SIDETRACK_RANKER_RECONSTRUCT_CAP']);
+      const reconstructCap = Number.isFinite(capRaw) && capRaw > 0 ? capRaw : 200;
+      let reconstructed = 0;
+      const result = await runRecallImpressionBootstrap({
+        vaultRoot,
+        history,
+        snapshot,
+        reconstructFeedback: async (req) => {
+          if (reconstructed >= reconstructCap) {
+            return null;
+          }
+          reconstructed += 1;
+          // Yield a macrotask before each (CPU-heavy) reconstruction so
+          // /v1/status and other warm-path requests interleave. Back-to-back
+          // runRecall calls otherwise saturate the event loop — measured a
+          // ~42s /status freeze without this. With the yield the bootstrap
+          // takes the same wall-clock but /status stays responsive.
+          await new Promise((resolve) => setImmediate(resolve));
+          return runRecallV2(
+            { vaultRoot, ...(embedderState === undefined ? {} : { embedderState }) },
+            req.recallRequest,
+          );
+        },
+      });
+      if (result.status === 'trained') {
+        await context.refreshConnections?.();
+      }
+      return [200, { data: { ...result, reconstructed, historyEventCount: history.length } }];
+    },
+  },
   // Sync Contract v1 — Connections (Class B evidence graph) routes.
   //
   // GET /v1/connections                            full snapshot or
@@ -6819,7 +7949,14 @@ const routes: readonly RouteDefinition[] = [
           if (context.eventLog !== undefined) {
             snap = applyFeedbackOverlayToSnapshot(
               snap,
-              projectFeedback(await context.eventLog.readMerged()),
+              projectFeedback(
+                await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog,
+                  (event) => isFeedbackEventType(event.type),
+                  FEEDBACK_EVENT_TYPE_LIST,
+                ),
+              ),
             );
           }
           snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
@@ -6911,7 +8048,14 @@ const routes: readonly RouteDefinition[] = [
           if (context.eventLog !== undefined) {
             sub = applyFeedbackOverlayToSnapshot(
               sub,
-              projectFeedback(await context.eventLog.readMerged()),
+              projectFeedback(
+                await readEventsFromStoreOrLog(
+                  context,
+                  context.eventLog,
+                  (event) => isFeedbackEventType(event.type),
+                  FEEDBACK_EVENT_TYPE_LIST,
+                ),
+              ),
             );
           }
           sub = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), sub);
@@ -6940,7 +8084,14 @@ const routes: readonly RouteDefinition[] = [
       if (context.eventLog !== undefined) {
         snap = applyFeedbackOverlayToSnapshot(
           snap,
-          projectFeedback(await context.eventLog.readMerged()),
+          projectFeedback(
+            await readEventsFromStoreOrLog(
+              context,
+              context.eventLog,
+              (event) => isFeedbackEventType(event.type),
+              FEEDBACK_EVENT_TYPE_LIST,
+            ),
+          ),
         );
       }
       snap = await applyPageContentCoverageToSnapshot(requireVaultRoot(context), snap);
@@ -7066,28 +8217,8 @@ export const handleRequest = async (
     return;
   }
 
-  const url = request.url === undefined ? undefined : new URL(request.url, 'http://127.0.0.1');
-  const route = routes.find((candidate) => {
-    if (candidate.method !== method || url === undefined) {
-      return false;
-    }
-    return candidate.pattern.test(url.pathname);
-  });
-
-  if (url === undefined || route === undefined) {
-    sendJson(
-      response,
-      404,
-      createProblem({
-        status: 404,
-        code: 'NOT_FOUND',
-        title: 'Not found',
-        correlationId: requestId,
-      }),
-    );
-    return;
-  }
-
+  // Host/origin loopback gate FIRST — before any route work or auth,
+  // so an off-loopback caller learns nothing about the surface.
   if (!isLocalHost(request.headers.host) || !isAllowedOrigin(request.headers.origin)) {
     sendJson(
       response,
@@ -7102,12 +8233,51 @@ export const handleRequest = async (
     return;
   }
 
-  if (route.authRequired) {
+  const url = request.url === undefined ? undefined : new URL(request.url, 'http://127.0.0.1');
+  if (url === undefined) {
+    sendJson(
+      response,
+      404,
+      createProblem({
+        status: 404,
+        code: 'NOT_FOUND',
+        title: 'Not found',
+        correlationId: requestId,
+      }),
+    );
+    return;
+  }
+
+  // Auth gate BEFORE route matching. Everything except the explicit
+  // public allowlist requires the bridge key — including unknown paths,
+  // which return the auth error (not a 404), so an unauthenticated
+  // caller can't enumerate the route table by probing status codes.
+  // Debug/diagnostic routes are NOT in the allowlist, so they now
+  // require auth like every other route.
+  //
+  // F02 — the companion accepts TWO keys and classifies the caller by
+  // which one authenticated:
+  //   - the extension bridge key  → `extension` (the user's surface, exempt
+  //     from workstream-trust enforcement — every route open).
+  //   - the MCP key (mcpBridgeKey) → `mcp`. An mcp caller is default-DENIED
+  //     any mutating route (POST/PUT/PATCH/DELETE) unless the route is on the
+  //     sanctioned MCP_ALLOWED_MUTATING_ROUTES allowlist (enforced below at
+  //     dispatch via isMcpAllowedRoute); reads stay open. Allowlisted write
+  //     routes STILL run requireWorkstreamTrust for per-workstream, per-tool
+  //     trust. The MCP key is checked FIRST so an mcp-key caller is never
+  //     mis-classified as the extension. When no MCP key is wired, only the
+  //     bridge-key path exists (pre-F02 behaviour).
+  if (!isPublicUnauthenticatedPath(method, url.pathname)) {
     const actualKey = request.headers['x-bac-bridge-key'];
-    if (
-      typeof actualKey !== 'string' ||
-      !(await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey))
-    ) {
+    const isMcpKey =
+      typeof actualKey === 'string' &&
+      context.mcpBridgeKey !== undefined &&
+      bridgeKeysMatch(context.mcpBridgeKey, actualKey);
+    const accepted =
+      typeof actualKey === 'string' &&
+      (isMcpKey ||
+        (await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey)));
+    if (!accepted) {
       sendJson(
         response,
         401,
@@ -7120,6 +8290,46 @@ export const handleRequest = async (
       );
       return;
     }
+    // The tool header is honoured for LOGGING only (deprecation window):
+    // it seeds the audit `tool` hint + the mcp client-name, but the trust
+    // decision is derived from the authenticating key above, never here.
+    // Honoured for LOGGING only: `x-sidetrack-mcp-client` names the MCP
+    // client (e.g. 'codex', 'claude_code') for `mcp:<client-name>` audit
+    // provenance; `x-sidetrack-mcp-tool` is the legacy tool hint. Neither
+    // influences the trust decision (derived from the key above).
+    const clientHeader = request.headers['x-sidetrack-mcp-client'];
+    const clientName =
+      typeof clientHeader === 'string' && clientHeader.length > 0 ? clientHeader : undefined;
+    // Touch the tool header so it stays a live (logging-only) surface
+    // during the deprecation window; the value is not load-bearing.
+    void mcpToolHeader(request);
+    setCallerIdentity(
+      request,
+      isMcpKey
+        ? { callerClass: 'mcp', ...(clientName === undefined ? {} : { clientName }) }
+        : { callerClass: 'extension' },
+    );
+  }
+
+  const route = routes.find((candidate) => {
+    if (candidate.method !== method) {
+      return false;
+    }
+    return candidate.pattern.test(url.pathname);
+  });
+
+  if (route === undefined) {
+    sendJson(
+      response,
+      404,
+      createProblem({
+        status: 404,
+        code: 'NOT_FOUND',
+        title: 'Not found',
+        correlationId: requestId,
+      }),
+    );
+    return;
   }
 
   if (method === 'GET' && url.pathname === '/v1/vault/changes') {
@@ -7147,19 +8357,76 @@ export const handleRequest = async (
 
   try {
     const match = route.pattern.exec(url.pathname);
+    // F02 systemic default-deny. An mcp-key caller may only reach a
+    // mutating route that is on the sanctioned allowlist; every other
+    // mutating route (trust management, workstream delete/patch, settings
+    // patch, export, annotation writes) is refused here — BEFORE the
+    // handler runs — so an mcp caller can never self-grant, delete, or
+    // otherwise escalate through an ungated route. Reads are unaffected.
+    if (
+      callerIdentityFor(request).callerClass === 'mcp' &&
+      !isMcpAllowedRoute(method, url.pathname)
+    ) {
+      throw new HttpRouteError(
+        403,
+        'MCP_OPERATION_NOT_ALLOWED',
+        'This operation is not available to MCP callers.',
+        'This operation is not available to MCP callers. Only sanctioned workstream ' +
+          'write tools (thread move/archive/unarchive, queue create, workstream ' +
+          'bump/create) are reachable with an MCP key; trust management, workstream ' +
+          'delete/edit, settings, export, and annotation writes require the ' +
+          "extension's own bridge key.",
+      );
+    }
     // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
     // what the extension actually polls + per-request latency. Written
     // to a file because the screen-session pty isn't capturable.
     // Fire-and-forget; zero overhead when the env is unset.
     const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
     const httpLogStartedMs = httpLog ? Date.now() : 0;
-    const [status, body] = await route.handle(request, requestId, match?.groups ?? {}, context);
-    if (httpLog) {
-      void appendFile(
-        '/tmp/sidetrack-http-debug.log',
-        `${new Date().toISOString()} ${method} ${url.pathname}${url.search} ${String(status)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+    // F02 — bind the base audit provenance for the request so any vault
+    // write it triggers records the caller class. The trust gate refines
+    // this (tool / scope / trustModeActive) when it runs. Only mutating
+    // methods write audit lines, so reads skip the wrapper. argsSummary
+    // is the method + pathname (never query/body — no full payloads).
+    const auditBase: AuditContext = {
+      agent: auditAgentLabel(callerIdentityFor(request)),
+      tool: null,
+      scope: null,
+      trustModeActive: false,
+      argsSummary: boundArgsSummary(`${method ?? 'UNKNOWN'} ${url.pathname}`),
+    };
+    const runHandler = (): Promise<readonly [number, unknown]> =>
+      route.handle(request, requestId, match?.groups ?? {}, context);
+    const [status, body] =
+      method === 'GET' ? await runHandler() : await runWithAuditContext(auditBase, runHandler);
+    const logHttp = (statusForLog: number): void => {
+      if (!httpLog) return;
+      // pathname ONLY — url.search is deliberately omitted (PII).
+      void appendHttpDebugLine(
+        `${new Date().toISOString()} ${method ?? 'UNKNOWN'} ${url.pathname} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
       ).catch(() => undefined);
+    };
+    // Conditional GET / response ETag. Restricted to GET because
+    // mutations (POST/PATCH/PUT/DELETE) have side effects we can't
+    // skip even if a duplicate request's response matches; the
+    // idempotency-key path already covers replay safety for those.
+    if (method === 'GET') {
+      const etag = computeBodyEtag(status, body);
+      if (etag !== null) {
+        const ifNoneMatch = request.headers['if-none-match'];
+        const incoming = Array.isArray(ifNoneMatch) ? ifNoneMatch[0] : ifNoneMatch;
+        if (typeof incoming === 'string' && incoming === etag) {
+          logHttp(304);
+          send304(response, etag);
+          return;
+        }
+        logHttp(status);
+        sendJsonWithEtag(response, status, body, etag);
+        return;
+      }
     }
+    logHttp(status);
     sendJson(response, status, body);
   } catch (error) {
     const issues = getValidationIssues(error);
@@ -7167,8 +8434,8 @@ export const handleRequest = async (
     const settingsRevisionConflict = error instanceof SettingsRevisionConflictError;
     const codingTokenInvalid = error instanceof CodingAttachTokenInvalidError;
     const codingSessionNotFound = error instanceof CodingSessionNotFoundError;
-    const vaultUnavailable =
-      error instanceof Error && error.message === 'Vault path is unavailable.';
+    const vaultUnavailable = VaultUnavailableError.matches(error);
+    const exportConfinement = VaultExportConfinementError.matches(error);
     const status =
       routeError?.status ??
       (settingsRevisionConflict
@@ -7177,11 +8444,13 @@ export const handleRequest = async (
           ? 410
           : codingSessionNotFound
             ? 404
-            : issues === undefined
-              ? vaultUnavailable
-                ? 503
-                : 500
-              : 400);
+            : exportConfinement
+              ? 400
+              : issues === undefined
+                ? vaultUnavailable
+                  ? 503
+                  : 500
+                : 400);
     const detail = error instanceof Error ? error.message : undefined;
     if (status === 500 && error instanceof Error) {
       // eslint-disable-next-line no-console
@@ -7200,11 +8469,13 @@ export const handleRequest = async (
               ? 'ATTACH_TOKEN_INVALID'
               : codingSessionNotFound
                 ? 'CODING_SESSION_NOT_FOUND'
-                : issues === undefined
-                  ? vaultUnavailable
-                    ? 'VAULT_UNAVAILABLE'
-                    : 'INTERNAL_ERROR'
-                  : 'VALIDATION_ERROR'),
+                : exportConfinement
+                  ? 'EXPORT_PATH_REJECTED'
+                  : issues === undefined
+                    ? vaultUnavailable
+                      ? 'VAULT_UNAVAILABLE'
+                      : 'INTERNAL_ERROR'
+                    : 'VALIDATION_ERROR'),
         title:
           routeError?.title ??
           (issues === undefined
@@ -7214,9 +8485,11 @@ export const handleRequest = async (
                 ? 'Attach token invalid or expired.'
                 : codingSessionNotFound
                   ? 'Coding session not found.'
-                  : vaultUnavailable
-                    ? 'Vault path is unavailable.'
-                    : 'Internal companion error.'
+                  : exportConfinement
+                    ? 'Export path rejected.'
+                    : vaultUnavailable
+                      ? 'Vault path is unavailable.'
+                      : 'Internal companion error.'
             : 'Validation failed.'),
         correlationId: requestId,
         ...(detail === undefined ? {} : { detail }),

@@ -8,6 +8,10 @@ import {
   type ConnectionNodeMetadata,
   nodeIdFor,
 } from '../connections/types.js';
+import {
+  chunkSupportFor,
+  type VisitSimilarityChunkEvidence,
+} from '../connections/visitSimilarity.js';
 import { ENGAGEMENT_SESSION_AGGREGATED, type EngagementDimensions } from '../engagement/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
@@ -220,7 +224,6 @@ const extract = (
     readonly nodes?: readonly ConnectionNode[];
     readonly edges?: readonly ConnectionEdge[];
     readonly updatedAt?: string;
-    readonly negativeContainerPairs?: ReadonlySet<string>;
   } = {},
 ): CandidatePairFeatures => {
   const snapshotInput = {
@@ -231,24 +234,24 @@ const extract = (
   return extractFeatures(input.candidate ?? candidate(), {
     merged: [...(input.merged ?? [])],
     snapshot: snapshot(snapshotInput),
-    ...(input.negativeContainerPairs === undefined
-      ? {}
-      : { negativeContainerPairs: input.negativeContainerPairs }),
+    retrievalContext: { missingRetrievalContext: true },
   });
 };
 
 describe('ranker feature schema', () => {
-  it('keeps schema version 5 and byte-stable feature serialization', () => {
+  it('keeps schema version 6 and byte-stable feature serialization', () => {
     const first = JSON.stringify(extract());
     const second = JSON.stringify(extract());
 
-    expect(FEATURE_SCHEMA_VERSION).toBe(5);
+    expect(FEATURE_SCHEMA_VERSION).toBe(6);
     expect(first).toBe(second);
     expect(Object.keys(JSON.parse(first) as Record<string, unknown>)).toEqual(
-      CANDIDATE_PAIR_FEATURE_KEYS,
+      CANDIDATE_PAIR_FEATURE_KEYS.filter(
+        (key) => key !== 'cross_encoder_score' && key !== 'cross_encoder_rank_delta',
+      ),
     );
     expect(JSON.parse(first) as CandidatePairFeatures).toEqual({
-      schemaVersion: 5,
+      schemaVersion: 6,
       same_workstream: 0,
       opener_chain_depth: 0,
       in_navigation_chain: 0,
@@ -282,7 +285,18 @@ describe('ranker feature schema', () => {
       content_quality_pair_min: 0,
       chunk_support_count: 0,
       max_chunk_pair_score: 0,
-      container_negative_match: 0,
+      max_chunk_pair_vector_cosine: 0,
+      top3_mean_chunk_pair_vector_cosine: 0,
+      chunk_pair_vector_support_count: 0,
+      bm25_score: 0,
+      bm25_rank: 0,
+      dense_doc_score: 0,
+      dense_doc_rank: 0,
+      rrf_score: 0,
+      rrf_rank: 0,
+      graph_similarity_rank: 0,
+      candidate_source_flags: 0,
+      served_position: 0,
     });
   });
 });
@@ -373,6 +387,61 @@ describe('ranker graph and navigation features', () => {
     });
 
     expect(features.in_navigation_chain).toBe(1);
+  });
+});
+
+describe('ranker retrieval features', () => {
+  it('populates retrieval fields from an explicit retrieval context', () => {
+    const features = extractFeatures(candidate({ fromVisitId: 'visit-a', toVisitId: 'visit-b' }), {
+      merged: [],
+      snapshot: snapshot(),
+      retrievalContext: {
+        byToVisitId: new Map([
+          [
+            'visit-b',
+            {
+              bm25Score: 0.4,
+              bm25Rank: 3,
+              denseDocScore: 0.7,
+              denseDocRank: 2,
+              rrfScore: 0.03,
+              rrfRank: 1,
+              graphSimilarityRank: 5,
+              candidateSourceFlags: 1 | 8,
+              servedPosition: 4,
+              crossEncoderScore: 0.91,
+              crossEncoderRankDelta: 2,
+            },
+          ],
+        ]),
+      },
+    });
+
+    expect(features).toMatchObject({
+      bm25_score: 0.4,
+      bm25_rank: 3,
+      dense_doc_score: 0.7,
+      dense_doc_rank: 2,
+      rrf_score: 0.03,
+      rrf_rank: 1,
+      graph_similarity_rank: 5,
+      candidate_source_flags: 9,
+      served_position: 4,
+      cross_encoder_score: 0.91,
+      cross_encoder_rank_delta: 2,
+    });
+  });
+
+  it('zero-fills retrieval fields only when the caller marks context missing', () => {
+    const features = extractFeatures(candidate({ fromVisitId: 'visit-a', toVisitId: 'visit-b' }), {
+      merged: [],
+      snapshot: snapshot(),
+      retrievalContext: { missingRetrievalContext: true },
+    });
+
+    expect(features.bm25_score).toBe(0);
+    expect(features.candidate_source_flags).toBe(0);
+    expect('cross_encoder_score' in features).toBe(false);
   });
 });
 
@@ -969,55 +1038,63 @@ describe('ranker page-content quality features', () => {
   });
 });
 
-describe('container_negative_match (Step 7)', () => {
-  // The feature replaces the train-time Cartesian expansion of
-  // container-shaped user negatives with a single learned column.
-  // The retrain caller precomputes the (from, to) pair set via
-  // `deriveNegativeVisitPairLabelsFromSnapshot` and passes it on
-  // the context.
+const unitVec = (values: readonly number[]): Float32Array => {
+  let norm = 0;
+  for (const value of values) norm += value * value;
+  const out = new Float32Array(values.length);
+  const scale = norm <= 0 ? 1 : 1 / Math.sqrt(norm);
+  for (let index = 0; index < values.length; index += 1) out[index] = (values[index] ?? 0) * scale;
+  return out;
+};
 
-  const fromUrl = 'https://example.test/from';
-  const toUrl = 'https://example.test/to';
+const meanVector = (vectors: readonly Float32Array[]): Float32Array => {
+  const out = new Float32Array(vectors[0]?.length ?? 0);
+  for (const vector of vectors) {
+    for (let index = 0; index < out.length; index += 1) {
+      out[index] = (out[index] ?? 0) + (vector[index] ?? 0) / vectors.length;
+    }
+  }
+  return unitVec([...out]);
+};
 
-  it('returns 1 when the candidate (fromVisit, toVisit) is in the precomputed negative set', async () => {
-    const { negativeContainerPairKey } = await import('./features.js');
-    const set = new Set<string>([negativeContainerPairKey(fromUrl, toUrl)]);
-    const features = extract({
-      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
-      negativeContainerPairs: set,
-    });
-    expect(features.container_negative_match).toBe(1);
-  });
+const cosine = (left: Float32Array, right: Float32Array): number => {
+  let dot = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    dot += (left[index] ?? 0) * (right[index] ?? 0);
+  }
+  return dot;
+};
 
-  it('returns 0 when the pair is NOT in the negative set', async () => {
-    const { negativeContainerPairKey } = await import('./features.js');
-    const set = new Set<string>([
-      negativeContainerPairKey('https://other.test/x', 'https://other.test/y'),
-    ]);
-    const features = extract({
-      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
-      negativeContainerPairs: set,
-    });
-    expect(features.container_negative_match).toBe(0);
-  });
+describe('chunk-vector ranker features', () => {
+  it('finds localized semantic support stronger than pooled document vectors', () => {
+    const docAParagraphVectors = [
+      unitVec([1, 0, 0]),
+      unitVec([0, 1, 0]),
+      unitVec([0, 0, 1]),
+      unitVec([1, 1, 0]),
+      unitVec([1, 0, 1]),
+    ];
+    const docBParagraphVectors = [
+      unitVec([0, 0.05, 0.99]),
+      unitVec([1, -1, 0]),
+      unitVec([0.5, 0.5, 0]),
+      unitVec([-1, 0, 0]),
+      unitVec([0, -1, 0]),
+    ];
+    const chunksFor = (vectors: readonly Float32Array[]): readonly VisitSimilarityChunkEvidence[] =>
+      vectors.map((embeddingVector) => ({ embeddingVector }));
 
-  it('defaults to 0 when negativeContainerPairs is absent (serve-time callers without feedback access)', () => {
-    const features = extract({
-      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
-    });
-    expect(features.container_negative_match).toBe(0);
-  });
+    const support = chunkSupportFor(
+      chunksFor(docAParagraphVectors),
+      chunksFor(docBParagraphVectors),
+    );
+    const docVectorCosine = cosine(
+      meanVector(docAParagraphVectors),
+      meanVector(docBParagraphVectors),
+    );
 
-  it('keys are directional: (from, to) and (to, from) are distinct', async () => {
-    const { negativeContainerPairKey } = await import('./features.js');
-    const set = new Set<string>([negativeContainerPairKey(toUrl, fromUrl)]); // reversed
-    const features = extract({
-      candidate: candidate({ fromVisitId: fromUrl, toVisitId: toUrl }),
-      negativeContainerPairs: set,
-    });
-    // The candidate (from, to) doesn't match the reversed (to, from)
-    // entry — mirrors how `deriveNegativeVisitPairLabelsFromSnapshot`
-    // emits directionally.
-    expect(features.container_negative_match).toBe(0);
+    expect(support).toBeDefined();
+    expect(support?.maxVectorCosine).toBeGreaterThan(docVectorCosine);
+    expect(support?.vectorSupportCount).toBeGreaterThan(0);
   });
 });

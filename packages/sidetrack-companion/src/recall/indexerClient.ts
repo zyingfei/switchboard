@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 
+import { withBunSmolExecArgv } from '../process/bunMemory.js';
+
 export interface IndexerRebuildInput {
   readonly vaultRoot: string;
   readonly reason: string;
@@ -76,6 +78,7 @@ export const createRecallIndexerClient = (
       return new Promise<IndexerRebuildResult>((resolve) => {
         const child = fork_(entryPath, [], {
           env: process.env,
+          execArgv: withBunSmolExecArgv(process.execArgv),
           stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         });
         current = child;

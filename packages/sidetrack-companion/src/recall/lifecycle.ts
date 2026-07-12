@@ -2,6 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { EventLog } from '../sync/eventLog.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import {
   embed,
   getResolvedEmbedderAccelerator,
@@ -10,11 +11,12 @@ import {
   type EmbedderAccelerator,
   type EmbedderDevice,
 } from './embedder.js';
-import { RECALL_TOMBSTONE_TARGET } from './events.js';
+import { CAPTURE_RECORDED, isCaptureRecordedPayload, RECALL_TOMBSTONE_TARGET } from './events.js';
 import {
   appendEntry as appendEntryRaw,
   gcEntries as gcEntriesRaw,
   readIndex,
+  readIndexHeader,
   tombstoneByThread as tombstoneByThreadRaw,
   upsertEntries as upsertEntriesRaw,
 } from './indexFile.js';
@@ -84,7 +86,14 @@ export interface RecallStatusReport {
 
 export interface RecallLifecycle {
   readonly report: () => Promise<RecallStatusReport>;
-  readonly ensureFresh: () => Promise<RecallStatusReport>;
+  /**
+   * Boot freshness check. Triggers a full rebuild ONLY on a missing/
+   * corrupt index or a model change — read cheaply from the index header
+   * (no full-index parse, no full-log turn-count scan). Incremental drift
+   * is healed by the recall materializer's catchUp, and precise drift is
+   * available on demand via report(). Side-effecting; returns nothing.
+   */
+  readonly ensureFresh: () => Promise<void>;
   readonly scheduleRebuild: (reason: 'startup' | 'manual' | 'reconnect' | 'drift') => void;
   readonly waitForRebuild: () => Promise<void>;
   readonly isRebuilding: () => boolean;
@@ -210,21 +219,39 @@ const countTurnsInEventLog = async (
   let total = 0;
   const seenBacIds = new Set<string>();
   if (eventLog !== undefined) {
-    const accepted = await eventLog.readMerged();
-    for (const event of accepted) {
-      if (event.type !== 'capture.recorded') continue;
-      const payload = event.payload as { readonly bac_id?: unknown; readonly turns?: unknown };
-      if (typeof payload.bac_id === 'string') {
-        seenBacIds.add(payload.bac_id);
-      }
-      if (!Array.isArray(payload.turns)) continue;
-      for (const rawTurn of payload.turns) {
-        if (typeof rawTurn !== 'object' || rawTurn === null) continue;
-        const text = (rawTurn as { readonly text?: unknown }).text;
-        if (typeof text === 'string' && text.trim().length > 0) {
-          total += 1;
+    const store = await getCaughtUpSharedEventStore(vaultRoot);
+    if (store !== null) {
+      await store.forEachChunk((chunk) => {
+        for (const event of chunk) {
+          if (event.type !== CAPTURE_RECORDED || !isCaptureRecordedPayload(event.payload)) {
+            continue;
+          }
+          seenBacIds.add(event.payload.bac_id);
+          for (const turn of event.payload.turns) {
+            if (typeof turn.text === 'string' && turn.text.trim().length > 0) total += 1;
+          }
         }
-      }
+      }, 2000);
+    } else {
+      // Stream the log (O(1) memory) to count capture turns instead of
+      // materialising the full merged array just for a freshness count —
+      // avoids warming the ~700MB memo at boot. Order-independent (a
+      // count + an id set).
+      await eventLog.streamEvents((event) => {
+        if (event.type !== 'capture.recorded') return;
+        const payload = event.payload as { readonly bac_id?: unknown; readonly turns?: unknown };
+        if (typeof payload.bac_id === 'string') {
+          seenBacIds.add(payload.bac_id);
+        }
+        if (!Array.isArray(payload.turns)) return;
+        for (const rawTurn of payload.turns) {
+          if (typeof rawTurn !== 'object' || rawTurn === null) continue;
+          const text = (rawTurn as { readonly text?: unknown }).text;
+          if (typeof text === 'string' && text.trim().length > 0) {
+            total += 1;
+          }
+        }
+      }, new Set(['capture.recorded']));
     }
   }
   const eventDir = eventLogPathFor(vaultRoot);
@@ -431,12 +458,22 @@ export const createRecallLifecycle = (opts: CreateRecallLifecycleOptions): Recal
     });
   };
 
-  const ensureFresh = async (): Promise<RecallStatusReport> => {
-    const current = await report();
-    if (current.status === 'missing' || current.status === 'stale') {
-      scheduleRebuild(current.status === 'missing' ? 'startup' : 'drift');
+  const ensureFresh = async (): Promise<void> => {
+    // Cheap boot probe: read ONLY the index header (modelId + count), not
+    // the full multi-MB index + a full-log turn-count scan (~340MB of
+    // transient allocation per boot). The recall materializer's catchUp
+    // re-ingests captures at boot, so incremental drift is healed there;
+    // ensureFresh only needs to trigger a FULL rebuild on a missing/
+    // corrupt index or a model change. Precise drift remains available on
+    // demand via report() (used by /v1/status).
+    const header = await readIndexHeader(indexPathFor(opts.vaultRoot));
+    if (header === null) {
+      scheduleRebuild('startup');
+      return;
     }
-    return current;
+    if (header.modelId !== currentModelId) {
+      scheduleRebuild('drift');
+    }
   };
 
   const waitForRebuild = async (): Promise<void> => {

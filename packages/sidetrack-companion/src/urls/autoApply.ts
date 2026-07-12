@@ -6,9 +6,11 @@ import {
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { URL_ATTRIBUTION_INFERRED } from './events.js';
 import {
+  createEmptyUrlProjectionAccumulator,
   deserializeUrlProjection,
   foldEventIntoUrlProjectionAccumulator,
   projectUrls,
@@ -54,6 +56,7 @@ export interface AutoApplyUrlAttributionInput {
   readonly canonicalUrl: string;
   readonly events?: readonly AcceptedEvent[];
   readonly urlProjection?: SerializedUrlProjection;
+  readonly vaultRoot?: string;
   readonly useEventCandidateSimilarity?: boolean;
   readonly policyMode?: AttributionPolicyMode;
   readonly policyTelemetry?: AttributionPolicyTelemetry;
@@ -71,13 +74,29 @@ const clientEventIdForResolution = (result: UrlResolutionResult): string =>
     result.reasons.dependencyKey,
   ].join(':');
 
+const projectUrlsFromStoreOrLog = async (
+  eventLog: EventLog,
+  vaultRoot: string | undefined,
+): Promise<UrlProjection> => {
+  if (vaultRoot === undefined) return projectUrls(await eventLog.readMerged());
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) return projectUrls(await eventLog.readMerged());
+  const accumulator = createEmptyUrlProjectionAccumulator();
+  await store.forEachChunk((chunk) => {
+    for (const event of chunk) foldEventIntoUrlProjectionAccumulator(accumulator, event);
+  }, 2000);
+  return urlProjectionFromAccumulator(accumulator);
+};
+
 export const autoApplyUrlAttribution = async (
   input: AutoApplyUrlAttributionInput,
 ): Promise<AutoApplyUrlAttributionResult> => {
   const beforeEvents = input.events ?? (await input.eventLog.readMerged());
   const beforeProjection =
     input.urlProjection === undefined
-      ? projectUrls(beforeEvents)
+      ? input.events === undefined
+        ? await projectUrlsFromStoreOrLog(input.eventLog, input.vaultRoot)
+        : projectUrls(beforeEvents)
       : deserializeUrlProjection(input.urlProjection);
   const existing = beforeProjection.byCanonicalUrl.get(input.canonicalUrl)?.currentAttribution;
   const resolution = resolveUrlAttribution({
@@ -186,6 +205,6 @@ export const autoApplyUrlAttribution = async (
     status: 'applied',
     resolution,
     accepted,
-    projection: projectUrls(await input.eventLog.readMerged()),
+    projection: await projectUrlsFromStoreOrLog(input.eventLog, input.vaultRoot),
   };
 };

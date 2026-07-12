@@ -10,6 +10,7 @@ export type ConnectionNodeKind =
   | 'queue-item'
   | 'inbound-reminder'
   | 'coding-session'
+  | 'page'
   | 'timeline-visit'
   | 'visit-instance'
   | 'tab-session'

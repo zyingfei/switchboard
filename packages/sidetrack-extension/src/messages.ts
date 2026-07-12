@@ -181,6 +181,13 @@ export const messageTypes = {
   // this one message; background POSTs to companion's /v2/recall and
   // returns the evidence-rich response.
   recallV2Query: 'sidetrack.recall.v2.query',
+  // Phase 0 of the recall+ranker v2 hard-replacement. Caller (content
+  // script or sidepanel) emits a user action on a served recall
+  // candidate. Background relays as POST /v1/recall/action so the
+  // companion can append a `recall.action` event, joined to the
+  // parent `recall.served` by `servedContextId`. Fire-and-forget on
+  // the caller side — failures are not user-visible.
+  recallActionEmit: 'sidetrack.recall.v2.action',
 } as const;
 
 export interface SelectorCanaryReport {
@@ -264,6 +271,14 @@ export interface OpenConnectionsDejaVuItem {
   // graph neighborhood. Optional because some sources (raw vector
   // hits without a derived node) won't have one.
   readonly anchorNodeId?: string;
+  // P2 — impression join for the trainable recall.action mirror.
+  // The déjà-vu popover's /v2 batch stamps both so the sidepanel can
+  // seed its impression registry: entityId is the SERVED
+  // results[].entityId byte-exact (`id` above may be candidateId),
+  // servedContextId the response's meta.servedContextId. Optional so
+  // old payloads still parse.
+  readonly entityId?: string;
+  readonly servedContextId?: string;
 }
 
 // Per-dispatch context recorded locally when the user fires an
@@ -300,12 +315,22 @@ export const isFocusThreadInSidePanelMessage = (
   (value.title === undefined || typeof value.title === 'string') &&
   (value.lastSeenAt === undefined || typeof value.lastSeenAt === 'string');
 
+// P2 — per-item guard for the impression-join fields. The rest of the
+// item shape stays unvalidated (as before — the sender is our own
+// content script), but these two feed the impression registry and a
+// non-string value would poison the recall.action join.
+const hasValidDejaVuImpressionFields = (item: unknown): boolean =>
+  isRecord(item) &&
+  (item.entityId === undefined || typeof item.entityId === 'string') &&
+  (item.servedContextId === undefined || typeof item.servedContextId === 'string');
+
 export const isOpenConnectionsDejaVuMessage = (
   value: unknown,
 ): value is OpenConnectionsDejaVuMessage =>
   isRecord(value) &&
   value.type === messageTypes.openConnectionsDejaVu &&
   Array.isArray(value.items) &&
+  value.items.every(hasValidDejaVuImpressionFields) &&
   typeof value.selectionText === 'string' &&
   typeof value.sourceUrl === 'string';
 
@@ -520,6 +545,20 @@ export type WorkboardRequest =
       readonly req: Record<string, unknown>;
     }
   | {
+      // Phase 0 of the recall+ranker v2 hard-replacement — user action
+      // on a served recall candidate. Background relays as POST
+      // /v1/recall/action; companion appends a `recall.action` event.
+      readonly type: typeof messageTypes.recallActionEmit;
+      readonly payload: {
+        readonly payloadVersion: 1;
+        readonly servedContextId: string;
+        readonly entityId: string;
+        readonly actionKind: string;
+        readonly actionAt: string;
+        readonly referencesEventId?: string;
+      };
+    }
+  | {
       readonly type: typeof messageTypes.createReminder;
       readonly reminder: ReminderCreate;
     }
@@ -559,10 +598,20 @@ export type WorkboardRequest =
   | {
       readonly type: typeof messageTypes.saveLocalPreferences;
       readonly preferences: {
+        readonly captureEnabled?: boolean;
         readonly autoTrack?: boolean;
         readonly vaultPath?: string;
         readonly notifyOnQueueComplete?: boolean;
         readonly pageEvidenceAutoExtractEnabled?: boolean;
+        // P2 — kill-switch for the sidepanel's trainable recall.action
+        // mirror (src/sidepanel/recall/emitTrainableAction.ts). Absent
+        // = on; persist `false` to silence emission.
+        readonly recallEmitTrainableActions?: boolean;
+        // F01 — redacted-clipboard flag (default ON). Absent = on;
+        // persist `false` to restore the raw-original clipboard while
+        // the original-cache mechanism is dogfooded. Auto-send is never
+        // gated on this.
+        readonly redactedClipboard?: boolean;
       };
     }
   | {
@@ -886,6 +935,7 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
   if (hasType(value, messageTypes.openConnectionsDejaVu)) {
     return (
       Array.isArray(value.items) &&
+      value.items.every(hasValidDejaVuImpressionFields) &&
       typeof value.selectionText === 'string' &&
       typeof value.sourceUrl === 'string'
     );
@@ -893,6 +943,18 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.recallV2Query)) {
     return isRecord(value.req) && typeof value.req['q'] === 'string';
+  }
+
+  if (hasType(value, messageTypes.recallActionEmit)) {
+    const payload = value['payload'];
+    return (
+      isRecord(payload) &&
+      payload['payloadVersion'] === 1 &&
+      typeof payload['servedContextId'] === 'string' &&
+      typeof payload['entityId'] === 'string' &&
+      typeof payload['actionKind'] === 'string' &&
+      typeof payload['actionAt'] === 'string'
+    );
   }
 
   if (hasType(value, messageTypes.createReminder)) {

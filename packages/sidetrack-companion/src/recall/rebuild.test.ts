@@ -1,14 +1,12 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { stubEmbed } from './__test__/stubEmbedder.js';
-
-vi.mock('./embedder.js', () => ({
-  MODEL_ID: 'stub-model',
-  embed: stubEmbed,
-}));
+// DI seam instead of vi.mock: vi.mock leaks process-globally under bun test
+// and strips setEmbedderOverride for every other suite in the run.
+import { MODEL_ID, setEmbedderOverride } from './embedder.js';
 
 const { readIndex } = await import('./indexFile.js');
 const { rebuildFromEventLog } = await import('./rebuild.js');
@@ -17,11 +15,13 @@ describe('rebuildFromEventLog', () => {
   let vaultRoot: string;
 
   beforeEach(async () => {
+    setEmbedderOverride(stubEmbed);
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-rebuild-test-'));
     await mkdir(join(vaultRoot, '_BAC', 'events'), { recursive: true });
   });
 
   afterEach(async () => {
+    setEmbedderOverride(undefined);
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
@@ -50,7 +50,7 @@ describe('rebuildFromEventLog', () => {
     const index = await readIndex(join(vaultRoot, '_BAC', 'recall', 'index.bin'));
 
     expect(result.indexed).toBe(3);
-    expect(index?.modelId).toBe('stub-model');
+    expect(index?.modelId).toBe(MODEL_ID);
     // V3: each turn produces one or more chunks; ids encode the
     // source bac_id + ordinal + content hash.
     const ids = index?.items.map((item) => item.id) ?? [];

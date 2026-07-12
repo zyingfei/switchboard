@@ -1,5 +1,7 @@
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { mkdir, open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 
 import {
   type AcceptedEvent,
@@ -13,6 +15,12 @@ import {
   vectorFromEvents,
 } from './causal.js';
 import type { ReplicaContext } from './replicaId.js';
+import {
+  incrementDotCollisions,
+  incrementDuplicateCaptures,
+  incrementSkippedMalformedLines,
+  incrementUnreadableShards,
+} from './eventLaneHealth.js';
 
 // Errors surfaced when a peer event collides with an existing event
 // under the (replicaId, seq) "dot" identity, or when a clientEventId
@@ -185,6 +193,43 @@ export interface EventLog {
     input: AppendInput<TPayload>,
   ) => Promise<AcceptedEvent<TPayload>>;
   readonly readMerged: () => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Watermark-resume read: events strictly past `frontier`, read
+   * directly from shard tails (newest shard first, short-circuiting
+   * whole shards whose tail seq is already covered). Independent of
+   * the readMerged memo — the connections materializer advances its
+   * frontier with this without materializing the full log.
+   */
+  readonly readMergedSince: (frontier: VersionVector) => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Stream every event one at a time (O(1) memory) — never materialises
+   * the merged array. For boot consumers that only need a small subset.
+   * Shard order, not merged order.
+   */
+  readonly streamEvents: (
+    onEvent: (event: AcceptedEvent) => void,
+    typeHints?: ReadonlySet<string>,
+  ) => Promise<void>;
+  /**
+   * Streamed `(await readMerged()).filter(predicate)` — collects only the
+   * matching subset, then sorts it identically to the merged array. Use
+   * when the subset is small (filter callers) to avoid warming the memo.
+   * Pass `typeHints` (the event types the predicate accepts) to skip
+   * JSON.parse on non-matching lines — avoids parsing the high-volume
+   * engagement.interval bulk entirely.
+   */
+  readonly streamFiltered: (
+    predicate: (event: AcceptedEvent) => boolean,
+    typeHints?: ReadonlySet<string>,
+  ) => Promise<readonly AcceptedEvent[]>;
+  /**
+   * Cheap content signature of the durable log (shard mtimes + sizes).
+   * Changes iff any shard was appended/added. Lets callers cache derived
+   * projections and serve them on an unchanged log WITHOUT calling
+   * readMerged() — so the full-log memo can idle out instead of being
+   * re-warmed by every poll.
+   */
+  readonly logSignature: () => Promise<string>;
   readonly readReplica: (replicaId: string) => Promise<readonly AcceptedEvent[]>;
   readonly readByAggregate: (aggregateId: string) => Promise<readonly AcceptedEvent[]>;
   readonly findByClientEventId: (clientEventId: string) => Promise<AcceptedEvent | null>;
@@ -206,11 +251,29 @@ export interface EventLog {
   //   3. Byte-identical re-imports (same dot AND same content) are
   //      no-ops — Syncthing redelivery, relay replay, etc.
   readonly importPeerEvent: (event: AcceptedEvent) => Promise<{ readonly imported: boolean }>;
+  /**
+   * Warm the append-path indexes off the request path (idempotent,
+   * single-flighted; appends issued meanwhile join the in-flight
+   * warm). Long-lived processes call this at boot so the FIRST user
+   * write doesn't pay the one-time streaming pass over the log;
+   * short-lived CLI invocations skip it and pay only if they append.
+   */
+  readonly prewarmAppendIndexes: () => Promise<void>;
 }
 
 export interface EventLogOptions {
   readonly now?: () => Date;
   readonly hlcStamper?: () => Hlc | undefined;
+  /** True when shard files can be written by ANOTHER process (a sync
+   *  transport dropping peer shards in, or a concurrent CLI `import`).
+   *  Only then does the append path need to re-check the on-disk log
+   *  signature before each dedupe/deps decision. In the common
+   *  single-companion case (default false) the in-memory append indexes
+   *  are the sole authority — this process is the only writer and
+   *  maintains them incrementally — so the per-append signature scan
+   *  (readdir of every replica dir + stat of every shard file, twice
+   *  per write) is pure overhead and is skipped. */
+  readonly externalWritersPossible?: boolean;
 }
 
 const LOG_ROOT_SEGMENTS = ['_BAC', 'log'] as const;
@@ -252,11 +315,20 @@ export const isAcceptedEvent = (value: unknown): value is AcceptedEvent => {
 
 const parseLine = (line: string): AcceptedEvent | null => {
   const trimmed = line.trim();
+  // Empty lines are structural (trailing newline, blank separators),
+  // NOT data loss — do not count them.
   if (trimmed.length === 0) return null;
   try {
     const parsed = JSON.parse(trimmed) as unknown;
-    return isAcceptedEvent(parsed) ? parsed : null;
+    if (isAcceptedEvent(parsed)) return parsed;
+    // Parsed as JSON but not a valid AcceptedEvent — a garbled/partial
+    // line that survived JSON.parse; still a skipped event.
+    incrementSkippedMalformedLines();
+    return null;
   } catch {
+    // Non-empty line that does not parse — a torn tail (crash without
+    // fsync) or corrupted line. This is the primary data-loss signal.
+    incrementSkippedMalformedLines();
     return null;
   }
 };
@@ -295,6 +367,158 @@ const readLogFile = async (path: string): Promise<AcceptedEvent[]> => {
   return events;
 };
 
+// Streaming tail-read helpers for `readMergedSince` — the watermark-resume
+// path the connections materializer uses to advance its frontier without
+// materializing the full merged log. Reads only past the frontier and
+// short-circuits whole shards via their last-line seq.
+const readLogFileSince = async (
+  path: string,
+  frontier: VersionVector,
+  expectedReplicaId?: string,
+): Promise<{ readonly events: AcceptedEvent[]; readonly maxSeq: number | null }> => {
+  const events: AcceptedEvent[] = [];
+  let maxSeq: number | null = null;
+  let stream: ReturnType<typeof createReadStream>;
+  try {
+    stream = createReadStream(path, { encoding: 'utf8' });
+  } catch (error) {
+    if (isEnoent(error)) {
+      return { events, maxSeq };
+    }
+    // A shard that exists but can't be opened (EACCES/EIO/EMFILE). Wrap
+    // so the runtime read path (readMergedSince) can distinguish it from
+    // a genuinely missing shard and skip it without treating it as an
+    // absent tail. Mirrors readShardTailSeq.
+    throw new ShardUnreadableError(path, error);
+  }
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  let processed = 0;
+  try {
+    for await (const line of lines) {
+      const event = parseLine(line);
+      if (
+        event !== null &&
+        (expectedReplicaId === undefined || event.dot.replicaId === expectedReplicaId)
+      ) {
+        maxSeq = Math.max(maxSeq ?? 0, event.dot.seq);
+        if (event.dot.seq > (frontier[event.dot.replicaId] ?? 0)) {
+          events.push(event);
+        }
+      }
+      processed += 1;
+      if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+    }
+  } catch (error) {
+    if (isEnoent(error)) {
+      return { events, maxSeq };
+    }
+    throw new ShardUnreadableError(path, error);
+  }
+  return { events, maxSeq };
+};
+
+const TAIL_READ_CHUNK_BYTES = 64 * 1024;
+
+// A shard file that exists but cannot be read (EACCES/EIO/EMFILE — a
+// network-mounted or iCloud-dataless vault, fd exhaustion, or a
+// permissions glitch on ONE shard). Distinguished from a missing shard
+// (ENOENT, handled as "no tail") because a read failure must NOT be
+// silently treated as an absent tail: if the seq file were ALSO lost,
+// silently skipping the shard would let nextSeq reissue a duplicate dot.
+// Callers decide policy (proceed on an intact seq file, refuse when the
+// counter is untrusted) — see `maxShardTailSeqForReplica`.
+export class ShardUnreadableError extends Error {
+  readonly shardPath: string;
+  constructor(shardPath: string, cause: unknown) {
+    super(`Event-log shard is unreadable: ${shardPath}`, { cause });
+    this.name = 'ShardUnreadableError';
+    this.shardPath = shardPath;
+  }
+}
+
+const isEnoent = (error: unknown): boolean =>
+  error instanceof Error && 'code' in error && error.code === 'ENOENT';
+
+// Yield the shard's non-empty lines from the END backward, one at a
+// time, using bounded chunked reads (never a full-file materialisation
+// for the common case where the last line already parses). The backward
+// scan lets `readShardTailSeq` recover the last VALID line for a replica
+// when the final line was torn by a crash mid-append.
+async function* readNonEmptyLinesFromTail(
+  handle: Awaited<ReturnType<typeof open>>,
+  size: number,
+): AsyncGenerator<string, void, void> {
+  let position = size;
+  // `pending` holds bytes read but not yet split into complete lines —
+  // its LEADING segment may still be the tail of a line whose start is
+  // in an earlier chunk, so it is only emitted once we hit a newline
+  // before it (or reach the file start).
+  let pending = '';
+  while (position > 0) {
+    const readLength = Math.min(TAIL_READ_CHUNK_BYTES, position);
+    position -= readLength;
+    const buffer = Buffer.allocUnsafe(readLength);
+    const { bytesRead } = await handle.read(buffer, 0, readLength, position);
+    pending = `${buffer.subarray(0, bytesRead).toString('utf8')}${pending}`;
+    // Emit every complete line whose start we have now seen (i.e. that
+    // is preceded by a newline within `pending`). Keep the leading
+    // segment (before the first newline) buffered — its start may be in
+    // the next chunk.
+    let lineBreak = pending.lastIndexOf('\n');
+    while (lineBreak >= 0) {
+      const line = pending.slice(lineBreak + 1).replace(/[\r\n]+$/u, '');
+      pending = pending.slice(0, lineBreak);
+      if (line.length > 0) yield line;
+      lineBreak = pending.lastIndexOf('\n');
+    }
+  }
+  const first = pending.replace(/[\r\n]+$/u, '');
+  if (first.length > 0) yield first;
+}
+
+// Highest seq committed by `expectedReplicaId` in this shard, or null if
+// the shard carries no valid line for that replica. Scans BACKWARD from
+// the tail and returns the first line that parses AND belongs to the
+// replica — so a crash that tore only the final line (no fsync anywhere)
+// still recovers the prior valid line's seq rather than under-recovering
+// to null. Throws `ShardUnreadableError` on a non-ENOENT read failure
+// (the caller must not treat that as "no tail"); returns null on ENOENT.
+const readShardTailSeq = async (
+  path: string,
+  expectedReplicaId: string,
+): Promise<number | null> => {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, 'r');
+  } catch (error) {
+    if (isEnoent(error)) return null;
+    throw new ShardUnreadableError(path, error);
+  }
+  try {
+    const { size } = await handle.stat();
+    for await (const line of readNonEmptyLinesFromTail(handle, size)) {
+      const event = parseLine(line);
+      if (event !== null && event.dot.replicaId === expectedReplicaId) {
+        return event.dot.seq;
+      }
+      // Otherwise: torn last line, a foreign replica's interleaved line,
+      // or garbage — keep scanning backward for this replica's last
+      // valid line rather than giving up (which would under-recover the
+      // high-water mark).
+    }
+    return null;
+  } catch (error) {
+    if (isEnoent(error)) return null;
+    throw new ShardUnreadableError(path, error);
+  } finally {
+    await handle.close();
+  }
+};
+
 const listJsonlFiles = async (dir: string): Promise<string[]> => {
   let entries;
   try {
@@ -310,12 +534,82 @@ const listJsonlFiles = async (dir: string): Promise<string[]> => {
     .map((entry) => join(dir, entry.name));
 };
 
+// Boot reconciliation for the replica seq high-water-mark. A lost,
+// regressed, or garbled `replica-seq` file would otherwise hand out a
+// seq that ALREADY appears on disk, minting a duplicate (replicaId,
+// seq) dot — the causal event log's primary key. Because appendClient
+// dedupes on clientEventId only, that reissued dot appends unchecked
+// and poisons every downstream causal reader (deps, conflict verdicts,
+// vector frontiers). Reconcile the counter against the durable truth:
+// the highest seq this replica ever committed to its OWN shards.
+//
+// Bounded work: reads ONLY this replica's shard directory and tail-reads
+// each shard file (last valid line, scanning backward), never a full-log
+// scan. Within a replica's own shard, appendClient allocates strictly
+// increasing seqs, so the tail line carries that file's max; the max
+// across the replica's shards is its committed high-water mark.
+//
+// `unreadableShards` lists shards that EXIST but could not be read
+// (non-ENOENT: EACCES/EIO/EMFILE). It is reported, NOT swallowed: a
+// shard whose tail we could not verify may hide a higher committed seq,
+// so advancing the counter as if it did not exist could reissue a
+// duplicate dot when the seq file is also untrusted. The boot caller
+// (`loadOrCreateReplica`) decides policy from this field.
+export interface ShardTailReconciliation {
+  // Max committed seq across the readable shards (0 when none).
+  readonly maxSeq: number;
+  // Paths of shards that exist but failed to read (non-ENOENT).
+  readonly unreadableShards: readonly string[];
+}
+
+export const reconcileShardTailSeqForReplica = async (
+  vaultPath: string,
+  replicaId: string,
+): Promise<ShardTailReconciliation> => {
+  const files = await listJsonlFiles(replicaLogDir(vaultPath, replicaId));
+  let maxSeq = 0;
+  const unreadableShards: string[] = [];
+  for (const file of files) {
+    let tailSeq: number | null;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- bounded, one tail read per shard
+      tailSeq = await readShardTailSeq(file, replicaId);
+    } catch (error) {
+      if (error instanceof ShardUnreadableError) {
+        unreadableShards.push(error.shardPath);
+        continue;
+      }
+      throw error;
+    }
+    if (tailSeq !== null && tailSeq > maxSeq) maxSeq = tailSeq;
+  }
+  return { maxSeq, unreadableShards };
+};
+
+// Back-compat strict variant: the committed high-water mark, throwing on
+// any unreadable shard. Retained for callers that want the raw number
+// and treat an unreadable shard as fatal. Returns 0 for a fresh replica.
+export const maxShardTailSeqForReplica = async (
+  vaultPath: string,
+  replicaId: string,
+): Promise<number> => {
+  const { maxSeq, unreadableShards } = await reconcileShardTailSeqForReplica(
+    vaultPath,
+    replicaId,
+  );
+  if (unreadableShards.length > 0) {
+    throw new ShardUnreadableError(unreadableShards[0] as string, undefined);
+  }
+  return maxSeq;
+};
+
 export const createEventLog = (
   vaultPath: string,
   replica: ReplicaContext,
   options: EventLogOptions = {},
 ): EventLog => {
   const now = options.now ?? (() => new Date());
+  const externalWritersPossible = options.externalWritersPossible ?? false;
 
   let writeChain: Promise<unknown> = Promise.resolve();
   const enqueueAppend = <T>(task: () => Promise<T>): Promise<T> => {
@@ -374,6 +668,40 @@ export const createEventLog = (
   let mergedInFlight: { signature: string; promise: Promise<readonly AcceptedEvent[]> } | null =
     null;
 
+  // Idle TTL eviction for the full-log memo. The memo holds every
+  // AcceptedEvent as a JS object; on an active vault that is hundreds
+  // of MB. Without eviction it lives for the whole process lifetime
+  // even when nothing reads it. The sweep drops it after the log has
+  // been idle (no readMerged access) for MERGED_MEMO_IDLE_MS; the next
+  // reader rebuilds from disk. One unref'd timer slot, clear-before-rearm,
+  // and it bails while a miss is in flight (the resolution re-installs +
+  // re-schedules).
+  const MERGED_MEMO_IDLE_MS = 60_000;
+  let mergedMemoLastAccessMs = 0;
+  let mergedMemoSweepTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelMergedSweep = (): void => {
+    if (mergedMemoSweepTimer !== null) {
+      clearTimeout(mergedMemoSweepTimer);
+      mergedMemoSweepTimer = null;
+    }
+  };
+  const scheduleMergedSweep = (delayMs: number): void => {
+    cancelMergedSweep();
+    const t = setTimeout(() => {
+      mergedMemoSweepTimer = null;
+      if (mergedInFlight !== null) return;
+      if (mergedMemo === null) return;
+      const idleMs = Date.now() - mergedMemoLastAccessMs;
+      if (idleMs >= MERGED_MEMO_IDLE_MS) {
+        mergedMemo = null;
+      } else {
+        scheduleMergedSweep(MERGED_MEMO_IDLE_MS - idleMs);
+      }
+    }, delayMs);
+    t.unref?.();
+    mergedMemoSweepTimer = t;
+  };
+
   const computeLogSignature = async (): Promise<string> => {
     const ids = await listReplicaIds();
     const parts: string[] = [];
@@ -403,6 +731,7 @@ export const createEventLog = (
   const readMerged = async (): Promise<readonly AcceptedEvent[]> => {
     const signature = await computeLogSignature();
     if (mergedMemo !== null && mergedMemo.signature === signature) {
+      mergedMemoLastAccessMs = Date.now();
       return mergedMemo.value;
     }
     if (mergedInFlight !== null && mergedInFlight.signature === signature) {
@@ -412,6 +741,10 @@ export const createEventLog = (
       try {
         const value = await readMergedUncached();
         mergedMemo = { signature, value };
+        // Anchor the eviction timer to install time, not the prior
+        // last-access, so the sweep can't fire against a stale memo.
+        mergedMemoLastAccessMs = Date.now();
+        scheduleMergedSweep(MERGED_MEMO_IDLE_MS);
         return value;
       } finally {
         if (mergedInFlight !== null && mergedInFlight.signature === signature) {
@@ -423,40 +756,335 @@ export const createEventLog = (
     return promise;
   };
 
+  const readMergedSince = async (frontier: VersionVector): Promise<readonly AcceptedEvent[]> => {
+    const ids = await listReplicaIds();
+    const out: AcceptedEvent[] = [];
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort().reverse();
+      const frontierSeq = frontier[id] ?? 0;
+      let parseBeforeTailCheck = true;
+      for (const file of files) {
+        try {
+          if (!parseBeforeTailCheck) {
+            const shardTailSeq = await readShardTailSeq(file, id);
+            if (shardTailSeq !== null && shardTailSeq <= frontierSeq) break;
+          }
+          const shard = await readLogFileSince(file, frontier, id);
+          for (const event of shard.events) {
+            out.push(event);
+          }
+          if (shard.maxSeq !== null && shard.maxSeq <= frontierSeq) break;
+          parseBeforeTailCheck = false;
+        } catch (error) {
+          // A transient per-shard read failure (EACCES/EIO/EMFILE on a
+          // network-mounted / dataless vault, fd exhaustion) must NOT
+          // throw out of a materializer drain. Count it, skip THIS shard
+          // for this pass, and continue with the rest. Crucially we do
+          // NOT break and do NOT advance any frontier past the unread
+          // shard: the caller advances only over events it actually
+          // received, so the shard's events are re-attempted next pass —
+          // the durability safety property. Re-throw anything that is
+          // not a shard-read failure.
+          if (error instanceof ShardUnreadableError) {
+            incrementUnreadableShards();
+            // Cannot trust a tail-seq short-circuit relative to an unread
+            // shard, so force a full parse of the remaining (older)
+            // shards this pass rather than a tail-check break.
+            parseBeforeTailCheck = true;
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
+    return sortAcceptedEvents(out);
+  };
+
+  // Stream every event through `onEvent` one at a time, O(1) memory —
+  // never materialises the full merged array. The boot consumers that
+  // only need a small subset (privacy: 3 types; recall freshness: a
+  // count; projection: structural types) use this instead of
+  // readMerged() so they don't each warm the ~700MB full-log memo.
+  // Shard order (per-replica seq, replicas concatenated); callers that
+  // need merged order use streamFiltered (which sorts the subset).
+  const streamEvents = async (
+    onEvent: (event: AcceptedEvent) => void,
+    typeHints?: ReadonlySet<string>,
+  ): Promise<void> => {
+    // Pre-parse type skip: when the caller only wants specific event
+    // types, test the raw line for `"type":"<t>"` BEFORE JSON.parse.
+    // The ~173k engagement.interval lines (88% of the log) then never
+    // get parsed, so the transient parse garbage that sets the libpas
+    // high-water is never allocated. Safe: the type field is always
+    // serialised as `"type":"value"` with the closing quote, so there
+    // are no false negatives (and a substring type can't false-match a
+    // longer type); a stray match inside a payload only costs one wasted
+    // parse, which the caller's predicate still filters out.
+    const needles = typeHints === undefined ? null : [...typeHints].map((t) => `"type":"${t}"`);
+    const ids = await listReplicaIds();
+    let processed = 0;
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort();
+      for (const file of files) {
+        let stream: ReturnType<typeof createReadStream>;
+        try {
+          stream = createReadStream(file, { encoding: 'utf8' });
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+          throw error;
+        }
+        const lines = createInterface({ input: stream, crlfDelay: Infinity });
+        try {
+          for await (const line of lines) {
+            if (needles === null || needles.some((n) => line.includes(n))) {
+              const event = parseLine(line);
+              if (event !== null) onEvent(event);
+            }
+            processed += 1;
+            if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+              await new Promise<void>((resolve) => {
+                setImmediate(resolve);
+              });
+            }
+          }
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
+          throw error;
+        }
+      }
+    }
+  };
+
+  // Streamed equivalent of `(await readMerged()).filter(predicate)`:
+  // collects only the matching subset (bounded), then sorts it the same
+  // way readMerged does. Byte-identical ordering to filtering the merged
+  // array, because a total order is stable under subsetting — so callers
+  // that fold/last-write-wins over the result are unaffected.
+  const streamFiltered = async (
+    predicate: (event: AcceptedEvent) => boolean,
+    typeHints?: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    const out: AcceptedEvent[] = [];
+    await streamEvents((event) => {
+      if (predicate(event)) out.push(event);
+    }, typeHints);
+    return sortAcceptedEvents(out);
+  };
+
   const readByAggregate = async (aggregateId: string): Promise<readonly AcceptedEvent[]> => {
     const merged = await readMerged();
     return merged.filter((event) => event.aggregateId === aggregateId);
   };
 
   const findByClientEventId = async (clientEventId: string): Promise<AcceptedEvent | null> => {
-    const merged = await readMerged();
-    return merged.find((event) => event.clientEventId === clientEventId) ?? null;
+    // Negative fast-path: when the append indexes are warm they are
+    // authoritative for membership — absent there means absent in the
+    // log, no need to read anything. (A stale-index false negative
+    // self-corrects at the guarded append: freshAppendIndexes rebuilds
+    // on a foreign signature change before any dedupe decision.)
+    if (appendIndexes !== null && !appendIndexes.clientIdToDot.has(clientEventId)) {
+      return null;
+    }
+    // Positive / cold path: stream-scan instead of readMerged. The
+    // duplicate-replay case fires exactly when the companion is busy
+    // (a write succeeded server-side but timed out client-side and
+    // got replayed) — warming the ~700MB full-log memo there would
+    // re-pin the memory the indexes exist to release.
+    const matches = await streamFiltered((event) => event.clientEventId === clientEventId);
+    return matches[0] ?? null;
   };
 
   const findByDot = async (dot: Dot): Promise<AcceptedEvent | null> => {
-    const merged = await readMerged();
-    return (
-      merged.find((event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq) ??
-      null
+    // Stream-scan for the single event — see findByClientEventId for
+    // why this avoids readMerged (memo pinning on the busy path).
+    const matches = await streamFiltered(
+      (event) => event.dot.replicaId === dot.replicaId && event.dot.seq === dot.seq,
     );
+    return matches[0] ?? null;
+  };
+
+  // ── Append-path indexes ─────────────────────────────────────────
+  // clientEventId → dot, dot-key set, aggregateId → deps vector.
+  // Warmed ONCE via streamEvents (O(1) memory during the pass; the
+  // retained maps hold ids/dots only, never payloads), then maintained
+  // by every append/import — which all run under the enqueueAppend
+  // mutex, so warm + reads + writes never race.
+  //
+  // Why: every append used to call readMerged() for dedupe + deps, and
+  // the append itself invalidates the memo's file signature — so each
+  // write re-read + re-parsed the ENTIRE log (333k events ≈ tens of
+  // seconds under --smol), serialized behind the append mutex. Live
+  // symptom: 46-69 s POST /v1/timeline/events / page-evidence writes
+  // cascading every other write (incl. recall.served appends), panel
+  // flapping to "busy". With the indexes, appends are O(batch) plus
+  // one file append, and the ~700MB full-log memo can idle out instead
+  // of being re-warmed per write.
+  //
+  // Indexes are add-only: rewriting/compacting shard files while the
+  // process runs is not supported (the readMerged memo tolerates it
+  // via its signature; these indexes would go stale — there is no such
+  // writer in-tree today).
+  interface AppendIndexes {
+    readonly clientIdToDot: Map<string, Dot>;
+    readonly dotKeys: Set<string>;
+    readonly aggregateVectors: Map<string, VersionVector>;
+  }
+  let appendIndexes: AppendIndexes | null = null;
+  let appendIndexesWarming: Promise<AppendIndexes> | null = null;
+
+  const dotKeyOf = (dot: Dot): string => `${dot.replicaId}:${String(dot.seq)}`;
+
+  const registerInAppendIndexes = (idx: AppendIndexes, event: AcceptedEvent): void => {
+    idx.clientIdToDot.set(event.clientEventId, event.dot);
+    idx.dotKeys.add(dotKeyOf(event.dot));
+    const prior = idx.aggregateVectors.get(event.aggregateId) ?? {};
+    idx.aggregateVectors.set(
+      event.aggregateId,
+      maxVector(prior, { [event.dot.replicaId]: event.dot.seq }),
+    );
+  };
+
+  const warmAppendIndexes = (): Promise<AppendIndexes> => {
+    if (appendIndexes !== null) return Promise.resolve(appendIndexes);
+    appendIndexesWarming ??= (async () => {
+      const idx: AppendIndexes = {
+        clientIdToDot: new Map(),
+        dotKeys: new Set(),
+        aggregateVectors: new Map(),
+      };
+      await streamEvents((event) => {
+        registerInAppendIndexes(idx, event);
+      });
+      appendIndexes = idx;
+      appendIndexesWarming = null;
+      return idx;
+    })().catch((error: unknown) => {
+      // A failed warm (transient read error mid-stream) must not pin a
+      // rejected promise here forever — that would fail EVERY later
+      // append until restart. Clear the slot so the next append
+      // retries the warm from scratch.
+      appendIndexesWarming = null;
+      throw error;
+    });
+    return appendIndexesWarming;
+  };
+
+  // Log signature the indexes were last reconciled against. The
+  // indexes are in-process state, but the shard files can gain events
+  // from OUTSIDE this process (a CLI `import` run against the same
+  // vault, file-level sync dropping a peer shard in). The old
+  // readMerged-per-append path picked those up via the memo's file
+  // signature; the indexes must do the same or dedupe/deps run against
+  // stale data and mint duplicate identities. Every guarded append
+  // compares the live signature first (one stat pass over the shard
+  // files, single-digit ms) and rebuilds the indexes when something
+  // else moved the log; after its own write it re-records the
+  // signature so the next check doesn't self-trigger.
+  let appendIndexesSignature: string | null = null;
+
+  const freshAppendIndexes = async (): Promise<AppendIndexes> => {
+    // Single-writer (default): the in-memory indexes are authoritative —
+    // no other process mutates the log, so skip the on-disk signature
+    // scan entirely (the indexes are warmed once and maintained by our
+    // own appends).
+    if (!externalWritersPossible) return warmAppendIndexes();
+    let idx = await warmAppendIndexes();
+    const sig = await computeLogSignature();
+    if (appendIndexesSignature !== null && appendIndexesSignature !== sig) {
+      appendIndexes = null;
+      idx = await warmAppendIndexes();
+      appendIndexesSignature = await computeLogSignature();
+      return idx;
+    }
+    appendIndexesSignature = sig;
+    return idx;
+  };
+
+  const recordAppendIndexesSignature = async (): Promise<void> => {
+    // Only meaningful when freshAppendIndexes is signature-checking.
+    if (!externalWritersPossible) return;
+    appendIndexesSignature = await computeLogSignature();
+  };
+
+  // Critical correctness rule: deps must reflect the editor's observed
+  // state at edit time, NOT the companion's current frontier. Otherwise
+  // an outbox replay arriving after peer events would falsely claim to
+  // have observed those peer events and silently win conflicts.
+  //
+  // Sync Contract v1, served from the maintained indexes instead of
+  // the merged log:
+  //   - Browser-observed (appendClientObserved): baseVector present
+  //     (possibly `{}`) → deps stamped EXACTLY from it. Empty means
+  //     "browser observed nothing" — legitimate; never replaced with
+  //     the companion's own frontier.
+  //   - Server-observed (appendServerObserved): baseVector omitted →
+  //     deps = union vector of the aggregate's prior events (the fold
+  //     registerInAppendIndexes maintains is vectorFromEvents of
+  //     exactly that subset).
+  //   - clientDeps → resolved id→dot via the index, so events that
+  //     depend on a sibling event in the SAME POST batch get the right
+  //     dot; unresolved deps drop (not yet in our log — reconstructed
+  //     when the missing events arrive).
+  const computeDepsIndexed = <TPayload extends Record<string, unknown>>(
+    input: AppendInput<TPayload>,
+    idx: AppendIndexes,
+  ): VersionVector => {
+    let deps: VersionVector =
+      input.baseVector !== undefined
+        ? input.baseVector
+        : (idx.aggregateVectors.get(input.aggregateId) ?? {});
+    if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
+      for (const dep of input.clientDeps) {
+        const resolved = idx.clientIdToDot.get(dep);
+        if (resolved !== undefined) {
+          deps = maxVector(deps, { [resolved.replicaId]: resolved.seq });
+        }
+      }
+    }
+    return deps;
   };
 
   const appendClient = <TPayload extends Record<string, unknown>>(
     input: AppendInput<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
     enqueueAppend(async () => {
-      const existing = await findByClientEventId(input.clientEventId);
-      if (existing !== null) {
-        return existing as AcceptedEvent<TPayload>;
+      const idx = await freshAppendIndexes();
+      if (idx.clientIdToDot.has(input.clientEventId)) {
+        // Duplicate replay (rare) — the index proves presence; fetch
+        // the full event from the merged log for the return contract.
+        const existing = await findByClientEventId(input.clientEventId);
+        if (existing !== null) {
+          return existing as AcceptedEvent<TPayload>;
+        }
+        // Index and merged log disagree (corrupt/unreadable line).
+        // Minting a fresh dot for an id the log already carries would
+        // poison sync with a ClientEventIdReuse on every peer — fail
+        // the append loudly instead.
+        throw new Error(
+          `Event log inconsistent: clientEventId ${input.clientEventId} is indexed but unreadable from the shards.`,
+        );
       }
-      // Resolve clientDeps to dots so deps reflects "everything the
-      // editor caused or observed at edit time."
-      const merged = await readMerged();
-      const deps = computeDepsFromInput(input, merged);
+      // Resolve deps from the maintained indexes — same Sync Contract
+      // v1 stamping as computeDepsFromInput without re-reading the log.
+      const deps = computeDepsIndexed(input, idx);
       const seq = await replica.nextSeq();
+      const dot: Dot = { replicaId: replica.replicaId, seq };
+      // Defense-in-depth against dot reuse: the boot reconciliation
+      // (loadOrCreateReplica ← maxShardTailSeqForReplica) already lifts
+      // the seq counter past every committed shard tail, so a fresh seq
+      // must not collide. But if the seq counter were ever corrupted at
+      // runtime, appending on a dot the index already carries would mint
+      // a duplicate causal primary key. The index is already in hand
+      // here (freshAppendIndexes above) — no extra scan — so reject
+      // loudly instead of poisoning the log.
+      if (idx.dotKeys.has(dotKeyOf(dot))) {
+        throw new Error(
+          `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
+        );
+      }
       const event: AcceptedEvent<TPayload> = {
         clientEventId: input.clientEventId,
-        dot: { replicaId: replica.replicaId, seq },
+        dot,
         deps,
         aggregateId: input.aggregateId,
         type: input.type,
@@ -476,6 +1104,11 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
+      // Register only after the durable write — a failed write must
+      // not leave the index claiming presence (it would silently drop
+      // the retry as a duplicate).
+      registerInAppendIndexes(idx, event);
+      await recordAppendIndexesSignature();
       return event;
     });
 
@@ -485,27 +1118,54 @@ export const createEventLog = (
   ): Promise<readonly { readonly clientEventId: string; readonly imported: boolean }[]> =>
     enqueueAppend(async () => {
       if (inputs.length === 0) return [];
-      // ONE readMerged for the whole batch (vs findByClientEventId +
-      // deps readMerged PER event). Edge-event deps are `{}` (explicit
-      // baseVector, no clientDeps) so this single snapshot is exact.
-      const merged = await readMerged();
-      const present = new Set(merged.map((event) => event.clientEventId));
+      // Index-backed dedupe + deps (was: ONE readMerged per batch —
+      // which still re-read the whole log every time, because the
+      // previous batch's append invalidates the memo).
+      const idx = await freshAppendIndexes();
+      const presentInBatch = new Set<string>();
+      // Dots minted earlier in THIS batch. Kept separate from the shared
+      // idx.dotKeys (which only registers after the durable write) so a
+      // mid-batch write failure can't strand phantom dots in the live
+      // index, while a regressed counter that hands out the same seq
+      // twice within one batch is still caught.
+      const dotsInBatch = new Set<string>();
       const events: AcceptedEvent<TPayload>[] = [];
       const results: { clientEventId: string; imported: boolean }[] = [];
       const at = now();
       for (const input of inputs) {
-        if (present.has(input.clientEventId)) {
+        if (idx.clientIdToDot.has(input.clientEventId) || presentInBatch.has(input.clientEventId)) {
           // Already in the log OR earlier in this batch — dedupe,
-          // exactly like appendClient's findByClientEventId guard.
+          // exactly like appendClient's index guard.
           results.push({ clientEventId: input.clientEventId, imported: false });
           continue;
         }
-        const deps = computeDepsFromInput(input, merged);
+        const deps = computeDepsIndexed(input, idx);
         // eslint-disable-next-line no-await-in-loop -- nextSeq is a cheap monotonic counter
         const seq = await replica.nextSeq();
+        const dot: Dot = { replicaId: replica.replicaId, seq };
+        // Same defense-in-depth as appendClient: boot reconciliation
+        // (loadOrCreateReplica ← reconcileShardTailSeqForReplica) lifts
+        // the counter past every committed shard tail, so a fresh seq
+        // must not collide. But under the correlated fault this fix
+        // guards (seq file lost/regressed AND a shard tail torn) the
+        // counter could regress; without this guard the batch path would
+        // SILENTLY write a duplicate (replicaId, seq) dot — a permanent
+        // DotCollisionError that poisons sync. The index is already in
+        // hand (no extra scan) — reject loudly instead. Also check the
+        // batch-local set so a regressed counter handing out the same seq
+        // twice WITHIN one batch is caught, without mutating the shared
+        // index before the durable write (which would strand phantom dots
+        // on a mid-batch write failure).
+        const dotKey = dotKeyOf(dot);
+        if (idx.dotKeys.has(dotKey) || dotsInBatch.has(dotKey)) {
+          throw new Error(
+            `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
+          );
+        }
+        dotsInBatch.add(dotKey);
         const event: AcceptedEvent<TPayload> = {
           clientEventId: input.clientEventId,
-          dot: { replicaId: replica.replicaId, seq },
+          dot,
           deps,
           aggregateId: input.aggregateId,
           type: input.type,
@@ -518,7 +1178,7 @@ export const createEventLog = (
               : {}
             : { hlc: input.hlc }),
         };
-        present.add(input.clientEventId);
+        presentInBatch.add(input.clientEventId);
         events.push(event);
         results.push({ clientEventId: input.clientEventId, imported: true });
       }
@@ -531,6 +1191,12 @@ export const createEventLog = (
           `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
           { encoding: 'utf8', flag: 'a' },
         );
+        // Index registration only after the durable write (see
+        // appendClient) — and after, not during, the input loop, so a
+        // mid-batch write failure can't strand half a batch as
+        // phantom duplicates.
+        for (const event of events) registerInAppendIndexes(idx, event);
+        await recordAppendIndexesSignature();
       }
       // Dispatch AFTER the durable write so a hook only ever sees
       // events that are on disk — same ordering guarantee as the
@@ -548,18 +1214,34 @@ export const createEventLog = (
       if (event.dot.replicaId === replica.replicaId) {
         return { imported: false } as const;
       }
-      const byDot = await findByDot(event.dot);
-      if (byDot !== null) {
-        if (canonicalEquals(byDot, event)) {
-          return { imported: false } as const;
+      const idx = await freshAppendIndexes();
+      if (idx.dotKeys.has(dotKeyOf(event.dot))) {
+        // Dot already present — the collision/equality verdict needs
+        // the full stored event; this (rare) path may warm the memo.
+        const byDot = await findByDot(event.dot);
+        if (byDot !== null) {
+          if (canonicalEquals(byDot, event)) {
+            return { imported: false } as const;
+          }
+          // Two DIFFERENT events claim the same (replicaId, seq) — the
+          // causal primary key collided. Count the anomaly before we
+          // reject the import.
+          incrementDotCollisions();
+          throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
         }
-        throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
+        // Index claims the dot exists but the merged read can't
+        // surface it (transient shard-read failure). Appending on top
+        // of a claimed dot would write a duplicate identity — treat
+        // as a benign redelivery instead; the peer retries if needed.
+        return { imported: false } as const;
       }
-      const byClient = await findByClientEventId(event.clientEventId);
-      if (byClient !== null) {
+      const knownDot = idx.clientIdToDot.get(event.clientEventId);
+      if (knownDot !== undefined) {
         // Same clientEventId arriving under a different dot: a peer
-        // is reusing the id under different identities. Reject.
-        throw new ClientEventIdReuseError(event.clientEventId, byClient.dot, event.dot);
+        // is reusing the id under different identities. Writing it would
+        // mint a duplicate capture identity — count then reject.
+        incrementDuplicateCaptures();
+        throw new ClientEventIdReuseError(event.clientEventId, knownDot, event.dot);
       }
       const dir = replicaLogDir(vaultPath, event.dot.replicaId);
       await mkdir(dir, { recursive: true });
@@ -569,6 +1251,8 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
+      registerInAppendIndexes(idx, event);
+      await recordAppendIndexesSignature();
       // Each replica's seq counter is independent; we don't bump our
       // own seq when ingesting a peer event (that would corrupt our
       // local namespace). Causal ordering across replicas is handled
@@ -611,12 +1295,19 @@ export const createEventLog = (
     appendClientObservedBatch,
     appendServerObserved,
     readMerged,
+    readMergedSince,
+    streamEvents,
+    streamFiltered,
+    logSignature: computeLogSignature,
     readReplica,
     readByAggregate,
     findByClientEventId,
     findByDot,
     listReplicaIds,
     importPeerEvent,
+    prewarmAppendIndexes: async (): Promise<void> => {
+      await warmAppendIndexes();
+    },
   };
 };
 
@@ -629,59 +1320,5 @@ export const createEventLog = (
 // stay in lockstep.
 const canonicalEquals = (a: AcceptedEvent, b: AcceptedEvent): boolean =>
   canonicalEventString(a) === canonicalEventString(b);
-
-// Critical correctness rule: deps must reflect the editor's observed
-// state at edit time, NOT the companion's current frontier. Otherwise
-// an outbox replay arriving after peer events would falsely claim to
-// have observed those peer events and silently win conflicts.
-//
-// We resolve `clientDeps` against the merged log so events that
-// depend on a sibling event in the SAME POST batch (e.g. a comment.set
-// after a span.added) get the right dot. clientDeps that don't
-// resolve are dropped (they refer to events not yet in our log;
-// they'll be reconstructed when the missing events arrive).
-const computeDepsFromInput = <TPayload extends Record<string, unknown>>(
-  input: AppendInput<TPayload>,
-  merged: readonly AcceptedEvent[],
-): VersionVector => {
-  // Sync Contract v1: two semantics, expressed by presence of
-  // `baseVector`:
-  //
-  //   - Browser-observed (appendClientObserved): baseVector is
-  //     present (possibly `{}`). Deps stamped EXACTLY from
-  //     baseVector. Empty `{}` means "browser observed nothing"
-  //     and is a legitimate state — a stale outbox arriving after
-  //     peer events drained is accepted as concurrent (does not
-  //     dominate). The companion does NOT replace the explicit
-  //     vector with its own frontier.
-  //
-  //   - Server-observed (appendServerObserved): baseVector is
-  //     omitted. Deps stamped from the union of every prior event
-  //     for the SAME aggregate. The caller asserts they ARE the
-  //     latest server-observed state.
-  //
-  // Tests that simulate concurrent first-writes call this method
-  // (or appendClient) with `baseVector: {}` directly — that's
-  // the legitimate empty-observation case. There is no escape
-  // hatch field; empty is just a legal arg.
-  const explicit = input.baseVector;
-  let deps: VersionVector;
-  if (explicit !== undefined) {
-    deps = explicit;
-  } else {
-    deps = vectorFromEvents(merged.filter((event) => event.aggregateId === input.aggregateId));
-  }
-  if (input.clientDeps !== undefined && input.clientDeps.length > 0) {
-    const byClientId = new Map<string, AcceptedEvent>();
-    for (const event of merged) byClientId.set(event.clientEventId, event);
-    for (const dep of input.clientDeps) {
-      const resolved = byClientId.get(dep);
-      if (resolved !== undefined) {
-        deps = maxVector(deps, { [resolved.dot.replicaId]: resolved.dot.seq });
-      }
-    }
-  }
-  return deps;
-};
 
 const maybeAttachHlc = (hlc: Hlc | undefined): { hlc?: Hlc } => (hlc === undefined ? {} : { hlc });

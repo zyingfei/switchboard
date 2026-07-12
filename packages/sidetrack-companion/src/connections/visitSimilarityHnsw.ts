@@ -20,6 +20,7 @@ export interface LoadedSimilarityHnswStore {
   recoveredFromCorruption(): boolean;
   insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void>;
   delete(visitId: string): Promise<void>;
+  embedding(visitId: string): Promise<readonly number[] | null>;
   queryTopK(
     visitId: string,
     k: number,
@@ -243,6 +244,13 @@ export const createSimilarityHnswStore = (
       loaded.index.markDelete(label);
       loaded.visitIdToLabel.delete(visitId);
       loaded.labelToVisitId.delete(label);
+    },
+
+    async embedding(visitId: string): Promise<readonly number[] | null> {
+      const loaded = requireLoaded();
+      const label = loaded.visitIdToLabel.get(visitId);
+      if (label === undefined) return null;
+      return Array.from(loaded.index.getPoint(label));
     },
 
     async queryTopK(

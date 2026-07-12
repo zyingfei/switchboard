@@ -19,7 +19,6 @@ import {
   type DejaVuItem,
   type RestoredAnchor,
 } from '../src/contentOverlays';
-import { buildDejaVuHits } from '../src/contentOverlays/dejaVuModel';
 import type { OpenConnectionsDejaVuItem } from '../src/messages';
 import type { SearchHitFacet, UnifiedSearchHit } from '../src/sidepanel/search/types';
 import { settleAndExtractPageContent } from '../src/pageContent/extraction';
@@ -89,7 +88,10 @@ const mapResultToPersistedItem = (r: {
     readonly rawScore?: number;
     readonly vectorDistance?: number;
   }[];
-}): OpenConnectionsDejaVuItem => {
+// P2 — servedContextId (the batch's meta.servedContextId) rides each
+// item so the sidepanel can seed its impression registry and emit
+// impression-joined recall.action for gestures on See-all rows.
+}, servedContextId?: string): OpenConnectionsDejaVuItem => {
   const url = r.canonicalUrl ?? window.location.href;
   const provider = detectProviderFromUrl(url);
   const providerKey = mapDejaVuProviderKey(provider);
@@ -98,6 +100,10 @@ const mapResultToPersistedItem = (r: {
   const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
   return {
     id: r.candidateId ?? r.entityId,
+    // The SERVED entityId, byte-exact — the companion joins actions to
+    // impressions on this string (id above may be the candidateId).
+    entityId: r.entityId,
+    ...(servedContextId === undefined ? {} : { servedContextId }),
     providerKey,
     providerLabel: mapDejaVuProviderLabel(providerKey),
     title: r.title ?? '',
@@ -1048,9 +1054,13 @@ export default defineContentScript({
         const v2Raw = (await chrome.runtime.sendMessage({
           type: messageTypes.recallV2Query,
           req: {
+            // limit bumped 12 -> 20 on 2026-05-26: user expected the
+            // popover to show the rerank's top-20 (rerankTopK=20),
+            // not the prior 12-cap. Tiering decides strong vs
+            // collapsed visibility within that 20.
             q: text,
-            limit: 12,
-            perSourceLimit: 20,
+            limit: 20,
+            perSourceLimit: 25,
             session: { currentUrl: window.location.href },
             strategy: { explain: true },
           },
@@ -1077,6 +1087,29 @@ export default defineContentScript({
                   readonly vectorDistance?: number;
                 }[];
               }[];
+              // Phase 0 — companion stamps a per-impression id on
+              // every response so click / open-new-tab actions can be
+              // joined back to the served context for ranker training.
+              readonly meta?: {
+                readonly servedContextId?: string;
+                readonly activeSessionMarkers?: readonly {
+                  readonly entityId: string;
+                  readonly reason: 'current_chat' | 'open_tab' | 'recently_created';
+                }[];
+                readonly tiering?: {
+                  readonly policyVersion: 'v1';
+                  readonly scores: readonly number[];
+                  readonly scoreGaps: readonly number[];
+                  readonly suggestedStrongCount: number;
+                  readonly suggestedCollapsedCount: number;
+                  readonly confidenceStats: {
+                    readonly topScore: number;
+                    readonly medianScore: number;
+                    readonly minScore: number;
+                    readonly largestGap: { readonly index: number; readonly delta: number };
+                  };
+                };
+              };
             }
           | { readonly ok: false; readonly error?: string }
           | null
@@ -1093,7 +1126,39 @@ export default defineContentScript({
           if (!force) return;
         }
         const results = v2 != null && v2.ok === true ? v2.results : [];
+        const servedContextId =
+          v2 != null && v2.ok === true ? v2.meta?.servedContextId : undefined;
+        const activeSessionMarkers =
+          v2 != null && v2.ok === true ? v2.meta?.activeSessionMarkers ?? [] : [];
+        const tiering = v2 != null && v2.ok === true ? v2.meta?.tiering : undefined;
+        const markerByEntity = new Map<string, 'current_chat' | 'open_tab' | 'recently_created'>();
+        for (const m of activeSessionMarkers) markerByEntity.set(m.entityId, m.reason);
         if (results.length === 0 && !force) return;
+        // Phase 0 — pre-build the lookup table for emitting recall.action
+        // when the user clicks/opens a row. Maps the popover row id back
+        // to the original entityId the server stamped.
+        const entityIdByPopoverId = new Map<string, string>();
+        for (const r of results) {
+          entityIdByPopoverId.set(r.candidateId ?? r.entityId, r.entityId);
+        }
+        const emitRecallAction = (
+          popoverId: string,
+          actionKind: 'click' | 'open_new_tab',
+        ): void => {
+          if (servedContextId === undefined) return;
+          const entityId = entityIdByPopoverId.get(popoverId);
+          if (entityId === undefined) return;
+          void chrome.runtime.sendMessage({
+            type: messageTypes.recallActionEmit,
+            payload: {
+              payloadVersion: 1,
+              servedContextId,
+              entityId,
+              actionKind,
+              actionAt: new Date().toISOString(),
+            },
+          });
+        };
         // Map v2 source_kind → DejaVuItem facet (overlay's UI shape).
         const v2FacetOf = (k: string): SearchHitFacet | undefined => {
           if (k === 'page_content' || k === 'timeline_visit') return 'page';
@@ -1109,12 +1174,14 @@ export default defineContentScript({
               const vectorDist = r.evidence.find((e) => e.vectorDistance !== undefined)
                 ?.vectorDistance;
               const similarity = vectorDist !== undefined ? 1 - vectorDist : undefined;
+              const marker = markerByEntity.get(r.entityId);
               return {
                 id: r.candidateId ?? r.entityId,
                 title: r.title ?? r.canonicalUrl ?? '(no title)',
                 snippet: r.snippet ?? '',
                 score: r.fusedScore,
                 relativeWhen: r.lastSeenAt ?? r.firstSeenAt ?? '',
+                ...(marker === undefined ? {} : { marker }),
                 ...(facet === undefined ? {} : { facet }),
                 provider: detectProviderFromUrl(
                   r.canonicalUrl ?? window.location.href,
@@ -1129,6 +1196,16 @@ export default defineContentScript({
             },
           ),
           anchorRect,
+          ...(tiering != null
+            ? {
+                tiering: {
+                  strongCount: tiering.suggestedStrongCount,
+                  collapsedCount: tiering.suggestedCollapsedCount,
+                  scores: tiering.scores,
+                  largestGap: tiering.confidenceStats.largestGap,
+                },
+              }
+            : {}),
           onJump: (item) => {
             // Chat hits from /v1/content/query carry the conversation
             // URL as canonicalUrl (no threadUrl) — still focus it in
@@ -1137,6 +1214,10 @@ export default defineContentScript({
             const threadTarget =
               item.threadUrl ?? (item.facet === 'chat' ? item.canonicalUrl : undefined);
             if (threadTarget !== undefined) {
+              // Phase 0 — focus-in-sidepanel counts as a 'click' action
+              // (the user engaged with the served candidate but didn't
+              // open it as a fresh navigation).
+              emitRecallAction(item.id, 'click');
               void chrome.runtime.sendMessage({
                 type: messageTypes.focusThreadInSidePanel,
                 threadUrl: threadTarget,
@@ -1151,6 +1232,9 @@ export default defineContentScript({
               });
             } else if (item.canonicalUrl !== undefined) {
               // Page-content hit — no thread to focus; open the page.
+              // Phase 0 — opening in a new tab is the strongest implicit
+              // positive signal we capture in this phase.
+              emitRecallAction(item.id, 'open_new_tab');
               window.open(item.canonicalUrl, '_blank', 'noopener,noreferrer');
             }
             closeDejaVu();
@@ -1174,7 +1258,7 @@ export default defineContentScript({
               type: messageTypes.openConnectionsDejaVu,
               selectionText: text,
               sourceUrl: window.location.href,
-              items: results.map((r) => mapResultToPersistedItem(r)),
+              items: results.map((r) => mapResultToPersistedItem(r, servedContextId)),
             });
             closeDejaVu();
           },
@@ -1222,7 +1306,7 @@ export default defineContentScript({
               recallContext: {
                 selectionText: text,
                 sourceUrl: window.location.href,
-                hits: results.map((r) => mapResultToPersistedItem(r)),
+                hits: results.map((r) => mapResultToPersistedItem(r, servedContextId)),
               },
             });
           },

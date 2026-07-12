@@ -1,17 +1,104 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  getCanonicalCollisionSnapshot,
+  recordCanonicalCollision,
+} from './canonicalize-telemetry.js';
+import {
+  canonicalizePageUrl,
   pageContentCoverageCounts,
   queryPageContent,
   readPageContentCoverage,
+  scanForOverCollapsedPageContent,
+  sha256Hex,
   writePageContentExtracted,
   writePageContentTombstoned,
 } from './store.js';
 import { PAGE_CONTENT_COVERAGE_STATES } from './types.js';
 import type { PageContentExtractedPayload } from './types.js';
+
+describe('canonicalizePageUrl', () => {
+  it.each([
+    [
+      'preserves Hacker News item ids',
+      'https://news.ycombinator.com/item?id=48282814',
+      'https://news.ycombinator.com/item?id=48282814',
+    ],
+    [
+      'preserves YouTube video ids',
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    ],
+    [
+      'keeps arXiv URLs unchanged',
+      'https://arxiv.org/abs/2401.01234',
+      'https://arxiv.org/abs/2401.01234',
+    ],
+    [
+      'preserves Google query terms',
+      'https://www.google.com/search?q=hello+world',
+      'https://www.google.com/search?q=hello+world',
+    ],
+    [
+      'keeps X/Twitter status URLs unchanged',
+      'https://twitter.com/user/status/12345',
+      'https://twitter.com/user/status/12345',
+    ],
+    [
+      'strips trailing slashes',
+      'https://reddit.com/r/foo/comments/abc/title/',
+      'https://reddit.com/r/foo/comments/abc/title',
+    ],
+    [
+      'strips tracking params without dropping semantic params',
+      'https://example.com/page?id=1&utm_source=twitter&fbclid=xyz',
+      'https://example.com/page?id=1',
+    ],
+    [
+      'sorts query params',
+      'https://example.com/page?b=2&a=1',
+      'https://example.com/page?a=1&b=2',
+    ],
+    ['strips hashes', 'https://example.com/page#section', 'https://example.com/page'],
+  ])('%s', (_name, raw, expected) => {
+    expect(canonicalizePageUrl(raw)).toBe(expected);
+  });
+
+  it('keeps Hacker News thread ids distinct in collision telemetry', () => {
+    const urls = [48282814, 48282815, 48282816, 48282817, 48282818].map(
+      (id) => `https://news.ycombinator.com/item?id=${String(id)}`,
+    );
+    const canonicals = urls.map((rawUrl) => {
+      const canonicalUrl = canonicalizePageUrl(rawUrl);
+      recordCanonicalCollision(rawUrl, canonicalUrl);
+      return canonicalUrl;
+    });
+
+    expect(new Set(canonicals).size).toBe(5);
+    const host = getCanonicalCollisionSnapshot().byHost['news.ycombinator.com'];
+    expect(host).toMatchObject({ rawCount: 5, canonicalCount: 5 });
+    expect(host === undefined ? 0 : host.rawCount / host.canonicalCount).toBe(1);
+  });
+
+  it('keeps YouTube video ids distinct in collision telemetry', () => {
+    const urls = ['alpha01', 'alpha02', 'alpha03', 'alpha04', 'alpha05'].map(
+      (id) => `https://www.youtube.com/watch?v=${id}`,
+    );
+    const canonicals = urls.map((rawUrl) => {
+      const canonicalUrl = canonicalizePageUrl(rawUrl);
+      recordCanonicalCollision(rawUrl, canonicalUrl);
+      return canonicalUrl;
+    });
+
+    expect(new Set(canonicals).size).toBe(5);
+    const host = getCanonicalCollisionSnapshot().byHost['www.youtube.com'];
+    expect(host).toMatchObject({ rawCount: 5, canonicalCount: 5 });
+    expect(host === undefined ? 0 : host.rawCount / host.canonicalCount).toBe(1);
+  });
+});
 
 describe('page-content store', () => {
   let root: string;
@@ -237,5 +324,47 @@ describe('page-content store', () => {
     }
     expect(counts.byState['indexing']).toBe(0);
     expect(counts.byState['stale_index']).toBe(0);
+  });
+
+  it('scans for over-collapsed page-content records', async () => {
+    const dir = join(root, '_BAC', 'page-content', 'by-url');
+    await mkdir(dir, { recursive: true });
+    const writeRecord = async (canonicalUrl: string, chunkCount: number): Promise<void> => {
+      await writeFile(
+        join(dir, `${sha256Hex(canonicalUrl)}.json`),
+        `${JSON.stringify(
+          {
+            coverage: {
+              canonicalUrl,
+              state: 'indexed',
+              lastIndexedAt: '2026-05-26T12:00:00.000Z',
+              contentHash: `hash-${String(chunkCount)}-${sha256Hex(canonicalUrl).slice(0, 8)}`,
+              chunkCount,
+            },
+            url: canonicalUrl,
+            updatedAt: '2026-05-26T12:00:00.000Z',
+            sourceEventType: 'page.content.extracted',
+          },
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      );
+    };
+    await writeRecord('https://collapse.example.test/big', 67);
+    await writeRecord('https://collapse.example.test/small-a', 8);
+    await writeRecord('https://collapse.example.test/small-b', 8);
+    await writeRecord('https://collapse.example.test/small-c', 8);
+
+    const records = await scanForOverCollapsedPageContent(root);
+
+    expect(records).toEqual([
+      {
+        canonicalUrl: 'https://collapse.example.test/big',
+        chunkCount: 67,
+        lastIndexedAt: '2026-05-26T12:00:00.000Z',
+        contentHash: expect.stringMatching(/^hash-67-/u),
+      },
+    ]);
   });
 });

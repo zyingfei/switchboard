@@ -23,8 +23,17 @@ import { existsSync } from 'node:fs';
 
 const detectCustomSqlitePath = (): string | null => {
   const envPath = process.env['SIDETRACK_SQLITE_LIB'];
-  if (typeof envPath === 'string' && envPath.length > 0 && existsSync(envPath)) {
-    return envPath;
+  if (typeof envPath === 'string') {
+    // Explicit opt-out: run against Bun's built-in SQLite (no sqlite-vec).
+    // Used by CI so the test suite matches the local dev default, where
+    // no system libsqlite3 sits on the probe path. A vec-capable system
+    // lib (e.g. Ubuntu's /usr/lib/.../libsqlite3.so) enforces strict vec
+    // column dimensions and rejects the low-dimension fixtures some
+    // recall/connections tests feed — a test-fixture mismatch, not a
+    // product issue. See the vec-integration-lane followup.
+    const normalized = envPath.trim().toLowerCase();
+    if (['off', 'none', '0', 'false', 'disabled'].includes(normalized)) return null;
+    if (envPath.length > 0 && existsSync(envPath)) return envPath;
   }
   const candidates = [
     '/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib',

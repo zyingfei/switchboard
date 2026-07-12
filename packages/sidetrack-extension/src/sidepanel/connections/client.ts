@@ -1,4 +1,5 @@
 import { messageTypes } from '../../messages';
+import { maybeEmitTrainableRecallAction } from '../recall/emitTrainableAction';
 import type { ContextPackInput } from './contextPack';
 import { topicLabel, type TopicLabelResult } from './topicLabel';
 import type { ConnectionEdge, ConnectionNode, ConnectionsScopedResult } from './types';
@@ -186,11 +187,17 @@ export const feedbackRelationKindForEdgeKind = (edgeKind: string): UserFlowRelat
 
 export const postFeedbackEvent = (
   event: FeedbackEventEnvelope,
-): Promise<ConnectionsClientResponse<FeedbackPostResult>> =>
-  call(messageTypes.postConnectionsFeedbackEvent, {
-    event,
-    clientEventId: feedbackClientEventId(event),
-  });
+): Promise<ConnectionsClientResponse<FeedbackPostResult>> => {
+  const clientEventId = feedbackClientEventId(event);
+  // P2 — mirror the gesture as an impression-joined recall.action when
+  // the judged subject was recently recall-served (registry miss = the
+  // common case = silent no-op). MUST reuse this exact envelope +
+  // clientEventId: referencesEventId is how the companion trainer
+  // dedupes the live action against its own historical reconstruction
+  // of this same feedback event.
+  maybeEmitTrainableRecallAction(event, clientEventId);
+  return call(messageTypes.postConnectionsFeedbackEvent, { event, clientEventId });
+};
 
 export const postUserFlowConfirmed = (
   payload: Omit<UserFlowConfirmedPayload, 'payloadVersion'>,

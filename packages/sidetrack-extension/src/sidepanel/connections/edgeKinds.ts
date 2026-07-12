@@ -252,6 +252,7 @@ export const NODE_KIND_DISPLAY: Record<
   'queue-item': { label: 'Queue item', tintClass: 'cx-type-queue' },
   'inbound-reminder': { label: 'Reminder', tintClass: 'cx-type-reminder' },
   'coding-session': { label: 'Coding session', tintClass: 'cx-type-coding' },
+  page: { label: 'Page', tintClass: 'cx-type-visit' },
   // Stage 5 polish — the three visit-shaped kinds confused the
   // user (Orbital graph showed "Browser visit" + "Visit instance" +
   // "Tab session" for the SAME URL with identical titles). New
@@ -299,6 +300,7 @@ export const NODE_KIND_GROUP_ORDER: readonly ConnectionNodeKind[] = [
   'coding-session',
   'tab-session',
   'visit-instance',
+  'page',
   'timeline-visit',
   'topic',
   'snippet',

@@ -351,7 +351,13 @@ describe('connections — snapshot reducer (Given/Then)', () => {
     expect(snap.edges.find((e) => e.kind === 'queue_targets_workstream')).toBeDefined();
   });
 
-  it('reminder for a thread yields reminder_for_thread edge', () => {
+  it('reminder records are NOT projected into the graph (2026-05-27)', () => {
+    // Per dogfood feedback: every chatgpt capture writes a reminder
+    // with status='new' to _BAC/reminders/, and we were projecting
+    // each one as an inbound-reminder node + reminder_for_thread edge.
+    // On a real vault that was 400+ vestigial nodes (~6% of the graph)
+    // for a feature that was never wired. Filter at the projection
+    // layer; keep the JSON records on disk for a future inbox feature.
     const snap = buildConnectionsSnapshot(
       emptyInput({
         reminders: [
@@ -365,10 +371,8 @@ describe('connections — snapshot reducer (Given/Then)', () => {
         ],
       }),
     );
-    const edge = snap.edges.find((e) => e.kind === 'reminder_for_thread');
-    expect(edge).toBeDefined();
-    expect(edge?.fromNodeId).toBe(nodeIdFor('inbound-reminder', 'rem_1'));
-    expect(edge?.toNodeId).toBe(nodeIdFor('thread', 'thread_a'));
+    expect(snap.edges.find((e) => e.kind === 'reminder_for_thread')).toBeUndefined();
+    expect(snap.nodes.find((n) => n.kind === 'inbound-reminder')).toBeUndefined();
   });
 
   it('coding session with workstreamId yields coding_session_in_workstream', () => {
@@ -1041,7 +1045,10 @@ describe('connections — content-derived edges', () => {
       'dispatch_requested_coding_session',
       'queue_targets_thread',
       'queue_targets_workstream',
-      'reminder_for_thread',
+      // 'reminder_for_thread' was emitted per chatgpt capture; filtered
+      // from the snapshot projection on 2026-05-27 (the records were
+      // vestigial — never wired to an inbox UI). See snapshot.ts and
+      // the dedicated regression test above.
       'coding_session_in_workstream',
       'timeline_same_url_as_thread',
       'annotation_targets_thread',
@@ -1380,7 +1387,11 @@ describe('connections — content-derived edges', () => {
           topK: 2,
           predict: (_features, candidate) => {
             const score = scoreByToVisit.get(candidate.toVisitId) ?? 0.1;
-            return { score, contributions: rankerContributionsFor(score) };
+            return {
+              score,
+              rankerKind: 'graph_baseline',
+              contributions: rankerContributionsFor(score),
+            };
           },
         },
       }),
@@ -1395,6 +1406,7 @@ describe('connections — content-derived edges', () => {
       nodeIdFor('timeline-visit', 'https://ranker.test/b'),
       nodeIdFor('timeline-visit', 'https://ranker.test/c'),
     ]);
+    expect(fromA.map((edge) => edge.metadata?.['score'])).toEqual([0.91, 0.62]);
     expect(fromA[0]).toMatchObject({
       observedAt: '2026-05-07T09:01:30.000Z',
       producedBy: { source: 'ranker', revisionId: 'ranker-rev-1' },
@@ -1402,6 +1414,7 @@ describe('connections — content-derived edges', () => {
       family: 'urlmatch',
       metadata: {
         score: 0.91,
+        rankerKind: 'graph_baseline',
         featureSchemaVersion: FEATURE_SCHEMA_VERSION,
         topContributions: [
           { feature: 'same_host', weight: 0.455 },

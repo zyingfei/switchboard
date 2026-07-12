@@ -148,7 +148,7 @@ const main = async () => {
   const companionWrapper = `#!/usr/bin/env bash
 set -euo pipefail
 DIR="$( cd "$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
-exec bun "$DIR/../companion/dist/cli.js" "$@"
+exec bun --smol "$DIR/../companion/dist/cli.js" "$@"
 `;
   await writeFile(join(stage, 'bin', 'sidetrack-companion'), companionWrapper, 'utf8');
   await chmod(join(stage, 'bin', 'sidetrack-companion'), 0o755);
@@ -156,7 +156,7 @@ exec bun "$DIR/../companion/dist/cli.js" "$@"
     const mcpWrapper = `#!/usr/bin/env bash
 set -euo pipefail
 DIR="$( cd "$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
-exec bun "$DIR/../mcp/dist/cli.js" "$@"
+exec bun --smol "$DIR/../mcp/dist/cli.js" "$@"
 `;
     await writeFile(join(stage, 'bin', 'sidetrack-mcp'), mcpWrapper, 'utf8');
     await chmod(join(stage, 'bin', 'sidetrack-mcp'), 0o755);

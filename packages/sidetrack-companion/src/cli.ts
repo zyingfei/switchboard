@@ -22,16 +22,29 @@ import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
+import { pairingToken, writePairToken } from './auth/bridgeKey.js';
 import { pickInstaller } from './install/index.js';
 import { ensurePageContentLexicalIndex } from './page-content/store.js';
+import { withBunSmolCommand } from './process/bunMemory.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
 import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
 import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
 import { startRelayServer, type StartedRelayServer } from './sync/relayServer.js';
+import { installCrashHandlers } from './system/crashHandler.js';
 import { COMPANION_VERSION } from './version.js';
 
 export const companionVersion = COMPANION_VERSION;
+
+// Resolved vault root for the crash handler's durable record. Set once
+// the vault path is known (an uncaught throw before that point still
+// logs to stderr; it just skips the file write). Module-scoped so the
+// crash handler installed at the CLI entry point can read the latest
+// value through a closure without threading it through every call.
+let crashRecordVaultRoot: string | undefined;
+const setCrashRecordVaultRoot = (vaultRoot: string): void => {
+  crashRecordVaultRoot = vaultRoot;
+};
 
 export interface CliStreams {
   readonly stdout: Writable;
@@ -306,7 +319,11 @@ const spawnMcpServer = (input: {
   readonly mcpAuthKey: string;
   readonly vaultPath: string;
   readonly companionUrl: string;
-  readonly bridgeKey: string;
+  // F02: pass the MCP-scoped key (mcp.key) as the child's --bridge-key so
+  // the companion server classifies the MCP caller separately from the
+  // extension surface. The extension's bridge.key is never given to the
+  // MCP child.
+  readonly mcpKey: string;
   readonly stdout: Writable;
   readonly stderr: Writable;
 }): ChildProcess => {
@@ -321,11 +338,12 @@ const spawnMcpServer = (input: {
     '--companion-url',
     input.companionUrl,
     '--bridge-key',
-    input.bridgeKey,
+    input.mcpKey,
     '--mcp-auth-key',
     input.mcpAuthKey,
   ];
-  const child = spawn(process.execPath, args, {
+  const command = withBunSmolCommand([process.execPath, ...args]);
+  const child = spawn(command[0] ?? process.execPath, command.slice(1), {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   child.stdout.on('data', (chunk: Buffer) => {
@@ -352,7 +370,9 @@ const resolveDefaultMcpBin = (): string => {
 
 const currentCompanionCommand = (): readonly string[] => {
   const entrypoint = process.argv[1];
-  return entrypoint === undefined ? [process.execPath] : [process.execPath, resolve(entrypoint)];
+  return withBunSmolCommand(
+    entrypoint === undefined ? [process.execPath] : [process.execPath, resolve(entrypoint)],
+  );
 };
 
 const relayUrl = (relay: StartedRelayServer): string => `ws://${relay.host}:${String(relay.port)}/`;
@@ -813,6 +833,10 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     writeLine(streams.stderr, renderHelp());
     return 2;
   }
+  // Vault root is now known — point the crash handler's durable record
+  // at it so an uncaught throw during startup / serving writes a
+  // post-mortem under this vault's _BAC/diagnostics/.
+  setCrashRecordVaultRoot(args.vaultPath);
 
   if (args.syncRelay !== undefined && args.syncRelayLocalPort !== undefined) {
     writeLine(streams.stderr, 'Use either --sync-relay or --sync-relay-local, not both.');
@@ -1032,6 +1056,25 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     );
   }
 
+  // Pairing token — one paste covers port + key. Written next to the key
+  // and printed every run so the user can grab a single string instead
+  // of separately hunting the port and catting the key.
+  let pairPath: string | undefined;
+  try {
+    pairPath = await writePairToken(runtime.vaultPath, args.port, runtime.bridgeKey);
+  } catch {
+    // Non-fatal — the key file + printed token below still pair fine.
+  }
+  writeLine(streams.stdout, '');
+  writeLine(
+    streams.stdout,
+    'Pair the extension in one paste — Settings → Companion connection → "Paste pairing string":',
+  );
+  writeLine(streams.stdout, `  ${pairingToken(args.port, runtime.bridgeKey)}`);
+  if (pairPath !== undefined) {
+    writeLine(streams.stdout, `  (also saved to ${pairPath})`);
+  }
+
   // Track an optional MCP child + close hook on a single object so
   // there's exactly one shutdown path regardless of which optional
   // sidecars are wired (mcp / local relay / neither).
@@ -1057,7 +1100,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       mcpAuthKey: resolvedMcpAuthKey,
       vaultPath: args.vaultPath,
       companionUrl: runtime.url,
-      bridgeKey: runtime.bridgeKey,
+      // F02: use the MCP-scoped key so the companion classifies this
+      // child's requests as `mcp` (trust-gated) not `extension`.
+      mcpKey: runtime.mcpKey,
       stdout: streams.stdout,
       stderr: streams.stderr,
     });
@@ -1125,6 +1170,13 @@ const isCliEntry = (): boolean => {
 };
 
 if (isCliEntry()) {
+  // Sole-writer crash supervision. Installed BEFORE runCli so an
+  // uncaught throw / unhandled rejection at ANY point in startup or
+  // serving writes a structured post-mortem (stderr + best-effort
+  // _BAC/diagnostics/crash-<ts>.json) and exits non-zero, rather than
+  // dying silently mid-operation or limping on corrupt. The vault root
+  // is read lazily so a throw before it is resolved still logs.
+  installCrashHandlers({ getVaultRoot: () => crashRecordVaultRoot });
   runCli(process.argv.slice(2), {
     stdout: process.stdout,
     stderr: process.stderr,

@@ -1337,3 +1337,83 @@ describe('live side-panel App wiring', () => {
     });
   });
 });
+
+describe('master capture switch (the side-panel eye)', () => {
+  it('pauses all capture when the eye is toggled off', async () => {
+    const sendMessage = installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+
+    render(<App />);
+
+    const eye = await screen.findByRole('button', {
+      name: 'Capture is on — click to pause all capture',
+    });
+    fireEvent.click(eye);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.saveLocalPreferences,
+        preferences: { captureEnabled: false },
+      });
+    });
+  });
+
+  it('resumes capture when the eye is toggled back on', async () => {
+    const base = liveState();
+    const sendMessage = installChromeMock(
+      { ...base, settings: { ...base.settings, captureEnabled: false } },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    const eye = await screen.findByRole('button', {
+      name: 'Capture is paused — click to resume capture',
+    });
+    fireEvent.click(eye);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.saveLocalPreferences,
+        preferences: { captureEnabled: true },
+      });
+    });
+  });
+
+  it('disables the capture-oriented icons while paused', async () => {
+    const base = liveState();
+    installChromeMock(
+      { ...base, settings: { ...base.settings, captureEnabled: false } },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    // The eye itself stays live so the user can resume.
+    const eye = await screen.findByRole('button', {
+      name: 'Capture is paused — click to resume capture',
+    });
+    expect(eye).toBeEnabled();
+    // Capture-mode toggle (Manual, since autoTrack defaults off) goes inert.
+    expect(
+      screen.getByRole('button', { name: 'Capture mode is Manual — switch to Auto' }),
+    ).toBeDisabled();
+    // So does the explicit capture-current-tab button.
+    expect(screen.getByRole('button', { name: 'Capture current tab' })).toBeDisabled();
+  });
+
+  it('routes diagnostics through the toolbar overflow menu instead of standalone icons', async () => {
+    installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+
+    render(<App />);
+
+    await screen.findByRole('main', { name: 'Sidetrack workboard' });
+    // The old standalone health icon is gone — diagnostics live behind ⋯.
+    expect(
+      screen.queryByRole('button', { name: 'Open capture health diagnostics' }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('toolbar-overflow'));
+    expect(await screen.findByRole('menuitem', { name: 'Capture health' })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'Design preview' })).toBeInTheDocument();
+  });
+});

@@ -102,6 +102,12 @@ export interface SystemBannersStackProps {
   readonly captureSuccessHost?: string;
   readonly companionActionLabel?: string;
   readonly companionStatus?: 'running' | 'slow' | 'down';
+  // Why the companion is down, surfaced in the banner so the CTA is
+  // actionable: "bridge key rejected — update the key" vs "no response
+  // on :17374 — start it or fix the port". Without this the banner just
+  // says "disconnected" and the user can't tell key-problem from
+  // process-problem.
+  readonly companionDetail?: string;
   // Live relay connectivity. 'unconfigured' = no --sync-relay, no
   // banner. 'up' = connected, no banner. 'down' = configured but
   // not currently connected → relay_disconnected banner.
@@ -131,6 +137,7 @@ export function SystemBannersStack({
   captureSuccessHost,
   companionActionLabel = 'Retry',
   companionStatus = 'running',
+  companionDetail,
   relayStatus = 'unconfigured',
   vaultStatus = 'connected',
   providerHealth = 'ok',
@@ -156,6 +163,7 @@ export function SystemBannersStack({
       <SystemBanner
         key="companion"
         state="companion_disconnected"
+        {...(companionDetail !== undefined ? { detail: companionDetail } : {})}
         action={
           onRetryCompanion ? { label: companionActionLabel, onClick: onRetryCompanion } : undefined
         }

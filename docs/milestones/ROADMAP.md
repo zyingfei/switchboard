@@ -4,86 +4,93 @@
 shifts. Authoritative milestone *plans* live in
 `docs/milestones/M<n>-<name>/README.md`; this file is the index.
 
-This document sketches what comes after **M2 — Dispatch + Safety**. It
-deliberately stays light — no E2E acceptance criteria, no sequencing,
-no agent prompts. Each milestone here gets a full plan when it's the
-next-up milestone (i.e., when its predecessor is in flight or
-complete).
-
 ---
 
-## Milestone state
+## Milestone state (truth pass 2026-07-11)
 
 | Milestone | Status | Branch | PR | Notes |
 |---|---|---|---|---|
-| **M1 — Foundation (Tracker)** | building | `m1/foundation` | #13 | Full P0 tracker. Three providers + generic-fallback. No dispatch surface. ~3-4 weeks. |
-| **M2 — Dispatch + Safety** | planning | `m2/dispatch-planning` | #15 | Dispatch + §24.10 safety chain + inline review + remaining mocks + MCP writes/host + Codex web extractor. Build branch (`m2/dispatch`) created off main once M1 lands. ~4-5 weeks. |
-| **M3 — Recall + Annotation** | sketch (this doc) | — | — | Smart recall (vector), persistent web annotation, notebook link-back, suggestion layer. ~3-4 weeks expected. |
-| **M4+ — Productization & multi-tenant** | sketch (this doc) | — | — | Companion auto-start, multi-vault, notebook structured sync-back, distribution. Loose grouping; will split when M3 lands. |
+| **M1 — Foundation (Tracker)** | **SHIPPED** | `m1/foundation` | #13 | Full P0 tracker. Three providers + generic-fallback. Dispatch surface not included. |
+| **M2 — Dispatch + Safety** | **SHIPPED** | `feat/recall-ranker-v2-replacement` | — | Dispatch + §24.10 safety chain + inline review + MCP writes. Outbound-preflight unification landing in current wave-set. Note: the original planning branch `m2/dispatch-planning` was superseded by the active feature branch. |
+| **M3 — Recall + Annotation** | **SUBSTANTIALLY DELIVERED EARLY** on `feat/recall-ranker-v2-replacement` | — | — | Hybrid lexical+vector recall (/v2 pipeline, SQLite FTS5 + sqlite-vec), learned ranker, connections IVM, suggestions, annotation anchoring all shipped on the active branch. Notebook link-back still open. See M-MVP-closure for remaining P0 gaps. |
+| **M-MVP-closure** | **ACTIVE** | `feat/recall-ranker-v2-replacement` | — | Open P0 gaps before §13 closes. See detail below. Exit gate: all 16 §13 steps pass + CI green. |
+| **M4+ — Productization & multi-tenant** | sketch (this doc) | — | — | Companion auto-start, multi-vault, notebook structured sync-back, distribution. Gated on the 30-day §15 window after M-MVP-closure merges. |
 
 ---
 
-## M3 — Recall + Annotation (sketch)
+## M-MVP-closure — Open P0 gaps (active, 2026-07-11)
 
-**Theme**: turn the tracked + organized + dispatched corpus into a
-*memory surface*. M1 captured. M2 acted on. M3 makes the captured
-corpus *findable across time* and lets the user pin and re-find
-arbitrary web content.
+**Theme**: close the remaining P0 gaps so the §13 acceptance scenario
+runs end-to-end. The branch `feat/recall-ranker-v2-replacement` is
+~247 commits ahead of main and substantially delivers M3 scope early,
+but several §13 steps remain open.
 
-**Probable in-scope**:
+**Open P0 gaps (exit criteria)**:
 
-- **Smart recall (vector)** per PRD §6.3.1
-  - `transformers.js` + `MiniLM-L6-v2` (~25 MB, per BRAINSTORM §24.4)
-  - Calibrated-freshness ranking (3d / 3w / 3m / 3y per §24.8)
-  - Index lives in `_BAC/recall/index.bin` as a rebuildable cache
-    (reconstruct from event log; never the source of truth)
-  - On-device only (no cloud embedding API)
-  - Surfaces in: side panel "déjà-vu" pop-on-highlight, packet
-    composer scope picker (suggested items), bac-mcp `bac.recall`
-    tool
-- **Persistent web annotation** per PRD §6.3.4
-  - Hypothesis client (BSD-2) for `TextQuoteSelector` +
-    `TextPosition` + `CssSelector` fallbacks (per BRAINSTORM §24.4)
-  - Restore highlights on revisit
-  - Annotation now usable as a §28 review target (not just lightweight
-    capture from M2)
-- **Notebook link-back** (PRD §10 Case B)
-  - Sync-in: scan vault for human-authored notes whose frontmatter
-    references a Sidetrack workstream (`bac_workstream:` field)
-  - Sidetrack records the link; does NOT parse the note body
-  - Surfaces in workstream detail: "linked notes from your vault"
-- **Suggestion layer** (PRD §6.3.6)
-  - "This thread looks related to {workstream X}" surface in
-    Workboard's Needs-Organize section
-  - Signal: lexical + vector + link-neighborhood
-  - User must accept; never auto-applies (per §6.5 anti-pattern list)
-  - Only ships once M1+M2 manual-org workflow is dogfood-validated
-- **`bac.recall` MCP tool** (read-only) — surfaces vector recall
-  results to coding agents
+- **Checklist UI** — `## Checklist` markdown body section in side panel
+  (§6.1.6 amended); workstream detail view renders + edits checklist
+  items.
+- **Inbound view** — "Inbound" panel section surfaces tracked threads
+  with new assistant turns since last visit (§6.1.5 / §13 step 9).
+- **Queued view** — "Queued" panel section shows pending queue items
+  grouped by thread/workstream (§6.1.4 / §13 step 4+6).
+- **Queue → packet** ("Compose packet from queue") — selected queue
+  items compose the questions section of a Research Packet; in flight
+  this wave-set (§6.1.9 / §13 step 11).
+- **Export route** — vault write on manual export; path projection
+  from workstream tree (§6.1.11 / §13 step 13).
+- **`chrome.sessions` tab restore** — `chrome.sessions.restore` path
+  for recently-closed tabs (§6.1.7 / §13 step 8).
+- **Safety inversion** (§24.10 outbound-preflight unification) —
+  outbound dispatch routes consistently through RedactionPipeline +
+  token-budget + screen-share-safe + injection-scrub; landing this
+  wave-set.
+- **MCP identity / audit** — server-derived agent identity + per-call
+  audit trail (`_BAC/audit/<date>.jsonl`); trust-opt-in reverted per
+  §11 decision 10 (amended 2026-07-11); landing this wave-set.
 
-**Probable deferrals to M4+**:
-- Streaming embeddings (large-corpus performance) — M3 ships
-  embed-on-capture; if performance tanks, optimize in M4
-- Vector index sharding (Pagefind pattern per BRAINSTORM §24.4) — M3
-  ships single-index; shard if cold-start time crosses budget
-- EmbeddingGemma-300M opt-in — MiniLM is the M3 default
-
-**Why M3 is its own milestone (not folded into M2)**:
-- Vector recall has its own engineering surface (transformers.js
-  loading, OPFS for model weights, index management) that's
-  orthogonal to dispatch
-- Persistent annotation needs Hypothesis client integration which is
-  its own significant lift (CSP, content-script anchoring, revisit
-  detection)
-- Suggestion layer can't ship before manual-org has been dogfooded
-  through M1+M2 — needs the empirical "what users actually do" signal
+**Exit gate**: all 16 §13 steps pass end-to-end + CI green on the
+feature branch. Subject to the P1 freeze (§11 decision 9): no new
+ranker/recall/connections/attribution scope during closure.
 
 ---
 
-## M4+ — Productization & multi-tenant (sketch)
+## M3 — Recall + Annotation (substantially delivered early)
+
+Most M3 scope shipped ahead of schedule on `feat/recall-ranker-v2-replacement`
+(2026-07-11 truth pass). The items below are the original M3 sketch;
+delivered items are marked.
+
+**Delivered on active branch**:
+- Hybrid lexical + vector recall (/v2 pipeline, SQLite FTS5 + sqlite-vec,
+  calibrated-freshness ranking) — PRD §6.3.1 pulled forward to P0.
+- Learned reranker (LambdaMART + online LR head, impression emission,
+  trainable recall.action events).
+- Suggestion layer (workstream suggestions, topic suggestions).
+- `sidetrack.recall.query` MCP tool (read-only).
+
+**Still open from original M3 scope**:
+
+- **Persistent web annotation** (PRD §6.3.4) — Hypothesis-style
+  anchoring (TextQuote + TextPosition + CssSelector fallbacks);
+  restore highlights on revisit; annotation as §28 review target.
+  Lightweight annotation capture shipped in M2; persistent anchoring
+  is the remaining lift.
+- **Notebook link-back** (PRD §10 Case B) — sync-in scan for vault
+  notes referencing a workstream via `bac_workstream:` frontmatter
+  field; surfaces in workstream detail.
+
+These two items are candidates for M4 or a thin M3-close milestone
+depending on product priority after M-MVP-closure merges.
+
+---
+
+## M4+ — Productization & multi-tenant (sketch, gated on §15 window)
 
 These are loose buckets that will split into proper milestones when
-M3 lands and we have a clearer signal. Listed in rough priority order:
+M-MVP-closure merges and the 30-day §15 dogfood window concludes.
+Do not plan M4 scope until §15 success criteria are met. Listed in
+rough priority order:
 
 ### M4-candidate: Productization
 

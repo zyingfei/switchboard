@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   companionStatusLabel,
   compareQueueItems,
+  defaultSettings,
   initialWorkboardSections,
   maskTitleForPrivacy,
   type QueueItem,
@@ -33,6 +34,13 @@ describe('workboard scaffold', () => {
       'needs-organize',
       'recent-search',
     ]);
+  });
+
+  it('defaults the master capture switch on so capture works out of the box', () => {
+    // The side-panel "eye" reads this. Default on = Sidetrack observes
+    // until the user explicitly pauses; off would silently capture
+    // nothing, which is the opposite of the product's purpose.
+    expect(defaultSettings.captureEnabled).toBe(true);
   });
 
   it('maps companion status to side-panel copy', () => {

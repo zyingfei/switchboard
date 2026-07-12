@@ -467,6 +467,66 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     expect(m.health().status).toBe('healthy');
   });
 
+  it('fires onDrainSuccess on successful catchUp + drain passes and survives a throwing hook', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    let hookCalls = 0;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      // The hook throws on purpose: it is fire-and-forget by contract,
+      // so a throwing hook must never fail an otherwise-successful
+      // pass. (Absent-safety — no `onDrainSuccess` at all — is covered
+      // by every other test in this file.)
+      onDrainSuccess: () => {
+        hookCalls += 1;
+        throw new Error('hook exploded');
+      },
+    });
+
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_a',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/a',
+          title: 'A',
+          lastSeenAt: '2026-05-07T10:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(hookCalls, 'catchUp success invokes the hook').toBeGreaterThanOrEqual(1);
+    expect(m.health().status).toBe('healthy');
+
+    const callsAfterCatchUp = hookCalls;
+    const second = buildEvent({
+      seq: 2,
+      type: THREAD_UPSERTED,
+      payload: {
+        bac_id: 'thread_b',
+        provider: 'chatgpt',
+        threadUrl: 'https://x/b',
+        title: 'B',
+        lastSeenAt: '2026-05-07T10:01:00.000Z',
+        tags: [],
+      },
+    });
+    await eventLog.importPeerEvent(second);
+    m.onAccepted(second, { origin: 'peer' });
+    await m.awaitIdle();
+    expect(hookCalls, 'drain success invokes the hook').toBeGreaterThan(callsAfterCatchUp);
+    expect(m.health().status).toBe('healthy');
+  });
+
   it('runs visitSimilarity before snapshot and persists the active revision', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
@@ -1960,16 +2020,26 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
   // back-to-back full connections rebuilds); it is reconstructed from
   // the page-evidence store inside every drain, so omitting it keeps
   // the snapshot correct.
-  it('engagement.session.aggregated is NOT in handles (deferred to next structural drain)', async () => {
+  it('engagement.session.aggregated never triggers a per-event drain (deferred to next structural drain)', async () => {
+    // `m.handles` is the union of HANDLES + CONTENT_LANE_ONLY_HANDLES +
+    // PROJECTION_ONLY_HANDLES (so the runner dispatches all of those to
+    // onAccepted). What this test pins down is that these high-frequency
+    // event types do NOT enter the structural-drain-triggering HANDLES
+    // bucket — `page.evidence.extracted` rides in CONTENT_LANE_ONLY_HANDLES,
+    // and the others aren't handled at all.
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
     const store = createConnectionsStore(vaultRoot);
     const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store });
 
+    // Not handled at all — runner doesn't even deliver these.
     expect(m.handles.has('engagement.session.aggregated')).toBe(false);
     expect(m.handles.has('visual.fingerprint.observed')).toBe(false);
-    expect(m.handles.has('page.evidence.extracted')).toBe(false);
+    // Handled (so the content-lane queue + progress can advance) but does
+    // not trigger a structural drain — the behavioural guarantee tested
+    // by the next case in this file.
+    expect(m.handles.has('page.evidence.extracted')).toBe(true);
   });
 
   it('engagement bursts do not trigger any drain (deferred until next structural event)', async () => {

@@ -20,6 +20,9 @@ import { parseCompanionIdentity, type CompanionIdentity } from './identity';
 
 export interface CompanionClient {
   readonly status: () => Promise<CompanionStatus>;
+  /** /v1/status with a short (4 s) budget — for post-failure
+   *  down-vs-busy classification only; see CompanionRequestError. */
+  readonly statusQuick: () => Promise<CompanionStatus>;
   /** Fetch /v1/version — companion identity (vault + code path).
    *  Returns null if the payload is unrecognizable. */
   readonly version: () => Promise<CompanionIdentity | null>;
@@ -48,6 +51,15 @@ export interface CompanionClient {
     readonly workstreamId?: string;
   }) => Promise<readonly CodingSession[]>;
   readonly detachCodingSession: (codingSessionId: string) => Promise<CodingSession>;
+  /** §13 step 13 — export a workstream to the vault via the tree-path
+   *  route. Returns the vault-relative paths of the written files. */
+  readonly exportWorkstream: (
+    workstreamId: string,
+    options?: { readonly includeThreads?: boolean },
+  ) => Promise<readonly string[]>;
+  /** §13 step 13 — export a single thread to the vault. Same response
+   *  shape as exportWorkstream (an array of written file paths). */
+  readonly exportThread: (threadId: string) => Promise<readonly string[]>;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -64,6 +76,14 @@ const parseProblemMessage = (value: unknown): string | undefined => {
     : typeof problem.title === 'string'
       ? problem.title
       : undefined;
+};
+
+const parseProblemCode = (value: unknown): string | undefined => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const code = (value as Partial<Problem>).code;
+  return typeof code === 'string' ? code : undefined;
 };
 
 const parseStatus = (value: unknown): CompanionStatus => {
@@ -177,6 +197,29 @@ const parseStringArray = (value: unknown): readonly string[] => {
   return value.filter((item): item is string => typeof item === 'string');
 };
 
+// §13 step 13 — export routes return { data: { files: [{ path }] } }.
+// We surface just the vault-relative paths (the caller renders them as
+// a success confirmation). Parse defensively; a malformed shape is a
+// hard error the panel surfaces rather than a silent empty success.
+const parseExportPaths = (value: unknown): readonly string[] => {
+  if (!isRecord(value)) {
+    throw new Error('Companion export response was not an object.');
+  }
+  const data = (value as { readonly data?: unknown }).data;
+  if (!isRecord(data)) {
+    throw new Error('Companion export response missing data.');
+  }
+  const files = (data as { readonly files?: unknown }).files;
+  if (!Array.isArray(files)) {
+    throw new Error('Companion export response missing files array.');
+  }
+  return files.flatMap((file) => {
+    if (!isRecord(file)) return [];
+    const path = (file as { readonly path?: unknown }).path;
+    return typeof path === 'string' && path.length > 0 ? [path] : [];
+  });
+};
+
 const parseChecklist = (value: unknown): WorkstreamProjectionRecord['checklist'] => {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
@@ -268,8 +311,51 @@ const parseWorkstreamProjections = (value: unknown): readonly WorkstreamProjecti
   });
 };
 
+// Typed transport failure so the SW can tell "nothing is listening on
+// the port" (network → the companion is down) apart from "the request
+// outlived its budget" (timeout → the companion is up but chewing;
+// observed live: 46-69 s timeline / page-evidence writes while
+// /v1/status stays ~40 ms). The connection banner must only go red for
+// the former.
+export class CompanionRequestError extends Error {
+  constructor(
+    message: string,
+    readonly kind: 'timeout' | 'network',
+  ) {
+    super(message);
+    this.name = 'CompanionRequestError';
+  }
+}
+
+/**
+ * The companion answered with a non-2xx status — a deliberate rejection
+ * (validation, revision conflict, trust denial, …), NOT a connectivity
+ * failure. Callers use this to distinguish "companion said no" (do not
+ * fork local state) from "companion unreachable" (optimistic local write).
+ */
+export class CompanionHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | undefined,
+  ) {
+    super(message);
+    this.name = 'CompanionHttpError';
+  }
+}
+
 export class HttpCompanionClient implements CompanionClient {
   private readonly baseUrl: string;
+  // Conditional-GET cache. Keyed on the request path (incl. querystring),
+  // because the same logical endpoint with different query args is a
+  // different cache entry. Stores the ETag the companion last gave us
+  // plus the last successful parsed body. On 304 we return the cached
+  // body verbatim — saves the wire-format JSON parse + the React state
+  // update churn that would otherwise fire on every 15s poll cycle.
+  // Bounded by the set of distinct GET endpoints the extension polls
+  // (~20 today); old entries are evicted on the LRU schedule below.
+  private readonly etagCache = new Map<string, { etag: string; value: unknown }>();
+  private static readonly ETAG_CACHE_MAX = 64;
 
   constructor(private readonly settings: CompanionSettings) {
     this.baseUrl = `http://127.0.0.1:${String(settings.port)}/v1`;
@@ -287,6 +373,16 @@ export class HttpCompanionClient implements CompanionClient {
     // 45-second timeout still bounds the worst case to one extra
     // poll window.
     return parseStatus(await this.request('/status', { method: 'GET' }, 45_000));
+  }
+
+  async statusQuick(): Promise<CompanionStatus> {
+    // Short-budget variant for POST-FAILURE classification only. After
+    // a heavy endpoint fails, the SW needs to know "down or merely
+    // busy?" without inheriting status()'s 45 s worst case on the
+    // error path. 4 s is comfortably above the observed healthy
+    // /v1/status latency (~40 ms even at full CPU) and far below the
+    // user's patience for a wrong red banner.
+    return parseStatus(await this.request('/status', { method: 'GET' }, 4_000));
   }
 
   async appendEvent(event: CaptureEvent, idempotencyKey: string): Promise<MutationResult> {
@@ -427,6 +523,29 @@ export class HttpCompanionClient implements CompanionClient {
     return (value as { data: CodingSession }).data;
   }
 
+  async exportWorkstream(
+    workstreamId: string,
+    options?: { readonly includeThreads?: boolean },
+  ): Promise<readonly string[]> {
+    return parseExportPaths(
+      await this.request(`/workstreams/${encodeURIComponent(workstreamId)}/export`, {
+        method: 'POST',
+        body: JSON.stringify(
+          options?.includeThreads === undefined ? {} : { includeThreads: options.includeThreads },
+        ),
+      }),
+    );
+  }
+
+  async exportThread(threadId: string): Promise<readonly string[]> {
+    return parseExportPaths(
+      await this.request(`/threads/${encodeURIComponent(threadId)}/export`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    );
+  }
+
   async version(): Promise<CompanionIdentity | null> {
     // /v1/version is unauthenticated + cheap (no work triggered);
     // short timeout is fine. The bridge-key header `request` always
@@ -442,6 +561,17 @@ export class HttpCompanionClient implements CompanionClient {
     const headers = new Headers(init.headers);
     headers.set('content-type', 'application/json');
     headers.set('x-bac-bridge-key', this.settings.bridgeKey);
+
+    // GET-only conditional fetch: replay the last ETag the companion
+    // gave us for this path so the companion can short-circuit with a
+    // 304 (empty body) when nothing changed. Mutations (POST/PATCH/...)
+    // intentionally don't participate: they have side-effects, and the
+    // idempotency-key path handles dedupe for those instead.
+    const isGet = (init.method ?? 'GET').toUpperCase() === 'GET';
+    const cached = isGet ? this.etagCache.get(path) : undefined;
+    if (cached !== undefined) {
+      headers.set('if-none-match', cached.etag);
+    }
 
     // Fixes: side panel stuck on "Companion: disconnected" even when the
     // full tab is fine. Root cause: no fetch timeout here meant a slow
@@ -461,23 +591,66 @@ export class HttpCompanionClient implements CompanionClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`${this.baseUrl}${path}`, {
-        ...init,
-        headers,
-        signal: controller.signal,
-      });
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}${path}`, {
+          ...init,
+          headers,
+          signal: controller.signal,
+        });
+      } catch (fetchError) {
+        // Aborts fall through to the single timeout translation in the
+        // outer catch; everything else here is a transport failure —
+        // nothing listening on the port.
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          throw fetchError;
+        }
+        throw new CompanionRequestError(
+          fetchError instanceof Error ? fetchError.message : 'Companion fetch failed.',
+          'network',
+        );
+      }
+      // 304 Not Modified: the companion confirmed our cached body is
+      // still current. Return the cached value verbatim — callers see
+      // referentially-identical data, so React's reconciliation skips
+      // the re-render. Saves the wire-format JSON parse + state churn.
+      if (response.status === 304 && cached !== undefined) {
+        return cached.value;
+      }
       const value = (await response.json()) as unknown;
       if (!response.ok) {
-        throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
+        throw new CompanionHttpError(
+          parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`,
+          response.status,
+          parseProblemCode(value),
+        );
+      }
+      // Store the fresh ETag for next time. Bounded LRU: when the
+      // map grows past the cap, drop the oldest entry. Map iteration
+      // order is insertion order, so the first key is the eldest.
+      if (isGet) {
+        const etag = response.headers.get('etag');
+        if (etag !== null && etag.length > 0) {
+          if (this.etagCache.size >= HttpCompanionClient.ETAG_CACHE_MAX) {
+            const eldest = this.etagCache.keys().next().value;
+            if (eldest !== undefined) this.etagCache.delete(eldest);
+          }
+          // Re-insert to mark as most-recently-used.
+          this.etagCache.delete(path);
+          this.etagCache.set(path, { etag, value });
+        }
       }
       return value;
     } catch (error) {
-      // Translate AbortError into something users can act on; otherwise
-      // surface the underlying network error.
+      // Single translation point for the abort timer — whether it
+      // fired during the fetch or mid-body (between headers and
+      // response.json()), the meaning is the same: the companion is
+      // processing, not gone.
       if (error instanceof Error && error.name === 'AbortError') {
         const seconds = Math.round(timeoutMs / 1000);
-        throw new Error(
+        throw new CompanionRequestError(
           `Companion did not respond within ${String(seconds)}s on ${path}. It may be busy (catchUp on a large vault). Retry in a few seconds.`,
+          'timeout',
         );
       }
       throw error;

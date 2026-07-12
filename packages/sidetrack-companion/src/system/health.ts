@@ -1,4 +1,5 @@
 import type { RecallActivityReport } from '../recall/activity.js';
+import type { EventLaneHealth } from '../sync/eventLaneHealth.js';
 import type { WorkGraphHealthReport } from './workGraphHealth.js';
 
 export interface CaptureProviderHealth {
@@ -30,6 +31,75 @@ export interface CaptureWarningHealth {
 // itself reports it is behind. `ok` is a fresh real value.
 export type SectionAvailability = 'ok' | 'stale' | 'unavailable';
 export type HealthStatus = 'ok' | 'degraded' | 'failed';
+
+// Data-loss tripwires (durability wave, roadmap H3). PRD §15 claims zero
+// data loss; before this section that claim was UNFALSIFIABLE — nothing
+// on the health surface counted the places the read/write path detects a
+// dropped or torn event. `counters` are the process-lifetime event-lane
+// counters (any non-zero value is a visible red signal). `reconciliation`
+// is the store's OWN store-vs-JSONL delta, computed cheaply from what the
+// event store already tracks (its row count vs the sum of its per-replica
+// watermarks) — never a full JSONL scan on the health path. It is absent
+// when the event store is off / not open, so callers must distinguish
+// `null` (not measured) from `{ delta: 0 }` (measured, converged).
+export interface DataLossHealth {
+  readonly counters: EventLaneHealth;
+  // True iff every event-lane counter is zero AND (when measured) the
+  // store reconciliation delta is zero. The load-bearing single boolean
+  // the UI flips to red on.
+  readonly clean: boolean;
+  readonly reconciliation: {
+    // Rows physically present in the event store mirror.
+    readonly storeRowCount: number;
+    // Sum of the store's per-replica watermarks — the count the store
+    // expects to hold if every committed seq is present and dense.
+    readonly expectedFromWatermark: number;
+    // expectedFromWatermark - storeRowCount. Non-zero ⇒ the store is
+    // missing committed events it believes it accepted (a durability
+    // red flag), or seqs are sparse (also worth surfacing).
+    readonly delta: number;
+  } | null;
+}
+
+// Learned-rerank (ranker) refresh liveness. The background model refresh
+// can fail silently — a dead ranker keeps serving the last order with no
+// operator signal. Surfaced here so a stuck refresh is visible. All
+// fields optional: the getter is only wired when a ranker is configured.
+export interface RankerRefreshHealth {
+  readonly serveable: boolean;
+  readonly revisionId: string | null;
+  readonly lastRefreshAt: string | null;
+  readonly lastError: string | null;
+}
+
+// Spawned MCP child liveness. `running` reflects the actual child process
+// state (not a config flag); a silently-dead child is otherwise invisible.
+export interface McpChildHealth {
+  readonly running: boolean;
+  readonly pid: number | null;
+  readonly lastExitCode: number | null;
+  readonly lastError: string | null;
+}
+
+// F28 honest service.running. Historically `service.running` was inferred
+// from plist EXISTENCE — a crashed-but-installed service read as running
+// forever. Reconcile the installer's plist-existence heuristic with a real
+// liveness probe: the probe is authoritative when it can answer
+// (running/not-running); `unknown` (tool absent / timed out) falls back to
+// the heuristic rather than fabricating a false negative. Pure + exported
+// so the honesty rule is unit-testable without spinning up the server.
+export const resolveServiceRunning = (
+  plistInferredRunning: boolean,
+  liveness: Liveness,
+): boolean => {
+  if (liveness === 'running') return true;
+  if (liveness === 'not-running') return false;
+  return plistInferredRunning;
+};
+
+// Mirror of install/launchd Liveness so health.ts owns a stable local
+// type (the install module is the source of truth for the probe itself).
+export type Liveness = 'running' | 'not-running' | 'unknown';
 
 export interface HealthObservability {
   // ISO timestamp this report was collected (all sections share it
@@ -119,6 +189,12 @@ export interface HealthReport {
   // Optional so the many call-sites/tests that construct HealthReport
   // literals stay valid; collectHealth always populates it.
   readonly observability?: HealthObservability;
+  // Data-loss tripwires — always populated by collectHealth (the getter
+  // is cheap and required). Makes PRD §15 falsifiable.
+  readonly dataLoss?: DataLossHealth;
+  // Liveness edges — present only when the runtime wires the getter.
+  readonly ranker?: RankerRefreshHealth;
+  readonly mcpChild?: McpChildHealth;
   readonly workGraph?: WorkGraphHealthReport;
   // Identity of the local replica + its Lamport high-water mark.
   // Optional so legacy / test call-sites that don't wire a replica
@@ -142,20 +218,6 @@ export interface HealthReport {
         readonly lastError: string | null;
         readonly pending: boolean;
         readonly frontier?: Record<string, number>;
-        readonly lastDriftCheck?: {
-          readonly at: string;
-          readonly conclusion: 'clean' | 'drift';
-          readonly nodeDiffSummary: {
-            readonly added: number;
-            readonly removed: number;
-            readonly changed: number;
-          };
-          readonly edgeDiffSummary: {
-            readonly added: number;
-            readonly removed: number;
-            readonly changed: number;
-          };
-        };
       }
     >;
   };
@@ -172,7 +234,34 @@ export interface HealthDeps {
   readonly serviceStatus: () => Promise<HealthReport['service']>;
   readonly syncSummary?: () => HealthReport['sync'];
   readonly workGraphSummary?: () => Promise<WorkGraphHealthReport>;
+  // Data-loss tripwires. `eventLaneHealth` is the sync module's
+  // process-lifetime counter snapshot (getEventLaneHealth). Defaults to
+  // an all-zero snapshot so legacy test call-sites need not wire it.
+  readonly eventLaneHealth?: () => EventLaneHealth;
+  // Cheap store-vs-JSONL reconciliation the store already knows (row
+  // count + summed watermark). Returns null when the store is off/closed.
+  // Must NOT full-scan; at most one COUNT query plus a watermark read.
+  readonly storeReconciliation?: () => Promise<DataLossHealth['reconciliation']>;
+  // Liveness edges — synchronous, side-effect-free getters. Omitted when
+  // no ranker / MCP child is managed.
+  readonly rankerHealth?: () => RankerRefreshHealth;
+  readonly mcpChildHealth?: () => McpChildHealth;
 }
+
+const ZERO_EVENT_LANE_HEALTH: EventLaneHealth = {
+  skippedMalformedLines: 0,
+  storeSkippedOutOfOrder: 0,
+  dotCollisions: 0,
+  duplicateCaptures: 0,
+  unreadableShards: 0,
+};
+
+const anyLaneCounterNonZero = (h: EventLaneHealth): boolean =>
+  h.skippedMalformedLines > 0 ||
+  h.storeSkippedOutOfOrder > 0 ||
+  h.dotCollisions > 0 ||
+  h.duplicateCaptures > 0 ||
+  h.unreadableShards > 0;
 
 // Per-operation timeout. The 250ms cap that lived here originally
 // was tight enough to silently force `captureSummary` and
@@ -218,31 +307,41 @@ const worst = (a: HealthStatus, b: HealthStatus): HealthStatus => {
 
 export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => {
   const now = deps.now?.() ?? new Date();
-  const [writableR, sizeBytesR, captureR, recallR, serviceR, workGraphR] = await Promise.all([
-    withTrackedBudget(deps.vaultWritable, false),
-    withTrackedBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
-    withTrackedBudget(
-      deps.captureSummary,
-      { lastByProvider: {}, queueDepthHint: null, droppedHint: null },
-      HEAVY_OP_BUDGET_MS,
-    ),
-    withTrackedBudget(
-      deps.recallSummary,
-      { indexExists: false, entryCount: null, modelId: null, sizeBytes: null },
-      HEAVY_OP_BUDGET_MS,
-    ),
-    withTrackedBudget(deps.serviceStatus, { installed: false, running: false }),
-    deps.workGraphSummary === undefined
-      ? Promise.resolve<{ value: WorkGraphHealthReport | undefined; timedOut: boolean }>({
-          value: undefined,
-          timedOut: false,
-        })
-      : withTrackedBudget<WorkGraphHealthReport | undefined>(
-          deps.workGraphSummary,
-          undefined,
-          HEAVY_OP_BUDGET_MS,
-        ),
-  ]);
+  const [writableR, sizeBytesR, captureR, recallR, serviceR, workGraphR, reconciliationR] =
+    await Promise.all([
+      withTrackedBudget(deps.vaultWritable, false),
+      withTrackedBudget(deps.vaultSizeBytes, null, HEAVY_OP_BUDGET_MS),
+      withTrackedBudget(
+        deps.captureSummary,
+        { lastByProvider: {}, queueDepthHint: null, droppedHint: null },
+        HEAVY_OP_BUDGET_MS,
+      ),
+      withTrackedBudget(
+        deps.recallSummary,
+        { indexExists: false, entryCount: null, modelId: null, sizeBytes: null },
+        HEAVY_OP_BUDGET_MS,
+      ),
+      withTrackedBudget(deps.serviceStatus, { installed: false, running: false }),
+      deps.workGraphSummary === undefined
+        ? Promise.resolve<{ value: WorkGraphHealthReport | undefined; timedOut: boolean }>({
+            value: undefined,
+            timedOut: false,
+          })
+        : withTrackedBudget<WorkGraphHealthReport | undefined>(
+            deps.workGraphSummary,
+            undefined,
+            HEAVY_OP_BUDGET_MS,
+          ),
+      // Reconciliation is a cheap COUNT+watermark read, but a wedged
+      // sqlite handle must never wedge the health path — give it a
+      // FAST budget and fall back to "not measured" (null) on timeout.
+      deps.storeReconciliation === undefined
+        ? Promise.resolve<{ value: DataLossHealth['reconciliation']; timedOut: boolean }>({
+            value: null,
+            timedOut: false,
+          })
+        : withTrackedBudget<DataLossHealth['reconciliation']>(deps.storeReconciliation, null),
+    ]);
   const writable = writableR.value;
   const sizeBytes = sizeBytesR.value;
   const capture = captureR.value;
@@ -250,6 +349,35 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
   const service = serviceR.value;
   const workGraph = workGraphR.value;
   const sync = deps.syncSummary?.();
+
+  // Data-loss tripwires. Counters are a synchronous snapshot (default
+  // all-zero when unwired). `clean` folds the counters with the store
+  // reconciliation delta so the UI has one boolean to flip red.
+  const laneCounters = deps.eventLaneHealth?.() ?? ZERO_EVENT_LANE_HEALTH;
+  const reconciliation = reconciliationR.value;
+  const dataLoss: DataLossHealth = {
+    counters: laneCounters,
+    reconciliation,
+    clean:
+      !anyLaneCounterNonZero(laneCounters) &&
+      (reconciliation === null || reconciliation.delta === 0),
+  };
+  // Liveness edges — synchronous getters; guard against a throwing getter
+  // so a broken probe can't take down the whole health response.
+  const ranker = ((): RankerRefreshHealth | undefined => {
+    try {
+      return deps.rankerHealth?.();
+    } catch {
+      return undefined;
+    }
+  })();
+  const mcpChild = ((): McpChildHealth | undefined => {
+    try {
+      return deps.mcpChildHealth?.();
+    } catch {
+      return undefined;
+    }
+  })();
 
   // Per-section availability: timed-out summaries are `unavailable`
   // (served the empty fallback), not a real zero. A vault size that
@@ -269,6 +397,16 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     sections['workGraph'] = workGraphR.timedOut ? 'unavailable' : 'ok';
   }
   if (sync !== undefined) sections['sync'] = 'ok';
+  // A tripped tripwire is `stale` (a real, non-fallback signal that
+  // something durable went wrong), and the reconciliation timing out is
+  // `unavailable`. Both drive the worst-of below.
+  sections['dataLoss'] = reconciliationR.timedOut
+    ? 'unavailable'
+    : dataLoss.clean
+      ? 'ok'
+      : 'stale';
+  if (ranker !== undefined) sections['ranker'] = ranker.lastError === null ? 'ok' : 'stale';
+  if (mcpChild !== undefined) sections['mcpChild'] = mcpChild.running ? 'ok' : 'stale';
 
   // Derived worst-of. A real outage (vault not writable, a materializer
   // failed) is `failed`; missing/stale data or a degraded materializer
@@ -287,6 +425,13 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     if (materializer.status === 'failed') status = worst(status, 'failed');
     else if (materializer.status === 'degraded') status = worst(status, 'degraded');
   }
+  // A tripped data-loss tripwire is a `failed`, not merely `degraded`,
+  // signal: PRD §15 promises zero data loss, so any non-zero counter or
+  // a non-zero reconciliation delta is the loudest thing this surface can
+  // say. A silently-dead MCP child (running=false but installed) is a
+  // real outage of that subsystem → failed.
+  if (!dataLoss.clean) status = worst(status, 'failed');
+  if (mcpChild !== undefined && !mcpChild.running) status = worst(status, 'failed');
 
   return {
     uptimeSec: Math.max(0, Math.floor((now.getTime() - deps.startedAt.getTime()) / 1000)),
@@ -294,7 +439,10 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     capture,
     recall,
     service,
+    dataLoss,
     observability: { asOf: now.toISOString(), status, sections },
+    ...(ranker === undefined ? {} : { ranker }),
+    ...(mcpChild === undefined ? {} : { mcpChild }),
     ...(workGraph === undefined ? {} : { workGraph }),
     ...(sync === undefined ? {} : { sync }),
   };

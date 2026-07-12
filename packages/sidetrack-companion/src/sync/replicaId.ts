@@ -3,6 +3,7 @@ import { mkdir, readFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { writeFileAtomic } from '../vault/atomic.js';
+import { reconcileShardTailSeqForReplica } from './eventLog.js';
 
 // Per-replica identity + per-replica monotonic seq.
 //
@@ -46,14 +47,27 @@ const readReplicaIdFile = async (path: string): Promise<string | null> => {
   }
 };
 
-const readSeqFile = async (path: string): Promise<number> => {
+// `intact` is true only when the file existed AND parsed to a valid
+// non-negative counter. A missing (ENOENT) or garbled/negative file
+// yields `{ value: 0, intact: false }` — the caller must NOT treat that
+// zero as a trusted high-water mark when a shard tail is also
+// unverifiable (that pairing is exactly the correlated fault that could
+// reissue a duplicate dot).
+interface SeqFileState {
+  readonly value: number;
+  readonly intact: boolean;
+}
+
+const readSeqFile = async (path: string): Promise<SeqFileState> => {
   try {
     const raw = (await readFile(path, 'utf8')).trim();
     const value = Number.parseInt(raw, 10);
-    return Number.isFinite(value) && value >= 0 ? value : 0;
+    return Number.isFinite(value) && value >= 0
+      ? { value, intact: true }
+      : { value: 0, intact: false };
   } catch (error) {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      return 0;
+      return { value: 0, intact: false };
     }
     throw error;
   }
@@ -96,15 +110,61 @@ export const loadOrCreateReplica = async (vaultPath: string): Promise<ReplicaCon
   // Migration path: pick the higher of the two files. If only the
   // legacy file exists, copy its value forward and delete the old one
   // so subsequent startups read only the canonical name.
-  const [seqFromCanonical, seqFromLegacy] = await Promise.all([
+  const [canonical, legacy] = await Promise.all([
     readSeqFile(seqPath),
     readSeqFile(legacyPath),
   ]);
-  let highWaterMark = Math.max(seqFromCanonical, seqFromLegacy);
-  if (seqFromLegacy > 0 && seqFromCanonical < seqFromLegacy) {
+  // Reconcile the seq counter against the durable shard tails before
+  // trusting the seq file. A lost, regressed, or garbled `replica-seq`
+  // file would otherwise let nextSeq() reissue a (replicaId, seq) dot
+  // that already exists on disk — a duplicate causal-log primary key
+  // that appendClient's clientEventId-only dedupe cannot catch. The
+  // shard high-water mark is bounded work (this replica's own shard
+  // tails only) and is the source of truth for what we have committed.
+  const { maxSeq: seqFromShards, unreadableShards } =
+    await reconcileShardTailSeqForReplica(vaultPath, replicaId);
+
+  // A shard that EXISTS but could not be read (network-mounted or
+  // iCloud-dataless vault, fd exhaustion, a transient permissions glitch
+  // on ONE shard) may hide a higher committed seq than the readable
+  // shards revealed. Deciding what to trust:
+  //   • Seq file intact → proceed with the seq-file value (it is the
+  //     durable counter; the readable-shard max only ever RAISES it).
+  //     Emit a loud warning so the operator knows a shard was skipped.
+  //   • Seq file missing/garbled AND a shard is unreadable → the
+  //     counter is untrusted and the durable truth is unverifiable.
+  //     Refuse startup rather than silently advancing past an
+  //     unverifiable tail (which could reissue a duplicate dot). This
+  //     matches the safety property: never advance past an unverifiable
+  //     shard tail when the counter is untrusted.
+  const counterIntact = canonical.intact || legacy.intact;
+  if (unreadableShards.length > 0 && !counterIntact) {
+    const list = unreadableShards.join(', ');
+    throw new Error(
+      `Refusing to start: the replica-seq counter for ${replicaId} is missing or ` +
+        `unreadable AND ${String(unreadableShards.length)} event-log shard tail(s) ` +
+        `could not be read (${list}). Advancing the seq counter now could reissue a ` +
+        `duplicate (replicaId, seq) dot and poison sync. Restore access to the vault ` +
+        `shards (check that the network/iCloud vault is fully materialised and ` +
+        `readable) and restart, or repair/restore the replica-seq file to its last ` +
+        `known-good value.`,
+    );
+  }
+  if (unreadableShards.length > 0) {
+    // eslint-disable-next-line no-console -- boot-time durability warning, must be visible in logs
+    console.warn(
+      `[replicaId] ${String(unreadableShards.length)} event-log shard tail(s) for ${replicaId} ` +
+        `could not be read (${unreadableShards.join(', ')}); proceeding with the intact ` +
+        `replica-seq counter. If a shard hid a higher committed seq than the counter, ` +
+        `restore shard access and restart before appending.`,
+    );
+  }
+
+  let highWaterMark = Math.max(canonical.value, legacy.value, seqFromShards);
+  if (highWaterMark > canonical.value) {
     await writeFileAtomic(seqPath, `${String(highWaterMark)}\n`);
   }
-  if (seqFromLegacy > 0) {
+  if (legacy.value > 0) {
     await unlink(legacyPath).catch(() => undefined);
   }
 

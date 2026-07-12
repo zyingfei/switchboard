@@ -1,6 +1,7 @@
 import type { ExtractionStore } from '../../recall/extraction/store.js';
 import type { ExtractionRevision, ExtractionSourceState } from '../../recall/extraction/types.js';
 import type { AcceptedEvent } from '../causal.js';
+import { getCaughtUpSharedEventStore } from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import { eventTypesForMaterializer } from './registry.js';
@@ -36,6 +37,7 @@ import { CAPTURE_RECORDED } from '../../recall/events.js';
 export interface CreateExtractionMaterializerDeps {
   readonly store: ExtractionStore;
   readonly eventLog: EventLog;
+  readonly vaultRoot?: string;
 }
 
 export const createExtractionMaterializer = (
@@ -198,13 +200,23 @@ export const createExtractionMaterializer = (
   const catchUp: Materializer['catchUp'] = async (eventLog) => {
     incInFlight();
     try {
-      const merged = await eventLog.readMerged();
       // Schedule every event through handleEvent → per-source
       // serialization. AWAIT all of them so catchUp resolves only
       // after the queue is drained — same AWAIT-drain rule as the
       // runner's catchUpAll. Different sourceUnitIds run in
       // parallel; same-source events serialize via the queue.
-      await Promise.all(merged.filter((e) => handles.has(e.type)).map((e) => handleEvent(e)));
+      const store =
+        deps.vaultRoot === undefined ? null : await getCaughtUpSharedEventStore(deps.vaultRoot);
+      if (store === null) {
+        // Stream only the handled extraction types instead of
+        // materialising the full ~700MB merged log at boot.
+        const handled = await eventLog.streamFiltered((e) => handles.has(e.type), handles);
+        await Promise.all(handled.map((e) => handleEvent(e)));
+      } else {
+        await store.forEachChunk(async (chunk) => {
+          await Promise.all(chunk.filter((e) => handles.has(e.type)).map((e) => handleEvent(e)));
+        }, 2000);
+      }
       lastSuccessAt = new Date().toISOString();
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);

@@ -11,13 +11,26 @@ import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { listPageEvidenceRecords } from '../../page-evidence/store.js';
-import { readIndex } from '../../recall/indexFile.js';
 import {
-  readSemanticRecallVectorStore,
-} from '../../recall/semanticRecallPool.js';
-import { MODEL_ID } from '../../recall/embedder.js';
-import type { RecallStore, StoreDocument } from './types.js';
+  listPageEvidenceRecordFiles,
+  listPageEvidenceRecords,
+  readPageEvidenceRecordByFileName,
+} from '../../page-evidence/store.js';
+import type { PageEvidenceRecord } from '../../page-evidence/types.js';
+import { mapInChunks } from '../../domain/asyncChunks.js';
+import { readIndex } from '../../recall/indexFile.js';
+import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
+import { RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
+import type { PageEvidenceEmbedder } from '../../page-evidence/embedding.js';
+
+// Lazy embedder: this module sits in http/server.ts's static import
+// graph (server → recall-v2/pipeline → here), which must not pull
+// recall/embedder.js (transformers/ONNX init) at import time per the
+// /v1/status availability contract (statusContract.test.ts).
+const defaultEmbed: PageEvidenceEmbedder = async (texts) =>
+  (await import('../../recall/embedder.js')).embed(texts);
+import type { PageContentChunk } from '../../page-content/types.js';
+import type { RecallStore, StoreDocument, StoreDocumentChunk } from './types.js';
 
 // Local readJson — page-content/store.ts has the same shape internally
 // but doesn't export it. Inlined here to keep the SQLite backfill
@@ -34,8 +47,7 @@ const readJson = async <T>(path: string): Promise<T | null> => {
 // Mirrors page-content/store.ts:recordPathForCanonicalUrl + chunksDir.
 // Inlined so we don't import store internals (and to keep backfill
 // resilient to refactors in page-content/store.ts).
-const sha256Hex = (input: string): string =>
-  createHash('sha256').update(input).digest('hex');
+const sha256Hex = (input: string): string => createHash('sha256').update(input).digest('hex');
 const pageContentRecordPath = (vaultRoot: string, canonicalUrl: string): string =>
   join(vaultRoot, '_BAC', 'page-content', 'by-url', `${sha256Hex(canonicalUrl)}.json`);
 const pageContentChunksPath = (vaultRoot: string, contentHash: string): string =>
@@ -141,30 +153,60 @@ export const backfillFromPageEvidence = async (
     ...store.allEntityIdsByKind('timeline_visit'),
   ]);
   const tSnapshot = Date.now() - t0;
-  const upserted = new Set<string>();
   const tListStart = Date.now();
   const records = await listPageEvidenceRecords(vaultRoot);
   const tList = Date.now() - tListStart;
+  const tIngestStart = Date.now();
+  const { pageContent, timelineVisit, upserted } = await ingestEvidenceRecords(
+    vaultRoot,
+    store,
+    records,
+  );
+  const tIngest = Date.now() - tIngestStart;
+  // Sweep stale rows — entity_ids in `existing` but not `upserted`
+  // had their JSON source disappear (file removed, tombstoned, etc.).
+  const tSweepStart = Date.now();
+  let deleted = 0;
+  await runInChunks(store, existing, (id) => {
+    if (!upserted.has(id)) {
+      store.deleteDocument(id);
+      deleted += 1;
+    }
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    pageContent,
+    timelineVisit,
+    deleted,
+    timingMs: {
+      snapshot: tSnapshot,
+      list: tList,
+      ingest: tIngest,
+      sweep: tSweep,
+    },
+  };
+};
+
+/** Upsert one batch of page-evidence records as docs rows. Shared by
+ *  the full pass (all records) and the manifest-delta pass (changed
+ *  records only). FU2 — chunked PARALLEL reads: each chunk fires its
+ *  readJson() calls concurrently, then upsertDocument runs
+ *  synchronously over the resolved data; yields per chunk keep the
+ *  event loop responsive. Chunk size 50 ≈ 100 concurrent fds, plenty
+ *  to saturate the page cache without thrashing. */
+const ingestEvidenceRecords = async (
+  vaultRoot: string,
+  store: RecallStore,
+  records: readonly PageEvidenceRecord[],
+): Promise<{ pageContent: number; timelineVisit: number; upserted: Set<string> }> => {
+  const upserted = new Set<string>();
   let pageContent = 0;
   let timelineVisit = 0;
-  const root = join(vaultRoot, '_BAC', 'page-content', 'by-url');
-  const tIngestStart = Date.now();
-  // FU2 — chunked PARALLEL reads. Was: sequential await readJson()
-  // per record (2 reads per record = N×2 serial filesystem ops).
-  // For 1000 URLs on SSD that's ~2-4s of I/O wall-clock; on slower
-  // disks it's much worse. Now each chunk fires all its readJson()
-  // calls concurrently via Promise.all, then upsertDocument runs
-  // synchronously over the resolved data. Yields still happen
-  // per-chunk so the event loop stays responsive.
-  //
-  // Chunk size kept small (50) for the parallel-reads pass because
-  // ~100 concurrent file descriptors is plenty to saturate the OS
-  // page cache without thrashing.
   const READ_CHUNK_SIZE = 50;
   for (let start = 0; start < records.length; start += READ_CHUNK_SIZE) {
     const chunk = records.slice(start, start + READ_CHUNK_SIZE);
     type Enriched = {
-      readonly record: (typeof records)[number];
+      readonly record: PageEvidenceRecord;
       readonly contentHash: string | undefined;
       readonly body: string | undefined;
     };
@@ -227,32 +269,7 @@ export const backfillFromPageEvidence = async (
     }
     await yieldToEventLoop();
   }
-  const tIngest = Date.now() - tIngestStart;
-  // Sweep stale rows — entity_ids in `existing` but not `upserted`
-  // had their JSON source disappear (file removed, tombstoned, etc.).
-  const tSweepStart = Date.now();
-  let deleted = 0;
-  await runInChunks(store, existing, (id) => {
-    if (!upserted.has(id)) {
-      store.deleteDocument(id);
-      deleted += 1;
-    }
-  });
-  const tSweep = Date.now() - tSweepStart;
-  // Mark unused `root` var so the linter is happy (kept the join for
-  // future expansion when we read chunks lazily).
-  void root;
-  return {
-    pageContent,
-    timelineVisit,
-    deleted,
-    timingMs: {
-      snapshot: tSnapshot,
-      list: tList,
-      ingest: tIngest,
-      sweep: tSweep,
-    },
-  };
+  return { pageContent, timelineVisit, upserted };
 };
 
 /** Backfill chat-turn rows from the recall index. Each turn becomes
@@ -374,12 +391,445 @@ export const backfillVectors = async (
   };
 };
 
+interface ChunkBackfillRow {
+  readonly chunk: PageContentChunk;
+  readonly documentEntityId: string;
+  readonly embedText: string;
+}
+
+const chunkRowForStore = (item: ChunkBackfillRow): StoreDocumentChunk => ({
+  chunkId: item.chunk.id,
+  documentEntityId: item.documentEntityId,
+  chunkIndex: item.chunk.chunkIndex,
+  charStart: item.chunk.charStart,
+  charEnd: item.chunk.charEnd,
+  text: item.chunk.text,
+  evidenceTermsJson: JSON.stringify(item.chunk.terms ?? []),
+  quality: item.chunk.quality,
+});
+
+const chunkEmbedText = (chunk: PageContentChunk): string => {
+  const title = chunk.title?.trim();
+  return `passage: ${title === undefined || title.length === 0 ? chunk.text : `${title}\n\n${chunk.text}`}`;
+};
+
+/** Backfill canonical page-content chunk rows and per-chunk vectors.
+ *  This is idempotent: chunk rows are replaced per document, existing
+ *  chunk vectors are skipped, and stale chunk rows/vectors are swept at
+ *  the end. A killed process can resume without re-embedding chunks
+ *  already persisted in documents_chunks_vec. */
+export const backfillChunkVectors = async (
+  vaultRoot: string,
+  store: RecallStore,
+  embedder: PageEvidenceEmbedder = defaultEmbed,
+): Promise<{
+  chunks: number;
+  vectors: number;
+  deleted: number;
+  timingMs: Record<string, number>;
+}> => {
+  const t0 = Date.now();
+  const existingChunks = store.allDocumentChunkIds();
+  const existingVectors = store.allChunkVectorIds();
+  const tSnapshot = Date.now() - t0;
+  const upsertedChunkIds = new Set<string>();
+  const tReadStart = Date.now();
+  const records = await listPageEvidenceRecords(vaultRoot);
+  const items: ChunkBackfillRow[] = [];
+  for (const record of records) {
+    const contentHash = record.content?.contentHash;
+    if (contentHash === undefined) continue;
+    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
+      pageContentChunksPath(vaultRoot, contentHash),
+    );
+    const chunks = raw?.chunks ?? [];
+    const documentEntityId = entityIdForUrl(record.canonicalUrl);
+    for (const chunk of chunks) {
+      items.push({
+        chunk,
+        documentEntityId,
+        embedText: chunkEmbedText(chunk),
+      });
+      upsertedChunkIds.add(chunk.id);
+    }
+  }
+  const tRead = Date.now() - tReadStart;
+
+  const tRowsStart = Date.now();
+  const rowsByDocument = new Map<string, StoreDocumentChunk[]>();
+  for (const item of items) {
+    const rows = rowsByDocument.get(item.documentEntityId) ?? [];
+    rows.push(chunkRowForStore(item));
+    rowsByDocument.set(item.documentEntityId, rows);
+  }
+  store.runTransaction(() => {
+    for (const [documentEntityId, rows] of rowsByDocument) {
+      store.upsertDocumentChunks(
+        documentEntityId,
+        [...rows].sort((left, right) => left.chunkIndex - right.chunkIndex),
+      );
+    }
+  });
+  const tRows = Date.now() - tRowsStart;
+
+  let vectors = 0;
+  let tEmbed = 0;
+  if (store.vectorBackendAvailable) {
+    const tEmbedStart = Date.now();
+    const missing = items.filter((item) => !existingVectors.has(item.chunk.id));
+    const EMBED_BATCH_SIZE = 32;
+    for (let start = 0; start < missing.length; start += EMBED_BATCH_SIZE) {
+      const batch = missing.slice(start, start + EMBED_BATCH_SIZE);
+      const embedded = await embedder(batch.map((item) => item.embedText));
+      store.runTransaction(() => {
+        for (let index = 0; index < batch.length; index += 1) {
+          const item = batch[index];
+          const vector = embedded[index];
+          if (item === undefined || vector === undefined || vector.length === 0) continue;
+          store.upsertChunkVector(item.chunk.id, vector);
+          vectors += 1;
+        }
+      });
+      if (start + EMBED_BATCH_SIZE < missing.length) await yieldToEventLoop();
+    }
+    tEmbed = Date.now() - tEmbedStart;
+  }
+
+  const tSweepStart = Date.now();
+  let deleted = 0;
+  await runInChunks(store, existingChunks, (chunkId) => {
+    if (!upsertedChunkIds.has(chunkId)) {
+      store.deleteDocumentChunk(chunkId);
+      deleted += 1;
+    }
+  });
+  await runInChunks(store, existingVectors, (chunkId) => {
+    if (!upsertedChunkIds.has(chunkId)) {
+      store.deleteChunkVector(chunkId);
+    }
+  });
+  const tSweep = Date.now() - tSweepStart;
+  return {
+    chunks: items.length,
+    vectors,
+    deleted,
+    timingMs: { snapshot: tSnapshot, read: tRead, rows: tRows, embed: tEmbed, sweep: tSweep },
+  };
+};
+
+// ── Record-level page-evidence delta ────────────────────────────
+// The signature gate in pipeline.ts is all-or-nothing per phase: ONE
+// changed page-evidence record re-ran the FULL pass — every record
+// JSON re-read (observed live: pageEv.list 16.6 s) plus every chunk
+// JSON re-read sequentially (chunkVec.read 10.7 s) on the main loop
+// at boot. The manifest below makes the re-run O(changed): a
+// readdir+stat pass diffs (name, mtimeMs, size) against the manifest
+// persisted in the store, and only changed records are read/upserted;
+// removed files delete their rows via the urls the manifest carries.
+// The manifest lives in recall_metadata, so a recreated store has no
+// manifest and self-heals with a full pass.
+
+export const PAGE_EVIDENCE_MANIFEST_KEY = 'manifest_v1_page_evidence';
+
+// name → `${mtimeMs}:${size}:${canonicalUrl}` (url may contain ':').
+type EvidenceManifest = Record<string, string>;
+
+const parseEvidenceManifest = (raw: string | undefined): EvidenceManifest | null => {
+  if (raw === undefined) return null;
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === 'object' && value !== null ? (value as EvidenceManifest) : null;
+  } catch {
+    return null;
+  }
+};
+
+const manifestUrlOf = (entry: string): string => entry.split(':').slice(2).join(':');
+
+/** Scoped chunk + chunk-vector ingest for a set of changed records.
+ *  Per-doc chunk rows are replaced; a record whose content was REMOVED
+ *  (contentHash gone — e.g. re-extraction downgraded to metadata_only)
+ *  has its chunk rows deleted, cascading their vectors. Orphaned
+ *  vectors from replaced chunk sets are pruned by a global id diff —
+ *  two SELECTs over ~1k ids, NOT a re-read of any JSON. */
+const ingestChunksForRecords = async (
+  vaultRoot: string,
+  store: RecallStore,
+  records: readonly PageEvidenceRecord[],
+  embedder: PageEvidenceEmbedder,
+): Promise<{ chunks: number; vectors: number }> => {
+  if (records.length === 0) return { chunks: 0, vectors: 0 };
+  // Content removed → the doc must stop serving body chunks.
+  for (const record of records) {
+    if (record.content?.contentHash === undefined) {
+      store.deleteDocumentChunks(entityIdForUrl(record.canonicalUrl));
+    }
+  }
+  const withHash = records.filter((r) => r.content?.contentHash !== undefined);
+  if (withHash.length === 0) return { chunks: 0, vectors: 0 };
+  // Snapshot BEFORE replacing rows: vectors for unchanged chunk ids
+  // must survive (re-embedding them would waste the embedder budget).
+  const existingVectors = store.vectorBackendAvailable
+    ? store.allChunkVectorIds()
+    : new Set<string>();
+  const toEmbed: ChunkBackfillRow[] = [];
+  let chunksN = 0;
+  for (const record of withHash) {
+    const contentHash = record.content?.contentHash;
+    if (contentHash === undefined) continue;
+    const documentEntityId = entityIdForUrl(record.canonicalUrl);
+    // eslint-disable-next-line no-await-in-loop -- bounded by |changed records|
+    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
+      pageContentChunksPath(vaultRoot, contentHash),
+    );
+    const chunks = raw?.chunks ?? [];
+    const rows = chunks
+      .map((chunk) => chunkRowForStore({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) }))
+      .sort((left, right) => left.chunkIndex - right.chunkIndex);
+    store.runTransaction(() => {
+      // upsertDocumentChunks replaces this doc's rows (vectors are
+      // pruned by the orphan diff below, so unchanged ids keep theirs).
+      store.upsertDocumentChunks(documentEntityId, rows);
+    });
+    chunksN += chunks.length;
+    for (const chunk of chunks) {
+      if (!existingVectors.has(chunk.id)) {
+        toEmbed.push({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) });
+      }
+    }
+  }
+  // Prune orphaned vectors: ids that had a vector but no longer have
+  // a chunk row anywhere (their doc's chunk set changed).
+  if (store.vectorBackendAvailable) {
+    const liveChunkIds = store.allDocumentChunkIds();
+    for (const id of existingVectors) {
+      if (!liveChunkIds.has(id)) store.deleteChunkVector(id);
+    }
+  }
+  let vectors = 0;
+  if (store.vectorBackendAvailable && toEmbed.length > 0) {
+    const EMBED_BATCH_SIZE = 32;
+    for (let start = 0; start < toEmbed.length; start += EMBED_BATCH_SIZE) {
+      const batch = toEmbed.slice(start, start + EMBED_BATCH_SIZE);
+      // eslint-disable-next-line no-await-in-loop -- embedder is batched
+      const embedded = await embedder(batch.map((item) => item.embedText));
+      store.runTransaction(() => {
+        for (let index = 0; index < batch.length; index += 1) {
+          const item = batch[index];
+          const vector = embedded[index];
+          if (item === undefined || vector === undefined || vector.length === 0) continue;
+          store.upsertChunkVector(item.chunk.id, vector);
+          vectors += 1;
+        }
+      });
+      // eslint-disable-next-line no-await-in-loop -- yield between embed batches
+      if (start + EMBED_BATCH_SIZE < toEmbed.length) await yieldToEventLoop();
+    }
+  }
+  return { chunks: chunksN, vectors };
+};
+
+/** Stats for the manifest-delta pass. */
+export interface PageEvidenceDeltaStats {
+  readonly mode: 'full' | 'delta';
+  readonly changed: number;
+  readonly removed: number;
+  readonly pageContent: number;
+  readonly timelineVisit: number;
+  readonly chunkVectors: number;
+  readonly deleted: number;
+  readonly timingMs: Record<string, number>;
+}
+
+/** Manifest-diffed page-evidence + chunk-vector backfill.
+ *
+ *  delta mode (manifest present): stat pass → read ONLY changed
+ *  records → upsert docs + their chunks/vectors → delete docs of
+ *  removed files. O(changed) JSON reads. When the caller's source
+ *  signature moved but ZERO record files changed (the signature also
+ *  spans page-content/by-url + chunks — body/chunk JSON can change
+ *  without a record rewrite), `fullOnEmptyDelta` falls back to the
+ *  full reconcile so that content is not silently skipped forever.
+ *
+ *  full mode (no manifest — fresh store or first run after this code
+ *  lands): ONE listPageEvidenceRecords read feeds the doc ingest, the
+ *  doc sweep, the chunk reconcile AND the manifest seed (record file
+ *  names are sha256(canonicalUrl).json, so no re-read is needed —
+ *  and the seed carries real urls, never '' placeholders that would
+ *  leak rows on later deletion).
+ *
+ *  The manifest persists LAST: a crash mid-pass re-runs the same
+ *  delta next time (all writes are idempotent upserts/deletes). */
+export const backfillPageEvidenceDelta = async (
+  vaultRoot: string,
+  store: RecallStore,
+  embedder: PageEvidenceEmbedder = defaultEmbed,
+  options: { readonly fullOnEmptyDelta?: boolean } = {},
+): Promise<PageEvidenceDeltaStats> => {
+  const timingMs: Record<string, number> = {};
+  let t = Date.now();
+  const files = await listPageEvidenceRecordFiles(vaultRoot);
+  timingMs['stat'] = Date.now() - t;
+  const stored = parseEvidenceManifest(store.getRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY));
+
+  const runFull = async (): Promise<PageEvidenceDeltaStats> => {
+    // One records read shared by everything below.
+    t = Date.now();
+    const records = await listPageEvidenceRecords(vaultRoot);
+    timingMs['list'] = Date.now() - t;
+    t = Date.now();
+    const existing = new Set<string>([
+      ...store.allEntityIdsByKind('page_content'),
+      ...store.allEntityIdsByKind('timeline_visit'),
+    ]);
+    const { pageContent, timelineVisit, upserted } = await ingestEvidenceRecords(
+      vaultRoot,
+      store,
+      records,
+    );
+    timingMs['ingest'] = Date.now() - t;
+    t = Date.now();
+    let deleted = 0;
+    await runInChunks(store, existing, (id) => {
+      if (!upserted.has(id)) {
+        // Cascades the doc's chunks + vectors.
+        store.deleteDocument(id);
+        deleted += 1;
+      }
+    });
+    timingMs['sweep'] = Date.now() - t;
+    t = Date.now();
+    // ingestChunksForRecords over ALL records is the full chunk
+    // reconcile: docs with content get their rows replaced, docs
+    // without get their rows dropped, swept docs cascaded above, and
+    // the orphan-vector diff prunes the rest.
+    const chunkVec = await ingestChunksForRecords(vaultRoot, store, records, embedder);
+    timingMs['chunks'] = Date.now() - t;
+    t = Date.now();
+    const statByName = new Map(files.map((f) => [f.name, f]));
+    const seeded: EvidenceManifest = {};
+    for (const record of records) {
+      const name = `${sha256Hex(record.canonicalUrl)}.json`;
+      const f = statByName.get(name);
+      if (f === undefined) continue;
+      seeded[name] = `${String(f.mtimeMs)}:${String(f.size)}:${record.canonicalUrl}`;
+    }
+    store.setRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY, JSON.stringify(seeded));
+    timingMs['manifestSeed'] = Date.now() - t;
+    return {
+      mode: 'full',
+      changed: files.length,
+      removed: 0,
+      pageContent,
+      timelineVisit,
+      chunkVectors: chunkVec.vectors,
+      deleted,
+      timingMs,
+    };
+  };
+
+  if (stored === null) {
+    return runFull();
+  }
+
+  // Delta mode.
+  const next: EvidenceManifest = {};
+  const changedNames: string[] = [];
+  for (const f of files) {
+    const prior = stored[f.name];
+    const statKey = `${String(f.mtimeMs)}:${String(f.size)}:`;
+    if (prior !== undefined && prior.startsWith(statKey)) {
+      next[f.name] = prior;
+    } else {
+      changedNames.push(f.name);
+    }
+  }
+  const liveNames = new Set(files.map((f) => f.name));
+  const removedUrls: string[] = [];
+  for (const [name, entry] of Object.entries(stored)) {
+    if (liveNames.has(name)) continue;
+    const url = manifestUrlOf(entry);
+    if (url.length > 0) removedUrls.push(url);
+  }
+
+  if (changedNames.length === 0 && removedUrls.length === 0 && options.fullOnEmptyDelta === true) {
+    // The caller only invokes this when the page-evidence source
+    // signature moved — if no record file changed, the movement was in
+    // page-content/by-url or chunks (body or chunk JSON written
+    // without a record rewrite). Those aren't visible to the record
+    // diff, so reconcile fully rather than mark the signature done
+    // with the content silently unindexed.
+    return runFull();
+  }
+
+  t = Date.now();
+  const statByName = new Map(files.map((f) => [f.name, f]));
+  const changedRecords: PageEvidenceRecord[] = [];
+  const loaded = await mapInChunks(changedNames, 50, async (name) => ({
+    name,
+    record: await readPageEvidenceRecordByFileName(vaultRoot, name),
+  }));
+  for (const { name, record } of loaded) {
+    const f = statByName.get(name);
+    if (f === undefined) continue;
+    if (record !== null) {
+      next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${record.canonicalUrl}`;
+      changedRecords.push(record);
+      continue;
+    }
+    // Read failed schema validation (corrupted rewrite) or raced
+    // with a delete. The full pass drops such records and its sweep
+    // removes their rows; mirror that — delete the doc via the url
+    // the manifest knew, and CARRY that url forward so a later file
+    // deletion can still resolve the entity. Recording '' here
+    // would leak the row forever.
+    const priorUrl = manifestUrlOf(stored[name] ?? '');
+    if (priorUrl.length > 0) removedUrls.push(priorUrl);
+    next[name] = `${String(f.mtimeMs)}:${String(f.size)}:${priorUrl}`;
+  }
+  timingMs['read'] = Date.now() - t;
+
+  t = Date.now();
+  const { pageContent, timelineVisit } = await ingestEvidenceRecords(
+    vaultRoot,
+    store,
+    changedRecords,
+  );
+  timingMs['ingest'] = Date.now() - t;
+
+  t = Date.now();
+  let deleted = 0;
+  await runInChunks(store, removedUrls, (url) => {
+    // deleteDocument cascades the doc's chunks + vectors.
+    store.deleteDocument(entityIdForUrl(url));
+    deleted += 1;
+  });
+  timingMs['remove'] = Date.now() - t;
+
+  t = Date.now();
+  const chunkVec = await ingestChunksForRecords(vaultRoot, store, changedRecords, embedder);
+  timingMs['chunks'] = Date.now() - t;
+
+  store.setRecallMetadata(PAGE_EVIDENCE_MANIFEST_KEY, JSON.stringify(next));
+  return {
+    mode: 'delta',
+    changed: changedNames.length,
+    removed: removedUrls.length,
+    pageContent,
+    timelineVisit,
+    chunkVectors: chunkVec.vectors,
+    deleted,
+    timingMs,
+  };
+};
+
 /** Result type for backfillRecallStore. */
 export interface BackfillStats {
   readonly pageContent: number;
   readonly timelineVisit: number;
   readonly chatTurn: number;
   readonly vectors: number;
+  readonly chunkVectors: number;
   readonly deleted: number;
   /** Per-phase wall-clock ms. Surfaced via the [recall-v2] log line so
    *  /v1/status starvation regressions can be triaged without
@@ -397,18 +847,19 @@ export const backfillRecallStore = async (
   const evidence = await backfillFromPageEvidence(vaultRoot, store);
   const chat = await backfillFromRecallIndex(vaultRoot, store);
   const vec = await backfillVectors(vaultRoot, store);
+  const chunkVec = await backfillChunkVectors(vaultRoot, store);
   return {
     pageContent: evidence.pageContent,
     timelineVisit: evidence.timelineVisit,
     chatTurn: chat.chatTurn,
     vectors: vec.vectors,
-    deleted: evidence.deleted + chat.deleted + vec.deleted,
+    chunkVectors: chunkVec.vectors,
+    deleted: evidence.deleted + chat.deleted + vec.deleted + chunkVec.deleted,
     timingMs: {
+      ...Object.fromEntries(Object.entries(chat.timingMs).map(([k, v]) => [`chat.${k}`, v])),
+      ...Object.fromEntries(Object.entries(vec.timingMs).map(([k, v]) => [`vec.${k}`, v])),
       ...Object.fromEntries(
-        Object.entries(chat.timingMs).map(([k, v]) => [`chat.${k}`, v]),
-      ),
-      ...Object.fromEntries(
-        Object.entries(vec.timingMs).map(([k, v]) => [`vec.${k}`, v]),
+        Object.entries(chunkVec.timingMs).map(([k, v]) => [`chunkVec.${k}`, v]),
       ),
     },
   };
@@ -416,8 +867,7 @@ export const backfillRecallStore = async (
 
 /** Quick check: does the store have ANY rows? Used to skip backfill on
  *  warm starts. */
-export const recallStoreIsEmpty = (store: RecallStore): boolean =>
-  store.documentCount() === 0;
+export const recallStoreIsEmpty = (store: RecallStore): boolean => store.documentCount() === 0;
 
 /** Per-source freshness signatures.
  *
@@ -455,18 +905,14 @@ const sigForPaths = async (paths: readonly string[]): Promise<string> => {
   return createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 32);
 };
 
-export const computeSourceSignatures = async (
-  vaultRoot: string,
-): Promise<SourceSignatures> => ({
+export const computeSourceSignatures = async (vaultRoot: string): Promise<SourceSignatures> => ({
   pageEvidence: await sigForPaths([
     join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
     join(vaultRoot, '_BAC', 'page-content', 'by-url'),
     join(vaultRoot, '_BAC', 'page-content', 'chunks'),
   ]),
   chatTurn: await sigForPaths([join(vaultRoot, '_BAC', 'recall')]),
-  vectors: await sigForPaths([
-    join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json'),
-  ]),
+  vectors: await sigForPaths([join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json')]),
 });
 
 /** @deprecated kept for backward compat; prefer computeSourceSignatures.
@@ -481,4 +927,3 @@ export const computeSourceSignature = async (vaultRoot: string): Promise<string>
 };
 
 export const SOURCE_SIGNATURE_KEY = 'source_signature_v1';
-

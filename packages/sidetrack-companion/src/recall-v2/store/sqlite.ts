@@ -20,6 +20,7 @@ import { getSqliteDriver, type SqliteHandle, type SqliteStatement } from './driv
 import type {
   RecallStore,
   StoreDocument,
+  StoreDocumentChunk,
   StoreFtsHit,
   StoreSourceKind,
 } from './types.js';
@@ -65,6 +66,24 @@ CREATE TABLE IF NOT EXISTS docs (
 );
 CREATE INDEX IF NOT EXISTS docs_source ON docs(source_kind);
 CREATE INDEX IF NOT EXISTS docs_last_seen ON docs(last_seen_at);
+-- queryByCanonicalUrl is on the hot /v2/recall focus path (focus
+-- lookup + graph-neighbor title hydration, several calls per request)
+-- — without this index each call full-scans the docs table.
+CREATE INDEX IF NOT EXISTS docs_canonical_url ON docs(canonical_url);
+
+CREATE TABLE IF NOT EXISTS documents_chunks (
+  chunk_id           TEXT PRIMARY KEY,
+  document_entity_id TEXT NOT NULL,
+  chunk_index        INTEGER NOT NULL,
+  char_start         INTEGER NOT NULL,
+  char_end           INTEGER NOT NULL,
+  text               TEXT NOT NULL,
+  evidence_terms_json TEXT NOT NULL,
+  quality            TEXT NOT NULL,
+  FOREIGN KEY(document_entity_id) REFERENCES docs(entity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS documents_chunks_document
+  ON documents_chunks(document_entity_id, chunk_index);
 
 -- Tracks freshness signatures for the backfill staleness check.
 -- See pipeline.ts:getOrOpenStore — backfill re-runs if the source-
@@ -160,6 +179,10 @@ class SqliteRecallStore implements RecallStore {
             entity_id TEXT PRIMARY KEY,
             embedding FLOAT[384]
           );
+          CREATE VIRTUAL TABLE IF NOT EXISTS documents_chunks_vec USING vec0(
+            chunk_id TEXT PRIMARY KEY,
+            embedding float[384]
+          );
         `);
         this.vecAvailable = true;
         console.warn(`[recall-v2] sqlite-vec loaded via ${driver.name}; docs_vec ready`);
@@ -207,6 +230,8 @@ class SqliteRecallStore implements RecallStore {
   }
 
   deleteDocument(entityId: string): void {
+    this.deleteDocumentChunks(entityId);
+    this.deleteVector(entityId);
     this.deleteStmt.run(entityId);
   }
 
@@ -262,6 +287,81 @@ class SqliteRecallStore implements RecallStore {
     }
   }
 
+  upsertDocumentChunks(documentEntityId: string, chunks: readonly StoreDocumentChunk[]): void {
+    this.db
+      .prepare('DELETE FROM documents_chunks WHERE document_entity_id = ?')
+      .run(documentEntityId);
+    const stmt = this.db.prepare(`
+      INSERT INTO documents_chunks (
+        chunk_id, document_entity_id, chunk_index, char_start, char_end,
+        text, evidence_terms_json, quality
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chunk_id) DO UPDATE SET
+        document_entity_id=excluded.document_entity_id,
+        chunk_index=excluded.chunk_index,
+        char_start=excluded.char_start,
+        char_end=excluded.char_end,
+        text=excluded.text,
+        evidence_terms_json=excluded.evidence_terms_json,
+        quality=excluded.quality
+    `);
+    for (const chunk of chunks) {
+      stmt.run(
+        chunk.chunkId,
+        chunk.documentEntityId,
+        chunk.chunkIndex,
+        chunk.charStart,
+        chunk.charEnd,
+        chunk.text,
+        chunk.evidenceTermsJson,
+        chunk.quality,
+      );
+    }
+  }
+
+  deleteDocumentChunks(documentEntityId: string): void {
+    const rows = this.db
+      .prepare('SELECT chunk_id AS chunkId FROM documents_chunks WHERE document_entity_id = ?')
+      .all<{ chunkId: string }>(documentEntityId);
+    this.db
+      .prepare('DELETE FROM documents_chunks WHERE document_entity_id = ?')
+      .run(documentEntityId);
+    for (const row of rows) this.deleteChunkVector(row.chunkId);
+  }
+
+  deleteDocumentChunk(chunkId: string): void {
+    this.db.prepare('DELETE FROM documents_chunks WHERE chunk_id = ?').run(chunkId);
+    this.deleteChunkVector(chunkId);
+  }
+
+  allDocumentChunkIds(): ReadonlySet<string> {
+    const rows = this.db
+      .prepare('SELECT chunk_id AS chunkId FROM documents_chunks')
+      .all<{ chunkId: string }>();
+    return new Set(rows.map((row) => row.chunkId));
+  }
+
+  deleteChunkVector(chunkId: string): void {
+    if (!this.vecAvailable) return;
+    try {
+      this.db.prepare('DELETE FROM documents_chunks_vec WHERE chunk_id = ?').run(chunkId);
+    } catch (err) {
+      console.warn('[recall-v2] chunk vec delete failed:', err);
+    }
+  }
+
+  allChunkVectorIds(): ReadonlySet<string> {
+    if (!this.vecAvailable) return new Set();
+    try {
+      const rows = this.db
+        .prepare('SELECT chunk_id AS chunkId FROM documents_chunks_vec')
+        .all<{ chunkId: string }>();
+      return new Set(rows.map((r) => r.chunkId));
+    } catch {
+      return new Set();
+    }
+  }
+
   allVectorEntityIds(): ReadonlySet<string> {
     if (!this.vecAvailable) return new Set();
     try {
@@ -275,9 +375,9 @@ class SqliteRecallStore implements RecallStore {
   }
 
   documentCount(sourceKind?: StoreSourceKind): number {
-    const row = (sourceKind === undefined
-      ? this.countStmt.get()
-      : this.countByKindStmt.get(sourceKind)) as { c: number } | undefined;
+    const row = (
+      sourceKind === undefined ? this.countStmt.get() : this.countByKindStmt.get(sourceKind)
+    ) as { c: number } | undefined;
     return row?.c ?? 0;
   }
 
@@ -387,22 +487,24 @@ class SqliteRecallStore implements RecallStore {
       lastSeenAt: number | null;
       firstSeenAt: number | null;
     }[];
-    return rows.map((r): StoreFtsHit => ({
-      entityId: r.entityId,
-      sourceKind: r.sourceKind as StoreSourceKind,
-      ...(r.canonicalUrl === null ? {} : { canonicalUrl: r.canonicalUrl }),
-      ...(r.title === null ? {} : { title: r.title }),
-      ...(r.threadId === null ? {} : { threadId: r.threadId }),
-      // bm25 is N/A for direct lookup; use a constant 1.0 so the
-      // pipeline's downstream candidate-from-hit conversion still
-      // emits a stable per-row rank.
-      bm25: 1,
-      ...(r.firstSeenAt === null
-        ? r.lastSeenAt === null
-          ? {}
-          : { capturedAtMs: r.lastSeenAt }
-        : { capturedAtMs: r.firstSeenAt }),
-    }));
+    return rows.map(
+      (r): StoreFtsHit => ({
+        entityId: r.entityId,
+        sourceKind: r.sourceKind as StoreSourceKind,
+        ...(r.canonicalUrl === null ? {} : { canonicalUrl: r.canonicalUrl }),
+        ...(r.title === null ? {} : { title: r.title }),
+        ...(r.threadId === null ? {} : { threadId: r.threadId }),
+        // bm25 is N/A for direct lookup; use a constant 1.0 so the
+        // pipeline's downstream candidate-from-hit conversion still
+        // emits a stable per-row rank.
+        bm25: 1,
+        ...(r.firstSeenAt === null
+          ? r.lastSeenAt === null
+            ? {}
+            : { capturedAtMs: r.lastSeenAt }
+          : { capturedAtMs: r.firstSeenAt }),
+      }),
+    );
   }
 
   upsertVector(entityId: string, vec: Float32Array): void {
@@ -412,12 +514,23 @@ class SqliteRecallStore implements RecallStore {
       // upsert via DELETE + INSERT to avoid conflict on the PK.
       this.db.prepare('DELETE FROM docs_vec WHERE entity_id = ?').run(entityId);
       const arr = Array.from(vec);
-      this.db.prepare('INSERT INTO docs_vec (entity_id, embedding) VALUES (?, ?)').run(
-        entityId,
-        JSON.stringify(arr),
-      );
+      this.db
+        .prepare('INSERT INTO docs_vec (entity_id, embedding) VALUES (?, ?)')
+        .run(entityId, JSON.stringify(arr));
     } catch (err) {
       console.warn('[recall-v2] vec upsert failed:', err);
+    }
+  }
+
+  upsertChunkVector(chunkId: string, vec: Float32Array): void {
+    if (!this.vecAvailable) return;
+    try {
+      this.db.prepare('DELETE FROM documents_chunks_vec WHERE chunk_id = ?').run(chunkId);
+      this.db
+        .prepare('INSERT INTO documents_chunks_vec (chunk_id, embedding) VALUES (?, ?)')
+        .run(chunkId, JSON.stringify(Array.from(vec)));
+    } catch (err) {
+      console.warn('[recall-v2] chunk vec upsert failed:', err);
     }
   }
 
@@ -486,5 +599,4 @@ class SqliteRecallStore implements RecallStore {
 export const openSqliteRecallStore = (vaultRoot: string): RecallStore =>
   new SqliteRecallStore(RECALL_DB_PATH(vaultRoot));
 
-export const openInMemoryRecallStore = (): RecallStore =>
-  new SqliteRecallStore(':memory:');
+export const openInMemoryRecallStore = (): RecallStore => new SqliteRecallStore(':memory:');

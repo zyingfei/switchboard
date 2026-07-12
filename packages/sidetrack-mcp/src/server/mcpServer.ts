@@ -151,6 +151,14 @@ export interface CompanionWriteClient {
   readonly unarchiveThread?: (input: {
     readonly bac_id: string;
   }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
+  // F32 — create a workstream (new_cluster). parentId nests it; kind is a
+  // free-form label persisted as a tag hint. Routed through the same
+  // trust+audit path as the other write tools.
+  readonly createWorkstream?: (input: {
+    readonly title: string;
+    readonly parentId?: string;
+    readonly kind?: string;
+  }) => Promise<{ readonly bac_id: string; readonly revision: string }>;
   readonly listDispatches?: (input: {
     readonly limit?: number;
     readonly since?: string;
@@ -553,6 +561,47 @@ export const createSidetrackMcpServer = (
         );
       }
       return asStructuredContent(await companionClient.bumpWorkstream({ bac_id }));
+    },
+  );
+
+  // F32 new_cluster — create a workstream. Nests under parentId when
+  // given (the companion trust-gates a child create on the parent).
+  // link_items is deferred per the 2026-07-11 PRD amendment.
+  server.registerTool(
+    'sidetrack.workstreams.create',
+    {
+      description:
+        'Create a new workstream (cluster) to group related threads. Pass parentId to nest it under an existing workstream, else it lands at the top level. kind is an optional free-form label (e.g. "project", "topic"). Returns the new workstream bac_id + revision.',
+      inputSchema: {
+        title: z.string().min(1).describe('Human-readable workstream title.'),
+        parentId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Parent workstream bac_id to nest under; omit for a top-level workstream.'),
+        kind: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Optional free-form category label for the workstream.'),
+      },
+    },
+    async ({ title, parentId, kind }) => {
+      if (companionClient?.createWorkstream === undefined) {
+        throw new Error(
+          'sidetrack-mcp was started without --companion-url / --bridge-key; sidetrack.workstreams.create is unavailable.',
+        );
+      }
+      const result = await companionClient.createWorkstream({
+        title,
+        ...(parentId === undefined ? {} : { parentId }),
+        ...(kind === undefined ? {} : { kind }),
+      });
+      return asStructuredContent({
+        bac_id: result.bac_id,
+        revision: result.revision,
+        createdAt: new Date().toISOString(),
+      });
     },
   );
 

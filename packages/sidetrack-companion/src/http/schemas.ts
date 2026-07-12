@@ -197,6 +197,13 @@ export const queueCreateSchema = z.object({
   status: z.enum(['pending', 'done', 'dismissed']).optional(),
 });
 
+// §13 step 13 — user-facing Markdown export. The workstream variant may
+// also project its threads; the thread variant takes no body options.
+// Body is optional (empty POST ⇒ includeThreads defaults off).
+export const workstreamExportSchema = z.object({
+  includeThreads: z.boolean().optional(),
+});
+
 export const reminderCreateSchema = z.object({
   threadId: bacIdSchema,
   provider: providerSchema,
@@ -358,6 +365,20 @@ export const auditEventSchema = z.object({
   outcome: z.enum(['success', 'failure']),
   bac_id: z.string().min(1).optional(),
   timestamp: isoDateTimeSchema,
+  // F02 audit provenance. All optional so JSONL lines written before
+  // this landed (which lack these fields) still parse — old audit
+  // history stays readable. Newer write sites populate every field.
+  //   agent          — caller class, e.g. 'mcp:<client-name>' | 'extension'.
+  //   tool           — the MCP write tool that drove the write, else null.
+  //   argsSummary    — bounded, redaction-safe description of the call;
+  //                    NEVER the full request payload.
+  //   scope          — workstream id the write was trust-scoped to, else null.
+  //   trustModeActive — whether workstream-trust enforcement gated this call.
+  agent: z.string().min(1).optional(),
+  tool: z.string().min(1).nullable().optional(),
+  argsSummary: z.string().max(500).optional(),
+  scope: z.string().min(1).nullable().optional(),
+  trustModeActive: z.boolean().optional(),
 });
 
 export const auditListQuerySchema = z.object({

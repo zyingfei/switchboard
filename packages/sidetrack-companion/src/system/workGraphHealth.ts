@@ -2,10 +2,17 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  getCanonicalCollisionSnapshot,
+  type CanonicalCollisionSamplePair,
+} from '../page-content/canonicalize-telemetry.js';
+import {
+  scanForOverCollapsedPageContent,
+  type OverCollapsedRecord,
+} from '../page-content/store.js';
+import {
   rankerMethodologySpineDiagnosticsFromTrainQuality,
   type MaterializerRankerMethodologySpineDiagnostics,
 } from '../connections/materializerDiagnostics.js';
-import { createConnectionsStore } from '../connections/snapshot.js';
 import {
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
@@ -27,21 +34,43 @@ import {
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
 import {
-  augmentFeedbackWithVisitPairLabels,
+  RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX,
+  minRecallImpressionPositiveGroups,
+  readRecallImpressionRetrainState,
+  summarizeRecallImpressionEvents,
+} from '../ranker/retrain-impressions.js';
+import {
+  DEFAULT_RANKER_RETRAIN_COOLDOWN_MS,
+  DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD,
+  RANKER_RETRAIN_LABEL_THRESHOLD_ENV,
   fingerprintFeedbackTrainingLabels,
   planRankerRetrain,
   readRankerRetrainState,
   type RankerRetrainSkipReason,
 } from '../ranker/retrain.js';
+// Light import: onlineLabelLedger only pulls train.js (already in this
+// module's graph via retrain). The SIDETRACK_ONLINE_RANKER flag is read
+// from process.env directly so we do NOT static-import the heavy
+// onlineHead.ts (predict/snapshot) into this status-reachable module.
+import { readOnlineRankerState } from '../ranker/onlineLabelLedger.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+} from '../feedback/events.js';
 
 type DiagnosticCandidateMetric = string | number | boolean | null;
 
 export interface DiagnosticCandidate {
   readonly id: string;
   readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
-  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic';
+  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
   readonly reason: string | null;
@@ -54,6 +83,7 @@ export interface WorkGraphHealthReport {
   readonly ranker: {
     readonly activeRevisionId: string | null;
     readonly loadStatus: 'missing' | 'ready' | 'invalid-model';
+    readonly loadReason: string | null;
     readonly activeModelVersion: string | null;
     readonly expectedModelVersion: string;
     readonly activeFeatureSchemaVersion: number | null;
@@ -63,25 +93,46 @@ export interface WorkGraphHealthReport {
     readonly trainingDatasetHash: string | null;
     readonly retrainSkipReason: RankerRetrainSkipReason | null;
     readonly retrainNewLabelCount: number;
+    readonly shipGateV2: {
+      readonly status: 'pass' | 'fail' | 'unavailable';
+      readonly reason: string;
+      readonly revisionId: string;
+      readonly updatedAt: number;
+      readonly activeNdcgAt10: number;
+      readonly baselineNdcgAt10: number;
+      readonly activeMrr: number;
+      readonly baselineMrr: number;
+      readonly explicitRejectPrecisionDelta: number;
+    } | null;
     readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
     // Honest training mix (plan TODO-R5/X1). `negativeLabelCount`
     // alone is the misleading-metric trap: it counts only explicit
     // user-feedback negatives at last train (historically 0, and even
     // those were dropped pre-fix). The model actually trains on
     // grade-0 rows — synthetic random_unrelated/recently_skipped plus
-    // the now-derived visit-pair negatives. Surface all three so a
+    // explicit user rejections. Surface all three so a
     // reader cannot mistake "0 user negatives" for "no negatives".
     readonly trainingMix: {
       readonly positivesAtTrain: number;
       readonly userFeedbackNegativesAtTrain: number;
-      // grade-0 training rows from the model manifest (synthetic +
-      // derived). null when the active manifest predates trainQuality
+      // grade-0 training rows from the model manifest. null when the
+      // active manifest predates trainQuality
       // capture — rendered as "unknown", never as 0.
       readonly trainingNegatives: number | null;
     } | null;
     // True when the current feedback fingerprint differs from what the
     // active model was trained on — "data changed, model is behind".
     readonly datasetChangedSinceTrain: boolean;
+    readonly expandedNegativeCount: number;
+    readonly labelDriftWithoutFeedback: number;
+    readonly rawPositiveCount: number;
+    readonly rawNegativeCount: number;
+    readonly groupCount: number;
+    readonly avgCandidatesPerGroup: number;
+    readonly positivesPerGroup: number;
+    readonly explicitRejectsPerGroup: number;
+    readonly unjudgedCandidatesPerGroup: number;
+    readonly candidateSourceDistribution: Readonly<Record<string, number>>;
     readonly augmentation: {
       readonly status: string;
       readonly reason: string | null;
@@ -97,6 +148,35 @@ export interface WorkGraphHealthReport {
       readonly rankerSourceEdgeCount: number;
       readonly asOf: string | null;
     } | null;
+    // Progress toward the next batch retrain — what has to happen before
+    // the trained date can move. Both gates surfaced: the v6 impression
+    // path (positive groups toward the floor) and the legacy label path
+    // (new positive labels toward the threshold). `eligible` is true when
+    // either gate is already satisfied; otherwise `retrainSkipReason`
+    // carries the binding reason.
+    readonly nextRetrain: {
+      readonly eligible: boolean;
+      readonly positiveGroups: { readonly current: number; readonly required: number };
+      readonly newLabels: { readonly current: number; readonly required: number };
+      readonly cooldownMs: number;
+    };
+    // Online-adaptation head. The batch model's trained date does NOT move
+    // when this nudges weights — it is a serving-time delta layered on
+    // `activeRevisionId`, live only while `baseRevisionId` matches the
+    // served model (`inUse`). `enabled` reflects the SIDETRACK_ONLINE_RANKER
+    // flag; `present` whether a persisted state exists.
+    readonly onlineHead: {
+      readonly enabled: boolean;
+      readonly present: boolean;
+      readonly inUse: boolean;
+      readonly baseRevisionId: string | null;
+      readonly updateCount: number;
+      readonly activeWeightCount: number;
+      // Last state write (frontier advances refresh this every drain).
+      readonly updatedAtMs: number | null;
+      // Last time a pairwise update actually moved the weights.
+      readonly lastNudgeAtMs: number | null;
+    };
   };
   readonly ann: {
     readonly backend: 'hnsw' | 'flat';
@@ -114,6 +194,54 @@ export interface WorkGraphHealthReport {
     readonly topicCount: number;
     readonly lineageCount: number;
   };
+  // Phase 0 of the recall+ranker v2 hard-replacement. The trainer
+  // (Phase 3) joins served × action by `servedContextId`. These
+  // counters surface the impression-log volume on the health panel
+  // so cold-start gating is auditable end-to-end.
+  readonly impressionLog: {
+    readonly servedCount: number;
+    readonly actionCount: number;
+    readonly actionsByKind: Readonly<Record<string, number>>;
+  };
+  // Phase 5 of the recall+ranker v2 hard-replacement. Dogfood-config
+  // visibility on the health panel: what retrieval backend the
+  // companion is serving, what vector store is canonical, and whether
+  // the cross-encoder rerank is firing on /v2/recall. These let the
+  // CFT smoke test verify "the system is actually running the new
+  // architecture" without reading internal config.
+  //
+  // Phase 4 added canonicalVectorCounts (documents_vec +
+  // documents_chunks_vec sizes) so the single-source-of-truth
+  // consistency contract is auditable end-to-end.
+  readonly recall: {
+    readonly retrievalBackend: 'v2';
+    readonly vectorStore: 'sqlite' | 'sidecar';
+    readonly fusionImplementation: 'recall-v2';
+    readonly crossEncoder: {
+      readonly enabled: boolean;
+      readonly rerankTopK: number;
+    };
+    readonly canonicalVectorCounts: {
+      readonly documentVectorCount: number;
+      readonly chunkVectorCount: number;
+    };
+    readonly canonicalizationTelemetry: {
+      readonly trackedHostCount: number;
+      readonly suspiciousHosts: readonly {
+        readonly host: string;
+        readonly canonicalCount: number;
+        readonly rawCount: number;
+        readonly collisionRatio: number;
+        readonly samplePairs: readonly CanonicalCollisionSamplePair[];
+      }[];
+    };
+  };
+  readonly hygiene: {
+    readonly overCollapsedRecords: {
+      readonly count: number;
+      readonly samples: readonly OverCollapsedRecord[];
+    };
+  };
   readonly candidates: readonly DiagnosticCandidate[];
 }
 
@@ -129,9 +257,58 @@ export interface WorkGraphHealthDeps {
   readonly eventLog?: EventLog;
   readonly connectionsDiagnostics?: () => ConnectionsDiagnosticSnapshot;
   readonly now?: () => Date;
+  // Phase 4 — when provided, health reports canonical vector counts
+  // from documents_vec + documents_chunks_vec. Optional because the
+  // SQLite store is lazily opened on first /v2/recall; absent →
+  // counts default to 0 with a comment in the report.
+  readonly canonicalRecallStore?: {
+    readonly allVectorEntityIds: () => ReadonlySet<string>;
+    readonly allChunkVectorIds: () => ReadonlySet<string>;
+  };
 }
 
 const emptyEvents: readonly AcceptedEvent[] = [];
+const feedbackEventTypes = new Set<string>([
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+]);
+
+// Type-filtered read: the health/feedback probes want a tiny typed
+// subset (a few hundred feedback / recall.served / recall.action events)
+// of a log that is ~92% engagement.interval. A full forEachChunk scan of
+// the 370K-event store dominated the 5s health budget, so use the
+// SQL-level type filter (events_type_idx) when the store is available.
+const readEventsForHealth = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+  types: readonly string[],
+): Promise<readonly AcceptedEvent[]> => {
+  if (eventLog === undefined) return emptyEvents;
+  const typeSet = new Set(types);
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) {
+    return (await eventLog.readMerged()).filter((event) => typeSet.has(event.type));
+  }
+  const events: AcceptedEvent[] = [];
+  await store.forEachChunkOfTypes(
+    types,
+    (chunk) => {
+      for (const event of chunk) events.push(event);
+    },
+    2000,
+  );
+  return events;
+};
+
+const readFeedbackEvents = (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<readonly AcceptedEvent[]> =>
+  readEventsForHealth(vaultRoot, eventLog, [...feedbackEventTypes]);
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
@@ -162,6 +339,56 @@ const numberOrNull = (value: unknown): number | null =>
 const booleanOrFalse = (value: unknown): boolean => (typeof value === 'boolean' ? value : false);
 
 const CONTENT_LANE_BACKLOG_WARN_MS = 10 * 60 * 1000;
+const OVER_COLLAPSED_PAGE_CONTENT_CACHE_TTL_MS = 60_000;
+
+let overCollapsedPageContentCache: {
+  readonly vaultRoot: string;
+  readonly computedAtMs: number;
+  readonly records: readonly OverCollapsedRecord[];
+} | null = null;
+
+const scanForOverCollapsedPageContentCached = async (
+  vaultRoot: string,
+): Promise<readonly OverCollapsedRecord[]> => {
+  const now = Date.now();
+  if (
+    overCollapsedPageContentCache !== null &&
+    overCollapsedPageContentCache.vaultRoot === vaultRoot &&
+    now - overCollapsedPageContentCache.computedAtMs < OVER_COLLAPSED_PAGE_CONTENT_CACHE_TTL_MS
+  ) {
+    return overCollapsedPageContentCache.records;
+  }
+  const records = await scanForOverCollapsedPageContent(vaultRoot);
+  overCollapsedPageContentCache = { vaultRoot, computedAtMs: now, records };
+  return records;
+};
+
+const canonicalizationTelemetry = (): WorkGraphHealthReport['recall']['canonicalizationTelemetry'] => {
+  const snapshot = getCanonicalCollisionSnapshot();
+  const suspiciousHosts = Object.entries(snapshot.byHost)
+    .map(([host, hostSnapshot]) => ({
+      host,
+      canonicalCount: hostSnapshot.canonicalCount,
+      rawCount: hostSnapshot.rawCount,
+      collisionRatio:
+        hostSnapshot.canonicalCount === 0
+          ? 0
+          : hostSnapshot.rawCount / hostSnapshot.canonicalCount,
+      samplePairs: hostSnapshot.suspiciousPairs,
+    }))
+    .filter((host) => host.collisionRatio > 1.5)
+    .sort((left, right) => {
+      const ratioDelta = right.collisionRatio - left.collisionRatio;
+      if (ratioDelta !== 0) return ratioDelta;
+      const rawDelta = right.rawCount - left.rawCount;
+      return rawDelta !== 0 ? rawDelta : left.host.localeCompare(right.host);
+    })
+    .slice(0, 10);
+  return {
+    trackedHostCount: Object.keys(snapshot.byHost).length,
+    suspiciousHosts,
+  };
+};
 
 const metrics = (
   input: Readonly<Record<string, DiagnosticCandidateMetric>>,
@@ -404,12 +631,30 @@ const buildDiagnosticCandidates = (input: {
   const hotSimilarityEnabled = hotSimilarityModeEnabled();
   const hotTopicsEnabled = hotTopicsModeEnabled();
   const hotPath = raw !== null && isRecord(raw['hotPath']) ? raw['hotPath'] : null;
-  const hotSim =
-    hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
+  const hotSim = hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
   const hotTop = hotPath !== null && isRecord(hotPath['topics']) ? hotPath['topics'] : null;
   const runnerMode = reconcileRunnerMode();
 
-  return [
+  // Health-panel cleanup (2026-05-26): filter out perpetually-off
+  // diagnostic candidates so the panel only renders meaningful state.
+  // Set ids stay defined here for telemetry; the array is filtered at
+  // the bottom of this function. Adding a new always-off candidate?
+  // Add it to the predicate below too.
+  const alwaysOffCandidateIds = new Set([
+    'topic.hdbscan-standby',          // status=off, no-production-selector
+    'topic.algorithm-comparison',      // status=off, no-runtime-route
+    'quality.gray-zone-scorer',        // status=off, no-runtime-model-injection
+  ]);
+  const isStaleDiagnostic = (cand: DiagnosticCandidate): boolean => {
+    if (alwaysOffCandidateIds.has(cand.id)) return true;
+    // Shadow producer that nobody enabled — pure noise.
+    if (cand.id === 'topic.shadow-idf-rkn-split' && cand.status === 'unavailable') return true;
+    // Legacy methodology spine when not populated (shipGateV2 owns this surface now).
+    if (cand.id === 'ranker.methodology-spine' && cand.status === 'unavailable') return true;
+    return false;
+  };
+
+  const allCandidates: readonly DiagnosticCandidate[] = [
     {
       id: 'topic.active-producer',
       family: 'topic',
@@ -520,21 +765,25 @@ const buildDiagnosticCandidates = (input: {
       servingImpact: rankerActiveModelServingImpact(input.ranker),
       status: candidateStatusForRankerLoad(input.ranker.loadStatus),
       reason:
-        input.ranker.loadStatus === 'ready'
+        input.ranker.loadReason ??
+        (input.ranker.loadStatus === 'ready'
           ? null
           : input.ranker.loadStatus === 'missing'
             ? 'no-active-manifest'
-            : 'invalid-active-model',
+            : 'invalid-active-model'),
       revisionId: input.ranker.activeRevisionId,
       asOf: rankerObservedAt,
       metrics: metrics({
         loadStatus: input.ranker.loadStatus,
+        loadReason: input.ranker.loadReason,
         activeModelVersion: input.ranker.activeModelVersion,
         expectedModelVersion: input.ranker.expectedModelVersion,
         activeFeatureSchemaVersion: input.ranker.activeFeatureSchemaVersion,
         expectedFeatureSchemaVersion: input.ranker.expectedFeatureSchemaVersion,
         needsRetrain: input.ranker.needsRetrain,
         datasetChangedSinceTrain: input.ranker.datasetChangedSinceTrain,
+        shipGateV2Status: input.ranker.shipGateV2?.status ?? null,
+        shipGateV2Reason: input.ranker.shipGateV2?.reason ?? null,
       }),
     },
     {
@@ -569,6 +818,8 @@ const buildDiagnosticCandidates = (input: {
         splitStatus: methodologySpine?.split.status ?? null,
         shipGateStatus: methodologySpine?.shipGate.status ?? null,
         shipGateCandidate: methodologySpine?.shipGate.candidate ?? null,
+        shipGateV2Status: input.ranker.shipGateV2?.status ?? null,
+        shipGateV2Reason: input.ranker.shipGateV2?.reason ?? null,
       }),
     },
     {
@@ -594,8 +845,10 @@ const buildDiagnosticCandidates = (input: {
       // U2 — now ON by default + the actual decision is surfaced (was
       // a perpetual 'last-fast-path-decision-unavailable' standby).
       // servingImpact reflects whether the incremental path actually
-      // ran this drain.
-      lane: 'standby',
+      // ran this drain. Lane renamed 'standby' → 'incremental' on
+      // 2026-05-27 (the IVM hot path IS the serving path in steady
+      // state; "standby" misled in the panel).
+      lane: 'incremental',
       servingImpact: booleanOrFalse(hotSim?.['usedHotPath']) ? 'serving' : 'not-serving',
       status: !hotSimilarityEnabled
         ? 'off'
@@ -616,7 +869,8 @@ const buildDiagnosticCandidates = (input: {
       metrics: metrics({
         envEnabled: hotSimilarityEnabled,
         envName: HOT_SIMILARITY_ENV,
-        shouldEmbedOnHotPath: hotSim === null ? null : booleanOrFalse(hotSim['shouldEmbedOnHotPath']),
+        shouldEmbedOnHotPath:
+          hotSim === null ? null : booleanOrFalse(hotSim['shouldEmbedOnHotPath']),
         usedHotPath: hotSim === null ? null : booleanOrFalse(hotSim['usedHotPath']),
         decisionReason: stringOrNull(hotSim?.['reason']),
         corpusSize: numberOrNull(hotSim?.['corpusSize']),
@@ -628,7 +882,8 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'topic.hot-incremental',
       family: 'topic',
-      lane: 'standby',
+      // Lane: see similarity.hot-incremental note. Same rename.
+      lane: 'incremental',
       servingImpact: booleanOrFalse(hotTop?.['usedFastPath']) ? 'serving' : 'not-serving',
       status: !hotTopicsEnabled
         ? 'off'
@@ -661,7 +916,9 @@ const buildDiagnosticCandidates = (input: {
     {
       id: 'content-lane.dirty-source-queue',
       family: 'content-lane',
-      lane: 'standby',
+      // Queue health — not a standby alternative; rename per panel
+      // cleanup 2026-05-27.
+      lane: 'queue',
       servingImpact: 'not-serving',
       status: contentLaneStatus,
       reason:
@@ -710,37 +967,54 @@ const buildDiagnosticCandidates = (input: {
       metrics: metrics({ learnedModelLoaded: false }),
     },
   ];
+
+  return allCandidates.filter((c) => !isStaleDiagnostic(c));
 };
 
 export const collectWorkGraphHealth = async ({
   vaultRoot,
   eventLog,
   connectionsDiagnostics: readConnectionsDiagnostics,
+  canonicalRecallStore,
   now = () => new Date(),
 }: WorkGraphHealthDeps): Promise<WorkGraphHealthReport> => {
   const collectedAt = now().toISOString();
-  const merged = eventLog === undefined ? emptyEvents : await eventLog.readMerged();
-  const baseFeedback = projectFeedback(merged);
-  const currentSnapshot = await createConnectionsStore(vaultRoot).readCurrent();
-  const feedback =
-    currentSnapshot === null
-      ? baseFeedback
-      : augmentFeedbackWithVisitPairLabels(baseFeedback, currentSnapshot);
+  const feedback = projectFeedback(await readFeedbackEvents(vaultRoot, eventLog));
+  const merged = await readEventsForHealth(vaultRoot, eventLog, ['recall.served', 'recall.action']);
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
-  const [activeManifest, activeManifestProbe, retrainState, ann, topicRevision, diagnostics] =
-    await Promise.all([
-      readActiveClosestVisitRankerRevisionManifest(vaultRoot),
-      readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
-      readRankerRetrainState(vaultRoot),
-      annStatus(),
-      createTopicRevisionStore(vaultRoot).readActiveRevision(),
-      readLatestConnectionsDiagnostics(vaultRoot),
-    ]);
+  const [
+    activeManifest,
+    activeManifestProbe,
+    retrainState,
+    impressionRetrainState,
+    onlineRankerState,
+    ann,
+    topicRevision,
+    diagnostics,
+    overCollapsedRecords,
+  ] = await Promise.all([
+    readActiveClosestVisitRankerRevisionManifest(vaultRoot),
+    readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
+    readRankerRetrainState(vaultRoot),
+    readRecallImpressionRetrainState(vaultRoot),
+    readOnlineRankerState(vaultRoot),
+    annStatus(),
+    createTopicRevisionStore(vaultRoot).readActiveRevision(),
+    readLatestConnectionsDiagnostics(vaultRoot),
+    scanForOverCollapsedPageContentCached(vaultRoot),
+  ]);
   const augmentation = parseRankerAugmentationStatus(diagnostics);
   const activeRevision =
     activeManifest === null
       ? null
       : await readClosestVisitRankerRevision(vaultRoot, activeManifest.revisionId);
+  // Round 1 #5 softening (2026-05-26): v6-from-legacy ("sparse") is no
+  // longer marked invalid. The ship-gate decides serveability over
+  // impression-level metrics; training source is informational only.
+  // The flag is still surfaced as `trainingOrigin` for auditability.
+  const activeV6FromLegacy =
+    activeManifest?.modelVersion === 'lightgbm-lambdamart-v6' &&
+    activeManifest.trainedFromImpressions === false;
   const retrainPlan = planRankerRetrain({ fingerprint, state: retrainState });
   const gradeHistogram = (
     activeRevision as { trainQuality?: { gradeHistogram?: Record<string, number> } } | null
@@ -759,8 +1033,107 @@ export const collectWorkGraphHealth = async ({
         };
   const datasetChangedSinceTrain =
     retrainState !== null && retrainState.lastTrainedLabelDatasetHash !== fingerprint.hash;
+  const impressionTraining = summarizeRecallImpressionEvents(merged);
+  // Env-aware floor — MUST match the real gate (`minRecallImpressionPositiveGroups`,
+  // which honors SIDETRACK_RANKER_IMPRESSION_MIN_GROUPS). The old hardcoded
+  // MIN_RECALL_IMPRESSION_POSITIVE_GROUPS diverged from the actual retrain
+  // decision on dogfood companions that override the floor.
+  const impressionGroupsRequired = minRecallImpressionPositiveGroups();
+  const v6ColdStartSkipReason: RankerRetrainSkipReason | null =
+    impressionTraining.groupCountWithPositives < impressionGroupsRequired
+      ? 'insufficient_groups'
+      : null;
+  const activeLightgbmGate = activeManifest?.artifactQuality?.find(
+    (artifact) => artifact.kind === 'lightgbm_lambdamart',
+  )?.shipGate;
+  const activeLightgbmV2GateFailed =
+    activeLightgbmGate?.reason.startsWith(RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX) === true &&
+    activeLightgbmGate.status !== 'pass';
+  const v6ShipGateSkipReason: RankerRetrainSkipReason | null =
+    v6ColdStartSkipReason !== null
+      ? v6ColdStartSkipReason
+      : impressionRetrainState?.status === 'ship_gate_failed' || activeLightgbmV2GateFailed
+        ? 'ship_gate_failed'
+        : null;
+  const shipGateV2 =
+    impressionRetrainState === null
+      ? null
+      : {
+          status: impressionRetrainState.shipGateDecision.status,
+          reason: impressionRetrainState.shipGateDecision.reason,
+          revisionId: impressionRetrainState.revisionId,
+          updatedAt: impressionRetrainState.updatedAt,
+          activeNdcgAt10: impressionRetrainState.shipGateDecision.active.nDcgAt10,
+          baselineNdcgAt10: impressionRetrainState.shipGateDecision.baseline.nDcgAt10,
+          activeMrr: impressionRetrainState.shipGateDecision.active.mrr,
+          baselineMrr: impressionRetrainState.shipGateDecision.baseline.mrr,
+          explicitRejectPrecisionDelta:
+            impressionRetrainState.shipGateDecision.deltas.explicitRejectPrecision,
+        };
+  const activeRevisionId =
+    activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null;
+  // Single source of truth for "would a retrain run right now" — the same
+  // value surfaced as `retrainSkipReason`. `nextRetrain.eligible` is its
+  // exact negation so the two never disagree.
+  //
+  // Precedence mirrors the DRAIN's control flow, not a fixed ranking:
+  // when the impression path is cold (groups below the floor) the drain
+  // falls through to the legacy label path, and that path trains AND
+  // promotes unconditionally — so a train-ready legacy plan means there
+  // is no skip reason, and `insufficient_groups` must not mask it (it
+  // did: the panel showed "blocked" while the next drain would train).
+  const retrainSkipReason: RankerRetrainSkipReason | null =
+    v6ColdStartSkipReason !== null && retrainPlan.action === 'train'
+      ? null
+      : (v6ShipGateSkipReason ?? (retrainPlan.action === 'skip' ? retrainPlan.reason : null));
+  // Next-retrain progress — surface BOTH gates the trainer checks so the
+  // UI can show "what has to happen before the model retrains": the v6
+  // impression path (positive groups toward the floor) and the legacy
+  // label path (new positive labels toward the threshold).
+  const rawNewLabelThreshold = Number(process.env[RANKER_RETRAIN_LABEL_THRESHOLD_ENV]);
+  const newLabelsRequired = Math.max(
+    1,
+    Math.floor(
+      Number.isFinite(rawNewLabelThreshold)
+        ? rawNewLabelThreshold
+        : DEFAULT_RANKER_RETRAIN_LABEL_THRESHOLD,
+    ),
+  );
+  const nextRetrain = {
+    eligible: retrainSkipReason === null,
+    positiveGroups: {
+      current: impressionTraining.groupCountWithPositives,
+      required: impressionGroupsRequired,
+    },
+    newLabels: { current: retrainPlan.newLabelCount, required: newLabelsRequired },
+    cooldownMs: DEFAULT_RANKER_RETRAIN_COOLDOWN_MS,
+  };
+  // Online-adaptation head. `enabled` = SIDETRACK_ONLINE_RANKER flag;
+  // `inUse` = enabled AND a persisted state exists AND its base matches
+  // the served model (so its clamped delta is actually blended). Read
+  // from env directly to avoid a heavy onlineHead.ts import here.
+  const onlineRankerFlag = process.env['SIDETRACK_ONLINE_RANKER'] === '1';
+  const onlineHead = {
+    enabled: onlineRankerFlag,
+    present: onlineRankerState !== null,
+    inUse:
+      onlineRankerFlag &&
+      onlineRankerState !== null &&
+      onlineRankerState.baseRevisionId === activeRevisionId,
+    baseRevisionId: onlineRankerState?.baseRevisionId ?? null,
+    updateCount: onlineRankerState?.updateCount ?? 0,
+    activeWeightCount:
+      onlineRankerState === null
+        ? 0
+        : onlineRankerState.weights.filter((weight) => weight !== 0).length,
+    updatedAtMs:
+      onlineRankerState !== null && onlineRankerState.updatedAtMs > 0
+        ? onlineRankerState.updatedAtMs
+        : null,
+    lastNudgeAtMs: onlineRankerState?.lastNudgeAtMs ?? null,
+  };
   const ranker: WorkGraphHealthReport['ranker'] = {
-    activeRevisionId: activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null,
+    activeRevisionId,
     loadStatus:
       activeManifest === null
         ? activeManifestProbe === null
@@ -769,6 +1142,14 @@ export const collectWorkGraphHealth = async ({
         : activeRevision === null
           ? 'invalid-model'
           : 'ready',
+    loadReason:
+      activeManifest === null
+        ? activeManifestProbe === null
+          ? 'no-active-manifest'
+          : 'invalid-active-model'
+        : activeRevision === null
+          ? 'invalid-active-model'
+          : null,
     activeModelVersion:
       activeManifestProbe?.activeModelVersion ?? activeManifest?.modelVersion ?? null,
     expectedModelVersion:
@@ -783,14 +1164,27 @@ export const collectWorkGraphHealth = async ({
     needsRetrain: activeManifestProbe?.staleModelSchema ?? false,
     trainedAt: activeManifest?.trainedAt ?? null,
     trainingDatasetHash: activeManifest?.trainingDatasetHash ?? null,
-    retrainSkipReason: retrainPlan.action === 'skip' ? retrainPlan.reason : null,
+    retrainSkipReason,
     retrainNewLabelCount: retrainPlan.newLabelCount,
+    shipGateV2,
     methodologySpine: rankerMethodologySpineDiagnosticsFromTrainQuality(
       activeManifest?.trainQuality,
     ),
     trainingMix,
     datasetChangedSinceTrain,
+    expandedNegativeCount: 0,
+    labelDriftWithoutFeedback: 0,
+    rawPositiveCount: impressionTraining.rawPositiveCount,
+    rawNegativeCount: impressionTraining.rawNegativeCount,
+    groupCount: impressionTraining.groupCount,
+    avgCandidatesPerGroup: impressionTraining.avgCandidatesPerGroup,
+    positivesPerGroup: impressionTraining.positivesPerGroup,
+    explicitRejectsPerGroup: impressionTraining.explicitRejectsPerGroup,
+    unjudgedCandidatesPerGroup: impressionTraining.unjudgedCandidatesPerGroup,
+    candidateSourceDistribution: impressionTraining.candidateSourceDistribution,
     augmentation,
+    nextRetrain,
+    onlineHead,
   };
   const topicProducer: WorkGraphHealthReport['topicProducer'] = {
     activeRevisionId: topicRevision?.revisionId ?? null,
@@ -801,6 +1195,68 @@ export const collectWorkGraphHealth = async ({
   const connectionsDiagnosticSnapshot = readConnectionsDiagnostics?.() ?? null;
   const topicProducedAt =
     topicRevision === null ? null : new Date(topicRevision.producedAt).toISOString();
+  // Phase 0 — count recall.served + recall.action events from the
+  // merged log. Cheap single pass; same data the trainer reads.
+  let servedCount = 0;
+  let actionCount = 0;
+  const actionsByKind: Record<string, number> = {};
+  for (const event of merged) {
+    if (event.type === 'recall.served') {
+      servedCount += 1;
+    } else if (event.type === 'recall.action') {
+      actionCount += 1;
+      const kind = (event.payload as { actionKind?: unknown })?.actionKind;
+      if (typeof kind === 'string') {
+        actionsByKind[kind] = (actionsByKind[kind] ?? 0) + 1;
+      }
+    }
+  }
+  const impressionLog: WorkGraphHealthReport['impressionLog'] = {
+    servedCount,
+    actionCount,
+    actionsByKind,
+  };
+  // Phase 5 — dogfood-config snapshot. Values are constants here
+  // because the server-side wiring is the single source of truth
+  // (http/server.ts sets DOGFOOD_RERANK_TOP_K on every /v2/recall).
+  //
+  // Phase 4 — canonicalVectorCounts default to 0 (the SQLite store
+  // is lazily opened on first /v2/recall; a health poll BEFORE that
+  // legitimately sees 0). Live counts populate when the store is
+  // injected via `canonicalRecallStore` dep — see WorkGraphHealthDeps.
+  // The runtime canonical truth lives in
+  // recall-v2/store/sqlite.ts (documents_vec + documents_chunks_vec).
+  const DOGFOOD_RERANK_TOP_K = 20;
+  let documentVectorCount = 0;
+  let chunkVectorCount = 0;
+  if (canonicalRecallStore !== undefined) {
+    try {
+      documentVectorCount = canonicalRecallStore.allVectorEntityIds().size;
+      chunkVectorCount = canonicalRecallStore.allChunkVectorIds().size;
+    } catch {
+      // Store probe failures are non-fatal for health; counts stay 0.
+    }
+  }
+  const recall: WorkGraphHealthReport['recall'] = {
+    retrievalBackend: 'v2',
+    vectorStore: 'sqlite',
+    fusionImplementation: 'recall-v2',
+    crossEncoder: {
+      enabled: true,
+      rerankTopK: DOGFOOD_RERANK_TOP_K,
+    },
+    canonicalVectorCounts: {
+      documentVectorCount,
+      chunkVectorCount,
+    },
+    canonicalizationTelemetry: canonicalizationTelemetry(),
+  };
+  const hygiene: WorkGraphHealthReport['hygiene'] = {
+    overCollapsedRecords: {
+      count: overCollapsedRecords.length,
+      samples: overCollapsedRecords.slice(0, 5),
+    },
+  };
   return {
     ranker,
     ann,
@@ -810,6 +1266,9 @@ export const collectWorkGraphHealth = async ({
       negativeLabelCount: feedback.negativeLabels.length,
     },
     topicProducer,
+    impressionLog,
+    recall,
+    hygiene,
     candidates: buildDiagnosticCandidates({
       ranker,
       topicProducer,

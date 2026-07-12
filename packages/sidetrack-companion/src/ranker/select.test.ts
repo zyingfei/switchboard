@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { FEATURE_SCHEMA_VERSION } from './feature-schema.js';
-import { selectActiveRanker } from './select.js';
+import { isServeable, selectActiveRanker } from './select.js';
 import {
   COMBINER_FEATURE_KINDS,
   composeCombinerVector,
@@ -22,6 +22,7 @@ const baseRevision = (overrides: Partial<RankerRevision> = {}): RankerRevision =
   featureSchemaVersion: FEATURE_SCHEMA_VERSION,
   trainingDatasetHash: 'a'.repeat(64),
   trainedAt: 1779000000000,
+  trainedFromImpressions: true,
   modelBytes: new ArrayBuffer(64), // non-zero so isServeable(lightgbm) holds
   ...overrides,
 });
@@ -30,17 +31,19 @@ const artifact = (
   kind: RankerArtifactKind,
   status: 'pass' | 'fail' | 'unavailable',
   reservedTestNdcg: number | undefined,
+  reasonOverride?: string,
 ): RankerArtifactQuality => ({
   kind,
   candidate: `version-${kind}`,
   shipGate: {
     status,
     reason:
-      status === 'pass'
+      reasonOverride ??
+      (status === 'pass'
         ? 'artifact-cleared-baseline-and-floor'
         : status === 'fail'
           ? 'artifact-does-not-beat-baseline'
-          : 'reserved-test-metric-unavailable',
+          : 'reserved-test-metric-unavailable'),
   },
   ...(reservedTestNdcg === undefined
     ? {}
@@ -105,6 +108,25 @@ describe('selectActiveRanker', () => {
     expect(selectActiveRanker(revision).selectedKind).toBe('logistic_batch');
   });
 
+  it('does not prioritize v2 LightGBM over a higher-metric passing artifact', () => {
+    const revision = baseRevision({
+      logisticBatchWeights: Array.from({ length: RANKER_FEATURE_KEYS.length + 1 }, () => 0.1),
+      logisticBatchFeatureStatsVersion: 'no-normalization-v1',
+      artifactQuality: [
+        artifact('logistic_batch', 'pass', 0.72),
+        artifact('lightgbm_lambdamart', 'pass', 0.61, 'ship_gate_v2:active-cleared'),
+      ],
+    });
+
+    const selection = selectActiveRanker(revision);
+
+    expect(selection).toMatchObject({
+      selectedKind: 'logistic_batch',
+      reservedTestNdcgAt5: 0.72,
+      shipGateReason: 'artifact-cleared-baseline-and-floor',
+    });
+  });
+
   it('refuses to pick logistic_batch when the persisted weights are absent', () => {
     // A revision where the gate passed but the writer didn't persist
     // weights (e.g. an older Step-2-only revision before Step-3
@@ -120,6 +142,24 @@ describe('selectActiveRanker', () => {
     });
 
     expect(selectActiveRanker(revision).selectedKind).toBe('graph_baseline');
+  });
+
+  it('allows v6 LightGBM trained from legacy ("sparse") to serve — softened on 2026-05-26', () => {
+    // Round 1 #5 originally blocked v6-from-legacy entirely. Softened
+    // per dogfood: the model still carries ~27 real features from
+    // explicit feedback; only the 5 retrieval features are zero-fills.
+    // Let it compete via the ship-gate; trainingOrigin remains
+    // surfaced in health for auditability.
+    const revision = baseRevision({
+      trainedFromImpressions: false,
+      artifactQuality: [artifact('lightgbm_lambdamart', 'pass', 0.8)],
+    });
+
+    expect(isServeable('lightgbm_lambdamart', revision)).toBe(true);
+    expect(selectActiveRanker(revision)).toMatchObject({
+      selectedKind: 'lightgbm_lambdamart',
+      reason: 'best_passing',
+    });
   });
 
   it('falls back when artifactQuality is missing (legacy revision)', () => {

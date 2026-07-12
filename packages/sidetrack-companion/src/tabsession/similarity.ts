@@ -1,6 +1,6 @@
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
-import { generateCandidates } from '../ranker/candidates.js';
+import { generateCandidates, isCoarseMultiTopicDomain } from '../ranker/candidates.js';
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate } from '../ranker/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -25,6 +25,76 @@ export interface BuildSimilarityEvidenceInput {
 const VISIT_PREFIX = 'timeline-visit:';
 const VISIT_INSTANCE_PREFIX = 'visit-instance:';
 const WORKSTREAM_PREFIX = 'workstream:';
+
+// Content channels that indicate real topical similarity (as opposed to
+// behavior + title/host/path "metadata" chrome). See visitSimilarity.ts.
+const CONTENT_SIMILARITY_CHANNELS = [
+  'contentVector',
+  'contentTerms',
+  'keyphrases',
+  'entities',
+  'chunkSupport',
+] as const;
+
+// Structural candidate sources the aggregator guard suppresses at generation
+// time; a persisted ranker edge built solely from these is a chrome artifact.
+const CHROME_ONLY_SUPPRESSED_SOURCES = new Set<string>([
+  'same_repo_or_domain',
+  'same_title_path_tokens',
+]);
+
+// The one candidate source derived from raw `visit_resembles_visit` edges
+// regardless of channel — for an aggregator pair those edges are overwhelmingly
+// chrome-only (behavior + metadata), so this source can't be trusted between
+// two aggregator pages. Genuine content similarity arrives via the distinct
+// `content_embedding_neighborhood` / `content_term_overlap` sources instead.
+const CHROME_PRONE_AGGREGATOR_SOURCES = new Set<string>(['embedding_neighborhood']);
+
+const urlWithinNodeId = (nodeIdOrUrl: string): string | null => {
+  const match = nodeIdOrUrl.match(/https?:\/\/.+$/u);
+  return match ? match[0] : null;
+};
+
+// True when a visit node id / raw key resolves to a large multi-topic platform
+// (Hacker News, Reddit, YouTube, …) where a shared URL skeleton is not topical
+// evidence. Reuses the ranker's registrable-domain classifier.
+const isCoarseMultiTopicVisit = (nodeIdOrUrl: string): boolean => {
+  const url = urlWithinNodeId(nodeIdOrUrl);
+  if (url === null) return false;
+  try {
+    return isCoarseMultiTopicDomain(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+};
+
+// A persisted similarity edge whose signal is chrome only: a
+// resemblance/continues edge with no content channel (only behavior + the
+// title/host/path "metadata" channel), or a closest_visit edge the ranker
+// built solely from the suppressed structural sources. Between two aggregator
+// pages such an edge is a site-skeleton false-friend, not topical similarity
+// (7000+ such resemblance edges exist on a real vault, scored 0.8–0.99), so
+// the resolver must not attribute from it.
+const isChromeOnlySimilarityEdge = (
+  metadata: Readonly<Record<string, unknown>> | undefined,
+): boolean => {
+  const channels = metadata?.['channels'];
+  if (channels !== null && typeof channels === 'object') {
+    const record = channels as Record<string, unknown>;
+    const hasContent = CONTENT_SIMILARITY_CHANNELS.some((key) => {
+      const value = record[key];
+      return typeof value === 'number' && value > 0;
+    });
+    return !hasContent;
+  }
+  const sources = metadata?.['candidateSources'];
+  if (Array.isArray(sources) && sources.length > 0) {
+    return sources.every(
+      (source) => typeof source === 'string' && CHROME_ONLY_SUPPRESSED_SOURCES.has(source),
+    );
+  }
+  return false;
+};
 
 const scoreForEdge = (kind: string, metadata?: Readonly<Record<string, unknown>>): number => {
   if (kind === 'closest_visit') return 1;
@@ -84,6 +154,10 @@ export const buildSimilarityEvidence = ({
       canonicalVisitForNode(snapshot, targetVisitNodeId),
     ),
   );
+  // When the page being resolved is itself an aggregator item, its similarity
+  // to other aggregator items is untrustworthy (shared site skeleton, not
+  // topic). Guard both evidence loops below against that class of false-friend.
+  const targetIsCoarseMultiTopic = [...canonicalTargetVisitNodeIds].some(isCoarseMultiTopicVisit);
   const visitWorkstream = new Map<string, string>();
   for (const edge of snapshot.edges) {
     if (edge.kind !== 'visit_in_workstream' && edge.kind !== 'visit_instance_in_workstream') {
@@ -132,7 +206,11 @@ export const buildSimilarityEvidence = ({
           closestVisitRanker === undefined
             ? scoreForCandidateSources(candidate)
             : closestVisitRanker.predict(
-                extractFeatures(candidate, { merged: [...events], snapshot }),
+                extractFeatures(candidate, {
+                  merged: [...events],
+                  snapshot,
+                  retrievalContext: { missingRetrievalContext: true },
+                }),
                 candidate,
               ).score;
         return Number.isFinite(score) && score > 0 ? { candidate, score } : null;
@@ -154,6 +232,16 @@ export const buildSimilarityEvidence = ({
       .slice(0, Math.max(0, Math.floor(k)));
     for (const item of scored) {
       const candidateVisitKey = visitKeyFromNodeOrRaw(item.candidate.toVisitId);
+      // Skip a chrome-derived neighbor between two aggregator pages: the only
+      // basis is `embedding_neighborhood` (built from chrome resemblance
+      // edges). Content-backed candidates carry other sources and pass.
+      if (
+        targetIsCoarseMultiTopic &&
+        isCoarseMultiTopicVisit(candidateVisitKey) &&
+        item.candidate.sources.every((source) => CHROME_PRONE_AGGREGATOR_SOURCES.has(source))
+      ) {
+        continue;
+      }
       addScore(
         visitWorkstream.get(candidateVisitKey) ??
           visitWorkstream.get(visitNodeId(candidateVisitKey)),
@@ -178,6 +266,15 @@ export const buildSimilarityEvidence = ({
               ? canonicalVisitForNode(snapshot, edge.fromNodeId)
               : null;
     if (other === null) continue;
+    // Ignore a chrome-only persisted similarity edge between two aggregator
+    // pages (site-skeleton false-friend; see isChromeOnlySimilarityEdge).
+    if (
+      targetIsCoarseMultiTopic &&
+      isCoarseMultiTopicVisit(other) &&
+      isChromeOnlySimilarityEdge(edge.metadata)
+    ) {
+      continue;
+    }
     const matchedTerms = [
       ...(Array.isArray(edge.metadata?.['matchedTerms'])
         ? edge.metadata['matchedTerms'].filter((term): term is string => typeof term === 'string')

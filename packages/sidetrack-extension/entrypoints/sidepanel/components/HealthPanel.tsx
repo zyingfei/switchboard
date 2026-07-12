@@ -178,6 +178,31 @@ interface WorkGraphRankerHealth {
   readonly datasetChangedSinceTrain?: boolean;
   readonly methodologySpine?: WorkGraphRankerMethodologySpine | null;
   readonly augmentation?: WorkGraphRankerAugmentationHealth | null;
+  // What has to happen before the trained date can move. Both gates the
+  // trainer checks: the v6 impression path (positive groups → floor) and
+  // the legacy label path (new positive labels → threshold). Optional:
+  // an older companion omits it.
+  readonly nextRetrain?: {
+    readonly eligible: boolean;
+    readonly positiveGroups: { readonly current: number; readonly required: number };
+    readonly newLabels: { readonly current: number; readonly required: number };
+    readonly cooldownMs: number;
+  } | null;
+  // Online-adaptation head. The trained date does NOT move when this
+  // nudges weights — it's a serving-time delta on `activeRevisionId`,
+  // live only while `inUse` (baseRevisionId matches the served model).
+  readonly onlineHead?: {
+    readonly enabled: boolean;
+    readonly present: boolean;
+    readonly inUse: boolean;
+    readonly baseRevisionId: string | null;
+    readonly updateCount: number;
+    readonly activeWeightCount: number;
+    // Last state write — refreshes every drain (frontier advance), so it
+    // is NOT "when did feedback last move the weights"; lastNudgeAtMs is.
+    readonly updatedAtMs: number | null;
+    readonly lastNudgeAtMs?: number | null;
+  } | null;
 }
 
 interface WorkGraphTopicProducerHealth {
@@ -192,7 +217,7 @@ type DiagnosticCandidateMetric = string | number | boolean | null;
 interface DiagnosticCandidate {
   readonly id: string;
   readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
-  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic';
+  readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
   readonly reason: string | null;
@@ -205,6 +230,20 @@ interface WorkGraphHealth {
   readonly ranker: WorkGraphRankerHealth;
   readonly topicProducer?: WorkGraphTopicProducerHealth;
   readonly candidates?: readonly DiagnosticCandidate[];
+  // PR A / Phase 4 — v2 retrieval stack canonical vector counts. The
+  // panel prefers these over legacy chat-turn entry count because
+  // /v2/recall actually serves from sqlite-vec (docs + chunks); the
+  // chat-turn index is one source among several.
+  readonly recall?: {
+    readonly retrievalBackend?: string;
+    readonly vectorStore?: string;
+    readonly fusionImplementation?: string;
+    readonly crossEncoder?: { readonly enabled: boolean; readonly rerankTopK: number };
+    readonly canonicalVectorCounts?: {
+      readonly documentVectorCount: number;
+      readonly chunkVectorCount: number;
+    };
+  };
 }
 
 interface HealthReport {
@@ -474,11 +513,80 @@ const isCandidateSignal = (candidate: DiagnosticCandidate): boolean =>
   candidate.lane === 'active' &&
   (candidate.servingImpact === 'serving' || candidate.id === 'ranker.active-model');
 
-const metricSummary = (candidate: DiagnosticCandidate): string =>
-  Object.entries(candidate.metrics)
+// Per-candidate compact formatters. Renders 2-4 key statistics at-a-
+// glance instead of the verbose `key=value · key=value · …` dump.
+// Cards not listed here fall back to the generic dump.
+//
+// Honest naming: when the metric is missing (null/undefined), the
+// formatter omits it rather than rendering "—" so a half-populated
+// card stays readable.
+const m2 = (v: unknown): string => {
+  if (v === null || v === undefined) return '';
+  // Defensive cast: candidate metrics are JSON-serialized scalars in
+  // practice, but the formatter map types each field as unknown so
+  // typescript can't prove primitive-ness here. After the null/undef
+  // check, formatCandidateMetric handles string/number/boolean cleanly.
+  return String(formatCandidateMetric(v as string | number | boolean | null));
+};
+const compactMetricsByCandidateId: Record<string, (m: Record<string, unknown>) => string> = {
+  'similarity.hot-incremental': (m) => {
+    const parts: string[] = [];
+    if (m['edgeCount'] != null) parts.push(`${m2(m['edgeCount'])} edges`);
+    if (m['newEmbedded'] != null) parts.push(`${m2(m['newEmbedded'])} new embeds`);
+    if (m['runtimeMs'] != null) parts.push(`${m2(m['runtimeMs'])}ms`);
+    if (m['usedHotPath'] === false) parts.push('fallback');
+    return parts.join(' · ');
+  },
+  'topic.hot-incremental': (m) => {
+    const parts: string[] = [];
+    if (m['topicCount'] != null) parts.push(`${m2(m['topicCount'])} topics`);
+    if (m['componentCount'] != null) parts.push(`${m2(m['componentCount'])} components`);
+    if (m['cacheHit'] === true) parts.push('cache hit');
+    else if (m['cacheHit'] === false) parts.push('cache miss');
+    if (m['runtimeMs'] != null) parts.push(`${m2(m['runtimeMs'])}ms`);
+    return parts.join(' · ');
+  },
+  'content-lane.dirty-source-queue': (m) => {
+    const parts: string[] = [];
+    parts.push(`${m2(m['dirtySourceCount'] ?? 0)} pending`);
+    if (m['tombstonedSourceCount'] != null) parts.push(`${m2(m['tombstonedSourceCount'])} tombstoned`);
+    if (m['oldestDirtySourceAgeMs'] != null) parts.push(`oldest ${m2(m['oldestDirtySourceAgeMs'])}ms`);
+    return parts.join(' · ');
+  },
+  'topic.active-producer': (m) => {
+    const parts: string[] = [];
+    if (m['algorithmVersion'] != null) parts.push(m2(m['algorithmVersion']));
+    if (m['topicCount'] != null) parts.push(`${m2(m['topicCount'])} topics`);
+    if (m['lineageCount'] != null) parts.push(`${m2(m['lineageCount'])} lineage`);
+    return parts.join(' · ');
+  },
+  'ranker.active-model': (m) => {
+    const parts: string[] = [];
+    if (m['activeModelVersion'] != null) parts.push(m2(m['activeModelVersion']));
+    if (m['loadStatus'] != null) parts.push(m2(m['loadStatus']));
+    if (m['shipGateV2Status'] != null) parts.push(`gate ${m2(m['shipGateV2Status'])}`);
+    return parts.join(' · ');
+  },
+  'ranker.augmentation': (m) => {
+    const parts: string[] = [];
+    if (m['closestVisitEdgeCount'] != null) parts.push(`${m2(m['closestVisitEdgeCount'])} closest_visit edges`);
+    if (m['modelFreshness'] != null) parts.push(`freshness ${m2(m['modelFreshness'])}`);
+    return parts.join(' · ');
+  },
+  'reconcile.runner-mode': (m) => (m['mode'] != null ? m2(m['mode']) : ''),
+};
+
+const metricSummary = (candidate: DiagnosticCandidate): string => {
+  const compact = compactMetricsByCandidateId[candidate.id];
+  if (compact !== undefined) {
+    const text = compact(candidate.metrics);
+    if (text.length > 0) return text;
+  }
+  return Object.entries(candidate.metrics)
     .slice(0, 4)
     .map(([key, value]) => `${key}=${formatCandidateMetric(value)}`)
     .join(' · ');
+};
 
 type PipelineStatus = 'ok' | 'warn' | 'err' | 'idle' | 'unavailable';
 interface PipelineStage {
@@ -538,6 +646,24 @@ function ReceiptRow({ dt, dd, mono }: { dt: string; dd: React.ReactNode; mono?: 
       <dt>{dt}</dt>
       <dd className={mono === true ? 'mono' : undefined}>{dd}</dd>
     </div>
+  );
+}
+
+// Meter — a progress bar toward a threshold (e.g. retrain gate progress).
+// Fills sage once `current >= required`, amber while short. The numeric
+// "current / required" always shows alongside so it's never just a bar.
+function Meter({ current, required }: { current: number; required: number }) {
+  const met = required <= 0 || current >= required;
+  const pct = required <= 0 ? 100 : Math.min(100, Math.max(0, Math.round((current / required) * 100)));
+  return (
+    <span className="sx-meter">
+      <span className="sx-meter-track">
+        <span className={`sx-meter-fill ${met ? 'ok' : 'warn'}`} style={{ width: `${String(pct)}%` }} />
+      </span>
+      <span className="sx-meter-num sx-mono">
+        {String(current)} / {String(required)}
+      </span>
+    </span>
   );
 }
 
@@ -818,16 +944,33 @@ export function HealthPanel({
               ? 'ok'
               : 'idle';
     const rebuildPhaseTag = report.recall.rebuildPhase ? `[${report.recall.rebuildPhase}] ` : '';
+    // Health-panel cleanup 2026-05-26: prefer v2 canonical vector counts
+    // (what /v2/recall actually serves from) over the legacy chat-turn
+    // index entry count. The chat-turn count was previously the only
+    // number rendered ("9134 vectors") which misled — that's just one
+    // store; v2 also has document + chunk vectors in sqlite-vec.
+    const canonical = report.workGraph?.recall?.canonicalVectorCounts;
+    const docVec = canonical?.documentVectorCount ?? 0;
+    const chunkVec = canonical?.chunkVectorCount ?? 0;
+    const chatTurnCount = report.recall.entryCount ?? 0;
+    const v2Summary =
+      canonical !== undefined
+        ? `${formatCount(docVec)} docs · ${formatCount(chunkVec)} chunks · ${formatCount(chatTurnCount)} chat`
+        : `${formatCount(chatTurnCount)} chat turns`;
     const recallDetail =
       recallStatus === 'rebuilding'
         ? report.recall.rebuildTotal !== undefined && report.recall.rebuildTotal > 0
           ? `rebuilding ${rebuildPhaseTag}${String(report.recall.rebuildEmbedded ?? 0)}/${String(report.recall.rebuildTotal)}`
           : `rebuilding ${rebuildPhaseTag}…`
         : recallStatus === undefined
-          ? `${formatCount(report.recall.entryCount)} vectors`
-          : `${recallStatus} · ${formatCount(report.recall.entryCount)} vectors`;
+          ? v2Summary
+          : `${recallStatus} · ${v2Summary}`;
     const recallHead =
-      recallStatus === 'rebuilding' ? 'Rebuilding' : `${formatCount(report.recall.entryCount)} vec`;
+      recallStatus === 'rebuilding'
+        ? 'Rebuilding'
+        : canonical !== undefined
+          ? `${formatCount(docVec + chunkVec)} vec`
+          : `${formatCount(chatTurnCount)} vec`;
 
     // Ranker — driven by workGraph.ranker. Honest training mix: never
     // the raw negative count alone; the labeled triple + dataset-
@@ -857,6 +1000,16 @@ export function HealthPanel({
             rankerHealth.retrainSkipReason === null ? '' : ` (${rankerHealth.retrainSkipReason})`
           }`
         : '';
+    // Surface online adaptation at a glance — "live" when its delta is
+    // actually blending into serving, "armed" when the flag is on but not
+    // yet applied. Makes the dynamic layer visible without opening the drill.
+    const online = rankerHealth?.onlineHead;
+    const onlineLine =
+      online === undefined || online === null || !online.enabled
+        ? ''
+        : online.inUse
+          ? ` · online live (${String(online.updateCount)} nudges)`
+          : ' · online armed';
     const rankerDetail = workGraphUnavailable
       ? 'unavailable — metrics didn’t load'
       : rankerHealth === undefined
@@ -864,7 +1017,7 @@ export function HealthPanel({
         : rankerHealth.loadStatus === 'ready' && rankerHealth.trainedAt !== null
           ? `snapshot ${formatRelative(
               new Date(rankerHealth.trainedAt).toISOString(),
-            )}${mixLine}${staleLine}`
+            )}${mixLine}${staleLine}${onlineLine}`
           : rankerHealth.loadStatus === 'missing'
             ? `${
                 rankerHealth.retrainSkipReason === null
@@ -873,7 +1026,7 @@ export function HealthPanel({
               }${mixLine}`
             : rankerHealth.loadStatus === 'invalid-model'
               ? 'snapshot invalid'
-              : `ready${mixLine}${staleLine}`;
+              : `ready${mixLine}${staleLine}${onlineLine}`;
     const rankerHead = workGraphUnavailable
       ? 'Unavailable'
       : rankerHealth === undefined
@@ -1618,6 +1771,106 @@ export function HealthPanel({
           </div>
         </div>
 
+        {r?.nextRetrain !== undefined && r.nextRetrain !== null ? (
+          <div className="sx-receipt" data-testid="hp-ranker-next-retrain">
+            <div className="sx-receipt-head">
+              <span className={`sx-stamp ${r.nextRetrain.eligible ? 'deterministic' : 'partial'}`}>
+                <span />
+                {r.nextRetrain.eligible ? 'Retrain eligible' : 'Retrain blocked'}
+              </span>
+              <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+                next batch retrain
+              </span>
+            </div>
+            <dl>
+              <ReceiptRow
+                dt="Impression groups"
+                dd={
+                  <Meter
+                    current={r.nextRetrain.positiveGroups.current}
+                    required={r.nextRetrain.positiveGroups.required}
+                  />
+                }
+              />
+              <ReceiptRow
+                dt="New positive labels"
+                dd={
+                  <Meter
+                    current={r.nextRetrain.newLabels.current}
+                    required={r.nextRetrain.newLabels.required}
+                  />
+                }
+              />
+              {r.retrainSkipReason !== null && r.retrainSkipReason !== undefined ? (
+                <ReceiptRow
+                  dt="Blocked by"
+                  dd={<span className="sx-mono">{r.retrainSkipReason}</span>}
+                />
+              ) : null}
+            </dl>
+            <div className="sx-receipt-reason">
+              The batch model retrains — and its <em>trained date</em> moves — only when one of
+              these gates clears (either path suffices). Until then the date stays put even as you
+              keep browsing; the online head below is what adapts ranking in the meantime.
+            </div>
+          </div>
+        ) : null}
+
+        {r?.onlineHead !== undefined && r.onlineHead !== null ? (
+          <div className="sx-receipt" data-testid="hp-ranker-online-head">
+            <div className="sx-receipt-head">
+              <span
+                className={`sx-stamp ${
+                  r.onlineHead.inUse ? 'signal' : r.onlineHead.enabled ? 'partial' : ''
+                }`}
+              >
+                <span />
+                {r.onlineHead.inUse ? 'Live' : r.onlineHead.enabled ? 'Armed' : 'Off'}
+              </span>
+              <span className="sx-mono sx-dim" style={{ flex: 1 }}>
+                online adaptation
+              </span>
+            </div>
+            <dl>
+              <ReceiptRow
+                dt="Status"
+                dd={
+                  <span className="sx-mono">
+                    {!r.onlineHead.enabled
+                      ? 'disabled'
+                      : r.onlineHead.inUse
+                        ? 'blending into serving'
+                        : r.onlineHead.present
+                          ? 'enabled · base mismatch (rebasing)'
+                          : 'enabled · no updates yet'}
+                  </span>
+                }
+              />
+              <ReceiptRow dt="Feedback nudges" dd={String(r.onlineHead.updateCount)} />
+              <ReceiptRow dt="Active weights" dd={String(r.onlineHead.activeWeightCount)} />
+              <ReceiptRow
+                dt="Last nudge"
+                dd={
+                  // Only the true nudge timestamp — updatedAtMs refreshes on
+                  // every drain (frontier writes) and would fake freshness.
+                  r.onlineHead.lastNudgeAtMs === null ||
+                  r.onlineHead.lastNudgeAtMs === undefined
+                    ? '—'
+                    : formatRelative(new Date(r.onlineHead.lastNudgeAtMs).toISOString())
+                }
+              />
+              {r.onlineHead.baseRevisionId !== null ? (
+                <ReceiptRow dt="Based on" dd={r.onlineHead.baseRevisionId} mono />
+              ) : null}
+            </dl>
+            <div className="sx-receipt-reason">
+              A per-feedback weight nudge layered on the active model — it adapts ranking between
+              batch retrains, but does <em>not</em> change the model revision or its trained date.
+              It needs confirm/reject feedback to move; plain browsing alone does not feed it.
+            </div>
+          </div>
+        ) : null}
+
         {aug !== undefined && aug !== null ? (
           <div className="sx-receipt" data-testid="hp-ranker-augmentation">
             <div className="sx-receipt-head">
@@ -2160,8 +2413,12 @@ export function HealthPanel({
       },
       {
         label: 'Topics',
-        num: tp.topicCount > 0 ? `${String(tp.topicCount)} topics` : 'no clusters yet',
-        foot: 'served to inbox + suggestions',
+        num: tp.topicCount > 0 ? `${String(tp.topicCount)} clusters` : 'no clusters yet',
+        // Diagnostic only: these are connections-graph clusters that
+        // feed the suggestion resolver as ONE signal — they are NOT
+        // items shown in the Inbox. The old "served to inbox +
+        // suggestions" copy was misread as "the Inbox shows 93 topics".
+        foot: 'cluster signal for suggestions',
       },
       {
         label: 'Lineage',

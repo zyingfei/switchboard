@@ -28,8 +28,13 @@ const stubEvent = (type: string): AcceptedEvent => ({
 const stubLog = (): EventLog => ({
   appendClient: vi.fn(),
   appendClientObserved: vi.fn(),
+  appendClientObservedBatch: vi.fn(async () => []),
   appendServerObserved: vi.fn(),
   readMerged: vi.fn(async () => []),
+  readMergedSince: vi.fn(async () => []),
+  streamEvents: vi.fn(async () => {}),
+  streamFiltered: vi.fn(async () => []),
+  logSignature: vi.fn(async () => ''),
   readReplica: vi.fn(async () => []),
   readByAggregate: vi.fn(async () => []),
   findByClientEventId: vi.fn(async () => null),

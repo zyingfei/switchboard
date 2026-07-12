@@ -32,7 +32,7 @@
 // existing e5 embedder + W2 leidenCpmPartition (no new algorithm).
 
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 
@@ -585,19 +585,92 @@ const readVectorStore = async (
   vaultRoot: string,
   modelId: string,
 ): Promise<Map<string, Float32Array> | null> => {
+  const path = vectorStorePath(vaultRoot);
+  const cacheKey = `${vaultRoot}\0${modelId}`;
+  let currentStat: { readonly mtimeMs: number; readonly size: number };
   try {
-    const raw = JSON.parse(
-      await readFile(vectorStorePath(vaultRoot), 'utf8'),
-    ) as SemanticRecallVectorStore;
-    if (raw.modelId !== modelId) return null; // model changed ⇒ unusable
-    const out = new Map<string, Float32Array>();
-    for (const [u, v] of Object.entries(raw.byUrl)) {
-      out.set(u, l2normalize(Float32Array.from(v)));
-    }
-    return out;
+    const s = await stat(path);
+    currentStat = { mtimeMs: s.mtimeMs, size: s.size };
   } catch {
+    vectorStoreReadCache.delete(cacheKey);
     return null;
   }
+  const cached = vectorStoreReadCache.get(cacheKey);
+  if (
+    cached !== undefined &&
+    cached.mtimeMs === currentStat.mtimeMs &&
+    cached.size === currentStat.size
+  ) {
+    touchVectorStoreCache();
+    return cached.vectors;
+  }
+  const inFlightKey = `${cacheKey}\0${String(currentStat.mtimeMs)}\0${String(currentStat.size)}`;
+  const inFlight = vectorStoreReadInFlight.get(inFlightKey);
+  if (inFlight !== undefined) return await inFlight;
+  const promise = (async (): Promise<Map<string, Float32Array> | null> => {
+    try {
+      const raw = JSON.parse(await readFile(path, 'utf8')) as SemanticRecallVectorStore;
+      if (raw.modelId !== modelId) {
+        vectorStoreReadCache.set(cacheKey, { ...currentStat, vectors: null });
+        touchVectorStoreCache();
+        return null;
+      }
+      const out = new Map<string, Float32Array>();
+      for (const [u, v] of Object.entries(raw.byUrl)) {
+        out.set(u, l2normalize(Float32Array.from(v)));
+      }
+      vectorStoreReadCache.set(cacheKey, { ...currentStat, vectors: out });
+      touchVectorStoreCache();
+      return out;
+    } catch {
+      return null;
+    }
+  })();
+  vectorStoreReadInFlight.set(inFlightKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (vectorStoreReadInFlight.get(inFlightKey) === promise) {
+      vectorStoreReadInFlight.delete(inFlightKey);
+    }
+  }
+};
+
+const vectorStoreReadCache = new Map<
+  string,
+  {
+    readonly mtimeMs: number;
+    readonly size: number;
+    readonly vectors: Map<string, Float32Array> | null;
+  }
+>();
+const vectorStoreReadInFlight = new Map<string, Promise<Map<string, Float32Array> | null>>();
+
+// Idle TTL eviction for the parsed vector cache (Float32Arrays + url keys).
+// Source of truth is on disk; re-parse on the next "Similar" query is a few
+// ms. Without this the parsed vectors live for the whole process lifetime
+// (unbounded heap resident). Mirrors the eventLog mergedMemo / snapshot
+// sweep pattern: one unref'd timer slot, clear-before-rearm.
+const VECTOR_STORE_CACHE_IDLE_MS = 90_000;
+let vectorStoreCacheLastAccessMs = 0;
+let vectorStoreCacheSweepTimer: ReturnType<typeof setTimeout> | null = null;
+const scheduleVectorStoreCacheSweep = (delayMs: number): void => {
+  if (vectorStoreCacheSweepTimer !== null) clearTimeout(vectorStoreCacheSweepTimer);
+  const timer = setTimeout(() => {
+    vectorStoreCacheSweepTimer = null;
+    if (vectorStoreReadCache.size === 0) return;
+    const idleMs = Date.now() - vectorStoreCacheLastAccessMs;
+    if (idleMs >= VECTOR_STORE_CACHE_IDLE_MS) {
+      vectorStoreReadCache.clear();
+      return;
+    }
+    scheduleVectorStoreCacheSweep(VECTOR_STORE_CACHE_IDLE_MS - idleMs);
+  }, delayMs);
+  timer.unref?.();
+};
+const touchVectorStoreCache = (): void => {
+  vectorStoreCacheLastAccessMs = Date.now();
+  if (vectorStoreCacheSweepTimer === null) scheduleVectorStoreCacheSweep(VECTOR_STORE_CACHE_IDLE_MS);
 };
 
 const writeVectorStore = async (
@@ -612,6 +685,7 @@ const writeVectorStore = async (
   const tmp = `${path}.${String(process.pid)}.${String(Date.now())}.tmp`;
   await writeFile(tmp, `${JSON.stringify({ modelId, byUrl })}\n`, 'utf8');
   await rename(tmp, path);
+  vectorStoreReadCache.delete(`${vaultRoot}\0${modelId}`);
 };
 
 // Decide full vs incremental from the delta vs the persisted pool, and

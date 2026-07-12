@@ -14,7 +14,11 @@ import {
   bridgeKeyValidationCopy,
   validateBridgeKeyCandidate,
 } from '../src/companion/bridgeKeyValidation';
-import { createCompanionClient } from '../src/companion/client';
+import {
+  CompanionHttpError,
+  CompanionRequestError,
+  createCompanionClient,
+} from '../src/companion/client';
 import {
   compareCompanionIdentity,
   identityWarningFor,
@@ -88,6 +92,7 @@ import {
   type VisualFingerprintObservedPayload,
 } from '../src/content/visual/dom-hash';
 import { allocateNextSeq, loadOrCreateEdgeReplica } from '../src/sync/edgeReplicaId';
+import { idempotencyKey } from '../src/idempotencyKey';
 import { createVaultChangesClient } from '../src/companion/vaultChanges';
 import { indexTurnsCoalesced } from '../src/companion/recallClient';
 import {
@@ -146,6 +151,7 @@ import {
   readSettings,
   recordSelectorCanary,
   saveAutoTrack,
+  saveCaptureEnabled,
   saveCompanionSettings,
   saveCollapsedBuckets,
   saveCollapsedSections,
@@ -157,6 +163,8 @@ import {
   reorderLocalQueueItems,
   saveNotifyOnQueueComplete,
   savePageEvidenceAutoExtractEnabled,
+  saveRecallEmitTrainableActions,
+  saveRedactedClipboard,
   updateLocalCaptureNote,
   updateLocalQueueItem,
   updateLocalReminder,
@@ -180,6 +188,7 @@ import {
   setDispatchArchived,
 } from '../src/background/state';
 import { createDispatchClient } from '../src/dispatch/client';
+import { preflightOutbound } from '../src/dispatch/outboundPreflight';
 import { localRecallStore } from '../src/local-recall/store';
 import { ingestVisit } from '../src/local-recall/ingestion';
 
@@ -268,15 +277,27 @@ const tryAutoLinkCapturedThread = async (
   userTurnTexts: readonly string[],
   capturedAtMs: number,
 ): Promise<void> => {
-  const [recentDispatches, existingLinks, originalBodiesById, allThreads] = await Promise.all([
-    readCachedDispatches(),
-    readDispatchLinks(),
-    readDispatchOriginals(),
-    readThreads(),
-  ]);
+  const [recentDispatches, existingLinks, rawOriginalBodiesById, allThreads, settings] =
+    await Promise.all([
+      readCachedDispatches(),
+      readDispatchLinks(),
+      readDispatchOriginals(),
+      readThreads(),
+      readSettings(),
+    ]);
   if (recentDispatches.length === 0) {
     return;
   }
+  // F01 — reconcile the matcher against what the user actually pasted.
+  // With the redacted-clipboard flag ON (default), the clipboard ships
+  // the SAFE (redacted) body, so the captured turn contains the
+  // redacted text — the matcher must compare against `dispatch.body`
+  // (redacted), NOT the cached unredacted original. Passing the raw
+  // originals here would make the redacted prefix fail to substring-
+  // match the pasted redacted turn. Only feed the raw originals when
+  // the flag is explicitly OFF (raw-clipboard dogfood escape hatch).
+  const originalBodiesById =
+    settings.redactedClipboard === false ? rawOriginalBodiesById : {};
   // Pass the live set so the matcher can ignore "already-linked"
   // entries that point at threads no longer in storage. Without
   // this, a wiped/reassigned destination thread leaves the dispatch
@@ -355,7 +376,15 @@ const dismissRemindersForActiveTab = async (): Promise<boolean> => {
     if (url === undefined) {
       return false;
     }
-    const thread = (await readThreads()).find((t) => t.threadUrl === url);
+    // Match canonically, like `userIsViewingThreadUrl` — the live tab
+    // URL carries provider query/fragment (?model= / ?session= / #…)
+    // that the stored `threadUrl` has stripped. A strict `===` here made
+    // the dismiss silently miss, so the "Unread reply" pill never
+    // cleared even while the user was reading the chat.
+    const canonicalActive = canonicalThreadUrl(url);
+    const thread = (await readThreads()).find(
+      (t) => t.threadUrl === url || canonicalThreadUrl(t.threadUrl) === canonicalActive,
+    );
     if (thread === undefined) {
       return false;
     }
@@ -377,9 +406,6 @@ const snapshotFromTab = (tab: chrome.tabs.Tab, capturedAt: string) => {
     capturedAt,
   };
 };
-
-const idempotencyKey = (prefix: string, value: string): string =>
-  `${prefix}-${value.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 160)}`;
 
 const hostFromUrl = (url: string): string => {
   try {
@@ -504,7 +530,19 @@ const invalidateTimelineGateCache = (): void => {
   cachedPrivacyProjection = null;
 };
 
+// Master capture kill-switch — the side-panel "eye". Read fresh (not
+// cached) so a flip takes effect immediately on every gated path.
+// `!== false` treats a missing flag as on, matching readSettings'
+// default-merge (captureEnabled defaults to true).
+const isCaptureEnabled = async (): Promise<boolean> =>
+  (await readSettings()).captureEnabled !== false;
+
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
+  // The master switch overrides the per-feature gate: capture off means
+  // no ambient timeline ingestion, full stop. Checked before the cache
+  // so a flip is honored immediately (the captureEnabled read is cheap
+  // and the gate cache only memoizes the companion-side projection).
+  if (!(await isCaptureEnabled())) return false;
   const now = Date.now();
   if (cachedTimelineGateState !== null && cachedTimelineGateState.expiresAtMs > now) {
     return cachedTimelineGateState.value;
@@ -635,7 +673,10 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   await ensureEngagementGateDefaultOpen().catch(() => undefined);
   const gateOpen = await isEngagementPrivacyGateOpen();
   const hasPermission = await hasEngagementHostPermission();
-  const shouldRegister = gateOpen && hasPermission;
+  // Master capture switch gates engagement observation too — off means
+  // the content script unregisters and stops emitting intervals.
+  const captureOn = await isCaptureEnabled();
+  const shouldRegister = gateOpen && hasPermission && captureOn;
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [ENGAGEMENT_CONTENT_SCRIPT_ID],
   });
@@ -643,6 +684,7 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
   await recordEngagementSyncDiag('sync.invoked', {
     gateOpen,
     hasPermission,
+    captureOn,
     shouldRegister,
     alreadyRegistered,
   });
@@ -684,7 +726,8 @@ const syncEngagementContentScriptRegistration = async (): Promise<void> => {
 };
 
 const syncVisualFingerprintContentScriptRegistration = async (): Promise<void> => {
-  const shouldRegister = await isVisualFingerprintPrivacyGateOpen();
+  const shouldRegister =
+    (await isVisualFingerprintPrivacyGateOpen()) && (await isCaptureEnabled());
   const registered = await chrome.scripting.getRegisteredContentScripts({
     ids: [VISUAL_FINGERPRINT_CONTENT_SCRIPT_ID],
   });
@@ -1034,6 +1077,9 @@ const extractPageContentFromTab = async (
   if (typeof tab.id !== 'number') {
     throw new Error('Current tab has no tab id.');
   }
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to index page content.');
+  }
   if (tab.incognito === true) {
     throw new Error('Page-content indexing is disabled in incognito tabs.');
   }
@@ -1088,6 +1134,9 @@ const extractPageEvidenceFromTab = async (
   if (typeof tab.id !== 'number') {
     throw new Error('Current tab has no tab id.');
   }
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to extract page evidence.');
+  }
   if (tab.incognito === true) {
     throw new Error('Page-evidence extraction is disabled in incognito tabs.');
   }
@@ -1139,6 +1188,7 @@ const maybeExtractAutoPageEvidence = async (
   detail: Record<string, unknown> = {},
 ): Promise<void> => {
   const settings = await readSettings();
+  if (settings.captureEnabled === false) return;
   if (settings.pageEvidenceAutoExtractEnabled !== true) return;
   if (typeof tab.id !== 'number') return;
   if (tab.incognito === true) return;
@@ -1370,6 +1420,12 @@ const storeCaptureEvent = async (
 };
 
 const captureTab = async (): Promise<void> => {
+  // Master capture switch off — refuse the explicit "+" capture too.
+  // The toolbar disables the button when capture is off, so this is
+  // defense-in-depth; the thrown message surfaces in the panel banner.
+  if (!(await isCaptureEnabled())) {
+    throw new Error('Capture is paused — turn the eye back on to capture this tab.');
+  }
   const tab = await activeTab();
   if (!tab) {
     throw new Error('No active tab is available.');
@@ -1638,7 +1694,14 @@ export const peekCachedCompanionIdentity = (): typeof cachedCompanionIdentity =>
   cachedCompanionIdentity;
 export const peekCachedIdentityWarning = (): typeof cachedIdentityWarning => cachedIdentityWarning;
 
-const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' | 'local-only'> => {
+// Single probe body shared by the regular reachability check and the
+// post-failure classifier. `quick` swaps the 45 s cold-start-tolerant
+// status budget for the 4 s classification budget and skips the
+// /v1/version identity refresh (an extra round-trip the classifier
+// doesn't need — identity re-verifies on the next healthy poll).
+const probeCompanion = async (opts: {
+  readonly quick: boolean;
+}): Promise<'connected' | 'vault-error' | 'local-only'> => {
   const settings = await readSettings();
   if (settings.companion.bridgeKey.length === 0) {
     cachedRelayStatus = null;
@@ -1648,16 +1711,78 @@ const assertCompanionReachable = async (): Promise<'connected' | 'vault-error' |
     return 'local-only';
   }
   const client = createCompanionClient(settings.companion);
-  const status = await client.status();
+  const status = await (opts.quick ? client.statusQuick() : client.status());
   // Capture the live relay block (if any) so the workboard-state
   // builder can route a relay-disconnected banner without a
   // second round-trip.
   cachedRelayStatus = status.sync?.relay ?? null;
   cachedSnapshotRevision = status.snapshotRevision ?? null;
-  // Connection identity check — detects a different companion (test
-  // vs daily, stale build) silently owning the configured port.
-  await refreshCompanionIdentity(client, settings.companion.port);
+  if (!opts.quick) {
+    // Connection identity check — detects a different companion (test
+    // vs daily, stale build) silently owning the configured port.
+    await refreshCompanionIdentity(client, settings.companion.port);
+  }
   return status.vault === 'connected' ? 'connected' : 'vault-error';
+};
+
+const assertCompanionReachable = (): Promise<'connected' | 'vault-error' | 'local-only'> =>
+  probeCompanion({ quick: false });
+
+// Post-failure classification. A failed companion call must not, by
+// itself, repaint the panel "disconnected — start the companion":
+// heavy endpoints time out at their 5 s budget while the companion
+// chews (observed live: 46-69 s timeline / page-evidence writes) even
+// though the process is up and /v1/status answers in ~40 ms.
+//
+// Fast path: when the failure is a typed transport error, its kind
+// already IS the classification — no probe round-trip:
+//   timeout → 'busy' (alive, saturated — soft pill, no red banner)
+//   network → 'disconnected' (nothing listening — red banner)
+// Anything else (handler/logic errors, HTTP-shaped failures) asks the
+// cheap /status probe what's actually true. The probe is single-flight
+// and memoized for a few seconds: every failing call while the
+// companion is saturated would otherwise spawn its own 4 s probe at
+// the exact process that's overloaded.
+const CLASSIFY_MEMO_MS = 3_000;
+let classifyMemo: {
+  readonly at: number;
+  readonly status: 'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only';
+} | null = null;
+let classifyInFlight: Promise<
+  'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
+> | null = null;
+
+const probeCompanionStatus = async (): Promise<
+  'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'
+> => {
+  try {
+    return await probeCompanion({ quick: true });
+  } catch (probeError) {
+    return probeError instanceof CompanionRequestError && probeError.kind === 'timeout'
+      ? 'busy'
+      : 'disconnected';
+  }
+};
+
+const classifyCompanionFailure = async (
+  error?: unknown,
+): Promise<'connected' | 'busy' | 'disconnected' | 'vault-error' | 'local-only'> => {
+  if (error instanceof CompanionRequestError) {
+    return error.kind === 'timeout' ? 'busy' : 'disconnected';
+  }
+  const now = Date.now();
+  if (classifyMemo !== null && now - classifyMemo.at < CLASSIFY_MEMO_MS) {
+    return classifyMemo.status;
+  }
+  classifyInFlight ??= probeCompanionStatus()
+    .then((status) => {
+      classifyMemo = { at: Date.now(), status };
+      return status;
+    })
+    .finally(() => {
+      classifyInFlight = null;
+    });
+  return classifyInFlight;
 };
 
 // Find the live tab that hosts a tracked thread. Try the snapshot's
@@ -1737,7 +1862,15 @@ const isAutoSendResult = (
   'ok' in value &&
   typeof (value as { readonly ok?: unknown }).ok === 'boolean';
 
-const autoSendOnceTabReady = (tabId: number, body: string): void => {
+const autoSendOnceTabReady = (tabId: number, body: string, provider: string): void => {
+  // F01 — auto-send is ALWAYS preflighted (no flag): this is the
+  // zero-gate path the audit flagged, where the body was typed
+  // verbatim into a provider tab. Every caller passes an
+  // already-preflighted body, but we scrub again here as the single
+  // choke point so a future caller can't reintroduce the gap. The
+  // scrub is idempotent — redaction placeholders don't re-match and
+  // already-wrapped injection context isn't double-wrapped.
+  const safeBody = preflightOutbound(body, provider).safeText;
   let cleared = false;
   const fire = (): void => {
     if (cleared) {
@@ -1754,7 +1887,7 @@ const autoSendOnceTabReady = (tabId: number, body: string): void => {
       for (;;) {
         const dispatch = await sendToContentScriptWithRecovery(tabId, {
           type: messageTypes.autoSendItem,
-          text: body,
+          text: safeBody,
           perItemTimeoutMs: 90_000,
         });
         if (!dispatch.ok) {
@@ -2270,7 +2403,7 @@ const openAutoApprovedMcpDispatchesInner = async (
       const created = await chrome.tabs.create({ url, active: true });
       if (typeof created.id === 'number') {
         await writeMcpDispatchTab(created.id, dispatch.bac_id);
-        autoSendOnceTabReady(created.id, dispatch.body);
+        autoSendOnceTabReady(created.id, dispatch.body, dispatch.target.provider);
         openedThisTick += 1;
         await writeLastMcpDispatchOpenedMs(Date.now());
       }
@@ -2377,7 +2510,13 @@ const withCompanionStatus = async (
     if (work !== undefined) {
       await work();
     }
-    await replayQueuedCaptures();
+    // Replay failures must not abort the refresh or poison the
+    // connection state: the captures stay queued (queuedCaptureCount
+    // still surfaces them) and the next poll retries. Before this
+    // isolation, one slow replay POST timing out re-painted the panel
+    // "disconnected" on every 15 s poll for as long as the companion
+    // stayed busy.
+    await replayQueuedCaptures().catch(() => undefined);
     const status = await assertCompanionReachable();
     if (status === 'connected') {
       await refreshCachedWorkstreams();
@@ -2403,7 +2542,7 @@ const withCompanionStatus = async (
       ok: false,
       error: error instanceof Error ? error.message : 'Sidetrack background action failed.',
       state: await buildState(
-        'disconnected',
+        await classifyCompanionFailure(error),
         error instanceof Error ? error.message : 'Action failed.',
       ),
     };
@@ -2453,7 +2592,18 @@ const updateWorkstream = async (workstreamId: string, update: WorkstreamUpdate):
   try {
     const result = await client.updateWorkstream(workstreamId, update);
     await updateLocalWorkstream(workstreamId, update, result);
-  } catch {
+  } catch (error) {
+    // A deliberate server rejection — most importantly a 409 revision
+    // conflict (a concurrent panel/API caller wrote a fresher workstream
+    // between this panel's read and its PATCH) — must NOT be mirrored
+    // locally: doing so forks the panel past the conflict and silently
+    // drops the other writer's edits. Re-throw so withCompanionStatus
+    // surfaces ok:false and the next poll re-reads the true state. The
+    // optimistic local write is only correct when the companion is
+    // genuinely unreachable (timeout/network/down).
+    if (error instanceof CompanionHttpError) {
+      throw error;
+    }
     await updateLocalWorkstream(workstreamId, update);
   }
 };
@@ -2702,6 +2852,12 @@ const handleRequest = async (
   }
 
   if (request.type === messageTypes.autoCapture) {
+    // Master capture switch (the side-panel eye) is off — drop silently,
+    // capture nothing. content.ts is statically registered so we can't
+    // unregister it; this handler gate is the stop for AI-thread auto.
+    if (!(await isCaptureEnabled())) {
+      return { ok: true, state: await buildState('connected') };
+    }
     // Defense-in-depth gate: even if a content script (or test) injects
     // an autoCapture for a non-thread URL on a known provider, drop it
     // silently rather than create a junk thread row.
@@ -2991,17 +3147,14 @@ const handleRequest = async (
     // RecallResponse opaque to the extension; callers narrow as
     // needed. Companion does fusion/dedupe/suppression server-side.
     //
-    // P0 — active-chat suppression contract. The content script only
-    // knows `currentUrl`; the background SW knows the recent dispatches
-    // (Ask-AI artifacts, very recent thread creations). We ENRICH the
-    // request here by injecting:
+    // P0 / PR-B — active-session marker contract. The content script
+    // only knows `currentUrl`; the background SW knows the recent
+    // dispatches (Ask-AI artifacts, very recent thread creations). We
+    // ENRICH the request here by injecting:
     //   - activeChatBacIds: every dispatch within the last 10 minutes
-    //   - excludeEntityIds: every dispatch within the last 10 minutes
-    //     hashed the way pipeline.ts:entityIdFor would hash them
-    //   - sessionId: the SW startup timestamp as a coarse session id
-    // The server's SuppressionPolicy then strips these from results,
-    // closing the "I just created this chat 9 minutes ago — why is it
-    // surfacing as déjà-vu" leak (case-study residual).
+    // The server surfaces matching results with
+    // meta.activeSessionMarkers instead of hiding them, so rank order
+    // stays intact and the UI can render a presentation-only badge.
     const buildRecallV2Response = async (): Promise<unknown> => {
       try {
         const settings = await readSettings();
@@ -3051,15 +3204,12 @@ const handleRequest = async (
           // activeChatBacIds — always added; harmless for search
           // (callers may pass [] or omit), useful for dejavu.
           suppressActiveChatBacIds: mergedActiveBacIds,
-          // For dejavu, keep the historical dejavu-shaped defaults
-          // (10-min freshness floor + suppress current page) since
-          // the user just selected text on a page and the server
-          // hasn't necessarily seen the dispatch yet. For search /
-          // focus, leave suppressCurrentPage + minHitAgeMs UNSET so
-          // the server's intent profile (SEARCH = 'never' + 0) wins.
+          // For dejavu, keep suppress-current-page since the user
+          // just selected text on that page. Do not add the old
+          // 10-minute minHitAgeMs floor here: active chats are now
+          // marked for presentation, not filtered by age.
           ...(intent === 'dejavu'
             ? {
-                minHitAgeMs: ACTIVE_WINDOW_MS,
                 suppressCurrentPage: 'always' as const,
               }
             : {}),
@@ -3099,6 +3249,43 @@ const handleRequest = async (
       }
     };
     return (await buildRecallV2Response()) as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.recallActionEmit) {
+    // Phase 0 of the recall+ranker v2 hard-replacement.
+    // The content script / sidepanel forwards user actions on served
+    // recall candidates here. We POST to /v1/recall/action so the
+    // companion can append a `recall.action` event joined to its
+    // parent `recall.served` by `servedContextId`. Fire-and-forget:
+    // emission failures must never block the user's click.
+    const emit = async (): Promise<void> => {
+      try {
+        const settings = await readSettings();
+        if (settings.companion.bridgeKey.trim().length === 0) {
+          // No companion configured — nothing to log. Silent.
+          return;
+        }
+        const payload = request.payload as {
+          readonly payloadVersion: 1;
+          readonly servedContextId: string;
+          readonly entityId: string;
+          readonly actionKind: string;
+          readonly actionAt: string;
+          readonly referencesEventId?: string;
+        };
+        await createPageContentClient(settings.companion).recallAction(payload);
+      } catch (error) {
+        // Logged but never surfaced. The impression-log is best-effort
+        // from the extension's perspective; the trainer tolerates
+        // missing actions for some served impressions.
+        console.warn(
+          '[sidetrack] recall.action emit failed',
+          error instanceof Error ? error.message : error,
+        );
+      }
+    };
+    void emit();
+    return { ok: true } as unknown as RuntimeResponse;
   }
 
   if (request.type === messageTypes.annotateTurn) {
@@ -3272,7 +3459,10 @@ const handleRequest = async (
           console.warn('[dispatchAutoSendInNewTab] tab create returned no tabId');
           return;
         }
-        autoSendOnceTabReady(tabId, body);
+        // F01 — provider derived from the destination URL for the
+        // preflight's token gate; the redaction + injection scrub are
+        // provider-agnostic and run regardless.
+        autoSendOnceTabReady(tabId, body, detectProviderFromUrl(url));
       } catch (error) {
         console.warn('[dispatchAutoSendInNewTab] open failed:', error);
       }
@@ -3299,8 +3489,10 @@ const handleRequest = async (
             { kind: 'research', target: { provider, mode: 'auto-send' }, title, body },
             idempotencyKey,
           );
-          // Feeds the auto-link matcher (it compares the UNREDACTED
-          // body against the captured chat's first user turn).
+          // Keep caching the unredacted body while the redacted-
+          // clipboard flag exists — the matcher gating in
+          // tryAutoLinkCapturedThread decides which body to compare
+          // against based on the flag (redacted paste vs raw paste).
           await writeDispatchOriginal(result.bac_id, body);
           // Persist the Déjà-vu breadcrumb if the caller shipped one
           // (Ask AI from a popover selection). Stays local-only — the
@@ -3310,13 +3502,15 @@ const handleRequest = async (
             await writeDispatchRecallContext(result.bac_id, request.recallContext);
           }
           // Optimistic local row so it shows immediately; the next
-          // companion poll merge is idempotent by bac_id.
+          // companion poll merge is idempotent by bac_id. F01 — store
+          // the SAFE (companion-redacted) body on the row so the
+          // sidepanel renders/re-copies the redacted form.
           const record: DispatchEventRecord = {
             bac_id: result.bac_id,
             kind: 'research',
             target: { provider, mode: 'auto-send' },
             title,
-            body,
+            body: result.redactedBody ?? body,
             createdAt: new Date().toISOString(),
             redactionSummary: result.redactionSummary ?? { matched: 0, categories: [] },
             tokenEstimate: result.tokenEstimate ?? 0,
@@ -3336,7 +3530,10 @@ const handleRequest = async (
           console.warn('[submitSelectionDispatch] tab create returned no tabId');
           return;
         }
-        autoSendOnceTabReady(tabId, body);
+        // F01 — auto-send is always preflighted inside
+        // autoSendOnceTabReady; pass the request provider for the
+        // token gate.
+        autoSendOnceTabReady(tabId, body, provider);
       } catch (error) {
         console.warn('[submitSelectionDispatch] open failed:', error);
       }
@@ -3407,7 +3604,7 @@ const handleRequest = async (
         ok: false,
         error: error instanceof Error ? error.message : 'Could not create attach token.',
         state: await buildState(
-          'disconnected',
+          await classifyCompanionFailure(error),
           error instanceof Error ? error.message : 'Action failed.',
         ),
       };
@@ -3440,6 +3637,14 @@ const handleRequest = async (
 
   if (request.type === messageTypes.saveLocalPreferences) {
     return await withCompanionStatus(async () => {
+      if (typeof request.preferences.captureEnabled === 'boolean') {
+        await saveCaptureEnabled(request.preferences.captureEnabled);
+        // The master switch gates the dynamically-registered observation
+        // scripts (engagement, visual-fingerprint). Re-sync so they
+        // unregister immediately when capture is turned off and come
+        // back when it's turned on — don't wait for the next nav/poll.
+        void syncPrivacyGatedContentScriptRegistrations().catch(() => undefined);
+      }
       if (typeof request.preferences.autoTrack === 'boolean') {
         await saveAutoTrack(request.preferences.autoTrack);
       }
@@ -3461,6 +3666,12 @@ const handleRequest = async (
             });
           }
         }
+      }
+      if (typeof request.preferences.recallEmitTrainableActions === 'boolean') {
+        await saveRecallEmitTrainableActions(request.preferences.recallEmitTrainableActions);
+      }
+      if (typeof request.preferences.redactedClipboard === 'boolean') {
+        await saveRedactedClipboard(request.preferences.redactedClipboard);
       }
     }, 'settings');
   }
@@ -3799,6 +4010,13 @@ export default defineBackground(() => {
       });
       return;
     }
+    // Master capture switch off — drop in-flight intervals. The script
+    // is unregistered when capture is off, but a message can still be in
+    // transit at the instant of the flip; this is belt-and-suspenders.
+    if (!(await isCaptureEnabled())) {
+      await recordEngagementSyncDiag('interval.dropped', { reason: 'capture-disabled', tabId });
+      return;
+    }
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
     const payloads: {
@@ -3829,6 +4047,8 @@ export default defineBackground(() => {
 
   const handleSelectionLineage = async (message: unknown): Promise<void> => {
     if (!isSelectionLineageMessage(message)) return;
+    // Master capture switch off — don't record copy/paste lineage.
+    if (!(await isCaptureEnabled())) return;
     const allocated = await allocateNextSeq(1);
     const streamName =
       message.type === 'sidetrack.selection.copied' ? 'selection.copied' : 'selection.pasted';
@@ -4279,14 +4499,19 @@ export default defineBackground(() => {
       });
       // Phase 10 — also ingest into OPFS local recall so the visit is
       // findable offline. Cheap upsert; fire-and-forget; never blocks.
+      // Gated by the master capture switch (off = no ambient visits).
       if (typeof tab.url === 'string' && /^https?:\/\//u.test(tab.url)) {
-        void ingestVisit({
-          canonicalUrl: tab.url,
-          ...(typeof tab.title === 'string' && tab.title.length > 0
-            ? { title: tab.title }
-            : {}),
-          seenAtMs: Date.now(),
-        });
+        const visitUrl = tab.url;
+        const visitTitle =
+          typeof tab.title === 'string' && tab.title.length > 0 ? tab.title : undefined;
+        void (async () => {
+          if (!(await isCaptureEnabled())) return;
+          await ingestVisit({
+            canonicalUrl: visitUrl,
+            ...(visitTitle !== undefined ? { title: visitTitle } : {}),
+            seenAtMs: Date.now(),
+          });
+        })();
       }
     }
   });
@@ -4543,6 +4768,8 @@ export default defineBackground(() => {
         if (typeof tabId !== 'number') {
           throw new Error('navigation link click has no sender tab');
         }
+        // Master capture switch off — drop the link-click signal.
+        if (!(await isCaptureEnabled())) return;
         await webNavigationRuntime.recordLinkClick({
           tabId,
           sourceUrl: message.sourceUrl,
@@ -5066,7 +5293,7 @@ export default defineBackground(() => {
           ok: false,
           error: error instanceof Error ? error.message : 'Sidetrack request failed.',
           state: await buildState(
-            'disconnected',
+            await classifyCompanionFailure(error),
             error instanceof Error ? error.message : 'Request failed.',
           ),
         });

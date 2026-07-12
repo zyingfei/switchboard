@@ -1,5 +1,10 @@
 import type { CompanionSettings, Problem } from '../companion/model';
-import type { DispatchEventInput, DispatchEventRecord, DispatchSubmitResult } from './types';
+import type {
+  DispatchEventInput,
+  DispatchEventRecord,
+  DispatchSubmitResult,
+  DispatchTokenWarning,
+} from './types';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
@@ -32,6 +37,32 @@ const parseRedactionSummary = (value: unknown): DispatchSubmitResult['redactionS
   return undefined;
 };
 
+const parseTokenWarning = (value: unknown): DispatchTokenWarning | undefined => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const { provider, threshold, exceeded } = value;
+  if (
+    typeof provider === 'string' &&
+    typeof threshold === 'number' &&
+    typeof exceeded === 'boolean'
+  ) {
+    return { provider, threshold, exceeded };
+  }
+  return undefined;
+};
+
+const parseRedactionRules = (value: unknown): readonly string[] | undefined => {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const rules = value.rules;
+  if (Array.isArray(rules) && rules.every((r) => typeof r === 'string')) {
+    return rules;
+  }
+  return undefined;
+};
+
 const parseSubmitResult = (value: unknown): DispatchSubmitResult => {
   if (!isRecord(value)) {
     throw new Error('Dispatch response was not an object.');
@@ -45,6 +76,9 @@ const parseSubmitResult = (value: unknown): DispatchSubmitResult => {
     readonly status?: unknown;
     readonly tokenEstimate?: unknown;
     readonly redactionSummary?: unknown;
+    readonly body?: unknown;
+    readonly redaction?: unknown;
+    readonly tokenWarning?: unknown;
   };
   if (typeof data.bac_id !== 'string') {
     throw new Error('Dispatch response missing bac_id.');
@@ -53,6 +87,8 @@ const parseSubmitResult = (value: unknown): DispatchSubmitResult => {
     throw new Error('Dispatch response status was not "recorded".');
   }
   const redaction = parseRedactionSummary(data.redactionSummary);
+  const redactionRules = parseRedactionRules(data.redaction);
+  const tokenWarning = parseTokenWarning(data.tokenWarning);
   const warnings = envelope.warnings;
   return {
     bac_id: data.bac_id,
@@ -62,6 +98,10 @@ const parseSubmitResult = (value: unknown): DispatchSubmitResult => {
       : {}),
     ...(typeof data.tokenEstimate === 'number' ? { tokenEstimate: data.tokenEstimate } : {}),
     ...(redaction !== undefined ? { redactionSummary: redaction } : {}),
+    // F01 — the SAFE redacted body the companion returned.
+    ...(typeof data.body === 'string' ? { redactedBody: data.body } : {}),
+    ...(redactionRules !== undefined ? { redactionRules } : {}),
+    ...(tokenWarning !== undefined ? { tokenWarning } : {}),
   };
 };
 

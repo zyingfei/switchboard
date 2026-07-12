@@ -16,9 +16,15 @@ import type { ReviewDraft } from './review/types';
 // landed — even when the companion was responsive. Treat 'unknown'
 // as "still checking" and don't surface the red banner until we've
 // actually heard back with a failure.
+// 'busy' = the companion process answered (or recently answered) the
+// cheap /v1/status probe but a request outlived its budget — alive,
+// chewing through heavy work. Render soft ("responding slowly"), never
+// the red "start the companion" banner: that banner is reserved for a
+// port nobody is listening on.
 export type CompanionStatus =
   | 'unknown'
   | 'connected'
+  | 'busy'
   | 'disconnected'
   | 'vault-error'
   | 'local-only';
@@ -162,6 +168,12 @@ export interface SelectorHealth {
 
 export interface UiSettings {
   readonly companion: CompanionSettings;
+  // Master capture kill-switch — the side-panel "eye". Default on.
+  // When false, EVERY capture path is gated off: AI-thread auto +
+  // explicit capture, page-text / page-evidence extraction, ambient
+  // timeline visits, engagement, and visual-fingerprint observation.
+  // Nothing is recorded anywhere until it's flipped back on.
+  readonly captureEnabled: boolean;
   readonly autoTrack: boolean;
   readonly siteToggles: Readonly<Record<Exclude<ProviderId, 'unknown'>, boolean>>;
   // Fire a chrome.notifications toast when the auto-send drain
@@ -170,6 +182,22 @@ export interface UiSettings {
   // away and come back when it's done.
   readonly notifyOnQueueComplete: boolean;
   readonly pageEvidenceAutoExtractEnabled: boolean;
+  // P2 — kill-switch for the sidepanel's trainable recall.action
+  // mirror (src/sidepanel/recall/emitTrainableAction.ts). Optional
+  // with absent = ON so existing installs pick the feature up without
+  // a settings migration; only an explicit `false` (persisted via
+  // saveLocalPreferences) silences emission.
+  readonly recallEmitTrainableActions?: boolean;
+  // F01 — when ON (default), the clipboard/redispatch paths ship the
+  // companion-redacted SAFE body instead of the unredacted original.
+  // The flag exists so the redacted-clipboard behaviour can be
+  // dogfooded for >=1 week before the original-cache mechanism
+  // (cacheDispatchOriginal / dispatchOriginals) is deleted. Optional
+  // with absent = ON so existing installs get the safe behaviour with
+  // no migration; only an explicit `false` restores the raw-original
+  // clipboard. Auto-send is NEVER gated on this — it is always
+  // preflighted (it was the zero-gate path the audit flagged).
+  readonly redactedClipboard?: boolean;
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /
@@ -381,6 +409,10 @@ export const companionStatusLabel = (status: CompanionStatus): string => {
     return 'vault: connecting…';
   }
 
+  if (status === 'busy') {
+    return 'vault: busy — responding slowly';
+  }
+
   return 'vault: disconnected';
 };
 
@@ -403,6 +435,9 @@ export const defaultSettings: UiSettings = {
     port: 17_373,
     bridgeKey: '',
   },
+  // Capture is on by default — observing is the whole point of the
+  // tool. The side-panel eye flips this; off = nothing captured.
+  captureEnabled: true,
   // Default = manual per spec. Known-provider captures still land in
   // Open threads, but the user owns the choice to keep tracking them.
   // Toggle on in Settings to auto-track every detected AI thread.

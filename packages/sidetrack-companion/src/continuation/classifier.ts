@@ -203,6 +203,7 @@ export const scoreCrossReplicaContinuationCandidates = (
         const s18Features = extractFeatures(candidateForPair(from, to), {
           merged: [...input.merged],
           snapshot: input.snapshot,
+          retrievalContext: { missingRetrievalContext: true },
         });
         const minutes = Math.max(0, (to.observedAtMs - from.observedAtMs) / MINUTE_MS);
         const features: ContinuationFeatures = {

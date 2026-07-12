@@ -76,6 +76,7 @@ describe('service installers', () => {
 
     const body = files.writes.get(result.path) ?? '';
     expect(body).toContain('<string>/usr/local/bin/bun</string>');
+    expect(body).toContain('<string>--smol</string>');
     expect(body).toContain('<string>/repo/packages/sidetrack-companion/dist/cli.js</string>');
     expect(body).toContain('<string>--vault</string>');
     expect(body).toContain('<string>/Users/test/Sidetrack vault</string>');

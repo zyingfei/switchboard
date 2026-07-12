@@ -180,6 +180,9 @@ export interface PageEvidenceSimilarityMetadata {
   readonly matchedEntities?: readonly string[];
   readonly chunkSupportCount?: number;
   readonly maxChunkPairScore?: number;
+  readonly maxChunkPairVectorCosine?: number;
+  readonly top3MeanChunkPairVectorCosine?: number;
+  readonly chunkPairVectorSupportCount?: number;
   readonly featureSchemaVersion: number;
 }
 

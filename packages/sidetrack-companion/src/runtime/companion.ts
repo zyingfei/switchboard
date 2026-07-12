@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
+import { ensureMcpKey } from '../auth/mcpKey.js';
 import { createIdempotencyStore } from '../http/idempotency.js';
 import { pickInstaller } from '../install/index.js';
 import { createRecallActivityTracker } from '../recall/activity.js';
@@ -34,6 +35,12 @@ import {
 import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEmbedderClient } from '../recall/embedderClient.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
+import { eventStoreEnabled, getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import {
+  collectWorkGraphHealth,
+  type ConnectionsDiagnosticSnapshot,
+} from '../system/workGraphHealth.js';
+import { writeWorkGraphHealthArtifact } from '../system/workGraphHealthArtifact.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
@@ -118,6 +125,102 @@ export const scheduleSqliteVacuumGc = (
   return () => {
     clearInterval(sqliteVacuumGc);
     clearTimeout(sqliteVacuumGcKickoff);
+  };
+};
+
+// Debounce so a drain burst coalesces into one artifact collect.
+export const WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS = 2_000;
+// Min-interval floor between successful collects. The artifact feeds
+// the extension's health panel, which polls /v1/system/health on a
+// ~30s cadence, and each collect materializes ALL recall.served /
+// recall.action events — a cost that grows with history. Refreshing
+// at drain cadence (every few seconds under active browsing) is
+// precision no reader can observe: pure wasted work.
+export const WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS = 30_000;
+
+// Scheduler for the drain-time workGraph health artifact. Exported as
+// a factory (same testing seam as scheduleSqliteVacuumGc above) so the
+// debounce / floor / trailing-rerun semantics are unit-testable
+// without booting a companion.
+export const createWorkGraphHealthArtifactScheduler = (options: {
+  // Collects + writes one artifact. Resolves true only when the
+  // artifact was actually written — failures and skips (event store
+  // absent) must not advance the floor, so the next drain retries.
+  readonly materialize: () => Promise<boolean>;
+  // Cheap outer gate (SIDETRACK_EVENT_STORE): without the shared
+  // event store, collectWorkGraphHealth degrades to TWO full
+  // eventLog.readMerged() passes — that cost must not move to drain
+  // time on default configs. The route's live fallback
+  // (budget-guarded) still serves those installs.
+  readonly enabled: () => boolean;
+  readonly now?: () => number;
+}): { readonly schedule: () => void; readonly teardown: () => void } => {
+  const now = options.now ?? Date.now;
+  let inFlight = false;
+  let rerunRequested = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let lastSuccessAtMs: number | null = null;
+
+  const run = async (): Promise<void> => {
+    if (inFlight) {
+      // A drain landed while a collect was mid-read, so its changes
+      // are not in the in-flight pass. Request one trailing rerun
+      // instead of dropping it: on a quiet vault the next drain may
+      // never come, which would freeze the artifact on pre-drain
+      // state indefinitely. Single flag = single trailing collect,
+      // so single-flight is preserved.
+      rerunRequested = true;
+      return;
+    }
+    inFlight = true;
+    try {
+      if (await options.materialize()) lastSuccessAtMs = now();
+    } finally {
+      inFlight = false;
+      if (rerunRequested) {
+        rerunRequested = false;
+        schedule({ trailingRerun: true });
+      }
+    }
+  };
+
+  const schedule = (opts?: { readonly trailingRerun?: boolean }): void => {
+    if (!options.enabled()) return;
+    if (timer !== null) return;
+    const sinceSuccessMs =
+      lastSuccessAtMs === null ? Number.POSITIVE_INFINITY : now() - lastSuccessAtMs;
+    const floorRemainingMs = WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS - sinceSuccessMs;
+    // Min-interval floor: a fresh-enough artifact already exists, and
+    // the next drain (or the trailing rerun below) re-schedules, so a
+    // plain skip is enough here.
+    if (opts?.trailingRerun !== true && floorRemainingMs > 0) return;
+    // The trailing rerun waits out the floor instead of bypassing it:
+    // bypassing would re-enable back-to-back collects whenever a
+    // collect overlaps a drain — exactly the busy periods the floor
+    // exists for. Scheduling at floor expiry keeps ≤1 collect per
+    // interval while still guaranteeing the missed drain's changes
+    // land without waiting for another drain.
+    const delayMs =
+      opts?.trailingRerun === true
+        ? Math.max(WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS, floorRemainingMs)
+        : WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS;
+    timer = setTimeout(() => {
+      timer = null;
+      void run();
+    }, delayMs);
+    // A pending refresh must never hold the process open (mirrors
+    // the materializer's own drainDebounceTimer).
+    timer.unref();
+  };
+
+  return {
+    schedule: () => {
+      schedule();
+    },
+    teardown: () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
   };
 };
 
@@ -213,6 +316,11 @@ export interface CompanionRuntime {
   readonly bridgeKey: string;
   readonly bridgeKeyPath: string;
   readonly bridgeKeyCreated: boolean;
+  // F02 — MCP-scoped auth key. The companion spawner must pass this to the
+  // MCP child as its --bridge-key argument so the companion server can
+  // classify MCP callers separately from the extension surface.
+  readonly mcpKey: string;
+  readonly mcpKeyPath: string;
   readonly replicaId: string;
   readonly replicaIdCreated: boolean;
   readonly close: () => Promise<void>;
@@ -248,6 +356,12 @@ export const startCompanion = async (
   };
   try {
     const ensured = await ensureBridgeKey(options.vaultPath);
+    // Generate the MCP-scoped auth key alongside bridge.key. The companion
+    // passes this key to the MCP child process (as its --bridge-key arg) so
+    // the server can distinguish MCP callers from the extension surface and
+    // apply workstream-trust enforcement (F02). Stable across boots — the
+    // same file is reused if it already exists (same pattern as bridge.key).
+    const ensuredMcpKey = await ensureMcpKey(options.vaultPath);
     const replica = await loadOrCreateReplica(options.vaultPath);
     // Refuse startup if another live process owns the recall index
     // for this vault — concurrent writers would corrupt the binary.
@@ -370,7 +484,16 @@ export const startCompanion = async (
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : 6 * 60 * 60 * 1000;
     })();
     const recallActivity = createRecallActivityTracker();
-    const baseEventLog = createEventLog(options.vaultPath, replica);
+    // The append-path signature guard (re-stat the whole log per write to
+    // detect external shard writers) is only needed when another process
+    // can write shards: a configured sync relay, or an operator running a
+    // concurrent CLI `import` (force via SIDETRACK_EXTERNAL_WRITERS=1).
+    // The default single-companion vault is the sole writer, so the guard
+    // is skipped and writes don't pay ~222 syscalls × 2 per append.
+    const externalWritersPossible =
+      (options.relay !== undefined && options.relay.rendezvousSecret.trim().length > 0) ||
+      process.env['SIDETRACK_EXTERNAL_WRITERS'] === '1';
+    const baseEventLog = createEventLog(options.vaultPath, replica, { externalWritersPossible });
     const projectionChanges = createProjectionChangeFeed(options.vaultPath);
 
     // Sync Contract v1 — runner. Single dispatch point for every
@@ -397,6 +520,7 @@ export const startCompanion = async (
       createExtractionMaterializer({
         store: extractionStore,
         eventLog: baseEventLog,
+        vaultRoot: options.vaultPath,
       }),
     );
     // First future surface — Class B timeline projection. Reduces
@@ -409,6 +533,7 @@ export const startCompanion = async (
       createTimelineMaterializer({
         store: timelineStore,
         eventLog: baseEventLog,
+        vaultRoot: options.vaultPath,
       }),
     );
     // Class B Connections — consumer-only materializer that joins
@@ -425,6 +550,14 @@ export const startCompanion = async (
       eventLog: baseEventLog,
       timelineStore,
       store: connectionsStore,
+      // Drain-time workGraph health artifact. The scheduler is defined
+      // below (next to the server wiring — it shares the route's dep
+      // set); referencing it through this closure is safe because the
+      // hook can only fire after a drain completes, long past this
+      // startup frame, and the materializer swallows hook errors.
+      onDrainSuccess: () => {
+        scheduleWorkGraphHealthArtifact();
+      },
     });
     syncContractRunner.register(connectionsMaterializer);
 
@@ -553,6 +686,12 @@ export const startCompanion = async (
         return accepted;
       },
     };
+    // Warm the append-path indexes off the request path: the first
+    // write after boot otherwise pays the one-time streaming pass over
+    // the log (tens of seconds on a 333k-event vault). Fire-and-forget
+    // — appends issued while the warm runs join the in-flight pass
+    // (single-flight) instead of triggering their own.
+    void baseEventLog.prewarmAppendIndexes().catch(() => undefined);
     // Recall indexer client — runs full rebuilds in a separate OS
     // process so the main thread is never pinned by the recall
     // pipeline (read merged log + project + scan legacy JSONL +
@@ -618,15 +757,40 @@ export const startCompanion = async (
     let cachedPrivacyProjection: PrivacyProjection = projectPrivacy([]);
     const refreshPrivacyProjectionFromLog = async (): Promise<void> => {
       try {
-        const all = await baseEventLog.readMerged();
-        cachedPrivacyProjection = projectPrivacy(
-          all.filter(
-            (e) =>
-              e.type === PRIVACY_GATE_FLIPPED ||
-              e.type === PRIVACY_PERMISSION_GRANTED ||
-              e.type === PRIVACY_PERMISSION_REVOKED,
-          ),
-        );
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        const events: AcceptedEvent[] = [];
+        if (store === null) {
+          // Stream + collect only the 3 privacy event types instead of
+          // materialising the full ~700MB merged log just to filter them.
+          // This is the FIRST boot caller, so warming the memo here set
+          // the libpas high-water for the whole process.
+          events.push(
+            ...(await baseEventLog.streamFiltered(
+              (e) =>
+                e.type === PRIVACY_GATE_FLIPPED ||
+                e.type === PRIVACY_PERMISSION_GRANTED ||
+                e.type === PRIVACY_PERMISSION_REVOKED,
+              new Set([
+                PRIVACY_GATE_FLIPPED,
+                PRIVACY_PERMISSION_GRANTED,
+                PRIVACY_PERMISSION_REVOKED,
+              ]),
+            )),
+          );
+        } else {
+          await store.forEachChunk((chunk) => {
+            for (const event of chunk) {
+              if (
+                event.type === PRIVACY_GATE_FLIPPED ||
+                event.type === PRIVACY_PERMISSION_GRANTED ||
+                event.type === PRIVACY_PERMISSION_REVOKED
+              ) {
+                events.push(event);
+              }
+            }
+          }, 2000);
+        }
+        cachedPrivacyProjection = projectPrivacy(events);
       } catch {
         // Initial empty projection is the safe default.
       }
@@ -738,6 +902,34 @@ export const startCompanion = async (
     }
     // ────────────────────────────────────────────────────────────────
 
+    // Embedder sidecar — owns ONNX + transformers.js in a child process
+    // so the main thread isn't blocked by inference. Opt-out with
+    // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
+    // diagnostic) wants the legacy in-process path. The test embedder
+    // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
+    // deterministic test embedder is sync and the child overhead is
+    // pure waste.
+    //
+    // MUST be installed BEFORE the recall catchUp/rebuild IIFE below: that
+    // background task embeds (recall ingest + visit similarity), and if the
+    // override isn't set yet those calls fall through to the in-process
+    // ONNX/CoreML path, faulting ~200MB of IOAccelerator (Metal) surfaces
+    // into the MAIN process. Setting the override first routes every embed
+    // to the child, so the main never links the GPU surfaces.
+    const inProcessEmbedder = !useChildProcesses;
+    const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
+    if (embedderClient !== null) {
+      teardown.push(async () => {
+        await embedderClient.stop();
+      });
+      // Install the sidecar as the global embed implementation so all
+      // call sites (recall rebuild, recall ingestor, visit similarity)
+      // dispatch through the child process automatically. The override
+      // is module-scoped in `recall/embedder.ts`.
+      const { setEmbedderOverride } = await import('../recall/embedder.js');
+      setEmbedderOverride(embedderClient.embed);
+    }
+
     // Don't block startup on the rebuild — health endpoint will report
     // status: 'rebuilding' until the background task completes.
     // The fresh-check + incremental ingest BOTH run through the
@@ -779,26 +971,6 @@ export const startCompanion = async (
       eventLoopMonitor.stop();
     });
 
-    // Embedder sidecar — owns ONNX + transformers.js in a child process
-    // so the main thread isn't blocked by inference. Opt-out with
-    // SIDETRACK_EMBEDDER_INPROCESS=1 if a caller (test harness, special
-    // diagnostic) wants the legacy in-process path. The test embedder
-    // env (SIDETRACK_TEST_EMBEDDER=1) ALWAYS routes in-process — the
-    // deterministic test embedder is sync and the child overhead is
-    // pure waste.
-    const inProcessEmbedder = !useChildProcesses;
-    const embedderClient = inProcessEmbedder ? null : createEmbedderClient();
-    if (embedderClient !== null) {
-      teardown.push(async () => {
-        await embedderClient.stop();
-      });
-      // Install the sidecar as the global embed implementation so all
-      // call sites (recall rebuild, recall ingestor, visit similarity)
-      // dispatch through the child process automatically. The override
-      // is module-scoped in `recall/embedder.ts`.
-      const { setEmbedderOverride } = await import('../recall/embedder.js');
-      setEmbedderOverride(embedderClient.embed);
-    }
     const getEmbedderStatus = (): {
       readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
       readonly lastError?: string;
@@ -812,8 +984,71 @@ export const startCompanion = async (
         ...(err === undefined ? {} : { lastError: err }),
       };
     };
+    // Server-shaped view of the connections dirty queue. Shared by the
+    // /v1/system/health route context below AND the drain-time
+    // workGraph health artifact so both surfaces report the same
+    // numbers.
+    const connectionsDiagnostics = (): ConnectionsDiagnosticSnapshot => {
+      const dirty = connectionsMaterializer.getDirtySources();
+      return {
+        dirtySourceCount: dirty.dirtySourceUnitIds.length,
+        tombstonedSourceCount: dirty.tombstonedSourceUnitIds.length,
+        latestExtractionCount: dirty.latestExtractionFor.size,
+        oldestDirtySourceAgeMs: null,
+      };
+    };
+    // Drain-time workGraph health artifact (system/workGraphHealthArtifact.ts).
+    // collectWorkGraphHealth is too heavy for the request path on a
+    // cold process (typed event reads + a usearch native load blow the
+    // /v1/system/health 5s budget → the workGraph section pins
+    // 'unavailable' for the whole-report TTL after every boot), so
+    // materialize it after each successful connections drain and let
+    // the route serve the report from disk. Debounce / min-interval
+    // floor / single-flight + trailing rerun live in
+    // createWorkGraphHealthArtifactScheduler above; errors swallowed —
+    // observability must never surface as a drain failure.
+    const materializeWorkGraphHealthArtifact = async (): Promise<boolean> => {
+      try {
+        // The scheduler's env gate proves the flag, not the store:
+        // sync/eventStore.ts caches a FAILED open as a forever-null
+        // promise, and with a broken store collectWorkGraphHealth's
+        // readEventsForHealth silently degrades to TWO full
+        // eventLog.readMerged() passes per collect — the exact cost
+        // this artifact exists to avoid. Resolve the shared store
+        // first and bail (false → floor does not advance) when it is
+        // actually unavailable.
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        if (store === null) return false;
+        // Same dep set the route's live fallback builds (server.ts
+        // workGraphSummary): peek — never open — the canonical recall
+        // store; absent pre-first-/v2/recall ⇒ counts default to 0.
+        const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+        const canonicalRecallStore = await peekRecallV2Store(options.vaultPath);
+        const report = await collectWorkGraphHealth({
+          vaultRoot: options.vaultPath,
+          eventLog,
+          connectionsDiagnostics,
+          ...(canonicalRecallStore === undefined ? {} : { canonicalRecallStore }),
+        });
+        await writeWorkGraphHealthArtifact(options.vaultPath, report);
+        return true;
+      } catch {
+        // Best-effort: the serve side falls back to live compute when
+        // no (fresh) artifact exists.
+        return false;
+      }
+    };
+    const workGraphArtifactScheduler = createWorkGraphHealthArtifactScheduler({
+      materialize: materializeWorkGraphHealthArtifact,
+      enabled: eventStoreEnabled,
+    });
+    const scheduleWorkGraphHealthArtifact = workGraphArtifactScheduler.schedule;
+    teardown.push(workGraphArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
+      // F02: classify MCP callers by this key so the auth gate can apply
+      // workstream-trust enforcement. Always set (generated at boot).
+      mcpBridgeKey: ensuredMcpKey.key,
       vaultWriter,
       vaultRoot: options.vaultPath,
       serviceInstaller: pickInstaller(),
@@ -845,15 +1080,7 @@ export const startCompanion = async (
       eventLog,
       projectionChanges,
       syncMaterializerHealth: () => syncContractRunner.health(),
-      connectionsDiagnostics: () => {
-        const dirty = connectionsMaterializer.getDirtySources();
-        return {
-          dirtySourceCount: dirty.dirtySourceUnitIds.length,
-          tombstonedSourceCount: dirty.tombstonedSourceUnitIds.length,
-          latestExtractionCount: dirty.latestExtractionFor.size,
-          oldestDirtySourceAgeMs: null,
-        };
-      },
+      connectionsDiagnostics,
       // Class F edge-event import path: plugin-originated events
       // (e.g. browser.timeline.observed) arrive pre-shaped with an
       // edge dot allocated by the plugin. Earlier turns relayed those
@@ -1016,6 +1243,8 @@ export const startCompanion = async (
       bridgeKey: ensured.key,
       bridgeKeyPath: ensured.path,
       bridgeKeyCreated: ensured.created,
+      mcpKey: ensuredMcpKey.key,
+      mcpKeyPath: ensuredMcpKey.path,
       replicaId: replica.replicaId,
       replicaIdCreated: replica.created,
       close: async () => {

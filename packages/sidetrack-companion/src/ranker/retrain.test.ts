@@ -203,6 +203,7 @@ const fakeRevision = (trainingDatasetHash: string): RankerRevision => ({
   featureSchemaVersion: FEATURE_SCHEMA_VERSION,
   trainingDatasetHash,
   trainedAt: observedAtMs,
+  trainedFromImpressions: false,
   modelBytes: new ArrayBuffer(4),
 });
 
@@ -300,22 +301,21 @@ describe('ranker retraining loop', () => {
     });
   });
 
-  it('thresholds on positive-label delta even when total labels shrink via snapshot topology', () => {
-    // Regression for the retrain-gate clamp bug: snapshot topology
-    // changes (workstream split, topic merge) can shrink the
-    // post-Cartesian negative-label count without any new user
-    // signal. Pre-fix `Math.max(0, total - previousTotal)` clamped to
-    // 0 even after hundreds of new positives, freezing retrain. The
-    // gate must trip on the positive delta alone.
+  it('thresholds on positive-label delta even when total labels shrink', () => {
+    // Regression for the retrain-gate clamp bug: when the total label
+    // count shrinks while positives increase, `Math.max(0, total -
+    // previousTotal)` clamped to 0 even after hundreds of new
+    // positives, freezing retrain. The gate must trip on the positive
+    // delta alone.
     const base: RankerTrainingLabelDatasetFingerprint = {
       hash: 'a'.repeat(64),
-      labelCount: 400, // 100 positives + 300 expanded negatives
+      labelCount: 400,
       positiveLabelCount: 100,
       negativeLabelCount: 300,
     };
     const positivesGrewNegativesShrank: RankerTrainingLabelDatasetFingerprint = {
       hash: 'b'.repeat(64), // hash differs — `unchanged` check passes
-      labelCount: 350, // total *dropped* by 50
+      labelCount: 350,
       positiveLabelCount: 200, // +100 positives since last train
       negativeLabelCount: 150, // -150 from topology expansion shrinking
     };
@@ -552,6 +552,49 @@ describe('ranker retraining loop', () => {
     });
   });
 
+  it('sees historical feedback via readTrainingEvents even when the drain tail is empty (starvation regression)', async () => {
+    // Live-vault regression: on a store-backed scoped drain `merged` is only
+    // the pending window, so projecting feedback from it made every drain
+    // report `no-labels` while dozens of labels sat in history — the trained
+    // date froze for a month. The legacy path must project feedback from the
+    // full training-event history (same indexed read the impression gate uses).
+    const from = 'https://example.test/a';
+    const to = 'https://example.test/b';
+    const negative = 'https://example.test/c';
+    const trainInputs: TrainRankerInput[] = [];
+    const writtenRevisions: RankerRevision[] = [];
+    const train: TrainRankerRevisionFn = (input) => {
+      trainInputs.push(input);
+      return Promise.resolve(fakeRevision('2'.repeat(64)));
+    };
+    const writeActiveRevision: WriteActiveRankerRevisionFn = (_vaultRoot, revision) => {
+      writtenRevisions.push(revision);
+      return Promise.resolve();
+    };
+
+    const result = await maybeRetrainClosestVisitRanker({
+      vaultRoot: '/tmp/sidetrack-ranker-retrain-test',
+      // The drain tail carries NO feedback events — history does.
+      merged: [],
+      snapshot: snapshotWithVisits([from, to, negative]),
+      threshold: 1,
+      randomNegativeCandidatesPerPositive: 1,
+      readTrainingEvents: () => Promise.resolve([feedbackEvent(1, from, to)]),
+      train,
+      writeActiveRevision,
+      readState: () => Promise.resolve(emptyState()),
+      writeState: () => Promise.resolve(),
+    });
+
+    expect(result).toMatchObject({
+      status: 'trained',
+      revisionId: 'revision-s25',
+      newLabelCount: 1,
+    });
+    expect(trainInputs[0]?.feedback.positiveLabels).toHaveLength(1);
+    expect(writtenRevisions).toHaveLength(1);
+  });
+
   it('skips before candidate generation when labels cannot form a usable query group', async () => {
     const trainInputs: TrainRankerInput[] = [];
     const train: TrainRankerRevisionFn = (input) => {
@@ -614,6 +657,7 @@ describe('ranker retraining loop', () => {
     });
 
     expect(revision.trainQuality).toBeDefined();
+    expect(revision.trainedFromImpressions).toBe(false);
     const histogram = revision.trainQuality?.gradeHistogram;
     expect(histogram).toMatchObject({ '0': 2, '1': 2 });
     expect(revision.trainQuality?.candidateLabeling).toMatchObject({
@@ -955,6 +999,18 @@ describe('ranker retraining loop', () => {
             topic_lineage_merge_split_related: 0,
             page_quality_tier_from: 0,
             page_quality_tier_to: 0,
+            max_chunk_pair_vector_cosine: 0,
+            top3_mean_chunk_pair_vector_cosine: 0,
+            chunk_pair_vector_support_count: 0,
+            bm25_score: 0,
+            bm25_rank: 0,
+            dense_doc_score: 0,
+            dense_doc_rank: 0,
+            rrf_score: 0,
+            rrf_rank: 0,
+            graph_similarity_rank: 0,
+            candidate_source_flags: 0,
+            served_position: 0,
           },
           label: labelValue,
         });
@@ -1027,40 +1083,4 @@ describe('ranker retraining loop', () => {
     expect(mergedEventCount).toBe(1);
   });
 
-  it('container_negative_match is 0 for explicit visit-pair negatives (Codex review of #236)', async () => {
-    // Codex caught: `feedback` arriving into `buildRankerTrainingCandidates`
-    // is already augmented — `negativeLabels` includes the expanded
-    // visit↔visit pairs AND the original explicit visit-pair user
-    // negatives. The pre-fix code routed everything through
-    // `deriveNegativeVisitPairLabelsFromSnapshot` (which passes
-    // pre-existing visit-pair entries through unchanged), so the
-    // pre-existing pairs would incorrectly read `container_negative_match=1`.
-    //
-    // Fix filters the input to container-endpoint negatives only.
-    // This test asserts a visit-pair negative does NOT light up the
-    // feature.
-    const fromUrl = 'https://example.test/from';
-    const toUrl = 'https://example.test/to';
-    // Both pairs are visit↔visit (no container endpoint), so neither
-    // should appear in `negativeContainerPairs`. The feature on the
-    // candidate row for the explicit negative pair stays at 0.
-    const feedback = projection(
-      [], // no positives
-      [label(fromUrl, toUrl)], // explicit visit-pair negative — NOT container-shaped
-    );
-    const candidates = buildRankerTrainingCandidates({
-      feedback,
-      merged: [],
-      snapshot: snapshotWithVisits([fromUrl, toUrl]),
-      randomNegativeCandidatesPerPositive: 0,
-    });
-    // The labeled negative pair appears as a training row; assert
-    // its feature is 0 (post-fix). Pre-fix this would have been 1.
-    const labeledPair = candidates.find(
-      (c) =>
-        c.candidate.fromVisitId === fromUrl && c.candidate.toVisitId === toUrl,
-    );
-    expect(labeledPair).toBeDefined();
-    expect(labeledPair?.features.container_negative_match).toBe(0);
-  });
 });

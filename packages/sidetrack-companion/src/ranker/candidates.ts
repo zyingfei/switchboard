@@ -459,6 +459,96 @@ const chainGenerator = (
   };
 };
 
+// Registrable domains of large multi-author / multi-topic platforms where two
+// pages sharing the domain are NOT topically related. For these, the bare
+// `domain:` grouping key AND the shared site-chrome title/path tokens ("hacker",
+// "news", "item", "comments", "watch", …) are pure noise: they linked an
+// AI-generated-video Hacker News post to unrelated security items and placed it
+// in a linux-security workstream at 82% confidence (same_repo_or_domain scores
+// 0.65, same_title_path_tokens 0.45). GitHub/GitLab hit the same coarseness and
+// are already grouped at repo granularity instead. Matched by registrable
+// domain, so every subdomain is covered (news.ycombinator.com, old.reddit.com,
+// m.youtube.com, gemini.google.com, …). Kill-switch (absent = on):
+// SIDETRACK_AGGREGATOR_GROUPING_GUARD=0 restores the old bare-domain grouping.
+const COARSE_MULTI_TOPIC_DOMAINS: ReadonlySet<string> = new Set([
+  'ycombinator.com',
+  'reddit.com',
+  'lobste.rs',
+  'twitter.com',
+  'x.com',
+  't.co',
+  'youtube.com',
+  'youtu.be',
+  'facebook.com',
+  'instagram.com',
+  'linkedin.com',
+  'medium.com',
+  'substack.com',
+  'quora.com',
+  'pinterest.com',
+  'tumblr.com',
+  'stackoverflow.com',
+  'stackexchange.com',
+  'google.com',
+  'bing.com',
+  'duckduckgo.com',
+  'chatgpt.com',
+  'openai.com',
+  'claude.ai',
+]);
+
+// Call-time + case-insensitive so it is togglable in tests and consistent with
+// the repo's other boolean flags (lexicalFallbackEnabled, embeddingDisabled).
+const aggregatorGroupingGuardEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD']?.toLowerCase();
+  return raw !== '0' && raw !== 'false';
+};
+
+/**
+ * True when `hostname` belongs to a large multi-topic platform — i.e. two pages
+ * sharing only this domain (or its site-chrome tokens) are not topically
+ * related. Matched by registrable domain, so any subdomain qualifies. Exported
+ * for tests. See {@link COARSE_MULTI_TOPIC_DOMAINS}.
+ */
+export const isCoarseMultiTopicDomain = (hostname: string): boolean => {
+  // Strip a trailing dot (FQDN form, e.g. `news.ycombinator.com.`) so it does
+  // not defeat the suffix match.
+  const host = hostname.toLowerCase().replace(/^www\./u, '').replace(/\.$/u, '');
+  if (host.length === 0) return false;
+  const labels = host.split('.');
+  // Test the full host and each registrable suffix, never the bare TLD.
+  for (let index = 0; index < labels.length - 1; index += 1) {
+    if (COARSE_MULTI_TOPIC_DOMAINS.has(labels.slice(index).join('.'))) return true;
+  }
+  return false;
+};
+
+const suppressCoarseGrouping = (hostname: string): boolean =>
+  aggregatorGroupingGuardEnabled() && isCoarseMultiTopicDomain(hostname);
+
+// On some multi-topic platforms the URL structure encodes a coherent
+// sub-community (a subreddit, a Medium author). Grouping by that — the same way
+// GitHub groups by `repo:owner/repo` rather than `domain:github.com` — recovers
+// the legitimate signal the bare-domain suppression drops, without the
+// topic-blind fan-out of the whole platform.
+const communityGroupingKey = (
+  hostname: string,
+  segments: readonly string[],
+): string | null => {
+  if (hostname === 'reddit.com' || hostname.endsWith('.reddit.com')) {
+    return segments[0] === 'r' && segments[1] !== undefined && segments[1].length > 0
+      ? `forum:reddit.com/r/${segments[1]}`
+      : null;
+  }
+  if (hostname === 'medium.com' || hostname.endsWith('.medium.com')) {
+    const author = segments[0];
+    return author !== undefined && author.startsWith('@') && author.length > 1
+      ? `author:medium.com/${author}`
+      : null;
+  }
+  return null;
+};
+
 const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
   try {
     const parsed = new URL(record.canonicalUrl);
@@ -475,7 +565,14 @@ const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
     ) {
       return [`repo:${hostname}/${owner}/${repo}`];
     }
-    return hostname.length === 0 ? [] : [`domain:${hostname}`];
+    if (hostname.length === 0) return [];
+    if (suppressCoarseGrouping(hostname)) {
+      // Coarse platform: prefer a community-level key when the URL encodes one;
+      // otherwise emit nothing (the bare domain is topic-blind).
+      const community = communityGroupingKey(hostname, segments);
+      return community === null ? [] : [community];
+    }
+    return [`domain:${hostname}`];
   } catch {
     return [];
   }
@@ -535,6 +632,10 @@ const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
   if (record.title !== undefined) pieces.push(record.title);
   try {
     const parsed = new URL(record.canonicalUrl);
+    // On multi-topic platforms the title is dominated by site chrome ("… |
+    // Hacker News") and the path is a generic stub ("item"), so title/path
+    // tokens link unrelated items. Rely on content signals for these pages.
+    if (suppressCoarseGrouping(parsed.hostname)) return [];
     for (const part of parsed.pathname.split('/')) {
       pieces.push(safeDecode(part));
     }

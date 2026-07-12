@@ -84,7 +84,9 @@ export const renderWorkstreamMarkdown = (input: WorkstreamProjectionInput): stri
     ['revision', input.revision],
     ['kind', 'workstream'],
     ['title', input.title ?? input.bac_id],
-    ['privacy', input.privacy ?? 'shared'],
+    // Absent-privacy defaults to 'private' for symmetry with the vault
+    // writer (createWorkstream) and the WORKSTREAM_UPSERTED event spread.
+    ['privacy', input.privacy ?? 'private'],
     ['screenShareSensitive', input.screenShareSensitive ?? false],
     ['parent', input.parentId],
     ['tags', input.tags ?? []],

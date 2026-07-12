@@ -1,7 +1,7 @@
 import { useState, type ReactElement } from 'react';
 
 import { formatEntityDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
-import { EDGE_KINDS, nodeKindDisplayFor } from './edgeKinds';
+import { EDGE_KINDS, contentDerivedHint, nodeKindDisplayFor } from './edgeKinds';
 import { KindIcons } from './icons';
 import { ReplicaDots } from './ReplicaDots';
 import type { ConnectionEdge, ConnectionNode } from './types';
@@ -37,6 +37,7 @@ export const NodeRow = ({
   direction,
   selected,
   highlighted,
+  edgeTitle,
   onPromoteSnippet,
   onUseAsAnchor,
   onClick,
@@ -48,6 +49,7 @@ export const NodeRow = ({
   readonly direction: 'in' | 'out';
   readonly selected: boolean;
   readonly highlighted?: boolean;
+  readonly edgeTitle?: string;
   readonly onPromoteSnippet?: (input: {
     readonly snippetId: string;
     readonly sourceVisitId: string;
@@ -64,6 +66,7 @@ export const NodeRow = ({
   const display = nodeKindDisplayFor(node.kind);
   const entity = formatEntityDisplay(node, ctx);
   const meta = edge !== null ? EDGE_KINDS[edge.kind] : null;
+  const hint = edge === null ? null : contentDerivedHint(edge.kind);
   const cls = [
     'cx-row',
     display.tintClass,
@@ -92,7 +95,13 @@ export const NodeRow = ({
   };
   return (
     <div className={cls} data-testid={`node-${node.id}`}>
-      <button type="button" onClick={onClick} className="cx-row-click">
+      <button
+        type="button"
+        onClick={onClick}
+        className="cx-row-click"
+        data-testid={edge === null ? undefined : `edge-${edge.id}`}
+        title={edgeTitle}
+      >
         <span className={`cx-node-icon ${display.tintClass}`} aria-hidden>
           {KindIcons[node.kind]}
         </span>
@@ -123,7 +132,12 @@ export const NodeRow = ({
         </span>
         {meta !== null ? (
           <span className="cx-row-edge">
-            {direction === 'out' ? `→ ${meta.label}` : meta.label}
+            <span>{direction === 'out' ? `→ ${meta.label}` : meta.label}</span>
+            {hint !== null ? (
+              <span className="bac-connections-edge-hint" data-testid={`edge-hint-${edge?.id}`}>
+                {hint}
+              </span>
+            ) : null}
           </span>
         ) : null}
       </button>

@@ -18,6 +18,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { writeSemanticRecallPool } from '../recall/semanticRecallPool.js';
 import { runRecall, type PipelineDeps } from './pipeline.js';
 import type { RecallStore, StoreDocument, StoreFtsHit, StoreSourceKind } from './store/types.js';
 
@@ -55,9 +56,7 @@ const makeStubStore = (): RecallStore => {
       docs.set(doc.entityId, doc);
     },
     queryFts({ q, sourceKind, limit }) {
-      const kinds = new Set<StoreSourceKind>(
-        Array.isArray(sourceKind) ? sourceKind : [sourceKind],
-      );
+      const kinds = new Set<StoreSourceKind>(Array.isArray(sourceKind) ? sourceKind : [sourceKind]);
       return [...docs.values()]
         .filter((d) => kinds.has(d.sourceKind) && matches(q, d))
         .slice(0, limit)
@@ -77,10 +76,17 @@ const makeStubStore = (): RecallStore => {
       new Set([...docs.values()].filter((d) => d.sourceKind === kind).map((d) => d.entityId)),
     deleteVector: () => {},
     allVectorEntityIds: () => new Set(),
+    upsertDocumentChunks: () => {},
+    deleteDocumentChunks: () => {},
+    deleteDocumentChunk: () => {},
+    allDocumentChunkIds: () => new Set(),
+    deleteChunkVector: () => {},
+    allChunkVectorIds: () => new Set(),
     runTransaction: <T>(fn: () => T): T => fn(),
     getRecallMetadata: () => undefined,
     setRecallMetadata: () => {},
     upsertVector: () => {},
+    upsertChunkVector: () => {},
     queryVector: () => [],
     close: () => {},
   };
@@ -223,6 +229,87 @@ describe('runRecall — intent profiles', () => {
     });
     const urls = resp.results.map((r) => r.canonicalUrl);
     expect(urls).not.toContain('https://example.com/page');
+  });
+
+  it('focus intent graph neighbors carry titles hydrated from the docs table', async () => {
+    // The semantic pool knows urls only; the generator must join the
+    // docs table for the display title. Seed a pool where the focused
+    // page neighbors other.com/foo (which the seeded store titles
+    // "Unrelated other thing").
+    const d = deps();
+    await writeSemanticRecallPool(d.vaultRoot, {
+      signature: 'test',
+      modelId: 'stub',
+      featureVersion: 1,
+      producedAtMs: Date.parse('2026-05-24T00:00:00.000Z'),
+      entryCount: 2,
+      clusterCount: 1,
+      byUrl: {
+        'https://example.com/page': {
+          canonicalUrl: 'https://example.com/page',
+          clusterId: 'c1',
+          neighbors: [{ canonicalUrl: 'https://other.com/foo', cosine: 0.9 }],
+          textHash: 'aaaaaaaaaaaa',
+        },
+        'https://other.com/foo': {
+          canonicalUrl: 'https://other.com/foo',
+          clusterId: 'c1',
+          neighbors: [{ canonicalUrl: 'https://example.com/page', cosine: 0.9 }],
+          textHash: 'bbbbbbbbbbbb',
+        },
+      },
+    });
+    const resp = await runRecall(d, {
+      q: '',
+      intent: 'focus',
+      session: { currentUrl: 'https://example.com/page' },
+      suppression: { suppressCurrentPage: 'always' },
+    });
+    const neighbor = resp.results.find(
+      (r) => r.sourceKind === 'graph_neighbor' && r.canonicalUrl === 'https://other.com/foo',
+    );
+    expect(neighbor).toBeDefined();
+    expect(neighbor?.title).toBe('Unrelated other thing');
+  });
+
+  it('focus intent tolerates trailing-slash drift on session.currentUrl', async () => {
+    // The browser reports https://example.com/page/ while the docs
+    // table and the semantic pool key https://example.com/page — the
+    // lookup must try both variants instead of returning nothing.
+    const d = deps();
+    await writeSemanticRecallPool(d.vaultRoot, {
+      signature: 'test',
+      modelId: 'stub',
+      featureVersion: 1,
+      producedAtMs: Date.parse('2026-05-24T00:00:00.000Z'),
+      entryCount: 2,
+      clusterCount: 1,
+      byUrl: {
+        'https://example.com/page': {
+          canonicalUrl: 'https://example.com/page',
+          clusterId: 'c1',
+          neighbors: [{ canonicalUrl: 'https://other.com/foo', cosine: 0.9 }],
+          textHash: 'aaaaaaaaaaaa',
+        },
+        'https://other.com/foo': {
+          canonicalUrl: 'https://other.com/foo',
+          clusterId: 'c1',
+          neighbors: [{ canonicalUrl: 'https://example.com/page', cosine: 0.9 }],
+          textHash: 'bbbbbbbbbbbb',
+        },
+      },
+    });
+    const resp = await runRecall(d, {
+      q: '',
+      intent: 'focus',
+      session: { currentUrl: 'https://example.com/page/' },
+      suppression: { suppressCurrentPage: 'always' },
+    });
+    // The slash-variant page itself is found (then suppressed as the
+    // current page) and its pool neighbors surface.
+    const urls = resp.results.map((r) => r.canonicalUrl);
+    expect(urls).not.toContain('https://example.com/page');
+    expect(urls).toContain('https://other.com/foo');
   });
 
   it('explicit sources on the request overrides intent defaults', async () => {

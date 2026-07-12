@@ -2,6 +2,11 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useRecallSearch } from '../../../src/sidepanel/connections/useRecallSearch';
+import {
+  lookupByEntityId,
+  lookupByUrl,
+  resetImpressionRegistryForTests,
+} from '../../../src/sidepanel/recall/impressionRegistry';
 
 // Stub a minimal chrome.runtime.sendMessage that replies via the
 // supplied callback synchronously (vitest's userEvent timing
@@ -22,9 +27,11 @@ const stubChrome = (responder: (request: unknown) => unknown): void => {
 describe('useRecallSearch', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    resetImpressionRegistryForTests();
   });
   afterEach(() => {
     vi.useRealTimers();
+    resetImpressionRegistryForTests();
     // @ts-expect-error — restore default
     delete globalThis.chrome;
   });
@@ -247,5 +254,63 @@ describe('useRecallSearch', () => {
     });
     expect(result.current.items.length).toBe(1);
     expect(result.current.localFallback).toBe(true);
+  });
+
+  it('keeps the raw entityId on hits and feeds the impression registry (P2)', () => {
+    // candidateId shadows RecallHit.id — the registry (and the
+    // trainable-action join) must still see the SERVED entityId
+    // byte-exact, plus the canonicalUrl secondary index.
+    stubChrome(() => ({
+      ok: true,
+      results: [
+        {
+          candidateId: 'cand:shadowed',
+          entityId: 'timeline-visit:https://served.example/page',
+          sourceKind: 'timeline_visit',
+          canonicalUrl: 'https://served.example/page',
+          title: 'Served page',
+          fusedScore: 0.7,
+          lastSeenAt: '2026-07-01T00:00:00.000Z',
+          evidence: [{ retriever: 'fts5', sourceKind: 'timeline_visit', rank: 1 }],
+        },
+      ],
+      meta: { servedContextId: 'ctx-search-1' },
+    }));
+    const { result } = renderHook(() => useRecallSearch('served', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    const hit = result.current.items[0]!;
+    expect(hit.id).toBe('cand:shadowed');
+    expect(hit.entityId).toBe('timeline-visit:https://served.example/page');
+    expect(lookupByEntityId('timeline-visit:https://served.example/page')).toEqual({
+      servedContextId: 'ctx-search-1',
+      servedEntityId: 'timeline-visit:https://served.example/page',
+    });
+    // Slash-variant tolerant URL join.
+    expect(lookupByUrl('https://served.example/page/')?.servedContextId).toBe('ctx-search-1');
+  });
+
+  it('does not feed the registry when the response carries no servedContextId', () => {
+    stubChrome(() => ({
+      ok: true,
+      results: [
+        {
+          candidateId: 'cand:x',
+          entityId: 'entity:x',
+          sourceKind: 'timeline_visit',
+          canonicalUrl: 'https://x.example/p',
+          title: 'X',
+          fusedScore: 0.5,
+          lastSeenAt: '2026-07-01T00:00:00.000Z',
+          evidence: [],
+        },
+      ],
+    }));
+    renderHook(() => useRecallSearch('nometa', { debounceMs: 100 }));
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(lookupByEntityId('entity:x')).toBeNull();
   });
 });

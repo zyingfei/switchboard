@@ -240,7 +240,13 @@ asks.
 - **Stop auto-tracking** — per-tab and per-site.
 - **Remove tracking** — drops the item entirely.
 - **Selector-canary fallback** — when DOM selectors break (provider
-  redesign), switch to clipboard mode and warn in side panel.
+  redesign), switch to clipboard mode and warn in side panel. The
+  warn-on-broken-selector behavior is P0. The clipboard-capture
+  selector fallback path (keeping capture live after selector failure)
+  is demoted to **P2** (amended 2026-07-11): canary + source
+  provenance shipped; a single dogfooding developer detects selector
+  breakage same-day via the canary banner, making the silent-recovery
+  path low urgency.
 - **Source provenance** on every captured turn: `provider`, `model` if
   detectable, `threadId`, `threadUrl`, `capturedAt`, `selectorCanary`
   status.
@@ -257,15 +263,34 @@ asks.
   expected to happen often.
 - **Tags** orthogonal to the tree (one item, multiple tags).
 - **Links** between items (typed: `related`, `source_of`, `follow_up`,
-  `coding_session_for`, `dispatched_to`, etc.).
+  `coding_session_for`, `dispatched_to`, etc.). The connections graph
+  (shipped) serves as the interim link substrate. Typed user-authored
+  links and the `link_items` MCP tool are moved to **P2** (amended
+  2026-07-11): the connections graph provides the navigational value;
+  explicit typed links add authoring overhead without a validated user
+  need at this stage.
+- **MCP write tools (shipped)**: `move_item`, `new_cluster`,
+  `queue_item`, `attach_coding_session` are the four P0 write tools
+  (§6.1.14). `new_cluster` and server-derived agent identity are
+  landing this wave-set. `link_items` is P2 per the disposition above.
 
 #### 6.1.4 Queue (outbound asks)
 
 - `QueueItem` attached to: a tracked thread, a workstream, a provider,
   or global.
-- Status: `pending` → `ready` → `sent` / `done` / `skipped`.
+- Status: `pending` → `done` / `dismissed` — shipped 3-state lifecycle
+  (amended 2026-07-11). The PRD's original `pending → ready → sent /
+  done / skipped` five-state model is superseded by the implemented
+  3-state queue: `pending` (created, not yet acted on), `done`
+  (completed), `dismissed` (explicitly skipped). The `ready` and
+  `skipped` intermediate states were removed as they added UI complexity
+  without a validated user need; `sent` collapsed into `done`. The
+  `QueueItem` type in §7 retains the old enumeration for reference;
+  treat `sent` and `skipped` as aliases for `done` and `dismissed`
+  respectively when reading older event logs.
 - "Compose packet from queue" — selected queue items become the
-  questions section of a Research Packet.
+  questions section of a Research Packet. This feature is in flight
+  as of this wave-set and lands separately.
 - No auto-send (paste-mode default per §24.10).
 
 #### 6.1.5 Inbound reminders (NEW — was missing in planner draft)
@@ -290,8 +315,15 @@ Closes the napkin's *"Project can also allow creating manual checklists
   `note`.
 - Pure UI: user adds, ticks, removes. No automation, no AI suggestion.
 - Renders in side panel under the workstream's expanded view.
-- Persists to vault as a `bac:checklist:` frontmatter array on the
-  workstream's index Markdown file (so it's editable in Obsidian too).
+- Persists to vault as a `## Checklist` markdown body section on the
+  workstream's index Markdown file (amended 2026-07-11). The original
+  `bac:checklist:` frontmatter array specification is superseded: a
+  dedicated `## Checklist` heading section in the Markdown body is
+  editable directly in Obsidian's normal editing flow without
+  frontmatter plugins, satisfying the requirement's intent (the user
+  should be able to tick checklist items in Obsidian without tooling).
+  The `## Checklist` format also handles multi-line notes more
+  naturally than YAML arrays.
 
 #### 6.1.7 Tab recovery
 
@@ -307,14 +339,23 @@ Closes the napkin's *"Project can also allow creating manual checklists
 - Side panel surfaces "closed (restorable)" status distinct from "open"
   vs "removed".
 
-#### 6.1.8 Search + recent déjà-vu (lexical)
+#### 6.1.8 Search + recent déjà-vu (lexical + hybrid vector)
 
 - Local FTS (MiniSearch per §24.4) over tracked items: title, provider,
   workstream path, captured turns.
 - "Did I research X recently" surface — answers "what tracked threads
   match this query, in the last N days?".
-- **Smart recall** (vector + calibrated freshness) is **P1**, not P0.
-  The MVP ships lexical only; vector is a follow-up.
+- **Hybrid lexical + vector recall via `/v2` endpoint DELIVERED EARLY**
+  (amended 2026-07-11): the PRD's P1 §6.3.1 smart-recall (vector +
+  calibrated freshness) was pulled forward and shipped on this branch.
+  The `/v2/recall` pipeline combines SQLite FTS5, sqlite-vec cosine
+  candidates, page-content search, timeline-visit search, and a learned
+  reranker on top; freshness decay (3d/3w/3m/3y per §24.8) is applied.
+  As a consequence, §6.3.1 is marked delivered and the P1 classification
+  no longer applies to the core vector recall capability. The learned
+  reranker is subject to the **P1 freeze** (see §11 decisions log):
+  no new ranker/recall/connections/attribution scope ships until all 16
+  §13 steps pass.
 
 #### 6.1.9 Packet generation
 
@@ -354,9 +395,14 @@ turn:
 - **Dispatch-out** — bundles reviewed turn + annotations + (optional)
   prior-context turns; dispatches to a different chat (multi-target,
   same primitive as packet dispatch).
-- **Track** — `ReviewEvent` stored as `bac_reviews:` frontmatter array
-  on the captured-turn note; future recall ranker uses verdict signal
-  (P1).
+- **Track** — `ReviewEvent` stored in `_BAC/reviews/<date>.jsonl`
+  (amended 2026-07-11). The original `bac_reviews:` frontmatter array
+  specification is superseded: high-volume review events are better
+  stored as append-only JSONL rows (same pattern as the event log)
+  rather than growing frontmatter arrays on individual notes. Each
+  review file follows the `_BAC/reviews/YYYY-MM-DD.jsonl` naming
+  convention. Future recall ranker uses verdict signal (P1, subject
+  to the P1 freeze).
 
 Review is a P0 capability for the dogfood demo (§13).
 
@@ -370,7 +416,13 @@ Review is a P0 capability for the dogfood demo (§13).
 
 #### 6.1.12 Stable IDs (technical invariant — not user-facing)
 
-- Every entity has `bac_id` (16-char ULID).
+- Every entity has `bac_id` (16-char random Crockford-base32, amended
+  2026-07-11). The original "16-char ULID" description is functionally
+  equivalent for the identity invariant — both are 16 printable
+  characters without ambiguous glyphs — but the implementation uses
+  random Crockford-base32 rather than timestamp-prefixed ULIDs. The
+  invariant (IDs are stable across rename/move/restructure) is
+  unchanged.
 - File paths and folder names are projections; `bac_id` is identity.
 - Rename/move/restructure never breaks reference.
 - This is a hard invariant the data model must preserve through every
@@ -415,14 +467,20 @@ Per the Q1/Q7 decision, MCP write tools ship in MVP (not P1). Closes
 the napkin's *"based on same api where MCP apis can also be called by
 api agents to do the same."*
 
-- **Tools**: `move_item`, `new_cluster`, `queue_item`, `link_items`,
-  `attach_coding_session`. Each has a typed Zod schema and a
-  capability spec (per `templates/mcp-capability-spec.md`).
-- **Trust model**: per-workstream. User opts in once per workstream
-  ("trust Codex inside `Sidetrack / MVP PRD`"); within scope, tools
-  execute without per-call approval. Outside scope, fall back to
-  per-call approval modal in the side panel ("Codex wants to move 3
-  items into 'X' — approve? / reject?").
+- **Tools (shipped 4 of 5)**: `move_item`, `new_cluster`, `queue_item`,
+  `attach_coding_session`. `link_items` is P2 per the §6.1.3
+  disposition (amended 2026-07-11). `new_cluster` and server-derived
+  agent identity are landing in this wave-set. Each shipped tool has a
+  typed Zod schema and a capability spec.
+- **Trust model**: per-workstream opt-in (amended 2026-07-11 —
+  allow-by-default trust flip reverted to PRD opt-in). An earlier
+  implementation landed an allow-by-default posture; this is reverted
+  to the PRD's explicit opt-in model as part of the identity rework
+  landing in this wave-set. User opts in once per workstream ("trust
+  Codex inside `Sidetrack / MVP PRD`"); within scope, tools execute
+  without per-call approval. Outside scope, fall back to per-call
+  approval modal in the side panel ("Codex wants to move 3 items into
+  'X' — approve? / reject?").
 - **Audit log every call** to `_BAC/audit/<date>.jsonl` regardless of
   trust mode. Includes: agent ID (MCP client), tool name, args,
   scope (workstream the call was scoped to), trust-mode-active
@@ -472,16 +530,17 @@ you see I might lost track if some of those are async"*.
 Closes the napkin's *"or by default download to structured naming
 conventions"* (the planner draft only handled the manual case).
 
-- Per-workstream toggle (per Q3 decision):
-  - **Default off** for workstream root and Inbox/Misc (scratch
-    space stays scratch).
-  - **Default on** for project / cluster / subcluster (real projects
-    get auto-projection — vault is canonical for things that matter).
-  - **Per-workstream override** in settings: user can flip any
-    workstream independently of its tier.
-- When on: every promoted artifact (decision, review verdict, packet)
-  writes to vault on creation, using the §6.1.11 naming convention.
-- Off: nothing writes until user explicitly exports.
+- **Promote-time vault write satisfies the P0.5 core**: when a user
+  explicitly promotes an artifact, the companion writes it to vault
+  at that moment, using the §6.1.11 naming convention. This is the
+  shipped P0.5 posture (amended 2026-07-11).
+- **Per-workstream auto-download toggle** is a P1 follow-up (amended
+  2026-07-11). The per-workstream toggle (Q3 decision: default-off
+  for root/Misc, default-on for project tier) is correct as a product
+  direction but is not required to close the dogfood scenario — the
+  promote-time write is sufficient. The toggle will land as a P1
+  settings surface once the promote flow is validated.
+- Off path: nothing writes until user explicitly promotes or exports.
 
 #### 6.2.4 Markdown / Obsidian projection
 
@@ -501,23 +560,29 @@ inline review):
 - Persistent overlay deferred to P1 (Hypothesis-style anchoring).
 - The captured annotation can be opened later as a §28 review target.
 
-#### 6.2.6 MCP server (read-only, stdio + local WebSocket)
+#### 6.2.6 MCP server (read-only, stdio + streamable-HTTP)
 
-Reuses `poc/mcp-server` from main (already validated against fixtures):
+Ships as `sidetrack-mcp` (amended 2026-07-11 — supersedes original
+`bac-mcp` / `npx bac-mcp` wording):
 
-- Tools use the `bac.*` namespace and mirror the existing read-side
-  companion surface: `bac.recall`, `bac.read_thread_md`,
-  `bac.read_workstream_md`, `bac.list_dispatches`,
-  `bac.list_workstream_notes`, `bac.list_buckets`,
-  `bac.list_audit_events`, `bac.list_annotations`,
-  `bac.system_health`, archive/unarchive helpers, and workstream
-  suggestions/bumps.
+- Tools use the `sidetrack.*` namespace (amended 2026-07-11). The
+  original `bac.*` namespace is superseded; the shipped namespace is
+  `sidetrack.*` (e.g. `sidetrack.recall.query`,
+  `sidetrack.workstreams.context_pack`, `sidetrack.dispatch.create`).
+  See `packages/sidetrack-mcp/src/capabilities.ts` for the full tool
+  list.
 - Reads vault state via Node `fs` (per §27.6).
 - One-line stdio install in Claude Code / Cursor / Codex MCP config:
-  `npx sidetrack-mcp --vault <path>`.
-- Long-lived local-agent route:
-  `ws://127.0.0.1:8721/mcp?token=<bridge-key>` or
-  `Sec-WebSocket-Protocol: bearer.<bridge-key>`.
+  `sidetrack-mcp --vault <path>` (via Bun global install or local path).
+- **Local transport: MCP Streamable-HTTP on :8721, auth required**
+  (amended 2026-07-11 — supersedes raw WebSocket wording). The
+  long-lived local-agent route uses MCP Streamable-HTTP transport
+  (`--transport streamable-http --port 8721`) with mandatory
+  `Authorization: Bearer <key>` on every request. This is not a raw
+  WebSocket endpoint; it is the MCP SDK's `StreamableHTTPServerTransport`
+  over plain HTTP. The bridge key lives at
+  `_BAC/.config/bridge.key`. The original `ws://127.0.0.1:8721/mcp`
+  URL scheme is deprecated.
 - Audit log every tool call to `_BAC/audit/<date>.jsonl`.
 
 ### 6.3 P1 — post-MVP
@@ -943,7 +1008,7 @@ what the system does. Production PRD requirement, not optional.
 |---|---|---|---|
 | **Companion process down** | Extension can't reach NM/HTTP endpoint | "Companion: disconnected · N items queued" red badge | Captures queue locally; reads from hot cache; replays on reconnect; oldest-eviction at 1000 items |
 | **Bridge key setup invalid** | First-run / settings validation distinguishes missing key, malformed copied value, and companion auth rejection | Inline setup error: "Bridge key missing", "Bridge key malformed", or "Bridge key rejected" | Do not close setup; do not persist rejected keys; user can paste the correct `_BAC/.config/bridge.key` and retry |
-| **Vault folder unreachable** | Companion `fs` operations fail | "Vault: error" yellow badge with reason | Companion buffers writes in-memory (cap 100 items); side panel surfaces "vault unreachable for X minutes — re-pick folder?" |
+| **Vault folder unreachable** | Companion `fs` operations fail | "Vault: error" yellow badge with reason | In-memory write buffer (cap 100 items) SUPERSEDED by the extension capture outbox (amended 2026-07-11). The shipped durability posture is: extension buffers events in the capture outbox (chrome.storage.local, cap 1000, oldest-eviction); companion drains the outbox on reconnect with chronological replay. There is no fsync guarantee on outbox events — crash-window semantics apply (events written since the last successful drain may be lost if both extension and companion crash simultaneously). The §15 zero-data-loss success criterion is falsifiable against the health tripwires: if the companion's health surface reports drain-lag exceeding the health threshold or outbox size approaching cap, that constitutes a data-loss risk condition. Side panel surfaces "vault unreachable for X minutes — re-pick folder?" |
 | **Provider-capture broken** (selector failure) | Per-load selector canary detects miss | Yellow banner on side panel: "ChatGPT extractor health: 4/10 recent captures clean" | Switch to clipboard mode; surface a "queue diagnostic bundle" button |
 | **Token budget exceeded** (about to dispatch) | tiktoken count > model context window | Pre-dispatch warning with "edit / proceed anyway / cancel" | Default-deny; user must explicitly proceed |
 | **Redaction rule fires** (PII / API key in dispatch) | RedactionPipeline matches | "Redacted N items: AWS key, email" with reveal toggle | Replace with `<redacted:kind>` markers; user can opt to include unredacted (logged as audit event) |
@@ -993,11 +1058,12 @@ edits, and those changes propagate back to Sidetrack state.
   edits alone; every structured sync-back must be previewed or
   conflict-checked
 
-## 11. Decisions log (resolved 2026-04-26)
+## 11. Decisions log (resolved 2026-04-26; amended 2026-07-11)
 
 The eight open questions from this PRD's prior draft were resolved
 together with the user. Recording answers + brief rationale here so
-the trail isn't lost.
+the trail isn't lost. Subsequent decisions dated 2026-07-11 follow at
+the end of this section.
 
 1. **MCP API parity with UI actions** → **upgraded to P0 with
    per-workstream trust mode**. Write tools (`move_item`,
@@ -1051,6 +1117,29 @@ the trail isn't lost.
 8. **MVP product name** → **Sidetrack**. (Repo on GitHub remains at
    `switchboard/` for backward-compat with existing PRs; rename
    when convenient.)
+
+9. **P1 FREEZE** (2026-07-11) → **No new ranker / recall / connections
+   / attribution scope until all 16 section-13 acceptance steps pass.**
+   The branch `feat/recall-ranker-v2-replacement` is substantially
+   ahead of main with learned-ranker, hybrid recall, connections IVM,
+   and attribution fixes. Before any new capability scope is added to
+   these subsystems, the §13 scenario must run end-to-end successfully
+   (all 16 steps) against the current implementation. Live learning
+   loops (impression emission, recall event emission, retrain worker)
+   are maintenance-only during the freeze: bug fixes and stability
+   improvements are permitted; new feature scope is not. The freeze
+   lifts automatically when §13 closes and the branch merges to main.
+
+10. **MERGE STRATEGY** (2026-07-11) → **Single audited merge to main
+    once CI is green; escape hatch: promote branch to mainline if main
+    proves unmergeable.** The normal path is: all §13 steps pass on
+    the feature branch, CI is green, a single squash/merge PR lands to
+    main. If the merge proves unmergeable due to divergence (main has
+    accrued conflicting structural changes), the escape hatch is to
+    promote `feat/recall-ranker-v2-replacement` as the new mainline and
+    cherry-pick any main-only commits onto it. This escape hatch should
+    not be triggered lightly — it is recorded here so the decision is
+    not re-litigated under time pressure.
 
 ## 12. What this PRD intentionally does NOT do (vs the planner draft)
 
@@ -1121,9 +1210,14 @@ Setup: companion is running, vault is wired, side panel is open.
 14. User opens the vault in Obsidian. Frontmatter mirror is intact;
     Bases dashboard "Where Was I" shows current state; Canvas project
     map renders the workstream tree.
-15. From terminal, user runs `npx bac-mcp --vault <path>`, configures
-    Codex to use it, runs `bac.context_pack({ workstream: "MVP PRD" })`.
-    Returns the same data the side panel shows.
+15. From terminal, user runs `sidetrack-mcp --vault <path>`, configures
+    Codex to use it, runs `sidetrack.workstreams.context_pack` with
+    `{ workstreamId: "<MVP PRD bac_id>" }` over stdio or over
+    authenticated Streamable-HTTP on :8721
+    (`--transport streamable-http --mcp-auth-key <key>`).
+    Returns the same data the side panel shows. (amended 2026-07-11 —
+    shipped surface is `sidetrack-mcp` with `sidetrack.*` namespace,
+    not `npx bac-mcp` with `bac.*` namespace.)
 16. User starts a screen-share for a video call. Side panel auto-masks
     titles to `[private]`; user confirms with the screen-share
     indicator. Stops share — titles re-render.

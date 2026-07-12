@@ -10,6 +10,7 @@ import {
   TrashIcon,
 } from './icons';
 import { messageTypes } from '../../messages';
+import { recordImpressionFromRecallResults } from '../recall/impressionRegistry';
 import { SEARCH_DEBOUNCE_MS, SEARCH_MIN_QUERY_CHARS } from '../search/constants';
 
 export const ENGAGEMENT_CLASSES = [
@@ -325,27 +326,24 @@ const uniqueStrings = (values: readonly (string | undefined)[]): readonly string
   return out;
 };
 
+// Candidate GROUP names — not page titles. We used to splice in the
+// top attentive-visit titles ("Account Details | Audible.com") and
+// `topic.label` itself, which (a) duplicated the rename input value
+// and (b) treated descriptive page titles as group-name candidates,
+// which they aren't. Algorithm now produces only real candidate
+// labels: the dominant workstream's name (when the cluster already
+// overlaps an owned workstream) + the model-emitted `suggestedLabels`.
+// If the topic ships no `suggestedLabels`, the section stays empty —
+// better than a wall of misleading page titles.
 const nameSuggestionsForTopic = (
   topic: TopicNode,
-  visits: readonly TopicVisit[],
+  _visits: readonly TopicVisit[],
   workstreamOptions: readonly FocusWorkstreamOption[],
 ): readonly string[] => {
   const dominantWorkstream = workstreamOptions.find(
     (option) => option.id === topic.dominantWorkstreamId,
   )?.label;
-  const attentiveVisits = [...visits]
-    .sort(
-      (left, right) =>
-        right.focusedWindowMs - left.focusedWindowMs || left.label.localeCompare(right.label),
-    )
-    .slice(0, 4)
-    .map((visit) => visit.label);
-  return uniqueStrings([
-    dominantWorkstream,
-    topic.label,
-    ...(topic.suggestedLabels ?? []),
-    ...attentiveVisits,
-  ]).slice(0, 8);
+  return uniqueStrings([dominantWorkstream, ...(topic.suggestedLabels ?? [])]).slice(0, 8);
 };
 
 // Map a v2 RecallCandidate (opaque record, since the companion types
@@ -572,6 +570,7 @@ export const FocusView = ({
             readonly ok?: unknown;
             readonly results?: unknown;
             readonly error?: unknown;
+            readonly meta?: { readonly servedContextId?: unknown };
           };
           if (wrap.ok !== true) {
             setSearchItems(EMPTY_SEARCH_ITEMS);
@@ -580,6 +579,10 @@ export const FocusView = ({
             return;
           }
           const raws = Array.isArray(wrap.results) ? wrap.results : [];
+          // P2 — the add-drawer candidates are recall-served; remember
+          // the impression so a subsequent group-save/promote of one of
+          // them emits an impression-joined trainable recall.action.
+          recordImpressionFromRecallResults(wrap.meta?.servedContextId, raws);
           const items = raws
             .map(recallCandidateToFocusCandidate)
             .filter((item): item is FocusCandidate => item !== null);
@@ -1012,9 +1015,16 @@ export const FocusView = ({
         const displayLabel = displayLabelFor(topic);
         const renameDraft = renameDraftFor(topic);
         const visibleVisitIds = visibleVisits.map((visit) => visit.id);
-        const canPromote =
-          onFocusGroupSave !== undefined ||
-          (onTopicPromote !== undefined && workstreamOptions.length > 0);
+        // Head-icon promote: ONLY the no-composer fallback path. When the
+        // composer is wired (`onFocusGroupSave`), the in-body "Promote
+        // to workstream" / "Add to <X>" button is the single canonical
+        // save affordance — having a floppy in the header AND a button
+        // in the composer was the source of the "three saves on one
+        // card" confusion.
+        const canDirectPromote =
+          onFocusGroupSave === undefined &&
+          onTopicPromote !== undefined &&
+          workstreamOptions.length > 0;
         const canAnchorTopic =
           onTopicAnchor !== undefined && topic.source !== 'related-neighborhood';
         const composing = composingTopicIds.has(topic.id);
@@ -1059,18 +1069,17 @@ export const FocusView = ({
                 >
                   {needsTriage ? 'Needs triage' : 'Suggestion'}
                 </span>
-                {canPromote ? (
+                {canDirectPromote ? (
                   <button
                     type="button"
                     className="cx-focus-head-action"
                     disabled={promotingTopicId === topic.id || visibleVisits.length === 0}
                     onClick={() => {
-                      if (onFocusGroupSave !== undefined) openComposition(topic, visibleVisits);
-                      else submitTopicPromote(topic, visibleVisitIds);
+                      submitTopicPromote(topic, visibleVisitIds);
                     }}
                     data-testid={`focus-promote-${topic.id}`}
-                    title="Save this suggestion"
-                    aria-label={`Save ${displayLabel} suggestion`}
+                    title="Promote this suggestion to a workstream"
+                    aria-label={`Promote ${displayLabel} to a workstream`}
                   >
                     {iconSlot(SaveIcon)}
                   </button>
@@ -1166,8 +1175,10 @@ export const FocusView = ({
                   </button>
                 </div>
                 {nameSuggestions.length === 0 ? null : (
-                  <div className="cx-focus-name-suggestions">
-                    <span className="cx-focus-rename-label">Name suggestions</span>
+                  <details className="cx-focus-name-suggestions">
+                    <summary className="cx-focus-rename-label">
+                      Name suggestions ({nameSuggestions.length})
+                    </summary>
                     <div className="cx-focus-chip-row">
                       {nameSuggestions.map((label) => (
                         <button
@@ -1186,67 +1197,85 @@ export const FocusView = ({
                         </button>
                       ))}
                     </div>
-                  </div>
+                  </details>
                 )}
-                {onFocusGroupSave === undefined ? null : (
-                  <div className="cx-focus-compose-actions">
-                    <select
-                      className="cx-focus-target-select"
-                      value={saveTargetByTopic[topic.id] ?? 'new'}
-                      onChange={(event) => {
-                        setSaveTargetByTopic((current) => ({
-                          ...current,
-                          [topic.id]: event.currentTarget.value,
-                        }));
-                      }}
-                      data-testid={`focus-save-target-${topic.id}`}
-                      aria-label="Save target"
-                    >
-                      <option value="new">New group</option>
-                      {workstreamOptions.map((option) => (
-                        <option key={option.id} value={option.id}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="cx-focus-expand cx-focus-inline-action"
-                      disabled={savingTopicId === topic.id || selectedCanonicalUrls.length === 0}
-                      onClick={() => {
-                        if (!composing) openComposition(topic, visibleVisits);
-                        submitFocusGroupSave(topic, visibleVisits, 'create');
-                      }}
-                      data-testid={`focus-save-group-${topic.id}`}
-                    >
-                      {iconSlot(SaveIcon)}
-                      {savingTopicId === topic.id ? 'Saving' : 'Save group'}
-                    </button>
-                    <button
-                      type="button"
-                      className="cx-focus-expand cx-focus-inline-action"
-                      onClick={() => {
-                        openComposition(topic, visibleVisits);
-                      }}
-                      data-testid={`focus-refine-${topic.id}`}
-                    >
-                      {iconSlot(EditIcon)}
-                      Refine
-                    </button>
-                    <button
-                      type="button"
-                      className="cx-focus-expand cx-focus-inline-action"
-                      onClick={() => {
-                        openComposition(topic, visibleVisits);
-                        setAddDrawerTopicId(topic.id);
-                      }}
-                      data-testid={`focus-add-pages-${topic.id}`}
-                    >
-                      {iconSlot(CheckIcon)}
-                      Add pages
-                    </button>
-                  </div>
-                )}
+                {onFocusGroupSave === undefined ? null : (() => {
+                  const saveTarget = saveTargetByTopic[topic.id] ?? 'new';
+                  const targetWorkstream =
+                    saveTarget === 'new'
+                      ? null
+                      : (workstreamOptions.find((option) => option.id === saveTarget) ?? null);
+                  const saveVerb =
+                    targetWorkstream === null
+                      ? 'Promote to workstream'
+                      : `Add to ${targetWorkstream.label}`;
+                  return (
+                  <>
+                    <div className="cx-focus-compose-actions">
+                      <select
+                        className="cx-focus-target-select"
+                        value={saveTarget}
+                        onChange={(event) => {
+                          setSaveTargetByTopic((current) => ({
+                            ...current,
+                            [topic.id]: event.currentTarget.value,
+                          }));
+                        }}
+                        data-testid={`focus-save-target-${topic.id}`}
+                        aria-label="Promote target"
+                      >
+                        <option value="new">New workstream</option>
+                        {workstreamOptions.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="cx-focus-expand cx-focus-inline-action"
+                        disabled={savingTopicId === topic.id || selectedCanonicalUrls.length === 0}
+                        onClick={() => {
+                          if (!composing) openComposition(topic, visibleVisits);
+                          submitFocusGroupSave(topic, visibleVisits, 'create');
+                        }}
+                        data-testid={`focus-save-group-${topic.id}`}
+                      >
+                        {iconSlot(SaveIcon)}
+                        {savingTopicId === topic.id ? 'Saving' : saveVerb}
+                      </button>
+                      <button
+                        type="button"
+                        className="cx-focus-expand cx-focus-inline-action"
+                        onClick={() => {
+                          openComposition(topic, visibleVisits);
+                        }}
+                        data-testid={`focus-refine-${topic.id}`}
+                      >
+                        {iconSlot(EditIcon)}
+                        Refine
+                      </button>
+                      <button
+                        type="button"
+                        className="cx-focus-expand cx-focus-inline-action"
+                        onClick={() => {
+                          openComposition(topic, visibleVisits);
+                          setAddDrawerTopicId(topic.id);
+                        }}
+                        data-testid={`focus-add-pages-${topic.id}`}
+                      >
+                        {iconSlot(CheckIcon)}
+                        Add pages
+                      </button>
+                    </div>
+                    <div className="cx-mono cx-dim cx-focus-compose-helper">
+                      {targetWorkstream === null
+                        ? 'Turns the selected pages into a new workstream you can track.'
+                        : `Attaches the selected pages to “${targetWorkstream.label}.”`}
+                    </div>
+                  </>
+                  );
+                })()}
                 {renameError !== null && renameErrorTopicId === topic.id ? (
                   <div className="cx-mono cx-dim" role="alert" data-testid="focus-rename-error">
                     {renameError}
@@ -1351,9 +1380,14 @@ export const FocusView = ({
                         value={searchQueryByTopic[topic.id] ?? ''}
                         placeholder="Search pages by title or URL…"
                         onChange={(event) => {
+                          // Read before the updater runs — React nulls
+                          // currentTarget once the synthetic event's
+                          // dispatch finishes, and state updaters may
+                          // run after that.
+                          const { value } = event.currentTarget;
                           setSearchQueryByTopic((current) => ({
                             ...current,
-                            [topic.id]: event.currentTarget.value,
+                            [topic.id]: value,
                           }));
                         }}
                         data-testid={`focus-search-${topic.id}`}

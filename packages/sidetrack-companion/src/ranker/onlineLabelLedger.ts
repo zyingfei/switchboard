@@ -51,17 +51,11 @@ import {
   USER_ORGANIZED_ITEM,
   USER_SNIPPET_PROMOTED,
 } from '../feedback/events.js';
-import {
-  type AcceptedEvent,
-  type Dot,
-  maxVector,
-  type VersionVector,
-} from '../sync/causal.js';
+import { type AcceptedEvent, type Dot, maxVector, type VersionVector } from '../sync/causal.js';
 import { FEATURE_SCHEMA_VERSION } from './feature-schema.js';
 import { LOGISTIC_BATCH_FEATURE_STATS_VERSION } from './train.js';
 
-const ONLINE_RANKER_STATE_RELATIVE_PATH =
-  '_BAC/connections/closest-visit/online-ranker-state.json';
+const ONLINE_RANKER_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/online-ranker-state.json';
 const ONLINE_RANKER_STATE_SCHEMA_VERSION = 1 as const;
 
 export type LabelPolarity = 'positive' | 'negative';
@@ -106,6 +100,11 @@ export interface OnlineRankerState {
   readonly appliedLabelFrontier: VersionVector;
   readonly updateCount: number;
   readonly updatedAtMs: number;
+  // When a pairwise weight update last APPLIED. `updatedAtMs` refreshes on
+  // every frontier-advance write (each drain observes new events), so it
+  // cannot answer "when did feedback last move the weights" — this can.
+  // Optional: absent on states persisted before the field existed.
+  readonly lastNudgeAtMs?: number;
 }
 
 export const EMPTY_ONLINE_RANKER_STATE = (featureCount: number): OnlineRankerState => ({
@@ -124,11 +123,8 @@ export const EMPTY_ONLINE_RANKER_STATE = (featureCount: number): OnlineRankerSta
 // Deterministic dedup key. Field-separator NUL keeps "a\0b" from
 // colliding with "ab\0" — same convention the feedback projection
 // uses for `itemId` keying in user.flow.confirmed (`fromId\0toId`).
-export const labelKeyFor = (
-  fromId: string,
-  toId: string,
-  polarity: LabelPolarity,
-): string => `${fromId}\u0000${toId}\u0000${polarity}`;
+export const labelKeyFor = (fromId: string, toId: string, polarity: LabelPolarity): string =>
+  `${fromId}\u0000${toId}\u0000${polarity}`;
 
 const digestLabelKeys = (sortedKeys: readonly string[]): string =>
   createHash('sha256').update(sortedKeys.join('\n')).digest('hex');
@@ -141,11 +137,8 @@ interface RawLabel {
 }
 
 // Pure event → labels extractor. Mirrors `feedback/projection.ts`
-// label-emission logic without touching feedback's container
-// expansion — the online path stays pair-shaped end-to-end (the
-// Cartesian expansion is a training-time concern of the batch LR /
-// LightGBM path). The plan's Step 7 will retire that expansion in
-// favor of a feature predicate.
+// label-emission logic without ever expanding container membership;
+// the online path stays event-scoped end-to-end.
 const labelsFromEvent = (event: AcceptedEvent): readonly RawLabel[] => {
   const out: RawLabel[] = [];
   if (event.type === USER_FLOW_CONFIRMED && isUserFlowConfirmedPayload(event.payload)) {
@@ -182,11 +175,8 @@ const labelsFromEvent = (event: AcceptedEvent): readonly RawLabel[] => {
         });
       }
     }
-    // `ignore` / `split` actions produce expanded container negatives
-    // in the batch path. The online path keeps the explicit
-    // user-rejected-pair from `user.flow.rejected` only — container
-    // expansion is a snapshot-derived concern that doesn't belong in
-    // the per-label causal ledger.
+    // `ignore` / `split` container negatives stay event-scoped here;
+    // snapshot membership must not rewrite them into pairwise labels.
     return out;
   }
   if (event.type === USER_SNIPPET_PROMOTED && isUserSnippetPromotedPayload(event.payload)) {
@@ -398,6 +388,9 @@ export const readOnlineRankerState = async (
     if (!isFiniteNumber(parsed['updatedAtMs'])) return null;
     const baseRevisionId = parsed['baseRevisionId'];
     if (baseRevisionId !== null && typeof baseRevisionId !== 'string') return null;
+    // Optional (pre-existing states omit it); malformed ⇒ treat as absent
+    // rather than dropping the whole state.
+    const lastNudgeAtMs = parsed['lastNudgeAtMs'];
     return {
       schemaVersion: ONLINE_RANKER_STATE_SCHEMA_VERSION,
       baseRevisionId,
@@ -409,6 +402,7 @@ export const readOnlineRankerState = async (
       appliedLabelFrontier: parsed['appliedLabelFrontier'],
       updateCount: parsed['updateCount'],
       updatedAtMs: parsed['updatedAtMs'],
+      ...(isFiniteNumber(lastNudgeAtMs) ? { lastNudgeAtMs } : {}),
     };
   } catch {
     return null;

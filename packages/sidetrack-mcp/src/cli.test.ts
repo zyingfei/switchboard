@@ -60,4 +60,11 @@ describe('runCli', () => {
       '--transport must be either stdio or streamable-http.',
     );
   });
+
+  // F03 — streamable-http without an auth key must throw with bridge.key guidance
+  it('throws when streamable-http transport is requested without an auth key', async () => {
+    await expect(
+      runCli(['--transport', 'streamable-http', '--vault', '/tmp/fake-vault'], createStreams()),
+    ).rejects.toThrow('~/.sidetrack-vault/_BAC/.config/bridge.key');
+  });
 });

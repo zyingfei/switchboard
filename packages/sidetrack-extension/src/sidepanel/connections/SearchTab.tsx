@@ -30,6 +30,14 @@ interface SearchTabProps {
   // header when wired (parent owns the actual mode switch + hit
   // population). Hidden when omitted.
   readonly onDejaVuPivot?: (query: string) => void;
+  // The browser tab the user is on right now. When set, the header
+  // shows an "Anchor to current tab" shortcut that calls onPick with
+  // `timeline-visit:<url>` so the user doesn't have to search/type.
+  readonly currentTabUrl?: string;
+  // Canonical URL of whatever the graph is currently anchored on
+  // (when the anchor carries a URL). When set, the header offers an
+  // "Open current anchor" shortcut that calls onOpenUrl.
+  readonly currentAnchorUrl?: string;
 }
 
 interface SearchHit {
@@ -185,6 +193,8 @@ export const SearchTab = ({
   recallError = null,
   onOpenUrl,
   onDejaVuPivot,
+  currentTabUrl,
+  currentAnchorUrl,
 }: SearchTabProps): ReactElement => {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [hiddenKinds, setHiddenKinds] = useState<ReadonlySet<ConnectionNodeKind>>(
@@ -420,6 +430,36 @@ export const SearchTab = ({
     <section className="cx-search-tab" data-testid="connections-search-tab">
       <div className="cx-search-tab-opbar">
         <span className="cx-search-tab-label">Search</span>
+        {currentTabUrl !== undefined && currentTabUrl.length > 0 ? (
+          <button
+            type="button"
+            className="cx-search-dejavu-pivot"
+            data-testid="connections-search-anchor-current-tab"
+            onClick={() => {
+              // Skip searching — jump straight to the anchor. Matches
+              // SearchTab's onPick contract (id + display label).
+              onPick(`timeline-visit:${currentTabUrl}`, 'Current tab');
+            }}
+            title={`Anchor the graph on ${currentTabUrl}`}
+          >
+            ⇄ Anchor current tab
+          </button>
+        ) : null}
+        {onOpenUrl !== undefined &&
+        currentAnchorUrl !== undefined &&
+        currentAnchorUrl.length > 0 ? (
+          <button
+            type="button"
+            className="cx-search-dejavu-pivot"
+            data-testid="connections-search-open-current-anchor"
+            onClick={() => {
+              onOpenUrl(currentAnchorUrl);
+            }}
+            title={`Open the current anchor (${currentAnchorUrl}) in a browser tab`}
+          >
+            ↗ Open anchor
+          </button>
+        ) : null}
         {onDejaVuPivot !== undefined && trimmed.length > 0 ? (
           <button
             type="button"
@@ -449,7 +489,7 @@ export const SearchTab = ({
                 pickTop();
               }
             }}
-            placeholder="Search the graph by title…"
+            placeholder="Search titles, page text, chats…"
             aria-label="Search connections"
             data-testid="connections-search-tab-input"
           />
@@ -466,10 +506,10 @@ export const SearchTab = ({
             </button>
           ) : null}
         </label>
-        {loading || recallLoading ? (
+        {(loading || recallLoading) && trimmed.length > 0 ? (
           <span className="cx-search-tab-status cx-mono cx-dim">
             <span className="cx-search-tab-pulse" aria-hidden />
-            {loading ? 'Searching…' : 'Searching…'}
+            Searching…
           </span>
         ) : null}
         <span className="cx-grow" />

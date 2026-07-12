@@ -18,13 +18,18 @@ export interface IncrementalGraphDrainPlan {
   readonly eventTypes: readonly IncrementalGraphEventClass[];
 }
 
+// Event-type strings must match the runtime constants exactly. Earlier
+// drafts used the plural form (`threads.upserted`, `workstreams.upserted`)
+// which silently disabled row-local classification for thread/workstream
+// upserts — those events fell through to the `full-reducer` bucket, so
+// every drain that included one was forced into a full rebuild. The
+// actual constants are singular: `thread.upserted` and `workstream.upserted`.
 const ROW_LOCAL_EVENT_TYPES = new Set<string>([
   'browser.timeline.observed',
   'navigation.committed',
-  'threads.upserted',
-  'workstreams.upserted',
+  'thread.upserted',
+  'workstream.upserted',
   'tabsession.attribution.inferred',
-  'url.attribution.inferred',
   'urls.attribution.inferred',
   'urls.ignored',
   'user.organized.item',
@@ -34,12 +39,10 @@ const rowLocalReason = (eventType: string): string => {
   if (eventType === 'browser.timeline.observed' || eventType === 'navigation.committed') {
     return 'timeline/url/tab-session rows';
   }
-  if (eventType === 'threads.upserted') return 'thread node row';
-  if (eventType === 'workstreams.upserted') return 'workstream node row';
+  if (eventType === 'thread.upserted') return 'thread node row';
+  if (eventType === 'workstream.upserted') return 'workstream node row';
   if (eventType === 'tabsession.attribution.inferred') return 'tab-session attribution edge rows';
-  if (eventType === 'url.attribution.inferred' || eventType === 'urls.attribution.inferred') {
-    return 'url attribution edge rows';
-  }
+  if (eventType === 'urls.attribution.inferred') return 'url attribution edge rows';
   if (eventType === 'urls.ignored') return 'url ignored-state row';
   if (eventType === 'user.organized.item') return 'user assertion overlay rows';
   return 'row-local';

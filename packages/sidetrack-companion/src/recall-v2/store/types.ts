@@ -29,6 +29,17 @@ export interface StoreDocument {
   readonly bodyIndexed: 0 | 1;
 }
 
+export interface StoreDocumentChunk {
+  readonly chunkId: string;
+  readonly documentEntityId: string;
+  readonly chunkIndex: number;
+  readonly charStart: number;
+  readonly charEnd: number;
+  readonly text: string;
+  readonly evidenceTermsJson: string;
+  readonly quality: string;
+}
+
 /** A single FTS5 hit. Score is BM25 (negative is better in bun:sqlite's
  *  bm25() ranking column — we'll convert to higher-is-better). */
 export interface StoreFtsHit {
@@ -93,6 +104,24 @@ export interface RecallStore {
   /** Enumerate every entity_id currently in docs_vec. */
   allVectorEntityIds(): ReadonlySet<string>;
 
+  /** Replace the canonical chunk rows for one document. */
+  upsertDocumentChunks(documentEntityId: string, chunks: readonly StoreDocumentChunk[]): void;
+
+  /** Delete chunk rows and chunk vectors for a document. */
+  deleteDocumentChunks(documentEntityId: string): void;
+
+  /** Delete one chunk row and its vector. */
+  deleteDocumentChunk(chunkId: string): void;
+
+  /** Enumerate chunk ids currently persisted in documents_chunks. */
+  allDocumentChunkIds(): ReadonlySet<string>;
+
+  /** Delete one chunk vector. No-op when vec is unavailable. */
+  deleteChunkVector(chunkId: string): void;
+
+  /** Enumerate every chunk_id currently in documents_chunks_vec. */
+  allChunkVectorIds(): ReadonlySet<string>;
+
   /** Run `fn` inside a single SQLite transaction (BEGIN IMMEDIATE …
    *  COMMIT). Used by backfill to amortize per-row autocommit
    *  overhead — without this, 7000+ upserts in a chunk each fsync
@@ -109,6 +138,9 @@ export interface RecallStore {
   /** Upsert a vector for an existing entity. No-op if the entity row
    *  doesn't exist (vectors are derived; the parent doc rules). */
   upsertVector(entityId: string, vec: Float32Array): void;
+
+  /** Upsert a per-page-content chunk vector. */
+  upsertChunkVector(chunkId: string, vec: Float32Array): void;
 
   /** Vector KNN — top-K nearest by cosine distance (lower = closer).
    *  Joins back to the docs table so callers receive canonical_url +

@@ -7,9 +7,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { pollUntil } from '../../test-helpers/bunTestTimers.js';
 
 import {
-  createConnectionsStore,
   type ConnectionsSnapshot,
   type ConnectionsStore,
 } from '../../connections/snapshot.js';
@@ -58,9 +58,19 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       readonly store?: ConnectionsStore;
       readonly events?: readonly AcceptedEvent[];
       readonly topicRevisionStore?: TopicRevisionStore;
+      readonly onReadMerged?: () => void;
     } = {},
-  ): ReturnType<typeof createConnectionsMaterializer> =>
-    createConnectionsMaterializer({
+  ): ReturnType<typeof createConnectionsMaterializer> => {
+    const unusedStore: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async () => {},
+      readMaterializerProgress: async () => null,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    return createConnectionsMaterializer({
       vaultRoot,
       // The dirty-queue wiring lives in onAccepted before any I/O —
       // tests only need the materializer surface, not a working
@@ -70,17 +80,25 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
         appendClient: () => {
           throw new Error('unused');
         },
-        readMerged: () => Promise.resolve([...(input.events ?? [])]),
+        readMerged: () => {
+          input.onReadMerged?.();
+          return Promise.resolve([...(input.events ?? [])]);
+        },
+        readMergedSince: () => Promise.resolve([...(input.events ?? [])]),
+        // streamFiltered is used by the ranker trainer; return empty so
+        // the drain succeeds without actual training data in the test stub.
+        streamFiltered: () => Promise.resolve([]),
         append: () => {
           throw new Error('unused');
         },
       } as any,
       timelineStore: createTimelineStore(vaultRoot),
-      store: input.store ?? createConnectionsStore(vaultRoot),
+      store: input.store ?? unusedStore,
       ...(input.topicRevisionStore === undefined
         ? {}
         : { topicRevisionStore: input.topicRevisionStore }),
     });
+  };
 
   it('capture.recorded accumulates the sourceUnitId into the dirty set', () => {
     const mat = createMat();
@@ -218,6 +236,120 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     expect(snapshotWrites).toBe(0);
     expect(latestProgress.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
     expect(latestProgress.appliedFrontier).toEqual({ 'replica-A': 2 });
+  });
+
+  it('coalesces idle content-lane progress into one progress write', async () => {
+    const baseProgress: MaterializerProgress = {
+      ...EMPTY_PROGRESS('connections', MATERIALIZER_VERSION),
+      appliedDotIntervals: { 'replica-A': [[1, 1] as const] },
+      appliedFrontier: { 'replica-A': 1 },
+      snapshotRevisionId: 'rev-base',
+    };
+    let latestProgress: MaterializerProgress = baseProgress;
+    let progressWrites = 0;
+    const store: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async () => {},
+      writeMaterializerProgress: async (progress) => {
+        progressWrites += 1;
+        latestProgress = progress;
+      },
+      readMaterializerProgress: async () => latestProgress,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const mat = createMat({ store });
+
+    for (const seq of [2, 3, 4]) {
+      mat.onAccepted(
+        buildEvent({
+          seq,
+          type: PAGE_EVIDENCE_EXTRACTED,
+          payload: {
+            payloadVersion: 1,
+            canonicalUrl: `https://example.test/${String(seq)}`,
+            extractedAt: '2026-05-23T23:00:00.000Z',
+          },
+        }),
+        { origin: 'local' },
+      );
+    }
+
+    expect(mat.health().pending).toBe(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(progressWrites).toBe(1);
+    expect(latestProgress.appliedDotIntervals['replica-A']).toEqual([[1, 4]]);
+    expect(latestProgress.appliedFrontier).toEqual({ 'replica-A': 4 });
+  });
+
+  it('defers content-lane progress accepted during a graph drain without a backlog scan', async () => {
+    let mat: ReturnType<typeof createConnectionsMaterializer> | null = null;
+    let readMergedCalls = 0;
+    let latestProgress: MaterializerProgress | null = null;
+    const graphEvent = buildEvent({
+      seq: 1,
+      type: NAVIGATION_COMMITTED,
+      payload: {
+        payloadVersion: 1,
+        tabId: 1,
+        windowId: 1,
+        url: 'https://example.test/article',
+        committedAt: '2026-05-23T23:00:00.000Z',
+      },
+    });
+    const contentEvent = buildEvent({
+      seq: 2,
+      type: PAGE_EVIDENCE_EXTRACTED,
+      payload: {
+        payloadVersion: 1,
+        canonicalUrl: 'https://example.test/article',
+        extractedAt: '2026-05-23T23:00:01.000Z',
+      },
+    });
+    const store: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async (_snapshot, progress) => {
+        latestProgress = progress;
+        mat?.onAccepted(contentEvent, { origin: 'local' });
+      },
+      writeMaterializerProgress: async (progress) => {
+        latestProgress = progress;
+      },
+      readMaterializerProgress: async () => latestProgress,
+      readCurrent: async () => null,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    mat = createMat({
+      store,
+      events: [graphEvent],
+      onReadMerged: () => {
+        readMergedCalls += 1;
+      },
+    });
+
+    await mat.catchUp({} as any);
+    await mat.awaitIdle();
+
+    // The content-only progress write goes through a 25ms requeue timer
+    // (flushContentOnlyProgressEvents backs off when running=true and
+    // retries after 25ms). Under load the graph drain itself takes longer
+    // than 50ms, so a fixed wait is too tight. Poll until the deferred
+    // write lands; 2 s is generous for a 25ms nominal delay.
+    await pollUntil(
+      () => {
+        expect(latestProgress?.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
+      },
+      { timeoutMs: 2000, intervalMs: 10 },
+    );
+
+    expect(readMergedCalls).toBe(1);
+    expect(latestProgress?.appliedDotIntervals['replica-A']).toEqual([[1, 2]]);
+    expect(latestProgress?.appliedFrontier).toEqual({ 'replica-A': 2 });
+    expect(mat.health().pending).toBe(false);
   });
 
   it('catchUp advances a content-lane-only backlog without rebuilding graph rows', async () => {
@@ -447,6 +579,163 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       replacements[0]?.metadata?.urlProjection?.byCanonicalUrl['https://new.test/page']
         ?.currentAttribution,
     ).toMatchObject({ workstreamId: 'ws-1', source: 'inferred' });
+  });
+
+  it('re-visit / graph-inert window re-asserts owned rows instead of a full rebuild', async () => {
+    // P0 fix A regression guard. A drain whose window touches scopes that
+    // ALREADY own graph rows but carries no graph-row-affecting event
+    // (here: a lone URL_ATTRIBUTION_INFERRED — projection overlay, no
+    // NAVIGATION_COMMITTED / thread / new timeline entry) must NOT fall
+    // into the ~18s full base rebuild. It must re-assert the owned rows
+    // from the previous snapshot via a scoped replaceScopeRows + advance
+    // the frontier, while writing the projection overlay (the
+    // attribution). Toggling SIDETRACK_SCOPED_REVISIT_NOOP proves the
+    // fails-without / passes-with behaviour in one test.
+    const ownedUrl = 'https://owned.test/page';
+    const ownedNode = {
+      id: `timeline-visit:${ownedUrl}`,
+      kind: 'timeline-visit' as const,
+      label: 'Owned Page',
+      originReplicaIds: ['replica-A'],
+      metadata: { canonicalUrl: ownedUrl },
+    };
+    const makePreviousSnapshot = (): ConnectionsSnapshot => ({
+      scope: {},
+      nodes: [ownedNode],
+      edges: [],
+      updatedAt: '2026-05-23T00:00:00.000Z',
+      nodeCount: 1,
+      edgeCount: 0,
+      urlProjection: { schemaVersion: 1, byCanonicalUrl: {} },
+      tabSessionProjection: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} },
+      snapshotRevision: 'rev-base',
+    });
+    const baseProgress: MaterializerProgress = {
+      ...EMPTY_PROGRESS('connections', MATERIALIZER_VERSION),
+      appliedDotIntervals: { 'replica-A': [[1, 1] as const] },
+      appliedFrontier: { 'replica-A': 1 },
+      snapshotRevisionId: 'rev-base',
+    };
+    const alreadyApplied = buildEvent({
+      seq: 1,
+      type: CAPTURE_EXTRACTION_PRODUCED,
+      payload: {
+        sourceUnitId: 'src-1',
+        extractionRevisionId: 'rev-1',
+        extractorId: 'extractor',
+        extractorVersion: '1',
+        extractionSchemaVersion: 1,
+        content: {},
+      },
+    });
+    const attributionEvent = buildEvent({
+      seq: 2,
+      type: URL_ATTRIBUTION_INFERRED,
+      payload: {
+        payloadVersion: 1,
+        canonicalUrl: ownedUrl,
+        workstreamId: 'ws-1',
+        policyMode: 'balanced',
+        dominantSource: 'similarity',
+        rawFusionLogit: 1.2,
+        margin: 0.7,
+        corroborationCount: 1,
+        modelRevision: 'model-rev',
+        graphRevision: 'graph-rev',
+        evidenceHash: 'evidence-hash',
+        resolverDependencyKey: 'resolver-key',
+        reasonSummary: 'similar page',
+      },
+    });
+    const previousTopicRevision = {
+      revisionId: 'topic-rev-base',
+      visitSimilarityRevisionId: 'visit-sim-rev-base',
+      cosineThreshold: 0.85,
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+      topics: [],
+      lineage: [],
+      producedAt: 1_700_000_000_000,
+    };
+    const topicRevisionStore: TopicRevisionStore = {
+      putRevision: async () => {},
+      putActiveRevision: async () => {},
+      putShadowRevision: async () => {},
+      putCandidateShadowRevision: async () => {},
+      readShadowRevision: async () => null,
+      readCandidateShadowRevision: async () => null,
+      readRevision: async () => null,
+      readActiveRevision: async () => previousTopicRevision,
+      listRevisionIds: async () => [],
+    };
+
+    const runDrain = async (
+      noOpEnabled: boolean,
+    ): Promise<{
+      snapshotWrites: number;
+      replacements: { scopes: readonly { kind: string; id: string }[]; nodes: readonly unknown[] }[];
+    }> => {
+      let snapshotWrites = 0;
+      const replacements: {
+        scopes: readonly { kind: string; id: string }[];
+        nodes: readonly unknown[];
+        metadata?: ConnectionsSnapshot;
+      }[] = [];
+      const store: ConnectionsStore = {
+        putCurrent: async () => {
+          snapshotWrites += 1;
+        },
+        writeSnapshotAndProgress: async () => {
+          snapshotWrites += 1;
+        },
+        replaceScopeRows: async (input) => {
+          replacements.push({
+            scopes: input.scopes,
+            nodes: input.nodes,
+            metadata: input.metadata as ConnectionsSnapshot | undefined,
+          });
+        },
+        readMaterializerProgress: async () => baseProgress,
+        readCurrent: async () => makePreviousSnapshot(),
+        putDay: async () => {},
+        readDay: async () => null,
+        listDays: async () => [],
+      };
+      const prevSim = process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'];
+      const prevNoOp = process.env['SIDETRACK_SCOPED_REVISIT_NOOP'];
+      process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'] = '0';
+      process.env['SIDETRACK_SCOPED_REVISIT_NOOP'] = noOpEnabled ? '1' : '0';
+      try {
+        const mat = createMat({ store, events: [alreadyApplied, attributionEvent], topicRevisionStore });
+        await mat.catchUp({} as any);
+      } finally {
+        const restore = (key: string, value: string | undefined): void => {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        };
+        restore('SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY', prevSim);
+        restore('SIDETRACK_SCOPED_REVISIT_NOOP', prevNoOp);
+      }
+      return { snapshotWrites, replacements };
+    };
+
+    // Disabled: the owned-rows + graph-inert window falls into the full
+    // base rebuild (the bug) — a whole-snapshot write, no scoped replace.
+    const off = await runDrain(false);
+    expect(off.snapshotWrites).toBeGreaterThan(0);
+
+    // Enabled (the fix / default): no full rebuild; a scoped replace that
+    // re-asserts the owned url's existing node and carries the attribution
+    // projection overlay.
+    const on = await runDrain(true);
+    expect(on.snapshotWrites).toBe(0);
+    expect(on.replacements).toHaveLength(1);
+    expect(on.replacements[0]?.scopes).toEqual([{ kind: 'url', id: ownedUrl }]);
+    expect((on.replacements[0]?.nodes ?? []).map((n) => (n as { id: string }).id)).toContain(
+      `timeline-visit:${ownedUrl}`,
+    );
+    expect(
+      on.replacements[0]?.metadata?.urlProjection?.byCanonicalUrl[ownedUrl]?.currentAttribution,
+    ).toMatchObject({ workstreamId: 'ws-1' });
   });
 
   it('mixed timeline navigation and engagement batches use scoped delta', async () => {

@@ -12,6 +12,7 @@ import { createPprCache, runPPR, seedHash } from './causalPpr.js';
 import { buildClusterEvidence } from './clusterEvidence.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence } from './fusion.js';
+import { decideAttribution } from './policy.js';
 import { projectTabSessions } from './projection.js';
 import {
   inferredAttributionPayloadFromResolution,
@@ -27,6 +28,7 @@ const snapshot = (
     readonly kind: ConnectionsSnapshot['edges'][number]['kind'];
     readonly from: string;
     readonly to: string;
+    readonly metadata?: Record<string, unknown>;
   }[],
 ): ConnectionsSnapshot => ({
   scope: {},
@@ -53,6 +55,7 @@ const snapshot = (
     observedAt: '2026-05-10T10:00:00.000Z',
     producedBy: { source: 'event-log' },
     confidence: edge.kind === 'tab_session_in_workstream' ? 'asserted' : 'observed',
+    ...(edge.metadata === undefined ? {} : { metadata: edge.metadata }),
   })),
   updatedAt: '2026-05-10T10:00:00.000Z',
   nodeCount: nodeIds.length,
@@ -395,6 +398,107 @@ describe('tab-session resolver', () => {
 
     expect(evidence.map((item) => item.workstreamId)).toContain('ws_new');
     expect(evidence.map((item) => item.workstreamId)).not.toContain('ws_old');
+  });
+
+  it('ignores a chrome-only similarity edge between two aggregator pages', () => {
+    // Two Hacker News items resemble each other only on behavior + title/host/
+    // path chrome (no content channel). The resolver must not attribute the
+    // current item to the other one's workstream. (~7000 such edges on a real
+    // vault, scored 0.8–0.99.)
+    const currentUrl = 'https://news.ycombinator.com/item?id=1';
+    const anchorUrl = 'https://news.ycombinator.com/item?id=2';
+    const snap = snapshot(
+      [`timeline-visit:${currentUrl}`, `timeline-visit:${anchorUrl}`, 'workstream:ws_unrelated'],
+      [
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_unrelated',
+        },
+        {
+          kind: 'visit_resembles_visit',
+          from: `timeline-visit:${currentUrl}`,
+          to: `timeline-visit:${anchorUrl}`,
+          metadata: { score: 0.95, channels: { behavior: 0.95, metadata: 0.9 } },
+        },
+      ],
+    );
+
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set([`timeline-visit:${currentUrl}`]),
+      events: [observed(1, 'tses_current', currentUrl), observed(2, 'tses_anchor', anchorUrl)],
+    });
+
+    expect(evidence.map((item) => item.workstreamId)).not.toContain('ws_unrelated');
+  });
+
+  it('keeps a content-backed similarity edge between two aggregator pages', () => {
+    // Same two aggregator pages, but the resemblance is backed by a real
+    // content vector — genuine topical similarity, must be preserved.
+    const currentUrl = 'https://news.ycombinator.com/item?id=1';
+    const anchorUrl = 'https://news.ycombinator.com/item?id=2';
+    const snap = snapshot(
+      [`timeline-visit:${currentUrl}`, `timeline-visit:${anchorUrl}`, 'workstream:ws_topic'],
+      [
+        {
+          kind: 'visit_in_workstream',
+          from: `timeline-visit:${anchorUrl}`,
+          to: 'workstream:ws_topic',
+        },
+        {
+          kind: 'visit_resembles_visit',
+          from: `timeline-visit:${currentUrl}`,
+          to: `timeline-visit:${anchorUrl}`,
+          metadata: { score: 0.8, channels: { contentVector: 0.8, metadata: 0.5 } },
+        },
+      ],
+    );
+
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set([`timeline-visit:${currentUrl}`]),
+      events: [observed(1, 'tses_current', currentUrl), observed(2, 'tses_anchor', anchorUrl)],
+    });
+
+    expect(evidence.map((item) => item.workstreamId)).toContain('ws_topic');
+  });
+
+  it('does not suggest a lone low-agreement similarity pick with no corroboration', () => {
+    // The exact shape of the misattribution: one similarity edge, no graph
+    // path, no cluster. Pre-discount this fused to logit ~1.5 → suggest ~82%.
+    const [candidate] = fuseCandidates([
+      {
+        workstreamId: 'ws_x',
+        pprScore: 0.0006,
+        simTopScore: 0.65,
+        simMeanScore: 0.65,
+        simAgreement: 0.2,
+        simMargin: 0.65,
+        clusterPosterior: 0,
+        corroborationCount: 1,
+      },
+    ]);
+    expect(candidate?.dominantSource).toBe('similarity');
+    expect(candidate!.rawFusionLogit).toBeGreaterThanOrEqual(1.2); // would otherwise 'suggest'
+    expect(decideAttribution([candidate!], 'balanced').action).toBe('inbox');
+  });
+
+  it('still suggests a similarity pick once a second source corroborates it', () => {
+    const fused = fuseCandidates([
+      {
+        workstreamId: 'ws_x',
+        pprScore: 0.05, // > 0.01 → contributes a corroboration
+        simTopScore: 0.65,
+        simMeanScore: 0.65,
+        simAgreement: 0.2,
+        simMargin: 0.65,
+        clusterPosterior: 0,
+        corroborationCount: 2,
+      },
+    ]);
+    expect(fused[0]?.dominantSource).toBe('similarity');
+    expect(decideAttribution(fused, 'balanced').action).toBe('suggest');
   });
 
   it('resolves a strong causal session with explainable candidates and no writes', () => {

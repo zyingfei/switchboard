@@ -1,32 +1,26 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { installStubEmbedder, type StubEmbedderHandle } from '../test-helpers/stubEmbedder.js';
 import { ingestIncremental, readIngestState, readRecallManifest } from './ingestor.js';
 import { readIndex } from './indexFile.js';
 
-vi.mock('./embedder.js', async () => {
-  const real = await vi.importActual<typeof import('./embedder.js')>('./embedder.js');
-  return {
-    ...real,
-    embed: async (texts: readonly string[]) =>
-      texts.map(() => {
-        const v = new Float32Array(384);
-        v[0] = 1;
-        return v;
-      }),
-  };
-});
-
+// The embedder is stubbed through the production `setEmbedderOverride`
+// seam (see installStubEmbedder) rather than a module mock — `bun test`
+// has no `vi.importActual` and `vi.mock` leaks process-globally here.
 describe('ingestor', () => {
   let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
 
   beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ingestor-'));
   });
 
   afterEach(async () => {
+    stubEmbedder.restore();
     await rm(vaultRoot, { recursive: true, force: true });
   });
 

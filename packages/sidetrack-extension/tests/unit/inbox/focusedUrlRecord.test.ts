@@ -91,4 +91,88 @@ describe('resolveFocusedUrlRecord', () => {
     expect(synthesize).toHaveBeenCalledOnce();
     expect(got).toBe(synth);
   });
+
+  // Bug: a URL filed into a workstream before it was ever visited has a
+  // projection record with an attribution but no latestUrl/latestTitle,
+  // so the current-tab card rendered the literal "(untracked tab)".
+  const filedNoVisit = (canonicalUrl: string): UrlVisitRecord =>
+    rec({
+      canonicalUrl,
+      currentAttribution: {
+        workstreamId: 'ws_db',
+        source: 'user_asserted',
+        observedAt: 't',
+        clientEventId: 'e1',
+      },
+    });
+
+  it('overlays the live-tab title onto an attribution-only record for the live focused tab', () => {
+    const url = 'https://github.com/microsoft/pg_durable';
+    const live = rec({
+      canonicalUrl: url,
+      latestUrl: url,
+      latestTitle: 'microsoft/pg_durable',
+      provider: 'github',
+    });
+    const got = resolveFocusedUrlRecord({
+      focusedTabUrl: url,
+      projection: projection([filedNoVisit(url)]),
+      comparable,
+      synthesize: () => live,
+      isLiveFocus: true,
+    });
+    expect(got?.latestTitle).toBe('microsoft/pg_durable');
+    expect(got?.latestUrl).toBe(url);
+    expect(got?.provider).toBe('github');
+    // The attribution must survive the overlay (regressing this would
+    // re-introduce the "already-filed page keeps re-asking" bug).
+    expect(got?.currentAttribution?.workstreamId).toBe('ws_db');
+  });
+
+  it('does NOT overlay when the record already carries a captured title', () => {
+    const visited = rec({
+      canonicalUrl: 'https://example.test/a',
+      latestUrl: 'https://example.test/a',
+      latestTitle: 'Real captured title',
+    });
+    const got = resolveFocusedUrlRecord({
+      focusedTabUrl: 'https://example.test/a',
+      projection: projection([visited]),
+      comparable,
+      synthesize: () => synth,
+      isLiveFocus: true,
+    });
+    expect(got).toBe(visited);
+  });
+
+  it('does NOT overlay a pinned / non-live card (isLiveFocus falsy)', () => {
+    const url = 'https://github.com/microsoft/pg_durable';
+    const record = filedNoVisit(url);
+    const got = resolveFocusedUrlRecord({
+      focusedTabUrl: url,
+      projection: projection([record]),
+      comparable,
+      synthesize: () => synth,
+      isLiveFocus: false,
+    });
+    expect(got).toBe(record);
+  });
+
+  it('overlays through the comparable-match path as well', () => {
+    const record = filedNoVisit('https://news.ycombinator.com/item?id=9');
+    const live = rec({
+      canonicalUrl: 'live',
+      latestUrl: 'https://news.ycombinator.com/item?id=9',
+      latestTitle: 'HN: a post',
+    });
+    const got = resolveFocusedUrlRecord({
+      focusedTabUrl: 'https://news.ycombinator.com/item',
+      projection: projection([record]),
+      comparable,
+      synthesize: () => live,
+      isLiveFocus: true,
+    });
+    expect(got?.latestTitle).toBe('HN: a post');
+    expect(got?.currentAttribution?.workstreamId).toBe('ws_db');
+  });
 });

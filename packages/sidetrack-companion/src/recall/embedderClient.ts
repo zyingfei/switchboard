@@ -19,6 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
 
+import { withBunSmolExecArgv } from '../process/bunMemory.js';
+
 export type EmbedderState = 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
 
 export interface EmbedderClient {
@@ -92,6 +94,7 @@ export const createEmbedderClient = (options: EmbedderClientOptions = {}): Embed
       // SIDETRACK_OFFLINE_MODELS / SIDETRACK_TEST_EMBEDDER all flow
       // through unchanged.
       env: process.env,
+      execArgv: withBunSmolExecArgv(process.execArgv),
       // pipe stdout/stderr to the parent so [recall.child] logs land
       // in the same place as the rest of the companion's output.
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],

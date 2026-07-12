@@ -25,6 +25,7 @@ export interface ClosestVisitRankerRevisionManifest {
   readonly featureSchemaVersion: RankerRevision['featureSchemaVersion'];
   readonly trainingDatasetHash: string;
   readonly trainedAt: number;
+  readonly trainedFromImpressions: boolean;
   readonly modelByteLength: number;
   readonly modelSha256: string;
   /**
@@ -120,6 +121,7 @@ const manifestForRevision = (revision: RankerRevision): ClosestVisitRankerRevisi
     featureSchemaVersion: revision.featureSchemaVersion,
     trainingDatasetHash: revision.trainingDatasetHash,
     trainedAt: revision.trainedAt,
+    trainedFromImpressions: revision.trainedFromImpressions,
     modelByteLength: modelBytes.byteLength,
     modelSha256: sha256Hex(modelBytes),
     ...(revision.trainQuality === undefined ? {} : { trainQuality: revision.trainQuality }),
@@ -751,6 +753,8 @@ const finalizeManifest = (
     featureSchemaVersion: value.featureSchemaVersion,
     trainingDatasetHash: value.trainingDatasetHash,
     trainedAt: value.trainedAt,
+    trainedFromImpressions:
+      (value as { readonly trainedFromImpressions?: unknown }).trainedFromImpressions === true,
     modelByteLength: value.modelByteLength,
     modelSha256: value.modelSha256,
     ...(trainQuality === undefined ? {} : { trainQuality }),
@@ -879,6 +883,7 @@ export const readClosestVisitRankerRevision = async (
       featureSchemaVersion: manifest.featureSchemaVersion,
       trainingDatasetHash: manifest.trainingDatasetHash,
       trainedAt: manifest.trainedAt,
+      trainedFromImpressions: manifest.trainedFromImpressions,
       modelBytes: toOwnedArrayBuffer(bytes),
       ...(manifest.trainQuality === undefined ? {} : { trainQuality: manifest.trainQuality }),
       // Codex review of PR #229: the persisted manifest carries

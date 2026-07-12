@@ -1,7 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { FocusView } from './FocusView';
+import {
+  lookupByEntityId,
+  resetImpressionRegistryForTests,
+} from '../recall/impressionRegistry';
 
 describe('FocusView', () => {
   it('groups visits by topic cards', () => {
@@ -570,5 +574,70 @@ describe('FocusView', () => {
 
     expect(screen.queryByText('Kept')).toBeNull();
     expect(screen.getAllByText('Keep')).toHaveLength(2);
+  });
+
+  // P2 — the add-drawer search results are recall-served; the response
+  // parse must seed the impression registry so a later group-save /
+  // promote of one of those candidates can emit an impression-joined
+  // trainable recall.action.
+  it('feeds the impression registry from add-drawer search responses', () => {
+    vi.useFakeTimers();
+    resetImpressionRegistryForTests();
+    const send = vi.fn((_message: unknown, cb?: (response: unknown) => void) => {
+      cb?.({
+        ok: true,
+        results: [
+          {
+            candidateId: 'cand:drawer',
+            entityId: 'timeline-visit:https://drawer.example/hit',
+            sourceKind: 'timeline_visit',
+            canonicalUrl: 'https://drawer.example/hit',
+            title: 'Drawer hit',
+            fusedScore: 0.8,
+          },
+        ],
+        meta: { servedContextId: 'ctx-drawer-1' },
+      });
+    });
+    globalThis.chrome = {
+      runtime: { sendMessage: send, lastError: undefined },
+    } as unknown as typeof chrome;
+    try {
+      render(
+        <FocusView
+          topics={[{ id: 'topic:a', label: 'Alpha', memberCount: 1, cohesion: 0.91 }]}
+          visitsByTopic={{
+            'topic:a': [
+              { id: 'timeline-visit:https://example.test/a', label: 'A', focusedWindowMs: 10_000 },
+            ],
+          }}
+          engagementClassesByVisit={{}}
+          onFocusGroupSave={() => Promise.resolve()}
+          onTopicClick={() => undefined}
+          onVisitClick={() => undefined}
+        />,
+      );
+      fireEvent.click(screen.getByText('Alpha'));
+      fireEvent.click(screen.getByTestId('focus-add-pages-topic:a'));
+      fireEvent.click(screen.getByText('Search'));
+      fireEvent.change(screen.getByTestId('focus-search-topic:a'), {
+        target: { value: 'drawer hit' },
+      });
+      act(() => {
+        vi.advanceTimersByTime(400); // > SEARCH_DEBOUNCE_MS
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(lookupByEntityId('timeline-visit:https://drawer.example/hit')).toEqual({
+        servedContextId: 'ctx-drawer-1',
+        servedEntityId: 'timeline-visit:https://drawer.example/hit',
+      });
+      // The rendered candidate row is still there (parse unchanged).
+      expect(screen.getByText('Drawer hit')).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      resetImpressionRegistryForTests();
+      // @ts-expect-error — restore default
+      delete globalThis.chrome;
+    }
   });
 });

@@ -49,6 +49,13 @@ export interface InboxViewProps {
    * InboxCard → PageEvidenceBadge so captured chats don't render as
    * "Metadata only" just because page-text auto-extract is off. */
   readonly isChatThreadCaptured?: (record: TabSessionRecord) => boolean;
+  /** True when "Deeper page access" is granted. When false, new visits
+   * earn no engagement → no similarity edges → every Inbox row resolves
+   * to "No attribution". Surfacing it at the top of the Inbox (with a
+   * one-click grant) turns that silent dead-end into a fix — the same
+   * pattern the Current-Tab card's empty placeholder already uses. */
+  readonly pageAccessGranted?: boolean;
+  readonly onGrantAccess?: () => void;
 }
 
 // Stage 5 polish — Inbox-only search filter. Pure client-side, runs on
@@ -84,6 +91,8 @@ export function InboxView({
   onQueryConsumed,
   onSearchGlobally,
   isChatThreadCaptured,
+  pageAccessGranted,
+  onGrantAccess,
 }: InboxViewProps) {
   const [query, setQuery] = useState('');
   // Cross-surface request — accept a pre-filled query exactly once,
@@ -105,6 +114,18 @@ export function InboxView({
     [inbox.items, trimmed],
   );
   const slice = sliceInboxForPanel(filtered, inbox.total);
+  // When page access IS granted but (nearly) every visible card still resolves
+  // to no candidate, the user faces a silent wall of "—" rows with no guidance.
+  // Surface an explainer pointing at the fix (move a few into a workstream),
+  // distinct from the page-access-off banner above (mutually exclusive gate).
+  const visibleNoSignalCount = slice.visible.filter(
+    (record) => (suggestions[record.tabSessionId]?.fusedCandidates.length ?? 0) === 0,
+  ).length;
+  const showNoSignalExplainer =
+    pageAccessGranted !== false &&
+    trimmed.length === 0 &&
+    slice.visible.length >= 5 &&
+    visibleNoSignalCount >= Math.ceil(slice.visible.length * 0.8);
   return (
     <section className="tab-session-inbox" data-testid="tab-session-inbox">
       <div className="sec-head">
@@ -112,7 +133,7 @@ export function InboxView({
         <span className="sec-head-actions">
           <span className="count mono">
             {trimmed.length === 0
-              ? String(inbox.total)
+              ? `${String(slice.visible.length)} / ${String(inbox.total)}`
               : `${String(filtered.length)} / ${String(inbox.total)}`}
           </span>
           <button type="button" className="btn-link sec-head-btn" onClick={onRefresh}>
@@ -144,6 +165,47 @@ export function InboxView({
           </button>
         ) : null}
       </div>
+      {pageAccessGranted === false && inbox.total > 0 ? (
+        <div
+          className="banner warning deeper-access-banner"
+          role="status"
+          aria-live="polite"
+          data-testid="inbox-page-access-banner"
+        >
+          <div className="deeper-access-banner-body">
+            <strong>No attributions yet — page access is off.</strong> Inbox
+            items stay unattributed until Deeper page access is granted: new
+            visits need it to earn engagement (focus, scroll), the signal that
+            links them to related visits and workstreams.
+          </div>
+          {onGrantAccess !== undefined ? (
+            <div className="deeper-access-banner-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={onGrantAccess}
+                data-testid="inbox-grant-access"
+              >
+                Grant access
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {showNoSignalExplainer ? (
+        <div
+          className="banner deeper-access-banner"
+          role="status"
+          aria-live="polite"
+          data-testid="inbox-no-signal-banner"
+        >
+          <div className="deeper-access-banner-body">
+            <strong>Nothing to suggest yet.</strong> These pages aren’t linked to
+            a workstream — move a few in (drag a card onto a workstream, or use
+            “Pick another…”) and Sidetrack starts recognizing similar pages.
+          </div>
+        </div>
+      ) : null}
       {error !== null ? <div className="banner danger">{error}</div> : null}
       {loading ? <div className="thread-empty subtle">Loading tab sessions…</div> : null}
       {!loading && slice.visible.length === 0 ? (

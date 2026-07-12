@@ -43,6 +43,8 @@ export interface SerializedTabSessionProjection {
   readonly openSessionsByTabId: Record<string, string>;
 }
 
+export type SerializedTabSessionProjectionAccumulator = SerializedTabSessionProjection;
+
 const compareString = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
@@ -344,6 +346,15 @@ export const tabSessionProjectionAccumulatorFromSerialized = (
     ),
   ),
 });
+
+export const serializeTabSessionProjectionAccumulator = (
+  accumulator: TabSessionProjectionAccumulator,
+): SerializedTabSessionProjectionAccumulator =>
+  serializeTabSessionProjection(tabSessionProjectionFromAccumulator(accumulator));
+
+export const deserializeTabSessionProjectionAccumulator = (
+  serialized: SerializedTabSessionProjectionAccumulator,
+): TabSessionProjectionAccumulator => tabSessionProjectionAccumulatorFromSerialized(serialized);
 
 export const projectTabSessions = (events: readonly AcceptedEvent[]): TabSessionProjection => {
   if (events.length === 0) return emptyProjection();

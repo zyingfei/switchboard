@@ -632,6 +632,70 @@ describe('HealthPanel pipeline strip', () => {
     expect(aug.textContent).toMatch(/3322 \/ 3322/);
   });
 
+  it('surfaces next-retrain progress + online-head status in the Ranker drill', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(
+      mkHealth({
+        workGraph: {
+          ranker: {
+            activeRevisionId: 'rev_online',
+            loadStatus: 'ready' as const,
+            trainedAt: Date.now() - 26 * 24 * 60 * 60_000,
+            retrainSkipReason: 'insufficient_groups',
+            retrainNewLabelCount: 3,
+            // Neither gate met → blocked; meters show progress toward each.
+            nextRetrain: {
+              eligible: false,
+              positiveGroups: { current: 16, required: 50 },
+              newLabels: { current: 3, required: 5 },
+              cooldownMs: 600_000,
+            },
+            // Online head live: enabled + present + base matches active.
+            onlineHead: {
+              enabled: true,
+              present: true,
+              inUse: true,
+              baseRevisionId: 'rev_online',
+              updateCount: 5,
+              activeWeightCount: 4,
+              updatedAtMs: Date.now() - 30_000,
+              lastNudgeAtMs: Date.now() - 30_000,
+            },
+          },
+          topicProducer: {
+            activeRevisionId: 'topic-rev',
+            algorithmVersion: 'topic-revision:v3:leiden-cpm',
+            topicCount: 87,
+            lineageCount: 90,
+          },
+        },
+      }),
+    );
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-ranker')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-ranker'));
+
+    await waitFor(() => {
+      // Next-retrain card — blocked, with both gate meters + binding reason.
+      const next = screen.getByTestId('hp-ranker-next-retrain');
+      expect(next.textContent).toMatch(/Retrain blocked/);
+      expect(next.textContent).toMatch(/16 \/ 50/); // impression-groups meter
+      expect(next.textContent).toMatch(/3 \/ 5/); // new-labels meter
+      expect(next.textContent).toMatch(/insufficient_groups/);
+    });
+
+    // Online-head card — live, blending, nudge count, base revision.
+    const online = screen.getByTestId('hp-ranker-online-head');
+    expect(online.textContent).toMatch(/Live/);
+    expect(online.textContent).toMatch(/blending into serving/);
+    expect(online.textContent).toMatch(/5/);
+    expect(online.textContent).toMatch(/rev_online/);
+  });
+
   it('does not crash when shipGate.reason or augmentation.reason are null (live server emits null, not undefined)', async () => {
     // Live CfT crash report: Cannot read properties of null (reading
     // 'length'). The earlier `!== undefined && X.length > 0` guards

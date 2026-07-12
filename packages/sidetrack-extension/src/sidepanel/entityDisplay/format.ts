@@ -55,6 +55,7 @@ const ID_LIKE_PATTERNS: readonly RegExp[] = [
   /^bac_[A-Za-z0-9]/i,
   /^visit-instance:/i,
   /^timeline-visit:/i,
+  /^page:/i,
   /^tab-session:/i,
   /^workstream:/i,
   /^thread:/i,
@@ -130,6 +131,7 @@ const KIND_FROM_PREFIX: ReadonlyMap<string, ConnectionNodeKind> = new Map([
   ['tab-session', 'tab-session'],
   ['visit-instance', 'visit-instance'],
   ['timeline-visit', 'timeline-visit'],
+  ['page', 'page'],
   ['workstream', 'workstream'],
   ['thread', 'thread'],
   ['dispatch', 'dispatch'],
@@ -239,6 +241,7 @@ export const formatEntityDisplay = (node: ConnectionNode, ctx: EntityDisplayCtx)
       // Tooltip is canonical URL only — never the raw `visit-instance:tses_*:date:url` id.
       return { primary, secondary, kindBadge, tooltip: safeTooltip(canonicalUrl) };
     }
+    case 'page':
     case 'timeline-visit': {
       // The canonical aggregate. Secondary calls out the visitCount
       // so it's clear this row represents N visits (not just one).
@@ -423,8 +426,9 @@ export const formatNodeIdDisplay = (
   if (kind === 'tab-session') {
     return { primary: 'Tab session', kindBadge, tooltip: undefined };
   }
-  if (kind === 'timeline-visit') {
-    const url = trimPrefix(nodeId, 'timeline-visit:');
+  if (kind === 'timeline-visit' || kind === 'page') {
+    const url =
+      kind === 'page' ? trimPrefix(nodeId, 'page:') : trimPrefix(nodeId, 'timeline-visit:');
     const host = hostOf(url);
     return { primary: host ?? '(visit)', kindBadge, tooltip: safeTooltip(url) };
   }

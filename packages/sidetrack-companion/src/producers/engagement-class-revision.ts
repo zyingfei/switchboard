@@ -301,6 +301,79 @@ export const buildEngagementClassifierInputs = (
 ): readonly EngagementClassifierInput[] =>
   engagementClassifierInputsFromAccumulator(seedEngagementAccumulator(events, timelineDays));
 
+/**
+ * Compact, persistence-friendly projection of a single
+ * `engagement.session.aggregated` event — what a derived fact store
+ * (e.g. the SQLite `EngagementFactsStore`) persists per (replicaId, seq)
+ * instead of retaining the full `AcceptedEvent`.
+ */
+export interface EngagementSessionFactRow {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly visitId: string;
+  readonly sessionId: string;
+  readonly acceptedAtMs: number;
+  readonly engagement: EngagementDimensions;
+}
+
+/** Compact projection of a `navigation.committed` event, in event order. */
+export interface NavigationVisitFactRow {
+  readonly visitId: string;
+  readonly canonicalUrl: string;
+}
+
+/**
+ * Byte-equivalent twin of `buildEngagementClassifierInputs`, sourced
+ * from a persisted fact store instead of a full `AcceptedEvent[]` walk.
+ *
+ * This performs the SAME accumulator operations, in the SAME order, as
+ * `seedEngagementAccumulator` (navigation canonical-URL folds, then
+ * timeline-day folds, then engagement session aggregates, then snippet
+ * paste lineage), then runs the identical
+ * `engagementClassifierInputsFromAccumulator` derive. Callers persist
+ * the four relevant event types as compact rows; non-engagement events
+ * `seedEngagementAccumulator` would have ignored are simply never
+ * projected. `navigationFacts` MUST be supplied in event order so the
+ * last-write-wins canonical-URL resolution matches a merged-log walk.
+ */
+export const engagementInputsFromFacts = (params: {
+  readonly engagementFacts: readonly EngagementSessionFactRow[];
+  readonly navigationFacts: readonly NavigationVisitFactRow[];
+  readonly selectionEvents: readonly AcceptedEvent[];
+  readonly timelineDays: readonly TimelineDayProjection[];
+}): readonly EngagementClassifierInput[] => {
+  const acc = createEmptyEngagementAccumulator();
+  for (const nav of params.navigationFacts) {
+    recordCanonical(acc.canonicalUrlByVisitId, nav.visitId, nav.canonicalUrl);
+  }
+  for (const day of params.timelineDays) {
+    recordTimelineDay(acc.canonicalUrlByVisitId, day);
+  }
+  for (const fact of params.engagementFacts) {
+    const next: LatestSessionAggregate = {
+      visitId: fact.visitId,
+      sessionId: fact.sessionId,
+      engagement: fact.engagement,
+      acceptedAtMs: fact.acceptedAtMs,
+      replicaId: fact.replicaId,
+      seq: fact.seq,
+    };
+    const key = [fact.visitId, fact.sessionId, fact.replicaId, String(fact.seq)].join(' ');
+    const existing = acc.latestByVisitSession.get(key);
+    if (existing === undefined || compareEventOrder(existing, next) < 0) {
+      acc.latestByVisitSession.set(key, next);
+    }
+  }
+  for (const lineage of projectSnippetLineage(params.selectionEvents).lineages) {
+    const canonical = canonicalUrlForVisitId(lineage.copiedVisitId, acc.canonicalUrlByVisitId);
+    addLineageSummary(acc.lineageSummaries, lineage.copiedVisitId, lineage.destinationKind);
+    for (const alias of canonicalVisitAliases(canonical)) {
+      addLineageSummary(acc.lineageSummaries, alias, lineage.destinationKind);
+    }
+  }
+  return engagementClassifierInputsFromAccumulator(acc);
+};
+
 export const buildEngagementClassRevisionFromEvents = (
   events: readonly AcceptedEvent[],
   timelineDays: readonly TimelineDayProjection[],

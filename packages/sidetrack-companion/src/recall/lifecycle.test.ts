@@ -98,8 +98,11 @@ describe('recall lifecycle', () => {
         log: () => undefined,
         warn: () => undefined,
       });
-      const before = await lifecycle.ensureFresh();
+      // report() (the full status path) still sees 'missing'; ensureFresh
+      // (now a cheap header probe returning void) schedules the rebuild.
+      const before = await lifecycle.report();
       expect(before.status).toBe('missing');
+      await lifecycle.ensureFresh();
       expect(lifecycle.isRebuilding()).toBe(true);
       await lifecycle.waitForRebuild();
       const after = await lifecycle.report();

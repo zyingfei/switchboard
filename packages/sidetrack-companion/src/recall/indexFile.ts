@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
@@ -156,6 +156,56 @@ export const readIndex = async (path: string): Promise<IndexFile | null> => {
     };
   } catch {
     return null;
+  }
+};
+
+/**
+ * Cheap freshness probe: reads ONLY the index header (the u32-length-
+ * prefixed JSON blob at the file start), not the multi-MB body. Returns
+ * the same `null` in the same cases `readIndex` does (missing, corrupt,
+ * wrong magic/version/dim) so a caller's rebuild trigger is identical —
+ * but without the full-file read + per-item parse. Used by the boot
+ * freshness check (`lifecycle.ensureFresh`) so startup no longer parses
+ * the whole index just to read `modelId` + `count`.
+ */
+export const readIndexHeader = async (
+  path: string,
+): Promise<{ readonly modelId: string; readonly count: number } | null> => {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    // The header is a few hundred bytes; 64 KiB covers it with margin and
+    // never touches the embedding body.
+    const head = Buffer.allocUnsafe(64 * 1024);
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    if (bytesRead < 4) return null;
+    const headerLength = head.readUInt32LE(0);
+    if (4 + headerLength > bytesRead) return null; // header larger than probe ⇒ treat as corrupt → rebuild
+    const header = JSON.parse(head.subarray(4, 4 + headerLength).toString('utf8')) as {
+      readonly magic?: unknown;
+      readonly version?: unknown;
+      readonly dim?: unknown;
+      readonly count?: unknown;
+      readonly modelId?: unknown;
+    };
+    if (
+      header.magic !== MAGIC ||
+      header.version !== VERSION ||
+      header.dim !== DIM ||
+      typeof header.count !== 'number' ||
+      typeof header.modelId !== 'string'
+    ) {
+      return null;
+    }
+    return { modelId: header.modelId, count: header.count };
+  } catch {
+    return null;
+  } finally {
+    await handle.close();
   }
 };
 
