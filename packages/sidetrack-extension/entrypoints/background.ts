@@ -1315,10 +1315,13 @@ const openTabPreviewForPageContent = (
   if (!/^https?:\/\//u.test(url)) {
     return { ...base, eligible: false, reason: 'Not an HTTP(S) page' };
   }
-  if (
-    noCaptureRules.length > 0 &&
-    matchesNoCaptureRules({ url, ...(title.length > 0 ? { title } : {}) }, noCaptureRules)
-  ) {
+  // Match on URL ONLY, exactly like the authoritative gate
+  // (`isCaptureAllowedForUrl` above passes `{ url }` with no title). If
+  // the preview passed the title too, a 'similar' rule whose category
+  // token appears only in the TITLE would mark the tab ineligible here
+  // while the background gate would ALLOW extraction — the reverse of
+  // the mismatch this preview was added to close.
+  if (noCaptureRules.length > 0 && matchesNoCaptureRules({ url }, noCaptureRules)) {
     return { ...base, eligible: false, reason: 'No-capture list' };
   }
   return { ...base, eligible: true };

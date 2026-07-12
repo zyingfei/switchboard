@@ -124,6 +124,21 @@ describe('matchesNoCaptureRules', () => {
     expect(matchesNoCaptureRules({ url: 'https://myaccount.other.com/home' }, rules)).toBe(false);
   });
 
+  it('title-only token hit diverges from URL-only matching (gate-alignment guard)', () => {
+    // The authoritative capture gate (background.ts isCaptureAllowedForUrl)
+    // matches on URL ONLY — no title. A 'similar' rule whose token appears
+    // only in the TITLE (not the path/query/hash) therefore MUST NOT match
+    // URL-only, or the panel badge / open-tabs preview would say "blocked"
+    // while the background actually captures. This pins that divergence so
+    // the UI + preview callers keep passing URL-only.
+    const rules = [similarRule('pge.com', ['statement'])];
+    const page = { url: 'https://other.com/home', title: 'Monthly Statement' };
+    // With the title, the matcher DOES trip (title token hit)…
+    expect(matchesNoCaptureRules(page, rules)).toBe(true);
+    // …but URL-only — exactly what the gate/UI/preview pass — does NOT.
+    expect(matchesNoCaptureRules({ url: page.url }, rules)).toBe(false);
+  });
+
   it('empty rule list never matches', () => {
     expect(matchesNoCaptureRules({ url: 'https://pge.com/x' }, [])).toBe(false);
   });

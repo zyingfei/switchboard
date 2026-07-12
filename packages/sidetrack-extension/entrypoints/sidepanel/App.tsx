@@ -4939,21 +4939,18 @@ const App = () => {
   // work, so this only aligns what the card SAYS with what actually
   // happens. We reuse the SAME matcher the gate uses (imported, not
   // duplicated) so the panel can never disagree with the background.
+  //
+  // Match on URL ONLY — the authoritative gate (`isCaptureAllowedForUrl`
+  // in background.ts) passes URL alone, so a 'similar' rule whose
+  // category token appears only in the TITLE would be blocked here but
+  // ALLOWED by the gate. Passing the title too would make this badge
+  // (and the open-tabs preview) disagree with what the background
+  // actually captures. Keep the inputs identical to the gate's.
   const currentTabBlockingRule = useMemo(() => {
     const url = focusedUrl ?? currentSiteUrl;
     if (typeof url !== 'string' || url.length === 0) return null;
-    const title = focusedTabSession?.latestTitle ?? liveActiveTabTitle;
-    return firstMatchingNoCaptureRule(
-      { url, ...(typeof title === 'string' && title.length > 0 ? { title } : {}) },
-      state.settings.noCaptureRules ?? [],
-    );
-  }, [
-    focusedUrl,
-    currentSiteUrl,
-    focusedTabSession?.latestTitle,
-    liveActiveTabTitle,
-    state.settings.noCaptureRules,
-  ]);
+    return firstMatchingNoCaptureRule({ url }, state.settings.noCaptureRules ?? []);
+  }, [focusedUrl, currentSiteUrl, state.settings.noCaptureRules]);
   const currentSiteBlocked = currentTabBlockingRule !== null;
   // Tri-state for the card: master pause wins over a per-site rule.
   const currentTabCaptureState: 'capturing' | 'paused' | 'blocked' = captureOff
