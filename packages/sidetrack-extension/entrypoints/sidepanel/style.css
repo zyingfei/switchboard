@@ -2746,28 +2746,57 @@ textarea.preview-body:focus {
 }
 
 /* ── Inbound card ── */
+/* ══════════════════════════════════════════════════════════════════════
+   Inbound reply rows (R1.1 restyle) — clean row anatomy on the token
+   system. Row 1 = unread dot + provider chip + title + age; Row 2 = one
+   aligned action row. Seen replies are a quiet paper card; UNSEEN replies
+   get a left accent rail + a static unread dot (an unread AI reply is the
+   highest-value actionable-now signal) — no muddy amber wash, no pulse.
+   ══════════════════════════════════════════════════════════════════════ */
 .inbound-card {
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 9px 11px;
-  border: var(--hair);
-  border-radius: var(--rad-s);
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-4);
+  border: var(--hair-soft);
+  border-radius: var(--r2);
   background: var(--paper-light);
+  transition: border-color var(--motion-fast) var(--ease-standard);
 }
+.inbound-card:hover {
+  border-color: var(--rule);
+}
+/* Unseen = accented left rail (drawn as a border so it never shifts the
+   content box) + a slightly warmer card. Kept AA-quiet: a rail, not a
+   full wash. */
 .inbound-card.status-unseen {
-  border-color: var(--signal-tint);
-  background: var(--signal-bg);
+  border-color: var(--rule-soft);
+  border-left: 2px solid var(--signal);
+  padding-left: calc(var(--space-4) - 1px);
 }
 .inbound-row1 {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.inbound-unread-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--signal);
 }
 .inbound-title {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--body);
   font-size: 13px;
+  color: var(--ink);
 }
 .inbound-title.ai-italic {
   font-family: var(--display);
@@ -2778,13 +2807,79 @@ textarea.preview-body:focus {
   font-size: 11px;
   color: var(--ink-3);
 }
-.inbound-row2 {
-  color: var(--ink-3);
+/* Age — mono, muted, right-aligned; the machine fact of the row. */
+.inbound-age {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--ink-4);
+}
+/* Provenance sentence kept for the pinned "{provider} replied {age}"
+   assertion + screen readers; visually folded into the chip + age above. */
+.inbound-provenance-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .inbound-actions {
   display: flex;
-  gap: 4px;
-  margin-top: 2px;
+  align-items: center;
+  gap: var(--space-2);
+}
+.inbound-btn {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--r1);
+  background: transparent;
+  color: var(--ink-2);
+  font-family: var(--body);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+.inbound-btn:hover {
+  background: var(--paper-deep);
+  color: var(--ink);
+}
+.inbound-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+.inbound-btn-primary {
+  color: var(--signal);
+  border-color: var(--signal-tint);
+}
+.inbound-btn-primary:hover {
+  background: var(--signal-bg);
+  color: var(--signal);
+  border-color: var(--signal);
+}
+/* Dismiss sits to the right, quietest of the three. */
+.inbound-btn-muted {
+  margin-left: auto;
+  color: var(--ink-4);
+}
+.inbound-btn-muted:hover {
+  color: var(--ink-2);
+}
+/* Consistent vertical rhythm between reply rows. */
+.inbound-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
 }
 
 /* ── Recent dispatches ── */
@@ -5086,62 +5181,93 @@ input.thread-turn-annotate-input {
   margin-top: 3px;
 }
 
-/* =====================================================
-   View toggle (Workstream | All threads) — PR 3
-   ===================================================== */
-.view-tabs {
+/* ══════════════════════════════════════════════════════════════════════
+   Contextual sub-tabs (R1.1) — the ONLY secondary tablist.
+
+   The legacy flat 7-tab bar (.view-tabs / .view-tab) is retired. Each
+   primary section reveals just its own destinations in this one strip,
+   so the chrome reads as a single system: lamp → sections → sub-tabs.
+   Counts carry a salience layer — ambient backlog is quiet mono; the
+   actionable-now variant (unread Replies, failed Queued) is accented.
+   ══════════════════════════════════════════════════════════════════════ */
+.sub-tabs {
   display: flex;
-  gap: 2px;
-  margin-left: 12px;
-  margin-right: auto;
-  padding-left: 12px;
-  border-left: 1px solid var(--rule-soft, #e5ddc9);
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-5);
+  border-bottom: var(--hair-soft);
+  background: var(--paper);
 }
-.view-tab {
-  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
-  font-size: 10px;
-  letter-spacing: 0.04em;
-  padding: 4px 8px;
-  border-radius: 4px;
+.sub-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--r1);
   border: 1px solid transparent;
   background: transparent;
-  color: var(--ink-3, #7a7269);
+  color: var(--ink-3);
+  font-family: var(--body);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    border-color 120ms ease;
+    background var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
 }
-.view-tab:hover {
-  background: var(--paper-deep, #e8dfc8);
-  color: var(--ink-2, #4a453d);
+.sub-tab:hover {
+  background: var(--paper-deep);
+  color: var(--ink-2);
 }
-.view-tab.on {
-  background: var(--paper-light, #fbf7ee);
-  color: var(--ink, #1b1916);
-  border-color: var(--rule, #d4cdb8);
+.sub-tab.on {
+  background: var(--paper-light);
+  color: var(--ink);
+  border-color: var(--rule);
 }
-.view-tab:focus {
+.sub-tab:focus {
   outline: none;
 }
-.view-tab:focus-visible {
+.sub-tab:focus-visible {
   outline: none;
-  border-color: var(--signal, #c2410c);
-  box-shadow: 0 0 0 2px var(--signal-tint, #fed7aa);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
 }
-/* Count chip inside the v2 sp-tabs (e.g. "All threads 12"). */
-.view-tab .ct {
-  margin-left: 5px;
-  color: var(--ink-4, #a39a8c);
-  font-size: 9px;
+/* Modal-opening sub-tabs (Capture & Rules, Health) never carry the
+   selected state — they hand off to a modal, not a viewMode. */
+.sub-tab-modal {
+  color: var(--ink-3);
 }
-.view-tab.on .ct {
-  color: var(--ink-3, #7a7269);
+/* Ambient-backlog count — quiet mono, no shouting (the "964 inbox"
+   must not read as urgent). */
+.sub-tab-ct {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--ink-4);
+}
+.sub-tab.on .sub-tab-ct {
+  color: var(--ink-3);
+}
+/* Actionable-now count — accented (unread replies / failed queued are
+   time-sensitive and must stand out from ambient backlog). Fixed signal
+   fill + light text so it stays legible in every lamp state (the accent
+   bus goes neutral/gray when idle, which would erase the count). */
+.sub-tab-ct-actionable {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: var(--signal-on);
+  background: var(--signal);
+  text-align: center;
 }
 
-/* Header status pills (vault + companion) — sit just under the
-   .view-tabs row so the user can glance at health without diving
-   into Settings. */
+/* Status pills (vault + companion). The header strip that used these is
+   retired (folded into the connect-dot + Trust→Health); the pill/dot
+   classes below are still consumed by the SettingsPanel connection row. */
 .sp-status {
   display: flex;
   gap: 8px;
@@ -5210,7 +5336,7 @@ input.thread-turn-annotate-input {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
+  padding: var(--space-4) var(--space-5);
   border-bottom: var(--hair-soft);
   background: var(--accent-bg);
   /* One-shot accent cross-fade on capture-state change (~200ms). NEVER
@@ -5223,8 +5349,8 @@ input.thread-turn-annotate-input {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
   flex: none;
   border-radius: 999px;
   font-size: 12px;
@@ -5235,6 +5361,14 @@ input.thread-turn-annotate-input {
     background var(--motion-base) var(--ease-standard),
     color var(--motion-base) var(--ease-standard);
 }
+/* Idle glyph: capture is on but nothing is in focus. A filled warm dot
+   would over-claim "recording", so the idle state paints a quiet hollow
+   ring instead of a solid accent fill. */
+.capture-lamp-strip.lamp-idle .lamp-glyph {
+  background: transparent;
+  border: 1.5px solid var(--ink-4);
+  color: var(--ink-3);
+}
 .lamp-domain {
   flex: none;
   max-width: 40%;
@@ -5244,6 +5378,12 @@ input.thread-turn-annotate-input {
   font: var(--type-mono) var(--mono);
   font-weight: 500;
   color: var(--ink-2);
+}
+/* No page in focus — the domain slot collapses entirely so the verdict
+   ("No page in focus") isn't crowded by a placeholder that reads like a
+   second verdict. */
+.lamp-domain-empty {
+  display: none;
 }
 .capture-lamp-strip.lamp-blocked .lamp-domain,
 .capture-lamp-strip.lamp-paused .lamp-domain {

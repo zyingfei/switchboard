@@ -2797,10 +2797,6 @@ const App = () => {
     },
     [threads],
   );
-  const findIconPulsing =
-    activeTabTrackedThread !== undefined &&
-    focusingThreadId !== activeTabTrackedThread.bac_id &&
-    state.activeTabUrl !== findPulseDismissedUrl;
   // Master capture switch (the side-panel "eye"). Off = nothing is
   // captured anywhere; the capture-oriented toolbar icons go inert so
   // the paused state reads at a glance.
@@ -5113,7 +5109,7 @@ const App = () => {
       ? 'now'
       : viewMode === 'all' || viewMode === 'workstream' || viewMode === 'queued'
         ? 'work'
-        : viewMode === 'inbound'
+        : viewMode === 'inbound' || viewMode === 'inbox'
           ? 'trust'
           : 'memory';
 
@@ -6603,13 +6599,22 @@ const App = () => {
         <span className="lamp-glyph mono" aria-hidden>
           {lampVerdict.glyph}
         </span>
-        <span
-          className="lamp-domain mono"
-          title={lampDomain ?? 'No active tab'}
-          data-testid="capture-lamp-domain"
-        >
-          {lampDomain ?? '— no active tab'}
-        </span>
+        {lampDomain === null ? (
+          // No capturable page in focus — the verdict ("No page in
+          // focus") already carries the meaning, so we don't paint a
+          // placeholder domain that reads like a second verdict. The
+          // testid stays for the pinned lamp tests; it renders empty and
+          // is hidden by CSS so the strip stays quiet and composed.
+          <span
+            className="lamp-domain mono lamp-domain-empty"
+            data-testid="capture-lamp-domain"
+            aria-hidden
+          />
+        ) : (
+          <span className="lamp-domain mono" title={lampDomain} data-testid="capture-lamp-domain">
+            {lampDomain}
+          </span>
+        )}
         <span
           className="lamp-verdict mono"
           role="status"
@@ -6699,12 +6704,17 @@ const App = () => {
               },
               {
                 id: 'memory',
+                // Memory absorbs Search + Explore (connections). Its
+                // default sub-tab is Search — Inbox moved to Trust, so
+                // Memory must NOT default to the inbox viewMode.
                 label: 'Memory',
                 active: primarySection === 'memory',
-                go: () => setViewMode('inbox'),
+                go: () => setViewMode('search'),
               },
               {
                 id: 'trust',
+                // Trust absorbs Inbound replies + Inbox (+ Capture &
+                // Rules / Health modals). Its default sub-tab is Replies.
                 label: 'Trust',
                 active: primarySection === 'trust',
                 go: () => setViewMode('inbound'),
@@ -6732,111 +6742,6 @@ const App = () => {
             </button>
           ))}
         </nav>
-        <div className="view-tabs sp-tabs" role="tablist" aria-label="View">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'now'}
-            aria-label="Now"
-            className={'view-tab' + (viewMode === 'now' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('now');
-            }}
-          >
-            Now
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'all'}
-            aria-label="Threads"
-            className={'view-tab' + (viewMode === 'all' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('all');
-            }}
-          >
-            Threads
-            <span className="ct mono" aria-hidden>
-              {state.threads.length}
-            </span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'workstream'}
-            aria-label="Workstreams"
-            className={'view-tab' + (viewMode === 'workstream' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('workstream');
-            }}
-          >
-            Workstreams
-            <span className="ct mono" aria-hidden>
-              {state.workstreams.length}
-            </span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'inbox'}
-            aria-label="Inbox"
-            className={'view-tab' + (viewMode === 'inbox' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('inbox');
-            }}
-          >
-            Inbox
-            <span className="ct mono" aria-hidden>
-              {urlInbox.total}
-            </span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'inbound'}
-            aria-label="Inbound replies"
-            className={'view-tab' + (viewMode === 'inbound' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('inbound');
-            }}
-          >
-            Inbound
-            {inboundReminders.length > 0 ? (
-              <span className="ct mono" aria-hidden>
-                {inboundReminders.length}
-              </span>
-            ) : null}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'queued'}
-            aria-label="Queued follow-ups"
-            className={'view-tab' + (viewMode === 'queued' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('queued');
-            }}
-          >
-            Queued
-            {queueGroups.length > 0 ? (
-              <span className="ct mono" aria-hidden>
-                {queueGroups.reduce((sum, g) => sum + g.items.length, 0)}
-              </span>
-            ) : null}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={viewMode === 'search' || viewMode === 'connections'}
-            aria-label="Search"
-            className={'view-tab' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
-            onClick={() => {
-              setViewMode('search');
-            }}
-          >
-            Search
-          </button>
-        </div>
         <div className="app-actions">
           {/* Search — stays a top-level tool (opens the Search/Explore
               surface under Memory). */}
@@ -6860,61 +6765,15 @@ const App = () => {
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
-          {/* Secondary capture tools — relocated out of the primary row
-              into a contextual cluster. They VISIBLY QUIESCE
-              (desaturate + disabled) under paused/blocked via the
-              [data-capture-state] accent bus on <main>; testids + ARIA
-              labels are unchanged so §13 steps + e2e stay reachable. */}
+          {/* Secondary capture tools — the steady-state toolbar keeps only
+              the two most-used capture controls (capture-current-tab `+`
+              when Manual, and the Auto/Manual mode toggle). The rarer
+              tools (screenshare-mask, find-active-tab, coding-attach) moved
+              into the ⋯ overflow (R1.1) so the header stays lean. They all
+              VISIBLY QUIESCE (disabled) under paused/blocked via the
+              [data-capture-state] bus; testids + ARIA labels are unchanged
+              so §13 steps + e2e stay reachable. */}
           <div className="capture-tools" data-testid="capture-tools">
-          {/* Screenshare-mask toggle. Re-glyphed from the old eye to a
-              cast/monitor icon so the eye unambiguously means capture.
-              Inert while capture is paused (nothing to mask). */}
-          <button
-            className={'icon-btn' + (state.screenShareMode ? ' on' : '')}
-            title="Screenshare mode — mask sensitive workstreams"
-            onClick={() => {
-              void runAction(() =>
-                sendRequest({
-                  type: messageTypes.setScreenShareMode,
-                  enabled: !state.screenShareMode,
-                }),
-              );
-            }}
-            type="button"
-            aria-label="Toggle screenshare mode"
-            aria-pressed={state.screenShareMode}
-            disabled={captureOff}
-          >
-            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.cast}</span>
-          </button>
-          <button
-            className={'icon-btn' + (findIconPulsing ? ' pulsing' : '')}
-            title="Find this tab in the side panel — scrolls + flashes the matching thread row"
-            onClick={findActiveTabThread}
-            type="button"
-            aria-label="Find active tab in side panel"
-            disabled={captureOff}
-          >
-            {/* Crosshair / locator. Visually distinct from the
-                magnifier in "Search indexed threads" — this one
-                tells you where the active tab IS, not searches
-                for something to find. */}
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <circle cx="12" cy="12" r="9" />
-              <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
-              <line x1="12" y1="2" x2="12" y2="5.5" />
-              <line x1="12" y1="18.5" x2="12" y2="22" />
-              <line x1="2" y1="12" x2="5.5" y2="12" />
-              <line x1="18.5" y1="12" x2="22" y2="12" />
-            </svg>
-          </button>
           {/* Capture-current-tab (+) is only useful when capture mode
               is Manual. When mode is Auto, Sidetrack refreshes
               detected threads automatically and the user has nothing
@@ -6982,32 +6841,6 @@ const App = () => {
               {state.settings.autoTrack ? 'auto' : 'manual'}
             </span>
           </button>
-          <button
-            className="icon-btn"
-            title={
-              state.companionStatus === 'connected'
-                ? 'Attach coding session'
-                : 'Coding-session attach needs a companion — click to configure'
-            }
-            onClick={() => {
-              // Don't gate the icon dead — when companion is missing,
-              // route the user to the wizard so they can fix it.
-              if (state.companionStatus !== 'connected') {
-                setWizardOpen(true);
-                return;
-              }
-              setCodingAttachOpen(true);
-            }}
-            type="button"
-            aria-label="Attach coding session"
-            disabled={captureOff}
-          >
-            <svg viewBox="0 0 24 24">
-              <rect x="2" y="4" width="20" height="16" rx="2" />
-              <polyline points="6 10 9 13 6 16" />
-              <line x1="13" y1="16" x2="18" y2="16" />
-            </svg>
-          </button>
           </div>
           {/* Diagnostics collapsed into an overflow menu so the
               steady-state toolbar stays lean — capture health, dump
@@ -7023,6 +6856,26 @@ const App = () => {
               setDesignPreviewOpen(true);
             }}
             dumpStatus={dumpStatus.kind}
+            screenShareMode={state.screenShareMode}
+            onToggleScreenShare={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.setScreenShareMode,
+                  enabled: !state.screenShareMode,
+                }),
+              );
+            }}
+            onFindActiveTab={findActiveTabThread}
+            onAttachCoding={() => {
+              // Don't gate the entry dead — when companion is missing,
+              // route the user to the wizard so they can fix it.
+              if (state.companionStatus !== 'connected') {
+                setWizardOpen(true);
+                return;
+              }
+              setCodingAttachOpen(true);
+            }}
+            captureTools={captureOff ? 'quiesced' : 'live'}
             {...(currentSiteLabel === undefined
               ? {}
               : {
@@ -7054,6 +6907,150 @@ const App = () => {
           />
         </div>
       </div>
+
+      {/* Contextual sub-tabs — the ONLY secondary tablist. The old flat
+          7-tab bar is retired; each primary section now reveals just its
+          own destinations here, so the chrome reads as one system
+          (lamp → sections → contextual sub-tabs). Every sub-tab keeps its
+          exact role=tab + accessible name so the viewMode router and its
+          pinned getByRole('tab', {name}) tests stay intact. Counts gain a
+          salience layer: ambient backlog (Threads/Workstreams/Inbox) is
+          quiet mono; actionable-now (unread Replies, failed Queued) is
+          accented. Now has no sub-tabs (single live surface); Settings is
+          a modal. */}
+      {primarySection === 'work' ? (
+        <div className="sub-tabs" role="tablist" aria-label="Work views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'all'}
+            aria-label="Threads"
+            className={'sub-tab' + (viewMode === 'all' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('all');
+            }}
+          >
+            Threads
+            <span className="sub-tab-ct mono" aria-hidden>
+              {state.threads.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'workstream'}
+            aria-label="Workstreams"
+            className={'sub-tab' + (viewMode === 'workstream' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('workstream');
+            }}
+          >
+            Workstreams
+            <span className="sub-tab-ct mono" aria-hidden>
+              {state.workstreams.length}
+            </span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'queued'}
+            aria-label="Queued follow-ups"
+            className={'sub-tab' + (viewMode === 'queued' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('queued');
+            }}
+          >
+            Queued
+            {queueGroups.length > 0 ? (
+              <span className="sub-tab-ct sub-tab-ct-actionable mono" aria-hidden>
+                {queueGroups.reduce((sum, g) => sum + g.items.length, 0)}
+              </span>
+            ) : null}
+          </button>
+        </div>
+      ) : primarySection === 'memory' ? (
+        <div className="sub-tabs" role="tablist" aria-label="Memory views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'search'}
+            aria-label="Search"
+            className={'sub-tab' + (viewMode === 'search' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('search');
+            }}
+          >
+            Search
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'connections'}
+            aria-label="Explore"
+            className={'sub-tab' + (viewMode === 'connections' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('connections');
+            }}
+          >
+            Explore
+          </button>
+        </div>
+      ) : primarySection === 'trust' ? (
+        <div className="sub-tabs" role="tablist" aria-label="Trust views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'inbound'}
+            aria-label="Inbound replies"
+            className={'sub-tab' + (viewMode === 'inbound' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('inbound');
+            }}
+          >
+            Replies
+            {inboundReminders.length > 0 ? (
+              <span className="sub-tab-ct sub-tab-ct-actionable mono" aria-hidden>
+                {inboundReminders.length}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'inbox'}
+            aria-label="Inbox"
+            className={'sub-tab' + (viewMode === 'inbox' ? ' on' : '')}
+            onClick={() => {
+              setViewMode('inbox');
+            }}
+          >
+            Inbox
+            <span className="sub-tab-ct mono" aria-hidden>
+              {urlInbox.total}
+            </span>
+          </button>
+          <button
+            type="button"
+            className="sub-tab sub-tab-modal"
+            title="No-capture rules — sites Sidetrack never records"
+            onClick={() => {
+              openSettingsAt('no-capture-rules');
+            }}
+          >
+            Capture &amp; Rules
+          </button>
+          <button
+            type="button"
+            className="sub-tab sub-tab-modal"
+            title="Capture health — pipeline, recall, and companion status"
+            onClick={() => {
+              setHealthPanelOpen(true);
+            }}
+          >
+            Health
+          </button>
+        </div>
+      ) : null}
 
       {/* Vault + companion + recall status now live in the header's
           connect-dot popover (ConnectDot, above). The dump-result chip

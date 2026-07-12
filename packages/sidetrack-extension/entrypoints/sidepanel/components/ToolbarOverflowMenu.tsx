@@ -22,6 +22,15 @@ export interface ToolbarOverflowMenuProps {
   readonly currentSiteLabel?: string;
   readonly onBlockCurrentSite?: () => void;
   readonly onBlockSimilarSites?: () => void;
+  // Secondary capture tools, relocated out of the top toolbar (R1.1) to
+  // keep the steady-state chrome lean. Testids/labels are preserved so
+  // §13 steps + e2e stay reachable; each quiesces (disabled) under paused.
+  readonly screenShareMode?: boolean;
+  readonly onToggleScreenShare?: () => void;
+  readonly onFindActiveTab?: () => void;
+  readonly onAttachCoding?: () => void;
+  // When set, the secondary capture tools render disabled (capture paused).
+  readonly captureTools?: 'live' | 'quiesced';
 }
 
 export function ToolbarOverflowMenu({
@@ -32,7 +41,13 @@ export function ToolbarOverflowMenu({
   currentSiteLabel,
   onBlockCurrentSite,
   onBlockSimilarSites,
+  screenShareMode = false,
+  onToggleScreenShare,
+  onFindActiveTab,
+  onAttachCoding,
+  captureTools = 'live',
 }: ToolbarOverflowMenuProps) {
+  const toolsDisabled = captureTools === 'quiesced';
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
@@ -113,6 +128,82 @@ export function ToolbarOverflowMenu({
             >
               <span className="toolbar-overflow-item-icon">{Icons.eyeOff ?? Icons.activity}</span>
               <span className="toolbar-overflow-item-label">Don&rsquo;t capture similar sites</span>
+            </button>
+          ) : null}
+          {onToggleScreenShare !== undefined ? (
+            <button
+              type="button"
+              role="menuitem"
+              className={
+                'toolbar-overflow-item' + (screenShareMode ? ' toolbar-overflow-item-on' : '')
+              }
+              onClick={pick(onToggleScreenShare)}
+              disabled={toolsDisabled}
+              aria-pressed={screenShareMode}
+              aria-label="Toggle screenshare mode"
+              title="Screenshare mode — mask sensitive workstreams"
+            >
+              <span className="toolbar-overflow-item-icon">{Icons.cast}</span>
+              <span className="toolbar-overflow-item-label">
+                Screenshare mask{screenShareMode ? ' ✓' : ''}
+              </span>
+            </button>
+          ) : null}
+          {onFindActiveTab !== undefined ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="toolbar-overflow-item"
+              onClick={pick(onFindActiveTab)}
+              disabled={toolsDisabled}
+              aria-label="Find active tab in side panel"
+              title="Find this tab in the side panel — scrolls + flashes the matching thread row"
+            >
+              <span className="toolbar-overflow-item-icon">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="12" cy="12" r="9" />
+                  <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
+                  <line x1="12" y1="2" x2="12" y2="5.5" />
+                  <line x1="12" y1="18.5" x2="12" y2="22" />
+                  <line x1="2" y1="12" x2="5.5" y2="12" />
+                  <line x1="18.5" y1="12" x2="22" y2="12" />
+                </svg>
+              </span>
+              <span className="toolbar-overflow-item-label">Find active tab</span>
+            </button>
+          ) : null}
+          {onAttachCoding !== undefined ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="toolbar-overflow-item"
+              onClick={pick(onAttachCoding)}
+              disabled={toolsDisabled}
+              aria-label="Attach coding session"
+              title="Attach a coding-agent session (companion required)"
+            >
+              <span className="toolbar-overflow-item-icon">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <rect x="2" y="4" width="20" height="16" rx="2" />
+                  <polyline points="6 10 9 13 6 16" />
+                  <line x1="13" y1="16" x2="18" y2="16" />
+                </svg>
+              </span>
+              <span className="toolbar-overflow-item-label">Attach coding session</span>
             </button>
           ) : null}
           <button
