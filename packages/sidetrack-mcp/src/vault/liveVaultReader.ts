@@ -216,8 +216,21 @@ const readJsonDirectory = async <TValue>(
     if (!entry.isFile() || !entry.name.endsWith('.json')) {
       continue;
     }
-    const raw = await readFile(join(absoluteDirectory, entry.name), 'utf8');
-    values.push(schema.parse(JSON.parse(raw) as unknown));
+    // A single torn/malformed record (e.g. a write interrupted before the
+    // atomic-fsync durability fix landed) must not abort the whole read and
+    // take every MCP tool (context_pack, workstream lists, …) down with it.
+    // Skip the bad file with a warning and serve the rest.
+    try {
+      const raw = await readFile(join(absoluteDirectory, entry.name), 'utf8');
+      values.push(schema.parse(JSON.parse(raw) as unknown));
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[sidetrack-mcp] skipping unreadable ${directory}/${entry.name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   return values;
