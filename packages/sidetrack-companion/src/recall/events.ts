@@ -110,6 +110,32 @@ export interface RecallServedCandidateSnapshot {
   /** Rank within the final response (0-based). */
   readonly servedPosition: number;
   readonly canonicalUrl?: string;
+  /**
+   * Point-in-time served feature vector (Move 1). A plain number array
+   * aligned to the ranker's canonical feature-key order
+   * (CANDIDATE_PAIR_FEATURE_KEYS in ranker/feature-schema.ts) at the
+   * moment the impression was served — the AS-OF truth the trainer would
+   * otherwise re-derive against a drifted graph. Encoded via
+   * ranker/servedFeatureVector.ts; decode with the matching helper.
+   * Absent when no warm FeatureModel was available to compute it at serve
+   * time (the trainer then falls back to reconstruction).
+   */
+  readonly features?: readonly number[];
+  /**
+   * Schema version of `features` — mirrors FEATURE_SCHEMA_VERSION at
+   * serve time. The trainer only trusts `features` when this equals the
+   * current schema version; a mismatch (schema drifted since serve) falls
+   * back to reconstruction so columns never silently misalign.
+   */
+  readonly featureSchemaVersion?: number;
+  /**
+   * Query-anchored cosine SIMILARITY (not distance) for the dense
+   * (semantic_query) lane, threaded from the request-time computation
+   * (1 − vectorDistance). The single most-relevant discarded signal.
+   * Absent when the request had no dense lane / this candidate did not
+   * surface from semantic_query.
+   */
+  readonly queryCosine?: number;
 }
 
 export interface RecallServedPayload {
@@ -179,6 +205,24 @@ export const isRecallServedCandidateSnapshot = (
   if (typeof value['sourceKind'] !== 'string' || value['sourceKind'].length === 0) return false;
   if (typeof value['fusedScore'] !== 'number') return false;
   if (typeof value['servedPosition'] !== 'number') return false;
+  // Move 1 optional fields — validated only when present so legacy rows
+  // (no features/cosine) still pass. A malformed features array or a
+  // non-numeric schema version invalidates the row rather than being
+  // silently ignored.
+  if (
+    value['features'] !== undefined &&
+    (!Array.isArray(value['features']) ||
+      !value['features'].every((entry) => typeof entry === 'number'))
+  ) {
+    return false;
+  }
+  if (
+    value['featureSchemaVersion'] !== undefined &&
+    typeof value['featureSchemaVersion'] !== 'number'
+  ) {
+    return false;
+  }
+  if (value['queryCosine'] !== undefined && typeof value['queryCosine'] !== 'number') return false;
   return true;
 };
 

@@ -13,6 +13,12 @@ import {
 import type { RecallCandidate, RecallResponse } from '../recall-v2/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import {
+  CANDIDATE_PAIR_FEATURE_KEYS,
+  FEATURE_SCHEMA_VERSION,
+  type CandidatePairFeatures,
+} from './feature-schema.js';
+import type { extractFeatures } from './features.js';
+import {
   buildRecallImpressionTrainingGroups,
   maybeRetrainRecallImpressionRanker,
 } from './retrain-impressions.js';
@@ -163,6 +169,146 @@ const recallResponse = (results: readonly RecallCandidate[]): RecallResponse => 
     timingsMs: {},
     flags: {},
   },
+});
+
+// A logged feature vector aligned to CANDIDATE_PAIR_FEATURE_KEYS with a
+// recognizable sentinel per column so the decoded row is distinguishable
+// from any reconstruction the trainer would produce against the (empty)
+// snapshot fixture. Sentinel = column index + 100.
+const loggedFeatureVector = (): number[] =>
+  CANDIDATE_PAIR_FEATURE_KEYS.map((_key, index) => index + 100);
+
+// A spy standing in for `extractFeatures`. Records every call so a test
+// can assert the reconstruction path was (or was not) taken, and returns a
+// distinct constant so we can tell reconstructed rows from logged ones.
+const RECONSTRUCTED_SENTINEL = -777;
+const makeExtractFeaturesSpy = (): {
+  fn: typeof extractFeatures;
+  calls: number;
+} => {
+  const state = { calls: 0 };
+  const fn: typeof extractFeatures = () => {
+    state.calls += 1;
+    const out = {} as Record<keyof CandidatePairFeatures, number>;
+    for (const key of CANDIDATE_PAIR_FEATURE_KEYS) out[key] = RECONSTRUCTED_SENTINEL;
+    out.schemaVersion = FEATURE_SCHEMA_VERSION;
+    return out as CandidatePairFeatures;
+  };
+  return {
+    fn,
+    get calls(): number {
+      return state.calls;
+    },
+  };
+};
+
+const servedCandidateWithFeatures = (
+  entityId: string,
+  sourceKind: string,
+  servedPosition: number,
+  featureOverrides: Partial<RecallServedCandidateSnapshot>,
+): RecallServedCandidateSnapshot => ({
+  ...servedCandidate(entityId, sourceKind, servedPosition),
+  ...featureOverrides,
+});
+
+describe('recall impression training — logged point-in-time features (Move 1)', () => {
+  it('uses the logged feature vector when the schema version matches (no reconstruction)', async () => {
+    const spy = makeExtractFeaturesSpy();
+    const vector = loggedFeatureVector();
+    const merged = [
+      served(1, 'ctx-1', [
+        servedCandidateWithFeatures('positive', 'page_content', 0, {
+          features: vector,
+          featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        }),
+        servedCandidateWithFeatures('negative', 'semantic_query', 1, {
+          features: vector,
+          featureSchemaVersion: FEATURE_SCHEMA_VERSION,
+        }),
+      ]),
+      action(2, 'ctx-1', 'positive', 'flow_confirm'),
+      action(3, 'ctx-1', 'negative', 'reject'),
+    ];
+
+    const result = await buildRecallImpressionTrainingGroups({
+      merged,
+      snapshot,
+      extractFeaturesFn: spy.fn,
+    });
+
+    // Reconstruction MUST NOT run for schema-matching logged rows.
+    expect(spy.calls).toBe(0);
+    const group = result.groups[0];
+    expect(group?.rows).toHaveLength(2);
+    // Decoded features carry the logged sentinels, not the reconstruction
+    // sentinel — proving the point-in-time vector was consumed verbatim.
+    const bm25Col = CANDIDATE_PAIR_FEATURE_KEYS.indexOf('bm25_score');
+    for (const row of group?.rows ?? []) {
+      expect(row.features.bm25_score).toBe(vector[bm25Col]);
+      expect(row.features.bm25_score).not.toBe(RECONSTRUCTED_SENTINEL);
+      // schemaVersion is stamped from the current constant on decode.
+      expect(row.features.schemaVersion).toBe(FEATURE_SCHEMA_VERSION);
+    }
+  });
+
+  it('falls back to reconstruction for legacy rows with no logged features', async () => {
+    const spy = makeExtractFeaturesSpy();
+    const merged = [
+      served(1, 'ctx-1', [
+        // Plain servedCandidate() carries NO features field (legacy).
+        servedCandidate('positive', 'page_content', 0),
+        servedCandidate('negative', 'semantic_query', 1),
+      ]),
+      action(2, 'ctx-1', 'positive', 'flow_confirm'),
+      action(3, 'ctx-1', 'negative', 'reject'),
+    ];
+
+    const result = await buildRecallImpressionTrainingGroups({
+      merged,
+      snapshot,
+      extractFeaturesFn: spy.fn,
+    });
+
+    // One reconstruction per served candidate (2).
+    expect(spy.calls).toBe(2);
+    const group = result.groups[0];
+    for (const row of group?.rows ?? []) {
+      expect(row.features.bm25_score).toBe(RECONSTRUCTED_SENTINEL);
+    }
+  });
+
+  it('falls back to reconstruction on a schema-version mismatch rather than mixing schemas', async () => {
+    const spy = makeExtractFeaturesSpy();
+    const vector = loggedFeatureVector();
+    const merged = [
+      served(1, 'ctx-1', [
+        servedCandidateWithFeatures('positive', 'page_content', 0, {
+          features: vector,
+          // Stale schema — must NOT be trusted.
+          featureSchemaVersion: FEATURE_SCHEMA_VERSION - 1,
+        }),
+        servedCandidateWithFeatures('negative', 'semantic_query', 1, {
+          features: vector,
+          featureSchemaVersion: FEATURE_SCHEMA_VERSION - 1,
+        }),
+      ]),
+      action(2, 'ctx-1', 'positive', 'flow_confirm'),
+      action(3, 'ctx-1', 'negative', 'reject'),
+    ];
+
+    const result = await buildRecallImpressionTrainingGroups({
+      merged,
+      snapshot,
+      extractFeaturesFn: spy.fn,
+    });
+
+    expect(spy.calls).toBe(2);
+    const group = result.groups[0];
+    for (const row of group?.rows ?? []) {
+      expect(row.features.bm25_score).toBe(RECONSTRUCTED_SENTINEL);
+    }
+  });
 });
 
 describe('recall impression training groups', () => {
