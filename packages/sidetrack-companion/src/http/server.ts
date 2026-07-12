@@ -359,6 +359,20 @@ import {
   isWorkGraphHealthArtifactFresh,
   readWorkGraphHealthArtifact,
 } from '../system/workGraphHealthArtifact.js';
+import {
+  DOMAIN_TOMBSTONE,
+  buildDomainTombstoneSet,
+  registrableDomain,
+  registrableDomainFromUrl,
+  type DomainTombstonePayload,
+  type DomainTombstoneSet,
+  type DomainTombstoneCategoryToken,
+  DOMAIN_TOMBSTONE_CATEGORY_TOKENS,
+} from '../privacy/domainTombstone.js';
+import {
+  readDomainTombstones,
+  upsertDomainTombstone,
+} from '../privacy/domainTombstoneStore.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
@@ -981,6 +995,143 @@ const requireVaultRoot = (context: CompanionHttpConfig): string => {
     throw new Error('Vault root is unavailable.');
   }
   return context.vaultRoot;
+};
+
+// Domain-tombstone privacy gate. Read boundaries (timeline, recall-v2,
+// connections snapshot, context pack) call this to get a compiled
+// matcher that excludes purged domains. Cached with a short TTL +
+// in-flight coalescing so a burst of serve calls shares one disk read;
+// the tombstone write path invalidates the cache immediately so a purge
+// takes effect on the next serve without waiting out the TTL. An empty
+// / unavailable vault ⇒ an empty set (nothing hidden).
+const DOMAIN_TOMBSTONE_CACHE_TTL_MS = 5_000;
+let cachedDomainTombstoneSet: { value: DomainTombstoneSet; expiresAtMs: number } | null = null;
+let domainTombstoneInFlight: Promise<DomainTombstoneSet> | null = null;
+
+const invalidateDomainTombstoneCache = (): void => {
+  cachedDomainTombstoneSet = null;
+};
+
+const domainTombstoneSetFor = async (
+  context: CompanionHttpConfig,
+): Promise<DomainTombstoneSet> => {
+  if (context.vaultRoot === undefined) return buildDomainTombstoneSet([]);
+  const now = Date.now();
+  if (cachedDomainTombstoneSet !== null && cachedDomainTombstoneSet.expiresAtMs > now) {
+    return cachedDomainTombstoneSet.value;
+  }
+  if (domainTombstoneInFlight !== null) return domainTombstoneInFlight;
+  const vaultRoot = context.vaultRoot;
+  domainTombstoneInFlight = (async (): Promise<DomainTombstoneSet> => {
+    try {
+      const set = buildDomainTombstoneSet(await readDomainTombstones(vaultRoot));
+      cachedDomainTombstoneSet = { value: set, expiresAtMs: Date.now() + DOMAIN_TOMBSTONE_CACHE_TTL_MS };
+      return set;
+    } catch {
+      // Fail toward "nothing hidden" on a read error — the tombstone is
+      // durably in the event log, and a stale empty set never leaks MORE
+      // than an intact list would suppress. It just under-hides until the
+      // next successful read; a privacy gate must not throw on the hot
+      // serve path.
+      return buildDomainTombstoneSet([]);
+    } finally {
+      domainTombstoneInFlight = null;
+    }
+  })();
+  return domainTombstoneInFlight;
+};
+
+// Does a connections node belong to a tombstoned domain? Matches on the
+// node's URL metadata; falls back to a `timeline-visit:<canonicalUrl>`
+// id when metadata is bare (that id convention encodes the URL).
+const connectionNodeIsTombstoned = (
+  node: {
+    readonly id: string;
+    readonly label?: string;
+    readonly metadata?: { readonly url?: unknown; readonly canonicalUrl?: unknown; readonly title?: unknown };
+  },
+  tombstones: DomainTombstoneSet,
+): boolean => {
+  const meta = node.metadata ?? {};
+  const url =
+    typeof meta.canonicalUrl === 'string'
+      ? meta.canonicalUrl
+      : typeof meta.url === 'string'
+        ? meta.url
+        : node.id.startsWith('timeline-visit:')
+          ? node.id.slice('timeline-visit:'.length)
+          : undefined;
+  if (url === undefined) return false;
+  const title = typeof meta.title === 'string' ? meta.title : node.label;
+  return tombstones.matchesPage({ url, ...(title === undefined ? {} : { title }) });
+};
+
+// Drop recall-v2 candidates whose domain has been tombstoned. Candidates
+// carry an optional canonicalUrl + title; a candidate with no URL can't
+// be domain-matched here (chat-turn hits) — those are handled by vector
+// deletion at write time. Returns a new response with the filtered list.
+const filterRecallResponseByTombstones = (
+  response: unknown,
+  tombstones: DomainTombstoneSet,
+): unknown => {
+  if (typeof response !== 'object' || response === null) return response;
+  const results = (response as { results?: unknown }).results;
+  if (!Array.isArray(results)) return response;
+  const kept = (results as { canonicalUrl?: unknown; title?: unknown }[]).filter((candidate) => {
+    const url = typeof candidate.canonicalUrl === 'string' ? candidate.canonicalUrl : undefined;
+    if (url === undefined) return true;
+    const title = typeof candidate.title === 'string' ? candidate.title : undefined;
+    return !tombstones.matchesPage({ url, ...(title === undefined ? {} : { title }) });
+  });
+  if (kept.length === results.length) return response;
+  return { ...(response as object), results: kept };
+};
+
+// Filter a served /v1/connections result envelope: drop nodes on a
+// tombstoned domain and any edge touching a dropped node. Returns the
+// input unchanged when nothing matches (cheap common case).
+const excludeTombstonedNodesFromConnectionsResult = (
+  result: readonly [number, unknown],
+  tombstones: DomainTombstoneSet,
+): readonly [number, unknown] => {
+  if (tombstones.isEmpty) return result;
+  const [status, body] = result;
+  if (typeof body !== 'object' || body === null) return result;
+  const data = (body as { data?: unknown }).data;
+  if (typeof data !== 'object' || data === null) return result;
+  const snapshot = (data as { snapshot?: unknown }).snapshot;
+  if (typeof snapshot !== 'object' || snapshot === null) return result;
+  const snap = snapshot as {
+    nodes?: unknown;
+    edges?: unknown;
+    nodeCount?: number;
+    edgeCount?: number;
+  };
+  if (!Array.isArray(snap.nodes)) return result;
+  const nodes = snap.nodes as { id: string; label?: string; metadata?: Record<string, unknown> }[];
+  const droppedIds = new Set<string>();
+  const keptNodes = nodes.filter((node) => {
+    if (connectionNodeIsTombstoned(node, tombstones)) {
+      droppedIds.add(node.id);
+      return false;
+    }
+    return true;
+  });
+  if (droppedIds.size === 0) return result;
+  const edges = Array.isArray(snap.edges)
+    ? (snap.edges as { fromNodeId?: string; toNodeId?: string }[]).filter(
+        (edge) =>
+          !droppedIds.has(edge.fromNodeId ?? '') && !droppedIds.has(edge.toNodeId ?? ''),
+      )
+    : snap.edges;
+  const nextSnapshot = {
+    ...snapshot,
+    nodes: keptNodes,
+    edges,
+    nodeCount: keptNodes.length,
+    ...(Array.isArray(edges) ? { edgeCount: edges.length } : {}),
+  };
+  return [status, { ...(body as object), data: { ...(data as object), snapshot: nextSnapshot } }];
 };
 
 const buildServiceInstallOptions = (context: CompanionHttpConfig): InstallOptions => {
@@ -3256,6 +3407,113 @@ const routes: readonly RouteDefinition[] = [
                   PRIVACY_EVENT_TYPES,
                 ),
               ),
+            },
+          },
+        ];
+      });
+    },
+  },
+  {
+    // Domain-tombstone privacy purge. Invoked by the extension's
+    // per-rule "Purge captured data" action. Persists a DOMAIN_TOMBSTONE
+    // (event log for audit/sync + a materialized JSON list for the
+    // read-boundary gate), hard-deletes matching recall-v2 vectors, and
+    // invalidates the tombstone cache so every serve boundary excludes
+    // the domain immediately.
+    //
+    // MUTATING + NOT in MCP_ALLOWED_MUTATING_ROUTES ⇒ auto-DENIED to
+    // mcp-key callers by the dispatch layer (data-lifecycle is never an
+    // agent-sanctioned operation). authRequired gates the extension key.
+    method: 'POST',
+    pattern: /^\/v1\/privacy\/domain-tombstone$/u,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      if (context.vaultRoot === undefined) {
+        throw new HttpRouteError(
+          503,
+          'VAULT_UNAVAILABLE',
+          'Vault root is unavailable — cannot persist a domain tombstone.',
+        );
+      }
+      const eventLog = context.eventLog;
+      const vaultRoot = context.vaultRoot;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'domainTombstone', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const kind = body?.['kind'];
+        const rawDomain = body?.['domain'];
+        if (kind !== 'domain' && kind !== 'similar') {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'kind must be "domain" or "similar".',
+          );
+        }
+        if (typeof rawDomain !== 'string' || rawDomain.trim().length === 0) {
+          throw new HttpRouteError(400, 'VALIDATION_ERROR', 'domain is required.');
+        }
+        // Normalize the domain to eTLD+1 defensively (a hostname or full
+        // URL both collapse to the registrable domain).
+        const domain = rawDomain.includes('/')
+          ? registrableDomainFromUrl(rawDomain)
+          : registrableDomain(rawDomain);
+        if (domain.length === 0) {
+          throw new HttpRouteError(400, 'VALIDATION_ERROR', 'domain has no registrable eTLD+1.');
+        }
+        const rawTokens = body?.['categoryTokens'];
+        const categoryTokens: DomainTombstoneCategoryToken[] = Array.isArray(rawTokens)
+          ? (rawTokens.filter((token): token is DomainTombstoneCategoryToken =>
+              (DOMAIN_TOMBSTONE_CATEGORY_TOKENS as readonly string[]).includes(token as string),
+            ))
+          : [];
+        const tombstone: DomainTombstonePayload = {
+          payloadVersion: 1,
+          kind,
+          domain,
+          ...(kind === 'similar' && categoryTokens.length > 0 ? { categoryTokens } : {}),
+          tombstonedAt: new Date().toISOString(),
+        };
+        // 1. Append to the event log (audit + sync durability).
+        await eventLog
+          .appendServerObserved({
+            clientEventId: `${DOMAIN_TOMBSTONE}:${kind}:${domain}`,
+            aggregateId: `privacy:domain-tombstone:${domain}`,
+            type: DOMAIN_TOMBSTONE,
+            payload: tombstone as unknown as Record<string, unknown>,
+          })
+          .catch(() => undefined);
+        // 2. Materialize the tombstone list the serve boundaries read.
+        const all = await upsertDomainTombstone(vaultRoot, tombstone);
+        // 3. Invalidate the read-boundary cache so the next serve hides it.
+        invalidateDomainTombstoneCache();
+        // 4. Hard-delete matching recall-v2 vectors/docs/chunks (derived
+        //    store scrub). Best-effort — a store that can't purge just
+        //    relies on the serve-boundary filter. The raw JSONL log is
+        //    intentionally NOT rewritten (append indexes reject in-process
+        //    shard rewrites; a full offline scrub is a separate tool).
+        let vectorsPurged = 0;
+        try {
+          const { purgeRecallV2StoreByDomain } = await import('../recall-v2/pipeline.js');
+          vectorsPurged = await purgeRecallV2StoreByDomain(vaultRoot, domain);
+        } catch {
+          vectorsPurged = 0;
+        }
+        return [
+          201,
+          {
+            data: {
+              tombstoned: true,
+              domain,
+              kind,
+              vectorsPurged,
+              tombstoneCount: all.length,
             },
           },
         ];
@@ -6412,10 +6670,19 @@ const routes: readonly RouteDefinition[] = [
         },
         reqWithDefaultRerank,
       );
+      // Domain-tombstone privacy gate — drop candidates on a purged
+      // domain from what's SERVED (the vector entries themselves are
+      // deleted at tombstone-write time; this catches any residual /
+      // non-vector candidate). Read-boundary filter only; scoring is
+      // untouched — we just remove hidden rows from the served list.
+      const tombstones = await domainTombstoneSetFor(context);
+      const gated = tombstones.isEmpty
+        ? response
+        : filterRecallResponseByTombstones(response, tombstones);
       // Wrap in { data } to match the rest of the v1 API convention so
       // the bridge clients (recallV2 in pageContentClient.ts) can
       // unwrap consistently with the other endpoints.
-      return [200, { data: response }];
+      return [200, { data: gated }];
     },
   },
   {
@@ -7660,6 +7927,10 @@ const routes: readonly RouteDefinition[] = [
       const limitRaw = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
 
+      // Privacy gate — exclude visits whose domain has been tombstoned
+      // via a no-capture-rule purge. Read boundary filter only (the raw
+      // JSONL log is untouched); serving math is unaffected.
+      const tombstones = await domainTombstoneSetFor(context);
       const days = await context.timelineStore.listDays();
       // Day-bucket coarse filter — picks files we need to open.
       const inRange = days.filter((d) => {
@@ -7697,6 +7968,16 @@ const routes: readonly RouteDefinition[] = [
         if (day === null) continue;
         for (const entry of day.entries) {
           if (!overlapsRange(entry)) continue;
+          // Domain-tombstone privacy gate — drop purged domains.
+          if (
+            !tombstones.isEmpty &&
+            tombstones.matchesPage({
+              url: entry.url,
+              ...(entry.title === undefined ? {} : { title: entry.title }),
+            })
+          ) {
+            continue;
+          }
           if (q.length > 0) {
             const hay = `${entry.title ?? ''} ${entry.url}`.toLowerCase();
             if (!hay.includes(q)) continue;
@@ -8041,7 +8322,16 @@ const routes: readonly RouteDefinition[] = [
           ];
         },
       );
-      return connectionsResult;
+      // Domain-tombstone privacy gate — applied POST-cache (outside the
+      // revision-keyed connections cache) so a purge takes effect on the
+      // next serve without waiting for the graph revision to change.
+      // Drops matching nodes and any edge touching a dropped node.
+      const tombstones = await domainTombstoneSetFor(context);
+      const filtered = excludeTombstonedNodesFromConnectionsResult(
+        connectionsResult,
+        tombstones,
+      );
+      return filtered;
     },
   },
   {

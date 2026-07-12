@@ -90,6 +90,16 @@ export interface RecallStore {
   /** Delete by entityId. No-op if missing. */
   deleteDocument(entityId: string): void;
 
+  /** Privacy purge — delete every document (and its vectors + chunks)
+   *  whose `host` belongs to the eTLD+1 family `domain` (host === domain
+   *  OR host endsWith `.domain`). Used by the domain-tombstone purge so
+   *  a blocked site's captured recall entries are hard-removed from the
+   *  derived store, not just hidden at serve. Returns the number of
+   *  document rows deleted. No-op returning 0 when nothing matches.
+   *  Optional so lightweight test stubs don't have to implement it; the
+   *  purge path treats absence as "no vector deletion available". */
+  deleteDocumentsByHostFamily?(domain: string): number;
+
   /** Enumerate every entity_id currently stored for `sourceKind`. Used
    *  by the backfill deletion sweep — backfill snapshots this set,
    *  upserts every record in JSON, then deletes entityIds in the
