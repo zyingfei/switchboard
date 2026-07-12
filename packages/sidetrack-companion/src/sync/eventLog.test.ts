@@ -1,10 +1,14 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { AcceptedEvent } from './causal.js';
 import { createEventLog } from './eventLog.js';
+import {
+  getEventLaneHealth,
+  resetEventLaneHealthForTests,
+} from './eventLaneHealth.js';
 import { loadOrCreateReplica, type ReplicaContext } from './replicaId.js';
 
 describe('event log', () => {
@@ -430,5 +434,148 @@ describe('event log', () => {
     expect((await log.appendClientObservedBatch([input])).map((r) => r.imported)).toEqual([true]);
     expect((await log.appendClientObservedBatch([input])).map((r) => r.imported)).toEqual([false]);
     expect((await log.readMerged()).filter((e) => e.clientEventId === 'no-hook-1')).toHaveLength(1);
+  });
+});
+
+describe('event-lane health counters', () => {
+  let vaultRoot: string;
+  let replica: ReplicaContext;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-event-lane-'));
+    replica = await loadOrCreateReplica(vaultRoot);
+    resetEventLaneHealthForTests();
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('getEventLaneHealth exposes a stable zero baseline after reset', () => {
+    expect(getEventLaneHealth()).toEqual({
+      skippedMalformedLines: 0,
+      storeSkippedOutOfOrder: 0,
+      dotCollisions: 0,
+      duplicateCaptures: 0,
+      unreadableShards: 0,
+    });
+  });
+
+  it('counts a torn / malformed line skipped during readMerged (skippedMalformedLines)', async () => {
+    // One valid event line, one torn tail (crash without fsync), one
+    // JSON-parseable-but-not-an-AcceptedEvent line. Blank lines must NOT
+    // count.
+    const valid: AcceptedEvent = {
+      clientEventId: 'v-1',
+      dot: { replicaId: 'peer-torn', seq: 1 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: { x: 1 },
+      acceptedAtMs: 100,
+    };
+    const dir = join(vaultRoot, '_BAC', 'log', 'peer-torn');
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, '2026-05-05.jsonl'),
+      // valid line, torn tail (no closing brace), a valid-JSON non-event,
+      // and a blank line (structural — not counted).
+      `${JSON.stringify(valid)}\n{"clientEventId":"broke\n{"not":"an event"}\n\n`,
+      'utf8',
+    );
+
+    const log = createEventLog(vaultRoot, replica);
+    const before = getEventLaneHealth().skippedMalformedLines;
+    const merged = await log.readMerged();
+    // Only the valid event survives.
+    expect(merged.map((e) => e.clientEventId)).toEqual(['v-1']);
+    // The torn tail + the non-event line both counted; the blank did not.
+    expect(getEventLaneHealth().skippedMalformedLines).toBe(before + 2);
+  });
+
+  it('counts a dot collision on importPeerEvent (dotCollisions)', async () => {
+    const { DotCollisionError } = await import('./eventLog.js');
+    const log = createEventLog(vaultRoot, replica);
+    const a: AcceptedEvent = {
+      clientEventId: 'p-a',
+      dot: { replicaId: 'peer-X', seq: 5 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: { x: 1 },
+      acceptedAtMs: 100,
+    };
+    const b: AcceptedEvent = { ...a, clientEventId: 'p-b', payload: { x: 2 } };
+    await log.importPeerEvent(a);
+    const before = getEventLaneHealth().dotCollisions;
+    await expect(log.importPeerEvent(b)).rejects.toBeInstanceOf(DotCollisionError);
+    expect(getEventLaneHealth().dotCollisions).toBe(before + 1);
+  });
+
+  it('counts a reused clientEventId on importPeerEvent (duplicateCaptures)', async () => {
+    const { ClientEventIdReuseError } = await import('./eventLog.js');
+    const log = createEventLog(vaultRoot, replica);
+    const a: AcceptedEvent = {
+      clientEventId: 'reused',
+      dot: { replicaId: 'peer-X', seq: 1 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: {},
+      acceptedAtMs: 100,
+    };
+    const b: AcceptedEvent = { ...a, dot: { replicaId: 'peer-Y', seq: 1 } };
+    await log.importPeerEvent(a);
+    const before = getEventLaneHealth().duplicateCaptures;
+    await expect(log.importPeerEvent(b)).rejects.toBeInstanceOf(ClientEventIdReuseError);
+    expect(getEventLaneHealth().duplicateCaptures).toBe(before + 1);
+  });
+
+  it('readMergedSince tolerates a shard-read error without throwing + counts unreadableShards', async () => {
+    // Two shards for the same peer replica: an OLDER readable one and a
+    // NEWER unreadable one (chmod 000 → EACCES). readMergedSince must
+    // skip the unreadable shard, count it, still return the readable
+    // shard's events, and NOT throw out of the drain.
+    const readable: AcceptedEvent = {
+      clientEventId: 'r-1',
+      dot: { replicaId: 'peer-R', seq: 1 },
+      deps: {},
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: {},
+      acceptedAtMs: 100,
+    };
+    const unreadable: AcceptedEvent = {
+      clientEventId: 'r-2',
+      dot: { replicaId: 'peer-R', seq: 2 },
+      deps: { 'peer-R': 1 },
+      aggregateId: 'agg',
+      type: 'noop',
+      payload: {},
+      acceptedAtMs: 200,
+    };
+    const dir = join(vaultRoot, '_BAC', 'log', 'peer-R');
+    await mkdir(dir, { recursive: true });
+    // Sorted-reverse means '2026-05-06' (newer) is visited first.
+    await writeFile(join(dir, '2026-05-05.jsonl'), `${JSON.stringify(readable)}\n`, 'utf8');
+    const unreadablePath = join(dir, '2026-05-06.jsonl');
+    await writeFile(unreadablePath, `${JSON.stringify(unreadable)}\n`, 'utf8');
+    await chmod(unreadablePath, 0o000);
+
+    const log = createEventLog(vaultRoot, replica);
+    const before = getEventLaneHealth().unreadableShards;
+    let events: readonly AcceptedEvent[];
+    try {
+      // Must resolve, not reject, even though the newest shard is
+      // unreadable.
+      events = await log.readMergedSince({});
+    } finally {
+      // Restore perms so afterEach cleanup can remove the temp dir.
+      await chmod(unreadablePath, 0o644);
+    }
+    // The readable shard's event still came through.
+    expect(events.map((e) => e.clientEventId)).toContain('r-1');
+    // The unreadable shard was counted.
+    expect(getEventLaneHealth().unreadableShards).toBe(before + 1);
   });
 });

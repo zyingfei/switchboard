@@ -15,6 +15,12 @@ import {
   vectorFromEvents,
 } from './causal.js';
 import type { ReplicaContext } from './replicaId.js';
+import {
+  incrementDotCollisions,
+  incrementDuplicateCaptures,
+  incrementSkippedMalformedLines,
+  incrementUnreadableShards,
+} from './eventLaneHealth.js';
 
 // Errors surfaced when a peer event collides with an existing event
 // under the (replicaId, seq) "dot" identity, or when a clientEventId
@@ -309,11 +315,20 @@ export const isAcceptedEvent = (value: unknown): value is AcceptedEvent => {
 
 const parseLine = (line: string): AcceptedEvent | null => {
   const trimmed = line.trim();
+  // Empty lines are structural (trailing newline, blank separators),
+  // NOT data loss — do not count them.
   if (trimmed.length === 0) return null;
   try {
     const parsed = JSON.parse(trimmed) as unknown;
-    return isAcceptedEvent(parsed) ? parsed : null;
+    if (isAcceptedEvent(parsed)) return parsed;
+    // Parsed as JSON but not a valid AcceptedEvent — a garbled/partial
+    // line that survived JSON.parse; still a skipped event.
+    incrementSkippedMalformedLines();
+    return null;
   } catch {
+    // Non-empty line that does not parse — a torn tail (crash without
+    // fsync) or corrupted line. This is the primary data-loss signal.
+    incrementSkippedMalformedLines();
     return null;
   }
 };
@@ -367,10 +382,14 @@ const readLogFileSince = async (
   try {
     stream = createReadStream(path, { encoding: 'utf8' });
   } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+    if (isEnoent(error)) {
       return { events, maxSeq };
     }
-    throw error;
+    // A shard that exists but can't be opened (EACCES/EIO/EMFILE). Wrap
+    // so the runtime read path (readMergedSince) can distinguish it from
+    // a genuinely missing shard and skip it without treating it as an
+    // absent tail. Mirrors readShardTailSeq.
+    throw new ShardUnreadableError(path, error);
   }
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   let processed = 0;
@@ -394,10 +413,10 @@ const readLogFileSince = async (
       }
     }
   } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+    if (isEnoent(error)) {
       return { events, maxSeq };
     }
-    throw error;
+    throw new ShardUnreadableError(path, error);
   }
   return { events, maxSeq };
 };
@@ -745,16 +764,37 @@ export const createEventLog = (
       const frontierSeq = frontier[id] ?? 0;
       let parseBeforeTailCheck = true;
       for (const file of files) {
-        if (!parseBeforeTailCheck) {
-          const shardTailSeq = await readShardTailSeq(file, id);
-          if (shardTailSeq !== null && shardTailSeq <= frontierSeq) break;
+        try {
+          if (!parseBeforeTailCheck) {
+            const shardTailSeq = await readShardTailSeq(file, id);
+            if (shardTailSeq !== null && shardTailSeq <= frontierSeq) break;
+          }
+          const shard = await readLogFileSince(file, frontier, id);
+          for (const event of shard.events) {
+            out.push(event);
+          }
+          if (shard.maxSeq !== null && shard.maxSeq <= frontierSeq) break;
+          parseBeforeTailCheck = false;
+        } catch (error) {
+          // A transient per-shard read failure (EACCES/EIO/EMFILE on a
+          // network-mounted / dataless vault, fd exhaustion) must NOT
+          // throw out of a materializer drain. Count it, skip THIS shard
+          // for this pass, and continue with the rest. Crucially we do
+          // NOT break and do NOT advance any frontier past the unread
+          // shard: the caller advances only over events it actually
+          // received, so the shard's events are re-attempted next pass —
+          // the durability safety property. Re-throw anything that is
+          // not a shard-read failure.
+          if (error instanceof ShardUnreadableError) {
+            incrementUnreadableShards();
+            // Cannot trust a tail-seq short-circuit relative to an unread
+            // shard, so force a full parse of the remaining (older)
+            // shards this pass rather than a tail-check break.
+            parseBeforeTailCheck = true;
+            continue;
+          }
+          throw error;
         }
-        const shard = await readLogFileSince(file, frontier, id);
-        for (const event of shard.events) {
-          out.push(event);
-        }
-        if (shard.maxSeq !== null && shard.maxSeq <= frontierSeq) break;
-        parseBeforeTailCheck = false;
       }
     }
     return sortAcceptedEvents(out);
@@ -1183,6 +1223,10 @@ export const createEventLog = (
           if (canonicalEquals(byDot, event)) {
             return { imported: false } as const;
           }
+          // Two DIFFERENT events claim the same (replicaId, seq) — the
+          // causal primary key collided. Count the anomaly before we
+          // reject the import.
+          incrementDotCollisions();
           throw new DotCollisionError(event.dot, byDot.clientEventId, event.clientEventId);
         }
         // Index claims the dot exists but the merged read can't
@@ -1194,7 +1238,9 @@ export const createEventLog = (
       const knownDot = idx.clientIdToDot.get(event.clientEventId);
       if (knownDot !== undefined) {
         // Same clientEventId arriving under a different dot: a peer
-        // is reusing the id under different identities. Reject.
+        // is reusing the id under different identities. Writing it would
+        // mint a duplicate capture identity — count then reject.
+        incrementDuplicateCaptures();
         throw new ClientEventIdReuseError(event.clientEventId, knownDot, event.dot);
       }
       const dir = replicaLogDir(vaultPath, event.dot.replicaId);

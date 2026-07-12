@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { sortAcceptedEvents, type AcceptedEvent, type VersionVector } from './causal.js';
 import { createEventStore } from './eventStore.js';
+import { getEventLaneHealth, resetEventLaneHealthForTests } from './eventLaneHealth.js';
 
 const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
 
@@ -203,6 +204,77 @@ describe('EventStore sqlite', () => {
     expect(await store.catchUpFromJsonl(logRoot)).toBe(appendedEvents.length);
     expect(store.count()).toBe(events.length);
     expect(store.readSince({})).toEqual(referenceReadSince(events, {}));
+    store.close();
+  });
+});
+
+describe('EventStore data-loss counters', () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  const tempVault = async (): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), 'event-store-health-'));
+    dirs.push(dir);
+    await mkdir(join(dir, '_BAC', 'connections'), { recursive: true });
+    return dir;
+  };
+
+  sqliteIt('counts events at/below the watermark skipped in catchUp (storeSkippedOutOfOrder)', async () => {
+    const vault = await tempVault();
+    const store = await createEventStore(vault);
+    resetEventLaneHealthForTests();
+    // First catch-up advances the watermark to replica-a seq 2.
+    await store.catchUp([
+      event({ replicaId: 'replica-a', seq: 1, acceptedAtMs: 10 }),
+      event({ replicaId: 'replica-a', seq: 2, acceptedAtMs: 20 }),
+    ]);
+    const before = getEventLaneHealth().storeSkippedOutOfOrder;
+    // Re-deliver seq 1 + 2 (both at/below watermark → skipped) plus a new
+    // seq 3 (accepted).
+    const applied = await store.catchUp([
+      event({ replicaId: 'replica-a', seq: 1, acceptedAtMs: 10 }),
+      event({ replicaId: 'replica-a', seq: 2, acceptedAtMs: 20 }),
+      event({ replicaId: 'replica-a', seq: 3, acceptedAtMs: 30 }),
+    ]);
+    expect(applied).toBe(1);
+    expect(getEventLaneHealth().storeSkippedOutOfOrder).toBe(before + 2);
+    store.close();
+  });
+
+  sqliteIt('counts a redelivered dot with identical content as a duplicate capture (duplicateCaptures)', async () => {
+    const vault = await tempVault();
+    const store = await createEventStore(vault);
+    const e = event({ replicaId: 'replica-a', seq: 1, acceptedAtMs: 10 });
+    // ingestMany does NOT filter by watermark, so a second ingest of the
+    // same event reaches the INSERT OR IGNORE and is detected there.
+    store.ingestMany([e]);
+    resetEventLaneHealthForTests();
+    store.ingestMany([e]);
+    const health = getEventLaneHealth();
+    expect(health.duplicateCaptures).toBe(1);
+    expect(health.dotCollisions).toBe(0);
+    store.close();
+  });
+
+  sqliteIt('counts two different events on the same dot as a collision (dotCollisions)', async () => {
+    const vault = await tempVault();
+    const store = await createEventStore(vault);
+    const first = event({ replicaId: 'replica-a', seq: 1, acceptedAtMs: 10 });
+    // Same (replica_id, seq) dot, DIFFERENT clientEventId + payload.
+    const colliding: AcceptedEvent = {
+      ...first,
+      clientEventId: 'different-id',
+      payload: { payloadVersion: 1, value: 'collision' },
+    };
+    store.ingestMany([first]);
+    resetEventLaneHealthForTests();
+    store.ingestMany([colliding]);
+    const health = getEventLaneHealth();
+    expect(health.dotCollisions).toBe(1);
+    expect(health.duplicateCaptures).toBe(0);
+    // The store keeps the first-written row (INSERT OR IGNORE).
+    expect(store.count()).toBe(1);
     store.close();
   });
 });

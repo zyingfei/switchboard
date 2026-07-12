@@ -31,9 +31,20 @@ import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
 import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
 import { startRelayServer, type StartedRelayServer } from './sync/relayServer.js';
+import { installCrashHandlers } from './system/crashHandler.js';
 import { COMPANION_VERSION } from './version.js';
 
 export const companionVersion = COMPANION_VERSION;
+
+// Resolved vault root for the crash handler's durable record. Set once
+// the vault path is known (an uncaught throw before that point still
+// logs to stderr; it just skips the file write). Module-scoped so the
+// crash handler installed at the CLI entry point can read the latest
+// value through a closure without threading it through every call.
+let crashRecordVaultRoot: string | undefined;
+const setCrashRecordVaultRoot = (vaultRoot: string): void => {
+  crashRecordVaultRoot = vaultRoot;
+};
 
 export interface CliStreams {
   readonly stdout: Writable;
@@ -822,6 +833,10 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     writeLine(streams.stderr, renderHelp());
     return 2;
   }
+  // Vault root is now known — point the crash handler's durable record
+  // at it so an uncaught throw during startup / serving writes a
+  // post-mortem under this vault's _BAC/diagnostics/.
+  setCrashRecordVaultRoot(args.vaultPath);
 
   if (args.syncRelay !== undefined && args.syncRelayLocalPort !== undefined) {
     writeLine(streams.stderr, 'Use either --sync-relay or --sync-relay-local, not both.');
@@ -1155,6 +1170,13 @@ const isCliEntry = (): boolean => {
 };
 
 if (isCliEntry()) {
+  // Sole-writer crash supervision. Installed BEFORE runCli so an
+  // uncaught throw / unhandled rejection at ANY point in startup or
+  // serving writes a structured post-mortem (stderr + best-effort
+  // _BAC/diagnostics/crash-<ts>.json) and exits non-zero, rather than
+  // dying silently mid-operation or limping on corrupt. The vault root
+  // is read lazily so a throw before it is resolved still logs.
+  installCrashHandlers({ getVaultRoot: () => crashRecordVaultRoot });
   runCli(process.argv.slice(2), {
     stdout: process.stdout,
     stderr: process.stderr,

@@ -9,6 +9,11 @@ import { join } from 'node:path';
 
 import { isAcceptedEvent } from './eventLog.js';
 import type { AcceptedEvent, Hlc, TargetRef, VersionVector } from './causal.js';
+import {
+  incrementDotCollisions,
+  incrementDuplicateCaptures,
+  incrementStoreSkippedOutOfOrder,
+} from './eventLaneHealth.js';
 
 export interface EventStore {
   /** Idempotent by (replicaId, seq). Watermark advances for every valid event. */
@@ -124,6 +129,15 @@ const numberField = (row: unknown, field: string): number => {
   return typeof value === 'number' ? value : Number(value);
 };
 
+// bun:sqlite `.run()` returns `{ changes, lastInsertRowid }`. `changes`
+// is 0 when an `INSERT OR IGNORE` was ignored because the primary key
+// already existed. We validate the shape as unknown before reading it.
+const rowsChanged = (runResult: unknown): number => {
+  if (typeof runResult !== 'object' || runResult === null) return 0;
+  const changes = (runResult as Record<string, unknown>)['changes'];
+  return typeof changes === 'number' ? changes : 0;
+};
+
 const stringField = (row: unknown, field: string): string =>
   String((row as Record<string, unknown>)[field]);
 
@@ -194,6 +208,9 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     `INSERT INTO ingest_watermark (replica_id, max_seq) VALUES (?, ?)
      ON CONFLICT(replica_id) DO UPDATE SET max_seq = MAX(max_seq, excluded.max_seq)`,
   );
+  const selectClientEventIdByDot = db.query(
+    'SELECT client_event_id FROM events WHERE replica_id = ? AND seq = ?',
+  );
   const selectShardProgress = db.query(
     'SELECT size, mtime_ms, read_offset FROM shard_progress WHERE path = ?',
   );
@@ -208,7 +225,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
   const ingest = (event: AcceptedEvent): boolean => {
     if (!isStructurallyValidAcceptedEvent(event)) return false;
     const { replicaId, seq } = event.dot;
-    insertEvent.run(
+    const runResult = insertEvent.run(
       replicaId,
       seq,
       event.clientEventId,
@@ -220,6 +237,24 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       optionalJsonText(event.hlc),
       event.aggregateId,
     );
+    // changes === 0 ⇒ the INSERT OR IGNORE hit the (replica_id, seq)
+    // primary key: a row already exists for this dot. Classify the
+    // anomaly against the stored row (one indexed lookup, only on the
+    // rare ignore path — never the hot insert path). Same
+    // client_event_id ⇒ a duplicate replica-seq dot redelivered
+    // (duplicate capture); different ⇒ two distinct events claim the
+    // same dot (a true collision). Either way the store keeps the
+    // first-written row (INSERT OR IGNORE); we only observe.
+    if (rowsChanged(runResult) === 0) {
+      const existing = selectClientEventIdByDot.get(replicaId, seq);
+      if (existing === null || existing === undefined) {
+        incrementDuplicateCaptures();
+      } else if (stringField(existing, 'client_event_id') === event.clientEventId) {
+        incrementDuplicateCaptures();
+      } else {
+        incrementDotCollisions();
+      }
+    }
     bumpWatermark.run(replicaId, seq);
     return true;
   };
@@ -255,7 +290,13 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     let pending: AcceptedEvent[] = [];
     for (const event of events) {
       if (!isStructurallyValidAcceptedEvent(event)) continue;
-      if (event.dot.seq <= (wm[event.dot.replicaId] ?? 0)) continue;
+      if (event.dot.seq <= (wm[event.dot.replicaId] ?? 0)) {
+        // Event at or below the persisted per-replica watermark: an
+        // out-of-order / already-committed redelivery that is
+        // permanently dropped from this catch-up.
+        incrementStoreSkippedOutOfOrder();
+        continue;
+      }
       pending.push(event);
       if (pending.length >= CATCHUP_CHUNK) {
         count += ingestMany(pending);
@@ -352,7 +393,12 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
           try {
             const parsed = JSON.parse(trimmed) as unknown;
             if (!isAcceptedEvent(parsed)) continue;
-            if (parsed.dot.seq <= (wm[parsed.dot.replicaId] ?? 0)) continue;
+            if (parsed.dot.seq <= (wm[parsed.dot.replicaId] ?? 0)) {
+              // Below the per-replica watermark: an out-of-order /
+              // already-committed shard event, permanently skipped.
+              incrementStoreSkippedOutOfOrder();
+              continue;
+            }
             pending.push(parsed);
             if (pending.length >= CATCHUP_CHUNK) await flush();
           } catch {
