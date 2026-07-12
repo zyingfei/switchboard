@@ -114,27 +114,37 @@ const toQueuedCapture = (item: OutboxItem<CapturePayload>): QueuedCapture => ({
   intent: item.payload.intent,
 });
 
-// Clear a leftover eviction scratch record. A non-empty scratch means
-// a prior evictAndEnqueueExplicit crashed after staging but the primary
-// QUEUE_KEY still holds a valid queue (either the original full queue,
-// if the crash preceded the swap, or the correct post-eviction queue,
-// if it followed). Either way the primary is authoritative, so we just
-// drop the stale scratch. Best-effort — never throws into the caller.
-const reconcileEvictionScratch = async (storage: StoragePort): Promise<void> => {
+// Best-effort cleanup of a leftover eviction scratch record. MUST run
+// under withQueueLock (its read+clear is a read-modify-write on the same
+// key domain as eviction). A non-empty scratch means a prior
+// evictAndEnqueueExplicit crashed AFTER the primary-key commit but before
+// the scratch clear (Phase 3): the primary QUEUE_KEY already holds the
+// correct post-eviction queue, so the scratch is inert and we just drop
+// it. It is never READ for recovery — the atomicity of eviction comes
+// entirely from the single atomic captureOutbox.write, not from the
+// scratch (a crash BEFORE the commit leaves the original full queue; a
+// crash AFTER it leaves the correct post-eviction queue). The scratch
+// remains only as a forensic marker of an interrupted eviction and to
+// keep the on-disk key clean across upgrades. Best-effort — never throws.
+const clearStaleEvictionScratchLocked = async (storage: StoragePort): Promise<void> => {
   try {
     const scratch = await storage.get<readonly unknown[]>(EVICTION_SCRATCH_KEY, []);
     if (Array.isArray(scratch) && scratch.length > 0) {
       await storage.set({ [EVICTION_SCRATCH_KEY]: [] });
     }
   } catch {
-    // A failed reconcile must never block a read; the scratch is inert.
+    // A failed cleanup must never block the caller; the scratch is inert.
   }
 };
 
+// readQueue is a pure read: it must NOT mutate storage. The prior version
+// cleared the eviction scratch from here, which was an unsynchronized
+// write from a read path racing an in-flight eviction's scratch stage.
+// Scratch cleanup now happens only inside lock-held write paths
+// (enqueue/clear), where it cannot race.
 export const readQueue = async (
   storage: StoragePort = chromeStoragePort,
 ): Promise<readonly QueuedCapture[]> => {
-  await reconcileEvictionScratch(storage);
   const items = await captureOutbox.read(storage);
   return items.map(toQueuedCapture);
 };
@@ -226,6 +236,11 @@ export const enqueueCaptureInternal = async (
   evictionFaultHook: EvictionFaultHook,
 ): Promise<EnqueueResult> =>
   await withQueueLock(storage, async () => {
+    // Reconcile any leftover eviction scratch under the lock. A prior
+    // eviction that crashed after its atomic primary commit but before
+    // the Phase-3 scratch clear leaves a stale (inert) scratch record;
+    // drop it here now that we hold the lock, so it never accumulates.
+    await clearStaleEvictionScratchLocked(storage);
     // For passive captures the original drop-oldest semantics still
     // hold — an auto-track session that's been offline for weeks can
     // safely lose its oldest snapshots. createOutbox.enqueue caps at
@@ -326,10 +341,10 @@ export const retryFailedCaptures = async (
 ): Promise<{ readonly requeued: number }> => {
   // Phase 1: atomically read and clear FAILED_KEY under withFailedLock so
   // a concurrent drainQueueInner cannot race between the read and clear.
-  // We release the lock before calling enqueueCapture to avoid a deadlock:
-  // enqueueCapture acquires withQueueLock, and drainQueueInner holds
-  // withQueueLock while it tries to acquire withFailedLock — holding both
-  // locks in opposite orders would produce AB/BA deadlock.
+  // We release the FAILED lock before calling enqueueCapture (which takes
+  // the QUEUE lock): never hold both chains at once, so no lock-ordering
+  // (AB/BA) deadlock is possible even if the two lock domains ever became
+  // nested elsewhere.
   let failed: readonly FailedCapture[] = [];
   await withFailedLock(storage, async () => {
     failed = await readFailedCaptures(storage);
@@ -377,11 +392,24 @@ export const drainQueue = async (
 ): Promise<DrainResult> =>
   // Coalesce concurrent replayQueuedCaptures calls onto one in-flight
   // drain so two overlapping workboard polls don't each read the same
-  // queue and double-send items. The drain then runs under the queue
-  // mutex so its persist can't interleave with an enqueue/eviction
-  // read-modify-write on the same key.
+  // queue and double-send items.
+  //
+  // Crucially the queue mutex is NOT held across the network sends. A
+  // full drain awaits send() (≤5s each) for up to QUEUE_LIMIT items; if
+  // the whole loop held withQueueLock, a concurrent nav/explicit
+  // enqueueCapture would block on the same chain for minutes — and if
+  // the MV3 service worker were idle-killed mid-drain the blocked
+  // enqueue would never run, silently losing the explicit capture.
+  // Instead the drain sends lock-free and takes withQueueLock only for
+  // its terminal persist (via DrainOptions.persistLock). atomicDrainMerge
+  // makes that persist re-read + merge by id, so an enqueue that landed
+  // during the send window survives. Enqueue latency is bounded to the
+  // sub-millisecond persist, never a whole backlog drain.
   await singleFlight(storage, () =>
-    withQueueLock(storage, () => drainQueueInner(send, storage, now, random, opts)),
+    drainQueueInner(send, storage, now, random, {
+      ...opts,
+      persistLock: (task) => withQueueLock(storage, task),
+    }),
   );
 
 const drainQueueInner = async (
@@ -425,10 +453,11 @@ const drainQueueInner = async (
   );
   if (newlyFailed.length > 0) {
     // Route through withFailedLock to serialize against retryFailedCaptures
-    // which does its own read-clear-write on the same key. The two locks
-    // (withQueueLock for the main queue, withFailedLock for the failed
-    // queue) are independent chains so this call cannot deadlock with the
-    // outer withQueueLock that wraps drainQueueInner.
+    // which does its own read-clear-write on the same key. This runs after
+    // captureOutbox.drain has already returned (its persistLock/withQueueLock
+    // is released by now), so no queue-lock is held here and no AB/BA
+    // deadlock with the main-queue chain is possible — the two chains are
+    // independent regardless.
     await withFailedLock(storage, async () => {
       const existing = await readFailedCaptures(storage);
       const existingIds = new Set(existing.map((e) => e.id));

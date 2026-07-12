@@ -25,6 +25,17 @@ export interface DrainOptions {
   // paths where we have a fresh positive signal that the companion
   // is up; failures still re-arm the backoff for the next pass.
   readonly ignoreBackoff?: boolean;
+  // Serialize ONLY the terminal persist (the dropped-count bump and the
+  // merged write of the queue key) against concurrent mutators, without
+  // holding the lock across the network sends. The drain calls this with
+  // the persist body; the lock function runs it to completion before
+  // releasing. Leave undefined to persist without a lock (the default —
+  // used by outboxes whose callers serialize their own writes another
+  // way). This is the fix for the drain-lock starvation: an enqueue that
+  // arrives while a slow multi-item drain awaits the network only ever
+  // contends with the sub-millisecond persist, not the whole backlog
+  // drain, and the atomic merge (below) keeps that enqueue's write.
+  readonly persistLock?: (task: () => Promise<void>) => Promise<void>;
 }
 
 export interface DrainResult {
@@ -326,10 +337,19 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
       }
     }
 
-    if (dropped > 0) {
-      await storage.set({ [config.droppedKey]: (await readDropped(storage)) + dropped });
-    }
-    if (changed) {
+    // Persist the drain outcomes. When a persistLock is supplied we run
+    // this block (and ONLY this block — never the network sends above)
+    // under the caller's lock, so a concurrent enqueue contends with the
+    // sub-millisecond persist, not the whole drain. With atomicDrainMerge
+    // the re-read + merge happens inside that lock, so an enqueue that
+    // landed while we awaited the network is preserved rather than
+    // clobbered. `remaining` is captured from inside the locked body.
+    let remaining = nextQueue.length;
+    const persist = async (): Promise<void> => {
+      if (dropped > 0) {
+        await storage.set({ [config.droppedKey]: (await readDropped(storage)) + dropped });
+      }
+      if (!changed) return;
       if (atomicDrainMerge) {
         // Re-read at write time and apply outcomes by id so an enqueue
         // that landed while we awaited the network is not clobbered by
@@ -351,11 +371,17 @@ export const createOutbox = <TPayload>(config: OutboxConfig<TPayload>): Outbox<T
           // omit it from the merged queue.
         }
         await storage.set({ [config.storageKey]: merged });
-        return { sent, remaining: merged.length };
+        remaining = merged.length;
+        return;
       }
       await storage.set({ [config.storageKey]: nextQueue });
+    };
+    if (opts.persistLock !== undefined) {
+      await opts.persistLock(persist);
+    } else {
+      await persist();
     }
-    return { sent, remaining: nextQueue.length };
+    return { sent, remaining };
   };
 
   return {

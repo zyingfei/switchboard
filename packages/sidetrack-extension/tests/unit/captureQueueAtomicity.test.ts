@@ -134,10 +134,23 @@ describe('capture queue atomicity (F12)', () => {
     expect(urls).toContain('https://e.test/p2');
     expect(urls).toHaveLength(2);
 
-    // A leftover scratch record is reconciled on the next read and the
-    // queue reads back exactly the two survivors.
+    // A pure read never mutates storage, so the (inert) leftover scratch
+    // is still present after readQueue — but the two survivors read back
+    // verbatim regardless (the scratch is never consulted for recovery).
     const readBack = (await readQueue(storage)).map((q) => q.event.threadUrl);
     expect(readBack.sort()).toEqual(['https://e.test/p1', 'https://e.test/p2']);
+    expect(storage.raw(SCRATCH_KEY)).toEqual([
+      // survivor p2 + the not-yet-committed explicit item (staged then
+      // abandoned by the crash; p1 was the intended evictee).
+      expect.objectContaining({ payload: expect.objectContaining({ intent: 'passive' }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ intent: 'explicit' }) }),
+    ]);
+
+    // The leftover scratch is reconciled on the next LOCK-HELD write, not
+    // on a read: a subsequent enqueue clears it while it holds the queue
+    // lock, so eviction-scratch cleanup can never race an in-flight
+    // eviction's staging write.
+    await enqueueCapture(event('https://e.test/next'), storage, 5, 'passive');
     expect(storage.raw(SCRATCH_KEY)).toEqual([]);
   });
 
@@ -214,6 +227,188 @@ describe('capture queue atomicity (F12)', () => {
       'https://e.test/fill-3',
       'https://e.test/fill-4',
     ]);
+  });
+});
+
+describe('drain-lock starvation (F12 regression)', () => {
+  it('an enqueue issued while a slow multi-item drain is in flight is persisted without waiting for the whole drain', async () => {
+    // The drain must NOT hold the queue lock across its network sends.
+    // We park the drain on a gate mid-flight and fire a concurrent
+    // enqueue; the enqueue must resolve AND land in storage BEFORE the
+    // drain is allowed to finish. Under the old whole-drain lock the
+    // enqueue could not even begin until the entire multi-item backlog
+    // drained.
+    const storage = createMemoryStorage();
+    // Two passive items to drain; the first send parks on a gate.
+    await enqueueCapture(event('https://e.test/drain-1'), storage, 100, 'passive');
+    await enqueueCapture(event('https://e.test/drain-2'), storage, 100, 'passive');
+
+    const firstSendReached = deferred();
+    const releaseFirstSend = deferred();
+    let sends = 0;
+    const drainPromise = drainQueue(
+      async () => {
+        sends += 1;
+        if (sends === 1) {
+          firstSendReached.resolve();
+          // Park the drain here, holding no queue lock, simulating a
+          // slow network send. Enqueues fired now must not block on us.
+          await releaseFirstSend.promise;
+        }
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    // Wait until the drain is parked in its first send.
+    await firstSendReached.promise;
+
+    // Fire an explicit enqueue WHILE the drain is parked. This must
+    // resolve without waiting for releaseFirstSend — bounded latency.
+    const enqueueResult = await enqueueCapture(
+      event('https://e.test/enqueued-mid-drain'),
+      storage,
+      100,
+      'explicit',
+    );
+    expect(enqueueResult.accepted).toBe(true);
+
+    // The enqueued item is durably in storage BEFORE the drain finishes.
+    const midDrain = (await readQueue(storage)).map((q) => q.event.threadUrl);
+    expect(midDrain).toContain('https://e.test/enqueued-mid-drain');
+
+    // Now let the drain complete and confirm the enqueued item survived
+    // the end-of-drain persist (atomic merge, not a stale rewrite).
+    releaseFirstSend.resolve();
+    const drainResult = await drainPromise;
+    expect(drainResult.sent).toBe(2);
+    const after = (await readQueue(storage)).map((q) => q.event.threadUrl);
+    expect(after).toContain('https://e.test/enqueued-mid-drain');
+    expect(after).not.toContain('https://e.test/drain-1');
+    expect(after).not.toContain('https://e.test/drain-2');
+  });
+
+  it('an SW death (abandoned send) mid-drain does not lose a concurrently enqueued explicit capture', async () => {
+    // Model the MV3 idle-kill: the drain awaits a send that never
+    // resolves (the SW is torn down). A user + Capture fired during that
+    // window must be persisted to the queue regardless — under the old
+    // whole-drain lock the enqueue would be stuck behind the dead drain
+    // and the explicit capture would be silently lost.
+    const storage = createMemoryStorage();
+    await enqueueCapture(event('https://e.test/drain-a'), storage, 100, 'passive');
+
+    const sendReached = deferred();
+    const neverResolves = deferred();
+    // Fire the drain but never await it — its send hangs forever,
+    // standing in for the killed service worker.
+    void drainQueue(
+      async () => {
+        sendReached.resolve();
+        await neverResolves.promise;
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+
+    await sendReached.promise;
+
+    // The concurrent explicit enqueue must complete (not deadlock behind
+    // the hung drain) and persist the capture.
+    const result = await Promise.race([
+      enqueueCapture(event('https://e.test/explicit-during-death'), storage, 100, 'explicit'),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('enqueue blocked behind hung drain')), 1_000),
+      ),
+    ]);
+    expect(result.accepted).toBe(true);
+
+    const persisted = (await readQueue(storage)).map((q) => q.event.threadUrl);
+    expect(persisted).toContain('https://e.test/explicit-during-death');
+    // The un-sent drain item is still queued too (its send never
+    // completed, so the persist for that item never ran).
+    expect(persisted).toContain('https://e.test/drain-a');
+  });
+
+  it('concurrent drains still coalesce to a single drain despite the lock-free sends', async () => {
+    // Re-assert the single-flight property under the new model: the queue
+    // lock no longer wraps the whole drain, but singleFlight still
+    // coalesces two overlapping drain calls onto one in-flight run so no
+    // item is double-sent.
+    const storage = createMemoryStorage();
+    await enqueueCapture(event('https://e.test/c1'), storage, 100, 'passive');
+    await enqueueCapture(event('https://e.test/c2'), storage, 100, 'passive');
+
+    const sent: string[] = [];
+    const send = async (e: CaptureEvent): Promise<void> => {
+      sent.push(e.threadUrl);
+      await Promise.resolve();
+    };
+
+    const drainA = drainQueue(send, storage, new Date('2030-01-01T00:00:00.000Z'), () => 0.5, {
+      ignoreBackoff: true,
+    });
+    const drainB = drainQueue(send, storage, new Date('2030-01-01T00:00:00.000Z'), () => 0.5, {
+      ignoreBackoff: true,
+    });
+
+    const [resultA, resultB] = await Promise.all([drainA, drainB]);
+    expect(resultA).toEqual(resultB);
+    // Each item sent exactly once despite two concurrent drain calls.
+    expect(sent.sort()).toEqual(['https://e.test/c1', 'https://e.test/c2']);
+    expect(await readQueue(storage)).toEqual([]);
+  });
+
+  it('an eviction cannot interleave into the drain persist (both serialize on the queue lock)', async () => {
+    // The lock-free sends must NOT weaken the invariant that the drain's
+    // terminal persist and an eviction's crash-safe swap are mutually
+    // exclusive. We park a drain's send, fire an at-capacity explicit
+    // enqueue that must evict a passive, and confirm the final state is
+    // consistent (the evicting explicit item and the drain's merge both
+    // land; no survivor is lost).
+    const storage = createMemoryStorage();
+    // Cap-3 queue full of passives; one will be drained, the others stay.
+    await enqueueCapture(event('https://e.test/e1'), storage, 3, 'passive');
+    await enqueueCapture(event('https://e.test/e2'), storage, 3, 'passive');
+    await enqueueCapture(event('https://e.test/e3'), storage, 3, 'passive');
+
+    const sendReached = deferred();
+    const releaseSend = deferred();
+    let sends = 0;
+    const drainPromise = drainQueue(
+      async () => {
+        sends += 1;
+        if (sends === 1) {
+          sendReached.resolve();
+          await releaseSend.promise;
+        }
+      },
+      storage,
+      new Date('2030-01-01T00:00:00.000Z'),
+      () => 0.5,
+      { ignoreBackoff: true },
+    );
+    await sendReached.promise;
+
+    // At capacity → explicit enqueue evicts the oldest passive. This runs
+    // under withQueueLock while the drain is parked (lock-free) in send.
+    const evictResult = await enqueueCapture(event('https://e.test/explicit'), storage, 3, 'explicit');
+    expect(evictResult.accepted).toBe(true);
+    expect(evictResult.evicted).toBe(1);
+
+    releaseSend.resolve();
+    await drainPromise;
+
+    const final = (await readQueue(storage)).map((q) => q.event.threadUrl).sort();
+    // The explicit item persisted; the drained items are gone; the scratch
+    // is clean (no leftover from a torn eviction).
+    expect(final).toContain('https://e.test/explicit');
+    expect(storage.raw(SCRATCH_KEY)).toEqual([]);
+    // No duplicate of the explicit item; queue length is bounded.
+    expect(final.filter((u) => u === 'https://e.test/explicit')).toHaveLength(1);
   });
 });
 

@@ -11,11 +11,17 @@
 //
 //   withQueueLock  — every mutation on the MAIN queue key runs to
 //                    completion before the next one starts (a per-
-//                    storage promise chain).
-//   withFailedLock — same guarantee for the separate FAILED_KEY. Uses
-//                    a distinct chain so callers already inside
-//                    withQueueLock (e.g. drainQueueInner) can safely
-//                    call withFailedLock without deadlocking.
+//                    storage promise chain). A drain does NOT hold this
+//                    across its network sends — only across its terminal
+//                    persist (via DrainOptions.persistLock) — so a
+//                    concurrent enqueue is never starved behind a slow
+//                    backlog drain. The atomic-merge persist keeps that
+//                    enqueue's write.
+//   withFailedLock — same guarantee for the separate FAILED_KEY, on a
+//                    distinct chain. Kept independent so the failed-write
+//                    (run after the drain's queue-lock persist releases)
+//                    can never form a lock-ordering cycle with the main
+//                    queue chain.
 //   singleFlight   — concurrent drain calls coalesce onto the one
 //                    in-flight drain promise instead of each racing a
 //                    fresh read/rewrite.
