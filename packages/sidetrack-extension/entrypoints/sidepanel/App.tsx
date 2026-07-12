@@ -3658,6 +3658,19 @@ const App = () => {
     })();
   };
 
+  // A closed/restorable thread carries a stored TabSnapshot; the reopen
+  // affordance should offer the recovery modal (focus-open / restore-
+  // session / reopen-URL strategies) rather than blindly creating a new
+  // tab. Live threads open directly. Without this, the fully-built
+  // TabRecovery modal was unreachable (§13 step 8).
+  const reopenOrRecoverThread = (thread: TrackedThread) => {
+    if (thread.status === 'closed' || thread.status === 'restorable') {
+      setRecoveryThreadId(thread.bac_id);
+      return;
+    }
+    openTabForThread(thread);
+  };
+
   // "Find" icon in the side-panel header. Reads the active tab in
   // the focused window, finds a tracked thread whose threadUrl
   // matches, scrolls + flashes the row using the same
@@ -5577,11 +5590,11 @@ const App = () => {
           <button
             type="button"
             className="btn-link thread-action-icon"
-            title="Open the thread's tab (or reopen if closed)"
+            title="Open the thread's tab (or recover if closed)"
             aria-label="Open thread tab"
             onClick={(e) => {
               e.stopPropagation();
-              openTabForThread(thread);
+              reopenOrRecoverThread(thread);
             }}
           >
             <span className="icon-12" aria-hidden>
