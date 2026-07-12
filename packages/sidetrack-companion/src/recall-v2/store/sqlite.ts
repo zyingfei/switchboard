@@ -543,6 +543,7 @@ class SqliteRecallStore implements RecallStore {
     readonly canonicalUrl: string | undefined;
     readonly title: string | undefined;
     readonly cosineDistance: number;
+    readonly bodyIndexed: 0 | 1;
   }[] {
     if (!this.vecAvailable) return [];
     try {
@@ -556,11 +557,20 @@ class SqliteRecallStore implements RecallStore {
       //
       // Fix: do the MATCH+LIMIT in a subquery (vec0 sees its own
       // LIMIT), then join out to docs for canonical_url / title.
+      // body_indexed is already on the docs schema (1 = body extracted,
+      // 0 = title+URL only). Returning it lets callers distinguish a
+      // content vector from a title-only vector so they can LOG the
+      // provenance of a KNN hit. It is READ-ONLY here: fusion/ordering
+      // is unchanged (the ORDER BY is still cosine distance), and any
+      // down-weighting of title-only hits is a serving-math change gated
+      // behind the P1 freeze (ADR-0011). COALESCE guards the LEFT JOIN
+      // miss (vector present but docs row swept) — treat unknown as 0.
       const sql = `
         SELECT v.entityId AS entityId,
                d.canonical_url AS canonicalUrl,
                d.title AS title,
-               v.distance AS cosineDistance
+               v.distance AS cosineDistance,
+               COALESCE(d.body_indexed, 0) AS bodyIndexed
         FROM (
           SELECT entity_id AS entityId, distance
           FROM docs_vec
@@ -575,12 +585,14 @@ class SqliteRecallStore implements RecallStore {
         canonicalUrl: string | null;
         title: string | null;
         cosineDistance: number;
+        bodyIndexed: number;
       }[];
       const mapped = rows.map((r) => ({
         entityId: r.entityId,
         canonicalUrl: r.canonicalUrl ?? undefined,
         title: r.title ?? undefined,
         cosineDistance: r.cosineDistance,
+        bodyIndexed: (r.bodyIndexed === 1 ? 1 : 0) as 0 | 1,
       }));
       const exclude = opts.excludeEntityIds;
       if (exclude === undefined) return mapped;

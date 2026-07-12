@@ -20,6 +20,9 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { installCustomSqlite } from './setup-sqlite.js';
+import { openInMemoryRecallStore } from './sqlite.js';
+
 import type { RecallStore, StoreDocument, StoreSourceKind } from './types.js';
 
 // Local stub store mirroring the production sqlite.ts surface for
@@ -68,19 +71,30 @@ const makeCanonicalStub = (): RecallStore => {
       chunkVectors.set(chunkId, new Float32Array(vec));
     },
     queryVector: (opts) => {
-      const queryVec = opts.queryVector;
-      if (queryVec === undefined) return [];
-      const out: { entityId: string; distance: number }[] = [];
+      const queryVec = opts.vec;
+      const out: {
+        entityId: string;
+        canonicalUrl: string | undefined;
+        title: string | undefined;
+        cosineDistance: number;
+        bodyIndexed: 0 | 1;
+      }[] = [];
       for (const [entityId, vec] of docVectors) {
         // Cosine distance over L2-normalized vectors = 1 - dot.
         let dot = 0;
         const len = Math.min(queryVec.length, vec.length);
         for (let i = 0; i < len; i += 1) dot += (queryVec[i] ?? 0) * (vec[i] ?? 0);
-        out.push({ entityId, distance: 1 - dot });
+        const doc = docs.get(entityId);
+        out.push({
+          entityId,
+          canonicalUrl: doc?.canonicalUrl,
+          title: doc?.title,
+          cosineDistance: 1 - dot,
+          bodyIndexed: doc?.bodyIndexed ?? 0,
+        });
       }
-      out.sort((a, b) => a.distance - b.distance);
-      const limit = opts.limit ?? out.length;
-      return out.slice(0, limit);
+      out.sort((a, b) => a.cosineDistance - b.cosineDistance);
+      return out.slice(0, opts.limit);
     },
     close: () => {},
   };
@@ -109,15 +123,15 @@ describe('Phase 4 — canonical vector store contract', () => {
     const b = l2Normalize(new Float32Array([0, 1, 0, 1]));
     store.upsertVector('doc:a', a);
     store.upsertVector('doc:b', b);
-    const hits = store.queryVector({ queryVector: a, limit: 2 });
+    const hits = store.queryVector({ vec: a, limit: 2 });
     expect(hits.length).toBe(2);
     // doc:a is the query → distance 0
     expect(hits[0]?.entityId).toBe('doc:a');
-    expect(hits[0]?.distance).toBeCloseTo(0, 6);
+    expect(hits[0]?.cosineDistance).toBeCloseTo(0, 6);
     // doc:b cosine = a·b (already normalized), distance = 1 - cosine
     const expectedDistance = 1 - cosineSimilarity(a, b);
     expect(hits[1]?.entityId).toBe('doc:b');
-    expect(hits[1]?.distance).toBeCloseTo(expectedDistance, 6);
+    expect(hits[1]?.cosineDistance).toBeCloseTo(expectedDistance, 6);
   });
 
   it('isolates document vectors from chunk vectors (separate name-spaces)', () => {
@@ -141,11 +155,11 @@ describe('Phase 4 — canonical vector store contract', () => {
     // Caller mutates their copy after upsert — canonical store
     // must NOT be affected.
     original[0] = 99;
-    const hits = store.queryVector({ queryVector: l2Normalize(new Float32Array([1, 0, 0, 1])), limit: 1 });
+    const hits = store.queryVector({ vec: l2Normalize(new Float32Array([1, 0, 0, 1])), limit: 1 });
     expect(hits[0]?.entityId).toBe('doc:a');
     // Distance should be near 0 because the stored vector is the
     // pre-mutation value.
-    expect(hits[0]?.distance).toBeCloseTo(0, 6);
+    expect(hits[0]?.cosineDistance).toBeCloseTo(0, 6);
   });
 
   it('vector inventory is enumerable for health reporting', () => {
@@ -158,5 +172,74 @@ describe('Phase 4 — canonical vector store contract', () => {
     store.upsertChunkVector('chunk:b:0', v2);
     expect(store.allVectorEntityIds().size).toBe(2);
     expect(store.allChunkVectorIds().size).toBe(2);
+  });
+});
+
+// Move 4 (a) — queryVector surfaces the docs.body_indexed column so a
+// caller can tell a content-derived KNN hit from a title-only one and
+// LOG that provenance. Runs against the REAL SqliteRecallStore (the stub
+// above cannot exercise the SELECT). The docs_vec table is FLOAT[384],
+// so this needs a vec-capable system libsqlite3 (Homebrew locally); on
+// CI (SIDETRACK_SQLITE_LIB=off) vectorBackendAvailable is false and the
+// documented empty-return contract holds instead.
+describe('Move 4 (a) — queryVector body_indexed provenance', () => {
+  const l2Normalize384 = (seed: number): Float32Array => {
+    const v = new Float32Array(384);
+    // A couple of non-zero coordinates so the two docs are distinct but
+    // both retrievable; exact geometry is irrelevant to the body_indexed
+    // read under test.
+    v[seed % 384] = 1;
+    v[(seed * 7 + 1) % 384] = 0.5;
+    let norm = 0;
+    for (let i = 0; i < v.length; i += 1) norm += (v[i] ?? 0) ** 2;
+    const inv = norm === 0 ? 1 : 1 / Math.sqrt(norm);
+    for (let i = 0; i < v.length; i += 1) v[i] = (v[i] ?? 0) * inv;
+    return v;
+  };
+
+  const contentDoc: StoreDocument = {
+    entityId: 'pc:content',
+    sourceKind: 'page_content',
+    canonicalUrl: 'https://example.test/content',
+    title: 'Content page',
+    bodyIndexed: 1,
+  };
+  const titleOnlyDoc: StoreDocument = {
+    entityId: 'tv:title-only',
+    sourceKind: 'timeline_visit',
+    canonicalUrl: 'https://example.test/title-only',
+    title: 'Title-only page',
+    bodyIndexed: 0,
+  };
+
+  it('returns 1 for a content vector and 0 for a title-only vector', () => {
+    installCustomSqlite();
+    const store = openInMemoryRecallStore();
+    try {
+      const queryVec = l2Normalize384(3);
+      if (!store.vectorBackendAvailable) {
+        // No vec-capable lib on this runner (e.g. CI opt-out): the
+        // documented contract is an empty result, which still typechecks
+        // against the body_indexed-bearing row shape.
+        expect(store.queryVector({ vec: queryVec, limit: 5 })).toEqual([]);
+        return;
+      }
+      store.upsertDocument(contentDoc);
+      store.upsertDocument(titleOnlyDoc);
+      store.upsertVector(contentDoc.entityId, l2Normalize384(3));
+      store.upsertVector(titleOnlyDoc.entityId, l2Normalize384(11));
+
+      const hits = store.queryVector({ vec: queryVec, limit: 5 });
+      const byId = new Map(hits.map((h) => [h.entityId, h] as const));
+      expect(byId.get(contentDoc.entityId)?.bodyIndexed).toBe(1);
+      expect(byId.get(titleOnlyDoc.entityId)?.bodyIndexed).toBe(0);
+      // body_indexed is read-only provenance — ordering is still by
+      // cosine distance, unaffected by the flag.
+      expect(byId.get(contentDoc.entityId)?.cosineDistance).toBeLessThan(
+        byId.get(titleOnlyDoc.entityId)?.cosineDistance ?? Infinity,
+      );
+    } finally {
+      store.close();
+    }
   });
 });

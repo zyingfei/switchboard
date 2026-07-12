@@ -252,6 +252,7 @@ const vectorSeededStore = (): RecallStore => {
         canonicalUrl: 'https://example.com/semantic-only',
         title: 'Semantic-only page',
         cosineDistance: 0.2, // → query cosine 0.8
+        bodyIndexed: 1,
       },
     ],
   };
