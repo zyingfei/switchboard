@@ -36,6 +36,7 @@ import {
 import {
   firstMatchingNoCaptureRule,
   noCaptureRuleDisplayLabel,
+  registrableDomainFromUrl,
 } from '../../src/capture/noCaptureRules';
 import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
@@ -73,6 +74,7 @@ import {
   TabRecovery,
   InboundView,
   QueuedView,
+  NoCaptureRulesSection,
   Wizard,
   type RestoreStrategy,
   type ReviewVerdict,
@@ -852,7 +854,15 @@ const App = () => {
   // user, so once they navigate to another panel tab they stay
   // there until they explicitly choose Now again.
   const [viewMode, setViewMode] = useState<
-    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search' | 'inbound' | 'queued'
+    | 'now'
+    | 'workstream'
+    | 'all'
+    | 'inbox'
+    | 'connections'
+    | 'search'
+    | 'inbound'
+    | 'queued'
+    | 'privacy'
   >('now');
   // Stage 5 polish — cross-surface jumps between Inbox and Connections.
   // `connectionsAnchorRequest` is a string that ConnectionsView watches
@@ -2766,7 +2776,15 @@ const App = () => {
   // through a ref so the listener always reads the latest values
   // even though the registration runs only once.
   const viewModeRef = useRef<
-    'now' | 'workstream' | 'all' | 'inbox' | 'connections' | 'search' | 'inbound' | 'queued'
+    | 'now'
+    | 'workstream'
+    | 'all'
+    | 'inbox'
+    | 'connections'
+    | 'search'
+    | 'inbound'
+    | 'queued'
+    | 'privacy'
   >('now');
   const currentWsIdRef = useRef<string | null>(null);
   const expandBucketForThreadRef = useRef<((thread: TrackedThread) => Promise<void>) | null>(null);
@@ -3598,9 +3616,34 @@ const App = () => {
           },
           kind,
         });
+        // Refresh the workboard so state.settings.noCaptureRules (and
+        // therefore the lamp's blocked verdict + the inline Privacy
+        // list) reflect the new rule immediately, not on next reload.
+        // The add handler doesn't broadcast, so we pull once here.
+        const next = await sendRequest({ type: messageTypes.getWorkboardState });
+        setState(next);
       } catch {
-        // Best-effort; the Settings Capture section is the source of
-        // truth and will reflect the persisted list on next open.
+        // Best-effort; the Privacy rules list is the source of truth
+        // and will reflect the persisted list on next open.
+      }
+    })();
+  };
+
+  // Re-enable capture for the current site by removing its matching
+  // no-capture rule (the block ↔ re-enable round-trip on the lamp's
+  // per-site icons). Refreshes state so the lamp flips back to
+  // "Recording" the moment the rule is gone.
+  const removeNoCaptureRuleById = (ruleId: string) => {
+    void (async () => {
+      try {
+        await chrome.runtime.sendMessage({
+          type: messageTypes.removeNoCaptureRule,
+          ruleId,
+        });
+        const next = await sendRequest({ type: messageTypes.getWorkboardState });
+        setState(next);
+      } catch {
+        // Best-effort; the Privacy rules list stays authoritative.
       }
     })();
   };
@@ -5017,6 +5060,38 @@ const App = () => {
     return firstMatchingNoCaptureRule({ url }, state.settings.noCaptureRules ?? []);
   }, [focusedUrl, currentSiteUrl, state.settings.noCaptureRules]);
   const currentSiteBlocked = currentTabBlockingRule !== null;
+
+  // Per-kind rule state for the lamp's two per-site capture controls.
+  // Each icon must be independently stateful (a site can be blocked by
+  // a 'domain' rule, a 'similar' rule, both, or neither), so we resolve
+  // the EXACT rule of each kind that owns this site's family — matched
+  // on the registrable domain so the icon flips filled + offers
+  // "re-enable" the instant that specific rule exists. Distinct from
+  // `currentTabBlockingRule` (the first-any match that drives the
+  // verdict); these drive the two toggles.
+  const currentSiteRegistrableDomain = useMemo((): string => {
+    const url = focusedUrl ?? currentSiteUrl;
+    if (typeof url !== 'string' || url.length === 0) return '';
+    return registrableDomainFromUrl(url);
+  }, [focusedUrl, currentSiteUrl]);
+  const currentSiteDomainRule = useMemo(
+    () =>
+      currentSiteRegistrableDomain.length === 0
+        ? null
+        : ((state.settings.noCaptureRules ?? []).find(
+            (rule) => rule.kind === 'domain' && rule.domain === currentSiteRegistrableDomain,
+          ) ?? null),
+    [currentSiteRegistrableDomain, state.settings.noCaptureRules],
+  );
+  const currentSiteSimilarRule = useMemo(
+    () =>
+      currentSiteRegistrableDomain.length === 0
+        ? null
+        : ((state.settings.noCaptureRules ?? []).find(
+            (rule) => rule.kind === 'similar' && rule.domain === currentSiteRegistrableDomain,
+          ) ?? null),
+    [currentSiteRegistrableDomain, state.settings.noCaptureRules],
+  );
   // Tri-state for the card: master pause wins over a per-site rule.
   const currentTabCaptureState: 'capturing' | 'paused' | 'blocked' = captureOff
     ? 'paused'
@@ -5103,15 +5178,21 @@ const App = () => {
   // sub-tab tablist keeps every old viewMode tab (with its exact ARIA
   // name) queryable/clickable regardless — this only drives which
   // primary section reads as "current" in the top nav. Settings is a
-  // modal, not a viewMode, so it's never derived-active here.
-  const primarySection: 'now' | 'work' | 'memory' | 'trust' =
+  // gear-opened modal, not a viewMode, so it's never derived-active
+  // here. Section map (R1.2 naming decision): Now / Work / Inbox /
+  // Library / Privacy. Inbox merges the two incoming-things surfaces
+  // (Inbound replies + ambient Inbox); Library is the old Memory
+  // (Search + Explore); Privacy renders the no-capture rules inline.
+  const primarySection: 'now' | 'work' | 'inbox' | 'library' | 'privacy' =
     viewMode === 'now'
       ? 'now'
       : viewMode === 'all' || viewMode === 'workstream' || viewMode === 'queued'
         ? 'work'
         : viewMode === 'inbound' || viewMode === 'inbox'
-          ? 'trust'
-          : 'memory';
+          ? 'inbox'
+          : viewMode === 'privacy'
+            ? 'privacy'
+            : 'library';
 
   const [currentTabPageTextOpen, setCurrentTabPageTextOpen] = useState(false);
   const [currentTabCoverage, setCurrentTabCoverage] = useState<PageContentCoverage | null>(null);
@@ -6586,92 +6667,172 @@ const App = () => {
       data-capture-state={lampAccentState}
     >
       {/* ── Persistent header: the SPINE. Row A = the capture lamp
-          strip (privacy verdict, always visible + announced). Row B =
-          app mark + the 5 primary sections + tools. */}
-      {/* Row A — Capture Lamp strip. The one living signature element:
-          lamp glyph + current domain (mono) + capture verdict
-          (aria-live) + the master eye. Retints the whole panel via the
-          [data-capture-state] accent bus set on <main> above. */}
+          strip, now the CAPTURE CONTROL CENTER. Row B = app mark + the
+          5 primary sections + tools. */}
+      {/* Row A — Capture Lamp strip. LEFT = the living verdict (lamp
+          glyph + current domain (mono) + capture verdict, aria-live).
+          RIGHT = three co-located controls: two per-site toggles
+          (don't-capture-this-domain / don't-capture-similar-sites,
+          each stateful — filled + "re-enable" when a rule owns this
+          site) and the GLOBAL master eye (pause/resume everything).
+          The whole panel retints via the [data-capture-state] accent
+          bus set on <main> above. */}
       <div
         className={'capture-lamp-strip lamp-' + lampAccentState}
         data-testid="capture-lamp-strip"
       >
-        <span className="lamp-glyph mono" aria-hidden>
-          {lampVerdict.glyph}
-        </span>
-        {lampDomain === null ? (
-          // No capturable page in focus — the verdict ("No page in
-          // focus") already carries the meaning, so we don't paint a
-          // placeholder domain that reads like a second verdict. The
-          // testid stays for the pinned lamp tests; it renders empty and
-          // is hidden by CSS so the strip stays quiet and composed.
+        <div className="lamp-left">
+          <span className="lamp-glyph mono" aria-hidden>
+            {lampVerdict.glyph}
+          </span>
+          {lampDomain === null ? (
+            // No capturable page in focus — the verdict ("No page in
+            // focus") already carries the meaning, so we don't paint a
+            // placeholder domain that reads like a second verdict. The
+            // testid stays for the pinned lamp tests; it renders empty
+            // and is hidden by CSS so the strip stays quiet + composed.
+            <span
+              className="lamp-domain mono lamp-domain-empty"
+              data-testid="capture-lamp-domain"
+              aria-hidden
+            />
+          ) : (
+            <span className="lamp-domain mono" title={lampDomain} data-testid="capture-lamp-domain">
+              {lampDomain}
+            </span>
+          )}
           <span
-            className="lamp-domain mono lamp-domain-empty"
-            data-testid="capture-lamp-domain"
-            aria-hidden
-          />
-        ) : (
-          <span className="lamp-domain mono" title={lampDomain} data-testid="capture-lamp-domain">
-            {lampDomain}
-          </span>
-        )}
-        <span
-          className="lamp-verdict mono"
-          role="status"
-          aria-live="polite"
-          data-testid="capture-lamp-verdict"
-        >
-          {lampVerdict.text}
-        </span>
-        {currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null ? (
-          <button
-            type="button"
-            className="lamp-rule-chip mono"
-            onClick={() => {
-              openSettingsAt('no-capture-rules');
-            }}
-            title={`Manage the no-capture rule for this site in Settings. Rule: ${noCaptureRuleDisplayLabel(
-              currentTabBlockingRule,
-            )}`}
-            aria-label={`Not captured — rule: ${noCaptureRuleDisplayLabel(
-              currentTabBlockingRule,
-            )}. Manage rule in Settings.`}
-            data-testid="capture-lamp-rule-chip"
+            className="lamp-verdict mono"
+            role="status"
+            aria-live="polite"
+            data-testid="capture-lamp-verdict"
           >
-            rule: {noCaptureRuleDisplayLabel(currentTabBlockingRule)}
-          </button>
-        ) : null}
-        {/* Master capture switch — the privacy "eye", promoted out of
-            the old 11-icon row to be the strip's primary control. Same
-            testid/aria-pressed/class + ON/PAUSED copy. */}
-        <button
-          className={'icon-btn capture-eye lamp-eye' + (captureOff ? ' off' : '')}
-          title={
-            captureEnabled
-              ? 'Capture is ON — Sidetrack is observing this browser. Click to pause all capture.'
-              : 'Capture is PAUSED — nothing is being recorded anywhere. Click to resume.'
-          }
-          onClick={() => {
-            void runAction(() =>
-              sendRequest({
-                type: messageTypes.saveLocalPreferences,
-                preferences: { captureEnabled: captureOff },
-              }),
-            );
-          }}
-          type="button"
-          aria-label={
-            captureEnabled
-              ? 'Capture is on — click to pause all capture'
-              : 'Capture is paused — click to resume capture'
-          }
-          aria-pressed={captureEnabled}
-          data-testid="capture-toggle"
-        >
-          <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
-            {captureEnabled ? Icons.eye : Icons.eyeOff}
+            {lampVerdict.text}
           </span>
-        </button>
+          {currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null ? (
+            <button
+              type="button"
+              className="lamp-rule-chip mono"
+              onClick={() => {
+                setViewMode('privacy');
+              }}
+              title={`Manage the no-capture rule for this site in Privacy. Rule: ${noCaptureRuleDisplayLabel(
+                currentTabBlockingRule,
+              )}`}
+              aria-label={`Not captured — rule: ${noCaptureRuleDisplayLabel(
+                currentTabBlockingRule,
+              )}. Manage rule in Privacy.`}
+              data-testid="capture-lamp-rule-chip"
+            >
+              rule: {noCaptureRuleDisplayLabel(currentTabBlockingRule)}
+            </button>
+          ) : null}
+        </div>
+        {/* Right-side control cluster — the three capture controls the
+            user asked to co-locate with the verdict they affect. */}
+        <div className="lamp-controls" data-testid="capture-lamp-controls">
+          {/* Per-site control 1 — don't capture THIS domain. Stateful:
+              filled/active when a domain rule already owns this site
+              (clicking then re-enables by removing the rule). Only
+              rendered when the current tab is a capturable http(s)
+              page (currentSiteLabel is defined). */}
+          {currentSiteLabel === undefined ? null : (
+            <button
+              type="button"
+              className={
+                'icon-btn lamp-site-btn' + (currentSiteDomainRule !== null ? ' on' : '')
+              }
+              title={
+                currentSiteDomainRule !== null
+                  ? `Not capturing ${currentSiteLabel} (rule active). Click to re-enable capture for this site.`
+                  : `Don't capture ${currentSiteLabel} — stop recording this whole site.`
+              }
+              aria-label={
+                currentSiteDomainRule !== null
+                  ? `Capture blocked for ${currentSiteLabel} — click to re-enable`
+                  : `Don't capture ${currentSiteLabel}`
+              }
+              aria-pressed={currentSiteDomainRule !== null}
+              onClick={() => {
+                if (currentSiteDomainRule !== null) {
+                  removeNoCaptureRuleById(currentSiteDomainRule.id);
+                } else {
+                  addNoCaptureRuleForCurrentSite('domain');
+                }
+              }}
+              data-testid="lamp-block-domain"
+            >
+              <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+                {Icons.siteBlock}
+              </span>
+            </button>
+          )}
+          {/* Per-site control 2 — don't capture SITES LIKE this (the
+              account / billing / login family). Same stateful toggle
+              semantics against a 'similar' rule. */}
+          {currentSiteLabel === undefined ? null : (
+            <button
+              type="button"
+              className={
+                'icon-btn lamp-site-btn' + (currentSiteSimilarRule !== null ? ' on' : '')
+              }
+              title={
+                currentSiteSimilarRule !== null
+                  ? `Not capturing sites like ${currentSiteLabel} (rule active). Click to re-enable.`
+                  : "Don't capture sites like this — account / billing / login pages."
+              }
+              aria-label={
+                currentSiteSimilarRule !== null
+                  ? 'Capture blocked for similar sites — click to re-enable'
+                  : "Don't capture sites like this"
+              }
+              aria-pressed={currentSiteSimilarRule !== null}
+              onClick={() => {
+                if (currentSiteSimilarRule !== null) {
+                  removeNoCaptureRuleById(currentSiteSimilarRule.id);
+                } else {
+                  addNoCaptureRuleForCurrentSite('similar');
+                }
+              }}
+              data-testid="lamp-block-similar"
+            >
+              <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+                {Icons.sitesBlock}
+              </span>
+            </button>
+          )}
+          {/* Master capture switch — the GLOBAL privacy "eye". Pauses /
+              resumes EVERYTHING, everywhere. Same testid/aria-pressed/
+              class + ON/PAUSED copy. */}
+          <button
+            className={'icon-btn capture-eye lamp-eye' + (captureOff ? ' off' : '')}
+            title={
+              captureEnabled
+                ? 'Capture is ON everywhere — Sidetrack is observing this browser. Click to pause all capture.'
+                : 'Capture is PAUSED everywhere — nothing is being recorded anywhere. Click to resume.'
+            }
+            onClick={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.saveLocalPreferences,
+                  preferences: { captureEnabled: captureOff },
+                }),
+              );
+            }}
+            type="button"
+            aria-label={
+              captureEnabled
+                ? 'Capture is on — click to pause all capture'
+                : 'Capture is paused — click to resume capture'
+            }
+            aria-pressed={captureEnabled}
+            data-testid="capture-toggle"
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+              {captureEnabled ? Icons.eye : Icons.eyeOff}
+            </span>
+          </button>
+        </div>
       </div>
       <div className="app-head">
         <div className="app-mark">
@@ -6703,30 +6864,36 @@ const App = () => {
                 go: () => setViewMode('all'),
               },
               {
-                id: 'memory',
-                // Memory absorbs Search + Explore (connections). Its
-                // default sub-tab is Search — Inbox moved to Trust, so
-                // Memory must NOT default to the inbox viewMode.
-                label: 'Memory',
-                active: primarySection === 'memory',
-                go: () => setViewMode('search'),
-              },
-              {
-                id: 'trust',
-                // Trust absorbs Inbound replies + Inbox (+ Capture &
-                // Rules / Health modals). Its default sub-tab is Replies.
-                label: 'Trust',
-                active: primarySection === 'trust',
+                id: 'inbox',
+                // Inbox is the single incoming-things home — it merges
+                // the old Trust→Replies (unread AI replies, the badge)
+                // and Trust→Inbox (ambient backlog). Defaults to the
+                // Replies sub-tab (the actionable-now surface).
+                label: 'Inbox',
+                active: primarySection === 'inbox',
+                // Unread replies are the actionable-now signal — badge
+                // the whole section so the user sees them without
+                // opening it.
+                badge: inboundReminders.length,
                 go: () => setViewMode('inbound'),
               },
               {
-                id: 'settings',
-                label: 'Settings',
-                active: false,
-                go: () => {
-                  dismissThemeAutoHint();
-                  setSettingsOpen(true);
-                },
+                id: 'library',
+                // Library (formerly "Memory") is where you look things
+                // up + browse what's stored: Search + Explore. Its
+                // default sub-tab is Search.
+                label: 'Library',
+                active: primarySection === 'library',
+                go: () => setViewMode('search'),
+              },
+              {
+                id: 'privacy',
+                // Privacy is the lamp's honest destination — it renders
+                // the no-capture rules INLINE (list / toggle / remove /
+                // purge / add-current-site). No Settings jump.
+                label: 'Privacy',
+                active: primarySection === 'privacy',
+                go: () => setViewMode('privacy'),
               },
             ] as const
           ).map((s) => (
@@ -6739,6 +6906,15 @@ const App = () => {
               data-testid={`section-nav-${s.id}`}
             >
               {s.label}
+              {'badge' in s && s.badge > 0 ? (
+                <span
+                  className="section-nav-badge mono"
+                  aria-hidden
+                  data-testid={`section-nav-badge-${s.id}`}
+                >
+                  {s.badge}
+                </span>
+              ) : null}
             </button>
           ))}
         </nav>
@@ -6765,14 +6941,14 @@ const App = () => {
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
-          {/* Secondary capture tools — the steady-state toolbar keeps only
-              the two most-used capture controls (capture-current-tab `+`
-              when Manual, and the Auto/Manual mode toggle). The rarer
-              tools (screenshare-mask, find-active-tab, coding-attach) moved
-              into the ⋯ overflow (R1.1) so the header stays lean. They all
-              VISIBLY QUIESCE (disabled) under paused/blocked via the
-              [data-capture-state] bus; testids + ARIA labels are unchanged
-              so §13 steps + e2e stay reachable. */}
+          {/* Steady-state capture tools. R1.2 (user feedback 2):
+              find-active-tab, screenshare-mask, and attach-coding-session
+              RETURN to the visible toolbar — this user screenshares +
+              demos daily, so the daily tools stay one click away. Only
+              DIAGNOSTICS hide behind ⋯. All capture-affecting tools
+              VISIBLY QUIESCE (disabled) under paused via the
+              [data-capture-state] bus; testids + ARIA labels are
+              unchanged so §13 steps + e2e stay reachable. */}
           <div className="capture-tools" data-testid="capture-tools">
           {/* Capture-current-tab (+) is only useful when capture mode
               is Manual. When mode is Auto, Sidetrack refreshes
@@ -6841,12 +7017,92 @@ const App = () => {
               {state.settings.autoTrack ? 'auto' : 'manual'}
             </span>
           </button>
+          {/* Find active tab — scrolls + flashes the matching thread
+              row. Back in the visible toolbar (feedback 2). Same
+              aria-label so the §13/e2e queries stay reachable. */}
+          <button
+            className="icon-btn"
+            title="Find this tab in the side panel — scrolls + flashes the matching thread row"
+            onClick={findActiveTabThread}
+            type="button"
+            aria-label="Find active tab in side panel"
+            data-testid="find-active-tab"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="9" />
+              <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
+              <line x1="12" y1="2" x2="12" y2="5.5" />
+              <line x1="12" y1="18.5" x2="12" y2="22" />
+              <line x1="2" y1="12" x2="5.5" y2="12" />
+              <line x1="18.5" y1="12" x2="22" y2="12" />
+            </svg>
+          </button>
+          {/* Screenshare mask — the daily demo/streaming control. Back
+              in the visible toolbar (feedback 2). aria-pressed reflects
+              the mode; quiesces while capture is paused. */}
+          <button
+            className={'icon-btn' + (state.screenShareMode ? ' on' : '')}
+            title="Screenshare mode — mask sensitive workstreams while sharing your screen"
+            onClick={() => {
+              void runAction(() =>
+                sendRequest({
+                  type: messageTypes.setScreenShareMode,
+                  enabled: !state.screenShareMode,
+                }),
+              );
+            }}
+            type="button"
+            aria-label="Toggle screenshare mode"
+            aria-pressed={state.screenShareMode}
+            disabled={captureOff}
+            data-testid="screenshare-mask"
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.cast}</span>
+          </button>
+          {/* Attach coding session — the coding-agent handoff. Back in
+              the visible toolbar (feedback 2). Routes to the wizard when
+              the companion is missing rather than dead-ending. */}
+          <button
+            className="icon-btn"
+            title="Attach a coding-agent session (companion required)"
+            onClick={() => {
+              if (state.companionStatus !== 'connected') {
+                setWizardOpen(true);
+                return;
+              }
+              setCodingAttachOpen(true);
+            }}
+            type="button"
+            aria-label="Attach coding session"
+            disabled={captureOff}
+            data-testid="attach-coding-session"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <rect x="2" y="4" width="20" height="16" rx="2" />
+              <polyline points="6 10 9 13 6 16" />
+              <line x1="13" y1="16" x2="18" y2="16" />
+            </svg>
+          </button>
           </div>
-          {/* Diagnostics collapsed into an overflow menu so the
-              steady-state toolbar stays lean — capture health, dump
-              panel state, design preview + the no-capture-rule create
-              actions. The dump-result chip lives in the connect-dot
-              popover below. */}
+          {/* Diagnostics-only overflow menu (⋯). R1.2: the daily tools
+              moved back to the visible toolbar; ⋯ now holds ONLY the
+              three diagnostics — capture health, dump panel state,
+              design preview. The dump-result chip lives in the
+              connect-dot popover below. */}
           <ToolbarOverflowMenu
             onOpenHealth={() => {
               setHealthPanelOpen(true);
@@ -6856,38 +7112,24 @@ const App = () => {
               setDesignPreviewOpen(true);
             }}
             dumpStatus={dumpStatus.kind}
-            screenShareMode={state.screenShareMode}
-            onToggleScreenShare={() => {
-              void runAction(() =>
-                sendRequest({
-                  type: messageTypes.setScreenShareMode,
-                  enabled: !state.screenShareMode,
-                }),
-              );
-            }}
-            onFindActiveTab={findActiveTabThread}
-            onAttachCoding={() => {
-              // Don't gate the entry dead — when companion is missing,
-              // route the user to the wizard so they can fix it.
-              if (state.companionStatus !== 'connected') {
-                setWizardOpen(true);
-                return;
-              }
-              setCodingAttachOpen(true);
-            }}
-            captureTools={captureOff ? 'quiesced' : 'live'}
-            {...(currentSiteLabel === undefined
-              ? {}
-              : {
-                  currentSiteLabel,
-                  onBlockCurrentSite: () => {
-                    addNoCaptureRuleForCurrentSite('domain');
-                  },
-                  onBlockSimilarSites: () => {
-                    addNoCaptureRuleForCurrentSite('similar');
-                  },
-                })}
           />
+          {/* Settings — demoted from a primary nav pill to a gear button
+              (iOS/Chrome pattern). Settings is for rare visits (vault
+              path, appearance, connection, diagnostics), so it no longer
+              sits at equal salience with the daily sections. */}
+          <button
+            className="icon-btn"
+            title="Settings — connection, vault, appearance, diagnostics"
+            onClick={() => {
+              dismissThemeAutoHint();
+              setSettingsOpen(true);
+            }}
+            type="button"
+            aria-label="Settings"
+            data-testid="app-settings-gear"
+          >
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.settings}</span>
+          </button>
           {/* Connect-dot — the vault + companion + recall status,
               quieted into a single compound health dot with a popover.
               Steady state = one calm dot; the three-domain tri-state
@@ -6968,8 +7210,8 @@ const App = () => {
             ) : null}
           </button>
         </div>
-      ) : primarySection === 'memory' ? (
-        <div className="sub-tabs" role="tablist" aria-label="Memory views">
+      ) : primarySection === 'library' ? (
+        <div className="sub-tabs" role="tablist" aria-label="Library views">
           <button
             type="button"
             role="tab"
@@ -6995,8 +7237,13 @@ const App = () => {
             Explore
           </button>
         </div>
-      ) : primarySection === 'trust' ? (
-        <div className="sub-tabs" role="tablist" aria-label="Trust views">
+      ) : primarySection === 'inbox' ? (
+        // Inbox = the ONE incoming-things home. Replies (unread AI
+        // replies, the actionable-now surface) + the ambient Inbox
+        // backlog. The old Capture & Rules / Health modal sub-tabs are
+        // gone: capture rules now live in Privacy (inline), Health in
+        // Settings + the ⋯ shortcut.
+        <div className="sub-tabs" role="tablist" aria-label="Inbox views">
           <button
             type="button"
             role="tab"
@@ -7028,26 +7275,6 @@ const App = () => {
             <span className="sub-tab-ct mono" aria-hidden>
               {urlInbox.total}
             </span>
-          </button>
-          <button
-            type="button"
-            className="sub-tab sub-tab-modal"
-            title="No-capture rules — sites Sidetrack never records"
-            onClick={() => {
-              openSettingsAt('no-capture-rules');
-            }}
-          >
-            Capture &amp; Rules
-          </button>
-          <button
-            type="button"
-            className="sub-tab sub-tab-modal"
-            title="Capture health — pipeline, recall, and companion status"
-            onClick={() => {
-              setHealthPanelOpen(true);
-            }}
-          >
-            Health
           </button>
         </div>
       ) : null}
@@ -7225,6 +7452,10 @@ const App = () => {
                 }
           }
         />
+      ) : viewMode === 'privacy' ? (
+        // Privacy renders its own section header (sec-head) below, so
+        // the ws-bar context label would be a redundant second header.
+        null
       ) : (
         <div className="ws-bar all-bar">
           <span className="lbl">
@@ -7335,19 +7566,20 @@ const App = () => {
                     // This site matches a no-capture rule: the background
                     // gate refuses every ingress, so the card must NOT
                     // read "Indexing…"/a stale tier. Name the rule and
-                    // give a one-click jump to manage/remove it.
+                    // give a one-click jump to manage/remove it — inline
+                    // in the Privacy section, not a Settings modal.
                     <button
                       type="button"
                       className="tab-session-capture-badge is-blocked"
                       title={`This site is on your no-capture list — page content is not indexed. Rule: ${noCaptureRuleDisplayLabel(
                         currentTabBlockingRule,
-                      )}. Click to manage in Settings → Capture.`}
+                      )}. Click to manage in Privacy.`}
                       aria-label={`Capture status: not captured — rule: ${noCaptureRuleDisplayLabel(
                         currentTabBlockingRule,
-                      )}. Manage rule in Settings.`}
+                      )}. Manage rule in Privacy.`}
                       data-testid="capture-blocked-badge"
                       onClick={() => {
-                        openSettingsAt('no-capture-rules');
+                        setViewMode('privacy');
                       }}
                     >
                       Not captured — rule: {noCaptureRuleDisplayLabel(currentTabBlockingRule)}
@@ -8287,6 +8519,77 @@ const App = () => {
             );
           }}
         />
+      ) : viewMode === 'privacy' ? (
+        // Privacy section (feedback 5): the no-capture rules render
+        // INLINE as a real panel — list every rule (kind, domain,
+        // created), toggle/remove, per-rule Purge, and an "add current
+        // site" affordance. No Settings jump. The lamp's blocked-rule
+        // chip deep-links here. NoCaptureRulesSection is the SAME
+        // standalone component Settings mounts; we reuse it verbatim
+        // and wrap it with the section header + add-current-site row.
+        <div className="privacy-view" aria-label="Privacy — capture rules">
+          <div className="sec-head">
+            <span>Capture &amp; rules</span>
+            <span className="count mono">
+              {String((state.settings.noCaptureRules ?? []).length)}
+            </span>
+          </div>
+          <p className="privacy-lede subtle">
+            Sites you&rsquo;ve told Sidetrack never to record. Add the current site, or
+            re-enable capture by removing a rule. Nothing here is captured — no visits, page
+            text, evidence, or fingerprints.
+          </p>
+          {currentSiteLabel === undefined ? (
+            <p className="privacy-add-hint subtle mono">
+              Open a normal web page to add it to the no-capture list.
+            </p>
+          ) : (
+            <div className="privacy-add-current" data-testid="privacy-add-current">
+              <span className="privacy-add-current-label">
+                Current site: <strong className="mono">{currentSiteLabel}</strong>
+              </span>
+              <div className="privacy-add-current-actions">
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={currentSiteDomainRule !== null}
+                  onClick={() => {
+                    addNoCaptureRuleForCurrentSite('domain');
+                  }}
+                  data-testid="privacy-add-domain"
+                  title={
+                    currentSiteDomainRule !== null
+                      ? `${currentSiteLabel} is already on the no-capture list`
+                      : `Don't capture ${currentSiteLabel}`
+                  }
+                >
+                  {currentSiteDomainRule !== null
+                    ? 'This site is blocked'
+                    : "Don't capture this site"}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  disabled={currentSiteSimilarRule !== null}
+                  onClick={() => {
+                    addNoCaptureRuleForCurrentSite('similar');
+                  }}
+                  data-testid="privacy-add-similar"
+                  title={
+                    currentSiteSimilarRule !== null
+                      ? 'Similar sites are already blocked'
+                      : "Don't capture sites like this (account / billing / login)"
+                  }
+                >
+                  {currentSiteSimilarRule !== null
+                    ? 'Similar sites blocked'
+                    : "Don't capture similar sites"}
+                </button>
+              </div>
+            </div>
+          )}
+          <NoCaptureRulesSection busy={busy} />
+        </div>
       ) : null}
 
       {viewMode === 'now' ? (() => {
@@ -8507,7 +8810,7 @@ const App = () => {
         );
       })() : null}
 
-      {viewMode !== 'connections' ? (
+      {viewMode !== 'connections' && viewMode !== 'privacy' ? (
         <>
           <div className="sec-head">
             <span>Captures</span>
@@ -9314,6 +9617,12 @@ const App = () => {
             // stacked behind it.
             setSettingsOpen(false);
             setWizardOpen(true);
+          }}
+          onOpenHealth={() => {
+            // Health moved into Settings' Diagnostics group. Close
+            // Settings first so HealthPanel isn't stacked behind it.
+            setSettingsOpen(false);
+            setHealthPanelOpen(true);
           }}
           theme={theme}
           density={density}

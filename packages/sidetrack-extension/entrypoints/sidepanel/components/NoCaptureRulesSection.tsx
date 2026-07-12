@@ -3,11 +3,13 @@ import { useCallback, useEffect, useState } from 'react';
 import { messageTypes } from '../../../src/messages';
 import type { NoCaptureRule } from '../../../src/capture/noCaptureRules';
 
-// Settings → Capture → "No-capture sites". Lists the persisted domain
-// blocklist rules with (i) remove and (ii) a per-rule "Purge captured
-// data" button that invokes the companion domain-tombstone route. Rules
-// are created from the toolbar overflow menu ("Don't capture this
-// site" / "…similar sites"); this panel is the management surface.
+// The no-capture rules management surface. Mounted BOTH in the Privacy
+// section (inline, the primary home) and in Settings → Capture. Lists
+// the persisted domain blocklist rules with (i) remove (re-enable
+// capture) and (ii) a per-rule "Purge captured data" button that
+// invokes the companion domain-tombstone route. Rules are created from
+// the Privacy "add current site" affordance or the lamp strip's
+// per-site capture controls.
 
 interface RuleActionState {
   readonly ruleId: string;
@@ -120,7 +122,7 @@ export function NoCaptureRulesSection({ busy = false }: { readonly busy?: boolea
       <h4 className="settings-subsection-title">No-capture sites</h4>
       <p className="settings-section-lede">
         Sites here are never captured — no visits, page text, evidence, engagement, or fingerprints.
-        Add rules from the toolbar &ldquo;&hellip;&rdquo; menu on the current tab.
+        Add the current site from the Privacy section or the lamp&rsquo;s per-site controls.
       </p>
       {loaded && rules.length === 0 ? (
         <p className="settings-empty mono">No no-capture rules yet.</p>
