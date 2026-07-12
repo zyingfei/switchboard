@@ -476,12 +476,31 @@ describe('buildVisitSimilarity', () => {
   });
 
   it('does not emit a candidate below the top-K cutoff even when it clears threshold', async () => {
-    const source = visit('a');
+    // Determinism note (was an order-dependent CI flake): every visit here
+    // shares the `example.test` host token, so the hybrid ranker's lexical
+    // (BM25) fusion arm scored all 60 candidates identically — a 60-way tie
+    // that the FUSION_WINDOW=50 slice cut arbitrarily. Which side of that
+    // tie b-51 landed on (and therefore whether it acquired a lexical RRF
+    // rank and displaced b-50 at the final top-K) depended on MiniSearch's
+    // iteration order over the tied block, which is not stable across the
+    // process history a bare `bun test` run accumulates — the flake.
+    //
+    // Fix: give the intended in-window candidates (and the source) a shared
+    // `anchortopic` token the below-cutoff candidates lack, so the lexical
+    // arm scores the in-window set strictly above the below-cutoff set. The
+    // boundary between b-50 and b-51 is now genuinely untied on BOTH arms,
+    // so no tie-iteration order can resurrect a below-cutoff candidate. The
+    // assertion (top-K cutoff, not threshold, excludes b-51) is unchanged.
+    const inWindowVisit = (key: string): VisitSimilarityEntry => ({
+      ...visit(key),
+      title: `visit-${key} anchortopic`,
+    });
+    const source = inWindowVisit('a');
     const candidates: VisitSimilarityEntry[] = [];
     const vectors = new Map<string, Float32Array>([['visit-a', unit([1, 0])]]);
     for (let index = 1; index <= 60; index += 1) {
       const key = `b-${String(index).padStart(2, '0')}`;
-      candidates.push(visit(key));
+      candidates.push(index <= 50 ? inWindowVisit(key) : visit(key));
       const cosine = index <= 50 ? 0.99 - index * 0.001 : index === 51 ? 0.9 : 0.2;
       vectors.set(`visit-${key}`, vectorAtCosine(cosine));
     }

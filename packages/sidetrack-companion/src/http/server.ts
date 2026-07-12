@@ -360,6 +360,16 @@ import {
   readWorkGraphHealthArtifact,
 } from '../system/workGraphHealthArtifact.js';
 import {
+  isSection15ArtifactFresh,
+  readSection15Artifact,
+} from '../system/section15Artifact.js';
+import { collectSection15Report } from '../system/section15Collector.js';
+import {
+  CHROME_SESSIONS_RESTORE,
+  TAB_RECOVERY_AGGREGATE_ID,
+  isChromeSessionsRestorePayload,
+} from '../system/section15Events.js';
+import {
   DOMAIN_TOMBSTONE,
   buildDomainTombstoneSet,
   registrableDomain,
@@ -4914,6 +4924,83 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // PRD §15 falsifiability counter table (ADR-0011 freeze-lift
+    // condition). Serves the drain-time artifact
+    // (system/section15Artifact.ts) that the connections drain
+    // materializes after every successful pass — the same cold-boot-off
+    // -the-heavy-collect pattern as workGraph-health above. The artifact
+    // additionally persists the per-day clean ledger, so the
+    // ≥7-clean-days streak (criterion 6) survives restarts; that streak
+    // CANNOT be reconstructed live (dataLoss.clean is point-in-time), so
+    // when the artifact is missing/stale the live fallback reports the
+    // streak as 0 (honest — no ledger to walk) while the other five
+    // counters are computed fresh. Serve gate is symmetric with the
+    // writer's (eventStoreEnabled) AND age-bounded.
+    method: 'GET',
+    pattern: /^\/v1\/system\/section15$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      if (eventStoreEnabled()) {
+        const artifact = await readSection15Artifact(vaultRoot);
+        if (artifact !== null && isSection15ArtifactFresh(artifact)) {
+          return [
+            200,
+            { data: { availability: 'ok', generatedAt: artifact.generatedAt, report: artifact.report } },
+          ];
+        }
+      }
+      // Live fallback — no fresh artifact. CleanDays defaults to empty
+      // (criterion 6 → streak 0) because the point-in-time clean ledger
+      // only exists in the artifact.
+      const report = await collectSection15Report({
+        vaultRoot,
+        ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+      });
+      return [200, { data: { availability: 'live', generatedAt: null, report } }];
+    },
+  },
+  {
+    // PRD §15 criterion 4 — tab recovery. The extension POSTs here after
+    // a SUCCESSFUL chrome.sessions.restore (App.tsx restoreThreadSession)
+    // so the recovery leaves a durable, event-log-sourced trace the §15
+    // counter can read. Observability-only: no serving consumer reads
+    // chrome.sessions.restore, so it is freeze-safe (ADR-0011).
+    method: 'POST',
+    pattern: /^\/v1\/system\/tab-recovery$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'tabRecovery', idempotencyKey, async () => {
+        const payload = objectRecord(await readBody(request));
+        if (payload === undefined || !isChromeSessionsRestorePayload(payload)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must be a valid chrome.sessions.restore payload.',
+          );
+        }
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId: TAB_RECOVERY_AGGREGATE_ID,
+          type: CHROME_SESSIONS_RESTORE,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, TAB_RECOVERY_AGGREGATE_ID),
+        });
+        return [201, { data: { accepted } }];
+      });
+    },
+  },
+  {
     method: 'POST',
     pattern: /^\/v1\/auth\/rotate-bridge-key$/,
     authRequired: true,
@@ -8082,13 +8169,21 @@ const routes: readonly RouteDefinition[] = [
     // (warm pipeline, I/O-bound → interleaves with /v1/status), trains
     // OFF-THREAD via the train-groups worker, ship-gates, and promotes the
     // active closest-visit revision on PASS. Manual + idempotent (the trainer
-    // dedupes already-referenced feedback). Gated by
-    // SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK; reconstruction capped by
-    // SIDETRACK_RANKER_RECONSTRUCT_CAP (default 200, oldest-first).
+    // dedupes already-referenced feedback).
+    //
+    // Two envs gate this route (both read at the handler below):
+    //   SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK — INVERTED opt-out, NOT an
+    //     opt-in. The bootstrap is ON by default (env absent or any value
+    //     other than '0' ⇒ enabled); only the literal '0' disables it and
+    //     returns 403. There is no "=1 to enable" — do not add one.
+    //   SIDETRACK_RANKER_RECONSTRUCT_CAP — positive integer cap on how many
+    //     historical feedback events are reconstructed per run, oldest-first;
+    //     non-finite / non-positive / absent falls back to the default 200.
     method: 'POST',
     pattern: /^\/v1\/ranker\/impression-bootstrap$/u,
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => {
+      // Inverted opt-out: only '0' disables; absence/anything-else = enabled.
       if (process.env['SIDETRACK_RANKER_RECONSTRUCT_FEEDBACK'] === '0') {
         throw new HttpRouteError(403, 'BOOTSTRAP_DISABLED', 'Impression bootstrap is disabled.');
       }

@@ -46,6 +46,9 @@ export const messageTypes = {
   loadConnectionsEdge: 'sidetrack.connections.edge',
   loadConnectionsPath: 'sidetrack.connections.path',
   postConnectionsFeedbackEvent: 'sidetrack.connections.feedback-event',
+  // PRD §15 criterion 4 — persist a chrome.sessions.restore success so
+  // the falsifiability counter can read the recovery from the event log.
+  reportTabRecovery: 'sidetrack.system.tab-recovery',
   captureCurrentTab: 'sidetrack.capture.current-tab',
   createWorkstream: 'sidetrack.workstream.create',
   updateWorkstream: 'sidetrack.workstream.update',

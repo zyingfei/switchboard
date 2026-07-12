@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { sidetrackToolNames } from './capabilities.js';
+import { createFileContextPackAuditSink } from './server/contextPackAudit.js';
 import { createSidetrackMcpServer, type CompanionWriteClient } from './server/mcpServer.js';
 import {
   sidetrackMcpHttpPort,
@@ -698,11 +699,21 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
       ? createCompanionWriteClient(args.companionUrl, args.bridgeKey, args.clientName)
       : undefined;
   const vaultPath = args.vaultPath;
-  const createServer = () =>
-    createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient);
 
   if (args.transport === 'streamable-http') {
     const authKey = args.mcpAuthKey ?? args.bridgeKey ?? '';
+    // PRD §15 criterion 5: only the streamable-HTTP transport emits the
+    // context-pack audit signal (the freeze-lift table names it "via
+    // streamable-HTTP"). stdio callers don't count toward the criterion,
+    // so the stdio server below omits the sink.
+    const contextPackAuditSink = createFileContextPackAuditSink({
+      vaultRoot: vaultPath,
+      agent: `mcp:${args.clientName}`,
+    });
+    const createServer = () =>
+      createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient, {
+        contextPackAuditSink,
+      });
     // startStreamableHttpMcpServer enforces a non-empty key; the thrown
     // error includes bridge.key guidance. No need to duplicate the check here.
     const started = await startStreamableHttpMcpServer({
@@ -715,7 +726,7 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
     return 0;
   }
 
-  const server = createServer();
+  const server = createSidetrackMcpServer(new LiveVaultReader(vaultPath), companionClient);
   await server.connect(new StdioServerTransport());
   return 0;
 };

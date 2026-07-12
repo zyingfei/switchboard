@@ -169,6 +169,19 @@ export const renderHelp = (): string =>
     '    connection revisions, diagnostics, debug dumps, temp files, expired',
     '    idempotency records, and ranker caches. It never touches _BAC/log,',
     '    _BAC/events, threads, workstreams, or other canonical user state.',
+    '',
+    'Eval subcommand (report-only; runs WITHOUT the companion):',
+    '  sidetrack-companion eval replay --vault <path> [--json] [--no-persist]',
+    '  sidetrack-companion eval connections-precision --vault <path> [--json]',
+    '  sidetrack-companion eval significance --vault <path> [--json] [--no-persist]',
+    '    Replays the logged recall.served impressions and scores each arm — the',
+    '    trained model, the deterministic graph baseline, and the honest external',
+    '    floors (grep-over-vault BM25, recency) — side by side (nDCG@10 / MRR /',
+    '    recall@k / reject-FPR), with a paired-bootstrap significance verdict.',
+    '    connections-precision scores the live graph\'s served similarity edges',
+    '    against accepted user signal, reporting precision by M4 evidence tier.',
+    '    Report-only: nothing here influences serving or gates promotion. The',
+    '    verdict is persisted under _BAC/eval/ unless --no-persist is given.',
   ].join('\n');
 
 // Post-install guidance printed after `--install-service` succeeds. Pure
@@ -722,6 +735,68 @@ const runGcSubcommand = async (argv: readonly string[], streams: CliStreams): Pr
   return result.errors.length === 0 ? 0 : 1;
 };
 
+// Wave 0 — freeze-safe eval spine. `eval {replay|connections-precision|
+// significance}` runs the report-only harness against a vault WITHOUT the
+// companion: replay re-scores logged impressions across the trained model,
+// the graph baseline, and the honest external floors; connections-precision
+// scores the live served similarity edges by M4 evidence tier;
+// significance persists the paired-bootstrap verdict artifact. None of it
+// influences serving or gates promotion.
+const runEvalSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion eval {replay|connections-precision|significance} --vault <path> [--json] [--no-persist]',
+    );
+    return verb === undefined ? 2 : 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for the eval sub-command.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const persist = !argv.includes('--no-persist');
+
+  const {
+    runReplayEval,
+    formatReplayEvalRunResult,
+    runConnectionsPrecisionEval,
+    formatConnectionsPrecisionRunResult,
+  } = await import('./ranker/eval/cli.js');
+
+  if (verb === 'replay' || verb === 'significance') {
+    // `replay` and `significance` run the same harness; `significance`
+    // simply foregrounds the paired-bootstrap verdict. Both persist the
+    // verdict artifact unless --no-persist.
+    const result = await runReplayEval(vaultPath, { persist });
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(result.verdict, null, 2));
+      return 0;
+    }
+    writeLine(streams.stdout, formatReplayEvalRunResult(result));
+    return 0;
+  }
+
+  if (verb === 'connections-precision') {
+    const result = await runConnectionsPrecisionEval(vaultPath);
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(result.report, null, 2));
+      return 0;
+    }
+    writeLine(streams.stdout, formatConnectionsPrecisionRunResult(result));
+    return 0;
+  }
+
+  writeLine(streams.stderr, `unknown eval verb: ${verb}`);
+  writeLine(streams.stderr, 'try: replay | connections-precision | significance');
+  return 2;
+};
+
 // Sync Contract v1 / Class F — companion `ingest --import <archive>`
 // CLI verb. Imports an archive pack of edge-origin events into the
 // companion's event log. Idempotent on edge dot — same archive
@@ -813,6 +888,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'ingest') {
     return await runIngestSubcommand(argv, streams);
+  }
+  if (argv[0] === 'eval') {
+    return await runEvalSubcommand(argv, streams);
   }
 
   const args = parseArgs(argv);

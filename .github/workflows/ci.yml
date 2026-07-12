@@ -11,11 +11,6 @@
 # working-directory must use ../../node_modules/.bin/<tool>.
 # Each job runs its own `bun install --frozen-lockfile` (fast, deterministic)
 # instead of a cross-job cache dance — reliability over seconds saved.
-#
-# Extension unit tests use continue-on-error because there are 13 pre-existing
-# failures on this branch that have not been triaged yet.
-# TODO(F16): once the F16 triage wave resolves those failures, flip
-#   continue-on-error to false so the extension test step is blocking.
 
 name: CI
 
@@ -51,10 +46,12 @@ jobs:
         run: bun install --frozen-lockfile
 
       # tsconfig.build.json is the repo's declared typecheck gate (matches the
-      # local convention). The full tsconfig.json includes test files that
-      # carry pre-existing type drift — tracked backlog, not a CI gate yet.
-      # This emits dist/ (not --noEmit) because the HNSW reconcile child
-      # integration suite spawns a child from
+      # local convention) and MUST stay clean. The full tsconfig.json also
+      # typechecks test files, which carry a known ~45-error pre-existing type
+      # backlog (`tsc --noEmit -p tsconfig.json` reports 45 as of 2026-07-12);
+      # that backlog is deliberately NOT gated here — do not read a green
+      # build-gate as "tsconfig.json is clean". This emits dist/ (not --noEmit)
+      # because the HNSW reconcile child integration suite spawns a child from
       # dist/sync/contract/connectionsReconcileChild.entry.js.
       - name: Typecheck + build dist (child-process tests need it)
         working-directory: packages/sidetrack-companion
@@ -78,11 +75,8 @@ jobs:
   # Extension (@sidetrack/extension)
   # Unit tests only — vitest.config.ts includes only tests/unit/**/*.test.{ts,tsx}
   # and src/**/*.test.{ts,tsx}; e2e specs live in tests/e2e/ and are excluded.
-  #
-  # WARNING: continue-on-error is TRUE because of the 13 pre-existing unit
-  # failures on this branch. CI will NOT block on red extension tests until
-  # those are triaged.
-  # TODO(F16): set continue-on-error to false once pre-existing failures are resolved.
+  # The unit-test step is BLOCKING (no continue-on-error): the F16 triage wave
+  # (2026-07-11) cleared the old 13-fail baseline, so red extension tests fail CI.
   # ---------------------------------------------------------------------------
   extension:
     name: Extension — typecheck + unit tests

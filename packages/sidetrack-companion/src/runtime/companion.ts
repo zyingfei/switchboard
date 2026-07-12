@@ -41,6 +41,9 @@ import {
   type ConnectionsDiagnosticSnapshot,
 } from '../system/workGraphHealth.js';
 import { writeWorkGraphHealthArtifact } from '../system/workGraphHealthArtifact.js';
+import { writeSection15Artifact } from '../system/section15Artifact.js';
+import { anyLaneCounterNonZero } from '../system/health.js';
+import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
@@ -557,6 +560,7 @@ export const startCompanion = async (
       // startup frame, and the materializer swallows hook errors.
       onDrainSuccess: () => {
         scheduleWorkGraphHealthArtifact();
+        scheduleSection15Artifact();
       },
     });
     syncContractRunner.register(connectionsMaterializer);
@@ -1044,6 +1048,45 @@ export const startCompanion = async (
     });
     const scheduleWorkGraphHealthArtifact = workGraphArtifactScheduler.schedule;
     teardown.push(workGraphArtifactScheduler.teardown);
+    // Drain-time PRD §15 falsifiability artifact (system/section15Artifact.ts).
+    // Same discipline as the workGraph artifact: typed event reads
+    // (forEachChunkOfTypes) + a bounded audit-file scan materialized after
+    // each successful drain, served from disk by GET /v1/system/section15.
+    // The ≥7-clean-days streak (criterion 6) is folded here from the
+    // event-lane counters + the store reconciliation delta — the exact
+    // dataLoss.clean the health surface computes — so a restart never
+    // resets the streak (the folded per-day ledger lives in the artifact).
+    // Reuses the workGraph scheduler factory (generic debounce/floor/
+    // single-flight); errors swallowed — observability must never surface
+    // as a drain failure.
+    const materializeSection15Artifact = async (): Promise<boolean> => {
+      try {
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        if (store === null) return false;
+        // dataLoss.clean, computed exactly as /v1/system/health does:
+        // every process-lifetime lane counter zero AND the store
+        // reconciliation delta zero. count()/watermark() are single
+        // indexed queries — never a JSONL scan.
+        const watermark = store.watermark();
+        const expectedFromWatermark = Object.values(watermark).reduce((sum, seq) => sum + seq, 0);
+        const reconciliationClean = expectedFromWatermark - store.count() === 0;
+        const dataLossClean = !anyLaneCounterNonZero(getEventLaneHealth()) && reconciliationClean;
+        await writeSection15Artifact({
+          vaultRoot: options.vaultPath,
+          eventLog,
+          dataLossClean,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const section15ArtifactScheduler = createWorkGraphHealthArtifactScheduler({
+      materialize: materializeSection15Artifact,
+      enabled: eventStoreEnabled,
+    });
+    const scheduleSection15Artifact = section15ArtifactScheduler.schedule;
+    teardown.push(section15ArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
       // F02: classify MCP callers by this key so the auth gate can apply
