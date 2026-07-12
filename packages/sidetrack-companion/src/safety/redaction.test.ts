@@ -43,12 +43,63 @@ describe('redact', () => {
     expect(result.matched).toBe(1);
   });
 
-  it('redacts loose card numbers', () => {
+  it('redacts loose card numbers with space grouping (Luhn-valid)', () => {
+    // 4242 4242 4242 4242 is Luhn-valid and card-grouped.
     const result = redact('card 4242 4242 4242 4242');
 
     expect(result.output).toBe('card [card-number]');
     expect(result.categories).toEqual(['card-number']);
     expect(result.matched).toBe(1);
+  });
+
+  it('redacts compact card number (no separator, Luhn-valid)', () => {
+    // 4111111111111111 is a standard Luhn-valid test card.
+    const result = redact('charge 4111111111111111 now');
+
+    expect(result.output).toBe('charge [card-number] now');
+    expect(result.categories).toEqual(['card-number']);
+    expect(result.matched).toBe(1);
+  });
+
+  it('does NOT redact a Discord/Twitter snowflake (16 digits, Luhn-invalid, no card grouping)', () => {
+    // 175928847299117063 is a real Discord snowflake — 18 digits, Luhn-invalid.
+    const result = redact('user id 175928847299117063 joined');
+
+    expect(result.output).toBe('user id 175928847299117063 joined');
+    expect(result.matched).toBe(0);
+  });
+
+  it('does NOT redact a 16-digit epoch-nanos timestamp (Luhn-invalid)', () => {
+    // 1720627200000000000 is 19 digits (out of 13-19 range) — but let us
+    // also test a 16-digit nanos value that is Luhn-invalid.
+    // We construct one that is 16 digits but fails Luhn.
+    // 1234567890123456 — last digit chosen so Luhn fails.
+    const result = redact('ts=1234567890123456');
+
+    // Should pass through: Luhn check fails for this value and no card grouping.
+    expect(result.output).toBe('ts=1234567890123456');
+    expect(result.matched).toBe(0);
+  });
+
+  it('does NOT redact a 17-digit numeric id (Luhn-invalid, no card grouping)', () => {
+    const result = redact('order_id=12345678901234567');
+
+    expect(result.output).toBe('order_id=12345678901234567');
+    expect(result.matched).toBe(0);
+  });
+
+  it('does NOT redact an 18-digit numeric id (Luhn-invalid, no card grouping)', () => {
+    const result = redact('snowflake: 175928847299117063');
+
+    expect(result.output).toBe('snowflake: 175928847299117063');
+    expect(result.matched).toBe(0);
+  });
+
+  it('does NOT redact a 19-digit numeric id (Luhn-invalid, no card grouping)', () => {
+    const result = redact('event_id=1234567890123456789');
+
+    expect(result.output).toBe('event_id=1234567890123456789');
+    expect(result.matched).toBe(0);
   });
 
   it('redacts AWS access key ids', () => {
@@ -97,6 +148,9 @@ describe('redact', () => {
 
     expect(result.output).toBe('Email [email] and use [openai-key] with [card-number]');
     expect(result.matched).toBe(3);
-    expect(result.categories).toEqual(['openai-key', 'email', 'card-number']);
+    // card-number fires before the rules loop, so its order in categories may
+    // differ — use arrayContaining rather than exact order.
+    expect(result.categories).toEqual(expect.arrayContaining(['openai-key', 'email', 'card-number']));
+    expect(result.categories).toHaveLength(3);
   });
 });

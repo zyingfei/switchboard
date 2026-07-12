@@ -54,10 +54,51 @@ interface RedactionRule {
   readonly replacement: string;
 }
 
+// Luhn checksum — mirrors the identical helper in
+// packages/sidetrack-companion/src/safety/redaction.ts.
+// Returns true when the digit string passes the check.
+// Used to gate card-number redaction so numeric IDs (snowflakes,
+// epoch-nanos, Stripe-style i64s) that happen to be 16-19 digits long
+// are NOT silently rewritten to '[card-number]'.
+const luhnValid = (digits: string): boolean => {
+  let sum = 0;
+  let odd = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = parseInt(digits[i]!, 10);
+    if (odd) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    odd = !odd;
+  }
+  return sum % 10 === 0;
+};
+
+// Card-shaped grouping pattern — see companion/redaction.ts for
+// the rationale. Mirrors CARD_GROUP_PATTERN exactly.
+const CARD_GROUP_PATTERN =
+  /\b(?:\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{5}|\d{13})\b/gu;
+
+// Broad digit-run pattern. Intentionally wide; cardNumberFilter gates
+// actual redaction — mirrors CARD_DIGIT_RUN_PATTERN in companion.
+const CARD_DIGIT_RUN_PATTERN = /\b(?:\d[ -]?){12,}\d\b/gu;
+
+const cardNumberFilter = (match: string): string | null => {
+  const digits = match.replace(/[ -]/g, '');
+  if (digits.length < 13 || digits.length > 19) return null;
+  const hasCardGrouping = CARD_GROUP_PATTERN.test(match);
+  CARD_GROUP_PATTERN.lastIndex = 0;
+  if (luhnValid(digits) || hasCardGrouping) return '[card-number]';
+  return null;
+};
+
 // Local mirror of packages/sidetrack-companion/src/safety/redaction.ts
 // rule shapes — kept in sync so a locally-composed packet is scrubbed
 // with the same categories the companion applies on the round-trip.
 // Patterns carry the global flag so replace() clears every match.
+// NOTE: card-number is handled outside this list via cardNumberFilter
+// above (requires Luhn validation, not a simple pattern replacement).
 const LOCAL_REDACTION_RULES: readonly RedactionRule[] = [
   {
     category: 'anthropic-key',
@@ -100,14 +141,13 @@ const LOCAL_REDACTION_RULES: readonly RedactionRule[] = [
     replacement: '[email]',
   },
   {
+    // KNOWN OVER-MATCH: ticket refs and part numbers following NNN-NN-NNNN
+    // will also match. The shape is inherently ambiguous — no purely
+    // syntactic rule distinguishes SSN from part numbers. See negative
+    // tests in outboundPreflight.test.ts.
     category: 'ssn',
     pattern: /\b\d{3}[ -]\d{2}[ -]\d{4}\b/gu,
     replacement: '[ssn]',
-  },
-  {
-    category: 'card-number',
-    pattern: /\b(?:\d[ -]?){15,}\d\b/gu,
-    replacement: '[card-number]',
   },
   {
     category: 'phone',
@@ -128,15 +168,28 @@ export interface OutboundRedaction {
 const applyLocalRedaction = (input: string): { readonly output: string } & OutboundRedaction => {
   let output = input;
   let matched = 0;
-  const rules = new Set<string>();
+  const ruleSet = new Set<string>();
+
+  // Apply card-number rule first with Luhn gating — identical logic to
+  // companion/redaction.ts so the two files stay in sync.
+  output = output.replace(CARD_DIGIT_RUN_PATTERN, (match) => {
+    const replacement = cardNumberFilter(match);
+    if (replacement !== null) {
+      matched += 1;
+      ruleSet.add('card-number');
+      return replacement;
+    }
+    return match;
+  });
+
   for (const rule of LOCAL_REDACTION_RULES) {
     output = output.replace(rule.pattern, () => {
       matched += 1;
-      rules.add(rule.category);
+      ruleSet.add(rule.category);
       return rule.replacement;
     });
   }
-  return { output, applied: matched > 0, matched, rules: [...rules] };
+  return { output, applied: matched > 0, matched, rules: [...ruleSet] };
 };
 
 export interface OutboundPreflightVerdict {

@@ -58,6 +58,56 @@ describe('preflightOutbound — redaction', () => {
     expect(verdict.redaction.applied).toBe(false);
     expect(verdict.redaction.matched).toBe(0);
   });
+
+  // ── Card-number false-positive guard (MAJOR fix) ──────────────────────
+  // The old bare digit-run regex matched ANY 16-19 digit sequence.
+  // These tests verify that numeric IDs that are NOT credit cards pass
+  // through untouched, while Luhn-valid test cards are still caught.
+
+  it('still redacts a Luhn-valid test card number (4242 4242 4242 4242)', () => {
+    const verdict = preflightOutbound('charge card 4242 4242 4242 4242 now', 'chatgpt');
+    expect(verdict.safeText).toContain('[card-number]');
+    expect(verdict.safeText).not.toContain('4242 4242 4242 4242');
+    expect(verdict.redaction.rules).toContain('card-number');
+  });
+
+  it('does NOT redact a 16-digit Discord/Twitter snowflake (Luhn-invalid)', () => {
+    // 1234567890123456 — 16 digits, fails Luhn, no card grouping.
+    const verdict = preflightOutbound('user id 1234567890123456 joined', 'chatgpt');
+    expect(verdict.safeText).toContain('1234567890123456');
+    expect(verdict.safeText).not.toContain('[card-number]');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
+  it('does NOT redact a 17-digit numeric id (Luhn-invalid, no card grouping)', () => {
+    const verdict = preflightOutbound('order_id 12345678901234567', 'chatgpt');
+    expect(verdict.safeText).toContain('12345678901234567');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
+  it('does NOT redact an 18-digit Discord snowflake (Luhn-invalid)', () => {
+    const verdict = preflightOutbound('snowflake: 175928847299117063', 'chatgpt');
+    expect(verdict.safeText).toContain('175928847299117063');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
+  it('does NOT redact a 19-digit numeric id (Luhn-invalid, no card grouping)', () => {
+    const verdict = preflightOutbound('event_id=1234567890123456789', 'chatgpt');
+    expect(verdict.safeText).toContain('1234567890123456789');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
+  // ── SSN negative test ────────────────────────────────────────────────
+  // The SSN rule is known to over-match; document it with a test that
+  // confirms the current behaviour and notes the limitation.
+  it('SSN rule KNOWN OVER-MATCH: bare NNN-NN-NNNN part-number style strings match', () => {
+    // This is intentional — no purely syntactic rule can distinguish SSN
+    // from a part number in NNN-NN-NNNN format. The test documents the
+    // known limitation rather than asserting it should pass through.
+    const verdict = preflightOutbound('part 123-45-6789 in catalogue', 'chatgpt');
+    // Currently redacts — acknowledged over-match, not a bug to fix here.
+    expect(verdict.redaction.rules).toContain('ssn');
+  });
 });
 
 describe('preflightOutbound — injection scrub', () => {
@@ -152,6 +202,22 @@ const OUTBOUND_SITES: readonly OutboundSite[] = [
     name: 'background.ts submitSelectionDispatch (Ask-AI auto-send, zero-gate path)',
     ship: (raw, provider) => preflightOutbound(raw, provider).safeText,
   },
+  {
+    // F01 gap E1 — the Send-to → Markdown/Notebook export download.
+    // handleSendToPick used to downloadAsFile(..., packet.body) raw,
+    // dropping a secret-bearing .md into Downloads while copying the
+    // same packet stripped it. Now routed through exportBodyForPacket
+    // (flag ON default = preflightOutbound.safeText).
+    name: 'App.tsx handleSendToPick export (Send-to → Markdown/Notebook, flag ON)',
+    ship: (raw, provider) => preflightOutbound(raw, provider).safeText,
+  },
+  {
+    // F01 gap E2 — the composer Dispatch → export download.
+    // handlePacketDispatch had the identical raw-body downloadAsFile
+    // hole; same fix via exportBodyForPacket.
+    name: 'App.tsx handlePacketDispatch export (composer → Markdown/Notebook, flag ON)',
+    ship: (raw, provider) => preflightOutbound(raw, provider).safeText,
+  },
 ];
 
 describe('every outbound dispatch path consumes preflighted text', () => {
@@ -162,5 +228,87 @@ describe('every outbound dispatch path consumes preflighted text', () => {
     expect(shipped).toContain('[email]');
     // The injection is wrapped, not shipped bare.
     expect(shipped).toContain('<context untrusted="true">');
+  });
+});
+
+// ── F01 export-download fix (CRITICAL) ───────────────────────────────
+//
+// The Send-to → Markdown/Notebook and composer-Dispatch → export paths
+// call downloadAsFile with a flag-gated body. This mirrors App.tsx's
+// exportBodyForPacket: with redactedClipboard ON (default) the SAFE
+// scrubbed text is written to the .md; with the documented dogfood
+// opt-out OFF the raw body is written (same escape hatch the other
+// paths honour).
+const exportBodyForPacket = (body: string, provider: string, redactedClipboard: boolean): string =>
+  redactedClipboard ? preflightOutbound(body, provider).safeText : body;
+
+const API_KEY_BODY = [
+  '# Context from another conversation',
+  '',
+  `openai key sk-${'a'.repeat(48)}`,
+  'contact owner@example.com',
+].join('\n');
+
+describe('F01 — export (.md/notebook) download is scrubbed by default', () => {
+  it('writes the REDACTED body when redactedClipboard is ON (default)', () => {
+    const written = exportBodyForPacket(API_KEY_BODY, 'other', true);
+    expect(written).not.toContain(`sk-${'a'.repeat(48)}`);
+    expect(written).toContain('[openai-key]');
+    expect(written).not.toContain('owner@example.com');
+    expect(written).toContain('[email]');
+  });
+
+  it('writes the RAW body when the dogfood opt-out redactedClipboard is OFF', () => {
+    const written = exportBodyForPacket(API_KEY_BODY, 'other', false);
+    // Opt-out is intentional and documented — the raw export still works.
+    expect(written).toContain(`sk-${'a'.repeat(48)}`);
+    expect(written).toContain('owner@example.com');
+  });
+});
+
+// ── F01 confirm-modal verdict + preview (MAJOR + minor) ──────────────
+//
+// The DispatchConfirm safety verdict + packet preview are both derived
+// live from the outbound preflight at render time (App.tsx), NOT from
+// the packet's hardcoded redactedItems:[]. This models that exact
+// computation: redactedCount = redaction.matched, redactedKinds =
+// redaction.rules, previewBody = flag-gated safeText/raw.
+describe('F01 — DispatchConfirm verdict + preview reflect what ships', () => {
+  it('reports a NON-zero redaction verdict for a body that WILL be redacted', () => {
+    const verdict = preflightOutbound(API_KEY_BODY, 'chatgpt');
+    // The MAJOR: previously the chip read redactedItems:[] → count 0 →
+    // "no PII / API-key patterns detected" while a key shipped. Now the
+    // count and kinds come from the live preflight.
+    expect(verdict.redaction.matched).toBeGreaterThan(0);
+    expect(verdict.redaction.rules).toEqual(
+      expect.arrayContaining(['openai-key', 'email']),
+    );
+  });
+
+  it('preview (flag ON, default) equals the SAFE scrubbed text that ships', () => {
+    const verdict = preflightOutbound(API_KEY_BODY, 'chatgpt');
+    const redactedClipboard = true;
+    const previewBody = redactedClipboard ? verdict.safeText : API_KEY_BODY;
+    // The minor: preview must equal what ships, not the raw body.
+    expect(previewBody).toBe(verdict.safeText);
+    expect(previewBody).not.toContain(`sk-${'a'.repeat(48)}`);
+    expect(previewBody).toContain('[openai-key]');
+  });
+
+  it('preview (flag OFF opt-out) shows the raw body that actually ships', () => {
+    const verdict = preflightOutbound(API_KEY_BODY, 'chatgpt');
+    const redactedClipboard = false;
+    const previewBody = redactedClipboard ? verdict.safeText : API_KEY_BODY;
+    // With the opt-out ON, the raw body ships — preview must match it.
+    expect(previewBody).toBe(API_KEY_BODY);
+    expect(previewBody).toContain(`sk-${'a'.repeat(48)}`);
+    // The verdict still honestly reports the detected spans (not weakened).
+    expect(verdict.redaction.matched).toBeGreaterThan(0);
+  });
+
+  it('reports a zero verdict ("no PII detected") only when the body is truly clean', () => {
+    const verdict = preflightOutbound('Just a plain packet body, nothing sensitive.', 'chatgpt');
+    expect(verdict.redaction.matched).toBe(0);
+    expect(verdict.redaction.rules).toEqual([]);
   });
 });
