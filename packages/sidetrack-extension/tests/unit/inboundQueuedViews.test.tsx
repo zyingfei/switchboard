@@ -4,7 +4,11 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { InboundView } from '../../entrypoints/sidepanel/components/InboundView';
 import { QueuedView } from '../../entrypoints/sidepanel/components/QueuedView';
 import type { InboundReminder } from '../../entrypoints/sidepanel/components/InboundCard';
-import type { QueueGroup } from '../../src/sidepanel/queued/groupQueueItems';
+import {
+  groupQueueItems,
+  type QueueGroup,
+} from '../../src/sidepanel/queued/groupQueueItems';
+import type { QueueItem } from '../../src/workboard';
 
 const reminders: readonly InboundReminder[] = [
   {
@@ -118,5 +122,35 @@ describe('QueuedView — §13 step 9', () => {
   it('shows an empty state when nothing is queued', () => {
     render(<QueuedView groups={[]} onDismiss={() => undefined} onRetry={() => undefined} />);
     expect(screen.getByText(/Nothing queued/)).toBeInTheDocument();
+  });
+
+  // §13 step 4/9 — end-to-end for the new scope selector's outputs:
+  // workstream- and global-scoped items must group and render their own
+  // section headers alongside the existing thread groups.
+  it('renders workstream and global group headers from grouped items', () => {
+    const queueItem = (over: Partial<QueueItem> & Pick<QueueItem, 'bac_id'>): QueueItem => ({
+      text: 'ask',
+      scope: 'thread',
+      status: 'pending',
+      createdAt: '2026-07-11T10:00:00.000Z',
+      updatedAt: '2026-07-11T10:00:00.000Z',
+      ...over,
+    });
+    const grouped = groupQueueItems(
+      [
+        queueItem({ bac_id: 'q1', scope: 'thread', targetId: 't1', createdAt: 'a' }),
+        queueItem({ bac_id: 'q2', scope: 'workstream', targetId: 'w1', createdAt: 'b' }),
+        queueItem({ bac_id: 'q3', scope: 'global', targetId: undefined, createdAt: 'c' }),
+      ],
+      [{ bac_id: 't1', title: 'State machine review', provider: 'claude' }],
+      [{ bac_id: 'w1', title: 'MVP PRD' }],
+    );
+    expect(grouped.map((g) => g.scope).sort()).toEqual(['global', 'thread', 'workstream']);
+    render(
+      <QueuedView groups={grouped} onDismiss={() => undefined} onRetry={() => undefined} />,
+    );
+    expect(screen.getByText('State machine review')).toBeInTheDocument();
+    expect(screen.getByText('MVP PRD')).toBeInTheDocument();
+    expect(screen.getByText('Anywhere')).toBeInTheDocument();
   });
 });
