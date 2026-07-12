@@ -3,6 +3,7 @@ import type { WorkstreamNode } from '../../../src/workboard';
 import { parsePairingString } from '../../../src/companion/pairingString';
 import { CollectorsSection } from './CollectorsSection';
 import type { CollectorStatus } from './CollectorsSection';
+import { NoCaptureRulesSection } from './NoCaptureRulesSection';
 import { Modal } from './Modal';
 import {
   AppearanceSection,
@@ -1024,6 +1025,7 @@ export function SettingsPanel({
             </span>
           </span>
         </label>
+        <NoCaptureRulesSection busy={busy} />
       </div>
 
       <div className="settings-section">

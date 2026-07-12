@@ -241,6 +241,30 @@ export const peekRecallV2Store = async (
   }
 };
 
+/** Privacy purge — hard-delete recall-v2 documents/vectors/chunks whose
+ *  host is in the eTLD+1 family `domain`. Opens (or reuses) the store so
+ *  a purge lands even before the first /v2/recall. Returns the number of
+ *  document rows deleted; 0 when the store isn't openable or the backend
+ *  can't purge (older store without deleteDocumentsByHostFamily). */
+export const purgeRecallV2StoreByDomain = async (
+  vaultRoot: string,
+  domain: string,
+): Promise<number> => {
+  if (domain.trim().length === 0) return 0;
+  let store: RecallStore;
+  try {
+    store = await getOrOpenStore(vaultRoot);
+  } catch {
+    return 0;
+  }
+  if (store.deleteDocumentsByHostFamily === undefined) return 0;
+  try {
+    return store.deleteDocumentsByHostFamily(domain);
+  } catch {
+    return 0;
+  }
+};
+
 /** Re-runs backfill phases whose source signature changed. Cheap
  *  (3 dir stats) when nothing's moved. Single-flight per vault so
  *  concurrent /v2/recall callers share one backfill pass instead of

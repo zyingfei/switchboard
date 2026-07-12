@@ -16,6 +16,12 @@ export interface ToolbarOverflowMenuProps {
   // Surfaced on the trigger (pulses while dumping) and the Dump row so
   // the user gets the same feedback the standalone button used to give.
   readonly dumpStatus: DumpStatusKind;
+  // No-capture rule actions for the current tab. When the current tab
+  // has no capturable http(s) URL these are omitted (undefined) and the
+  // rows don't render. A short label (the eTLD+1) shown inline.
+  readonly currentSiteLabel?: string;
+  readonly onBlockCurrentSite?: () => void;
+  readonly onBlockSimilarSites?: () => void;
 }
 
 export function ToolbarOverflowMenu({
@@ -23,6 +29,9 @@ export function ToolbarOverflowMenu({
   onDumpState,
   onOpenDesignPreview,
   dumpStatus,
+  currentSiteLabel,
+  onBlockCurrentSite,
+  onBlockSimilarSites,
 }: ToolbarOverflowMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -73,6 +82,39 @@ export function ToolbarOverflowMenu({
       </button>
       {open ? (
         <div className="toolbar-overflow-menu" role="menu">
+          {onBlockCurrentSite !== undefined ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="toolbar-overflow-item"
+              onClick={pick(onBlockCurrentSite)}
+              data-testid="block-current-site"
+              title={
+                currentSiteLabel === undefined
+                  ? "Don't capture this site"
+                  : `Don't capture ${currentSiteLabel}`
+              }
+            >
+              <span className="toolbar-overflow-item-icon">{Icons.eyeOff ?? Icons.activity}</span>
+              <span className="toolbar-overflow-item-label">
+                Don&rsquo;t capture this site
+                {currentSiteLabel === undefined ? '' : ` (${currentSiteLabel})`}
+              </span>
+            </button>
+          ) : null}
+          {onBlockSimilarSites !== undefined ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="toolbar-overflow-item"
+              onClick={pick(onBlockSimilarSites)}
+              data-testid="block-similar-sites"
+              title="Don't capture similar sites (account / billing / login pages)"
+            >
+              <span className="toolbar-overflow-item-icon">{Icons.eyeOff ?? Icons.activity}</span>
+              <span className="toolbar-overflow-item-label">Don&rsquo;t capture similar sites</span>
+            </button>
+          ) : null}
           <button
             type="button"
             role="menuitem"

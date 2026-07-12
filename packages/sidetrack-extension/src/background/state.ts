@@ -13,6 +13,7 @@ import type {
   WorkstreamUpdate,
 } from '../companion/model';
 import { readDroppedCount, readFailedCaptures, readQueue } from '../companion/queue';
+import type { NoCaptureRule } from '../capture/noCaptureRules';
 import { canonicalThreadUrl, detectProviderFromUrl } from '../capture/providerDetection';
 import type { DispatchEventRecord } from '../dispatch/types';
 import type { ReviewDraftClientEvent, TargetRef } from '../review/draftClient';
@@ -173,6 +174,22 @@ export const saveRedactedClipboard = async (
 ): Promise<UiSettings> => {
   const current = await readSettings();
   const next: UiSettings = { ...current, redactedClipboard };
+  await storageSet({ [SETTINGS_KEY]: next });
+  return next;
+};
+
+// Domain no-capture blocklist. The full rule list is persisted inside
+// UiSettings (one settings read yields both the pause switch and the
+// blocklist for the master capture gate). Callers own de-dup / merge;
+// this just writes the array verbatim.
+export const readNoCaptureRules = async (): Promise<readonly NoCaptureRule[]> =>
+  (await readSettings()).noCaptureRules ?? [];
+
+export const saveNoCaptureRules = async (
+  noCaptureRules: readonly NoCaptureRule[],
+): Promise<UiSettings> => {
+  const current = await readSettings();
+  const next: UiSettings = { ...current, noCaptureRules };
   await storageSet({ [SETTINGS_KEY]: next });
   return next;
 };

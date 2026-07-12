@@ -5,6 +5,7 @@ import type {
   ProviderId,
   TabSnapshot,
 } from './companion/model';
+import type { NoCaptureRule } from './capture/noCaptureRules';
 import type { DispatchEventRecord } from './dispatch/types';
 import type { ReviewDraft } from './review/types';
 
@@ -198,6 +199,11 @@ export interface UiSettings {
   // clipboard. Auto-send is NEVER gated on this — it is always
   // preflighted (it was the zero-gate path the audit flagged).
   readonly redactedClipboard?: boolean;
+  // Domain no-capture blocklist — a persisted list of rules the master
+  // capture gate consults on every ingress. Optional with absent = []
+  // so existing installs pick it up with no migration. See
+  // src/capture/noCaptureRules.ts for the rule model + matching.
+  readonly noCaptureRules?: readonly NoCaptureRule[];
 }
 
 // Manual notes the user types in the side panel (and, later, Obsidian /

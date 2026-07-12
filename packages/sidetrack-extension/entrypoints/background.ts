@@ -2,6 +2,13 @@ import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
 import {
+  matchesNoCaptureRules,
+  registrableDomainFromUrl,
+  detectCategoryTokens,
+  type NoCaptureRule,
+  type NoCaptureCategoryToken,
+} from '../src/capture/noCaptureRules';
+import {
   canonicalThreadUrl,
   detectProviderFromUrl,
   isProviderThreadUrl,
@@ -149,6 +156,8 @@ import {
   readThreads,
   mirrorRemoteWorkstream,
   readSettings,
+  readNoCaptureRules,
+  saveNoCaptureRules,
   recordSelectorCanary,
   saveAutoTrack,
   saveCaptureEnabled,
@@ -536,6 +545,37 @@ const invalidateTimelineGateCache = (): void => {
 // default-merge (captureEnabled defaults to true).
 const isCaptureEnabled = async (): Promise<boolean> =>
   (await readSettings()).captureEnabled !== false;
+
+// THE SINGLE SHARED CAPTURE GATE. Every ingress that records browsing
+// activity (auto/explicit capture, page-text, page-evidence, timeline
+// visits, engagement, visual fingerprint, selection, nav-click,
+// navigation.committed, trainable emissions) MUST route its allow/deny
+// decision through one of these two helpers rather than checking
+// `captureEnabled` (or the blocklist) piecemeal. Prior to this,
+// `captureEnabled` was sprinkled at ~12 sites and at least one ingress
+// (chrome.webNavigation.onCommitted in web-navigation.ts) had no gate
+// at all — that was the pause-bypass that leaked pge.com.
+//
+// `isCaptureAllowed()` — no-URL gate: honors only the pause switch.
+// `isCaptureAllowedForUrl(url)` — honors the pause switch AND the
+//   domain no-capture blocklist. Prefer this whenever a URL is in scope.
+const isCaptureAllowed = async (): Promise<boolean> => isCaptureEnabled();
+
+const isCaptureAllowedForUrl = async (url: string | undefined): Promise<boolean> => {
+  if (!(await isCaptureEnabled())) return false;
+  if (typeof url !== 'string' || url.length === 0) return true;
+  try {
+    const rules = await readNoCaptureRules();
+    if (rules.length === 0) return true;
+    return !matchesNoCaptureRules({ url }, rules);
+  } catch {
+    // Never fail-open on the pause switch (already checked), but a
+    // blocklist read failure should not silently start capturing a
+    // blocked page — treat an unreadable list as "no rules" only, i.e.
+    // fall through to allow. The pause switch remains authoritative.
+    return true;
+  }
+};
 
 const isTimelinePrivacyGateOpen = async (): Promise<boolean> => {
   // The master switch overrides the per-feature gate: capture off means
@@ -1087,6 +1127,9 @@ const extractPageContentFromTab = async (
   if (!/^https?:\/\//u.test(tabUrl)) {
     throw new Error('Page-content indexing only supports HTTP(S) pages.');
   }
+  if (!(await isCaptureAllowedForUrl(tabUrl))) {
+    throw new Error('This site is on your no-capture list — page content was not indexed.');
+  }
   const request = {
     type: messageTypes.pageContentExtract,
     mode,
@@ -1144,6 +1187,9 @@ const extractPageEvidenceFromTab = async (
   if (!/^https?:\/\//u.test(tabUrl)) {
     throw new Error('Page-evidence extraction only supports HTTP(S) pages.');
   }
+  if (!(await isCaptureAllowedForUrl(tabUrl))) {
+    throw new Error('This site is on your no-capture list — page evidence was not extracted.');
+  }
   const request = {
     type: messageTypes.pageContentExtract,
     mode: 'page',
@@ -1194,6 +1240,8 @@ const maybeExtractAutoPageEvidence = async (
   if (tab.incognito === true) return;
   const tabUrl = tab.url ?? '';
   if (!/^https?:\/\//u.test(tabUrl)) return;
+  // No-capture blocklist — short-circuit before touching the page.
+  if (!(await isCaptureAllowedForUrl(tabUrl))) return;
   const canonicalUrl = canonicalThreadUrl(tabUrl);
   const now = Date.now();
   const previous = pageEvidenceAutoExtractedAtByCanonical.get(canonicalUrl);
@@ -2855,7 +2903,9 @@ const handleRequest = async (
     // Master capture switch (the side-panel eye) is off — drop silently,
     // capture nothing. content.ts is statically registered so we can't
     // unregister it; this handler gate is the stop for AI-thread auto.
-    if (!(await isCaptureEnabled())) {
+    // isCaptureAllowedForUrl folds in the pause switch AND the domain
+    // no-capture blocklist (matched against the thread URL).
+    if (!(await isCaptureAllowedForUrl(request.capture.threadUrl))) {
       return { ok: true, state: await buildState('connected') };
     }
     // Defense-in-depth gate: even if a content script (or test) injects
@@ -3260,6 +3310,12 @@ const handleRequest = async (
     // emission failures must never block the user's click.
     const emit = async (): Promise<void> => {
       try {
+        // Master capture gate — a paused browser emits no new trainable
+        // signals. (The payload carries an entityId, not a clean URL, so
+        // the per-URL blocklist can't apply here; served recall results
+        // are tombstone-filtered companion-side. The pause switch is the
+        // authoritative gate for this ingress.)
+        if (!(await isCaptureAllowed())) return;
         const settings = await readSettings();
         if (settings.companion.bridgeKey.trim().length === 0) {
           // No companion configured — nothing to log. Silent.
@@ -3684,6 +3740,79 @@ const handleRequest = async (
     }, 'settings');
   }
 
+  if (request.type === messageTypes.listNoCaptureRules) {
+    return { ok: true, noCaptureRules: await readNoCaptureRules() } as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.addNoCaptureRule) {
+    const domain = registrableDomainFromUrl(request.source.url);
+    if (domain.length === 0) {
+      return {
+        ok: false,
+        error: 'This page has no capturable domain (only http/https pages can be blocked).',
+      } as unknown as RuntimeResponse;
+    }
+    const existing = await readNoCaptureRules();
+    // De-dup: one rule per (kind, domain). Re-adding is a no-op that
+    // returns the current list so the UI stays consistent.
+    if (existing.some((rule) => rule.kind === request.kind && rule.domain === domain)) {
+      return { ok: true, noCaptureRules: existing } as unknown as RuntimeResponse;
+    }
+    const base = {
+      id: `ncr_${crypto.randomUUID().replaceAll('-', '_')}`,
+      domain,
+      label: domain,
+      createdAt: new Date().toISOString(),
+    };
+    let rule: NoCaptureRule;
+    if (request.kind === 'similar') {
+      const categoryTokens: readonly NoCaptureCategoryToken[] = detectCategoryTokens({
+        url: request.source.url,
+        ...(request.source.title === undefined ? {} : { title: request.source.title }),
+      });
+      rule = { ...base, kind: 'similar', categoryTokens };
+    } else {
+      rule = { ...base, kind: 'domain' };
+    }
+    const next = [...existing, rule];
+    await saveNoCaptureRules(next);
+    return { ok: true, noCaptureRules: next } as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.removeNoCaptureRule) {
+    const existing = await readNoCaptureRules();
+    const next = existing.filter((rule) => rule.id !== request.ruleId);
+    await saveNoCaptureRules(next);
+    return { ok: true, noCaptureRules: next } as unknown as RuntimeResponse;
+  }
+
+  if (request.type === messageTypes.purgeNoCaptureRule) {
+    const existing = await readNoCaptureRules();
+    const rule = existing.find((candidate) => candidate.id === request.ruleId);
+    if (rule === undefined) {
+      return { ok: false, error: 'No-capture rule not found.' } as unknown as RuntimeResponse;
+    }
+    // Purge invokes the companion's domain-tombstone route: it persists
+    // a DOMAIN_TOMBSTONE and excludes matching records at every read
+    // boundary + drops them from derived stores (vectors). The raw
+    // append-only JSONL log is not rewritten (a full offline scrub is a
+    // separate future tool). Requires a configured companion.
+    return await withCompanionStatus(async () => {
+      const body = {
+        kind: rule.kind,
+        domain: rule.domain,
+        ...(rule.kind === 'similar' ? { categoryTokens: rule.categoryTokens } : {}),
+      };
+      await companionJson('/v1/privacy/domain-tombstone', {
+        method: 'POST',
+        headers: {
+          'idempotency-key': idempotencyKey('domain-tombstone', `${rule.kind}:${rule.domain}`),
+        },
+        body: JSON.stringify(body),
+      });
+    }, 'settings');
+  }
+
   if (request.type === messageTypes.createCaptureNote) {
     const note = request.note;
     return await withCompanionStatus(
@@ -3961,6 +4090,11 @@ export default defineBackground(() => {
   let requestEdgeEventDrain: () => void = () => undefined;
   const webNavigationRuntime = registerDefaultWebNavigationListeners(tabOpenerStore, {
     onNavigationBuffered: () => requestEdgeEventDrain(),
+    // Route every navigation.committed / link-click through the single
+    // shared capture gate (pause switch + domain blocklist). Closes the
+    // pause-bypass — chrome.webNavigation.onCommitted previously buffered
+    // the URL with no gate at all.
+    isCaptureAllowedForUrl: (url: string) => isCaptureAllowedForUrl(url),
   });
 
   const engagementEventBuffer = new IndexedDbEventBuffer();
@@ -4025,6 +4159,13 @@ export default defineBackground(() => {
       await recordEngagementSyncDiag('interval.dropped', { reason: 'capture-disabled', tabId });
       return;
     }
+    // No-capture blocklist — resolve the tab URL and drop engagement for
+    // blocked sites so a suppressed domain records no dwell/focus signal.
+    const engagementTab = await chrome.tabs.get(tabId).catch(() => null);
+    if (engagementTab !== null && !(await isCaptureAllowedForUrl(engagementTab.url))) {
+      await recordEngagementSyncDiag('interval.dropped', { reason: 'no-capture-blocklist', tabId });
+      return;
+    }
     const runtime = await engagementRuntime();
     const merged = runtime.cache.mergeInterval(tabId, message);
     const payloads: {
@@ -4053,10 +4194,19 @@ export default defineBackground(() => {
     ]);
   };
 
-  const handleSelectionLineage = async (message: unknown): Promise<void> => {
+  const handleSelectionLineage = async (
+    message: unknown,
+    tabId?: number,
+  ): Promise<void> => {
     if (!isSelectionLineageMessage(message)) return;
     // Master capture switch off — don't record copy/paste lineage.
     if (!(await isCaptureEnabled())) return;
+    // No-capture blocklist — resolve the source tab URL and drop
+    // selection lineage for blocked sites.
+    if (tabId !== undefined) {
+      const selectionTab = await chrome.tabs.get(tabId).catch(() => null);
+      if (selectionTab !== null && !(await isCaptureAllowedForUrl(selectionTab.url))) return;
+    }
     const allocated = await allocateNextSeq(1);
     const streamName =
       message.type === 'sidetrack.selection.copied' ? 'selection.copied' : 'selection.pasted';
@@ -4074,6 +4224,11 @@ export default defineBackground(() => {
   const handleVisualFingerprintObserved = async (message: unknown): Promise<void> => {
     if (!isVisualFingerprintObservedMessage(message)) return;
     if (!(await isVisualFingerprintPrivacyGateOpen())) return;
+    // Master capture switch — a paused browser buffers no fingerprints.
+    // (Inert by default since the content script only registers when
+    // capture is on, but keep the gate here too for belt-and-suspenders
+    // against an in-flight message at the instant of a flip.)
+    if (!(await isCaptureAllowed())) return;
     const allocated = await allocateNextSeq(1);
     await engagementEventBuffer.appendMany([
       {
@@ -4513,7 +4668,7 @@ export default defineBackground(() => {
         const visitTitle =
           typeof tab.title === 'string' && tab.title.length > 0 ? tab.title : undefined;
         void (async () => {
-          if (!(await isCaptureEnabled())) return;
+          if (!(await isCaptureAllowedForUrl(visitUrl))) return;
           await ingestVisit({
             canonicalUrl: visitUrl,
             ...(visitTitle !== undefined ? { title: visitTitle } : {}),
@@ -4538,6 +4693,7 @@ export default defineBackground(() => {
     await initializeTimelineWiring({
       readCompanion: readTimelineCompanionConfig,
       readTimelineGateState: isTimelinePrivacyGateOpen,
+      isCaptureAllowedForUrl: (url: string) => isCaptureAllowedForUrl(url),
     });
   })().catch((error: unknown) => {
     console.warn('[timeline] init failed:', error);
@@ -4743,7 +4899,7 @@ export default defineBackground(() => {
     }
 
     if (isSelectionLineageMessage(message)) {
-      void handleSelectionLineage(message)
+      void handleSelectionLineage(message, sender.tab?.id)
         .then(() => {
           sendResponse({ ok: true } as unknown as RuntimeResponse);
         })
@@ -4866,6 +5022,7 @@ export default defineBackground(() => {
         await initializeTimelineWiring({
           readCompanion: readTimelineCompanionConfig,
           readTimelineGateState: isTimelinePrivacyGateOpen,
+          isCaptureAllowedForUrl: (url: string) => isCaptureAllowedForUrl(url),
         });
       })()
         .then(() => {
@@ -4972,6 +5129,7 @@ export default defineBackground(() => {
         await initializeTimelineWiring({
           readCompanion: readTimelineCompanionConfig,
           readTimelineGateState: isTimelinePrivacyGateOpen,
+          isCaptureAllowedForUrl: (url: string) => isCaptureAllowedForUrl(url),
         });
       })()
         .then(() => {

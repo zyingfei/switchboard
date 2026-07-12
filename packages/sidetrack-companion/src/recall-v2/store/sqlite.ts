@@ -235,6 +235,25 @@ class SqliteRecallStore implements RecallStore {
     this.deleteStmt.run(entityId);
   }
 
+  deleteDocumentsByHostFamily(domain: string): number {
+    const trimmed = domain.trim().toLowerCase();
+    if (trimmed.length === 0) return 0;
+    // Match the eTLD+1 family: exact host or any subdomain of it. We
+    // also defend against rows whose `host` was stored with a www.
+    // prefix (host === 'www.' + domain) via the LIKE '%.'+domain arm.
+    const suffix = `%.${trimmed}`;
+    const rows = this.db
+      .prepare('SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ?')
+      .all<{ entityId: string }>(trimmed, suffix);
+    if (rows.length === 0) return 0;
+    // deleteDocument cascades to chunks + vectors. Wrap in a
+    // transaction so a multi-row purge is atomic + amortizes WAL fsync.
+    this.runTransaction(() => {
+      for (const row of rows) this.deleteDocument(row.entityId);
+    });
+    return rows.length;
+  }
+
   getRecallMetadata(key: string): string | undefined {
     const row = this.db
       .prepare('SELECT value FROM recall_metadata WHERE key = ?')

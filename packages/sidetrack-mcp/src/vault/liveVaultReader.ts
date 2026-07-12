@@ -2,6 +2,8 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 
+import { loadDomainTombstoneGate } from './domainTombstone.js';
+
 const threadSchema = z
   .object({
     bac_id: z.string(),
@@ -347,16 +349,31 @@ export class LiveVaultReader {
   }
 
   async readSnapshot(): Promise<LiveVaultSnapshot> {
-    const [threads, workstreams, queueItems, reminders, events] = await Promise.all([
+    const [threads, workstreams, queueItems, reminders, events, tombstones] = await Promise.all([
       readJsonDirectory(this.vaultPath, '_BAC/threads', threadSchema),
       readJsonDirectory(this.vaultPath, '_BAC/workstreams', workstreamSchema),
       readJsonDirectory(this.vaultPath, '_BAC/queue', queueItemSchema),
       readJsonDirectory(this.vaultPath, '_BAC/reminders', reminderSchema),
       readEventLogs(this.vaultPath),
+      loadDomainTombstoneGate(this.vaultPath),
     ]);
 
+    // Domain-tombstone privacy gate — exclude threads on a purged
+    // domain from what MCP context packs + the snapshot resource serve.
+    // Read-boundary filter only (the thread files on disk are untouched;
+    // a full offline scrub is a separate future tool).
+    const visibleThreads = tombstones.isEmpty
+      ? threads
+      : threads.filter(
+          (thread) =>
+            !tombstones.matchesPage({
+              ...(thread.threadUrl === undefined ? {} : { url: thread.threadUrl }),
+              ...(thread.title === undefined ? {} : { title: thread.title }),
+            }),
+        );
+
     return {
-      threads: threads.sort((left, right) =>
+      threads: visibleThreads.sort((left, right) =>
         (right.lastSeenAt ?? '').localeCompare(left.lastSeenAt ?? ''),
       ),
       workstreams,
