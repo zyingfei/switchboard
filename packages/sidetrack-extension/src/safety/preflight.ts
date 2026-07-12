@@ -7,22 +7,23 @@
 //   3. Screen-share-safe mode is OFF (user is not currently sharing).
 //   4. Token budget — the wrapped text fits the model's context window.
 //
-// Plus the injection-scrub from `injectionScrub.ts` runs unconditionally
-// — its job is to *wrap*, not refuse, so it never blocks; it just
-// modifies the outbound text and reports whether anything looked
-// suspicious.
+// Plus TWO unconditional text transforms run before the gates so that
+// whatever ships is safe (the F01 inversion — the auto-send drain must
+// not leak secrets any more than the clipboard/dispatch paths do):
+//   - secret redaction (`applyLocalRedaction`, shared with the dispatch
+//     paths) masks API keys / tokens / cards / SSNs / emails, and
+//   - injection-scrub (`injectionScrub.ts`) *wraps* untrusted content;
+//     it never refuses, it just reports whether anything looked suspicious.
 //
-// This module is pure. The (future) content-script auto-send drain in
-// `entrypoints/content.ts` will be the only caller.
+// This module is pure. The content-script auto-send drain is the caller.
 
+import { applyLocalRedaction } from '../dispatch/outboundPreflight';
 import type { ProviderId } from '../companion/model';
 import { scanForInjection } from './injectionScrub';
+import { estimateTokensFast } from './tokenEstimate';
 
-// Fast char/4 heuristic, matching what PacketComposer renders for live
-// preview. Real cl100k counts come from the companion at dispatch time;
-// we don't bundle the BPE table into the side-panel/content bundle to
-// keep MV3 size in check.
-export const estimateTokensFast = (text: string): number => Math.ceil(text.length / 4);
+// Re-exported for existing callers that import it from here.
+export { estimateTokensFast };
 
 // 200K is the largest published context across the providers we drive
 // (Claude 200K, GPT 4o 128K, Gemini 1M but practical chat ~200K).
@@ -67,9 +68,13 @@ const KNOWN_PROVIDERS = new Set<ProviderId>(['chatgpt', 'claude', 'gemini']);
 export const evaluateAutoSendPreflight = (
   input: AutoSendPreflightInput,
 ): AutoSendPreflightVerdict => {
-  // Run injection-scrub first — its output is what we'd send AND it
-  // doesn't block, so we always have a final text to report.
-  const scrub = scanForInjection(input.text);
+  // Redact secrets FIRST (shared rules with the dispatch paths), then
+  // injection-scrub the redacted text — its output is what we'd send AND
+  // neither transform blocks, so we always have a final safe text to
+  // report. Without the redaction step the drain shipped raw secrets
+  // (the F01 gap: this path never went through outboundPreflight).
+  const redacted = applyLocalRedaction(input.text);
+  const scrub = scanForInjection(redacted.output);
   const tokenEstimate = estimateTokensFast(scrub.wrapped);
   const tokenLimit = input.tokenLimit ?? DEFAULT_TOKEN_LIMIT;
   const baseFields = {
