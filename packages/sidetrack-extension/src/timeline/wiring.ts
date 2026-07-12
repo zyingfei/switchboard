@@ -420,6 +420,12 @@ interface InitDeps {
   // Production reads the Class A privacy projection. Tests may omit it
   // and fall back to the legacy storage gate helper above.
   readonly readTimelineGateState?: () => Promise<boolean>;
+  // Domain no-capture blocklist check (the shared capture gate,
+  // per-URL). readTimelineGateState already folds in the master pause
+  // switch; this adds the per-URL blocklist so a blocked domain is not
+  // observed even while the timeline gate + capture switch are open.
+  // Optional ⇒ allow (tests / legacy callers).
+  readonly isCaptureAllowedForUrl?: (url: string) => Promise<boolean>;
 }
 
 // Captured at init() so external triggerTimelineDrain() can run the
@@ -526,6 +532,16 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
   initializeCalls += 1;
   if (initialized) return;
   const readTimelineGateState = deps.readTimelineGateState ?? isTimelineEnabled;
+  // Per-URL no-capture blocklist. Absent dep ⇒ allow. Fails CLOSED on
+  // read error so a blocked domain is never observed by accident.
+  const captureAllowedForUrl = async (url: string): Promise<boolean> => {
+    if (deps.isCaptureAllowedForUrl === undefined) return true;
+    try {
+      return await deps.isCaptureAllowedForUrl(url);
+    } catch {
+      return false;
+    }
+  };
   // Gate first — if the user hasn't opted in via the privacy
   // projection, register nothing.
   const initGateOpen = await readTimelineGateState();
@@ -573,6 +589,12 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       contentTitleSinkSkippedGateClosed += 1;
       // eslint-disable-next-line no-console
       console.warn('[sidetrack:title-sink] gate closed', input.url);
+      return;
+    }
+    if (!(await captureAllowedForUrl(input.url))) {
+      contentTitleSinkSkippedGateClosed += 1;
+      // eslint-disable-next-line no-console
+      console.warn('[sidetrack:title-sink] no-capture blocklist', input.url);
       return;
     }
     const tabSession = await tabSessions.recordActivity({
@@ -696,6 +718,7 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
         // never represent meaningful work to attribute, and we don't want
         // them showing up in Inbox or Connections.
         if (!isTrackableUrl(tab.url)) return;
+        if (!(await captureAllowedForUrl(tab.url))) return;
         const tabSession = await tabSessions.recordActivity({
           tabIdHash: hashTabId(info.tabId, info.windowId),
           windowIdHash: hashWindowId(info.windowId),
@@ -784,6 +807,10 @@ export const initializeTimelineWiring = async (deps: InitDeps): Promise<void> =>
       // See onActivated above: never observe non-content surfaces.
       if (!isTrackableUrl(url)) {
         updateLastOnUpdated(sequence, { skippedReason: 'non-trackable-scheme' });
+        return;
+      }
+      if (!(await captureAllowedForUrl(url))) {
+        updateLastOnUpdated(sequence, { skippedReason: 'no-capture-blocklist' });
         return;
       }
       updateLastOnUpdated(sequence, { urlUsed: url });

@@ -104,6 +104,12 @@ export const messageTypes = {
   codingAttachListOffers: 'sidetrack.codingAttach.listOffers',
   codingAttachMarkStatus: 'sidetrack.codingAttach.markStatus',
   saveLocalPreferences: 'sidetrack.preferences.local.save',
+  // Domain no-capture blocklist — add / remove rules and purge a
+  // rule's already-captured data via the companion tombstone route.
+  listNoCaptureRules: 'sidetrack.capture.noCaptureRules.list',
+  addNoCaptureRule: 'sidetrack.capture.noCaptureRules.add',
+  removeNoCaptureRule: 'sidetrack.capture.noCaptureRules.remove',
+  purgeNoCaptureRule: 'sidetrack.capture.noCaptureRules.purge',
   // Side panel asks the background to retry every explicit capture
   // that exhausted its retry budget while the companion was offline.
   // Drains failed-queue → re-enqueue as fresh explicit → trigger
@@ -615,6 +621,28 @@ export type WorkboardRequest =
       };
     }
   | {
+      readonly type: typeof messageTypes.listNoCaptureRules;
+    }
+  | {
+      readonly type: typeof messageTypes.addNoCaptureRule;
+      // Add a rule for the given page. kind='domain' suppresses the
+      // page's eTLD+1 family; kind='similar' also suppresses cross-domain
+      // pages that hit the category tokens detected on this page.
+      readonly source: {
+        readonly url: string;
+        readonly title?: string;
+      };
+      readonly kind: 'domain' | 'similar';
+    }
+  | {
+      readonly type: typeof messageTypes.removeNoCaptureRule;
+      readonly ruleId: string;
+    }
+  | {
+      readonly type: typeof messageTypes.purgeNoCaptureRule;
+      readonly ruleId: string;
+    }
+  | {
       readonly type: typeof messageTypes.createCaptureNote;
       readonly note: CaptureNoteCreate;
     }
@@ -1012,6 +1040,26 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.saveLocalPreferences)) {
     return isRecord(value.preferences);
+  }
+
+  if (hasType(value, messageTypes.listNoCaptureRules)) {
+    return true;
+  }
+
+  if (hasType(value, messageTypes.addNoCaptureRule)) {
+    return (
+      isRecord(value.source) &&
+      typeof value.source.url === 'string' &&
+      (value.kind === 'domain' || value.kind === 'similar')
+    );
+  }
+
+  if (hasType(value, messageTypes.removeNoCaptureRule)) {
+    return typeof value.ruleId === 'string';
+  }
+
+  if (hasType(value, messageTypes.purgeNoCaptureRule)) {
+    return typeof value.ruleId === 'string';
   }
 
   if (hasType(value, messageTypes.createCaptureNote)) {

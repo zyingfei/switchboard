@@ -99,6 +99,13 @@ export interface NavigationListenerDeps {
   readonly edgeReplicaId: string;
   readonly allocateSeq: typeof allocateNextSeq;
   readonly now: () => Date;
+  // The single shared capture gate (pause switch + domain blocklist),
+  // resolved per-URL. Optional so unit tests + legacy callers default
+  // to "allow"; production ALWAYS wires it (background.ts) so a paused
+  // or blocked page never buffers a navigation.committed event. This
+  // was the pause-bypass: chrome.webNavigation.onCommitted fired on
+  // every navigation and buffered the URL with no gate at all.
+  readonly isCaptureAllowedForUrl?: (url: string) => Promise<boolean>;
 }
 
 interface NavigationSessionStorage {
@@ -295,6 +302,18 @@ export const createWebNavigationListener = (
   let hydrated = false;
   let hydratePromise: Promise<void> | null = null;
 
+  // The shared capture gate. Absent dep ⇒ allow (tests / legacy).
+  const captureAllowedForUrl = async (url: string): Promise<boolean> => {
+    if (deps.isCaptureAllowedForUrl === undefined) return true;
+    try {
+      return await deps.isCaptureAllowedForUrl(url);
+    } catch {
+      // Fail CLOSED for the navigation-committed path: a gate-read
+      // failure must not resurrect the leak this whole change closes.
+      return false;
+    }
+  };
+
   const hydrate = async (): Promise<void> => {
     if (hydrated) return;
     if (hydratePromise !== null) return hydratePromise;
@@ -389,6 +408,14 @@ export const createWebNavigationListener = (
   };
 
   const recordLinkClick = async (details: NavigationLinkClickDetails): Promise<void> => {
+    // Gate on BOTH endpoints — either a paused/blocked source or target
+    // must not buffer a link-click (it seeds a navigation.committed).
+    if (
+      !(await captureAllowedForUrl(details.sourceUrl)) ||
+      !(await captureAllowedForUrl(details.targetUrl))
+    ) {
+      return;
+    }
     await hydrate();
     const clickedAtMs = Number.isFinite(details.timeStamp)
       ? details.timeStamp
@@ -495,6 +522,10 @@ export const createWebNavigationListener = (
 
   const handleCommitted = async (details: WebNavigationCommittedDetails): Promise<void> => {
     if (details.frameId !== 0) return;
+    // Master capture gate — pause switch + domain no-capture blocklist.
+    // Checked BEFORE hydrate/buffer so a paused or blocked navigation
+    // records nothing anywhere. This is the fix for the pause-bypass.
+    if (!(await captureAllowedForUrl(details.url))) return;
     await hydrate();
 
     const commitTimestamp = Number.isFinite(details.timeStamp)
@@ -606,7 +637,13 @@ export const loadOrCreateBrowserSessionStartMs = async (): Promise<number> => {
 
 export const registerDefaultWebNavigationListeners = (
   tabOpenerStore: TabOpenerStore,
-  options: { readonly onNavigationBuffered?: () => void } = {},
+  options: {
+    readonly onNavigationBuffered?: () => void;
+    // The shared capture gate, injected from background.ts so this
+    // listener honors the pause switch + domain blocklist. Absent ⇒
+    // allow (should never happen in production).
+    readonly isCaptureAllowedForUrl?: (url: string) => Promise<boolean>;
+  } = {},
 ): {
   readonly recordLinkClick: (details: NavigationLinkClickDetails) => Promise<void>;
   readonly hydrate: () => Promise<void>;
@@ -631,6 +668,9 @@ export const registerDefaultWebNavigationListeners = (
         edgeReplicaId: replica.edgeReplicaId,
         allocateSeq: allocateNextSeq,
         now: () => new Date(),
+        ...(options.isCaptureAllowedForUrl === undefined
+          ? {}
+          : { isCaptureAllowedForUrl: options.isCaptureAllowedForUrl }),
       });
     })();
     return listenerPromise;
