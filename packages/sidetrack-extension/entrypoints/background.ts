@@ -3378,15 +3378,23 @@ const handleRequest = async (
           };
         }
         await focusTabForUserVisibleSend(match);
+        // Route the annotation message through the outbound safety funnel
+        // (secret redaction + injection scrub) before it types into the
+        // provider tab — this path fed autoSendItem raw, bypassing F01.
+        const annotationMessage = buildAnnotationChatMessage({
+          turnText: request.turnText,
+          turnRole: request.turnRole,
+          ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
+          note: request.note,
+          capturedAt: request.capturedAt,
+        });
+        const safeAnnotationMessage = preflightOutbound(
+          annotationMessage,
+          detectProviderFromUrl(request.threadUrl),
+        ).safeText;
         const result = await sendToContentScriptWithRecovery(match.id, {
           type: messageTypes.autoSendItem,
-          text: buildAnnotationChatMessage({
-            turnText: request.turnText,
-            turnRole: request.turnRole,
-            ...(request.anchorText === undefined ? {} : { anchorText: request.anchorText }),
-            note: request.note,
-            capturedAt: request.capturedAt,
-          }),
+          text: safeAnnotationMessage,
           perItemTimeoutMs: 120_000,
           waitForCompletion: false,
         });

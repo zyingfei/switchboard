@@ -131,6 +131,11 @@ import {
 } from '../../src/sidepanel/tabsession/sessionRestore';
 import { mapInboundReminders } from '../../src/sidepanel/inbound/mapInboundReminder';
 import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
+import {
+  canScopeToWorkstream,
+  resolveQueueScope,
+  type QueueScopeChoice,
+} from '../../src/sidepanel/queued/queueScopeChoice';
 import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
 import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTitle';
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
@@ -858,6 +863,12 @@ const App = () => {
     setViewMode('inbox');
   };
   const [queueDraft, setQueueDraft] = useState('');
+  // §13 step 4 — where the composed follow-up is parked: on the thread
+  // (default, current behavior), rolled up to the thread's workstream,
+  // or global. Reset to 'thread' whenever the composer opens/closes so a
+  // leftover choice from a prior thread never leaks. The selector only
+  // offers 'workstream' when the expanded thread has a home workstream.
+  const [queueScopeChoice, setQueueScopeChoice] = useState<QueueScopeChoice>('thread');
   const [queueExpandFor, setQueueExpandFor] = useState<string | null>(null);
   // Set briefly after the user opens compose-at-end via the row's
   // "Queue follow-up" menu so the input grabs focus on the next render.
@@ -3658,6 +3669,19 @@ const App = () => {
     })();
   };
 
+  // A closed/restorable thread carries a stored TabSnapshot; the reopen
+  // affordance should offer the recovery modal (focus-open / restore-
+  // session / reopen-URL strategies) rather than blindly creating a new
+  // tab. Live threads open directly. Without this, the fully-built
+  // TabRecovery modal was unreachable (§13 step 8).
+  const reopenOrRecoverThread = (thread: TrackedThread) => {
+    if (thread.status === 'closed' || thread.status === 'restorable') {
+      setRecoveryThreadId(thread.bac_id);
+      return;
+    }
+    openTabForThread(thread);
+  };
+
   // "Find" icon in the side-panel header. Reads the active tab in
   // the focused window, finds a tracked thread whose threadUrl
   // matches, scrolls + flashes the row using the same
@@ -3871,22 +3895,30 @@ const App = () => {
     setPendingDispatch(packet);
   };
 
-  const submitQueueFollowUp = (threadId: string) => {
+  const submitQueueFollowUp = (thread: TrackedThread) => {
     const text = queueDraft.trim();
     if (text.length === 0) {
       return;
     }
+    // Map the composer's scope choice onto the QueueCreate the
+    // background handler already forwards verbatim. Global drops the
+    // targetId; workstream rolls up to the thread's home workstream;
+    // thread (default) keeps the current behavior. resolveQueueScope
+    // defends the wire contract if the choice is 'workstream' on a
+    // thread with no workstream.
+    const item = resolveQueueScope(queueScopeChoice, thread, text);
     void runAction(async () => {
       const next = await sendRequest({
         type: messageTypes.queueFollowUp,
-        item: { text, scope: 'thread', targetId: threadId },
+        item,
       });
       // Keep the queue expanded and the compose input focused so the
       // user can stack the next follow-up without re-clicking. Only
-      // the draft text is cleared.
+      // the draft text is cleared; the scope choice persists so a run
+      // of workstream-scoped asks doesn't reset between each Add.
       setQueueDraft('');
-      setQueueExpandFor(threadId);
-      setQueueComposeAutoFocus(threadId);
+      setQueueExpandFor(thread.bac_id);
+      setQueueComposeAutoFocus(thread.bac_id);
       return next;
     });
   };
@@ -5363,6 +5395,7 @@ const App = () => {
               onClick={(e) => {
                 e.stopPropagation();
                 setQueueExpandFor(queueExpanded ? null : thread.bac_id);
+                setQueueScopeChoice('thread');
               }}
             >
               {String(queuedCount)} queued
@@ -5577,11 +5610,11 @@ const App = () => {
           <button
             type="button"
             className="btn-link thread-action-icon"
-            title="Open the thread's tab (or reopen if closed)"
+            title="Open the thread's tab (or recover if closed)"
             aria-label="Open thread tab"
             onClick={(e) => {
               e.stopPropagation();
-              openTabForThread(thread);
+              reopenOrRecoverThread(thread);
             }}
           >
             <span className="icon-12" aria-hidden>
@@ -5684,9 +5717,11 @@ const App = () => {
                           if (queueExpandFor === thread.bac_id) {
                             setQueueExpandFor(null);
                             setQueueDraft('');
+                            setQueueScopeChoice('thread');
                           } else {
                             setQueueExpandFor(thread.bac_id);
                             setQueueDraft('');
+                            setQueueScopeChoice('thread');
                             setQueueComposeAutoFocus(thread.bac_id);
                           }
                         }}
@@ -5956,7 +5991,7 @@ const App = () => {
                 className="thread-queue-compose"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  submitQueueFollowUp(thread.bac_id);
+                  submitQueueFollowUp(thread);
                 }}
               >
                 <input
@@ -5978,6 +6013,21 @@ const App = () => {
                     setQueueDraft(e.target.value);
                   }}
                 />
+                <select
+                  className="thread-queue-scope mono"
+                  aria-label="Queue scope"
+                  title="Where this follow-up waits"
+                  value={queueScopeChoice}
+                  onChange={(e) => {
+                    setQueueScopeChoice(e.target.value as QueueScopeChoice);
+                  }}
+                >
+                  <option value="thread">Thread</option>
+                  {canScopeToWorkstream(thread) ? (
+                    <option value="workstream">This workstream</option>
+                  ) : null}
+                  <option value="global">Global</option>
+                </select>
                 <button
                   type="submit"
                   className="btn-link"

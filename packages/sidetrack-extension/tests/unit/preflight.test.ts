@@ -23,6 +23,18 @@ describe('§24.10 auto-send preflight', () => {
     expect(verdict.text).toBe(baseInput.text);
   });
 
+  it('redacts secrets in the shipped text (F01: the drain must not leak secrets)', () => {
+    const verdict = evaluateAutoSendPreflight({
+      ...baseInput,
+      text: 'my key is sk-ant-api03-SECRETSECRETSECRET and email me at a@b.com',
+    });
+    expect(verdict.ok).toBe(true);
+    // verdict.text is exactly what the drain ships into the provider tab —
+    // before the fix it typed the raw secret verbatim.
+    expect(verdict.text).not.toContain('sk-ant-api03-SECRETSECRETSECRET');
+    expect(verdict.text).not.toContain('a@b.com');
+  });
+
   it('blocks when the thread toggle is off', () => {
     const verdict = evaluateAutoSendPreflight({ ...baseInput, threadAutoSendEnabled: false });
     expect(verdict.ok).toBe(false);

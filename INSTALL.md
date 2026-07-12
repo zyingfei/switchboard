@@ -32,23 +32,51 @@ the test suites — use it before sending a PR.
 The companion owns the vault. Point it at any directory; Sidetrack
 writes only under that directory's `_BAC/` namespace.
 
+### Recommended: install it as a background service (unattended)
+
+This is the supported way to keep the companion running. It registers a
+login service — **launchd** on macOS, a **systemd `--user`** unit on
+Linux, a **Scheduled Task** on Windows — that starts the companion at
+login and **respawns it on crash** (KeepAlive / `Restart=always`). Use
+this if you want Sidetrack to keep capturing across restarts without
+babysitting a terminal.
+
+```bash
+cd packages/sidetrack-companion
+bun dist/cli.js --install-service --vault ~/sidetrack-vault --port 17373
+```
+
+The command loads the service, then prints exact next-steps (where the
+bridge key lives, how to pair the extension, how to check status, how to
+uninstall). Manage it later with:
+
+```bash
+bun dist/cli.js --service-status      # installed? running?
+bun dist/cli.js --uninstall-service   # stop + remove the service
+```
+
+The one-liner wraps the same path — `--service` is the recommended mode:
+
+```bash
+bash scripts/install-companion.sh --vault ~/sidetrack-vault --service
+```
+
+On Linux the installer also enables `loginctl enable-linger` (best
+effort) so the `--user` service keeps running after you log out.
+
+### Alternative: run it in the foreground (dev)
+
+For hacking on the companion, run it directly and watch the log. Ctrl-C
+stops it; nothing auto-restarts it — prefer the service above for
+day-to-day use.
+
 ```bash
 cd packages/sidetrack-companion
 bun dist/cli.js --vault ~/sidetrack-vault --port 17373
 ```
 
-On first run it prints a **bridge key** (also saved to
+On first run either mode prints a **bridge key** (also saved to
 `<vault>/_BAC/.config/bridge.key`). Keep that — the extension needs it.
-
-To run the companion as a background service instead of a foreground
-process (launchd on macOS, systemd user unit on Linux, Scheduled Task
-on Windows):
-
-```bash
-bun dist/cli.js --install-service --vault ~/sidetrack-vault --port 17373
-bun dist/cli.js --service-status
-bun dist/cli.js --uninstall-service
-```
 
 `bun dist/cli.js --help` lists every flag (recall model cache, sync
 relay, MCP port, …).

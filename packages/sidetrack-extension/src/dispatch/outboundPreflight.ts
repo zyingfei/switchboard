@@ -23,7 +23,7 @@
 // import it.
 
 import { scanForInjection } from '../safety/injectionScrub';
-import { estimateTokensFast } from '../safety/preflight';
+import { estimateTokensFast } from '../safety/tokenEstimate';
 
 // Per-provider chat-surface context windows (approximations — the
 // companion's safety/tokenBudget.ts carries the authoritative map and
@@ -167,7 +167,12 @@ export interface OutboundRedaction {
   readonly rules: readonly string[];
 }
 
-const applyLocalRedaction = (input: string): { readonly output: string } & OutboundRedaction => {
+// Exported so the auto-send drain preflight (safety/preflight.ts) shares
+// the exact same secret-redaction rules as the clipboard/dispatch paths —
+// otherwise the drain would ship injection-scrubbed-but-unredacted text.
+export const applyLocalRedaction = (
+  input: string,
+): { readonly output: string } & OutboundRedaction => {
   let output = input;
   let matched = 0;
   const ruleSet = new Set<string>();

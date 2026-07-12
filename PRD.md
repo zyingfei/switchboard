@@ -1225,6 +1225,14 @@ Setup: companion is running, vault is wired, side panel is open.
 If all 16 steps work, MVP ships.
 ```
 
+**Amendment (2026-07-11)** — The §13 UI is fully coded (Checklist,
+Inbound, Queued, Export, tab-recovery modal, safety inversion, MCP
+identity/audit). A live recorded run of all 16 steps is pending;
+the runbook lives at `docs/demos/2026-07-11-section13-acceptance-runbook.md`.
+No §13 step is unimplemented; the recorded run is the remaining gate
+before the branch merges to main. Until that run completes and is
+archived, §13 status is **coded, not accepted**.
+
 ## 14. Out of scope (explicit, P2 or beyond)
 
 Mirrors §6.5; restated here for unambiguous PRD-readers:
@@ -1260,6 +1268,23 @@ This MVP succeeds if, over a 30-day dogfood window, the user can:
   crashes or Chrome restarts.
 
 If any of these fail, the MVP is bug, not feature.
+
+**Amendment (2026-07-11)** — Observable counter table for the freeze-lift
+condition (ADR-0011). The P1 freeze on ranker/recall/connections/attribution
+serving math lifts when **all** of the following are met:
+
+| Criterion | Observable signal | Met? |
+|---|---|---|
+| ≥80% tracked | Health panel: `trackedSessionsFraction` over 30d | pending |
+| ≥3 lossless reorgs | Event log: ≥3 `move_item` sequences with no identity loss | pending |
+| ≥5 packets dispatched | `_BAC/audit/*.jsonl`: ≥5 `research_packet` or `coding_agent_packet` dispatch events | pending |
+| ≥1 tab recovery | Event log: ≥1 `chrome.sessions.restore` success | pending |
+| ≥1 MCP context-pack session | `_BAC/audit/*.jsonl`: ≥1 `sidetrack.workstreams.context_pack` call via streamable-HTTP | pending |
+| ≥7 days zero data loss | Health tripwires: drain-lag and outbox-size health checks both green for ≥7 consecutive days | pending |
+
+The §15 window does not begin until §13 closes (the recorded demo run
+passes). Update this table from the companion's health surface and audit
+log at the end of the 30-day window.
 
 ## 16. Strongest one-liner
 

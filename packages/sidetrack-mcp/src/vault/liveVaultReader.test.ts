@@ -100,6 +100,34 @@ describe('LiveVaultReader', () => {
     expect(snapshot.events[0]?.['title']).toBe('Event');
   });
 
+  it('skips a torn/malformed record file and still serves the valid ones', async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-torn-'));
+    await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
+
+    await writeFile(
+      join(vaultPath, '_BAC', 'threads', 'good.json'),
+      JSON.stringify({
+        bac_id: 'good',
+        provider: 'chatgpt',
+        threadUrl: 'https://chatgpt.com/c/ok',
+        title: 'Readable thread',
+        lastSeenAt: '2026-04-26T21:30:00.000Z',
+      }),
+    );
+    // A write interrupted mid-string (the pre-fsync torn-write shape): an
+    // unterminated string with a raw control character. Must not take the
+    // whole read down.
+    await writeFile(
+      join(vaultPath, '_BAC', 'threads', 'torn.json'),
+      '{\n  "bac_id": "torn",\n  "updatedAt": "2026-05-27T',
+    );
+
+    const snapshot = await new LiveVaultReader(vaultPath).readSnapshot();
+
+    expect(snapshot.threads.map((t) => t.bac_id)).toEqual(['good']);
+    expect(snapshot.threads[0]?.title).toBe('Readable thread');
+  });
+
   it('reads dispatch JSONL files newest first with in-memory filters', async () => {
     const vaultPath = await mkdtemp(join(tmpdir(), 'sidetrack-mcp-dispatches-'));
     await mkdir(join(vaultPath, '_BAC', 'dispatches'), { recursive: true });
