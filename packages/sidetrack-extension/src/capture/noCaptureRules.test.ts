@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   detectCategoryTokens,
+  firstMatchingNoCaptureRule,
   matchesNoCaptureRules,
+  noCaptureRuleDisplayLabel,
   registrableDomain,
   registrableDomainFromUrl,
   type NoCaptureCategoryToken,
@@ -122,6 +124,21 @@ describe('matchesNoCaptureRules', () => {
     expect(matchesNoCaptureRules({ url: 'https://myaccount.other.com/home' }, rules)).toBe(false);
   });
 
+  it('title-only token hit diverges from URL-only matching (gate-alignment guard)', () => {
+    // The authoritative capture gate (background.ts isCaptureAllowedForUrl)
+    // matches on URL ONLY — no title. A 'similar' rule whose token appears
+    // only in the TITLE (not the path/query/hash) therefore MUST NOT match
+    // URL-only, or the panel badge / open-tabs preview would say "blocked"
+    // while the background actually captures. This pins that divergence so
+    // the UI + preview callers keep passing URL-only.
+    const rules = [similarRule('pge.com', ['statement'])];
+    const page = { url: 'https://other.com/home', title: 'Monthly Statement' };
+    // With the title, the matcher DOES trip (title token hit)…
+    expect(matchesNoCaptureRules(page, rules)).toBe(true);
+    // …but URL-only — exactly what the gate/UI/preview pass — does NOT.
+    expect(matchesNoCaptureRules({ url: page.url }, rules)).toBe(false);
+  });
+
   it('empty rule list never matches', () => {
     expect(matchesNoCaptureRules({ url: 'https://pge.com/x' }, [])).toBe(false);
   });
@@ -130,5 +147,51 @@ describe('matchesNoCaptureRules', () => {
     expect(matchesNoCaptureRules({ url: 'chrome://settings' }, [domainRule('settings')])).toBe(
       false,
     );
+  });
+});
+
+describe('firstMatchingNoCaptureRule', () => {
+  it('returns the matched rule (not just a boolean) so the UI can name it', () => {
+    const rule = domainRule('pge.com');
+    const matched = firstMatchingNoCaptureRule({ url: 'https://www.pge.com/pay' }, [rule]);
+    expect(matched).toBe(rule);
+  });
+
+  it('returns the FIRST matching rule when several match', () => {
+    const first = domainRule('pge.com');
+    const second = similarRule('pge.com', ['account']);
+    const matched = firstMatchingNoCaptureRule({ url: 'https://www.pge.com/x' }, [first, second]);
+    expect(matched).toBe(first);
+  });
+
+  it('returns null when nothing matches', () => {
+    expect(firstMatchingNoCaptureRule({ url: 'https://example.com/x' }, [domainRule('pge.com')])).toBe(
+      null,
+    );
+    expect(firstMatchingNoCaptureRule({ url: 'https://pge.com/x' }, [])).toBe(null);
+  });
+
+  it('agrees with matchesNoCaptureRules (the boolean wrapper)', () => {
+    const rules = [domainRule('pge.com')];
+    for (const url of ['https://www.pge.com/x', 'https://example.com/x', 'chrome://settings']) {
+      expect(firstMatchingNoCaptureRule({ url }, rules) !== null).toBe(
+        matchesNoCaptureRules({ url }, rules),
+      );
+    }
+  });
+});
+
+describe('noCaptureRuleDisplayLabel', () => {
+  it('reads a domain rule as its label', () => {
+    expect(noCaptureRuleDisplayLabel(domainRule('pge.com'))).toBe('pge.com');
+  });
+
+  it('prefixes a similar rule with "similar:"', () => {
+    expect(noCaptureRuleDisplayLabel(similarRule('pge.com', ['account']))).toBe('similar:pge.com');
+  });
+
+  it('falls back to the domain when the label is empty', () => {
+    const rule: NoCaptureRule = { ...domainRule('pge.com'), label: '' };
+    expect(noCaptureRuleDisplayLabel(rule)).toBe('pge.com');
   });
 });

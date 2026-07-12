@@ -138,15 +138,18 @@ export const detectCategoryTokens = (input: {
   return hits;
 };
 
-// Does the given page match ANY of the supplied no-capture rules?
-// Pure + synchronous — callers pass the already-loaded rule list.
-export const matchesNoCaptureRules = (
+// Return the FIRST no-capture rule the page matches, or null if none.
+// Pure + synchronous — callers pass the already-loaded rule list. This
+// is the single matching primitive; `matchesNoCaptureRules` is a thin
+// boolean wrapper so the gate and the UI share ONE code path (the UI
+// needs the matched rule to name it; the gate only needs the boolean).
+export const firstMatchingNoCaptureRule = (
   page: { readonly url: string; readonly title?: string },
   rules: readonly NoCaptureRule[],
-): boolean => {
-  if (rules.length === 0) return false;
+): NoCaptureRule | null => {
+  if (rules.length === 0) return null;
   const pageDomain = registrableDomainFromUrl(page.url);
-  if (pageDomain.length === 0) return false;
+  if (pageDomain.length === 0) return null;
   // Lazily computed — only when a 'similar' cross-domain rule needs it.
   let pageTokens: readonly NoCaptureCategoryToken[] | null = null;
   const tokensForPage = (): readonly NoCaptureCategoryToken[] => {
@@ -163,18 +166,18 @@ export const matchesNoCaptureRules = (
     switch (rule.kind) {
       case 'domain': {
         // Exact eTLD+1 family (registrableDomain collapses subdomains).
-        if (rule.domain.length > 0 && rule.domain === pageDomain) return true;
+        if (rule.domain.length > 0 && rule.domain === pageDomain) return rule;
         break;
       }
       case 'similar': {
         // Same family always matches (the source domain itself).
-        if (rule.domain.length > 0 && rule.domain === pageDomain) return true;
+        if (rule.domain.length > 0 && rule.domain === pageDomain) return rule;
         // Cross-domain: require at least one category-token overlap AND
         // the token must be present in the PAGE's path/title (enforced
         // by detectCategoryTokens — bare-domain hits don't count).
         if (rule.categoryTokens.length > 0) {
           const hits = tokensForPage();
-          if (hits.some((token) => rule.categoryTokens.includes(token))) return true;
+          if (hits.some((token) => rule.categoryTokens.includes(token))) return rule;
         }
         break;
       }
@@ -182,5 +185,20 @@ export const matchesNoCaptureRules = (
       // 'semantic-exemplar' arm lands here.
     }
   }
-  return false;
+  return null;
+};
+
+// Does the given page match ANY of the supplied no-capture rules?
+// Pure + synchronous — callers pass the already-loaded rule list.
+export const matchesNoCaptureRules = (
+  page: { readonly url: string; readonly title?: string },
+  rules: readonly NoCaptureRule[],
+): boolean => firstMatchingNoCaptureRule(page, rules) !== null;
+
+// Short human label for a matched rule, for UI ("Not captured — rule: …").
+// Domain rules read as the eTLD+1; 'similar' rules read as
+// "similar:<domain>" to signal the cross-domain category match.
+export const noCaptureRuleDisplayLabel = (rule: NoCaptureRule): string => {
+  const base = rule.label.length > 0 ? rule.label : rule.domain;
+  return rule.kind === 'similar' ? `similar:${base}` : base;
 };

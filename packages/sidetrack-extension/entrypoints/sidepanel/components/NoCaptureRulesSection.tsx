@@ -116,7 +116,7 @@ export function NoCaptureRulesSection({ busy = false }: { readonly busy?: boolea
   };
 
   return (
-    <div className="settings-subsection" data-testid="no-capture-rules">
+    <div className="settings-subsection" id="no-capture-rules" data-testid="no-capture-rules">
       <h4 className="settings-subsection-title">No-capture sites</h4>
       <p className="settings-section-lede">
         Sites here are never captured — no visits, page text, evidence, engagement, or fingerprints.

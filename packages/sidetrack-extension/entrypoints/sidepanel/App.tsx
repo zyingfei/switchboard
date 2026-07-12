@@ -33,6 +33,10 @@ import {
   detectProviderFromUrl,
   isProviderThreadUrl,
 } from '../../src/capture/providerDetection';
+import {
+  firstMatchingNoCaptureRule,
+  noCaptureRuleDisplayLabel,
+} from '../../src/capture/noCaptureRules';
 import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
   CodingAttach,
@@ -4928,6 +4932,33 @@ const App = () => {
   // state); refresh() → a background tab-session reload so the card's
   // evidence badge refreshes too.
   const currentTabCanonicalUrl = focusedRecordEffective?.canonicalUrl ?? null;
+  // ── Per-page capture state for the current-tab card. The master
+  // "eye" (captureOff) pauses EVERYTHING; a matching noCaptureRule
+  // BLOCKS just this site's family. Both must suppress the
+  // "Indexing…"/tier copy — the background gate already refuses the
+  // work, so this only aligns what the card SAYS with what actually
+  // happens. We reuse the SAME matcher the gate uses (imported, not
+  // duplicated) so the panel can never disagree with the background.
+  //
+  // Match on URL ONLY — the authoritative gate (`isCaptureAllowedForUrl`
+  // in background.ts) passes URL alone, so a 'similar' rule whose
+  // category token appears only in the TITLE would be blocked here but
+  // ALLOWED by the gate. Passing the title too would make this badge
+  // (and the open-tabs preview) disagree with what the background
+  // actually captures. Keep the inputs identical to the gate's.
+  const currentTabBlockingRule = useMemo(() => {
+    const url = focusedUrl ?? currentSiteUrl;
+    if (typeof url !== 'string' || url.length === 0) return null;
+    return firstMatchingNoCaptureRule({ url }, state.settings.noCaptureRules ?? []);
+  }, [focusedUrl, currentSiteUrl, state.settings.noCaptureRules]);
+  const currentSiteBlocked = currentTabBlockingRule !== null;
+  // Tri-state for the card: master pause wins over a per-site rule.
+  const currentTabCaptureState: 'capturing' | 'paused' | 'blocked' = captureOff
+    ? 'paused'
+    : currentSiteBlocked
+      ? 'blocked'
+      : 'capturing';
+  const currentTabCaptureSuppressed = currentTabCaptureState !== 'capturing';
   const [currentTabPageTextOpen, setCurrentTabPageTextOpen] = useState(false);
   const [currentTabCoverage, setCurrentTabCoverage] = useState<PageContentCoverage | null>(null);
   const [currentTabPageContentBusy, setCurrentTabPageContentBusy] = useState<
@@ -4953,6 +4984,17 @@ const App = () => {
       setCurrentTabBulkPreview(null);
       return;
     }
+    // Paused (master off) or blocked (matching no-capture rule): the
+    // card renders an explicit not-captured state instead of a tier, so
+    // clear any stale coverage and DON'T round-trip the companion for a
+    // read-only coverage lookup on a page we're deliberately not
+    // indexing. (This was the stale-'Indexed chunks' driver for a page
+    // indexed BEFORE it was blocklisted — investigation leak #2.)
+    if (currentTabCaptureSuppressed) {
+      setCurrentTabCoverage(null);
+      setCurrentTabBulkPreview(null);
+      return;
+    }
     if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
     let active = true;
     // Clear stale coverage while the new URL's fetch is in flight so
@@ -4969,7 +5011,7 @@ const App = () => {
     return () => {
       active = false;
     };
-  }, [currentTabCanonicalUrl]);
+  }, [currentTabCanonicalUrl, currentTabCaptureSuppressed]);
 
   const runCurrentTabPageContentAction = (
     type:
@@ -7101,7 +7143,40 @@ const App = () => {
                   >
                     {tabSessionDisplayTitle(focusedTabSession)}
                   </span>
-                  {focusedTabSession.pageEvidence === undefined ? (
+                  {currentTabCaptureState === 'paused' ? (
+                    // Master switch OFF: NOTHING is captured anywhere.
+                    // Suppress the Indexing…/tier copy entirely — it would
+                    // falsely imply work. The eye toggle resumes.
+                    <span
+                      className="tab-session-capture-badge is-paused"
+                      title="Capture is paused — nothing on any page is being recorded. Click the eye in the toolbar to resume."
+                      aria-label="Capture status: paused"
+                      data-testid="capture-paused-badge"
+                    >
+                      Capture paused
+                    </span>
+                  ) : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null ? (
+                    // This site matches a no-capture rule: the background
+                    // gate refuses every ingress, so the card must NOT
+                    // read "Indexing…"/a stale tier. Name the rule and
+                    // give a one-click jump to manage/remove it.
+                    <button
+                      type="button"
+                      className="tab-session-capture-badge is-blocked"
+                      title={`This site is on your no-capture list — page content is not indexed. Rule: ${noCaptureRuleDisplayLabel(
+                        currentTabBlockingRule,
+                      )}. Click to manage in Settings → Capture.`}
+                      aria-label={`Capture status: not captured — rule: ${noCaptureRuleDisplayLabel(
+                        currentTabBlockingRule,
+                      )}. Manage rule in Settings.`}
+                      data-testid="capture-blocked-badge"
+                      onClick={() => {
+                        openSettingsAt('no-capture-rules');
+                      }}
+                    >
+                      Not captured — rule: {noCaptureRuleDisplayLabel(currentTabBlockingRule)}
+                    </button>
+                  ) : focusedTabSession.pageEvidence === undefined ? (
                     state.settings.pageEvidenceAutoExtractEnabled ? (
                       <span
                         className="tab-session-capture-badge is-unknown"
@@ -7148,7 +7223,31 @@ const App = () => {
                         return liveActiveTabUrl;
                       }
                     })()}
-                  <span className="tab-attribution-card-pending mono"> (capturing…)</span>
+                  {currentTabCaptureState === 'paused' ? (
+                    <span
+                      className="tab-attribution-card-pending mono is-paused"
+                      data-testid="capture-pending-suffix"
+                    >
+                      {' '}
+                      (capture paused)
+                    </span>
+                  ) : currentTabCaptureState === 'blocked' ? (
+                    <span
+                      className="tab-attribution-card-pending mono is-blocked"
+                      data-testid="capture-pending-suffix"
+                    >
+                      {' '}
+                      (not captured)
+                    </span>
+                  ) : (
+                    <span
+                      className="tab-attribution-card-pending mono"
+                      data-testid="capture-pending-suffix"
+                    >
+                      {' '}
+                      (capturing…)
+                    </span>
+                  )}
                 </span>
               ) : (
                 <span className="tab-attribution-card-title subtle">No tracked tab in focus</span>
@@ -7256,6 +7355,15 @@ const App = () => {
                   <PageTextPanel
                     testIdPrefix="current-tab"
                     canonicalUrl={currentTabCanonicalUrl}
+                    captureDisabledReason={
+                      currentTabCaptureState === 'paused'
+                        ? 'Capture is paused — resume with the eye in the toolbar to index this page.'
+                        : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null
+                          ? `This site is on your no-capture list (rule: ${noCaptureRuleDisplayLabel(
+                              currentTabBlockingRule,
+                            )}). Remove the rule in Settings → Capture to index it.`
+                          : undefined
+                    }
                     open={currentTabPageTextOpen}
                     onToggleOpen={() => {
                       setCurrentTabPageTextOpen((v) => !v);

@@ -1289,7 +1289,13 @@ const maybeExtractAttentionGatePageEvidence = async (
   });
 };
 
-const openTabPreviewForPageContent = (tab: chrome.tabs.Tab): PageContentOpenTabPreview => {
+const openTabPreviewForPageContent = (
+  tab: chrome.tabs.Tab,
+  // Pre-read no-capture rules so a blocklisted tab is honestly marked
+  // ineligible up front instead of showing "Eligible" and then failing
+  // at extract time (the gate throws in extractPageContentFromTab).
+  noCaptureRules: readonly NoCaptureRule[],
+): PageContentOpenTabPreview => {
   const title =
     typeof tab.title === 'string' && tab.title.trim().length > 0
       ? tab.title.trim()
@@ -1309,13 +1315,23 @@ const openTabPreviewForPageContent = (tab: chrome.tabs.Tab): PageContentOpenTabP
   if (!/^https?:\/\//u.test(url)) {
     return { ...base, eligible: false, reason: 'Not an HTTP(S) page' };
   }
+  // Match on URL ONLY, exactly like the authoritative gate
+  // (`isCaptureAllowedForUrl` above passes `{ url }` with no title). If
+  // the preview passed the title too, a 'similar' rule whose category
+  // token appears only in the TITLE would mark the tab ineligible here
+  // while the background gate would ALLOW extraction — the reverse of
+  // the mismatch this preview was added to close.
+  if (noCaptureRules.length > 0 && matchesNoCaptureRules({ url }, noCaptureRules)) {
+    return { ...base, eligible: false, reason: 'No-capture list' };
+  }
   return { ...base, eligible: true };
 };
 
 const pageContentOpenTabsPreview = async (): Promise<readonly PageContentOpenTabPreview[]> => {
   const tabs = await chrome.tabs.query({});
+  const noCaptureRules = await readNoCaptureRules().catch(() => [] as readonly NoCaptureRule[]);
   const previews = tabs
-    .map(openTabPreviewForPageContent)
+    .map((tab) => openTabPreviewForPageContent(tab, noCaptureRules))
     .sort(
       (left, right) =>
         Number(right.eligible) - Number(left.eligible) || left.title.localeCompare(right.title),
