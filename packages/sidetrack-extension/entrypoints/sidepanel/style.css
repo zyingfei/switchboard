@@ -5265,6 +5265,13 @@ input.thread-turn-annotate-input {
   text-align: center;
 }
 
+/* .sub-tab.on .sub-tab-ct (0,2,1) outweighs the base rule above and
+   repaints the digit --ink-3 on the signal fill (~1.6:1) when the
+   actionable sub-tab is selected — keep the light-on-signal pairing. */
+.sub-tab.on .sub-tab-ct-actionable {
+  color: var(--signal-on);
+}
+
 /* Status pills (vault + companion). The header strip that used these is
    retired (folded into the connect-dot + Trust→Health); the pill/dot
    classes below are still consumed by the SettingsPanel connection row. */
