@@ -76,9 +76,11 @@ const luhnValid = (digits: string): boolean => {
 };
 
 // Card-shaped grouping pattern — see companion/redaction.ts for
-// the rationale. Mirrors CARD_GROUP_PATTERN exactly.
+// the rationale. Mirrors CARD_GROUP_PATTERN exactly. A bare 13-digit
+// run is intentionally excluded: without a separator it is a 13-digit
+// epoch-millis / EAN-13, so it redacts only via the Luhn branch.
 const CARD_GROUP_PATTERN =
-  /\b(?:\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{5}|\d{13})\b/gu;
+  /\b(?:\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{5})\b/gu;
 
 // Broad digit-run pattern. Intentionally wide; cardNumberFilter gates
 // actual redaction — mirrors CARD_DIGIT_RUN_PATTERN in companion.

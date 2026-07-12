@@ -79,6 +79,21 @@ describe('preflightOutbound — redaction', () => {
     expect(verdict.redaction.rules).not.toContain('card-number');
   });
 
+  it('does NOT redact a 13-digit epoch-millis timestamp (Luhn-invalid, no separator)', () => {
+    // 1700000000000 is a real Date.now() value — a bare 13-digit run must
+    // not be treated as a compact Visa; only Luhn-valid 13-digit redacts.
+    const verdict = preflightOutbound('captured at 1700000000000 utc', 'chatgpt');
+    expect(verdict.safeText).toContain('1700000000000');
+    expect(verdict.safeText).not.toContain('[card-number]');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
+  it('does NOT redact a 13-digit EAN-13 barcode (Luhn-invalid, no separator)', () => {
+    const verdict = preflightOutbound('barcode 4006381333931 scanned', 'chatgpt');
+    expect(verdict.safeText).toContain('4006381333931');
+    expect(verdict.redaction.rules).not.toContain('card-number');
+  });
+
   it('does NOT redact a 17-digit numeric id (Luhn-invalid, no card grouping)', () => {
     const verdict = preflightOutbound('order_id 12345678901234567', 'chatgpt');
     expect(verdict.safeText).toContain('12345678901234567');

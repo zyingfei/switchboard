@@ -34,12 +34,16 @@ const luhnValid = (digits: string): boolean => {
 //   4-4-4-4  (Visa/MC/Discover 16-digit)
 //   4-4-4-4-3 (19-digit)
 //   4-6-5     (Amex 15-digit, space-separated)
-//   13-digit compact Visa
-// A separator is required between groups (space or dash) — a solid
-// 16-digit run of digits with no separator is treated as an opaque ID
-// UNLESS it passes Luhn on its own (see cardNumberFilter below).
+// A separator is required between groups (space or dash) — a solid run
+// of digits with no separator is treated as an opaque ID UNLESS it
+// passes Luhn on its own (see cardNumberFilter below). A bare 13-digit
+// "compact Visa" run is deliberately NOT a grouping match: without a
+// separator it is indistinguishable from a 13-digit epoch-millis
+// timestamp (Date.now()) or EAN-13 barcode, so it redacts only via the
+// Luhn branch — a real compact Visa is Luhn-valid; a timestamp/barcode
+// is not.
 const CARD_GROUP_PATTERN =
-  /\b(?:\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{5}|\d{13})\b/gu;
+  /\b(?:\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{5})\b/gu;
 
 // Broad digit-run pattern — catches 13-19 consecutive digit sequences
 // (including space/dash-separated). This is intentionally wide; the

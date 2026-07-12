@@ -81,6 +81,23 @@ describe('redact', () => {
     expect(result.matched).toBe(0);
   });
 
+  it('does NOT redact a 13-digit epoch-millis timestamp (Luhn-invalid, no separator)', () => {
+    // 1700000000000 is a valid Date.now() value (Nov 2023) — 13 digits,
+    // Luhn-invalid. A bare 13-digit run must NOT be treated as a compact
+    // Visa; only a Luhn-valid 13-digit run redacts.
+    const result = redact('captured at 1700000000000 utc');
+
+    expect(result.output).toBe('captured at 1700000000000 utc');
+    expect(result.matched).toBe(0);
+  });
+
+  it('does NOT redact a 13-digit EAN-13 barcode (Luhn-invalid, no separator)', () => {
+    const result = redact('barcode 4006381333931 scanned');
+
+    expect(result.output).toBe('barcode 4006381333931 scanned');
+    expect(result.matched).toBe(0);
+  });
+
   it('does NOT redact a 17-digit numeric id (Luhn-invalid, no card grouping)', () => {
     const result = redact('order_id=12345678901234567');
 
