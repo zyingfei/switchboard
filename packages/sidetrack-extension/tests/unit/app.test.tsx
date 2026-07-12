@@ -1581,3 +1581,160 @@ describe('current-tab capture-state indicator', () => {
     });
   });
 });
+
+// ── Capture lamp strip (R1 "Private Ledger" header spine). The lamp is
+// the ONE always-visible privacy indicator: glyph + current domain +
+// verdict (role=status aria-live=polite — the a11y fix for the reported
+// "i don't even see a privacy change" incident). It reuses the SAME
+// tri-state invariant as the current-tab card, so recording / paused /
+// blocked stay in lock-step, and re-points the accent bus via
+// [data-capture-state] on the panel root.
+describe('capture lamp strip', () => {
+  const SITE_URL = 'https://research.google.com/paper';
+
+  const renderLamp = (
+    settingsOverride: Partial<WorkboardState['settings']> = {},
+  ): ReturnType<typeof installChromeMock> => {
+    const base = liveState();
+    const sendMessage = installChromeMock(
+      {
+        ...base,
+        companionStatus: 'connected',
+        activeTabUrl: SITE_URL,
+        settings: { ...base.settings, ...settingsOverride },
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return sendMessage;
+  };
+
+  // A 'domain' rule matches the eTLD+1 family (research.google.com →
+  // google.com), so the rule's domain is the registrable domain.
+  const googleDomainRule = [
+    { id: 'r_g', kind: 'domain' as const, domain: 'google.com', label: 'google.com', createdAt: NOW },
+  ];
+
+  it('is present in every view with a role=status aria-live verdict', async () => {
+    renderLamp();
+    render(<App />);
+
+    const strip = await screen.findByTestId('capture-lamp-strip');
+    // Verdict carries the meaning (not color-only) and is announced.
+    const verdict = within(strip).getByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveAttribute('role', 'status');
+    expect(verdict).toHaveAttribute('aria-live', 'polite');
+
+    // Still present after switching away from Now — it's the spine.
+    fireEvent.click(screen.getByRole('tab', { name: 'Threads' }));
+    expect(screen.getByTestId('capture-lamp-strip')).toBeInTheDocument();
+  });
+
+  it('reads "Recording this page" + retints the panel to recording by default', async () => {
+    renderLamp();
+    render(<App />);
+
+    const verdict = await screen.findByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveTextContent('Recording this page');
+    // The accent bus defaults to recording — no paused/blocked attribute.
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'capturing',
+    );
+  });
+
+  it('goes amber/paused when the master switch is off', async () => {
+    renderLamp({ captureEnabled: false });
+    render(<App />);
+
+    const verdict = await screen.findByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveTextContent('Capture paused — everywhere');
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'paused',
+    );
+    // No rule chip while merely paused.
+    expect(screen.queryByTestId('capture-lamp-rule-chip')).not.toBeInTheDocument();
+  });
+
+  it('goes rose/blocked with a rule chip on a no-capture site', async () => {
+    renderLamp({ noCaptureRules: googleDomainRule });
+    render(<App />);
+
+    const verdict = await screen.findByTestId('capture-lamp-verdict');
+    expect(verdict).toHaveTextContent('Not captured — rule: google.com');
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'blocked',
+    );
+    // The rule chip is the primary blocked affordance (→ Settings).
+    expect(screen.getByTestId('capture-lamp-rule-chip')).toBeInTheDocument();
+  });
+
+  it('shows the current domain (mono) and moves the master eye into the strip', async () => {
+    renderLamp();
+    render(<App />);
+
+    const strip = await screen.findByTestId('capture-lamp-strip');
+    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('google.com');
+    // The eye (capture-toggle) is now the strip's primary control and
+    // keeps its testid + aria-pressed.
+    const eye = within(strip).getByTestId('capture-toggle');
+    expect(eye).toHaveClass('capture-eye');
+    expect(eye).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('reads "— no active tab" when there is no focused/active tab', async () => {
+    const base = liveState();
+    installChromeMock(
+      { ...base, companionStatus: 'connected' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+
+    const strip = await screen.findByTestId('capture-lamp-strip');
+    expect(within(strip).getByTestId('capture-lamp-domain')).toHaveTextContent('no active tab');
+  });
+});
+
+// ── Theme default follows the OS ('auto'). jsdom has no matchMedia, so
+// the resolver falls back to light — no data-theme attribute is set,
+// and the panel renders in the light "paper ledger" palette.
+describe('theme default (auto follows system)', () => {
+  it('resolves to light in a no-matchMedia environment (no data-theme)', async () => {
+    installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
+    render(<App />);
+
+    await screen.findByRole('main', { name: 'Sidetrack workboard' });
+    expect(document.documentElement.hasAttribute('data-theme')).toBe(false);
+  });
+});
+
+// ── Connect-dot folds the old three-pill sp-status row into one quiet
+// dot; the tri-state (vault / companion / recall) is PRESERVED on expand.
+describe('connect-dot status', () => {
+  it('expands to the preserved vault + companion detail on click', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+
+    const dot = await screen.findByTestId('connect-dot');
+    fireEvent.click(dot);
+    const popover = await screen.findByRole('dialog', { name: 'Connection status' });
+    expect(within(popover).getByText('Vault')).toBeInTheDocument();
+    expect(within(popover).getByText('Companion')).toBeInTheDocument();
+  });
+});

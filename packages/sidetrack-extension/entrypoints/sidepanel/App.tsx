@@ -61,6 +61,7 @@ import {
   Icons,
   DesignPreview,
   ToolbarOverflowMenu,
+  ConnectDot,
   WorkstreamDetailPanel,
   TurnText,
   NeedsOrganizeSuggestion,
@@ -741,6 +742,25 @@ const dispatchDiagnosticReasonText = (
 // auto-recovers — a stale entry only ever lives until the next
 // refresh() lands, ~1 s after mount.
 const COMPANION_STATUS_CACHE_KEY = 'sidetrack.lastCompanionStatus';
+// One-time hint shown when the theme now follows the OS ('auto' default).
+// Persisted so dark-OS users see the "the panel follows your system"
+// note once, then never again. localStorage-guarded (test env / private
+// mode may throw).
+const THEME_AUTO_HINT_KEY = 'sidetrack.themeAutoHintSeen';
+const readThemeAutoHintSeen = (): boolean => {
+  try {
+    return window.localStorage.getItem(THEME_AUTO_HINT_KEY) === '1';
+  } catch {
+    return true; // On failure, suppress the hint rather than nag.
+  }
+};
+const writeThemeAutoHintSeen = (): void => {
+  try {
+    window.localStorage.setItem(THEME_AUTO_HINT_KEY, '1');
+  } catch {
+    // Best-effort.
+  }
+};
 const COMPANION_STATUS_VALUES: ReadonlySet<string> = new Set([
   'connected',
   'busy',
@@ -940,6 +960,19 @@ const App = () => {
   const [hasDeeperPagePermission, setHasDeeperPagePermission] = useState<boolean>(true);
   const [deeperAccessBannerDismissed, setDeeperAccessBannerDismissed] = useState<boolean>(false);
   const [deeperAccessBannerBusy, setDeeperAccessBannerBusy] = useState<boolean>(false);
+  // First-run theme hint — shown once when the panel now follows the OS
+  // theme (auto default). Seeded from localStorage so it only ever
+  // appears the first time; dismissing (or opening Settings) marks it
+  // seen. Initialize true (suppressed) so first paint is clean; the
+  // effect below flips it on for genuinely-new users.
+  const [themeAutoHintSeen, setThemeAutoHintSeen] = useState<boolean>(true);
+  useEffect(() => {
+    if (!readThemeAutoHintSeen()) setThemeAutoHintSeen(false);
+  }, []);
+  const dismissThemeAutoHint = useCallback(() => {
+    writeThemeAutoHintSeen();
+    setThemeAutoHintSeen(true);
+  }, []);
   // Direct chrome.tabs read for the active tab URL. `state.activeTabUrl`
   // only updates on the 15 s state poll, so the Current-tab card lagged
   // visibly after every navigation. Subscribing to chrome.tabs events
@@ -1307,10 +1340,14 @@ const App = () => {
       onChanged?.removeListener(onStorageChanged);
     };
   }, []);
-  // Default to light explicitly — 'auto' was tracking system theme,
-  // surprising users who keep their OS in dark mode but expect the
-  // side panel to stay light. User can flip in Settings.
-  const [theme, setTheme] = useState<ThemeMode>('light');
+  // Theme default follows the OS ('auto') — the "Private Ledger"
+  // redesign restores system-following (light "paper ledger" / dark
+  // "midnight vault"). The matchMedia resolver below already handles
+  // 'auto' and is jsdom-guarded. A one-time first-run hint (see the
+  // themeHintDismissed banner) tells dark-OS users the panel now
+  // follows their system so the switch isn't a surprise — the exact
+  // reason 'auto' was disabled before.
+  const [theme, setTheme] = useState<ThemeMode>('auto');
   const [density, setDensity] = useState<DensityMode>('cozy');
 
   // Apply theme + density to the root <html> element so all sidepanel
@@ -4991,6 +5028,62 @@ const App = () => {
       ? 'blocked'
       : 'capturing';
   const currentTabCaptureSuppressed = currentTabCaptureState !== 'capturing';
+
+  // ── Capture-lamp derivation (Row A of the persistent header). The
+  // lamp is the ONE living signature element: it reuses the SAME
+  // tri-state invariant above (currentTabCaptureState — the URL-only
+  // matcher the background gate uses), never re-derives it, so the
+  // strip can never disagree with what is actually captured. The
+  // [data-capture-state] attribute on the panel root re-points the
+  // accent bus; the verdict text (role=status aria-live=polite) is the
+  // announced a11y fix for the reported "i don't even see a privacy
+  // change" incident. Domain is a display hint (mono); the background
+  // computes the authoritative eTLD+1.
+  const lampDomain = useMemo((): string | null => {
+    const url = focusedUrl ?? currentSiteUrl;
+    if (typeof url !== 'string' || url.length === 0) return null;
+    try {
+      const { protocol, hostname } = new URL(url);
+      if (protocol !== 'http:' && protocol !== 'https:') return null;
+      const host = hostname.replace(/^www\./u, '');
+      // Registrable-domain display hint: keep the last two labels for
+      // the common single-suffix case (research.google.com → google.com)
+      // and the last three for a known two-part public suffix
+      // (foo.co.uk → foo.co.uk). Not authoritative — display only.
+      const parts = host.split('.');
+      if (parts.length <= 2) return host;
+      const twoPartSuffix = /^(co|com|org|net|gov|edu|ac)\.[a-z]{2}$/u.test(
+        parts.slice(-2).join('.'),
+      );
+      return parts.slice(twoPartSuffix ? -3 : -2).join('.');
+    } catch {
+      return null;
+    }
+  }, [focusedUrl, currentSiteUrl]);
+  const lampVerdict: { readonly glyph: string; readonly text: string } =
+    currentTabCaptureState === 'paused'
+      ? { glyph: '⏸', text: 'Capture paused — everywhere' }
+      : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null
+        ? {
+            glyph: '⊘',
+            text: `Not captured — rule: ${noCaptureRuleDisplayLabel(currentTabBlockingRule)}`,
+          }
+        : { glyph: '●', text: 'Recording this page' };
+
+  // Which of the 5 primary sections owns the active viewMode. The
+  // sub-tab tablist keeps every old viewMode tab (with its exact ARIA
+  // name) queryable/clickable regardless — this only drives which
+  // primary section reads as "current" in the top nav. Settings is a
+  // modal, not a viewMode, so it's never derived-active here.
+  const primarySection: 'now' | 'work' | 'memory' | 'trust' =
+    viewMode === 'now'
+      ? 'now'
+      : viewMode === 'all' || viewMode === 'workstream' || viewMode === 'queued'
+        ? 'work'
+        : viewMode === 'inbound'
+          ? 'trust'
+          : 'memory';
+
   const [currentTabPageTextOpen, setCurrentTabPageTextOpen] = useState(false);
   const [currentTabCoverage, setCurrentTabCoverage] = useState<PageContentCoverage | null>(null);
   const [currentTabPageContentBusy, setCurrentTabPageContentBusy] = useState<
@@ -6458,7 +6551,90 @@ const App = () => {
   );
 
   return (
-    <main className="bac-app" aria-label="Sidetrack workboard">
+    <main
+      className="bac-app"
+      aria-label="Sidetrack workboard"
+      data-capture-state={currentTabCaptureState}
+    >
+      {/* ── Persistent header: the SPINE. Row A = the capture lamp
+          strip (privacy verdict, always visible + announced). Row B =
+          app mark + the 5 primary sections + tools. */}
+      {/* Row A — Capture Lamp strip. The one living signature element:
+          lamp glyph + current domain (mono) + capture verdict
+          (aria-live) + the master eye. Retints the whole panel via the
+          [data-capture-state] accent bus set on <main> above. */}
+      <div
+        className={'capture-lamp-strip lamp-' + currentTabCaptureState}
+        data-testid="capture-lamp-strip"
+      >
+        <span className="lamp-glyph mono" aria-hidden>
+          {lampVerdict.glyph}
+        </span>
+        <span
+          className="lamp-domain mono"
+          title={lampDomain ?? 'No active tab'}
+          data-testid="capture-lamp-domain"
+        >
+          {lampDomain ?? '— no active tab'}
+        </span>
+        <span
+          className="lamp-verdict mono"
+          role="status"
+          aria-live="polite"
+          data-testid="capture-lamp-verdict"
+        >
+          {lampVerdict.text}
+        </span>
+        {currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null ? (
+          <button
+            type="button"
+            className="lamp-rule-chip mono"
+            onClick={() => {
+              openSettingsAt('no-capture-rules');
+            }}
+            title={`Manage the no-capture rule for this site in Settings. Rule: ${noCaptureRuleDisplayLabel(
+              currentTabBlockingRule,
+            )}`}
+            aria-label={`Not captured — rule: ${noCaptureRuleDisplayLabel(
+              currentTabBlockingRule,
+            )}. Manage rule in Settings.`}
+            data-testid="capture-lamp-rule-chip"
+          >
+            rule: {noCaptureRuleDisplayLabel(currentTabBlockingRule)}
+          </button>
+        ) : null}
+        {/* Master capture switch — the privacy "eye", promoted out of
+            the old 11-icon row to be the strip's primary control. Same
+            testid/aria-pressed/class + ON/PAUSED copy. */}
+        <button
+          className={'icon-btn capture-eye lamp-eye' + (captureOff ? ' off' : '')}
+          title={
+            captureEnabled
+              ? 'Capture is ON — Sidetrack is observing this browser. Click to pause all capture.'
+              : 'Capture is PAUSED — nothing is being recorded anywhere. Click to resume.'
+          }
+          onClick={() => {
+            void runAction(() =>
+              sendRequest({
+                type: messageTypes.saveLocalPreferences,
+                preferences: { captureEnabled: captureOff },
+              }),
+            );
+          }}
+          type="button"
+          aria-label={
+            captureEnabled
+              ? 'Capture is on — click to pause all capture'
+              : 'Capture is paused — click to resume capture'
+          }
+          aria-pressed={captureEnabled}
+          data-testid="capture-toggle"
+        >
+          <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
+            {captureEnabled ? Icons.eye : Icons.eyeOff}
+          </span>
+        </button>
+      </div>
       <div className="app-head">
         <div className="app-mark">
           <span className="glyph" aria-hidden />
@@ -6472,6 +6648,57 @@ const App = () => {
             </span>
           ) : null}
         </div>
+        {/* Primary section nav — 5 salience-ranked sections that group
+            the underlying viewModes. Each jumps to its section's default
+            viewMode; the sub-tab tablist below keeps every old tab's
+            exact ARIA name (Threads/Workstreams/…) so the viewMode
+            router — and its pinned getByRole('tab', {name}) tests —
+            stay intact behind the new shell. */}
+        <nav className="section-nav" aria-label="Sections">
+          {(
+            [
+              { id: 'now', label: 'Now', active: primarySection === 'now', go: () => setViewMode('now') },
+              {
+                id: 'work',
+                label: 'Work',
+                active: primarySection === 'work',
+                go: () => setViewMode('all'),
+              },
+              {
+                id: 'memory',
+                label: 'Memory',
+                active: primarySection === 'memory',
+                go: () => setViewMode('inbox'),
+              },
+              {
+                id: 'trust',
+                label: 'Trust',
+                active: primarySection === 'trust',
+                go: () => setViewMode('inbound'),
+              },
+              {
+                id: 'settings',
+                label: 'Settings',
+                active: false,
+                go: () => {
+                  dismissThemeAutoHint();
+                  setSettingsOpen(true);
+                },
+              },
+            ] as const
+          ).map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              className={'section-nav-btn' + (s.active ? ' on' : '')}
+              aria-current={s.active ? 'page' : undefined}
+              onClick={s.go}
+              data-testid={`section-nav-${s.id}`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </nav>
         <div className="view-tabs sp-tabs" role="tablist" aria-label="View">
           <button
             type="button"
@@ -6578,38 +6805,34 @@ const App = () => {
           </button>
         </div>
         <div className="app-actions">
-          {/* Master capture switch — the privacy "eye". Default on; when
-              off, every capture path is gated in the background and the
-              capture-oriented icons below go disabled. Eye-open =
-              watching, slashed eye = paused. */}
+          {/* Search — stays a top-level tool (opens the Search/Explore
+              surface under Memory). */}
           <button
-            className={'icon-btn capture-eye' + (captureOff ? ' off' : '')}
-            title={
-              captureEnabled
-                ? 'Capture is ON — Sidetrack is observing this browser. Click to pause all capture.'
-                : 'Capture is PAUSED — nothing is being recorded anywhere. Click to resume.'
-            }
+            className={'icon-btn' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
+            title="Search"
             onClick={() => {
-              void runAction(() =>
-                sendRequest({
-                  type: messageTypes.saveLocalPreferences,
-                  preferences: { captureEnabled: captureOff },
-                }),
-              );
+              // FU3b — unified search. Routes to the top-level Search
+              // tab (/v2/recall via useRecallSearch). Special-case the
+              // Connections viewMode so power-users in graph view get
+              // the in-view SearchTab bump instead of switching out.
+              if (viewMode === 'connections') {
+                setConnectionsSearchRequest((n) => n + 1);
+                return;
+              }
+              setViewMode('search');
             }}
             type="button"
-            aria-label={
-              captureEnabled
-                ? 'Capture is on — click to pause all capture'
-                : 'Capture is paused — click to resume capture'
-            }
-            aria-pressed={captureEnabled}
-            data-testid="capture-toggle"
+            aria-label="Search"
+            aria-pressed={viewMode === 'search' || viewMode === 'connections'}
           >
-            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
-              {captureEnabled ? Icons.eye : Icons.eyeOff}
-            </span>
+            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
+          {/* Secondary capture tools — relocated out of the primary row
+              into a contextual cluster. They VISIBLY QUIESCE
+              (desaturate + disabled) under paused/blocked via the
+              [data-capture-state] accent bus on <main>; testids + ARIA
+              labels are unchanged so §13 steps + e2e stay reachable. */}
+          <div className="capture-tools" data-testid="capture-tools">
           {/* Screenshare-mask toggle. Re-glyphed from the old eye to a
               cast/monitor icon so the eye unambiguously means capture.
               Inert while capture is paused (nothing to mask). */}
@@ -6658,30 +6881,6 @@ const App = () => {
               <line x1="2" y1="12" x2="5.5" y2="12" />
               <line x1="18.5" y1="12" x2="22" y2="12" />
             </svg>
-          </button>
-          <button
-            className={'icon-btn' + (viewMode === 'search' || viewMode === 'connections' ? ' on' : '')}
-            title="Search"
-            onClick={() => {
-              // FU3b — unified search. Used to toggle the legacy
-              // threadSearchPanel form (hit /v1/recall/query, raw-id
-              // titles, separate code path). Now routes to the
-              // top-level Search tab (hit /v2/recall via
-              // useRecallSearch, formatted titles, single code
-              // path). Special-case the Connections viewMode so
-              // power-users in graph view get the in-view SearchTab
-              // bump instead of switching out.
-              if (viewMode === 'connections') {
-                setConnectionsSearchRequest((n) => n + 1);
-                return;
-              }
-              setViewMode('search');
-            }}
-            type="button"
-            aria-label="Search"
-            aria-pressed={viewMode === 'search' || viewMode === 'connections'}
-          >
-            <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.search}</span>
           </button>
           {/* Capture-current-tab (+) is only useful when capture mode
               is Manual. When mode is Auto, Sidetrack refreshes
@@ -6776,10 +6975,12 @@ const App = () => {
               <line x1="13" y1="16" x2="18" y2="16" />
             </svg>
           </button>
+          </div>
           {/* Diagnostics collapsed into an overflow menu so the
               steady-state toolbar stays lean — capture health, dump
-              panel state, design preview. The dump-result chip still
-              lives in the status row below. */}
+              panel state, design preview + the no-capture-rule create
+              actions. The dump-result chip lives in the connect-dot
+              popover below. */}
           <ToolbarOverflowMenu
             onOpenHealth={() => {
               setHealthPanelOpen(true);
@@ -6801,162 +7002,30 @@ const App = () => {
                   },
                 })}
           />
-          <button
-            className="icon-btn"
-            title="Settings"
-            onClick={() => {
-              setSettingsOpen(true);
+          {/* Connect-dot — the vault + companion + recall status,
+              quieted into a single compound health dot with a popover.
+              Steady state = one calm dot; the three-domain tri-state
+              (down / local-only / busy / connected) is PRESERVED on
+              expand (not deleted). Error routes to
+              Settings#companion-connection. */}
+          <ConnectDot
+            companionStatus={state.companionStatus}
+            recallStatus={recallStatus}
+            dumpStatus={dumpStatus}
+            onClearDump={() => {
+              setDumpStatus({ kind: 'idle' });
             }}
-            type="button"
-            aria-label="Settings"
-          >
-            <svg viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="3" />
-              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" />
-            </svg>
-          </button>
+            onOpenConnectionSettings={() => {
+              openSettingsAt('companion-connection');
+            }}
+          />
         </div>
       </div>
 
-      {/* Vault + companion status pills (v2 .sp-status). Glance-able
-          health at the top so the user doesn't have to dive into
-          Settings to see whether the companion is reachable. */}
-      <div className="sp-status">
-        <span
-          className={
-            'sp-status-pill mono ' + (state.companionStatus === 'vault-error' ? 'err' : 'ok')
-          }
-          title={
-            state.companionStatus === 'vault-error'
-              ? "Vault: companion can't reach the configured folder"
-              : 'Vault: synced via companion'
-          }
-        >
-          <span
-            className={
-              'sp-status-dot ' + (state.companionStatus === 'vault-error' ? 'red' : 'green')
-            }
-            aria-hidden
-          />
-          vault {state.companionStatus === 'vault-error' ? 'error' : 'connected'}
-        </span>
-        <span
-          className={
-            'sp-status-pill mono ' +
-            (state.companionStatus === 'connected'
-              ? 'ok'
-              : state.companionStatus === 'local-only' || state.companionStatus === 'busy'
-                ? 'warn'
-                : 'err')
-          }
-          title={`Companion: ${companionStatusLabel(state.companionStatus)}`}
-        >
-          <span
-            className={
-              'sp-status-dot ' +
-              (state.companionStatus === 'connected'
-                ? 'green'
-                : state.companionStatus === 'local-only' || state.companionStatus === 'busy'
-                  ? 'amber'
-                  : 'red')
-            }
-            aria-hidden
-          />
-          companion{' '}
-          {state.companionStatus === 'connected'
-            ? 'running'
-            : state.companionStatus === 'local-only'
-              ? 'local-only'
-              : state.companionStatus === 'busy'
-                ? 'busy'
-                : 'down'}
-        </span>
-        {/* Recall pill — only shown when status is non-ready, so the
-            steady state stays clean. Lets the user see "indexing…"
-            after companion startup or a model change without having
-            to dig into the diagnostics panel. */}
-        {recallStatus !== null && recallStatus !== 'ready' ? (
-          <span
-            className={
-              'sp-status-pill mono ' +
-              (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'warn' : 'err')
-            }
-            title={
-              recallStatus === 'rebuilding'
-                ? 'Recall: indexing in background. Déjà-vu lookups will return matches once the rebuild completes.'
-                : recallStatus === 'empty'
-                  ? 'Recall: index has no entries yet. Capture some threads to populate it.'
-                  : recallStatus === 'missing'
-                    ? 'Recall: no index file. The companion will rebuild it on the next startup.'
-                    : 'Recall: index is stale (model or schema mismatch). Open Capture health and click Re-index.'
-            }
-          >
-            <span
-              className={
-                'sp-status-dot ' +
-                (recallStatus === 'rebuilding' || recallStatus === 'empty' ? 'amber' : 'red')
-              }
-              aria-hidden
-            />
-            recall {recallStatus === 'rebuilding' ? 'indexing' : recallStatus}
-          </span>
-        ) : null}
-        {/* Dump-state result chip. Click "copy" to put the absolute
-            path on the clipboard, "open" to ask the OS to reveal the
-            file. Errors stay in the same chip so the user doesn't have
-            to hunt for them. */}
-        {dumpStatus.kind === 'dumped' ? (
-          <span
-            className="sp-status-pill mono ok"
-            title={`Dump written to ${dumpStatus.path} — click "copy" for the path`}
-            data-testid="dump-result"
-          >
-            <span className="sp-status-dot green" aria-hidden />
-            dumped
-            <button
-              type="button"
-              className="btn-link sp-status-pill-btn"
-              onClick={() => {
-                void navigator.clipboard.writeText(dumpStatus.path);
-              }}
-              title="Copy path to clipboard"
-            >
-              copy
-            </button>
-            <button
-              type="button"
-              className="btn-link sp-status-pill-btn"
-              onClick={() => {
-                setDumpStatus({ kind: 'idle' });
-              }}
-              title="Dismiss"
-              aria-label="Dismiss dump notice"
-            >
-              ✕
-            </button>
-          </span>
-        ) : dumpStatus.kind === 'error' ? (
-          <span
-            className="sp-status-pill mono warn"
-            title={dumpStatus.message}
-            data-testid="dump-result"
-          >
-            <span className="sp-status-dot amber" aria-hidden />
-            dump → clipboard fallback
-            <button
-              type="button"
-              className="btn-link sp-status-pill-btn"
-              onClick={() => {
-                setDumpStatus({ kind: 'idle' });
-              }}
-              title="Dismiss"
-              aria-label="Dismiss dump notice"
-            >
-              ✕
-            </button>
-          </span>
-        ) : null}
-      </div>
+      {/* Vault + companion + recall status now live in the header's
+          connect-dot popover (ConnectDot, above). The dump-result chip
+          moved there too, keeping its data-testid. This former
+          sp-status row is retired into that single quiet dot. */}
 
       {!hasDeeperPagePermission && !deeperAccessBannerDismissed ? (
         <div
@@ -6990,6 +7059,46 @@ const App = () => {
               aria-label="Dismiss banner"
             >
               Not now
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {/* First-run theme hint — the panel now follows the OS theme
+          (light "paper ledger" / dark "midnight vault"). Shown once so
+          dark-OS users aren't surprised by the switch; dismissing or
+          opening Settings marks it seen forever. */}
+      {!themeAutoHintSeen ? (
+        <div className="sp-banner info theme-auto-hint" data-testid="theme-auto-hint">
+          <span className="b-glyph" aria-hidden>
+            <svg viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.5 1.5M17.5 17.5L19 19M5 19l1.5-1.5M17.5 6.5L19 5" />
+            </svg>
+          </span>
+          <div className="b-body">
+            <b>Theme follows your system.</b>
+            Sidetrack now matches your OS light/dark setting. Change it any time in Settings →
+            Appearance.
+          </div>
+          <div className="b-actions">
+            <button
+              type="button"
+              className="b-ghost"
+              onClick={() => {
+                dismissThemeAutoHint();
+                setSettingsOpen(true);
+              }}
+            >
+              Settings
+            </button>
+            <button
+              type="button"
+              className="b-primary"
+              onClick={dismissThemeAutoHint}
+              aria-label="Dismiss theme hint"
+            >
+              Got it
             </button>
           </div>
         </div>
@@ -7132,7 +7241,11 @@ const App = () => {
             data-testid="focused-tab-attribution"
             aria-label="Current tab attribution"
           >
-            <div className="tab-attribution-card-head">
+            {/* defers-to-lamp: the capture verdict now lives in the
+                header lamp strip (§5.1). The tri-state badges below stay
+                (testid-stable secondary echo) but render quiet — the
+                lamp is the primary, announced verdict. */}
+            <div className="tab-attribution-card-head defers-to-lamp">
               <span className="tab-attribution-card-eyebrow mono" data-testid="now-page-kind">
                 {pageKindLabel[focusedPageKind]}
               </span>
@@ -7387,13 +7500,18 @@ const App = () => {
                   <PageTextPanel
                     testIdPrefix="current-tab"
                     canonicalUrl={currentTabCanonicalUrl}
+                    // Card head DE-DUP (R1): the header lamp strip now
+                    // owns the capture verdict (see §5.1). The card no
+                    // longer re-authors the full paused/blocked prose
+                    // here — it passes a short, non-duplicative reason
+                    // that keeps the index actions inert (the background
+                    // gate refuses them anyway) and points at the lamp
+                    // instead of restating the same fact a third time.
                     captureDisabledReason={
                       currentTabCaptureState === 'paused'
-                        ? 'Capture is paused — resume with the eye in the toolbar to index this page.'
-                        : currentTabCaptureState === 'blocked' && currentTabBlockingRule !== null
-                          ? `This site is on your no-capture list (rule: ${noCaptureRuleDisplayLabel(
-                              currentTabBlockingRule,
-                            )}). Remove the rule in Settings → Capture to index it.`
+                        ? 'Capture paused — see the lamp above.'
+                        : currentTabCaptureState === 'blocked'
+                          ? 'Not captured on this site — see the lamp above.'
                           : undefined
                     }
                     open={currentTabPageTextOpen}

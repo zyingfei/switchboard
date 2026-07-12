@@ -3,12 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,SOFT,WONK@9..144,0..100,0..1&family=JetBrains+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Fonts are bundled LOCALLY (public/fonts/*.woff2, wired via
+         @font-face in style.css). No remote font fetch, ever — the
+         panel must make zero outbound network requests for chrome
+         (privacy: nothing leaves the device; MV3 CSP + offline). The
+         old Google Fonts <link> was removed for exactly this reason. -->
     <title>Sidetrack</title>
   </head>
   <body>

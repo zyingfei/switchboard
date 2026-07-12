@@ -1,3 +1,48 @@
+/* ══════════════════════════════════════════════════════════════════════
+   BUNDLED FONTS — "Private Ledger" typography (R1)
+
+   Latin-subset woff2, served from the extension bundle root
+   (chrome-extension://<id>/fonts/…). NO remote @import or <link> — the
+   panel must make ZERO outbound network requests for chrome (privacy +
+   MV3 CSP + offline). font-display:swap so first paint uses the local
+   fallback stack (never blocks). Newsreader + IBM Plex Sans are variable
+   fonts (one file covers 400–600); IBM Plex Mono ships two static
+   weights. Total added ≈192 KB (budget ≤~400 KB). Licenses: SIL OFL 1.1
+   (see public/fonts/OFL.md).
+
+   If a face fails to load, the --display/--body/--mono fallback tails
+   below degrade silently to a curated LOCAL stack (never a CDN, never
+   Inter).
+   ══════════════════════════════════════════════════════════════════════ */
+@font-face {
+  font-family: 'Newsreader';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url(/fonts/newsreader-var.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url(/fonts/ibm-plex-sans-var.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(/fonts/ibm-plex-mono-400.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(/fonts/ibm-plex-mono-500.woff2) format('woff2');
+}
+
 :root {
   --paper: #f5efe2;
   --paper-light: #fbf7ee;
@@ -13,7 +58,9 @@
   --signal-2: #ea580c;
   --signal-tint: #fed7aa;
   --signal-bg: #fff7ed;
+  --signal-on: #fbf7ee;
   --amber: #a16207;
+  --amber-strong: #854d0e;
   --amber-tint: #fef3c7;
   --amber-bg: #fffbeb;
   --green: #166534;
@@ -21,9 +68,44 @@
   --green-bg: #f0fdf4;
   --slate: #475569;
   --slate-bg: #f1f5f9;
-  --display: 'Fraunces', 'EB Garamond', Georgia, serif;
-  --body: 'Source Serif 4', 'Source Serif Pro', Georgia, serif;
-  --mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+  /* Rose / blocked-here channel — NET-NEW on :root (previously lived
+     only inside the .sx-health scope). Drives the "blocked on this
+     site" lamp state. Tuned for WCAG-AA on paper/ink. */
+  --rose: #b91c3c;
+  --rose-2: #e11d48;
+  --rose-tint: #fecdd3;
+  --rose-bg: #fff1f2;
+
+  /* ── Lamp accent bus — the mechanism. Default = recording (signal).
+     [data-capture-state] on main.bac-app re-points these per state.
+     Components consume ONLY the semantic --accent* tokens, never the
+     state families directly — one state change retints the whole
+     panel. (R1 introduces the bus + wires the lamp; R2 migrates
+     component rules onto it.) */
+  --accent: var(--signal);
+  --accent-2: var(--signal-2);
+  --accent-tint: var(--signal-tint);
+  --accent-bg: var(--signal-bg);
+  --accent-on: var(--signal-on);
+
+  /* ── Typography. --display/--body/--mono keep their names (2551
+     var() usages depend on them); only the values change to point at
+     the bundled locals with curated LOCAL fallback tails. */
+  --display: 'Newsreader', 'Source Serif 4', ui-serif, Charter, Georgia, serif;
+  --body: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'JetBrains Mono', SFMono-Regular, monospace;
+
+  /* ── Type scale (size/line-height) */
+  --type-display: 22px / 1.15;
+  --type-title: 16px / 1.25;
+  --type-body: 14px / 1.5;
+  --type-meta: 12px / 1.4;
+  --type-mono: 12px / 1.4;
+  --type-micro: 11px / 1.3;
+
+  /* ── Radius scale (canonical). --rad-s / --rad-m / --rad-l are
+     DEPRECATED aliases onto the canonical r-scale so existing callers
+     keep resolving; the aliases are retired in R2. */
   --r1: 4px;
   --r2: 8px;
   --r3: 12px;
@@ -32,14 +114,65 @@
   --r6: 32px;
   --r7: 48px;
   --r8: 64px;
-  --rad-s: 4px;
   --rad-m: 6px;
-  --rad-l: 10px;
+  --rad-s: var(--r1);
+  --rad-l: var(--r3);
+
+  /* ── Space scale (real 4px scale; spacing had been borrowing --r*
+     radius tokens which double-booked meaning). R1 uses it in the new
+     header/nav/card chrome; existing rules migrate R2. */
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 48px;
+  --space-9: 64px;
+
+  /* ── Elevation (editorial-flat; ledger prefers hairlines over drop
+     shadows). Replaces inline rgba() shadows in R2. */
+  --elev-0: none;
+  --elev-1: 0 1px 0 var(--rule-soft);
+  --elev-2:
+    0 1px 2px rgba(27, 25, 22, 0.06),
+    0 2px 8px rgba(27, 25, 22, 0.05);
+  --elev-3: 0 4px 16px rgba(27, 25, 22, 0.1);
+
+  /* ── Motion — one-shot durations only. NO infinite loops (CPU-runaway
+     history). prefers-reduced-motion collapses these to 0ms below. */
+  --motion-fast: 120ms;
+  --motion-base: 200ms;
+  --motion-reveal: 260ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
   --hair: 1px solid var(--rule);
   --hair-soft: 1px solid var(--rule-soft);
   color: var(--ink);
   background: var(--paper);
   font-family: var(--body);
+}
+
+/* ── Lamp accent bus — per-state re-point on the panel root. The
+   attribute is set by an App.tsx effect keyed off currentTabCaptureState
+   (the URL-only tri-state invariant). Default (recording) inherits the
+   signal family from :root above. */
+[data-capture-state='paused'] {
+  --accent: var(--amber);
+  --accent-2: var(--amber);
+  --accent-tint: var(--amber-tint);
+  --accent-bg: var(--amber-bg);
+  --accent-on: var(--amber-strong);
+}
+[data-capture-state='blocked'] {
+  --accent: var(--rose);
+  --accent-2: var(--rose-2);
+  --accent-tint: var(--rose-tint);
+  --accent-bg: var(--rose-bg);
+  --accent-on: var(--paper-light);
 }
 
 * {
@@ -106,6 +239,14 @@ body::before {
 @media (prefers-reduced-motion: reduce) {
   .bac-app {
     animation: none;
+  }
+  /* Generalize the settle guard onto the motion tokens: any rule that
+     drives duration from --motion-* collapses to 0ms (opacity-only /
+     instant). One-shot only; the panel never loops. */
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+    --motion-reveal: 0ms;
   }
 }
 
@@ -908,6 +1049,20 @@ button:disabled {
 .tab-session-capture-badge.is-blocked:focus-visible {
   filter: brightness(0.97);
   text-decoration: underline;
+}
+
+/* Card head DE-DUP (R1, §5.1): the header lamp strip now owns the
+   capture verdict. The card's tri-state badges stay (testid-stable
+   secondary echo) but read as a quiet, smaller footnote — the lamp is
+   the primary, announced verdict. Interactive (blocked) badges keep
+   their affordance. */
+.tab-attribution-card-head.defers-to-lamp .tab-session-capture-badge {
+  font-size: 9.5px;
+  opacity: 0.82;
+}
+.tab-attribution-card-head.defers-to-lamp .tab-session-capture-badge.is-blocked:hover,
+.tab-attribution-card-head.defers-to-lamp .tab-session-capture-badge.is-blocked:focus-visible {
+  opacity: 1;
 }
 
 /* Optimistic-branch suffix reflecting the same tri-state. */
@@ -3553,11 +3708,13 @@ textarea.preview-body:focus {
   display: block;
 }
 .app-head {
-  padding: 14px 16px 12px;
+  padding: 10px 16px 10px;
   border-bottom: var(--hair-soft);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
   min-width: 0;
   background: var(--paper-light, #fbf7ee);
 }
@@ -5027,6 +5184,290 @@ input.thread-turn-annotate-input {
   background: #b91c1c;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   "Private Ledger" header — the SPINE (R1)
+
+   Row A = the capture lamp strip (privacy verdict, always visible +
+   announced). Row B = app mark + primary section nav + tools. The lamp
+   retints the whole panel via the accent bus, re-pointed on <main>
+   by [data-capture-state]. All new chrome uses the space / type / elev /
+   motion token scales — no hardcoded values.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── Row A: capture lamp strip ─────────────────────────────────────── */
+.capture-lamp-strip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: var(--hair-soft);
+  background: var(--accent-bg);
+  /* One-shot accent cross-fade on capture-state change (~200ms). NEVER
+     loops — the idle panel does not paint (CPU-runaway history). */
+  transition:
+    background var(--motion-base) var(--ease-standard),
+    border-color var(--motion-base) var(--ease-standard);
+}
+.lamp-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--accent-on);
+  background: var(--accent);
+  transition:
+    background var(--motion-base) var(--ease-standard),
+    color var(--motion-base) var(--ease-standard);
+}
+.lamp-domain {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--type-mono) var(--mono);
+  font-weight: 500;
+  color: var(--ink-2);
+}
+.capture-lamp-strip.lamp-blocked .lamp-domain,
+.capture-lamp-strip.lamp-paused .lamp-domain {
+  color: var(--ink-3);
+}
+.lamp-verdict {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: var(--type-mono) var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  transition: color var(--motion-base) var(--ease-standard);
+}
+.lamp-rule-chip {
+  flex: none;
+  padding: 2px var(--space-3);
+  border-radius: 999px;
+  border: 1px solid var(--accent-tint);
+  background: var(--accent-bg);
+  color: var(--accent);
+  font: var(--type-micro) var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lamp-rule-chip:hover {
+  border-color: var(--accent);
+}
+.lamp-rule-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+/* The eye promoted into the strip as its primary control. */
+.capture-lamp-strip .lamp-eye {
+  flex: none;
+  margin-left: auto;
+  color: var(--accent);
+}
+.capture-lamp-strip .lamp-eye:hover {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+}
+.capture-lamp-strip .lamp-eye.off {
+  color: var(--accent);
+}
+@media (prefers-reduced-motion: reduce) {
+  .capture-lamp-strip,
+  .lamp-glyph,
+  .lamp-verdict {
+    transition: none;
+  }
+}
+
+/* ── Row B: primary section nav ────────────────────────────────────── */
+.section-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-4);
+  margin-right: auto;
+  padding-left: var(--space-4);
+  border-left: 1px solid var(--rule-soft);
+}
+.section-nav-btn {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--r1);
+  background: transparent;
+  color: var(--ink-3);
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    color var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+.section-nav-btn:hover {
+  color: var(--ink);
+  background: var(--paper-deep);
+}
+.section-nav-btn.on {
+  color: var(--ink);
+  background: var(--paper-light);
+  border-color: var(--rule);
+}
+.section-nav-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+
+/* ── Row B: secondary capture tools (quiesce under paused/blocked) ──── */
+.capture-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+/* Systematized quiesce: when capture is paused or blocked on this site,
+   the secondary capture tools visibly desaturate. (The buttons keep
+   their own disabled={captureOff} for paused; blocked desaturates as a
+   signal even though those globals still act — R2 wires per-tool blocked
+   disabling.) */
+[data-capture-state='paused'] .capture-tools,
+[data-capture-state='blocked'] .capture-tools {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+/* ── Row B: connect-dot (quieted vault/companion/recall status) ─────── */
+.connect-dot {
+  position: relative;
+  flex: none;
+}
+.connect-dot-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--rule-soft);
+  border-radius: 999px;
+  background: var(--paper-light);
+  color: var(--ink-3);
+  font: var(--type-micro) var(--mono);
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.connect-dot-trigger:hover {
+  border-color: var(--rule);
+}
+.connect-dot-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+.connect-dot-glyph {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  flex: none;
+}
+.connect-dot-glyph.tone-ok {
+  background: var(--green);
+}
+.connect-dot-glyph.tone-warn {
+  background: var(--amber);
+}
+.connect-dot-glyph.tone-err {
+  background: var(--rose);
+}
+.connect-dot-trigger.tone-err {
+  border-color: var(--rose-tint);
+  color: var(--rose);
+}
+.connect-dot-word {
+  font-weight: 600;
+}
+.connect-dot-popover {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 40;
+  min-width: 190px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--rule);
+  border-radius: var(--rad-m);
+  background: var(--paper-light);
+  box-shadow: var(--elev-2);
+}
+.connect-dot-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.connect-dot-row-label {
+  flex: 1 1 auto;
+  font: var(--type-meta) var(--body);
+  color: var(--ink-2);
+}
+.connect-dot-row-value {
+  flex: none;
+  font: var(--type-mono) var(--mono);
+  color: var(--ink-3);
+}
+.connect-dot-fix {
+  margin-top: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--rose-tint);
+  border-radius: var(--r1);
+  background: var(--rose-bg);
+  color: var(--rose);
+  font: var(--type-meta) var(--body);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.connect-dot-fix:hover {
+  border-color: var(--rose);
+}
+.connect-dot-dump {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--rule-soft);
+  font: var(--type-micro) var(--mono);
+  color: var(--ink-3);
+}
+.connect-dot-dump-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connect-dot-dump-btn {
+  padding: 0 var(--space-2);
+  font: var(--type-micro) var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+
 /* All-threads view groups */
 .all-bar {
   /* same shell as ws-bar but no actionable workstream pill */
@@ -5888,11 +6329,23 @@ button.btn-link.thread-dispatched-name:hover {
   --rule-soft: #2a2620;
   --signal-bg: #2a1a0f;
   --signal-tint: #5c3318;
+  --signal-on: #15130f;
+  --amber-strong: #e0b155;
   --amber-bg: #2a220f;
   --amber-tint: #5c4818;
   --green-bg: #0f2a18;
   --green-tint: #1f5c32;
   --slate-bg: #1f2530;
+  /* Rose / blocked-here — dark "midnight vault" overrides (AA on ink). */
+  --rose: #f2778d;
+  --rose-2: #fb7185;
+  --rose-tint: #5c1f2b;
+  --rose-bg: #2a1015;
+  /* Elevation darkens toward black on the midnight-vault theme. */
+  --elev-2:
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.4);
+  --elev-3: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
 
 [data-density='compact'] {

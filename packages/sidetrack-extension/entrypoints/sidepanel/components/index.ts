@@ -113,3 +113,5 @@ export { DesignPreview } from './DesignPreview';
 export { TurnText } from './TurnText';
 export { ToolbarOverflowMenu } from './ToolbarOverflowMenu';
 export type { ToolbarOverflowMenuProps, DumpStatusKind } from './ToolbarOverflowMenu';
+export { ConnectDot } from './ConnectDot';
+export type { ConnectDotProps } from './ConnectDot';
