@@ -231,19 +231,22 @@ const createDefaultSettings = (revision = '0'): SettingsDocument =>
     revision,
   });
 
+// Canonical record write. Routed through the atomic primitive so a
+// crash mid-write can never publish a torn/half-written JSON record
+// (writeFileAtomic writes+fsyncs a temp file, then renames+fsyncs the
+// dir). writeJsonAtomic mkdirs the parent itself.
 const writeJson = async (path: string, value: unknown): Promise<void> => {
-  await mkdir(join(path, '..'), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await writeJsonAtomic(path, value);
 };
 
 // Markdown sidecar for a vault record. Lives next to the .json with
 // the same bac_id stem. Failures here are best-effort — the JSON is
 // the canonical store, the .md is for human browsing. We swallow
-// errors so a flaky filesystem can't take down a write.
+// errors so a flaky filesystem can't take down a write. Routed through
+// the atomic primitive so a crash never leaves a torn sidecar on disk.
 const writeMarkdownProjection = async (path: string, body: string): Promise<void> => {
   try {
-    await mkdir(join(path, '..'), { recursive: true });
-    await writeFile(path, body, 'utf8');
+    await writeFileAtomic(path, body);
   } catch {
     // Vault write failures are surfaced via audit elsewhere; the
     // markdown sidecar is non-critical, do not fail the upsert.
