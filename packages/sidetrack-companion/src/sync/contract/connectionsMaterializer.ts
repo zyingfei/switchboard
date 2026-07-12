@@ -90,24 +90,30 @@ import {
   USER_SNIPPET_PROMOTED,
   USER_TOPIC_RENAMED,
 } from '../../feedback/events.js';
-import { RECALL_ACTION, RECALL_SERVED } from '../../recall/events.js';
 
 /**
  * P1: the event types the impression ranker trainer consumes. Read via the
- * event-store TYPE INDEX (forEachChunkOfTypes → events_type_idx, ms-scale),
- * never a full-log scan — a per-drain readMerged/streamFiltered over the whole
- * log would be the I/O waste this work is guarding against.
+ * event-store TYPE INDEX (forEachChunkOfTypes → events_type_idx, ms-scale) when
+ * the store is on, and via the dedicated trainable-events shard when it is off —
+ * never a full-log scan per drain. Single source of truth is the shard's
+ * `TRAINABLE_EVENT_TYPES` so the store-on typed read and the shard's rebuild
+ * filter can never silently diverge.
  */
-const RANKER_TRAINING_EVENT_TYPES: readonly string[] = [
-  RECALL_SERVED,
-  RECALL_ACTION,
-  USER_FLOW_CONFIRMED,
-  USER_FLOW_REJECTED,
-  USER_ORGANIZED_ITEM,
-  USER_SNIPPET_PROMOTED,
-];
+const RANKER_TRAINING_EVENT_TYPES: readonly string[] = TRAINABLE_EVENT_TYPES;
 const rankerTrainFullLogEnabled = (): boolean =>
   process.env['SIDETRACK_RANKER_TRAIN_FULL_LOG'] !== '0';
+// Move 3 (a) — the O(labels) trainable-events shard is ON by default (it is the
+// point of this move). Opt out with SIDETRACK_RANKER_TRAINABLE_SHARD=0 (or
+// 'off'/'false') to force the store-OFF read back to the whole-log
+// streamFiltered scan — an escape hatch if the shard ever misbehaves. Absent ⇒
+// ON, matching the repo's explicit-disable convention (cf.
+// recallEmitTrainableActions). The shard ALSO falls back to streamFiltered on
+// any read error even when enabled, so this flag is a hard operator override,
+// not the only safety net.
+const rankerTrainableShardEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_RANKER_TRAINABLE_SHARD'];
+  return raw !== '0' && raw !== 'off' && raw !== 'false';
+};
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
@@ -153,6 +159,11 @@ import {
   type RankerRetrainer,
   type RankerRetrainResult,
 } from '../../ranker/retrain.js';
+import {
+  readTrainableEventsFromShard,
+  TRAINABLE_EVENT_TYPES,
+} from '../../ranker/trainableEventsShard.js';
+import { trainGroupsInWorker } from '../../ranker/impressionBootstrap.js';
 import {
   readVisitSimilarityRevision,
   writeVisitSimilarityRevision,
@@ -1092,7 +1103,19 @@ export const createConnectionsMaterializer = (
     deps.engagementClassStore ?? createEngagementClassRevisionStore(deps.vaultRoot);
   const rankerRetrainer =
     deps.rankerRetrainer ??
-    ((context) => maybeRetrainClosestVisitRanker({ vaultRoot: deps.vaultRoot, ...context }));
+    ((context) =>
+      maybeRetrainClosestVisitRanker({
+        vaultRoot: deps.vaultRoot,
+        ...context,
+        // Move 3 (c) — train the impression ranker OFF the drain thread. The
+        // LightGBM CPU was the exact re-embed/rebuild shape behind the
+        // historical 100-144% CPU incidents; route it through the same
+        // trainGroups worker the main-process bootstrap uses. A worker failure
+        // surfaces as a `failed` retrain result (logged via the drain mark)
+        // and is NOT retried inline on this thread.
+        trainGroups: (groups, options, labelingSummary) =>
+          trainGroupsInWorker({ groups, trainOptions: options, labelingSummary }),
+      }));
   // PR #141 — materializer diagnostics store. Captures per-drain
   // counters for the diagnostics route.
   const diagnosticsStore =
@@ -4151,10 +4174,34 @@ export const createConnectionsMaterializer = (
                 );
                 return sortAcceptedEvents(collected);
               }
-              return deps.eventLog.streamFiltered(
-                (event) => RANKER_TRAINING_EVENT_TYPES.includes(event.type),
-                new Set(RANKER_TRAINING_EVENT_TYPES),
-              );
+              // Store OFF (the default): read the trainable subset from the
+              // dedicated O(labels) shard instead of a whole-log
+              // streamFiltered byte-scan every drain. The shard self-heals off
+              // the log signature — the streamFiltered scan survives only as
+              // its rebuild source, run at most once per log-signature change.
+              // Prefer the shard when enabled + healthy; on the operator
+              // opt-out OR any shard error (unreadable sidecar, missing
+              // logSignature) fall back to the existing typed streamFiltered
+              // scan so the drain never breaks.
+              const streamFilteredFallback = (): Promise<readonly AcceptedEvent[]> =>
+                deps.eventLog.streamFiltered(
+                  (event) => RANKER_TRAINING_EVENT_TYPES.includes(event.type),
+                  new Set(RANKER_TRAINING_EVENT_TYPES),
+                );
+              if (!rankerTrainableShardEnabled()) {
+                return streamFilteredFallback();
+              }
+              try {
+                const result = await readTrainableEventsFromShard(deps.vaultRoot, deps.eventLog);
+                return result.events;
+              } catch (error) {
+                mark(
+                  `trainableEventsShard fallback err=${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                );
+                return streamFilteredFallback();
+              }
             },
           }
         : {}),
