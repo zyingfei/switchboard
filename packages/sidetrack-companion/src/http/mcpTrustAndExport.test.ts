@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ensureBridgeKey } from '../auth/bridgeKey.js';
 import { writeTrust } from '../auth/workstreamTrust.js';
+import { writeAnnotation, listAnnotations } from '../vault/annotationStore.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { handleRequest, type CompanionHttpConfig } from './server.js';
@@ -382,5 +383,303 @@ describe('§13 export route', () => {
     const files = (result.body as { data: { files: { path: string }[] } }).data.files;
     expect(files).toHaveLength(1);
     expect(files[0]?.path).toBe('Solo Thread-report1.md');
+  });
+});
+
+describe('F02 systemic default-deny for MCP callers (HTTP path)', () => {
+  let vaultRoot: string;
+  let bridgeKey: string;
+  const mcpBridgeKey = 'mcp-test-key-bbbbbbbbbbbbbbbbbbbbbbbb';
+  let context: CompanionHttpConfig;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-mcpdeny-'));
+    bridgeKey = (await ensureBridgeKey(vaultRoot)).key;
+    context = {
+      bridgeKey,
+      mcpBridgeKey,
+      vaultWriter: createVaultWriter(vaultRoot),
+      vaultRoot,
+      idempotencyStore: createIdempotencyStore(vaultRoot),
+    };
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const createWorkstream = async (key: string, title: string): Promise<{ id: string; revision: string }> => {
+    const result = await call(context, '/v1/workstreams', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': key },
+      body: JSON.stringify({ title }),
+    });
+    expect(result.status).toBe(201);
+    const data = (result.body as { data: { bac_id: string; revision: string } }).data;
+    return { id: data.bac_id, revision: data.revision };
+  };
+
+  const seedAnnotation = async (id: string): Promise<string> => {
+    const created = await writeAnnotation(vaultRoot, {
+      bac_id: id,
+      url: 'https://example.test/page',
+      pageTitle: 'Page',
+      anchor: {
+        textQuote: { exact: 'hi', prefix: '', suffix: '' },
+        textPosition: { start: 0, end: 2 },
+        cssSelector: 'body',
+      },
+      note: 'original',
+    });
+    return created.bac_id;
+  };
+
+  const readAudit = async (): Promise<Record<string, unknown>[]> => readAuditLines(vaultRoot);
+
+  // CRITICAL-1 — PUT /trust.
+  it('mcp caller cannot self-grant via PUT /v1/workstreams/:id/trust (403); extension can', async () => {
+    const { id } = await createWorkstream(bridgeKey, 'WS');
+    const denied = await call(context, `/v1/workstreams/${id}/trust`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ allowedTools: ['sidetrack.threads.archive'] }),
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+    // The self-grant did NOT persist.
+    const stillDenied = await call(context, `/v1/workstreams/${id}/trust`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect((stillDenied.body as { data: { allowedTools: string[] } }).data.allowedTools).toEqual([]);
+
+    // Extension can grant.
+    const granted = await call(context, `/v1/workstreams/${id}/trust`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ allowedTools: ['sidetrack.threads.archive'] }),
+    });
+    expect(granted.status).toBe(200);
+  });
+
+  // GET /trust is a read — stays open to mcp.
+  it('mcp caller can still GET /v1/workstreams/:id/trust (reads stay open)', async () => {
+    const { id } = await createWorkstream(bridgeKey, 'WS');
+    const read = await call(context, `/v1/workstreams/${id}/trust`, {
+      headers: { 'x-bac-bridge-key': mcpBridgeKey },
+    });
+    expect(read.status).toBe(200);
+  });
+
+  // CRITICAL-2 — DELETE workstream.
+  it('mcp caller cannot DELETE a workstream (403); extension can', async () => {
+    const { id } = await createWorkstream(bridgeKey, 'WS');
+    const denied = await call(context, `/v1/workstreams/${id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': mcpBridgeKey },
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+
+    const removed = await call(context, `/v1/workstreams/${id}`, {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(removed.status).toBe(200);
+  });
+
+  // MAJOR — PATCH workstream.
+  it('mcp caller cannot PATCH a workstream (403); extension can', async () => {
+    const { id, revision } = await createWorkstream(bridgeKey, 'WS');
+    const denied = await call(context, `/v1/workstreams/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ revision, privacy: 'public' }),
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+
+    const patched = await call(context, `/v1/workstreams/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ revision, title: 'Renamed' }),
+    });
+    expect(patched.status).toBe(200);
+  });
+
+  // MAJOR — PATCH settings.
+  it('mcp caller cannot PATCH /v1/settings (403); extension can', async () => {
+    const settings = await call(context, '/v1/settings', {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    const revision = (settings.body as { data: { revision: string } }).data.revision;
+
+    const denied = await call(context, '/v1/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ revision, screenShareSafeMode: true }),
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+
+    const patched = await call(context, '/v1/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ revision, screenShareSafeMode: true }),
+    });
+    expect(patched.status).toBe(200);
+  });
+
+  // MAJOR — annotation PATCH/DELETE.
+  it('mcp caller cannot PATCH or DELETE an annotation (403); extension can and it is audited', async () => {
+    await seedAnnotation('bac_anno_1');
+    await seedAnnotation('bac_anno_2');
+
+    const deniedPatch = await call(context, '/v1/annotations/bac_anno_1', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ note: 'hijacked' }),
+    });
+    expect(deniedPatch.status).toBe(403);
+    expect(deniedPatch.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+
+    const deniedDelete = await call(context, '/v1/annotations/bac_anno_1', {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': mcpBridgeKey },
+    });
+    expect(deniedDelete.status).toBe(403);
+    expect(deniedDelete.body).toMatchObject({ code: 'MCP_OPERATION_NOT_ALLOWED' });
+
+    // Extension PATCH succeeds and writes an audit row.
+    const patched = await call(context, '/v1/annotations/bac_anno_1', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ note: 'edited' }),
+    });
+    expect(patched.status).toBe(200);
+    let lines = await readAudit();
+    const patchLine = lines.find((l) => l['route'] === 'updateAnnotation' && l['bac_id'] === 'bac_anno_1');
+    expect(patchLine).toBeDefined();
+    expect(patchLine?.['agent']).toBe('extension');
+
+    // Extension DELETE succeeds and writes an audit row.
+    const deleted = await call(context, '/v1/annotations/bac_anno_2', {
+      method: 'DELETE',
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(deleted.status).toBe(200);
+    lines = await readAudit();
+    const deleteLine = lines.find((l) => l['route'] === 'deleteAnnotation' && l['bac_id'] === 'bac_anno_2');
+    expect(deleteLine).toBeDefined();
+    expect(deleteLine?.['agent']).toBe('extension');
+    // The soft-delete actually took.
+    const remaining = await listAnnotations(vaultRoot, { includeDeleted: false });
+    expect(remaining.some((a) => a.bac_id === 'bac_anno_2')).toBe(false);
+  });
+
+  // Sanctioned mcp tools still work when trusted, 403 when untrusted.
+  it('sanctioned mcp tool workstreams.bump: 403 untrusted, 200 once trusted', async () => {
+    const { id } = await createWorkstream(bridgeKey, 'WS');
+    const untrusted = await call(context, `/v1/workstreams/${id}/bump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': mcpBridgeKey },
+    });
+    // Reaches the handler (allowlisted), then the per-workstream trust gate
+    // denies with the trust code — NOT the systemic default-deny code.
+    expect(untrusted.status).toBe(403);
+    expect(untrusted.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+
+    await writeTrust(vaultRoot, [
+      { workstreamId: id, allowedTools: new Set(['sidetrack.workstreams.bump']) },
+    ]);
+    const trusted = await call(context, `/v1/workstreams/${id}/bump`, {
+      method: 'POST',
+      headers: { 'x-bac-bridge-key': mcpBridgeKey },
+    });
+    expect(trusted.status).toBe(200);
+  });
+
+  it('sanctioned mcp tool threads.move: 200 to a trusted ws, 403 to an untrusted ws', async () => {
+    const { id: trusted } = await createWorkstream(bridgeKey, 'Trusted');
+    const { id: untrusted } = await createWorkstream(bridgeKey, 'Untrusted');
+    // Extension seeds a thread with no workstream.
+    await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_m', provider: 'chatgpt', threadUrl: 'https://x/m', title: 'M', lastSeenAt: '2026-07-11T00:00:00.000Z' }),
+    });
+    await writeTrust(vaultRoot, [
+      { workstreamId: trusted, allowedTools: new Set(['sidetrack.threads.move']) },
+    ]);
+
+    const toUntrusted = await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_m', provider: 'chatgpt', threadUrl: 'https://x/m', title: 'M', primaryWorkstreamId: untrusted, lastSeenAt: '2026-07-11T00:00:00.000Z' }),
+    });
+    expect(toUntrusted.status).toBe(403);
+    expect(toUntrusted.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+
+    const toTrusted = await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_m', provider: 'chatgpt', threadUrl: 'https://x/m', title: 'M', primaryWorkstreamId: trusted, lastSeenAt: '2026-07-11T00:00:00.000Z' }),
+    });
+    expect(toTrusted.status).toBe(200);
+  });
+
+  // Source-trust hole: move OUT of an untrusted source (incl. detach to null)
+  // is denied even when the destination check would pass.
+  it('mcp caller cannot detach (primaryWorkstreamId:null) a thread from an untrusted source', async () => {
+    const { id: source } = await createWorkstream(bridgeKey, 'Source');
+    // Extension seeds a thread INSIDE the (untrusted-for-mcp) source.
+    await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_d', provider: 'chatgpt', threadUrl: 'https://x/d', title: 'D', primaryWorkstreamId: source, lastSeenAt: '2026-07-11T00:00:00.000Z' }),
+    });
+
+    // Detach (destination null). Destination gate no-ops; source gate must
+    // deny because the mcp caller has no trust on the source.
+    const detach = await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_d', primaryWorkstreamId: null }),
+    });
+    expect(detach.status).toBe(403);
+    expect(detach.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+  });
+
+  it('mcp caller cannot steal a thread from an untrusted source into a trusted destination', async () => {
+    const { id: source } = await createWorkstream(bridgeKey, 'UntrustedSource');
+    const { id: dest } = await createWorkstream(bridgeKey, 'TrustedDest');
+    await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': bridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_s', provider: 'chatgpt', threadUrl: 'https://x/s', title: 'S', primaryWorkstreamId: source, lastSeenAt: '2026-07-11T00:00:00.000Z' }),
+    });
+    // Trust the DESTINATION only.
+    await writeTrust(vaultRoot, [
+      { workstreamId: dest, allowedTools: new Set(['sidetrack.threads.move']) },
+    ]);
+
+    const steal = await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_s', primaryWorkstreamId: dest }),
+    });
+    expect(steal.status).toBe(403);
+    expect(steal.body).toMatchObject({ code: 'WORKSTREAM_NOT_TRUSTED' });
+
+    // With BOTH source and destination trusted, the move succeeds.
+    await writeTrust(vaultRoot, [
+      { workstreamId: dest, allowedTools: new Set(['sidetrack.threads.move']) },
+      { workstreamId: source, allowedTools: new Set(['sidetrack.threads.move']) },
+    ]);
+    const moved = await call(context, '/v1/threads', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bac-bridge-key': mcpBridgeKey },
+      body: JSON.stringify({ bac_id: 'bac_th_s', primaryWorkstreamId: dest }),
+    });
+    expect(moved.status).toBe(200);
   });
 });

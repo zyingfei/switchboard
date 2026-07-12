@@ -366,7 +366,7 @@ import {
   createVaultWriter,
   type VaultWriter,
 } from '../vault/writer.js';
-import { VaultUnavailableError } from './errors.js';
+import { VaultExportConfinementError, VaultUnavailableError } from './errors.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
@@ -374,6 +374,7 @@ import {
   annotationCreateSchema,
   annotationListQuerySchema,
   annotationUpdateSchema,
+  auditEventSchema,
   auditListQuerySchema,
   captureEventSchema,
   codingAttachTokenCreateSchema,
@@ -1422,6 +1423,56 @@ const setCallerIdentity = (request: IncomingMessage, identity: CallerIdentity): 
 const callerIdentityFor = (request: IncomingMessage): CallerIdentity =>
   callerIdentities.get(request) ?? { callerClass: 'extension' };
 
+// F02 systemic default-deny for MCP-key callers. Trust enforcement is
+// per-tool-per-workstream, but only a HANDFUL of mutating routes call
+// requireWorkstreamTrust — every OTHER mutating route was reachable by an
+// mcp-key caller with zero trust check (self-granting via PUT /trust,
+// deleting/renaming workstreams, mutating settings, writing annotations).
+// The route-dispatch layer now DENIES any mutating method (POST/PUT/PATCH/
+// DELETE) for an mcp caller UNLESS the route is in this explicit allowlist.
+// GET/read routes stay open. Allowed routes STILL run their own
+// requireWorkstreamTrust gate — the allowlist only decides which mutating
+// routes an mcp caller may attempt at all; per-workstream trust is enforced
+// inside the handler as before.
+//
+// The set is derived from the sanctioned workstream write tools
+// (workstreamWriteTools): threads.move (POST /v1/threads + the thread
+// archive/unarchive sub-routes), queue.create (POST /v1/queue),
+// workstreams.bump (POST /v1/workstreams/:id/bump), workstreams.create
+// (POST /v1/workstreams). Trust management (PUT/GET /trust), DELETE/PATCH
+// workstream, PATCH settings, export, and annotation writes are NOT
+// sanctioned MCP operations → they fall through to the default-deny.
+const MCP_ALLOWED_MUTATING_ROUTES: readonly { readonly method: HttpMethod; readonly pattern: RegExp }[] =
+  [
+    // threads.move — a thread upsert that (re)assigns primaryWorkstreamId.
+    { method: 'POST', pattern: /^\/v1\/threads$/ },
+    // threads.archive / threads.unarchive.
+    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/archive$/ },
+    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/unarchive$/ },
+    // queue.create.
+    { method: 'POST', pattern: /^\/v1\/queue$/ },
+    // workstreams.bump.
+    { method: 'POST', pattern: /^\/v1\/workstreams\/[A-Za-z0-9_-]+\/bump$/ },
+    // workstreams.create (child create is trust-gated on the parent inside
+    // the handler; a top-level create passes trust but is still a
+    // sanctioned tool, so it is allowed here).
+    { method: 'POST', pattern: /^\/v1\/workstreams$/ },
+  ];
+
+const MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+// Whether an mcp-key caller may attempt this route at all. Reads (and any
+// non-mutating method) are always permitted; a mutating route is permitted
+// only when it appears in the sanctioned allowlist above.
+const isMcpAllowedRoute = (method: string | undefined, pathname: string): boolean => {
+  if (method === undefined || !MUTATING_METHODS.has(method)) {
+    return true;
+  }
+  return MCP_ALLOWED_MUTATING_ROUTES.some(
+    (route) => route.method === method && route.pattern.test(pathname),
+  );
+};
+
 const auditAgentLabel = (identity: CallerIdentity): string =>
   identity.callerClass === 'mcp'
     ? identity.clientName === undefined
@@ -1430,11 +1481,17 @@ const auditAgentLabel = (identity: CallerIdentity): string =>
     : 'extension';
 
 // Enforce per-workstream MCP write trust. Enforcement is driven by the
-// SERVER-DERIVED caller class, NOT the voluntary tool header: an MCP-key
-// caller is gated on every write route it can reach, header or no header.
-// The extension surface (user's own bridge key) is exempt. Also refines
-// the ambient audit context so the resulting audit line records the tool
-// + workstream scope + that trust mode was active.
+// SERVER-DERIVED caller class, NOT the voluntary tool header. The full
+// model is TWO layers: (1) the route-dispatch layer default-denies any
+// mutating route for an mcp caller unless it is on the sanctioned
+// MCP_ALLOWED_MUTATING_ROUTES allowlist (isMcpAllowedRoute); (2) this
+// function is the second layer, called INSIDE each allowlisted write
+// handler to gate the specific workstream on its granted tool set. An
+// mcp caller that reaches this function has already passed the allowlist;
+// here it still needs explicit per-workstream trust for the tool. The
+// extension surface (user's own bridge key) is exempt from both layers.
+// Also refines the ambient audit context so the resulting audit line
+// records the tool + workstream scope + that trust mode was active.
 const requireWorkstreamTrust = async (
   context: CompanionHttpConfig,
   request: IncomingMessage,
@@ -1475,6 +1532,47 @@ const recordAuditTool = (tool: string, scope: string | null): void => {
 const recordAuditTrustModeActive = (): void => {
   const ctx = currentAuditContextMut();
   if (ctx !== undefined) ctx.trustModeActive = true;
+};
+
+// Write an audit row for an HTTP write that does NOT flow through the
+// vault writer's own audit() closure (annotation edits/deletes go straight
+// to annotationStore, so they never recorded a provenance line). Mirrors
+// the writer's audit format + on-disk layout (_BAC/audit/<YYYY-MM-DD>.jsonl,
+// one JSON object per line) and merges the ambient request-scoped
+// AuditContext (agent / tool / argsSummary / scope / trustModeActive) so
+// the caller identity is on the line. Best-effort: an audit-write failure
+// must never fail the mutation it records.
+const appendHttpAuditLine = async (
+  vaultRoot: string,
+  event: { readonly requestId: string; readonly route: string; readonly bac_id?: string },
+): Promise<void> => {
+  const timestamp = new Date().toISOString();
+  const provenance = currentAuditContextMut();
+  const base = {
+    requestId: event.requestId,
+    route: event.route,
+    outcome: 'success' as const,
+    ...(event.bac_id === undefined ? {} : { bac_id: event.bac_id }),
+    timestamp,
+  };
+  const enriched =
+    provenance === undefined
+      ? base
+      : {
+          ...base,
+          agent: provenance.agent,
+          tool: provenance.tool,
+          ...(provenance.argsSummary === undefined ? {} : { argsSummary: provenance.argsSummary }),
+          scope: provenance.scope,
+          trustModeActive: provenance.trustModeActive,
+        };
+  // Validate against the shared schema so an invalid line can never reach
+  // disk (the audit reader parses with the same schema).
+  const parsed = auditEventSchema.safeParse(enriched);
+  if (!parsed.success) return;
+  const auditPath = join(vaultRoot, '_BAC', 'audit', `${timestamp.slice(0, 10)}.jsonl`);
+  await mkdir(join(vaultRoot, '_BAC', 'audit'), { recursive: true }).catch(() => undefined);
+  await appendFile(auditPath, `${JSON.stringify(parsed.data)}\n`, 'utf8').catch(() => undefined);
 };
 
 // The tool header is retained for LOGGING during the deprecation window
@@ -5518,8 +5616,17 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
+      const vaultRoot = requireVaultRoot(context);
       const input = annotationUpdateSchema.parse(await readBody(request));
-      const updated = await updateAnnotation(requireVaultRoot(context), match.annotationId, input);
+      const updated = await updateAnnotation(vaultRoot, match.annotationId, input);
+      // Annotation edits go straight to annotationStore, bypassing the vault
+      // writer's audit() closure — record a provenance line here so an mcp
+      // (or extension) caller's edit is attributable in the audit log.
+      await appendHttpAuditLine(vaultRoot, {
+        requestId,
+        route: 'updateAnnotation',
+        bac_id: match.annotationId,
+      });
       if (context.eventLog !== undefined && typeof input.note === 'string') {
         await context.eventLog
           .appendServerObserved({
@@ -5541,11 +5648,26 @@ const routes: readonly RouteDefinition[] = [
       if (match.annotationId === undefined) {
         throw new Error('Missing annotationId path parameter.');
       }
-      const result = await softDeleteAnnotation(requireVaultRoot(context), match.annotationId);
-      if (context.eventLog !== undefined && context.replica !== undefined) {
+      const vaultRoot = requireVaultRoot(context);
+      const result = await softDeleteAnnotation(vaultRoot, match.annotationId);
+      // Annotation deletes bypass the vault writer's audit() closure —
+      // record a provenance line here so a delete is attributable.
+      await appendHttpAuditLine(vaultRoot, {
+        requestId,
+        route: 'deleteAnnotation',
+        bac_id: match.annotationId,
+      });
+      // Emit ANNOTATION_DELETED whenever an event log is configured. The
+      // clientEventId falls back to a stable 'local' replica placeholder
+      // when no replica is bound — previously the whole event was SKIPPED
+      // if replica was undefined, so a delete could vanish from the log
+      // (and from peers) on any companion without a replica context.
+      // requestId already makes the key unique per call.
+      if (context.eventLog !== undefined) {
+        const replicaId = context.replica?.replicaId ?? 'local';
         await context.eventLog
           .appendServerObserved({
-            clientEventId: `annotation-delete:${context.replica.replicaId}:${match.annotationId}:${requestId}`,
+            clientEventId: `annotation-delete:${replicaId}:${match.annotationId}:${requestId}`,
             aggregateId: match.annotationId,
             type: ANNOTATION_DELETED,
             payload: { bac_id: match.annotationId },
@@ -6517,16 +6639,37 @@ const routes: readonly RouteDefinition[] = [
     pattern: /^\/v1\/threads$/,
     authRequired: true,
     handle: async (request, requestId, _match, context) => {
-      const input = await parseThreadUpsertBody(requireVaultRoot(context), await readBody(request));
+      const vaultRoot = requireVaultRoot(context);
+      const input = await parseThreadUpsertBody(vaultRoot, await readBody(request));
       // Enforce trust for MCP-key callers regardless of the (voluntary,
       // now logging-only) tool header. A thread upsert that sets a
-      // primaryWorkstreamId is a move; gate it on that workstream.
+      // primaryWorkstreamId is a move; gate it on the DESTINATION
+      // workstream.
       await requireWorkstreamTrust(
         context,
         request,
         input.primaryWorkstreamId,
         'sidetrack.threads.move',
       );
+      // ALSO gate on the SOURCE workstream — the thread's CURRENT
+      // primaryWorkstreamId — mirroring archive/unarchive which gate on
+      // readThreadWorkstreamId. Without this, an mcp caller could steal a
+      // thread OUT of an untrusted workstream (destination-only checks let
+      // "move untrusted A → trusted B" and detach-to-null slip through with
+      // zero source trust). A brand-new thread (no bac_id, nothing on disk)
+      // has no source scope, so this is a no-op create. Detach (destination
+      // null/absent) is still gated on the source here.
+      if (input.bac_id !== undefined) {
+        const sourceWorkstreamId = await readThreadWorkstreamId(vaultRoot, input.bac_id);
+        if (sourceWorkstreamId !== undefined && sourceWorkstreamId !== input.primaryWorkstreamId) {
+          await requireWorkstreamTrust(
+            context,
+            request,
+            sourceWorkstreamId,
+            'sidetrack.threads.move',
+          );
+        }
+      }
       const result = await context.vaultWriter.upsertThread(input, requestId);
       // Mirror the upsert as a `thread.upserted` AcceptedEvent so
       // peers see thread state via sync. The legacy thread.json
@@ -8047,11 +8190,15 @@ export const handleRequest = async (
   // F02 — the companion accepts TWO keys and classifies the caller by
   // which one authenticated:
   //   - the extension bridge key  → `extension` (the user's surface, exempt
-  //     from workstream-trust enforcement).
-  //   - the MCP key (mcpBridgeKey) → `mcp` (subject to trust enforcement on
-  //     every write route). The MCP key is checked FIRST so an mcp-key
-  //     caller is never mis-classified as the extension. When no MCP key is
-  //     wired, only the bridge-key path exists (pre-F02 behaviour).
+  //     from workstream-trust enforcement — every route open).
+  //   - the MCP key (mcpBridgeKey) → `mcp`. An mcp caller is default-DENIED
+  //     any mutating route (POST/PUT/PATCH/DELETE) unless the route is on the
+  //     sanctioned MCP_ALLOWED_MUTATING_ROUTES allowlist (enforced below at
+  //     dispatch via isMcpAllowedRoute); reads stay open. Allowlisted write
+  //     routes STILL run requireWorkstreamTrust for per-workstream, per-tool
+  //     trust. The MCP key is checked FIRST so an mcp-key caller is never
+  //     mis-classified as the extension. When no MCP key is wired, only the
+  //     bridge-key path exists (pre-F02 behaviour).
   if (!isPublicUnauthenticatedPath(method, url.pathname)) {
     const actualKey = request.headers['x-bac-bridge-key'];
     const isMcpKey =
@@ -8142,6 +8289,27 @@ export const handleRequest = async (
 
   try {
     const match = route.pattern.exec(url.pathname);
+    // F02 systemic default-deny. An mcp-key caller may only reach a
+    // mutating route that is on the sanctioned allowlist; every other
+    // mutating route (trust management, workstream delete/patch, settings
+    // patch, export, annotation writes) is refused here — BEFORE the
+    // handler runs — so an mcp caller can never self-grant, delete, or
+    // otherwise escalate through an ungated route. Reads are unaffected.
+    if (
+      callerIdentityFor(request).callerClass === 'mcp' &&
+      !isMcpAllowedRoute(method, url.pathname)
+    ) {
+      throw new HttpRouteError(
+        403,
+        'MCP_OPERATION_NOT_ALLOWED',
+        'This operation is not available to MCP callers.',
+        'This operation is not available to MCP callers. Only sanctioned workstream ' +
+          'write tools (thread move/archive/unarchive, queue create, workstream ' +
+          'bump/create) are reachable with an MCP key; trust management, workstream ' +
+          'delete/edit, settings, export, and annotation writes require the ' +
+          "extension's own bridge key.",
+      );
+    }
     // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
     // what the extension actually polls + per-request latency. Written
     // to a file because the screen-session pty isn't capturable.
@@ -8199,6 +8367,7 @@ export const handleRequest = async (
     const codingTokenInvalid = error instanceof CodingAttachTokenInvalidError;
     const codingSessionNotFound = error instanceof CodingSessionNotFoundError;
     const vaultUnavailable = VaultUnavailableError.matches(error);
+    const exportConfinement = VaultExportConfinementError.matches(error);
     const status =
       routeError?.status ??
       (settingsRevisionConflict
@@ -8207,11 +8376,13 @@ export const handleRequest = async (
           ? 410
           : codingSessionNotFound
             ? 404
-            : issues === undefined
-              ? vaultUnavailable
-                ? 503
-                : 500
-              : 400);
+            : exportConfinement
+              ? 400
+              : issues === undefined
+                ? vaultUnavailable
+                  ? 503
+                  : 500
+                : 400);
     const detail = error instanceof Error ? error.message : undefined;
     if (status === 500 && error instanceof Error) {
       // eslint-disable-next-line no-console
@@ -8230,11 +8401,13 @@ export const handleRequest = async (
               ? 'ATTACH_TOKEN_INVALID'
               : codingSessionNotFound
                 ? 'CODING_SESSION_NOT_FOUND'
-                : issues === undefined
-                  ? vaultUnavailable
-                    ? 'VAULT_UNAVAILABLE'
-                    : 'INTERNAL_ERROR'
-                  : 'VALIDATION_ERROR'),
+                : exportConfinement
+                  ? 'EXPORT_PATH_REJECTED'
+                  : issues === undefined
+                    ? vaultUnavailable
+                      ? 'VAULT_UNAVAILABLE'
+                      : 'INTERNAL_ERROR'
+                    : 'VALIDATION_ERROR'),
         title:
           routeError?.title ??
           (issues === undefined
@@ -8244,9 +8417,11 @@ export const handleRequest = async (
                 ? 'Attach token invalid or expired.'
                 : codingSessionNotFound
                   ? 'Coding session not found.'
-                  : vaultUnavailable
-                    ? 'Vault path is unavailable.'
-                    : 'Internal companion error.'
+                  : exportConfinement
+                    ? 'Export path rejected.'
+                    : vaultUnavailable
+                      ? 'Vault path is unavailable.'
+                      : 'Internal companion error.'
             : 'Validation failed.'),
         correlationId: requestId,
         ...(detail === undefined ? {} : { detail }),
