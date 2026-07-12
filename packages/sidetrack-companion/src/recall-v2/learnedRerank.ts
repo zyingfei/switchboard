@@ -257,3 +257,28 @@ export const applyLearnedRerank = async (
   );
   return { results: reordered, applied: true, revisionId: cached.revisionId, reason: 'applied' };
 };
+
+/**
+ * Peek the learned-rerank warm FeatureModel (built by `refresh` over the
+ * SAME LearnedRerankContext the served-feature warmer would build from),
+ * or null when none is cached / it is older than `maxAgeMs`. Purely a
+ * cache read — it NEVER triggers a build and NEVER blocks the caller.
+ *
+ * Used by servedFeatureModel.ts to REUSE this model instead of building a
+ * second, byte-identical FeatureModel per TTL when the learned reranker is
+ * active (`SIDETRACK_RECALL_LEARNED_RERANK=1` + a ship-gate-passed model):
+ * both consumers need the same buildFeatureModel(context) output, and that
+ * build is this codebase's documented CPU-runaway cause, so it must run at
+ * most once per TTL across all consumers. When the reranker is off (the
+ * default) nothing is cached here and the warmer builds its own.
+ */
+export const peekLearnedRerankFeatureModel = (
+  vaultRoot: string,
+  nowMs: number,
+  maxAgeMs: number,
+): FeatureModel | null => {
+  const cached = modelByVault.get(vaultRoot);
+  if (cached === undefined) return null;
+  if (nowMs - cached.builtAtMs >= maxAgeMs) return null;
+  return cached.model;
+};

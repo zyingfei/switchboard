@@ -340,6 +340,17 @@ export interface RankerTrainingCandidate {
 
 export interface RankerTrainingRow extends RankerTrainingCandidate {
   readonly label: number;
+  /**
+   * Optional per-row instance weight passed to LightGBM's `weight` field.
+   * When ANY row in the training set carries a weight, the whole set is
+   * weighted (rows without an explicit weight default to 1.0); when NO row
+   * carries a weight, the weight field is never set and training is
+   * byte-identical to the pre-weight behaviour. Move 2(a) uses this to give
+   * shown-but-unjudged weak negatives a LOWER weight than explicit rejects
+   * without changing their label (both are label 0). This affects TRAINING
+   * DATA only — the model still cannot serve until it clears the ship gate.
+   */
+  readonly weight?: number;
 }
 
 export interface RankerTrainingGroup {
@@ -434,6 +445,7 @@ export const RANKER_MODEL_FEATURE_COUNT =
 interface LightGbmWasm {
   readonly HEAPU8: Uint8Array;
   readonly HEAP32: Int32Array;
+  readonly HEAPF32: Float32Array;
   readonly _malloc: (size: number) => number;
   readonly _free: (ptr: number) => void;
   readonly _wl_lgb_dataset_set_field: (
@@ -448,6 +460,7 @@ interface LightGbmWasm {
 }
 
 const LIGHTGBM_C_API_DTYPE_INT32 = 2;
+const LIGHTGBM_C_API_DTYPE_FLOAT32 = 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -456,6 +469,7 @@ const isLightGbmWasm = (value: unknown): value is LightGbmWasm =>
   isRecord(value) &&
   value['HEAPU8'] instanceof Uint8Array &&
   value['HEAP32'] instanceof Int32Array &&
+  value['HEAPF32'] instanceof Float32Array &&
   typeof value['_malloc'] === 'function' &&
   typeof value['_free'] === 'function' &&
   typeof value['_wl_lgb_dataset_set_field'] === 'function' &&
@@ -691,6 +705,9 @@ const stableDatasetBody = (
       toVisitId: row.candidate.toVisitId,
       sources: [...row.candidate.sources].sort(compareText),
       label: row.label,
+      // Only serialized when set, so an unweighted training set hashes
+      // byte-identically to the pre-weight behaviour (stable revision id).
+      ...(row.weight === undefined ? {} : { weight: row.weight }),
       features: stableFeatureObject(row.features),
     })),
   });
@@ -796,6 +813,46 @@ const setLightGbmGroupField = async (
   } finally {
     wasm._free(ptr);
   }
+};
+
+// Move 2(a) — set the per-row instance `weight` field so weak negatives can
+// be down-weighted relative to explicit rejects. Mirrors setLightGbmGroupField
+// but uses the FLOAT32 dtype LightGBM expects for weights. Only called when at
+// least one row carries an explicit weight; otherwise the field is never set
+// and LightGBM defaults every row to weight 1.0 (the pre-weight behaviour).
+const setLightGbmWeightField = async (
+  dataset: Dataset,
+  weights: Float32Array,
+): Promise<void> => {
+  const wasm = await loadLightGbmWasmInternals();
+  const ptr = wasm._malloc(weights.byteLength);
+  wasm.HEAPF32.set(weights, ptr / 4);
+  try {
+    const result = withCString(wasm, 'weight', (fieldPtr) =>
+      wasm._wl_lgb_dataset_set_field(
+        dataset.handle,
+        fieldPtr,
+        ptr,
+        weights.length,
+        LIGHTGBM_C_API_DTYPE_FLOAT32,
+      ),
+    );
+    if (result !== 0) {
+      throw new Error(`LightGBM weight field failed: ${lightGbmLastError(wasm)}`);
+    }
+  } finally {
+    wasm._free(ptr);
+  }
+};
+
+// Returns the per-row weight vector when ANY row carries an explicit weight
+// (rows without one default to 1.0), else null so the caller skips the weight
+// field entirely — keeping the unweighted training path unchanged.
+const weightsForRows = (rows: readonly RankerTrainingRow[]): Float32Array | null => {
+  if (!rows.some((row) => row.weight !== undefined)) return null;
+  return new Float32Array(
+    rows.map((row) => (row.weight !== undefined && Number.isFinite(row.weight) ? row.weight : 1)),
+  );
 };
 
 const gradeHistogramForRows = (rows: readonly RankerTrainingRow[]): Record<RankerGrade, number> => {
@@ -1206,6 +1263,8 @@ const scoreEvaluationRowsWithFreshBooster = async (
     try {
       dataset.setLabel(labelsForRows(trainRows));
       await setLightGbmGroupField(dataset, trainGroupSizes);
+      const trainWeights = weightsForRows(trainRows);
+      if (trainWeights !== null) await setLightGbmWeightField(dataset, trainWeights);
       const booster = new Booster(dataset.handle, params);
       try {
         for (let iteration = 0; iteration < trainingConfig.numRound; iteration += 1) {
@@ -1489,6 +1548,8 @@ export const trainRankerRevisionFromRows = async (
   try {
     dataset.setLabel(labelsForRows(rows));
     await setLightGbmGroupField(dataset, groupSizes);
+    const rowWeights = weightsForRows(rows);
+    if (rowWeights !== null) await setLightGbmWeightField(dataset, rowWeights);
     const booster = new Booster(dataset.handle, params);
     try {
       for (let iteration = 0; iteration < numRound; iteration += 1) {

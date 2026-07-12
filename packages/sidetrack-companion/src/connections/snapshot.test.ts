@@ -6,7 +6,10 @@ import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../dispatches/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { NAVIGATION_COMMITTED, type NavigationCommittedPayload } from '../navigation/events.js';
 import { QUEUE_CREATED } from '../queue/events.js';
-import type { PageEvidenceRecord } from '../page-evidence/types.js';
+import type {
+  PageEvidenceRecord,
+  PageEvidenceSimilarityMetadata,
+} from '../page-evidence/types.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { CAPTURE_RECORDED } from '../recall/events.js';
 import { SELECTION_COPIED, SELECTION_PASTED } from '../snippets/events.js';
@@ -1326,10 +1329,216 @@ describe('connections — content-derived edges', () => {
     // `extension/src/sidepanel/connections/client.ts:455`. The fix
     // persists them on the edge so the why-related panel can show
     // the real score.
-    expect(edge?.metadata).toEqual({ cosine: 0.91, threshold: 0.85 });
+    //
+    // Move 4 (b): this edge has no page-evidence (cosine-only served
+    // edge) so its evidence tier is title_only, and the producedAt is
+    // the similarity revision's producedAt (the endpoint embeddings'
+    // produce time). Provenance is read/emit only — cosine/threshold and
+    // which edges serve are unchanged.
+    expect(edge?.metadata).toEqual({
+      cosine: 0.91,
+      threshold: 0.85,
+      evidenceTier: 'title_only',
+      evidenceProducedAt: 1_777_777_777_000,
+    });
     expect(
       snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
     ).toHaveLength(1);
+  });
+
+  // Move 4 (b) — evidence-tier provenance on newly produced similarity
+  // edges. The reducer derives the tier from the channels the producer
+  // actually used and stamps the endpoint embeddings' producedAt; it is
+  // read/emit only (no scoring/threshold/ordering change).
+  const twoVisitDay = (): TimelineDayProjection => ({
+    date: '2026-05-07',
+    entries: [
+      {
+        id: 'https://example.test/a',
+        firstSeenAt: '2026-05-07T09:00:00.000Z',
+        lastSeenAt: '2026-05-07T09:05:00.000Z',
+        url: 'https://example.test/a',
+        canonicalUrl: 'https://example.test/a',
+        title: 'A',
+        provider: 'generic',
+        visitCount: 1,
+      },
+      {
+        id: 'https://example.test/b',
+        firstSeenAt: '2026-05-07T09:10:00.000Z',
+        lastSeenAt: '2026-05-07T09:15:00.000Z',
+        url: 'https://example.test/b',
+        canonicalUrl: 'https://example.test/b',
+        title: 'B',
+        provider: 'generic',
+        visitCount: 1,
+      },
+    ],
+    updatedAt: '2026-05-07T09:15:00.000Z',
+    entryCount: 2,
+  });
+
+  const similarityMetadataWith = (
+    channels: PageEvidenceSimilarityMetadata['channels'],
+  ): PageEvidenceSimilarityMetadata => ({
+    producer: channels.contentVector === undefined ? 'metadata-only' : 'content-enriched',
+    policyId: 'policy-test',
+    policyMode: 'default',
+    defaultEligible: true,
+    score: 0.9,
+    confidence: 0.9,
+    evidenceTierFrom: 'metadata_only',
+    evidenceTierTo: 'metadata_only',
+    channels,
+    featureSchemaVersion: 2,
+  });
+
+  it('Pass 7 stamps content_vector tier when the pair carries a content-vector channel', () => {
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [twoVisitDay()],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-content',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'model-rev',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/b',
+              cosine: 0.91,
+              metadata: similarityMetadataWith({ contentVector: 0.88, metadata: 0.4 }),
+            },
+          ],
+          producedAt: 1_777_000_000_000,
+        },
+      }),
+    );
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    expect(edge?.metadata?.['evidenceTier']).toBe('content_vector');
+    expect(edge?.metadata?.['evidenceProducedAt']).toBe(1_777_000_000_000);
+    // Provenance is additive: the producer's own channel metadata still
+    // round-trips unchanged alongside the stamp.
+    expect((edge?.metadata?.['channels'] as Record<string, number>)['contentVector']).toBe(0.88);
+  });
+
+  it('Pass 7 stamps metadata tier when the pair carries only metadata channels', () => {
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [twoVisitDay()],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-meta',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'model-rev',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/b',
+              cosine: 0.91,
+              metadata: similarityMetadataWith({ metadata: 0.6, behavior: 0.5 }),
+            },
+          ],
+          producedAt: 1_777_000_000_500,
+        },
+      }),
+    );
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    expect(edge?.metadata?.['evidenceTier']).toBe('metadata');
+    expect(edge?.metadata?.['evidenceProducedAt']).toBe(1_777_000_000_500);
+  });
+
+  // Move 4 (c) regression — an edge produced BEFORE this move (no
+  // evidenceTier/evidenceProducedAt on its metadata) still reduces and is
+  // served unchanged. We simulate "already persisted, pre-stamp" by
+  // feeding the edge through the reducer path that carries the same
+  // metadata a legacy revision would have (cosine-only, no channels) and
+  // confirm nothing downstream requires the new keys — the guard reads
+  // channels, not the tier, so behavior is identical.
+  it('reduces cosine-only edges and still serves them (pre-stamp edges are tolerated)', () => {
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [twoVisitDay()],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-legacy',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'model-rev',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [
+            {
+              fromVisitKey: 'https://example.test/a',
+              toVisitKey: 'https://example.test/b',
+              cosine: 0.91,
+            },
+          ],
+          producedAt: 1_777_000_001_000,
+        },
+      }),
+    );
+    const edge = snap.edges.find((candidate) => candidate.kind === 'visit_resembles_visit');
+    // Edge is served (present) with its cosine + threshold intact.
+    expect(edge).toBeDefined();
+    expect(edge?.metadata?.['cosine']).toBe(0.91);
+    expect(edge?.metadata?.['threshold']).toBe(0.85);
+    // A downstream consumer that does not know about evidenceTier reads
+    // the same edge exactly as before — the field is simply present now,
+    // never required.
+    expect(edge?.confidence).toBe('inferred');
+    expect(edge?.family).toBe('urlmatch');
+  });
+
+  it('Pass 12 stamps evidence tier on closest_visit edges from candidate sources', () => {
+    const urls = ['https://alpha.test/reference', 'https://bravo.invalid/handbook'] as const;
+    const day: TimelineDayProjection = {
+      date: '2026-05-07',
+      entries: urls.map((url, index) => ({
+        id: url,
+        firstSeenAt: `2026-05-07T09:0${String(index)}:00.000Z`,
+        lastSeenAt: `2026-05-07T09:0${String(index)}:30.000Z`,
+        url,
+        canonicalUrl: url,
+        title: index === 0 ? 'Alpha reference' : 'Bravo handbook',
+        provider: 'generic',
+        visitCount: 1,
+        workstreamId: 'ws_scope',
+      })),
+      updatedAt: '2026-05-07T09:01:30.000Z',
+      entryCount: urls.length,
+    };
+    const snap = buildConnectionsSnapshot(
+      emptyInput({
+        timelineDays: [day],
+        visitSimilarity: {
+          revisionId: 'visit-sim-rev-1',
+          modelId: 'Xenova/multilingual-e5-small',
+          modelRevision: 'test-model',
+          featureSchemaVersion: 1,
+          threshold: 0.85,
+          edges: [{ fromVisitKey: urls[0], toVisitKey: urls[1], cosine: 0.91 }],
+          producedAt: Date.parse('2026-05-07T09:02:00.000Z'),
+          producer: 'embedding',
+        },
+        closestVisitRanker: {
+          revisionId: 'ranker-rev-1',
+          threshold: 0.1,
+          topK: 1,
+          predict: () => ({ score: 1, contributions: rankerContributionsFor(1) }),
+        },
+      }),
+    );
+    const edge = snap.edges.find(
+      (candidate) =>
+        candidate.kind === 'closest_visit' &&
+        candidate.fromNodeId === nodeIdFor('timeline-visit', urls[0]) &&
+        candidate.toNodeId === nodeIdFor('timeline-visit', urls[1]),
+    );
+    // The candidate source here is the title-only embedding_neighborhood
+    // (HNSW), which is chrome-prone → title_only, never content_vector.
+    expect(edge?.metadata?.['candidateSources']).toEqual(['embedding_neighborhood']);
+    expect(edge?.metadata?.['evidenceTier']).toBe('title_only');
   });
 
   it('Pass 12 emits closest_visit top-K edges with score and feature contributions', () => {

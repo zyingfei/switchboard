@@ -6,6 +6,7 @@ import {
   isUserFlowConfirmedPayload,
   isUserFlowRejectedPayload,
   isUserOrganizedItemPayload,
+  isUserRejectedRelationPayload,
   isUserSnippetPromotedPayload,
   isUserTopicRenamedPayload,
 } from './events.js';
@@ -104,6 +105,19 @@ const cases: readonly GuardCase[] = [
     missingRequiredKey: 'targetId',
     invalidEnumPatch: { targetKind: 'bookmark' },
   },
+  {
+    name: 'user.rejected.relation',
+    guard: isUserRejectedRelationPayload,
+    valid: {
+      payloadVersion: 1,
+      fromRef: 'https://example.test/a',
+      toRef: 'https://example.test/b',
+      surface: 'connections',
+      reason: 'not-related',
+    },
+    missingRequiredKey: 'toRef',
+    invalidEnumPatch: { surface: 'nowhere' },
+  },
 ];
 
 describe('feedback event payload guards', () => {
@@ -183,6 +197,26 @@ describe('feedback event payload guards', () => {
         itemId: 'topic:topic-alpha',
         action: 'ignore',
         details: { reason: 'unsupported' },
+      }),
+    ).toBe(false);
+  });
+
+  it('accepts a rejected-relation payload without an optional reason', () => {
+    expect(
+      isUserRejectedRelationPayload({
+        payloadVersion: 1,
+        fromRef: 'https://example.test/a',
+        toRef: 'https://example.test/b',
+        surface: 'related-strip',
+      }),
+    ).toBe(true);
+    // Empty refs and unknown surfaces are rejected.
+    expect(
+      isUserRejectedRelationPayload({
+        payloadVersion: 1,
+        fromRef: '',
+        toRef: 'https://example.test/b',
+        surface: 'related-strip',
       }),
     ).toBe(false);
   });

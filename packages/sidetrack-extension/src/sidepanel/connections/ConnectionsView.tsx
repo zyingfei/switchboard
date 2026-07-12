@@ -7,6 +7,7 @@ import {
   postUserEngagementRelabeled,
   postUserFlowConfirmed,
   postUserFlowRejected,
+  postUserRejectedRelation,
   postUserSnippetPromoted,
   postUserTopicRenamed,
   type UserFlowRelationKind,
@@ -2440,6 +2441,19 @@ export const ConnectionsView = ({
           });
     if (!response.ok) {
       throw new Error(response.error ?? 'feedback failed');
+    }
+    // Move 2(b) — a reject on a relation edge is also a stand-alone "these two
+    // pages are NOT related" assertion. Persist it on its own channel so the
+    // pair-rejection survives independent of the flow-relation-kind correction
+    // above (collect-store-only; suppression is deferred behind the freeze).
+    // Fire-and-forget: a failure here must not fail the primary reject gesture.
+    if (choice === 'reject') {
+      void postUserRejectedRelation({
+        fromRef: edge.fromNodeId,
+        toRef: edge.toNodeId,
+        surface: 'connections',
+        reason: 'not-related',
+      });
     }
   };
 

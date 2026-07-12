@@ -24,12 +24,14 @@ import {
 } from '../recall/events.js';
 import type { RecallCandidate, RecallRequest, RecallResponse } from '../recall-v2/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { extractFeatures } from './features.js';
-import type {
-  CandidatePairFeatures,
-  CandidateRetrievalFeatureContext,
-  RetrievalContext,
+import { extractFeatures, extractFeaturesWithModel, type FeatureModel } from './features.js';
+import {
+  FEATURE_SCHEMA_VERSION,
+  type CandidatePairFeatures,
+  type CandidateRetrievalFeatureContext,
+  type RetrievalContext,
 } from './feature-schema.js';
+import { decodeServedFeatureVector, encodeServedFeatureVector } from './servedFeatureVector.js';
 import { loadRankerModel, predictRanker } from './predict.js';
 import {
   computeImpressionMetrics,
@@ -65,6 +67,31 @@ const EXPLICIT_NEGATIVE_ACTIONS: ReadonlySet<RecallActionKind> = new Set([
 ]);
 
 const ENGAGEMENT_ACTIONS: ReadonlySet<RecallActionKind> = new Set(['click', 'open_new_tab']);
+
+/**
+ * Move 2(a) — instance weight applied to shown-but-unjudged candidates that
+ * are emitted as WEAK negatives (label 0). Kept strictly BELOW the explicit
+ * reject weight so an explicit "not this one" outweighs a mere non-click.
+ * These are TRAINING-DATA-only rows (label 0, LightGBM row weight): the model
+ * still cannot serve until it clears the ship gate, which is why the judge
+ * ruled densifying negatives freeze-safe.
+ */
+export const WEAK_NEGATIVE_INSTANCE_WEIGHT = 0.2;
+/** Explicit rejects keep the LightGBM default weight of 1.0. */
+export const EXPLICIT_REJECT_INSTANCE_WEIGHT = 1;
+
+/**
+ * Whether shown-but-unjudged candidates are emitted as weak-negative training
+ * rows. Collection defaults ON (repo convention: opt-IN behaviours use =1, but
+ * default-ON collection uses an explicit-DISABLE env). Set
+ * SIDETRACK_RANKER_WEAK_NEGATIVES=0 (or =off/false) to restore the legacy
+ * one-positive-plus-explicit-rejects grouping. Read here so the disable knob is
+ * documented at its read site.
+ */
+export const weakNegativesEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_RANKER_WEAK_NEGATIVES'];
+  return raw !== '0' && raw !== 'off' && raw !== 'false';
+};
 
 export const MIN_RECALL_IMPRESSION_POSITIVE_GROUPS = 50;
 /**
@@ -191,6 +218,87 @@ const retrievalContextForServed = (
   served: RecallServedPayload,
 ): RetrievalContext => retrievalContextForCandidates(anchorId, served.results);
 
+/**
+ * The anchor id the impression trainer keys features on, computed from the
+ * serve-time session context (currentUrl when present, else a stable
+ * per-impression `recall-query:<ctx>` id). Exported so the serve-time
+ * capture path (Move 1) uses the IDENTICAL anchor the trainer will use,
+ * which also resolves the query-only train/serve anchorId skew noted in the
+ * data-architecture review — logged features are anchored the trainer's way,
+ * not the reranker's `req.q` way.
+ */
+export const anchorIdForServedContext = (
+  sessionContext: Readonly<Record<string, unknown>> | undefined,
+  servedContextId: string,
+): string => {
+  const currentUrl = sessionContext?.['currentUrl'];
+  if (typeof currentUrl === 'string' && currentUrl.length > 0) return currentUrl;
+  return `recall-query:${servedContextId}`;
+};
+
+/**
+ * Move 1 — compute the POINT-IN-TIME served feature vector for each served
+ * candidate against a PRE-BUILT (warm) FeatureModel, using the SAME
+ * builders the trainer uses (retrievalContextForCandidates + the trainer's
+ * anchor + extractFeaturesWithModel). Returns a plain number[] per entity
+ * aligned to CANDIDATE_PAIR_FEATURE_KEYS, plus the current schema version.
+ *
+ * Cost is O(candidates) given a warm model — the caller passes the
+ * top-k served rows and MUST NOT build the model on the hot path. Returns
+ * null when capture is not possible (no model) so the caller can omit the
+ * fields and let the trainer fall back to reconstruction.
+ */
+export const computeServedFeatureVectors = (input: {
+  readonly sessionContext: Readonly<Record<string, unknown>> | undefined;
+  readonly servedContextId: string;
+  readonly candidates: readonly RecallServedCandidateSnapshot[];
+  readonly model: FeatureModel;
+  readonly generatedAtMs: number;
+}): {
+  readonly featureSchemaVersion: number;
+  readonly byEntityId: ReadonlyMap<string, number[]>;
+} => {
+  const anchorId = anchorIdForServedContext(input.sessionContext, input.servedContextId);
+  const retrievalContext = retrievalContextForCandidates(anchorId, input.candidates);
+  const byEntityId = new Map<string, number[]>();
+  for (const candidate of input.candidates) {
+    const toVisitId = candidate.canonicalUrl ?? candidate.entityId;
+    const pair: Candidate = {
+      fromVisitId: anchorId,
+      toVisitId,
+      sources: [candidateSourceFor(candidate.sourceKind)],
+      generatedAt: input.generatedAtMs,
+    };
+    const features = extractFeaturesWithModel(pair, input.model, retrievalContext);
+    byEntityId.set(candidate.entityId, encodeServedFeatureVector(features));
+  }
+  return { featureSchemaVersion: FEATURE_SCHEMA_VERSION, byEntityId };
+};
+
+/**
+ * Move 1 consumption — PREFER the point-in-time feature vector logged into
+ * the served candidate over re-deriving features against today's (drifted)
+ * graph. The logged vector is trusted only when its `featureSchemaVersion`
+ * equals the CURRENT FEATURE_SCHEMA_VERSION and it decodes to the current
+ * column count; on a mismatch (schema drifted since serve) or a legacy row
+ * (no logged vector) we fall back to `reconstruct()` so columns can never
+ * silently misalign or mix schemas. `reconstruct` is a lazy closure so the
+ * expensive reconstruction path runs ONLY when needed.
+ */
+const featuresForServedCandidate = (
+  servedCandidate: RecallServedCandidateSnapshot,
+  reconstruct: () => CandidatePairFeatures,
+): CandidatePairFeatures => {
+  if (
+    servedCandidate.features !== undefined &&
+    servedCandidate.featureSchemaVersion === FEATURE_SCHEMA_VERSION
+  ) {
+    const decoded = decodeServedFeatureVector(servedCandidate.features);
+    if (decoded !== null) return decoded;
+  }
+  return reconstruct();
+};
+
 const latestActionByEntity = (
   servedContextId: string,
   actions: readonly AcceptedEvent[],
@@ -214,6 +322,16 @@ export interface RecallImpressionTrainingBuildInput {
   readonly merged: readonly AcceptedEvent[];
   readonly snapshot: ConnectionsSnapshot;
   readonly reconstructFeedback?: RecallHistoricalFeedbackReconstructor | undefined;
+  /**
+   * Injectable feature reconstructor — defaults to the real
+   * `extractFeatures`. Move 1 prefers the POINT-IN-TIME feature vector
+   * logged into each served candidate and only calls this to RECONSTRUCT
+   * features for legacy impressions (no logged vector) or on a schema
+   * mismatch. Tests inject a spy to assert reconstruction is skipped for
+   * rows that carry a schema-matching logged vector (DI seam avoids the
+   * process-global vi.mock leak under `bun test`).
+   */
+  readonly extractFeaturesFn?: typeof extractFeatures;
 }
 
 export interface RecallImpressionScoringRow {
@@ -235,6 +353,12 @@ export interface RecallImpressionTrainingBuildResult {
   readonly rawNegativeCount: number;
   readonly totalCandidateCount: number;
   readonly unjudgedCandidateCount: number;
+  /**
+   * Move 2(a) — count of shown-but-unjudged candidates promoted to
+   * weak-negative TRAINING rows (0 when SIDETRACK_RANKER_WEAK_NEGATIVES is
+   * disabled). Explicit rejects are counted in rawNegativeCount, not here.
+   */
+  readonly weakNegativeCount: number;
   readonly candidateSourceDistribution: Readonly<Record<string, number>>;
 }
 
@@ -377,6 +501,7 @@ export const buildRecallImpressionTrainingGroups = async ({
   merged,
   snapshot,
   reconstructFeedback,
+  extractFeaturesFn = extractFeatures,
 }: RecallImpressionTrainingBuildInput): Promise<RecallImpressionTrainingBuildResult> => {
   const servedEvents = merged
     .filter((event) => event.type === RECALL_SERVED && isRecallServedPayload(event.payload))
@@ -391,6 +516,12 @@ export const buildRecallImpressionTrainingGroups = async ({
   let rawNegativeCount = 0;
   let totalCandidateCount = 0;
   let unjudgedCandidateCount = 0;
+  let weakNegativeCount = 0;
+  // Move 2(a) — densify labels: unjudged-but-shown candidates become
+  // weak-negative rows (label 0, low instance weight) instead of being
+  // dropped, so a group is no longer one-positive-plus-explicit-rejects.
+  // Default ON; SIDETRACK_RANKER_WEAK_NEGATIVES=0 restores the legacy path.
+  const emitWeakNegatives = weakNegativesEnabled();
   const candidateSourceDistribution: Record<string, number> = {};
 
   for (const servedEvent of servedEvents) {
@@ -413,20 +544,36 @@ export const buildRecallImpressionTrainingGroups = async ({
         sources: [candidateSourceFor(servedCandidate.sourceKind)],
         generatedAt: parseTime(served.servedAt) || servedEvent.acceptedAtMs,
       };
-      const features = extractFeatures(candidate, {
-        merged: [...merged],
-        snapshot,
-        retrievalContext,
-      });
+      // Move 1 — prefer the point-in-time logged feature vector; only
+      // reconstruct against today's graph for legacy / schema-mismatched
+      // rows. The reconstruction closure is lazy so it never runs when the
+      // logged vector is used.
+      const features = featuresForServedCandidate(servedCandidate, () =>
+        extractFeaturesFn(candidate, {
+          merged: [...merged],
+          snapshot,
+          retrievalContext,
+        }),
+      );
       if (action === undefined) {
         unjudgedCandidateCount += 1;
         scoringRows.push({ candidate, features });
+        if (emitWeakNegatives) {
+          weakNegativeCount += 1;
+          rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+        }
         continue;
       }
       const label = trainingLabelForAction(action.actionKind);
       if (label === undefined) {
+        // Engagement-only action (click / open) — no explicit label, so it is
+        // still an unjudged row; treat as a weak negative like a non-click.
         unjudgedCandidateCount += 1;
         scoringRows.push({ candidate, features });
+        if (emitWeakNegatives) {
+          weakNegativeCount += 1;
+          rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+        }
         continue;
       }
       const labelKind = label > 0 ? 'positive' : 'negative';
@@ -437,6 +584,12 @@ export const buildRecallImpressionTrainingGroups = async ({
         candidate,
         features,
         label,
+        // Explicit rejects keep full weight (1.0) so they outrank weak
+        // negatives; only stamped when weak negatives are active, otherwise
+        // `weight` stays undefined and the unweighted path is unchanged.
+        ...(emitWeakNegatives && label === 0
+          ? { weight: EXPLICIT_REJECT_INSTANCE_WEIGHT }
+          : {}),
       });
     }
     if (scoringRows.length > 0) {
@@ -504,20 +657,33 @@ export const buildRecallImpressionTrainingGroups = async ({
           sources: [candidateSourceFor(servedCandidate.sourceKind)],
           generatedAt: event.acceptedAtMs,
         };
-        const features = extractFeatures(candidate, {
+        // Historical-feedback path — always reconstructs (the synthesized
+        // response carries no logged feature vector), so extract directly.
+        const features = extractFeaturesFn(candidate, {
           merged: [...merged],
           snapshot,
           retrievalContext,
         });
         if (!candidateMatchesTarget(candidateResult, spec.targetEntityId)) {
+          // Reconstructed impression: every non-target candidate is unjudged
+          // (only the feedback target carries a label), so it becomes a weak
+          // negative under the same gate as the served path.
           unjudgedCandidateCount += 1;
           scoringRows.push({ candidate, features });
+          if (emitWeakNegatives) {
+            weakNegativeCount += 1;
+            rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+          }
           continue;
         }
         const label = trainingLabelForAction(spec.actionKind);
         if (label === undefined) {
           unjudgedCandidateCount += 1;
           scoringRows.push({ candidate, features });
+          if (emitWeakNegatives) {
+            weakNegativeCount += 1;
+            rows.push({ candidate, features, label: 0, weight: WEAK_NEGATIVE_INSTANCE_WEIGHT });
+          }
           continue;
         }
         const labelKind = label > 0 ? 'positive' : 'negative';
@@ -528,6 +694,9 @@ export const buildRecallImpressionTrainingGroups = async ({
           candidate,
           features,
           label,
+          ...(emitWeakNegatives && label === 0
+            ? { weight: EXPLICIT_REJECT_INSTANCE_WEIGHT }
+            : {}),
         });
       }
       if (scoringRows.length > 0) {
@@ -554,6 +723,7 @@ export const buildRecallImpressionTrainingGroups = async ({
     rawNegativeCount,
     totalCandidateCount,
     unjudgedCandidateCount,
+    weakNegativeCount,
     candidateSourceDistribution,
   };
 };
@@ -937,7 +1107,9 @@ export const maybeRetrainRecallImpressionRanker = async (input: {
     labeledRows: build.groups.reduce((sum, group) => sum + group.rows.length, 0),
     positiveRows: build.rawPositiveCount,
     negativeRows: build.rawNegativeCount,
-    implicitNegativeRows: 0,
+    // Weak negatives (shown-but-unjudged rows) are the implicit-negative
+    // population; explicit rejects are counted in negativeRows above.
+    implicitNegativeRows: build.weakNegativeCount,
     unlabeledCandidateCount: build.unjudgedCandidateCount,
   };
   const baseRevision = await (input.train ?? trainRankerRevisionFromGroups)(

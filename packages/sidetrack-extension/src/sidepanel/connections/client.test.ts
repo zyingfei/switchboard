@@ -8,6 +8,7 @@ import {
   postUserFlowConfirmed,
   postUserFlowRejected,
   postUserOrganizedItem,
+  postUserRejectedRelation,
   postUserSnippetPromoted,
   postUserTopicRenamed,
   setConnectionsClientTransportForTests,
@@ -297,6 +298,38 @@ describe('connections client helpers', () => {
           },
         },
         clientEventId: expect.stringMatching(/^feedback-user\.organized\.item-/u),
+      }),
+    ]);
+  });
+
+  it('posts a rejected-relation event through the feedback proxy (Move 2b)', async () => {
+    const sent: unknown[] = [];
+    setConnectionsClientTransportForTests((message) => {
+      sent.push(message);
+      return Promise.resolve({ ok: true, data: { accepted: true } });
+    });
+
+    await postUserRejectedRelation({
+      fromRef: 'https://example.test/a',
+      toRef: 'https://example.test/b',
+      surface: 'connections',
+      reason: 'not-related',
+    });
+
+    expect(sent).toEqual([
+      expect.objectContaining({
+        type: messageTypes.postConnectionsFeedbackEvent,
+        event: {
+          type: 'user.rejected.relation',
+          payload: {
+            payloadVersion: 1,
+            fromRef: 'https://example.test/a',
+            toRef: 'https://example.test/b',
+            surface: 'connections',
+            reason: 'not-related',
+          },
+        },
+        clientEventId: expect.stringMatching(/^feedback-user\.rejected\.relation-/u),
       }),
     ]);
   });

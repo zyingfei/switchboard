@@ -40,11 +40,16 @@ import {
   trainRankerRevisionFromGroups,
   trainRankerRevision,
   type RankerRevision,
+  type RankerTrainingGroup,
   type RankerTrainingLabelingSummary,
   type RankerTrainingCandidate,
   type TrainRankerInput,
   type TrainRankerOptions,
 } from './train.js';
+import {
+  fingerprintTrainableEvents,
+  type TrainableEventsFingerprint,
+} from './trainableEventsShard.js';
 import type { Candidate, CandidateSource } from './types.js';
 
 // Lowered from 50 to 5 (post-PR141 backfill made 50 unreachable in
@@ -57,6 +62,7 @@ export const DEFAULT_RANDOM_NEGATIVES_PER_POSITIVE_FROM = 5;
 // user organizing.
 export const DEFAULT_RANKER_RETRAIN_COOLDOWN_MS = 10 * 60_000;
 export const RANKER_RETRAIN_STATE_SCHEMA_VERSION = 1;
+export const IMPRESSION_RETRAIN_GUARD_STATE_SCHEMA_VERSION = 1;
 
 // Stage 5 / T4 — env-tunable retrain threshold for dogfood.
 // Explicit `threshold` option still wins over the env.
@@ -90,6 +96,13 @@ export const deriveVisitPairLabelsFromSnapshot = (
 };
 
 const RANKER_RETRAIN_STATE_RELATIVE_PATH = '_BAC/connections/closest-visit/retrain-state.json';
+// Move 3 (b) — the impression path's own cooldown/fingerprint marker. Separate
+// from the legacy retrain-state.json above: the legacy state tracks the
+// feedback-label dataset hash, this one tracks the trainable-events fingerprint
+// (counts + latest dot per type) so a drain with no new impressions/actions/
+// feedback short-circuits before the group-build+train.
+const IMPRESSION_RETRAIN_GUARD_STATE_RELATIVE_PATH =
+  '_BAC/connections/closest-visit/impression-retrain-guard.json';
 const TIMELINE_VISIT_PREFIX = 'timeline-visit:';
 
 export interface RankerTrainingLabelDatasetFingerprint {
@@ -175,6 +188,15 @@ export interface RankerRetrainContext {
 export type RankerRetrainer = (context: RankerRetrainContext) => Promise<RankerRetrainResult>;
 
 export type TrainRankerRevisionFn = (input: TrainRankerInput) => Promise<RankerRevision>;
+// Move 3 (c) — off-thread trainer for the impression path. Takes pre-built
+// groups + a labeling summary and returns a revision; the default is the inline
+// `trainRankerRevisionFromGroups`, and the materializer supplies a worker-backed
+// implementation so the LightGBM CPU never runs on the drain thread.
+export type TrainGroupsFn = (
+  groups: readonly RankerTrainingGroup[],
+  options: TrainRankerOptions,
+  labelingSummary: RankerTrainingLabelingSummary,
+) => Promise<RankerRevision>;
 export type WriteActiveRankerRevisionFn = (
   vaultRoot: string,
   revision: RankerRevision,
@@ -215,11 +237,25 @@ export interface MaybeRetrainClosestVisitRankerInput extends RankerRetrainContex
   readonly randomNegativeCandidatesPerPositive?: number | undefined;
   readonly trainOptions?: TrainRankerOptions | undefined;
   readonly train?: TrainRankerRevisionFn | undefined;
+  // Move 3 (c) — off-thread trainer for the impression path. When supplied, the
+  // impression branch trains via this (the worker) instead of the inline
+  // `trainRankerRevisionFromGroups`. Gate evaluation stays on-thread; a worker
+  // failure surfaces as a `failed` result (logged upstream), never a silent
+  // inline fallback on the drain thread.
+  readonly trainGroups?: TrainGroupsFn | undefined;
   readonly writeActiveRevision?: WriteActiveRankerRevisionFn | undefined;
   readonly writeCandidateRevision?: WriteActiveRankerRevisionFn | undefined;
   readonly readState?: ((vaultRoot: string) => Promise<RankerRetrainState | null>) | undefined;
   readonly writeState?:
     | ((vaultRoot: string, state: RankerRetrainState) => Promise<void>)
+    | undefined;
+  // Move 3 (b) — impression cooldown/fingerprint guard-state seams (injected
+  // for tests). Default to the on-disk guard-state read/write.
+  readonly readImpressionGuardState?:
+    | ((vaultRoot: string) => Promise<ImpressionRetrainGuardState | null>)
+    | undefined;
+  readonly writeImpressionGuardState?:
+    | ((vaultRoot: string, state: ImpressionRetrainGuardState) => Promise<void>)
     | undefined;
 }
 
@@ -398,6 +434,110 @@ export const writeRankerRetrainState = async (
   state: RankerRetrainState,
 ): Promise<void> => {
   await writeAtomic(rankerRetrainStatePath(vaultRoot), `${JSON.stringify(state, null, 2)}\n`);
+};
+
+// ── Move 3 (b): impression-path cooldown/fingerprint guard ──────────────────
+// Mirrors the legacy planRankerRetrain shape (unchanged-fingerprint skip +
+// cooldown window), but keys off the trainable-events fingerprint rather than
+// the feedback-label dataset. The impression path builds groups by re-running
+// the training reconstruction — expensive enough that a no-new-label drain must
+// short-circuit before it, exactly like the legacy path already does.
+
+export interface ImpressionRetrainGuardState {
+  readonly schemaVersion: typeof IMPRESSION_RETRAIN_GUARD_STATE_SCHEMA_VERSION;
+  /** Trainable-events fingerprint hash of the last attempted train. */
+  readonly lastFingerprintHash: string;
+  /** Trainable-event count at the last attempted train. */
+  readonly lastTrainableCount: number;
+  /** ms epoch of the last attempted train (cooldown anchor). */
+  readonly updatedAt: number;
+}
+
+const isImpressionRetrainGuardState = (value: unknown): value is ImpressionRetrainGuardState => {
+  if (!isRecord(value)) return false;
+  return (
+    value['schemaVersion'] === IMPRESSION_RETRAIN_GUARD_STATE_SCHEMA_VERSION &&
+    isHex64(value['lastFingerprintHash']) &&
+    isNonNegativeInteger(value['lastTrainableCount']) &&
+    typeof value['updatedAt'] === 'number' &&
+    Number.isFinite(value['updatedAt'])
+  );
+};
+
+export const impressionRetrainGuardStatePath = (vaultRoot: string): string =>
+  join(vaultRoot, IMPRESSION_RETRAIN_GUARD_STATE_RELATIVE_PATH);
+
+export const readImpressionRetrainGuardState = async (
+  vaultRoot: string,
+): Promise<ImpressionRetrainGuardState | null> => {
+  try {
+    const parsed = JSON.parse(
+      await readFile(impressionRetrainGuardStatePath(vaultRoot), 'utf8'),
+    ) as unknown;
+    return isImpressionRetrainGuardState(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+export const writeImpressionRetrainGuardState = async (
+  vaultRoot: string,
+  state: ImpressionRetrainGuardState,
+): Promise<void> => {
+  await writeAtomic(
+    impressionRetrainGuardStatePath(vaultRoot),
+    `${JSON.stringify(state, null, 2)}\n`,
+  );
+};
+
+export type ImpressionRetrainGuardDecision =
+  | { readonly action: 'train'; readonly fingerprint: TrainableEventsFingerprint }
+  | {
+      readonly action: 'skip';
+      readonly reason: 'no-labels' | 'unchanged' | 'cooldown';
+      readonly fingerprint: TrainableEventsFingerprint;
+    };
+
+export interface PlanImpressionRetrainInput {
+  readonly fingerprint: TrainableEventsFingerprint;
+  readonly state: ImpressionRetrainGuardState | null;
+  /** Cooldown in ms since last attempted train; ignored when `force` set. */
+  readonly cooldownMs?: number | undefined;
+  /** `Date.now()` for cooldown comparison; injected for tests. */
+  readonly nowMs?: number | undefined;
+  /** Bypasses unchanged/cooldown (still respects no-labels). */
+  readonly force?: boolean | undefined;
+}
+
+export const planImpressionRetrain = ({
+  fingerprint,
+  state,
+  cooldownMs,
+  nowMs,
+  force,
+}: PlanImpressionRetrainInput): ImpressionRetrainGuardDecision => {
+  if (fingerprint.count === 0) {
+    return { action: 'skip', reason: 'no-labels', fingerprint };
+  }
+  if (force === true) {
+    return { action: 'train', fingerprint };
+  }
+  // Same trainable set as the last attempt ⇒ nothing new to learn from; skip
+  // the whole group-build+train. This is the "exactly zero group-builds on a
+  // no-new-label second drain" short-circuit.
+  if (state !== null && state.lastFingerprintHash === fingerprint.hash) {
+    return { action: 'skip', reason: 'unchanged', fingerprint };
+  }
+  // Cooldown — hold off even when new labels arrived, matching the legacy
+  // guard. Skipped when never trained (state === null).
+  if (state !== null) {
+    const cooldown = normalizedCooldownMs(cooldownMs);
+    const now = nowMs ?? Date.now();
+    if (cooldown > 0 && now - state.updatedAt < cooldown) {
+      return { action: 'skip', reason: 'cooldown', fingerprint };
+    }
+  }
+  return { action: 'train', fingerprint };
 };
 
 const visitKeyFromNodeOrRaw = (value: string): string =>
@@ -867,10 +1007,13 @@ export const maybeRetrainClosestVisitRanker = async ({
   randomNegativeCandidatesPerPositive,
   trainOptions,
   train = trainRankerRevision,
+  trainGroups = trainRankerRevisionFromGroups,
   writeActiveRevision = writeActiveClosestVisitRankerRevision,
   writeCandidateRevision = writeClosestVisitRankerRevision,
   readState = readRankerRetrainState,
   writeState = writeRankerRetrainState,
+  readImpressionGuardState = readImpressionRetrainGuardState,
+  writeImpressionGuardState = writeImpressionRetrainGuardState,
   readTrainingEvents,
 }: MaybeRetrainClosestVisitRankerInput): Promise<RankerRetrainResult> => {
   // P1: feed the trainer the full training-event history (read I/O-safely
@@ -889,6 +1032,45 @@ export const maybeRetrainClosestVisitRanker = async ({
   const impressionEventSummary = summarizeRecallImpressionEvents(impressionEvents);
   if (impressionEventSummary.groupCountWithPositives >= minRecallImpressionPositiveGroups()) {
     const newLabelCount = impressionEventSummary.groupCountWithPositives;
+    // Move 3 (b) — cooldown/fingerprint short-circuit. Compute the trainable
+    // fingerprint (counts + latest dot per type) and skip the whole
+    // group-build+train when the trainable set is unchanged since the last
+    // attempt, or the cooldown window has not elapsed. The legacy path below
+    // has had this guard since PR141; the impression path did not, so it
+    // re-ran the build + trained inline on EVERY drain once the positive-group
+    // floor was met — the no-cooldown per-drain retrain the CPU-runaway audit
+    // flagged.
+    const trainableFingerprint = fingerprintTrainableEvents(impressionEvents);
+    const guardState = await readImpressionGuardState(vaultRoot);
+    const impressionForceEnv = process.env[RANKER_RETRAIN_FORCE_ENV];
+    const impressionCooldownEnv = readEnvNumber(RANKER_RETRAIN_COOLDOWN_MS_ENV);
+    const guardDecision = planImpressionRetrain({
+      fingerprint: trainableFingerprint,
+      state: guardState,
+      ...(impressionCooldownEnv === undefined ? {} : { cooldownMs: impressionCooldownEnv }),
+      force: forceInput === true || impressionForceEnv === '1' || impressionForceEnv === 'true',
+    });
+    if (guardDecision.action === 'skip') {
+      return {
+        status: 'skipped',
+        reason: guardDecision.reason,
+        fingerprint,
+        newLabelCount,
+      };
+    }
+    // The fingerprint to stamp into the guard state once we commit to an
+    // outcome that is deterministic on this trainable set (insufficient_groups,
+    // ship_gate_failed, or trained). Stamped AFTER the build/train, not before,
+    // so a transient build/train failure leaves the guard untouched and the
+    // next drain retries rather than being blocked by the unchanged-hash
+    // short-circuit. The cooldown anchor is the drain time.
+    const advanceGuard = (): Promise<void> =>
+      writeImpressionGuardState(vaultRoot, {
+        schemaVersion: IMPRESSION_RETRAIN_GUARD_STATE_SCHEMA_VERSION,
+        lastFingerprintHash: trainableFingerprint.hash,
+        lastTrainableCount: trainableFingerprint.count,
+        updatedAt: Date.now(),
+      });
     try {
       const build = await buildRecallImpressionTrainingGroups({
         merged: impressionEvents,
@@ -900,6 +1082,9 @@ export const maybeRetrainClosestVisitRanker = async ({
       });
       const stats = summarizeRecallImpressionTraining(build);
       if (stats.groupCountWithPositives < minRecallImpressionPositiveGroups()) {
+        // Deterministic on unchanged input — stamp the guard so an unchanged
+        // follow-up drain short-circuits instead of rebuilding these groups.
+        await advanceGuard();
         return {
           status: 'skipped',
           reason: 'insufficient_groups',
@@ -908,11 +1093,19 @@ export const maybeRetrainClosestVisitRanker = async ({
           candidateCount: build.totalCandidateCount,
         };
       }
-      const baseRevision = await trainRankerRevisionFromGroups(
+      // Move 3 (c) — train OFF the drain thread. `trainGroups` is the worker in
+      // production; only the LightGBM CPU moves off-thread, the ship-gate below
+      // still runs here. A worker failure throws → caught below → `failed`
+      // result (guard left untouched for retry); it never silently falls back
+      // to an inline drain-thread train.
+      const baseRevision = await trainGroups(
         build.groups,
         trainOptions ?? {},
         recallImpressionLabelingSummary(build),
       );
+      // Train succeeded — stamp the guard now, before the gate, so a follow-up
+      // no-new-label drain short-circuits whatever the gate verdict.
+      await advanceGuard();
       const gate = await evaluateRecallImpressionShipGateV2(baseRevision, build);
       const revision = applyRecallImpressionShipGateV2(baseRevision, gate.decision);
       const retrainStateStatus = gate.decision.status === 'pass' ? 'promoted' : 'ship_gate_failed';
@@ -944,6 +1137,9 @@ export const maybeRetrainClosestVisitRanker = async ({
         candidateCount: build.totalCandidateCount,
       };
     } catch (error) {
+      // Build/train failure — the guard was NOT stamped (advanceGuard runs only
+      // after the build+train succeed), so the next drain retries the same
+      // trainable set rather than being blocked by the unchanged-hash guard.
       return {
         status: 'failed',
         error: errorMessage(error),

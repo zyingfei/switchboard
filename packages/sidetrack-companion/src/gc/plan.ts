@@ -8,7 +8,8 @@ export type GcGroup =
   | 'diagnostics-history'
   | 'debug-dumps'
   | 'expired-idempotency'
-  | 'closest-visit-revisions';
+  | 'closest-visit-revisions'
+  | 'connections-snapshots';
 
 export interface GcPlanEntry {
   readonly path: string;
@@ -34,6 +35,7 @@ export interface BuildGcPlanOptions {
   readonly keepDebugDumps?: number;
   readonly keepIdempotencyReceipts?: number;
   readonly keepIdempotencyBytes?: number;
+  readonly keepConnectionsSnapshots?: number;
 }
 
 export interface GcInventory {
@@ -90,6 +92,23 @@ const oldRevisions = (
     .filter((row) => row.path.endsWith('.json'))
     .filter((row) => !protectedBasenames.has(row.path.split('/').at(-1) ?? ''))
     .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .slice(Math.max(0, keep));
+
+// Daily connections snapshots are named `<YYYY-MM-DD>.json`. Retention
+// is keyed on the DATE in the filename (lexicographic sort is correct for
+// YYYY-MM-DD), not mtime: a re-materialize can rewrite an old day's file
+// and bump its mtime, which would make an mtime-sort keep the wrong days.
+// Keep the newest `keep` dates; the rest are prunable. Conservative
+// default keep (see buildGcPlan) — each file is a bounded single-day
+// artifact, so retention only trims the long idle tail.
+const SNAPSHOT_DATE_NAME_RE = /^(\d{4}-\d{2}-\d{2})\.json$/u;
+const oldDatedSnapshots = (
+  rows: readonly { readonly path: string; readonly mtimeMs: number; readonly bytes: number }[],
+  keep: number,
+): readonly { readonly path: string; readonly bytes: number }[] =>
+  rows
+    .filter((row) => SNAPSHOT_DATE_NAME_RE.test(row.path.split('/').at(-1) ?? ''))
+    .sort((left, right) => (right.path.split('/').at(-1) ?? '').localeCompare(left.path.split('/').at(-1) ?? ''))
     .slice(Math.max(0, keep));
 
 const appendEntries = (
@@ -149,6 +168,10 @@ export const buildGcPlan = async (
   const keepDebugDumps = options.keepDebugDumps ?? 10;
   const keepIdempotencyReceipts = options.keepIdempotencyReceipts ?? 5000;
   const keepIdempotencyBytes = options.keepIdempotencyBytes ?? 128 * 1024 * 1024;
+  // Conservative default: keep ~a month of daily connections snapshots.
+  // Each is a bounded single-day artifact (lower severity than the log),
+  // so this only trims the long idle tail.
+  const keepConnectionsSnapshots = options.keepConnectionsSnapshots ?? 30;
   const entries: GcPlanEntry[] = [];
 
   const connectionsRoot = join(vaultRoot, '_BAC', 'connections');
@@ -219,6 +242,16 @@ export const buildGcPlan = async (
 
   appendEntries(
     entries,
+    oldDatedSnapshots(
+      await listFiles(join(connectionsRoot, 'snapshots')),
+      keepConnectionsSnapshots,
+    ),
+    'connections-snapshots',
+    `daily connections snapshot outside newest ${String(keepConnectionsSnapshots)}`,
+  );
+
+  appendEntries(
+    entries,
     await expiredIdempotency(vaultRoot, now, {
       keepReceipts: keepIdempotencyReceipts,
       keepBytes: keepIdempotencyBytes,
@@ -268,6 +301,7 @@ const ALL_GC_GROUPS: readonly GcGroup[] = [
   'debug-dumps',
   'expired-idempotency',
   'closest-visit-revisions',
+  'connections-snapshots',
 ];
 
 export const gcInventory = async (

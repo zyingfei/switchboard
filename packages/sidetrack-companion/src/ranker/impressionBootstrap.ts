@@ -28,8 +28,10 @@ import type {
 import type { TrainGroupsWorkerJob } from './trainGroups.worker.js';
 
 /** Spawn the off-thread train-from-groups worker and resolve with the trained
- *  revision. Mirrors runMaybeRetrainInWorker; lazy-imports worker_threads. */
-const trainGroupsInWorker = async (job: TrainGroupsWorkerJob): Promise<RankerRevision> => {
+ *  revision. Mirrors runMaybeRetrainInWorker; lazy-imports worker_threads.
+ *  Exported so the drain-thread impression retrain (Move 3 c) reuses the exact
+ *  same worker entry as this bootstrap rather than duplicating the spawn glue. */
+export const trainGroupsInWorker = async (job: TrainGroupsWorkerJob): Promise<RankerRevision> => {
   const { Worker } = await import('node:worker_threads');
   const workerUrl = new URL('./trainGroups.worker.js', import.meta.url);
   return await new Promise<RankerRevision>((resolve, reject) => {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { VersionVector } from './causal.js';
@@ -23,8 +23,22 @@ import type { VersionVector } from './causal.js';
 //   _BAC/.sync/projection-changes-seq     single integer (max seq)
 //   _BAC/.sync/projection-changes.jsonl   one JSON line per change
 //
-// The JSONL grows over time; pruning is left as a future
-// optimisation (we'll snapshot once per day and drop older lines).
+// The JSONL grows over time. Rotation/pruning of sealed lines is left
+// as a future optimisation (see the followups) — no rotation discipline
+// exists on this feed yet, so this module only CURSOR-SKIPS already-read
+// lines rather than deleting them.
+//
+// Read fast path: readSince previously read + JSON.parsed the ENTIRE
+// file on every /changes poll — an O(total-history) cost on a hot polled
+// endpoint that grows one line per projection change forever. It now
+// keeps an in-memory byte-offset checkpoint {scannedBytes, maxScannedSeq}
+// advanced past every line it has parsed. A steady-state poll (the
+// browser resuming from the cursor it was just handed, i.e.
+// sinceSeq >= maxScannedSeq) seeks to the checkpoint and parses ONLY the
+// appended tail — every earlier line has seq <= maxScannedSeq <=
+// sinceSeq and would be filtered out anyway. The public readSince(token)
+// contract is unchanged: an older cursor, or a truncated/replaced file,
+// transparently falls back to a full scan and re-seeds the checkpoint.
 
 const SYNC_DIR_SEGMENTS = ['_BAC', '.sync'] as const;
 const SEQ_FILE = 'projection-changes-seq';
@@ -59,6 +73,13 @@ export interface ProjectionChangeFeed {
   readonly readSince: (
     sinceSeq: number,
   ) => Promise<{ readonly cursor: number; readonly changed: readonly ProjectionChange[] }>;
+  /**
+   * Test-only observability: total number of JSONL lines this feed has
+   * PARSED across all readSince calls. The cursor fast path exists to
+   * keep this from growing with total history on steady-state polls —
+   * a test asserts a second poll parses only the newly appended lines.
+   */
+  readonly __parsedLineCount: () => number;
 }
 
 const writeAtomic = async (path: string, body: string): Promise<void> => {
@@ -126,6 +147,16 @@ export const createProjectionChangeFeed = (
   let cachedSeq: number | null = null;
   let chain: Promise<unknown> = Promise.resolve();
 
+  // Byte-offset read checkpoint. `scannedBytes` is the offset of the end
+  // of the last fully-parsed line; `maxScannedSeq` is the highest seq
+  // seen at or before that offset. A poll with sinceSeq >= maxScannedSeq
+  // only needs the tail past scannedBytes. Reset (to 0/0) whenever the
+  // file shrinks or is replaced, forcing a safe full re-scan.
+  let scannedBytes = 0;
+  let maxScannedSeq = 0;
+  // Test-only: total JSONL lines parsed across all readSince calls.
+  let parsedLineCount = 0;
+
   const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
     const next = chain.then(task, task);
     chain = next.then(
@@ -169,36 +200,99 @@ export const createProjectionChangeFeed = (
       return change;
     });
 
-  const readSince = async (
+  // Parse a UTF-8 chunk that starts on a line boundary. Returns the
+  // matching changes (seq > sinceSeq), how many bytes were consumed up
+  // to the last COMPLETE line (a trailing partial line, if any, is left
+  // for a future read), and the max seq observed in the chunk.
+  const parseChunk = (
+    chunk: string,
     sinceSeq: number,
-  ): Promise<{ readonly cursor: number; readonly changed: readonly ProjectionChange[] }> => {
-    let raw: string;
-    try {
-      raw = await readFile(logPath(vaultPath), 'utf8');
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-        return { cursor: await ensureSeqLoaded(), changed: [] };
-      }
-      throw error;
-    }
+  ): { changes: ProjectionChange[]; consumedBytes: number; maxSeq: number } => {
     const changes: ProjectionChange[] = [];
-    for (const line of raw.split('\n')) {
+    let maxSeq = 0;
+    // Only whole lines (terminated by \n) are complete; anything after
+    // the last \n is a partial tail we must not consume.
+    const lastNl = chunk.lastIndexOf('\n');
+    const complete = lastNl < 0 ? '' : chunk.slice(0, lastNl + 1);
+    const consumedBytes = Buffer.byteLength(complete, 'utf8');
+    for (const line of complete.split('\n')) {
       const trimmed = line.trim();
       if (trimmed.length === 0) continue;
+      parsedLineCount += 1;
       try {
         const parsed = JSON.parse(trimmed) as unknown;
-        if (isProjectionChange(parsed) && parsed.seq > sinceSeq) {
-          changes.push(parsed);
+        if (isProjectionChange(parsed)) {
+          if (parsed.seq > maxSeq) maxSeq = parsed.seq;
+          if (parsed.seq > sinceSeq) changes.push(parsed);
         }
       } catch {
         // Tolerate malformed lines.
       }
     }
-    changes.sort((a, b) => a.seq - b.seq);
-    const lastChange = changes.at(-1);
-    const cursor = lastChange === undefined ? sinceSeq : lastChange.seq;
-    return { cursor, changed: changes };
+    return { changes, consumedBytes, maxSeq };
   };
 
-  return { appendChange, readSince };
+  // Serialised through the same chain as appendChange so the checkpoint
+  // is never advanced against a mid-append file and never races a
+  // concurrent poll.
+  const readSince = (
+    sinceSeq: number,
+  ): Promise<{ readonly cursor: number; readonly changed: readonly ProjectionChange[] }> =>
+    enqueue(async () => {
+      const path = logPath(vaultPath);
+      let size: number;
+      try {
+        size = (await stat(path)).size;
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+          scannedBytes = 0;
+          maxScannedSeq = 0;
+          return { cursor: await ensureSeqLoaded(), changed: [] };
+        }
+        throw error;
+      }
+
+      // File shrank or was replaced (rotation/truncation/fresh vault):
+      // the checkpoint is no longer valid — re-scan from the start.
+      if (size < scannedBytes) {
+        scannedBytes = 0;
+        maxScannedSeq = 0;
+      }
+
+      // Fast path: the caller resumes from at-or-after everything we have
+      // already parsed, so every matching line lives strictly in the
+      // appended tail. Read only [scannedBytes, size) — never the prefix.
+      const canResume = sinceSeq >= maxScannedSeq && scannedBytes > 0;
+      const startOffset = canResume ? scannedBytes : 0;
+
+      if (startOffset >= size) {
+        // Nothing new since the checkpoint.
+        return { cursor: sinceSeq, changed: [] };
+      }
+
+      const length = size - startOffset;
+      const buffer = Buffer.alloc(length);
+      const handle = await open(path, 'r');
+      try {
+        await handle.read(buffer, 0, length, startOffset);
+      } finally {
+        await handle.close();
+      }
+      const chunk = buffer.toString('utf8');
+      const { changes, consumedBytes, maxSeq } = parseChunk(chunk, sinceSeq);
+
+      // Advance the checkpoint past the completely-parsed bytes. On the
+      // full-scan path startOffset is 0; on the resume path we extend the
+      // prior checkpoint. maxScannedSeq only ever moves forward.
+      const newScanned = startOffset + consumedBytes;
+      if (newScanned > scannedBytes) scannedBytes = newScanned;
+      if (maxSeq > maxScannedSeq) maxScannedSeq = maxSeq;
+
+      changes.sort((a, b) => a.seq - b.seq);
+      const lastChange = changes.at(-1);
+      const cursor = lastChange === undefined ? sinceSeq : lastChange.seq;
+      return { cursor, changed: changes };
+    });
+
+  return { appendChange, readSince, __parsedLineCount: () => parsedLineCount };
 };

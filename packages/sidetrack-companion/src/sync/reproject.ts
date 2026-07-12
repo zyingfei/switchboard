@@ -1,9 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { AcceptedEvent } from './causal.js';
-import { getCaughtUpSharedEventStore } from './eventStore.js';
 import type { EventLog } from './eventLog.js';
+import { latestPerAggregateFromLog } from './latestPerAggregate.js';
 import type { ProjectionChangeFeed } from './projectionChanges.js';
 import { runImportProjectors } from './projectors.js';
 
@@ -44,43 +43,10 @@ const writeVersionFile = async (vaultRoot: string, version: number): Promise<voi
   await writeFile(file, JSON.stringify(body, null, 2), 'utf8');
 };
 
-// Pick the most recent event per aggregateId — runImportProjectors
-// reads the merged log per aggregate, so feeding it the latest event
-// for each aggregate is sufficient to re-emit the canonical projection
-// file. Earlier events for the same aggregate would re-do the same
-// work redundantly.
-const latestPerAggregate = (events: readonly AcceptedEvent[]): readonly AcceptedEvent[] => {
-  const byId = new Map<string, AcceptedEvent>();
-  for (const event of events) {
-    const prior = byId.get(event.aggregateId);
-    if (prior === undefined) {
-      byId.set(event.aggregateId, event);
-      continue;
-    }
-    if (event.acceptedAtMs >= prior.acceptedAtMs) {
-      byId.set(event.aggregateId, event);
-    }
-  }
-  return [...byId.values()];
-};
-
-const latestPerAggregateFromLog = async (
-  vaultRoot: string,
-  eventLog: EventLog,
-): Promise<readonly AcceptedEvent[]> => {
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
-  if (store === null) return latestPerAggregate(await eventLog.readMerged());
-  const byId = new Map<string, AcceptedEvent>();
-  await store.forEachChunk((chunk) => {
-    for (const event of chunk) {
-      const prior = byId.get(event.aggregateId);
-      if (prior === undefined || event.acceptedAtMs >= prior.acceptedAtMs) {
-        byId.set(event.aggregateId, event);
-      }
-    }
-  }, 2000);
-  return [...byId.values()];
-};
+// Reproject reads the LATEST event of EVERY aggregate (all types) — see
+// latestPerAggregateFromLog (no `handles` filter). runImportProjectors
+// reads the merged log per aggregate, so the latest event per aggregateId
+// is sufficient to re-emit the canonical projection file.
 
 export interface ReprojectOnVersionMismatchDeps {
   readonly vaultRoot: string;

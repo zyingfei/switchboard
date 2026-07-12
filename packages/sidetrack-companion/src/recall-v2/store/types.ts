@@ -144,7 +144,11 @@ export interface RecallStore {
 
   /** Vector KNN — top-K nearest by cosine distance (lower = closer).
    *  Joins back to the docs table so callers receive canonical_url +
-   *  title in one round-trip. */
+   *  title in one round-trip. `bodyIndexed` mirrors the docs column
+   *  (1 = content vector, 0 = title+URL only) so callers can tell a
+   *  content-derived hit from a title-only one and LOG that provenance.
+   *  It does NOT influence ranking here — down-weighting title-only
+   *  hits is a serving-math change gated behind the P1 freeze. */
   queryVector(opts: {
     readonly vec: Float32Array;
     readonly limit: number;
@@ -154,6 +158,7 @@ export interface RecallStore {
     readonly canonicalUrl: string | undefined;
     readonly title: string | undefined;
     readonly cosineDistance: number;
+    readonly bodyIndexed: 0 | 1;
   }[];
 
   close(): void;

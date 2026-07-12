@@ -37,6 +37,8 @@ import {
   type LearnedRerankContext,
   recallLearnedRerankEnabled,
 } from './learnedRerank.js';
+import { peekServedFeatureModel } from './servedFeatureModel.js';
+import { computeServedFeatureVectors } from '../ranker/retrain-impressions.js';
 import {
   backfillFromRecallIndex,
   backfillPageEvidenceDelta,
@@ -49,7 +51,7 @@ import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
 import { logShadowDiff, shadowQueryEnabled, shadowVariantsFromEnv } from './shadow.js';
 import { rerank } from './rerank.js';
-import type { RecallServedPayload } from '../recall/events.js';
+import type { RecallServedCandidateSnapshot, RecallServedPayload } from '../recall/events.js';
 import type {
   CandidateGeneratorOutput,
   RecallCandidate,
@@ -1358,17 +1360,33 @@ export const runRecall = async (
     rankMovement = moves;
   }
 
+  // Move 1 — query-anchored cosine per candidate, threaded from the
+  // dense (semantic_query) lane's request-time computation. The evidence
+  // carries `vectorDistance = 1 − cosine`, so cosine = 1 − vectorDistance.
+  // Absent when no dense lane surfaced this candidate. This revives the
+  // single most-relevant signal the impression log previously discarded.
+  const queryCosineByEntity = new Map<string, number>();
+  for (const cand of results) {
+    for (const ev of cand.evidence ?? []) {
+      if (ev.sourceKind === 'semantic_query' && ev.vectorDistance !== undefined) {
+        queryCosineByEntity.set(cand.entityId, 1 - ev.vectorDistance);
+        break;
+      }
+    }
+  }
+
   // Snapshot of the served candidates the trainer will read. We
   // intentionally store ONLY what survives suppression (POST-suppression
   // results) so labels can never reference a hidden candidate. Per-lane
   // ranks come from each candidate's evidence trail.
-  const servedCandidatesSnapshot = results.map((cand, position) => {
+  const servedCandidatesSnapshot: RecallServedCandidateSnapshot[] = results.map((cand, position) => {
     const perLaneRanks: Record<string, number> = {};
     const perLaneScores: Record<string, number> = {};
     for (const ev of cand.evidence ?? []) {
       if (ev.rank !== undefined) perLaneRanks[ev.sourceKind] = ev.rank;
       if (ev.rawScore !== undefined) perLaneScores[ev.sourceKind] = ev.rawScore;
     }
+    const queryCosine = queryCosineByEntity.get(cand.entityId);
     return {
       entityId: cand.entityId,
       sourceKind: cand.sourceKind,
@@ -1378,8 +1396,46 @@ export const runRecall = async (
       ...(cand.rerankScore !== undefined ? { rerankScore: cand.rerankScore } : {}),
       servedPosition: position,
       ...(cand.canonicalUrl !== undefined ? { canonicalUrl: cand.canonicalUrl } : {}),
+      ...(queryCosine !== undefined ? { queryCosine } : {}),
     };
   });
+
+  // Move 1 — capture the POINT-IN-TIME feature vector for the served
+  // (top-k) candidates so the trainer reads the AS-OF-serve truth instead
+  // of re-deriving features against a drifted graph. Reuses the trainer's
+  // own builders (computeServedFeatureVectors) against a PRE-BUILT, warm
+  // FeatureModel — peeked, never built inline, so the /v2 hot path stays
+  // free of the full-log read / model build that is this codebase's
+  // documented CPU-runaway cause. When no warm model is available (cold /
+  // capture disabled / no context loader) the fields are simply omitted
+  // and the trainer falls back to reconstruction — no correctness loss.
+  // Cost is O(served candidates) only, and only when impression emission
+  // is active (the `deps.appendImpression !== undefined` guard below).
+  if (deps.appendImpression !== undefined && deps.learnedRerankContext !== undefined) {
+    const warmModel = peekServedFeatureModel({
+      vaultRoot: deps.vaultRoot,
+      loadContext: deps.learnedRerankContext,
+      now: deps.now ?? Date.now,
+    });
+    if (warmModel !== null) {
+      const { featureSchemaVersion, byEntityId } = computeServedFeatureVectors({
+        ...(req.session !== undefined
+          ? { sessionContext: req.session as Readonly<Record<string, unknown>> }
+          : { sessionContext: undefined }),
+        servedContextId,
+        candidates: servedCandidatesSnapshot,
+        model: warmModel,
+        generatedAtMs: (deps.now ?? Date.now)(),
+      });
+      for (let index = 0; index < servedCandidatesSnapshot.length; index += 1) {
+        const row = servedCandidatesSnapshot[index];
+        if (row === undefined) continue;
+        const features = byEntityId.get(row.entityId);
+        if (features === undefined) continue;
+        servedCandidatesSnapshot[index] = { ...row, features, featureSchemaVersion };
+      }
+    }
+  }
 
   const suppressedEntityIds = dropped
     .map((c) => c.entityId)

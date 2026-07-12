@@ -85,9 +85,11 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
           return Promise.resolve([...(input.events ?? [])]);
         },
         readMergedSince: () => Promise.resolve([...(input.events ?? [])]),
-        // streamFiltered is used by the ranker trainer; return empty so
-        // the drain succeeds without actual training data in the test stub.
+        // streamFiltered + logSignature back the trainable-events shard the
+        // ranker trainer reads; return empty / a stable signature so the drain
+        // succeeds without actual training data in the test stub.
         streamFiltered: () => Promise.resolve([]),
+        logSignature: () => Promise.resolve('test-stub-signature'),
         append: () => {
           throw new Error('unused');
         },

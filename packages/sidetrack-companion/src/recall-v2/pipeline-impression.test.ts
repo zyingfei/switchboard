@@ -20,8 +20,15 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { RecallServedPayload } from '../recall/events.js';
+import { CANDIDATE_PAIR_FEATURE_KEYS, FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
+import type { LearnedRerankContext } from './learnedRerank.js';
 import { runRecall, type PipelineDeps } from './pipeline.js';
+import {
+  __resetServedFeatureModelCacheForTests,
+  peekServedFeatureModel,
+} from './servedFeatureModel.js';
 import type { RecallStore, StoreDocument, StoreFtsHit, StoreSourceKind } from './store/types.js';
 
 const stubEmbed = async (texts: readonly string[]): Promise<readonly Float32Array[]> =>
@@ -217,5 +224,175 @@ describe('runRecall — Phase 0 impression logging', () => {
         (r.perLaneScores !== undefined && Object.keys(r.perLaneScores).length > 0),
     );
     expect(hasAnyEvidence).toBe(true);
+  });
+});
+
+// Move 1 — point-in-time served features + query-anchored cosine.
+const emptySnapshot = (): ConnectionsSnapshot => ({
+  scope: {},
+  nodes: [],
+  edges: [],
+  updatedAt: new Date(Date.parse('2026-05-25T00:00:00.000Z')).toISOString(),
+  nodeCount: 0,
+  edgeCount: 0,
+});
+
+// A store whose vector backend returns one dense hit for a page NOT already
+// surfaced by the lexical lanes (so it is not excluded as an anchor URL and
+// keeps `semantic_query` as its primary sourceKind), so the served candidate
+// carries the request-time query-to-candidate cosine (1 − cosineDistance).
+const vectorSeededStore = (): RecallStore => {
+  const store = seededStore();
+  return {
+    ...store,
+    vectorBackendAvailable: true,
+    queryVector: () => [
+      {
+        entityId: 'vec:example.com/semantic-only',
+        canonicalUrl: 'https://example.com/semantic-only',
+        title: 'Semantic-only page',
+        cosineDistance: 0.2, // → query cosine 0.8
+        bodyIndexed: 1,
+      },
+    ],
+  };
+};
+
+// Prime the background served-feature-model warmer, then wait for its
+// async build so the NEXT runRecall can peek a warm model synchronously.
+const primeWarmModel = async (deps: PipelineDeps): Promise<void> => {
+  const loadContext = deps.learnedRerankContext;
+  if (loadContext === undefined) throw new Error('test wiring: learnedRerankContext required');
+  peekServedFeatureModel({ vaultRoot: deps.vaultRoot, loadContext, now: deps.now ?? Date.now });
+  // The warmer's refresh awaits loadContext() (immediate here) then builds
+  // the model synchronously; a few macrotask ticks let it settle.
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+describe('runRecall — Move 1 point-in-time features + query cosine', () => {
+  it('threads the query-anchored cosine into served snapshot rows from the dense lane', async () => {
+    __resetServedFeatureModelCacheForTests();
+    const captured: RecallServedPayload[] = [];
+    const deps = baseDeps({
+      store: vectorSeededStore(),
+      appendImpression: async (payload) => {
+        captured.push(payload);
+      },
+      learnedRerankContext: async (): Promise<LearnedRerankContext> => ({
+        snapshot: emptySnapshot(),
+        merged: [],
+      }),
+    });
+    await runRecall(deps, {
+      q: 'example',
+      intent: 'dejavu', // dejavu profile includes semantic_query
+      strategy: { rerankTopK: 0 },
+    });
+    await Promise.resolve();
+    const payload = captured[0];
+    expect(payload).toBeDefined();
+    if (payload === undefined) return;
+    const dense = payload.results.find((r) => r.sourceKind === 'semantic_query');
+    expect(dense).toBeDefined();
+    // cosineDistance 0.2 → cosine 0.8.
+    expect(dense?.queryCosine).toBeCloseTo(0.8, 5);
+  });
+
+  it('stamps the point-in-time feature vector + schema version once the model is warm', async () => {
+    __resetServedFeatureModelCacheForTests();
+    const captured: RecallServedPayload[] = [];
+    const deps = baseDeps({
+      store: vectorSeededStore(),
+      appendImpression: async (payload) => {
+        captured.push(payload);
+      },
+      learnedRerankContext: async (): Promise<LearnedRerankContext> => ({
+        snapshot: emptySnapshot(),
+        merged: [],
+      }),
+    });
+    await primeWarmModel(deps);
+    await runRecall(deps, {
+      q: 'example',
+      intent: 'dejavu',
+      strategy: { rerankTopK: 0 },
+    });
+    await Promise.resolve();
+    const payload = captured[0];
+    expect(payload).toBeDefined();
+    if (payload === undefined) return;
+    expect(payload.results.length).toBeGreaterThan(0);
+    for (const row of payload.results) {
+      expect(row.featureSchemaVersion).toBe(FEATURE_SCHEMA_VERSION);
+      expect(row.features).toBeDefined();
+      expect(row.features).toHaveLength(CANDIDATE_PAIR_FEATURE_KEYS.length);
+      // schemaVersion is column 0 of the canonical order.
+      expect(row.features?.[0]).toBe(FEATURE_SCHEMA_VERSION);
+    }
+  });
+
+  it('omits features (falls back) when no warm model is available', async () => {
+    __resetServedFeatureModelCacheForTests();
+    const captured: RecallServedPayload[] = [];
+    const deps = baseDeps({
+      store: vectorSeededStore(),
+      appendImpression: async (payload) => {
+        captured.push(payload);
+      },
+      learnedRerankContext: async (): Promise<LearnedRerankContext> => ({
+        snapshot: emptySnapshot(),
+        merged: [],
+      }),
+    });
+    // No prime — the first request peeks a cold cache, gets null, and
+    // emits the snapshot WITHOUT features (trainer reconstructs later).
+    await runRecall(deps, {
+      q: 'example',
+      intent: 'dejavu',
+      strategy: { rerankTopK: 0 },
+    });
+    await Promise.resolve();
+    const payload = captured[0];
+    expect(payload).toBeDefined();
+    if (payload === undefined) return;
+    for (const row of payload.results) {
+      expect(row.features).toBeUndefined();
+      expect(row.featureSchemaVersion).toBeUndefined();
+    }
+  });
+
+  it('does not capture features when SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE=0', async () => {
+    __resetServedFeatureModelCacheForTests();
+    const prev = process.env['SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE'];
+    process.env['SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE'] = '0';
+    try {
+      const captured: RecallServedPayload[] = [];
+      const deps = baseDeps({
+        store: vectorSeededStore(),
+        appendImpression: async (payload) => {
+          captured.push(payload);
+        },
+        learnedRerankContext: async (): Promise<LearnedRerankContext> => ({
+          snapshot: emptySnapshot(),
+          merged: [],
+        }),
+      });
+      await primeWarmModel(deps);
+      await runRecall(deps, {
+        q: 'example',
+        intent: 'dejavu',
+        strategy: { rerankTopK: 0 },
+      });
+      await Promise.resolve();
+      const payload = captured[0];
+      expect(payload).toBeDefined();
+      if (payload === undefined) return;
+      for (const row of payload.results) {
+        expect(row.features).toBeUndefined();
+      }
+    } finally {
+      if (prev === undefined) delete process.env['SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE'];
+      else process.env['SIDETRACK_RECALL_SERVED_FEATURE_CAPTURE'] = prev;
+    }
   });
 });

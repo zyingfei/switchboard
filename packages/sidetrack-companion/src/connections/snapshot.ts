@@ -33,7 +33,10 @@ import {
   type TopicSecondaryAffiliation,
 } from '../producers/topic-revision.js';
 import { QUEUE_CREATED, isQueueCreatedPayload } from '../queue/events.js';
-import type { PageEvidenceRecord } from '../page-evidence/types.js';
+import type {
+  PageEvidenceRecord,
+  PageEvidenceSimilarityMetadata,
+} from '../page-evidence/types.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
@@ -508,6 +511,76 @@ const upsertEdge = (
   if (input.observedAt < existing.observedAt) {
     edges.set(id, { id, ...input });
   }
+};
+
+// Move 4 (b) — evidence-tier provenance stamp for inferred similarity
+// edges. This is READ/EMIT metadata only: it records WHICH evidence the
+// producer actually used to form the edge, so downstream consumers (and
+// the aggregator chrome-only guard, once lifted) can distinguish a
+// content-vector edge from a chrome/title-only one. It does NOT change
+// scoring, thresholds, or which edges serve — deriving it from the
+// already-computed channels is purely additive.
+//
+//   content_vector — a doc-embedding cosine was present on the pair
+//                     (channels.contentVector), i.e. real content
+//                     similarity on both endpoints.
+//   metadata       — page-evidence channels were present but no content
+//                     vector (title/host/path "metadata" + behavior).
+//   title_only     — the served HNSW/cosine-only edge with no evidence
+//                     on either endpoint (the known false-friend class);
+//                     the producer emitted no channel metadata at all.
+//
+// NOTE: the aggregator guard (tabsession/similarity.ts
+// isChromeOnlySimilarityEdge) still keys off metadata.channels, which
+// these title-only served edges never carry — so it stays inert until it
+// is taught to read this tier. Teaching the guard is a serving-behavior
+// change gated behind the P1 freeze (ADR-0011); see followups.
+export type SimilarityEvidenceTier = 'title_only' | 'metadata' | 'content_vector';
+
+const evidenceTierForSimilarityMetadata = (
+  metadata: PageEvidenceSimilarityMetadata | undefined,
+): SimilarityEvidenceTier => {
+  if (metadata === undefined) return 'title_only';
+  const contentVector = metadata.channels.contentVector;
+  if (typeof contentVector === 'number' && contentVector > 0) return 'content_vector';
+  return 'metadata';
+};
+
+// The closest_visit ranker edge carries no page-evidence channels; its
+// evidence is the candidate SOURCE the ranker actually matched on. Map
+// those to the same tier vocabulary so both similarity-edge kinds report
+// provenance consistently:
+//   content_embedding_neighborhood — doc-embedding cosine on both
+//     endpoints => content_vector.
+//   content_term_overlap / structural-metadata sources (title/path/host,
+//     repo/domain, search query, copied snippet, opener/nav chains,
+//     user-confirmed, cross-replica continuation) => metadata.
+//   otherwise (only the title-only `embedding_neighborhood` HNSW source,
+//     or the chrome-prone structural-only class) => title_only.
+// Same rationale as the guard's channel classification in
+// tabsession/similarity.ts (embedding_neighborhood is chrome-prone; the
+// content_* sources are the genuine-content ones).
+const CONTENT_VECTOR_CANDIDATE_SOURCES = new Set<CandidateSource>([
+  'content_embedding_neighborhood',
+]);
+const TITLE_ONLY_CANDIDATE_SOURCES = new Set<CandidateSource>([
+  'embedding_neighborhood',
+  'same_repo_or_domain',
+  'same_title_path_tokens',
+  'recently_skipped',
+  'random_unrelated',
+]);
+
+const evidenceTierForCandidateSources = (
+  sources: readonly CandidateSource[],
+): SimilarityEvidenceTier => {
+  if (sources.some((source) => CONTENT_VECTOR_CANDIDATE_SOURCES.has(source))) {
+    return 'content_vector';
+  }
+  if (sources.some((source) => !TITLE_ONLY_CANDIDATE_SOURCES.has(source))) {
+    return 'metadata';
+  }
+  return 'title_only';
 };
 
 const snapshotFromAccumulators = (
@@ -1391,6 +1464,14 @@ export const closestVisitRankerEdgesForSnapshot = (
           candidateSources: [...scored.candidate.sources],
           primaryCandidateSource: primaryRankerCandidateSource(scored.candidate),
           topContributions: scored.topContributions,
+          // Move 4 (b) — evidence-tier provenance derived from the
+          // candidate source the ranker matched on (read/emit only, no
+          // score/threshold change). The closest_visit edge is a ranker
+          // prediction, not an embedding-revision edge, so its "produced
+          // at" provenance is the ranker revision already carried in
+          // producedBy.revisionId; there is no distinct endpoint-embedding
+          // timestamp to stamp here.
+          evidenceTier: evidenceTierForCandidateSources(scored.candidate.sources),
         },
       });
     }
@@ -2994,6 +3075,17 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           cosine: Number(similarityEdge.cosine.toFixed(4)),
           threshold: Number(input.visitSimilarity.threshold.toFixed(4)),
           ...(similarityEdge.metadata === undefined ? {} : similarityEdge.metadata),
+          // Move 4 (b) — evidence-tier provenance stamped at PRODUCE time
+          // (this edge is being emitted/updated now). Derived from the
+          // channels the producer actually used; read/emit only. The
+          // producedAt is the endpoint embeddings' produce time (the
+          // similarity revision's producedAt), so a later TTL/staleness or
+          // precision-sampling pass has an age to key off. Adding these
+          // keys revs only edges emitted from now on — the snapshotRevision
+          // hash is over counts, not edge metadata, and edges_index only
+          // extracts id/kind, so byte-equality of untouched edges holds.
+          evidenceTier: evidenceTierForSimilarityMetadata(similarityEdge.metadata),
+          evidenceProducedAt: input.visitSimilarity.producedAt,
         },
       });
     }
