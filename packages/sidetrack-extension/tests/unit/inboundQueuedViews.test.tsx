@@ -49,7 +49,11 @@ describe('InboundView — §13 steps 3/9', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     expect(onDismiss).toHaveBeenCalledWith('r1');
-    fireEvent.click(screen.getByRole('button', { name: 'Mark relevant' }));
+    // R1.2 (feedback 4): "Mark relevant" (ranker jargon) → "Helpful".
+    // Label-only rename; the callback (→ updateReminder status:'relevant'
+    // → trainable recall.action) is unchanged. Accessible name is the
+    // aria-label "Mark this reply as helpful".
+    fireEvent.click(screen.getByRole('button', { name: 'Mark this reply as helpful' }));
     expect(onMarkRelevant).toHaveBeenCalledWith('r1');
   });
 
