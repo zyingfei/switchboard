@@ -785,6 +785,11 @@ const App = () => {
   // modal opens; null means either no match or the lookup hasn't run,
   // in which case TabRecovery falls back to reopen-URL.
   const [recoverySessionId, setRecoverySessionId] = useState<string | null>(null);
+  // How the matched closed session was identified (url vs url+title).
+  // Recorded on the §15 tab-recovery event so the counter's provenance
+  // mirrors the extension's matcher. Parallel to recoverySessionId so the
+  // existing null-means-no-match render path is untouched.
+  const [recoveryMatchedOn, setRecoveryMatchedOn] = useState<'url' | 'url+title' | null>(null);
   // Bac_id of a dispatch the user clicked to inspect — used by the
   // External viewer modal (and as a fallback "show me the body" for
   // any dispatch the user wants to see again). Null = closed.
@@ -1451,6 +1456,7 @@ const App = () => {
   // or thread change so a stale lookup can't set a wrong sessionId.
   useEffect(() => {
     setRecoverySessionId(null);
+    setRecoveryMatchedOn(null);
     if (recoveryThread === undefined) return undefined;
     const sessions = (chrome as { sessions?: typeof chrome.sessions }).sessions;
     if (sessions?.getRecentlyClosed === undefined) return undefined;
@@ -1461,7 +1467,10 @@ const App = () => {
         const recent = (await sessions.getRecentlyClosed({})) as readonly ClosedSession[];
         if (cancelled) return;
         const match = findSessionRestoreMatch(recent, { url: threadUrl, title });
-        if (match !== null) setRecoverySessionId(match.sessionId);
+        if (match !== null) {
+          setRecoverySessionId(match.sessionId);
+          setRecoveryMatchedOn(match.matchedOn);
+        }
       } catch {
         // sessions API may be unavailable (permission not yet granted
         // after a reload); silently fall back to reopen-URL.
@@ -1474,14 +1483,37 @@ const App = () => {
   // Restore a closed tab from Chrome's session history, then close the
   // recovery modal. Best-effort: any failure leaves the modal's other
   // branches available.
-  const restoreThreadSession = useCallback((sessionId: string): void => {
-    const sessions = (chrome as { sessions?: typeof chrome.sessions }).sessions;
-    if (sessions?.restore === undefined) return;
-    void sessions.restore(sessionId).catch(() => {
-      // Session may have aged out of Chrome's history between lookup
-      // and click; the modal stays open so the user can reopen-URL.
-    });
-  }, []);
+  const restoreThreadSession = useCallback(
+    (sessionId: string): void => {
+      const sessions = (chrome as { sessions?: typeof chrome.sessions }).sessions;
+      if (sessions?.restore === undefined) return;
+      void sessions
+        .restore(sessionId)
+        .then(() => {
+          // PRD §15 criterion 4 — persist the successful recovery so the
+          // falsifiability counter can read it from the event log. Fire-
+          // and-forget via raw sendMessage (the tab-recovery handler
+          // returns a plain {ok} envelope, not a WorkboardState); a failed
+          // telemetry POST must not affect the user's already-restored tab.
+          void chrome.runtime
+            .sendMessage({
+              type: messageTypes.reportTabRecovery,
+              payload: {
+                payloadVersion: 1,
+                sessionId,
+                matchedOn: recoveryMatchedOn ?? 'url',
+                ...(recoveryThread === undefined ? {} : { threadId: recoveryThread.bac_id }),
+              },
+            })
+            .catch(() => undefined);
+        })
+        .catch(() => {
+          // Session may have aged out of Chrome's history between lookup
+          // and click; the modal stays open so the user can reopen-URL.
+        });
+    },
+    [recoveryMatchedOn, recoveryThread],
+  );
   const composeThread = useMemo(
     () => threads.find((thread) => thread.bac_id === composeThreadId),
     [composeThreadId, threads],

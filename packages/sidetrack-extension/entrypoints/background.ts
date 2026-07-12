@@ -4807,6 +4807,27 @@ export default defineBackground(() => {
       return result;
     }
 
+    // PRD §15 criterion 4 — persist a successful chrome.sessions.restore.
+    // Best-effort telemetry: a failed POST must never disrupt the
+    // recovery the user already saw succeed.
+    if (message['type'] === messageTypes.reportTabRecovery) {
+      const payload = message['payload'];
+      const clientEventId =
+        typeof message['clientEventId'] === 'string' && message['clientEventId'].length > 0
+          ? message['clientEventId']
+          : `tab-recovery-${String(Date.now())}`;
+      try {
+        await companionJson('/v1/system/tab-recovery', {
+          method: 'POST',
+          headers: { 'idempotency-key': idempotencyKey('tab-recovery', clientEventId) },
+          body: JSON.stringify(payload),
+        });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
     const cacheKey = JSON.stringify(message);
     const now = Date.now();
     const cached = connectionsCache.get(cacheKey);

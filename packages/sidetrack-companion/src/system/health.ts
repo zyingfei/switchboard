@@ -256,7 +256,11 @@ const ZERO_EVENT_LANE_HEALTH: EventLaneHealth = {
   unreadableShards: 0,
 };
 
-const anyLaneCounterNonZero = (h: EventLaneHealth): boolean =>
+// Exported so the drain-time §15 collector can reuse the exact
+// counters-clean predicate the health surface uses (section15Artifact.ts
+// folds dataLoss.clean into its per-day ledger for the ≥7-clean-days
+// streak, and MUST agree with what /v1/system/health reports).
+export const anyLaneCounterNonZero = (h: EventLaneHealth): boolean =>
   h.skippedMalformedLines > 0 ||
   h.storeSkippedOutOfOrder > 0 ||
   h.dotCollisions > 0 ||

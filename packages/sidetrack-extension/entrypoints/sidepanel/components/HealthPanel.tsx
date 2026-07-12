@@ -350,6 +350,49 @@ interface FocusHealthResponse {
   readonly history: readonly FocusHealthHistorySample[];
 }
 
+// ── §15 falsifiability endpoint (GET /v1/system/section15) ──
+// PRD §15 freeze-lift table (ADR-0011): the six observable criteria that
+// gate lifting the P1 serving-math freeze. Served from the drain-time
+// artifact (companion system/section15Artifact.ts). Every field guarded;
+// a missing/old response renders nothing rather than a fabricated pass.
+interface Section15Criterion {
+  readonly id: string;
+  readonly label: string;
+  readonly observable: string;
+  readonly value: number;
+  readonly threshold: number;
+  readonly unit: 'fraction' | 'count' | 'days';
+  readonly met: boolean;
+  readonly detail: string;
+}
+interface Section15Response {
+  readonly availability: 'ok' | 'live';
+  readonly generatedAt: string | null;
+  readonly report: {
+    readonly criteria: readonly Section15Criterion[];
+    readonly freezeLiftEligible: boolean;
+  };
+}
+
+const isSection15Response = (value: unknown): value is Section15Response => {
+  if (typeof value !== 'object' || value === null) return false;
+  const report = (value as { report?: unknown }).report;
+  if (typeof report !== 'object' || report === null) return false;
+  return Array.isArray((report as { criteria?: unknown }).criteria);
+};
+
+// Render a §15 criterion's measured value against its threshold in the
+// unit the counter reports (fraction → %, days → "Nd", else a raw count).
+const formatSection15Value = (criterion: Section15Criterion): string => {
+  if (criterion.unit === 'fraction') {
+    return `${Math.round(criterion.value * 100)}% / ${Math.round(criterion.threshold * 100)}%`;
+  }
+  if (criterion.unit === 'days') {
+    return `${String(criterion.value)}d / ${String(criterion.threshold)}d`;
+  }
+  return `${String(criterion.value)} / ${String(criterion.threshold)}`;
+};
+
 // ── Hygiene-status endpoint (GET /v1/system/hygiene-status) ──
 // GC inventory + page-content coverage. `availability.gc ===
 // 'unavailable'` is the design's whole thesis — render it as the
@@ -678,6 +721,7 @@ export function HealthPanel({
   const [report, setReport] = useState<HealthReport | null>(null);
   const [focusHealth, setFocusHealth] = useState<FocusHealthResponse | null>(null);
   const [hygiene, setHygiene] = useState<HygieneStatusResponse | null>(null);
+  const [section15, setSection15] = useState<Section15Response | null>(null);
   const [loadState, setLoadState] = useState<'loading' | 'live' | 'unavailable' | 'not-configured'>(
     companionPort === undefined || companionPort === null || !bridgeKey
       ? 'not-configured'
@@ -757,6 +801,24 @@ export function HealthPanel({
     }
   };
 
+  // §15 falsifiability table. Best-effort like focus/hygiene: an older
+  // companion without the route leaves state null and the section is
+  // simply not rendered — never a fabricated pass.
+  const fetchSection15 = async (): Promise<void> => {
+    if (base === null || authHeaders === undefined) return;
+    try {
+      const response = await fetch(`${base}/v1/system/section15`, { headers: authHeaders });
+      if (!response.ok) {
+        setSection15(null);
+        return;
+      }
+      const body = (await response.json()) as { readonly data?: unknown };
+      setSection15(isSection15Response(body.data) ? body.data : null);
+    } catch {
+      setSection15(null);
+    }
+  };
+
   const triggerRebuild = async (): Promise<void> => {
     if (base === null || authHeaders === undefined) {
       setRebuildState({ kind: 'error', message: 'Companion not configured.' });
@@ -831,7 +893,7 @@ export function HealthPanel({
     let cancelled = false;
     const run = async (): Promise<void> => {
       if (report === null) setLoadState('loading');
-      await Promise.all([fetchReport(), fetchFocusHealth(), fetchHygiene()]);
+      await Promise.all([fetchReport(), fetchFocusHealth(), fetchHygiene(), fetchSection15()]);
       if (cancelled) return;
     };
     void run();
@@ -2564,6 +2626,53 @@ export function HealthPanel({
                   ))
                 )}
               </div>
+
+              {section15 !== null ? (
+                <div data-testid="hp-section15">
+                  <h4 className="sx-h">
+                    §15 freeze-lift ·{' '}
+                    {section15.report.freezeLiftEligible ? (
+                      <span className="sx-mono">eligible</span>
+                    ) : (
+                      <span className="sx-mono">
+                        {String(section15.report.criteria.filter((c) => c.met).length)}/
+                        {String(section15.report.criteria.length)} met
+                      </span>
+                    )}
+                  </h4>
+                  <table className="sx-section15-table" data-testid="hp-section15-table">
+                    <tbody>
+                      {section15.report.criteria.map((criterion) => (
+                        <tr
+                          key={criterion.id}
+                          data-testid={`hp-section15-${criterion.id}`}
+                          data-met={criterion.met ? 'true' : 'false'}
+                        >
+                          <td className={criterion.met ? 'sx-ok' : 'sx-pending'}>
+                            {criterion.met ? '✓' : '○'}
+                          </td>
+                          <td title={criterion.detail}>{criterion.label}</td>
+                          <td className="sx-mono">{formatSection15Value(criterion)}</td>
+                          <td>
+                            {criterion.met ? (
+                              <span className="sx-ok">met</span>
+                            ) : (
+                              <span className="sx-pending">pending</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div className="sx-callout">
+                    The P1 serving-math freeze (ADR-0011) lifts only when all six criteria are met
+                    over the 30-day §15 window.{' '}
+                    {section15.availability === 'live'
+                      ? 'Live compute (no drain artifact yet — clean-days streak shows 0).'
+                      : `As of ${section15.generatedAt !== null ? formatWhen(section15.generatedAt) : 'unknown'}.`}
+                  </div>
+                </div>
+              ) : null}
 
               <div>
                 <h4 className="sx-h">Why this board</h4>
