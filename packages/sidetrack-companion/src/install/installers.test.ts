@@ -110,6 +110,72 @@ describe('service installers', () => {
     expect(files.removed).toContain(result.path);
   });
 
+  it('systemd unit renders label/exec/respawn/vault/port for the local checkout', async () => {
+    const files = fakeFiles();
+    const exec = fakeExec();
+    const installer = pickInstaller('linux', { homeDir: '/home/test', files, exec });
+
+    const result = await installer.install({
+      vaultPath: '/home/test/Sidetrack vault',
+      port: 17379,
+      companionCommand: ['/usr/local/bin/bun', '/repo/packages/sidetrack-companion/dist/cli.js'],
+      mcpPort: 8721,
+    });
+    const body = files.writes.get(result.path) ?? '';
+
+    // Unit identity.
+    expect(result.path.endsWith('sidetrack-companion.service')).toBe(true);
+    expect(body).toContain('Description=Sidetrack companion');
+    // KeepAlive equivalent: respawn on crash without a tight loop, and no
+    // permanent start-limit hold during a flaky startup.
+    expect(body).toContain('Restart=always');
+    expect(body).toContain('RestartSec=5');
+    expect(body).toContain('StartLimitIntervalSec=0');
+    expect(body).toContain('WantedBy=default.target');
+    // Exec line: --smol Bun checkout, shell-quoted vault (has a space), port.
+    expect(body).toContain("ExecStart='/usr/local/bin/bun' '--smol'");
+    expect(body).toContain("'/repo/packages/sidetrack-companion/dist/cli.js'");
+    expect(body).toContain("'--vault' '/home/test/Sidetrack vault'");
+    expect(body).toContain("'--port' '17379'");
+    expect(body).toContain("'--mcp-port' '8721'");
+    // enable --now gives RunAtLoad; daemon-reload picks up the new unit.
+    expect(exec.calls.some((call) => call.args.includes('daemon-reload'))).toBe(true);
+    expect(exec.calls.some((call) => call.args.join(' ') === '--user enable --now sidetrack-companion.service')).toBe(true);
+  });
+
+  it('launchd plist renders KeepAlive + RunAtLoad for auto-respawn', async () => {
+    const files = fakeFiles();
+    const exec = fakeExec();
+    const installer = pickInstaller('darwin', { homeDir: '/home/test', files, exec });
+
+    const result = await installer.install({
+      vaultPath: '/vault',
+      port: 17373,
+      companionCommand: ['/usr/local/bin/bun', '/repo/dist/cli.js'],
+    });
+    const body = files.writes.get(result.path) ?? '';
+
+    expect(body).toContain('<key>Label</key><string>com.sidetrack.companion</string>');
+    expect(body).toContain('<key>RunAtLoad</key><true/>');
+    expect(body).toContain('<key>KeepAlive</key><true/>');
+    expect(body).toContain('<string>--vault</string>');
+    expect(body).toContain('<string>/vault</string>');
+    expect(body).toContain('<string>--port</string>');
+    expect(body).toContain('<string>17373</string>');
+  });
+
+  it('pickInstaller selects the platform-correct generator', () => {
+    const deps = { homeDir: '/home/test' } as const;
+    expect(pickInstaller('darwin', deps).path).toBe(
+      '/home/test/Library/LaunchAgents/com.sidetrack.companion.plist',
+    );
+    expect(pickInstaller('linux', deps).path).toBe(
+      '/home/test/.config/systemd/user/sidetrack-companion.service',
+    );
+    expect(pickInstaller('win32', {}).path).toBe('SidetrackCompanion');
+    expect(() => pickInstaller('freebsd' as NodeJS.Platform, deps)).toThrow(/unsupported platform/);
+  });
+
   it('installs and uninstalls Windows scheduled task idempotently', async () => {
     const exec = fakeExec();
     const installer = pickInstaller('win32', { exec });

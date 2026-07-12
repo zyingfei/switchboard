@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 
-import { companionVersion, runCli } from './cli.js';
+import { companionVersion, renderServiceNextSteps, runCli } from './cli.js';
 
 class MemoryWritable extends Writable {
   private chunks = '';
@@ -187,5 +187,38 @@ describe('runCli', () => {
     } finally {
       await rm(vaultRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe('renderServiceNextSteps', () => {
+  it('names the platform manager and the auto-respawn behaviour (darwin)', () => {
+    const text = renderServiceNextSteps({
+      platform: 'darwin',
+      path: '/home/test/Library/LaunchAgents/com.sidetrack.companion.plist',
+      vaultPath: '/home/test/sidetrack-vault',
+      port: 17373,
+    });
+    expect(text).toContain('service installed (darwin)');
+    expect(text).toContain('launchd');
+    expect(text).toContain('restarts automatically');
+    expect(text).toContain(
+      'service file : /home/test/Library/LaunchAgents/com.sidetrack.companion.plist',
+    );
+  });
+
+  it('surfaces the vault, API URL, bridge key, pairing token, and management commands', () => {
+    const text = renderServiceNextSteps({
+      platform: 'linux',
+      path: '/home/test/.config/systemd/user/sidetrack-companion.service',
+      vaultPath: '/home/test/vault',
+      port: 17380,
+    });
+    expect(text).toContain('systemd (user)');
+    expect(text).toContain('vault        : /home/test/vault');
+    expect(text).toContain('API          : http://127.0.0.1:17380');
+    expect(text).toContain('bridge key   : /home/test/vault/_BAC/.config/bridge.key');
+    expect(text).toContain('/home/test/vault/_BAC/.config/pair.txt');
+    expect(text).toContain('--service-status');
+    expect(text).toContain('--uninstall-service');
   });
 });

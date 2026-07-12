@@ -22,7 +22,7 @@ import type { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
-import { pairingToken, writePairToken } from './auth/bridgeKey.js';
+import { bridgeKeyPath, pairTokenPath, pairingToken, writePairToken } from './auth/bridgeKey.js';
 import { pickInstaller } from './install/index.js';
 import { ensurePageContentLexicalIndex } from './page-content/store.js';
 import { withBunSmolCommand } from './process/bunMemory.js';
@@ -170,6 +170,46 @@ export const renderHelp = (): string =>
     '    idempotency records, and ranker caches. It never touches _BAC/log,',
     '    _BAC/events, threads, workstreams, or other canonical user state.',
   ].join('\n');
+
+// Post-install guidance printed after `--install-service` succeeds. Pure
+// string builder (no I/O) so it can be unit-tested and so the exact
+// next-steps stay in one place. The service is already loaded and running
+// under KeepAlive/Restart=always at this point — these lines tell the user
+// how to (a) pair the extension, (b) inspect the service, and (c) remove
+// it — the three things they need with no live foreground log to read.
+export const renderServiceNextSteps = (input: {
+  readonly platform: NodeJS.Platform;
+  readonly path: string;
+  readonly vaultPath: string;
+  readonly port: number;
+}): string => {
+  const manager =
+    input.platform === 'darwin'
+      ? 'launchd'
+      : input.platform === 'linux'
+        ? 'systemd (user)'
+        : input.platform === 'win32'
+          ? 'Task Scheduler'
+          : input.platform;
+  return [
+    `sidetrack companion service installed (${input.platform}).`,
+    `It now runs in the background under ${String(manager)} and restarts automatically`,
+    'on crash and at login — no foreground terminal needed.',
+    '',
+    `  service file : ${input.path}`,
+    `  vault        : ${input.vaultPath}`,
+    `  API          : http://127.0.0.1:${String(input.port)}`,
+    `  bridge key   : ${bridgeKeyPath(input.vaultPath)}`,
+    '',
+    'Next steps:',
+    '  1. Load the unpacked extension (see INSTALL.md step 3), open the side panel.',
+    `  2. Pair it: paste the pairing token from ${pairTokenPath(input.vaultPath)}`,
+    `     (or the raw key from ${bridgeKeyPath(input.vaultPath)}) into`,
+    '     Settings → Companion connection.',
+    '  3. Check it later with:  sidetrack-companion --service-status',
+    '  4. Remove it with:       sidetrack-companion --uninstall-service',
+  ].join('\n');
+};
 
 const writeLine = (stream: Writable, text: string): void => {
   stream.write(`${text}\n`);
@@ -895,8 +935,15 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
         : { syncRelayLocalPort: args.syncRelayLocalPort }),
       ...(args.syncRelay === undefined ? {} : { syncRelay: args.syncRelay }),
     });
-    writeLine(streams.stdout, `sidetrack companion service installed (${result.platform})`);
-    writeLine(streams.stdout, `path ${result.path}`);
+    writeLine(
+      streams.stdout,
+      renderServiceNextSteps({
+        platform: result.platform,
+        path: result.path,
+        vaultPath: args.vaultPath,
+        port: args.port,
+      }),
+    );
     return result.installed ? 0 : 1;
   }
 

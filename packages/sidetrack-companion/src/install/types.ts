@@ -36,6 +36,11 @@ export interface ExecPort {
 }
 
 export interface Installer {
+  // Location of the generated service artifact — a launchd plist path, a
+  // systemd unit path, or a Windows task name. Every concrete installer
+  // already exposes it; surfacing it on the interface lets callers report
+  // the install location without narrowing to a platform class.
+  readonly path: string;
   readonly install: (opts: InstallOptions) => Promise<InstallResult>;
   readonly uninstall: () => Promise<void>;
   readonly status: () => Promise<ServiceStatus>;
