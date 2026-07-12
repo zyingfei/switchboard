@@ -404,49 +404,100 @@ const readLogFileSince = async (
 
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
 
-const readLastNonEmptyLine = async (path: string): Promise<string | null> => {
-  let handle: Awaited<ReturnType<typeof open>>;
-  try {
-    handle = await open(path, 'r');
-  } catch (error) {
-    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-      return null;
-    }
-    throw error;
+// A shard file that exists but cannot be read (EACCES/EIO/EMFILE — a
+// network-mounted or iCloud-dataless vault, fd exhaustion, or a
+// permissions glitch on ONE shard). Distinguished from a missing shard
+// (ENOENT, handled as "no tail") because a read failure must NOT be
+// silently treated as an absent tail: if the seq file were ALSO lost,
+// silently skipping the shard would let nextSeq reissue a duplicate dot.
+// Callers decide policy (proceed on an intact seq file, refuse when the
+// counter is untrusted) — see `maxShardTailSeqForReplica`.
+export class ShardUnreadableError extends Error {
+  readonly shardPath: string;
+  constructor(shardPath: string, cause: unknown) {
+    super(`Event-log shard is unreadable: ${shardPath}`, { cause });
+    this.name = 'ShardUnreadableError';
+    this.shardPath = shardPath;
   }
+}
 
-  try {
-    const { size } = await handle.stat();
-    let position = size;
-    let suffix = '';
-    while (position > 0) {
-      const readLength = Math.min(TAIL_READ_CHUNK_BYTES, position);
-      position -= readLength;
-      const buffer = Buffer.allocUnsafe(readLength);
-      const { bytesRead } = await handle.read(buffer, 0, readLength, position);
-      suffix = `${buffer.subarray(0, bytesRead).toString('utf8')}${suffix}`;
-      const withoutTrailingBreaks = suffix.replace(/[\r\n]+$/u, '');
-      if (withoutTrailingBreaks.length === 0) continue;
-      const lineBreak = withoutTrailingBreaks.lastIndexOf('\n');
-      if (lineBreak >= 0 || position === 0) {
-        return withoutTrailingBreaks.slice(lineBreak + 1);
-      }
+const isEnoent = (error: unknown): boolean =>
+  error instanceof Error && 'code' in error && error.code === 'ENOENT';
+
+// Yield the shard's non-empty lines from the END backward, one at a
+// time, using bounded chunked reads (never a full-file materialisation
+// for the common case where the last line already parses). The backward
+// scan lets `readShardTailSeq` recover the last VALID line for a replica
+// when the final line was torn by a crash mid-append.
+async function* readNonEmptyLinesFromTail(
+  handle: Awaited<ReturnType<typeof open>>,
+  size: number,
+): AsyncGenerator<string, void, void> {
+  let position = size;
+  // `pending` holds bytes read but not yet split into complete lines —
+  // its LEADING segment may still be the tail of a line whose start is
+  // in an earlier chunk, so it is only emitted once we hit a newline
+  // before it (or reach the file start).
+  let pending = '';
+  while (position > 0) {
+    const readLength = Math.min(TAIL_READ_CHUNK_BYTES, position);
+    position -= readLength;
+    const buffer = Buffer.allocUnsafe(readLength);
+    const { bytesRead } = await handle.read(buffer, 0, readLength, position);
+    pending = `${buffer.subarray(0, bytesRead).toString('utf8')}${pending}`;
+    // Emit every complete line whose start we have now seen (i.e. that
+    // is preceded by a newline within `pending`). Keep the leading
+    // segment (before the first newline) buffered — its start may be in
+    // the next chunk.
+    let lineBreak = pending.lastIndexOf('\n');
+    while (lineBreak >= 0) {
+      const line = pending.slice(lineBreak + 1).replace(/[\r\n]+$/u, '');
+      pending = pending.slice(0, lineBreak);
+      if (line.length > 0) yield line;
+      lineBreak = pending.lastIndexOf('\n');
     }
-    return null;
-  } finally {
-    await handle.close();
   }
-};
+  const first = pending.replace(/[\r\n]+$/u, '');
+  if (first.length > 0) yield first;
+}
 
+// Highest seq committed by `expectedReplicaId` in this shard, or null if
+// the shard carries no valid line for that replica. Scans BACKWARD from
+// the tail and returns the first line that parses AND belongs to the
+// replica — so a crash that tore only the final line (no fsync anywhere)
+// still recovers the prior valid line's seq rather than under-recovering
+// to null. Throws `ShardUnreadableError` on a non-ENOENT read failure
+// (the caller must not treat that as "no tail"); returns null on ENOENT.
 const readShardTailSeq = async (
   path: string,
   expectedReplicaId: string,
 ): Promise<number | null> => {
-  const line = await readLastNonEmptyLine(path);
-  if (line === null) return null;
-  const event = parseLine(line);
-  if (event === null || event.dot.replicaId !== expectedReplicaId) return null;
-  return event.dot.seq;
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, 'r');
+  } catch (error) {
+    if (isEnoent(error)) return null;
+    throw new ShardUnreadableError(path, error);
+  }
+  try {
+    const { size } = await handle.stat();
+    for await (const line of readNonEmptyLinesFromTail(handle, size)) {
+      const event = parseLine(line);
+      if (event !== null && event.dot.replicaId === expectedReplicaId) {
+        return event.dot.seq;
+      }
+      // Otherwise: torn last line, a foreign replica's interleaved line,
+      // or garbage — keep scanning backward for this replica's last
+      // valid line rather than giving up (which would under-recover the
+      // high-water mark).
+    }
+    return null;
+  } catch (error) {
+    if (isEnoent(error)) return null;
+    throw new ShardUnreadableError(path, error);
+  } finally {
+    await handle.close();
+  }
 };
 
 const listJsonlFiles = async (dir: string): Promise<string[]> => {
@@ -474,22 +525,63 @@ const listJsonlFiles = async (dir: string): Promise<string[]> => {
 // the highest seq this replica ever committed to its OWN shards.
 //
 // Bounded work: reads ONLY this replica's shard directory and tail-reads
-// each shard file (last non-empty line), never a full-log scan. Within
-// a replica's own shard, appendClient allocates strictly increasing
-// seqs, so the tail line carries that file's max; the max across the
-// replica's shards is its committed high-water mark. Returns 0 when the
-// replica has no shards yet (fresh replica).
+// each shard file (last valid line, scanning backward), never a full-log
+// scan. Within a replica's own shard, appendClient allocates strictly
+// increasing seqs, so the tail line carries that file's max; the max
+// across the replica's shards is its committed high-water mark.
+//
+// `unreadableShards` lists shards that EXIST but could not be read
+// (non-ENOENT: EACCES/EIO/EMFILE). It is reported, NOT swallowed: a
+// shard whose tail we could not verify may hide a higher committed seq,
+// so advancing the counter as if it did not exist could reissue a
+// duplicate dot when the seq file is also untrusted. The boot caller
+// (`loadOrCreateReplica`) decides policy from this field.
+export interface ShardTailReconciliation {
+  // Max committed seq across the readable shards (0 when none).
+  readonly maxSeq: number;
+  // Paths of shards that exist but failed to read (non-ENOENT).
+  readonly unreadableShards: readonly string[];
+}
+
+export const reconcileShardTailSeqForReplica = async (
+  vaultPath: string,
+  replicaId: string,
+): Promise<ShardTailReconciliation> => {
+  const files = await listJsonlFiles(replicaLogDir(vaultPath, replicaId));
+  let maxSeq = 0;
+  const unreadableShards: string[] = [];
+  for (const file of files) {
+    let tailSeq: number | null;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- bounded, one tail read per shard
+      tailSeq = await readShardTailSeq(file, replicaId);
+    } catch (error) {
+      if (error instanceof ShardUnreadableError) {
+        unreadableShards.push(error.shardPath);
+        continue;
+      }
+      throw error;
+    }
+    if (tailSeq !== null && tailSeq > maxSeq) maxSeq = tailSeq;
+  }
+  return { maxSeq, unreadableShards };
+};
+
+// Back-compat strict variant: the committed high-water mark, throwing on
+// any unreadable shard. Retained for callers that want the raw number
+// and treat an unreadable shard as fatal. Returns 0 for a fresh replica.
 export const maxShardTailSeqForReplica = async (
   vaultPath: string,
   replicaId: string,
 ): Promise<number> => {
-  const files = await listJsonlFiles(replicaLogDir(vaultPath, replicaId));
-  let max = 0;
-  for (const file of files) {
-    const tailSeq = await readShardTailSeq(file, replicaId);
-    if (tailSeq !== null && tailSeq > max) max = tailSeq;
+  const { maxSeq, unreadableShards } = await reconcileShardTailSeqForReplica(
+    vaultPath,
+    replicaId,
+  );
+  if (unreadableShards.length > 0) {
+    throw new ShardUnreadableError(unreadableShards[0] as string, undefined);
   }
-  return max;
+  return maxSeq;
 };
 
 export const createEventLog = (
@@ -991,6 +1083,12 @@ export const createEventLog = (
       // previous batch's append invalidates the memo).
       const idx = await freshAppendIndexes();
       const presentInBatch = new Set<string>();
+      // Dots minted earlier in THIS batch. Kept separate from the shared
+      // idx.dotKeys (which only registers after the durable write) so a
+      // mid-batch write failure can't strand phantom dots in the live
+      // index, while a regressed counter that hands out the same seq
+      // twice within one batch is still caught.
+      const dotsInBatch = new Set<string>();
       const events: AcceptedEvent<TPayload>[] = [];
       const results: { clientEventId: string; imported: boolean }[] = [];
       const at = now();
@@ -1004,9 +1102,30 @@ export const createEventLog = (
         const deps = computeDepsIndexed(input, idx);
         // eslint-disable-next-line no-await-in-loop -- nextSeq is a cheap monotonic counter
         const seq = await replica.nextSeq();
+        const dot: Dot = { replicaId: replica.replicaId, seq };
+        // Same defense-in-depth as appendClient: boot reconciliation
+        // (loadOrCreateReplica ← reconcileShardTailSeqForReplica) lifts
+        // the counter past every committed shard tail, so a fresh seq
+        // must not collide. But under the correlated fault this fix
+        // guards (seq file lost/regressed AND a shard tail torn) the
+        // counter could regress; without this guard the batch path would
+        // SILENTLY write a duplicate (replicaId, seq) dot — a permanent
+        // DotCollisionError that poisons sync. The index is already in
+        // hand (no extra scan) — reject loudly instead. Also check the
+        // batch-local set so a regressed counter handing out the same seq
+        // twice WITHIN one batch is caught, without mutating the shared
+        // index before the durable write (which would strand phantom dots
+        // on a mid-batch write failure).
+        const dotKey = dotKeyOf(dot);
+        if (idx.dotKeys.has(dotKey) || dotsInBatch.has(dotKey)) {
+          throw new Error(
+            `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
+          );
+        }
+        dotsInBatch.add(dotKey);
         const event: AcceptedEvent<TPayload> = {
           clientEventId: input.clientEventId,
-          dot: { replicaId: replica.replicaId, seq },
+          dot,
           deps,
           aggregateId: input.aggregateId,
           type: input.type,
