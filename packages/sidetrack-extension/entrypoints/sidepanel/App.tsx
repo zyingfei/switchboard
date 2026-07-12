@@ -3494,6 +3494,48 @@ const App = () => {
     })();
   };
 
+  // Current tab's capturable URL + a short host label for the
+  // no-capture-rule overflow actions. undefined when the active tab has
+  // no http(s) URL (chrome://, extension pages, etc.) — the menu rows
+  // omit themselves in that case. The background computes the
+  // authoritative eTLD+1; this is only a display hint.
+  const currentSiteUrl =
+    liveActiveTabUrlRef.current ??
+    state.activeTabUrl ??
+    state.currentTab?.tabSnapshot?.url ??
+    state.currentTab?.threadUrl;
+  const currentSiteLabel = useMemo(() => {
+    if (typeof currentSiteUrl !== 'string' || currentSiteUrl.length === 0) return undefined;
+    try {
+      const parsed = new URL(currentSiteUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+      return parsed.hostname.replace(/^www\./u, '');
+    } catch {
+      return undefined;
+    }
+  }, [currentSiteUrl]);
+
+  const addNoCaptureRuleForCurrentSite = (kind: 'domain' | 'similar') => {
+    if (typeof currentSiteUrl !== 'string' || currentSiteLabel === undefined) return;
+    void (async () => {
+      try {
+        await chrome.runtime.sendMessage({
+          type: messageTypes.addNoCaptureRule,
+          source: {
+            url: currentSiteUrl,
+            ...(typeof state.currentTab?.title === 'string'
+              ? { title: state.currentTab.title }
+              : {}),
+          },
+          kind,
+        });
+      } catch {
+        // Best-effort; the Settings Capture section is the source of
+        // truth and will reflect the persisted list on next open.
+      }
+    })();
+  };
+
   const handleMoveTarget = (target: WorkstreamOption | { readonly create: string }) => {
     const threadId = moveThreadId;
     if (threadId === null) {
@@ -6673,6 +6715,17 @@ const App = () => {
               setDesignPreviewOpen(true);
             }}
             dumpStatus={dumpStatus.kind}
+            {...(currentSiteLabel === undefined
+              ? {}
+              : {
+                  currentSiteLabel,
+                  onBlockCurrentSite: () => {
+                    addNoCaptureRuleForCurrentSite('domain');
+                  },
+                  onBlockSimilarSites: () => {
+                    addNoCaptureRuleForCurrentSite('similar');
+                  },
+                })}
           />
           <button
             className="icon-btn"
