@@ -114,6 +114,7 @@ import {
   type FocusGroupSaveInput,
 } from '../../src/sidepanel/connections/ConnectionsView';
 import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
+import { sendMessageWithWatchdog } from '../../src/sidepanel/connections/sendMessageWithWatchdog';
 import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
 import { NowHistoryStrip } from '../../src/sidepanel/now/NowHistoryStrip';
@@ -5219,22 +5220,21 @@ const App = () => {
       setCurrentTabBulkPreview(null);
       return;
     }
-    // Paused (master off) or blocked (matching no-capture rule): the
-    // card renders an explicit not-captured state instead of a tier, so
-    // clear any stale coverage and DON'T round-trip the companion for a
-    // read-only coverage lookup on a page we're deliberately not
-    // indexing. (This was the stale-'Indexed chunks' driver for a page
-    // indexed BEFORE it was blocklisted — investigation leak #2.)
-    if (currentTabCaptureSuppressed) {
-      setCurrentTabCoverage(null);
-      setCurrentTabBulkPreview(null);
-      return;
-    }
     if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
     let active = true;
     // Clear stale coverage while the new URL's fetch is in flight so
     // the card never shows the previous page's index state.
+    setCurrentTabBulkPreview(null);
     setCurrentTabCoverage(null);
+    // Fetch coverage EVEN when capture is paused/blocked. Deleting text
+    // that was captured BEFORE the site was blocked (or before the pause)
+    // is a privacy action and must stay available — the delete button
+    // only renders when coverage shows an indexed state (PageTextPanel's
+    // `canDelete`). The panel suppresses the tier/chunk DISPLAY on a
+    // blocked page (captureDisabled ⇒ "not captured", chunk count hidden),
+    // so fetching here does NOT reintroduce the stale-'Indexed chunks'
+    // leak this effect previously guarded against — it only keeps the
+    // "Delete text" affordance alive on paused/blocked pages.
     chrome.runtime.sendMessage(
       { type: messageTypes.pageContentCoverage, canonicalUrl: currentTabCanonicalUrl },
       (response: unknown) => {
@@ -5267,11 +5267,13 @@ const App = () => {
       type === messageTypes.pageContentDelete
         ? { type, canonicalUrl: currentTabCanonicalUrl }
         : { type };
-    chrome.runtime.sendMessage(message, (response: unknown) => {
+    // Watchdog-wrapped: busy ALWAYS settles — on the response, a runtime
+    // lastError, a synchronous throw, or a client-side timeout. Prevents
+    // the reported "Delete text spins forever" when the companion is busy.
+    sendMessageWithWatchdog(message, ({ response, error }) => {
       setCurrentTabPageContentBusy(null);
-      const lastError = chrome.runtime.lastError;
-      if (lastError !== undefined) {
-        setCurrentTabPageContentError(lastError.message ?? 'Page-content operation failed.');
+      if (error !== null) {
+        setCurrentTabPageContentError(error);
         return;
       }
       const parsed = response as PageContentOperationResponse;
@@ -5287,13 +5289,12 @@ const App = () => {
   const loadCurrentTabBulkPreview = (): void => {
     setCurrentTabBulkBusy('preview');
     setCurrentTabPageContentError(null);
-    chrome.runtime.sendMessage(
+    sendMessageWithWatchdog(
       { type: messageTypes.pageContentOpenTabsPreview },
-      (response: unknown) => {
+      ({ response, error }) => {
         setCurrentTabBulkBusy(null);
-        const lastError = chrome.runtime.lastError;
-        if (lastError !== undefined) {
-          setCurrentTabPageContentError(lastError.message ?? 'Open-tab preview failed.');
+        if (error !== null) {
+          setCurrentTabPageContentError(error);
           return;
         }
         const parsed = response as PageContentOpenTabsPreviewResponse;
@@ -5309,13 +5310,12 @@ const App = () => {
   const runCurrentTabBulkIndex = (): void => {
     setCurrentTabBulkBusy('index');
     setCurrentTabPageContentError(null);
-    chrome.runtime.sendMessage(
+    sendMessageWithWatchdog(
       { type: messageTypes.pageContentIndexOpenTabs },
-      (response: unknown) => {
+      ({ response, error }) => {
         setCurrentTabBulkBusy(null);
-        const lastError = chrome.runtime.lastError;
-        if (lastError !== undefined) {
-          setCurrentTabPageContentError(lastError.message ?? 'Open-tab indexing failed.');
+        if (error !== null) {
+          setCurrentTabPageContentError(error);
           return;
         }
         const parsed = response as PageContentBulkOperationResponse;
