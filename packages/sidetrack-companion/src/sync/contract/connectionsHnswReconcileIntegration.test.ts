@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import type { ConnectionsSnapshot } from '../../connections/snapshot.js';
 import { DISPATCH_RECORDED } from '../../dispatches/events.js';
+import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import { createEventLog, type EventLog } from '../eventLog.js';
@@ -29,6 +30,7 @@ const envKeys = [
   'SIDETRACK_CONNECTIONS_CHILD',
   'SIDETRACK_CONNECTIONS_PHASE_LOG',
   'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES',
+  'SIDETRACK_SIMILARITY_REQUALIFY',
 ] as const;
 
 const childEntryPath = (): string =>
@@ -91,6 +93,43 @@ const appendDispatch = (
     },
   });
 
+// Append a late engagement.session.aggregated event that lifts an
+// already-logged visit past the >=5000ms similarity gate. Mirrors the
+// gap-backfill event shape (`visit:<url>` visitId) so the requalify
+// resolver exercises the same canonical-URL mapping the live path uses.
+const appendEngagementAggregate = (
+  eventLog: EventLog,
+  input: { readonly index: number; readonly focusedWindowMs: number },
+): ReturnType<EventLog['appendClientObserved']> => {
+  const url = `https://hnsw.test/${String(input.index)}`;
+  const visitId = `visit:${url}`;
+  return eventLog.appendClientObserved({
+    clientEventId: `engagement-aggregate-${String(input.index)}`,
+    aggregateId: `${ENGAGEMENT_SESSION_AGGREGATED}:${visitId}`,
+    type: ENGAGEMENT_SESSION_AGGREGATED,
+    baseVector: {},
+    payload: {
+      payloadVersion: 1,
+      visitId,
+      sessionId: `backfill:${visitId}`,
+      dimensions: {
+        engagement: {
+          activeMs: input.focusedWindowMs,
+          visibleMs: input.focusedWindowMs,
+          focusedWindowMs: input.focusedWindowMs,
+          idleMs: 0,
+          foregroundBursts: 1,
+          returnCount: 0,
+          scrollEvents: 0,
+          maxScrollRatio: 0,
+          copyCount: 0,
+          pasteCount: 0,
+        },
+      },
+    },
+  });
+};
+
 const hnswBasePath = (root: string): string =>
   join(root, '_BAC', 'connections', 'visit-similarity-hnsw');
 
@@ -149,6 +188,7 @@ describe('HNSW reconcile child integration', () => {
     process.env['SIDETRACK_TEST_EMBEDDER'] = '1';
     process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
     delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'];
+    delete process.env['SIDETRACK_SIMILARITY_REQUALIFY'];
     process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.8';
     process.env['SIDETRACK_SIMILARITY_TOP_K'] = '20';
     process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '5000';
@@ -495,6 +535,107 @@ describe('HNSW reconcile child integration', () => {
     }
 
     expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=3');
+  });
+
+  it('requalifies an old visit into the reconcile set when late engagement crosses the gate', async () => {
+    // Regression for the engagement-regression starvation: a visit
+    // observed below the >=5000ms gate is inserted into the HNSW store
+    // but forms no similarity edges. When a LATE engagement aggregate
+    // (a gap-backfill event) lifts it past the gate on a later drain,
+    // the scoped-delta reconcile set used to skip it entirely (its URL
+    // was never in pendingTimelineVisitIds), so the similarity edges
+    // never reformed. The requalify path must pull it back in.
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    // A corpus of eligible visits (index 0..7, default focusedWindowMs
+    // 10_000) that all share the sidetrack_eval_postgres title token so
+    // the requalified target has neighbours to resemble.
+    for (let index = 0; index < 8; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:0${String(index)}:00.000Z`,
+      });
+    }
+    // The target visit (index 8) starts BELOW the gate — inserted but
+    // edge-less. Same title token so it would resemble the corpus once
+    // eligible.
+    await appendVisit(eventLog, {
+      index: 8,
+      observedAt: '2026-05-22T10:08:00.000Z',
+      focusedWindowMs: 1,
+    });
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+
+    const targetVisitKey = 'https://hnsw.test/8';
+    const before = await createConnectionsStore(vaultRoot).readCurrent();
+    if (before === null) throw new Error('expected baseline snapshot');
+    const beforeTargetRows = similarityRows(before).filter((row) =>
+      rowTouchesVisit(row, new Set([targetVisitKey])),
+    );
+    expect(beforeTargetRows.length).toBe(0);
+
+    // Late engagement aggregate lifts the target past the gate. No new
+    // BROWSER_TIMELINE_OBSERVED for the target — this is the exact live
+    // gap: only the engagement event arrives.
+    await appendEngagementAggregate(eventLog, { index: 8, focusedWindowMs: 60_000 });
+
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    } finally {
+      writeSpy.mockRestore();
+    }
+    // The phase log must show the target was requalified into the set.
+    expect(output.join('')).toContain('requalified=1');
+
+    const after = await createConnectionsStore(vaultRoot).readCurrent();
+    if (after === null) throw new Error('expected reconciled snapshot');
+    const afterTargetRows = similarityRows(after).filter((row) =>
+      rowTouchesVisit(row, new Set([targetVisitKey])),
+    );
+    expect(afterTargetRows.length).toBeGreaterThan(0);
+  });
+
+  it('does not requalify a late-engagement visit when the kill-switch is set', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    process.env['SIDETRACK_SIMILARITY_REQUALIFY'] = '0';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let index = 0; index < 8; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:0${String(index)}:00.000Z`,
+      });
+    }
+    await appendVisit(eventLog, {
+      index: 8,
+      observedAt: '2026-05-22T10:08:00.000Z',
+      focusedWindowMs: 1,
+    });
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+
+    await appendEngagementAggregate(eventLog, { index: 8, focusedWindowMs: 60_000 });
+
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    } finally {
+      writeSpy.mockRestore();
+    }
+    // Kill-switch: the requalify resolver must be inert (requalified=0).
+    expect(output.join('')).toContain('requalified=0');
   });
 
   it('marks parent health successful when a runner drain completes in a child process', async () => {

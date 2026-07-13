@@ -891,13 +891,104 @@ const runIngestSubcommand = async (
 // double-counting). Defaults to a dry-run; pass --apply to write.
 //
 // See engagement/backfillSessionAggregates.ts for the derivation rationale.
+const runRequalifySimilarityVerb = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined) {
+    writeLine(streams.stderr, '--vault <path> is required for engagement requalify-similarity.');
+    return 2;
+  }
+  const apply = argv.includes('--apply');
+  const gateRaw = findArgValue(argv, '--gate-ms');
+  const gateMs = gateRaw === undefined ? 5_000 : Number(gateRaw);
+  if (!Number.isFinite(gateMs) || gateMs < 0) {
+    writeLine(streams.stderr, `--gate-ms must be a non-negative number (got ${String(gateRaw)}).`);
+    return 2;
+  }
+  const maxRaw = findArgValue(argv, '--max');
+  const maxPings = maxRaw === undefined ? 0 : Number(maxRaw);
+  if (!Number.isFinite(maxPings) || maxPings < 0) {
+    writeLine(streams.stderr, `--max must be a non-negative number (got ${String(maxRaw)}).`);
+    return 2;
+  }
+
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+  const { createConnectionsStore } = await import('./connections/snapshot.js');
+  const { ENGAGEMENT_SESSION_AGGREGATED } = await import('./engagement/events.js');
+  const { planSimilarityRequalify, urlsWithSimilarityEdgeFromEdges } = await import(
+    './engagement/requalifySimilarity.js'
+  );
+
+  const replica = await loadOrCreateReplica(vaultPath);
+  const eventLog = createEventLog(vaultPath, replica);
+  // Type-hinted read — only the aggregate events, not the ~92% intervals.
+  const aggregates = await eventLog.streamFiltered(
+    (e) => e.type === ENGAGEMENT_SESSION_AGGREGATED,
+    new Set([ENGAGEMENT_SESSION_AGGREGATED]),
+  );
+  const snapshot = await createConnectionsStore(vaultPath).readCurrent();
+  const urlsWithSimilarityEdge = urlsWithSimilarityEdgeFromEdges(snapshot?.edges ?? []);
+
+  const plan = planSimilarityRequalify({
+    aggregates,
+    urlsWithSimilarityEdge,
+    options: { engagementGateMs: gateMs, maxPings },
+  });
+  writeLine(
+    streams.stdout,
+    `requalify gate=${String(gateMs)}ms servedSimilarityUrls=${String(urlsWithSimilarityEdge.size)}`,
+  );
+  writeLine(
+    streams.stdout,
+    `  aggregates: scanned=${String(plan.stats.aggregatesScanned)} eligibleVisits=${String(plan.stats.distinctEligibleVisits)}`,
+  );
+  writeLine(
+    streams.stdout,
+    `  backlog: hasSimEdge=${String(plan.stats.visitsWithSimilarityEdge)} needsRequalify=${String(plan.stats.requalifyBacklog)} pingsPlanned=${String(plan.stats.pingsPlanned)}${plan.stats.cappedBy === null ? '' : ` (capped at ${String(plan.stats.cappedBy)})`}`,
+  );
+  for (const url of plan.backlogUrls.slice(0, 10)) {
+    writeLine(streams.stdout, `    - ${url}`);
+  }
+  if (plan.backlogUrls.length > 10) {
+    writeLine(streams.stdout, `    ... and ${String(plan.backlogUrls.length - 10)} more`);
+  }
+  if (!apply) {
+    writeLine(streams.stdout, 'dry-run: no events written. Re-run with --apply to append pings.');
+    return 0;
+  }
+  let imported = 0;
+  let skipped = 0;
+  let errors = 0;
+  for (const event of plan.events) {
+    try {
+      const result = await eventLog.importPeerEvent(event);
+      if (result.imported) imported += 1;
+      else skipped += 1;
+    } catch (err) {
+      errors += 1;
+      writeLine(
+        streams.stderr,
+        `[requalify] ${event.payload.visitId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  writeLine(
+    streams.stdout,
+    `requalify: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)}`,
+  );
+  return errors > 0 ? 1 : 0;
+};
+
 const runEngagementSubcommand = async (
   argv: readonly string[],
   streams: CliStreams,
 ): Promise<number> => {
   const verb = argv[1];
   if (verb === undefined || verb === 'help' || verb === '--help') {
-    writeLine(streams.stdout, 'Engagement session-aggregate gap backfill.');
+    writeLine(streams.stdout, 'Engagement session-aggregate gap backfill + similarity requalification.');
     writeLine(streams.stdout, '');
     writeLine(streams.stdout, 'Usage:');
     writeLine(
@@ -908,16 +999,31 @@ const runEngagementSubcommand = async (
       streams.stdout,
       '      [--from <iso|ms>] [--to <iso|ms>] [--apply]',
     );
+    writeLine(
+      streams.stdout,
+      '  sidetrack-companion engagement requalify-similarity --vault <path> \\',
+    );
+    writeLine(
+      streams.stdout,
+      '      [--gate-ms <n>] [--max <n>] [--apply]',
+    );
     writeLine(streams.stdout, '');
-    writeLine(streams.stdout, 'Derives missing engagement.session.aggregated events from logged');
-    writeLine(streams.stdout, 'engagement.interval.observed events (per-visit sum, excluding visits');
-    writeLine(streams.stdout, 'that already have a real aggregate). Dry-run unless --apply is given.');
-    writeLine(streams.stdout, 'Idempotent: safe to re-run.');
+    writeLine(streams.stdout, 'backfill-aggregates: derives missing engagement.session.aggregated events');
+    writeLine(streams.stdout, '  from logged engagement.interval.observed events (per-visit sum,');
+    writeLine(streams.stdout, '  excluding visits that already have a real aggregate).');
+    writeLine(streams.stdout, 'requalify-similarity: finds visits whose summed engagement crosses the');
+    writeLine(streams.stdout, '  >=5000ms gate but have NO visit_resembles_visit edge in the served');
+    writeLine(streams.stdout, '  snapshot (the historical requalification backlog), and emits a');
+    writeLine(streams.stdout, '  zero-dimension requalify ping per visit to force it back into a drain.');
+    writeLine(streams.stdout, 'Both dry-run unless --apply is given. Idempotent: safe to re-run.');
     return verb === undefined ? 2 : 0;
+  }
+  if (verb === 'requalify-similarity') {
+    return await runRequalifySimilarityVerb(argv, streams);
   }
   if (verb !== 'backfill-aggregates') {
     writeLine(streams.stderr, `unknown engagement verb: ${verb}`);
-    writeLine(streams.stderr, 'try: backfill-aggregates --vault <path> [--apply]');
+    writeLine(streams.stderr, 'try: backfill-aggregates | requalify-similarity --vault <path> [--apply]');
     return 2;
   }
   const vaultPath = findArgValue(argv, '--vault');

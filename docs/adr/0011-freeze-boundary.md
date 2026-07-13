@@ -151,3 +151,66 @@ The freeze lifts when **both** conditions are met:
 When both gates pass, update this ADR's status to Superseded and record
 the freeze-lift date. The first post-freeze ranker/recall/connections
 scope item should reference this ADR to confirm the lift.
+
+## Amendment 2026-07-12 — evidence-gated regression repair is freeze-safe
+
+**Context.** The engagement→similarity chain regressed: the extension
+stopped emitting `engagement.session.aggregated` under MV3 service-worker
+eviction (fixed by PR #251's durable session store + drain-alarm sweep),
+which starved the >=5000ms visit-similarity gate. Result: the served
+connections snapshot dropped from a ~30k `visit_resembles_visit` baseline
+(June) to **zero** (July) — verified live on the test companion
+(`/v1/connections` shows 0 similarity edges; the eval spine's
+`connections-precision` reports `totalServedSimilarityEdges=0` with 70
+user-confirmed related-pairs unscored). PR #251 backfilled 127 gap
+aggregates, but the OLD visits' similarity edges did not reform, because
+the scoped-delta materializer only revisits a visit whose URL is in the
+drain window (a fresh `browser.timeline.observed`). A late engagement
+event puts the URL in neither the reconcile set nor the touched set — the
+visit is starved forever (same structural gap as
+content-arrives-never-re-embeds).
+
+**Decision.** Under the OWNER DIRECTIVE ("connect built-but-unserved
+intelligence, evidence-gated — every serving change ships behind a flag
+whose default is set by the eval-spine verdict"), a change that **repairs
+a regression back toward a previously-validated baseline** is classified
+freeze-safe, subject to three conditions:
+
+1. It restores prior behavior; it does not add new serving scope, new
+   edge types, new weights, or new thresholds. (The similarity math,
+   gate, and edge kind are unchanged.)
+2. It ships behind a kill-switch env flag. The requalification path is
+   `SIDETRACK_SIMILARITY_REQUALIFY` (default ON, restores the lane;
+   `=0` disables and reverts to the regressed scoped-delta behavior).
+3. It is bounded per the CPU regime — no per-drain full rebuild. The
+   full-timeline reload only fires when a late engagement event actually
+   requalifies a visit absent from the window, and only re-embeds that
+   handful of visits (mirrors the existing `topicFullTimeline` precedent).
+
+**What landed (this amendment's scope):**
+
+- Companion `connectionsMaterializer.ts`: when an `engagement.session.
+  aggregated` event lifts an old visit past the similarity gate, that
+  visit's full-timeline entry is spliced into the similarity entry set
+  and its canonical URL joins `hnswReconcileVisitIds`, so the HNSW
+  producer re-embeds it and re-derives its edges. Observable in the
+  phase log as `buildVisitSimilarityHnsw.start … requalified=N`.
+- Offline CLI `engagement requalify-similarity` (planner/apply, report-
+  only default, `--apply`, `--max` batch cap): heals the historical
+  June-era backlog (visits gate-eligible but with no served similarity
+  edge) without a drain-storm, by emitting a zero-dimension "requalify
+  ping" per backlog visit. Zero dimensions add nothing to the classifier
+  sum (no double-count); the ping's `engagementVisit` invalidation is
+  the sole effect. Dry-run against the live vault copy: 1180 eligible
+  visits, all 1180 in the backlog (0 served similarity edges).
+
+**Boundary-test note.** This DID touch `connections/similarity`-adjacent
+production code (`connectionsMaterializer.ts`), which the boundary test
+lists as FROZEN. The exception is narrow: regression-repair-to-baseline,
+flag-gated, no new math. A change that altered the gate value, the
+similarity threshold, the edge weight, or added a new edge kind would
+still be FROZEN and is out of scope here. The eval-spine verdict that
+sets the default: `connections-precision` currently scores nothing
+(`overallPrecision=null`) precisely because zero edges are served — so
+restoring the lane is a prerequisite for the eval spine to produce any
+verdict at all, which is why the flag defaults ON.
