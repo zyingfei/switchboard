@@ -66,6 +66,7 @@ import { useConnectionsEdge, useConnectionsSnapshot } from './useConnectionsSnap
 import { useConnectionsFullSnapshot } from './useConnectionsFullSnapshot';
 import { useRecallSearch } from './useRecallSearch';
 import { PageTextPanel } from './PageTextPanel';
+import { sendMessageWithWatchdog } from './sendMessageWithWatchdog';
 import {
   dejaVuFacetLabel,
   dejaVuFacetChipLabel,
@@ -2312,11 +2313,12 @@ export const ConnectionsView = ({
       type === messageTypes.pageContentDelete
         ? { type, canonicalUrl: anchorCanonicalUrl }
         : { type };
-    chrome.runtime.sendMessage(message, (response: unknown) => {
+    // Watchdog-wrapped so busy ALWAYS settles — see the mirror on the
+    // current-tab card in App.tsx and sendMessageWithWatchdog.ts.
+    sendMessageWithWatchdog(message, ({ response, error }) => {
       setPageContentBusy(null);
-      const lastError = chrome.runtime.lastError;
-      if (lastError !== undefined) {
-        setPageContentError(lastError.message ?? 'Page-content operation failed.');
+      if (error !== null) {
+        setPageContentError(error);
         return;
       }
       const parsed = response as PageContentOperationResponse;
@@ -2332,13 +2334,12 @@ export const ConnectionsView = ({
   const loadPageContentBulkPreview = (): void => {
     setPageContentBulkBusy('preview');
     setPageContentError(null);
-    chrome.runtime.sendMessage(
+    sendMessageWithWatchdog(
       { type: messageTypes.pageContentOpenTabsPreview },
-      (response: unknown) => {
+      ({ response, error }) => {
         setPageContentBulkBusy(null);
-        const lastError = chrome.runtime.lastError;
-        if (lastError !== undefined) {
-          setPageContentError(lastError.message ?? 'Open-tab preview failed.');
+        if (error !== null) {
+          setPageContentError(error);
           return;
         }
         const parsed = response as PageContentOpenTabsPreviewResponse;
@@ -2354,13 +2355,12 @@ export const ConnectionsView = ({
   const runPageContentBulkIndex = (): void => {
     setPageContentBulkBusy('index');
     setPageContentError(null);
-    chrome.runtime.sendMessage(
+    sendMessageWithWatchdog(
       { type: messageTypes.pageContentIndexOpenTabs },
-      (response: unknown) => {
+      ({ response, error }) => {
         setPageContentBulkBusy(null);
-        const lastError = chrome.runtime.lastError;
-        if (lastError !== undefined) {
-          setPageContentError(lastError.message ?? 'Open-tab indexing failed.');
+        if (error !== null) {
+          setPageContentError(error);
           return;
         }
         const parsed = response as PageContentBulkOperationResponse;

@@ -1552,11 +1552,18 @@ describe('current-tab capture-state indicator', () => {
     // …and no "Indexing" progress copy leaks in.
     expect(card).not.toHaveTextContent('Indexing');
 
-    // Leak regression: no read-only coverage round-trip for a blocked page.
-    expect(sendMessage).not.toHaveBeenCalledWith(
-      { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
-      expect.any(Function),
-    );
+    // Display-leak regression is satisfied by the tier/Indexing assertions
+    // above (the DISPLAY is suppressed), independent of whether coverage
+    // is fetched. Coverage IS now fetched even for a blocked page so the
+    // "Delete text" affordance survives — deleting text captured BEFORE
+    // the block is a privacy action and must stay available. Assert the
+    // round-trip fires (it drives canDelete) but does NOT surface a tier.
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
+        expect.any(Function),
+      );
+    });
   });
 
   it('disables the "Index page" action for a blocklisted site', async () => {
@@ -1572,6 +1579,11 @@ describe('current-tab capture-state indicator', () => {
     expect(within(card).getByTestId('current-tab-index-selection')).toBeDisabled();
     expect(within(card).getByTestId('current-tab-index-open-tabs')).toBeDisabled();
   });
+
+  // NB: the "Delete text stays ENABLED on a paused/blocked page" invariant
+  // is pinned directly (and robustly) at the component level in
+  // PageTextPanel.deleteHang.test.tsx — the App-level card renders it from
+  // the same `coverage` the round-trip above now fetches on blocked pages.
 
   it('shows a "Capture paused" badge when the master switch is off and hides the tier / Indexing copy', async () => {
     const sendMessage = renderNowCardFor({ captureEnabled: false });
@@ -1589,11 +1601,16 @@ describe('current-tab capture-state indicator', () => {
     expect(card).not.toHaveTextContent('Indexed chunks');
     expect(card).not.toHaveTextContent('Indexing');
 
-    // Leak regression: paused ⇒ no coverage round-trip either.
-    expect(sendMessage).not.toHaveBeenCalledWith(
-      { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
-      expect.any(Function),
-    );
+    // As with the blocked case: coverage IS fetched even while paused so
+    // the "Delete text" affordance stays available (deleting already-
+    // captured data is a privacy action). The DISPLAY suppression above is
+    // what prevents the stale-tier leak, not the absence of the fetch.
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: BLOCKED_URL },
+        expect.any(Function),
+      );
+    });
   });
 
   it('renders the normal tier badge when the site is neither paused nor blocked', async () => {
