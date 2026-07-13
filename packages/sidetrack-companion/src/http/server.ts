@@ -364,6 +364,7 @@ import {
   readSection15Artifact,
 } from '../system/section15Artifact.js';
 import { collectSection15Report } from '../system/section15Collector.js';
+import { collectEngagementLaneHealth } from '../system/engagementLaneHealth.js';
 import {
   CHROME_SESSIONS_RESTORE,
   TAB_RECOVERY_AGGREGATE_ID,
@@ -4763,6 +4764,11 @@ const routes: readonly RouteDefinition[] = [
                   delta: expectedFromWatermark - storeRowCount,
                 };
               },
+              // Engagement-lane freshness — two indexed MAX queries on
+              // the shared store; observability only (aggregate-vs-interval
+              // divergence, the fingerprint of the 06-27 regression that
+              // starved visit similarity). Best-effort inside collectHealth.
+              engagementLaneHealth: () => collectEngagementLaneHealth({ vaultRoot }),
               ...(context.rankerHealth === undefined
                 ? {}
                 : { rankerHealth: context.rankerHealth }),

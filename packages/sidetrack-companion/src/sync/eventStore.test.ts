@@ -87,6 +87,20 @@ describe('EventStore sqlite', () => {
     store.close();
   });
 
+  sqliteIt('maxAcceptedAtMsForType returns the newest per type, 0 for unseen', async () => {
+    const vault = await tempVault();
+    const store = await createEventStore(vault);
+    store.ingestMany([
+      event({ replicaId: 'r', seq: 1, acceptedAtMs: 100, type: 'engagement.interval.observed' }),
+      event({ replicaId: 'r', seq: 2, acceptedAtMs: 300, type: 'engagement.interval.observed' }),
+      event({ replicaId: 'r', seq: 3, acceptedAtMs: 200, type: 'engagement.session.aggregated' }),
+    ]);
+    expect(store.maxAcceptedAtMsForType('engagement.interval.observed')).toBe(300);
+    expect(store.maxAcceptedAtMsForType('engagement.session.aggregated')).toBe(200);
+    expect(store.maxAcceptedAtMsForType('engagement.never.seen')).toBe(0);
+    store.close();
+  });
+
   sqliteIt('ingest is idempotent by (replicaId, seq)', async () => {
     const events = buildEvents();
     const vault = await tempVault();

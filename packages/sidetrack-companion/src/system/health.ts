@@ -1,5 +1,6 @@
 import type { RecallActivityReport } from '../recall/activity.js';
 import type { EventLaneHealth } from '../sync/eventLaneHealth.js';
+import type { EngagementLaneHealth } from './engagementLaneHealth.js';
 import type { WorkGraphHealthReport } from './workGraphHealth.js';
 
 export interface CaptureProviderHealth {
@@ -192,6 +193,10 @@ export interface HealthReport {
   // Data-loss tripwires — always populated by collectHealth (the getter
   // is cheap and required). Makes PRD §15 falsifiable.
   readonly dataLoss?: DataLossHealth;
+  // Engagement-lane freshness — aggregate-vs-interval divergence.
+  // Present only when the runtime wires the probe (needs the shared
+  // event store). Observability only; freeze-safe.
+  readonly engagementLane?: EngagementLaneHealth;
   // Liveness edges — present only when the runtime wires the getter.
   readonly ranker?: RankerRefreshHealth;
   readonly mcpChild?: McpChildHealth;
@@ -246,6 +251,11 @@ export interface HealthDeps {
   // no ranker / MCP child is managed.
   readonly rankerHealth?: () => RankerRefreshHealth;
   readonly mcpChildHealth?: () => McpChildHealth;
+  // Engagement-lane freshness probe (aggregate-vs-interval divergence).
+  // Async — two indexed MAX queries against the shared event store.
+  // Omitted (undefined) when the store is off; a throw/timeout degrades
+  // to an absent engagementLane, never a failed health response.
+  readonly engagementLaneHealth?: () => Promise<EngagementLaneHealth>;
 }
 
 const ZERO_EVENT_LANE_HEALTH: EventLaneHealth = {
@@ -382,6 +392,16 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
       return undefined;
     }
   })();
+  // Engagement-lane freshness — async, best-effort. A stalled aggregate
+  // lane is observability, not a health failure (it never sets `status`);
+  // any error/absence just omits the field.
+  const engagementLane = await (async (): Promise<EngagementLaneHealth | undefined> => {
+    try {
+      return await deps.engagementLaneHealth?.();
+    } catch {
+      return undefined;
+    }
+  })();
 
   // Per-section availability: timed-out summaries are `unavailable`
   // (served the empty fallback), not a real zero. A vault size that
@@ -444,6 +464,7 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
     recall,
     service,
     dataLoss,
+    ...(engagementLane === undefined ? {} : { engagementLane }),
     observability: { asOf: now.toISOString(), status, sections },
     ...(ranker === undefined ? {} : { ranker }),
     ...(mcpChild === undefined ? {} : { mcpChild }),
