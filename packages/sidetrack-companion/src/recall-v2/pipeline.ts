@@ -50,6 +50,11 @@ import {
 import { openSqliteRecallStore } from './store/sqlite.js';
 import type { RecallStore, StoreFtsHit } from './store/types.js';
 import { logShadowDiff, shadowQueryEnabled, shadowVariantsFromEnv } from './shadow.js';
+import {
+  retrievalArmsFromEnv,
+  TITLE_ONLY_COSINE_MULTIPLIER,
+  type RetrievalArms,
+} from './retrievalFlags.js';
 import { rerank } from './rerank.js';
 import type { RecallServedCandidateSnapshot, RecallServedPayload } from '../recall/events.js';
 import type {
@@ -183,6 +188,12 @@ export interface PipelineDeps {
    *  background FeatureModel build; it is invoked at most once per TTL,
    *  never inline on the request path. Omit to disable entirely. */
   readonly learnedRerankContext?: () => Promise<LearnedRerankContext | null>;
+  /** Page-feature-driven retrieval arms (chunk-vector pooling +
+   *  title-only provenance down-weight). When omitted the pipeline reads
+   *  the env-backed defaults (`retrievalArmsFromEnv`). The eval/replay
+   *  harness INJECTS this to run arm-vs-arm without mutating process env.
+   *  Gated under the P1 freeze (ADR-0011); defaults OFF by eval verdict. */
+  readonly retrievalArms?: RetrievalArms;
 }
 
 // Per-vault SQLite store cache. Opened lazily on first /v2/recall;
@@ -639,6 +650,7 @@ const generateSemanticQuery = async (
   queryEmbedding: Float32Array | undefined,
   excludeUrls: ReadonlySet<string>,
   store: RecallStore | undefined,
+  arms: RetrievalArms,
 ): Promise<CandidateGeneratorOutput> => {
   const start = (deps.now ?? Date.now)();
   if (queryEmbedding === undefined) {
@@ -648,49 +660,104 @@ const generateSemanticQuery = async (
     entityId?: string;
     canonicalUrl: string;
     title?: string;
+    /** Raw query-to-candidate cosine as retrieved (title-only or not). */
     cosine: number;
+    /** 1 = content-derived vector, 0 = title/URL-only. undefined when the
+     *  provenance is unknown (JSON-sidecar fallback carries no flag). */
+    bodyIndexed?: 0 | 1;
+    /** Present when this hit came from chunk-vector max-chunk pooling. */
+    pooledChunkCount?: number;
   };
   let rawHits: readonly CandidateLike[] = [];
+  let retrievedVia: 'chunk_vec' | 'doc_vec' | 'json_sidecar' = 'json_sidecar';
   if (store !== undefined && store.vectorBackendAvailable) {
     const excludeIds = new Set<string>();
     for (const url of excludeUrls) {
       const { createHash } = await import('node:crypto');
       excludeIds.add(`url:${createHash('sha256').update(url).digest('hex').slice(0, 24)}`);
     }
-    const vecHits = store.queryVector({
-      vec: queryEmbedding,
-      limit: Math.max(limit * 2, 20),
-      excludeEntityIds: excludeIds,
-    });
-    if (vecHits.length > 0) {
-      rawHits = vecHits
-        .filter((h) => h.canonicalUrl !== undefined && h.canonicalUrl.length > 0)
-        .map((h) => ({
-          entityId: h.entityId,
-          canonicalUrl: h.canonicalUrl!,
-          ...(h.title === undefined ? {} : { title: h.title }),
-          cosine: 1 - h.cosineDistance,
-        }));
+    // Arm 1 — chunk-vector KNN + doc-level max-chunk pooling. Preferred
+    // where clean chunk vectors exist: passage-level retrieval finds the
+    // matching SECTION rather than the whole-doc centroid. Falls through
+    // to doc-vec when the pooled query is empty (no chunk vectors yet, or
+    // none survived the URL exclude), so enabling the arm never regresses
+    // a corpus that has only doc vectors.
+    if (arms.chunkVectors) {
+      const pooled = store.queryChunkVector({
+        vec: queryEmbedding,
+        limit: Math.max(limit * 2, 20),
+        excludeEntityIds: excludeIds,
+      });
+      if (pooled.length > 0) {
+        retrievedVia = 'chunk_vec';
+        rawHits = pooled
+          .filter((h) => h.canonicalUrl !== undefined && h.canonicalUrl.length > 0)
+          .map((h) => ({
+            entityId: h.entityId,
+            canonicalUrl: h.canonicalUrl!,
+            ...(h.title === undefined ? {} : { title: h.title }),
+            cosine: 1 - h.cosineDistance,
+            bodyIndexed: h.bodyIndexed,
+            pooledChunkCount: h.pooledChunkCount,
+          }));
+      }
+    }
+    if (rawHits.length === 0) {
+      const vecHits = store.queryVector({
+        vec: queryEmbedding,
+        limit: Math.max(limit * 2, 20),
+        excludeEntityIds: excludeIds,
+      });
+      if (vecHits.length > 0) {
+        retrievedVia = 'doc_vec';
+        rawHits = vecHits
+          .filter((h) => h.canonicalUrl !== undefined && h.canonicalUrl.length > 0)
+          .map((h) => ({
+            entityId: h.entityId,
+            canonicalUrl: h.canonicalUrl!,
+            ...(h.title === undefined ? {} : { title: h.title }),
+            cosine: 1 - h.cosineDistance,
+            bodyIndexed: h.bodyIndexed,
+          }));
+      }
     }
   }
   if (rawHits.length === 0) {
+    retrievedVia = 'json_sidecar';
     const vectors = await readSemanticRecallVectorStore(deps.vaultRoot, MODEL_ID);
     rawHits = expandSemanticByQuery(vectors, queryEmbedding, {
       limit,
       exclude: excludeUrls,
     });
   }
-  const topCosine = rawHits.length > 0 ? rawHits[0]!.cosine : 0;
+  // Arm 2 — provenance down-weight. A title-only vector (body_indexed=0,
+  // e.g. a bare timeline visit) is a weaker relevance signal than a
+  // content-derived one at the same cosine. When the arm is on, we score
+  // and gate title-only hits at a discounted `effectiveCosine`; the raw
+  // cosine is preserved in evidence for honesty. Hits with unknown
+  // provenance (JSON-sidecar fallback) are treated as content (no
+  // penalty) — the arm only down-weights a hit we KNOW is title-only.
+  const effectiveCosine = (h: CandidateLike): number =>
+    arms.provenanceDownweight && h.bodyIndexed === 0
+      ? h.cosine * TITLE_ONLY_COSINE_MULTIPLIER
+      : h.cosine;
+  // Rank by effective cosine so the down-weight actually reorders (the
+  // fused RRF contribution is rank-derived below). Stable for the
+  // no-op case: effectiveCosine === cosine and the retrieval order is
+  // already cosine-descending.
+  const ranked = [...rawHits].sort((a, b) => effectiveCosine(b) - effectiveCosine(a));
+  const topCosine = ranked.length > 0 ? effectiveCosine(ranked[0]!) : 0;
   const dynamicFloor = Math.max(
     SEMANTIC_ABSOLUTE_MIN_COSINE,
     SEMANTIC_RELATIVE_FRACTION * topCosine,
   );
-  const filtered = rawHits.filter((h) => h.cosine >= dynamicFloor);
+  const filtered = ranked.filter((h) => effectiveCosine(h) >= dynamicFloor);
   // Score-modulated RRF (smooth gap-based gate). For the e5-small
   // embedder, queries with `top - p50` gap < 0.03 are flat noise
   // (every candidate at the noise floor); the gate mutes them.
-  // Thresholds live in model-registry.ts.
-  const filteredCosinesDesc = filtered.map((h) => h.cosine).sort((a, b) => b - a);
+  // Thresholds live in model-registry.ts. Uses effective cosine so the
+  // gate sees the same provenance-adjusted distribution the ranking did.
+  const filteredCosinesDesc = filtered.map((h) => effectiveCosine(h)).sort((a, b) => b - a);
   const p50Cosine =
     filteredCosinesDesc.length > 0
       ? filteredCosinesDesc[Math.floor(filteredCosinesDesc.length * 0.5)]!
@@ -715,23 +782,32 @@ const generateSemanticQuery = async (
     };
   }
   const hits = filtered.slice(0, limit);
-  const candidates: RecallCandidate[] = hits.map((h, i) => ({
-    candidateId: `semantic-query:${h.canonicalUrl}`,
-    entityId: h.entityId ?? entityIdFor({ canonicalUrl: h.canonicalUrl }),
-    sourceKind: 'semantic_query',
-    canonicalUrl: h.canonicalUrl,
-    ...(h.title === undefined ? {} : { title: h.title }),
-    fusedScore: gateMultiplier / (RRF_K + (i + 1)),
-    evidence: [
-      {
-        retriever: 'dense',
-        sourceKind: 'semantic_query',
-        rawScore: h.cosine,
-        vectorDistance: 1 - h.cosine,
-        rank: i + 1,
-      },
-    ],
-  }));
+  const candidates: RecallCandidate[] = hits.map((h, i) => {
+    const downWeighted = arms.provenanceDownweight && h.bodyIndexed === 0;
+    const explainParts: string[] = [`via ${retrievedVia}`];
+    if (h.pooledChunkCount !== undefined) explainParts.push(`pooled ${h.pooledChunkCount} chunks`);
+    if (downWeighted) explainParts.push('title-only down-weight');
+    return {
+      candidateId: `semantic-query:${h.canonicalUrl}`,
+      entityId: h.entityId ?? entityIdFor({ canonicalUrl: h.canonicalUrl }),
+      sourceKind: 'semantic_query',
+      canonicalUrl: h.canonicalUrl,
+      ...(h.title === undefined ? {} : { title: h.title }),
+      fusedScore: gateMultiplier / (RRF_K + (i + 1)),
+      evidence: [
+        {
+          retriever: 'dense',
+          sourceKind: 'semantic_query',
+          // rawScore is the true retrieved cosine (honest provenance);
+          // the down-weight already took effect via ranking + gating.
+          rawScore: h.cosine,
+          vectorDistance: 1 - h.cosine,
+          rank: i + 1,
+          explain: explainParts.join('; '),
+        },
+      ],
+    };
+  });
   return { sourceKind: 'semantic_query', candidates, elapsedMs: timeoutMs(start, deps.now ?? Date.now) };
 };
 
@@ -1125,6 +1201,10 @@ export const runRecall = async (
   const perSource = req.perSourceLimit ?? DEFAULT_PER_SOURCE_LIMIT;
   const strategy: RecallStrategy = req.strategy ?? {};
   const timings: Record<string, number> = {};
+  // Page-feature-driven retrieval arms. Injected by the eval harness for
+  // arm-vs-arm replay; otherwise read from env (both default OFF by the
+  // eval verdict, per ADR-0011).
+  const retrievalArms = deps.retrievalArms ?? retrievalArmsFromEnv();
 
   // chat_turn used to need an embedding for the legacy rankHybrid path
   // (dense + lexical combined). The current generator routes through
@@ -1230,7 +1310,9 @@ export const runRecall = async (
         .filter((u): u is string => u !== undefined),
     ]);
     anchorUrls = [...lexicalAnchors];
-    groups.push(await generateSemanticQuery(deps, perSource, queryEmbedding, lexicalAnchors, store));
+    groups.push(
+      await generateSemanticQuery(deps, perSource, queryEmbedding, lexicalAnchors, store, retrievalArms),
+    );
   }
   if (sources.has('graph_neighbor')) {
     const excludeUrls = new Set(
@@ -1508,6 +1590,8 @@ export const runRecall = async (
         queryEmbedded: queryEmbedding !== undefined,
         rerankApplied,
         degradedToLexical,
+        recallChunkVectors: retrievalArms.chunkVectors,
+        recallProvenanceDownweight: retrievalArms.provenanceDownweight,
         ...(learnedRerankApplied ? { learnedRerankApplied } : {}),
       },
       servedContextId,

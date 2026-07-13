@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildExtractedPageEvidence } from '../page-evidence/extract.js';
 import type { PageEvidenceExtractedRequest, VectorRef } from '../page-evidence/types.js';
@@ -171,8 +171,26 @@ const readVisitSimilarityFixture = async (filename: string): Promise<VisitSimila
   };
 };
 
+// These suites assert the content-enriched similarity CAPABILITY (the
+// evidence corpus + content-vector channels). That path is gated behind
+// SIDETRACK_SIMILARITY_CONTENT_CORPUS (default OFF in production until the
+// eval-spine verdict clears it — see ADR-0011 amendment 2026-07-12b). Turn
+// the gate ON for these unit tests so they exercise the mechanism; the
+// default-OFF frozen behavior is asserted separately in
+// similarityContentCorpus.test.ts.
+const previousContentCorpusFlag: string | undefined =
+  process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'];
+beforeEach(() => {
+  process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'] = '1';
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
+  if (previousContentCorpusFlag === undefined) {
+    delete process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'];
+  } else {
+    process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'] = previousContentCorpusFlag;
+  }
 });
 
 describe('buildVisitSimilarity', () => {

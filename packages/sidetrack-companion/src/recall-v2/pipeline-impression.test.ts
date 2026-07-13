@@ -97,6 +97,7 @@ const makeStubStore = (): RecallStore => {
     upsertVector: () => {},
     upsertChunkVector: () => {},
     queryVector: () => [],
+    queryChunkVector: () => [],
     close: () => {},
   };
 };

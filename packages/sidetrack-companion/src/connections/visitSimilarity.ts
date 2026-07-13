@@ -159,14 +159,51 @@ const hostnameForUrl = (url: string): string => {
   }
 };
 
+// Content-corpus serving gate. Whether visit-similarity may draw the
+// similarity corpus (and, downstream, the content-enriched pair scoring)
+// from loaded page-evidence CONTENT rather than the title/host/path
+// skeleton. Default OFF: this is the evidence-gated connect of a built-
+// but-unserved path (the corpus code has ALWAYS preferred content when a
+// content-backed record was loaded — it simply never was, because doc
+// embeddings sat at ~13.6% coverage; the background-embedding lane now
+// fills them). Under the OWNER DIRECTIVE / ADR-0011, the serving flip
+// ships behind a flag whose default is set by the eval-spine verdict
+// (connections-precision over the 70 confirmed pairs), NOT by optimism.
+// While OFF, corpusForVisitEntry returns the frozen title-only skeleton,
+// so a partially-embedded backlog cannot silently shift served edges
+// before the eval spine can score the change. Flip with
+// SIDETRACK_SIMILARITY_CONTENT_CORPUS=1 (+ restart) once the verdict
+// clears it. See ADR-0011 amendment 2026-07-12b.
+//
+// RECORDED VERDICT (ADR-0011 amendment 2026-07-13b): stays OFF. The
+// connections-precision spine, run offline against a read-only snapshot
+// of the live test vault, reported servedSimilarityEdges=0 — the
+// similarity lane serves ZERO edges on this vault (the July regression;
+// page-access-off → the engagement gate never trips), so precision by
+// evidence tier is UNDEFINED (n/a), not low. There is nothing for the
+// content tier to out-precise yet. Re-score once the requalify lanes
+// restore served edges (June baseline ~30k), then flip on the recorded
+// number.
+export const similarityContentCorpusEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'] === '1';
+
 // Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
 // from outside this module. They're stateless + cheap; expose as named
 // exports so the materializer can compute pre-embedding inputs.
+//
+// The content-corpus gate lives HERE so a single check governs BOTH
+// consumers of a visit's evidence: the similarity corpus
+// (corpusForVisitEntry) AND the content-enriched pair scoring (which
+// reads NormalizedVisit.evidence). While the flag is OFF, evidence is
+// invisible to the similarity path end-to-end — the served edges are the
+// frozen title-only baseline, so a partially-embedded backlog cannot
+// shift them before the eval spine scores the flip.
 const evidenceForEntry = (
   entry: VisitSimilarityEntry,
   evidenceByCanonicalUrl: ReadonlyMap<string, PageEvidenceRecord> | undefined,
 ): PageEvidenceRecord | undefined => {
   if (evidenceByCanonicalUrl === undefined) return undefined;
+  if (!similarityContentCorpusEnabled()) return undefined;
   const visitKey = visitKeyForVisitEntry(entry);
   return evidenceByCanonicalUrl.get(visitKey);
 };

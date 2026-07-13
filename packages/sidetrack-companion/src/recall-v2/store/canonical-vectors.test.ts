@@ -23,7 +23,12 @@ import { describe, expect, it } from 'vitest';
 import { installCustomSqlite } from './setup-sqlite.js';
 import { openInMemoryRecallStore } from './sqlite.js';
 
-import type { RecallStore, StoreDocument, StoreSourceKind } from './types.js';
+import type {
+  RecallStore,
+  StoreDocument,
+  StoreDocumentChunk,
+  StoreSourceKind,
+} from './types.js';
 
 // Local stub store mirroring the production sqlite.ts surface for
 // the canonical-vectors contract. The PROD store IS the canonical
@@ -34,6 +39,10 @@ const makeCanonicalStub = (): RecallStore => {
   const docs = new Map<string, StoreDocument>();
   const docVectors = new Map<string, Float32Array>();
   const chunkVectors = new Map<string, Float32Array>();
+  // chunk_id -> parent document entity id (populated by
+  // upsertDocumentChunks), so the pooling stub can map a KNN chunk hit
+  // back to its document the way the SQLite JOIN does.
+  const chunkToDoc = new Map<string, string>();
   return {
     vectorBackendAvailable: true,
     upsertDocument(doc) {
@@ -51,7 +60,9 @@ const makeCanonicalStub = (): RecallStore => {
       docVectors.delete(id);
     },
     allVectorEntityIds: () => new Set(docVectors.keys()),
-    upsertDocumentChunks: () => {},
+    upsertDocumentChunks(documentEntityId, chunks) {
+      for (const chunk of chunks) chunkToDoc.set(chunk.chunkId, documentEntityId);
+    },
     deleteDocumentChunks: () => {},
     deleteDocumentChunk: () => {},
     allDocumentChunkIds: () => new Set(chunkVectors.keys()),
@@ -95,6 +106,37 @@ const makeCanonicalStub = (): RecallStore => {
       }
       out.sort((a, b) => a.cosineDistance - b.cosineDistance);
       return out.slice(0, opts.limit);
+    },
+    queryChunkVector: (opts) => {
+      const queryVec = opts.vec;
+      // Max-chunk pool: best (min-distance) chunk per parent document.
+      const bestByDoc = new Map<string, { distance: number; count: number }>();
+      for (const [chunkId, vec] of chunkVectors) {
+        const docId = chunkToDoc.get(chunkId);
+        if (docId === undefined) continue;
+        let dot = 0;
+        const len = Math.min(queryVec.length, vec.length);
+        for (let i = 0; i < len; i += 1) dot += (queryVec[i] ?? 0) * (vec[i] ?? 0);
+        const distance = 1 - dot;
+        const prev = bestByDoc.get(docId);
+        if (prev === undefined) bestByDoc.set(docId, { distance, count: 1 });
+        else bestByDoc.set(docId, { distance: Math.min(prev.distance, distance), count: prev.count + 1 });
+      }
+      const out = [...bestByDoc.entries()].map(([entityId, agg]) => {
+        const doc = docs.get(entityId);
+        return {
+          entityId,
+          canonicalUrl: doc?.canonicalUrl,
+          title: doc?.title,
+          cosineDistance: agg.distance,
+          bodyIndexed: (doc?.bodyIndexed ?? 0) as 0 | 1,
+          pooledChunkCount: agg.count,
+        };
+      });
+      out.sort((a, b) => a.cosineDistance - b.cosineDistance);
+      const excluded = opts.excludeEntityIds;
+      const filtered = excluded === undefined ? out : out.filter((r) => !excluded.has(r.entityId));
+      return filtered.slice(0, opts.limit);
     },
     close: () => {},
   };
@@ -238,6 +280,123 @@ describe('Move 4 (a) — queryVector body_indexed provenance', () => {
       expect(byId.get(contentDoc.entityId)?.cosineDistance).toBeLessThan(
         byId.get(titleOnlyDoc.entityId)?.cosineDistance ?? Infinity,
       );
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// Chunk-vector KNN + doc-level max-chunk pooling against the REAL
+// SqliteRecallStore. Exercises the two-stage KNN + GROUP BY MIN(distance)
+// JOIN over documents_chunks_vec → documents_chunks → docs. On a runner
+// without a vec-capable libsqlite3 (CI opt-out) the documented empty
+// contract holds.
+describe('queryChunkVector — doc-level max-chunk pooling', () => {
+  const unit384 = (axis: number, second: number): Float32Array => {
+    const v = new Float32Array(384);
+    v[axis % 384] = 1;
+    v[second % 384] = 0.5;
+    let norm = 0;
+    for (let i = 0; i < v.length; i += 1) norm += (v[i] ?? 0) ** 2;
+    const inv = norm === 0 ? 1 : 1 / Math.sqrt(norm);
+    for (let i = 0; i < v.length; i += 1) v[i] = (v[i] ?? 0) * inv;
+    return v;
+  };
+
+  const docA: StoreDocument = {
+    entityId: 'url:doc-a',
+    sourceKind: 'page_content',
+    canonicalUrl: 'https://example.test/doc-a',
+    title: 'Doc A',
+    bodyIndexed: 1,
+  };
+  const docB: StoreDocument = {
+    entityId: 'url:doc-b',
+    sourceKind: 'page_content',
+    canonicalUrl: 'https://example.test/doc-b',
+    title: 'Doc B',
+    bodyIndexed: 1,
+  };
+
+  const chunkRow = (
+    chunkId: string,
+    documentEntityId: string,
+    chunkIndex: number,
+  ): StoreDocumentChunk => ({
+    chunkId,
+    documentEntityId,
+    chunkIndex,
+    charStart: chunkIndex * 100,
+    charEnd: chunkIndex * 100 + 100,
+    text: `chunk ${chunkId}`,
+    evidenceTermsJson: '[]',
+    quality: 'high',
+  });
+
+  it('pools per document keeping the best (min-distance) chunk', () => {
+    installCustomSqlite();
+    const store = openInMemoryRecallStore();
+    try {
+      const query = unit384(3, 22);
+      if (!store.vectorBackendAvailable) {
+        expect(store.queryChunkVector({ vec: query, limit: 5 })).toEqual([]);
+        return;
+      }
+      store.upsertDocument(docA);
+      store.upsertDocument(docB);
+      // Doc A has two chunks: one off-axis (far) and one near the query
+      // (close). Pooling must surface Doc A at the CLOSE chunk's distance.
+      store.upsertDocumentChunks(docA.entityId, [
+        chunkRow('chunk:a:0', docA.entityId, 0),
+        chunkRow('chunk:a:1', docA.entityId, 1),
+      ]);
+      store.upsertDocumentChunks(docB.entityId, [chunkRow('chunk:b:0', docB.entityId, 0)]);
+      store.upsertChunkVector('chunk:a:0', unit384(200, 201)); // far from query
+      store.upsertChunkVector('chunk:a:1', unit384(3, 22)); // == query → distance ~0
+      store.upsertChunkVector('chunk:b:0', unit384(3, 190)); // partial overlap
+
+      const hits = store.queryChunkVector({ vec: query, limit: 5 });
+      const byId = new Map(hits.map((h) => [h.entityId, h] as const));
+
+      // Doc A pooled to its BEST chunk (the exact-match one) → ~0 distance,
+      // NOT the average of its two chunks.
+      expect(byId.get(docA.entityId)?.cosineDistance).toBeCloseTo(0, 5);
+      // Doc A appears ONCE (pooled), and its two chunks both counted.
+      expect(byId.get(docA.entityId)?.pooledChunkCount).toBe(2);
+      expect(byId.get(docB.entityId)?.pooledChunkCount).toBe(1);
+      // Provenance + hydration flow through the JOIN.
+      expect(byId.get(docA.entityId)?.bodyIndexed).toBe(1);
+      expect(byId.get(docA.entityId)?.canonicalUrl).toBe('https://example.test/doc-a');
+      // One row per document (no chunk-level duplicates).
+      expect(hits.filter((h) => h.entityId === docA.entityId).length).toBe(1);
+      // Ordered by pooled distance ascending — Doc A (0) before Doc B.
+      expect(hits[0]?.entityId).toBe(docA.entityId);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('honors excludeEntityIds and returns [] when no chunk vectors exist', () => {
+    installCustomSqlite();
+    const store = openInMemoryRecallStore();
+    try {
+      const query = unit384(3, 22);
+      if (!store.vectorBackendAvailable) {
+        expect(store.queryChunkVector({ vec: query, limit: 5 })).toEqual([]);
+        return;
+      }
+      // No chunk vectors → empty.
+      expect(store.queryChunkVector({ vec: query, limit: 5 })).toEqual([]);
+
+      store.upsertDocument(docA);
+      store.upsertDocumentChunks(docA.entityId, [chunkRow('chunk:a:0', docA.entityId, 0)]);
+      store.upsertChunkVector('chunk:a:0', unit384(3, 22));
+      const excluded = store.queryChunkVector({
+        vec: query,
+        limit: 5,
+        excludeEntityIds: new Set([docA.entityId]),
+      });
+      expect(excluded).toEqual([]);
     } finally {
       store.close();
     }

@@ -8,6 +8,7 @@ import { AttributionBadge } from './AttributionBadge';
 import { AttributionProvenance } from './AttributionProvenance';
 import { tabSessionDisplayTitle } from './displayTitle';
 import { PageEvidenceBadge } from './PageEvidenceBadge';
+import { endorsementFor } from './suggestionEndorsement';
 import {
   TAB_SESSION_DRAG_MIME,
   type TabSessionRecord,
@@ -82,13 +83,14 @@ export function InboxCard({
 }: InboxCardProps) {
   const host = hostFor(record);
   const title = tabSessionDisplayTitle(record);
-  // Decision-level workstreamId is set only for confident suggest/
-  // auto-apply. For a low-confidence "Best guess" the target lives in
-  // fusedCandidates[0] (same source AttributionProvenance renders) —
-  // confirming the best guess is exactly the documented one-click
-  // intent, so fall back to it instead of hiding "Yes, that's right".
-  const suggestedWorkstreamId =
-    suggestion?.decision.workstreamId ?? suggestion?.fusedCandidates[0]?.workstreamId;
+  // endorsementFor() is the single source of truth. decision.workstreamId is
+  // set only for an endorsed (suggest/auto-apply) pick; a weak guess (policy
+  // inbox) carries its lean in fusedCandidates[0]. We still let the user
+  // one-click confirm a weak guess — that's the documented teaching path —
+  // but the button copy stays honest ("Confirm guess" vs "Yes, that's right").
+  const endorsement = endorsementFor(suggestion);
+  const suggestedWorkstreamId = endorsement.workstreamId;
+  const isWeakGuess = endorsement.level === 'weak-guess';
   const canConfirmSuggestion =
     suggestedWorkstreamId !== undefined &&
     record.currentAttribution === undefined &&
@@ -190,13 +192,17 @@ export function InboxCard({
           {canConfirmSuggestion ? (
             <button
               type="button"
-              className="tab-session-action primary"
+              className={`tab-session-action${isWeakGuess ? '' : ' primary'}`}
               onClick={() => {
                 onAttribute(record.tabSessionId, suggestedWorkstreamId);
               }}
-              title="Confirm the suggested workstream"
+              title={
+                isWeakGuess
+                  ? 'Confirm this weak guess — Sidetrack wasn’t confident, but you can file it here'
+                  : 'Confirm the suggested workstream'
+              }
             >
-              Yes, that's right
+              {isWeakGuess ? 'Confirm guess' : "Yes, that's right"}
             </button>
           ) : null}
           <button

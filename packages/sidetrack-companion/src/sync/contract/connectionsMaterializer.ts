@@ -117,6 +117,7 @@ const rankerTrainableShardEnabled = (): boolean => {
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
+  isEngagementSessionAggregatedPayload,
 } from '../../engagement/events.js';
 import {
   createEngagementFactsStore,
@@ -321,6 +322,22 @@ const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 
+// The exact event types buildTimelineDays + buildEngagementClassifierInputs
+// consume for the similarity-requalify re-derive. buildTimelineDays reads
+// BROWSER_TIMELINE_OBSERVED; seedEngagementAccumulator additionally folds
+// NAVIGATION_COMMITTED (canonical-URL map), ENGAGEMENT_SESSION_AGGREGATED
+// (the engagement sums), and SELECTION_COPIED/SELECTION_PASTED (paste
+// lineage). Every other type is ignored by both builders, so a typed
+// store read over these is byte-equivalent to filtering readMerged() to
+// them — but O(matching rows) via events_type_idx, not O(all events).
+export const REQUALIFY_ENGAGEMENT_SOURCE_TYPES: readonly string[] = [
+  BROWSER_TIMELINE_OBSERVED,
+  NAVIGATION_COMMITTED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+  SELECTION_COPIED,
+  SELECTION_PASTED,
+];
+
 // Permanent-gap sealing (default OFF). A "permanent gap" is a per-replica
 // event seq the log/store skip forever (a rejected/never-emitted seq). It
 // freezes frontierFromIntervals just below it, so readSince re-returns the
@@ -456,6 +473,41 @@ export const classifyConnectionsMaterializerHealth = (input: {
 // to prevent accidental regression back to full-rebuild semantics.
 const incrementalRankerEnabled = (): boolean => true;
 const incrementalSimilarityEnabled = (): boolean => true;
+// Similarity requalification (§ engagement-regression fix). When late
+// engagement (an ENGAGEMENT_SESSION_AGGREGATED event — including a
+// gap-backfill event) lifts an OLD visit's focusedWindowMs past the
+// >=5000ms similarity gate, the scoped-delta reconcile set never
+// revisited it: the reconcile set was built from pendingTimelineVisitIds
+// (BROWSER_TIMELINE_OBSERVED only) intersected with the eligible set,
+// and a late engagement event puts the URL in NEITHER. The visit stays
+// out of the HNSW active set forever (same class as content-arrives-
+// never-re-embeds). This joins engagement-invalidated visits that have
+// crossed the gate to the reconcile set on the drain that classifies
+// them. Bounded: only visits whose engagement class changed this drain,
+// each already embeddable from existing page evidence — no unbounded
+// re-embed. Default ON (restores the pre-regression similarity lane;
+// June baseline served ~30k visit_resembles_visit edges, July served 0);
+// kill-switch via env=0 + restart.
+const similarityRequalifyEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_REQUALIFY'] !== '0';
+// Content-arrival similarity requalification. When page-evidence CONTENT
+// (and its doc embedding) arrives for a visit AFTER its timeline entry
+// left the drain window — via PAGE_EVIDENCE_EXTRACTED, or the background
+// embedding lane completing a backlog embed — the scoped-delta reconcile
+// set never revisits that visit (its URL is in neither
+// pendingTimelineVisitIds nor the engagement-requalify set). The visit's
+// edges stay title-only forever: the "better-evidence-never-revalidates"
+// loop the audit named. This joins content-requalified visits to
+// hnswReconcileVisitIds on the next drain so buildHnswVisitSimilarity
+// re-embeds them from the now-content-backed corpus and re-derives their
+// edges. Default ON (a pure requalification of already-eligible visits —
+// no new edge kind, weight, or threshold; same class as the engagement
+// requalify path). Kill-switch via env=0 + restart. NOTE: whether the
+// re-embed actually USES the content is separately gated by
+// SIDETRACK_SIMILARITY_CONTENT_CORPUS (default OFF); with that flag off
+// this requalify is a cheap no-op re-derive against the title skeleton.
+const contentRequalifyEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'] !== '0';
 // Source engagement classifier inputs from the persistent SQLite fact
 // store instead of re-walking the full AcceptedEvent[] every drain.
 // Kill-switch to the legacy in-memory path (drift/replay) via env=0.
@@ -834,6 +886,21 @@ export interface ConnectionsMaterializer extends Materializer {
    * orchestrates and acks via clearDirtySources.
    */
   readonly drainContentLaneQueue: (reconciler: ContentLaneSourceUnitReconciler) => Promise<number>;
+  /**
+   * Task 3 — mark a visit for similarity re-embedding because its
+   * page-evidence content just arrived (background-embedding lane
+   * completion, or an out-of-window PAGE_EVIDENCE_EXTRACTED). Accumulates
+   * the canonical URL and requests a debounced drain; the drain folds it
+   * into hnswReconcileVisitIds and clears it. No-op when
+   * SIDETRACK_SIMILARITY_CONTENT_REQUALIFY=0.
+   */
+  readonly requalifyVisitForSimilarity: (canonicalUrl: string) => void;
+  /**
+   * True while a connections drain is running. The background-embedding
+   * lane consults this to pause its embedding work — the drain thread
+   * must never contend with embedding CPU (CPU regime).
+   */
+  readonly isDrainActive: () => boolean;
 }
 
 export interface ContentLaneSourceUnitReconciler {
@@ -1316,6 +1383,12 @@ export const createConnectionsMaterializer = (
   let contentOnlyProgressFlushScheduled = false;
   let contentOnlyProgressFlushRunning = false;
   let progressOnlyDirty = false;
+  // Canonical URLs whose page-evidence content arrived since the last
+  // drain and must be re-embedded for similarity (see
+  // contentRequalifyEnabled). Populated by PAGE_EVIDENCE_EXTRACTED window
+  // events + the background-embedding lane's requalifyVisitForSimilarity.
+  // Drained (read + cleared) once per drain into hnswReconcileVisitIds.
+  const contentRequalifyVisitKeys = new Set<string>();
   let urgentDrainRequested = false;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
   // (e.g. multiple tabs activating in sequence, peer-event imports)
@@ -1679,6 +1752,125 @@ export const createConnectionsMaterializer = (
 
   const timelineEntryVisitKey = (entry: TimelineEntryWithDimensions): string =>
     stripFragmentAndTrailingSlash(entry.canonicalUrl ?? entry.url);
+
+  // Similarity requalification (engagement-regression fix). Returns the
+  // set of engagement visitIds carried by ENGAGEMENT_SESSION_AGGREGATED
+  // events in THIS drain's window — the only events that can lift an old
+  // visit's summed focusedWindowMs past the >=5000ms similarity gate
+  // AFTER its timeline entry has already left the window. Deliberately
+  // scans the pending events (not the `engagementVisit` invalidation
+  // keys): that key kind is ALSO emitted by BROWSER_TIMELINE_OBSERVED /
+  // NAVIGATION_COMMITTED, whose visitId is an eventId (not a `visit:<url>`
+  // / URL) — those would falsely look like missing requalify candidates
+  // and trigger the full-timeline reload on every normal browsing drain.
+  // Restricting to aggregate payloads keeps the reload rare (late
+  // engagement / backfills only). Cheap: one pass, gated by the flag.
+  const persistentSimilarityRequalifyPossible = (
+    pendingEvents: readonly AcceptedEvent[],
+  ): ReadonlySet<string> => {
+    if (!similarityRequalifyEnabled()) return new Set<string>();
+    const engagementVisitIds = new Set<string>();
+    for (const event of pendingEvents) {
+      if (event.type !== ENGAGEMENT_SESSION_AGGREGATED) continue;
+      if (!isEngagementSessionAggregatedPayload(event.payload)) continue;
+      engagementVisitIds.add(event.payload.visitId);
+    }
+    return engagementVisitIds;
+  };
+
+  // Source the events buildTimelineDays + buildEngagementClassifierInputs
+  // consume for the requalify re-derive. When the event store is on, a
+  // typed read over exactly REQUALIFY_ENGAGEMENT_SOURCE_TYPES
+  // (events_type_idx) is byte-equivalent to filtering readMerged() to
+  // those types — both builders ignore every other type — but is
+  // O(matching rows), not O(all events). The collected chunks are sorted
+  // into merged order (sortAcceptedEvents) so the accumulator's
+  // event-order-dependent folds (navigation last-write-wins,
+  // compareEventOrder aggregate selection) match a whole-log walk.
+  const readRequalifyEngagementSource = async (
+    typedEventSource: EventStore | null,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (typedEventSource === null) return deps.eventLog.readMerged();
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      REQUALIFY_ENGAGEMENT_SOURCE_TYPES,
+      (chunk) => {
+        for (const event of chunk) collected.push(event);
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
+  };
+
+  // Re-derive the timeline entries for engagement-requalified visits from
+  // the FULL event log WITH full engagement (mirrors the topicFullTimeline
+  // precedent). Only the requalified visits' entries are returned, and
+  // only when they (a) cross the gate under full engagement and (b) are
+  // NOT already present in this drain's window entries — so a live
+  // aggregate for an in-window visit stays on the cheap scoped path and
+  // pays nothing. Bounded to the handful of requalified visits.
+  //
+  // Sourcing: `buildTimelineDays` + `buildEngagementClassifierInputs`
+  // consume ONLY the five event types in
+  // REQUALIFY_ENGAGEMENT_SOURCE_TYPES — any other type is ignored by both
+  // builders (verified against seedEngagementAccumulator). When the event
+  // store is on, read exactly those types via the type index
+  // (forEachChunkOfTypes → events_type_idx) and sort into merged order,
+  // which is byte-equivalent to filtering readMerged() but O(matching
+  // rows) instead of O(all events). On the 452k-event / ~92%-engagement-
+  // interval vault this avoids the per-drain full-log scan the scoped-
+  // delta work removed: a routine session aggregate firing ~30s after its
+  // visit (past the 30s drain interval, so the visit's timeline entry has
+  // left the window) is out-of-window and would otherwise fire the full
+  // readMerged rebuild on ordinary browsing drains. Falls back to
+  // readMerged only when the store is unavailable (legacy path). Mirrors
+  // the scopedTimelineSourcing typed-read precedent below.
+  const loadRequalifiedSimilarityEntries = async (
+    candidateEngagementVisitIds: ReadonlySet<string>,
+    windowEntries: readonly TimelineEntryWithDimensions[],
+    engagementGateMs: number,
+    typedEventSource: EventStore | null,
+  ): Promise<readonly TimelineEntryWithDimensions[]> => {
+    if (candidateEngagementVisitIds.size === 0) return [];
+    // Resolve engagement visitIds → canonical URL keys. The `visit:<url>`
+    // gap-backfill form strips to the canonical URL; a bare URL / eventId
+    // strips the same way. This mirrors canonicalUrlForVisitId in the
+    // engagement classifier so the keys align with visitKeyForVisitEntry.
+    const candidateVisitKeys = new Set<string>();
+    for (const visitId of candidateEngagementVisitIds) {
+      candidateVisitKeys.add(
+        stripFragmentAndTrailingSlash(
+          visitId.startsWith('visit:') ? visitId.slice('visit:'.length) : visitId,
+        ),
+      );
+    }
+    // Skip visits already present in the window timeline — they're on the
+    // normal scoped path already (nothing to requalify).
+    const windowVisitKeys = new Set(windowEntries.map(visitKeyForVisitEntry));
+    const missingVisitKeys = new Set(
+      [...candidateVisitKeys].filter((visitKey) => !windowVisitKeys.has(visitKey)),
+    );
+    if (missingVisitKeys.size === 0) return [];
+    const fullEvents = await readRequalifyEngagementSource(typedEventSource);
+    const fullTimeline = buildTimelineDays(fullEvents);
+    const fullEngagement = buildEngagementClassifierInputs(fullEvents, fullTimeline);
+    const enrichedFull = enrichTimelineDaysWithEngagement(fullTimeline, fullEngagement);
+    const out: TimelineEntryWithDimensions[] = [];
+    const emitted = new Set<string>();
+    for (const day of enrichedFull) {
+      for (const entry of day.entries) {
+        const visitKey = visitKeyForVisitEntry(entry);
+        if (!missingVisitKeys.has(visitKey) || emitted.has(visitKey)) continue;
+        // Only splice entries that actually cross the gate under full
+        // engagement — the requalification only matters when the visit is
+        // now eligible.
+        if (focusedWindowMsFromEntry(entry) < engagementGateMs) continue;
+        emitted.add(visitKey);
+        out.push(entry);
+      }
+    }
+    return out;
+  };
 
   const pendingEventIsSearchTimelineVisit = (event: AcceptedEvent): boolean =>
     event.type === BROWSER_TIMELINE_OBSERVED &&
@@ -2784,13 +2976,68 @@ export const createConnectionsMaterializer = (
     // corpus/focus). If the same set of visits has already been
     // processed, the on-disk revision is reusable byte-for-byte — no
     // need to re-embed.
-    const similarityEntries = timelineDays.flatMap((day) => day.entries);
+    const windowSimilarityEntries = timelineDays.flatMap((day) => day.entries);
     // PR #141 — resolve the similarity config once so the same
     // (threshold / topK / engagementGateMs / lexical fallback) values
     // feed both the revision id + the build call. Honors env overrides:
     // SIDETRACK_SIMILARITY_{THRESHOLD,MIN_ENGAGEMENT_MS,TOP_K} +
     // SIDETRACK_SIMILARITY_LEXICAL_{THRESHOLD,FALLBACK_ENABLED}.
     const similarityConfig: EffectiveVisitSimilarityConfig = resolveVisitSimilarityConfig();
+    // Similarity requalification (engagement-regression fix). A LATE
+    // engagement event (an ENGAGEMENT_SESSION_AGGREGATED — including a
+    // gap-backfill event) can lift an OLD visit's focusedWindowMs past
+    // the >=5000ms gate. On a scoped/incremental drain the window's
+    // timeline days (buildTimelineDays over the pending window) carry
+    // NO entry for that old visit — its BROWSER_TIMELINE_OBSERVED landed
+    // on a prior drain — so it never re-enters activeSimilarityEntries
+    // and the HNSW producer never reforms its edges (same starvation
+    // class as content-arrives-never-re-embeds; see topicFullTimeline
+    // precedent below). When such an engagement event is in this drain's
+    // window AND its visit is absent from the window timeline, re-derive
+    // JUST those visits' entries from the full timeline WITH full
+    // engagement, then splice them into the similarity entry set. Bounded
+    // to the requalifying visits; the full read is cadence-free because
+    // late engagement events are rare (backfills / resumed sessions), not
+    // the ~30s live aggregate cadence (those visits are already in-window).
+    const requalifyCandidateEngagementVisitIds =
+      persistentSimilarityRequalifyPossible(pendingEventsForDrain);
+    // Content-arrival requalification (task 3). Drain (read + clear) the
+    // visit keys whose page-evidence content arrived since the last drain
+    // and merge them with the engagement-requalify candidates. Both share
+    // the same full-timeline splice: loadRequalifiedSimilarityEntries only
+    // re-derives entries for keys ABSENT from the window AND still
+    // gate-eligible under full engagement — so an in-window or
+    // now-ineligible content arrival costs nothing. Clearing here (not at
+    // drain end) is correct: any content arrival racing THIS drain calls
+    // requestDrain again, scheduling the next pass.
+    const contentRequalifyCandidateVisitKeys = new Set<string>();
+    if (contentRequalifyEnabled() && contentRequalifyVisitKeys.size > 0) {
+      for (const key of contentRequalifyVisitKeys) contentRequalifyCandidateVisitKeys.add(key);
+      contentRequalifyVisitKeys.clear();
+    }
+    const combinedRequalifyCandidateVisitIds =
+      contentRequalifyCandidateVisitKeys.size === 0
+        ? requalifyCandidateEngagementVisitIds
+        : new Set<string>([
+            ...requalifyCandidateEngagementVisitIds,
+            ...contentRequalifyCandidateVisitKeys,
+          ]);
+    const requalifiedSimilarityEntries =
+      combinedRequalifyCandidateVisitIds.size > 0
+        ? await loadRequalifiedSimilarityEntries(
+            combinedRequalifyCandidateVisitIds,
+            windowSimilarityEntries,
+            similarityConfig.engagementGateMs,
+            storeBackedEvents,
+          )
+        : [];
+    const similarityEntries =
+      requalifiedSimilarityEntries.length > 0
+        ? [...windowSimilarityEntries, ...requalifiedSimilarityEntries]
+        : windowSimilarityEntries;
+    const requalifiedVisitKeys = new Set(
+      requalifiedSimilarityEntries.map(visitKeyForVisitEntry),
+    );
     const activeSimilarityEntries = similarityEntries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= similarityConfig.engagementGateMs,
     );
@@ -2873,10 +3120,29 @@ export const createConnectionsMaterializer = (
           [...similarityEligibleVisitIds].filter((visitId) => !knownHnswVisitIds.has(visitId)),
         )
       : new Set<string>();
+    // Similarity requalification set. `requalifiedVisitKeys` holds the
+    // canonical URLs of OLD visits whose late engagement lifted them past
+    // the gate this drain (see the full-timeline splice above). Their URLs
+    // are absent from pendingTimelineVisitIds (no fresh timeline event),
+    // so the scoped-delta reconcile set would otherwise never revisit
+    // them. Keep only the ones still eligible after the join (guards
+    // against a stale requalifiedVisitKeys entry) and fold into reconcile
+    // so buildHnswVisitSimilarity re-embeds them and re-derives edges.
+    const engagementRequalifiedVisitIds =
+      persistentHnswSimilarityMode && requalifiedVisitKeys.size > 0
+        ? new Set(
+            [...requalifiedVisitKeys].filter((visitId) =>
+              similarityEligibleVisitIds.has(visitId),
+            ),
+          )
+        : new Set<string>();
     const hnswReconcileVisitIds = persistentHnswSimilarityMode
-      ? new Set(
-          [...pendingTimelineVisitIds].filter((visitId) => similarityEligibleVisitIds.has(visitId)),
-        )
+      ? new Set([
+          ...[...pendingTimelineVisitIds].filter((visitId) =>
+            similarityEligibleVisitIds.has(visitId),
+          ),
+          ...engagementRequalifiedVisitIds,
+        ])
       : new Set<string>();
     const hnswRequiresFullCorpusEdgeRequery =
       persistentHnswSimilarityMode &&
@@ -3057,7 +3323,9 @@ export const createConnectionsMaterializer = (
       const reconcileVisitIds = hnswReconcileVisitIds;
       usedHotSimilarityPath = true;
       hotSimNewEmbedded = hnswFullRebuild ? similarityEligibleCount : touchedVisitIds.size;
-      mark(`buildVisitSimilarityHnsw.start entries=${String(similarityEntries.length)}`);
+      mark(
+        `buildVisitSimilarityHnsw.start entries=${String(similarityEntries.length)} requalified=${String(engagementRequalifiedVisitIds.size)}`,
+      );
       try {
         visitSimilarity = await buildHnswVisitSimilarity({
           entries: similarityEntries,
@@ -4948,6 +5216,21 @@ export const createConnectionsMaterializer = (
       const canonicalUrl = event.payload['canonicalUrl'];
       if (typeof canonicalUrl === 'string') {
         pageEvidenceRecordCache.delete(canonicalizeEvidenceUrl(canonicalUrl));
+        // Content-arrival requalification: the fresh evidence may now be
+        // content-backed, so this visit must be re-embedded for similarity
+        // (see contentRequalifyEnabled). ACCUMULATE the key only — do NOT
+        // force a graph drain here. PAGE_EVIDENCE_EXTRACTED is content-
+        // lane-only precisely to avoid a graph drain per content event
+        // (the "defers content-lane progress ... without a backlog scan"
+        // invariant). Content arrivals are navigation-correlated, so the
+        // next natural graph drain folds this key into hnswReconcileVisitIds
+        // and re-derives the edges. The worker-lane path
+        // (requalifyVisitForSimilarity) DOES request a drain — nothing else
+        // would trigger one for a backlog embed completed on a quiet vault.
+        if (contentRequalifyEnabled()) {
+          const visitKey = normalizeVisitUrl(canonicalUrl);
+          if (visitKey.length > 0) contentRequalifyVisitKeys.add(visitKey);
+        }
       }
     }
     if (!handlesGraph) {
@@ -5236,6 +5519,25 @@ export const createConnectionsMaterializer = (
   // this method just orchestrates. Tombstoned units are reconciled
   // first to ensure index removals happen before chunk re-adds during
   // a re-add-then-tombstone-then-re-add sequence on the same source.
+  // Task 3 seam for the background-embedding lane. When the lane
+  // completes a backlog doc embedding it calls this so the visit is
+  // re-embedded for similarity on the next drain (the same content-
+  // arrival requalification PAGE_EVIDENCE_EXTRACTED triggers). Bounded:
+  // accumulates a canonical URL and requests a (debounced) drain; the
+  // drain drains + clears the set. Respects the kill-switch.
+  const requalifyVisitForSimilarity = (rawCanonicalUrl: string): void => {
+    if (!contentRequalifyEnabled()) return;
+    const visitKey = normalizeVisitUrl(rawCanonicalUrl);
+    if (visitKey.length === 0) return;
+    contentRequalifyVisitKeys.add(visitKey);
+    requestDrain();
+  };
+
+  // The lane pauses embedding while a drain runs (CPU regime — never
+  // contend with the drain thread). Expose the running flag so the lane's
+  // isDrainActive() reads the authoritative signal.
+  const isDrainActive = (): boolean => running;
+
   const drainContentLaneQueue = async (
     reconciler: ContentLaneSourceUnitReconciler,
   ): Promise<number> => {
@@ -5286,5 +5588,7 @@ export const createConnectionsMaterializer = (
     getTopicAccumulator,
     getEmbedderWarmthTracker,
     drainContentLaneQueue,
+    requalifyVisitForSimilarity,
+    isDrainActive,
   };
 };

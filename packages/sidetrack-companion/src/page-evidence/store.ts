@@ -615,3 +615,115 @@ export const readPageEvidenceVectorMap = async (
   }
   return out;
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// Background-embedding lane adapters
+//
+// These bind the abstract BackgroundEmbeddingLaneDeps
+// (page-evidence/backgroundEmbeddingLane.ts) to concrete vault I/O. The
+// lane owns cadence + batch-cap + drain-pause; these functions own the
+// per-record vault reads/writes.
+// ─────────────────────────────────────────────────────────────────────
+
+/** List every record as a lane candidate. The lane classifies backlog
+ *  membership itself (isBackgroundEmbeddingBacklog); this just surfaces
+ *  the structural fields it needs. */
+export const listBackgroundEmbeddingCandidates = async (
+  vaultRoot: string,
+): Promise<
+  readonly {
+    readonly canonicalUrl: string;
+    readonly url: string;
+    readonly title?: string;
+    readonly evidenceTier: PageEvidenceTier;
+    readonly content?: {
+      readonly embeddingState?: 'disabled' | 'missing' | 'failed' | 'ready';
+      readonly docEmbeddingRef?: VectorRef;
+    };
+  }[]
+> => {
+  const records = await listPageEvidenceRecords(vaultRoot);
+  return records.map((record) => ({
+    canonicalUrl: record.canonicalUrl,
+    // The record stores only the canonical URL (no raw URL); it is a
+    // fully-formed https URL, so it satisfies the tombstone matcher's
+    // registrableDomainFromUrl. `metadata.host` is the bare host only.
+    url: record.canonicalUrl,
+    ...(record.metadata.title === undefined ? {} : { title: record.metadata.title }),
+    evidenceTier: record.evidenceTier,
+    ...(record.content === undefined
+      ? {}
+      : {
+          content: {
+            ...(record.content.embeddingState === undefined
+              ? {}
+              : { embeddingState: record.content.embeddingState }),
+            ...(record.content.docEmbeddingRef === undefined
+              ? {}
+              : { docEmbeddingRef: record.content.docEmbeddingRef }),
+          },
+        }),
+  }));
+};
+
+/**
+ * Embed one backlog canonical URL by reconstructing the extraction
+ * payload (with raw text) from the page-content store, then routing it
+ * through the SAME `completeExtractedPageEvidenceEmbedding` path the
+ * request handler uses. The embedder is the process-global override
+ * (recall/embedder.js) — off-main when the runtime installed the
+ * embedder child.
+ *
+ * Returns:
+ *   - 'skipped'  — no indexed content payload on disk (content-features-
+ *                  only page, or raw text absent). Not a failure.
+ *   - 'embedded' — a ready vector now backs the record.
+ *   - 'failed'   — the record still has no ready vector after the pass
+ *                  (embed threw, or produced no vector).
+ */
+export const embedBacklogCanonicalUrl = async (
+  vaultRoot: string,
+): Promise<(canonicalUrl: string) => Promise<'embedded' | 'skipped' | 'failed'>> => {
+  return async (rawCanonicalUrl) => {
+    const payload = await readPageContentExtractedPayloadForEvidence(vaultRoot, rawCanonicalUrl);
+    if (payload === null) return 'skipped';
+    const record = await completeExtractedPageEvidenceEmbedding(
+      vaultRoot,
+      { ...payload, storageMode: 'indexed_chunks' },
+      { rebuildManifestAfterWrite: false },
+    );
+    if (record.content?.embeddingState === 'ready' && record.content.docEmbeddingRef !== undefined) {
+      return 'embedded';
+    }
+    return 'failed';
+  };
+};
+
+const BACKGROUND_EMBEDDING_PROGRESS_FILENAME = 'embed-lane-progress.json';
+
+const backgroundEmbeddingProgressPath = (vaultRoot: string): string =>
+  join(pageEvidenceRoot(vaultRoot), BACKGROUND_EMBEDDING_PROGRESS_FILENAME);
+
+export interface BackgroundEmbeddingProgressArtifact {
+  readonly schemaVersion: 1;
+  readonly attemptsByCanonicalUrl: Record<string, number>;
+  readonly embeddedTotal: number;
+  readonly lastRunAtMs: number | null;
+}
+
+export const readBackgroundEmbeddingProgress = async (
+  vaultRoot: string,
+): Promise<BackgroundEmbeddingProgressArtifact | null> => {
+  const parsed = await readJson<BackgroundEmbeddingProgressArtifact>(
+    backgroundEmbeddingProgressPath(vaultRoot),
+  );
+  if (parsed === null || parsed.schemaVersion !== 1) return null;
+  return parsed;
+};
+
+export const writeBackgroundEmbeddingProgress = async (
+  vaultRoot: string,
+  progress: BackgroundEmbeddingProgressArtifact,
+): Promise<void> => {
+  await atomicWriteJson(backgroundEmbeddingProgressPath(vaultRoot), progress);
+};

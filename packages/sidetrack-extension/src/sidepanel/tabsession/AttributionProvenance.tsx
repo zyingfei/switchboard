@@ -1,5 +1,11 @@
 import { formatAnchorDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import type { ConnectionNode } from '../connections/types';
+import {
+  endorsementFor,
+  hostFromUrl,
+  isAggregatorHost,
+  reasonChipsFor,
+} from './suggestionEndorsement';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
@@ -63,18 +69,18 @@ export function AttributionProvenance({
       </span>
     );
   }
-  // Surface the resolver's top fused candidate even when the decision
-  // is `inbox` (cold-start under threshold) — the user can still see
-  // the best guess and one-click confirm. This is the difference
-  // between "we have no idea" and "we have a guess but aren't sure".
-  // Decision-level workstreamId is set only for suggest/auto-apply;
-  // for inbox decisions we read fusedCandidates[0] directly.
-  const decisionTarget = suggestion?.decision.workstreamId;
+  // Surface the resolver's top fused candidate even when the policy did
+  // NOT endorse it (action='inbox') — the user can still see the lean and
+  // one-click confirm. But we must be honest about *whether the policy
+  // endorsed it*: a suggest/auto-apply is a real "Suggested", an inbox
+  // decision is a de-emphasised "Weak guess — not filed" so it never
+  // masquerades as a settled or recommended pick (the live -0.62-margin
+  // bug). endorsementFor() is the single source of truth.
+  const endorsement = endorsementFor(suggestion);
   const topCandidate = suggestion?.fusedCandidates[0];
-  const targetWorkstreamId = decisionTarget ?? topCandidate?.workstreamId;
-  if (targetWorkstreamId !== undefined && topCandidate !== undefined) {
+  if (endorsement.level !== 'none' && topCandidate !== undefined) {
     const targetPath =
-      workstreams.find((workstream) => workstream.bac_id === targetWorkstreamId)?.path ??
+      workstreams.find((workstream) => workstream.bac_id === endorsement.workstreamId)?.path ??
       '(removed)';
     const source = topCandidate.dominantSource;
     const seen = new Set<string>();
@@ -90,15 +96,59 @@ export function AttributionProvenance({
       }
       if (anchorLabels.length >= 3) break;
     }
-    // Different phrasing makes the confidence level legible to the user.
-    const verb = decisionTarget === undefined ? 'Best guess' : 'Suggested';
-    const margin = suggestion?.decision.margin ?? 0;
+    const chips = reasonChipsFor(topCandidate, record.pageEvidence);
+    const isWeak = endorsement.level === 'weak-guess';
+    // Honest phrasing: endorsed → "Suggested"; un-endorsed lean →
+    // "Weak guess — not filed".
+    const verb = isWeak ? 'Weak guess — not filed' : 'Suggested';
+    const margin = endorsement.margin;
     return (
-      <span className="tab-session-provenance mono">
-        {verb}: {targetPath} · {source} · margin {margin.toFixed(2)}
-        {anchorLabels.length > 0 ? ` · ${anchorLabels.join(' · ')}` : ''}
+      <span
+        className={`tab-session-provenance mono${isWeak ? ' is-weak-guess' : ''}`}
+        data-endorsement={endorsement.level}
+      >
+        <span className="tab-session-provenance-verb">{verb}</span>: {targetPath}
+        {chips.length > 0 ? (
+          <span className="tab-session-reason-chips">
+            {chips.map((chip) => (
+              <span
+                key={chip.kind}
+                className={`tab-session-reason-chip is-${chip.kind}`}
+                title={chip.title}
+              >
+                {chip.label}
+              </span>
+            ))}
+          </span>
+        ) : null}
+        <span className="tab-session-provenance-num">
+          {source} · margin {margin.toFixed(2)}
+        </span>
+        {anchorLabels.length > 0 ? (
+          <span className="tab-session-provenance-anchors">{anchorLabels.join(' · ')}</span>
+        ) : null}
       </span>
     );
   }
-  return <span className="tab-session-provenance mono">No attribution</span>;
+  // No candidate at all. On a broad multi-topic platform (aggregator /
+  // social / search) the structural similarity signal is deliberately
+  // suppressed as an untrustworthy false-friend, so quiet here is expected
+  // — say so instead of a bare "No attribution".
+  const host = hostFromUrl(record.latestUrl);
+  if (isAggregatorHost(host)) {
+    return (
+      <span
+        className="tab-session-provenance mono is-quiet"
+        data-endorsement="none"
+        title="Broad multi-topic sites (news aggregators, social, search) share a URL skeleton across unrelated pages, so Sidetrack suppresses that similarity as a false-friend and waits for stronger evidence (graph proximity or page content)."
+      >
+        Broad site — waiting for stronger evidence
+      </span>
+    );
+  }
+  return (
+    <span className="tab-session-provenance mono" data-endorsement="none">
+      No attribution
+    </span>
+  );
 }

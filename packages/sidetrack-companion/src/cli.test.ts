@@ -303,6 +303,104 @@ describe('runCli', () => {
     }
   });
 
+  it('engagement requalify-similarity reports the backlog then applies pings idempotently', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'engagement-requalify-'));
+    try {
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const log = createEventLog(vaultRoot, replica);
+      const dims = (focusedWindowMs: number) => ({
+        activeMs: focusedWindowMs,
+        visibleMs: focusedWindowMs,
+        focusedWindowMs,
+        idleMs: 0,
+        foregroundBursts: 1,
+        returnCount: 0,
+        scrollEvents: 0,
+        maxScrollRatio: 0,
+        copyCount: 0,
+        pasteCount: 0,
+      });
+      // Two gate-eligible aggregates (backfill lane) with no served
+      // similarity edges → both are backlog.
+      const seed = [
+        {
+          clientEventId: 'ra-1',
+          dot: { replicaId: 'edge_backfill', seq: 1 },
+          deps: {},
+          aggregateId: 'engagement.session.aggregated:visit:https://a.test/x',
+          type: 'engagement.session.aggregated',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:https://a.test/x',
+            sessionId: 'backfill:visit:https://a.test/x',
+            dimensions: { engagement: dims(40_000) },
+          },
+          acceptedAtMs: 6_000,
+        },
+        {
+          clientEventId: 'ra-2',
+          dot: { replicaId: 'edge_backfill', seq: 2 },
+          deps: {},
+          aggregateId: 'engagement.session.aggregated:visit:https://b.test/y',
+          type: 'engagement.session.aggregated',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:https://b.test/y',
+            sessionId: 'backfill:visit:https://b.test/y',
+            dimensions: { engagement: dims(9_000) },
+          },
+          acceptedAtMs: 6_000,
+        },
+      ];
+      for (const event of seed) await log.importPeerEvent(event as never);
+
+      // Dry-run: reports 2 backlog visits, writes nothing.
+      const dry = createStreams();
+      const dryExit = await runCli(
+        ['engagement', 'requalify-similarity', '--vault', vaultRoot],
+        dry,
+      );
+      expect(dryExit).toBe(0);
+      expect(dry.stdout.text()).toContain('needsRequalify=2');
+      expect(dry.stdout.text()).toContain('dry-run: no events written');
+
+      // Apply: appends one zero-dimension ping per backlog visit under
+      // the requalify replica.
+      const apply1 = createStreams();
+      const applyExit = await runCli(
+        ['engagement', 'requalify-similarity', '--vault', vaultRoot, '--apply'],
+        apply1,
+      );
+      expect(applyExit).toBe(0);
+      expect(apply1.stdout.text()).toContain('imported=2');
+
+      const merged = await log.readMerged();
+      const pings = merged.filter((e) => e.dot.replicaId === 'similarity_requalify');
+      expect(pings).toHaveLength(2);
+      // Zero dimensions — adds nothing to the classifier's per-visit sum.
+      for (const ping of pings) {
+        expect(
+          (ping.payload as { dimensions: { engagement: { focusedWindowMs: number } } }).dimensions
+            .engagement.focusedWindowMs,
+        ).toBe(0);
+      }
+
+      // Re-apply: the pings are deduped by clientEventId — idempotent.
+      const apply2 = createStreams();
+      const reapplyExit = await runCli(
+        ['engagement', 'requalify-similarity', '--vault', vaultRoot, '--apply'],
+        apply2,
+      );
+      expect(reapplyExit).toBe(0);
+      expect(apply2.stdout.text()).toContain('skipped=2');
+      expect(apply2.stdout.text()).toContain('imported=0');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
   it('recall reingest refuses when the recall process-lock is held by a live foreign PID', async () => {
     // A running companion holds `_BAC/recall/.lock` for the same
     // single-writer reason that `recall reingest` does — letting them

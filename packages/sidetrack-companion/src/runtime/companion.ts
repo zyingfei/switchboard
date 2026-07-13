@@ -54,7 +54,14 @@ import { createTimelineStore } from '../timeline/projection.js';
 import {
   canonicalizeEvidenceUrl,
   ensurePageEvidenceForTimelineEntries,
+  embedBacklogCanonicalUrl,
+  listBackgroundEmbeddingCandidates,
+  readBackgroundEmbeddingProgress,
+  writeBackgroundEmbeddingProgress,
 } from '../page-evidence/store.js';
+import { createBackgroundEmbeddingLane } from '../page-evidence/backgroundEmbeddingLane.js';
+import { buildDomainTombstoneSet } from '../privacy/domainTombstone.js';
+import { readDomainTombstones } from '../privacy/domainTombstoneStore.js';
 import type { TimelineProvider } from '../timeline/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
@@ -964,6 +971,50 @@ export const startCompanion = async (
         // verb + lifecycle stale-check rebuilds remain available.
       }
     })();
+    // Off-main-loop page-evidence content embedding lane. Drains the
+    // backlog of content-tier page-evidence records that have no doc
+    // vector yet (the ~13.6%-coverage ceiling the audit flagged),
+    // embedding them in bounded idle batches through the embedder CHILD
+    // (the same setEmbedderOverride installed above) so the heavy
+    // ONNX/CoreML work never lands on the API process. Gated by
+    // SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING (default OFF — the flag
+    // now drives THIS lane, not the retired setTimeout(0) request-path
+    // embed) AND by useChildProcesses (an in-process embedder would put
+    // the exact main-loop CPU this lane exists to avoid right back on the
+    // event loop). On each completed embed the lane requalifies the visit
+    // so the next connections drain re-derives its similarity edges.
+    const backgroundEmbeddingLaneEnabled =
+      (process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'] === '1' ||
+        process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING']?.toLowerCase() === 'true') &&
+      useChildProcesses;
+    if (backgroundEmbeddingLaneEnabled) {
+      // Load the privacy tombstone set once at startup. A page whose
+      // domain is tombstoned is never embedded (privacy gate). The set is
+      // a snapshot; a tombstone added mid-session takes effect on the next
+      // restart — acceptable because the backlog is durable and the
+      // record's content is already on disk regardless.
+      const tombstoneSet = buildDomainTombstoneSet(
+        await readDomainTombstones(options.vaultPath).catch(() => []),
+      );
+      const embedOne = await embedBacklogCanonicalUrl(options.vaultPath);
+      const backgroundEmbeddingLane = createBackgroundEmbeddingLane({
+        listCandidates: () => listBackgroundEmbeddingCandidates(options.vaultPath),
+        embedCanonicalUrl: embedOne,
+        isDrainActive: () => connectionsMaterializer.isDrainActive(),
+        isTombstoned: (page) => tombstoneSet.matchesPage(page),
+        onEmbedded: (canonicalUrl) =>
+          connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
+        readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
+        writeProgress: (progress) =>
+          writeBackgroundEmbeddingProgress(options.vaultPath, progress),
+        log: (message) => process.stdout.write(`${message}\n`),
+      });
+      backgroundEmbeddingLane.start();
+      teardown.push(() => {
+        backgroundEmbeddingLane.stop();
+      });
+    }
+
     // Event-loop stall monitor. Spans the entire process lifetime so
     // /v1/status can report `eventLoop.maxRecentStallMs` etc. independent
     // of whether the materializer or recall lifecycle is doing work.

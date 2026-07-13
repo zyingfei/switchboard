@@ -578,12 +578,13 @@ class SqliteRecallStore implements RecallStore {
       // LIMIT), then join out to docs for canonical_url / title.
       // body_indexed is already on the docs schema (1 = body extracted,
       // 0 = title+URL only). Returning it lets callers distinguish a
-      // content vector from a title-only vector so they can LOG the
-      // provenance of a KNN hit. It is READ-ONLY here: fusion/ordering
-      // is unchanged (the ORDER BY is still cosine distance), and any
-      // down-weighting of title-only hits is a serving-math change gated
-      // behind the P1 freeze (ADR-0011). COALESCE guards the LEFT JOIN
-      // miss (vector present but docs row swept) — treat unknown as 0.
+      // content vector from a title-only vector. It is READ-ONLY here:
+      // fusion/ordering is unchanged (the ORDER BY is still cosine
+      // distance). Provenance down-weighting of title-only hits is a
+      // caller-side serving choice, flag-gated behind SIDETRACK_RECALL_
+      // PROVENANCE_DOWNWEIGHT (ADR-0011 amendment 2026-07-12c; default
+      // OFF by eval verdict). COALESCE guards the LEFT JOIN miss (vector
+      // present but docs row swept) — treat unknown as 0.
       const sql = `
         SELECT v.entityId AS entityId,
                d.canonical_url AS canonicalUrl,
@@ -618,6 +619,90 @@ class SqliteRecallStore implements RecallStore {
       return mapped.filter((r) => !exclude.has(r.entityId));
     } catch (err) {
       console.warn('[recall-v2] vec query failed:', err);
+      return [];
+    }
+  }
+
+  queryChunkVector(opts: {
+    readonly vec: Float32Array;
+    readonly limit: number;
+    readonly excludeEntityIds?: ReadonlySet<string>;
+  }): readonly {
+    readonly entityId: string;
+    readonly canonicalUrl: string | undefined;
+    readonly title: string | undefined;
+    readonly cosineDistance: number;
+    readonly bodyIndexed: 0 | 1;
+    readonly pooledChunkCount: number;
+  }[] {
+    if (!this.vecAvailable) return [];
+    try {
+      const target = JSON.stringify(Array.from(opts.vec));
+      // Doc-level max-chunk pooling over documents_chunks_vec.
+      //
+      // Chunk vectors are content-derived (a doc's body is split into
+      // passages, each embedded separately), so KNN over the chunk
+      // space finds the single best-matching PASSAGE rather than the
+      // whole-doc average. To turn that back into a doc-level ranking
+      // we pool: each document's score is its BEST chunk (max cosine
+      // similarity == MIN cosine distance). This is the standard
+      // max-pool retrieval strategy — it rewards a doc that has one
+      // strongly-relevant passage over a doc that is diffusely on-topic,
+      // which is what "find the page that discussed X" wants.
+      //
+      // Two-stage so vec0 sees its own LIMIT (same constraint as
+      // queryVector — a bare join hides the KNN LIMIT and vec0 throws):
+      //   1. Inner KNN pulls the top-N nearest CHUNK vectors.
+      //   2. Outer join maps chunk_id -> document_entity_id -> docs,
+      //      then GROUP BY the document and keep MIN(distance).
+      // We over-pull chunks (limit * poolFanout) so a single hot doc
+      // whose top passages crowd the KNN frontier doesn't starve other
+      // docs out of the pooled result. body_indexed is read straight
+      // off docs (chunk vectors only exist for content-indexed docs, so
+      // this is ~always 1 — but we COALESCE-guard the LEFT JOIN miss).
+      const poolFanout = 4;
+      const chunkKnnLimit = Math.max(opts.limit * poolFanout, 40);
+      const sql = `
+        SELECT d.entity_id AS entityId,
+               d.canonical_url AS canonicalUrl,
+               d.title AS title,
+               MIN(v.distance) AS cosineDistance,
+               COALESCE(d.body_indexed, 0) AS bodyIndexed,
+               COUNT(*) AS pooledChunkCount
+        FROM (
+          SELECT chunk_id AS chunkId, distance
+          FROM documents_chunks_vec
+          WHERE embedding MATCH ?
+          ORDER BY distance
+          LIMIT ?
+        ) AS v
+        JOIN documents_chunks AS c ON c.chunk_id = v.chunkId
+        JOIN docs AS d ON d.entity_id = c.document_entity_id
+        GROUP BY d.entity_id
+        ORDER BY cosineDistance
+        LIMIT ?
+      `;
+      const rows = this.db.prepare(sql).all(target, chunkKnnLimit, opts.limit) as {
+        entityId: string;
+        canonicalUrl: string | null;
+        title: string | null;
+        cosineDistance: number;
+        bodyIndexed: number;
+        pooledChunkCount: number;
+      }[];
+      const mapped = rows.map((r) => ({
+        entityId: r.entityId,
+        canonicalUrl: r.canonicalUrl ?? undefined,
+        title: r.title ?? undefined,
+        cosineDistance: r.cosineDistance,
+        bodyIndexed: (r.bodyIndexed === 1 ? 1 : 0) as 0 | 1,
+        pooledChunkCount: r.pooledChunkCount,
+      }));
+      const exclude = opts.excludeEntityIds;
+      if (exclude === undefined) return mapped;
+      return mapped.filter((r) => !exclude.has(r.entityId));
+    } catch (err) {
+      console.warn('[recall-v2] chunk vec query failed:', err);
       return [];
     }
   }

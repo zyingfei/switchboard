@@ -3,6 +3,7 @@ import {
   confidenceLevelLabel,
   probabilityFromLogit,
 } from '../suggestion/confidence';
+import { endorsementFor } from './suggestionEndorsement';
 import type { TabSessionResolutionResult, TabSessionWorkstreamOption } from './types';
 
 // Stage 5 polish — surface the resolver's confidence in human-readable
@@ -200,6 +201,13 @@ export function SuggestionStats({
   const level = confidenceLevelFromProbability(probability, { margin });
   const label = workstreamLabel(top.workstreamId, workstreams);
   const isTied = level === 'no-clear-pick';
+  // Honesty gate: the policy only *endorsed* this pick when the decision is
+  // suggest / auto-apply. An action='inbox' decision is a weak guess — the
+  // model has a lean but chose not to surface it. Flag it so the headline
+  // reads "weak guess — not filed" rather than a confident-looking pick
+  // (the live -0.62-margin bug where an inbox decision rendered as a
+  // suggestion). Confidence numbers stay visible for power users.
+  const isWeakGuess = endorsementFor(suggestion).level === 'weak-guess';
   // When the leader's margin is tiny the resolver is admitting it
   // can't separate the top candidates. Force the alternatives row on
   // so the user sees the near-ties instead of an invented winner.
@@ -245,8 +253,18 @@ export function SuggestionStats({
     </>
   );
   return (
-    <div className={`suggestion-stats is-${level}${compact ? ' is-compact' : ''}`}>
+    <div
+      className={`suggestion-stats is-${level}${compact ? ' is-compact' : ''}${
+        isWeakGuess ? ' is-weak-guess' : ''
+      }`}
+      data-endorsement={isWeakGuess ? 'weak-guess' : 'endorsed'}
+    >
       <span className="suggestion-stats-row">
+        {isWeakGuess ? (
+          <span className="suggestion-stats-weak" title="Below the resolver's confidence bar — not filed. Confirm to teach it.">
+            weak guess — not filed
+          </span>
+        ) : null}
         <span className="suggestion-stats-target">{label}</span>
         <span className="suggestion-stats-confidence">
           {confidenceLevelLabel(level)} · {Math.round(probability * 100)}%
