@@ -2815,6 +2815,29 @@ textarea.preview-body:focus {
   letter-spacing: 0.02em;
   color: var(--ink-4);
 }
+/* §3.4 context line — "<workstream> · in reply to \"…\"". The
+   disambiguator for "what does this reply answer?". Muted, single line. */
+.inbound-context {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--ink-3, #7a7269);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Optional one-line reply snippet (in-memory only). Quoted, clamped. */
+.inbound-snippet {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--ink-2, #4a453d);
+  font-style: italic;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 /* Provenance sentence kept for the pinned "{provider} replied {age}"
    assertion + screen readers; visually folded into the chip + age above. */
 .inbound-provenance-sr {
@@ -5945,7 +5968,7 @@ button.thread-queued:focus-visible {
   letter-spacing: 0.04em;
 }
 .queue-row-text {
-  color: var(--ink-1, #1b1916);
+  color: var(--ink, #1b1916);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5967,6 +5990,30 @@ button.thread-queued:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Named blocker line (§3.3) — the drain bail reason in plain words. */
+.queue-row-blocker {
+  margin-top: 3px;
+  color: #be123c;
+  font-size: 10px;
+}
+.queue-row-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.queue-row-edit-input,
+.queued-item-edit-input {
+  width: 100%;
+  resize: vertical;
+  font-size: 11px;
+  padding: 5px 7px;
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  border-radius: var(--rad-s, 4px);
+  background: var(--paper-light, #fffdf7);
+  color: var(--ink, #1b1916);
+  box-sizing: border-box;
 }
 .queue-row-actions {
   display: inline-flex;
@@ -5999,6 +6046,100 @@ button.thread-queued:focus-visible {
 .queue-row-actions .btn-link.thread-queue-retry:hover,
 .queue-retry-all-row .btn-link.thread-queue-retry:hover {
   color: var(--signal-2, #ea580c);
+}
+
+/* =====================================================
+   Queued view (§3.3) — the send-triage workbench.
+   ===================================================== */
+.queued-group {
+  margin-top: 10px;
+}
+.queued-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
+.queued-group-label {
+  font-weight: 500;
+  color: var(--ink, #1b1916);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queued-group-head .count {
+  margin-left: auto;
+  color: var(--ink-4, #a39a8c);
+}
+.queued-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.queued-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--rule-soft, #e5ddc9);
+}
+.queued-item.has-blocker {
+  background: #fff8f8;
+}
+.queued-item-text {
+  color: var(--ink, #1b1916);
+  font-size: 12px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.queued-item-blocker {
+  color: #be123c;
+  font-size: 10.5px;
+}
+.queued-item-actions {
+  display: inline-flex;
+  gap: 10px;
+  margin-top: 2px;
+}
+.queued-item-actions .btn-link {
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10.5px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--ink-2, #4a453d);
+  white-space: nowrap;
+}
+.queued-item-actions .btn-link:hover {
+  color: var(--signal, #c2410c);
+}
+.queued-item-actions .btn-link.queued-act-primary {
+  color: var(--signal, #c2410c);
+  font-weight: 500;
+}
+.queued-item-actions .btn-link.btn-muted {
+  color: var(--ink-4, #a39a8c);
+}
+.queued-empty .queued-empty-head {
+  font-weight: 500;
+  color: var(--ink, #1b1916);
+  margin-bottom: 4px;
+}
+.queued-nonthread-banner {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--amber-tint, #fef3c7);
+  background: var(--amber-bg, #fffbeb);
+  color: var(--amber, #a16207);
+  border-radius: var(--rad-s, 4px);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .thread-ws-path {
@@ -6142,6 +6283,48 @@ button.thread-queued:focus-visible {
   border-color: var(--amber-tint, #fef3c7);
   background: var(--amber-bg, #fffbeb);
   color: var(--amber, #a16207);
+}
+
+/* Conversation-loop state chip (§3.2). One per thread row; the same
+   word the Inbox uses for the same event. Shares the pill footprint;
+   the queued / replied variants are <button>s (tap into send / read),
+   so reset the default button chrome. */
+.loop-chip {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px var(--r2, 8px);
+  border-radius: var(--rad-s, 4px);
+  border: 1px solid var(--rule-soft, #e5ddc9);
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
+  white-space: nowrap;
+  font-family: var(--mono, 'JetBrains Mono', ui-monospace, monospace);
+}
+button.loop-chip {
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+button.loop-chip:hover {
+  filter: brightness(0.97);
+}
+.loop-chip.signal {
+  border-color: var(--signal-tint, #fed7aa);
+  background: var(--signal-bg, #fff7ed);
+  color: var(--signal, #c2410c);
+}
+.loop-chip.amber {
+  border-color: var(--amber-tint, #fef3c7);
+  background: var(--amber-bg, #fffbeb);
+  color: var(--amber, #a16207);
+}
+.loop-chip.gray {
+  border-color: var(--rule-soft, #e5ddc9);
+  background: var(--paper-light, #fbf7ee);
+  color: var(--ink-3, #7a7269);
 }
 
 /* =====================================================

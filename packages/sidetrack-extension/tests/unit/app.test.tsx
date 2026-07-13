@@ -1230,7 +1230,12 @@ describe('live side-panel App wiring', () => {
     expect(findButton).toBeInTheDocument();
   });
 
-  it('renders queue-item progress chips for auto-send state', async () => {
+  it('renders the Sending phase for an in-flight (typing) queue item', async () => {
+    // §3.5 — the item-level "waiting for reply" label is GONE (it
+    // competed with the thread's Waiting-on-AI chip, the "two waitings"
+    // confusion). Only the transient `typing` state renders a phase line
+    // ("typing into <provider>…"); a `waiting`-flagged item is just a
+    // pending row labelled "Queued". Verify the typing phase renders.
     const state = liveState();
     installChromeMock(
       {
@@ -1242,7 +1247,7 @@ describe('live side-panel App wiring', () => {
             scope: 'thread',
             targetId: 'bac_thread_test',
             status: 'pending',
-            progress: 'waiting',
+            progress: 'typing',
             createdAt: NOW,
             updatedAt: NOW,
           },
@@ -1256,7 +1261,69 @@ describe('live side-panel App wiring', () => {
     await goToTab('Threads');
     fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
 
-    expect(await screen.findByText(/waiting for Claude's reply/)).toBeInTheDocument();
+    // The in-flight item shows the "typing into <provider>" phase, and
+    // NO "waiting for reply" label anywhere (removed per §3.5).
+    expect(await screen.findByText(/typing into Claude/)).toBeInTheDocument();
+    expect(screen.queryByText(/waiting for Claude's reply/)).not.toBeInTheDocument();
+  });
+
+  it('[Open] on an auto-send-off queued row with a closed tab opens exactly one tab', async () => {
+    // Regression: openThreadAndDrain used to call openTabForThread AND
+    // (on the auto-send-off branch) openThreadForPasteSend, which opens
+    // the tab a SECOND time. With no cross-call dedup, a closed tab —
+    // the exact scenario [Open] exists to fix — meant two concurrent
+    // chrome.tabs.create calls → two duplicate tabs. This is the
+    // dominant case since autoSendEnabled defaults undefined (off).
+    const base = liveState();
+    installChromeMock(
+      {
+        ...base,
+        threads: [
+          {
+            ...base.threads[0],
+            // Auto-send off (undefined) and NO tab snapshot → the tab is
+            // closed, so openTabForThread must fall through to create.
+            autoSendEnabled: undefined,
+            tabSnapshot: undefined,
+          },
+        ],
+        queueItems: [
+          {
+            bac_id: 'bac_queue_thread_open',
+            text: 'Reopen the thread and paste this follow-up.',
+            scope: 'thread',
+            targetId: 'bac_thread_test',
+            status: 'pending',
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ],
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+      // No active tab URL → chrome.tabs.query resolves [] (tab closed),
+      // so both open paths would otherwise fall through to create.
+    );
+    // Deterministic clipboard for the paste lane (jsdom has none).
+    vi.stubGlobal('navigator', {
+      ...globalThis.navigator,
+      clipboard: { writeText: vi.fn(() => Promise.resolve()) },
+    });
+    const createSpy = (chrome.tabs as unknown as { create: ReturnType<typeof vi.fn> }).create;
+
+    render(<App />);
+
+    await goToTab('Queued follow-ups');
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
+
+    // Exactly one tab is created — not two. Both open paths (the top-level
+    // openTabForThread and the paste lane's) must not double-fire.
+    await waitFor(() => {
+      expect(createSpy).toHaveBeenCalledTimes(1);
+    });
+    // Give any second (buggy) create a chance to fire before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(createSpy).toHaveBeenCalledWith({ url: 'https://claude.ai/chat/thread' });
   });
 
   it('keeps shared workstream titles visible and masks screenshare-sensitive rows only when enabled', async () => {

@@ -82,6 +82,9 @@ describe('InboundView — §13 steps 3/9', () => {
   });
 });
 
+// One clean pending item + one blocked (tab closed) so the row's
+// blocker line and action set can be asserted. The blocked item's
+// lastError is the EXACT string findTabForThread writes.
 const groups: readonly QueueGroup[] = [
   {
     key: 'thread:t1',
@@ -107,43 +110,124 @@ const groups: readonly QueueGroup[] = [
         status: 'pending',
         createdAt: 'b',
         updatedAt: 'b',
-        lastError: 'chat tab closed',
+        lastError: 'Open the chat tab; auto-send needs the conversation visible to type into.',
       },
     ],
   },
 ];
 
-describe('QueuedView — §13 step 9', () => {
+const noop = () => undefined;
+
+describe('QueuedView — actionable rows (§3.3)', () => {
   it('renders grouped rows with a target header and total count', () => {
     render(
-      <QueuedView groups={groups} onDismiss={() => undefined} onRetry={() => undefined} />,
+      <QueuedView groups={groups} onOpen={noop} onSendNow={noop} onEdit={noop} onRemove={noop} />,
     );
     expect(screen.getByText('State machine review')).toBeInTheDocument();
     expect(screen.getByText('Critique the design')).toBeInTheDocument();
     expect(screen.getByText('Compare with the alternative')).toBeInTheDocument();
   });
 
-  it('offers Retry only for failed items and Dismiss for all', () => {
-    const onRetry = vi.fn();
-    const onDismiss = vi.fn();
-    render(<QueuedView groups={groups} onDismiss={onDismiss} onRetry={onRetry} />);
-    const retryButtons = screen.getAllByRole('button', { name: 'Retry' });
-    expect(retryButtons).toHaveLength(1);
-    fireEvent.click(retryButtons[0]);
-    expect(onRetry).toHaveBeenCalledWith('q2');
-    const dismissButtons = screen.getAllByRole('button', { name: 'Dismiss' });
-    expect(dismissButtons).toHaveLength(2);
+  it('names the blocker and offers [Open] when the tab is closed', () => {
+    const onOpen = vi.fn();
+    render(
+      <QueuedView
+        groups={groups}
+        onOpen={onOpen}
+        onSendNow={noop}
+        onEdit={noop}
+        onRemove={noop}
+      />,
+    );
+    // §3.3: the tab-closed drain reason maps to the plain blocker line.
+    expect(screen.getByText('The chat tab is closed.')).toBeInTheDocument();
+    // [Open] shows on both rows (the fix for a closed tab, and the
+    // reopen affordance generally). The tab-closed row is the one that
+    // does NOT offer [Send now] (the tab isn't open yet). The blocked
+    // row's [Open] is the second one (clean row q1 renders first).
+    const opens = screen.getAllByRole('button', { name: 'Open' });
+    expect(opens).toHaveLength(2);
+    fireEvent.click(opens[1]);
+    expect(onOpen).toHaveBeenCalledWith('t1', 'q2');
+    // Send now only on the clean (unblocked) row — the tab-closed row
+    // suppresses it (Open handles reopening).
+    const sendNows = screen.getAllByRole('button', { name: 'Send now' });
+    expect(sendNows).toHaveLength(1);
   });
 
-  it('shows an empty state when nothing is queued', () => {
-    render(<QueuedView groups={[]} onDismiss={() => undefined} onRetry={() => undefined} />);
-    expect(screen.getByText(/Nothing queued/)).toBeInTheDocument();
+  it('fires [Send now] with the target + item id for an unblocked row', () => {
+    const onSendNow = vi.fn();
+    render(
+      <QueuedView
+        groups={groups}
+        onOpen={noop}
+        onSendNow={onSendNow}
+        onEdit={noop}
+        onRemove={noop}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Send now' }));
+    expect(onSendNow).toHaveBeenCalledWith('t1', 'q1');
   });
 
-  // §13 step 4/9 — end-to-end for the new scope selector's outputs:
-  // workstream- and global-scoped items must group and render their own
-  // section headers alongside the existing thread groups.
-  it('renders workstream and global group headers from grouped items', () => {
+  it('offers [Edit] on every row and [Remove] on every row', () => {
+    const onRemove = vi.fn();
+    render(
+      <QueuedView
+        groups={groups}
+        onOpen={noop}
+        onSendNow={noop}
+        onEdit={noop}
+        onRemove={onRemove}
+      />,
+    );
+    expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(2);
+    const removes = screen.getAllByRole('button', { name: 'Remove' });
+    expect(removes).toHaveLength(2);
+    fireEvent.click(removes[0]);
+    expect(onRemove).toHaveBeenCalledWith('q1');
+  });
+
+  it('[Edit] opens an inline editor that saves the rewritten text', () => {
+    const onEdit = vi.fn();
+    render(
+      <QueuedView
+        groups={groups}
+        onOpen={noop}
+        onSendNow={noop}
+        onEdit={onEdit}
+        onRemove={noop}
+      />,
+    );
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    const textarea = screen.getByDisplayValue('Critique the design');
+    fireEvent.change(textarea, { target: { value: 'Shorter ask' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onEdit).toHaveBeenCalledWith('q1', 'Shorter ask');
+  });
+
+  it('shows the §3.3 empty state when nothing is queued', () => {
+    render(
+      <QueuedView groups={[]} onOpen={noop} onSendNow={noop} onEdit={noop} onRemove={noop} />,
+    );
+    expect(screen.getByText(/Nothing queued yet/)).toBeInTheDocument();
+  });
+
+  it('shows the non-thread banner when pre-existing non-thread items exist (D6)', () => {
+    render(
+      <QueuedView
+        groups={groups}
+        hasNonThreadItems
+        onOpen={noop}
+        onSendNow={noop}
+        onEdit={noop}
+        onRemove={noop}
+      />,
+    );
+    expect(screen.getByText(/isn.t tied to an open chat/)).toBeInTheDocument();
+  });
+
+  it('still groups any legacy workstream/global items by target', () => {
     const queueItem = (over: Partial<QueueItem> & Pick<QueueItem, 'bac_id'>): QueueItem => ({
       text: 'ask',
       scope: 'thread',
@@ -163,7 +247,13 @@ describe('QueuedView — §13 step 9', () => {
     );
     expect(grouped.map((g) => g.scope).sort()).toEqual(['global', 'thread', 'workstream']);
     render(
-      <QueuedView groups={grouped} onDismiss={() => undefined} onRetry={() => undefined} />,
+      <QueuedView
+        groups={grouped}
+        onOpen={noop}
+        onSendNow={noop}
+        onEdit={noop}
+        onRemove={noop}
+      />,
     );
     expect(screen.getByText('State machine review')).toBeInTheDocument();
     expect(screen.getByText('MVP PRD')).toBeInTheDocument();

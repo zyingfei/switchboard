@@ -6,6 +6,13 @@ export interface InboundReminder {
   readonly inboundTurnAt: string; // relative
   readonly status: 'unseen' | 'seen' | 'dismissed';
   readonly aiAuthored?: boolean;
+  // §3.4 context line — the thread's workstream label and the excerpt
+  // of the follow-up this reply answers. Both optional; the card omits
+  // the part that's absent (never renders an empty "in reply to").
+  readonly workstreamLabel?: string;
+  readonly inReplyTo?: string;
+  // Optional first ~90 chars of the reply itself (in-memory only).
+  readonly replySnippet?: string;
 }
 
 export interface InboundCardProps {
@@ -30,6 +37,20 @@ export function InboundCard({
 }: InboundCardProps) {
   const title = masked ? '[private — workstream item]' : reminder.threadTitle;
   const unread = reminder.status === 'unseen';
+  // §3.4 context line: "<workstream> · in reply to \"…\"". Masked cards
+  // hide the in-reply-to excerpt (it can leak the private prompt) but
+  // keep the workstream label. Built as parts so a missing piece never
+  // renders a bare separator.
+  const contextParts: string[] = [];
+  if (reminder.workstreamLabel !== undefined && reminder.workstreamLabel.length > 0) {
+    contextParts.push(reminder.workstreamLabel);
+  }
+  if (!masked && reminder.inReplyTo !== undefined && reminder.inReplyTo.length > 0) {
+    contextParts.push(`in reply to “${reminder.inReplyTo}”`);
+  }
+  const contextLine = contextParts.join(' · ');
+  const showSnippet =
+    !masked && reminder.replySnippet !== undefined && reminder.replySnippet.length > 0;
   return (
     <div className={'inbound-card status-' + reminder.status}>
       <div className="inbound-row1">
@@ -46,6 +67,8 @@ export function InboundCard({
         </span>
         <span className="inbound-age mono">{reminder.inboundTurnAt}</span>
       </div>
+      {contextLine.length > 0 ? <div className="inbound-context">{contextLine}</div> : null}
+      {showSnippet ? <div className="inbound-snippet">“{reminder.replySnippet}”</div> : null}
       <div className="inbound-actions">
         {/* Screen-reader / test-stable provenance sentence. Visually
             folded into the age chip above; kept for the pinned

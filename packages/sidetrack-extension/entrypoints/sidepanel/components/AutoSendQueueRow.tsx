@@ -1,5 +1,18 @@
-import { useEffect, useMemo, useState, type DragEvent } from 'react';
+import { useState, type DragEvent } from 'react';
 import type { QueueItem } from '../../../src/workboard';
+import { resolveQueueBlocker } from '../../../src/sidepanel/queued/blocker';
+
+// The inline per-thread queue row (under a thread card). Mirrors the
+// Queued view's row anatomy (§3.3) so both surfaces agree on vocabulary
+// and actions: text + blocker line + [Open] / [Send now] / [Edit] /
+// [Remove]. The two surfaces are two views of the SAME queue predicate.
+//
+// §3.5: the user-facing `progress:'waiting'` label is REMOVED — once an
+// item ships it's 'done' and the *thread* is Waiting on AI (its loop
+// chip). A per-item "waiting for reply" competed with that thread-level
+// signal ("two waitings"). The `waiting` field stays for the drain's
+// internal use; it just isn't rendered as a label here. `typing` still
+// renders as "Sending…" progress (the transient in-flight state).
 
 export interface AutoSendQueueRowDnd {
   readonly draggable: boolean;
@@ -16,55 +29,36 @@ export interface AutoSendQueueRowProps {
   readonly index: number;
   readonly total: number;
   readonly providerLabel: string;
-  readonly copied: boolean;
-  readonly onCopy: () => void;
-  readonly onRetry: () => void;
-  readonly onDismiss: () => void;
+  readonly onOpen: () => void;
+  readonly onSendNow: () => void;
+  readonly onEdit: (nextText: string) => void;
+  readonly onRemove: () => void;
   readonly dnd?: AutoSendQueueRowDnd;
 }
-
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
 
 export function AutoSendQueueRow({
   item,
   index,
   total,
   providerLabel,
-  copied,
-  onCopy,
-  onRetry,
-  onDismiss,
+  onOpen,
+  onSendNow,
+  onEdit,
+  onRemove,
   dnd,
 }: AutoSendQueueRowProps) {
-  const [now, setNow] = useState(() => Date.now());
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(item.text);
 
-  useEffect(() => {
-    if (item.progress !== 'waiting') {
-      return undefined;
-    }
-    const handle = window.setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
-    return () => {
-      window.clearInterval(handle);
-    };
-  }, [item.progress]);
-
-  const elapsedSeconds = useMemo(() => {
-    const startedAt = Date.parse(item.updatedAt);
-    if (Number.isNaN(startedAt)) {
-      return 0;
-    }
-    return Math.max(0, Math.floor((now - startedAt) / 1000));
-  }, [item.updatedAt, now]);
-
-  const failed = item.lastError !== undefined;
-  const active = !failed && item.progress !== undefined;
+  const blocker = resolveQueueBlocker(item.lastError, providerLabel);
+  const blocked = blocker.kind !== 'none';
+  const typing = item.progress === 'typing';
   const sent = item.status === 'done';
-  const statusClass = failed ? 'failed' : sent ? 'sent' : active ? 'active' : 'queued';
-  const glyph = failed ? '✕' : sent ? '✓' : active ? '◉' : '◯';
-  const label = failed ? 'Failed' : sent ? 'Sent' : active ? 'Sending now' : 'Queued';
-  const spinnerFrame = SPINNER_FRAMES[Math.floor(now / 120) % SPINNER_FRAMES.length];
+  const statusClass = blocked ? 'failed' : sent ? 'sent' : typing ? 'active' : 'queued';
+  const glyph = blocked ? '✕' : sent ? '✓' : typing ? '◉' : '◯';
+  // Header word mirrors the loop vocabulary: Sending (typing) / Sent /
+  // Blocked / Queued. No "waiting for reply" (that's the thread chip).
+  const label = blocked ? 'Blocker' : sent ? 'Sent' : typing ? 'Sending' : 'Queued';
 
   const dndProps = dnd
     ? {
@@ -84,6 +78,46 @@ export function AutoSendQueueRow({
   ]
     .filter(Boolean)
     .join(' ');
+
+  if (editing) {
+    return (
+      <li className="queue-row editing">
+        <form
+          className="queue-row-edit-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            onEdit(draft);
+            setEditing(false);
+          }}
+        >
+          <textarea
+            className="queue-row-edit-input mono"
+            value={draft}
+            rows={2}
+            autoFocus
+            onChange={(e) => {
+              setDraft(e.target.value);
+            }}
+          />
+          <div className="queue-row-actions">
+            <button type="submit" className="btn-link">
+              Save
+            </button>
+            <button
+              type="button"
+              className="btn-link"
+              onClick={() => {
+                setDraft(item.text);
+                setEditing(false);
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      </li>
+    );
+  }
 
   return (
     <li className={className} {...dndProps}>
@@ -105,36 +139,39 @@ export function AutoSendQueueRow({
         <div className="queue-row-text" title={item.text}>
           “{item.text}”
         </div>
-        {item.progress === 'typing' ? (
+        {typing ? (
           <div className="queue-row-phase mono" role="status">
-            <span className="queue-row-spinner" aria-hidden>
-              {spinnerFrame}
-            </span>{' '}
             typing into {providerLabel}…
           </div>
         ) : null}
-        {item.progress === 'waiting' ? (
-          <div className="queue-row-phase mono" role="status">
-            ⏳ waiting for {providerLabel}&apos;s reply · {String(elapsedSeconds)}s
-          </div>
-        ) : null}
-        {failed ? (
-          <div className="queue-row-error mono" title={item.lastError}>
-            {item.lastError}
-          </div>
-        ) : null}
+        {blocked ? <div className="queue-row-blocker mono">{blocker.rowCopy}</div> : null}
       </div>
       <div className="queue-row-actions">
-        <button type="button" className="btn-link" onClick={onCopy}>
-          {copied ? 'Copied' : 'Copy'}
-        </button>
-        {failed ? (
-          <button type="button" className="btn-link thread-queue-retry" onClick={onRetry}>
-            Retry
+        {/* Mirror the Queued-view actions. Hide Send now when the tab is
+            closed (Open handles it); hide Open when the fix is Edit
+            (over-budget). Remove is always available. */}
+        {blocker.primaryAction === 'edit' ? null : (
+          <button type="button" className="btn-link" onClick={onOpen}>
+            Open
           </button>
-        ) : null}
-        <button type="button" className="btn-link" onClick={onDismiss}>
-          Dismiss
+        )}
+        {blocker.kind === 'tab-closed' || blocker.primaryAction === 'edit' ? null : (
+          <button type="button" className="btn-link" onClick={onSendNow}>
+            Send now
+          </button>
+        )}
+        <button
+          type="button"
+          className="btn-link"
+          onClick={() => {
+            setDraft(item.text);
+            setEditing(true);
+          }}
+        >
+          Edit
+        </button>
+        <button type="button" className="btn-link" onClick={onRemove}>
+          Remove
         </button>
       </div>
     </li>
