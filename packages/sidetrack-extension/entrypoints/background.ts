@@ -3085,6 +3085,21 @@ const handleRequest = async (
     }, 'queue');
   }
 
+  if (request.type === messageTypes.triggerAutoSendDrain) {
+    // [Open] / [Send now] on a Queued row, and Inbox "Open" (D10):
+    // the user has opened/focused the thread tab, so attempt the
+    // drain. runAutoSendDrain runs the §24.10 preflight funnel
+    // unchanged — every gate still applies; a blocked item's
+    // lastError updates in place. We never force-flip autoSendEnabled
+    // (drain no-ops with stoppedReason 'thread-off' when it's off —
+    // the paste fallback covers that case on the panel side).
+    const { threadId } = request;
+    return await withCompanionStatus(() => {
+      triggerAutoSendDrain(threadId);
+      return Promise.resolve();
+    }, 'queue');
+  }
+
   if (request.type === messageTypes.cacheDispatchOriginal) {
     // Side panel just successfully submitted a dispatch and got back
     // a bac_id. Stash the unredacted body locally so the auto-link

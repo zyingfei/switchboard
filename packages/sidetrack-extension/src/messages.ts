@@ -66,6 +66,13 @@ export const messageTypes = {
   // previously failed (lastError set). Background clears lastError,
   // re-fires the drain for the item's thread.
   retryAutoSend: 'sidetrack.queue.autoSend.retry',
+  // Side panel asks the background to run the auto-send drain for a
+  // thread on explicit user intent — the [Open] / [Send now] actions
+  // on a Queued row and the Inbox "Open" (D10). The drain runs the
+  // §24.10 preflight funnel unchanged; if a gate blocks, the item's
+  // lastError updates in place. This is the "tab became available →
+  // drain" trigger, fired only on user action (no global tab listener).
+  triggerAutoSendDrain: 'sidetrack.queue.autoSend.drain',
   // Side panel asks the background to (re-)dispatch a recorded
   // packet by opening the target chat URL in a new tab and
   // auto-sending the body via the existing content-script driver
@@ -503,6 +510,10 @@ export type WorkboardRequest =
       readonly queueItemId: string;
     }
   | {
+      readonly type: typeof messageTypes.triggerAutoSendDrain;
+      readonly threadId: string;
+    }
+  | {
       readonly type: typeof messageTypes.dispatchAutoSendInNewTab;
       readonly dispatchId: string;
       readonly url: string;
@@ -929,6 +940,10 @@ export const isRuntimeRequest = (value: unknown): value is RuntimeRequest => {
 
   if (hasType(value, messageTypes.retryAutoSend)) {
     return typeof value.queueItemId === 'string';
+  }
+
+  if (hasType(value, messageTypes.triggerAutoSendDrain)) {
+    return typeof value.threadId === 'string';
   }
 
   if (hasType(value, messageTypes.dispatchAutoSendInNewTab)) {
