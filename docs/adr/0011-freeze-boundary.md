@@ -497,3 +497,132 @@ output — they change no serving math:
 **Freeze-lift interaction.** None. The serving math is untouched; this is
 read-path presentation + observability + verification only, per the
 write-path-vs-read-path boundary this ADR defines.
+
+## Amendment 2026-07-13b — eval-spine verdict: the flag defaults hold (all serving flips stay OFF)
+
+**Context.** Amendments 12/12b/12c connected built-but-unserved
+intelligence to the serving path, each behind a kill-switch flag whose
+DEFAULT was to be "set by the eval-spine verdict, not optimism." Those
+amendments landed the flags at their pre-verdict default (OFF for the
+new serving-math flags; ON for the regression-repair requalify flags)
+and named the harness that would clear them. This amendment RECORDS the
+result of actually running that harness — the evidence gate the OWNER
+DIRECTIVE rides on. Read-only, offline, against a consistent snapshot of
+the live test vault (`~/.sidetrack-vault-test`, copied to scratch so the
+long-running old-code companion was never touched — no mutating call, no
+`--apply`).
+
+**How the eval ran.** `sidetrack-companion eval replay` and
+`eval connections-precision` (both report-only; neither gates promotion)
+over the vault snapshot. The replay harness reads the logged
+`recall.served` impressions, joins the `recall.action` labels the
+trainer's way (`buildRecallImpressionTrainingGroups`), reconstructs the
+point-in-time candidate features against the committed connections
+snapshot (no impression here carries a #242 logged feature vector — they
+predate it, so every row went through the honest reconstruction
+fallback), and re-scores each impression group under every arm.
+
+**What the numbers say.**
+
+*Replay (report-only, over the vault's logged impressions):*
+
+    impressions=707  withPositive=1
+      Served order (production)   nDCG@10=1.0000 MRR=1.0000 R@5=1.0000 R@10=1.0000
+      Trained model               nDCG@10=0.3155 MRR=0.1250 R@5=0.0000 R@10=1.0000
+      Graph/heuristic baseline    nDCG@10=1.0000 MRR=1.0000 R@5=1.0000 R@10=1.0000
+      Grep-over-vault (BM25)      nDCG@10=1.0000 MRR=1.0000 R@5=1.0000 R@10=1.0000
+      Recency (newest-first)      nDCG@10=1.0000 MRR=1.0000 R@5=1.0000 R@10=1.0000
+
+    paired-bootstrap (trained vs each reference): Δmean nDCG@10=-0.6845,
+    CI[-0.6845,-0.6845], p=0.0000, n=1 (degenerate — a single paired
+    impression, zero CI width).
+
+  The decisive fact is `withPositive=1`: of 707 reconstructable
+  impression groups, exactly ONE carries a joined positive action, so
+  every metric is computed over a single gradeable impression. The
+  vault holds 1442 `recall.served` and 65 `recall.action` events, but
+  61 of the 65 actions are 2026-05-27 test-harness gestures whose served
+  contexts/candidates no longer reconstruct against today's snapshot,
+  and the remaining handful don't land on a reconstructable candidate.
+  n=1 is not a signal; it is the ABSENCE of one. (This is the honest
+  read of amendment 13's "65/65 actions join by servedContextId+entityId"
+  observation: the raw events join, but the TRAINER's feature-anchored
+  join — the unit the replay scores — yields one gradeable positive.)
+
+*Connections precision (report-only, over the committed snapshot):*
+
+    servedSimilarityEdges=0  judged=0  signal(confirmed=70, rejected=2)
+      content_vector precision=n/a (served=0)
+      metadata       precision=n/a (served=0)
+      title_only     precision=n/a (served=0)
+      overall precision=n/a (no served edge falls on a user-judged pair)
+
+  The snapshot has 16,593 edges but ZERO `closest_visit` /
+  `visit_resembles_visit` similarity edges — the July regression the
+  requalify flags exist to repair (June served ~30k, July serves 0,
+  page-access-off → engagement gate never trips → no sim lane). There
+  ARE 70 confirmed + 2 rejected user pairs, but no served similarity
+  edge intersects any of them, because there are no served similarity
+  edges at all. Precision by evidence tier is therefore UNDEFINED, not
+  low — the harness cannot score a lane that serves nothing.
+
+*Coverage context (read-only over the recall-v2 store + page-evidence):*
+
+    docs=11,801   doc-vectors=1,275 (10.8%)   chunk-vectors=1,234 chunks
+    docs.body_indexed: 9,736 content (82%) / 2,065 title-only (18%)
+    page-evidence tiers: 1,098 content_features_only · 969 metadata_only
+                         · 100 indexed_chunks (4.6% have chunk vectors)
+
+**Decision — the verdict per flag.** No flip is authorized. The replay
+harness cannot even MEASURE the two recall retrieval arms (they change
+candidate RETRIEVAL; the harness re-ranks a FIXED logged candidate set,
+so a retrieval-layer change is not counterfactually replayable from
+these impressions), and where it can measure (the reranking arms) it has
+n=1 — noise. The connections-precision harness scores the similarity
+lane at n/a because that lane serves 0 edges on this vault. So EVERY
+serving-math flag stays at its current default; the code already encodes
+the honest verdict and this amendment ships no code default change,
+only this recorded verdict + the enable commands for when data accrues.
+
+| Flag | Class | Verdict | Default (unchanged) | Enable after data |
+|---|---|---|---|---|
+| `SIDETRACK_RECALL_CHUNK_VECTORS` | recall serving | inconclusive (unmeasurable by impression-replay; 4.6% chunk coverage) | **OFF** | `SIDETRACK_RECALL_CHUNK_VECTORS=1` + restart |
+| `SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT` | recall serving | inconclusive (n=1 replay; not retrieval-replayable) | **OFF** | `SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT=1` + restart |
+| `SIDETRACK_SIMILARITY_CONTENT_CORPUS` | similarity serving | inconclusive (0 served sim edges → precision n/a) | **OFF** | `SIDETRACK_SIMILARITY_CONTENT_CORPUS=1` + restart |
+| `SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING` | infra (child-lane) | inconclusive; keep OFF until a live CPU soak on the child lane clears it | **OFF** | `SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING=1` (requires child-process embedder) + restart |
+| `SIDETRACK_PAGE_EVIDENCE_DOC_EMBEDDINGS` | infra (embed-on-extract) | keep default — pre-existing lane, not a serving-math change | **ON** (disable with `=0`) | n/a |
+| `SIDETRACK_SIMILARITY_REQUALIFY` | regression-repair | keep default — restores the June baseline lane, not a new serving change; eval cannot argue against a repair it can't yet observe (lane serves 0) | **ON** (kill with `=0`) | n/a |
+| `SIDETRACK_SIMILARITY_CONTENT_REQUALIFY` | regression-repair | keep default — pure re-derive of already-eligible visits; no-op against the title skeleton while CONTENT_CORPUS is OFF | **ON** (kill with `=0`) | n/a |
+
+**Why "inconclusive → OFF" and not "OFF because it lost."** The owner
+directive is explicit that defaults are set by the verdict, not
+optimism — and the honest verdict is that this vault cannot yet produce
+the evidence. An inconclusive arm defaults OFF (the freeze-safe posture)
+WITH its enable command documented, exactly so a later data-accrual pass
+can flip it on the recorded number rather than a hunch. The two recall
+arms are additionally UNMEASURABLE by the current replay spine (a
+retrieval-layer change vs an impression-replay that re-ranks a fixed
+candidate set); clearing them needs a retrieval-level A/B (serve arm-on
+vs arm-off over live queries and compare click-through), which is a
+post-restart / post-data task, not something the offline impression
+replay can decide. This is filed as the concrete next step, not left
+implicit.
+
+**Re-run recipe (for the data-accrual pass).** From
+`packages/sidetrack-companion`, against a READ-ONLY vault copy (never the
+live vault):
+
+    rsync -a --delete ~/.sidetrack-vault-test/_BAC/ /tmp/eval-scratch/_BAC/
+    bun src/cli.ts eval replay --vault /tmp/eval-scratch --no-persist
+    bun src/cli.ts eval connections-precision --vault /tmp/eval-scratch
+
+  A flip becomes authorized when replay shows `withPositive` in the tens
+  with the arm's paired-bootstrap CI excluding 0 (`a_better`), OR — for
+  the retrieval arms — a live retrieval A/B clears them; and when
+  connections-precision reports a defined per-tier precision with the
+  content tier at least matching the title-only floor.
+
+**Freeze-lift interaction.** None. The serving math is byte-identical to
+the pre-amendment baseline (all serving flags at their recorded
+defaults); this amendment is the recorded EVIDENCE that the gate did not
+open, per the write-path-vs-read-path boundary this ADR defines.

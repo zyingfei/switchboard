@@ -174,6 +174,16 @@ const hostnameForUrl = (url: string): string => {
 // before the eval spine can score the change. Flip with
 // SIDETRACK_SIMILARITY_CONTENT_CORPUS=1 (+ restart) once the verdict
 // clears it. See ADR-0011 amendment 2026-07-12b.
+//
+// RECORDED VERDICT (ADR-0011 amendment 2026-07-13b): stays OFF. The
+// connections-precision spine, run offline against a read-only snapshot
+// of the live test vault, reported servedSimilarityEdges=0 — the
+// similarity lane serves ZERO edges on this vault (the July regression;
+// page-access-off → the engagement gate never trips), so precision by
+// evidence tier is UNDEFINED (n/a), not low. There is nothing for the
+// content tier to out-precise yet. Re-score once the requalify lanes
+// restore served edges (June baseline ~30k), then flip on the recorded
+// number.
 export const similarityContentCorpusEnabled = (): boolean =>
   process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'] === '1';
 

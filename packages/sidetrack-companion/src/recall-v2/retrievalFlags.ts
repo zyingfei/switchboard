@@ -21,14 +21,22 @@
 //      Flag: SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT.
 //
 // DEFAULTS. Both are default OFF. This is the honest eval-spine verdict,
-// not timidity: the recall replay harness cannot yet score these arms
-// against the fixtures with real chunk-vector coverage on the live
-// vault, so neither flip is authorized by evidence and must not default
-// ON (mirrors ADR-0011 amendment 2026-07-12b's
-// SIDETRACK_SIMILARITY_CONTENT_CORPUS reasoning). When the harness scores
-// an arm as a win, flip its default in a follow-up citing the recorded
-// verdict — the same evidence-gated protocol the OWNER DIRECTIVE
-// requires.
+// not timidity — and as of ADR-0011 amendment 2026-07-13b it is a
+// RECORDED verdict, not a pending one. The replay spine was run offline
+// against a read-only snapshot of the live test vault and returned
+// `withPositive=1` (a single gradeable impression → n=1 paired-bootstrap,
+// pure noise); it moreover CANNOT measure these two arms at all, because
+// they change candidate RETRIEVAL while the impression-replay re-ranks a
+// FIXED logged candidate set (a retrieval-layer change is not
+// counterfactually replayable from logged rerank impressions). Live-vault
+// chunk-vector coverage is 1,234 chunks over ~100 docs (4.6% of records).
+// So neither flip is authorized by evidence and both must stay OFF
+// (mirrors amendment 2026-07-12b's SIDETRACK_SIMILARITY_CONTENT_CORPUS).
+// To flip: clear the arm with a retrieval-level live A/B (arm-on vs
+// arm-off click-through), then set its default in a follow-up citing the
+// recorded verdict — the evidence-gated protocol the OWNER DIRECTIVE
+// requires. Enable for that A/B with SIDETRACK_RECALL_CHUNK_VECTORS=1 /
+// SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT=1 (+ restart).
 
 /** Resolved retrieval-arm configuration for one pipeline run. Injected
  *  via PipelineDeps so the eval harness can force each arm per-run
