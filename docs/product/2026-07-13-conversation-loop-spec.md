@@ -187,7 +187,7 @@ Per-row actions and exact copy, mapped to the blocker:
 | Provider not opted in | `<Provider> isn't opted in for auto-send.` | **[Open]** → paste | Open the tab in **paste mode** (dispatch/paste flow, item preloaded) — respects the gate verbatim |
 | Screen-share-safe on | `Screen-share-safe mode is on.` | **[Open]** → paste | same paste fallback |
 | Over token budget | `This follow-up is over the send limit.` | **[Edit]** | Edit to shorten, then it re-drains |
-| Send failed (transient) | `Send failed — try again.` | **[Send now]** | `retryAutoSend` (background.ts:3075) |
+| Send failed (transient) | `Send failed — try again.` | **[Send now]** | `triggerAutoSendDrain` (App.tsx `sendNowForThread`) — the drain re-selects all `status:'pending'` items and clears `lastError:null` before the attempt (autoSendDrain.ts:180), so it is functionally a retry. The separate `retryAutoSend` message (background.ts:3075) is now unused from the UI; kept only as a legacy background handler. |
 | No blocker (tab open, gates pass, not yet drained) | *(none)* | **[Send now]** | `triggerAutoSendDrain` |
 
 **[Open] semantics (the fix for complaint #1):**
@@ -201,11 +201,16 @@ Per-row actions and exact copy, mapped to the blocker:
    the item's blocker line updates in place (no silent failure).
 3. **If auto-send is off** (the most common case — `autoSendEnabled`
    defaults undefined), [Open] does NOT force-flip the toggle. It opens the
-   thread tab and hands the item to the **existing dispatch/paste flow**
-   (`DispatchConfirm`, `dispatchKind:'chat-paste'`) with the item text
-   preloaded — the user pastes to send. This routes through
-   `preflightOutbound` so the pasted text is **redacted/scrubbed**, never
-   raw (the §24.10 redaction funnel is unconditional and un-bypassable).
+   thread tab and puts the item text on the clipboard for the user to paste
+   (`openThreadForPasteSend`, App.tsx). The clipboard write runs through
+   `preflightOutbound(...).safeText`, so the pasted text is
+   **redacted/scrubbed + injection-scrubbed**, never raw (the §24.10
+   redaction funnel is unconditional and un-bypassable). *Implementation
+   note:* this uses a direct redacted `navigator.clipboard.writeText`, not
+   the `DispatchConfirm`/`dispatchKind:'chat-paste'` modal — the safety
+   guarantee (redaction) is identical, but there is no separate confirm
+   dialog on this lane. A DispatchConfirm review step is a possible future
+   enhancement, deferred.
 
 **[Send now]** appears only when the tab is already open and gates would
 pass; it fires the drain directly (no tab open needed).
@@ -309,7 +314,7 @@ Mapped 1:1 from the verified dead-end list.
 | D4 | **Screen-share-safe on** | **RESOLVED (paste fallback).** Blocker line: "Screen-share-safe mode is on." [Open] → paste mode. |
 | D5 | **Over token budget** — no edit-to-shorten | **RESOLVED.** [Edit] lets the user shorten in place; clears `lastError`; re-drains. |
 | D6 | **Workstream / global scoped** — never drains, never auto-resolves | **RESOLVED by removing the trap.** The scope selector's non-thread options lead to a permanent dead-end. This wave **hides the workstream/global scope options** from the composer (they were PR #241 speculative). Queue is thread-scoped only — matching what §13 step 4 already documents as "the same object." Global/workstream drain is **explicitly deferred** (needs a real fan-out drain design). Any *existing* non-thread items get a Queued-view banner: "This follow-up isn't tied to an open chat — Remove it and re-queue on a thread." |
-| D7 | **Auto-send off, want manual send** — queue has no paste lane, only raw Copy | **RESOLVED.** [Open] → dispatch/paste flow (preflighted + redacted). The raw `copyQueueItemText` (no redaction) is **replaced** by the paste flow's safe copy — closes a redaction gap. |
+| D7 | **Auto-send off, want manual send** — queue has no paste lane, only raw Copy | **RESOLVED.** [Open] → `openThreadForPasteSend`: opens the tab and writes the **redacted** `preflightOutbound(...).safeText` to the clipboard (no DispatchConfirm modal on this lane). The raw `copyQueueItemText` (no redaction) is **replaced** by this safe copy — closes a redaction gap. |
 | D8 | **Reply captured but thread not tracked** — no reminder, invisible | **ACCEPTED LIMITATION.** Reminder creation is intentionally gated on a tracked thread (background.ts:1047/1442). Auto-tracking untracked-tab replies is out of scope (new capture semantics). Documented, not fixed. |
 | D9 | **Reply captured while viewing the thread** — no reminder (by design), race can hide it | **ACCEPTED LIMITATION (design).** `userIsViewingThreadUrl` short-circuits to `dismissRemindersForThread` — if you're looking at it, it's read. The tab-away race is a narrow window; the reply still lives on the thread. Not fixed this wave. |
 | D10 | **Inbox Open recreates tab but doesn't drain** — queued follow-ups still sit | **RESOLVED.** After `onOpen`/`openTabForThread`, fire `triggerAutoSendDrain(threadId)` (same hook [Open] uses in Queued). Opening a thread with pending items — from Inbox *or* Queued — now attempts the drain. |
@@ -351,11 +356,15 @@ These are the three steps this wave touches; all other steps are unaffected.
   one-event-two-views handshake as a thing to verify.
 
 **Step 10 (inline review → dispatch out):**
-- Unchanged in mechanics, but note the **shared paste path**: the Queued
-  [Open]→paste fallback reuses the same `DispatchConfirm` / `chat-paste`
-  flow this step exercises. If step 10's dispatch/redaction passes, the
-  Queued paste fallback inherits the same safety guarantee (call it out so
-  a reviewer doesn't re-test redaction twice).
+- Unchanged in mechanics. The Queued [Open]→paste fallback shares the same
+  **redaction primitive** (`preflightOutbound` / §24.10 funnel) this step
+  exercises, but *not* the `DispatchConfirm` modal — the fallback writes the
+  redacted `safeText` straight to the clipboard (`openThreadForPasteSend`),
+  no confirm dialog. If step 10's redaction passes, the Queued fallback
+  inherits the same **redaction** guarantee (same `safeText`), so a reviewer
+  need not re-test redaction — but should verify the paste lane separately if
+  they specifically want to exercise the DispatchConfirm review UI (it is not
+  on this path).
 
 **Scorecard summary update:** step 4 moves from "Partial by design" to
 "Should pass cleanly" (the thread-scope is now spec, and the blocker/[Open]

@@ -3838,9 +3838,10 @@ const App = () => {
   // force-flip the toggle — we hand the item to the paste flow instead
   // (openThreadForPasteSend), which preflights + redacts the text.
   const openThreadAndDrain = (thread: TrackedThread, item?: { readonly text: string }) => {
-    openTabForThread(thread);
     if (thread.autoSendEnabled === true) {
-      // Give the tab a beat to exist before the drain resolves it.
+      // Auto-send on → open the tab here, then drain into it. Give the
+      // tab a beat to exist before the drain resolves it.
+      openTabForThread(thread);
       window.setTimeout(() => {
         void runAction(() =>
           sendRequest({ type: messageTypes.triggerAutoSendDrain, threadId: thread.bac_id }),
@@ -3849,8 +3850,15 @@ const App = () => {
       return;
     }
     // Auto-send off → paste fallback (respects the toggle verbatim).
+    // openThreadForPasteSend opens the tab itself, so we must NOT also
+    // call openTabForThread here — both run chrome.tabs.query→create with
+    // no cross-call dedup, and when the tab is closed (the exact [Open]
+    // scenario) two concurrent creates open two duplicate tabs.
     if (item !== undefined) {
       void openThreadForPasteSend(thread, item.text);
+    } else {
+      // No item text (bare Open with nothing to paste) → just open/focus.
+      openTabForThread(thread);
     }
   };
 
