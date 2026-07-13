@@ -182,6 +182,14 @@ export const renderHelp = (): string =>
     '    against accepted user signal, reporting precision by M4 evidence tier.',
     '    Report-only: nothing here influences serving or gates promotion. The',
     '    verdict is persisted under _BAC/eval/ unless --no-persist is given.',
+    '',
+    'Engagement subcommand (one-shot gap backfill):',
+    '  sidetrack-companion engagement backfill-aggregates --vault <path> \\',
+    '      [--from <iso|ms>] [--to <iso|ms>] [--apply]',
+    '    Derives the missing engagement.session.aggregated events from logged',
+    '    engagement.interval.observed events (per-visit sum, excluding visits that',
+    '    already have a real aggregate) and appends them. Dry-run unless --apply.',
+    '    Event-sourced + idempotent: safe to re-run; never rewrites the log.',
   ].join('\n');
 
 // Post-install guidance printed after `--install-service` succeeds. Pure
@@ -873,12 +881,137 @@ const runIngestSubcommand = async (
   return errors > 0 ? 1 : 0;
 };
 
+// One-shot engagement gap backfill. Derives the missing
+// `engagement.session.aggregated` events from logged
+// `engagement.interval.observed` events for a time window and appends them
+// via importPeerEvent (event-sourced, no rewriting). EXPLICIT only — never
+// automatic. Idempotent (deterministic dots/clientEventIds; re-runs dedup).
+// Conservative: one synthetic aggregate per visitId that has NO real
+// aggregate (excluding visits that already attributed avoids the classifier
+// double-counting). Defaults to a dry-run; pass --apply to write.
+//
+// See engagement/backfillSessionAggregates.ts for the derivation rationale.
+const runEngagementSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  const verb = argv[1];
+  if (verb === undefined || verb === 'help' || verb === '--help') {
+    writeLine(streams.stdout, 'Engagement session-aggregate gap backfill.');
+    writeLine(streams.stdout, '');
+    writeLine(streams.stdout, 'Usage:');
+    writeLine(
+      streams.stdout,
+      '  sidetrack-companion engagement backfill-aggregates --vault <path> \\',
+    );
+    writeLine(
+      streams.stdout,
+      '      [--from <iso|ms>] [--to <iso|ms>] [--apply]',
+    );
+    writeLine(streams.stdout, '');
+    writeLine(streams.stdout, 'Derives missing engagement.session.aggregated events from logged');
+    writeLine(streams.stdout, 'engagement.interval.observed events (per-visit sum, excluding visits');
+    writeLine(streams.stdout, 'that already have a real aggregate). Dry-run unless --apply is given.');
+    writeLine(streams.stdout, 'Idempotent: safe to re-run.');
+    return verb === undefined ? 2 : 0;
+  }
+  if (verb !== 'backfill-aggregates') {
+    writeLine(streams.stderr, `unknown engagement verb: ${verb}`);
+    writeLine(streams.stderr, 'try: backfill-aggregates --vault <path> [--apply]');
+    return 2;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined) {
+    writeLine(streams.stderr, '--vault <path> is required for engagement backfill-aggregates.');
+    return 2;
+  }
+  const apply = argv.includes('--apply');
+  // Parse a bound as either epoch-ms or an ISO date; undefined => open.
+  const parseBound = (raw: string | undefined, fallback: number): number => {
+    if (raw === undefined) return fallback;
+    const asNum = Number(raw);
+    if (Number.isFinite(asNum) && /^\d+$/.test(raw)) return asNum;
+    const asDate = Date.parse(raw);
+    return Number.isNaN(asDate) ? fallback : asDate;
+  };
+  const fromMs = parseBound(findArgValue(argv, '--from'), 0);
+  const toMs = parseBound(findArgValue(argv, '--to'), Date.now());
+  if (fromMs > toMs) {
+    writeLine(streams.stderr, `--from (${String(fromMs)}) is after --to (${String(toMs)}).`);
+    return 2;
+  }
+
+  const { createEventLog } = await import('./sync/eventLog.js');
+  const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+  const { planEngagementBackfill } = await import('./engagement/backfillSessionAggregates.js');
+  const { ENGAGEMENT_INTERVAL_OBSERVED, ENGAGEMENT_SESSION_AGGREGATED } = await import(
+    './engagement/events.js'
+  );
+  const replica = await loadOrCreateReplica(vaultPath);
+  const eventLog = createEventLog(vaultPath, replica);
+  // Type-hinted streaming reads — skip JSON.parse on non-matching lines so
+  // the ~92%-interval log doesn't dominate the scan.
+  const intervals = await eventLog.streamFiltered(
+    (e) => e.type === ENGAGEMENT_INTERVAL_OBSERVED,
+    new Set([ENGAGEMENT_INTERVAL_OBSERVED]),
+  );
+  const existingAggregates = await eventLog.streamFiltered(
+    (e) => e.type === ENGAGEMENT_SESSION_AGGREGATED,
+    new Set([ENGAGEMENT_SESSION_AGGREGATED]),
+  );
+  const plan = planEngagementBackfill({
+    intervals,
+    existingAggregates,
+    options: { fromMs, toMs },
+  });
+  writeLine(
+    streams.stdout,
+    `engagement backfill window=[${new Date(fromMs).toISOString()}..${new Date(toMs).toISOString()}]`,
+  );
+  writeLine(
+    streams.stdout,
+    `  intervals: scanned=${String(plan.stats.intervalsScanned)} inWindow=${String(plan.stats.intervalsInWindow)}`,
+  );
+  writeLine(
+    streams.stdout,
+    `  visits: inWindow=${String(plan.stats.distinctVisitsInWindow)} alreadyAggregated=${String(plan.stats.visitsWithExistingAggregate)} toSynthesize=${String(plan.stats.synthesizedVisits)}`,
+  );
+  if (!apply) {
+    writeLine(streams.stdout, 'dry-run: no events written. Re-run with --apply to append.');
+    return 0;
+  }
+  let imported = 0;
+  let skipped = 0;
+  let errors = 0;
+  for (const event of plan.events) {
+    try {
+      const result = await eventLog.importPeerEvent(event);
+      if (result.imported) imported += 1;
+      else skipped += 1;
+    } catch (err) {
+      errors += 1;
+      writeLine(
+        streams.stderr,
+        `[engagement.backfill] ${event.payload.visitId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  writeLine(
+    streams.stdout,
+    `engagement backfill: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)}`,
+  );
+  return errors > 0 ? 1 : 0;
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   // Sub-command dispatch happens BEFORE the flag-driven parser so a
   // verb like `models` doesn't get interpreted as a positional vault
   // path. Existing flag-only invocations are unaffected.
   if (argv[0] === 'models') {
     return await runModelsSubcommand(argv, streams);
+  }
+  if (argv[0] === 'engagement') {
+    return await runEngagementSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);
