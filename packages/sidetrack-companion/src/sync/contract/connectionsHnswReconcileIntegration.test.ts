@@ -31,6 +31,7 @@ const envKeys = [
   'SIDETRACK_CONNECTIONS_PHASE_LOG',
   'SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES',
   'SIDETRACK_SIMILARITY_REQUALIFY',
+  'SIDETRACK_EVENT_STORE',
 ] as const;
 
 const childEntryPath = (): string =>
@@ -189,6 +190,7 @@ describe('HNSW reconcile child integration', () => {
     process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'] = '1';
     delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SIMILARITY'];
     delete process.env['SIDETRACK_SIMILARITY_REQUALIFY'];
+    delete process.env['SIDETRACK_EVENT_STORE'];
     process.env['SIDETRACK_SIMILARITY_THRESHOLD'] = '0.8';
     process.env['SIDETRACK_SIMILARITY_TOP_K'] = '20';
     process.env['SIDETRACK_SIMILARITY_MIN_ENGAGEMENT_MS'] = '5000';
@@ -601,6 +603,66 @@ describe('HNSW reconcile child integration', () => {
       rowTouchesVisit(row, new Set([targetVisitKey])),
     );
     expect(afterTargetRows.length).toBeGreaterThan(0);
+  });
+
+  it('requalifies a late-engagement visit via the typed event-store read (no full-log rebuild)', async () => {
+    // Fix regression: the requalify re-derive used a full-log readMerged()
+    // + full timeline + full engagement rebuild ON THE DRAIN THREAD. On the
+    // 452k-event vault a routine session aggregate firing ~30s after a
+    // visit (past the drain interval, so the visit has left the window)
+    // triggered that per-drain full-log scan. With the event store on, the
+    // re-derive now sources ONLY the requalify-relevant event types via the
+    // type index (events_type_idx). This test drives the exact same late-
+    // engagement requalify scenario with the store ENABLED, so the typed-
+    // read branch runs, and asserts the requalified edge still forms —
+    // proving the typed source is byte-equivalent to the readMerged path.
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    for (let index = 0; index < 8; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:0${String(index)}:00.000Z`,
+      });
+    }
+    await appendVisit(eventLog, {
+      index: 8,
+      observedAt: '2026-05-22T10:08:00.000Z',
+      focusedWindowMs: 1,
+    });
+    expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+
+    const targetVisitKey = 'https://hnsw.test/8';
+    const before = await createConnectionsStore(vaultRoot).readCurrent();
+    if (before === null) throw new Error('expected baseline snapshot');
+    expect(
+      similarityRows(before).filter((row) => rowTouchesVisit(row, new Set([targetVisitKey]))).length,
+    ).toBe(0);
+
+    // Late engagement aggregate only — no fresh BROWSER_TIMELINE_OBSERVED,
+    // so the target is out-of-window and hits the requalify re-derive.
+    await appendEngagementAggregate(eventLog, { index: 8, focusedWindowMs: 60_000 });
+
+    const output: string[] = [];
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      output.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect(output.join('')).toContain('requalified=1');
+
+    const after = await createConnectionsStore(vaultRoot).readCurrent();
+    if (after === null) throw new Error('expected reconciled snapshot');
+    expect(
+      similarityRows(after).filter((row) => rowTouchesVisit(row, new Set([targetVisitKey]))).length,
+    ).toBeGreaterThan(0);
   });
 
   it('does not requalify a late-engagement visit when the kill-switch is set', async () => {

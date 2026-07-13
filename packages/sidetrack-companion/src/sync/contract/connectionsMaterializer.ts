@@ -322,6 +322,22 @@ const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
 
+// The exact event types buildTimelineDays + buildEngagementClassifierInputs
+// consume for the similarity-requalify re-derive. buildTimelineDays reads
+// BROWSER_TIMELINE_OBSERVED; seedEngagementAccumulator additionally folds
+// NAVIGATION_COMMITTED (canonical-URL map), ENGAGEMENT_SESSION_AGGREGATED
+// (the engagement sums), and SELECTION_COPIED/SELECTION_PASTED (paste
+// lineage). Every other type is ignored by both builders, so a typed
+// store read over these is byte-equivalent to filtering readMerged() to
+// them — but O(matching rows) via events_type_idx, not O(all events).
+export const REQUALIFY_ENGAGEMENT_SOURCE_TYPES: readonly string[] = [
+  BROWSER_TIMELINE_OBSERVED,
+  NAVIGATION_COMMITTED,
+  ENGAGEMENT_SESSION_AGGREGATED,
+  SELECTION_COPIED,
+  SELECTION_PASTED,
+];
+
 // Permanent-gap sealing (default OFF). A "permanent gap" is a per-replica
 // event seq the log/store skip forever (a rejected/never-emitted seq). It
 // freezes frontierFromIntervals just below it, so readSince re-returns the
@@ -1762,6 +1778,30 @@ export const createConnectionsMaterializer = (
     return engagementVisitIds;
   };
 
+  // Source the events buildTimelineDays + buildEngagementClassifierInputs
+  // consume for the requalify re-derive. When the event store is on, a
+  // typed read over exactly REQUALIFY_ENGAGEMENT_SOURCE_TYPES
+  // (events_type_idx) is byte-equivalent to filtering readMerged() to
+  // those types — both builders ignore every other type — but is
+  // O(matching rows), not O(all events). The collected chunks are sorted
+  // into merged order (sortAcceptedEvents) so the accumulator's
+  // event-order-dependent folds (navigation last-write-wins,
+  // compareEventOrder aggregate selection) match a whole-log walk.
+  const readRequalifyEngagementSource = async (
+    typedEventSource: EventStore | null,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (typedEventSource === null) return deps.eventLog.readMerged();
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      REQUALIFY_ENGAGEMENT_SOURCE_TYPES,
+      (chunk) => {
+        for (const event of chunk) collected.push(event);
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
+  };
+
   // Re-derive the timeline entries for engagement-requalified visits from
   // the FULL event log WITH full engagement (mirrors the topicFullTimeline
   // precedent). Only the requalified visits' entries are returned, and
@@ -1769,10 +1809,27 @@ export const createConnectionsMaterializer = (
   // NOT already present in this drain's window entries — so a live
   // aggregate for an in-window visit stays on the cheap scoped path and
   // pays nothing. Bounded to the handful of requalified visits.
+  //
+  // Sourcing: `buildTimelineDays` + `buildEngagementClassifierInputs`
+  // consume ONLY the five event types in
+  // REQUALIFY_ENGAGEMENT_SOURCE_TYPES — any other type is ignored by both
+  // builders (verified against seedEngagementAccumulator). When the event
+  // store is on, read exactly those types via the type index
+  // (forEachChunkOfTypes → events_type_idx) and sort into merged order,
+  // which is byte-equivalent to filtering readMerged() but O(matching
+  // rows) instead of O(all events). On the 452k-event / ~92%-engagement-
+  // interval vault this avoids the per-drain full-log scan the scoped-
+  // delta work removed: a routine session aggregate firing ~30s after its
+  // visit (past the 30s drain interval, so the visit's timeline entry has
+  // left the window) is out-of-window and would otherwise fire the full
+  // readMerged rebuild on ordinary browsing drains. Falls back to
+  // readMerged only when the store is unavailable (legacy path). Mirrors
+  // the scopedTimelineSourcing typed-read precedent below.
   const loadRequalifiedSimilarityEntries = async (
     candidateEngagementVisitIds: ReadonlySet<string>,
     windowEntries: readonly TimelineEntryWithDimensions[],
     engagementGateMs: number,
+    typedEventSource: EventStore | null,
   ): Promise<readonly TimelineEntryWithDimensions[]> => {
     if (candidateEngagementVisitIds.size === 0) return [];
     // Resolve engagement visitIds → canonical URL keys. The `visit:<url>`
@@ -1794,7 +1851,7 @@ export const createConnectionsMaterializer = (
       [...candidateVisitKeys].filter((visitKey) => !windowVisitKeys.has(visitKey)),
     );
     if (missingVisitKeys.size === 0) return [];
-    const fullEvents = await deps.eventLog.readMerged();
+    const fullEvents = await readRequalifyEngagementSource(typedEventSource);
     const fullTimeline = buildTimelineDays(fullEvents);
     const fullEngagement = buildEngagementClassifierInputs(fullEvents, fullTimeline);
     const enrichedFull = enrichTimelineDaysWithEngagement(fullTimeline, fullEngagement);
@@ -2971,6 +3028,7 @@ export const createConnectionsMaterializer = (
             combinedRequalifyCandidateVisitIds,
             windowSimilarityEntries,
             similarityConfig.engagementGateMs,
+            storeBackedEvents,
           )
         : [];
     const similarityEntries =

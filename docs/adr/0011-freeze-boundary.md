@@ -626,3 +626,69 @@ live vault):
 the pre-amendment baseline (all serving flags at their recorded
 defaults); this amendment is the recorded EVIDENCE that the gate did not
 open, per the write-path-vs-read-path boundary this ADR defines.
+
+## Amendment 2026-07-13c — CPU-regime repair: the requalify re-derive no longer full-log-scans on ordinary drains
+
+**Context.** Amendment 2026-07-12 (engagement requalify) and 2026-07-12b
+(content requalify) both route through
+`loadRequalifiedSimilarityEntries` in `connectionsMaterializer.ts`. Both
+amendments asserted the full-timeline reload is "bounded — no per-drain
+full rebuild … the full-timeline reload only fires when a late engagement
+event actually requalifies a visit absent from the window" (condition 3
+in each). That reasoning had a hole. On the incremental / store-backed
+drain the window (`merged = pendingEventsForDrain`) is WINDOW-ONLY, and
+the drain min-interval is 30s (`DEFAULT_DRAIN_MIN_INTERVAL_MS`). A
+routine `engagement.session.aggregated` fires ~30s after its visit — so
+by the time it lands, that visit's `browser.timeline.observed` has
+already left the window. The requalify candidate is therefore
+`missingVisitKeys`-positive on ORDINARY browsing drains, not just on rare
+backfills, and each such drain ran `deps.eventLog.readMerged()` + a full
+`buildTimelineDays` + a full `buildEngagementClassifierInputs` +
+`enrichTimelineDaysWithEngagement` over the WHOLE log — on the drain
+thread. On the 494MB / 452k-event / ~92%-engagement-interval vault this
+is exactly the per-drain full-log rebuild the scoped-delta work removed
+and the U1–U3 CPU post-mortems forbid ("cache-before-decide,
+bound-every-batch, never-rebuild-per-drain"). The 9-visit integration
+test hid the cost (the full scan is cheap at unit scale).
+
+**Decision.** This is a CPU-regime bug fix to an already-landed
+freeze-safe repair — not new serving scope — so it is itself freeze-safe
+(ADR-0008 maintenance-only clause; no edge kind, weight, threshold, or
+gate changes; served output is byte-identical). The re-derive now sources
+its events by TYPE INDEX instead of a whole-log scan, mirroring the
+existing `scopedTimelineSourcing` precedent in the same file.
+
+**What landed (this amendment's scope):**
+
+- `connectionsMaterializer.ts`:
+  `buildTimelineDays` + `buildEngagementClassifierInputs` consume ONLY
+  five event types (`browser.timeline.observed`, `navigation.committed`,
+  `engagement.session.aggregated`, `selection.copied`, `selection.pasted`
+  — verified against `seedEngagementAccumulator`; every other type is
+  ignored by both builders). The new `REQUALIFY_ENGAGEMENT_SOURCE_TYPES`
+  constant plus `readRequalifyEngagementSource(typedEventSource)` read
+  exactly those types via `forEachChunkOfTypes` (→ `events_type_idx`,
+  O(matching rows)) and sort into merged order (`sortAcceptedEvents`,
+  the same total order `readMerged` returns), which is byte-equivalent to
+  `readMerged().filter(type ∈ the five)` but avoids the full-log scan.
+  When the event store is off, it falls back to `readMerged()` (legacy
+  path, unchanged). No new flag: the fix is a strict CPU improvement that
+  preserves the requalify's observable output (`requalified=N`).
+- Test: `connectionsHnswReconcileIntegration.test.ts` gains a store-ON
+  (`SIDETRACK_EVENT_STORE=1`) sibling of the existing late-engagement
+  requalify test, driving the exact out-of-window aggregate scenario so
+  the typed-read branch runs, and asserting the requalified edge still
+  forms (`requalified=1`) — proving the typed source is byte-equivalent
+  to the `readMerged` path.
+
+**Boundary-test note.** This touched `connectionsMaterializer.ts` (listed
+FROZEN by the boundary test), but the change is narrow: it swaps the READ
+SUBSTRATE of a bounded re-derive (whole-log scan → type-index scan) with
+identical output. The similarity math, gate, thresholds, edge kinds, and
+the requalify flag defaults are all unchanged. No eval-spine verdict
+gates it because nothing about the served math or its inputs changes —
+only how many rows the drain thread reads to compute the same result.
+
+**Freeze-lift interaction.** None. Served output is byte-identical; this
+is a CPU/stability fix to the retrain-adjacent drain path, permitted by
+the maintenance-only clause and the write-path-vs-read-path boundary.
