@@ -44,7 +44,12 @@ export const deriveLifecycle = (
   if (thread.trackingMode === 'stopped') {
     return { kind: 'tracking-stopped', dotClass: 'gray', stampLabel: 'Tracking stopped' };
   }
-  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed');
+  // "Unread reply" means a reply the user has not READ yet — status
+  // 'new'. Once opened (status 'seen') or auto-marked-seen for the
+  // active tab, the pill clears even though the reminder record
+  // persists (only 'dismissed' used to clear it, so a read-but-kept
+  // reply wrongly stayed "unread").
+  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status === 'new');
   if (hasUnread) {
     return {
       kind: 'unread-reply',

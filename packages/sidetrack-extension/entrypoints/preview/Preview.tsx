@@ -171,13 +171,7 @@ export function Preview() {
 
         <PreviewSection title="Inbound reminders (Mock 13a)">
           {STUB_INBOUND.map((reminder) => (
-            <InboundCard
-              key={reminder.bac_id}
-              reminder={reminder}
-              onOpen={noop}
-              onMarkRelevant={noop}
-              onDismiss={noop}
-            />
+            <InboundCard key={reminder.bac_id} reminder={reminder} onOpen={noop} onDismiss={noop} />
           ))}
         </PreviewSection>
 

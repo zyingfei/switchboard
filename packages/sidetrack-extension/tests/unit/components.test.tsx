@@ -524,28 +524,23 @@ describe('UX skeleton components — render-without-crash + key text present', (
   });
 
   it('InboundCard renders thread title, provider chip, action row', () => {
-    render(
-      <InboundCard reminder={STUB_INBOUND} onOpen={noop} onMarkRelevant={noop} onDismiss={noop} />,
-    );
+    render(<InboundCard reminder={STUB_INBOUND} onOpen={noop} onDismiss={noop} />);
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('Claude')).toBeInTheDocument();
     expect(screen.getByText('Open')).toBeInTheDocument();
-    // R1.2 (feedback 4): "Mark relevant" → "Helpful" (label-only).
-    expect(screen.getByText('Helpful')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Mark this reply as helpful' })).toBeInTheDocument();
     expect(screen.getByText('Dismiss')).toBeInTheDocument();
+    // The "Helpful" button is removed — it wrote status:'relevant' and
+    // claimed a trainable emission that never fired (updateReminder
+    // never touches the recall-action path). Card actions are Open +
+    // Dismiss only.
+    expect(screen.queryByText('Helpful')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Mark this reply as helpful' }),
+    ).not.toBeInTheDocument();
   });
 
   it('InboundCard masks title when masked=true', () => {
-    render(
-      <InboundCard
-        reminder={STUB_INBOUND}
-        masked
-        onOpen={noop}
-        onMarkRelevant={noop}
-        onDismiss={noop}
-      />,
-    );
+    render(<InboundCard reminder={STUB_INBOUND} masked onOpen={noop} onDismiss={noop} />);
     expect(screen.getByText('[private — workstream item]')).toBeInTheDocument();
   });
 

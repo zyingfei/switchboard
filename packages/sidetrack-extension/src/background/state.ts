@@ -1683,6 +1683,28 @@ export const dismissRemindersForThread = async (threadId: string): Promise<numbe
   return changed;
 };
 
+// Mark a thread's UNREAD reminders as read (status 'seen') without
+// dismissing them. Used when the user is passively viewing the
+// thread's tab — they've now seen the reply, so it should leave the
+// unread queue + Inbox badge, but the record stays (recoverable in
+// the collapsed "Read" group). Only touches 'new' reminders; already
+// read/dismissed ones are left untouched.
+export const markRemindersSeenForThread = async (threadId: string): Promise<number> => {
+  const current = await readReminders();
+  let changed = 0;
+  const next = current.map((reminder) => {
+    if (reminder.threadId !== threadId || reminder.status !== 'new') {
+      return reminder;
+    }
+    changed += 1;
+    return { ...reminder, status: 'seen' as const };
+  });
+  if (changed > 0) {
+    await storageSet({ [REMINDERS_KEY]: next });
+  }
+  return changed;
+};
+
 export const recordSelectorCanary = async (event: CaptureEvent): Promise<void> => {
   if (event.provider === 'unknown' || event.selectorCanary === undefined) {
     return;

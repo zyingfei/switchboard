@@ -142,6 +142,7 @@ import {
   createLocalQueueItem,
   createLocalReminder,
   dismissRemindersForThread,
+  markRemindersSeenForThread,
   setThreadAutoSend,
   createLocalWorkstream,
   deleteLocalCaptureNote,
@@ -373,12 +374,16 @@ const userIsViewingThreadUrl = async (threadUrl: string): Promise<boolean> => {
 };
 
 // Look at the currently-active tab in the focused window — if it
-// matches a tracked thread that has any non-dismissed reminder,
-// dismiss them. Called on tab activation/URL-change AND every
-// time the side panel polls workboard state, so an idle chat
-// doesn't leave a stale "Unread reply" pill behind. Returns true
-// if anything changed (caller can broadcast).
-const dismissRemindersForActiveTab = async (): Promise<boolean> => {
+// matches a tracked thread that has an unread reminder, mark those
+// reminders READ ('seen'), NOT dismissed. The user is looking at the
+// thread, so they've now seen the reply: it should leave the unread
+// queue + Inbox badge + "Unread reply" pill, but the record stays
+// (recoverable in the collapsed "Read" group; the thread itself still
+// holds the reply). Called on tab activation / URL-change only — NOT
+// on every workboard poll (that firehose was both a CPU tax and, once
+// this hard-dismissed, silently ate replies the user never opened).
+// Returns true if anything changed (caller can broadcast).
+const markRemindersSeenForActiveTab = async (): Promise<boolean> => {
   try {
     const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     const url = tabs[0]?.url;
@@ -388,7 +393,7 @@ const dismissRemindersForActiveTab = async (): Promise<boolean> => {
     // Match canonically, like `userIsViewingThreadUrl` — the live tab
     // URL carries provider query/fragment (?model= / ?session= / #…)
     // that the stored `threadUrl` has stripped. A strict `===` here made
-    // the dismiss silently miss, so the "Unread reply" pill never
+    // the match silently miss, so the "Unread reply" pill never
     // cleared even while the user was reading the chat.
     const canonicalActive = canonicalThreadUrl(url);
     const thread = (await readThreads()).find(
@@ -397,8 +402,8 @@ const dismissRemindersForActiveTab = async (): Promise<boolean> => {
     if (thread === undefined) {
       return false;
     }
-    const dismissed = await dismissRemindersForThread(thread.bac_id);
-    return dismissed > 0;
+    const marked = await markRemindersSeenForThread(thread.bac_id);
+    return marked > 0;
   } catch {
     return false;
   }
@@ -2975,11 +2980,14 @@ const handleRequest = async (
   }
 
   if (request.type === messageTypes.getWorkboardState) {
-    // Side panel just polled for state — if the user is currently
-    // staring at a tracked thread, drop any "Unread reply" pill for
-    // it before we return so the panel doesn't render the stale
-    // signal. Cheap; runs in parallel with the rest of the build.
-    await dismissRemindersForActiveTab();
+    // Just return current state. Marking the active tab's reminders
+    // read is driven by the tab-activation / URL-change handler
+    // (markSeenAndBroadcast), NOT here: mutating reminder state on
+    // every poll was a redundant write per poll AND, since it now
+    // marks read rather than dismisses, would prematurely clear a
+    // reply's unread signal simply because the panel polled — the
+    // user must actually be viewing the tab, which the activation
+    // handler already guarantees.
     return await withCompanionStatus();
   }
 
@@ -4640,13 +4648,14 @@ export default defineBackground(() => {
   // Whenever the user activates a different tab or a tab's URL
   // changes (SPA nav, browser back/forward), check if they landed
   // on a tracked thread that has unread-reply reminders waiting.
-  // Dismiss them — they're looking at it now, the pill is wrong.
-  // Broadcast on success so the side panel re-renders without a
-  // poll round-trip.
-  const dismissAndBroadcast = (): void => {
-    void dismissRemindersForActiveTab()
+  // Mark them READ ('seen') — they're looking at it now, the pill is
+  // wrong. The reminder record survives (not dismissed) but leaves
+  // the unread queue + badge. Broadcast on success so the side panel
+  // re-renders without a poll round-trip.
+  const markSeenAndBroadcast = (): void => {
+    void markRemindersSeenForActiveTab()
       .then((changed) => {
-        // Only broadcast when a reminder was ACTUALLY dismissed.
+        // Only broadcast when a reminder was ACTUALLY marked read.
         // Previously this fired a 'thread' workboard-changed on EVERY
         // tab activation / URL change / window focus even when nothing
         // changed — a refresh firehose that (especially now the
@@ -4660,7 +4669,7 @@ export default defineBackground(() => {
       .catch(() => undefined);
   };
   chrome.tabs.onActivated.addListener((info) => {
-    dismissAndBroadcast();
+    markSeenAndBroadcast();
     void maybeExtractObservedPageEvidenceForTabId(info.tabId, {
       source: 'tab-activated',
     });
@@ -4670,7 +4679,7 @@ export default defineBackground(() => {
     // updates that fire on every page mutation.
     if (changeInfo.url !== undefined) {
       void detectCodingAttachForTab(tabId, changeInfo.url);
-      dismissAndBroadcast();
+      markSeenAndBroadcast();
     }
     if (changeInfo.status === 'complete') {
       void maybeExtractAutoPageEvidence(tab, 'auto-observed', {
@@ -4698,7 +4707,7 @@ export default defineBackground(() => {
     if (windowId === chrome.windows.WINDOW_ID_NONE) {
       return;
     }
-    dismissAndBroadcast();
+    markSeenAndBroadcast();
   });
 
   // Sync Contract v1 / Class F — bind chrome.tabs to the timeline
