@@ -136,11 +136,52 @@ const contentWriteIdempotencyKey = async (
   return `${prefix}-${fingerprint.slice(0, 40)}`;
 };
 
+// Default per-request budget for the page-content bridge calls. Chosen
+// to match the companion client's write/list default (client.ts) so a
+// busy companion (mid-drain, ~100% CPU) can't hang an in-flight request
+// forever. Without this, a stalled fetch never settles → the SW's
+// handleRequest promise never resolves → sendResponse is never called →
+// the side panel's sendMessage callback never fires → the panel's busy
+// state (e.g. "Delete text") is stuck ON with no error surfaced. Bounding
+// the fetch guarantees the SW handler ALWAYS returns within the budget,
+// either with the parsed body or a thrown timeout error the caller turns
+// into a visible inline message.
+const DEFAULT_PAGE_CONTENT_TIMEOUT_MS = 15_000;
+
 export class PageContentClient {
   private readonly baseUrl: string;
 
   constructor(private readonly settings: CompanionSettings) {
     this.baseUrl = `http://127.0.0.1:${String(settings.port)}/v1`;
+  }
+
+  // Every page-content fetch routes through here so NONE can hang
+  // unboundedly. On timeout (AbortError) we throw a plain, user-facing
+  // message the background handler propagates as `{ ok: false, error }`;
+  // the panel then clears busy and shows the error rather than spinning
+  // forever. A transport failure (nothing listening on the port) throws
+  // its native message, which is equally actionable.
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number = DEFAULT_PAGE_CONTENT_TIMEOUT_MS,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(
+          `Companion did not respond within ${String(
+            Math.round(timeoutMs / 1000),
+          )}s — it may be busy. Try again.`,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async parseOrThrow(response: Response): Promise<unknown> {
@@ -153,7 +194,7 @@ export class PageContentClient {
 
   async index(payload: PageContentExtractedPayload): Promise<PageContentCoverage> {
     const idempotencyKey = await contentWriteIdempotencyKey('page-content', payload);
-    const response = await fetch(`${this.baseUrl}/page-content/extracted`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/page-content/extracted`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -173,7 +214,7 @@ export class PageContentClient {
     storageMode: PageEvidenceStorageMode = 'features_only',
   ): Promise<PageEvidenceRecord> {
     const idempotencyKey = await contentWriteIdempotencyKey('page-evidence', payload, storageMode);
-    const response = await fetch(`${this.baseUrl}/page-evidence/extracted`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/page-evidence/extracted`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -191,9 +232,12 @@ export class PageContentClient {
 
   async coverage(canonicalUrl: string): Promise<PageContentCoverage> {
     const params = new URLSearchParams({ canonicalUrl });
-    const response = await fetch(`${this.baseUrl}/page-content/coverage?${params.toString()}`, {
-      headers: { 'x-bac-bridge-key': this.settings.bridgeKey },
-    });
+    const response = await this.fetchWithTimeout(
+      `${this.baseUrl}/page-content/coverage?${params.toString()}`,
+      {
+        headers: { 'x-bac-bridge-key': this.settings.bridgeKey },
+      },
+    );
     const body = await this.parseOrThrow(response);
     const data = isRecord(body) ? body.data : undefined;
     if (!isCoverage(data)) throw new Error('Companion returned an invalid coverage payload.');
@@ -207,7 +251,7 @@ export class PageContentClient {
       tombstonedAt: new Date().toISOString(),
       reason: 'user-delete',
     };
-    const response = await fetch(`${this.baseUrl}/page-content/tombstone`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/page-content/tombstone`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -248,14 +292,21 @@ export class PageContentClient {
   }> {
     // baseUrl is "http://127.0.0.1:port/v1" — swap the prefix to /v2.
     const v2Base = this.baseUrl.replace(/\/v1$/, '/v2');
-    const response = await fetch(`${v2Base}/recall`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-bac-bridge-key': this.settings.bridgeKey,
+    // Recall can legitimately run longer than a write (fusion + rerank on
+    // a cold companion), so give it a wider budget than the default. Still
+    // bounded so a wedged companion surfaces an error instead of hanging.
+    const response = await this.fetchWithTimeout(
+      `${v2Base}/recall`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-bac-bridge-key': this.settings.bridgeKey,
+        },
+        body: JSON.stringify(req),
       },
-      body: JSON.stringify(req),
-    });
+      45_000,
+    );
     const body = await this.parseOrThrow(response);
     const data = isRecord(body) ? body.data : undefined;
     if (!isRecord(data)) throw new Error('Companion /v2/recall returned no data field.');
@@ -287,7 +338,7 @@ export class PageContentClient {
         : `${payload.servedContextId}:${payload.entityId}:${payload.actionKind}:${payload.referencesEventId}`,
     );
     const idempotencyKey = `recall-action-${fingerprint.slice(0, 40)}`;
-    const response = await fetch(`${this.baseUrl}/recall/action`, {
+    const response = await this.fetchWithTimeout(`${this.baseUrl}/recall/action`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
