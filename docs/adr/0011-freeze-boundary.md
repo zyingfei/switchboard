@@ -214,3 +214,111 @@ sets the default: `connections-precision` currently scores nothing
 (`overallPrecision=null`) precisely because zero edges are served — so
 restoring the lane is a prerequisite for the eval spine to produce any
 verdict at all, which is why the flag defaults ON.
+
+## Amendment 2026-07-12b — make similarity page-feature-driven (content embedding lane)
+
+**Context.** Amendment 2026-07-12 restored the engagement→similarity
+lane so edges reform at all. The audit's second finding remained: even
+with edges flowing, the similarity corpus is TITLE-ONLY
+(`corpusForVisitEntry` = `[title, host, path-tokens]`), so served edges
+are `metadata_only`/`title_only` tier, never `content_vector`. The cause
+is a supply gap, not a logic gap: `corpusForVisitEntry` has ALWAYS
+preferred page-evidence content when a content-backed record is loaded,
+but doc-embedding coverage sat at ~13.6% because the ONLY producer of
+page-evidence doc vectors was an inline `setTimeout(0)` embed on the API
+request path (`server.ts`, behind
+`SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING`). That path ran ONNX/CoreML
+on the main event loop, so the flag was correctly kept OFF (the U1–U3 CPU
+post-mortems). And records already written content-tier with
+`embeddingState:'missing'` were never revisited — the
+"better-evidence-never-revalidates" loop.
+
+**Decision.** Under the OWNER DIRECTIVE ("make similarity page-feature
+driven … connect built-but-unserved intelligence, evidence-gated — every
+serving change ships behind a flag whose default is set by the eval-spine
+verdict"), connecting the content path to similarity is classified
+freeze-safe, subject to the same three conditions as the prior amendment
+PLUS the CPU regime:
+
+1. No new serving math. No new edge kind, weight, threshold, or gate. The
+   content-vector channel, the content-enriched producer, and the
+   `content_vector` evidence-tier stamp (`snapshot.ts`
+   `evidenceTierForSimilarityMetadata`) are all PRE-EXISTING M4 plumbing;
+   this work supplies the doc vectors that make them fire and gates
+   whether the corpus draws on them.
+2. Every serving flip is behind a kill-switch env flag whose DEFAULT is
+   set by the eval-spine verdict, not optimism:
+   - `SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING` (default **OFF**) —
+     now gates the new OFF-main-loop embedding LANE, not the retired
+     request-path embed. Producing vectors is data-side, not serving-side,
+     but it stays default-OFF until an operator opts in (it is CPU work).
+   - `SIDETRACK_SIMILARITY_CONTENT_CORPUS` (default **OFF**) — the actual
+     SERVING flip. While OFF, `corpusForVisitEntry` returns the frozen
+     title-only skeleton AND a visit's evidence is invisible to the
+     content-enriched pair scoring, so a partially-embedded backlog cannot
+     shift served edges before `connections-precision` can score the flip
+     against the 70 confirmed pairs. Default OFF is the honest verdict:
+     the eval spine cannot yet score content-backed edges (none are
+     served), so the flip is NOT authorized by evidence and must not
+     default ON. (Contrast the prior amendment's requalify flag, which
+     defaults ON only because restoring *any* edge is a precondition for
+     the eval spine to run at all.)
+   - `SIDETRACK_SIMILARITY_CONTENT_REQUALIFY` (default **ON**) — a pure
+     requalification of already-eligible visits (no new math); with the
+     corpus flag OFF it is a cheap no-op re-derive against the title
+     skeleton, so ON is safe and closes the revalidation loop the moment
+     the corpus flag is cleared.
+3. Bounded per the CPU regime. The embedding lane
+   (`page-evidence/backgroundEmbeddingLane.ts`) is an idle-scheduled
+   backlog processor: a hard `batchCap` per cycle, a hard PAUSE whenever a
+   connections drain is running (`materializer.isDrainActive()`), a
+   re-check of the drain gate between records, a per-record failure
+   quarantine, and persisted progress. It forks NO new child — it routes
+   embeds through the existing embedder child
+   (`setEmbedderOverride`), so no second ONNX instance and no main-loop
+   inference. A worker/embed failure is caught and skipped, never inline.
+
+**What landed (this amendment's scope):**
+
+- `page-evidence/backgroundEmbeddingLane.ts` + store adapters
+  (`listBackgroundEmbeddingCandidates`, `embedBacklogCanonicalUrl`,
+  progress read/write): the OFF-main-loop lane, wired in
+  `runtime/companion.ts` (gated on the flag AND `useChildProcesses`). The
+  retired `setTimeout(0)` request-path embed is removed from `server.ts`.
+- `connections/visitSimilarity.ts`: `similarityContentCorpusEnabled()`
+  gate at the single `evidenceForEntry` seam, governing BOTH the corpus
+  and the content-enriched pair scoring.
+- `connections/connectionsMaterializer.ts`: content-arrival
+  requalification. `PAGE_EVIDENCE_EXTRACTED` (window) accumulates a
+  requalify key WITHOUT forcing a graph drain (preserves the content-lane-
+  only optimization); the lane's `requalifyVisitForSimilarity` accumulates
+  AND requests a debounced drain. The drain folds these into
+  `hnswReconcileVisitIds` via the existing engagement-requalify splice
+  (`loadRequalifiedSimilarityEntries`), bounded to visits absent from the
+  window and still gate-eligible.
+- Evidence-tier stamping (task 4) needed NO change: verified that
+  content-backed pairs emit the `contentVector` channel that
+  `snapshot.ts` already stamps `content_vector`
+  (`similarityContentCorpus.test.ts` end-to-end + `snapshot.test.ts`
+  Pass-7).
+
+**Freeze-lift interaction.** None of this lifts the freeze. The serving
+math is unchanged; `SIDETRACK_SIMILARITY_CONTENT_CORPUS` stays OFF until
+the `connections-precision` verdict (with content-backed edges finally
+scorable) clears it. When it does, flip the default in a follow-up that
+cites this amendment and the recorded verdict — the same evidence-gated
+protocol the OWNER DIRECTIVE requires.
+
+**Follow-up when the corpus flag flips ON.** The cache-probe revisionId
+(`computeVisitSimilarityRevisionId`) already incorporates the gated
+corpus, so the on-disk cached-revision path invalidates correctly across
+the flip. The persistent HNSW store (`persistentHnswSimilarityMode`),
+however, caches per-visit embeddings by visit key and does NOT re-embed
+existing visits on a mere flag flip — only NEW visits and content-arrival
+requalified visits re-embed. So the FIRST enablement of the corpus flag
+should be paired with a one-time similarity HNSW rebuild (bump
+`MATERIALIZER_VERSION` or clear the HNSW files) so the whole corpus picks
+up content vectors, not just the incremental frontier. Until then the
+background lane + requalify path upgrade visits opportunistically as they
+are revisited. This is a deployment step for the future flip, not a
+correctness gap at the current default-OFF.

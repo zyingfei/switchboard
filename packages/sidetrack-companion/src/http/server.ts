@@ -85,7 +85,6 @@ import {
   type PageContentTombstonedPayload,
 } from '../page-content/types.js';
 import {
-  completeExtractedPageEvidenceEmbedding,
   listPageEvidenceRecords,
   readPageEvidence,
   readPageEvidenceMap,
@@ -2230,11 +2229,6 @@ const invalidateResolveCaches = (): void => {
   for (const key of [...routeInFlight.keys()]) {
     if (key.startsWith('visres:') || key.startsWith('tabres:')) routeInFlight.delete(key);
   }
-};
-
-const pageEvidenceBackgroundEmbeddingEnabled = (): boolean => {
-  const raw = process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'];
-  return raw === '1' || raw?.toLowerCase() === 'true';
 };
 
 const resolverSignalEventsForCanonicalUrls = (
@@ -6560,22 +6554,15 @@ const routes: readonly RouteDefinition[] = [
         const evidence = await writeExtractedPageEvidenceFast(vaultRoot, payload, {
           rebuildManifestAfterWrite: false,
         });
-        if (
-          pageEvidenceBackgroundEmbeddingEnabled() &&
-          evidence.evidenceTier !== 'metadata_only' &&
-          evidence.content?.embeddingState === 'missing'
-        ) {
-          setTimeout(() => {
-            void completeExtractedPageEvidenceEmbedding(vaultRoot, payload, {
-              rebuildManifestAfterWrite: false,
-            }).catch((error: unknown) => {
-              console.warn(
-                '[page-evidence] background doc embedding failed:',
-                error instanceof Error ? error.message : error,
-              );
-            });
-          }, 0);
-        }
+        // Doc embedding is NOT run on the request path. The record is
+        // written content-tier with embeddingState:'missing'; the
+        // off-main-loop background-embedding lane (page-evidence/
+        // backgroundEmbeddingLane.ts, wired in runtime/companion.ts) drains
+        // that backlog in bounded idle batches through the embedder child.
+        // The prior setTimeout(0) inline path ran ONNX/CoreML on the API
+        // process — the exact main-loop CPU that kept
+        // SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING pinned OFF. The flag
+        // now gates the lane, not this handler.
         if (context.eventLog !== undefined) {
           if (coverage !== null) {
             await context.eventLog.appendServerObserved({

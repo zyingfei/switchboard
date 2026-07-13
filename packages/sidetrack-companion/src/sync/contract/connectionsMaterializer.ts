@@ -474,6 +474,24 @@ const incrementalSimilarityEnabled = (): boolean => true;
 // kill-switch via env=0 + restart.
 const similarityRequalifyEnabled = (): boolean =>
   process.env['SIDETRACK_SIMILARITY_REQUALIFY'] !== '0';
+// Content-arrival similarity requalification. When page-evidence CONTENT
+// (and its doc embedding) arrives for a visit AFTER its timeline entry
+// left the drain window — via PAGE_EVIDENCE_EXTRACTED, or the background
+// embedding lane completing a backlog embed — the scoped-delta reconcile
+// set never revisits that visit (its URL is in neither
+// pendingTimelineVisitIds nor the engagement-requalify set). The visit's
+// edges stay title-only forever: the "better-evidence-never-revalidates"
+// loop the audit named. This joins content-requalified visits to
+// hnswReconcileVisitIds on the next drain so buildHnswVisitSimilarity
+// re-embeds them from the now-content-backed corpus and re-derives their
+// edges. Default ON (a pure requalification of already-eligible visits —
+// no new edge kind, weight, or threshold; same class as the engagement
+// requalify path). Kill-switch via env=0 + restart. NOTE: whether the
+// re-embed actually USES the content is separately gated by
+// SIDETRACK_SIMILARITY_CONTENT_CORPUS (default OFF); with that flag off
+// this requalify is a cheap no-op re-derive against the title skeleton.
+const contentRequalifyEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'] !== '0';
 // Source engagement classifier inputs from the persistent SQLite fact
 // store instead of re-walking the full AcceptedEvent[] every drain.
 // Kill-switch to the legacy in-memory path (drift/replay) via env=0.
@@ -852,6 +870,21 @@ export interface ConnectionsMaterializer extends Materializer {
    * orchestrates and acks via clearDirtySources.
    */
   readonly drainContentLaneQueue: (reconciler: ContentLaneSourceUnitReconciler) => Promise<number>;
+  /**
+   * Task 3 — mark a visit for similarity re-embedding because its
+   * page-evidence content just arrived (background-embedding lane
+   * completion, or an out-of-window PAGE_EVIDENCE_EXTRACTED). Accumulates
+   * the canonical URL and requests a debounced drain; the drain folds it
+   * into hnswReconcileVisitIds and clears it. No-op when
+   * SIDETRACK_SIMILARITY_CONTENT_REQUALIFY=0.
+   */
+  readonly requalifyVisitForSimilarity: (canonicalUrl: string) => void;
+  /**
+   * True while a connections drain is running. The background-embedding
+   * lane consults this to pause its embedding work — the drain thread
+   * must never contend with embedding CPU (CPU regime).
+   */
+  readonly isDrainActive: () => boolean;
 }
 
 export interface ContentLaneSourceUnitReconciler {
@@ -1334,6 +1367,12 @@ export const createConnectionsMaterializer = (
   let contentOnlyProgressFlushScheduled = false;
   let contentOnlyProgressFlushRunning = false;
   let progressOnlyDirty = false;
+  // Canonical URLs whose page-evidence content arrived since the last
+  // drain and must be re-embedded for similarity (see
+  // contentRequalifyEnabled). Populated by PAGE_EVIDENCE_EXTRACTED window
+  // events + the background-embedding lane's requalifyVisitForSimilarity.
+  // Drained (read + cleared) once per drain into hnswReconcileVisitIds.
+  const contentRequalifyVisitKeys = new Set<string>();
   let urgentDrainRequested = false;
   // Stage 5.2 W1a — debounce timer. Coalesces burst event arrivals
   // (e.g. multiple tabs activating in sequence, peer-event imports)
@@ -2905,10 +2944,31 @@ export const createConnectionsMaterializer = (
     // the ~30s live aggregate cadence (those visits are already in-window).
     const requalifyCandidateEngagementVisitIds =
       persistentSimilarityRequalifyPossible(pendingEventsForDrain);
+    // Content-arrival requalification (task 3). Drain (read + clear) the
+    // visit keys whose page-evidence content arrived since the last drain
+    // and merge them with the engagement-requalify candidates. Both share
+    // the same full-timeline splice: loadRequalifiedSimilarityEntries only
+    // re-derives entries for keys ABSENT from the window AND still
+    // gate-eligible under full engagement — so an in-window or
+    // now-ineligible content arrival costs nothing. Clearing here (not at
+    // drain end) is correct: any content arrival racing THIS drain calls
+    // requestDrain again, scheduling the next pass.
+    const contentRequalifyCandidateVisitKeys = new Set<string>();
+    if (contentRequalifyEnabled() && contentRequalifyVisitKeys.size > 0) {
+      for (const key of contentRequalifyVisitKeys) contentRequalifyCandidateVisitKeys.add(key);
+      contentRequalifyVisitKeys.clear();
+    }
+    const combinedRequalifyCandidateVisitIds =
+      contentRequalifyCandidateVisitKeys.size === 0
+        ? requalifyCandidateEngagementVisitIds
+        : new Set<string>([
+            ...requalifyCandidateEngagementVisitIds,
+            ...contentRequalifyCandidateVisitKeys,
+          ]);
     const requalifiedSimilarityEntries =
-      requalifyCandidateEngagementVisitIds.size > 0
+      combinedRequalifyCandidateVisitIds.size > 0
         ? await loadRequalifiedSimilarityEntries(
-            requalifyCandidateEngagementVisitIds,
+            combinedRequalifyCandidateVisitIds,
             windowSimilarityEntries,
             similarityConfig.engagementGateMs,
           )
@@ -5098,6 +5158,21 @@ export const createConnectionsMaterializer = (
       const canonicalUrl = event.payload['canonicalUrl'];
       if (typeof canonicalUrl === 'string') {
         pageEvidenceRecordCache.delete(canonicalizeEvidenceUrl(canonicalUrl));
+        // Content-arrival requalification: the fresh evidence may now be
+        // content-backed, so this visit must be re-embedded for similarity
+        // (see contentRequalifyEnabled). ACCUMULATE the key only — do NOT
+        // force a graph drain here. PAGE_EVIDENCE_EXTRACTED is content-
+        // lane-only precisely to avoid a graph drain per content event
+        // (the "defers content-lane progress ... without a backlog scan"
+        // invariant). Content arrivals are navigation-correlated, so the
+        // next natural graph drain folds this key into hnswReconcileVisitIds
+        // and re-derives the edges. The worker-lane path
+        // (requalifyVisitForSimilarity) DOES request a drain — nothing else
+        // would trigger one for a backlog embed completed on a quiet vault.
+        if (contentRequalifyEnabled()) {
+          const visitKey = normalizeVisitUrl(canonicalUrl);
+          if (visitKey.length > 0) contentRequalifyVisitKeys.add(visitKey);
+        }
       }
     }
     if (!handlesGraph) {
@@ -5386,6 +5461,25 @@ export const createConnectionsMaterializer = (
   // this method just orchestrates. Tombstoned units are reconciled
   // first to ensure index removals happen before chunk re-adds during
   // a re-add-then-tombstone-then-re-add sequence on the same source.
+  // Task 3 seam for the background-embedding lane. When the lane
+  // completes a backlog doc embedding it calls this so the visit is
+  // re-embedded for similarity on the next drain (the same content-
+  // arrival requalification PAGE_EVIDENCE_EXTRACTED triggers). Bounded:
+  // accumulates a canonical URL and requests a (debounced) drain; the
+  // drain drains + clears the set. Respects the kill-switch.
+  const requalifyVisitForSimilarity = (rawCanonicalUrl: string): void => {
+    if (!contentRequalifyEnabled()) return;
+    const visitKey = normalizeVisitUrl(rawCanonicalUrl);
+    if (visitKey.length === 0) return;
+    contentRequalifyVisitKeys.add(visitKey);
+    requestDrain();
+  };
+
+  // The lane pauses embedding while a drain runs (CPU regime — never
+  // contend with the drain thread). Expose the running flag so the lane's
+  // isDrainActive() reads the authoritative signal.
+  const isDrainActive = (): boolean => running;
+
   const drainContentLaneQueue = async (
     reconciler: ContentLaneSourceUnitReconciler,
   ): Promise<number> => {
@@ -5436,5 +5530,7 @@ export const createConnectionsMaterializer = (
     getTopicAccumulator,
     getEmbedderWarmthTracker,
     drainContentLaneQueue,
+    requalifyVisitForSimilarity,
+    isDrainActive,
   };
 };

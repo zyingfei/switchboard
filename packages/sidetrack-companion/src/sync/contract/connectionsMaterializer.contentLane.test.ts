@@ -240,6 +240,51 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     expect(latestProgress.appliedFrontier).toEqual({ 'replica-A': 2 });
   });
 
+  it('page.evidence.extracted accumulates a content-requalify key without forcing a graph drain', async () => {
+    // Task 3: content arrival must NOT trigger a graph drain per event
+    // (preserves the content-lane-only optimization); it accumulates the
+    // requalify key for the next natural drain to fold in.
+    const mat = createMat();
+    mat.onAccepted(
+      buildEvent({
+        seq: 2,
+        type: PAGE_EVIDENCE_EXTRACTED,
+        payload: {
+          payloadVersion: 1,
+          canonicalUrl: 'https://news.ycombinator.com/newest',
+          extractedAt: '2026-05-23T23:00:00.000Z',
+        },
+      }),
+      { origin: 'local' },
+    );
+    // No graph drain requested (pending stays false — same invariant as
+    // the preceding test).
+    expect(mat.health().pending).toBe(false);
+    expect(mat.isDrainActive()).toBe(false);
+  });
+
+  it('requalifyVisitForSimilarity requests a drain; respects its kill-switch', () => {
+    // Task 3: the background-embedding lane's completion callback DOES
+    // request a drain — nothing else would trigger one for a backlog
+    // embed on a quiet vault.
+    const mat = createMat();
+    expect(mat.isDrainActive()).toBe(false);
+    mat.requalifyVisitForSimilarity('https://example.test/embedded-page');
+    expect(mat.health().pending).toBe(true);
+
+    // Kill-switch: env=0 makes it a no-op.
+    const previous = process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'];
+    process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'] = '0';
+    try {
+      const gated = createMat();
+      gated.requalifyVisitForSimilarity('https://example.test/other');
+      expect(gated.health().pending).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'];
+      else process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'] = previous;
+    }
+  });
+
   it('coalesces idle content-lane progress into one progress write', async () => {
     const baseProgress: MaterializerProgress = {
       ...EMPTY_PROGRESS('connections', MATERIALIZER_VERSION),
