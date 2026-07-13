@@ -86,12 +86,14 @@ import {
   type EngagementIntervalObservedPayload,
   type EngagementSessionAggregatedPayload,
 } from '../src/background/state/engagementCache';
+import { resolveEngagementEmission } from '../src/background/state/engagementEmission';
 import {
   isSelectionLineageMessage,
   type SelectionCopiedPayload,
   type SelectionPastedPayload,
 } from '../src/content/engagement/copy-paste';
 import type { EngagementIntervalMessage } from '../src/content/engagement/aggregator';
+import { engagementVisitIdForLocation } from '../src/content/engagement/visibility';
 import {
   VISUAL_FINGERPRINT_OBSERVED,
   VISUAL_FINGERPRINT_PRIVACY_GET,
@@ -4165,57 +4167,134 @@ export default defineBackground(() => {
     message: unknown,
     tabId: number | undefined,
   ): Promise<void> => {
-    if (tabId === undefined) {
-      await recordEngagementSyncDiag('interval.dropped', { reason: 'no-tabId' });
-      return;
+    const shapeValid = isEngagementIntervalMessage(message);
+    // The gate signals. Master capture switch and per-URL blocklist are
+    // only evaluated when we have a valid message + tab; a paused/blocked
+    // page must produce NOTHING (interval OR aggregate) and additionally
+    // purge any durable mirror so the idle-sweep can never resurrect a
+    // suppressed session (composes with the #243 capture-gate rework).
+    const captureEnabled = shapeValid && tabId !== undefined ? await isCaptureEnabled() : false;
+    let captureAllowedForUrl = false;
+    if (shapeValid && tabId !== undefined && captureEnabled) {
+      const engagementTab = await chrome.tabs.get(tabId).catch(() => null);
+      // A tab we cannot resolve is treated as allowed (unchanged from the
+      // prior behavior: the old code only blocked when it positively
+      // resolved a disallowed URL).
+      captureAllowedForUrl =
+        engagementTab === null ? true : await isCaptureAllowedForUrl(engagementTab.url);
     }
-    if (!isEngagementIntervalMessage(message)) {
+
+    const decision = resolveEngagementEmission({
+      tabIdDefined: tabId !== undefined,
+      shapeValid,
+      captureEnabled,
+      captureAllowedForUrl,
+      final: shapeValid ? message.final : false,
+    });
+
+    if (decision.kind === 'drop') {
+      if (decision.clearDurable && tabId !== undefined) {
+        const runtime = await engagementRuntime();
+        void runtime.cache.clearDurable(tabId).catch(() => undefined);
+      }
       await recordEngagementSyncDiag('interval.dropped', {
-        reason: 'shape-mismatch',
-        rawType: typeof message,
+        reason: decision.reason,
+        ...(tabId !== undefined ? { tabId } : {}),
+        ...(decision.reason === 'shape-mismatch' ? { rawType: typeof message } : {}),
       });
       return;
     }
-    // Master capture switch off — drop in-flight intervals. The script
-    // is unregistered when capture is off, but a message can still be in
-    // transit at the instant of the flip; this is belt-and-suspenders.
-    if (!(await isCaptureEnabled())) {
-      await recordEngagementSyncDiag('interval.dropped', { reason: 'capture-disabled', tabId });
-      return;
-    }
-    // No-capture blocklist — resolve the tab URL and drop engagement for
-    // blocked sites so a suppressed domain records no dwell/focus signal.
-    const engagementTab = await chrome.tabs.get(tabId).catch(() => null);
-    if (engagementTab !== null && !(await isCaptureAllowedForUrl(engagementTab.url))) {
-      await recordEngagementSyncDiag('interval.dropped', { reason: 'no-capture-blocklist', tabId });
-      return;
-    }
+
+    // An 'emit' decision is only reachable with a valid message + defined
+    // tab; re-assert via the type guard so `message`/`tabId` narrow without
+    // casts (defensive: also a hard invariant check).
+    if (!isEngagementIntervalMessage(message) || tabId === undefined) return;
+    const validMessage = message;
+    const emitTabId = tabId;
     const runtime = await engagementRuntime();
-    const merged = runtime.cache.mergeInterval(tabId, message);
+    const merged = runtime.cache.mergeInterval(emitTabId, validMessage);
     const payloads: {
       readonly streamName: 'engagement.interval.observed' | 'engagement.session.aggregated';
       readonly payload: EngagementIntervalObservedPayload | EngagementSessionAggregatedPayload;
     }[] = [{ streamName: 'engagement.interval.observed', payload: merged.interval }];
-    if (message.final) {
+    if (decision.emitAggregate) {
       payloads.push({ streamName: 'engagement.session.aggregated', payload: merged.aggregate });
     }
     await appendEngagementEvents(payloads);
+    // Durability: mirror the running session to chrome.storage.local (or
+    // clear it on a final interval, whose aggregate we just emitted). This
+    // is what lets the idle-sweep / SW-wake seal finalize a session whose
+    // best-effort teardown beacon never reached a live service worker —
+    // the historical cause of `session.aggregated` silently stopping for
+    // weeks under MV3 SW eviction. Fire-and-forget: never blocks the hot
+    // interval path, never surfaces an error to the sender.
+    if (decision.durableAction === 'clear') {
+      void runtime.cache.clearDurable(emitTabId).catch(() => undefined);
+    } else {
+      void runtime.cache.persist(emitTabId).catch(() => undefined);
+    }
     await recordEngagementSyncDiag('interval.buffered', {
-      tabId,
-      final: message.final,
+      tabId: emitTabId,
+      final: validMessage.final,
       payloadCount: payloads.length,
     });
-    void maybeExtractAttentionGatePageEvidence(tabId, message);
+    void maybeExtractAttentionGatePageEvidence(emitTabId, validMessage);
   };
 
   const finalizeEngagementForTab = async (tabId: number): Promise<void> => {
     const runtime = await engagementRuntime();
     const finalized = runtime.cache.finalizeTab(tabId, Date.now());
-    if (finalized === null) return;
+    if (finalized === null) {
+      // Nothing live in memory — but the durable mirror may still hold an
+      // orphan (SW was evicted mid-session, then the tab closed on a fresh
+      // worker). Clear it so the idle-sweep doesn't later re-emit a
+      // session for a tab that's already gone.
+      void runtime.cache.clearDurable(tabId).catch(() => undefined);
+      return;
+    }
     await appendEngagementEvents([
       { streamName: 'engagement.interval.observed', payload: finalized.interval },
       { streamName: 'engagement.session.aggregated', payload: finalized.aggregate },
     ]);
+    void runtime.cache.clearDurable(tabId).catch(() => undefined);
+  };
+
+  // Nav-away finalize: when a tab navigates to a URL that maps to a
+  // DIFFERENT engagement visit than the one currently cached for the tab,
+  // finalize the prior session on the SW side. This does not depend on the
+  // old page's teardown beacon (which MV3 routinely drops) and prevents
+  // the next page's intervals from folding into the previous visit's
+  // totals (the cache keys sessions by tabId, so without this the
+  // sessionId/visitId would drift). `engagementVisitIdForLocation` folds
+  // out the hash, so an in-page anchor change is NOT treated as nav-away.
+  const finalizeEngagementOnNavAway = async (tabId: number, nextUrl: string): Promise<void> => {
+    const runtime = await engagementRuntime();
+    const cachedVisitId = runtime.cache.currentVisitId(tabId);
+    if (cachedVisitId === undefined) return;
+    const nextVisitId = engagementVisitIdForLocation({ href: nextUrl });
+    if (nextVisitId === cachedVisitId) return;
+    await finalizeEngagementForTab(tabId);
+  };
+
+  // Idle-sweep: finalize any durable session that hasn't seen an interval
+  // in ENGAGEMENT_IDLE_SWEEP_MS. A session that stops emitting intervals
+  // (tab discarded, SW evicted before the teardown beacon, browser
+  // quit mid-session) would otherwise never produce an aggregate. This is
+  // the backstop that makes the aggregate flow independent of best-effort
+  // teardown beacons — it can never silently stop for two weeks again.
+  const ENGAGEMENT_IDLE_SWEEP_MS = 5 * 60_000;
+  const sweepIdleEngagementSessions = async (): Promise<number> => {
+    const runtime = await engagementRuntime();
+    const finalized = await runtime.cache.sweepDurable(ENGAGEMENT_IDLE_SWEEP_MS, Date.now());
+    if (finalized.length === 0) return 0;
+    await appendEngagementEvents(
+      finalized.flatMap((f) => [
+        { streamName: 'engagement.interval.observed' as const, payload: f.interval },
+        { streamName: 'engagement.session.aggregated' as const, payload: f.aggregate },
+      ]),
+    );
+    await recordEngagementSyncDiag('session.swept', { count: finalized.length });
+    return finalized.length;
   };
 
   const handleSelectionLineage = async (
@@ -4589,9 +4668,18 @@ export default defineBackground(() => {
       return;
     }
     if (alarm.name === EDGE_EVENTS_DRAIN_ALARM) {
-      void drainBufferedEdgeEvents().catch((error: unknown) => {
-        console.warn('[edge-events.drain] periodic drain failed:', error);
-      });
+      // Sweep idle engagement sessions BEFORE the drain so any freshly
+      // finalized aggregate ships to the companion in the same cycle.
+      void sweepIdleEngagementSessions()
+        .catch((error: unknown) => {
+          console.warn('[engagement.sweep] periodic sweep failed:', error);
+          return 0;
+        })
+        .finally(() => {
+          void drainBufferedEdgeEvents().catch((error: unknown) => {
+            console.warn('[edge-events.drain] periodic drain failed:', error);
+          });
+        });
       return;
     }
   });
@@ -4599,7 +4687,13 @@ export default defineBackground(() => {
   void ensureEdgeEventsDrainAlarm();
   // Eager first drain on SW boot — picks up anything buffered across a
   // service-worker restart so the first drain doesn't wait a full minute.
-  void drainBufferedEdgeEvents().catch(() => undefined);
+  // Seal engagement sessions orphaned by the eviction that ended the
+  // previous worker FIRST, so any recovered aggregate is included.
+  void sweepIdleEngagementSessions()
+    .catch(() => 0)
+    .finally(() => {
+      void drainBufferedEdgeEvents().catch(() => undefined);
+    });
 
   // Debug hook for the SW DevTools console. `chrome.runtime.sendMessage`
   // from the SW itself never reaches the SW's own onMessage listener
@@ -4680,6 +4774,13 @@ export default defineBackground(() => {
     if (changeInfo.url !== undefined) {
       void detectCodingAttachForTab(tabId, changeInfo.url);
       markSeenAndBroadcast();
+      // Finalize the prior page's engagement session before its intervals
+      // bleed into the next visit. SW-side, so it survives a dropped
+      // content-script teardown beacon.
+      const navUrl = changeInfo.url;
+      void finalizeEngagementOnNavAway(tabId, navUrl)
+        .then(() => drainBufferedEdgeEvents())
+        .catch(() => undefined);
     }
     if (changeInfo.status === 'complete') {
       void maybeExtractAutoPageEvidence(tab, 'auto-observed', {

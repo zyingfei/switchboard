@@ -7752,6 +7752,11 @@ const App = () => {
                       onGrantAccess={() => {
                         void handleGrantDeeperPageAccess();
                       }}
+                      // Distinguish a revisit from a first visit in the
+                      // empty card — "seen N times, no connections yet" is
+                      // honest where "first time seeing this URL" would be
+                      // a lie the user can spot.
+                      visitCount={focusedRecordEffective.visitCount}
                       // UX4 — Now-card variant tucks the signal/alts
                       // rows into a "Why" disclosure so the headline
                       // reads cleanly. Inbox triage keeps the full

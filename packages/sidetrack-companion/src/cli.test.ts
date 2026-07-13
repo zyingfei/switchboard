@@ -167,6 +167,142 @@ describe('runCli', () => {
     }
   });
 
+  it('engagement backfill-aggregates dry-runs then applies idempotently', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'engagement-backfill-'));
+    try {
+      // Seed the log with two edge-origin interval events for one visit
+      // and one for a visit that already has a real aggregate (must be
+      // excluded). Import them via the same edge lane the extension uses.
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const log = createEventLog(vaultRoot, replica);
+      const dims = (focusedWindowMs: number) => ({
+        activeMs: focusedWindowMs,
+        visibleMs: focusedWindowMs,
+        focusedWindowMs,
+        idleMs: 0,
+        foregroundBursts: 1,
+        returnCount: 0,
+        scrollEvents: 0,
+        maxScrollRatio: 0,
+        copyCount: 0,
+        pasteCount: 0,
+      });
+      const seed = [
+        {
+          clientEventId: 'iv-1',
+          dot: { replicaId: 'edge_seed', seq: 1 },
+          deps: {},
+          aggregateId: 'engagement.interval.observed:visit:gap',
+          type: 'engagement.interval.observed',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:gap',
+            intervalStart: 1000,
+            intervalEnd: 2000,
+            dimensions: { engagement: dims(4000) },
+          },
+          acceptedAtMs: 5_000,
+        },
+        {
+          clientEventId: 'iv-2',
+          dot: { replicaId: 'edge_seed', seq: 2 },
+          deps: {},
+          aggregateId: 'engagement.interval.observed:visit:gap',
+          type: 'engagement.interval.observed',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:gap',
+            intervalStart: 2000,
+            intervalEnd: 3000,
+            dimensions: { engagement: dims(3000) },
+          },
+          acceptedAtMs: 6_000,
+        },
+        {
+          clientEventId: 'iv-3',
+          dot: { replicaId: 'edge_seed', seq: 3 },
+          deps: {},
+          aggregateId: 'engagement.interval.observed:visit:has-agg',
+          type: 'engagement.interval.observed',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:has-agg',
+            intervalStart: 1000,
+            intervalEnd: 2000,
+            dimensions: { engagement: dims(9000) },
+          },
+          acceptedAtMs: 5_000,
+        },
+        {
+          clientEventId: 'ag-1',
+          dot: { replicaId: 'edge_seed', seq: 4 },
+          deps: {},
+          aggregateId: 'engagement.session.aggregated:visit:has-agg',
+          type: 'engagement.session.aggregated',
+          payload: {
+            payloadVersion: 1,
+            visitId: 'visit:has-agg',
+            sessionId: 'session:real',
+            dimensions: { engagement: dims(9000) },
+          },
+          acceptedAtMs: 6_000,
+        },
+      ];
+      for (const event of seed) await log.importPeerEvent(event as never);
+
+      // Dry-run: reports the plan, writes nothing.
+      const dry = createStreams();
+      const dryExit = await runCli(
+        ['engagement', 'backfill-aggregates', '--vault', vaultRoot],
+        dry,
+      );
+      expect(dryExit).toBe(0);
+      expect(dry.stdout.text()).toContain('toSynthesize=1');
+      expect(dry.stdout.text()).toContain('alreadyAggregated=1');
+      expect(dry.stdout.text()).toContain('dry-run: no events written');
+
+      // Apply: appends exactly the one missing aggregate (visit:gap).
+      const apply1 = createStreams();
+      const applyExit = await runCli(
+        ['engagement', 'backfill-aggregates', '--vault', vaultRoot, '--apply'],
+        apply1,
+      );
+      expect(applyExit).toBe(0);
+      expect(apply1.stdout.text()).toContain('imported=1');
+
+      // The synthetic aggregate is in the log for visit:gap with the
+      // summed focusedWindowMs (4000 + 3000).
+      const merged = await log.readMerged();
+      const synthetic = merged.find(
+        (e) =>
+          e.type === 'engagement.session.aggregated' &&
+          (e.payload as { visitId?: string }).visitId === 'visit:gap',
+      );
+      expect(synthetic).toBeDefined();
+      expect(synthetic?.dot.replicaId).toBe('edge_backfill');
+      expect(
+        (synthetic?.payload as { dimensions: { engagement: { focusedWindowMs: number } } }).dimensions
+          .engagement.focusedWindowMs,
+      ).toBe(7000);
+
+      // Re-apply: visit:gap now HAS an aggregate (the one we just wrote),
+      // so it's excluded → nothing to synthesize. Idempotent by
+      // construction: a second pass can never double-write.
+      const apply2 = createStreams();
+      const reapplyExit = await runCli(
+        ['engagement', 'backfill-aggregates', '--vault', vaultRoot, '--apply'],
+        apply2,
+      );
+      expect(reapplyExit).toBe(0);
+      expect(apply2.stdout.text()).toContain('toSynthesize=0');
+      expect(apply2.stdout.text()).toContain('imported=0');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
   it('recall reingest refuses when the recall process-lock is held by a live foreign PID', async () => {
     // A running companion holds `_BAC/recall/.lock` for the same
     // single-writer reason that `recall reingest` does — letting them

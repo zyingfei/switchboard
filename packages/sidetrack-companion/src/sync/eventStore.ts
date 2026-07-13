@@ -28,6 +28,11 @@ export interface EventStore {
   /** Ordered like readMerged().filter(event => event.dot.seq > frontier[replica] ?? 0). */
   readonly readSince: (frontier: VersionVector) => readonly AcceptedEvent[];
   readonly maxAcceptedAtMs: () => number;
+  /** MAX(accepted_at_ms) for a single event type (events_type_idx filter),
+   *  0 when the type has never been seen. A single aggregate query — used
+   *  by the engagement-lane freshness probe to spot aggregate-vs-interval
+   *  divergence without materializing rows. */
+  readonly maxAcceptedAtMsForType: (type: string) => number;
   readonly count: () => number;
   readonly forEachChunk: (
     cb: (chunk: readonly AcceptedEvent[]) => void | Promise<void>,
@@ -452,6 +457,13 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     return row === null || row === undefined ? 0 : numberField(row, 'max');
   };
 
+  const maxAcceptedAtMsForType = (type: string): number => {
+    const row = db
+      .query('SELECT COALESCE(MAX(accepted_at_ms), 0) AS max FROM events WHERE type = ?')
+      .get(type);
+    return row === null || row === undefined ? 0 : numberField(row, 'max');
+  };
+
   const count = (): number => {
     const row = db.query('SELECT COUNT(*) AS count FROM events').get();
     return row === null || row === undefined ? 0 : numberField(row, 'count');
@@ -529,6 +541,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     rebuildFromJsonl,
     readSince,
     maxAcceptedAtMs,
+    maxAcceptedAtMsForType,
     count,
     forEachChunk,
     forEachChunkOfTypes,

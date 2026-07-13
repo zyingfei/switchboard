@@ -68,6 +68,15 @@ export interface SuggestionStatsProps {
   // (older callers) → keep the original placeholder.
   readonly pageAccessGranted?: boolean;
   readonly onGrantAccess?: () => void;
+  // How many times this URL has been visited (from the projection's
+  // UrlVisitRecord.visitCount). When the resolver returns zero candidates
+  // AND this is a REVISIT (>1), the empty card should say "seen N times —
+  // no connections yet" rather than the misleading "first time seeing this
+  // URL": the user knows they've been here, and the honest signal is that
+  // attribution hasn't found a link yet (often because the >=5s-engagement
+  // visit-similarity gate never produced edges). `undefined`/≤1 keeps the
+  // original first-seen copy.
+  readonly visitCount?: number;
 }
 
 export function SuggestionStats({
@@ -78,6 +87,7 @@ export function SuggestionStats({
   compact = false,
   pageAccessGranted,
   onGrantAccess,
+  visitCount,
 }: SuggestionStatsProps) {
   if (suggestion === undefined) {
     // Distinct from "fetched but empty" below — the suggestion has not
@@ -144,13 +154,26 @@ export function SuggestionStats({
     // The Graph button (⇄ Graph in the Current Tab / Inbox card head
     // row) is the diagnostic affordance: clicking it shows whether
     // the neighborhood exists at all.
+    //
+    // Distinguish a REVISIT from a genuine first visit: if the projection
+    // has already seen this URL more than once, "First time seeing this
+    // URL" is a lie the user can spot. Say so honestly — the real signal
+    // is "seen N times, still no connections" (typically because the
+    // ≥5s-engagement visit-similarity gate never yielded edges). First
+    // visits keep the original copy.
+    const isRevisit = typeof visitCount === 'number' && visitCount > 1;
     return (
       <div className="suggestion-stats is-empty">
         <span className="suggestion-stats-row">
-          <span className="suggestion-stats-target subtle">No signal yet</span>
+          <span className="suggestion-stats-target subtle">
+            {isRevisit ? 'No connections yet' : 'No signal yet'}
+          </span>
           <span
             className="suggestion-stats-info"
             title={
+              (isRevisit
+                ? `Seen ${String(visitCount)} times, but attribution hasn’t linked this URL yet.\n`
+                : '') +
               'Sidetrack checked three signals and all came up empty:\n' +
               '· no related visits link to a workstream (PPR=0)\n' +
               '· no workstream pages look similar (similarity=0)\n' +
@@ -163,7 +186,9 @@ export function SuggestionStats({
           </span>
         </span>
         <span className="suggestion-stats-source mono subtle">
-          First time seeing this URL — hover ⓘ for what was checked
+          {isRevisit
+            ? `Seen ${String(visitCount)} times — no connections yet, hover ⓘ for what was checked`
+            : 'First time seeing this URL — hover ⓘ for what was checked'}
         </span>
       </div>
     );

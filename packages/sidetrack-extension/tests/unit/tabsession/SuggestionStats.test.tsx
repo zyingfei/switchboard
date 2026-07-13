@@ -174,4 +174,74 @@ describe('SuggestionStats', () => {
     );
     expect(screen.queryByText(/Other candidates/)).toBeNull();
   });
+
+  const emptyResolution = (): TabSessionResolutionResult => ({
+    tabSessionId: 'https://revisit.example/page',
+    dryRun: true,
+    decision: { action: 'inbox', margin: 0 },
+    fusedCandidates: [],
+  });
+
+  it('distinguishes a revisit ("seen N times — no connections yet") from a first visit', () => {
+    render(
+      <SuggestionStats
+        suggestion={emptyResolution()}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+        visitCount={4}
+      />,
+    );
+    // Revisit copy — honest about the repeat visit, no "first time" lie.
+    expect(screen.getByText('No connections yet')).toBeInTheDocument();
+    expect(
+      screen.getByText(/Seen 4 times — no connections yet/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/First time seeing this URL/)).toBeNull();
+    // Tooltip surfaces the count too.
+    expect(screen.getByText('ⓘ').getAttribute('title')).toContain('Seen 4 times');
+  });
+
+  it('keeps the first-seen copy when visitCount is 1 (genuine first visit)', () => {
+    render(
+      <SuggestionStats
+        suggestion={emptyResolution()}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+        visitCount={1}
+      />,
+    );
+    expect(screen.getByText('No signal yet')).toBeInTheDocument();
+    expect(screen.getByText(/First time seeing this URL/)).toBeInTheDocument();
+    expect(screen.queryByText(/no connections yet/)).toBeNull();
+  });
+
+  it('keeps the first-seen copy when visitCount is undefined (older callers)', () => {
+    render(
+      <SuggestionStats
+        suggestion={emptyResolution()}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
+    expect(screen.getByText('No signal yet')).toBeInTheDocument();
+  });
+
+  it('page-access-off prompt takes priority over the revisit copy', () => {
+    // Even for a repeat visit, if page access is off the actionable
+    // grant-access branch must win (the fix is the same either way).
+    render(
+      <SuggestionStats
+        suggestion={emptyResolution()}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted={false}
+        visitCount={7}
+      />,
+    );
+    expect(screen.getByText('No signal — page access off')).toBeInTheDocument();
+    expect(screen.queryByText('No connections yet')).toBeNull();
+  });
 });
