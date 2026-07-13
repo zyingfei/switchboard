@@ -156,9 +156,12 @@ export interface RecallStore {
    *  Joins back to the docs table so callers receive canonical_url +
    *  title in one round-trip. `bodyIndexed` mirrors the docs column
    *  (1 = content vector, 0 = title+URL only) so callers can tell a
-   *  content-derived hit from a title-only one and LOG that provenance.
-   *  It does NOT influence ranking here — down-weighting title-only
-   *  hits is a serving-math change gated behind the P1 freeze. */
+   *  content-derived hit from a title-only one. This method does NOT
+   *  influence ranking — ordering is always by cosine distance.
+   *  Provenance down-weighting of title-only hits happens at the CALLER
+   *  (`generateSemanticQuery`), behind `SIDETRACK_RECALL_PROVENANCE_
+   *  DOWNWEIGHT` (default OFF by eval verdict; ADR-0011 amendment
+   *  2026-07-12c). */
   queryVector(opts: {
     readonly vec: Float32Array;
     readonly limit: number;
@@ -169,6 +172,35 @@ export interface RecallStore {
     readonly title: string | undefined;
     readonly cosineDistance: number;
     readonly bodyIndexed: 0 | 1;
+  }[];
+
+  /** Chunk-vector KNN with doc-level max-chunk pooling. Runs the KNN
+   *  over `documents_chunks_vec` (content passages), maps each hit chunk
+   *  back to its parent document via `documents_chunks`, then pools per
+   *  document keeping the BEST chunk (MIN cosine distance == MAX cosine
+   *  similarity). Returns the same doc-level shape as `queryVector` plus
+   *  `pooledChunkCount` (how many of this doc's chunks landed in the KNN
+   *  frontier — a coarse density signal for diagnostics). `bodyIndexed`
+   *  is ~always 1 here since only content docs have chunk vectors.
+   *
+   *  Preferred over `queryVector` (whole-doc average) where clean chunk
+   *  vectors exist because passage-level retrieval finds the specific
+   *  section that matches the query rather than the doc centroid. It is
+   *  a NO-OP returning [] when the vec backend is unavailable, so callers
+   *  can fall back to `queryVector` / the JSON sidecar. Gated at the
+   *  caller behind `SIDETRACK_RECALL_CHUNK_VECTORS` (P1 freeze; default
+   *  by eval verdict) — the store method itself is always available. */
+  queryChunkVector(opts: {
+    readonly vec: Float32Array;
+    readonly limit: number;
+    readonly excludeEntityIds?: ReadonlySet<string>;
+  }): readonly {
+    readonly entityId: string;
+    readonly canonicalUrl: string | undefined;
+    readonly title: string | undefined;
+    readonly cosineDistance: number;
+    readonly bodyIndexed: 0 | 1;
+    readonly pooledChunkCount: number;
   }[];
 
   close(): void;

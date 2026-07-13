@@ -322,3 +322,106 @@ up content vectors, not just the incremental frontier. Until then the
 background lane + requalify path upgrade visits opportunistically as they
 are revisited. This is a deployment step for the future flip, not a
 correctness gap at the current default-OFF.
+
+## Amendment 2026-07-12c — make RECALL page-feature-driven (chunk-vector serving + provenance down-weight)
+
+**Context.** Amendments 2026-07-12/12b addressed the CONNECTIONS
+similarity lane. The sibling gap is on the RECALL serving path
+(`/v2/recall`, the single funnel behind déjà-vu, focus/Now-card related,
+and Search). Two pieces of retrieval intelligence were BUILT but never
+served:
+
+1. **Chunk vectors are written but never queried.** The backfill embeds
+   per-passage chunk vectors into `documents_chunks_vec`
+   (`backfillChunkVectors`), but the semantic-query generator only ever
+   ran `queryVector` over the WHOLE-DOC `docs_vec` centroid. A doc with
+   one strongly-relevant passage and a lot of off-topic body scores by
+   its average, not its best section — the opposite of what "find the
+   page that discussed X" wants. There was no `queryChunkVector` at all.
+2. **body_indexed provenance is returned but ignored.** Since #242-M4,
+   `queryVector` returns `bodyIndexed` (1 = content-derived vector, 0 =
+   title/URL-only, e.g. a bare timeline visit), explicitly READ-ONLY:
+   "any down-weighting of title-only hits is a serving-math change gated
+   behind the P1 freeze (ADR-0011)." A title-only vector is a weaker
+   relevance signal than a content-derived one at the same cosine, but
+   fusion treated them identically.
+
+**Decision.** Under the OWNER DIRECTIVE ("make every ML / recommendation
+system … connected and working in plugin … evidence-gated — every serving
+change ships behind a flag whose default is set by the eval-spine
+verdict"), connecting these to the semantic-query lane is classified
+freeze-safe, subject to the same conditions as the prior amendments:
+
+1. No new retrieval SOURCE, no new edge kind, no new score fusion
+   formula. Both arms operate ENTIRELY within the existing
+   `generateSemanticQuery` lane: arm 1 swaps the vector SUBSTRATE
+   (chunk-pooled KNN vs whole-doc KNN) feeding the same cosine → floor →
+   gap-gate → RRF pipeline; arm 2 applies a cosine multiplier to
+   title-only hits BEFORE the same floors/gate. The RRF-K, the semantic
+   floors, the `model-registry` gap-gate, and the cross-encoder rerank
+   are all unchanged. Doc-level max-chunk pooling (MIN cosine distance ==
+   MAX similarity) and the `TITLE_ONLY_COSINE_MULTIPLIER` (0.85) are the
+   only new math, and both are dark until a flag is set.
+2. Every serving flip is behind a kill-switch env flag whose DEFAULT is
+   set by the eval-spine verdict, not optimism:
+   - `SIDETRACK_RECALL_CHUNK_VECTORS` (default **OFF**) — prefer
+     chunk-vector pooling in the semantic lane.
+   - `SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT` (default **OFF**) —
+     down-weight title-only KNN hits.
+
+   Default OFF is the honest verdict: the recall replay harness
+   (`recall-v2/eval`) cannot yet score these arms against real
+   chunk-vector coverage on the live vault (the same reasoning as
+   amendment 12b's `SIDETRACK_SIMILARITY_CONTENT_CORPUS`). The arms are
+   INJECTED via `PipelineDeps.retrievalArms` (not just env) so the
+   harness can run arm-vs-arm per-run without mutating process env; the
+   active arms are surfaced in `meta.flags.recallChunkVectors` /
+   `recallProvenanceDownweight` for the debug overlay. When the harness
+   scores an arm as a win, flip its default in a follow-up citing the
+   recorded verdict.
+3. Bounded per the CPU regime. Neither arm adds compute to the drain
+   thread. `queryChunkVector` is a single indexed SQLite KNN
+   (over-pull `limit * 4`, capped) + a GROUP BY on the request path —
+   the same shape and budget as the existing `queryVector`; no embedding
+   or rebuild is triggered. Chunk vectors are produced by the EXISTING
+   idle-batched backfill, unchanged. The down-weight is a scalar multiply
+   per candidate.
+
+**What landed (this amendment's scope):**
+
+- `recall-v2/store/sqlite.ts` + `store/types.ts`: `queryChunkVector` —
+  two-stage KNN over `documents_chunks_vec` (so vec0 sees its own LIMIT),
+  joined `documents_chunks → docs`, `GROUP BY document` keeping
+  `MIN(distance)` (max-chunk pool), returning the doc-level shape plus
+  `pooledChunkCount`. Always-available store method; gating is at the
+  caller.
+- `recall-v2/retrievalFlags.ts`: the two flags, the injectable
+  `RetrievalArms` type, `retrievalArmsFromEnv`, and the
+  `TITLE_ONLY_COSINE_MULTIPLIER` constant, all documented default-OFF.
+- `recall-v2/pipeline.ts`: `generateSemanticQuery` prefers
+  `queryChunkVector` when arm 1 is on (falling through to `queryVector`
+  then the JSON sidecar so enabling never regresses a chunk-less corpus),
+  and applies the provenance down-weight to the effective cosine used for
+  ranking + floors + gap-gate when arm 2 is on (raw cosine preserved in
+  evidence for honesty). Arms resolved once per run from
+  `deps.retrievalArms ?? retrievalArmsFromEnv()`.
+
+**No forked query paths (task 3).** Verified that déjà-vu (`intent:
+'dejavu'`), the Now-card related strip (`intent: 'focus'`,
+`useFocusedRelatedPages`), and Search (`intent: 'search'`) ALL POST the
+same `/v2/recall` via the extension's single `recallV2Query` bridge, and
+that the only semantic-vector retrieval in the pipeline is
+`generateSemanticQuery`. The `graph_neighbor`/"Similar" pool surface is
+anchor-anchored (a distinct SOURCE within the same pipeline), not a
+second query path. So both arms take effect uniformly across every recall
+surface with no divergence. The `queryVector` reference in
+`connections/visitSimilarity.ts` is a comment naming a local variable in
+the separate connections-drain subsystem, not a second caller of the
+store method.
+
+**Freeze-lift interaction.** None of this lifts the freeze. The served
+order is byte-identical to the prior baseline while both flags are OFF
+(the eval-spine fixtures are unchanged and green). When the recall replay
+harness can score an arm against the live-vault chunk coverage, flip its
+default in a follow-up that cites this amendment and the recorded
+verdict — the same evidence-gated protocol the OWNER DIRECTIVE requires.

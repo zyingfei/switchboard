@@ -79,6 +79,7 @@ const makeStubStore = (): StubStore => {
     upsertVector: () => {},
     upsertChunkVector: () => {},
     queryVector: () => [],
+    queryChunkVector: () => [],
     close: () => {},
   };
 };
