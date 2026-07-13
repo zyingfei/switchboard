@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  mapInboundReminder,
   mapInboundReminders,
   mapReadInboundReminders,
+  resolveInReplyTo,
   READ_GROUP_WINDOW_MS,
+  type InboundContext,
   type InboundThreadLite,
 } from '../../src/sidepanel/inbound/mapInboundReminder';
 import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
@@ -123,6 +126,109 @@ describe('mapReadInboundReminders — collapsed "Read" group', () => {
       NOW,
     );
     expect(read.map((m) => m.bac_id)).toEqual(['r-fresh']);
+  });
+});
+
+describe('mapInboundReminder — §3.4 context line', () => {
+  const wsThreads: readonly InboundThreadLite[] = [
+    {
+      bac_id: 't1',
+      title: 'State machine review',
+      lastTurnRole: 'assistant',
+      workstreamLabel: 'MVP / PRD',
+    },
+    { bac_id: 't2', title: 'Ungrouped thread', lastTurnRole: 'assistant' },
+  ];
+
+  const doneFollowUp: QueueItem = {
+    bac_id: 'q-done',
+    text: 'Can you compare this with the alternative design?',
+    scope: 'thread',
+    targetId: 't1',
+    status: 'done',
+    createdAt: '2026-07-11T09:58:00.000Z',
+    updatedAt: '2026-07-11T09:59:00.000Z',
+  };
+
+  it('joins the thread workstream label onto the card', () => {
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel);
+    expect(mapped.workstreamLabel).toBe('MVP / PRD');
+  });
+
+  it('resolves "in reply to" from the nearest done follow-up before the reply', () => {
+    const ctx: InboundContext = { queueItems: [doneFollowUp] };
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel, ctx);
+    expect(mapped.inReplyTo).toBe('Can you compare this with the alternative design?');
+  });
+
+  it('falls back to a thread-sourced dispatch body when no done follow-up exists', () => {
+    const ctx: InboundContext = {
+      dispatches: [
+        {
+          sourceThreadId: 't1',
+          body: 'Forwarded context: please critique the ranker approach.',
+          createdAt: '2026-07-11T09:30:00.000Z',
+        },
+      ],
+    };
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel, ctx);
+    expect(mapped.inReplyTo).toBe('Forwarded context: please critique the ranker approach.');
+  });
+
+  it('prefers the done follow-up over a dispatch when both exist', () => {
+    const ctx: InboundContext = {
+      queueItems: [doneFollowUp],
+      dispatches: [{ sourceThreadId: 't1', body: 'dispatch body', createdAt: '2026-07-11T09:30:00.000Z' }],
+    };
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel, ctx);
+    expect(mapped.inReplyTo).toBe('Can you compare this with the alternative design?');
+  });
+
+  it('omits "in reply to" when there is neither follow-up nor dispatch (never fabricates)', () => {
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel, {});
+    expect(mapped.inReplyTo).toBeUndefined();
+    // Still shows the workstream label.
+    expect(mapped.workstreamLabel).toBe('MVP / PRD');
+  });
+
+  it('omits the workstream label for an ungrouped thread', () => {
+    const [mapped] = mapInboundReminders(
+      [reminder({ bac_id: 'r1', threadId: 't2' })],
+      wsThreads,
+      rel,
+      {},
+    );
+    expect(mapped.workstreamLabel).toBeUndefined();
+  });
+
+  it('ignores a done follow-up dated AFTER the reply (can\'t answer the unsent)', () => {
+    const laterFollowUp: QueueItem = {
+      ...doneFollowUp,
+      updatedAt: '2026-07-11T10:05:00.000Z', // after detectedAt 10:00
+    };
+    const ctx: InboundContext = { queueItems: [laterFollowUp] };
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], wsThreads, rel, ctx);
+    expect(mapped.inReplyTo).toBeUndefined();
+  });
+
+  it('surfaces an in-memory reply snippet, and skips it when absent', () => {
+    const withSnippet = mapInboundReminder(reminder({ bac_id: 'r1' }), wsThreads, rel, {
+      replySnippetByReminderId: { r1: 'Here is the comparison you asked for…' },
+    });
+    expect(withSnippet?.replySnippet).toBe('Here is the comparison you asked for…');
+    const withoutSnippet = mapInboundReminder(reminder({ bac_id: 'r1' }), wsThreads, rel, {});
+    expect(withoutSnippet?.replySnippet).toBeUndefined();
+  });
+
+  it('resolveInReplyTo returns undefined with no candidates', () => {
+    expect(resolveInReplyTo('t1', '2026-07-11T10:00:00.000Z', [], [])).toBeUndefined();
+  });
+
+  it('null-safe: no context arg still produces a valid card (no context line)', () => {
+    const [mapped] = mapInboundReminders([reminder({ bac_id: 'r1' })], threads, rel);
+    expect(mapped.workstreamLabel).toBeUndefined();
+    expect(mapped.inReplyTo).toBeUndefined();
+    expect(mapped.threadTitle).toBe('State machine review');
   });
 });
 

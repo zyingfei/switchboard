@@ -30,9 +30,9 @@ export function InboundView({
 }: InboundViewProps) {
   const read = readReminders ?? [];
   return (
-    <div className="inbound-view" aria-label="Inbound replies">
+    <div className="inbound-view" aria-label="Replies">
       <div className="sec-head">
-        <span>Inbound replies</span>
+        <span>Replies</span>
         <span className="count mono">{String(reminders.length)}</span>
       </div>
       {reminders.length === 0 ? (
