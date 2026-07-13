@@ -6,6 +6,7 @@ import App, {
   formatBuildTimestamp,
 } from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
+import type { NoCaptureRule } from '../../src/capture/noCaptureRules';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -166,17 +167,18 @@ afterEach(() => {
 // callers still assert against `getByRole('tab', { name })` after this.
 //   Now             → Now section (single surface, no sub-tab)
 //   Threads/Workstreams/Queued follow-ups → Work section
-//   Search/Explore  → Memory section
-//   Inbound replies/Inbox → Trust section
+//   Search/Explore  → Library section (formerly Memory)
+//   Inbound replies/Inbox → Inbox section (the merged incoming-things
+//                           home; Trust was split three ways in R1.2)
 const SECTION_OF_TAB: Record<string, string> = {
   Now: 'now',
   Threads: 'work',
   Workstreams: 'work',
   'Queued follow-ups': 'work',
-  Search: 'memory',
-  Explore: 'memory',
-  'Inbound replies': 'trust',
-  Inbox: 'trust',
+  Search: 'library',
+  Explore: 'library',
+  'Inbound replies': 'inbox',
+  Inbox: 'inbox',
 };
 const goToTab = async (name: string): Promise<void> => {
   const section = SECTION_OF_TAB[name];
@@ -1199,10 +1201,10 @@ describe('live side-panel App wiring', () => {
     expect(screen.getByTestId('focused-tab-attribution')).not.toHaveTextContent('Sidetrack');
   });
 
-  it('exposes find-active-tab in the overflow menu when the active tab matches a tracked thread', async () => {
-    // The standalone pulsing find icon was retired into the ⋯ overflow
-    // (R1.1 streamline); the capability stays reachable there with its
-    // pinned aria-label.
+  it('exposes find-active-tab in the visible toolbar when the active tab matches a tracked thread', async () => {
+    // R1.2 (feedback 2): find-active-tab RETURNED to the visible toolbar
+    // — this user screenshares/demos daily, so the daily tools are one
+    // click away. Same pinned aria-label so §13/e2e stay reachable.
     const state = liveState();
     installChromeMock(
       {
@@ -1214,8 +1216,7 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    fireEvent.click(await screen.findByTestId('toolbar-overflow'));
-    const findButton = await screen.findByRole('menuitem', {
+    const findButton = await screen.findByRole('button', {
       name: 'Find active tab in side panel',
     });
     expect(findButton).toBeInTheDocument();
@@ -1330,10 +1331,9 @@ describe('live side-panel App wiring', () => {
 
     render(<App />);
 
-    // Find-active-tab relocated into the ⋯ overflow (R1.1) — open the
-    // menu, then pick it. Same aria-label + behaviour.
-    fireEvent.click(await screen.findByTestId('toolbar-overflow'));
-    const findButton = await screen.findByRole('menuitem', {
+    // R1.2: find-active-tab is back in the visible toolbar — click it
+    // directly. Same aria-label + behaviour.
+    const findButton = await screen.findByRole('button', {
       name: 'Find active tab in side panel',
     });
     fireEvent.click(findButton);
@@ -1807,5 +1807,323 @@ describe('connect-dot status', () => {
     const popover = await screen.findByRole('dialog', { name: 'Connection status' });
     expect(within(popover).getByText('Vault')).toBeInTheDocument();
     expect(within(popover).getByText('Companion')).toBeInTheDocument();
+  });
+});
+
+// ── R1.2 lamp control center — the two per-site capture toggles that
+// live on the lamp strip's right side. Each is independently stateful:
+// clicking blocks the current site (adds a rule), and on an
+// already-blocked page the icon reads as active and clicking again
+// re-enables capture (removes the rule). This drives the block ↔
+// re-enable round-trip against a stateful rules store.
+describe('lamp per-site capture controls', () => {
+  const SITE_URL = 'https://research.google.com/paper';
+
+  // A stateful chrome mock: addNoCaptureRule / removeNoCaptureRule
+  // mutate a live rules list, and getWorkboardState returns the state
+  // with the CURRENT rules — so the round-trip (block → active →
+  // re-enable) reflects real store transitions the way the background
+  // does. Returns the sendMessage spy + a peek at the live rules.
+  const installStatefulRulesMock = (
+    initialRules: readonly NoCaptureRule[] = [],
+  ): { sendMessage: ReturnType<typeof vi.fn>; rules: () => readonly NoCaptureRule[] } => {
+    let rules: NoCaptureRule[] = [...initialRules];
+    const base = liveState();
+    const buildState = (): WorkboardState => ({
+      ...base,
+      companionStatus: 'connected',
+      activeTabUrl: SITE_URL,
+      settings: { ...base.settings, noCaptureRules: rules },
+    });
+    const sendMessage = vi.fn((request: WorkboardRequest | { readonly type?: unknown }) => {
+      const type = (request as { type?: unknown }).type;
+      if (type === messageTypes.addNoCaptureRule) {
+        const kind = (request as { kind?: 'domain' | 'similar' }).kind ?? 'domain';
+        // Registrable domain of SITE_URL is google.com (the eTLD+1).
+        const domain = 'google.com';
+        if (!rules.some((r) => r.kind === kind && r.domain === domain)) {
+          rules = [
+            ...rules,
+            kind === 'similar'
+              ? {
+                  id: `ncr_${kind}`,
+                  kind: 'similar',
+                  domain,
+                  label: domain,
+                  createdAt: NOW,
+                  categoryTokens: [],
+                }
+              : { id: `ncr_${kind}`, kind: 'domain', domain, label: domain, createdAt: NOW },
+          ];
+        }
+        return Promise.resolve({ ok: true, noCaptureRules: rules });
+      }
+      if (type === messageTypes.removeNoCaptureRule) {
+        const ruleId = (request as { ruleId?: string }).ruleId;
+        rules = rules.filter((r) => r.id !== ruleId);
+        return Promise.resolve({ ok: true, noCaptureRules: rules });
+      }
+      // getWorkboardState (and everything else) returns the live state.
+      return Promise.resolve({ ok: true, state: buildState(), request });
+    });
+    const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
+      const values = { [SETUP_COMPLETED_KEY]: true } as Record<string, unknown>;
+      if (typeof query === 'string') return Promise.resolve({ [query]: values[query] });
+      if (Array.isArray(query))
+        return Promise.resolve(Object.fromEntries(query.map((k) => [k, values[k]])));
+      if (query !== null && query !== undefined)
+        return Promise.resolve(
+          Object.fromEntries(
+            Object.entries(query).map(([k, fb]) => [k, values[k] ?? fb]),
+          ),
+        );
+      return Promise.resolve({ ...values });
+    });
+    vi.stubGlobal('chrome', {
+      runtime: {
+        sendMessage,
+        onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+      },
+      storage: { local: { get, set: vi.fn(() => Promise.resolve()) }, session: { get, set: vi.fn(() => Promise.resolve()) } },
+      tabs: { query: vi.fn(() => Promise.resolve([{ url: SITE_URL }])) },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v1/visits/inbox')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+          };
+        }
+        return { ok: false, status: 404, text: async () => 'not found' };
+      }),
+    );
+    return { sendMessage, rules: () => rules };
+  };
+
+  it('renders both per-site controls (block domain + block similar) on a capturable page', async () => {
+    installStatefulRulesMock();
+    render(<App />);
+
+    const controls = await screen.findByTestId('capture-lamp-controls');
+    // Two per-site toggles + the global eye all live in the cluster.
+    expect(within(controls).getByTestId('lamp-block-domain')).toBeInTheDocument();
+    expect(within(controls).getByTestId('lamp-block-similar')).toBeInTheDocument();
+    expect(within(controls).getByTestId('capture-toggle')).toBeInTheDocument();
+    // Idle (no rule yet) → not pressed.
+    expect(within(controls).getByTestId('lamp-block-domain')).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    );
+  });
+
+  it('blocks this domain then re-enables it (round-trip against the rules store)', async () => {
+    const { sendMessage, rules } = installStatefulRulesMock();
+    render(<App />);
+
+    const blockDomain = await screen.findByTestId('lamp-block-domain');
+    // Not blocked initially.
+    expect(blockDomain).toHaveAttribute('aria-pressed', 'false');
+
+    // Click → adds a 'domain' rule for the current site.
+    fireEvent.click(blockDomain);
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: messageTypes.addNoCaptureRule, kind: 'domain' }),
+      );
+    });
+    // The store now holds one domain rule and the lamp flips to blocked.
+    await waitFor(() => {
+      expect(rules().some((r) => r.kind === 'domain')).toBe(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('lamp-block-domain')).toHaveAttribute('aria-pressed', 'true');
+    });
+    // The verdict reflects the block + the accent bus repaints.
+    expect(screen.getByTestId('capture-lamp-verdict')).toHaveTextContent('Not captured');
+    expect(screen.getByRole('main', { name: 'Sidetrack workboard' })).toHaveAttribute(
+      'data-capture-state',
+      'blocked',
+    );
+
+    // Click again → removes the rule (re-enable capture round-trip).
+    fireEvent.click(screen.getByTestId('lamp-block-domain'));
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: messageTypes.removeNoCaptureRule, ruleId: 'ncr_domain' }),
+      );
+    });
+    await waitFor(() => {
+      expect(rules().some((r) => r.kind === 'domain')).toBe(false);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('lamp-block-domain')).toHaveAttribute('aria-pressed', 'false');
+    });
+  });
+
+  it('the block-similar control is independently stateful from block-domain', async () => {
+    const { sendMessage, rules } = installStatefulRulesMock();
+    render(<App />);
+
+    const blockSimilar = await screen.findByTestId('lamp-block-similar');
+    fireEvent.click(blockSimilar);
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: messageTypes.addNoCaptureRule, kind: 'similar' }),
+      );
+    });
+    // A 'similar' rule exists; the similar control is active but the
+    // domain control stays inactive (independent toggles).
+    await waitFor(() => {
+      expect(rules().some((r) => r.kind === 'similar')).toBe(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('lamp-block-similar')).toHaveAttribute('aria-pressed', 'true');
+    });
+    expect(screen.getByTestId('lamp-block-domain')).toHaveAttribute('aria-pressed', 'false');
+  });
+});
+
+// ── R1.2 Privacy section — the no-capture rules render INLINE as a real
+// panel (feedback 5), reachable from the primary nav. It lists rule rows
+// with a per-rule Purge action + the "add current site" affordance, so
+// the user never jumps to Settings to see or change the list.
+describe('Privacy section (inline no-capture rules panel)', () => {
+  const SITE_URL = 'https://research.google.com/paper';
+  const existingRule: NoCaptureRule = {
+    id: 'ncr_existing',
+    kind: 'domain',
+    domain: 'pge.com',
+    label: 'pge.com',
+    createdAt: NOW,
+  };
+
+  const installPrivacyMock = (rules: readonly NoCaptureRule[]): ReturnType<typeof installChromeMock> => {
+    const base = liveState();
+    const sendMessage = installChromeMock(
+      {
+        ...base,
+        companionStatus: 'connected',
+        activeTabUrl: SITE_URL,
+        settings: { ...base.settings, noCaptureRules: rules },
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+      SITE_URL,
+    );
+    return sendMessage;
+  };
+
+  it('renders the rules list inline with a Purge action per rule (no Settings jump)', async () => {
+    // The list is populated via the listNoCaptureRules message the
+    // NoCaptureRulesSection issues on mount; make the mock answer it.
+    const base = liveState();
+    const sendMessage = vi.fn((request: WorkboardRequest | { readonly type?: unknown }) => {
+      const type = (request as { type?: unknown }).type;
+      if (type === messageTypes.listNoCaptureRules) {
+        return Promise.resolve({ ok: true, noCaptureRules: [existingRule] });
+      }
+      return Promise.resolve({
+        ok: true,
+        state: {
+          ...base,
+          companionStatus: 'connected',
+          activeTabUrl: SITE_URL,
+          settings: { ...base.settings, noCaptureRules: [existingRule] },
+        },
+        request,
+      });
+    });
+    const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
+      const values = { [SETUP_COMPLETED_KEY]: true } as Record<string, unknown>;
+      if (typeof query === 'string') return Promise.resolve({ [query]: values[query] });
+      if (Array.isArray(query))
+        return Promise.resolve(Object.fromEntries(query.map((k) => [k, values[k]])));
+      if (query !== null && query !== undefined)
+        return Promise.resolve(
+          Object.fromEntries(Object.entries(query).map(([k, fb]) => [k, values[k] ?? fb])),
+        );
+      return Promise.resolve({ ...values });
+    });
+    vi.stubGlobal('chrome', {
+      runtime: { sendMessage, onMessage: { addListener: vi.fn(), removeListener: vi.fn() } },
+      storage: {
+        local: { get, set: vi.fn(() => Promise.resolve()) },
+        session: { get, set: vi.fn(() => Promise.resolve()) },
+      },
+      tabs: { query: vi.fn(() => Promise.resolve([{ url: SITE_URL }])) },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+      })),
+    );
+
+    render(<App />);
+
+    // Navigate to Privacy via the primary nav (not Settings).
+    fireEvent.click(await screen.findByTestId('section-nav-privacy'));
+
+    // The inline rules panel mounts with a real rule row + Purge action.
+    const row = await screen.findByTestId('no-capture-rule-row');
+    expect(within(row).getByText('pge.com')).toBeInTheDocument();
+    expect(within(row).getByTestId('purge-captured-data')).toBeInTheDocument();
+    expect(within(row).getByTestId('remove-no-capture-rule')).toBeInTheDocument();
+    // The Settings modal did NOT open — this is inline.
+    expect(screen.queryByRole('dialog', { name: /Settings/ })).not.toBeInTheDocument();
+  });
+
+  it('offers an "add current site" affordance that adds a domain rule', async () => {
+    const sendMessage = installPrivacyMock([]);
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('section-nav-privacy'));
+    const addDomain = await screen.findByTestId('privacy-add-domain');
+    fireEvent.click(addDomain);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ type: messageTypes.addNoCaptureRule, kind: 'domain' }),
+      );
+    });
+  });
+});
+
+// ── R1.2 de-jargon (feedback 4): "Mark relevant" → "Helpful". This is a
+// LABEL-ONLY change — the trainable event MUST be byte-identical. The
+// click still fires updateReminder { status: 'relevant' }, which the
+// companion joins into the frozen recall.action ranker label. This test
+// guards that the rename did not perturb the emitted event.
+describe('Helpful action (renamed from "Mark relevant") emits the same trainable event', () => {
+  it('fires updateReminder { status: "relevant" } when the Helpful button is clicked', async () => {
+    const sendMessage = installChromeMock(
+      { ...liveState(), companionStatus: 'connected' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+
+    render(<App />);
+
+    // Reach the Inbound replies surface (Inbox section → Replies sub-tab).
+    await goToTab('Inbound replies');
+
+    // The renamed control keeps its accessible name "Mark this reply as
+    // helpful" (visible label "Helpful"). Click it.
+    const helpful = await screen.findByRole('button', { name: 'Mark this reply as helpful' });
+    fireEvent.click(helpful);
+
+    // FROZEN semantics: the emitted event is unchanged — status 'relevant'
+    // on the liveState reminder id. Do NOT let the label rename alter this.
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.updateReminder,
+        reminderId: 'bac_reminder_test',
+        update: { status: 'relevant' },
+      });
+    });
   });
 });

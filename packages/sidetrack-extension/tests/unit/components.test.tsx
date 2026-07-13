@@ -530,7 +530,9 @@ describe('UX skeleton components — render-without-crash + key text present', (
     expect(screen.getByText('Side-panel state machine review')).toBeInTheDocument();
     expect(screen.getByText('Claude')).toBeInTheDocument();
     expect(screen.getByText('Open')).toBeInTheDocument();
-    expect(screen.getByText('Mark relevant')).toBeInTheDocument();
+    // R1.2 (feedback 4): "Mark relevant" → "Helpful" (label-only).
+    expect(screen.getByText('Helpful')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Mark this reply as helpful' })).toBeInTheDocument();
     expect(screen.getByText('Dismiss')).toBeInTheDocument();
   });
 

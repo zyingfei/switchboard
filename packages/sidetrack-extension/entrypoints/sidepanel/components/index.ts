@@ -75,6 +75,7 @@ export type { ChecklistPanelProps, ChecklistPanelItem } from './ChecklistPanel';
 
 export { SettingsPanel } from './SettingsPanel';
 export type { SettingsPanelProps, SettingsValue } from './SettingsPanel';
+export { NoCaptureRulesSection } from './NoCaptureRulesSection';
 
 // v2 design pass — new surfaces backed by recently-shipped backend.
 export { UpdateBanner } from './UpdateBanner';

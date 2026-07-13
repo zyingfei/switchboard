@@ -18,7 +18,7 @@ export interface InboundCardProps {
 
 // Inbound reply row — rebuilt on the token system (R1.1). Clear anatomy:
 //   Row 1  · unread dot (static; unseen only) + provider chip + title + age
-//   Row 2  · one aligned action row (Open / Mark relevant / Dismiss)
+//   Row 2  · one aligned action row (Open / Helpful / Dismiss)
 // Unseen replies are accented (a left rail + a static unread dot) because
 // an unread AI reply is the highest-value actionable-now signal; seen
 // replies fall back to a quiet paper card. No muddy amber wash, no
@@ -58,8 +58,20 @@ export function InboundCard({
         <button type="button" className="inbound-btn inbound-btn-primary" onClick={onOpen}>
           Open
         </button>
-        <button type="button" className="inbound-btn" onClick={onMarkRelevant}>
-          Mark relevant
+        {/* Plain-language rename (R1.2 feedback 4): "Mark relevant" was
+            ranker jargon. "Helpful" is the universal thumbs-up gesture a
+            stranger reads instantly. LABEL-ONLY change — the click still
+            fires the SAME updateReminder{status:'relevant'} → trainable
+            recall.action emission (frozen ranker-label semantics). Do
+            not rename the prop/status value. */}
+        <button
+          type="button"
+          className="inbound-btn"
+          onClick={onMarkRelevant}
+          aria-label="Mark this reply as helpful"
+          title="Tell Sidetrack this reply was useful — improves what it surfaces"
+        >
+          Helpful
         </button>
         <button type="button" className="inbound-btn inbound-btn-muted" onClick={onDismiss}>
           Dismiss

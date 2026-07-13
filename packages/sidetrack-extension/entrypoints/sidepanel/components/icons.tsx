@@ -177,6 +177,29 @@ export const Icons = {
       <path d="M8 12.5 6.5 14a3 3 0 0 0 .8 5h7.2a4 4 0 0 0 4-4v-3" />
     </svg>
   ),
+  // Per-site capture controls that live on the lamp strip's right side.
+  // `siteBlock` = a globe with a strike-through: "don't capture THIS
+  // domain". `sitesBlock` = two overlapping globes with a strike:
+  // "don't capture sites LIKE this" (the account/billing/login family).
+  // Both read as "no" at a glance so the blocked state is legible.
+  siteBlock: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3.5 12h17" />
+      <path d="M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18Z" />
+      <path d="M4 4l16 16" />
+    </svg>
+  ),
+  sitesBlock: (
+    <svg viewBox="0 0 24 24" {...sw}>
+      <circle cx="9.5" cy="9.5" r="6.5" />
+      <path d="M4.2 6.5h10.6" />
+      <path d="M4.2 12.5h10.6" />
+      <path d="M15 15.2A6.5 6.5 0 0 1 15.2 15" />
+      <path d="M13.5 13.5a6.5 6.5 0 1 0 6.9 9" />
+      <path d="M4 4l16 16" />
+    </svg>
+  ),
 } satisfies Record<string, ReactElement>;
 
 export type IconName = keyof typeof Icons;

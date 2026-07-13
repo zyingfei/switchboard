@@ -124,6 +124,11 @@ export interface SettingsPanelProps {
   // "Fix connection" banner deep-links to 'companion-connection' so the
   // user lands on the field to change instead of hunting for it.
   readonly scrollToId?: string | null;
+  // Open the Capture-health diagnostics panel. Health left the
+  // user-facing nav (R1.2 feedback 6) and now lives in Settings'
+  // Diagnostics group here (plus the ⋯ "Capture health" shortcut). The
+  // HealthPanel itself is unchanged — this only surfaces its entry.
+  readonly onOpenHealth?: () => void;
   // Vault root the connected companion reports via /v1/version — the
   // source of truth for "where am I actually writing", distinct from the
   // editable next-launch path. null/undefined when not connected.
@@ -192,6 +197,7 @@ export function SettingsPanel({
   onSaveCompanionConnection,
   scrollToId,
   companionVaultRoot,
+  onOpenHealth,
 }: SettingsPanelProps) {
   // Deep-link scroll: when opened with a target section id, bring it
   // into view once it has mounted. Guard with a ref so we scroll once
@@ -1415,6 +1421,30 @@ export function SettingsPanel({
           });
         }}
       />
+
+      {/* Diagnostics — Health left the user-facing nav (R1.2 feedback
+          6: "health why under trust?"). A ranker/pipeline diagnostics
+          panel is not a daily destination, so its entry point moved
+          here (progressive disclosure hides diagnostics, not daily
+          tools). The ⋯ "Capture health" shortcut is kept too. The
+          HealthPanel internals + the §15 rail are unchanged. */}
+      {onOpenHealth !== undefined ? (
+        <div className="settings-section" id="diagnostics">
+          <h3 className="settings-section-title">Diagnostics</h3>
+          <p className="settings-section-lede ai-italic">
+            Pipeline, recall, and companion health — for when something looks off. Not needed
+            day to day.
+          </p>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={onOpenHealth}
+            data-testid="settings-open-health"
+          >
+            Open capture health
+          </button>
+        </div>
+      ) : null}
 
       {settingsNotice !== null ? <div className="settings-hint mono">{settingsNotice}</div> : null}
       {error !== null && error !== undefined ? (

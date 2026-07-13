@@ -5235,8 +5235,9 @@ input.thread-turn-annotate-input {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-tint);
 }
-/* Modal-opening sub-tabs (Capture & Rules, Health) never carry the
-   selected state — they hand off to a modal, not a viewMode. */
+/* Legacy modal-opening sub-tab style. R1.2 retired the modal sub-tabs
+   (Capture & Rules → Privacy inline; Health → Settings + ⋯). Kept as a
+   quiet-ink fallback for any future hand-off sub-tab. */
 .sub-tab-modal {
   color: var(--ink-3);
 }
@@ -5352,6 +5353,46 @@ input.thread-turn-annotate-input {
     background var(--motion-base) var(--ease-standard),
     border-color var(--motion-base) var(--ease-standard);
 }
+/* Left = the living verdict cluster (glyph + domain + verdict + rule
+   chip). Takes the free space and truncates gracefully. */
+.lamp-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Right = the capture control center: two per-site toggles + the global
+   eye. Never shrinks — these controls stay tappable at all widths. */
+.lamp-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  margin-left: auto;
+}
+/* Per-site capture toggle (don't-capture-this-domain / …-similar-sites).
+   Idle = quiet ink outline. Active (a rule owns this site) = filled
+   accent so the blocked state is legible and clicking re-enables. */
+.lamp-site-btn {
+  flex: none;
+  color: var(--ink-3);
+}
+.lamp-site-btn:hover {
+  color: var(--accent);
+  background: var(--accent-tint);
+  border-color: var(--accent);
+}
+.lamp-site-btn.on {
+  color: var(--accent-on);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.lamp-site-btn.on:hover {
+  color: var(--accent-on);
+  background: var(--accent);
+  filter: brightness(0.94);
+}
 .lamp-glyph {
   display: inline-flex;
   align-items: center;
@@ -5431,10 +5472,9 @@ input.thread-turn-annotate-input {
   outline: none;
   box-shadow: 0 0 0 2px var(--accent-tint);
 }
-/* The eye promoted into the strip as its primary control. */
+/* The global master eye — last control in the right cluster. */
 .capture-lamp-strip .lamp-eye {
   flex: none;
-  margin-left: auto;
   color: var(--accent);
 }
 .capture-lamp-strip .lamp-eye:hover {
@@ -5491,6 +5531,28 @@ input.thread-turn-annotate-input {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-tint);
+}
+/* Unread-replies badge on the Inbox section pill — the actionable-now
+   count elevated to the section level (spec §4.2). Accented so it reads
+   as "needs attention" even when the section isn't open. */
+.section-nav-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.section-nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-on);
+  font: var(--type-micro) var(--mono);
+  font-weight: 700;
+  line-height: 1;
 }
 
 /* ── Row B: secondary capture tools (quiesce under paused/blocked) ──── */
@@ -13286,4 +13348,145 @@ pre.diff {
 .tab-attribution-card-pinned-unpin:hover {
   background: var(--signal);
   color: var(--paper);
+}
+
+/* ── Privacy section (inline no-capture rules panel) ─────────────────
+   Feedback 5: capture rules render inline as a real panel — no Settings
+   jump. Reuses the NoCaptureRulesSection component + adds the section
+   header, lede, and "add current site" affordance. */
+.privacy-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.privacy-lede {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.privacy-add-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.privacy-add-current {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r1);
+  background: var(--paper-light);
+}
+.privacy-add-current-label {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.privacy-add-current-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+/* NoCaptureRulesSection ships with Settings-context type sizes. Inside
+   the Privacy view, tighten the nested subsection heading + lede so the
+   panel reads as one composed surface (not a transplanted Settings
+   block). The rule rows keep their own sizing. */
+.privacy-view .settings-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.privacy-view .settings-subsection-title {
+  margin: var(--space-2) 0 0;
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.privacy-view .settings-section-lede {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.privacy-view .settings-empty {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* Rule list — shared by the Privacy view + Settings → Capture. Concrete
+   rows: label + description on the left, Purge / Remove on the right. */
+.no-capture-rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.no-capture-rule-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r1);
+  background: var(--paper);
+}
+.no-capture-rule-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.no-capture-rule-label strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+.no-capture-rule-label .desc {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.no-capture-rule-label .desc.ok {
+  color: var(--accent);
+}
+.no-capture-rule-label .desc.warn {
+  color: var(--signal);
+}
+.no-capture-rule-actions {
+  display: inline-flex;
+  gap: var(--space-2);
+  flex: none;
+}
+
+/* Neutral secondary/ small buttons used by the rules list + add row.
+   Defined here because they had no prior styling (the rules panel only
+   ever rendered deep in Settings). */
+.btn-secondary {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--rule);
+  border-radius: var(--r1);
+  background: var(--paper-light);
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background var(--motion-fast) var(--ease-standard),
+    border-color var(--motion-fast) var(--ease-standard);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--paper-deep);
+  border-color: var(--ink-4);
+}
+.btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn-secondary.btn-sm {
+  padding: 4px var(--space-2);
+  font-size: 11px;
 }
