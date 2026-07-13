@@ -1,3 +1,4 @@
+import { endorsementFor } from './suggestionEndorsement';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
@@ -18,15 +19,25 @@ const workstreamLabel = (
 //   user-asserted: you moved it (solid, no extra marker)
 //   inferred: resolver auto-applied it (solid + sparkle marker)
 //   thread: derived from thread→workstream membership (dotted + loop)
-//   suggested: not yet applied, resolver has a guess (dashed)
+//   suggested: resolver ENDORSED this guess (policy suggest/auto-apply, dashed)
+//   weak-guess: resolver has a lean but did NOT endorse it (policy inbox —
+//               below the score/margin/corroboration gates). Rendered muted
+//               so it never masquerades as a real suggestion.
 //   ignored: user said "don't bother me about this URL" (struck-through)
 //   empty: no attribution, no suggestion (placeholder)
-type BadgeVariant = 'user-asserted' | 'inferred' | 'thread' | 'suggested' | 'ignored' | 'empty';
+type BadgeVariant =
+  | 'user-asserted'
+  | 'inferred'
+  | 'thread'
+  | 'suggested'
+  | 'weak-guess'
+  | 'ignored'
+  | 'empty';
 
 const variantFor = (
   attribution: TabSessionRecord['currentAttribution'] | undefined,
   ignored: TabSessionRecord['currentIgnored'] | undefined,
-  suggested: boolean,
+  guess: 'endorsed' | 'weak' | 'none',
 ): BadgeVariant => {
   // Real user-asserted attribution wins over an existing ignore — the
   // projection mutator clears ignored on re-organize. Defensive fallback
@@ -37,7 +48,9 @@ const variantFor = (
     return 'user-asserted';
   }
   if (ignored !== undefined) return 'ignored';
-  return suggested ? 'suggested' : 'empty';
+  if (guess === 'endorsed') return 'suggested';
+  if (guess === 'weak') return 'weak-guess';
+  return 'empty';
 };
 
 const titleFor = (variant: BadgeVariant, label: string): string => {
@@ -50,6 +63,8 @@ const titleFor = (variant: BadgeVariant, label: string): string => {
       return `From thread attribution: ${label}`;
     case 'suggested':
       return `Suggested by Sidetrack: ${label}`;
+    case 'weak-guess':
+      return `Weak guess — not filed. Sidetrack leans toward ${label} but isn’t confident enough to suggest it. Confirm or pick another to teach it.`;
     case 'ignored':
       return 'Ignored — you said don’t bother me about this URL';
     case 'empty':
@@ -68,6 +83,9 @@ const markerFor = (variant: BadgeVariant): string | null => {
     case 'ignored':
       // Slash = "muted / dismissed."
       return '⊘';
+    case 'weak-guess':
+      // Question mark = "a lean, not a decision."
+      return '?';
     case 'user-asserted':
     case 'suggested':
     case 'empty':
@@ -84,15 +102,20 @@ export interface AttributionBadgeProps {
 export function AttributionBadge({ record, suggestion, workstreams }: AttributionBadgeProps) {
   const attribution = record?.currentAttribution;
   const ignored = record?.currentIgnored;
-  // The resolver's guess lives in decision.workstreamId for an apply/confirm
-  // decision, but for an action:'inbox' decision that field is null — the top
-  // fused candidate is the only place the guess lives. Fall back to it so the
-  // badge shows the guess (like the InboxCard / provenance row) instead of a
-  // bare "?".
-  const suggestedWorkstreamId =
-    suggestion?.decision.workstreamId ?? suggestion?.fusedCandidates?.[0]?.workstreamId;
-  const hasGuess = suggestedWorkstreamId !== null && suggestedWorkstreamId !== undefined;
-  const variant = variantFor(attribution, ignored, hasGuess);
+  // The resolver's guess lives in decision.workstreamId ONLY when the policy
+  // endorsed it (suggest / auto-apply). For an action:'inbox' decision that
+  // field is absent — the top fused candidate carries the (un-endorsed) lean.
+  // endorsementFor() is the single source of truth so the badge, provenance
+  // row, and impression emit all agree on "did the policy endorse this?".
+  const endorsement = endorsementFor(suggestion);
+  const suggestedWorkstreamId = endorsement.workstreamId ?? null;
+  const guess: 'endorsed' | 'weak' | 'none' =
+    endorsement.level === 'endorsed'
+      ? 'endorsed'
+      : endorsement.level === 'weak-guess'
+        ? 'weak'
+        : 'none';
+  const variant = variantFor(attribution, ignored, guess);
   const marker = markerFor(variant);
   // No attribution and no guess: show a muted dash, not a confusing "?" — the
   // tooltip and the provenance row already say "No attribution".

@@ -3,6 +3,7 @@ import type { WorkstreamNode } from '../../../src/workboard';
 import { parsePairingString } from '../../../src/companion/pairingString';
 import { CollectorsSection } from './CollectorsSection';
 import type { CollectorStatus } from './CollectorsSection';
+import { IntelligenceRow } from './IntelligenceRow';
 import { NoCaptureRulesSection } from './NoCaptureRulesSection';
 import { Modal } from './Modal';
 import {
@@ -1428,21 +1429,34 @@ export function SettingsPanel({
           here (progressive disclosure hides diagnostics, not daily
           tools). The ⋯ "Capture health" shortcut is kept too. The
           HealthPanel internals + the §15 rail are unchanged. */}
-      {onOpenHealth !== undefined ? (
+      {onOpenHealth !== undefined || companionConfigured ? (
         <div className="settings-section" id="diagnostics">
           <h3 className="settings-section-title">Diagnostics</h3>
           <p className="settings-section-lede ai-italic">
             Pipeline, recall, and companion health — for when something looks off. Not needed
             day to day.
           </p>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={onOpenHealth}
-            data-testid="settings-open-health"
-          >
-            Open capture health
-          </button>
+          {/* Intelligence readout — the ML/recommendation connection matrix
+              as a living view (doc vectors, sim edges, last drain,
+              impressions), read from the same /v1/system/health the health
+              panel uses. Freeze-safe: pure observability, no new scans. */}
+          <div className="settings-intelligence" data-testid="settings-intelligence">
+            <span className="settings-subsection-title">Intelligence</span>
+            <IntelligenceRow
+              companionPort={companionPort ?? null}
+              bridgeKey={bridgeKey ?? null}
+            />
+          </div>
+          {onOpenHealth !== undefined ? (
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={onOpenHealth}
+              data-testid="settings-open-health"
+            >
+              Open capture health
+            </button>
+          ) : null}
         </div>
       ) : null}
 

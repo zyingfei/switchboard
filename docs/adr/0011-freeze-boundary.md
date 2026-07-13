@@ -425,3 +425,75 @@ order is byte-identical to the prior baseline while both flags are OFF
 harness can score an arm against the live-vault chunk coverage, flip its
 default in a follow-up that cites this amendment and the recorded
 verdict — the same evidence-gated protocol the OWNER DIRECTIVE requires.
+
+## Amendment 2026-07-13 — extension read-path honesty + impression-loop verify + intelligence observability
+
+**Context.** Amendments 12/12b/12c connected the COMPANION serving lanes
+(connections similarity, recall). This amendment covers the EXTENSION
+read-path: (1) the suggestion surface presented candidates the resolver's
+policy did NOT endorse in the same visual language as endorsed ones —
+observed live as a `decision.action='inbox'`, `margin=-0.62` pick rendered
+as a "Suggested" badge; (2) the impression → `recall.action` training loop
+needed live verification that panel usage actually accumulates joinable
+signal; (3) the built-but-unsurfaced intelligence had no glanceable
+readout of whether it is wired and moving.
+
+**Decision.** Under the OWNER DIRECTIVE ("make every ML / recommendation
+system … connected and working in plugin"), all three are classified
+FREEZE-SAFE because they are pure read-path consumers of already-served
+output — they change no serving math:
+
+1. No new serving scope. The honesty gate keys ENTIRELY on the resolver's
+   existing `decision.action` contract (`policy.ts`: `suggest`/`auto-apply`
+   = endorsed, `inbox` = not endorsed) and the existing per-candidate
+   `reasons[].source`. No threshold, weight, or policy value is touched;
+   the panel merely stops mis-presenting a signal the companion already
+   produced. Reason chips map the existing `ppr`/`similarity`/`cluster`
+   source (the title-vs-content split reads the existing
+   `pageEvidence.vector`). The aggregator quiet-state mirrors the
+   companion's existing `COARSE_MULTI_TOPIC_DOMAINS` registrable-domain
+   set (read-only classification, no candidate filtering).
+2. The Intelligence readout is pure observability. It reads ONLY fields
+   the companion already materializes on `GET /v1/system/health`
+   (`workGraph.recall.canonicalVectorCounts`,
+   `workGraph.ranker.augmentation`, `workGraph.impressionLog`,
+   `sync.materializers.connections.lastSuccessAt`) — the same endpoint the
+   Health panel consumes. No new scan, no new endpoint, no new event read.
+3. No flag is required because nothing about the served math changes; the
+   evidence-gate protocol applies to serving flips, and this ships none.
+   The impression-loop work is verification + a check that the extension
+   emit sites are wired, not a serving change.
+
+**What landed (this amendment's scope):**
+
+- Suggestion honesty (`src/sidepanel/tabsession/`): a single
+  `endorsementFor()` source-of-truth classifies a resolution as
+  `endorsed` / `weak-guess` / `none` against `decision.action`.
+  `AttributionBadge` gains a muted `weak-guess` variant; `AttributionProvenance`
+  renders "Weak guess — not filed" (vs "Suggested") with plain-language
+  reason chips + the aggregator quiet line; `SuggestionStats` marks the
+  un-endorsed headline; `InboxCard` keeps the one-click confirm but with
+  honest copy ("Confirm guess" vs "Yes, that's right").
+- Impression-loop liveness: VERIFIED on the live test rig (GET-only). The
+  extension emit sites (`impressionRegistry` record in `focusedRelated.ts`
+  / `FocusView.tsx` / `useRecallSearch.ts`; `emitTrainableAction` from
+  `client.ts` feedback + App.tsx URL-attribute) are all wired, and the
+  `recallActionEmit` background handler forwards to `/v1/recall/action`.
+  Live event log: 1442 `recall.served` accumulating (55 today), 65
+  `recall.action`, and 65/65 actions JOIN their parent served impression
+  by `servedContextId`+`entityId`. The #242 point-in-time fields
+  (`perLaneRanks`/`perLaneScores`/`fusedScore`/`rerankScore`/
+  `servedPosition`) are present on served results. No dead extension emit
+  site found. (Companion-side note: explicit trainable gestures remain
+  sparse — only 1 `flow_confirm` carried a `referencesEventId` — which is a
+  data-volume observation for post-restart verification, not a wiring bug.)
+- Intelligence observability (`src/settings/intelligenceSummary.ts` pure
+  parser + `entrypoints/.../IntelligenceRow.tsx`): a 2x2 living readout in
+  Settings → Diagnostics — doc-vector coverage, sim-edge count, last drain,
+  impressions collected — visually confirmed live (1,275 doc vectors /
+  1,234 chunks · 0 sim edges [page-access-off] · last drain "just now" ·
+  1,442 impressions / 65 actions).
+
+**Freeze-lift interaction.** None. The serving math is untouched; this is
+read-path presentation + observability + verification only, per the
+write-path-vs-read-path boundary this ADR defines.

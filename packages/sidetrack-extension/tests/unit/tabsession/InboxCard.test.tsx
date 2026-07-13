@@ -60,13 +60,15 @@ describe('InboxCard', () => {
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
-  it('confirms a low-confidence "Best guess" (decision has no workstreamId; uses fusedCandidates[0])', () => {
+  it('confirms an un-endorsed "weak guess" (policy inbox; lean lives in fusedCandidates[0])', () => {
     const onAttribute = vi.fn();
     const bestGuess: TabSessionResolutionResult = {
       tabSessionId: 'tses_test',
       dryRun: true,
-      // Low-confidence: decision carries NO workstreamId, only a
-      // top fused candidate — this is the "Best guess: …" provenance.
+      // Un-endorsed: the policy chose `inbox`, so decision carries NO
+      // workstreamId — only a top fused candidate lean. Honesty change:
+      // this renders as a "Weak guess — not filed" provenance with a
+      // "Confirm guess" (not "Yes, that's right") one-click confirm.
       decision: { action: 'inbox', margin: 0.05 },
       fusedCandidates: [
         {
@@ -92,7 +94,10 @@ describe('InboxCard', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: "Yes, that's right" }));
+    // Honest phrasing: a weak (un-endorsed) guess is not a "Suggested".
+    expect(screen.getByText('Weak guess — not filed')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: "Yes, that's right" })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm guess' }));
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
   });
 
@@ -192,7 +197,11 @@ describe('InboxCard', () => {
     expect(screen.getByTitle('Suggested by Sidetrack: Switchboard')).toHaveTextContent(
       'Switchboard',
     );
-    expect(screen.getByText(/Suggested: Switchboard · ppr/)).toBeInTheDocument();
+    // Endorsed pick: "Suggested" verb + target + a graph-proximity reason
+    // chip (dominantSource ppr) + the numeric detail, split across spans.
+    expect(screen.getByText('Suggested')).toBeInTheDocument();
+    expect(screen.getByText('via graph proximity')).toBeInTheDocument();
+    expect(screen.getByText(/ppr · margin/)).toBeInTheDocument();
   });
 
   it('caps inbox rendering at 50 records per panel session', () => {
