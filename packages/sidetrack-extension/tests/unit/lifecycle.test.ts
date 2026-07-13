@@ -33,7 +33,7 @@ describe('deriveLifecycle', () => {
     expect(result.kind).toBe('tracking-stopped');
   });
 
-  it('lights signal pill when there is a non-dismissed reminder for the thread', () => {
+  it('lights signal pill when there is an unread (new) reminder for the thread', () => {
     const result = deriveLifecycle(thread(), [{ threadId: 'bac_thread_1', status: 'new' }], NOW_MS);
     expect(result.kind).toBe('unread-reply');
     expect(result.dotClass).toBe('signal');
@@ -42,14 +42,29 @@ describe('deriveLifecycle', () => {
   });
 
   it('does NOT light Unread reply when the only reminder is dismissed', () => {
-    // Regression guard for the bug we just fixed — once
-    // dismissRemindersForActiveTab runs, the pill must clear.
+    // Regression guard — a dismissed reminder must not light the pill.
     const result = deriveLifecycle(
       thread(),
       [{ threadId: 'bac_thread_1', status: 'dismissed' }],
       NOW_MS,
     );
     expect(result.kind).not.toBe('unread-reply');
+  });
+
+  it('does NOT light Unread reply when the reminder has been READ (seen)', () => {
+    // Read-semantics core: opening a reply (or auto-marking it seen
+    // for the active tab) sets status 'seen'. The reminder record
+    // survives, but the unread pill must clear — "unread" now means
+    // 'new', not merely "not dismissed".
+    const seen = deriveLifecycle(thread(), [{ threadId: 'bac_thread_1', status: 'seen' }], NOW_MS);
+    expect(seen.kind).not.toBe('unread-reply');
+    // Legacy 'relevant' records collapse to read too.
+    const relevant = deriveLifecycle(
+      thread(),
+      [{ threadId: 'bac_thread_1', status: 'relevant' }],
+      NOW_MS,
+    );
+    expect(relevant.kind).not.toBe('unread-reply');
   });
 
   it('ignores reminders that target other threads', () => {

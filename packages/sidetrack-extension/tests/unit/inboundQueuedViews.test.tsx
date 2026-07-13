@@ -25,12 +25,7 @@ const reminders: readonly InboundReminder[] = [
 describe('InboundView — §13 steps 3/9', () => {
   it('renders an InboundCard per reminder with the relative timestamp', () => {
     render(
-      <InboundView
-        reminders={reminders}
-        onOpen={() => undefined}
-        onMarkRelevant={() => undefined}
-        onDismiss={() => undefined}
-      />,
+      <InboundView reminders={reminders} onOpen={() => undefined} onDismiss={() => undefined} />,
     );
     expect(screen.getByText('State machine review')).toBeInTheDocument();
     expect(screen.getByText('Claude replied 3 minutes ago')).toBeInTheDocument();
@@ -38,34 +33,51 @@ describe('InboundView — §13 steps 3/9', () => {
 
   it('fires per-card callbacks with the reminder id', () => {
     const onDismiss = vi.fn();
-    const onMarkRelevant = vi.fn();
+    const onOpen = vi.fn();
+    render(<InboundView reminders={reminders} onOpen={onOpen} onDismiss={onDismiss} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(onDismiss).toHaveBeenCalledWith('r1');
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }));
+    expect(onOpen).toHaveBeenCalledWith('r1');
+  });
+
+  it('has no "Helpful" affordance (dead trainable button removed)', () => {
+    render(<InboundView reminders={reminders} onOpen={() => undefined} onDismiss={() => undefined} />);
+    expect(screen.queryByText('Helpful')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Mark this reply as helpful' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders a collapsed "Read" group when readReminders are supplied', () => {
+    const read: readonly InboundReminder[] = [
+      {
+        bac_id: 'r-read',
+        threadTitle: 'Old but read thread',
+        provider: 'claude',
+        providerLabel: 'Claude',
+        inboundTurnAt: '2 hours ago',
+        status: 'seen',
+        aiAuthored: true,
+      },
+    ];
     render(
       <InboundView
         reminders={reminders}
+        readReminders={read}
         onOpen={() => undefined}
-        onMarkRelevant={onMarkRelevant}
-        onDismiss={onDismiss}
-      />,
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
-    expect(onDismiss).toHaveBeenCalledWith('r1');
-    // R1.2 (feedback 4): "Mark relevant" (ranker jargon) → "Helpful".
-    // Label-only rename; the callback (→ updateReminder status:'relevant'
-    // → trainable recall.action) is unchanged. Accessible name is the
-    // aria-label "Mark this reply as helpful".
-    fireEvent.click(screen.getByRole('button', { name: 'Mark this reply as helpful' }));
-    expect(onMarkRelevant).toHaveBeenCalledWith('r1');
-  });
-
-  it('shows an empty state when there are no replies', () => {
-    render(
-      <InboundView
-        reminders={[]}
-        onOpen={() => undefined}
-        onMarkRelevant={() => undefined}
         onDismiss={() => undefined}
       />,
     );
+    // The active reply is still shown; the read reply is available in
+    // the collapsed group (rendered in the DOM under <details>).
+    expect(screen.getByText('State machine review')).toBeInTheDocument();
+    expect(screen.getByText('Read')).toBeInTheDocument();
+    expect(screen.getByText('Old but read thread')).toBeInTheDocument();
+  });
+
+  it('shows an empty state when there are no replies', () => {
+    render(<InboundView reminders={[]} onOpen={() => undefined} onDismiss={() => undefined} />);
     expect(screen.getByText(/No new replies waiting/)).toBeInTheDocument();
   });
 });

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   mapInboundReminders,
+  mapReadInboundReminders,
+  READ_GROUP_WINDOW_MS,
   type InboundThreadLite,
 } from '../../src/sidepanel/inbound/mapInboundReminder';
 import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
@@ -45,6 +47,20 @@ describe('mapInboundReminders — §13 steps 3/9', () => {
     expect(mapped).toHaveLength(0);
   });
 
+  it('active list is UNREAD only — read (seen/relevant) reminders drop out', () => {
+    const mapped = mapInboundReminders(
+      [
+        reminder({ bac_id: 'r-new', status: 'new' }),
+        reminder({ bac_id: 'r-seen', status: 'seen' }),
+        reminder({ bac_id: 'r-relevant', status: 'relevant' }),
+        reminder({ bac_id: 'r-dismissed', status: 'dismissed' }),
+      ],
+      threads,
+      rel,
+    );
+    expect(mapped.map((m) => m.bac_id)).toEqual(['r-new']);
+  });
+
   it('prunes reminders whose thread is gone', () => {
     const mapped = mapInboundReminders(
       [reminder({ bac_id: 'r1', threadId: 'missing' })],
@@ -64,6 +80,49 @@ describe('mapInboundReminders — §13 steps 3/9', () => {
       rel,
     );
     expect(mapped.map((m) => m.bac_id)).toEqual(['new', 'old']);
+  });
+});
+
+describe('mapReadInboundReminders — collapsed "Read" group', () => {
+  const NOW = Date.parse('2026-07-11T12:00:00.000Z');
+
+  it('includes read (seen + legacy relevant) replies within the window, newest-first', () => {
+    const read = mapReadInboundReminders(
+      [
+        reminder({ bac_id: 'r-new', status: 'new', detectedAt: '2026-07-11T11:00:00.000Z' }),
+        reminder({ bac_id: 'r-seen', status: 'seen', detectedAt: '2026-07-11T10:00:00.000Z' }),
+        reminder({
+          bac_id: 'r-relevant',
+          status: 'relevant',
+          detectedAt: '2026-07-11T11:30:00.000Z',
+        }),
+        reminder({
+          bac_id: 'r-dismissed',
+          status: 'dismissed',
+          detectedAt: '2026-07-11T11:45:00.000Z',
+        }),
+      ],
+      threads,
+      rel,
+      NOW,
+    );
+    // 'new' + 'dismissed' excluded; seen/relevant kept, newest-first.
+    expect(read.map((m) => m.bac_id)).toEqual(['r-relevant', 'r-seen']);
+  });
+
+  it('excludes read replies older than the 7-day window', () => {
+    const stale = new Date(NOW - READ_GROUP_WINDOW_MS - 1000).toISOString();
+    const fresh = new Date(NOW - 1000).toISOString();
+    const read = mapReadInboundReminders(
+      [
+        reminder({ bac_id: 'r-stale', status: 'seen', detectedAt: stale }),
+        reminder({ bac_id: 'r-fresh', status: 'seen', detectedAt: fresh }),
+      ],
+      threads,
+      rel,
+      NOW,
+    );
+    expect(read.map((m) => m.bac_id)).toEqual(['r-fresh']);
   });
 });
 

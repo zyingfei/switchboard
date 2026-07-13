@@ -150,6 +150,14 @@ const installChromeMock = (
       query: vi.fn(() =>
         Promise.resolve(activeTabUrl === undefined ? [] : [{ url: activeTabUrl }]),
       ),
+      // openTabForThread (Open action) may focus/create a tab; stub so
+      // the async path resolves instead of throwing an unhandled
+      // rejection during the read-semantics tests.
+      update: vi.fn(() => Promise.resolve({ id: 42 })),
+      create: vi.fn(() => Promise.resolve({ id: 99 })),
+    },
+    windows: {
+      update: vi.fn(() => Promise.resolve({})),
     },
   });
   return sendMessage;
@@ -2094,36 +2102,118 @@ describe('Privacy section (inline no-capture rules panel)', () => {
   });
 });
 
-// ── R1.2 de-jargon (feedback 4): "Mark relevant" → "Helpful". This is a
-// LABEL-ONLY change — the trainable event MUST be byte-identical. The
-// click still fires updateReminder { status: 'relevant' }, which the
-// companion joins into the frozen recall.action ranker label. This test
-// guards that the rename did not perturb the emitted event.
-describe('Helpful action (renamed from "Mark relevant") emits the same trainable event', () => {
-  it('fires updateReminder { status: "relevant" } when the Helpful button is clicked', async () => {
+// ── Read semantics: "unread" means a reply the user hasn't READ yet
+// (status 'new'). Opening a reply marks it 'seen', which clears it from
+// the active inbound list AND the Inbox badge; the thread still holds the
+// reply. The "Helpful" button (which wrote status:'relevant' and falsely
+// claimed a trainable recall.action emission — updateReminder never
+// touches the recall-action path) is removed. Card actions are Open +
+// Dismiss only.
+describe('Inbound read semantics', () => {
+  // A state with one UNREAD reply (bac_reminder_test / bac_thread_test)
+  // plus one already-READ reply on a second tracked thread.
+  const stateWithMixedReminders = (): WorkboardState => {
+    const base = liveState();
+    return {
+      ...base,
+      companionStatus: 'connected',
+      threads: [
+        ...base.threads,
+        {
+          bac_id: 'bac_thread_read',
+          provider: 'claude',
+          threadUrl: 'https://claude.ai/chat/read-thread',
+          title: 'Already-read reply thread',
+          lastSeenAt: NOW,
+          status: 'active',
+          trackingMode: 'auto',
+          primaryWorkstreamId: 'bac_workstream_root',
+          tags: [],
+        },
+      ],
+      reminders: [
+        ...base.reminders, // status 'new'
+        {
+          bac_id: 'bac_reminder_read',
+          revision: 'rev_reminder_read',
+          threadId: 'bac_thread_read',
+          provider: 'claude',
+          // Recent so it falls inside the 7-day "Read" group window
+          // (which is measured against the real Date.now()).
+          detectedAt: new Date(Date.now() - 60_000).toISOString(),
+          status: 'seen',
+        },
+      ],
+    };
+  };
+
+  it('badges the Inbox with the UNREAD (new) count only, ignoring read replies', async () => {
+    installChromeMock(stateWithMixedReminders(), { [SETUP_COMPLETED_KEY]: true });
+    render(<App />);
+    // Two reminders exist (one 'new', one 'seen') but the badge counts
+    // only the unread one.
+    const badge = await screen.findByTestId('section-nav-badge-inbox');
+    expect(badge.textContent).toBe('1');
+  });
+
+  it('shows only the UNREAD reply in the active list; the read reply is in the collapsed Read group', async () => {
+    installChromeMock(stateWithMixedReminders(), { [SETUP_COMPLETED_KEY]: true });
+    render(<App />);
+    await goToTab('Inbound replies');
+    // The unread thread's title is in the active list.
+    expect(await screen.findByText('Side-panel state machine review')).toBeInTheDocument();
+    // The read reply is NOT in the active list but IS recoverable in
+    // the collapsed "Read" group (rendered in the DOM under <details>).
+    expect(screen.getByText('Read')).toBeInTheDocument();
+    expect(screen.getByText('Already-read reply thread')).toBeInTheDocument();
+  });
+
+  it('Open marks the reply read (status "seen"), which clears it from queue + badge', async () => {
     const sendMessage = installChromeMock(
       { ...liveState(), companionStatus: 'connected' },
       { [SETUP_COMPLETED_KEY]: true },
     );
-
     render(<App />);
-
-    // Reach the Inbound replies surface (Inbox section → Replies sub-tab).
     await goToTab('Inbound replies');
-
-    // The renamed control keeps its accessible name "Mark this reply as
-    // helpful" (visible label "Helpful"). Click it.
-    const helpful = await screen.findByRole('button', { name: 'Mark this reply as helpful' });
-    fireEvent.click(helpful);
-
-    // FROZEN semantics: the emitted event is unchanged — status 'relevant'
-    // on the liveState reminder id. Do NOT let the label rename alter this.
+    fireEvent.click(await screen.findByRole('button', { name: 'Open' }));
     await waitFor(() => {
       expect(sendMessage).toHaveBeenCalledWith({
         type: messageTypes.updateReminder,
         reminderId: 'bac_reminder_test',
-        update: { status: 'relevant' },
+        update: { status: 'seen' },
       });
     });
+  });
+
+  it('Dismiss fires updateReminder { status: "dismissed" }', async () => {
+    const sendMessage = installChromeMock(
+      { ...liveState(), companionStatus: 'connected' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+    await goToTab('Inbound replies');
+    fireEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith({
+        type: messageTypes.updateReminder,
+        reminderId: 'bac_reminder_test',
+        update: { status: 'dismissed' },
+      });
+    });
+  });
+
+  it('renders no "Helpful" button (dead trainable control removed)', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected' },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    render(<App />);
+    await goToTab('Inbound replies');
+    // The active Open button proves we're on the inbound surface.
+    await screen.findByRole('button', { name: 'Open' });
+    expect(screen.queryByText('Helpful')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Mark this reply as helpful' }),
+    ).not.toBeInTheDocument();
   });
 });

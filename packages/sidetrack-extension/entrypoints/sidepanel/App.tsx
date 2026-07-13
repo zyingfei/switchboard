@@ -136,7 +136,10 @@ import {
   findSessionRestoreMatch,
   type ClosedSession,
 } from '../../src/sidepanel/tabsession/sessionRestore';
-import { mapInboundReminders } from '../../src/sidepanel/inbound/mapInboundReminder';
+import {
+  mapInboundReminders,
+  mapReadInboundReminders,
+} from '../../src/sidepanel/inbound/mapInboundReminder';
 import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
 import {
   canScopeToWorkstream,
@@ -623,7 +626,11 @@ const classifyAllThread = (
   thread: TrackedThread,
   reminders: readonly { readonly threadId: string; readonly status: string }[],
 ): AllThreadsBucket => {
-  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status !== 'dismissed');
+  // "Unread reply" means a reply the user has not READ yet — status
+  // 'new'. Once a reply is opened (marked 'seen') or auto-marked seen
+  // for the active tab, the thread leaves the unread bucket even
+  // though the reminder record lives on (not dismissed).
+  const hasUnread = reminders.some((r) => r.threadId === thread.bac_id && r.status === 'new');
   if (hasUnread) return 'unread';
   if (thread.primaryWorkstreamId === undefined) return 'ungrouped';
   if (thread.lastTurnRole === 'user') return 'waiting';
@@ -4760,18 +4767,27 @@ const App = () => {
   // Inbound view, and pending queue items grouped by target for the
   // Queued view. Both derive off the same workboard state the rest of
   // the panel already consumes.
-  const inboundReminders = useMemo(
+  const inboundThreadsLite = useMemo(
     () =>
-      mapInboundReminders(
-        state.reminders,
-        state.threads.map((t) => ({
-          bac_id: t.bac_id,
-          title: t.title,
-          ...(t.lastTurnRole === undefined ? {} : { lastTurnRole: t.lastTurnRole }),
-        })),
-        formatRelative,
-      ),
-    [state.reminders, state.threads],
+      state.threads.map((t) => ({
+        bac_id: t.bac_id,
+        title: t.title,
+        ...(t.lastTurnRole === undefined ? {} : { lastTurnRole: t.lastTurnRole }),
+      })),
+    [state.threads],
+  );
+  // Active inbound list = UNREAD replies only (status 'new'). Opening
+  // a reply marks it 'seen', which drops it from this list and the
+  // Inbox badge (both derive off this memo).
+  const inboundReminders = useMemo(
+    () => mapInboundReminders(state.reminders, inboundThreadsLite, formatRelative),
+    [state.reminders, inboundThreadsLite],
+  );
+  // Read replies (status 'seen'/legacy 'relevant') from the last 7
+  // days — the collapsed "Read" recovery group under the active list.
+  const readInboundReminders = useMemo(
+    () => mapReadInboundReminders(state.reminders, inboundThreadsLite, formatRelative),
+    [state.reminders, inboundThreadsLite],
   );
   const queueGroups = useMemo(
     () =>
@@ -8471,10 +8487,13 @@ const App = () => {
       ) : viewMode === 'inbound' ? (
         <InboundView
           reminders={inboundReminders}
+          readReminders={readInboundReminders}
           onOpen={(reminderId) => {
             // Opening a reply focuses its thread's tab and marks the
-            // reminder seen. threadId is carried on the workboard
-            // record; look it up by the reminder's bac_id.
+            // reminder read (status 'seen'), which clears it from the
+            // active list and the Inbox badge. threadId is carried on
+            // the workboard record; look it up by the reminder's
+            // bac_id.
             const record = state.reminders.find((r) => r.bac_id === reminderId);
             if (record !== undefined) {
               const thread = state.threads.find((t) => t.bac_id === record.threadId);
@@ -8485,15 +8504,6 @@ const App = () => {
                 type: messageTypes.updateReminder,
                 reminderId,
                 update: { status: 'seen' },
-              }),
-            );
-          }}
-          onMarkRelevant={(reminderId) => {
-            void runAction(() =>
-              sendRequest({
-                type: messageTypes.updateReminder,
-                reminderId,
-                update: { status: 'relevant' },
               }),
             );
           }}

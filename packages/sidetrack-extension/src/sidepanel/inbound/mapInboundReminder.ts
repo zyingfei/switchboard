@@ -25,12 +25,19 @@ const providerLabelOf = (provider: string): string => PROVIDER_LABELS[provider] 
 // The workboard status vocabulary ('new' | 'seen' | 'relevant' |
 // 'dismissed') is richer than the card's ('unseen' | 'seen' |
 // 'dismissed'). 'new' → 'unseen'; 'relevant' collapses to 'seen'
-// (the user has acknowledged it); 'dismissed' passes through.
+// (a legacy acknowledgement — the 'relevant' status is no longer
+// written by any UI path but old records still carry it, so we treat
+// it as 'seen' everywhere); 'dismissed' passes through.
 const cardStatusOf = (status: InboundReminderRecord['status']): InboundCardReminder['status'] => {
   if (status === 'new') return 'unseen';
   if (status === 'dismissed') return 'dismissed';
   return 'seen';
 };
+
+// How far back the collapsed "Read" group reaches. Read replies older
+// than this simply drop off the list — the thread itself still holds
+// the reply.
+export const READ_GROUP_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Join one reminder with its thread. Returns null when the thread is
 // gone (orphaned reminder) so callers can prune it from the list.
@@ -56,19 +63,51 @@ export const mapInboundReminder = (
   };
 };
 
-// Map + prune the full reminder list, newest-first. Dismissed
-// reminders are dropped — the Inbound view is a live queue of replies
-// that still want attention.
-export const mapInboundReminders = (
+const mapSorted = (
   reminders: readonly InboundReminderRecord[],
   threads: readonly InboundThreadLite[],
   formatRelative: (iso: string) => string,
 ): readonly InboundCardReminder[] =>
   reminders
-    .filter((r) => r.status !== 'dismissed')
     .slice()
     .sort((a, b) => b.detectedAt.localeCompare(a.detectedAt))
     .flatMap((r) => {
       const mapped = mapInboundReminder(r, threads, formatRelative);
       return mapped === null ? [] : [mapped];
     });
+
+// The ACTIVE inbound list is unread replies only — a reply you have
+// not read yet. Opening one marks it 'seen', which drops it from this
+// list (the thread still holds the reply). 'seen'/'relevant'
+// (read) and 'dismissed' reminders never appear here; read items are
+// available in the collapsed group below (mapReadInboundReminders).
+export const mapInboundReminders = (
+  reminders: readonly InboundReminderRecord[],
+  threads: readonly InboundThreadLite[],
+  formatRelative: (iso: string) => string,
+): readonly InboundCardReminder[] =>
+  mapSorted(
+    reminders.filter((r) => r.status === 'new'),
+    threads,
+    formatRelative,
+  );
+
+// The collapsed "Read" group — replies you've already read (status
+// 'seen', or the legacy 'relevant') within the last 7 days, so a
+// glance can recover a reply you dismissed from the active list by
+// reading it. Older read replies and dismissed replies are excluded.
+export const mapReadInboundReminders = (
+  reminders: readonly InboundReminderRecord[],
+  threads: readonly InboundThreadLite[],
+  formatRelative: (iso: string) => string,
+  nowMs: number = Date.now(),
+): readonly InboundCardReminder[] =>
+  mapSorted(
+    reminders.filter((r) => {
+      if (r.status !== 'seen' && r.status !== 'relevant') return false;
+      const detectedMs = Date.parse(r.detectedAt);
+      return Number.isFinite(detectedMs) && nowMs - detectedMs <= READ_GROUP_WINDOW_MS;
+    }),
+    threads,
+    formatRelative,
+  );
