@@ -1230,7 +1230,12 @@ describe('live side-panel App wiring', () => {
     expect(findButton).toBeInTheDocument();
   });
 
-  it('renders queue-item progress chips for auto-send state', async () => {
+  it('renders the Sending phase for an in-flight (typing) queue item', async () => {
+    // §3.5 — the item-level "waiting for reply" label is GONE (it
+    // competed with the thread's Waiting-on-AI chip, the "two waitings"
+    // confusion). Only the transient `typing` state renders a phase line
+    // ("typing into <provider>…"); a `waiting`-flagged item is just a
+    // pending row labelled "Queued". Verify the typing phase renders.
     const state = liveState();
     installChromeMock(
       {
@@ -1242,7 +1247,7 @@ describe('live side-panel App wiring', () => {
             scope: 'thread',
             targetId: 'bac_thread_test',
             status: 'pending',
-            progress: 'waiting',
+            progress: 'typing',
             createdAt: NOW,
             updatedAt: NOW,
           },
@@ -1256,7 +1261,10 @@ describe('live side-panel App wiring', () => {
     await goToTab('Threads');
     fireEvent.click(await screen.findByRole('button', { name: '1 queued' }));
 
-    expect(await screen.findByText(/waiting for Claude's reply/)).toBeInTheDocument();
+    // The in-flight item shows the "typing into <provider>" phase, and
+    // NO "waiting for reply" label anywhere (removed per §3.5).
+    expect(await screen.findByText(/typing into Claude/)).toBeInTheDocument();
+    expect(screen.queryByText(/waiting for Claude's reply/)).not.toBeInTheDocument();
   });
 
   it('keeps shared workstream titles visible and masks screenshare-sensitive rows only when enabled', async () => {

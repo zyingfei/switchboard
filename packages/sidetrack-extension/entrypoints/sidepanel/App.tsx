@@ -143,7 +143,6 @@ import {
 } from '../../src/sidepanel/inbound/mapInboundReminder';
 import { groupQueueItems } from '../../src/sidepanel/queued/groupQueueItems';
 import {
-  canScopeToWorkstream,
   resolveQueueScope,
   type QueueScopeChoice,
 } from '../../src/sidepanel/queued/queueScopeChoice';
@@ -609,7 +608,7 @@ const ALL_THREAD_BUCKET_ORDER: readonly AllThreadsBucket[] = [
 ];
 
 const ALL_THREAD_BUCKET_LABEL: Record<AllThreadsBucket, string> = {
-  unread: 'Unread reply',
+  unread: 'Replied · unread',
   ungrouped: 'Ungrouped',
   waiting: 'Waiting on AI',
   stale: 'Stale or closed',
@@ -922,7 +921,6 @@ const App = () => {
   const [queueComposeAutoFocus, setQueueComposeAutoFocus] = useState<string | null>(null);
   const [draggedQueueItemId, setDraggedQueueItemId] = useState<string | null>(null);
   const [dragOverQueueItemId, setDragOverQueueItemId] = useState<string | null>(null);
-  const [queueCopiedId, setQueueCopiedId] = useState<string | null>(null);
   // Per-thread inline-review draft expansion. Mirrors queueExpandFor:
   // null = chip collapsed, threadId = footer expanded for that thread.
   const [reviewDraftExpandFor, setReviewDraftExpandFor] = useState<string | null>(null);
@@ -3831,6 +3829,83 @@ const App = () => {
     })();
   };
 
+  // ─── Queued-row loop actions (§3.3) ───────────────────────────────
+  // [Open] on a Queued row: reopen/focus the thread tab (the fix for
+  // "give me an Open button so it can auto-capture again"), then fire
+  // the auto-send drain IF auto-send is on for the thread. The drain
+  // runs the §24.10 preflight funnel unchanged; a blocked gate updates
+  // the item's lastError in place. When auto-send is OFF we do NOT
+  // force-flip the toggle — we hand the item to the paste flow instead
+  // (openThreadForPasteSend), which preflights + redacts the text.
+  const openThreadAndDrain = (thread: TrackedThread, item?: { readonly text: string }) => {
+    openTabForThread(thread);
+    if (thread.autoSendEnabled === true) {
+      // Give the tab a beat to exist before the drain resolves it.
+      window.setTimeout(() => {
+        void runAction(() =>
+          sendRequest({ type: messageTypes.triggerAutoSendDrain, threadId: thread.bac_id }),
+        );
+      }, 400);
+      return;
+    }
+    // Auto-send off → paste fallback (respects the toggle verbatim).
+    if (item !== undefined) {
+      void openThreadForPasteSend(thread, item.text);
+    }
+  };
+
+  // Auto-send-off paste lane: open the thread's existing chat tab and
+  // put the REDACTED item text on the clipboard so the user pastes it
+  // into the live conversation. Routes through preflightOutbound (the
+  // §24.10 redaction funnel) so we never surface the raw text — this
+  // replaces the old raw copyQueueItemText path (D7 redaction gap).
+  const openThreadForPasteSend = async (thread: TrackedThread, text: string): Promise<void> => {
+    const provider = providerIdToDispatchProvider(thread.provider);
+    const safe = preflightOutbound(text, provider).safeText;
+    openTabForThread(thread);
+    try {
+      await navigator.clipboard.writeText(safe);
+      setError(
+        `Opened ${providerLabel(thread.provider)} — follow-up copied (redacted). Paste to send.`,
+      );
+    } catch {
+      setError(`Opened ${providerLabel(thread.provider)} — paste your follow-up to send.`);
+    }
+  };
+
+  // [Send now] on a Queued row (tab already open, gates would pass):
+  // fire the drain directly. Same §24.10 funnel; no tab open needed.
+  // When auto-send is off, fall back to the paste lane so the button
+  // still ships something (redacted) rather than silently no-op'ing.
+  const sendNowForThread = (thread: TrackedThread, item?: { readonly text: string }) => {
+    if (thread.autoSendEnabled === true) {
+      void runAction(() =>
+        sendRequest({ type: messageTypes.triggerAutoSendDrain, threadId: thread.bac_id }),
+      );
+      return;
+    }
+    if (item !== undefined) {
+      void openThreadForPasteSend(thread, item.text);
+    }
+  };
+
+  // [Edit] on a Queued row: rewrite the item text in place and clear
+  // its lastError so it re-drains. Uses the existing updateQueueItem
+  // message (background forwards to updateLocalQueueItem verbatim).
+  const editQueueItemText = (queueItemId: string, nextText: string) => {
+    const text = nextText.trim();
+    if (text.length === 0) {
+      return;
+    }
+    void runAction(() =>
+      sendRequest({
+        type: messageTypes.updateQueueItem,
+        queueItemId,
+        update: { text, lastError: null },
+      }),
+    );
+  };
+
   // A closed/restorable thread carries a stored TabSnapshot; the reopen
   // affordance should offer the recovery modal (focus-open / restore-
   // session / reopen-URL strategies) rather than blindly creating a new
@@ -4316,20 +4391,6 @@ const App = () => {
     });
   };
 
-  const copyQueueItemText = (queueItemId: string, text: string) => {
-    void (async () => {
-      try {
-        await navigator.clipboard.writeText(text);
-        setQueueCopiedId(queueItemId);
-        setTimeout(() => {
-          setQueueCopiedId((current) => (current === queueItemId ? null : current));
-        }, 1200);
-      } catch {
-        // Clipboard API can be unavailable in some contexts; fail quietly.
-      }
-    })();
-  };
-
   const updateTracking = (threadId: string, trackingMode: TrackedThread['trackingMode']) => {
     void runAction(() =>
       sendRequest({
@@ -4774,21 +4835,49 @@ const App = () => {
         bac_id: t.bac_id,
         title: t.title,
         ...(t.lastTurnRole === undefined ? {} : { lastTurnRole: t.lastTurnRole }),
+        // §3.4 context line — resolve the home-workstream label so the
+        // Inbox card can show "<workstream> · in reply to …". Only when
+        // the thread is organized; ungrouped threads omit it.
+        ...(t.primaryWorkstreamId === undefined
+          ? {}
+          : { workstreamLabel: workstreamPath(t.primaryWorkstreamId, state.workstreams) }),
       })),
-    [state.threads],
+    [state.threads, state.workstreams],
+  );
+  // §3.4 "in reply to" join inputs — the resolved 'done' follow-ups and
+  // the thread-sourced dispatch bodies. Kept as a stable context bundle
+  // so the mapper stays pure; no store read (all already in workboard
+  // state / recentDispatches).
+  const inboundContext = useMemo(
+    () => ({
+      queueItems: state.queueItems,
+      dispatches: state.recentDispatches.map((d) => ({
+        ...(d.sourceThreadId === undefined ? {} : { sourceThreadId: d.sourceThreadId }),
+        body: d.body,
+        createdAt: d.createdAt,
+      })),
+    }),
+    [state.queueItems, state.recentDispatches],
   );
   // Active inbound list = UNREAD replies only (status 'new'). Opening
   // a reply marks it 'seen', which drops it from this list and the
   // Inbox badge (both derive off this memo).
   const inboundReminders = useMemo(
-    () => mapInboundReminders(state.reminders, inboundThreadsLite, formatRelative),
-    [state.reminders, inboundThreadsLite],
+    () => mapInboundReminders(state.reminders, inboundThreadsLite, formatRelative, inboundContext),
+    [state.reminders, inboundThreadsLite, inboundContext],
   );
   // Read replies (status 'seen'/legacy 'relevant') from the last 7
   // days — the collapsed "Read" recovery group under the active list.
   const readInboundReminders = useMemo(
-    () => mapReadInboundReminders(state.reminders, inboundThreadsLite, formatRelative),
-    [state.reminders, inboundThreadsLite],
+    () =>
+      mapReadInboundReminders(
+        state.reminders,
+        inboundThreadsLite,
+        formatRelative,
+        Date.now(),
+        inboundContext,
+      ),
+    [state.reminders, inboundThreadsLite, inboundContext],
   );
   const queueGroups = useMemo(
     () =>
@@ -5589,8 +5678,31 @@ const App = () => {
   // Inline thread-row renderer reused across views.
   const renderThreadRow = (thread: TrackedThread) => {
     const isPrivate = isThreadPrivate(thread, state.workstreams, state.screenShareMode);
-    const lifecycle = deriveLifecycle(thread, state.reminders);
-    const { dotClass, stampLabel, lifecyclePill } = lifecycle;
+    // Pending thread-scoped queue items for THIS thread — the same
+    // predicate the drain uses (targetId === thread.bac_id, pending),
+    // so the row chip's "N queued" and the Queued view stay provably
+    // consistent. Computed before deriveLifecycle so the loop-state
+    // chip can read the queue summary (Sending / Queued / blocker).
+    const pendingQueueItems = state.queueItems
+      .filter((q) => q.targetId === thread.bac_id && q.status === 'pending')
+      .slice()
+      .sort(compareQueueItems);
+    const queuedCount = pendingQueueItems.length;
+    // "Tab open" hint for the chip suffix: the focused tab matches this
+    // thread's URL. Best-effort (only the focused tab is known cheaply);
+    // when it's not the front tab we fall back to the drain-written
+    // lastError, which is authoritative for tab-closed. Send now / Open
+    // both re-run the drain, which corrects the blocker in place.
+    const tabOpen = liveActiveTabUrl === thread.threadUrl;
+    const frontRunner = pendingQueueItems[0];
+    const lifecycle = deriveLifecycle(thread, state.reminders, Date.now(), {
+      pendingCount: queuedCount,
+      anyTyping: pendingQueueItems.some((q) => q.progress === 'typing'),
+      ...(frontRunner?.lastError === undefined ? {} : { frontRunnerLastError: frontRunner.lastError }),
+      tabOpen,
+      providerLabel: providerLabel(thread.provider),
+    });
+    const { dotClass, stampLabel, lifecyclePill, loopChip } = lifecycle;
     // Two timestamps when we have captured turns:
     //   - synced (lastSeenAt) = when the side panel last fetched
     //   - updated (max turn capturedAt) = when the chat last changed
@@ -5613,11 +5725,6 @@ const App = () => {
             ? `synced ${formatRelative(thread.lastSeenAt)} · updated ${formatRelative(lastTurnAt)}`
             : `${stampLabel} · ${formatRelative(thread.lastSeenAt)}`;
     const titleDisplay = isPrivate ? '[private]' : thread.title;
-    const pendingQueueItems = state.queueItems
-      .filter((q) => q.targetId === thread.bac_id && q.status === 'pending')
-      .slice()
-      .sort(compareQueueItems);
-    const queuedCount = pendingQueueItems.length;
     // Expansion holds the compose-at-end row even when the queue is
     // empty, so the user can keep stacking follow-ups without the
     // list collapsing under them.
@@ -5725,7 +5832,7 @@ const App = () => {
             <button
               type="button"
               className={'thread-queued mono' + (queueExpanded ? ' on' : '')}
-              title={`Show ${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'} — copy or dismiss before replying`}
+              title={`Show ${String(queuedCount)} queued follow-up${queuedCount === 1 ? '' : 's'} — Open, Send now, Edit or Remove`}
               aria-expanded={queueExpanded}
               onClick={(e) => {
                 e.stopPropagation();
@@ -5758,12 +5865,63 @@ const App = () => {
             data-dot-class={dotClass}
           />
           <span className="stamp">{stamp}</span>
-          {/* Per spec: dot + stamp already convey lifecycle. The
-              lifecycle pill is redundant for unread / waiting /
-              you-replied / stale / tab-closed / tracking-stopped
-              (the dot color + stamp text agree). Keep it only for
-              "Needs organize" — no dot-color story for that. */}
-          {lifecyclePill?.label === 'Needs organize' ? (
+          {/* The single conversation-loop chip (§3.2). One per row,
+              derived by deriveLifecycle from the thread + its pending
+              queue. "Needs organize" keeps its own class (the suggestion
+              row below hangs off it); Queued and Replied·unread are
+              tap targets into the send / read path; the rest are quiet
+              status chips (dot color + stamp already agree). */}
+          {loopChip !== undefined && loopChip.label !== 'Needs organize' ? (
+            lifecycle.kind === 'queued' ? (
+              <button
+                type="button"
+                className={'loop-chip mono ' + loopChip.tone}
+                title="Open the chat and send this queued follow-up"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openThreadAndDrain(thread, frontRunner);
+                }}
+              >
+                {loopChip.label}
+              </button>
+            ) : lifecycle.kind === 'unread-reply' ? (
+              <button
+                type="button"
+                className={'loop-chip mono ' + loopChip.tone}
+                title="Open the reply and mark it read"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openTabForThread(thread);
+                  const unreadReminder = state.reminders.find(
+                    (r) => r.threadId === thread.bac_id && r.status === 'new',
+                  );
+                  if (unreadReminder !== undefined) {
+                    void runAction(() =>
+                      sendRequest({
+                        type: messageTypes.updateReminder,
+                        reminderId: unreadReminder.bac_id,
+                        update: { status: 'seen' },
+                      }),
+                    );
+                  }
+                  void runAction(() =>
+                    sendRequest({
+                      type: messageTypes.triggerAutoSendDrain,
+                      threadId: thread.bac_id,
+                    }),
+                  );
+                }}
+              >
+                {loopChip.label}
+              </button>
+            ) : (
+              <span className={'loop-chip mono ' + loopChip.tone}>
+                {lifecycle.kind === 'waiting-ai'
+                  ? `${loopChip.label} · ${formatRelative(lastTurnAt ?? thread.lastSeenAt)}`
+                  : loopChip.label}
+              </span>
+            )
+          ) : lifecyclePill?.label === 'Needs organize' ? (
             <span className={'lifecycle-pill mono ' + lifecyclePill.tone}>
               {lifecyclePill.label}
             </span>
@@ -6198,19 +6356,13 @@ const App = () => {
                   className="btn-link thread-queue-retry"
                   onClick={(e) => {
                     e.stopPropagation();
-                    pendingQueueItems
-                      .filter((item) => item.lastError !== undefined)
-                      .forEach((item) => {
-                        void runAction(() =>
-                          sendRequest({
-                            type: messageTypes.retryAutoSend,
-                            queueItemId: item.bac_id,
-                          }),
-                        );
-                      });
+                    // One drain pass ships every pending item for the
+                    // thread (in order), so a single trigger covers all
+                    // the blocked rows. Runs the §24.10 funnel unchanged.
+                    sendNowForThread(thread, pendingQueueItems[0]);
                   }}
                 >
-                  Retry all failed
+                  Send all now
                 </button>
               </li>
             ) : null}
@@ -6223,19 +6375,16 @@ const App = () => {
                   index={index}
                   total={pendingQueueItems.length}
                   providerLabel={providerLabel(thread.provider)}
-                  copied={queueCopiedId === item.bac_id}
-                  onCopy={() => {
-                    copyQueueItemText(item.bac_id, item.text);
+                  onOpen={() => {
+                    openThreadAndDrain(thread, { text: item.text });
                   }}
-                  onRetry={() => {
-                    void runAction(() =>
-                      sendRequest({
-                        type: messageTypes.retryAutoSend,
-                        queueItemId: item.bac_id,
-                      }),
-                    );
+                  onSendNow={() => {
+                    sendNowForThread(thread, { text: item.text });
                   }}
-                  onDismiss={() => {
+                  onEdit={(nextText) => {
+                    editQueueItemText(item.bac_id, nextText);
+                  }}
+                  onRemove={() => {
                     dismissQueueItem(item.bac_id);
                   }}
                   dnd={
@@ -6348,21 +6497,12 @@ const App = () => {
                     setQueueDraft(e.target.value);
                   }}
                 />
-                <select
-                  className="thread-queue-scope mono"
-                  aria-label="Queue scope"
-                  title="Where this follow-up waits"
-                  value={queueScopeChoice}
-                  onChange={(e) => {
-                    setQueueScopeChoice(e.target.value as QueueScopeChoice);
-                  }}
-                >
-                  <option value="thread">Thread</option>
-                  {canScopeToWorkstream(thread) ? (
-                    <option value="workstream">This workstream</option>
-                  ) : null}
-                  <option value="global">Global</option>
-                </select>
+                {/* D6 — the queue is thread-scoped only. The
+                    workstream/global scope options led to a permanent
+                    dead-end (they never drain and never auto-resolve),
+                    so the selector is gone; every follow-up parks on
+                    this thread. queueScopeChoice stays 'thread' and
+                    resolveQueueScope maps it verbatim. */}
                 <button
                   type="submit"
                   className="btn-link"
@@ -8502,7 +8642,19 @@ const App = () => {
             const record = state.reminders.find((r) => r.bac_id === reminderId);
             if (record !== undefined) {
               const thread = state.threads.find((t) => t.bac_id === record.threadId);
-              if (thread !== undefined) openTabForThread(thread);
+              if (thread !== undefined) {
+                openTabForThread(thread);
+                // D10 — opening the thread (from Inbox) with pending
+                // follow-ups now attempts the drain, same as Queued's
+                // [Open]. Runs the §24.10 funnel unchanged; a no-op when
+                // auto-send is off or there's nothing pending.
+                void runAction(() =>
+                  sendRequest({
+                    type: messageTypes.triggerAutoSendDrain,
+                    threadId: thread.bac_id,
+                  }),
+                );
+              }
             }
             void runAction(() =>
               sendRequest({
@@ -8525,13 +8677,26 @@ const App = () => {
       ) : viewMode === 'queued' ? (
         <QueuedView
           groups={queueGroups}
-          onDismiss={(queueItemId) => {
-            dismissQueueItem(queueItemId);
+          hasNonThreadItems={queueGroups.some((g) => g.scope !== 'thread')}
+          onOpen={(targetId, itemId) => {
+            const thread = state.threads.find((t) => t.bac_id === targetId);
+            const item = state.queueItems.find((q) => q.bac_id === itemId);
+            if (thread !== undefined) {
+              openThreadAndDrain(thread, item === undefined ? undefined : { text: item.text });
+            }
           }}
-          onRetry={(queueItemId) => {
-            void runAction(() =>
-              sendRequest({ type: messageTypes.retryAutoSend, queueItemId }),
-            );
+          onSendNow={(targetId, itemId) => {
+            const thread = state.threads.find((t) => t.bac_id === targetId);
+            const item = state.queueItems.find((q) => q.bac_id === itemId);
+            if (thread !== undefined) {
+              sendNowForThread(thread, item === undefined ? undefined : { text: item.text });
+            }
+          }}
+          onEdit={(itemId, nextText) => {
+            editQueueItemText(itemId, nextText);
+          }}
+          onRemove={(queueItemId) => {
+            dismissQueueItem(queueItemId);
           }}
         />
       ) : viewMode === 'privacy' ? (
@@ -8897,7 +9062,7 @@ const App = () => {
               <div className="capture-empty subtle">
                 <p>
                   Notes you save here are scoped to the current workstream. Inbound replies surface
-                  as the <strong>Unread reply</strong> badge on the thread row above. Obsidian /
+                  as the <strong>Replied · unread</strong> badge on the thread row above. Obsidian /
                   external imports come later.
                 </p>
               </div>
