@@ -136,16 +136,101 @@ export interface RecallServedCandidateSnapshot {
    * surface from semantic_query.
    */
   readonly queryCosine?: number;
+  /**
+   * Propensity logging (north-star §5 S1, pattern P12). The probability
+   * that THIS candidate landed at THIS `servedPosition` under the serving
+   * policy in force at serve time.
+   *
+   * INVARIANT (as of payloadVersion 2): the recall serving pipeline is
+   * fully DETERMINISTIC — every ordering site (RRF fusion, lexical
+   * tie-break, cross-encoder rerank, learned rerank) sorts by score with a
+   * stable id / position tie-break and NO randomness (no Math.random, no
+   * shuffle, no ε-greedy / Thompson exploration in the /v2 path). So the
+   * served ordering is a deterministic function of the logged candidates
+   * and this value is stamped 1.0 for every served candidate today.
+   *
+   * When exploration / stochastic tie-breaking / interleaving (S2+) is
+   * introduced, that code MUST set this to the actual selection
+   * probability at serve time — it is UNRECOVERABLE later (P12). Off-policy
+   * / prequential eval divides by this to de-bias the logged position
+   * prior; a wrong or missing value silently re-learns the UI's ranking as
+   * ground truth. Absent on legacy (v1) rows: readers treat absent as 1.0
+   * (deterministic serving is the historical truth for those rows too).
+   */
+  readonly propensity?: number;
 }
 
+/**
+ * Impression-level serving-config fingerprint (north-star §5 S1). The set
+ * of arms / flags in force when this impression was served, so replay and
+ * interleaving can attribute an outcome to the ARM that produced it rather
+ * than to the current process env (which drifts). Every field is a boolean
+ * or a small identifier read at serve time; all optional so a fingerprint
+ * can grow new arms without a schema bump (a missing field = "not recorded
+ * / arm did not exist at serve time", never "off").
+ *
+ * FREEZE-SAFE: this is a passive record of what was active — it does not
+ * change any serving decision.
+ */
+export interface ServingConfigFingerprint {
+  /** SIDETRACK_RECALL_CHUNK_VECTORS — chunk-vector / max-chunk pooling arm. */
+  readonly chunkVectors?: boolean;
+  /** SIDETRACK_RECALL_PROVENANCE_DOWNWEIGHT — title-only KNN down-weight arm. */
+  readonly provenanceDownweight?: boolean;
+  /** SIDETRACK_RECALL_LEARNED_RERANK — learned (closest-visit) rerank arm. */
+  readonly learnedRerank?: boolean;
+  /** Whether the cross-encoder rerank actually fired on this response. */
+  readonly crossEncoderRerank?: boolean;
+  /** Free-form arm/experiment identifier when an eval harness pins one. */
+  readonly armId?: string;
+}
+
+const isBooleanOrUndefined = (value: unknown): boolean =>
+  value === undefined || typeof value === 'boolean';
+
+export const isServingConfigFingerprint = (
+  value: unknown,
+): value is ServingConfigFingerprint => {
+  if (!isRecord(value)) return false;
+  if (!isBooleanOrUndefined(value['chunkVectors'])) return false;
+  if (!isBooleanOrUndefined(value['provenanceDownweight'])) return false;
+  if (!isBooleanOrUndefined(value['learnedRerank'])) return false;
+  if (!isBooleanOrUndefined(value['crossEncoderRerank'])) return false;
+  if (value['armId'] !== undefined && typeof value['armId'] !== 'string') return false;
+  return true;
+};
+
 export interface RecallServedPayload {
-  readonly payloadVersion: 1;
+  /**
+   * Impression schema version. v1 = the original impression (PR #242
+   * feature-vector capture). v2 (north-star §5 S1) adds per-candidate
+   * `propensity`, the explicit `surface` discriminator, and the
+   * impression-level `servingConfig` fingerprint. All v2 additions are
+   * optional so v1 rows still parse; readers treat this union, never a
+   * strict equality against the latest.
+   */
+  readonly payloadVersion: 1 | 2;
   /** Stable impression identity — joins served × action records. */
   readonly servedContextId: string;
   /** The query text as submitted. */
   readonly query: string;
   /** Recall intent (dejavu / search / focus). */
   readonly intent: string;
+  /**
+   * Explicit surface discriminator (north-star §5 S1). Per-surface
+   * calibration and interleaving key on this. Today it MIRRORS `intent`
+   * (dejavu / search / focus are the served surfaces), but it is a
+   * separate field so the surface taxonomy can diverge from intent (e.g.
+   * a related-pages strip vs a search box on the same intent) without a
+   * schema break. Absent on legacy (v1) rows: readers fall back to
+   * `intent`.
+   */
+  readonly surface?: string;
+  /**
+   * Serving-config fingerprint (arms/flags active at serve time). Absent
+   * on legacy (v1) rows and on v2 rows served before any arm was recorded.
+   */
+  readonly servingConfig?: ServingConfigFingerprint;
   /** Session context the request carried — currentUrl, activeChatBacIds, etc. */
   readonly sessionContext?: Readonly<Record<string, unknown>>;
   /** POST-suppression results, in the order shown to the user. */
@@ -223,12 +308,23 @@ export const isRecallServedCandidateSnapshot = (
     return false;
   }
   if (value['queryCosine'] !== undefined && typeof value['queryCosine'] !== 'number') return false;
+  // S1 optional field — validated only when present so v1 rows (no
+  // propensity) still parse. A propensity is a probability in (0, 1]; a
+  // non-numeric, non-finite, or non-positive value invalidates the row so
+  // an off-policy reader can never divide by a bad denominator (weight =
+  // 1 / propensity). Zero/negative would be a serving-code bug, not data.
+  if (value['propensity'] !== undefined) {
+    const p = value['propensity'];
+    if (typeof p !== 'number' || !Number.isFinite(p) || p <= 0 || p > 1) return false;
+  }
   return true;
 };
 
 export const isRecallServedPayload = (value: unknown): value is RecallServedPayload => {
   if (!isRecord(value)) return false;
-  if (value['payloadVersion'] !== 1) return false;
+  // Accept the v1 | v2 union — a v2 reader must still parse v1 rows written
+  // before the S1 propensity/surface/servingConfig fields existed.
+  if (value['payloadVersion'] !== 1 && value['payloadVersion'] !== 2) return false;
   if (typeof value['servedContextId'] !== 'string' || value['servedContextId'].length === 0) {
     return false;
   }
@@ -239,8 +335,39 @@ export const isRecallServedPayload = (value: unknown): value is RecallServedPayl
   if (typeof value['rerankApplied'] !== 'boolean') return false;
   if (typeof value['sequenceNumber'] !== 'number') return false;
   if (typeof value['servedAt'] !== 'string') return false;
+  // S1 optional fields — validated only when present (absent on v1 rows).
+  // A present surface must be a NON-EMPTY string: an empty surface would
+  // become a degenerate per-surface bucket key downstream (surfaceOf falls
+  // back to intent only when the field is ABSENT, not when it is "").
+  if (
+    value['surface'] !== undefined &&
+    (typeof value['surface'] !== 'string' || value['surface'].length === 0)
+  ) {
+    return false;
+  }
+  if (value['servingConfig'] !== undefined && !isServingConfigFingerprint(value['servingConfig'])) {
+    return false;
+  }
   return true;
 };
+
+/**
+ * Effective surface for an impression: the explicit S1 `surface` field
+ * when present, else the historical `intent` fallback (v1 rows and v2 rows
+ * whose surface tracks intent). One place so every reader — calibration,
+ * credit assignment, health — resolves surface identically.
+ */
+export const surfaceOf = (payload: RecallServedPayload): string =>
+  payload.surface ?? payload.intent;
+
+/**
+ * Effective propensity for a served candidate: the explicit S1
+ * `propensity` field when present, else 1.0 (deterministic serving is the
+ * historical truth for v1 rows, and remains the invariant today). One
+ * place so off-policy readers never divide by an implicit/missing value.
+ */
+export const propensityOf = (candidate: RecallServedCandidateSnapshot): number =>
+  candidate.propensity ?? 1;
 
 export const isRecallActionPayload = (value: unknown): value is RecallActionPayload => {
   if (!isRecord(value)) return false;

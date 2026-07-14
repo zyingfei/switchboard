@@ -23,7 +23,9 @@
 // /v1/system/health shape).
 
 export interface IntelligenceMetric {
-  readonly key: 'docVectors' | 'simEdges' | 'lastDrain' | 'impressions';
+  // 'calibration' is appended by reliabilitySummary.ts (S1 reliability
+  // readout) — a separate best-effort endpoint folded into the same strip.
+  readonly key: 'docVectors' | 'simEdges' | 'lastDrain' | 'impressions' | 'calibration';
   readonly label: string;
   /** Primary value, already formatted for display ("1,275", "3h ago"). */
   readonly value: string;

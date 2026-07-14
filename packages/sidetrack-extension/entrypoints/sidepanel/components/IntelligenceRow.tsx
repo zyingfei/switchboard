@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react';
 
 import {
   intelligenceSummaryFromHealth,
+  type IntelligenceMetric,
   type IntelligenceSummary,
 } from '../../../src/settings/intelligenceSummary';
+import { reliabilitySummaryFromReport } from '../../../src/settings/reliabilitySummary';
 
 // Freeze-safe observability: a compact, LIVING readout of the ML /
 // recommendation connection matrix, embedded in Settings → Diagnostics.
@@ -54,8 +56,30 @@ export function IntelligenceRow({ companionPort, bridgeKey }: IntelligenceRowPro
         }
         const body = (await response.json()) as unknown;
         const parsed = intelligenceSummaryFromHealth(body);
+        // Reliability is a SEPARATE, best-effort endpoint (S1). Its failure
+        // must never blank the (working) health readout — an older companion
+        // has no /v1/system/reliability, so a failed fetch just omits the
+        // Calibration metric. It is fetched after health so the primary
+        // readout renders even if reliability is slow/absent.
+        let calibrationMetric: IntelligenceMetric | undefined;
+        try {
+          const reliabilityResponse = await fetch(`${base}/v1/system/reliability`, {
+            headers: authHeaders,
+          });
+          if (reliabilityResponse.ok) {
+            calibrationMetric = reliabilitySummaryFromReport(
+              (await reliabilityResponse.json()) as unknown,
+            );
+          }
+        } catch {
+          // Reliability unavailable — leave the metric out; health stands.
+        }
         if (cancelled) return;
-        setSummary(parsed);
+        setSummary(
+          calibrationMetric === undefined
+            ? parsed
+            : { ...parsed, metrics: [...parsed.metrics, calibrationMetric] },
+        );
         setLoadState(parsed.available ? 'live' : 'unavailable');
       } catch {
         if (!cancelled) setLoadState('unavailable');
