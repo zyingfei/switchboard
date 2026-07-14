@@ -19,8 +19,29 @@ const HEALTH = {
   },
 };
 
+const RELIABILITY = {
+  data: {
+    availability: 'ok',
+    generatedAt: '2026-07-13T12:00:00.000Z',
+    report: {
+      numBins: 10,
+      totalSamples: 20,
+      surfaces: [{ surface: 'search', fit: { plattReliability: { ece: 0.08 } } }],
+    },
+  },
+};
+
 const okFetch = (body: unknown) =>
   vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(body) } as Response);
+
+// Route health vs reliability to their respective bodies so the appended
+// Calibration metric renders from the reliability endpoint.
+const routedFetch = (health: unknown, reliability: unknown) =>
+  vi.fn((input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const body = url.includes('/reliability') ? reliability : health;
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(body) } as Response);
+  });
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -45,6 +66,41 @@ describe('IntelligenceRow', () => {
     expect(doc?.className).toContain('is-live');
     const sim = screen.getByTestId('intelligence-row').querySelector('[data-metric="simEdges"]');
     expect(sim?.className).toContain('is-idle');
+  });
+
+  it('appends the S1 Calibration metric from the reliability endpoint', async () => {
+    vi.stubGlobal('fetch', routedFetch(HEALTH, RELIABILITY));
+    render(<IntelligenceRow companionPort={17374} bridgeKey="key" />);
+    await waitFor(() => {
+      expect(screen.getByText('ECE 0.080')).toBeDefined();
+    });
+    const cal = screen
+      .getByTestId('intelligence-row')
+      .querySelector('[data-metric="calibration"]');
+    expect(cal).not.toBeNull();
+    // ECE 0.08 ≤ 0.1 → well-calibrated → live dot.
+    expect(cal?.className).toContain('is-live');
+  });
+
+  it('omits the Calibration metric when reliability is unavailable (older companion)', async () => {
+    // Health OK, reliability 404s → the four health metrics still render,
+    // no Calibration metric appended.
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/reliability')) {
+        return Promise.resolve({ ok: false, json: () => Promise.resolve({}) } as Response);
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(HEALTH) } as Response);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<IntelligenceRow companionPort={17374} bridgeKey="key" />);
+    await waitFor(() => {
+      expect(screen.getByText('1,275')).toBeDefined();
+    });
+    const cal = screen
+      .getByTestId('intelligence-row')
+      .querySelector('[data-metric="calibration"]');
+    expect(cal).toBeNull();
   });
 
   it('shows an unavailable state when the fetch fails', async () => {

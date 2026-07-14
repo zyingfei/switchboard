@@ -42,6 +42,7 @@ import {
 } from '../system/workGraphHealth.js';
 import { writeWorkGraphHealthArtifact } from '../system/workGraphHealthArtifact.js';
 import { writeSection15Artifact } from '../system/section15Artifact.js';
+import { writeReliabilityArtifact } from '../system/reliabilityArtifact.js';
 import { anyLaneCounterNonZero } from '../system/health.js';
 import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
@@ -568,6 +569,7 @@ export const startCompanion = async (
       onDrainSuccess: () => {
         scheduleWorkGraphHealthArtifact();
         scheduleSection15Artifact();
+        scheduleReliabilityArtifact();
       },
     });
     syncContractRunner.register(connectionsMaterializer);
@@ -1138,6 +1140,34 @@ export const startCompanion = async (
     });
     const scheduleSection15Artifact = section15ArtifactScheduler.schedule;
     teardown.push(section15ArtifactScheduler.teardown);
+    // Drain-time per-surface reliability artifact (north-star §5 S1,
+    // system/reliabilityArtifact.ts). Same discipline as the section15 /
+    // workGraph artifacts: a typed event read (recall.served + recall.action
+    // via forEachChunkOfTypes) + per-surface Platt/temperature fits
+    // materialized after each successful drain, served from disk by GET
+    // /v1/system/reliability. FREEZE-SAFE: measurement only — nothing
+    // consumes the fitted calibrators at S1. Reuses the generic scheduler
+    // factory (debounce/floor/single-flight); errors swallowed so an
+    // observability collect never surfaces as a drain failure.
+    const materializeReliabilityArtifact = async (): Promise<boolean> => {
+      try {
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        if (store === null) return false;
+        await writeReliabilityArtifact({
+          vaultRoot: options.vaultPath,
+          eventLog,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const reliabilityArtifactScheduler = createWorkGraphHealthArtifactScheduler({
+      materialize: materializeReliabilityArtifact,
+      enabled: eventStoreEnabled,
+    });
+    const scheduleReliabilityArtifact = reliabilityArtifactScheduler.schedule;
+    teardown.push(reliabilityArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
       // F02: classify MCP callers by this key so the auth gate can apply

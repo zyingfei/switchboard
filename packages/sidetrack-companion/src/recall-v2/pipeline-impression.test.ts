@@ -172,10 +172,19 @@ describe('runRecall — Phase 0 impression logging', () => {
     const payload = captured[0];
     expect(payload).toBeDefined();
     if (payload === undefined) return;
-    expect(payload.payloadVersion).toBe(1);
+    // S1: impression schema bumped 1 → 2 for propensity/surface/servingConfig.
+    expect(payload.payloadVersion).toBe(2);
     expect(payload.servedContextId).toBe(resp.meta.servedContextId);
     expect(payload.query).toBe('example');
     expect(payload.intent).toBe('dejavu');
+    // S1: explicit surface discriminator mirrors intent today.
+    expect(payload.surface).toBe('dejavu');
+    // S1: serving-config fingerprint records the arms/flags at serve time.
+    // Both retrieval arms default OFF (ADR-0011), rerank disabled here.
+    expect(payload.servingConfig).toBeDefined();
+    expect(payload.servingConfig?.chunkVectors).toBe(false);
+    expect(payload.servingConfig?.provenanceDownweight).toBe(false);
+    expect(payload.servingConfig?.crossEncoderRerank).toBe(false);
     expect(payload.rerankApplied).toBe(false);
     expect(payload.results.length).toBe(resp.results.length);
     // Snapshot rows must reflect what the user actually saw — served
@@ -186,6 +195,9 @@ describe('runRecall — Phase 0 impression logging', () => {
       expect(snap?.entityId).toBe(live?.entityId);
       expect(snap?.servedPosition).toBe(i);
       expect(snap?.fusedScore).toBe(live?.fusedScore);
+      // S1: propensity is 1.0 for every candidate — serving is
+      // deterministic (no exploration / stochastic tie-break on /v2).
+      expect(snap?.propensity).toBe(1.0);
     }
     expect(typeof payload.sequenceNumber).toBe('number');
     expect(typeof payload.servedAt).toBe('string');

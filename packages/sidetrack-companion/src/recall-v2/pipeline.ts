@@ -56,7 +56,11 @@ import {
   type RetrievalArms,
 } from './retrievalFlags.js';
 import { rerank } from './rerank.js';
-import type { RecallServedCandidateSnapshot, RecallServedPayload } from '../recall/events.js';
+import type {
+  RecallServedCandidateSnapshot,
+  RecallServedPayload,
+  ServingConfigFingerprint,
+} from '../recall/events.js';
 import type {
   CandidateGeneratorOutput,
   RecallCandidate,
@@ -1503,6 +1507,20 @@ export const runRecall = async (
       servedPosition: position,
       ...(cand.canonicalUrl !== undefined ? { canonicalUrl: cand.canonicalUrl } : {}),
       ...(queryCosine !== undefined ? { queryCosine } : {}),
+      // Propensity logging (north-star §5 S1, P12). The recall serving
+      // pipeline is fully DETERMINISTIC: every ordering site above (RRF
+      // fusion at ~line 930, lexical tie-break in ranker.ts, cross-encoder
+      // rerank in rerank.ts, learned rerank in learnedRerank.ts) sorts by
+      // score with a stable id/position tie-break — NO Math.random, no
+      // shuffle, no ε-greedy / Thompson exploration anywhere on the /v2
+      // path. So each served candidate landed at its `servedPosition` with
+      // probability 1.0 given the logged candidate set. This is stamped
+      // here, not derived later, because propensity is UNRECOVERABLE after
+      // serve (P12). When S2+ introduces stochastic ordering / interleaving
+      // / exploration, that code MUST replace this 1.0 with the actual
+      // selection probability at serve time — see the invariant on
+      // RecallServedCandidateSnapshot.propensity.
+      propensity: 1.0,
     };
   });
 
@@ -1548,11 +1566,30 @@ export const runRecall = async (
     .filter((id): id is string => typeof id === 'string' && id.length > 0);
 
   if (deps.appendImpression !== undefined) {
+    // Serving-config fingerprint (north-star §5 S1). The arms/flags in
+    // force for THIS impression, stamped so replay/interleaving attributes
+    // an outcome to the arm that produced it rather than to a drifted
+    // process env. `retrievalArms` is the resolved (env-or-injected) arm
+    // set for this run; the two rerank flags are the actual serve-time
+    // decisions, not just their env toggles.
+    const servingConfig: ServingConfigFingerprint = {
+      chunkVectors: retrievalArms.chunkVectors,
+      provenanceDownweight: retrievalArms.provenanceDownweight,
+      learnedRerank: recallLearnedRerankEnabled(),
+      crossEncoderRerank: rerankApplied,
+    };
     const payload: RecallServedPayload = {
-      payloadVersion: 1,
+      // Bumped 1 → 2 for propensity + surface + servingConfig (S1). Legacy
+      // v1 rows still parse (all v2 additions are optional).
+      payloadVersion: 2,
       servedContextId,
       query: req.q,
       intent,
+      // Surface discriminator mirrors intent today (dejavu/search/focus are
+      // the served surfaces); a separate field so the surface taxonomy can
+      // diverge from intent later without a schema break.
+      surface: intent,
+      servingConfig,
       ...(req.session !== undefined
         ? { sessionContext: req.session as Readonly<Record<string, unknown>> }
         : {}),

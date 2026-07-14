@@ -363,6 +363,11 @@ import {
   readSection15Artifact,
 } from '../system/section15Artifact.js';
 import { collectSection15Report } from '../system/section15Collector.js';
+import {
+  isReliabilityArtifactFresh,
+  readReliabilityArtifact,
+} from '../system/reliabilityArtifact.js';
+import { collectReliabilityReport } from '../calibration/reliabilityCollector.js';
 import { collectEngagementLaneHealth } from '../system/engagementLaneHealth.js';
 import {
   CHROME_SESSIONS_RESTORE,
@@ -4954,6 +4959,37 @@ const routes: readonly RouteDefinition[] = [
       // (criterion 6 → streak 0) because the point-in-time clean ledger
       // only exists in the artifact.
       const report = await collectSection15Report({
+        vaultRoot,
+        ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+      });
+      return [200, { data: { availability: 'live', generatedAt: null, report } }];
+    },
+  },
+  {
+    // Per-surface reliability diagram (north-star §5 S1, P9). Serves the
+    // drain-time reliability artifact from disk when fresh; otherwise a
+    // live collect (typed recall.served + recall.action read + per-surface
+    // Platt/temperature fits). FREEZE-SAFE: measurement only — the fitted
+    // calibrators are reported, never applied to a serving decision at S1.
+    // Serve gate is symmetric with the writer's (eventStoreEnabled) AND
+    // age-bounded, matching section15.
+    method: 'GET',
+    pattern: /^\/v1\/system\/reliability$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      if (eventStoreEnabled()) {
+        const artifact = await readReliabilityArtifact(vaultRoot);
+        if (artifact !== null && isReliabilityArtifactFresh(artifact)) {
+          return [
+            200,
+            { data: { availability: 'ok', generatedAt: artifact.generatedAt, report: artifact.report } },
+          ];
+        }
+      }
+      // Live fallback — no fresh artifact. Bounded typed read; on a store-
+      // disabled install this is a single readMerged filtered to two types.
+      const report = await collectReliabilityReport({
         vaultRoot,
         ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
       });
