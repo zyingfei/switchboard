@@ -1,151 +1,145 @@
-# Context-Model North Star (v2, pattern-hardened)
+# Context-Model North Star (v3 — grounded in OUR pattern)
 
-**Date:** 2026-07-13
-**Status:** Accepted direction (post-lift execution; propensity logging + calibration are immediate)
-**Supersedes:** the channel-fusion attribution design (PPR/similarity/corroboration logit fusion in the tabsession resolver)
-**Companion docs:** `docs/audits/2026-07-11-recsys-data-architecture-review.md` (the N=1 regime),
-ADR-0011 + amendments (freeze scoping, eval-gated flips)
+**Date:** 2026-07-14 (v3) · v2 2026-07-13 (pattern survey) · v1 same day (first-principles sketch)
+**Status:** Accepted direction. v3 inverts the method: the core is derived from THIS vault's
+measured behavior; literature patterns live in Appendix B behind observed adoption triggers.
+**Owner directive that produced v3:** "I don't want to adopt so many patterns at the beginning…
+try to understand OUR pattern; keep existing ones in an appendix."
 
 ---
 
-## 1. The problem, stated as the ML problem it is
+## 1. Our pattern, measured (2026-07-14 vault study, read-only; 4 analysts)
 
-Continual, few-label (tens/week) inference of a user's **latent work contexts**
-("workstreams") over an on-device browsing event stream — serving three surfaces
-from one substrate: **attribution** (file this page), **recall/search**, and
-**related-page recommendation**. Contexts are born, drift, and die. Labels are
-scarce, delayed, noisy, and presentation-biased. Compute is a laptop background
-process with a documented CPU-runaway history. Nothing leaves the device.
+Ground truth: 677 `user.organized.item` events over 9.1 weeks; 515 usable move/promote
+labels; 5,046 web visit-instances in 2,995 tab sessions; event-store (not the truncated
+JSONL dir) as source. Full numbers in the study record (`wf_78c16b20`).
 
-Two evidence families exist and must be fused, not conflated:
+**W — the taxonomy is fixed.** All 32 workstreams were created in one 15-day setup burst
+(May 11–26); **zero created in the 49 days since**. Ongoing behavior is filing into a fixed
+set. "ai" is a catch-all (28% of members, 59 domains); 20/33 containers dormant >30d.
 
-- **Acquisition context** (intent): tab session, opener chain, search query,
-  temporal rhythm — *why you're reading*.
-- **Page content** (topic): what the page says — *what it is*.
+**L — label economics.** Burst-then-tail: ~202/week during the setup push, **~12/week
+steady-state**. Filing is bursty (48% of gaps <60s; top-10 cleanup sprees = 41% of all
+labels). Median visit→file latency 4.2 min (53% ≤5 min) with a real days-later tail (~15%).
+**80.3% of visited URLs are never organized** — abstention is the owner's revealed default.
+Explicit negatives barely exist (101 group-dismissals; 2 lifetime rejects). Re-files are
+5.6% and are genuine re-categorization, not noise.
 
-Workstreams differ in *shape*: topic-shaped (`cloud`, `rust`) want content
-evidence to dominate; project-shaped (`trading` = matching engines + AWS deploy
-+ exchange code) want intent evidence. Shape is measurable (dispersion of a
-workstream's member content) and must be learned per workstream, not assumed.
+**S — sessions are weak intent signals here.** 82.6% of sessions are singletons. On
+user-asserted labels only: consecutive-visit same-workstream probability **0.538** (switch
+rate 46.2% ≈ coin flip); only 26% of multi-visit labeled sessions are workstream-pure.
+Opener/referrer capture covers only ~1/3–59% of visits. Domains are **venues, not topics**:
+hubs (HN 44 topics, chatgpt 16 workstreams, github 14) carry 63% of labeled traffic.
 
-## 2. The design case study that seeded this (do not overfit to it)
+**E — embedding reality.** The encoder space is anisotropic: random unrelated pages average
+**0.825 ± 0.029 cosine** (p90 0.860) — absolute cosine thresholds near 0.85 skate on noise;
+only lift above baseline is meaningful. Vector coverage is time-biased (96% on early labels,
+39% on recent — backfill, not decision-time embedding), which makes today's embedding-NN
+signal **anti-causal** as evidence.
 
-EKS-kubeconfig page: resolver auto-applied `trading` at simTop 1.0 via a
-two-hop term bridge ("kubeconfig aws" search → "How to Build an Exchange …
-in AWS" article), while the user's ground truth was `cloud`. Lessons *as a
-class*, not as a bug: (a) confidence was uncalibrated (1.0 from weak
-evidence); (b) neighbor evidence was propagated without weighting by the
-coherence of the linking context; (c) aboutness ("about AWS" vs "deployed on
-AWS") is invisible to term overlap; (d) auto-apply fired where abstention was
-correct. Every element below addresses the class.
+**R — retrospective signal arbiter** (each simple signal alone vs the owner's 515 actual
+filings; time-ordered, no peeking):
 
-## 3. Pattern evidence (what proven systems forced us to change)
+| Signal | fires | precision when fired | overall top-1 |
+|---|---|---|---|
+| Title term-overlap → nearest workstream | 84.7% | 47.2% | **40.0%** |
+| Recency (last workstream filed into) | 99.8% | 38.3% | 38.3% |
+| Embedding-NN *(anti-causal, inflated)* | 72.2% | 50.0% | 36.1% (12% on recent labels) |
+| Domain-majority | 71.3% | 34.1% | 24.3% |
+| Session-majority | 55.9% | 39.6% | 22.1% |
+| Search-chain/opener | 48.3% | 39.8% | 19.2% |
 
-Surveyed four families (2026-07-13, adversarial brief): personal/on-device
-classifiers & task inference; industrial recsys/feed ranking; continual &
-streaming learning; ML serving systems. Full survey in the workflow record
-(`wf_76f85721`). The load-bearing findings:
+Domain splits cleanly: **69% precise on single-workstream domains, 21% on hubs.**
+Cascade order dominates: title→session→domain→recency = **45.2%**; 4-signal majority vote =
+**46.2%**; the six-signal oracle union = **66–70%**; majority-class baseline = 28.9%.
+Head/tail: ~53% on the 7 head workstreams, ~28% on the 22 tail ones. 30% of filings are
+unexplained by ALL six simple signals — the honest ceiling for this signal family.
 
-| # | Pattern (provenance) | What it forced |
-|---|---|---|
-| P1 | **Gmail Priority Inbox** (Google, 2010) — global model log-odds + bounded per-user correction | The context model is an **additive blend**: frozen semantic/global prior + small personal correction. A unified personal generative model is unlearnable at tens of labels/week; cold-start is permanent. |
-| P2 | **TaskPredictor2 / TaskTracer** (Oregon State, IUI'06/IJCAI'07) — the direct ancestor; ~80% precision at ~10% coverage, died anyway | **Abstention-first**: wrong auto-file priced near-catastrophic; coverage is a non-goal. Correction-loop labels are themselves noisy (their killer). Switch detection is the core problem, not a nice-to-have. |
-| P3 | **Apple Photos People clustering** (Apple MLR, 2021) — exemplar dictionaries, sparse-coding assignment, nightly re-cluster | Prototype sets confirmed, mechanics corrected: **soft-vote/sparse-code over the dictionary, never nearest-argmax**; instant corrections **plus periodic batch re-cluster** (online edits can't fix merge/split); explicit "is this a real cluster" gating heuristics. |
-| P4 | **Dirichlet-Hawkes processes** (KDD'15 lineage) — content likelihood × time-decaying intensity + DP new-cluster branch | Session stickiness, new-context discovery, and unknown-count clustering are **one coupled assignment**, not three modules (HMM + prototypes + lifecycle would disagree with no arbiter). |
-| P5 | **TDT first-story detection** | **Posterior entropy does not detect novel contexts** — new projects get *confidently mis-filed* to the nearest prototype. An explicit novelty branch is structural, not optional. |
-| P6 | **CluStream/BIRCH micro-clusters** | Bounded sufficient statistics per context (centroid, spread, count, last-active), not unbounded exemplar growth — the CPU/memory regime demands it. |
-| P7 | **Session-based recsys reproducibility results** (SKNN vs GRU4Rec) | Nonparametric-at-small-data validated externally. Serve nonparametric; keep all training offline. Tune the simple baseline as hard as any fancy challenger. |
-| P8 | **Two-stage retrieval→ranking discipline** (industry-wide) | The posterior must **never gate candidate admission**. Cheap recall shortlist (graph + prototype kNN) → calibrated precision on the shortlist only. |
-| P9 | **Calibration practice** | Decisions require calibrated probabilities, **per surface**; at N=1 use Platt/temperature or Bayesian shrinkage — isotonic staircases flip decisions at tiny N. Reliability diagram = health artifact. |
-| P10 | **Off-policy evaluation limits** (Airbnb KDD'25 lineage) | Replay over logged candidates **cannot** evaluate retrieval/candidate-set changes (unsupported mass) — exactly the changes this design ships. Replay gates re-ranking only. |
-| P11 | **Interleaving** (~50× A/B sensitivity) | The N=1 online arbiter: blend incumbent + candidate producers into one served strip, attribute wins by producer. Sits between replay pre-filter and any flag flip. |
-| P12 | **Propensity logging doctrine** | Served position + exploration randomness must be stamped into impressions **at serve time — unrecoverable later**. Without it, prequential eval re-learns the UI's position prior. |
-| P13 | **Snorkel label modeling** (VLDB'18) | Behavioral weak labels get **learned accuracies and correlations** — dwell/scroll/open co-move (≈ one source, not three); dismiss is presentation-conditioned, not missing-at-random. |
-| P14 | **Active learning under drift** | Pure info-gain querying starves quietly-shifted contexts (confidently-wrong regions are never queried). Mix info-gain + representativeness + a small random reservoir; space asks (fatigue), don't just cap them. |
-| P15 | **ADWIN/DDM drift triggers** | Re-distillation / prototype re-seeding fire on statistical triggers, not fixed cadence (we have scar tissue from both over-rebuilding and a 31-day starvation). |
-| P16 | **On-device distillation deployments** (Gboard, Apple adapters, Chrome Nano) | LLM-teacher offline-only is confirmed practice. **Teacher re-labeling = silent label drift**: version-stamp teacher outputs; freeze old labels on teacher swap or eval hallucinates wins. Nano's competence envelope: classify/tag/extract yes; long-doc reasoning no. |
-| P17 | **Focused Inbox two-tier corrections** | Soft (noisy) exemplar nudges + **hard deterministic pins** ("always file X → W") that override the model. Hard predictable rules build the trust the ancestors never earned. |
-| P18 | **Frecency/site-engagement priors** (Firefox/Chrome) | Behavioral intensity terms are cheap, decayed, bounded, *auditable* — and must not become "a dumping ground for signals." |
+## 2. The v1 model our data justifies (and nothing more)
 
-## 4. The architecture (v2)
+**A three-family scorer + abstention, arbitrated by the ranker we already have.**
 
-**One substrate.** Encoder embeddings for pages/queries/sessions (pretrained,
-never fine-tuned on-device) + the similarity graph + per-workstream **bounded
-prototype dictionaries** (exemplars + sufficient statistics per P3/P6).
+1. **Content-lexical family (primary):** title/term overlap between the visit and each
+   workstream's member titles (BM25-flavored, venue-term-suppressed). Best measured signal,
+   fires cold, no new infra.
+2. **Conditional domain prior:** domain→workstream only where the domain historically maps
+   to ONE workstream (69% precision regime); suppressed on measured-ambiguous hubs — the
+   per-domain dispersion table from the study is the initial coherence prior, *measured
+   rather than hardcoded*.
+3. **Recency prior:** the last-filed workstream as tie-breaker/fallback (38.3% floor,
+   orthogonal, free; encodes real burst-filing behavior).
 
-**One assignment mechanism** — the *time-modulated nonparametric context
-process* (P4): for visit `v` in session `s`,
+Session-majority may enter as a *weak fourth feature* where opener data exists — never as a
+cascade leader and never as a modeling layer.
 
-```
-score(k) = log ContentLikelihood(v | prototypes_k)        // soft-vote/sparse-code (P3)
-         + log ActivityIntensity_k(t)                     // decayed, Hawkes-flavored (P4, P18)
-         + log CoherencePrior(link-context → k)           // context-entropy weighting (EKS lesson)
-         + PersonalCorrection_k(v)                        // bounded, online, additive (P1)
-score(new) = log α · NoveltyLikelihood(v)                 // first-story branch (P5)
-```
+**Combiner:** the fixed vote/cascade ships first (46% for free, fully explainable); the
+existing LightGBM then earns its keep arbitrating exactly the 46%→66% gap, trained on the
+~12/week label stream with the existing count-gated retrain discipline. No generative model,
+no prototype dictionaries, no session process in v1.
 
-Sticky sessions, new-project detection, and workstream lifecycle all live in
-this one rule. Workstream shape emerges as the learned spread of each
-prototype dictionary; the coherence prior is the measured dispersion of the
-linking context (domain / path-prefix / tab-session / search-query), replacing
-the hardcoded aggregator list.
+**Decisions:** abstention-first, matched to the 80% base-rate. Suggest only in the
+measured-precision regime; **top-k (not top-1) for tail workstreams**; auto-apply effectively
+never. Confidence gating via per-workstream empirical precision with shrinkage
+(beta-binomial counts — data-native, honest at n=small; no calibration layer in v1).
 
-**Two-stage funnel (P8).** Stage 1: cheap candidate shortlist (graph
-neighbors + prototype kNN; high recall, hot-path-safe). Stage 2: the
-assignment score above + GBDT residual, **calibrated per surface** (P9).
-Stage 3: **abstention-first utility layer** (P2): auto-apply priced
-near-catastrophic; tiers auto-apply / suggest / silent; quiet-state renders
-calibrated uncertainty honestly. Hard pins (P17) bypass the model entirely.
+**Surfaces matched to observed behavior:** (a) at-visit suggestion — 53% of filings happen
+within 5 minutes of the visit; (b) a **batch cleanup queue** — the spree pattern (20–45
+filings in a sitting) is how the backlog actually drains; pace asks by spree detection, not
+per-ask throttles.
 
-**Multi-task heads, one substrate.** Attribution, recall, and related-pages
-each get their own calibrated head and cost function; sparse attribution
-borrows representation from label-rich recall.
+**Evaluation:** prequential replay **on the 915 user-asserted edges only** (system-inferred
+edges are partly circular); the frozen baseline is the 46% heuristic vote; a challenger
+ships only after beating it there, then wins an interleaving duel against the incumbent
+resolver in shadow.
 
-**Learning loops.**
-- *Weak labels* with learned noise/correlation structure (P13), folded as soft
-  evidence — never counted as votes.
-- *Corrections*: soft nudges update dictionaries instantly (noisy, P2);
-  nightly bounded re-cluster repairs merge/split (P3); hard pins are
-  deterministic (P17).
-- *Teacher loop*: offline Nano-class LLM produces aboutness summaries, topic
-  labels, and adjudications within its competence envelope; outputs
-  version-stamped; student (prototypes + GBDT) serves (P16).
-- *Asks*: mixed-strategy active learning under a spaced UX budget (P14);
-  exploration via Thompson/VOI confined to the suggest tier.
-- *Triggers*: ADWIN/DDM-style drift detectors gate re-distillation and
-  re-seeding (P15).
+## 3. Adoption triggers (what would bring the deferred machinery in)
 
-**Evaluation stack (the honesty layer).**
-1. **Propensity logging now** (P12): served position + exploration randomness
-   stamped into every impression at serve time.
-2. **Prequential replay** (test-then-train over the event-sourced log) with
-   fading factors, delayed-label re-crediting, and refusal on derived-view
-   hash mismatch — gates *re-ranking* changes only (P10).
-3. **Single-user interleaving** (P11): incumbent vs candidate producers in one
-   served strip — the arbiter for retrieval/candidate-set/attribution-model
-   changes that replay structurally cannot judge.
-4. Reliability diagrams per surface as standing health artifacts (P9).
+| Deferred mechanism (Appendix B ref) | Adopt when we OBSERVE |
+|---|---|
+| Embedding/content-similarity signal | decision-time vector coverage ≥70% on new visits (S0 lane) AND lift-corrected embedding beats title-lexical on asserted-edge replay |
+| Session/intent process (Hawkes/HMM, P4) | opener capture ≥70% AND asserted-only session stickiness >65% |
+| Novelty / new-workstream branch (P5) | owner creates ≥1 new workstream/month, two months running |
+| Prototype dictionaries + sparse-coding (P3) | title-lexical plateaus AND head workstreams have ≥30 members with decision-time vectors |
+| Label-noise modeling (P13) | re-file rate rises well above the observed 5.6% |
+| Platt/temperature calibration heads (P9) | suggestion volume makes beta-binomial gating visibly miscalibrated on the reliability artifact |
+| Active-ask policy (P14) | steady-state labels/week doubles or a second labeling surface ships |
+| Teacher/distillation loop (P16) | any of the above stalls for lack of labels/aboutness — teacher fills that specific gap |
 
-## 5. Sequencing
+**Immediate side-findings for the CURRENT system** (independent of v1): the reborn
+similarity lane's 0.85 cosine threshold sits at ~p90 of *random pairs* under this encoder —
+served similarity edges must be re-scored as lift-over-baseline; and eval of any
+embedding-flavored arm must exclude backfill-era vectors or it will flatter itself.
 
-| Stage | Work | Gate |
-|---|---|---|
-| S0 (running) | Content coverage: embedding worker lane, content-into-similarity, chunk serving | CPU soak + eval verdicts (existing flags) |
-| S1 (immediate, small) | **Propensity logging** into impressions + per-surface Platt/temperature calibration head + reliability health artifact | unit + replay compatibility |
-| S2 | Context process v1: prototype dictionaries (bounded), coherence prior, additive blend; served in **shadow** | interleaving vs incumbent resolver |
-| S3 | Abstention-first utility layer + hard pins + honest quiet-state UX | prequential + trust metrics (§15 counters) |
-| S4 | Novelty branch (new-workstream proposals), nightly re-cluster, drift triggers | interleaving + user acceptance of proposals |
-| S5 | Teacher loop (Nano aboutness/labels, version-stamped) + active-ask policy | student-vs-teacher gap tracking |
+## 4. What stays from the S1 work in flight
 
-**Not doing** (evidence-backed): on-device encoder fine-tuning; sequence
-models trained from scratch; RL; isotonic calibration at N=1; unbounded
-exemplar growth; info-gain-only querying; teacher calls on any hot path;
-coverage-maximizing auto-apply.
+Propensity logging: **keep** (data preservation; unrecoverable later). Interleaving
+scaffold: **keep** (the v1-vs-incumbent duel is its first real use). Per-surface Platt
+calibration head: **park behind its trigger** (beta-binomial gating suffices at v1 volume).
 
-## 6. Relationship to what exists
+---
 
-Nothing already built is discarded: embeddings, evidence tiers, the trainable
-label channel, eval spine, and §15 counters are this design's substrate and
-instrumentation. What gets **replaced** — only after losing an interleaving
-duel — is the resolver's channel-fusion core. The freeze discipline holds:
-every serving change ships flag-gated, shadowed, and promoted on evidence.
+## Appendix A — v2 architecture sketch (deferred superstructure)
+
+The time-modulated nonparametric context process (content likelihood × decayed activity
+intensity + new-context branch, additive personal correction, sparse-coded exemplar
+dictionaries, nightly re-cluster, multi-task calibrated heads, utility-tiered decisions,
+teacher + active loops). Retained verbatim from v2 as the shape this system grows *toward*
+if and only if the triggers in §3 fire. Nothing in it is licensed by current data except
+what v1 already includes.
+
+## Appendix B — pattern survey (18 load-bearing findings, 4 families)
+
+P1 Gmail Priority Inbox — additive global+personal blend · P2 TaskPredictor2/TaskTracer —
+abstention-first, correction noise, switch detection as the hard part · P3 Apple Photos
+People — exemplar dictionaries, sparse-code assignment, nightly re-cluster, cluster-gating ·
+P4 Dirichlet-Hawkes — stickiness/novelty/clustering as one coupled assignment · P5 TDT
+first-story detection — entropy ≠ novelty · P6 CluStream/BIRCH — bounded sufficient
+statistics · P7 SKNN-vs-GRU4Rec — nonparametric wins at small data · P8 two-stage funnels —
+posterior never gates admission · P9 calibration practice — Platt at small N, per-surface ·
+P10 off-policy limits — replay can't judge retrieval changes · P11 interleaving — the N=1
+online arbiter · P12 propensity logging — stamp at serve or lose it · P13 Snorkel — learned
+weak-label noise/correlations · P14 active learning under drift — mixed strategies, fatigue ·
+P15 ADWIN/DDM — drift-triggered retraining · P16 on-device distillation — offline teacher,
+version-stamped labels · P17 Focused Inbox — hard pins beside soft corrections · P18
+frecency/site-engagement — decayed auditable priors. Full survey with provenance and
+verdicts: workflow record `wf_76f85721` (2026-07-13).
