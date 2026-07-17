@@ -174,12 +174,17 @@ export const renderHelp = (): string =>
     '  sidetrack-companion eval replay --vault <path> [--json] [--no-persist]',
     '  sidetrack-companion eval connections-precision --vault <path> [--json]',
     '  sidetrack-companion eval significance --vault <path> [--json] [--no-persist]',
+    '  sidetrack-companion eval attribution prequential --vault <path> [--json] [--no-persist]',
     '    Replays the logged recall.served impressions and scores each arm — the',
     '    trained model, the deterministic graph baseline, and the honest external',
     '    floors (grep-over-vault BM25, recency) — side by side (nDCG@10 / MRR /',
     '    recall@k / reject-FPR), with a paired-bootstrap significance verdict.',
     '    connections-precision scores the live graph\'s served similarity edges',
     '    against accepted user signal, reporting precision by M4 evidence tier.',
+    '    attribution prequential replays the user-asserted organizing labels in',
+    '    acceptance-time order (no peeking) and scores the v1 attribution scorer',
+    '    against the frozen baselines (title-lexical, recency, 4-signal vote,',
+    '    majority-class): top-1/top-3/head/tail/abstain + precision-when-suggesting.',
     '    Report-only: nothing here influences serving or gates promotion. The',
     '    verdict is persisted under _BAC/eval/ unless --no-persist is given.',
     '',
@@ -755,10 +760,12 @@ const runEvalSubcommand = async (
   streams: CliStreams,
 ): Promise<number> => {
   const verb = argv[1];
+  // `attribution` takes a further sub-verb (`prequential`); the others don't.
+  const subVerb = argv[2] !== undefined && !argv[2].startsWith('--') ? argv[2] : undefined;
   if (verb === undefined || verb === 'help' || verb === '--help') {
     writeLine(
       streams.stdout,
-      'Usage: sidetrack-companion eval {replay|connections-precision|significance} --vault <path> [--json] [--no-persist]',
+      'Usage: sidetrack-companion eval {replay|connections-precision|significance|attribution prequential} --vault <path> [--json] [--no-persist]',
     );
     return verb === undefined ? 2 : 0;
   }
@@ -800,8 +807,32 @@ const runEvalSubcommand = async (
     return 0;
   }
 
+  if (verb === 'attribution') {
+    // Attribution v1 prequential replay (asserted edges only, time-ordered,
+    // no peeking): re-derives the label set from the event store, scores each
+    // arm (v1 scorer, title-lexical, recency, 4-signal vote baseline,
+    // majority-class), and reports top-1/top-3/head/tail/abstain +
+    // precision-when-suggesting, with the frozen-baseline verdict. Read-only;
+    // persists the report-only verdict under _BAC/eval/ unless --no-persist.
+    if (subVerb !== 'prequential') {
+      writeLine(streams.stderr, `unknown attribution eval verb: ${subVerb ?? '(none)'}`);
+      writeLine(streams.stderr, 'try: eval attribution prequential --vault <path> [--json] [--no-persist]');
+      return 2;
+    }
+    const { runAttributionPrequentialEval, formatPrequentialEvalRunResult } = await import(
+      './attribution-v1/eval/cli.js'
+    );
+    const result = await runAttributionPrequentialEval(vaultPath, { persist });
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify(result.artifact, null, 2));
+      return 0;
+    }
+    writeLine(streams.stdout, formatPrequentialEvalRunResult(result));
+    return 0;
+  }
+
   writeLine(streams.stderr, `unknown eval verb: ${verb}`);
-  writeLine(streams.stderr, 'try: replay | connections-precision | significance');
+  writeLine(streams.stderr, 'try: replay | connections-precision | significance | attribution');
   return 2;
 };
 
