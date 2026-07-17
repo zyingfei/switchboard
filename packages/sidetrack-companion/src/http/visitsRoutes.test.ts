@@ -747,4 +747,91 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       expect.anything(),
     );
   });
+
+  // Attribution v1 SHADOW parity: the served resolve response must be
+  // byte-identical whether the shadow lane runs (flag ON, default) or is
+  // disabled (SIDETRACK_ATTRIBUTION_V1_SHADOW=0). The scorer runs in shadow
+  // only; nothing it produces may change what serves.
+  it('GET /v1/visits/{url}/resolve response is identical with the v1 shadow flag on vs off', async () => {
+    // Materialize a v1 state artifact so the shadow lane actually fires
+    // (otherwise the emit is a no-op and the parity is trivial).
+    const { writeAttributionV1Artifact } = await import('../attribution-v1/artifact.js');
+    await eventLog.appendClient({
+      clientEventId: 'shadow-label-1',
+      aggregateId: 'shadow-agg',
+      type: 'user.organized.item',
+      payload: {
+        payloadVersion: 1,
+        itemKind: 'canonical-url',
+        itemId: 'https://shadow.test/on',
+        action: 'move',
+        toContainer: 'ws_shadow',
+      },
+      baseVector: {},
+    });
+    await writeAttributionV1Artifact({ vaultRoot, eventLog });
+
+    const prior = process.env['SIDETRACK_ATTRIBUTION_V1_SHADOW'];
+    const priorMemo = await import('../attribution-v1/emit.js');
+    try {
+      // Flag ON (default): distinct url + revision so the route cache does
+      // not short-circuit the second request below.
+      const onUrl = 'https://shadow.test/on';
+      await connectionsStore.putCurrent(snapshotForUrls([onUrl], 'rev-shadow-on'));
+      priorMemo.resetShadowStateMemoForTest();
+      delete process.env['SIDETRACK_ATTRIBUTION_V1_SHADOW'];
+      const onResponse = await fetch(
+        `${serverUrl}/v1/visits/${encodeURIComponent(onUrl)}/resolve?dryRun=true`,
+        { headers: reqHeaders() },
+      );
+      expect(onResponse.status).toBe(200);
+      const onBody = (await onResponse.json()) as { data: { canonicalUrl: string } };
+
+      // Flag OFF: same logical input, different url+revision to force a
+      // fresh resolve (not a cache hit).
+      const offUrl = 'https://shadow.test/off';
+      await connectionsStore.putCurrent(snapshotForUrls([offUrl], 'rev-shadow-off'));
+      priorMemo.resetShadowStateMemoForTest();
+      process.env['SIDETRACK_ATTRIBUTION_V1_SHADOW'] = '0';
+      const offResponse = await fetch(
+        `${serverUrl}/v1/visits/${encodeURIComponent(offUrl)}/resolve?dryRun=true`,
+        { headers: reqHeaders() },
+      );
+      expect(offResponse.status).toBe(200);
+      const offBody = (await offResponse.json()) as { data: { canonicalUrl: string } };
+
+      // The two requests deliberately use different url+revision to force a
+      // fresh resolve on each (the route cache is keyed on the snapshot).
+      // The resolver legitimately embeds the url/revision in url-derived
+      // fields (canonicalUrl, dependencyKey, evidenceHash, anchors,
+      // snapshotRevision) — none of which the shadow lane touches. Normalize
+      // those url/revision strings out and assert everything else is
+      // identical: the shadow lane changed nothing about the served shape.
+      const scrub = (value: unknown): unknown =>
+        JSON.parse(
+          JSON.stringify(value)
+            .replaceAll('shadow.test/on', 'URL')
+            .replaceAll('shadow.test/off', 'URL')
+            .replaceAll('rev-shadow-on', 'REV')
+            .replaceAll('rev-shadow-off', 'REV'),
+        );
+      const scrubbedOn = scrub(onBody) as { data: Record<string, unknown> };
+      const scrubbedOff = scrub(offBody) as { data: Record<string, unknown> };
+      // evidenceHash is a sha256 of the (now-normalized) inputs; it stays
+      // url-dependent through hashing, so drop it after confirming both
+      // sides still carry one.
+      const stripHash = (b: { data: Record<string, unknown> }): unknown => {
+        const reasons = b.data['reasons'] as Record<string, unknown> | undefined;
+        if (reasons !== undefined) {
+          expect(typeof reasons['evidenceHash']).toBe('string');
+          delete reasons['evidenceHash'];
+        }
+        return b;
+      };
+      expect(stripHash(scrubbedOff)).toEqual(stripHash(scrubbedOn));
+    } finally {
+      if (prior === undefined) delete process.env['SIDETRACK_ATTRIBUTION_V1_SHADOW'];
+      else process.env['SIDETRACK_ATTRIBUTION_V1_SHADOW'] = prior;
+    }
+  });
 });
