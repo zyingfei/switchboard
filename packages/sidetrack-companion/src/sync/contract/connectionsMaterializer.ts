@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -131,6 +131,7 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  activeClosestVisitRevisionManifestPath,
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
   readActiveClosestVisitRankerRevisionManifestProbe,
@@ -266,6 +267,7 @@ import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
   nodeIdFor,
+  type ConnectionEdge,
   type VisitSimilarityEdge,
   type VisitSimilarityRevision,
 } from '../../connections/types.js';
@@ -540,6 +542,23 @@ const scopedRevisitNoOpEnabled = (): boolean =>
 // apply branch fires instead of full-rebuilding on every navigation.
 const scopedTimelineSourcingEnabled = (): boolean =>
   process.env['SIDETRACK_SCOPED_TIMELINE_SOURCING'] !== '0';
+// Ranker augmentation on scoped-delta drains (default ON; disable with =0 +
+// restart for instant rollback). ON, the closest-visit ranker runs on a
+// scoped delta via the incremental FRONTIER augmentation — bounded to the
+// touched frontier, never a full-corpus per-drain pass — so closest_visit
+// edges are re-derived for re-visited urls instead of vanishing when the
+// scoped scope-row rewrite drops them. OFF restores the pre-fix pure
+// deferral (closest_visit relies solely on carry-forward, never refreshed on
+// scoped drains). Same regression-repair class as SIDETRACK_SIMILARITY_REQUALIFY.
+const rankerOnScopedDeltaAugmentationEnabled = (): boolean =>
+  process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'] !== '0';
+// Escape hatch (default OFF): when the incremental frontier ranker path is
+// unavailable on a scoped delta, permit the full-corpus augmentation instead
+// of skipping. OFF keeps scoped deltas bounded (the whole point of the
+// original e7bdba8b deferral); flip ON only to force a full re-tag on scoped
+// drains for debugging.
+const rankerFullAugmentationOnScopedDeltaEnabled = (): boolean =>
+  process.env['SIDETRACK_RANKER_FULL_AUGMENTATION_ON_SCOPED_DELTA'] === '1';
 // Incremental topic membership (default OFF): between full leiden
 // re-clusters, overlay newly-eligible visits onto their nearest existing
 // cluster as secondary affiliations so topics stay responsive to browsing
@@ -2291,6 +2310,100 @@ export const createConnectionsMaterializer = (
     });
   };
 
+  // closest_visit + visit_resembles_visit are timeline-visit↔timeline-visit
+  // edges owned by the FROM node's `scope:url=X`. Neither is present in the
+  // scoped snapshot for a scoped-delta drain: the ranker (closest_visit)
+  // augmentation pass runs AFTER the scoped-row rewrite (and defers on
+  // scoped deltas), and the similarity producer emits visit_resembles_visit
+  // only for the reconciled frontier. So when replaceScopeRowsForScopedDelta
+  // re-asserts scope:url=X from the scoped recompute, any prior similarity
+  // edge FROM X that this drain did not re-derive is erased — and once gone,
+  // the similarity producer's retained-edge path never gets it back (it
+  // reads the now-empty previous snapshot). That is the edge-family drop
+  // that took closest_visit/visit_resembles_visit to 0 within a day of
+  // scoped drains. This carry-forward makes deferred/frontier-scoped drains
+  // LOSSLESS for these kinds: for every url scope the delta rewrites, re-add
+  // the prior snapshot's similarity-family edges the scoped recompute did
+  // not already produce, preserving both endpoints. Freshly recomputed edges
+  // still win (same id → the scoped edge is kept). Losslessness is not
+  // optional, so this runs unconditionally.
+  const SIMILARITY_FAMILY_EDGE_KINDS: ReadonlySet<ConnectionEdge['kind']> = new Set([
+    'closest_visit',
+    'visit_resembles_visit',
+  ]);
+  const carryForwardSimilarityFamilyRowsForScopedDelta = (input: {
+    readonly output: ScopeRecomputeOutput;
+    readonly previousSnapshot: ConnectionsSnapshot;
+    readonly scopedSnapshot: ConnectionsSnapshot;
+    readonly rewrittenScopes: readonly Scope[];
+    // Owners the CURRENT similarity producer authoritatively recomputed this
+    // drain (the visit keys incident to any current visitSimilarity edge).
+    // For those owners the fresh visit_resembles_visit set replaces the
+    // prior one — carrying a stale prior edge would break incremental==rebuild
+    // equivalence (e.g. a pair that just dropped below threshold). closest_visit
+    // has no producer on a scoped delta, so it is never gated by this.
+    readonly similarityRecomputedOwnerVisitKeys: ReadonlySet<string>;
+  }): ScopeRecomputeOutput => {
+    const rewrittenUrlScopeIds = new Set(
+      input.rewrittenScopes.filter((scope) => scope.kind === 'url').map((scope) => scope.id),
+    );
+    if (rewrittenUrlScopeIds.size === 0) return input.output;
+    // Nothing to carry forward when the prior snapshot holds no
+    // similarity-family edges (fresh vault, thread-only vault, or a corpus the
+    // ranker/similarity producer has never touched — the common case). Bail
+    // before allocating the four lookup Maps below: this runs unconditionally
+    // on EVERY scoped-delta drain, so the O(nodes+edges) Map builds were paid
+    // per chunk across the whole chunked catch-up even when there was provably
+    // nothing to preserve. Cheap linear scan, zero allocation on the empty
+    // path. (Losslessness is unaffected: an empty prior similarity set carries
+    // nothing regardless.)
+    const priorHasSimilarityFamilyEdge = input.previousSnapshot.edges.some((edge) =>
+      SIMILARITY_FAMILY_EDGE_KINDS.has(edge.kind),
+    );
+    if (!priorHasSimilarityFamilyEdge) return input.output;
+    const edges = new Map(input.output.edges.map((edge) => [edge.id, edge]));
+    const nodes = new Map(input.output.nodes.map((node) => [node.id, node]));
+    const previousNodes = new Map(input.previousSnapshot.nodes.map((node) => [node.id, node]));
+    const scopedNodes = new Map(input.scopedSnapshot.nodes.map((node) => [node.id, node]));
+    // A similarity-family edge survives a full rebuild only if BOTH endpoints
+    // are still live visits. Mirror that: carry an edge forward only when
+    // each endpoint node exists in the recomputed output, the scoped
+    // snapshot, or the previous snapshot (so a genuinely deleted endpoint
+    // still drops the edge — carry-forward is not resurrection).
+    const endpointLive = (nodeId: string): boolean =>
+      nodes.has(nodeId) || scopedNodes.has(nodeId) || previousNodes.has(nodeId);
+    for (const edge of input.previousSnapshot.edges) {
+      if (!SIMILARITY_FAMILY_EDGE_KINDS.has(edge.kind)) continue;
+      if (edges.has(edge.id)) continue; // this drain re-derived it — keep the fresh one.
+      const ownerVisitKey = visitKeyFromTimelineNodeIdForDelta(edge.fromNodeId);
+      if (ownerVisitKey === null || !rewrittenUrlScopeIds.has(ownerVisitKey)) continue;
+      if (edge.kind === 'visit_resembles_visit') {
+        // The similarity producer is authoritative for pairs it touched this
+        // drain. If either endpoint was recomputed, the fresh set already
+        // reflects the correct edges for that pair — do NOT resurrect a stale
+        // one (that is exactly what diverges from a full rebuild).
+        const toVisitKey = visitKeyFromTimelineNodeIdForDelta(edge.toNodeId);
+        if (
+          input.similarityRecomputedOwnerVisitKeys.has(ownerVisitKey) ||
+          (toVisitKey !== null && input.similarityRecomputedOwnerVisitKeys.has(toVisitKey))
+        ) {
+          continue;
+        }
+      }
+      if (!endpointLive(edge.fromNodeId) || !endpointLive(edge.toNodeId)) continue;
+      edges.set(edge.id, edge);
+      for (const nodeId of [edge.fromNodeId, edge.toNodeId]) {
+        if (nodes.has(nodeId)) continue;
+        const node = previousNodes.get(nodeId) ?? scopedNodes.get(nodeId);
+        if (node !== undefined) nodes.set(nodeId, node);
+      }
+    }
+    return {
+      nodes: [...nodes.values()].sort((a, b) => a.id.localeCompare(b.id)),
+      edges: [...edges.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    };
+  };
+
   const newestNavigationCommittedEvents = (
     events: readonly AcceptedEvent[],
     limit: number,
@@ -2530,7 +2643,37 @@ export const createConnectionsMaterializer = (
     methodologySpine: result?.methodologySpine ?? null,
   });
 
+  // Absent-manifest fast path. Layer A (SIDETRACK_RANKER_ON_SCOPED_DELTA,
+  // default ON) now invokes this loader on EVERY scoped-delta drain instead
+  // of the pre-fix blanket defer. When no active ranker manifest exists (the
+  // common case: fresh vault, no trained model — including nearly every test
+  // fixture and the chunked catch-up integration paths), the full loader does
+  // two failing file reads per drain (readActive...Manifest → ENOENT, then
+  // readActive...ManifestProbe → ENOENT again) times thousands of chunked
+  // scoped drains. Under SIDETRACK_SQLITE_LIB=off that per-drain I/O
+  // amplification is enough to tip the heavy catch-up/child integration tests
+  // over their timeouts (23s→16s on the ClassB file with the flag, disk-I/O
+  // cascades under load). A single stat replaces the two reads: when the
+  // manifest file is absent we return the cached `missing` result without
+  // re-reading. The moment a manifest appears (stat succeeds) we always fall
+  // through to the full load, so a freshly-trained model is picked up on the
+  // very next drain — no staleness. A READY result is never cached here (its
+  // model is disposed at the end of each drain), so this only short-circuits
+  // the genuinely-absent case, which has no model.
+  const manifestAbsentResult: ClosestVisitRankerLoadResult = {
+    status: 'missing',
+    activeRevisionId: null,
+    reason: 'no-active-manifest',
+    needsRetrain: false,
+    methodologySpine: null,
+  };
   const loadClosestVisitRanker = async (): Promise<ClosestVisitRankerLoadResult> => {
+    try {
+      await stat(activeClosestVisitRevisionManifestPath(deps.vaultRoot));
+    } catch {
+      // No active manifest on disk → no model to load, nothing to dispose.
+      return manifestAbsentResult;
+    }
     const manifest = await readActiveClosestVisitRankerRevisionManifest(deps.vaultRoot);
     if (manifest === null) {
       const probe = await readActiveClosestVisitRankerRevisionManifestProbe(deps.vaultRoot);
@@ -4173,12 +4316,34 @@ export const createConnectionsMaterializer = (
           const rawScoped = unionScopeOutputs(
             rowLocalScopes.map((scope) => recomputeScope(scope, scopedSnapshot)),
           );
-          const scoped = preserveThreadRowsForScopedDelta({
+          const scopedWithThreads = preserveThreadRowsForScopedDelta({
             output: rawScoped,
             previousSnapshot: previousSnapshotForScopedDelta,
             scopedSnapshot,
             threadScopes: dirtyThreadScopes,
             deletedThreadIds: deletedThreadIdsForScopedDelta,
+          });
+          // Losslessness (unconditional): the scoped snapshot carries no
+          // ranker/frontier-scoped similarity edges, so re-asserting each
+          // rewritten url scope from it would erase the prior snapshot's
+          // closest_visit / visit_resembles_visit edges for untouched pairs.
+          // Carry them forward before the replacement.
+          // Visit keys the current similarity producer authoritatively
+          // recomputed this drain — every key incident to a current
+          // visitSimilarity edge. For those keys the fresh
+          // visit_resembles_visit set replaces the prior one; carry-forward
+          // must not resurrect stale similarity edges for them (equivalence).
+          const similarityRecomputedOwnerVisitKeys = new Set<string>();
+          for (const simEdge of visitSimilarity.edges) {
+            similarityRecomputedOwnerVisitKeys.add(simEdge.fromVisitKey);
+            similarityRecomputedOwnerVisitKeys.add(simEdge.toVisitKey);
+          }
+          const scoped = carryForwardSimilarityFamilyRowsForScopedDelta({
+            output: scopedWithThreads,
+            previousSnapshot: previousSnapshotForScopedDelta,
+            scopedSnapshot,
+            rewrittenScopes: rowLocalScopes,
+            similarityRecomputedOwnerVisitKeys,
           });
           const progress = progressForDrainSnapshot(scopedSnapshot);
           await replaceScopeRowsForScopedDelta({
@@ -4488,6 +4653,7 @@ export const createConnectionsMaterializer = (
       ? ((await deps.store.readCurrent()) ?? baseSnapshot)
       : baseSnapshot;
     let closestVisitRanker: ClosestVisitRankerLoadResult | null = null;
+    let rankerFrontierUnavailableOnScopedDelta = false;
     let rankerAugmentation = rankerAugmentationCounters({
       status: 'not-run',
       reason: null,
@@ -4500,12 +4666,30 @@ export const createConnectionsMaterializer = (
     try {
       // Stage 5.2 W3b/c — gate the ranker-augmented build behind
       // SIDETRACK_SKIP_RANKER_SNAPSHOT for HTTP-latency-sensitive
-      // consumers (recorder). The `RANKER_ON_SCOPED_DELTA=1` opt-in
-      // (run the ranker on every scoped delta = slow) was removed —
-      // the ranker is always deferred when a scoped delta applies
-      // and the loader is absent, matching the IVM contract.
+      // consumers (recorder).
+      //
+      // Original deferral (e7bdba8b, 2026-05-24): the `RANKER_ON_SCOPED_DELTA`
+      // opt-in ran the FULL-corpus ranker augmentation on every scoped delta
+      // and was slow, so it was removed and the ranker was deferred whenever
+      // a scoped delta applied AND `deps.closestVisitRankerLoader` was absent.
+      // But that guard tested the injected DEP, not the EFFECTIVE loader: the
+      // internal default loader (loadClosestVisitRanker) always loads the
+      // model, and the production child-reconcile entry never injects a
+      // loader — so in production the ranker ALWAYS deferred on scoped
+      // deltas. Every re-visit rewrites scope:url=X from a scoped snapshot
+      // that has no closest_visit edges, so closest_visit drained to 0.
+      //
+      // Honor the original latency concern with a BOUNDED pass instead of a
+      // blanket defer: when the effective loader is available we run the
+      // ranker on scoped deltas via the incremental FRONTIER augmentation
+      // (augmentConnectionsSnapshotWithClosestVisitRankerFrontier, gated by
+      // `canUseIncrementalRanker` below) — augmentation input is the touched
+      // frontier, NOT the corpus. The removed opt-in's full-corpus per-drain
+      // pass is never reintroduced. Kill-switch: set
+      // SIDETRACK_RANKER_ON_SCOPED_DELTA=0 to restore the pure deferral.
+      const rankerOnScopedDeltaEnabled = rankerOnScopedDeltaAugmentationEnabled();
       const deferRankerForScopedTimelineDelta =
-        scopedTimelineDeltaApplied && deps.closestVisitRankerLoader === undefined;
+        scopedTimelineDeltaApplied && !rankerOnScopedDeltaEnabled;
       if (deferRankerForScopedTimelineDelta) {
         mark('ranker-augmented skipped (scopedTimelineDelta)');
         rankerAugmentation = rankerAugmentationCounters({
@@ -4611,6 +4795,28 @@ export const createConnectionsMaterializer = (
             mark(
               `augmentConnectionsSnapshot ranker-frontier visits=${String(rankerFrontier.size)} nodes=${String(finalSnapshot.nodes.length)} edges=${String(finalSnapshot.edges.length)}`,
             );
+          } else if (
+            scopedTimelineDeltaApplied &&
+            !producerRevisionChanged &&
+            !rankerFullAugmentationOnScopedDeltaEnabled()
+          ) {
+            // Bounded-cost guarantee for Layer A. On a scoped delta with no
+            // touched visits (touchedVisitIds.size === 0 → the frontier path
+            // above is unavailable but there is genuinely nothing to
+            // re-rank), we DO NOT fall through to the full-corpus
+            // augmentation — that per-drain full pass is exactly what
+            // e7bdba8b removed for latency. Skip the ranker this drain;
+            // Layer B's carry-forward keeps the prior closest_visit edges
+            // intact. A `producerRevisionChanged` (model swap) is the ONE
+            // case that legitimately needs a full re-tag of every edge — it
+            // is rare (only on retrain/model-version change), not per-drain,
+            // so it still runs the full pass via the else branch below. Opt
+            // the full pass back on for the no-touch case with
+            // SIDETRACK_RANKER_FULL_AUGMENTATION_ON_SCOPED_DELTA=1.
+            mark(
+              `ranker-augmented frontier-unavailable on scopedDelta (touched=${String(touchedVisitIds.size)}) — deferring full pass, carry-forward preserves prior edges`,
+            );
+            rankerFrontierUnavailableOnScopedDelta = true;
           } else {
             finalSnapshot = augmentConnectionsSnapshotWithClosestVisitRanker(
               {
@@ -4625,17 +4831,31 @@ export const createConnectionsMaterializer = (
             );
           }
           lastRankerProducerRevision = producerRevision;
-          await writeSnapshotWithDrainProgress(finalSnapshot, dirtyScopeWrites);
-          mark('writeSnapshotAndProgress ranker-augmented');
-          rankerAugmentation = rankerAugmentationCounters({
-            status: 'emitted',
-            reason: null,
-            activeRevisionId: closestVisitRanker.activeRevisionId,
-            ...schemaDiagnosticsFor(closestVisitRanker),
-            modelFreshness: modelFreshnessFor(rankerRetrainResult),
-            baseSnapshot,
-            finalSnapshot,
-          });
+          if (rankerFrontierUnavailableOnScopedDelta) {
+            // The scoped-delta replace already persisted the carried-forward
+            // edges; there is nothing new to write this drain.
+            rankerAugmentation = rankerAugmentationCounters({
+              status: 'skipped',
+              reason: 'scopedTimelineDelta:frontier-unavailable',
+              activeRevisionId: closestVisitRanker.activeRevisionId,
+              ...schemaDiagnosticsFor(closestVisitRanker),
+              modelFreshness: 'unknown',
+              baseSnapshot,
+              finalSnapshot,
+            });
+          } else {
+            await writeSnapshotWithDrainProgress(finalSnapshot, dirtyScopeWrites);
+            mark('writeSnapshotAndProgress ranker-augmented');
+            rankerAugmentation = rankerAugmentationCounters({
+              status: 'emitted',
+              reason: null,
+              activeRevisionId: closestVisitRanker.activeRevisionId,
+              ...schemaDiagnosticsFor(closestVisitRanker),
+              modelFreshness: modelFreshnessFor(rankerRetrainResult),
+              baseSnapshot,
+              finalSnapshot,
+            });
+          }
         } else {
           const reason =
             closestVisitRanker.status === 'missing'
