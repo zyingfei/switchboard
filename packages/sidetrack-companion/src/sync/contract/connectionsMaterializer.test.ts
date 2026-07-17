@@ -33,9 +33,11 @@ import {
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
+import { EMPTY_PROGRESS, type MaterializerProgress } from './materializerProgress.js';
 import {
   classifyConnectionsMaterializerHealth,
   createConnectionsMaterializer,
+  MATERIALIZER_VERSION,
 } from './connectionsMaterializer.js';
 
 const buildEvent = (input: { seq: number; type: string; payload: unknown }): AcceptedEvent => ({
@@ -598,6 +600,260 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     const topicRevision = await createTopicRevisionStore(vaultRoot).readActiveRevision();
     expect(topicRevision?.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
     expect(m.health().status).toBe('healthy');
+  });
+
+  it('carries prior closest_visit + visit_resembles_visit edges forward across a scoped-delta drain', async () => {
+    // Regression (served until June 27, then 0): closest_visit and
+    // visit_resembles_visit are timeline-visit↔timeline-visit edges owned by
+    // the FROM node's `scope:url=X`. A scoped-delta drain that touches url X
+    // recomputes scope:url=X from the SCOPED snapshot — which never carries
+    // ranker (closest_visit) edges (the augmentation pass defers on scoped
+    // deltas) and lacks visit_resembles_visit for pairs the similarity
+    // producer didn't re-emit this drain. replaceScopeRowsForScopedDelta then
+    // overwrites scope:url=X with rows that lack those edges, erasing them —
+    // and once erased, `retainedSimilarityEdgesFromSnapshot(previousSnapshot)`
+    // never gets them back. The carry-forward makes deferred scoped drains
+    // LOSSLESS for both kinds. This test seeds the two edge families on the
+    // previous snapshot, drives a scoped-delta touching their owning url, and
+    // asserts the scoped-delta scope-row rewrite for that url STILL carries
+    // them. Before the carry-forward, both vanish.
+    const homeUrl = 'https://news.ycombinator.com/newest';
+    const neighborUrl = 'https://example.test/neighbor';
+    const tabSessionId = 'tses_home';
+    const tabSessionIdHash = 'tab_hash_home';
+    const homeNodeId = `timeline-visit:${homeUrl}`;
+    const neighborNodeId = `timeline-visit:${neighborUrl}`;
+    const timelineVisitNode = (
+      url: string,
+      title: string,
+    ): ConnectionsSnapshot['nodes'][number] => ({
+      id: `timeline-visit:${url}`,
+      kind: 'timeline-visit',
+      label: title,
+      firstSeenAt: '2026-05-23T00:00:00.000Z',
+      lastSeenAt: '2026-05-23T00:00:00.000Z',
+      originReplicaIds: ['replica-A'],
+      metadata: { url, canonicalUrl: url, title },
+    });
+    const closestVisitEdge: ConnectionsSnapshot['edges'][number] = {
+      id: `edge:closest_visit:${homeNodeId}:${neighborNodeId}`,
+      kind: 'closest_visit',
+      fromNodeId: homeNodeId,
+      toNodeId: neighborNodeId,
+      observedAt: '2026-05-23T00:00:00.000Z',
+      producedBy: { source: 'ranker', revisionId: 'ranker-rev-prior' },
+      confidence: 'inferred',
+      family: 'urlmatch',
+      metadata: { score: 0.9 },
+    };
+    const resemblesEdge: ConnectionsSnapshot['edges'][number] = {
+      id: `edge:visit_resembles_visit:${homeNodeId}:${neighborNodeId}`,
+      kind: 'visit_resembles_visit',
+      fromNodeId: homeNodeId,
+      toNodeId: neighborNodeId,
+      observedAt: '2026-05-23T00:00:00.000Z',
+      producedBy: { source: 'visit-similarity', revisionId: 'visit-sim-rev-prior' },
+      confidence: 'inferred',
+      metadata: { cosine: 0.95 },
+    };
+    const previousSnapshot: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        timelineVisitNode(homeUrl, 'home page'),
+        timelineVisitNode(neighborUrl, 'Neighbor'),
+      ],
+      edges: [closestVisitEdge, resemblesEdge],
+      updatedAt: '2026-05-23T00:00:00.000Z',
+      nodeCount: 2,
+      edgeCount: 2,
+      urlProjection: { schemaVersion: 1, byCanonicalUrl: {} },
+      tabSessionProjection: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} },
+      snapshotRevision: 'rev-base',
+    };
+    const baseProgress: MaterializerProgress = {
+      ...EMPTY_PROGRESS('connections', MATERIALIZER_VERSION),
+      appliedDotIntervals: { 'replica-A': [[1, 2] as const] },
+      appliedFrontier: { 'replica-A': 2 },
+      snapshotRevisionId: 'rev-base',
+    };
+    // seq 1 + 2 are already applied (baseProgress frontier at 2): the home
+    // and neighbor timeline rows exist so the scoped-delta timeline-sourcing
+    // can supply the required neighbor row (its edge partner) rather than
+    // falling into a full rebuild. seq 3/4 (home re-visit + nav) are the
+    // delta that touches scope:url=homeUrl.
+    const homeInitial = timelineObservedUrlEvent({
+      seq: 1,
+      eventId: 'timeline-home-initial',
+      url: homeUrl,
+      title: 'home page',
+      observedAt: '2026-05-23T00:00:00.000Z',
+    });
+    const neighborInitial = timelineObservedUrlEvent({
+      seq: 2,
+      eventId: 'timeline-neighbor-initial',
+      url: neighborUrl,
+      title: 'home neighbor',
+      observedAt: '2026-05-23T00:00:30.000Z',
+    });
+    const homeRevisit = buildEvent({
+      seq: 3,
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        payloadVersion: 1,
+        eventId: 'timeline-home-revisit',
+        observedAt: '2026-05-23T00:01:00.000Z',
+        url: homeUrl,
+        canonicalUrl: homeUrl,
+        title: 'home page',
+        provider: 'generic',
+        transition: 'activated',
+        tabSessionId,
+      },
+    });
+    const homeNavigation = buildEvent({
+      seq: 4,
+      type: NAVIGATION_COMMITTED,
+      payload: {
+        payloadVersion: 1,
+        visitId: 'visit_home_1',
+        url: homeUrl,
+        canonicalUrl: homeUrl,
+        documentId: 'doc_home_1',
+        parentDocumentId: null,
+        tabSessionIdHash,
+        windowSessionIdHash: 'win_hash_home',
+        openerVisitId: null,
+        previousVisitId: null,
+        navigationSequence: 1,
+        transitionType: 'link',
+        transitionQualifiers: [],
+        commitTimestamp: 1_700_000_001_000,
+      },
+    });
+
+    type ReplaceScopeRowsInput = Parameters<NonNullable<ConnectionsStore['replaceScopeRows']>>[0];
+    const replacements: ReplaceScopeRowsInput[] = [];
+    let currentSnapshot: ConnectionsSnapshot | null = previousSnapshot;
+    const store: ConnectionsStore = {
+      putCurrent: async () => {},
+      writeSnapshotAndProgress: async () => {},
+      replaceScopeRows: async (input) => {
+        replacements.push(input);
+        // Faithfully model the store: a scope-row replacement REPLACES all
+        // rows owned by each named scope with the supplied rows. Rows whose
+        // owning scope is NOT named are left untouched.
+        const replacedScopeKeys = new Set(input.scopes.map((s) => `${s.kind}:${s.id}`));
+        const scopeOfEdge = (edge: ConnectionsSnapshot['edges'][number]): string | null => {
+          // closest_visit / visit_resembles_visit own scope:url=<from url>.
+          const prefix = 'timeline-visit:';
+          if (edge.fromNodeId.startsWith(prefix)) {
+            return `url:${edge.fromNodeId.slice(prefix.length)}`;
+          }
+          return null;
+        };
+        const keptEdges = (currentSnapshot?.edges ?? []).filter((edge) => {
+          const scope = scopeOfEdge(edge);
+          return scope === null || !replacedScopeKeys.has(scope);
+        });
+        const edges = new Map(keptEdges.map((edge) => [edge.id, edge] as const));
+        for (const edge of input.edges) edges.set(edge.id, edge);
+        const nodes = new Map(
+          (currentSnapshot?.nodes ?? []).map((node) => [node.id, node] as const),
+        );
+        for (const node of input.nodes) nodes.set(node.id, node);
+        currentSnapshot = {
+          scope: {},
+          ...(currentSnapshot ?? {}),
+          nodes: [...nodes.values()],
+          edges: [...edges.values()],
+          nodeCount: nodes.size,
+          edgeCount: edges.size,
+          updatedAt: currentSnapshot?.updatedAt ?? '2026-05-23T00:00:00.000Z',
+        };
+      },
+      readMaterializerProgress: async () => baseProgress,
+      readCurrent: async () => currentSnapshot,
+      putDay: async () => {},
+      readDay: async () => null,
+      listDays: async () => [],
+    };
+    const previousTopicRevision = {
+      revisionId: 'topic-rev-base',
+      visitSimilarityRevisionId: 'visit-sim-rev-base',
+      cosineThreshold: 0.85,
+      algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+      topics: [],
+      lineage: [],
+      producedAt: 1_700_000_000_000,
+    };
+    const topicRevisionStore = {
+      putRevision: async () => {},
+      putActiveRevision: async () => {},
+      putShadowRevision: async () => {},
+      putCandidateShadowRevision: async () => {},
+      readShadowRevision: async () => null,
+      readCandidateShadowRevision: async () => null,
+      readRevision: async () => null,
+      readActiveRevision: async () => previousTopicRevision,
+      listRevisionIds: async () => [],
+    };
+
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    await eventLog.importPeerEvent(homeInitial);
+    await eventLog.importPeerEvent(neighborInitial);
+    await eventLog.importPeerEvent(homeRevisit);
+    await eventLog.importPeerEvent(homeNavigation);
+    const timelineStore = createTimelineStore(vaultRoot);
+    // A trivial embedder keeps the similarity pass off the real model load;
+    // homeUrl re-embeds to a fixed vector (its neighbour is on the previous
+    // snapshot, not re-derived this drain).
+    const embed = embedFromVectors(new Map<string, Float32Array>([['home', unit([1, 0])]]));
+    // No closestVisitRankerLoader → deps.closestVisitRankerLoader is
+    // undefined, exactly like the production child-reconcile entry, so the
+    // ranker augmentation defers on the scoped-delta drain.
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+      topicRevisionStore: topicRevisionStore as never,
+    });
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    // The scoped-delta drain re-asserted scope:url=homeUrl. That rewrite
+    // must carry the prior closest_visit + visit_resembles_visit edges.
+    const homeUrlScope = { kind: 'url' as const, id: homeUrl };
+    const rewroteHomeScope = replacements.some((r) =>
+      r.scopes.some((s) => s.kind === homeUrlScope.kind && s.id === homeUrlScope.id),
+    );
+    expect(rewroteHomeScope).toBe(true);
+
+    const finalSnapshot = await store.readCurrent();
+    // closest_visit is a directional ranker edge (from → to). The ranker does
+    // not run on this scoped delta, so carry-forward is the only thing keeping
+    // it — it must survive in exactly the seeded direction.
+    const hasClosestVisit = (finalSnapshot?.edges ?? []).some(
+      (edge) =>
+        edge.kind === 'closest_visit' &&
+        edge.fromNodeId === homeNodeId &&
+        edge.toNodeId === neighborNodeId,
+    );
+    expect(hasClosestVisit).toBe(true);
+    // visit_resembles_visit is a symmetric similarity edge; the producer
+    // canonicalizes the pair direction, so accept either orientation — what
+    // matters is the pair still connects after the scoped-delta drain.
+    const hasResembles = (finalSnapshot?.edges ?? []).some(
+      (edge) =>
+        edge.kind === 'visit_resembles_visit' &&
+        ((edge.fromNodeId === homeNodeId && edge.toNodeId === neighborNodeId) ||
+          (edge.fromNodeId === neighborNodeId && edge.toNodeId === homeNodeId)),
+    );
+    expect(hasResembles).toBe(true);
   });
 
   it('skips ranker-augmented snapshot when SIDETRACK_SKIP_RANKER_SNAPSHOT=1 and reports it', async () => {

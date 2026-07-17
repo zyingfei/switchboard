@@ -238,6 +238,19 @@ const ranker = (revisionId: string, seenFrom?: Set<string>): ClosestVisitRanker 
 const closestEdges = (snapshot: ConnectionsSnapshot): readonly ConnectionEdge[] =>
   snapshot.edges.filter((candidate) => candidate.kind === 'closest_visit');
 
+const noRetrain = () =>
+  Promise.resolve({
+    status: 'skipped' as const,
+    reason: 'below-threshold' as const,
+    fingerprint: {
+      hash: '0'.repeat(64),
+      labelCount: 0,
+      positiveLabelCount: 0,
+      negativeLabelCount: 0,
+    },
+    newLabelCount: 0,
+  });
+
 const incidentClosestEdges = (
   snapshot: ConnectionsSnapshot,
   frontier: ReadonlySet<string>,
@@ -395,6 +408,137 @@ describe('connections incremental ranker frontier', () => {
       'https://ranker.test/bravo',
       'https://ranker.test/charlie',
     ]);
+  });
+
+  it('runs the ranker on a scoped-delta drain (child-mode effective loader) and honors the kill-switch', async () => {
+    // Layer A wiring. In production the child reconcile entry never injects a
+    // closestVisitRankerLoader, so `deps.closestVisitRankerLoader` is
+    // undefined; the internal default loader still loads the model. The
+    // pre-fix guard tested the DEP, not the effective loader, so the ranker
+    // ALWAYS deferred on scoped deltas and closest_visit drained to 0.
+    //
+    // Mimic the effective loader with an injected ready ranker and drive a
+    // scoped-delta drain: the ranker must RUN (emit closest_visit for the new
+    // frontier). Then set SIDETRACK_RANKER_ON_SCOPED_DELTA=0 and confirm the
+    // deferral is restored (kill-switch).
+    const runScopedDeltaDrain = async (root: string): Promise<ConnectionsSnapshot | null> => {
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      const timelineStore = createTimelineStore(root);
+      const store = createConnectionsStore(root);
+      const readyLoader = () =>
+        Promise.resolve({
+          status: 'ready' as const,
+          activeRevisionId: 'ranker-rev-1',
+          ranker: ranker('ranker-rev-1'),
+          model: { dispose: () => undefined } as never,
+        });
+      // Drain 1 (full): establish a snapshot with two visits.
+      for (const accepted of [event(1, 'alpha', 'tab-1'), event(2, 'bravo', 'tab-1')]) {
+        await eventLog.importPeerEvent(accepted);
+      }
+      await createConnectionsMaterializer({
+        vaultRoot: root,
+        eventLog,
+        timelineStore,
+        store,
+        rankerRetrainer: noRetrain,
+        closestVisitRankerLoader: readyLoader,
+      }).catchUp(eventLog);
+      // Drain 2 (scoped delta): a fresh visit in the same tab session.
+      await eventLog.importPeerEvent(event(3, 'charlie', 'tab-1'));
+      await createConnectionsMaterializer({
+        vaultRoot: root,
+        eventLog,
+        timelineStore,
+        store,
+        rankerRetrainer: noRetrain,
+        closestVisitRankerLoader: readyLoader,
+      }).catchUp(eventLog);
+      return store.readCurrent();
+    };
+
+    const onRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-scoped-on-'));
+    const offRoot = await mkdtemp(join(tmpdir(), 'sidetrack-ranker-scoped-off-'));
+    try {
+      // Default ON — the ranker runs on the scoped delta; the new visit
+      // (charlie) gets closest_visit edges.
+      delete process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'];
+      const onSnapshot = await runScopedDeltaDrain(onRoot);
+      const charlieNodeId = nodeIdFor('timeline-visit', 'https://ranker.test/charlie');
+      const onCharlieClosest = closestEdges(onSnapshot ?? snapshotFixture()).filter(
+        (candidate) =>
+          candidate.fromNodeId === charlieNodeId || candidate.toNodeId === charlieNodeId,
+      );
+      expect(onCharlieClosest.length).toBeGreaterThan(0);
+
+      // Kill-switch — the ranker defers on the scoped delta, so the new
+      // visit's closest_visit edges are NOT freshly produced this drain.
+      process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'] = '0';
+      const offSnapshot = await runScopedDeltaDrain(offRoot);
+      const offCharlieClosest = closestEdges(offSnapshot ?? snapshotFixture()).filter(
+        (candidate) =>
+          candidate.fromNodeId === charlieNodeId || candidate.toNodeId === charlieNodeId,
+      );
+      expect(offCharlieClosest.length).toBe(0);
+    } finally {
+      delete process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'];
+      await rm(onRoot, { recursive: true, force: true });
+      await rm(offRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds the scoped-delta ranker augmentation to the touched frontier, not the corpus', () => {
+    // Layer A must not reintroduce the per-drain full-corpus pass e7bdba8b
+    // removed. On a scoped delta the ranker runs via the frontier
+    // augmentation, whose scoring input is the touched frontier — asserted
+    // here by counting the distinct `from` visits the ranker was asked to
+    // score against a corpus strictly larger than the frontier.
+    // Each visit is in its own tab session and there is no prior closest
+    // edge, so touching one visit does NOT drag the whole corpus into the
+    // frontier — the frontier stays a strict subset of the corpus.
+    const events = [
+      event(1, 'alpha', 'tab-1'),
+      event(2, 'bravo', 'tab-2'),
+      event(3, 'charlie', 'tab-3'),
+      event(4, 'delta', 'tab-4'),
+      event(5, 'echo', 'tab-5'),
+    ];
+    const input = inputFor(events);
+    // Expand the frontier against the BASE snapshot (no pre-existing
+    // closest_visit edges), so includePriorClosestNeighbors adds nothing.
+    const base = buildConnectionsSnapshot(input);
+    const frontier = expandRankerFrontier(new Set(['https://ranker.test/charlie']), base, {
+      includeSameUrlSiblings: true,
+      includeSameTabSession: true,
+      includeSameWorkstream: true,
+      includeSameThread: true,
+      includePriorClosestNeighbors: true,
+      includeSimEdgeChanged: true,
+    });
+    const corpusVisitCount = base.nodes.filter((node) => node.kind === 'timeline-visit').length;
+    expect(frontier.size).toBeLessThan(corpusVisitCount);
+
+    const seenFrom = new Set<string>();
+    augmentConnectionsSnapshotWithClosestVisitRankerFrontier(
+      {
+        ...input,
+        closestVisitRanker: ranker('ranker-rev-1', seenFrom),
+        rankerFrontier: frontier,
+        inputFrontier: { 'replica-A': 3 },
+      },
+      base,
+    );
+    // The ranker only scored candidates whose `from` visit is in the frontier
+    // — the augmentation input size equals the frontier, never the corpus.
+    const scoredFromVisitKeys = new Set(
+      [...seenFrom].map((from) => from.replace(/^timeline-visit:/u, '')),
+    );
+    for (const from of scoredFromVisitKeys) {
+      expect(frontier.has(from)).toBe(true);
+    }
+    expect(scoredFromVisitKeys.size).toBeLessThanOrEqual(frontier.size);
+    expect(scoredFromVisitKeys.size).toBeLessThan(corpusVisitCount);
   });
 
   it('forces the next drain after cadence skips a similarity-changing topic recompute', async () => {
