@@ -7128,7 +7128,7 @@ const App = () => {
               }}
               type="button"
               aria-label="Capture current tab"
-              disabled={captureOff}
+              disabled={currentTabCaptureSuppressed}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -7172,7 +7172,7 @@ const App = () => {
                 : 'Capture mode is Manual — switch to Auto'
             }
             aria-pressed={state.settings.autoTrack}
-            disabled={captureOff}
+            disabled={currentTabCaptureSuppressed}
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>
               {state.settings.autoTrack ? Icons.autoCycle : Icons.manualTap}
@@ -7190,6 +7190,7 @@ const App = () => {
             onClick={findActiveTabThread}
             type="button"
             aria-label="Find active tab in side panel"
+            disabled={currentTabCaptureSuppressed}
             data-testid="find-active-tab"
           >
             <svg
@@ -7225,7 +7226,7 @@ const App = () => {
             type="button"
             aria-label="Toggle screenshare mode"
             aria-pressed={state.screenShareMode}
-            disabled={captureOff}
+            disabled={currentTabCaptureSuppressed}
             data-testid="screenshare-mask"
           >
             <span style={{ display: 'inline-flex', width: 14, height: 14 }}>{Icons.cast}</span>
@@ -7245,7 +7246,7 @@ const App = () => {
             }}
             type="button"
             aria-label="Attach coding session"
-            disabled={captureOff}
+            disabled={currentTabCaptureSuppressed}
             data-testid="attach-coding-session"
           >
             <svg

@@ -1513,6 +1513,52 @@ describe('master capture switch (the side-panel eye)', () => {
     expect(screen.getByRole('button', { name: 'Capture current tab' })).toBeDisabled();
   });
 
+  it('disables the capture-oriented icons on a BLOCKED site (capture still on)', async () => {
+    // R2 blocked-state affordance: when a per-site no-capture rule matches
+    // the current tab, capture is inert HERE even though the master switch
+    // is still on. The secondary capture tools must render disabled (not a
+    // clickable-gray button), driven by currentTabCaptureSuppressed (paused
+    // ∨ blocked), not the paused-only captureOff.
+    const base = liveState();
+    installChromeMock(
+      {
+        ...base,
+        activeTabUrl: 'https://www.pge.com/en/account/billing',
+        settings: {
+          ...base.settings,
+          captureEnabled: true,
+          noCaptureRules: [
+            {
+              id: 'r_pge',
+              kind: 'domain',
+              domain: 'pge.com',
+              label: 'pge.com',
+              createdAt: NOW,
+            },
+          ],
+        },
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+      'https://www.pge.com/en/account/billing',
+    );
+
+    render(<App />);
+
+    // The master switch stays ON (this is a per-site block, not a pause).
+    const eye = await screen.findByRole('button', {
+      name: 'Capture is on — click to pause all capture',
+    });
+    expect(eye).toBeEnabled();
+    // Capture tools are inert on this blocked page.
+    expect(
+      screen.getByRole('button', { name: 'Capture mode is Manual — switch to Auto' }),
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Capture current tab' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Find active tab in side panel' }),
+    ).toBeDisabled();
+  });
+
   it('routes diagnostics through the toolbar overflow menu instead of standalone icons', async () => {
     installChromeMock(liveState(), { [SETUP_COMPLETED_KEY]: true });
 

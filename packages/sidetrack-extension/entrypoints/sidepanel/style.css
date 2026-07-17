@@ -5766,11 +5766,12 @@ input.thread-turn-annotate-input {
   align-items: center;
   gap: var(--space-1);
 }
-/* Systematized quiesce: when capture is paused or blocked on this site,
-   the secondary capture tools visibly desaturate. (The buttons keep
-   their own disabled={captureOff} for paused; blocked desaturates as a
-   signal even though those globals still act — R2 wires per-tool blocked
-   disabling.) */
+/* Systematized quiesce: when capture is paused OR blocked on this site,
+   the secondary capture tools visibly desaturate AND go inert. R2 wired
+   the per-tool disabling — every tool now takes disabled=
+   currentTabCaptureSuppressed (paused ∨ blocked), so :disabled removes
+   pointer-events (a real disabled affordance, not a clickable-gray
+   button). This grayscale wash is the surface-level echo of that state. */
 [data-capture-state='paused'] .capture-tools,
 [data-capture-state='blocked'] .capture-tools {
   filter: grayscale(1);
