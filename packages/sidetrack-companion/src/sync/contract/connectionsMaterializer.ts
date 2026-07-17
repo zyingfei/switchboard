@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -131,6 +131,7 @@ import {
   type EngagementClassRevisionStore,
 } from '../../producers/engagement-class-revision.js';
 import {
+  activeClosestVisitRevisionManifestPath,
   expectedClosestVisitRankerSchema,
   readActiveClosestVisitRankerRevisionManifest,
   readActiveClosestVisitRankerRevisionManifestProbe,
@@ -2347,6 +2348,19 @@ export const createConnectionsMaterializer = (
       input.rewrittenScopes.filter((scope) => scope.kind === 'url').map((scope) => scope.id),
     );
     if (rewrittenUrlScopeIds.size === 0) return input.output;
+    // Nothing to carry forward when the prior snapshot holds no
+    // similarity-family edges (fresh vault, thread-only vault, or a corpus the
+    // ranker/similarity producer has never touched — the common case). Bail
+    // before allocating the four lookup Maps below: this runs unconditionally
+    // on EVERY scoped-delta drain, so the O(nodes+edges) Map builds were paid
+    // per chunk across the whole chunked catch-up even when there was provably
+    // nothing to preserve. Cheap linear scan, zero allocation on the empty
+    // path. (Losslessness is unaffected: an empty prior similarity set carries
+    // nothing regardless.)
+    const priorHasSimilarityFamilyEdge = input.previousSnapshot.edges.some((edge) =>
+      SIMILARITY_FAMILY_EDGE_KINDS.has(edge.kind),
+    );
+    if (!priorHasSimilarityFamilyEdge) return input.output;
     const edges = new Map(input.output.edges.map((edge) => [edge.id, edge]));
     const nodes = new Map(input.output.nodes.map((node) => [node.id, node]));
     const previousNodes = new Map(input.previousSnapshot.nodes.map((node) => [node.id, node]));
@@ -2629,7 +2643,37 @@ export const createConnectionsMaterializer = (
     methodologySpine: result?.methodologySpine ?? null,
   });
 
+  // Absent-manifest fast path. Layer A (SIDETRACK_RANKER_ON_SCOPED_DELTA,
+  // default ON) now invokes this loader on EVERY scoped-delta drain instead
+  // of the pre-fix blanket defer. When no active ranker manifest exists (the
+  // common case: fresh vault, no trained model — including nearly every test
+  // fixture and the chunked catch-up integration paths), the full loader does
+  // two failing file reads per drain (readActive...Manifest → ENOENT, then
+  // readActive...ManifestProbe → ENOENT again) times thousands of chunked
+  // scoped drains. Under SIDETRACK_SQLITE_LIB=off that per-drain I/O
+  // amplification is enough to tip the heavy catch-up/child integration tests
+  // over their timeouts (23s→16s on the ClassB file with the flag, disk-I/O
+  // cascades under load). A single stat replaces the two reads: when the
+  // manifest file is absent we return the cached `missing` result without
+  // re-reading. The moment a manifest appears (stat succeeds) we always fall
+  // through to the full load, so a freshly-trained model is picked up on the
+  // very next drain — no staleness. A READY result is never cached here (its
+  // model is disposed at the end of each drain), so this only short-circuits
+  // the genuinely-absent case, which has no model.
+  const manifestAbsentResult: ClosestVisitRankerLoadResult = {
+    status: 'missing',
+    activeRevisionId: null,
+    reason: 'no-active-manifest',
+    needsRetrain: false,
+    methodologySpine: null,
+  };
   const loadClosestVisitRanker = async (): Promise<ClosestVisitRankerLoadResult> => {
+    try {
+      await stat(activeClosestVisitRevisionManifestPath(deps.vaultRoot));
+    } catch {
+      // No active manifest on disk → no model to load, nothing to dispose.
+      return manifestAbsentResult;
+    }
     const manifest = await readActiveClosestVisitRankerRevisionManifest(deps.vaultRoot);
     if (manifest === null) {
       const probe = await readActiveClosestVisitRankerRevisionManifestProbe(deps.vaultRoot);

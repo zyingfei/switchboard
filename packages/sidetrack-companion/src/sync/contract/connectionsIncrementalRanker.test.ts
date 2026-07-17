@@ -279,9 +279,19 @@ describe('connections incremental ranker frontier', () => {
       'SIDETRACK_CONNECTIONS_TOPIC_EVERY_DRAINS',
       'SIDETRACK_CONNECTIONS_TOPIC_EVERY_MS',
       'SIDETRACK_TOPIC_PRODUCER',
+      // Layer A kill-switch. The 'honors the kill-switch' test sets this to
+      // '0'; snapshot+restore it here (not just in that test's finally) so a
+      // '0' can never leak — whether the test throws before its finally, an
+      // un-awaited drain restores it late, or a prior file left it dirty. The
+      // sibling 'forces a full ranker augmentation' test relies on the DEFAULT
+      // (ON) and fails deterministically (seenFrom=[]) if '0' leaks in.
+      'SIDETRACK_RANKER_ON_SCOPED_DELTA',
     ]) {
       previousEnv[key] = process.env[key];
     }
+    // Every test in this describe assumes the default-ON Layer A behavior
+    // unless it explicitly opts out; pin it so cross-file leakage is inert.
+    delete process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'];
   });
 
   afterEach(async () => {
