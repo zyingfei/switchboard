@@ -12766,41 +12766,21 @@ pre.diff {
    Source: /tmp/sb-design/switchboard/project/final-tokens.css
    ══════════════════════════════════════════════════════════════════════ */
 .sx-health {
-  /* Locked tokens from BAC paper/ink — scoped, not on :root */
-  --paper: var(--paper);
-  --paper-light: var(--paper-light);
-  --paper-tinted: var(--paper-tinted);
-  --paper-deep: var(--paper-deep);
-  --ink: var(--ink);
-  --ink-2: var(--ink-2);
-  --ink-3: var(--ink-3);
-  --ink-4: var(--ink-4);
-  --rule: var(--rule);
-  --rule-soft: var(--rule-soft);
-
-  --signal: var(--signal);
-  --signal-2: var(--signal-2);
-  --signal-tint: var(--signal-tint);
-  --signal-bg: var(--signal-bg);
-
-  /* R2: consume the themed :root channels (amber / sage / rose) instead
-     of the old light-only hardcodes, so the health panel flips with the
-     midnight-vault theme. No .sx-* class or testid changes. */
-  --amber: var(--amber);
-  --amber-bg: var(--amber-bg);
-  --amber-tint: var(--amber-tint);
-  --sage: var(--sage);
-  --sage-bg: var(--sage-bg);
-  --sage-tint: var(--sage-tint);
+  /* R2 reconciliation (spec §5.5): the health panel used to ship its OWN
+     copy of the paper/ink/signal palette hardcoded on this scope, so the
+     midnight-vault theme couldn't reach it. Now that the redesign carries
+     the full palette (both themes) on :root, .sx-health simply INHERITS
+     those tokens — the pass-through redeclarations are removed (a
+     self-referential `--x: var(--x)` is a CSS cycle → empty, which broke
+     the panel background). Only the health-local channels that genuinely
+     differ are declared here, pointing at the themed :root channels so
+     the panel flips. No .sx-* class or testid changes; the section-15
+     rail + Calibration row DOM is untouched. paper/ink/rule/signal/amber/
+     sage all inherit from :root now. Only --rose* is remapped: the health
+     panel's "rose" alarm == the global danger channel. */
   --rose: var(--danger);
   --rose-bg: var(--danger-bg);
   --rose-tint: var(--danger-tint);
-
-  /* Inherit the bundled Private-Ledger families (the old Fraunces /
-     Source Serif names ship no files → were falling back to Georgia). */
-  --display: var(--display);
-  --body: var(--body);
-  --mono: var(--mono);
 
   --rad-s: 4px;
   --rad-m: 6px;
