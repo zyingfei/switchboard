@@ -38,9 +38,9 @@ const formatList = (items: readonly string[]): string =>
   items.length > 0 ? items.join(', ') : 'none';
 
 const statusBadgeStyle = (status: CollectorLoadStatus): CSSProperties => ({
-  border: '1px solid ' + (status === 'loaded' ? 'var(--green-tint)' : 'var(--signal, #c0392b)'),
-  background: status === 'loaded' ? 'var(--green-bg)' : 'var(--danger-bg, #fff1f0)',
-  color: status === 'loaded' ? 'var(--green)' : 'var(--signal, #c0392b)',
+  border: '1px solid ' + (status === 'loaded' ? 'var(--green-tint)' : 'var(--signal)'),
+  background: status === 'loaded' ? 'var(--green-bg)' : 'var(--danger-bg)',
+  color: status === 'loaded' ? 'var(--green)' : 'var(--signal)',
   borderRadius: 999,
   padding: '2px 7px',
   fontSize: 10,
@@ -100,9 +100,9 @@ export function CollectorsSection({ collectors, onReplay }: CollectorsSectionPro
                   <div
                     className="mono"
                     style={{
-                      border: '1px solid var(--signal, #c0392b)',
-                      background: 'var(--danger-bg, #fff1f0)',
-                      color: 'var(--signal, #c0392b)',
+                      border: '1px solid var(--signal)',
+                      background: 'var(--danger-bg)',
+                      color: 'var(--signal)',
                       borderRadius: 4,
                       padding: '6px 8px',
                       marginBottom: 8,

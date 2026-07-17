@@ -64,7 +64,7 @@ const titleFor = (variant: BadgeVariant, label: string): string => {
     case 'suggested':
       return `Suggested by Sidetrack: ${label}`;
     case 'weak-guess':
-      return `Weak guess — not filed. Sidetrack leans toward ${label} but isn’t confident enough to suggest it. Confirm or pick another to teach it.`;
+      return `Weak guess — filed to inbox. Sidetrack leans toward ${label} but isn’t confident enough to suggest it. Confirm or pick another to teach it.`;
     case 'ignored':
       return 'Ignored — you said don’t bother me about this URL';
     case 'empty':

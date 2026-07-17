@@ -43,13 +43,16 @@ const suggestion = (overrides: {
 });
 
 describe('SuggestionStats', () => {
-  it('renders highly-likely bucket for logit ≥ 1.4', () => {
+  it('renders highly-likely bucket for logit ≥ 1.4 (qualitative lean only)', () => {
     render(
       <SuggestionStats suggestion={suggestion({ topLogit: 2.0 })} workstreams={workstreams} />,
     );
     // sigmoid(2.0) ≈ 0.881 → >80% → "Highly likely"
     expect(screen.getByText(/Highly likely/)).toBeInTheDocument();
-    expect(screen.getByText(/88%/)).toBeInTheDocument();
+    // The raw % is uncalibrated — it must NOT appear on the primary card
+    // headline; it moved into the ⓘ tooltip (see below).
+    expect(screen.queryByText(/88%/)).toBeNull();
+    expect(screen.getByText('ⓘ').getAttribute('title')).toContain('88%');
   });
 
   it('renders not-likely bucket for negative logit', () => {
@@ -59,7 +62,7 @@ describe('SuggestionStats', () => {
     expect(screen.getByText(/Not likely/)).toBeInTheDocument();
   });
 
-  it('tooltip exposes the raw logit + margin + source', () => {
+  it('tooltip labels the raw logit + margin + source as UNCALIBRATED diagnostics', () => {
     render(
       <SuggestionStats
         suggestion={suggestion({ topLogit: 0.5, margin: 0.8 })}
@@ -67,9 +70,12 @@ describe('SuggestionStats', () => {
       />,
     );
     const infoTip = screen.getByText('ⓘ');
-    expect(infoTip.getAttribute('title')).toContain('logit 0.50');
-    expect(infoTip.getAttribute('title')).toContain('Margin to runner-up: 0.80');
-    expect(infoTip.getAttribute('title')).toContain('Dominant signal: ppr');
+    const title = infoTip.getAttribute('title') ?? '';
+    // Honesty: framed as uncalibrated, not a calibrated probability.
+    expect(title).toContain('Uncalibrated diagnostics');
+    expect(title).toContain('logit 0.50');
+    expect(title).toContain('margin to runner-up 0.80');
+    expect(title).toContain('dominant signal ppr');
   });
 
   it('shows alternatives when showAlternatives is true', () => {

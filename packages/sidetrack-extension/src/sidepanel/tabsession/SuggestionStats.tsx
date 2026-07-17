@@ -208,16 +208,32 @@ export function SuggestionStats({
   // (the live -0.62-margin bug where an inbox decision rendered as a
   // suggestion). Confidence numbers stay visible for power users.
   const isWeakGuess = endorsementFor(suggestion).level === 'weak-guess';
+  // Calibration honesty (R2): there is no calibrated attribution-surface
+  // reliability fit (the only /v1/system/reliability surface is `dejavu`,
+  // and its raw ECE is ~0.61 — badly miscalibrated). So the fusion-logit
+  // sigmoid is NOT a trustworthy probability: we must not print it as a
+  // headline "%". Keep the qualitative ordinal level on the card (a
+  // defensible lean) and move the raw margin/logit/percent into the ⓘ
+  // tooltip, explicitly labelled as UNCALIBRATED diagnostics. If an
+  // attribution fit with reasonable ECE ever lands, this is where the
+  // calibrated confidence would surface on the card instead.
   // When the leader's margin is tiny the resolver is admitting it
   // can't separate the top candidates. Force the alternatives row on
   // so the user sees the near-ties instead of an invented winner.
   const showAlts = showAlternatives || isTied;
   const tooltip =
-    `Confidence: ${Math.round(probability * 100)}% (${confidenceLevelLabel(level)}).\n` +
-    `Raw logit ${top.rawFusionLogit.toFixed(2)} ` +
-    `(higher = more confident, typically -5 to +5).\n` +
-    `Margin to runner-up: ${margin.toFixed(2)} (bigger = clearer winner).\n` +
-    `Dominant signal: ${top.dominantSource} — ${sourceLabel(top.dominantSource)}.`;
+    (isWeakGuess
+      ? 'Weak guess — filed to inbox. The model has a lean but it fell ' +
+        'below the resolver’s confidence bar, so nothing was suggested.\n\n'
+      : '') +
+    'Uncalibrated diagnostics — these numbers are raw model internals, ' +
+    'not a calibrated probability (no reliability fit for this surface). ' +
+    'Read them as a rough lean, not a % chance:\n' +
+    `· lean ${confidenceLevelLabel(level)} (raw sigmoid ${Math.round(probability * 100)}%).\n` +
+    `· raw logit ${top.rawFusionLogit.toFixed(2)} ` +
+    `(higher = stronger lean, typically -5 to +5).\n` +
+    `· margin to runner-up ${margin.toFixed(2)} (bigger = clearer winner).\n` +
+    `· dominant signal ${top.dominantSource} — ${sourceLabel(top.dominantSource)}.`;
   const alternatives = showAlts
     ? suggestion.fusedCandidates.slice(1, 3).map((cand) => {
         const altProbability = probabilityFromLogit(cand.rawFusionLogit);
@@ -261,14 +277,17 @@ export function SuggestionStats({
     >
       <span className="suggestion-stats-row">
         {isWeakGuess ? (
-          <span className="suggestion-stats-weak" title="Below the resolver's confidence bar — not filed. Confirm to teach it.">
-            weak guess — not filed
+          <span
+            className="suggestion-stats-weak"
+            title="Below the resolver's confidence bar — filed to inbox, not suggested. Confirm to teach it."
+          >
+            weak guess — filed to inbox
           </span>
         ) : null}
         <span className="suggestion-stats-target">{label}</span>
-        <span className="suggestion-stats-confidence">
-          {confidenceLevelLabel(level)} · {Math.round(probability * 100)}%
-        </span>
+        {/* Qualitative lean only — the raw % is uncalibrated and lives in
+            the ⓘ tooltip labelled as diagnostics (see above). */}
+        <span className="suggestion-stats-confidence">{confidenceLevelLabel(level)}</span>
         <span className="suggestion-stats-info" title={tooltip} aria-label={tooltip}>
           ⓘ
         </span>

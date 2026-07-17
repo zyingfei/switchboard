@@ -99,8 +99,10 @@ export function AttributionProvenance({
     const chips = reasonChipsFor(topCandidate, record.pageEvidence);
     const isWeak = endorsement.level === 'weak-guess';
     // Honest phrasing: endorsed → "Suggested"; un-endorsed lean →
-    // "Weak guess — not filed".
-    const verb = isWeak ? 'Weak guess — not filed' : 'Suggested';
+    // "Weak guess — filed to inbox" (policy action='inbox' means the item
+    // went to the inbox, not a workstream — "not filed" wrongly implied it
+    // went nowhere).
+    const verb = isWeak ? 'Weak guess — filed to inbox' : 'Suggested';
     const margin = endorsement.margin;
     return (
       <span

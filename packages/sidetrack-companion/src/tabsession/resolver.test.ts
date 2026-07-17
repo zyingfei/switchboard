@@ -501,6 +501,41 @@ describe('tab-session resolver', () => {
     expect(decideAttribution(fused, 'balanced').action).toBe('suggest');
   });
 
+  it('still guards a thin-similarity aggregator false-friend even when the WEIGHTED label flips to ppr', () => {
+    // The aggregator/URL-skeleton false-friend shape: a thin similarity
+    // (only a top lexical match, near-zero mean/margin, weak agreement) plus
+    // a SMALL nonzero pprScore from the shared platform's link graph. Because
+    // pprScore carries a 5× weight, its weighted contribution (0.30×5 = 1.50)
+    // out-ranks the thin similarity family (0.55×1.6 + 0.15×0.75 = 0.99), so
+    // the diagnostic `dominantSource` label is 'ppr', NOT 'similarity'.
+    //
+    // The regret budget/rate telemetry may key off that label, but the
+    // corroboration guard must NOT — it keys off raw simTopScore dominance.
+    // The fused logit here (~1.64) clears the balanced 'suggest' floor (1.2)
+    // and, with a single candidate, the margin (1.64) clears policy.margin,
+    // so WITHOUT the guard this would 'suggest'. The guard is the deciding
+    // factor: it lifts requiredCorroboration to 2 on this lone-source pick and
+    // holds the false-friend in the inbox. Regression for the label flip
+    // silently bypassing B3 (commit 60369f18).
+    const [candidate] = fuseCandidates([
+      {
+        workstreamId: 'ws_agg',
+        pprScore: 0.3, // small platform-link PPR → 5× weight flips the LABEL to ppr
+        simTopScore: 0.55, // top raw evidence channel (> pprScore, > cluster)
+        simMeanScore: 0,
+        simAgreement: 0.15, // weak agreement — 1–2 neighbors only
+        simMargin: 0,
+        clusterPosterior: 0, // no topic corroboration
+        corroborationCount: 1, // pprScore > 0.01 contributes the lone source
+      },
+    ]);
+    expect(candidate?.dominantSource).toBe('ppr'); // label flipped, as designed
+    expect(candidate!.simTopScore).toBeGreaterThanOrEqual(candidate!.pprScore);
+    expect(candidate!.rawFusionLogit).toBeGreaterThanOrEqual(1.2); // would otherwise 'suggest'
+    // Guard still fires despite the flip → held in inbox, not suggested.
+    expect(decideAttribution([candidate!], 'balanced').action).toBe('inbox');
+  });
+
   it('resolves a strong causal session with explainable candidates and no writes', () => {
     const snap = snapshot(
       [
