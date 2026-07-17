@@ -43,6 +43,8 @@ import {
 import { writeWorkGraphHealthArtifact } from '../system/workGraphHealthArtifact.js';
 import { writeSection15Artifact } from '../system/section15Artifact.js';
 import { writeReliabilityArtifact } from '../system/reliabilityArtifact.js';
+import { writeAttributionV1Artifact } from '../attribution-v1/artifact.js';
+import { flushShadowBuffer } from '../attribution-v1/shadow.js';
 import { anyLaneCounterNonZero } from '../system/health.js';
 import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
@@ -570,6 +572,7 @@ export const startCompanion = async (
         scheduleWorkGraphHealthArtifact();
         scheduleSection15Artifact();
         scheduleReliabilityArtifact();
+        scheduleAttributionV1Artifact();
       },
     });
     syncContractRunner.register(connectionsMaterializer);
@@ -1168,6 +1171,38 @@ export const startCompanion = async (
     });
     const scheduleReliabilityArtifact = reliabilityArtifactScheduler.schedule;
     teardown.push(reliabilityArtifactScheduler.teardown);
+    // Drain-time attribution-v1 derived-state artifact + shadow-buffer
+    // flush (attribution-v1/{artifact,shadow}.ts, north-star §2). Same
+    // discipline as the section15 / reliability artifacts: a typed event
+    // read (user.organized.item + browser.timeline.observed via
+    // forEachChunkOfTypes) rebuilds the per-workstream term index /
+    // domain history / recency / label counts, atomically written; the
+    // in-process shadow ring buffer is flushed to a bounded JSONL log on
+    // the same cadence. SHADOW ONLY: nothing here changes what serves.
+    // Reuses the generic scheduler factory; errors swallowed so an
+    // observability collect never surfaces as a drain failure.
+    const materializeAttributionV1Artifact = async (): Promise<boolean> => {
+      try {
+        const store = await getCaughtUpSharedEventStore(options.vaultPath);
+        if (store === null) return false;
+        await writeAttributionV1Artifact({
+          vaultRoot: options.vaultPath,
+          eventLog,
+        });
+        // Flush the serve-time shadow ring buffer to the bounded JSONL log.
+        // Best-effort: a flush failure must not fail the drain.
+        await flushShadowBuffer(options.vaultPath).catch(() => 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const attributionV1ArtifactScheduler = createWorkGraphHealthArtifactScheduler({
+      materialize: materializeAttributionV1Artifact,
+      enabled: eventStoreEnabled,
+    });
+    const scheduleAttributionV1Artifact = attributionV1ArtifactScheduler.schedule;
+    teardown.push(attributionV1ArtifactScheduler.teardown);
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
       // F02: classify MCP callers by this key so the auth gate can apply
