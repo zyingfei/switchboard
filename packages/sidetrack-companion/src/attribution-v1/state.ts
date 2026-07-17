@@ -296,28 +296,90 @@ export const buildAttributionV1State = (
 
 // ---- derived views (read-time, cheap) ---------------------------------
 
+// PLAIN title term-overlap — the study's best-measured cold signal (§1 R:
+// 40.0% top-1 alone) and, per the 2026-07-16 prequential finding, STRONGER
+// standalone than the BM25/IDF/length-normalized family it replaces (39.6% vs
+// 25.6% on this vault: the IDF/normalization actively mis-ranked the correct
+// workstream ~35% of the time plain overlap would have won). This is the ONE
+// implementation of the primitive — the v1 scorer's title family AND the
+// prequential eval's `title-lexical` / vote-title arms both call it against the
+// same `AttributionV1State`, so the challenger and its yardstick cannot drift.
+//
+// For each distinct query term, add each workstream's member document-frequency
+// for that term (how many of the workstream's member titles carry it). A term
+// shared by many members of a workstream is stronger evidence for it; a
+// workstream that never carried the term contributes nothing. NO cross-
+// workstream IDF and NO BM25 length normalization — those are exactly what the
+// finding said to drop. Venue suppression is NOT the title family's job here;
+// it lives where the data said it works (the conditional-domain family's
+// ambiguity gate). Returns a workstream -> raw overlap-count map (empty when
+// the title has no folded terms), plus, per workstream, which query terms it
+// matched (for auditable scorer reasons).
+export interface PlainTitleOverlap {
+  // workstream id -> summed member document-frequency over matched query terms.
+  readonly scores: Map<string, number>;
+  // workstream id -> the query terms that matched at least one of its members.
+  readonly matchedTerms: Map<string, string[]>;
+}
+
+export const plainTitleOverlap = (
+  state: AttributionV1State,
+  title: string | null,
+): PlainTitleOverlap => {
+  const scores = new Map<string, number>();
+  const matchedTerms = new Map<string, string[]>();
+  if (title === null) return { scores, matchedTerms };
+  const terms = new Set(tokenizeTitle(title));
+  if (terms.size === 0) return { scores, matchedTerms };
+  for (const [workstreamId, stats] of state.workstreams) {
+    let score = 0;
+    const matched: string[] = [];
+    for (const term of terms) {
+      const df = stats.termDocFreq.get(term) ?? 0;
+      if (df === 0) continue;
+      score += df;
+      matched.push(term);
+    }
+    if (score > 0) {
+      scores.set(workstreamId, score);
+      matchedTerms.set(workstreamId, matched);
+    }
+  }
+  return { scores, matchedTerms };
+};
+
+// The single plain-overlap nearest workstream (argmax of plainTitleOverlap),
+// deterministic ties → lexicographically-smallest id. This is the eval's
+// `title-lexical` arm and the vote's title signal — sharing plainTitleOverlap
+// with the scorer keeps the frozen-baseline comparison honest.
+export const plainTitleNearestWorkstream = (
+  state: AttributionV1State,
+  title: string | null,
+): string | null => {
+  const { scores } = plainTitleOverlap(state, title);
+  let best: string | null = null;
+  let bestScore = 0;
+  for (const [workstreamId, score] of scores) {
+    if (score > bestScore || (score === bestScore && (best === null || workstreamId < best))) {
+      best = workstreamId;
+      bestScore = score;
+    }
+  }
+  return best;
+};
+
 // Cross-workstream inverse document frequency for a term. Smoothed IDF over
 // the workstream count: terms in most workstreams (venues/hubs) approach 0.
 // idf = ln(1 + (W - df + 0.5) / (df + 0.5)) where W = workstream count,
 // df = number of workstreams carrying the term. This BM25-style form is
-// always positive and monotone-decreasing in df.
+// always positive and monotone-decreasing in df. RETAINED as a derived view
+// (the state test asserts venue terms get lower IDF) but the v1 scorer no
+// longer uses it — the title family is now plain overlap (see above).
 export const termIdf = (state: AttributionV1State, term: string): number => {
   const totalWorkstreams = state.workstreams.size;
   if (totalWorkstreams === 0) return 0;
   const df = state.globalTermWorkstreamFreq.get(term) ?? 0;
   return Math.log(1 + (totalWorkstreams - df + 0.5) / (df + 0.5));
-};
-
-// Average member-title document length (in distinct-term count) across all
-// workstreams — the BM25 length-normalization base. Falls back to 1 when no
-// members have been folded yet.
-export const averageMemberTermCount = (state: AttributionV1State): number => {
-  if (state.totalMemberCount === 0) return 1;
-  let totalTerms = 0;
-  for (const stats of state.workstreams.values()) {
-    for (const count of stats.termDocFreq.values()) totalTerms += count;
-  }
-  return totalTerms / state.totalMemberCount;
 };
 
 // Domain -> the single workstream it maps to, or null when the domain is

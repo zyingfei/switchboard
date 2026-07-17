@@ -76,12 +76,18 @@ describe('runAttributionPrequentialEval', () => {
     expect(result.report.labelCount).toBe(2);
     expect(result.artifact.schemaVersion).toBe(ATTRIBUTION_PREQUENTIAL_VERDICT_SCHEMA_VERSION);
     expect(result.artifact.reportOnly).toBe(true);
+    // The evidence-gate tradeoff curve is attached (calibration evidence).
+    expect(result.artifact.thresholdCurve).toBeDefined();
+    expect(result.artifact.thresholdCurve!.length).toBeGreaterThan(0);
+    // v1-cascade arm is present alongside the weighted-sum v1.
+    expect(result.report.arms.map((a) => a.arm)).toContain('v1-cascade');
     // No persist ⇒ no path.
     expect(result.artifactPath).toBeNull();
-    // The CLI format string carries the table + verdict.
+    // The CLI format string carries the table + verdict + curve.
     const text = formatPrequentialEvalRunResult(result);
     expect(text).toContain('prequential replay');
     expect(text).toContain('VERDICT:');
+    expect(text).toContain('tradeoff curve');
   });
 
   it('persists the verdict artifact under _BAC/eval/ when persist is not disabled', async () => {

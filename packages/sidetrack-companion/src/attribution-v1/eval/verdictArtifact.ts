@@ -13,6 +13,7 @@ import type {
   ArmMetrics,
   PrequentialReport,
   PrequentialVerdict,
+  ThresholdCurvePoint,
 } from './prequential.js';
 
 export const ATTRIBUTION_PREQUENTIAL_VERDICT_SCHEMA_VERSION = 1;
@@ -37,11 +38,15 @@ export interface AttributionPrequentialArtifact {
   readonly tailLabelCount: number;
   readonly arms: readonly ArmMetrics[];
   readonly verdict: PrequentialVerdict;
+  // The evidence-gate tradeoff curve (v1 weighted-sum) — the calibration
+  // evidence for MIN_SUGGEST_SCORE. Optional (older artifacts omit it).
+  readonly thresholdCurve?: readonly ThresholdCurvePoint[];
   readonly reportOnly: true;
 }
 
 export interface BuildArtifactOptions {
   readonly generatedAt?: number;
+  readonly thresholdCurve?: readonly ThresholdCurvePoint[];
 }
 
 export const buildAttributionPrequentialArtifact = (
@@ -59,6 +64,7 @@ export const buildAttributionPrequentialArtifact = (
   tailLabelCount: report.tailLabelCount,
   arms: report.arms,
   verdict,
+  ...(options.thresholdCurve === undefined ? {} : { thresholdCurve: options.thresholdCurve }),
   reportOnly: true,
 });
 
@@ -105,7 +111,8 @@ export const readAttributionPrequentialArtifact = async (
 const pct = (value: number): string => `${(value * 100).toFixed(1)}%`;
 
 const ARM_LABELS: Record<string, string> = {
-  v1: 'v1 (three-family)',
+  v1: 'v1 (weighted-sum)',
+  'v1-cascade': 'v1 (cascade)',
   'title-lexical': 'title-lexical alone',
   recency: 'recency alone',
   vote4: '4-signal vote (baseline)',
@@ -148,6 +155,22 @@ export const formatPrequentialReport = (
         num(pct(arm.precisionWhenSuggesting), 10),
     );
   }
+  // Evidence-gate tradeoff curve (v1 weighted-sum) — the MIN_SUGGEST_SCORE
+  // calibration evidence (north-star §2 abstention-first).
+  const curve: string[] = [];
+  if (artifact.thresholdCurve !== undefined && artifact.thresholdCurve.length > 0) {
+    curve.push('', 'v1 evidence-gate tradeoff curve (weighted-sum):');
+    curve.push('  ' + num('thresh', 8) + num('top1', 8) + num('abstain', 10) + num('prec@sug', 10));
+    for (const point of artifact.thresholdCurve) {
+      curve.push(
+        '  ' +
+          num(point.minSuggestScore.toString(), 8) +
+          num(pct(point.top1), 8) +
+          num(pct(point.abstainRate), 10) +
+          num(pct(point.precisionWhenSuggesting), 10),
+      );
+    }
+  }
   const verdict = [
     '',
     `VERDICT: ${artifact.verdict.verdict}`,
@@ -155,5 +178,5 @@ export const formatPrequentialReport = (
     '',
     'Report-only: this does not gate serving or promotion (v1 runs in shadow only).',
   ];
-  return [...header, ...rows, ...verdict].join('\n');
+  return [...header, ...rows, ...curve, ...verdict].join('\n');
 };

@@ -9,8 +9,10 @@ import type { AcceptedEvent } from '../../sync/causal.js';
 import {
   buildPrequentialVerdict,
   runAttributionPrequential,
+  runV1ThresholdCurve,
   type PrequentialReport,
   type PrequentialVerdict,
+  type ThresholdCurvePoint,
 } from './prequential.js';
 import {
   attributionPrequentialVerdictPath,
@@ -57,7 +59,11 @@ export const runAttributionPrequentialEval = async (
   const events = await readEvents(vaultRoot);
   const report = runAttributionPrequential(events);
   const verdict = buildPrequentialVerdict(report);
+  // The evidence-gate tradeoff curve — the calibration evidence for
+  // MIN_SUGGEST_SCORE (north-star §2 abstention-first). Report-only.
+  const thresholdCurve: readonly ThresholdCurvePoint[] = runV1ThresholdCurve(events);
   const artifact = buildAttributionPrequentialArtifact(report, verdict, {
+    thresholdCurve,
     ...(options.generatedAt === undefined ? {} : { generatedAt: options.generatedAt }),
   });
   let artifactPath: string | null = null;

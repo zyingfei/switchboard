@@ -5,6 +5,7 @@ import {
   HEAD_WORKSTREAM_LABEL_THRESHOLD,
   buildPrequentialVerdict,
   runAttributionPrequential,
+  runV1ThresholdCurve,
   type ArmMetrics,
   type AttributionPrequentialArm,
 } from './prequential.js';
@@ -120,25 +121,29 @@ describe('runAttributionPrequential — hand-computable fixture', () => {
     expect(report.arms.map((a) => a.arm)).toEqual([...ATTRIBUTION_PREQUENTIAL_ARMS]);
   });
 
-  it('v1 abstains on this tiny corpus: the evidence gate needs real cross-workstream IDF', () => {
-    // With the score-based evidence gate (MIN_SUGGEST_SCORE), the v1 arm's
-    // absolute score must clear a floor calibrated to the REAL ~33-workstream
-    // vault. On this 2-workstream synthetic fixture the cross-workstream IDF
-    // collapses (every term sits in ~all workstreams ⇒ near-zero weight), so
-    // even the L2/L4 self-matches score well under the floor and v1 abstains
-    // on all four. This is the correct consequence of the gate, not a
-    // regression: the simple arms below (which do NOT use the gate) still
-    // produce their hand-traced numbers unchanged. A gate-clearing v1 trace on
-    // a realistically-scaled corpus is exercised in the head-with-distractors
-    // test and, at full scale, the prequential CLI.
+  it('v1 abstains on this tiny corpus: the plain-overlap count is under the gate', () => {
+    // With the score-based evidence gate (MIN_SUGGEST_SCORE = 14, calibrated to
+    // the REAL ~33-workstream vault), the v1 arm's plain title-overlap COUNT
+    // must clear the floor. On this fixture the only self-match ("alpha alpha
+    // topic") sums an overlap of ~2 (two distinct terms carried by one prior
+    // member), well under the floor, so v1 abstains on all four labels. This is
+    // the correct consequence of the abstention-first gate, not a regression:
+    // the simple arms below (which do NOT use the gate) still produce their
+    // hand-traced numbers unchanged. A gate-clearing v1 trace on a realistically
+    // -scaled corpus is exercised in the head-with-distractors test and, at full
+    // scale, the prequential CLI. Both v1 combiners (weighted-sum and cascade)
+    // abstain identically here — the cascade's domain/recency fallback tiers are
+    // also below the gate on this corpus.
     const report = runAttributionPrequential(handComputableEvents());
-    const v1 = armOf(report.arms, 'v1');
-    expect(v1.top1Hits).toBe(0);
-    expect(v1.abstentions).toBe(4);
-    expect(v1.abstainRate).toBeCloseTo(1.0, 10);
-    // All labels are tail.
-    expect(v1.tailLabelCount).toBe(4);
-    expect(v1.headLabelCount).toBe(0);
+    for (const armName of ['v1', 'v1-cascade'] as const) {
+      const arm = armOf(report.arms, armName);
+      expect(arm.top1Hits).toBe(0);
+      expect(arm.abstentions).toBe(4);
+      expect(arm.abstainRate).toBeCloseTo(1.0, 10);
+      // All labels are tail.
+      expect(arm.tailLabelCount).toBe(4);
+      expect(arm.headLabelCount).toBe(0);
+    }
   });
 
   it('scores title-lexical alone: 2/4 top-1, 2/4 abstain, 100% precision', () => {
@@ -271,10 +276,55 @@ describe('runAttributionPrequential — head/tail bucketing', () => {
     const v1 = armOf(report.arms, 'v1');
     expect(v1.headLabelCount).toBe(headCount);
     expect(v1.tailLabelCount).toBe(distractorCount + 1);
-    // Once the head workstream has members AND the corpus has enough
-    // workstreams to give its terms real IDF, its title-lexical family clears
-    // the evidence gate — so head top-1 must be strictly positive.
+    // Once the head workstream has accumulated enough members carrying the
+    // shared "distributed consensus raft protocol" terms, the plain-overlap
+    // COUNT for a matching visit clears the evidence gate — so head top-1 must
+    // be strictly positive.
     expect(v1.head).toBeGreaterThan(0);
+  });
+});
+
+// ---- evidence-gate threshold curve ------------------------------------
+
+describe('runV1ThresholdCurve', () => {
+  it('trades top-1 coverage for abstention as the gate rises (monotone)', () => {
+    // Build a small realistically-shaped corpus: a head workstream whose
+    // members repeat a distinctive multi-term title, filed first with
+    // distractors, then queried by a matching self-title. At a low gate the
+    // scorer suggests (some top-1); at a very high gate it abstains on
+    // everything. The curve must be monotone non-increasing in top-1 and
+    // non-decreasing in abstention.
+    resetSeq();
+    const events: AcceptedEvent[] = [];
+    let t = 1;
+    for (let d = 0; d < 6; d += 1) {
+      events.push(timelineEvent(`https://z${d}.example/1`, `junk${d} filler${d} token${d}`, t, `sz${d}`));
+      t += 1;
+    }
+    const n = HEAD_WORKSTREAM_LABEL_THRESHOLD + 3;
+    for (let i = 0; i < n; i += 1) {
+      events.push(timelineEvent(`https://h.example/${i}`, 'distributed consensus raft protocol log', t, `sh${i}`));
+      t += 1;
+    }
+    for (let d = 0; d < 6; d += 1) {
+      events.push(organizeEvent(`https://z${d}.example/1`, `wsz${d}`, t));
+      t += 1;
+    }
+    for (let i = 0; i < n; i += 1) {
+      events.push(organizeEvent(`https://h.example/${i}`, 'wsHead', t));
+      t += 1;
+    }
+
+    const curve = runV1ThresholdCurve(events, [0, 5, 1000]);
+    expect(curve).toHaveLength(3);
+    // Monotone non-increasing top-1, non-decreasing abstention.
+    expect(curve[0]!.top1).toBeGreaterThanOrEqual(curve[1]!.top1);
+    expect(curve[1]!.top1).toBeGreaterThanOrEqual(curve[2]!.top1);
+    expect(curve[0]!.abstainRate).toBeLessThanOrEqual(curve[1]!.abstainRate);
+    expect(curve[1]!.abstainRate).toBeLessThanOrEqual(curve[2]!.abstainRate);
+    // A very high gate abstains on everything.
+    expect(curve[2]!.abstainRate).toBeCloseTo(1.0, 6);
+    expect(curve[2]!.top1).toBeCloseTo(0, 6);
   });
 });
 

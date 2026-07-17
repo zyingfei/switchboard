@@ -7,19 +7,31 @@
 //
 // Families (contract §2, "the v1 model our data justifies and nothing
 // more"):
-//   1. TITLE-LEXICAL (primary): BM25-flavored overlap between the visit
-//      title and each workstream's member titles, using cross-workstream
-//      IDF so venue/hub terms self-suppress. The study's best cold signal
-//      (40.0% top-1 alone).
+//   1. TITLE-LEXICAL (primary): PLAIN term-overlap between the visit title
+//      and each workstream's member titles (state.ts plainTitleOverlap) —
+//      summed member document-frequency over the matched query terms, argmax
+//      wins. The study's best cold signal (40.0% top-1 alone) and, per the
+//      2026-07-16 prequential finding, STRONGER standalone than the BM25/IDF/
+//      length-normalized family it replaces (39.6% vs 25.6% on this vault: the
+//      IDF/normalization actively mis-ranked the correct workstream ~35% of the
+//      time plain overlap would have won). No cross-workstream IDF, no BM25
+//      length normalization. The eval's title-lexical arm scores this SAME
+//      primitive, so the frozen-baseline comparison is honest.
 //   2. CONDITIONAL DOMAIN: fires ONLY when the domain historically maps to
 //      a single workstream (the 69%-precision regime); hard-suppressed on
-//      measured-ambiguous hubs (21% precision). Domains are venues.
+//      measured-ambiguous hubs (21% precision). Domains are venues — this
+//      ambiguity gate is where venue handling now lives (the title family
+//      dropped its IDF venue-suppression per the finding).
 //   3. RECENCY: the last-filed workstream as a small tie-break / fallback
 //      (38.3% floor, orthogonal, free).
 //
-// COMBINER: a fixed weighted sum with title-lexical dominant (the doc's
-// "ordered-cascade-as-scores"). Weights are documented constants below; no
-// learned combiner in v1 (the LightGBM arbiter is a later trigger).
+// COMBINER: two variants, both fixed and explainable (contract §2). The
+// SHIPPING scoreVisit is the weighted sum with title-lexical dominant (the
+// doc's "ordered-cascade-as-scores"). scoreVisitCascade is the study's ordered
+// cascade (title fires → its answer; else domain-if-unambiguous; else recency),
+// evaluated alongside the sum in the harness so we adopt whichever wins top-1
+// at acceptable precision. No learned combiner in v1 (the LightGBM arbiter is a
+// later trigger).
 //
 // DECISIONS (contract §2, "abstention-first, matched to the 80% base
 // rate"): a per-visit EVIDENCE gate (MIN_SUGGEST_SCORE, calibrated to the
@@ -33,11 +45,9 @@
 
 import {
   type AttributionV1State,
-  averageMemberTermCount,
   domainOfUrl,
   domainVerdict,
-  termIdf,
-  tokenizeTitle,
+  plainTitleOverlap,
   workstreamLabelCount,
 } from './state.js';
 
@@ -46,21 +56,24 @@ import {
 // Family weights for the fixed weighted sum. Title-lexical dominant per the
 // contract; conditional-domain is a meaningful but secondary corroborator
 // (it only ever contributes in the single-workstream regime); recency is a
-// small tie-break. These are NOT tuned — they encode the study's signal
-// ordering (title 40.0% > domain-precise 69%-when-fires-but-rare > recency
-// 38.3% floor). The domain weight is applied to a precision-scaled unit
-// signal, so a precise domain match is a strong but bounded nudge, never a
-// title-lexical override.
+// small tie-break. These encode the study's signal ordering (title 40.0% >
+// domain-precise 69%-when-fires-but-rare > recency 38.3% floor), NOT a tuned
+// grid.
+//
+// SCALE NOTE: the title family is now a raw overlap COUNT (summed member
+// document-frequency over matched terms — typically 1..O(tens), never < 1 when
+// it fires), replacing the old BM25 score that lived near ~2.8. So the domain
+// and recency weights are expressed in the same count units: a precise domain
+// match is worth up to `conditionalDomain` overlap-terms of corroboration, and
+// recency a fraction of one term. Both are applied so they can order candidates
+// among near-equal title scores (or supply a fallback) but can never override a
+// clearly-stronger title match. The domain weight multiplies a precision-scaled
+// unit signal (≤0.69), so its effective contribution is ≤ conditionalDomain.
 export const FAMILY_WEIGHTS = {
   titleLexical: 1.0,
-  conditionalDomain: 0.6,
-  recency: 0.15,
+  conditionalDomain: 2.0,
+  recency: 0.5,
 } as const;
-
-// BM25 term-saturation (k1) and length-normalization (b). Standard BM25
-// defaults; b is modest because member "documents" are short titles.
-const BM25_K1 = 1.2;
-const BM25_B = 0.6;
 
 // Beta-binomial precision prior. The study's head/tail precision anchors
 // (~53% head, ~28% tail; majority-class 28.9%) seed a weak Beta prior so a
@@ -99,16 +112,35 @@ const MIN_CANDIDATE_SCORE = 1e-6;
 // Per-visit EVIDENCE gate: the minimum top-candidate score to actually
 // SUGGEST. Unlike SUGGEST_PRECISION_FLOOR (a per-workstream label-count
 // prior), this keys on THIS visit's measured evidence, which is what makes
-// abstention the default. It is calibrated to the study's revealed base rate:
-// the owner leaves 80.3% of visited URLs unfiled, so an abstention-first
-// scorer should decline on the weak ~80% of matches and suggest only on the
-// strong ~20%. On the asserted-edge prequential replay this vault, a floor of
-// 2.8 (the p80 of fired top-candidate scores) yields ~80% abstention,
-// matching that base rate; below it ⇒ abstain. Without this gate the scorer
-// suggested on ~92% of visits (7.7% abstain) — the finding's "near no-op".
-// This is a fixed constant, not a per-run tuned value; it encodes the base
-// rate the study measured, not this replay's optimum.
-export const MIN_SUGGEST_SCORE = 2.8;
+// abstention the default. Calibrated to the study's revealed base rate: the
+// owner leaves 80.3% of visited URLs unfiled, so an abstention-first scorer
+// declines on the weak matches and suggests only on the strong ones.
+//
+// The score scale changed with the plain-overlap title family (raw overlap
+// COUNTS, not BM25), so this floor is expressed in overlap-count units. The
+// 2026-07-16 tradeoff curve on the asserted-edge prequential replay of
+// ~/.sidetrack-vault-test (runV1ThresholdCurve; full table in the commit
+// message) measured the abstention/precision frontier:
+//
+//   thresh   top1    abstain   prec@sug
+//        1   39.4%      7.7%     42.7%
+//        3   33.5%     25.8%     45.2%
+//        6   25.0%     42.3%     43.3%
+//       11   15.9%     68.7%     50.6%
+//   >> 14    11.6%     78.3%     53.3%  (base-rate-consistent, precision peak)
+//       18    9.8%     81.3%     52.2%
+//       30    2.8%     95.1%     58.3%
+//
+// The calibration TARGET is "precision-when-suggesting maximized subject to
+// abstention consistent with the 80.3% base rate" (north-star §2). The
+// precision peak inside the base-rate band (78–82% abstain) is at threshold
+// 14–15 (53.3% prec@sug, 78.3% abstain), so MIN_SUGGEST_SCORE = 14. This is a
+// deliberate abstention-first operating point, NOT a top-1 maximizer: v1's raw
+// top-1 peaks near ~42% at threshold≈0 (see the eval finding), but that means
+// ~0% abstention, which the north-star explicitly rejects for this vault. The
+// gap between the abstention-first bar and the frozen-vote top-1 is the honest
+// finding, not a number to chase. Fixed constant, not a per-run tuned value.
+export const MIN_SUGGEST_SCORE = 14;
 
 // ---- output shape -----------------------------------------------------
 
@@ -167,59 +199,11 @@ export const shrunkPrecision = (labelCount: number): number => {
   return (a0 + successes) / (n0 + labelCount);
 };
 
-// ---- title-lexical family (BM25 over the term index) ------------------
-
-interface LexicalScore {
-  readonly score: number;
-  readonly matchedTerms: readonly string[];
-}
-
-// BM25 of the visit title against one workstream's member-title term index.
-// Term frequency is the workstream's document frequency for the term (how
-// many member titles carry it) — a term shared by many members of a
-// workstream is strong evidence for it. IDF is cross-workstream so venues
-// self-suppress. Length-normalized by the workstream's member count vs the
-// corpus average.
-const lexicalScoreForWorkstream = (
-  state: AttributionV1State,
-  workstreamId: string,
-  queryTerms: readonly string[],
-  avgMemberTerms: number,
-): LexicalScore => {
-  const stats = state.workstreams.get(workstreamId);
-  if (stats === undefined || stats.memberCount === 0) {
-    return { score: 0, matchedTerms: [] };
-  }
-  // Length component: total distinct-term occurrences in this workstream's
-  // members, relative to the corpus average per member. Longer member sets
-  // are down-weighted so a catch-all workstream ("ai": 28% of members)
-  // doesn't win purely on breadth.
-  let workstreamTermMass = 0;
-  for (const count of stats.termDocFreq.values()) workstreamTermMass += count;
-  const docLen = workstreamTermMass;
-  const avgDocLen = avgMemberTerms * Math.max(1, state.totalMemberCount / Math.max(1, state.workstreams.size));
-  const norm = BM25_K1 * (1 - BM25_B + (BM25_B * docLen) / Math.max(1, avgDocLen));
-
-  let score = 0;
-  const matched: string[] = [];
-  for (const term of queryTerms) {
-    const tf = stats.termDocFreq.get(term) ?? 0;
-    if (tf === 0) continue;
-    const idf = termIdf(state, term);
-    if (idf <= 0) continue;
-    // Normalize tf by the workstream's member count so it reads as
-    // "fraction of members carrying the term", saturating via BM25.
-    const tfNorm = tf / stats.memberCount;
-    const contribution = idf * ((tfNorm * (BM25_K1 + 1)) / (tfNorm + norm));
-    if (contribution > 0) {
-      score += contribution;
-      matched.push(term);
-    }
-  }
-  return { score, matchedTerms: matched };
-};
-
 // ---- scorer -----------------------------------------------------------
+//
+// The title-lexical family is the shared PLAIN term-overlap primitive
+// (state.ts plainTitleOverlap) — no BM25, no cross-workstream IDF, no length
+// normalization. It is computed once per visit for all workstreams below.
 
 export interface ScoreVisitInput {
   readonly title: string;
@@ -235,37 +219,60 @@ const compareCandidates = (a: AttributionV1Candidate, b: AttributionV1Candidate)
   return a.workstreamId < b.workstreamId ? -1 : a.workstreamId > b.workstreamId ? 1 : 0;
 };
 
-// Score a visit against every workstream in the state and decide an action.
-// Pure: no I/O, no clock. `state` is the drain-time artifact snapshot.
-export const scoreVisit = (
-  input: ScoreVisitInput,
-  state: AttributionV1State,
-): AttributionV1Result => {
-  const queryTerms = [...new Set(tokenizeTitle(input.title))];
+// The per-family unit signals for one visit, computed once and shared by both
+// combiners (weighted-sum and cascade) so they read identical evidence.
+interface VisitSignals {
+  readonly domain: string | null;
+  readonly verdict: ReturnType<typeof domainVerdict> | null;
+  // The single workstream the domain corroborates (null on ambiguous hubs).
+  readonly domainWorkstreamId: string | null;
+  // Precision proxy for that domain match (0 when no unambiguous domain).
+  readonly domainPrecision: number;
+  // workstream -> raw plain title-overlap count (state.ts plainTitleOverlap).
+  readonly titleScores: Map<string, number>;
+  readonly titleMatchedTerms: Map<string, string[]>;
+}
+
+const computeVisitSignals = (input: ScoreVisitInput, state: AttributionV1State): VisitSignals => {
   const domain = input.domain ?? domainOfUrl(input.url);
   const verdict = domain === null ? null : domainVerdict(state, domain);
-  const avgMemberTerms = averageMemberTermCount(state);
-
-  // Which workstream(s) the domain corroborates (only the single-workstream
-  // regime; ambiguous hubs contribute nothing).
   const domainWorkstreamId =
     verdict !== null && !verdict.ambiguous ? verdict.workstreamId : null;
-  // Domain precision proxy: winner's asserted share, floored so a
-  // single-label domain still gives a modest nudge, capped at the study's
-  // 0.69 single-domain precision.
   const domainPrecision =
     verdict === null || domainWorkstreamId === null || verdict.assertedTotal === 0
       ? 0
       : Math.min(0.69, verdict.assertedForWinner / verdict.assertedTotal);
+  const overlap = plainTitleOverlap(state, input.title.length === 0 ? null : input.title);
+  return {
+    domain,
+    verdict,
+    domainWorkstreamId,
+    domainPrecision,
+    titleScores: overlap.scores,
+    titleMatchedTerms: overlap.matchedTerms,
+  };
+};
 
+// Build the ranked candidate list under the WEIGHTED-SUM combiner: title
+// (plain overlap) + conditional-domain (precision-scaled) + recency (flat
+// tie-break, gated on another family firing). Shared by scoreVisit.
+const buildWeightedCandidates = (
+  state: AttributionV1State,
+  signals: VisitSignals,
+): AttributionV1Candidate[] => {
   const candidates: AttributionV1Candidate[] = [];
-  for (const workstreamId of state.workstreams.keys()) {
-    const lexical = lexicalScoreForWorkstream(state, workstreamId, queryTerms, avgMemberTerms);
-    const titleContribution = FAMILY_WEIGHTS.titleLexical * lexical.score;
+  // Union of workstreams that could score: every workstream with a title
+  // overlap, plus the unambiguous domain workstream (domain can fire with no
+  // title match). Recency alone never manufactures a candidate.
+  const candidateIds = new Set<string>(signals.titleScores.keys());
+  if (signals.domainWorkstreamId !== null) candidateIds.add(signals.domainWorkstreamId);
 
-    const domainMatch = domainWorkstreamId === workstreamId;
+  for (const workstreamId of candidateIds) {
+    const titleContribution = FAMILY_WEIGHTS.titleLexical * (signals.titleScores.get(workstreamId) ?? 0);
+
+    const domainMatch = signals.domainWorkstreamId === workstreamId;
     const domainContribution = domainMatch
-      ? FAMILY_WEIGHTS.conditionalDomain * domainPrecision
+      ? FAMILY_WEIGHTS.conditionalDomain * signals.domainPrecision
       : 0;
 
     const isRecent = state.lastFiledWorkstreamId === workstreamId;
@@ -273,8 +280,7 @@ export const scoreVisit = (
     // last-filed workstream. It must never manufacture a candidate on its
     // own, so it's gated on at least one other family already firing.
     const hasOtherSignal = titleContribution > 0 || domainContribution > 0;
-    const recencyContribution =
-      isRecent && hasOtherSignal ? FAMILY_WEIGHTS.recency : 0;
+    const recencyContribution = isRecent && hasOtherSignal ? FAMILY_WEIGHTS.recency : 0;
 
     const score = titleContribution + domainContribution + recencyContribution;
     if (score <= MIN_CANDIDATE_SCORE) continue;
@@ -282,28 +288,22 @@ export const scoreVisit = (
     const labelCount = workstreamLabelCount(state, workstreamId);
     const reasons: AttributionV1Reason[] = [];
     if (titleContribution > 0) {
+      const matched = signals.titleMatchedTerms.get(workstreamId) ?? [];
       reasons.push({
         family: 'title-lexical',
         contribution: titleContribution,
-        summary:
-          lexical.matchedTerms.length === 0
-            ? 'title overlap'
-            : `title terms ${lexical.matchedTerms.slice(0, 5).join(', ')}`,
+        summary: matched.length === 0 ? 'title overlap' : `title terms ${matched.slice(0, 5).join(', ')}`,
       });
     }
-    if (domainContribution > 0 && verdict !== null) {
+    if (domainContribution > 0 && signals.verdict !== null) {
       reasons.push({
         family: 'conditional-domain',
         contribution: domainContribution,
-        summary: `domain ${domain} → single workstream (${verdict.assertedForWinner}/${verdict.assertedTotal} asserted, precision ${domainPrecision.toFixed(2)})`,
+        summary: `domain ${signals.domain} → single workstream (${signals.verdict.assertedForWinner}/${signals.verdict.assertedTotal} asserted, precision ${signals.domainPrecision.toFixed(2)})`,
       });
     }
     if (recencyContribution > 0) {
-      reasons.push({
-        family: 'recency',
-        contribution: recencyContribution,
-        summary: 'last-filed workstream',
-      });
+      reasons.push({ family: 'recency', contribution: recencyContribution, summary: 'last-filed workstream' });
     }
 
     candidates.push({
@@ -321,31 +321,128 @@ export const scoreVisit = (
   }
 
   candidates.sort(compareCandidates);
+  return candidates;
+};
 
-  if (candidates.length === 0) {
-    return { action: 'abstain', candidates: [] };
-  }
+// Optional per-call overrides — the eval harness sweeps the evidence gate to
+// report the abstention/precision tradeoff curve. Serving always uses the
+// documented constants (no options passed).
+export interface ScoreVisitOptions {
+  // Override MIN_SUGGEST_SCORE for a threshold-curve measurement.
+  readonly minSuggestScore?: number;
+}
 
-  // Abstention gate (two parts, both must pass — matches the 80.3%
-  // never-organized base rate):
+// The shared abstention + head/tail top-k gate (contract §2: abstention-first,
+// matched to the 80.3% base rate). Applied to the top-ranked candidate of
+// EITHER combiner so the decision policy is identical across variants.
+const decide = (
+  candidates: readonly AttributionV1Candidate[],
+  options: ScoreVisitOptions = {},
+): AttributionV1Result => {
+  if (candidates.length === 0) return { action: 'abstain', candidates: [] };
+  const minSuggestScore = options.minSuggestScore ?? MIN_SUGGEST_SCORE;
+  // Abstention gate (two parts, both must pass):
   //   1. PER-VISIT EVIDENCE: the top candidate's score must clear
-  //      MIN_SUGGEST_SCORE. This is the load-bearing gate — it keys on THIS
-  //      visit's measured evidence, so weak matches (the ~80% the owner never
-  //      files) abstain. Checked first because it does the abstaining.
+  //      MIN_SUGGEST_SCORE. Load-bearing — keys on THIS visit's measured
+  //      evidence, so weak matches (the ~80% the owner never files) abstain.
   //   2. PER-WORKSTREAM PRIOR: the top workstream's beta-binomial shrunk
-  //      precision must clear SUGGEST_PRECISION_FLOOR. This filters out
-  //      workstreams with too little history to trust; it is a weak prior on
-  //      the label count, not per-visit confidence.
+  //      precision must clear SUGGEST_PRECISION_FLOOR (a weak label-count
+  //      prior, not per-visit confidence).
   const top = candidates[0]!;
-  if (top.score < MIN_SUGGEST_SCORE || top.shrunkPrecision < SUGGEST_PRECISION_FLOOR) {
+  if (top.score < minSuggestScore || top.shrunkPrecision < SUGGEST_PRECISION_FLOOR) {
     return { action: 'abstain', candidates: [] };
   }
-
-  // Head vs tail: a head workstream (>= HEAD_LABEL_THRESHOLD labels) is
-  // trusted for a single top-1 suggestion; a tail workstream widens to
-  // top-k so the true target has room to appear (study: tail top-1 ~28%).
+  // Head vs tail: a head workstream (>= HEAD_LABEL_THRESHOLD labels) earns a
+  // single top-1 suggestion; a tail workstream widens to top-k so the true
+  // target has room to appear (study: tail top-1 ~28%).
   const action: AttributionV1Action =
     top.labelCount >= HEAD_LABEL_THRESHOLD ? 'suggest' : 'topk';
   const width = action === 'suggest' ? 1 : TOPK_WIDTH;
   return { action, candidates: candidates.slice(0, width) };
+};
+
+// Score a visit against every workstream in the state and decide an action
+// under the WEIGHTED-SUM combiner (the shipping v1 scorer). Pure: no I/O, no
+// clock. `state` is the drain-time artifact snapshot.
+export const scoreVisit = (
+  input: ScoreVisitInput,
+  state: AttributionV1State,
+  options: ScoreVisitOptions = {},
+): AttributionV1Result => {
+  const signals = computeVisitSignals(input, state);
+  return decide(buildWeightedCandidates(state, signals), options);
+};
+
+// The CASCADE combiner (the study's ordered cascade, contract §2 / north-star
+// §1 "cascade order dominates: title→session→domain→recency = 45.2%"). Ordered
+// semantics: title fires → its plain-overlap answer; else domain-if-unambiguous
+// → its answer; else recency → its answer. Whichever tier fires first supplies
+// the ranked list; lower tiers only fill the tail for top-k. The SAME
+// abstention + head/tail gate then applies, so cascade and weighted-sum differ
+// ONLY in how the ranking is formed — an apples-to-apples combiner comparison.
+//
+// Scored alongside the weighted sum in the harness (the `v1-cascade` arm); we
+// adopt whichever wins top-1 at acceptable precision.
+export const scoreVisitCascade = (
+  input: ScoreVisitInput,
+  state: AttributionV1State,
+  options: ScoreVisitOptions = {},
+): AttributionV1Result => {
+  const signals = computeVisitSignals(input, state);
+
+  // Rank the whole title-overlap list first (the dominant tier). Ties within a
+  // tier break by label count then id, via compareCandidates on the built list.
+  const titleCandidates = buildWeightedCandidates(state, signals).filter(
+    (c) => c.contributions.titleLexical > 0,
+  );
+
+  // Determine the cascade WINNER (the tier that fires first), then order the
+  // ranked list so that winner is at [0]; the remaining title candidates fill
+  // the top-k tail (they are the only other real evidence). Domain/recency
+  // winners with no title support become a single-candidate list.
+  const makeSingle = (
+    workstreamId: string,
+    family: AttributionV1Family,
+    contribution: number,
+    summary: string,
+  ): AttributionV1Candidate => {
+    const labelCount = workstreamLabelCount(state, workstreamId);
+    return {
+      workstreamId,
+      score: contribution,
+      contributions: {
+        titleLexical: family === 'title-lexical' ? contribution : 0,
+        conditionalDomain: family === 'conditional-domain' ? contribution : 0,
+        recency: family === 'recency' ? contribution : 0,
+      },
+      reasons: [{ family, contribution, summary }],
+      shrunkPrecision: shrunkPrecision(labelCount),
+      labelCount,
+    };
+  };
+
+  let ranked: AttributionV1Candidate[];
+  if (titleCandidates.length > 0) {
+    // Title tier fires: its ranking is the cascade answer.
+    ranked = titleCandidates;
+  } else if (signals.domainWorkstreamId !== null && signals.domainPrecision > 0) {
+    // Domain tier (unambiguous single-workstream domain).
+    ranked = [
+      makeSingle(
+        signals.domainWorkstreamId,
+        'conditional-domain',
+        FAMILY_WEIGHTS.conditionalDomain * signals.domainPrecision,
+        `domain ${signals.domain} → single workstream (precision ${signals.domainPrecision.toFixed(2)})`,
+      ),
+    ];
+  } else if (state.lastFiledWorkstreamId !== null) {
+    // Recency tier (fallback floor).
+    ranked = [
+      makeSingle(state.lastFiledWorkstreamId, 'recency', FAMILY_WEIGHTS.recency, 'last-filed workstream'),
+    ];
+  } else {
+    ranked = [];
+  }
+
+  return decide(ranked, options);
 };

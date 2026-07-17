@@ -18,19 +18,29 @@
 //   matters — a late title-backfill must not leak into an earlier decision.
 //
 // ARMS (contract §1 R "retrospective signal arbiter" + the frozen baselines):
-//   - v1            : the full three-family scorer (scorer.ts), the challenger.
-//   - title-lexical : the v1 title-lexical family alone (study 40.0% top-1).
+//   - v1            : the three-family scorer, WEIGHTED-SUM combiner (scoreVisit).
+//   - v1-cascade    : the three-family scorer, ORDERED-CASCADE combiner
+//                     (scoreVisitCascade) — the study's title→domain→recency
+//                     cascade semantics. Same families, same gate, different
+//                     ranking, so v1 vs v1-cascade is a clean combiner A/B.
+//   - title-lexical : the PLAIN term-overlap primitive alone (state.ts
+//                     plainTitleNearestWorkstream) — the study's 40.0% signal,
+//                     and now literally the v1 scorer's own title family, so the
+//                     baseline scores the challenger's primitive (no drift).
 //   - recency       : last-filed workstream alone (study 38.3%, fires 99.8%).
 //   - vote4         : the 4-signal majority vote (study's frozen 46.2%):
-//                     title-nearest, session-majority, domain-majority,
-//                     recency — one vote each, ties broken deterministically.
+//                     title-nearest (shared plain overlap), session-majority,
+//                     domain-majority, recency — one vote each, ties broken
+//                     deterministically.
 //   - majority      : the most-filed-so-far workstream (study 28.9% floor).
 //
 // All arms replay the SAME label stream in the SAME order and see the SAME
 // time-gated title/session/domain history — the only thing that varies is how
 // each arm turns that shared state into a prediction. That keeps the arm
 // comparison an apples-to-apples measurement of the decision rule, which is
-// the whole point of the frozen-baseline test.
+// the whole point of the frozen-baseline test. Both v1 arms and the
+// title-lexical arm read the SAME AttributionV1State term index (via the shared
+// plainTitleOverlap), so the challenger and its yardstick cannot silently drift.
 
 import {
   BROWSER_TIMELINE_OBSERVED,
@@ -42,15 +52,16 @@ import {
   applyOrganizingObservation,
   createEmptyAttributionV1State,
   domainOfUrl,
-  tokenizeTitle,
+  plainTitleNearestWorkstream,
   type AttributionV1State,
 } from '../state.js';
-import { scoreVisit } from '../scorer.js';
+import { scoreVisit, scoreVisitCascade, type ScoreVisitOptions } from '../scorer.js';
 
 // ---- shared definitions -----------------------------------------------
 
 export const ATTRIBUTION_PREQUENTIAL_ARMS = [
   'v1',
+  'v1-cascade',
   'title-lexical',
   'recency',
   'vote4',
@@ -94,10 +105,10 @@ interface PrequentialLabel {
 interface SimpleArmState {
   // workstream -> count of labels filed so far (majority + head/tail proxy).
   readonly workstreamLabelCounts: Map<string, number>;
-  // term -> workstream -> count of member titles carrying the term. Used by
-  // the vote's title-nearest signal (a compact bag-of-terms nearest-ws).
-  readonly termWorkstreamCounts: Map<string, Map<string, number>>;
-  // domain -> workstream -> asserted count (domain-majority signal).
+  // domain -> workstream -> asserted count (domain-majority signal). The title
+  // signal no longer lives here — it reads the shared AttributionV1State term
+  // index via plainTitleOverlap, so the vote's title arm and the scorer's title
+  // family are the same primitive.
   readonly domainWorkstreamCounts: Map<string, Map<string, number>>;
   // session -> workstream -> count (session-majority signal).
   readonly sessionWorkstreamCounts: Map<string, Map<string, number>>;
@@ -110,7 +121,6 @@ interface SimpleArmState {
 
 const createSimpleArmState = (): SimpleArmState => ({
   workstreamLabelCounts: new Map(),
-  termWorkstreamCounts: new Map(),
   domainWorkstreamCounts: new Map(),
   sessionWorkstreamCounts: new Map(),
   lastFiledWorkstreamId: null,
@@ -163,14 +173,9 @@ const foldSimpleArmState = (state: SimpleArmState, label: PrequentialLabel): voi
     state.majorityWorkstreamId = label.workstreamId;
   }
 
-  if (label.title !== null) {
-    const seen = new Set<string>();
-    for (const term of tokenizeTitle(label.title)) {
-      if (seen.has(term)) continue;
-      seen.add(term);
-      incNested(state.termWorkstreamCounts, term, label.workstreamId);
-    }
-  }
+  // NB: the title term index is NOT folded here — the title arms read the
+  // shared AttributionV1State (folded separately in the replay loop) so the
+  // baseline scores the scorer's own primitive.
   if (label.domain !== null) {
     incNested(state.domainWorkstreamCounts, label.domain, label.workstreamId);
   }
@@ -185,27 +190,13 @@ const foldSimpleArmState = (state: SimpleArmState, label: PrequentialLabel): voi
 
 // ---- arm predictions (over prior-only state) --------------------------
 
-// Title-nearest for the vote: the workstream whose member titles share the
-// most of the visit's distinct terms (a bag-of-terms nearest neighbour). No
-// IDF here — this is the study's plain "title term-overlap → nearest
-// workstream" signal, deliberately simpler than the v1 BM25 family.
-const titleNearestWorkstream = (state: SimpleArmState, title: string | null): string | null => {
-  if (title === null) return null;
-  const terms = new Set(tokenizeTitle(title));
-  if (terms.size === 0) return null;
-  const scores = new Map<string, number>();
-  for (const term of terms) {
-    const perWs = state.termWorkstreamCounts.get(term);
-    if (perWs === undefined) continue;
-    for (const [workstreamId, count] of perWs) {
-      // Count workstreams by whether they carry the term at all (overlap),
-      // weighted by how many members do (a broadly-shared term is stronger
-      // evidence for the workstream that owns it most).
-      scores.set(workstreamId, (scores.get(workstreamId) ?? 0) + count);
-    }
-  }
-  return scores.size === 0 ? null : argmaxWorkstream(scores);
-};
+// Title-nearest for the vote AND the title-lexical arm: the shared PLAIN
+// term-overlap primitive (state.ts plainTitleNearestWorkstream) read against
+// the SAME AttributionV1State the v1 scorer uses. This IS the scorer's title
+// family — no separate IDF/BM25 model, no parallel term index — so the frozen
+// baseline scores the challenger's own primitive and the two cannot drift.
+const titleNearestWorkstream = (state: AttributionV1State, title: string | null): string | null =>
+  plainTitleNearestWorkstream(state, title);
 
 // Domain-majority for the vote: the argmax workstream for the visit's domain,
 // UNCONDITIONALLY (unlike v1's conditional-domain family, the study's plain
@@ -244,9 +235,14 @@ const VOTE4_PRIORITY: readonly ('title' | 'session' | 'domain' | 'recency')[] = 
   'recency',
 ];
 
-const vote4Predict = (state: SimpleArmState, label: PrequentialLabel): Vote4Prediction => {
+const vote4Predict = (
+  state: SimpleArmState,
+  v1State: AttributionV1State,
+  label: PrequentialLabel,
+): Vote4Prediction => {
   const signals: Record<'title' | 'session' | 'domain' | 'recency', string | null> = {
-    title: titleNearestWorkstream(state, label.title),
+    // Title uses the SHARED plain-overlap primitive (the scorer's own family).
+    title: titleNearestWorkstream(v1State, label.title),
     session: sessionMajorityWorkstream(state, label.sessionId),
     domain: domainMajorityWorkstream(state, label.domain),
     recency: state.lastFiledWorkstreamId,
@@ -278,17 +274,27 @@ const vote4Predict = (state: SimpleArmState, label: PrequentialLabel): Vote4Pred
   return { workstreamId: winner, votes: winnerVotes };
 };
 
-// v1 top-k over the current v1 state. Returns the ranked workstream ids and
-// whether the scorer abstained (so the abstention arm can be measured).
+// v1 top-k over the current v1 state, for either combiner. Returns the ranked
+// workstream ids and whether the scorer abstained (so the abstention arm can be
+// measured). `combiner` selects the weighted-sum (scoreVisit) or ordered
+// cascade (scoreVisitCascade); `options` lets the harness sweep the evidence
+// gate for the tradeoff curve.
 interface V1Prediction {
   readonly ranked: readonly string[];
   readonly abstained: boolean;
 }
 
-const v1Predict = (v1State: AttributionV1State, label: PrequentialLabel): V1Prediction => {
-  const result = scoreVisit(
+const v1Predict = (
+  v1State: AttributionV1State,
+  label: PrequentialLabel,
+  combiner: 'weighted' | 'cascade',
+  options: ScoreVisitOptions = {},
+): V1Prediction => {
+  const score = combiner === 'cascade' ? scoreVisitCascade : scoreVisit;
+  const result = score(
     { title: label.title ?? '', url: label.canonicalUrl, ...(label.domain === null ? {} : { domain: label.domain }) },
     v1State,
+    options,
   );
   return {
     ranked: result.candidates.map((candidate) => candidate.workstreamId),
@@ -297,17 +303,17 @@ const v1Predict = (v1State: AttributionV1State, label: PrequentialLabel): V1Pred
 };
 
 // Title-lexical-alone (the study's frozen 40.0% baseline): "title term-overlap
-// → nearest workstream". This is the PLAIN term-overlap signal the study
-// measured standalone, NOT the v1 BM25 family — the frozen baseline arms must
-// reproduce the study's definitions exactly (verified: this arm lands at 39.6%
-// top-1 / 43.6% precision-when-fired on this vault, matching the study's
-// 40.0% / 47.2%). It is deliberately the same title signal the vote uses, so
-// the vote's 46% is an honest ensemble over the same primitive rather than a
-// different, stronger title model. v1's own BM25 title-lexical is a distinct
-// (and, as it turns out, weaker-standalone) family — that gap is a v1 finding,
-// not the baseline.
-const titleLexicalAlonePredict = (state: SimpleArmState, label: PrequentialLabel): string | null =>
-  titleNearestWorkstream(state, label.title);
+// → nearest workstream", the PLAIN primitive the study measured standalone.
+// This is now LITERALLY the v1 scorer's title family (shared plainTitleOverlap
+// over the same AttributionV1State) — the 2026-07-16 iteration replaced the old
+// BM25/IDF family with exactly this primitive because it scores 39.6% top-1
+// standalone vs the BM25 family's 25.6% on this vault. It is also the same
+// title signal the vote uses, so the vote's ~44% is an honest ensemble over the
+// same primitive rather than a different, stronger title model.
+const titleLexicalAlonePredict = (
+  v1State: AttributionV1State,
+  label: PrequentialLabel,
+): string | null => titleNearestWorkstream(v1State, label.title);
 
 // ---- metrics ----------------------------------------------------------
 
@@ -417,12 +423,22 @@ export interface PrequentialReport {
   readonly tailLabelCount: number;
 }
 
+// Options for the replay. `v1MinSuggestScore` overrides the scorer's evidence
+// gate for BOTH v1 arms — the CLI sweeps it to report the abstention/precision
+// tradeoff curve; the default run uses the shipping constant.
+export interface RunPrequentialOptions {
+  readonly v1MinSuggestScore?: number;
+}
+
 // Run the full prequential replay. `events` is the raw (any-order) event
 // slice; we sort a shallow copy by acceptance time here so callers can pass
 // the store's replica-ordered read directly.
 export const runAttributionPrequential = (
   events: readonly AcceptedEvent[],
+  options: RunPrequentialOptions = {},
 ): PrequentialReport => {
+  const v1Options: ScoreVisitOptions =
+    options.v1MinSuggestScore === undefined ? {} : { minSuggestScore: options.v1MinSuggestScore };
   const ordered = [...events].sort(byAcceptanceTime);
 
   // First pass over timeline events builds NOTHING ahead of time — we advance
@@ -475,6 +491,7 @@ export const runAttributionPrequential = (
 
   const tallies: Record<AttributionPrequentialArm, ArmTally> = {
     v1: createArmTally(),
+    'v1-cascade': createArmTally(),
     'title-lexical': createArmTally(),
     recency: createArmTally(),
     vote4: createArmTally(),
@@ -540,16 +557,19 @@ export const runAttributionPrequential = (
     const isHead = headWorkstreams.has(label.workstreamId);
 
     // --- test (predict from prior-only state) ---
-    const v1 = v1Predict(v1State, label);
+    const v1 = v1Predict(v1State, label, 'weighted', v1Options);
     scoreArm('v1', label, v1.ranked, isHead);
 
-    const titleLexical = titleLexicalAlonePredict(simple, label);
+    const v1Cascade = v1Predict(v1State, label, 'cascade', v1Options);
+    scoreArm('v1-cascade', label, v1Cascade.ranked, isHead);
+
+    const titleLexical = titleLexicalAlonePredict(v1State, label);
     scoreArm('title-lexical', label, titleLexical === null ? [] : [titleLexical], isHead);
 
     const recency = simple.lastFiledWorkstreamId;
     scoreArm('recency', label, recency === null ? [] : [recency], isHead);
 
-    const vote = vote4Predict(simple, label);
+    const vote = vote4Predict(simple, v1State, label);
     scoreArm('vote4', label, vote.workstreamId === null ? [] : [vote.workstreamId], isHead);
 
     const majority = simple.majorityWorkstreamId;
@@ -583,6 +603,42 @@ export const runAttributionPrequential = (
     tailLabelCount,
   };
 };
+
+// ---- threshold curve (evidence-gate tradeoff) -------------------------
+
+// One point on the abstention/precision tradeoff curve for a v1 combiner: at a
+// given MIN_SUGGEST_SCORE, how often it abstains, and — of the times it does
+// suggest — how precise it is (plus raw top-1 over all labels for context).
+export interface ThresholdCurvePoint {
+  readonly minSuggestScore: number;
+  readonly top1: number;
+  readonly abstainRate: number;
+  readonly precisionWhenSuggesting: number;
+}
+
+// The candidate thresholds the north-star's abstention-first calibration is
+// judged on. 0 = gate effectively off (raw combiner top-1, ~no abstention);
+// the higher points progressively trade coverage for precision. Reported at 3–4
+// points per the task; MIN_SUGGEST_SCORE is chosen from this curve.
+export const THRESHOLD_CURVE_POINTS: readonly number[] = [0, 1, 3, 6];
+
+// Re-run the replay once per candidate threshold and pull the v1 (weighted-sum)
+// arm's tradeoff at each. Cheap: the replay is O(labels × workstreams) and the
+// vault has ~492 labels × 33 workstreams. Used by the CLI to print the curve.
+export const runV1ThresholdCurve = (
+  events: readonly AcceptedEvent[],
+  thresholds: readonly number[] = THRESHOLD_CURVE_POINTS,
+): readonly ThresholdCurvePoint[] =>
+  thresholds.map((minSuggestScore) => {
+    const report = runAttributionPrequential(events, { v1MinSuggestScore: minSuggestScore });
+    const v1 = report.arms.find((a) => a.arm === 'v1');
+    return {
+      minSuggestScore,
+      top1: v1?.top1 ?? 0,
+      abstainRate: v1?.abstainRate ?? 0,
+      precisionWhenSuggesting: v1?.precisionWhenSuggesting ?? 0,
+    };
+  });
 
 // ---- verdict ----------------------------------------------------------
 
