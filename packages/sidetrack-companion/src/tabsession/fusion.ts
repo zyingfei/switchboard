@@ -43,15 +43,42 @@ export const fuseCandidates = (
         candidate.simMargin * WEIGHTS.simMargin +
         candidate.clusterPosterior * WEIGHTS.clusterPosterior +
         candidate.corroborationCount * WEIGHTS.corroborationCount;
+      // Dominant-source LABEL (diagnostic only — never feeds the fused
+      // score, the ordering, or the policy). Pick the channel that
+      // actually contributes the most to `rawFusionLogit`, i.e. argmax of
+      // WEIGHTED contribution (weight × value), not argmax of the raw
+      // channel values. The raw comparison was misleading: PPR carries a
+      // 5× weight, so a small pprScore can dominate the logit while losing
+      // a raw compare to a larger-but-lightly-weighted simTopScore.
+      // Similarity is a FAMILY (top + mean + agreement + margin), so its
+      // contribution is the sum of the family's weighted terms.
+      const pprContribution = candidate.pprScore * WEIGHTS.pprScore;
+      const similarityContribution =
+        candidate.simTopScore * WEIGHTS.simTopScore +
+        candidate.simMeanScore * WEIGHTS.simMeanScore +
+        candidate.simAgreement * WEIGHTS.simAgreement +
+        candidate.simMargin * WEIGHTS.simMargin;
+      const clusterContribution = candidate.clusterPosterior * WEIGHTS.clusterPosterior;
+      // Preserve the exact `'none'` gate from the raw formulation so the
+      // set of candidates that emit (resolver gates on dominantSource ===
+      // 'none') is byte-identical: 'none' only when the cluster channel is
+      // non-positive AND neither ppr nor similarity out-ranks it on the
+      // (non-negative) raw scores — unreachable for real ≥0 evidence,
+      // exactly as before.
       const dominantSource: FusedCandidate['dominantSource'] =
-        candidate.pprScore >= candidate.simTopScore &&
-        candidate.pprScore >= candidate.clusterPosterior
-          ? 'ppr'
-          : candidate.simTopScore >= candidate.clusterPosterior
-            ? 'similarity'
-            : candidate.clusterPosterior > 0
-              ? 'cluster'
-              : 'none';
+        candidate.clusterPosterior <= 0 &&
+        candidate.simTopScore < candidate.clusterPosterior &&
+        !(
+          candidate.pprScore >= candidate.simTopScore &&
+          candidate.pprScore >= candidate.clusterPosterior
+        )
+          ? 'none'
+          : pprContribution >= similarityContribution &&
+              pprContribution >= clusterContribution
+            ? 'ppr'
+            : similarityContribution >= clusterContribution
+              ? 'similarity'
+              : 'cluster';
       return { ...candidate, rawFusionLogit, dominantSource };
     })
     .sort((left, right) => {
