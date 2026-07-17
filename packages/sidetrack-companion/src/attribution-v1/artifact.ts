@@ -25,7 +25,9 @@ import {
   ATTRIBUTION_V1_SOURCE_EVENT_TYPES,
   buildAttributionV1State,
   createEmptyAttributionV1State,
+  domainDiscriminativenessTable,
   type AttributionV1State,
+  type DomainDiscriminativeness,
   type DomainHistory,
   type WorkstreamTermStats,
 } from './state.js';
@@ -33,7 +35,13 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 
-export const ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION = 1;
+// v2 (2026-07-16): adds the learned per-domain discriminativeness table
+// (`domainDiscriminativeness`) as an inspection field. It is DERIVED from the
+// serialized state (domainDiscriminativenessTable), so it is redundant with
+// `state` and is emitted for human/audit inspection only — the reader does not
+// depend on it (a v1 artifact without it still round-trips; the field is
+// optional on read). The bump signals the shape change to the lenient reader.
+export const ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION = 2;
 
 // Serve-side freshness bound — identical rationale to the sibling
 // artifacts: the writer only refreshes while drains succeed AND the shared
@@ -67,11 +75,41 @@ export interface SerializedAttributionV1State {
   readonly totalMemberCount: number;
 }
 
+// One row of the exported learned-domain-discriminativeness table (v2). Mirrors
+// state.ts DomainDiscriminativeness but as a plain serializable record. DERIVED
+// from `state` — present for inspection, not re-hydrated on read.
+export interface SerializedDomainDiscriminativeness {
+  readonly domain: string;
+  readonly discriminativeness: number;
+  readonly winnerWorkstreamId: string | null;
+  readonly assertedForWinner: number;
+  readonly assertedTotal: number;
+  readonly distinctWorkstreams: number;
+  readonly listedPrior: boolean;
+}
+
 export interface AttributionV1Artifact {
   readonly schemaVersion: number;
   readonly generatedAt: string;
   readonly state: SerializedAttributionV1State;
+  // Learned per-domain discriminativeness (v2), sorted most→least discriminative.
+  // Optional on read (v1 artifacts lack it); always written by v2.
+  readonly domainDiscriminativeness?: readonly SerializedDomainDiscriminativeness[];
 }
+
+// Serialize the derived discriminativeness table (round from the live state).
+const serializeDomainDiscriminativeness = (
+  rows: readonly DomainDiscriminativeness[],
+): SerializedDomainDiscriminativeness[] =>
+  rows.map((row) => ({
+    domain: row.domain,
+    discriminativeness: row.discriminativeness,
+    winnerWorkstreamId: row.winnerWorkstreamId,
+    assertedForWinner: row.assertedForWinner,
+    assertedTotal: row.assertedTotal,
+    distinctWorkstreams: row.distinctWorkstreams,
+    listedPrior: row.listedPrior,
+  }));
 
 const mapToRecord = (map: Map<string, number>): Record<string, number> => {
   const out: Record<string, number> = {};
@@ -182,10 +220,14 @@ export const readAttributionV1Artifact = async (
     if (!isRecord(state) || !isRecord(state['workstreams']) || !isRecord(state['domains'])) {
       return null;
     }
+    const table = parsed['domainDiscriminativeness'];
     return {
       schemaVersion: ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION,
       generatedAt: parsed['generatedAt'],
       state: state as unknown as SerializedAttributionV1State,
+      ...(Array.isArray(table)
+        ? { domainDiscriminativeness: table as unknown as SerializedDomainDiscriminativeness[] }
+        : {}),
     };
   } catch {
     return null;
@@ -261,6 +303,9 @@ export const writeAttributionV1Artifact = async (
     schemaVersion: ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION,
     generatedAt: now().toISOString(),
     state: serializeAttributionV1State(state),
+    domainDiscriminativeness: serializeDomainDiscriminativeness(
+      domainDiscriminativenessTable(state),
+    ),
   };
   await writeAtomic(
     attributionV1ArtifactPath(options.vaultRoot),
