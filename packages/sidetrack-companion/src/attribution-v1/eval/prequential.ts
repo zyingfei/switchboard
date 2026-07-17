@@ -51,8 +51,10 @@ import type { AcceptedEvent } from '../../sync/causal.js';
 import {
   applyOrganizingObservation,
   createEmptyAttributionV1State,
+  domainDiscriminativeness,
   domainOfUrl,
-  plainTitleNearestWorkstream,
+  NEUTRAL_DISCRIMINATIVENESS,
+  plainTitleNearestWorkstreamSuppressed,
   type AttributionV1State,
 } from '../state.js';
 import { scoreVisit, scoreVisitCascade, type ScoreVisitOptions } from '../scorer.js';
@@ -190,13 +192,27 @@ const foldSimpleArmState = (state: SimpleArmState, label: PrequentialLabel): voi
 
 // ---- arm predictions (over prior-only state) --------------------------
 
-// Title-nearest for the vote AND the title-lexical arm: the shared PLAIN
-// term-overlap primitive (state.ts plainTitleNearestWorkstream) read against
-// the SAME AttributionV1State the v1 scorer uses. This IS the scorer's title
+// Title-nearest for the vote AND the title-lexical arm: the shared VENUE-
+// SUPPRESSED plain term-overlap primitive (state.ts
+// plainTitleNearestWorkstreamSuppressed) read against the SAME AttributionV1State
+// the v1 scorer uses, with the SAME per-domain brand-term suppression AND the
+// SAME below-neutral conditioning (suppress only where the domain's learned
+// discriminativeness is below neutral — the hubs). This IS the scorer's title
 // family — no separate IDF/BM25 model, no parallel term index — so the frozen
-// baseline scores the challenger's own primitive and the two cannot drift.
-const titleNearestWorkstream = (state: AttributionV1State, title: string | null): string | null =>
-  plainTitleNearestWorkstream(state, title);
+// baseline scores the challenger's own primitive (brand suppression included)
+// and the two cannot drift.
+const titleNearestWorkstream = (
+  state: AttributionV1State,
+  title: string | null,
+  domain: string | null,
+): string | null => {
+  const suppressDomain =
+    domain !== null &&
+    domainDiscriminativeness(state, domain).discriminativeness < NEUTRAL_DISCRIMINATIVENESS
+      ? domain
+      : null;
+  return plainTitleNearestWorkstreamSuppressed(state, title, suppressDomain);
+};
 
 // Domain-majority for the vote: the argmax workstream for the visit's domain,
 // UNCONDITIONALLY (unlike v1's conditional-domain family, the study's plain
@@ -241,8 +257,9 @@ const vote4Predict = (
   label: PrequentialLabel,
 ): Vote4Prediction => {
   const signals: Record<'title' | 'session' | 'domain' | 'recency', string | null> = {
-    // Title uses the SHARED plain-overlap primitive (the scorer's own family).
-    title: titleNearestWorkstream(v1State, label.title),
+    // Title uses the SHARED venue-suppressed plain-overlap primitive (the
+    // scorer's own family), keyed on the label's domain for brand suppression.
+    title: titleNearestWorkstream(v1State, label.title, label.domain),
     session: sessionMajorityWorkstream(state, label.sessionId),
     domain: domainMajorityWorkstream(state, label.domain),
     recency: state.lastFiledWorkstreamId,
@@ -313,7 +330,7 @@ const v1Predict = (
 const titleLexicalAlonePredict = (
   v1State: AttributionV1State,
   label: PrequentialLabel,
-): string | null => titleNearestWorkstream(v1State, label.title);
+): string | null => titleNearestWorkstream(v1State, label.title, label.domain);
 
 // ---- metrics ----------------------------------------------------------
 

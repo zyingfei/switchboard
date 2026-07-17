@@ -22,6 +22,7 @@ import {
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import type { EventLog } from '../sync/eventLog.js';
 
 let seq = 0;
 const organizeEvent = (url: string, ws: string, atMs: number): AcceptedEvent => {
@@ -180,6 +181,54 @@ describe('artifact file I/O', () => {
     const body = await readFile(attributionV1ArtifactPath(vaultRoot), 'utf8');
     expect(attributionV1ArtifactPath(vaultRoot)).toContain('_BAC/system/attribution-v1-state.json');
     expect(JSON.parse(body).schemaVersion).toBe(ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION);
+  });
+
+  it('writes the learned per-domain discriminativeness table (v2) and reads it back', async () => {
+    // Inject a minimal eventLog so the artifact is built from real events: two
+    // labels on a single-workstream domain (⇒ discriminativeness 1) plus a
+    // timeline title join. The table must be present, sorted, and round-trip.
+    seq = 0;
+    const events: AcceptedEvent[] = [
+      timelineEvent('https://solo.example/a', 'Alpha topic content', 1),
+      timelineEvent('https://solo.example/b', 'Beta topic content', 2),
+      organizeEvent('https://solo.example/a', 'ws-solo', 10),
+      organizeEvent('https://solo.example/b', 'ws-solo', 11),
+    ];
+    const eventLog = { readMerged: async () => events } as unknown as EventLog;
+    const written = await writeAttributionV1Artifact({ vaultRoot, eventLog });
+    expect(written.domainDiscriminativeness).toBeDefined();
+    const solo = written.domainDiscriminativeness!.find((r) => r.domain === 'solo.example');
+    expect(solo).toBeDefined();
+    // Single-workstream domain ⇒ maximally discriminative.
+    expect(solo!.discriminativeness).toBe(1);
+    expect(solo!.winnerWorkstreamId).toBe('ws-solo');
+    expect(solo!.listedPrior).toBe(false);
+    // The reader surfaces the table when present.
+    const read = await readAttributionV1Artifact(vaultRoot);
+    expect(read!.domainDiscriminativeness).toBeDefined();
+    expect(read!.domainDiscriminativeness!.some((r) => r.domain === 'solo.example')).toBe(true);
+  });
+
+  it('reads a v2 envelope that lacks the optional discriminativeness table', async () => {
+    // Forward-compat guard: the reader tolerates an envelope without the
+    // optional table (e.g. a partially-written or hand-crafted file) — the field
+    // is simply absent, not a parse failure.
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const { dirname } = await import('node:path');
+    const path = attributionV1ArtifactPath(vaultRoot);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(
+      path,
+      JSON.stringify({
+        schemaVersion: ATTRIBUTION_V1_ARTIFACT_SCHEMA_VERSION,
+        generatedAt: '2026-07-16T00:00:00.000Z',
+        state: { workstreams: {}, domains: {} },
+      }),
+      'utf8',
+    );
+    const read = await readAttributionV1Artifact(vaultRoot);
+    expect(read).not.toBeNull();
+    expect(read!.domainDiscriminativeness).toBeUndefined();
   });
 
   it('is stale when older than the max age', async () => {

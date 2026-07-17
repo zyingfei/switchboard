@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   HEAD_LABEL_THRESHOLD,
   MIN_SUGGEST_SCORE,
+  MIN_TITLE_TERMS_ON_LOW_DISCRIM_DOMAIN,
   SUGGEST_PRECISION_FLOOR,
   TOPK_WIDTH,
   scoreVisit,
@@ -12,6 +13,7 @@ import {
 import {
   applyOrganizingObservation,
   createEmptyAttributionV1State,
+  domainDiscriminativeness,
   type AttributionV1State,
   type OrganizingObservation,
 } from './state.js';
@@ -163,12 +165,170 @@ describe('scoreVisit conditional-domain family', () => {
       state,
       { minSuggestScore: 0 },
     );
-    // github maps to two workstreams ⇒ conditional-domain contributes 0 for
-    // every candidate, even the one the title picks. Venue handling lives here
-    // now, not in the title family's IDF.
+    // github is filed ~evenly across two workstreams ⇒ its learned
+    // discriminativeness is ~0 ⇒ the continuous domain multiplier contributes 0
+    // for every candidate. The continuous score lands on the old binary
+    // "ambiguous hub ⇒ suppressed" behavior for a maximally-even split.
+    expect(domainDiscriminativeness(state, 'github.com').discriminativeness).toBeCloseTo(0, 6);
     for (const candidate of result.candidates) {
       expect(candidate.contributions.conditionalDomain).toBe(0);
     }
+  });
+
+  it('scales the domain contribution CONTINUOUSLY by learned discriminativeness', () => {
+    // lwn.net is single-workstream (linux) ⇒ discriminativeness ~1 (K=1) ⇒ the
+    // domain family contributes near the full conditionalDomain weight, not a
+    // precision-capped 0.69. Verify the contribution tracks the multiplier.
+    const state = buildScorerState();
+    const d = domainDiscriminativeness(state, 'lwn.net');
+    expect(d.discriminativeness).toBeCloseTo(1, 6);
+    const result = scoreVisit(
+      { title: 'Linux kernel scheduler memory paging article', url: 'https://lwn.net/article/new' },
+      state,
+      { minSuggestScore: 0 },
+    );
+    const linux = result.candidates.find((c) => c.workstreamId === 'ws-linux')!;
+    // conditionalDomain weight is 2.0; at discriminativeness ~1 the contribution
+    // is ~2.0 (the full weight), strictly greater than the old 0.69-capped
+    // ceiling (2.0 × 0.69 = 1.38).
+    expect(linux.contributions.conditionalDomain).toBeGreaterThan(1.38);
+  });
+});
+
+// ---- venue/brand-term suppression + >=2-term gate (2026-07-16) --------
+
+describe('scoreVisit venue-term suppression (HN front-page)', () => {
+  // A realistic HN hub: members filed across SEVERAL workstreams (as the study's
+  // "HN 44 topics" finding describes), all carrying the "Hacker News" venue
+  // suffix. This makes news.ycombinator.com below-neutral discriminativeness (a
+  // hub), which is where brand-term suppression engages. One workstream (ws-hn-a)
+  // is dominant so the front-page false-fire would land on it absent the fix.
+  const buildHnState = (): AttributionV1State => {
+    const state = createEmptyAttributionV1State();
+    let at = 5000;
+    const file = (ws: string, topic: string, n: number): void => {
+      for (let i = 0; i < n; i += 1) {
+        at += 1;
+        applyOrganizingObservation(state, {
+          workstreamId: ws,
+          canonicalUrl: `https://news.ycombinator.com/item?id=${ws}-${String(i)}`,
+          title: `${topic} ${String(i)} | Hacker News`,
+          atMs: at,
+          provenance: 'asserted',
+        });
+      }
+    };
+    // 15 dominant + spread across others ⇒ a genuine multi-topic hub.
+    file('ws-hn-a', 'distinctivealpha story', 15);
+    file('ws-hn-b', 'distinctivebeta piece', 6);
+    file('ws-hn-c', 'distinctivegamma post', 5);
+    return state;
+  };
+
+  it('the HN hub is below-neutral discriminativeness (so brand suppression engages)', () => {
+    const state = buildHnState();
+    expect(domainDiscriminativeness(state, 'news.ycombinator.com').discriminativeness).toBeLessThan(
+      0.5,
+    );
+  });
+
+  it('abstains on the bare "Hacker News" front-page title (brand tokens suppressed)', () => {
+    const state = buildHnState();
+    // The front page: title is just the venue name, url is the HN root. Every
+    // query term ("hacker","news") is a brand token of news.ycombinator.com and
+    // is suppressed on this below-neutral hub, so the title family finds nothing
+    // and v1 abstains — the exact false-fire the first shadow record caught.
+    const result = scoreVisit(
+      { title: 'Hacker News', url: 'https://news.ycombinator.com/' },
+      state,
+    );
+    expect(result.action).toBe('abstain');
+    expect(result.candidates).toEqual([]);
+  });
+
+  it('still fires on a genuine HN item whose title carries topical terms', () => {
+    const state = buildHnState();
+    // A real item page: the title carries distinctive topical terms in addition
+    // to the venue suffix. The suffix is suppressed but the topical terms
+    // survive and match the members, so v1 does NOT over-abstain. (Two surviving
+    // terms clear the below-neutral >=2-term gate too.)
+    const result = scoreVisit(
+      { title: 'distinctivealpha story 3 | Hacker News', url: 'https://news.ycombinator.com/item?id=3' },
+      state,
+      { minSuggestScore: 0 },
+    );
+    expect(result.candidates[0]?.workstreamId).toBe('ws-hn-a');
+  });
+});
+
+describe('scoreVisit >=2-surviving-terms on below-neutral domains', () => {
+  it('requires >=2 surviving overlap terms for the title family to fire on a dispersed hub', () => {
+    // A listed hub (reddit.com) filed evenly across two workstreams that share
+    // one generic term but each carry a distinctive one. Its discriminativeness
+    // is below neutral, so a ONE-term title match must NOT fire; a TWO-term
+    // match does.
+    const state = createEmptyAttributionV1State();
+    let at = 6000;
+    const file = (ws: string, title: string): void => {
+      at += 1;
+      applyOrganizingObservation(state, {
+        workstreamId: ws,
+        canonicalUrl: `https://reddit.com/r/${ws}/${String(at)}`,
+        title,
+        atMs: at,
+        provenance: 'asserted',
+      });
+    };
+    for (let i = 0; i < 4; i += 1) file('ws-a', 'shared alpha distinctivealpha');
+    for (let i = 0; i < 4; i += 1) file('ws-b', 'shared beta distinctivebeta');
+    // reddit.com is below neutral (listed + dispersed).
+    expect(domainDiscriminativeness(state, 'reddit.com').discriminativeness).toBeLessThan(0.5);
+    expect(MIN_TITLE_TERMS_ON_LOW_DISCRIM_DOMAIN).toBe(2);
+
+    // ONE surviving term ("shared") on this below-neutral domain ⇒ title family
+    // does not fire ⇒ no candidate manufactured from a lone generic term.
+    const oneTerm = scoreVisit(
+      { title: 'shared', url: 'https://reddit.com/r/misc/x' },
+      state,
+      { minSuggestScore: 0 },
+    );
+    for (const c of oneTerm.candidates) {
+      expect(c.contributions.titleLexical).toBe(0);
+    }
+
+    // TWO surviving terms ("shared alpha") ⇒ the title family fires for ws-a.
+    const twoTerms = scoreVisit(
+      { title: 'shared distinctivealpha', url: 'https://reddit.com/r/misc/y' },
+      state,
+      { minSuggestScore: 0 },
+    );
+    const wsA = twoTerms.candidates.find((c) => c.workstreamId === 'ws-a');
+    expect(wsA?.contributions.titleLexical).toBeGreaterThan(0);
+  });
+
+  it('a single surviving term still fires on an at/above-neutral domain', () => {
+    // A single-workstream (unlisted) domain has discriminativeness 1 ⇒ the
+    // >=2-term gate does NOT apply; one distinctive term is enough.
+    const state = createEmptyAttributionV1State();
+    let at = 7000;
+    for (let i = 0; i < 4; i += 1) {
+      at += 1;
+      applyOrganizingObservation(state, {
+        workstreamId: 'ws-solo',
+        canonicalUrl: `https://solo.example/${String(i)}`,
+        title: 'uniquetopicterm content here',
+        atMs: at,
+        provenance: 'asserted',
+      });
+    }
+    expect(domainDiscriminativeness(state, 'solo.example').discriminativeness).toBe(1);
+    const result = scoreVisit(
+      { title: 'uniquetopicterm', url: 'https://solo.example/new' },
+      state,
+      { minSuggestScore: 0 },
+    );
+    expect(result.candidates[0]?.workstreamId).toBe('ws-solo');
+    expect(result.candidates[0]?.contributions.titleLexical).toBeGreaterThan(0);
   });
 });
 

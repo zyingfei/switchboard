@@ -348,15 +348,9 @@ export const plainTitleOverlap = (
   return { scores, matchedTerms };
 };
 
-// The single plain-overlap nearest workstream (argmax of plainTitleOverlap),
-// deterministic ties → lexicographically-smallest id. This is the eval's
-// `title-lexical` arm and the vote's title signal — sharing plainTitleOverlap
-// with the scorer keeps the frozen-baseline comparison honest.
-export const plainTitleNearestWorkstream = (
-  state: AttributionV1State,
-  title: string | null,
-): string | null => {
-  const { scores } = plainTitleOverlap(state, title);
+// Argmax over a plain-overlap score map (deterministic ties → lexicographically-
+// smallest id). Shared by both nearest-workstream helpers below.
+const argmaxTitleScores = (scores: Map<string, number>): string | null => {
   let best: string | null = null;
   let bestScore = 0;
   for (const [workstreamId, score] of scores) {
@@ -367,6 +361,26 @@ export const plainTitleNearestWorkstream = (
   }
   return best;
 };
+
+// The single plain-overlap nearest workstream (argmax of plainTitleOverlap),
+// deterministic ties → lexicographically-smallest id. Domain-free variant,
+// retained for callers with no domain context.
+export const plainTitleNearestWorkstream = (
+  state: AttributionV1State,
+  title: string | null,
+): string | null => argmaxTitleScores(plainTitleOverlap(state, title).scores);
+
+// The venue-suppressed nearest workstream for a visit on `domain` (argmax of
+// plainTitleOverlapSuppressed). This is the eval's `title-lexical` arm and the
+// vote's title signal — sharing the SAME suppressed primitive the v1 scorer's
+// title family uses keeps the frozen-baseline comparison honest (the challenger
+// and its yardstick read identical evidence, including the brand-term
+// suppression).
+export const plainTitleNearestWorkstreamSuppressed = (
+  state: AttributionV1State,
+  title: string | null,
+  domain: string | null,
+): string | null => argmaxTitleScores(plainTitleOverlapSuppressed(state, title, domain).scores);
 
 // Cross-workstream inverse document frequency for a term. Smoothed IDF over
 // the workstream count: terms in most workstreams (venues/hubs) approach 0.
@@ -431,3 +445,424 @@ export const domainVerdict = (state: AttributionV1State, domain: string): Domain
 // Supervised label count for a workstream (head/tail routing + gate prior).
 export const workstreamLabelCount = (state: AttributionV1State, workstreamId: string): number =>
   state.workstreams.get(workstreamId)?.labelCount ?? 0;
+
+// ---- domain discriminativeness (continuous, learned) ------------------
+//
+// The 2026-07-16 iteration replaces the conditional-domain family's BINARY
+// gate (single-workstream domain fires; multi-workstream hub hard-suppressed)
+// with a CONTINUOUS discriminativeness score learned per domain from the
+// vault's own filing history — the north-star §2 direction ("the per-domain
+// dispersion table from the study is the initial coherence prior, MEASURED
+// rather than hardcoded"). The hardcoded COARSE_MULTI_TOPIC_DOMAINS list
+// (ranker/candidates.ts) is demoted to exactly that: a PRIOR that low
+// discriminativeness initializes with, and that accumulated evidence overrides.
+//
+// DEFINITION. For a domain D with per-workstream asserted/inferred label
+// tallies, discriminativeness = 1 − normalizedEntropy(workstream | domain).
+//   - Entropy H = −Σ p_w · log(p_w) over the smoothed workstream distribution.
+//   - normalizedEntropy = H / log(K) where K is the number of DISTINCT
+//     workstreams the smoothed distribution spreads mass over (the max entropy
+//     for K outcomes is log K). K=1 ⇒ H=0 ⇒ discriminativeness = 1 (a domain
+//     seen for exactly one workstream is perfectly discriminative). K=0 (unseen,
+//     no prior) ⇒ neutral (0.5) by convention.
+//   - discriminativeness ∈ [0, 1]: 1 = domain implies one workstream (the old
+//     "single-workstream 69%-precision regime"); → 0 = domain spread evenly
+//     across many workstreams (the old "measured-ambiguous hub"); 0.5 = neutral
+//     (no evidence either way — the low-data default for UNLISTED domains).
+//
+// BAYESIAN SMOOTHING. Raw entropy over a handful of labels is noisy: a domain
+// seen twice, both for the same workstream, would read as perfectly
+// discriminative on n=2. We smooth the workstream distribution toward a NEUTRAL
+// PRIOR (maximal-entropy over the observed support) with symmetric-Dirichlet
+// pseudo-counts, so low-sample domains shrink toward "no signal" (neutral) and
+// only accumulate confidence with real evidence. Concretely, each observed
+// workstream w gets smoothed mass proportional to (evidence_w + α), where α is
+// the per-workstream pseudo-count. Asserted labels are weighted fully; inferred
+// attributions are down-weighted (INFERRED_LABEL_WEIGHT) so asserted evidence
+// dominates (contract: "asserted labels weighted over inferred").
+//
+// THE LIST AS A PRIOR (not a gate). A listed coarse-multi-topic domain (HN,
+// reddit, youtube, chatgpt, …) is initialized as if it carried prior evidence
+// of HIGH dispersion: we inject LISTED_PRIOR_PSEUDO_MASS of pseudo-labels spread
+// across LISTED_PRIOR_WORKSTREAMS synthetic buckets, which pushes its smoothed
+// entropy up (discriminativeness DOWN) at n=0. As the domain accumulates real
+// asserted labels concentrated on ONE workstream, that real mass overwhelms the
+// diffuse prior and the discriminativeness climbs — the list can be OVERRIDDEN
+// by evidence, which is exactly what the design asked for. Unlisted low-data
+// domains get NO such prior: they initialize neutral (0.5).
+
+// α — the symmetric-Dirichlet per-workstream pseudo-count. One pseudo-label per
+// observed workstream. Small relative to real label volume so a well-evidenced
+// domain trusts its data, but large enough that n=1..2 domains shrink hard
+// toward neutral. Documented value, not a tuned grid.
+export const DOMAIN_DIRICHLET_ALPHA = 1.0;
+
+// Inferred attributions count for less than asserted labels when measuring
+// dispersion (contract: asserted weighted over inferred). v1 folds only
+// asserted today, so this is forward-wiring; kept explicit for the audit.
+export const INFERRED_LABEL_WEIGHT = 0.25;
+
+// Neutral discriminativeness — the low-data default for an UNLISTED domain and
+// the value a domain smooths toward with no concentrating evidence. 0.5 sits at
+// the midpoint of [0,1]; below it a domain is "worse than neutral" (dispersed),
+// above it "better than neutral" (concentrated).
+export const NEUTRAL_DISCRIMINATIVENESS = 0.5;
+
+// The list-as-prior parameters. A listed domain is seeded, at n=0, with
+// LISTED_PRIOR_PSEUDO_MASS total pseudo-label weight spread EVENLY across
+// LISTED_PRIOR_WORKSTREAMS synthetic buckets. Even spread ⇒ maximal prior
+// entropy ⇒ minimal prior discriminativeness. The mass is chosen so that a
+// listed domain with NO real data reads at discriminativeness 0 (hard-suppressed
+// initially — reproducing the old binary gate for the no-evidence case), while
+// real concentrated evidence can OVERRIDE it within a realistic label budget for
+// this vault: with 6 buckets × 0.75 = 4.5 diffuse pseudo-mass, a listed domain
+// whose labels concentrate on one workstream crosses NEUTRAL (0.5) at ~13
+// concentrated labels and keeps climbing — enough that a single click cannot
+// unlock a hub, but a genuinely single-workstream "listed" domain earns its
+// discriminativeness back over time (the design's "list demoted to a prior").
+export const LISTED_PRIOR_WORKSTREAMS = 6;
+export const LISTED_PRIOR_PSEUDO_MASS = 4.5;
+
+// The hardcoded coarse-multi-topic domain set, demoted from a binary gate to a
+// discriminativeness PRIOR. Matched by REGISTRABLE domain (last two labels), so
+// every subdomain qualifies (news.ycombinator.com, old.reddit.com,
+// gemini.google.com, …) — the same matching semantics as the ranker list this
+// was lifted from (ranker/candidates.ts COARSE_MULTI_TOPIC_DOMAINS). The v1
+// scorer NEVER hard-suppresses on this list anymore; it only uses it to lower
+// the initial discriminativeness of a listed domain, which real filing evidence
+// then overrides. Keep in sync with the ranker list by INTENT, not by import
+// (this module must not depend on the ranker).
+export const COARSE_MULTI_TOPIC_DOMAIN_PRIOR: ReadonlySet<string> = new Set<string>([
+  'ycombinator.com',
+  'reddit.com',
+  'lobste.rs',
+  'twitter.com',
+  'x.com',
+  't.co',
+  'youtube.com',
+  'youtu.be',
+  'facebook.com',
+  'instagram.com',
+  'linkedin.com',
+  'medium.com',
+  'substack.com',
+  'quora.com',
+  'pinterest.com',
+  'tumblr.com',
+  'stackoverflow.com',
+  'stackexchange.com',
+  'google.com',
+  'bing.com',
+  'duckduckgo.com',
+  'chatgpt.com',
+  'openai.com',
+  'claude.ai',
+]);
+
+// Registrable domain (last two dot-labels) of a host — the granularity the
+// coarse-multi-topic prior matches on, so subdomains inherit the prior. Returns
+// the input unchanged when it has fewer than two labels. Pure string op; no PSL
+// (the ranker list is likewise PSL-free — good enough for these well-known
+// two-label registrables).
+export const registrableDomainOf = (domain: string): string => {
+  const parts = domain.split('.');
+  if (parts.length < 2) return domain;
+  return `${parts[parts.length - 2]!}.${parts[parts.length - 1]!}`;
+};
+
+// True when a domain (any subdomain) is in the coarse-multi-topic prior set.
+export const isCoarseMultiTopicPriorDomain = (domain: string): boolean =>
+  COARSE_MULTI_TOPIC_DOMAIN_PRIOR.has(registrableDomainOf(domain));
+
+// The learned per-domain discriminativeness, with Bayesian smoothing and the
+// list-as-prior. Returns discriminativeness ∈ [0,1] plus the audit inputs
+// (effective sample size, distinct-workstream count, winner) the artifact table
+// and scorer reasons surface. Pure read over the folded DomainHistory.
+export interface DomainDiscriminativeness {
+  readonly domain: string;
+  // 1 − normalizedEntropy(workstream | domain), smoothed. ∈ [0,1].
+  readonly discriminativeness: number;
+  // The workstream carrying the most (asserted-weighted) evidence, or null when
+  // the domain has no real evidence (prior-only / unseen).
+  readonly winnerWorkstreamId: string | null;
+  // Asserted-weighted evidence for the winner / all workstreams on this domain
+  // (REAL labels only — excludes the synthetic prior). For audit + reasons.
+  readonly assertedForWinner: number;
+  readonly assertedTotal: number;
+  readonly distinctWorkstreams: number;
+  // Whether this domain drew the coarse-multi-topic prior (audit: shows the
+  // list's influence, and whether evidence has overridden it).
+  readonly listedPrior: boolean;
+}
+
+// Compute the asserted-weighted per-workstream evidence for a domain (asserted
+// full weight; inferred down-weighted). Returns an empty map for an unseen
+// domain. The winner and totals are over REAL evidence only.
+const domainWeightedEvidence = (history: DomainHistory | undefined): Map<string, number> => {
+  const evidence = new Map<string, number>();
+  if (history === undefined) return evidence;
+  for (const [workstreamId, count] of history.asserted) {
+    evidence.set(workstreamId, (evidence.get(workstreamId) ?? 0) + count);
+  }
+  for (const [workstreamId, count] of history.inferred) {
+    if (count === 0) continue;
+    evidence.set(workstreamId, (evidence.get(workstreamId) ?? 0) + count * INFERRED_LABEL_WEIGHT);
+  }
+  return evidence;
+};
+
+export const domainDiscriminativeness = (
+  state: AttributionV1State,
+  domain: string,
+): DomainDiscriminativeness => {
+  const history = state.domains.get(domain);
+  const evidence = domainWeightedEvidence(history);
+  const listedPrior = isCoarseMultiTopicPriorDomain(domain);
+
+  // Real-evidence audit fields (winner, totals) — over REAL labels only.
+  let assertedTotal = 0;
+  let winnerWorkstreamId: string | null = null;
+  let assertedForWinner = 0;
+  for (const [workstreamId, weight] of evidence) {
+    assertedTotal += weight;
+    if (
+      weight > assertedForWinner ||
+      (weight === assertedForWinner && (winnerWorkstreamId === null || workstreamId < winnerWorkstreamId))
+    ) {
+      winnerWorkstreamId = workstreamId;
+      assertedForWinner = weight;
+    }
+  }
+  const distinctWorkstreams = evidence.size;
+
+  // Build the SMOOTHED mass vector we take entropy over. Start from the real
+  // asserted-weighted evidence; add α per observed workstream (symmetric
+  // Dirichlet); then, for a listed domain, add the diffuse list prior across
+  // synthetic buckets that no real workstream can cancel out (they raise
+  // entropy until real concentrated mass dominates them).
+  const masses: number[] = [];
+  for (const weight of evidence.values()) masses.push(weight + DOMAIN_DIRICHLET_ALPHA);
+  if (listedPrior) {
+    const perBucket = LISTED_PRIOR_PSEUDO_MASS / LISTED_PRIOR_WORKSTREAMS;
+    for (let i = 0; i < LISTED_PRIOR_WORKSTREAMS; i += 1) masses.push(perBucket);
+  }
+
+  // No evidence AND no prior ⇒ neutral (the unlisted low-data default). A listed
+  // domain always has prior buckets, so it never lands here.
+  if (masses.length === 0) {
+    return {
+      domain,
+      discriminativeness: NEUTRAL_DISCRIMINATIVENESS,
+      winnerWorkstreamId,
+      assertedForWinner,
+      assertedTotal,
+      distinctWorkstreams,
+      listedPrior,
+    };
+  }
+  // A single smoothed outcome (K=1) is perfectly discriminative: the only way
+  // to reach K=1 is an unlisted domain seen for exactly one workstream with no
+  // prior buckets. Entropy 0 ⇒ discriminativeness 1.
+  const k = masses.length;
+  if (k === 1) {
+    return {
+      domain,
+      discriminativeness: 1,
+      winnerWorkstreamId,
+      assertedForWinner,
+      assertedTotal,
+      distinctWorkstreams,
+      listedPrior,
+    };
+  }
+  let total = 0;
+  for (const m of masses) total += m;
+  let entropy = 0;
+  for (const m of masses) {
+    const p = m / total;
+    if (p > 0) entropy -= p * Math.log(p);
+  }
+  const normalizedEntropy = entropy / Math.log(k);
+  const discriminativeness = 1 - normalizedEntropy;
+  return {
+    domain,
+    // Clamp for numerical safety (float error can nudge slightly outside [0,1]).
+    discriminativeness: Math.min(1, Math.max(0, discriminativeness)),
+    winnerWorkstreamId,
+    assertedForWinner,
+    assertedTotal,
+    distinctWorkstreams,
+    listedPrior,
+  };
+};
+
+// Full per-domain discriminativeness table (every folded domain), sorted most-
+// to least-discriminative then by domain for determinism. Exported into the
+// artifact for inspection and used by the eval's arm-table diagnostics.
+export const domainDiscriminativenessTable = (
+  state: AttributionV1State,
+): readonly DomainDiscriminativeness[] => {
+  const rows = [...state.domains.keys()].map((domain) => domainDiscriminativeness(state, domain));
+  rows.sort((a, b) =>
+    b.discriminativeness !== a.discriminativeness
+      ? b.discriminativeness - a.discriminativeness
+      : a.domain < b.domain
+        ? -1
+        : a.domain > b.domain
+          ? 1
+          : 0,
+  );
+  return rows;
+};
+
+// ---- venue/brand-term suppression (per-domain, targeted) --------------
+//
+// The first live shadow record caught v1 false-firing on the HACKER NEWS FRONT
+// PAGE: the plain title overlap matched the venue/brand tokens in stored member
+// titles ("Hacker News" appears in many HN member titles as a suffix), so a
+// visit whose title was literally "Hacker News" scored a large overlap against
+// the workstream those members live in. The incumbent correctly abstained.
+//
+// FIX (targeted, NOT global IDF — the 2026-07-16 finding already showed global
+// IDF loses to plain overlap). When scoring title overlap for a visit on domain
+// D, suppress terms that are part of D's OWN brand/name:
+//   1. Brand tokens derived from the domain STRING itself (the registrable
+//      domain's labels: "ycombinator", "reddit", "youtube", …), plus a small
+//      static map for well-known brands whose display name differs from the
+//      host ("hacker","news" for news.ycombinator.com).
+//   2. The most-frequent shared token(s) across THAT domain's own stored member
+//      titles — the data-driven half: whatever token nearly every member title
+//      on the domain carries is site chrome, not topic ("hacker"/"news" on
+//      news.ycombinator.com fall out of the member titles automatically).
+// Only terms on domain D are suppressed for a visit on domain D — this is not a
+// global stoplist, so a genuine topical term that happens to be a brand token
+// elsewhere is untouched. Purely additive to the plain-overlap primitive.
+
+// Brand tokens whose display name differs from the host string. Keyed by
+// registrable domain. Small and explicit — the domain-string derivation below
+// covers the rest ("reddit" from reddit.com, etc.). Kept minimal on purpose;
+// the data-driven shared-token half generalizes to domains not listed here.
+const STATIC_BRAND_TOKENS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['ycombinator.com', ['hacker', 'news', 'ycombinator']],
+  ['news.ycombinator.com', ['hacker', 'news', 'ycombinator']],
+]);
+
+// Fraction of a domain's member titles a token must appear in to count as site
+// chrome (the data-driven brand-token half). A token in ≥ this share of the
+// domain's members is treated as venue/brand, not topic. 0.6 = "most members
+// carry it" (the north-star's venue-term intuition), tolerant of the odd member
+// title that omits the suffix.
+export const DOMAIN_CHROME_TOKEN_SHARE = 0.6;
+
+// Minimum member titles on a domain before the data-driven shared-token
+// suppression engages — below this the "most-frequent shared token" is not yet
+// a reliable venue signal (a domain seen twice can't distinguish chrome from
+// coincidence). The domain-string tokens (static + derived) always apply.
+export const DOMAIN_CHROME_MIN_MEMBERS = 3;
+
+// Per-workstream member titles are not stored verbatim in the folded state
+// (only per-workstream term document-frequencies are). To derive a DOMAIN's
+// shared member tokens we need per-domain title term counts, which the state
+// does not carry. So the data-driven half operates on a small per-visit input:
+// the caller passes the domain and we combine (a) domain-string tokens with (b)
+// the domain's chrome tokens computed from a supplied term→member-count map
+// when available. To keep the state artifact unchanged this wave, the scorer
+// derives (b) from the domain's own member titles via the venue-token index
+// built below at fold time is NOT added; instead brandTokensForDomain uses only
+// the domain-string + static map, and the shared-token half is exercised in the
+// eval/tests through domainChromeTokens over an explicit title corpus. This
+// keeps the artifact schema stable while still suppressing the observed HN case
+// (its brand tokens ARE domain-string/static: "hacker","news","ycombinator").
+
+// The domain-string + static brand tokens for a domain (always available, no
+// corpus needed). Lowercased, length/stopword-filtered through the same
+// tokenizer the title family uses so the sets are comparable.
+//
+// Derives ONLY from the REGISTRABLE domain's non-TLD label(s) — NOT the full
+// host. Subdomain labels are frequently real topic words ("engineering" in
+// engineering.fb.com, "docs" in docs.rust-lang.org, "blog" in blog.acme.io);
+// tokenizing them as "brand" would wrongly strip topical terms from titles (a
+// 2026-07-16 vault measurement caught "engineering" being suppressed 89×). The
+// registrable label ("fb", "rust-lang", "acme") IS the site's own name and is
+// safe to suppress. Well-known sites whose display name differs from the host
+// (Hacker News on news.ycombinator.com) get their extra tokens from the static
+// map, keyed by BOTH the registrable and the full host so a subdomain-specific
+// brand ("hacker","news") can still be listed.
+export const brandTokensForDomain = (domain: string): Set<string> => {
+  const tokens = new Set<string>();
+  const registrable = registrableDomainOf(domain);
+  // Domain-string tokens: tokenize the registrable domain's labels EXCEPT the
+  // TLD. Subdomain labels are deliberately excluded (see above).
+  const registrableLabels = registrable.split('.');
+  const tld = registrableLabels.length > 0 ? registrableLabels[registrableLabels.length - 1]! : '';
+  for (const label of registrableLabels) {
+    if (label === tld) continue;
+    for (const token of tokenizeTitle(label)) tokens.add(token);
+  }
+  for (const token of STATIC_BRAND_TOKENS.get(registrable) ?? STATIC_BRAND_TOKENS.get(domain) ?? []) {
+    tokens.add(token);
+  }
+  return tokens;
+};
+
+// Data-driven chrome tokens for a domain, given that domain's member titles:
+// the tokens appearing in ≥ DOMAIN_CHROME_TOKEN_SHARE of the titles (site
+// chrome). Requires ≥ DOMAIN_CHROME_MIN_MEMBERS titles; below that returns
+// empty. Exposed for tests and the eval; the scorer combines this with
+// brandTokensForDomain when a corpus is available.
+export const domainChromeTokens = (memberTitles: readonly string[]): Set<string> => {
+  const chrome = new Set<string>();
+  const n = memberTitles.length;
+  if (n < DOMAIN_CHROME_MIN_MEMBERS) return chrome;
+  const docFreq = new Map<string, number>();
+  for (const title of memberTitles) {
+    for (const term of new Set(tokenizeTitle(title))) {
+      docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+    }
+  }
+  const threshold = DOMAIN_CHROME_TOKEN_SHARE * n;
+  for (const [term, df] of docFreq) {
+    if (df >= threshold) chrome.add(term);
+  }
+  return chrome;
+};
+
+// Plain title overlap with venue/brand-term suppression for a visit on `domain`.
+// Identical to plainTitleOverlap except the query terms that are brand tokens of
+// `domain` are dropped BEFORE scoring, so a visit whose title is only the site's
+// own name/chrome scores no overlap (the HN-front-page fix). `extraChromeTokens`
+// lets the caller inject the data-driven shared-token set for the domain when a
+// member-title corpus is available (eval/tests); the scorer passes the
+// domain-string + static tokens, which already cover the observed HN case.
+export const plainTitleOverlapSuppressed = (
+  state: AttributionV1State,
+  title: string | null,
+  domain: string | null,
+  extraChromeTokens: ReadonlySet<string> = new Set(),
+): PlainTitleOverlap => {
+  const scores = new Map<string, number>();
+  const matchedTerms = new Map<string, string[]>();
+  if (title === null) return { scores, matchedTerms };
+  const brand = domain === null ? new Set<string>() : brandTokensForDomain(domain);
+  const terms = new Set<string>();
+  for (const term of tokenizeTitle(title)) {
+    if (brand.has(term) || extraChromeTokens.has(term)) continue;
+    terms.add(term);
+  }
+  if (terms.size === 0) return { scores, matchedTerms };
+  for (const [workstreamId, stats] of state.workstreams) {
+    let score = 0;
+    const matched: string[] = [];
+    for (const term of terms) {
+      const df = stats.termDocFreq.get(term) ?? 0;
+      if (df === 0) continue;
+      score += df;
+      matched.push(term);
+    }
+    if (score > 0) {
+      scores.set(workstreamId, score);
+      matchedTerms.set(workstreamId, matched);
+    }
+  }
+  return { scores, matchedTerms };
+};

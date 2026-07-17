@@ -4,8 +4,12 @@ export {
   createEmptyAttributionV1State,
   applyOrganizingObservation,
   domainVerdict,
+  domainDiscriminativeness,
+  domainDiscriminativenessTable,
+  isCoarseMultiTopicPriorDomain,
   workstreamLabelCount,
   type AttributionV1State,
+  type DomainDiscriminativeness,
   type OrganizingObservation,
 } from './state.js';
 export {

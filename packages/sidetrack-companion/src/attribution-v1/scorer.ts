@@ -8,20 +8,37 @@
 // Families (contract §2, "the v1 model our data justifies and nothing
 // more"):
 //   1. TITLE-LEXICAL (primary): PLAIN term-overlap between the visit title
-//      and each workstream's member titles (state.ts plainTitleOverlap) —
-//      summed member document-frequency over the matched query terms, argmax
+//      and each workstream's member titles (state.ts plainTitleOverlapSuppressed)
+//      — summed member document-frequency over the matched query terms, argmax
 //      wins. The study's best cold signal (40.0% top-1 alone) and, per the
 //      2026-07-16 prequential finding, STRONGER standalone than the BM25/IDF/
 //      length-normalized family it replaces (39.6% vs 25.6% on this vault: the
 //      IDF/normalization actively mis-ranked the correct workstream ~35% of the
 //      time plain overlap would have won). No cross-workstream IDF, no BM25
-//      length normalization. The eval's title-lexical arm scores this SAME
-//      primitive, so the frozen-baseline comparison is honest.
-//   2. CONDITIONAL DOMAIN: fires ONLY when the domain historically maps to
-//      a single workstream (the 69%-precision regime); hard-suppressed on
-//      measured-ambiguous hubs (21% precision). Domains are venues — this
-//      ambiguity gate is where venue handling now lives (the title family
-//      dropped its IDF venue-suppression per the finding).
+//      length normalization. VENUE/BRAND-TERM SUPPRESSION (2026-07-16): query
+//      terms that are the visit domain's OWN brand/name tokens ("hacker","news"
+//      on news.ycombinator.com) are dropped before scoring — the targeted fix
+//      for the HN-front-page false-fire the first live shadow record caught
+//      (plain-title overlap matched the venue suffix in stored member titles).
+//      This is NOT global IDF (that already lost); it only suppresses a domain's
+//      own brand tokens for a visit on that domain. Below-neutral-
+//      discriminativeness domains additionally require >=2 surviving overlap
+//      terms to fire (a lone generic term on a dispersed hub is not evidence).
+//      The eval's title-lexical arm scores this SAME suppressed primitive, so
+//      the frozen-baseline comparison is honest.
+//   2. CONDITIONAL DOMAIN (learned discriminativeness — 2026-07-16): the
+//      domain family's contribution is now a CONTINUOUS multiplier on the
+//      domain's learned discriminativeness = 1 − normalizedEntropy(workstream |
+//      domain), Bayesian-smoothed toward a neutral prior (state.ts
+//      domainDiscriminativeness). This REPLACES the earlier binary gate (single-
+//      workstream domain fires; multi-workstream hub hard-suppressed). A domain
+//      that historically implies one workstream scores near 1 (the old 69%
+//      regime); a dispersed hub scores near 0 (the old suppressed regime); an
+//      unseen/low-data domain scores neutral (0.5). The hardcoded coarse-multi-
+//      topic list is demoted to a PRIOR that lowers a listed domain's INITIAL
+//      discriminativeness, which accumulated filing evidence can override. Venue
+//      handling ALSO lives in the title family now (brand-term suppression, see
+//      below) — the two are complementary, not the same knob.
 //   3. RECENCY: the last-filed workstream as a small tie-break / fallback
 //      (38.3% floor, orthogonal, free).
 //
@@ -45,9 +62,12 @@
 
 import {
   type AttributionV1State,
+  type DomainDiscriminativeness,
+  NEUTRAL_DISCRIMINATIVENESS,
+  domainDiscriminativeness,
   domainOfUrl,
   domainVerdict,
-  plainTitleOverlap,
+  plainTitleOverlapSuppressed,
   workstreamLabelCount,
 } from './state.js';
 
@@ -63,12 +83,15 @@ import {
 // SCALE NOTE: the title family is now a raw overlap COUNT (summed member
 // document-frequency over matched terms — typically 1..O(tens), never < 1 when
 // it fires), replacing the old BM25 score that lived near ~2.8. So the domain
-// and recency weights are expressed in the same count units: a precise domain
-// match is worth up to `conditionalDomain` overlap-terms of corroboration, and
-// recency a fraction of one term. Both are applied so they can order candidates
-// among near-equal title scores (or supply a fallback) but can never override a
-// clearly-stronger title match. The domain weight multiplies a precision-scaled
-// unit signal (≤0.69), so its effective contribution is ≤ conditionalDomain.
+// and recency weights are expressed in the same count units: a fully-
+// discriminative domain match is worth up to `conditionalDomain` overlap-terms
+// of corroboration, and recency a fraction of one term. Both are applied so they
+// can order candidates among near-equal title scores (or supply a fallback) but
+// can never override a clearly-stronger title match. The domain weight now
+// multiplies the domain's CONTINUOUS learned discriminativeness ∈ [0,1]
+// (2026-07-16), so a perfectly-concentrated domain contributes up to
+// conditionalDomain, a neutral domain half that, and a dispersed hub near zero —
+// a smooth generalization of the old binary "precise domain up to 0.69 / hub 0".
 export const FAMILY_WEIGHTS = {
   titleLexical: 1.0,
   conditionalDomain: 2.0,
@@ -224,11 +247,19 @@ const compareCandidates = (a: AttributionV1Candidate, b: AttributionV1Candidate)
 interface VisitSignals {
   readonly domain: string | null;
   readonly verdict: ReturnType<typeof domainVerdict> | null;
-  // The single workstream the domain corroborates (null on ambiguous hubs).
+  // The domain's learned continuous discriminativeness (2026-07-16) + audit
+  // fields, or null when the visit has no resolvable domain.
+  readonly discrim: DomainDiscriminativeness | null;
+  // The workstream the domain's evidence corroborates (its argmax), or null when
+  // the domain has no real evidence yet. UNLIKE the old binary gate this is
+  // populated even for a dispersed hub — the discriminativeness multiplier (not
+  // a null workstream) is what suppresses a hub's contribution.
   readonly domainWorkstreamId: string | null;
-  // Precision proxy for that domain match (0 when no unambiguous domain).
-  readonly domainPrecision: number;
-  // workstream -> raw plain title-overlap count (state.ts plainTitleOverlap).
+  // The continuous multiplier applied to the domain family (∈ [0,1]); 0 when no
+  // resolvable domain or no domain winner.
+  readonly domainDiscrimMultiplier: number;
+  // workstream -> raw plain title-overlap count (venue-suppressed, state.ts
+  // plainTitleOverlapSuppressed).
   readonly titleScores: Map<string, number>;
   readonly titleMatchedTerms: Map<string, string[]>;
 }
@@ -236,18 +267,38 @@ interface VisitSignals {
 const computeVisitSignals = (input: ScoreVisitInput, state: AttributionV1State): VisitSignals => {
   const domain = input.domain ?? domainOfUrl(input.url);
   const verdict = domain === null ? null : domainVerdict(state, domain);
-  const domainWorkstreamId =
-    verdict !== null && !verdict.ambiguous ? verdict.workstreamId : null;
-  const domainPrecision =
-    verdict === null || domainWorkstreamId === null || verdict.assertedTotal === 0
-      ? 0
-      : Math.min(0.69, verdict.assertedForWinner / verdict.assertedTotal);
-  const overlap = plainTitleOverlap(state, input.title.length === 0 ? null : input.title);
+  const discrim = domain === null ? null : domainDiscriminativeness(state, domain);
+  // The domain family now corroborates the domain's evidence WINNER (its
+  // argmax workstream) scaled by learned discriminativeness — no binary
+  // ambiguity gate. A hub still has a winner, but its discriminativeness is
+  // near 0 so its contribution vanishes smoothly.
+  const domainWorkstreamId = discrim?.winnerWorkstreamId ?? null;
+  const domainDiscrimMultiplier =
+    discrim === null || domainWorkstreamId === null ? 0 : discrim.discriminativeness;
+  // Title overlap with the visit domain's own brand/venue tokens suppressed
+  // (the HN-front-page fix). Brand-term suppression is applied ONLY on
+  // BELOW-NEUTRAL-discriminativeness domains — the hubs where venue chrome is
+  // an actual confusion risk (news.ycombinator.com sits at ~0.15 here). On a
+  // high-discriminativeness single-workstream domain the title terms are
+  // trustworthy (its own name is often the topic — rust-lang.org's "rust"), so
+  // suppressing there needlessly costs labels-side accuracy (a 2026-07-16
+  // measurement: unconditional suppression cost the title-lexical arm 3.0pts;
+  // below-neutral-only costs 1.6pts and still catches every hub false-fire).
+  // The scorer supplies the domain-string + static brand tokens; the data-driven
+  // shared-token half is exercised through the eval/tests corpus.
+  const suppressDomain =
+    discrim !== null && discrim.discriminativeness < NEUTRAL_DISCRIMINATIVENESS ? domain : null;
+  const overlap = plainTitleOverlapSuppressed(
+    state,
+    input.title.length === 0 ? null : input.title,
+    suppressDomain,
+  );
   return {
     domain,
     verdict,
+    discrim,
     domainWorkstreamId,
-    domainPrecision,
+    domainDiscrimMultiplier,
     titleScores: overlap.scores,
     titleMatchedTerms: overlap.matchedTerms,
   };
@@ -256,23 +307,45 @@ const computeVisitSignals = (input: ScoreVisitInput, state: AttributionV1State):
 // Build the ranked candidate list under the WEIGHTED-SUM combiner: title
 // (plain overlap) + conditional-domain (precision-scaled) + recency (flat
 // tie-break, gated on another family firing). Shared by scoreVisit.
+// Below-neutral discriminativeness domains need >=2 surviving overlap terms for
+// the title family to fire (contract: a lone generic term on a dispersed hub is
+// not evidence). At/above neutral, a single surviving term still fires.
+export const MIN_TITLE_TERMS_ON_LOW_DISCRIM_DOMAIN = 2;
+
 const buildWeightedCandidates = (
   state: AttributionV1State,
   signals: VisitSignals,
 ): AttributionV1Candidate[] => {
   const candidates: AttributionV1Candidate[] = [];
   // Union of workstreams that could score: every workstream with a title
-  // overlap, plus the unambiguous domain workstream (domain can fire with no
-  // title match). Recency alone never manufactures a candidate.
+  // overlap, plus the domain evidence winner (domain can fire with no title
+  // match). Recency alone never manufactures a candidate.
   const candidateIds = new Set<string>(signals.titleScores.keys());
   if (signals.domainWorkstreamId !== null) candidateIds.add(signals.domainWorkstreamId);
 
+  // Whether the visit domain is BELOW neutral discriminativeness (a dispersed
+  // hub or a listed-prior domain with no overriding evidence). On such a domain
+  // the title family requires >=2 surviving (venue-suppressed) overlap terms to
+  // fire — a single generic term is not evidence there.
+  const domainBelowNeutral =
+    signals.discrim !== null && signals.discrim.discriminativeness < NEUTRAL_DISCRIMINATIVENESS;
+
   for (const workstreamId of candidateIds) {
-    const titleContribution = FAMILY_WEIGHTS.titleLexical * (signals.titleScores.get(workstreamId) ?? 0);
+    const matchedTitleTerms = signals.titleMatchedTerms.get(workstreamId) ?? [];
+    // Enforce the >=2-surviving-terms requirement on below-neutral domains: a
+    // one-term title match on a dispersed hub does not fire the title family.
+    const titleFires =
+      matchedTitleTerms.length > 0 &&
+      (!domainBelowNeutral || matchedTitleTerms.length >= MIN_TITLE_TERMS_ON_LOW_DISCRIM_DOMAIN);
+    const titleContribution = titleFires
+      ? FAMILY_WEIGHTS.titleLexical * (signals.titleScores.get(workstreamId) ?? 0)
+      : 0;
 
     const domainMatch = signals.domainWorkstreamId === workstreamId;
+    // Continuous domain contribution: weight × the domain's learned
+    // discriminativeness (∈ [0,1]) — replaces the binary precision-or-zero gate.
     const domainContribution = domainMatch
-      ? FAMILY_WEIGHTS.conditionalDomain * signals.domainPrecision
+      ? FAMILY_WEIGHTS.conditionalDomain * signals.domainDiscrimMultiplier
       : 0;
 
     const isRecent = state.lastFiledWorkstreamId === workstreamId;
@@ -288,18 +361,20 @@ const buildWeightedCandidates = (
     const labelCount = workstreamLabelCount(state, workstreamId);
     const reasons: AttributionV1Reason[] = [];
     if (titleContribution > 0) {
-      const matched = signals.titleMatchedTerms.get(workstreamId) ?? [];
       reasons.push({
         family: 'title-lexical',
         contribution: titleContribution,
-        summary: matched.length === 0 ? 'title overlap' : `title terms ${matched.slice(0, 5).join(', ')}`,
+        summary:
+          matchedTitleTerms.length === 0
+            ? 'title overlap'
+            : `title terms ${matchedTitleTerms.slice(0, 5).join(', ')}`,
       });
     }
-    if (domainContribution > 0 && signals.verdict !== null) {
+    if (domainContribution > 0 && signals.discrim !== null) {
       reasons.push({
         family: 'conditional-domain',
         contribution: domainContribution,
-        summary: `domain ${signals.domain} → single workstream (${signals.verdict.assertedForWinner}/${signals.verdict.assertedTotal} asserted, precision ${signals.domainPrecision.toFixed(2)})`,
+        summary: `domain ${signals.domain ?? ''} discriminativeness ${signals.discrim.discriminativeness.toFixed(2)} (${signals.discrim.assertedForWinner}/${signals.discrim.assertedTotal} asserted${signals.discrim.listedPrior ? ', listed-prior' : ''})`,
       });
     }
     if (recencyContribution > 0) {
@@ -425,14 +500,15 @@ export const scoreVisitCascade = (
   if (titleCandidates.length > 0) {
     // Title tier fires: its ranking is the cascade answer.
     ranked = titleCandidates;
-  } else if (signals.domainWorkstreamId !== null && signals.domainPrecision > 0) {
-    // Domain tier (unambiguous single-workstream domain).
+  } else if (signals.domainWorkstreamId !== null && signals.domainDiscrimMultiplier > 0) {
+    // Domain tier: the domain's evidence winner, scaled by learned
+    // discriminativeness (continuous — no binary ambiguity gate).
     ranked = [
       makeSingle(
         signals.domainWorkstreamId,
         'conditional-domain',
-        FAMILY_WEIGHTS.conditionalDomain * signals.domainPrecision,
-        `domain ${signals.domain} → single workstream (precision ${signals.domainPrecision.toFixed(2)})`,
+        FAMILY_WEIGHTS.conditionalDomain * signals.domainDiscrimMultiplier,
+        `domain ${signals.domain ?? ''} discriminativeness ${signals.domainDiscrimMultiplier.toFixed(2)}`,
       ),
     ];
   } else if (state.lastFiledWorkstreamId !== null) {
