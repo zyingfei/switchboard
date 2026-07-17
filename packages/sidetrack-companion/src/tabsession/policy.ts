@@ -46,8 +46,20 @@ export const decideAttribution = (
   // lexical/site-skeleton false-friend — e.g. two unrelated items sharing an
   // aggregator platform's URL skeleton. Demand a second corroborating source
   // before surfacing such a pick, regardless of raw score.
+  //
+  // Key this off whether similarity is the top RAW evidence channel, NOT off
+  // `dominantSource`. The diagnostic label is the argmax of the WEIGHTED
+  // contribution, where a small nonzero pprScore (×5.0 weight) can out-rank a
+  // genuinely-thin similarity family and flip the label to 'ppr' — which is
+  // exactly the aggregator false-friend shape this guard exists to catch (a
+  // shared-platform link graph yields a tiny PPR alongside the skeleton-match
+  // similarity). Re-keying off the raw simTopScore dominance keeps the guard
+  // firing on that flip case while never firing on a genuinely PPR- or
+  // cluster-dominant pick.
+  const similarityIsTopRawChannel =
+    top.simTopScore >= top.pprScore && top.simTopScore >= top.clusterPosterior;
   const requiredCorroboration =
-    top.dominantSource === 'similarity' && top.simAgreement <= SIMILARITY_LONE_AGREEMENT_MAX
+    similarityIsTopRawChannel && top.simAgreement <= SIMILARITY_LONE_AGREEMENT_MAX
       ? Math.max(policy.corroboration, 2)
       : policy.corroboration;
   if (

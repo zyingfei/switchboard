@@ -43,15 +43,21 @@ export const fuseCandidates = (
         candidate.simMargin * WEIGHTS.simMargin +
         candidate.clusterPosterior * WEIGHTS.clusterPosterior +
         candidate.corroborationCount * WEIGHTS.corroborationCount;
-      // Dominant-source LABEL (diagnostic only — never feeds the fused
-      // score, the ordering, or the policy). Pick the channel that
-      // actually contributes the most to `rawFusionLogit`, i.e. argmax of
-      // WEIGHTED contribution (weight × value), not argmax of the raw
-      // channel values. The raw comparison was misleading: PPR carries a
-      // 5× weight, so a small pprScore can dominate the logit while losing
-      // a raw compare to a larger-but-lightly-weighted simTopScore.
-      // Similarity is a FAMILY (top + mean + agreement + margin), so its
-      // contribution is the sum of the family's weighted terms.
+      // Dominant-source LABEL. Does NOT feed the fused score or the
+      // ordering (both are `rawFusionLogit`, computed above). It DOES feed
+      // policy.ts: it selects the per-source regret budget/rate telemetry
+      // gate. It does NOT drive the aggregator false-friend guard — that
+      // guard is deliberately keyed off the raw simTopScore dominance, not
+      // this label, so a label flip cannot bypass it (see policy.ts).
+      //
+      // Pick the channel that actually contributes the most to
+      // `rawFusionLogit`, i.e. argmax of WEIGHTED contribution
+      // (weight × value), not argmax of the raw channel values. The raw
+      // comparison was misleading: PPR carries a 5× weight, so a small
+      // pprScore can dominate the logit while losing a raw compare to a
+      // larger-but-lightly-weighted simTopScore. Similarity is a FAMILY
+      // (top + mean + agreement + margin), so its contribution is the sum
+      // of the family's weighted terms.
       const pprContribution = candidate.pprScore * WEIGHTS.pprScore;
       const similarityContribution =
         candidate.simTopScore * WEIGHTS.simTopScore +
