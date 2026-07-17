@@ -67,7 +67,7 @@ describe('InboxCard', () => {
       dryRun: true,
       // Un-endorsed: the policy chose `inbox`, so decision carries NO
       // workstreamId — only a top fused candidate lean. Honesty change:
-      // this renders as a "Weak guess — not filed" provenance with a
+      // this renders as a "Weak guess — filed to inbox" provenance with a
       // "Confirm guess" (not "Yes, that's right") one-click confirm.
       decision: { action: 'inbox', margin: 0.05 },
       fusedCandidates: [
@@ -95,7 +95,7 @@ describe('InboxCard', () => {
     );
 
     // Honest phrasing: a weak (un-endorsed) guess is not a "Suggested".
-    expect(screen.getByText('Weak guess — not filed')).toBeInTheDocument();
+    expect(screen.getByText('Weak guess — filed to inbox')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: "Yes, that's right" })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Confirm guess' }));
     expect(onAttribute).toHaveBeenCalledWith('tses_test', 'ws_switchboard');

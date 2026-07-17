@@ -54,7 +54,7 @@ describe('AttributionProvenance honesty', () => {
       />,
     );
     expect(screen.getByText('Suggested')).toBeDefined();
-    expect(screen.queryByText('Weak guess — not filed')).toBeNull();
+    expect(screen.queryByText('Weak guess — filed to inbox')).toBeNull();
   });
 
   it('renders an un-endorsed (inbox) pick as a weak guess, never a suggestion', () => {
@@ -65,7 +65,7 @@ describe('AttributionProvenance honesty', () => {
         workstreams={workstreams}
       />,
     );
-    expect(screen.getByText('Weak guess — not filed')).toBeDefined();
+    expect(screen.getByText('Weak guess — filed to inbox')).toBeDefined();
     expect(screen.queryByText('Suggested')).toBeNull();
     expect(container.querySelector('[data-endorsement="weak-guess"]')).not.toBeNull();
   });
