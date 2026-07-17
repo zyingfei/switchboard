@@ -7,8 +7,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { writePageContentExtracted } from '../page-content/store.js';
 import { isBackgroundEmbeddingBacklog } from './backgroundEmbeddingLane.js';
 import {
+  createIncrementalBackgroundEmbeddingCandidateSource,
+  discoverBackgroundEmbeddingBacklog,
   embedBacklogCanonicalUrl,
   listBackgroundEmbeddingCandidates,
+  readBackgroundEmbeddingDiscoveryIndex,
   readBackgroundEmbeddingProgress,
   writeBackgroundEmbeddingProgress,
   writeExtractedPageEvidenceFast,
@@ -134,5 +137,121 @@ describe('background-embedding lane store adapters', () => {
     const loaded = await readBackgroundEmbeddingProgress(root);
     expect(loaded?.embeddedTotal).toBe(5);
     expect(loaded?.attemptsByCanonicalUrl[CANONICAL]).toBe(2);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Bug (b): incremental discovery — the lane must NOT re-parse the whole
+// store every cycle. discoverBackgroundEmbeddingBacklog reads JSON only
+// for the changed/new delta (mtime-bucketed), carrying prior verdicts
+// forward for unchanged files.
+// ─────────────────────────────────────────────────────────────────────
+describe('incremental background-embedding discovery', () => {
+  let root: string;
+
+  const writeBacklogRecord = async (canonicalUrl: string): Promise<void> => {
+    await writeExtractedPageEvidenceFast(
+      root,
+      payload({ canonicalUrl, url: canonicalUrl }),
+      { rebuildManifestAfterWrite: false },
+    );
+  };
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'sidetrack-embed-lane-discovery-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('first scan reads every file; a subsequent scan with no changes reads ZERO', async () => {
+    for (let i = 0; i < 6; i += 1) {
+      await writeBacklogRecord(`https://d.test/${String(i)}`);
+    }
+    // Cold scan: no prior index → reads all 6.
+    const first = await discoverBackgroundEmbeddingBacklog(root, null);
+    expect(first.totalFiles).toBe(6);
+    expect(first.filesRead).toBe(6);
+    expect(first.candidates).toHaveLength(6);
+
+    // Warm scan with the refreshed index and no file changes → reads NONE,
+    // but still returns the same backlog (carried forward from the index).
+    const second = await discoverBackgroundEmbeddingBacklog(root, first.index);
+    expect(second.totalFiles).toBe(6);
+    expect(second.filesRead).toBe(0); // <-- the whole point: no full re-parse
+    expect(second.candidates).toHaveLength(6);
+  });
+
+  it('reads ONLY the new file when the store grows by one', async () => {
+    for (let i = 0; i < 4; i += 1) {
+      await writeBacklogRecord(`https://g.test/${String(i)}`);
+    }
+    const first = await discoverBackgroundEmbeddingBacklog(root, null);
+    expect(first.filesRead).toBe(4);
+
+    // Append one record. Only that one should be JSON-read next cycle.
+    await writeBacklogRecord('https://g.test/NEW');
+    const second = await discoverBackgroundEmbeddingBacklog(root, first.index);
+    expect(second.totalFiles).toBe(5);
+    expect(second.filesRead).toBe(1);
+    expect(second.candidates).toHaveLength(5);
+  });
+
+  it('drops a record from the backlog once its embedding becomes ready', async () => {
+    await writePageContentExtracted(root, {
+      payloadVersion: 1,
+      canonicalUrl: CANONICAL,
+      url: CANONICAL,
+      title: 'F16 Minipack Data Center Fabric',
+      extractedAt: '2026-05-16T10:00:00.000Z',
+      extractionSource: 'reader-mode',
+      extractionPolicy: { trigger: 'manual' },
+      quality: 'high',
+      qualitySignals: payload().qualitySignals,
+      content: payload().content,
+    });
+    await writeBacklogRecord(CANONICAL);
+    const first = await discoverBackgroundEmbeddingBacklog(root, null);
+    expect(first.candidates.some((c) => isBackgroundEmbeddingBacklog(c))).toBe(true);
+
+    // Embed it (rewrites the record file with a ready vector, new mtime).
+    process.env['SIDETRACK_TEST_EMBEDDER'] = '1';
+    try {
+      const embedOne = await embedBacklogCanonicalUrl(root);
+      expect(await embedOne(CANONICAL)).toBe('embedded');
+    } finally {
+      delete process.env['SIDETRACK_TEST_EMBEDDER'];
+    }
+
+    // The changed file is re-read; the record is no longer backlog.
+    const second = await discoverBackgroundEmbeddingBacklog(root, first.index);
+    expect(second.filesRead).toBe(1);
+    const stillBacklog = second.candidates.filter((c) => isBackgroundEmbeddingBacklog(c));
+    expect(stillBacklog).toHaveLength(0);
+  });
+
+  it('createIncrementalBackgroundEmbeddingCandidateSource persists + reuses the cursor across calls', async () => {
+    for (let i = 0; i < 5; i += 1) {
+      await writeBacklogRecord(`https://s.test/${String(i)}`);
+    }
+    const source = createIncrementalBackgroundEmbeddingCandidateSource(root);
+    const c1 = await source.listCandidates();
+    expect(c1).toHaveLength(5);
+    expect(source.lastScan()).toEqual({ totalFiles: 5, filesRead: 5 });
+
+    // The cursor was persisted to disk.
+    expect(await readBackgroundEmbeddingDiscoveryIndex(root)).not.toBeNull();
+
+    // Second call reuses the in-memory cursor → zero JSON reads.
+    const c2 = await source.listCandidates();
+    expect(c2).toHaveLength(5);
+    expect(source.lastScan().filesRead).toBe(0);
+
+    // A FRESH source (simulating a restart) loads the persisted cursor and
+    // also does zero re-reads when nothing changed on disk.
+    const restarted = createIncrementalBackgroundEmbeddingCandidateSource(root);
+    const c3 = await restarted.listCandidates();
+    expect(c3).toHaveLength(5);
+    expect(restarted.lastScan().filesRead).toBe(0);
   });
 });

@@ -277,3 +277,218 @@ describe('createBackgroundEmbeddingLane.runOnce', () => {
     expect(result.pausedForDrain).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Bug (a): WARMUP RACE — an embedder that becomes ready AFTER lane start
+// must not permanently quarantine the backlog.
+// ─────────────────────────────────────────────────────────────────────
+describe('createBackgroundEmbeddingLane warmup recovery', () => {
+  it('does no embed work + burns no attempts while the embedder is warming', async () => {
+    let embedCalls = 0;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        isEmbedderReady: () => false, // still warming
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://a.test' })],
+        embedCanonicalUrl: async () => {
+          embedCalls += 1;
+          return 'embedded';
+        },
+      }),
+    );
+    const r = await lane.runOnce();
+    expect(r.pausedForWarmup).toBe(true);
+    expect(r.embedded).toBe(0);
+    expect(embedCalls).toBe(0); // the embedder was NEVER called against a cold child
+    // No attempts burned — the backlog is intact once the child warms.
+    expect(Object.keys(lane.progress().attemptsByCanonicalUrl)).toHaveLength(0);
+  });
+
+  it('recovers and embeds once the embedder becomes ready mid-run (no permanent quarantine)', async () => {
+    let ready = false;
+    let embedded = 0;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        isEmbedderReady: () => ready,
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://a.test' })],
+        embedCanonicalUrl: async () => {
+          embedded += 1;
+          return 'embedded';
+        },
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, maxAttemptsPerRecord: 3 },
+    );
+    // Simulate the exact soak race: several cycles fire while the child is
+    // cold. Under the OLD code these would fail → quarantine at 3 attempts.
+    await lane.runOnce();
+    await lane.runOnce();
+    await lane.runOnce();
+    await lane.runOnce();
+    expect(embedded).toBe(0);
+    expect(lane.health().inert).toBe(false); // warming, not inert
+    // Child warms. The very next cycle must embed the still-eligible record.
+    ready = true;
+    const r = await lane.runOnce();
+    expect(r.pausedForWarmup).toBe(false);
+    expect(r.embedded).toBe(1);
+    expect(embedded).toBe(1);
+  });
+
+  it('lifts quarantine after the cooldown so a warmup-race victim recovers', async () => {
+    let clock = 1_000;
+    let failNext = true;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        now: () => clock,
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://victim.test' })],
+        embedCanonicalUrl: async () => (failNext ? 'failed' : 'embedded'),
+      }),
+      {
+        ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
+        maxAttemptsPerRecord: 2,
+        quarantineCooldownMs: 10_000,
+      },
+    );
+    // Two failures → quarantined.
+    await lane.runOnce();
+    await lane.runOnce();
+    const quarantinedCycle = await lane.runOnce();
+    expect(quarantinedCycle.quarantined).toBe(1);
+    expect(quarantinedCycle.backlog).toBe(0);
+    // Before the cooldown elapses it stays quarantined.
+    clock += 5_000;
+    expect((await lane.runOnce()).quarantined).toBe(1);
+    // After the cooldown the record becomes eligible again; now it embeds.
+    clock += 6_000;
+    failNext = false;
+    const recovered = await lane.runOnce();
+    expect(recovered.embedded).toBe(1);
+    expect(recovered.quarantined).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Bug (b): the batch cap must count ATTEMPTS (successes + failures), not
+// successes only — a cycle of pure failures must make BOUNDED progress.
+// ─────────────────────────────────────────────────────────────────────
+describe('createBackgroundEmbeddingLane attempt-counted batch cap', () => {
+  it('caps work by attempts so a cycle of pure failures is bounded (no spin)', async () => {
+    let calls = 0;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () =>
+          Array.from({ length: 100 }, (_, i) =>
+            candidate({ canonicalUrl: `https://fail.test/${String(i)}` }),
+          ),
+        embedCanonicalUrl: async () => {
+          calls += 1;
+          return 'failed';
+        },
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 5 },
+    );
+    const r = await lane.runOnce();
+    // Under the OLD (success-only) cap this would call embed 100 times
+    // (never hitting the cap because nothing succeeded) — a full-backlog
+    // spin. Attempt-counting bounds it to batchCap.
+    expect(calls).toBe(5);
+    expect(r.failed).toBe(5);
+  });
+
+  it('counts a mix of successes + failures toward the same cap', async () => {
+    let calls = 0;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () =>
+          Array.from({ length: 20 }, (_, i) =>
+            candidate({ canonicalUrl: `https://mix.test/${String(i)}` }),
+          ),
+        embedCanonicalUrl: async () => {
+          calls += 1;
+          return calls % 2 === 0 ? 'embedded' : 'failed';
+        },
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 6 },
+    );
+    const r = await lane.runOnce();
+    expect(calls).toBe(6);
+    expect(r.embedded + r.failed).toBe(6);
+  });
+
+  it('skips do NOT consume the cap (they are not real work)', async () => {
+    let calls = 0;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () =>
+          Array.from({ length: 10 }, (_, i) =>
+            candidate({ canonicalUrl: `https://skip.test/${String(i)}` }),
+          ),
+        embedCanonicalUrl: async () => {
+          calls += 1;
+          return 'skipped';
+        },
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 3 },
+    );
+    const r = await lane.runOnce();
+    // All 10 are visited (skips are cheap no-ops) but none burn the cap.
+    expect(calls).toBe(10);
+    expect(r.skipped).toBe(10);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Lane health — a silently-inert lane (the 90-min soak failure) must be
+// VISIBLE via a synchronous health snapshot.
+// ─────────────────────────────────────────────────────────────────────
+describe('createBackgroundEmbeddingLane.health', () => {
+  it('flags inert=true when the lane ran but embedded nothing against a non-empty backlog', async () => {
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://stuck.test' })],
+        embedCanonicalUrl: async () => 'failed',
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, maxAttemptsPerRecord: 1 },
+    );
+    expect(lane.health().lastCycle).toBe('never-run');
+    await lane.runOnce();
+    const h = lane.health();
+    expect(h.inert).toBe(true);
+    expect(h.embeddedTotal).toBe(0);
+    expect(h.lastBacklog).toBeGreaterThan(0);
+    expect(h.lastSuccessAtMs).toBeNull();
+  });
+
+  it('reports embeddedTotal + lastSuccessAtMs + not-inert after real progress', async () => {
+    const clock = 5_000;
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        now: () => clock,
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://good.test' })],
+        embedCanonicalUrl: async () => 'embedded',
+      }),
+    );
+    await lane.runOnce();
+    const h = lane.health();
+    expect(h.inert).toBe(false);
+    expect(h.embeddedTotal).toBe(1);
+    expect(h.embeddedThisProcess).toBe(1);
+    expect(h.lastSuccessAtMs).toBe(5_000);
+    expect(h.lastCycle).toBe('embedded');
+  });
+
+  it('distinguishes paused-warmup from inert', async () => {
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        isEmbedderReady: () => false,
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://warm.test' })],
+        embedCanonicalUrl: async () => 'embedded',
+      }),
+    );
+    await lane.runOnce();
+    const h = lane.health();
+    expect(h.lastCycle).toBe('paused-warmup');
+    // Backlog was never scanned (warmup gate short-circuits) so inert is
+    // not asserted — the operator sees 'paused-warmup', not a false inert.
+    expect(h.inert).toBe(false);
+  });
+});

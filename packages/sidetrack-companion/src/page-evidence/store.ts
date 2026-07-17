@@ -625,9 +625,12 @@ export const readPageEvidenceVectorMap = async (
 // per-record vault reads/writes.
 // ─────────────────────────────────────────────────────────────────────
 
-/** List every record as a lane candidate. The lane classifies backlog
- *  membership itself (isBackgroundEmbeddingBacklog); this just surfaces
- *  the structural fields it needs. */
+/** List every record as a lane candidate via a full JSON-parse scan.
+ *  RETAINED for tests + one-shot callers; the LANE now uses
+ *  `createIncrementalBackgroundEmbeddingCandidateSource` (below) so it
+ *  never re-parses the whole store every 4 s. The lane classifies
+ *  backlog membership itself (isBackgroundEmbeddingBacklog); this just
+ *  surfaces the structural fields it needs. */
 export const listBackgroundEmbeddingCandidates = async (
   vaultRoot: string,
 ): Promise<
@@ -664,6 +667,260 @@ export const listBackgroundEmbeddingCandidates = async (
           },
         }),
   }));
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Incremental backlog discovery
+//
+// The prior lane path called `listBackgroundEmbeddingCandidates` every
+// cycle, and that function `readJson`-parses EVERY record file in
+// by-url/ (a ~1800-file full-store scan every 4 s — the "permanent
+// full-store scan" the soak flagged). Steady state that scan reads and
+// parses megabytes of JSON to re-derive a backlog set that changed by
+// zero rows.
+//
+// `discoverBackgroundEmbeddingBacklog` replaces it with the same
+// mtime-bucketed delta discipline the recall-v2 backfill already uses
+// (listPageEvidenceRecordFiles = one readdir + one parallel stat per
+// file, NO JSON reads). A persisted discovery index remembers, per file:
+// its last-seen (mtimeMs, size) fingerprint and the backlog verdict we
+// derived from it. On each cycle we:
+//   - list fingerprints (cheap),
+//   - read+classify JSON ONLY for files whose fingerprint changed or are
+//     new (the append-mostly delta),
+//   - carry the prior verdict forward for unchanged files,
+//   - drop index entries whose file vanished.
+// The returned candidate list is exactly today's backlog — but the JSON
+// work is bounded by the delta, not the corpus.
+// ─────────────────────────────────────────────────────────────────────
+
+const BACKGROUND_EMBEDDING_DISCOVERY_FILENAME = 'embed-lane-discovery.json';
+
+const backgroundEmbeddingDiscoveryPath = (vaultRoot: string): string =>
+  join(pageEvidenceRoot(vaultRoot), BACKGROUND_EMBEDDING_DISCOVERY_FILENAME);
+
+/** One remembered file: its fingerprint + the last derived candidate
+ *  fields. `canonicalUrl` is null when the file did not parse (kept so a
+ *  broken file isn't re-read every cycle until it actually changes). */
+interface DiscoveryIndexEntry {
+  readonly mtimeMs: number;
+  readonly size: number;
+  readonly canonicalUrl: string | null;
+  readonly url: string;
+  readonly title?: string;
+  readonly evidenceTier: PageEvidenceTier;
+  readonly embeddingState?: 'disabled' | 'missing' | 'failed' | 'ready';
+  readonly hasDocEmbeddingRef: boolean;
+}
+
+interface BackgroundEmbeddingDiscoveryIndex {
+  readonly schemaVersion: 1;
+  /** fileName -> remembered fingerprint + verdict. */
+  readonly byFileName: Record<string, DiscoveryIndexEntry>;
+}
+
+const emptyDiscoveryIndex = (): BackgroundEmbeddingDiscoveryIndex => ({
+  schemaVersion: 1,
+  byFileName: {},
+});
+
+export const readBackgroundEmbeddingDiscoveryIndex = async (
+  vaultRoot: string,
+): Promise<BackgroundEmbeddingDiscoveryIndex | null> => {
+  const parsed = await readJson<BackgroundEmbeddingDiscoveryIndex>(
+    backgroundEmbeddingDiscoveryPath(vaultRoot),
+  );
+  if (parsed === null || parsed.schemaVersion !== 1 || !isRecord(parsed.byFileName)) return null;
+  return parsed;
+};
+
+export const writeBackgroundEmbeddingDiscoveryIndex = async (
+  vaultRoot: string,
+  index: BackgroundEmbeddingDiscoveryIndex,
+): Promise<void> => {
+  await atomicWriteJson(backgroundEmbeddingDiscoveryPath(vaultRoot), index);
+};
+
+export interface BackgroundEmbeddingDiscovery {
+  readonly candidates: readonly {
+    readonly canonicalUrl: string;
+    readonly url: string;
+    readonly title?: string;
+    readonly evidenceTier: PageEvidenceTier;
+    readonly content?: {
+      readonly embeddingState?: 'disabled' | 'missing' | 'failed' | 'ready';
+      readonly docEmbeddingRef?: VectorRef;
+    };
+  }[];
+  /** The refreshed index to persist. */
+  readonly index: BackgroundEmbeddingDiscoveryIndex;
+  /** Bookkeeping so the lane can log/health-report scan cost. */
+  readonly totalFiles: number;
+  /** How many files were actually JSON-read this cycle (the delta). */
+  readonly filesRead: number;
+}
+
+const entryToCandidate = (
+  entry: DiscoveryIndexEntry,
+): BackgroundEmbeddingDiscovery['candidates'][number] | null => {
+  if (entry.canonicalUrl === null) return null;
+  return {
+    canonicalUrl: entry.canonicalUrl,
+    url: entry.url,
+    ...(entry.title === undefined ? {} : { title: entry.title }),
+    evidenceTier: entry.evidenceTier,
+    content: {
+      ...(entry.embeddingState === undefined ? {} : { embeddingState: entry.embeddingState }),
+      // The lane only needs to know a ref EXISTS (isBackgroundEmbeddingBacklog
+      // gates on `docEmbeddingRef !== undefined`); we don't persist the whole
+      // ref in the index, so surface a sentinel presence marker. Records with
+      // a ready ref are not backlog and never re-embedded, so the sentinel is
+      // never dereferenced.
+      ...(entry.hasDocEmbeddingRef
+        ? { docEmbeddingRef: { present: true } as unknown as VectorRef }
+        : {}),
+    },
+  };
+};
+
+const entryFromRecord = (
+  record: PageEvidenceRecord,
+  fingerprint: PageEvidenceRecordFileStat,
+): DiscoveryIndexEntry => ({
+  mtimeMs: fingerprint.mtimeMs,
+  size: fingerprint.size,
+  canonicalUrl: record.canonicalUrl,
+  url: record.canonicalUrl,
+  ...(record.metadata.title === undefined ? {} : { title: record.metadata.title }),
+  evidenceTier: record.evidenceTier,
+  ...(record.content?.embeddingState === undefined
+    ? {}
+    : { embeddingState: record.content.embeddingState }),
+  hasDocEmbeddingRef: record.content?.docEmbeddingRef !== undefined,
+});
+
+/**
+ * Discover the current backlog candidate set using the mtime-bucketed
+ * delta discipline. Reads+parses JSON only for record files whose
+ * (mtimeMs, size) fingerprint changed since `priorIndex` (or are new);
+ * carries forward the remembered verdict for every unchanged file.
+ * Returns the candidate list plus the refreshed index (persist it via
+ * writeBackgroundEmbeddingDiscoveryIndex) and scan bookkeeping.
+ */
+export const discoverBackgroundEmbeddingBacklog = async (
+  vaultRoot: string,
+  priorIndex: BackgroundEmbeddingDiscoveryIndex | null,
+): Promise<BackgroundEmbeddingDiscovery> => {
+  const prior = priorIndex ?? emptyDiscoveryIndex();
+  const fingerprints = await listPageEvidenceRecordFiles(vaultRoot);
+  const nextByFileName: Record<string, DiscoveryIndexEntry> = {};
+  let filesRead = 0;
+  // Read only the changed/new files. `mapInChunks` bounds concurrency the
+  // same way listPageEvidenceRecordFiles does.
+  const toRead = fingerprints.filter((fp) => {
+    const remembered = prior.byFileName[fp.name];
+    return (
+      remembered === undefined ||
+      remembered.mtimeMs !== fp.mtimeMs ||
+      remembered.size !== fp.size
+    );
+  });
+  const readEntries = await mapInChunks(toRead, 100, async (fp) => {
+    const record = await readPageEvidenceRecordByFileName(vaultRoot, fp.name);
+    if (record === null) {
+      // Unparseable — remember the fingerprint so we don't re-read it
+      // until the file changes, but produce no candidate.
+      return [
+        fp.name,
+        {
+          mtimeMs: fp.mtimeMs,
+          size: fp.size,
+          canonicalUrl: null,
+          url: '',
+          evidenceTier: 'metadata_only' as PageEvidenceTier,
+          hasDocEmbeddingRef: false,
+        } satisfies DiscoveryIndexEntry,
+      ] as const;
+    }
+    return [fp.name, entryFromRecord(record, fp)] as const;
+  });
+  const readByName = new Map<string, DiscoveryIndexEntry>(readEntries);
+  filesRead = readEntries.length;
+  for (const fp of fingerprints) {
+    const fresh = readByName.get(fp.name);
+    if (fresh !== undefined) {
+      nextByFileName[fp.name] = fresh;
+      continue;
+    }
+    // Unchanged file — carry the remembered verdict forward (its
+    // fingerprint is guaranteed to match, or it would have been re-read).
+    const remembered = prior.byFileName[fp.name];
+    if (remembered !== undefined) nextByFileName[fp.name] = remembered;
+  }
+  const candidates: BackgroundEmbeddingDiscovery['candidates'][number][] = [];
+  for (const entry of Object.values(nextByFileName)) {
+    const candidate = entryToCandidate(entry);
+    if (candidate !== null) candidates.push(candidate);
+  }
+  candidates.sort((left, right) => compareText(left.canonicalUrl, right.canonicalUrl));
+  return {
+    candidates,
+    index: { schemaVersion: 1, byFileName: nextByFileName },
+    totalFiles: fingerprints.length,
+    filesRead,
+  };
+};
+
+export interface IncrementalCandidateSource {
+  /** Discover the current backlog candidate set (bounded to the delta)
+   *  and persist the refreshed cursor. Safe to call every cycle. */
+  readonly listCandidates: () => Promise<
+    readonly {
+      readonly canonicalUrl: string;
+      readonly url: string;
+      readonly title?: string;
+      readonly evidenceTier: PageEvidenceTier;
+      readonly content?: {
+        readonly embeddingState?: 'disabled' | 'missing' | 'failed' | 'ready';
+        readonly docEmbeddingRef?: VectorRef;
+      };
+    }[]
+  >;
+  /** Last cycle's scan cost (files listed vs files JSON-read). */
+  readonly lastScan: () => { readonly totalFiles: number; readonly filesRead: number };
+}
+
+/**
+ * Build the LANE's candidate source: an incremental, cursor-backed
+ * discovery that reads+parses ONLY the files that changed since last
+ * cycle (mtime-bucketed delta). The cursor is loaded lazily on first
+ * call and persisted after each discovery, so a restart resumes from
+ * the on-disk index instead of a cold full scan.
+ */
+export const createIncrementalBackgroundEmbeddingCandidateSource = (
+  vaultRoot: string,
+): IncrementalCandidateSource => {
+  let index: BackgroundEmbeddingDiscoveryIndex | null = null;
+  let loaded = false;
+  let lastTotalFiles = 0;
+  let lastFilesRead = 0;
+  return {
+    listCandidates: async () => {
+      if (!loaded) {
+        loaded = true;
+        index = await readBackgroundEmbeddingDiscoveryIndex(vaultRoot).catch(() => null);
+      }
+      const discovery = await discoverBackgroundEmbeddingBacklog(vaultRoot, index);
+      index = discovery.index;
+      lastTotalFiles = discovery.totalFiles;
+      lastFilesRead = discovery.filesRead;
+      // Best-effort persist — a failure only costs a re-read of the
+      // delta next cycle, never correctness.
+      await writeBackgroundEmbeddingDiscoveryIndex(vaultRoot, discovery.index).catch(() => undefined);
+      return discovery.candidates;
+    },
+    lastScan: () => ({ totalFiles: lastTotalFiles, filesRead: lastFilesRead }),
+  };
 };
 
 /**

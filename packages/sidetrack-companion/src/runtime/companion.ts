@@ -58,11 +58,14 @@ import {
   canonicalizeEvidenceUrl,
   ensurePageEvidenceForTimelineEntries,
   embedBacklogCanonicalUrl,
-  listBackgroundEmbeddingCandidates,
+  createIncrementalBackgroundEmbeddingCandidateSource,
   readBackgroundEmbeddingProgress,
   writeBackgroundEmbeddingProgress,
 } from '../page-evidence/store.js';
-import { createBackgroundEmbeddingLane } from '../page-evidence/backgroundEmbeddingLane.js';
+import {
+  createBackgroundEmbeddingLane,
+  type BackgroundEmbeddingLaneHealth,
+} from '../page-evidence/backgroundEmbeddingLane.js';
 import { buildDomainTombstoneSet } from '../privacy/domainTombstone.js';
 import { readDomainTombstones } from '../privacy/domainTombstoneStore.js';
 import type { TimelineProvider } from '../timeline/events.js';
@@ -992,6 +995,10 @@ export const startCompanion = async (
       (process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'] === '1' ||
         process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING']?.toLowerCase() === 'true') &&
       useChildProcesses;
+    // Populated when the lane is enabled; surfaced on /v1/status so an
+    // inert lane (the 90-min soak failure) is observable. Absent → the
+    // lane is off and /status omits the field.
+    let backgroundEmbeddingLaneHealth: (() => BackgroundEmbeddingLaneHealth) | undefined;
     if (backgroundEmbeddingLaneEnabled) {
       // Load the privacy tombstone set once at startup. A page whose
       // domain is tombstoned is never embedded (privacy gate). The set is
@@ -1002,10 +1009,24 @@ export const startCompanion = async (
         await readDomainTombstones(options.vaultPath).catch(() => []),
       );
       const embedOne = await embedBacklogCanonicalUrl(options.vaultPath);
+      // Incremental, cursor-backed candidate discovery — reads+parses ONLY
+      // the changed/new record files each cycle (mtime-bucketed delta),
+      // not the whole ~1800-file store every 4 s. Replaces the prior
+      // listBackgroundEmbeddingCandidates full-scan the soak flagged.
+      const candidateSource = createIncrementalBackgroundEmbeddingCandidateSource(
+        options.vaultPath,
+      );
       const backgroundEmbeddingLane = createBackgroundEmbeddingLane({
-        listCandidates: () => listBackgroundEmbeddingCandidates(options.vaultPath),
+        listCandidates: candidateSource.listCandidates,
         embedCanonicalUrl: embedOne,
         isDrainActive: () => connectionsMaterializer.isDrainActive(),
+        // WARMUP GATE: do no embed work (and burn no attempts) until the
+        // embedder child has warmed. Before this, the lane's first cycles
+        // fired embeds against a cold child → 'failed' → permanent
+        // quarantine of the whole backlog (the 90-min soak inertness).
+        // embedderClient is non-null here (the lane is gated on
+        // useChildProcesses), but stay defensive.
+        isEmbedderReady: () => embedderClient?.isReady() ?? false,
         isTombstoned: (page) => tombstoneSet.matchesPage(page),
         onEmbedded: (canonicalUrl) =>
           connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
@@ -1014,6 +1035,9 @@ export const startCompanion = async (
           writeBackgroundEmbeddingProgress(options.vaultPath, progress),
         log: (message) => process.stdout.write(`${message}\n`),
       });
+      // Expose the lane's health snapshot to /v1/status so an inert lane
+      // is VISIBLE within minutes instead of a 90-min silent stall.
+      backgroundEmbeddingLaneHealth = backgroundEmbeddingLane.health;
       backgroundEmbeddingLane.start();
       teardown.push(() => {
         backgroundEmbeddingLane.stop();
@@ -1217,6 +1241,9 @@ export const startCompanion = async (
       bucketRegistry: createBucketRegistry(options.vaultPath),
       getEventLoopSnapshot: eventLoopMonitor.snapshot,
       getEmbedderStatus,
+      ...(backgroundEmbeddingLaneHealth === undefined
+        ? {}
+        : { getBackgroundEmbeddingLaneHealth: backgroundEmbeddingLaneHealth }),
       ...(collectorFramework === null
         ? {}
         : {

@@ -652,6 +652,15 @@ export interface CompanionHttpConfig {
     readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
     readonly lastError?: string;
   };
+  // Background page-evidence embedding lane health — surfaced on
+  // /v1/status.pageEvidenceEmbedLane so an INERT lane (the 90-min soak
+  // failure: the lane silently embedded nothing while the backlog sat
+  // full) is visible in minutes, not hours. Synchronous + side-effect-
+  // free (reads in-memory counters). Absent when the lane is disabled →
+  // /status omits the field.
+  readonly getBackgroundEmbeddingLaneHealth?: () => import(
+    '../page-evidence/backgroundEmbeddingLane.js'
+  ).BackgroundEmbeddingLaneHealth;
 }
 
 export interface StartedHttpServer {
@@ -3305,6 +3314,7 @@ const routes: readonly RouteDefinition[] = [
               detail: materializerHealth,
             };
       const eventLoopState = context.getEventLoopSnapshot?.();
+      const pageEvidenceEmbedLane = context.getBackgroundEmbeddingLaneHealth?.();
       return [
         200,
         {
@@ -3316,6 +3326,7 @@ const routes: readonly RouteDefinition[] = [
             ...(recallState === undefined ? {} : { recall: recallState }),
             ...(materializerState === undefined ? {} : { materializer: materializerState }),
             ...(eventLoopState === undefined ? {} : { eventLoop: eventLoopState }),
+            ...(pageEvidenceEmbedLane === undefined ? {} : { pageEvidenceEmbedLane }),
             ...(context.vaultChanges === undefined
               ? {}
               : { vaultChangeSubscribers: context.vaultChanges.subscriberCount() }),
