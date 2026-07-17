@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   HEAD_LABEL_THRESHOLD,
+  MIN_SUGGEST_SCORE,
   SUGGEST_PRECISION_FLOOR,
   TOPK_WIDTH,
   scoreVisit,
@@ -114,8 +115,11 @@ describe('scoreVisit title-lexical family', () => {
 describe('scoreVisit conditional-domain family', () => {
   it('adds a domain contribution for a single-workstream domain', () => {
     const state = buildScorerState();
+    // Strong kernel-term title so the top candidate clears the evidence gate
+    // (MIN_SUGGEST_SCORE) and the ranked candidates are exposed; the point of
+    // the test is the conditional-domain contribution, not the decision.
     const result = scoreVisit(
-      { title: 'Some kernel scheduler note', url: 'https://lwn.net/article/new' },
+      { title: 'Linux kernel scheduler memory paging article', url: 'https://lwn.net/article/new' },
       state,
     );
     const top = result.candidates.find((c) => c.workstreamId === 'ws-linux');
@@ -144,13 +148,22 @@ describe('scoreVisit recency family', () => {
   it('nudges the last-filed workstream only when another family already fired', () => {
     atMs = 1000;
     const state = createEmptyAttributionV1State();
-    // Two workstreams share the exact same single member title, so their
+    // Distractor workstreams so the shared terms are distinctive (high IDF)
+    // and the tie clears the evidence gate; otherwise a 2-workstream corpus
+    // suppresses the shared terms and the scorer abstains.
+    for (let d = 0; d < 8; d += 1) {
+      fill(state, `ws-d${d}`, [
+        { url: `https://d${d}.com/1`, title: `unrelated distractor topic ${d} words alpha${d}` },
+      ]);
+    }
+    // Two workstreams share the exact same multi-term member titles, so their
     // title-lexical scores tie. ws-b is filed last.
-    fill(state, 'ws-a', [{ url: 'https://a.com/1', title: 'shared topic alpha beta' }]);
-    fill(state, 'ws-b', [{ url: 'https://b.com/1', title: 'shared topic alpha beta' }]);
+    const sharedTitle = 'quantum entanglement photon qubit decoherence superposition';
+    fill(state, 'ws-a', [1, 2, 3, 4].map((i) => ({ url: `https://a.com/${i}`, title: sharedTitle })));
+    fill(state, 'ws-b', [1, 2, 3, 4].map((i) => ({ url: `https://b.com/${i}`, title: sharedTitle })));
     expect(state.lastFiledWorkstreamId).toBe('ws-b');
     const result = scoreVisit(
-      { title: 'shared topic alpha beta', url: 'https://query.example/x' },
+      { title: sharedTitle, url: 'https://query.example/x' },
       state,
     );
     // ws-b wins the tie via the recency nudge.
@@ -232,5 +245,35 @@ describe('scoreVisit decisions', () => {
     } else {
       expect(result.action).toBe('abstain');
     }
+  });
+
+  it('abstains on a weak match that clears the precision prior but not the evidence gate', () => {
+    // The evidence gate (MIN_SUGGEST_SCORE) is the load-bearing abstention
+    // control, keyed on THIS visit's score — NOT the workstream's label count.
+    // Regression guard for the "gate was a near no-op" finding: a head
+    // workstream (clears the precision prior comfortably) still abstains when
+    // the visit's evidence is weak.
+    const state = buildScorerState();
+    // Only the shared venue term overlaps ("github" has near-zero IDF), so the
+    // top score is well under MIN_SUGGEST_SCORE even though ws-linux is a head
+    // workstream whose shrunkPrecision clears SUGGEST_PRECISION_FLOOR.
+    const result = scoreVisit(
+      { title: 'github repo', url: 'https://github.com/x/y' },
+      state,
+    );
+    expect(result.action).toBe('abstain');
+    expect(result.candidates).toEqual([]);
+  });
+
+  it('suggests once the top score clears the evidence gate', () => {
+    // Complement of the above: a strong topical match clears MIN_SUGGEST_SCORE
+    // and is surfaced. Locks the gate threshold against silent drift.
+    const state = buildScorerState();
+    const result = scoreVisit(
+      { title: 'Linux kernel scheduler memory paging article', url: 'https://lwn.net/article/head' },
+      state,
+    );
+    expect(result.action).not.toBe('abstain');
+    expect(result.candidates[0]!.score).toBeGreaterThanOrEqual(MIN_SUGGEST_SCORE);
   });
 });

@@ -120,21 +120,25 @@ describe('runAttributionPrequential — hand-computable fixture', () => {
     expect(report.arms.map((a) => a.arm)).toEqual([...ATTRIBUTION_PREQUENTIAL_ARMS]);
   });
 
-  it('scores v1 exactly: 2/4 top-1, 2/4 abstain, 100% precision-when-suggesting', () => {
+  it('v1 abstains on this tiny corpus: the evidence gate needs real cross-workstream IDF', () => {
+    // With the score-based evidence gate (MIN_SUGGEST_SCORE), the v1 arm's
+    // absolute score must clear a floor calibrated to the REAL ~33-workstream
+    // vault. On this 2-workstream synthetic fixture the cross-workstream IDF
+    // collapses (every term sits in ~all workstreams ⇒ near-zero weight), so
+    // even the L2/L4 self-matches score well under the floor and v1 abstains
+    // on all four. This is the correct consequence of the gate, not a
+    // regression: the simple arms below (which do NOT use the gate) still
+    // produce their hand-traced numbers unchanged. A gate-clearing v1 trace on
+    // a realistically-scaled corpus is exercised in the head-with-distractors
+    // test and, at full scale, the prequential CLI.
     const report = runAttributionPrequential(handComputableEvents());
     const v1 = armOf(report.arms, 'v1');
-    expect(v1.top1Hits).toBe(2);
-    expect(v1.top1).toBeCloseTo(0.5, 10);
-    expect(v1.top3).toBeCloseTo(0.5, 10);
-    expect(v1.abstentions).toBe(2);
-    expect(v1.abstainRate).toBeCloseTo(0.5, 10);
-    // Of the 2 labels v1 suggested on, both were correct.
-    expect(v1.precisionWhenSuggesting).toBeCloseTo(1.0, 10);
+    expect(v1.top1Hits).toBe(0);
+    expect(v1.abstentions).toBe(4);
+    expect(v1.abstainRate).toBeCloseTo(1.0, 10);
     // All labels are tail.
     expect(v1.tailLabelCount).toBe(4);
     expect(v1.headLabelCount).toBe(0);
-    expect(v1.tail).toBeCloseTo(0.5, 10);
-    expect(v1.head).toBe(0);
   });
 
   it('scores title-lexical alone: 2/4 top-1, 2/4 abstain, 100% precision', () => {
@@ -217,6 +221,24 @@ describe('runAttributionPrequential — head/tail bucketing', () => {
     resetSeq();
     const events: AcceptedEvent[] = [];
     let t = 1;
+    // Distractor workstreams (one member each, disjoint junk terms) filed
+    // first. They give the head workstream's title terms real cross-workstream
+    // IDF so the v1 evidence gate (MIN_SUGGEST_SCORE) can be cleared — on a
+    // single-workstream corpus every term's IDF collapses and v1 would abstain
+    // regardless of head/tail. This mirrors the real ~33-workstream vault the
+    // gate is calibrated against.
+    const distractorCount = 8;
+    for (let d = 0; d < distractorCount; d += 1) {
+      events.push(
+        timelineEvent(
+          `https://dd${d}.example/1`,
+          `distractorword${d} fillerword${d} junktoken${d}`,
+          t,
+          `sd${d}`,
+        ),
+      );
+      t += 1;
+    }
     // A head workstream: HEAD_WORKSTREAM_LABEL_THRESHOLD + 1 labels, each with
     // a shared distinctive title so title-lexical keeps matching.
     const headCount = HEAD_WORKSTREAM_LABEL_THRESHOLD + 1;
@@ -229,6 +251,10 @@ describe('runAttributionPrequential — head/tail bucketing', () => {
     events.push(timelineEvent('https://tail.example/1', 'gardening compost soil', t, 'st'));
     t += 1;
     // Now the labels, in order, at increasing times.
+    for (let d = 0; d < distractorCount; d += 1) {
+      events.push(organizeEvent(`https://dd${d}.example/1`, `wsd${d}`, t));
+      t += 1;
+    }
     for (let i = 0; i < headCount; i += 1) {
       events.push(organizeEvent(`https://head.example/${i}`, 'wsHead', t));
       t += 1;
@@ -236,15 +262,18 @@ describe('runAttributionPrequential — head/tail bucketing', () => {
     events.push(organizeEvent('https://tail.example/1', 'wsTail', t));
 
     const report = runAttributionPrequential(events);
+    // wsHead is the only >=threshold workstream; the distractors + wsTail are
+    // all single-label tail workstreams.
     expect(report.headWorkstreamCount).toBe(1);
-    expect(report.tailWorkstreamCount).toBe(1);
+    expect(report.tailWorkstreamCount).toBe(distractorCount + 1);
     expect(report.headLabelCount).toBe(headCount);
-    expect(report.tailLabelCount).toBe(1);
+    expect(report.tailLabelCount).toBe(distractorCount + 1);
     const v1 = armOf(report.arms, 'v1');
     expect(v1.headLabelCount).toBe(headCount);
-    expect(v1.tailLabelCount).toBe(1);
-    // The head workstream's title-lexical family should carry it once it has
-    // members, so head top-1 must be strictly positive.
+    expect(v1.tailLabelCount).toBe(distractorCount + 1);
+    // Once the head workstream has members AND the corpus has enough
+    // workstreams to give its terms real IDF, its title-lexical family clears
+    // the evidence gate — so head top-1 must be strictly positive.
     expect(v1.head).toBeGreaterThan(0);
   });
 });

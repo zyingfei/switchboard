@@ -174,7 +174,6 @@ import {
 import {
   emitAttributionV1Shadow,
   incumbentTopFromResolution,
-  titleForCanonicalUrl,
 } from '../attribution-v1/emit.js';
 import {
   createEmptyUrlProjectionAccumulator,
@@ -4141,12 +4140,13 @@ const routes: readonly RouteDefinition[] = [
           // records a compact comparison. Best-effort + fully self-
           // contained: it never throws and never touches `result`, so the
           // served response is byte-identical with the flag on or off.
+          // The O(nodes) title lookup runs LAZILY inside emit — only after
+          // its flag + fresh-state gates pass — so with the shadow flag off
+          // this call is a cheap no-op and no snapshot scan happens.
           await emitAttributionV1Shadow({
             vaultRoot: requireVaultRoot(context),
             canonicalUrl,
-            ...(titleForCanonicalUrl(snapshot, canonicalUrl) === undefined
-              ? {}
-              : { title: titleForCanonicalUrl(snapshot, canonicalUrl)! }),
+            snapshot,
             incumbentTop: incumbentTopFromResolution(result),
           });
           return [

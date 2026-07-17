@@ -6,14 +6,21 @@
 // It returns void and touches nothing on the served response — the caller
 // awaits it (or not) purely for the observability side effect.
 //
-// Reading the state artifact per resolve would add a disk read to the serve
-// path. Instead the deserialized state is memoized per (vaultRoot, artifact
-// generatedAt): the first resolve after a drain reads + deserializes once,
-// subsequent resolves reuse the in-memory state until the next drain writes
-// a fresher artifact. The read itself is a tiny JSON file; the memo keeps
-// the hot path allocation-free.
+// Reading the state artifact per resolve would add a 105KB disk read +
+// JSON.parse to the serve path. Instead the WHOLE load is memoized on the
+// artifact file's mtime: each resolve does a single cheap fs.stat, and only
+// when the mtime differs from the memo do we read + parse + deserialize. The
+// first resolve after a drain (which rewrites the file) reloads once;
+// subsequent resolves return the in-memory state after nothing but a stat.
+// The prior memo keyed on the parsed generatedAt, which still cost the read
+// + parse every resolve — the mtime guard is what makes the hot path
+// allocation-free.
+
+import { stat } from 'node:fs/promises';
 
 import {
+  ATTRIBUTION_V1_ARTIFACT_MAX_AGE_MS,
+  attributionV1ArtifactPath,
   deserializeAttributionV1State,
   isAttributionV1ArtifactFresh,
   readAttributionV1Artifact,
@@ -28,30 +35,55 @@ import {
 
 interface MemoizedState {
   readonly vaultRoot: string;
+  readonly mtimeMs: number;
   readonly generatedAt: string;
   readonly state: AttributionV1State;
 }
 
 let memoizedState: MemoizedState | null = null;
 
-// Resolve the current v1 state for a vault, memoized on the artifact's
-// generatedAt. Returns null when there is no fresh artifact (shadow simply
-// skips — it is observability, never a gate on serving).
+// Resolve the current v1 state for a vault, memoized on the artifact file's
+// mtime. Returns null when there is no fresh artifact (shadow simply skips —
+// it is observability, never a gate on serving). The stat is the only I/O on
+// the hot path once the memo is warm; a missing/unreadable file falls
+// through to null.
 const loadStateForShadow = async (
   vaultRoot: string,
   now: () => Date,
 ): Promise<AttributionV1State | null> => {
-  const artifact = await readAttributionV1Artifact(vaultRoot);
-  if (artifact === null || !isAttributionV1ArtifactFresh(artifact, now)) return null;
+  let mtimeMs: number;
+  try {
+    mtimeMs = (await stat(attributionV1ArtifactPath(vaultRoot))).mtimeMs;
+  } catch {
+    // No artifact yet (or unreadable) — nothing to shadow. Drop any stale
+    // memo so we don't serve state for a file that has since vanished.
+    memoizedState = null;
+    return null;
+  }
   if (
     memoizedState !== null &&
     memoizedState.vaultRoot === vaultRoot &&
-    memoizedState.generatedAt === artifact.generatedAt
+    memoizedState.mtimeMs === mtimeMs
   ) {
+    // Warm memo. Still enforce the age gate (cheap, no I/O) so a stalled
+    // writer whose file stops changing cannot serve state past the max age —
+    // preserving the pre-memo semantics without re-reading the file.
+    if (
+      now().getTime() - Date.parse(memoizedState.generatedAt) >
+      ATTRIBUTION_V1_ARTIFACT_MAX_AGE_MS
+    ) {
+      return null;
+    }
     return memoizedState.state;
   }
+  // mtime changed (or first load / different vault): read + parse + hydrate.
+  const artifact = await readAttributionV1Artifact(vaultRoot);
+  if (artifact === null || !isAttributionV1ArtifactFresh(artifact, now)) {
+    memoizedState = null;
+    return null;
+  }
   const state = deserializeAttributionV1State(artifact.state);
-  memoizedState = { vaultRoot, generatedAt: artifact.generatedAt, state };
+  memoizedState = { vaultRoot, mtimeMs, generatedAt: artifact.generatedAt, state };
   return state;
 };
 
@@ -59,12 +91,20 @@ export const resetShadowStateMemoForTest = (): void => {
   memoizedState = null;
 };
 
+// Snapshot shape the title lookup needs — structurally typed so this module
+// does not import the connections types. Matches both readCurrent() and the
+// resolver-subgraph reads (both expose `.nodes`).
+export type ShadowTitleSnapshot = Parameters<typeof titleForCanonicalUrl>[0];
+
 export interface EmitAttributionV1ShadowInput {
   readonly vaultRoot: string;
   readonly canonicalUrl: string;
-  // Best-effort visit title (from the snapshot node / timeline). Absent ⇒
-  // the scorer runs title-less (domain + recency only); still recorded.
-  readonly title?: string;
+  // The connections snapshot the title is looked up from. The lookup is an
+  // O(nodes) scan, so it runs LAZILY inside this function — only after the
+  // flag + fresh-state gates pass — never on the serve path when the shadow
+  // lane is off. Absent title ⇒ the scorer runs title-less (domain + recency
+  // only); still recorded.
+  readonly snapshot: ShadowTitleSnapshot;
   // The incumbent's decided workstream for this url, or null when it
   // abstained (inbox / no-suggestion). This is what agreement is measured
   // against.
@@ -83,8 +123,11 @@ export const emitAttributionV1Shadow = async (
     const now = input.now ?? (() => new Date());
     const state = await loadStateForShadow(input.vaultRoot, now);
     if (state === null) return;
+    // Only now — past the flag + fresh-state gates — pay for the O(nodes)
+    // title scan, exactly once.
+    const title = titleForCanonicalUrl(input.snapshot, input.canonicalUrl);
     const result = scoreVisit(
-      { title: input.title ?? '', url: input.canonicalUrl },
+      { title: title ?? '', url: input.canonicalUrl },
       state,
     );
     const record = buildShadowRecord({

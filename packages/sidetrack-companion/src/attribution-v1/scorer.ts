@@ -22,9 +22,11 @@
 // learned combiner in v1 (the LightGBM arbiter is a later trigger).
 //
 // DECISIONS (contract §2, "abstention-first, matched to the 80% base
-// rate"): per-workstream empirical precision with beta-binomial shrinkage
-// gates whether to suggest; TOP-K (not top-1) for tail workstreams; abstain
-// otherwise. No auto-apply in v1.
+// rate"): a per-visit EVIDENCE gate (MIN_SUGGEST_SCORE, calibrated to the
+// study's 80.3% never-organized base rate) is the primary abstention control;
+// the per-workstream beta-binomial shrunk precision is a secondary prior on
+// label volume. Both must clear to suggest; TOP-K (not top-1) for tail
+// workstreams; abstain otherwise. No auto-apply in v1.
 //
 // NO cosine anything (encoder anisotropy, contract §1 E / §2). No embedding
 // signal. Pure functions over AttributionV1State + the visit triple.
@@ -83,11 +85,30 @@ export const TOPK_WIDTH = 3;
 // Minimum shrunk precision to emit a suggestion at all. Set just above the
 // majority-class floor (28.9%): a candidate must clear "no better than
 // guessing the biggest bucket" to be worth surfacing. Below it ⇒ abstain.
+// NOTE: shrunkPrecision is keyed on the workstream's LABEL COUNT, so this
+// prior alone is a near-no-op gate — every workstream with >=1 label clears
+// it (shrunkPrecision(1)=0.308 > 0.30). It is a per-workstream *prior*, not
+// per-visit confidence; the per-visit evidence gate is MIN_SUGGEST_SCORE.
 export const SUGGEST_PRECISION_FLOOR = 0.3;
 
 // Minimum blended score for a candidate to be considered at all (drops the
-// long tail of near-zero title matches so abstention is the default).
+// long tail of near-zero title matches; a candidate below this is not even
+// ranked).
 const MIN_CANDIDATE_SCORE = 1e-6;
+
+// Per-visit EVIDENCE gate: the minimum top-candidate score to actually
+// SUGGEST. Unlike SUGGEST_PRECISION_FLOOR (a per-workstream label-count
+// prior), this keys on THIS visit's measured evidence, which is what makes
+// abstention the default. It is calibrated to the study's revealed base rate:
+// the owner leaves 80.3% of visited URLs unfiled, so an abstention-first
+// scorer should decline on the weak ~80% of matches and suggest only on the
+// strong ~20%. On the asserted-edge prequential replay this vault, a floor of
+// 2.8 (the p80 of fired top-candidate scores) yields ~80% abstention,
+// matching that base rate; below it ⇒ abstain. Without this gate the scorer
+// suggested on ~92% of visits (7.7% abstain) — the finding's "near no-op".
+// This is a fixed constant, not a per-run tuned value; it encodes the base
+// rate the study measured, not this replay's optimum.
+export const MIN_SUGGEST_SCORE = 2.8;
 
 // ---- output shape -----------------------------------------------------
 
@@ -305,11 +326,18 @@ export const scoreVisit = (
     return { action: 'abstain', candidates: [] };
   }
 
-  // Abstention gate: the top candidate's shrunk precision must clear the
-  // suggest floor. Below it, nothing is confident enough — abstain (matches
-  // the 80.3% never-organized base rate).
+  // Abstention gate (two parts, both must pass — matches the 80.3%
+  // never-organized base rate):
+  //   1. PER-VISIT EVIDENCE: the top candidate's score must clear
+  //      MIN_SUGGEST_SCORE. This is the load-bearing gate — it keys on THIS
+  //      visit's measured evidence, so weak matches (the ~80% the owner never
+  //      files) abstain. Checked first because it does the abstaining.
+  //   2. PER-WORKSTREAM PRIOR: the top workstream's beta-binomial shrunk
+  //      precision must clear SUGGEST_PRECISION_FLOOR. This filters out
+  //      workstreams with too little history to trust; it is a weak prior on
+  //      the label count, not per-visit confidence.
   const top = candidates[0]!;
-  if (top.shrunkPrecision < SUGGEST_PRECISION_FLOOR) {
+  if (top.score < MIN_SUGGEST_SCORE || top.shrunkPrecision < SUGGEST_PRECISION_FLOOR) {
     return { action: 'abstain', candidates: [] };
   }
 
