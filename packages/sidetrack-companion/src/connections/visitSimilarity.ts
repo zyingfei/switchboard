@@ -78,12 +78,69 @@ export const VISIT_SIMILARITY_ENGAGEMENT_GATE_MS_ENV = 'SIDETRACK_SIMILARITY_MIN
 export const VISIT_SIMILARITY_LEXICAL_THRESHOLD_ENV = 'SIDETRACK_SIMILARITY_LEXICAL_THRESHOLD';
 export const VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV = 'SIDETRACK_SIMILARITY_LEXICAL_FALLBACK';
 
+// -- Anisotropy baseline for the recall encoder (Xenova/multilingual-
+// e5-small) -----------------------------------------------------------
+//
+// Embedding cosine is NOT centered at 0 for this encoder: the vector
+// space is anisotropic, so even random UNRELATED page pairs sit at a
+// high mean cosine with a narrow spread. Measured over the live test
+// vault on 2026-07-14 ("anisotropy study"), random unrelated pairs had
+//   mean 0.825, sd 0.029  (p90 0.860, p99 0.901).
+// The historical raw gate VISIT_SIMILARITY_DEFAULT_THRESHOLD=0.85 is
+// therefore ≈ (0.85 − 0.825) / 0.029 ≈ z 0.86 ≈ the p80 of NOISE — it
+// admits a large fraction of unrelated pairs. A z-score re-centers the
+// cosine against this baseline so edge quality is measurable and the
+// gate can be recalibrated on evidence rather than on the raw scale.
+//
+// These are documented constants with env overrides; the sd/mean are a
+// property of the encoder + corpus, not of a single drain.
+// TODO(eval-spine): replace this frozen 2026-07-14 vault baseline with a
+// drain-time empirical estimate (sample random unrelated pairs per
+// drain, EWMA the mean/sd) once the connections-precision spine can
+// score the shift. Until then the study constants are the source of
+// truth and the z-gate below stays default-OFF.
+export const SIMILARITY_ANISOTROPY_MEAN = 0.825;
+export const SIMILARITY_ANISOTROPY_SD = 0.029;
+
+export const SIMILARITY_ANISOTROPY_MEAN_ENV = 'SIDETRACK_SIMILARITY_ANISOTROPY_MEAN';
+export const SIMILARITY_ANISOTROPY_SD_ENV = 'SIDETRACK_SIMILARITY_ANISOTROPY_SD';
+// Optional serving gate (default ABSENT = OFF): when set to a finite
+// number the visit-similarity producer gates on z >= value INSTEAD of
+// the raw cosine >= threshold. Flipping it is a SERVING change awaiting
+// the eval spine — leave unset to preserve byte-identical default edges.
+export const SIMILARITY_Z_MIN_ENV = 'SIDETRACK_SIMILARITY_Z_MIN';
+
 const readEnvNumber = (name: string): number | undefined => {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return undefined;
   const value = Number(raw);
   return Number.isFinite(value) ? value : undefined;
 };
+
+// Resolve the anisotropy baseline (env override wins, else the study
+// constant). SD is floored away from 0 so z is always finite.
+export const resolveAnisotropyBaseline = (): { readonly mean: number; readonly sd: number } => {
+  const mean = readEnvNumber(SIMILARITY_ANISOTROPY_MEAN_ENV) ?? SIMILARITY_ANISOTROPY_MEAN;
+  const sdRaw = readEnvNumber(SIMILARITY_ANISOTROPY_SD_ENV) ?? SIMILARITY_ANISOTROPY_SD;
+  const sd = Number.isFinite(sdRaw) && sdRaw > 0 ? sdRaw : SIMILARITY_ANISOTROPY_SD;
+  return { mean, sd };
+};
+
+// Standardize a raw cosine against the anisotropy baseline: how many
+// standard deviations above (or below) the noise floor this pair sits.
+// Rounded to 2dp — the stamped metadata is a diagnostic, not a key.
+export const anisotropyZScore = (
+  cosine: number,
+  baseline: { readonly mean: number; readonly sd: number } = resolveAnisotropyBaseline(),
+): number => {
+  if (!Number.isFinite(cosine)) return 0;
+  const z = (cosine - baseline.mean) / baseline.sd;
+  return Number.isFinite(z) ? Number(z.toFixed(2)) : 0;
+};
+
+// Optional z-gate minimum (default undefined = OFF). See SIMILARITY_Z_MIN_ENV.
+export const resolveSimilarityZMin = (): number | undefined =>
+  readEnvNumber(SIMILARITY_Z_MIN_ENV);
 
 const lexicalFallbackEnabled = (): boolean => {
   const raw = process.env[VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV];
@@ -1073,6 +1130,14 @@ export const buildVisitSimilarity = async (
   const config = resolveVisitSimilarityConfig(options);
   const { threshold, topK, engagementGateMs, lexicalThreshold } = config;
   const fallbackAllowed = config.lexicalFallbackEnabled;
+  // Optional anisotropy z-gate (default undefined = OFF). When set, the
+  // producer admits an edge on z >= zMin INSTEAD of the raw cosine >=
+  // threshold. Unset keeps the served edges byte-identical to the raw
+  // 0.85 gate. Flipping it is a serving change awaiting the eval spine.
+  const zMin = resolveSimilarityZMin();
+  const zBaseline = resolveAnisotropyBaseline();
+  const admitByScore = (score: number): boolean =>
+    zMin === undefined ? score >= threshold : anisotropyZScore(score, zBaseline) >= zMin;
   const modelRevision = RECALL_MODEL.revision;
   const visits = normalizeEntries(entries, options.evidenceByCanonicalUrl);
   // Stage 5.0 follow-up — embedding-path id is computed up front and
@@ -1246,11 +1311,10 @@ export const buildVisitSimilarity = async (
             options.pageContentChunksByCanonicalUrl,
           )
         : undefined;
-      const score =
-        candidate.similarity >= threshold
-          ? candidate.similarity
-          : (evidenceScore?.score ?? candidate.similarity);
-      if (score < threshold) continue;
+      const score = admitByScore(candidate.similarity)
+        ? candidate.similarity
+        : (evidenceScore?.score ?? candidate.similarity);
+      if (!admitByScore(score)) continue;
       edges.push({
         fromVisitKey: source.visitKey,
         toVisitKey: candidate.id,
