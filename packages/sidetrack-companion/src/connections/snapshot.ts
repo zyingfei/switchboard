@@ -97,6 +97,7 @@ import {
 import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
+import { anisotropyZScore } from './visitSimilarity.js';
 import {
   edgeIdFor,
   nodeIdFor,
@@ -3086,6 +3087,17 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
           // extracts id/kind, so byte-equality of untouched edges holds.
           evidenceTier: evidenceTierForSimilarityMetadata(similarityEdge.metadata),
           evidenceProducedAt: input.visitSimilarity.producedAt,
+          // Anisotropy z-score — additive metadata (default-on). Raw
+          // cosine is not centered at 0 for this encoder: random
+          // unrelated pairs sit at mean 0.825, sd 0.029 (2026-07-14
+          // vault study), so 0.85 ≈ noise-p80. simZ re-centers the
+          // stamped cosine against that baseline (how many sd above the
+          // noise floor) so downstream consumers / the eval spine can
+          // read edge quality on a calibrated scale. Purely additive:
+          // same byte-equality argument as evidenceTier above — new/
+          // updated edges only, snapshotRevision hashes counts not
+          // metadata, edges_index extracts id/kind.
+          simZ: anisotropyZScore(similarityEdge.cosine),
         },
       });
     }

@@ -1340,6 +1340,10 @@ describe('connections — content-derived edges', () => {
       threshold: 0.85,
       evidenceTier: 'title_only',
       evidenceProducedAt: 1_777_777_777_000,
+      // Anisotropy z-score (additive, default-on): re-centers the cosine
+      // against the noise baseline mean 0.825, sd 0.029 →
+      // (0.91 - 0.825) / 0.029 ≈ 2.93.
+      simZ: 2.93,
     });
     expect(
       snap.edges.filter((candidate) => candidate.kind === 'visit_resembles_visit'),
