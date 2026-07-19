@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Sidetrack</string>
+    <key>CFBundleDisplayName</key>
+    <string>Sidetrack</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.sidetrack.menubar</string>
+    <key>CFBundleExecutable</key>
+    <string>Sidetrack</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <!-- Menu-bar-only: no Dock icon, no app-switcher entry. -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Local-first: this app makes ZERO external network calls. The
+         only connections are loopback (127.0.0.1) to the companion.
+         App Transport Security is left at defaults; loopback is exempt
+         from ATS, and no non-local domains are ever contacted. -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Sidetrack — local dev tool</string>
+</dict>
+</plist>
