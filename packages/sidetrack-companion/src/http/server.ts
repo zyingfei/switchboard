@@ -394,6 +394,7 @@ import {
 } from '../privacy/domainTombstoneStore.js';
 import { checkLatestVersion, type UpdateAdvisory } from '../system/versionCheck.js';
 import { COMPANION_VERSION } from '../version.js';
+import { readBuildInfo } from '../build-info.js';
 import { maybeRetrainClosestVisitRanker, runMaybeRetrainInWorker } from '../ranker/retrain.js';
 import { runRecallImpressionBootstrap } from '../ranker/impressionBootstrap.js';
 import {
@@ -3078,6 +3079,17 @@ const routes: readonly RouteDefinition[] = [
             process.env['SIDETRACK_COMPANION_GIT_SHA'].length > 0
               ? { gitSha: process.env['SIDETRACK_COMPANION_GIT_SHA'] }
               : {}),
+            // buildSha/buildTime/buildBranch: dist build provenance
+            // stamped by scripts/stamp-build.mjs into
+            // dist/BUILD_INFO.json at build time. Unlike gitSha (which
+            // needs an explicit env/flag at launch), these are baked
+            // into dist itself, so they answer "which build is this
+            // dist" even for a plain `bun dist/cli.js` run. Always
+            // present as fields; null when the artifact is absent
+            // (e.g. a raw tsc-only build) so consumers can rely on the
+            // keys existing. buildSha vs the current checkout is the
+            // stale-dist signal the menu-bar app surfaces.
+            ...readBuildInfo(),
             requestId,
           },
         },
