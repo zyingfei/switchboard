@@ -28,7 +28,8 @@
     "zod": "^4.3.6"
   },
   "scripts": {
-    "build": "bunx --bun --no-install tsc -p tsconfig.build.json",
+    "build": "bunx --bun --no-install tsc -p tsconfig.build.json && bun scripts/stamp-build.mjs",
+    "stamp": "bun scripts/stamp-build.mjs",
     "typecheck": "bunx --bun --no-install tsc --noEmit -p tsconfig.json",
     "lint": "bunx --bun --no-install eslint \"**/*.{ts,tsx}\"",
     "format": "bunx --bun --no-install prettier --write .",

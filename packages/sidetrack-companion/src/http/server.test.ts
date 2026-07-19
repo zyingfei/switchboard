@@ -295,6 +295,35 @@ describe('companion HTTP server', () => {
     }
   });
 
+  it('/v1/version always exposes buildSha/buildTime/buildBranch keys', async () => {
+    // Build provenance from dist/BUILD_INFO.json (Part A). The keys are
+    // always present so the menu-bar app can read them unconditionally;
+    // under the test harness the artifact is absent, so they are null.
+    // (readBuildInfo's present-file mapping is covered in
+    // build-info.test.ts against a fixture.) This asserts the endpoint
+    // wires them in additively and never crashes when the file is gone.
+    const result = await jsonFetch(context, `${baseUrl}/v1/version`);
+
+    expect(result.status).toBe(200);
+    const body = result.body as {
+      readonly data: {
+        readonly companionVersion: string;
+        readonly buildSha: string | null;
+        readonly buildTime: string | null;
+        readonly buildBranch: string | null;
+      };
+    };
+    // Existing fields unchanged.
+    expect(typeof body.data.companionVersion).toBe('string');
+    // New additive fields present as keys, null when dist is un-stamped.
+    expect(body.data).toHaveProperty('buildSha');
+    expect(body.data).toHaveProperty('buildTime');
+    expect(body.data).toHaveProperty('buildBranch');
+    expect(body.data.buildSha).toBeNull();
+    expect(body.data.buildTime).toBeNull();
+    expect(body.data.buildBranch).toBeNull();
+  });
+
   it('rejects state routes without bridge key auth', async () => {
     const result = await jsonFetch(context, `${baseUrl}/v1/status`);
 
