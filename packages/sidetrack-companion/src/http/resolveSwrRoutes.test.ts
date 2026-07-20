@@ -81,6 +81,8 @@ describe('resolve-family SWR HTTP wiring', () => {
       putDay: async () => undefined,
       readDay: async () => null,
       listDays: async () => [],
+      writeSnapshotAndProgress: async () => {},
+      readMaterializerProgress: async () => null,
     };
     const config: CompanionHttpConfig = {
       bridgeKey,
