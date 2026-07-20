@@ -71,6 +71,12 @@ export interface EventStore {
 export const eventStoreEnabled = (): boolean => process.env['SIDETRACK_EVENT_STORE'] === '1';
 
 const sharedEventStores = new Map<string, Promise<EventStore | null>>();
+// Single-flight guard for catch-up: concurrent callers (a background
+// /v1/status kick + an inline resolve/projection/health read) share ONE
+// catchUpFromJsonl pass. Without this, the first read after idle on a large
+// vault runs a 40s+ catch-up per caller — duplicated CPU and racing shard-
+// progress/watermark writes on the same SQLite handle.
+const catchUpInFlight = new Map<string, Promise<void>>();
 
 interface SqliteStatement {
   readonly run: (...params: readonly unknown[]) => unknown;
@@ -566,6 +572,23 @@ export const getCaughtUpSharedEventStore = async (
 ): Promise<EventStore | null> => {
   const store = await getSharedEventStore(vaultRoot);
   if (store === null) return null;
-  await store.catchUpFromJsonl(join(vaultRoot, '_BAC', 'log'));
+  // Single-flight the catch-up so overlapping callers coalesce into one
+  // JSONL pass. A caller that arrives mid-catch-up awaits the SAME promise;
+  // callers arriving after it completes start a fresh (now-cheap, only-new-
+  // bytes) pass. The guard is cleared in finally so a failed pass can retry.
+  const existing = catchUpInFlight.get(vaultRoot);
+  if (existing !== undefined) {
+    await existing;
+    return store;
+  }
+  const pass = (async (): Promise<void> => {
+    try {
+      await store.catchUpFromJsonl(join(vaultRoot, '_BAC', 'log'));
+    } finally {
+      catchUpInFlight.delete(vaultRoot);
+    }
+  })();
+  catchUpInFlight.set(vaultRoot, pass);
+  await pass;
   return store;
 };

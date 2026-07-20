@@ -414,6 +414,7 @@ import {
   type VaultWriter,
 } from '../vault/writer.js';
 import { VaultExportConfinementError, VaultUnavailableError } from './errors.js';
+import { ResolveSwrCache, type ResolveFreshness } from './resolveSwrCache.js';
 import type { IdempotencyStore } from './idempotency.js';
 import type { ValidationIssue } from './problem.js';
 import { createProblem } from './problem.js';
@@ -662,6 +663,16 @@ export interface CompanionHttpConfig {
   readonly getBackgroundEmbeddingLaneHealth?: () => import(
     '../page-evidence/backgroundEmbeddingLane.js'
   ).BackgroundEmbeddingLaneHealth;
+  // Bounded event-store catch-up trigger. Wired by the runtime to
+  // getCaughtUpSharedEventStore(vaultRoot). /v1/status kicks this in the
+  // BACKGROUND (single-flight) and returns immediately with `catchingUp: true`
+  // rather than awaiting it inline: on a large vault after idle the JSONL
+  // catch-up can run 40s+ and, since it holds the single Bun loop, would
+  // freeze EVERY endpoint (even /v1/version). Must resolve when the store is
+  // current and reject/throw only on genuine failure. Optional so route-only
+  // tests and event-store-disabled runtimes keep working (field absent ⇒
+  // /status never reports catchingUp).
+  readonly eventStoreCatchUp?: () => Promise<void>;
 }
 
 export interface StartedHttpServer {
@@ -2219,19 +2230,111 @@ const releaseResolveSlot = (): void => {
     resolvePermits += 1;
   }
 };
-const cachedResolveRoute = (
-  key: string,
-  ttlMs: number,
+// Stale-while-revalidate cache for the dry-run resolve family
+// (tabsessions/:id/resolve, visits/:url/resolve, and the per-item path of
+// visits/batch-resolve). See resolveSwrCache.ts for the full rationale. The
+// short version: the previous cache keyed each entry on the graph sig, so
+// EVERY drain (~1/min) evicted the whole visible set → the extension's ~15s
+// poll recomputed ~20 cards cold (5-13s each) concurrently on the single Bun
+// loop → convoy → 45s client timeouts. The SWR cache keys per URL+query
+// (sig-independent for the serve decision), serves the slightly-stale value
+// INSTANTLY — exactly what the panel already displays between its own polls —
+// and refreshes the stale key in the background under a small concurrency
+// bound so a drain can never convoy the loop.
+//
+// TTL + max-entries reuse the existing resolve env knobs. The background
+// refresh concurrency reuses RESOLVE_MAX_CONCURRENCY so the total inline +
+// background resolve CPU stays bounded by the same operator dial.
+const resolveSwrCache = new ResolveSwrCache({
+  ttlMs: ROUTE_CACHE_TTL_MS,
+  maxBackgroundRefresh: RESOLVE_MAX_CONCURRENCY,
+  maxEntries: 256,
+  now: () => Date.now(),
+});
+
+// Merge the additive `resolveFreshness` field into a served resolve body.
+// Additive only — nothing consumes it yet; the UI can later surface a
+// "refreshing…" affordance for stale-revalidating responses. Non-200 and
+// non-object bodies pass through untouched (freeze-safe).
+const withResolveFreshness = (
+  result: readonly [number, unknown],
+  freshness: ResolveFreshness,
+): readonly [number, unknown] => {
+  if (result[0] !== 200) return result;
+  const body = result[1];
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return result;
+  return [200, { ...(body as Record<string, unknown>), resolveFreshness: freshness }];
+};
+
+// Serve a dry-run resolve through the SWR cache. `serveKey` is per-URL+query
+// (NOT sig-keyed); `sig` is the current graph signature the entry is checked
+// against. Cold/TTL-expired builds run inline under the resolve concurrency
+// slot so a first-ever burst still can't peg every core; the SWR cache's own
+// bounded background lane handles stale refreshes.
+const serveResolveSwr = async (
+  serveKey: string,
+  sig: string,
   build: () => Promise<readonly [number, unknown]>,
-): Promise<readonly [number, unknown]> =>
-  cachedRoute(key, ttlMs, async (): Promise<readonly [number, unknown]> => {
+): Promise<readonly [number, unknown]> => {
+  const gatedBuild = async (): Promise<readonly [number, unknown]> => {
     await acquireResolveSlot();
     try {
       return await build();
     } finally {
       releaseResolveSlot();
     }
-  });
+  };
+  const served = await resolveSwrCache.serve(serveKey, sig, gatedBuild);
+  return withResolveFreshness(served.result, served.freshness);
+};
+
+// ---- Non-blocking event-store catch-up (CLASS A) ----------------------
+// The first /v1/status after idle used to coincide with a synchronous JSONL
+// catch-up (via getCaughtUpSharedEventStore on a resolve/projection route)
+// that ran 47s on a 720k-event / 565MB vault and — holding the single Bun
+// loop — froze EVERY endpoint (even /v1/version went 2s). Fix: /v1/status
+// (and /v1/system/health, which shares the same store) kicks the catch-up in
+// the BACKGROUND under a single-flight guard and returns immediately with an
+// additive `catchingUp: true` + `lastCatchUpCompletedAt`, never awaiting the
+// slow work inline. Subsequent polls return `catchingUp: false` once done.
+interface StatusCatchUpState {
+  inFlight: Promise<void> | null;
+  lastCompletedAtMs: number | null;
+  lastError: string | null;
+}
+const statusCatchUpState: StatusCatchUpState = {
+  inFlight: null,
+  lastCompletedAtMs: null,
+  lastError: null,
+};
+// Kick a background catch-up if one is not already running. Returns whether a
+// catch-up is currently in flight (freshly-kicked or still running). NEVER
+// awaits the catch-up — the caller responds immediately.
+const kickBackgroundEventStoreCatchUp = (catchUp: () => Promise<void>): boolean => {
+  if (statusCatchUpState.inFlight !== null) return true;
+  const run = (async (): Promise<void> => {
+    try {
+      await catchUp();
+      statusCatchUpState.lastError = null;
+    } catch (err) {
+      statusCatchUpState.lastError = err instanceof Error ? err.message : String(err);
+    } finally {
+      statusCatchUpState.lastCompletedAtMs = Date.now();
+      statusCatchUpState.inFlight = null;
+    }
+  })();
+  statusCatchUpState.inFlight = run;
+  // Swallow rejections on the retained handle so an unhandled rejection can
+  // never crash the loop; errors are captured in lastError above.
+  run.catch(() => undefined);
+  return true;
+};
+// Reset hook for deterministic tests (module state persists across a suite).
+export const resetStatusCatchUpStateForTest = (): void => {
+  statusCatchUpState.inFlight = null;
+  statusCatchUpState.lastCompletedAtMs = null;
+  statusCatchUpState.lastError = null;
+};
 
 // The suggestion-resolve caches (visres:/tabres:) are keyed on the
 // connections snapshot, deliberately NOT the event log (see the statSig
@@ -2248,6 +2351,7 @@ const invalidateResolveCaches = (): void => {
   for (const key of [...routeInFlight.keys()]) {
     if (key.startsWith('visres:') || key.startsWith('tabres:')) routeInFlight.delete(key);
   }
+  resolveSwrCache.invalidate((key) => key.startsWith('visres:') || key.startsWith('tabres:'));
 };
 
 const resolverSignalEventsForCanonicalUrls = (
@@ -2710,6 +2814,91 @@ const readEventsFromStoreOrLog = async (
 // Type hints for the readEventsFromStoreOrLog callers (must list every
 // type the corresponding predicate can match).
 const RESOLVER_SIGNAL_EVENT_TYPES = [USER_FLOW_REJECTED, USER_ORGANIZED_ITEM] as const;
+
+// SWR serve-key for a batch-resolve item. Namespaced `|batch` (distinct from
+// the GET route's `|?dryRun=…` query) because the batch path reads a
+// different subgraph shape; the `visres:` prefix keeps invalidateResolveCaches
+// purging it on user decisions.
+const batchResolveSwrKey = (canonicalUrl: string): string => `visres:${canonicalUrl}|batch`;
+
+// Background refresh for a single stale batch item: recompute via the
+// canonical single-URL subgraph + signal events (identical to what the GET
+// /v1/visits/:url/resolve route and cacheResolverResult persist for one URL).
+// Best-effort; failures leave the stale entry in place until the next request.
+const buildBatchResolveRefresh =
+  (
+    context: CompanionHttpConfig,
+    sqliteStore: SqliteConnectionsStore,
+    canonicalUrl: string,
+    snapshotRevision: string | undefined,
+  ) =>
+  async (): Promise<readonly [number, unknown]> => {
+    const snapshot = await sqliteStore.readResolverSubgraphForUrl(canonicalUrl);
+    if (snapshot === null) return [409, { error: 'CONNECTIONS_SNAPSHOT_MISSING' }];
+    const merged = await readEventsFromStoreOrLog(
+      context,
+      context.eventLog!,
+      (event) => event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
+      RESOLVER_SIGNAL_EVENT_TYPES,
+    );
+    const result = resolveUrlAttribution({
+      canonicalUrl,
+      snapshot,
+      events: resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl]),
+      useEventCandidateSimilarity: false,
+    });
+    // Keep the sqlite per-revision cache warm too so a same-revision GET hits.
+    if (snapshotRevision !== undefined) {
+      await sqliteStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+    }
+    return [200, result];
+  };
+
+// Serve a batch item from the SWR cache if a (possibly-stale) entry exists,
+// enqueuing a bounded single-URL background refresh when the graph sig has
+// moved. Returns undefined for a true-cold item so the batch loop computes it
+// inline in the existing batched path. The gated build keeps background
+// resolves under the shared resolve-concurrency dial.
+const serveStaleBatchItem = (
+  context: CompanionHttpConfig,
+  sqliteStore: SqliteConnectionsStore,
+  canonicalUrl: string,
+  graphSig: string,
+  snapshotRevision: string | undefined,
+): UrlResolutionResult | undefined => {
+  const refresh = buildBatchResolveRefresh(context, sqliteStore, canonicalUrl, snapshotRevision);
+  const gatedRefresh = async (): Promise<readonly [number, unknown]> => {
+    await acquireResolveSlot();
+    try {
+      return await refresh();
+    } finally {
+      releaseResolveSlot();
+    }
+  };
+  const served = resolveSwrCache.serveStaleOnly(
+    batchResolveSwrKey(canonicalUrl),
+    graphSig,
+    gatedRefresh,
+  );
+  if (served === undefined) return undefined;
+  // The cached SWR value is a `[200, UrlResolutionResult]` tuple (see
+  // primeBatchSwrEntry / buildBatchResolveRefresh); unwrap it back to the raw
+  // result the batch response embeds. The freshness marker is per-item and not
+  // surfaced in the batch response body (additive field is on the single-item
+  // routes); the batch already tolerates ≤TTL staleness by contract.
+  return served.result[1] as UrlResolutionResult;
+};
+
+// Seed the SWR cache from a batch item that resolved inline, storing the
+// `[200, result]` tuple shape the refresh/serve path expects.
+const primeBatchSwrEntry = (
+  canonicalUrl: string,
+  graphSig: string,
+  result: UrlResolutionResult,
+): void => {
+  resolveSwrCache.prime(batchResolveSwrKey(canonicalUrl), graphSig, [200, result]);
+};
+
 const RESOLVER_EXPAND_EVENT_TYPES = [
   BROWSER_TIMELINE_OBSERVED,
   USER_FLOW_REJECTED,
@@ -3327,6 +3516,14 @@ const routes: readonly RouteDefinition[] = [
             };
       const eventLoopState = context.getEventLoopSnapshot?.();
       const pageEvidenceEmbedLane = context.getBackgroundEmbeddingLaneHealth?.();
+      // Non-blocking event-store catch-up (CLASS A). Kick it in the BACKGROUND
+      // (single-flight) and report `catchingUp` — never await the potentially
+      // 40s+ JSONL catch-up inline, which would freeze the loop for every
+      // endpoint. When the runtime wires no catch-up hook the field is absent.
+      const catchingUp =
+        context.eventStoreCatchUp === undefined
+          ? undefined
+          : kickBackgroundEventStoreCatchUp(context.eventStoreCatchUp);
       return [
         200,
         {
@@ -3334,6 +3531,18 @@ const routes: readonly RouteDefinition[] = [
             companion: 'running',
             vault: await context.vaultWriter.status(),
             api: { live: true },
+            ...(catchingUp === undefined
+              ? {}
+              : {
+                  catchingUp,
+                  ...(statusCatchUpState.lastCompletedAtMs === null
+                    ? {}
+                    : {
+                        lastCatchUpCompletedAt: new Date(
+                          statusCatchUpState.lastCompletedAtMs,
+                        ).toISOString(),
+                      }),
+                }),
             ...(snapshotState === undefined ? {} : { snapshot: snapshotState }),
             ...(recallState === undefined ? {} : { recall: recallState }),
             ...(materializerState === undefined ? {} : { materializer: materializerState }),
@@ -3712,13 +3921,17 @@ const routes: readonly RouteDefinition[] = [
           'Tab-session resolver is dry-run only in this phase.',
         );
       }
-      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${await connectionsGraphSig(
+      // SWR serve-key is per tab-session + query only (NOT graph-sig): the
+      // sig is checked separately so a drain serves the stale entry instantly
+      // and refreshes THIS key in the background instead of evicting.
+      const tabResKey = `tabres:${decodeURIComponent(match.tabSessionId ?? '')}|${url.search}`;
+      const graphSig = await connectionsGraphSig(
         context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
-      )}|${url.search}`;
-      return cachedResolveRoute(
+      );
+      return serveResolveSwr(
         tabResKey,
-        ROUTE_CACHE_TTL_MS,
+        graphSig,
         async (): Promise<readonly [number, unknown]> => {
           const tabSessionId = decodeURIComponent(match.tabSessionId ?? '');
           const usesSqliteSubgraph = context.connectionsStore instanceof SqliteConnectionsStore;
@@ -4042,13 +4255,17 @@ const routes: readonly RouteDefinition[] = [
           'URL resolver is dry-run only in this phase.',
         );
       }
-      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${await connectionsGraphSig(
+      // SWR serve-key is per URL + query only (NOT graph-sig): the sig is
+      // checked separately so a drain serves the stale entry instantly and
+      // refreshes THIS key in the background instead of evicting.
+      const visResKey = `visres:${decodeURIComponent(match.canonicalUrl ?? '')}|${url.search}`;
+      const graphSig = await connectionsGraphSig(
         context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
-      )}|${url.search}`;
-      return cachedResolveRoute(
+      );
+      return serveResolveSwr(
         visResKey,
-        ROUTE_CACHE_TTL_MS,
+        graphSig,
         async (): Promise<readonly [number, unknown]> => {
           const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
           const expandEventCandidates =
@@ -4245,6 +4462,14 @@ const routes: readonly RouteDefinition[] = [
           );
         }
         const snapshotRevision = metadata.snapshotRevision;
+        // Current graph sig for the SWR staleness check (per-URL, sig-checked
+        // separately — mirrors the GET resolve routes so a drain serves the
+        // stale item instantly + refreshes in the background instead of
+        // recomputing the whole visible set cold on the single loop).
+        const batchGraphSig = await connectionsGraphSig(
+          sqliteStore,
+          join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+        );
         const results: Record<string, UrlResolutionResult> = {};
         const misses: string[] = [];
         for (const canonicalUrl of uniqueUrls) {
@@ -4261,6 +4486,22 @@ const routes: readonly RouteDefinition[] = [
               results[canonicalUrl] = cached as UrlResolutionResult;
               continue;
             }
+          }
+          // SWR: a prior compute exists but the graph sig has moved. Serve the
+          // stale value INSTANTLY (exactly what the panel already displays
+          // between polls) and refresh THIS item in the background via the
+          // canonical single-URL resolve, instead of recomputing inline in the
+          // convoy. Truly-cold items still fall through to `misses`.
+          const stale = serveStaleBatchItem(
+            context,
+            sqliteStore,
+            canonicalUrl,
+            batchGraphSig,
+            snapshotRevision,
+          );
+          if (stale !== undefined) {
+            results[canonicalUrl] = stale;
+            continue;
           }
           misses.push(canonicalUrl);
         }
@@ -4332,6 +4573,11 @@ const routes: readonly RouteDefinition[] = [
           results[canonicalUrl] = result;
           if (snapshotRevision !== undefined && !expandEventCandidates) {
             await sqliteStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+            // Seed the SWR cache so a later drain can serve this item stale +
+            // refresh in the background rather than recomputing it inline in
+            // the next convoy. eventCandidate items are intentionally excluded
+            // (they must always resolve fresh).
+            primeBatchSwrEntry(canonicalUrl, batchGraphSig, result);
           }
         }
         return [

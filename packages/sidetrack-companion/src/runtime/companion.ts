@@ -1031,8 +1031,7 @@ export const startCompanion = async (
         onEmbedded: (canonicalUrl) =>
           connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
         readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
-        writeProgress: (progress) =>
-          writeBackgroundEmbeddingProgress(options.vaultPath, progress),
+        writeProgress: (progress) => writeBackgroundEmbeddingProgress(options.vaultPath, progress),
         log: (message) => process.stdout.write(`${message}\n`),
       });
       // Expose the lane's health snapshot to /v1/status so an inert lane
@@ -1241,6 +1240,15 @@ export const startCompanion = async (
       bucketRegistry: createBucketRegistry(options.vaultPath),
       getEventLoopSnapshot: eventLoopMonitor.snapshot,
       getEmbedderStatus,
+      // Non-blocking event-store catch-up trigger for /v1/status (CLASS A).
+      // /status kicks this in the background so the first poll after idle
+      // never awaits the (up to ~47s on a large vault) JSONL catch-up inline,
+      // which would freeze every endpoint. getCaughtUpSharedEventStore is
+      // single-flight, so this shares one pass with any inline reader. A
+      // no-op when the event store is disabled (returns null → resolve).
+      eventStoreCatchUp: async () => {
+        await getCaughtUpSharedEventStore(options.vaultPath);
+      },
       ...(backgroundEmbeddingLaneHealth === undefined
         ? {}
         : { getBackgroundEmbeddingLaneHealth: backgroundEmbeddingLaneHealth }),
