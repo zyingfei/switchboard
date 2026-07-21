@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
+  PRIORITY_STREAMS,
+  selectEdgeEventDrainPriorityBatch,
   selectEdgeEventDrainScanBatch,
   summarizeEdgeEventDrain,
   type EdgeEventImportAck,
@@ -38,8 +40,9 @@ describe('summarizeEdgeEventDrain', () => {
     // uploaded). The new contract: send every buffered event to the
     // companion, let the companion validate, and act on its
     // `'invalid-event-type'` skip response on the next pass. This
-    // test pins that contract — the partition function now ONLY
-    // chunks by batch size; it never rejects locally.
+    // test pins that contract — the partition function never rejects
+    // locally, only chunks by batch size, and re-sorts priority streams
+    // (aggregates, then navs) ahead of the interval backlog.
     const batch = [
       event('navigation.committed', 1),
       event('engagement.interval.observed', 2),
@@ -49,7 +52,9 @@ describe('summarizeEdgeEventDrain', () => {
 
     const partition = partitionEdgeEventDrainBatch(batch, 3);
 
-    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([1, 4, 2]);
+    // aggregate (3) leads, then navs (1, 4); the interval (2) is dropped by
+    // the batch-size cap of 3.
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([3, 1, 4]);
     expect(partition.locallyRejectedBatch).toEqual([]);
     expect(partition.evictedByType).toEqual({});
     expect(partition.skippedByReason).toEqual({});
@@ -70,6 +75,75 @@ describe('summarizeEdgeEventDrain', () => {
       'engagement.interval.observed',
     ]);
     expect(partition.routeBatch.map((e) => e.lamport)).toEqual([50, 1]);
+  });
+
+  it('leads with the starved aggregate stream, then navs, then interval backlog', () => {
+    // Even though the aggregate has a HIGHER lamport (arrived later) than
+    // the interval backlog, it must ship first — it is the scarce signal
+    // the companion similarity gate feeds on. Nav lineage comes next.
+    const batch = [
+      event('engagement.interval.observed', 1),
+      event('engagement.interval.observed', 2),
+      event('navigation.committed', 40),
+      event('engagement.session.aggregated', 90),
+    ];
+
+    const partition = partitionEdgeEventDrainBatch(batch, 3);
+
+    expect(partition.routeBatch.map((e) => e.streamName)).toEqual([
+      'engagement.session.aggregated',
+      'navigation.committed',
+      'engagement.interval.observed',
+    ]);
+    expect(partition.routeBatch.map((e) => e.lamport)).toEqual([90, 40, 1]);
+  });
+});
+
+describe('selectEdgeEventDrainPriorityBatch', () => {
+  it('combines the per-stream priority peeks in PRIORITY_STREAMS order, aggregates first', () => {
+    // Simulates the drain peeking each priority stream by index: aggregates
+    // and navs each come back lamport-ordered within their own stream.
+    const aggregates = [event('engagement.session.aggregated', 7)];
+    const navs = [event('navigation.committed', 2), event('navigation.committed', 5)];
+    const peeksByStream = PRIORITY_STREAMS.map((streamName) =>
+      streamName === 'engagement.session.aggregated' ? aggregates : navs,
+    );
+
+    const combined = selectEdgeEventDrainPriorityBatch(peeksByStream, 10);
+
+    expect(combined.map((e) => e.streamName)).toEqual([
+      'engagement.session.aggregated',
+      'navigation.committed',
+      'navigation.committed',
+    ]);
+    expect(combined.map((e) => e.lamport)).toEqual([7, 2, 5]);
+  });
+
+  it('caps the combined batch at the route size, preserving priority order', () => {
+    const aggregates = [
+      event('engagement.session.aggregated', 1),
+      event('engagement.session.aggregated', 2),
+    ];
+    const navs = [event('navigation.committed', 3)];
+    const peeksByStream = PRIORITY_STREAMS.map((streamName) =>
+      streamName === 'engagement.session.aggregated' ? aggregates : navs,
+    );
+
+    const combined = selectEdgeEventDrainPriorityBatch(peeksByStream, 2);
+
+    // Both aggregates fill the cap; the nav is left for the next drain.
+    expect(combined.map((e) => e.streamName)).toEqual([
+      'engagement.session.aggregated',
+      'engagement.session.aggregated',
+    ]);
+  });
+
+  it('returns empty when both priority streams are empty (falls back to the scan)', () => {
+    const combined = selectEdgeEventDrainPriorityBatch([[], []], 10);
+    expect(combined).toEqual([]);
+    // selectEdgeEventDrainScanBatch then chooses the FIFO scan.
+    const scanned = [event('engagement.interval.observed', 1)];
+    expect(selectEdgeEventDrainScanBatch(combined, scanned)).toEqual(scanned);
   });
 
   it('keeps uploaded accounting separate from permanent skip eviction', () => {

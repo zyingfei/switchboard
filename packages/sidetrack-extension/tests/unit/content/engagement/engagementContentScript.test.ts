@@ -91,4 +91,44 @@ describe('engagement content script wiring', () => {
     expect(emitted.final).toBe(false);
     expect(emitted.dimensions?.engagement?.focusedWindowMs).toBeGreaterThanOrEqual(5_000);
   });
+
+  it('suppresses zero-delta periodic beacons from a background tab (only idle grows)', () => {
+    // A background (non-selected) tab: not visible, so no active/visible/
+    // focused time ever accrues. The attention gate never fires (0 focused
+    // time). The first periodic tick sends one snapshot; every later tick
+    // is zero-delta and is suppressed — the flood this whole change kills.
+    Object.defineProperty(document, 'visibilityState', {
+      value: 'hidden',
+      configurable: true,
+    });
+    Object.defineProperty(document, 'hasFocus', { value: () => false, configurable: true });
+
+    startEngagementTracking();
+
+    vi.advanceTimersByTime(30_000); // first periodic tick -> sent (first of session)
+    expect(sent).toHaveLength(1);
+    vi.advanceTimersByTime(30_000); // second periodic tick -> zero-delta -> suppressed
+    vi.advanceTimersByTime(30_000); // third -> still suppressed
+    expect(sent).toHaveLength(1);
+  });
+
+  it('resumes emitting once the background tab gains attention', () => {
+    Object.defineProperty(document, 'visibilityState', {
+      value: 'hidden',
+      configurable: true,
+    });
+    Object.defineProperty(document, 'hasFocus', { value: () => false, configurable: true });
+
+    startEngagementTracking();
+
+    vi.advanceTimersByTime(30_000);
+    expect(sent).toHaveLength(1);
+    // The tab becomes the selected tab in a focused window: a scroll records
+    // an attention delta, so the next periodic tick is no longer zero-delta.
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    document.dispatchEvent(new Event('scroll'));
+    vi.advanceTimersByTime(30_000);
+    expect(sent.length).toBeGreaterThan(1);
+  });
 });
