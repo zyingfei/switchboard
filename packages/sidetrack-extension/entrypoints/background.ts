@@ -75,6 +75,8 @@ import { registerDefaultWebNavigationListeners } from '../src/background/listene
 import {
   createEdgeEventDrainSingleFlight,
   partitionEdgeEventDrainBatch,
+  PRIORITY_STREAMS,
+  selectEdgeEventDrainPriorityBatch,
   selectEdgeEventDrainScanBatch,
   summarizeEdgeEventDrain,
 } from '../src/background/storage/edge-event-drain';
@@ -4379,7 +4381,10 @@ export default defineBackground(() => {
     return `${event.streamName}:${event.observedAt.slice(0, 10)}`;
   };
 
-  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 10;
+  // 25 (was 10): the companion's /v1/edge/events uses a batched import
+  // path, so a larger route batch clears the 1.2M-event backlog faster
+  // without extra per-request overhead.
+  const EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE = 25;
   const EDGE_EVENT_DRAIN_SCAN_BATCH_SIZE = 500;
   const EDGE_EVENT_DRAIN_DEFAULT_MAX_BATCHES = 1;
   const EDGE_EVENT_DRAIN_BULK_MAX_BATCHES = 50;
@@ -4433,11 +4438,33 @@ export default defineBackground(() => {
       return emptyEdgeEventDrainStats(await engagementEventBuffer.count());
     }
 
-    const priorityBatch =
-      (await engagementEventBuffer.peekByStream?.(
-        'navigation.committed',
-        EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
-      )) ?? [];
+    // Peek every priority stream directly (by stream index) so the scarce,
+    // starved signal — engagement.session.aggregated — leads, then
+    // navigation lineage, ahead of the FIFO interval backlog. When both are
+    // empty we fall back to the full lamport scan.
+    //
+    // Post-deploy transient (accepted): on the first boot after this ships,
+    // the buffer still holds the pre-rescued ~2,159 aggregates. Each returns
+    // 'already-imported' (acked + deleted, no retry loop, no data loss), but
+    // because aggregates fill the route cap first, navigation.committed (the
+    // other priority stream) and the interval backlog drain ~0 events/min
+    // until the aggregate backlog clears (~1.5h at 25/min/1 batch). This is
+    // self-resolving and far milder than the pre-fix state (navs buried behind
+    // 1.2M intervals). An operator can collapse it immediately with
+    // `sidetrackDebug.drainEdgeEventsBulk()`. Left strictly aggregates-first
+    // on purpose: interleaving nav slots would weaken the aggregate-lead
+    // invariant this whole fix depends on.
+    const priorityPeeks = await Promise.all(
+      PRIORITY_STREAMS.map((streamName) =>
+        engagementEventBuffer
+          .peekByStream?.(streamName, EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE)
+          .then((events) => events ?? []) ?? Promise.resolve<BufferedEvent[]>([]),
+      ),
+    );
+    const priorityBatch = selectEdgeEventDrainPriorityBatch(
+      priorityPeeks,
+      EDGE_EVENT_DRAIN_ROUTE_BATCH_SIZE,
+    );
     const scannedBatch =
       priorityBatch.length > 0
         ? []
@@ -4702,12 +4729,28 @@ export default defineBackground(() => {
   void ensureEdgeEventsDrainAlarm();
   // Eager first drain on SW boot — picks up anything buffered across a
   // service-worker restart so the first drain doesn't wait a full minute.
-  // Seal engagement sessions orphaned by the eviction that ended the
-  // previous worker FIRST, so any recovered aggregate is included.
-  void sweepIdleEngagementSessions()
-    .catch(() => 0)
+  // Order matters:
+  //   1. compact the buffer so a stale interval backlog (production peaked
+  //      at 1.2M) can't bury the scarce session.aggregated signal FIFO
+  //      again — MUST precede the first drain;
+  //   2. seal engagement sessions orphaned by the eviction that ended the
+  //      previous worker so any recovered aggregate is included; then
+  //   3. drain. Compaction serializes against concurrent beacons via the
+  //      driver's internal gate, so it is safe to start alongside onMessage
+  //      traffic. Failures are swallowed — a compaction that can't run must
+  //      never block delivery of what is already buffered.
+  void engagementEventBuffer
+    .compact()
+    .catch((error: unknown) => {
+      console.warn('[edge-events.compact] boot compaction failed:', error);
+      return null;
+    })
     .finally(() => {
-      void drainBufferedEdgeEvents().catch(() => undefined);
+      void sweepIdleEngagementSessions()
+        .catch(() => 0)
+        .finally(() => {
+          void drainBufferedEdgeEvents().catch(() => undefined);
+        });
     });
 
   // Debug hook for the SW DevTools console. `chrome.runtime.sendMessage`
@@ -4730,6 +4773,7 @@ export default defineBackground(() => {
     build: __BUILD_INFO__,
     drainEdgeEvents: drainBufferedEdgeEvents,
     drainEdgeEventsBulk: drainBufferedEdgeEventsBulk,
+    compactEdgeEventBuffer: () => engagementEventBuffer.compact(),
     engagementBufferCount: () => engagementEventBuffer.count(),
     engagementGate: isEngagementPrivacyGateOpen,
     engagementHostPermission: hasEngagementHostPermission,

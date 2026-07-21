@@ -61,12 +61,46 @@ const PERMANENT_SKIP_REASONS = new Set([
   'invalid-payload',
 ]);
 
-const PRIORITY_STREAMS = new Set<BufferedEvent['streamName']>(['navigation.committed']);
+// Priority streams are peeked directly (by stream index) ahead of the
+// FIFO scan so a scarce, latency-sensitive signal can't be starved behind
+// a large low-value backlog. `engagement.session.aggregated` is the ONE
+// event the companion's visit-similarity gate feeds on; in production it
+// sat trapped FIFO behind ~1.2M `engagement.interval.observed` beacons for
+// weeks. It leads the list so it drains first, then navigation lineage.
+// Order matters: `PRIORITY_STREAMS` is the drain peek order, and
+// `partitionEdgeEventDrainBatch` re-sorts a mixed batch so priority
+// streams keep their lead within a single route batch.
+export const PRIORITY_STREAMS: readonly BufferedEvent['streamName'][] = [
+  'engagement.session.aggregated',
+  'navigation.committed',
+];
+
+const PRIORITY_STREAM_SET = new Set<BufferedEvent['streamName']>(PRIORITY_STREAMS);
 
 export const selectEdgeEventDrainScanBatch = (
   priorityBatch: readonly BufferedEvent[],
   scannedBatch: readonly BufferedEvent[],
 ): readonly BufferedEvent[] => (priorityBatch.length > 0 ? priorityBatch : scannedBatch);
+
+// Combine the per-stream priority peeks into one route-sized batch, in
+// `PRIORITY_STREAMS` order (aggregates first, then navs), capped at the
+// route batch size. Each input is already lamport-ordered within its
+// stream (peekByStream). Returns [] when both streams are empty so the
+// caller falls back to the FIFO scan.
+export const selectEdgeEventDrainPriorityBatch = (
+  peeksByStream: readonly (readonly BufferedEvent[])[],
+  maxRouteBatchSize: number,
+): readonly BufferedEvent[] => {
+  const routeLimit = Math.max(0, Math.floor(maxRouteBatchSize));
+  const combined: BufferedEvent[] = [];
+  for (const peek of peeksByStream) {
+    for (const event of peek) {
+      if (combined.length >= routeLimit) return combined;
+      combined.push(event);
+    }
+  }
+  return combined;
+};
 
 export const partitionEdgeEventDrainBatch = (
   batch: readonly BufferedEvent[],
@@ -77,11 +111,21 @@ export const partitionEdgeEventDrainBatch = (
   // unknown types come back as `'invalid-event-type'` skips and
   // `summarizeEdgeEventDrain` evicts them on the next pass.
   const routeLimit = Math.max(0, Math.floor(maxRouteBatchSize));
-  const priority: BufferedEvent[] = [];
+  // Group priority events by their stream so the mixed-batch order matches
+  // `PRIORITY_STREAMS` (aggregates lead navs); non-priority events keep
+  // their incoming (lamport-scan) order behind them.
+  const priorityByStream = new Map<BufferedEvent['streamName'], BufferedEvent[]>();
   const normal: BufferedEvent[] = [];
   for (const event of batch) {
-    if (PRIORITY_STREAMS.has(event.streamName)) priority.push(event);
-    else normal.push(event);
+    if (PRIORITY_STREAM_SET.has(event.streamName)) {
+      const bucket = priorityByStream.get(event.streamName);
+      if (bucket === undefined) priorityByStream.set(event.streamName, [event]);
+      else bucket.push(event);
+    } else normal.push(event);
+  }
+  const priority: BufferedEvent[] = [];
+  for (const streamName of PRIORITY_STREAMS) {
+    priority.push(...(priorityByStream.get(streamName) ?? []));
   }
   const routeBatch = [...priority, ...normal].slice(0, routeLimit);
   return {

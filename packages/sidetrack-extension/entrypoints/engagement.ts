@@ -1,7 +1,11 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 
-import { createEngagementAggregator } from '../src/content/engagement/aggregator';
+import {
+  createEngagementAggregator,
+  type EngagementTotals,
+} from '../src/content/engagement/aggregator';
 import { attachCopyPasteLineage } from '../src/content/engagement/copy-paste';
+import { shouldEmitPeriodicSnapshot } from '../src/content/engagement/periodicEmit';
 import { scrollRatioForDocument, throttle } from '../src/content/engagement/scroll';
 import {
   engagementVisitIdForLocation,
@@ -24,10 +28,30 @@ export const startEngagementTracking = (): void => {
 
   let finalized = false;
   let attentionGateEmitted = false;
+  // Attention dimensions of the last snapshot actually SENT — used to
+  // suppress zero-delta periodic beacons (see periodicEmit.ts). Undefined
+  // until the first send.
+  let lastSentDims: EngagementTotals | undefined;
+  const send = (snapshot: ReturnType<typeof aggregator.snapshot>): void => {
+    lastSentDims = snapshot.dimensions.engagement;
+    safeSendRuntimeMessage(snapshot);
+  };
   const emit = (final: boolean): void => {
     if (finalized && final) return;
     if (final) finalized = true;
-    safeSendRuntimeMessage(aggregator.snapshot(final));
+    send(aggregator.snapshot(final));
+  };
+  // The 30s periodic tick. Skips zero-delta snapshots (only idleMs grew)
+  // so an abandoned background tab stops flooding the buffer — and stops
+  // refreshing the SW durable mirror, which lets the idle-sweep age it out
+  // to exactly one aggregate. The first snapshot of the session, any
+  // final:true, and the attention-gate emit go through their own paths and
+  // are never suppressed here.
+  const emitPeriodic = (): void => {
+    if (finalized) return;
+    const snapshot = aggregator.snapshot(false);
+    if (!shouldEmitPeriodicSnapshot(lastSentDims, snapshot.dimensions.engagement)) return;
+    send(snapshot);
   };
   const emitAttentionGateSnapshot = (): void => {
     if (finalized || attentionGateEmitted) return;
@@ -35,7 +59,7 @@ export const startEngagementTracking = (): void => {
     const focusedWindowMs = snapshot.dimensions.engagement.focusedWindowMs;
     if (focusedWindowMs >= ATTENTION_GATE_EMIT_MS) {
       attentionGateEmitted = true;
-      safeSendRuntimeMessage(snapshot);
+      send(snapshot);
       return;
     }
     window.setTimeout(
@@ -119,7 +143,7 @@ export const startEngagementTracking = (): void => {
   }
 
   window.setInterval(() => {
-    emit(false);
+    emitPeriodic();
   }, SUB_EMIT_MS);
   window.setTimeout(emitAttentionGateSnapshot, ATTENTION_GATE_EMIT_MS);
 };
