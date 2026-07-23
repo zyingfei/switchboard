@@ -650,6 +650,14 @@ const buildDiagnosticCandidates = (input: {
   const hotPath = raw !== null && isRecord(raw['hotPath']) ? raw['hotPath'] : null;
   const hotSim = hotPath !== null && isRecord(hotPath['similarity']) ? hotPath['similarity'] : null;
   const hotTop = hotPath !== null && isRecord(hotPath['topics']) ? hotPath['topics'] : null;
+  // Served-signal floor guard (flapping fix). The candidate status is
+  // driven by CURRENT state — the last-drain `suppressedCollapse` flag OR
+  // the durable `flapping` recent-window signal — NOT the lifetime
+  // `suppressedCollapseCount` (which only ever increments and would pin
+  // the health board `degraded` forever, i.e. alarm fatigue). The lifetime
+  // count is surfaced as a metric only, for trend visibility.
+  const similarityFloor =
+    raw !== null && isRecord(raw['similarityFloor']) ? raw['similarityFloor'] : null;
   const runnerMode = reconcileRunnerMode();
 
   // Health-panel cleanup (2026-05-26): filter out perpetually-off
@@ -668,6 +676,11 @@ const buildDiagnosticCandidates = (input: {
     if (cand.id === 'topic.shadow-idf-rkn-split' && cand.status === 'unavailable') return true;
     // Legacy methodology spine when not populated (shipGateV2 owns this surface now).
     if (cand.id === 'ranker.methodology-spine' && cand.status === 'unavailable') return true;
+    // Served-signal floor: only render the row once the diagnostic exists
+    // (absent for legacy vaults / pre-fix diagnostics / any drain before
+    // the first similarity revision) so it doesn't add a perpetual
+    // `unavailable` row to the signal-dense panel.
+    if (cand.id === 'similarity.served-signal-floor' && cand.status === 'unavailable') return true;
     return false;
   };
 
@@ -894,6 +907,55 @@ const buildDiagnosticCandidates = (input: {
         newEmbedded: numberOrNull(hotSim?.['newEmbedded']),
         edgeCount: numberOrNull(hotSim?.['edgeCount']),
         runtimeMs: numberOrNull(hotSim?.['runtimeMs']),
+      }),
+    },
+    {
+      // Served-signal floor guard (flapping fix, requirement B). This
+      // candidate is the visible, non-buried signal that a drain refused
+      // to publish a >90% similarity-edge collapse and carried the
+      // previous revision forward. `alarm` is the loudest DiagnosticCandidate
+      // status; the /v1/system/health board renders the workGraph section
+      // `unavailable`/`stale` on timeout but this row itself is the
+      // operator-facing "the served signal flapped" flag.
+      id: 'similarity.served-signal-floor',
+      family: 'similarity',
+      lane: 'active',
+      servingImpact: 'serving',
+      status:
+        similarityFloor === null
+          ? 'unavailable'
+          : // CURRENT state only: this drain suppressed, OR the durable
+            // recent-window `flapping` signal is set. NOT the lifetime
+            // count — that would latch `alarm` forever after a single flap.
+            booleanOrFalse(similarityFloor['suppressedCollapse']) ||
+              booleanOrFalse(similarityFloor['flapping'])
+            ? 'alarm'
+            : 'ok',
+      reason:
+        similarityFloor === null
+          ? 'similarity-floor-diagnostics-unavailable'
+          : booleanOrFalse(similarityFloor['suppressedCollapse'])
+            ? 'suppressed-collapse-this-drain'
+            : booleanOrFalse(similarityFloor['flapping'])
+              ? 'suppressed-collapse-recent'
+              : (stringOrNull(similarityFloor['allowedResetReason']) === null
+                  ? null
+                  : `collapse-allowed:${stringOrNull(similarityFloor['allowedResetReason'])}`),
+      revisionId: stringOrNull(similarityFloor?.['servedRevisionId']),
+      asOf: diagnosticsObservedAt,
+      metrics: metrics({
+        suppressedCollapse:
+          similarityFloor === null
+            ? null
+            : booleanOrFalse(similarityFloor['suppressedCollapse']),
+        flapping:
+          similarityFloor === null ? null : booleanOrFalse(similarityFloor['flapping']),
+        suppressedCollapseCount: numberOrNull(similarityFloor?.['suppressedCollapseCount']),
+        previousServedEdgeCount: numberOrNull(similarityFloor?.['previousServedEdgeCount']),
+        builtEdgeCount: numberOrNull(similarityFloor?.['builtEdgeCount']),
+        servedEdgeCount: numberOrNull(similarityFloor?.['servedEdgeCount']),
+        allowedResetReason: stringOrNull(similarityFloor?.['allowedResetReason']),
+        builtRevisionId: stringOrNull(similarityFloor?.['builtRevisionId']),
       }),
     },
     {

@@ -43,6 +43,7 @@ import { createDriftStateStore, type DriftStateStore } from './drift/driftStateS
 import { edgeKindIsPairwiseRelatedness } from './edgeSemantics.js';
 import type { SilhouetteSimilarityEdge, SilhouetteTopic } from './drift/temporalSilhouette.js';
 import type { EffectiveVisitSimilarityConfig } from './visitSimilarity.js';
+import type { SimilarityFloorDiagnostics } from './similarityFloorGuard.js';
 import type { PageEvidenceRecord } from '../page-evidence/types.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import type { UrlProjection } from '../urls/projection.js';
@@ -277,6 +278,10 @@ export interface MaterializerDiagnostics {
   // U2 — incremental hot-path decision + cheap counters (similarity +
   // topics). Always present (the materializer always produces it).
   readonly hotPath?: HotPathDiagnostics;
+  // Served-signal floor guard (flapping fix). Present on every drain that
+  // produced a similarity revision. `suppressedCollapse` / the running
+  // `suppressedCollapseCount` are what /v1/system/health flips non-ok on.
+  readonly similarityFloor?: SimilarityFloorDiagnostics;
   // W2 — which clustering produced the served revision + its
   // churn/lineage vs the previous served (auto-rollback signal).
   readonly servedTopicProducer?: ServedTopicProducerReport;
@@ -312,6 +317,7 @@ export interface MaterializerDiagnosticsInput {
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
   readonly hotPathDiagnostics?: HotPathDiagnostics;
   readonly servedTopicProducerReport?: ServedTopicProducerReport;
+  readonly similarityFloorDiagnostics?: SimilarityFloorDiagnostics;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -907,6 +913,9 @@ export const collectMaterializerDiagnostics = (
     ...(input.servedTopicProducerReport === undefined
       ? {}
       : { servedTopicProducer: input.servedTopicProducerReport }),
+    ...(input.similarityFloorDiagnostics === undefined
+      ? {}
+      : { similarityFloor: input.similarityFloorDiagnostics }),
   };
 };
 
@@ -930,6 +939,19 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
     `engagementEligible=${String(diagnostics.timeline.engagementEligibleEntryCount)}`,
     `engagementEvents=${String(diagnostics.engagement.sessionAggregatedCount)}`,
     `simEdges=${String(diagnostics.similarity.edgeCount)}(${diagnostics.similarity.producer})`,
+    ...(diagnostics.similarityFloor === undefined
+      ? []
+      : [
+          `simFloor=${
+            diagnostics.similarityFloor.suppressedCollapse
+              ? `SUPPRESSED(${String(diagnostics.similarityFloor.previousServedEdgeCount)}->${String(
+                  diagnostics.similarityFloor.builtEdgeCount,
+                )})`
+              : (diagnostics.similarityFloor.allowedResetReason ?? 'ok')
+          }`,
+          `simFloorSuppressedTotal=${String(diagnostics.similarityFloor.suppressedCollapseCount)}`,
+          `simFloorFlapping=${String(diagnostics.similarityFloor.flapping)}`,
+        ]),
     `topics=${String(diagnostics.topics.topicCount)}`,
     `topicMembers=${String(diagnostics.topics.memberCount)}`,
     `ranker=${diagnostics.ranker.status}${diagnostics.ranker.reason === null ? '' : `:${diagnostics.ranker.reason}`}`,

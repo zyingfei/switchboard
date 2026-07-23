@@ -23,6 +23,22 @@ import {
   type MaterializerRankerModelFreshness,
 } from '../../connections/materializerDiagnostics.js';
 import {
+  SIMILARITY_FLOOR_MIN_RETAINED_FRACTION,
+  carryForwardRevision,
+  decideSimilarityFloorGuard,
+  similarityFloorOperatorRebuildRequested,
+  type SimilarityFloorDiagnostics,
+  type SimilarityFloorResetReason,
+} from '../../connections/similarityFloorGuard.js';
+import {
+  createSimilarityFloorStateStore,
+  foldSimilarityFloorDrain,
+  purgeResetPending,
+  similarityFloorHealthFlapping,
+  similarityFloorSustainedCollapseReached,
+  type SimilarityFloorStateStore,
+} from '../../connections/similarityFloorState.js';
+import {
   augmentConnectionsSnapshotWithClosestVisitRanker,
   augmentConnectionsSnapshotWithClosestVisitRankerFrontier,
   buildConnectionsSnapshot,
@@ -216,6 +232,7 @@ import {
   RECALL_TOMBSTONE_TARGET,
 } from '../../recall/events.js';
 import { CAPTURE_EXTRACTION_PRODUCED } from '../../recall/extraction/events.js';
+import { DOMAIN_TOMBSTONE } from '../../privacy/domainTombstone.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import {
@@ -323,6 +340,11 @@ const FAILURE_COOLDOWN_MS = 5_000;
 const MATERIALIZER_NAME = 'connections';
 export const MATERIALIZER_VERSION = 'connections@2026-05-22-classB-phase2-local-scopes';
 const BACKLOG_FALLBACK_THRESHOLD = 5_000;
+
+// Shared empty visit-id set for the floor-guard stale-deletion suppression
+// (passed as removalCandidateVisitIds when a starved drain must not erode
+// the HNSW store). A module-level frozen constant avoids a per-drain alloc.
+const EMPTY_VISIT_ID_SET: ReadonlySet<string> = new Set<string>();
 
 // The exact event types buildTimelineDays + buildEngagementClassifierInputs
 // consume for the similarity-requalify re-derive. buildTimelineDays reads
@@ -733,6 +755,12 @@ export interface CreateConnectionsMaterializerDeps {
   readonly diagnosticsStore?: MaterializerDiagnosticsStore;
   readonly diagnosticsLogger?: (diagnostics: MaterializerDiagnostics) => void;
   readonly diagnosticsNow?: () => Date;
+  // Served-signal floor guard — durable cross-drain state. In production
+  // every drain runs in a fresh child fork, so the suppressed-collapse
+  // latch / consecutive-suppression counter / privacy-purge reset epoch
+  // must survive on disk (see similarityFloorState.ts). Defaults to the
+  // filesystem-backed store; tests inject an in-memory fake.
+  readonly similarityFloorStateStore?: SimilarityFloorStateStore;
   // Post-success observability hook (e.g. the drain-time workGraph
   // health artifact). Invoked fire-and-forget — never awaited, and a
   // throwing hook must never fail an otherwise-successful pass — at
@@ -1206,6 +1234,10 @@ export const createConnectionsMaterializer = (
   // counters for the diagnostics route.
   const diagnosticsStore =
     deps.diagnosticsStore ?? createMaterializerDiagnosticsStore(deps.vaultRoot);
+  // Served-signal floor guard — durable cross-drain state store (survives
+  // the child-per-drain fork; see similarityFloorState.ts).
+  const similarityFloorStateStore =
+    deps.similarityFloorStateStore ?? createSimilarityFloorStateStore(deps.vaultRoot);
   const diagnosticsLogger = deps.diagnosticsLogger ?? logMaterializerDiagnostics;
   const diagnosticsNow = deps.diagnosticsNow ?? ((): Date => new Date());
   // Stage 5.2 W7 — in-memory dirty-source queue. Group B events
@@ -1481,6 +1513,77 @@ export const createConnectionsMaterializer = (
       if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
       return left.cosine - right.cosine;
     });
+  };
+
+  // Served-signal floor guard — reconstruct the FULL similarity edge set
+  // from the previously served snapshot's `visit_resembles_visit` edges
+  // (no touched/active filter). Used to carry the previous revision
+  // forward when the just-built revision collapses by >90% with no
+  // legitimate reset reason. Self-contained: it reads the served snapshot,
+  // so a carry-forward survives a restart / a missing on-disk revision
+  // file (unlike relying on the persisted revision JSON).
+  // Cheap count of the previously served `visit_resembles_visit` edges —
+  // all the collapse DECISION needs. Avoids the Map build + O(N log N)
+  // sort of the full reconstruction on the common no-collapse drain (the
+  // full reconstruction is deferred to the carry-forward branch). Counts
+  // distinct unordered pairs to match allSimilarityEdgesFromSnapshot's
+  // dedupe (each undirected edge is stored once in the snapshot).
+  const countSimilarityEdgesFromSnapshot = (snapshot: ConnectionsSnapshot): number => {
+    const seen = new Set<string>();
+    for (const edge of snapshot.edges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const fromVisitKey = visitKeyFromTimelineNodeId(edge.fromNodeId);
+      const toVisitKey = visitKeyFromTimelineNodeId(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      const cosine = edge.metadata?.['cosine'];
+      if (typeof cosine !== 'number' || !Number.isFinite(cosine)) continue;
+      const [fromKey, toKey] = orderedSimilarityPair(fromVisitKey, toVisitKey);
+      seen.add(similarityPairKey(fromKey, toKey));
+    }
+    return seen.size;
+  };
+
+  const allSimilarityEdgesFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+  ): readonly VisitSimilarityEdge[] => {
+    const byPair = new Map<string, VisitSimilarityEdge>();
+    for (const edge of snapshot.edges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      const fromVisitKey = visitKeyFromTimelineNodeId(edge.fromNodeId);
+      const toVisitKey = visitKeyFromTimelineNodeId(edge.toNodeId);
+      if (fromVisitKey === null || toVisitKey === null) continue;
+      const cosine = edge.metadata?.['cosine'];
+      if (typeof cosine !== 'number' || !Number.isFinite(cosine)) continue;
+      const [fromKey, toKey] = orderedSimilarityPair(fromVisitKey, toVisitKey);
+      byPair.set(similarityPairKey(fromKey, toKey), {
+        fromVisitKey: fromKey,
+        toVisitKey: toKey,
+        cosine: Number(cosine.toFixed(6)),
+      });
+    }
+    return [...byPair.values()].sort((left, right) => {
+      if (left.fromVisitKey !== right.fromVisitKey)
+        return left.fromVisitKey < right.fromVisitKey ? -1 : 1;
+      if (left.toVisitKey !== right.toVisitKey) return left.toVisitKey < right.toVisitKey ? -1 : 1;
+      return left.cosine - right.cosine;
+    });
+  };
+
+  // Served-signal floor guard — recover the previously served similarity
+  // revision id from the snapshot's `visit_resembles_visit` edges (each
+  // carries `producedBy: { source: 'visit-similarity', revisionId }`).
+  // Used to label the carried-forward revision with the RIGHT id after a
+  // restart (when the in-memory `lastAcceptedSimilarityRevisionId` is not
+  // yet set), so the served edges never get stamped with the degenerate
+  // empty-corpus id.
+  const previousSimilarityRevisionIdFromSnapshot = (
+    snapshot: ConnectionsSnapshot,
+  ): string | null => {
+    for (const edge of snapshot.edges) {
+      if (edge.kind !== 'visit_resembles_visit') continue;
+      if (edge.producedBy.source === 'visit-similarity') return edge.producedBy.revisionId;
+    }
+    return null;
   };
 
   const cosineDistance = (left: readonly number[], right: readonly number[]): number => {
@@ -3244,16 +3347,107 @@ export const createConnectionsMaterializer = (
         )
       : new Set<string>();
     const hnswStoreVisitCount = loadedHnswStoreForGate?.elementCount() ?? 0;
+    // Served-signal floor guard (flapping fix, requirement A). Compute the
+    // legitimate reset reasons ONCE here, before the rebuild decision, and
+    // reuse them at the publish seam below. Detected from signals the drain
+    // already has PLUS the durable cross-drain floor state (which survives
+    // the child-per-drain fork): embedding-model change, materializer
+    // version bump, HNSW corruption recovery, a privacy purge (armed by a
+    // tombstone in THIS or a PRIOR drain and not yet consumed), or an
+    // explicit operator rebuild.
+    //
+    // Minor perf: only the COUNT of previously served edges is needed for
+    // the collapse decision; the full edge reconstruction (Map build +
+    // sort over ~51k edges) is deferred to the carry-forward branch where
+    // it is actually consumed. `previousServedSimilarityEdges` is a lazy
+    // memo so the common no-collapse drain never pays for it.
+    let previousServedSimilarityEdgesMemo: readonly VisitSimilarityEdge[] | null | undefined;
+    const previousServedSimilarityEdges = (): readonly VisitSimilarityEdge[] | null => {
+      if (previousServedSimilarityEdgesMemo === undefined) {
+        previousServedSimilarityEdgesMemo =
+          previousSnapshotForRanker === null
+            ? null
+            : allSimilarityEdgesFromSnapshot(previousSnapshotForRanker);
+      }
+      return previousServedSimilarityEdgesMemo;
+    };
+    const previousServedSimilarityEdgeCount =
+      previousSnapshotForRanker === null
+        ? null
+        : countSimilarityEdgesFromSnapshot(previousSnapshotForRanker);
+    const similarityFloorState = await similarityFloorStateStore.read();
+    const similarityFloorResetReasons: SimilarityFloorResetReason[] = [];
+    if (hnswDimensionMismatchRequiresFullRebuild) {
+      similarityFloorResetReasons.push('embedding-model-change');
+    } else if (
+      // Same-dimension model/revision change (a fine-tune or same-family
+      // revision bump) produces NO HNSW dimension mismatch but still moves
+      // the vector space — the old edges are now computed in the wrong
+      // space, so their collapse is a legitimate model-change reset, not a
+      // starved-corpus flap. Detect it by comparing the served model
+      // revision recorded in durable state against the live RECALL_MODEL.
+      similarityFloorState.servedModelRevision !== null &&
+      similarityFloorState.servedModelRevision !== RECALL_MODEL.revision
+    ) {
+      similarityFloorResetReasons.push('embedding-model-change');
+    }
+    if (
+      existingProgress !== null &&
+      existingProgress.materializerVersion !== MATERIALIZER_VERSION
+    ) {
+      similarityFloorResetReasons.push('materializer-version-bump');
+    }
+    if (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) {
+      similarityFloorResetReasons.push('store-corruption-recovery');
+    }
+    // Privacy purge — a tombstone event drives the similarity-edge
+    // collapse on a LATER drain than the one whose window carried the
+    // event (the visit-similarity corpus only shrinks once the timeline/
+    // serve boundary drops the purged domain's visits, and that drain's
+    // window no longer contains the tombstone). So the reset must be
+    // DURABLE: arming it here (if the event is in this drain's window) and
+    // treating it as active for every subsequent drain until a full
+    // rebuild / legitimate collapse consumes it (purgeResetPending).
+    const purgeObservedThisDrain = pendingEventsForDrain.some(
+      (event) => event.type === DOMAIN_TOMBSTONE || event.type === RECALL_TOMBSTONE_TARGET,
+    );
+    if (purgeObservedThisDrain || purgeResetPending(similarityFloorState)) {
+      similarityFloorResetReasons.push('privacy-purge');
+    }
+    if (similarityFloorOperatorRebuildRequested()) {
+      similarityFloorResetReasons.push('operator-rebuild');
+    }
+    // The drift heuristic forces a full HNSW rebuild (which RESETS the
+    // persisted index + returns edges:[] on an empty eligible corpus) when
+    // the eligible set collapses relative to the known store. On a warm
+    // delta-only drain that collapse is an UNLOADED-lane artifact, not a
+    // real change — treating it as "removal drift" is exactly requirement
+    // A's failure. Suppress the drift-driven rebuild when it would wipe a
+    // previously served signal with no legitimate reset reason. The genuine
+    // reset reasons above still force the rebuild (they SHOULD reset).
+    const driftRequiresFullRebuild = hnswStoreRemovalDriftRequiresFullRebuild(
+      hnswStoreVisitCount,
+      hnswActiveVisitIdsForGate.size,
+    );
+    const driftWouldWipeServedSignal =
+      driftRequiresFullRebuild &&
+      previousServedSimilarityEdgeCount !== null &&
+      previousServedSimilarityEdgeCount > 0 &&
+      similarityFloorResetReasons.length === 0;
+    if (driftWouldWipeServedSignal) {
+      mark(
+        `similarityFloor.driftRebuildSuppressed store=${String(hnswStoreVisitCount)} active=${String(
+          hnswActiveVisitIdsForGate.size,
+        )} prevServedEdges=${String(previousServedSimilarityEdgeCount)}`,
+      );
+    }
     const hnswFullRebuild =
       persistentHnswSimilarityMode &&
       (hnswDimensionMismatchRequiresFullRebuild ||
         (existingProgress !== null &&
           existingProgress.materializerVersion !== MATERIALIZER_VERSION) ||
         (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
-        hnswStoreRemovalDriftRequiresFullRebuild(
-          hnswStoreVisitCount,
-          hnswActiveVisitIdsForGate.size,
-        ));
+        (driftRequiresFullRebuild && !driftWouldWipeServedSignal));
     const fullPageEvidenceEnsure =
       previousSnapshotForRanker === null ||
       existingProgress === null ||
@@ -3476,7 +3670,21 @@ export const createConnectionsMaterializer = (
           config: similarityConfig,
           touchedVisitIds,
           reconcileVisitIds,
-          removalCandidateVisitIds: pendingTimelineVisitIds,
+          // Blocker fix — when the drift rebuild is suppressed because it
+          // would wipe the served signal (a starved-corpus drain), ALSO
+          // suppress the stale-visit deletion. Otherwise the incremental
+          // path still deletes the sub-gate re-visits from the HNSW store
+          // (buildHnswVisitSimilarity's `loadedHnswStore.delete`) and the
+          // store erodes monotonically each starved drain even though the
+          // served edges are carried forward — pinning Layer 1 into
+          // permanent rebuild-suppression while the embeddings the carried
+          // revision references silently disappear. Passing an empty
+          // removal set keeps the ~9k embeddings intact, matching the
+          // Layer 1 comment's promise, so the next genuinely-eligible
+          // drain can recompute from a consistent store.
+          removalCandidateVisitIds: driftWouldWipeServedSignal
+            ? EMPTY_VISIT_ID_SET
+            : pendingTimelineVisitIds,
           fullRebuild: hnswFullRebuild,
           previousSnapshot: previousSnapshotForRanker,
           embed: deps.embed ?? defaultEmbed,
@@ -3588,12 +3796,175 @@ export const createConnectionsMaterializer = (
       });
       mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
+    // Served-signal floor guard (requirement B/C — flapping fix). This is
+    // the single chokepoint where the freshly built `visitSimilarity` is
+    // finalized and BOTH publish paths (full rebuild + scoped-delta)
+    // downstream consume it. On a warm delta-only drain the corpus is
+    // assembled from the event WINDOW only, so a window with no
+    // gate-eligible visit yields an EMPTY eligible corpus → an empty
+    // revision → all ~51k `visit_resembles_visit` edges wiped from the
+    // served snapshot. That is an UNLOADED-lane read masquerading as an
+    // empty corpus (requirement A), not a real collapse. We refuse to
+    // publish a >90% collapse relative to the previously served revision
+    // unless an explicit, recorded reset reason applies; otherwise we
+    // carry the previous revision forward (self-contained from the served
+    // snapshot, so it survives a restart / missing revision file), so the
+    // degenerate empty revision is never assigned to `input.visitSimilarity`
+    // and never persisted as served. `previousServedSimilarityEdges`,
+    // `previousServedSimilarityEdgeCount`, and `similarityFloorResetReasons`
+    // were computed once above (before the rebuild decision) and are reused
+    // here so the drift-suppression and publish-suppression stay consistent.
+    const builtSimilarityRevisionId = visitSimilarity.revisionId;
+    const builtSimilarityEdgeCount = visitSimilarity.edges.length;
+    // Bounded-recovery escape (blocker fix) — has THIS same low-count band
+    // been suppressed for N consecutive drains? A flap alternates high/
+    // empty (the run resets on each clean drain), so reaching the threshold
+    // means a genuine SUSTAINED collapse (real deletion / legitimate corpus
+    // shrink) that must be published rather than pinned to the old high
+    // revision forever. Derived from durable state so it survives the
+    // child-per-drain fork.
+    const sustainedCollapseReached = similarityFloorSustainedCollapseReached(
+      similarityFloorState,
+      builtSimilarityEdgeCount,
+    );
+    const similarityFloorOutcome = decideSimilarityFloorGuard({
+      candidate: visitSimilarity,
+      previousServedEdgeCount: previousServedSimilarityEdgeCount,
+      resetReasons: similarityFloorResetReasons,
+      sustainedCollapseReached,
+    });
+    let carriedForward = false;
+    const carriedPreviousServedEdges =
+      similarityFloorOutcome.action === 'carry-forward' ? previousServedSimilarityEdges() : null;
+    if (
+      similarityFloorOutcome.action === 'carry-forward' &&
+      previousSnapshotForRanker !== null &&
+      carriedPreviousServedEdges !== null
+    ) {
+      // Suppress the collapse: republish the previously served revision.
+      // The previous revision id lives on the previous snapshot's revision
+      // metadata via the reconstructed edges; the modelId/threshold are
+      // stable config so we carry them from the just-built revision (same
+      // model + threshold — only the corpus was starved).
+      carriedForward = true;
+      visitSimilarity = carryForwardRevision(
+        {
+          revisionId:
+            lastAcceptedSimilarityRevisionId ??
+            previousSimilarityRevisionIdFromSnapshot(previousSnapshotForRanker) ??
+            visitSimilarity.revisionId,
+          modelId: visitSimilarity.modelId,
+          // The carried edges live in the PREVIOUSLY served model's vector
+          // space. Record the served model revision (durable state) so the
+          // carried revision does not lie about which model produced it; if
+          // that is unavailable, fall back to the built revision's value.
+          modelRevision: similarityFloorState.servedModelRevision ?? visitSimilarity.modelRevision,
+          featureSchemaVersion: visitSimilarity.featureSchemaVersion,
+          threshold: visitSimilarity.threshold,
+          ...(visitSimilarity.producer === undefined
+            ? {}
+            : { producer: visitSimilarity.producer }),
+        },
+        carriedPreviousServedEdges,
+        visitSimilarity.producedAt,
+      );
+      console.warn(
+        `[connections] similarity floor guard SUPPRESSED a collapse: served=${String(
+          similarityFloorOutcome.previousServedEdgeCount,
+        )} built=${String(builtSimilarityEdgeCount)} floor=${String(
+          similarityFloorOutcome.requiredEdgeFloor,
+        )} — carrying previous revision forward (built id ${builtSimilarityRevisionId} not served)`,
+      );
+      mark(
+        `similarityFloor.suppressedCollapse served=${String(
+          similarityFloorOutcome.previousServedEdgeCount,
+        )} built=${String(builtSimilarityEdgeCount)}`,
+      );
+    } else if (
+      similarityFloorOutcome.action === 'publish' &&
+      similarityFloorOutcome.allowedResetReason !== null
+    ) {
+      mark(
+        `similarityFloor.collapseAllowed reason=${similarityFloorOutcome.allowedResetReason} served=${String(
+          similarityFloorOutcome.previousServedEdgeCount,
+        )} built=${String(builtSimilarityEdgeCount)}`,
+      );
+    }
+    // Fold this drain's outcome into the durable cross-drain floor state.
+    // This is what makes the health surface reflect CURRENT state (not a
+    // process-lifetime latch), arms/consumes the durable privacy-purge
+    // reset, and advances the consecutive-suppression run that the
+    // bounded-recovery escape reads.
+    //
+    // Consume a pending purge reset ONLY when the purge-driven collapse has
+    // actually landed and been published under it — i.e. a collapse was
+    // observed and allowed this drain (allowedResetReason is set only when
+    // a >90% collapse occurred). A full rebuild that produced NO collapse
+    // (e.g. the tombstone's OWN drain, where the timeline projection has
+    // not yet dropped the purged visits) must NOT consume it — the collapse
+    // lands on a LATER drain and the pending reset must survive to permit
+    // it. A full rebuild that DID collapse consumes it via the same path.
+    const resetConsumedThisDrain =
+      similarityFloorOutcome.action === 'publish' &&
+      similarityFloorOutcome.allowedResetReason !== null &&
+      similarityFloorOutcome.previousServedEdgeCount !== null &&
+      similarityFloorOutcome.previousServedEdgeCount > 0 &&
+      similarityFloorOutcome.candidateEdgeCount <
+        similarityFloorOutcome.previousServedEdgeCount *
+          SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+    const nextSimilarityFloorState = foldSimilarityFloorDrain(similarityFloorState, {
+      suppressed: carriedForward,
+      builtEdgeCount: builtSimilarityEdgeCount,
+      nowMs: Date.now(),
+      purgeObservedThisDrain,
+      resetConsumedThisDrain,
+      sustainedCollapseAccepted:
+        similarityFloorOutcome.action === 'publish' &&
+        similarityFloorOutcome.allowedResetReason === 'sustained-collapse-accepted',
+      // Record the model revision of what we actually SERVE this drain: the
+      // carried revision keeps the old model's revision; a genuine publish
+      // records the live built model revision.
+      servedModelRevision: visitSimilarity.modelRevision,
+    });
+    // Persist the durable state (best-effort — observability/guard state
+    // must never fail a drain).
+    try {
+      await similarityFloorStateStore.write(nextSimilarityFloorState);
+    } catch {
+      /* durable floor-state write is best-effort; never fail the drain */
+    }
+    const similarityFloorDiagnostics: SimilarityFloorDiagnostics = {
+      servedRevisionId: visitSimilarity.revisionId,
+      builtRevisionId: builtSimilarityRevisionId,
+      previousServedEdgeCount: previousServedSimilarityEdgeCount,
+      builtEdgeCount: builtSimilarityEdgeCount,
+      servedEdgeCount: visitSimilarity.edges.length,
+      suppressedCollapse: carriedForward,
+      allowedResetReason:
+        similarityFloorOutcome.action === 'publish'
+          ? similarityFloorOutcome.allowedResetReason
+          : null,
+      // Durable lifetime count (survives the child fork) — a metric, not a
+      // status driver. The health surface uses `suppressedCollapse` (this
+      // drain) + `flapping` (recent-window) instead so it reflects current
+      // state.
+      suppressedCollapseCount: nextSimilarityFloorState.suppressedCollapseCount,
+      flapping: similarityFloorHealthFlapping(nextSimilarityFloorState),
+    };
     // U2 — similarity-stage wall time for HotPathDiagnostics (the
     // visitSimilarity revision is finalized here).
     const hotSimRuntimeMs = Date.now() - similarityStartedAtMs;
     if (
-      persistentHnswSimilarityMode ||
-      (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath)
+      // Skip the canonical revision-file write on carry-forward: the
+      // <prevRevisionId>.json already exists on disk from the good drain
+      // that produced it (with the real ~51k edges + full per-edge
+      // metadata). Re-writing it here would overwrite the canonical file
+      // with the metadata-stripped, re-rounded reconstruction and refresh
+      // its producedAt — corrupting content under a valid-looking id for
+      // any future replay / audit / worker reconciliation that reads it.
+      !carriedForward &&
+      (persistentHnswSimilarityMode ||
+        (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath))
     ) {
       // Stage 5.2 W3 wiring — record embedder latency only on cache miss
       // (cache hits don't exercise the embedder). Divide by entry count
@@ -4915,6 +5286,7 @@ export const createConnectionsMaterializer = (
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
       hotPathDiagnostics,
       servedTopicProducerReport,
+      similarityFloorDiagnostics,
     });
     // Statistical drift/evaluation layer — feed the diagnostic series
     // through the change detectors and fold the status into the

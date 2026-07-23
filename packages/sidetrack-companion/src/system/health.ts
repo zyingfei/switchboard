@@ -420,6 +420,22 @@ export const collectHealth = async (deps: HealthDeps): Promise<HealthReport> => 
   if (workGraph !== undefined || deps.workGraphSummary !== undefined) {
     sections['workGraph'] = workGraphR.timedOut ? 'unavailable' : 'ok';
   }
+  // Served-signal floor guard (flapping fix, requirement B). Surface the
+  // similarity floor as its OWN section so a suppressed collapse flips
+  // the top-level status non-ok (`degraded`), not buried inside the
+  // workGraph candidates list. Mirrors the dataLoss `stale` convention:
+  // a suppressed collapse (candidate `alarm`) is a real, non-fallback
+  // signal that the served graph would have flapped. Only wired when the
+  // workGraph report is present + the candidate exists (absent for legacy
+  // fixtures / pre-fix diagnostics).
+  if (workGraph !== undefined && !workGraphR.timedOut) {
+    const floorCandidate = workGraph.candidates.find(
+      (candidate) => candidate.id === 'similarity.served-signal-floor',
+    );
+    if (floorCandidate !== undefined) {
+      sections['similarityFloor'] = floorCandidate.status === 'alarm' ? 'stale' : 'ok';
+    }
+  }
   if (sync !== undefined) sections['sync'] = 'ok';
   // A tripped tripwire is `stale` (a real, non-fallback signal that
   // something durable went wrong), and the reconciliation timing out is
