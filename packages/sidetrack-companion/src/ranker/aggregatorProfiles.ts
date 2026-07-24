@@ -119,11 +119,92 @@ const mediumProfile: AggregatorProfile = {
   },
 };
 
-// Domains with no per-page item shape (pure feeds / search / chat surfaces).
-// Every page is a FEED — the domain-wide guard applies wholesale, which is
-// correct for these (a search results page or a chat home is never a stable
-// content object we want to group by URL). Listed WITHOUT an item classifier so
-// isItemUrl is always false.
+// Chat-provider profiles. A chat provider is an aggregator in the same sense HN
+// is: the domain hosts one FEED surface (the new-chat composer, login, history
+// index, marketing) plus many distinct ITEM pages — one per conversation thread,
+// each a stable content object keyed by its thread id in the URL. Filing thread
+// pages as FEED quarantined them exactly like a listing (user-reported via the
+// "Phantom与Shadow v2架构" thread), which is wrong: a thread IS the content
+// object we want to group by. So thread URLs are `item`; every other shape on
+// the domain stays `feed`.
+//
+// URL shapes below are DERIVED FROM THE LIVE TEST VAULT (doctrine rule 1 —
+// evidence, not assumption), read read-only from
+// ~/.sidetrack-vault-test/_BAC/connections/current.db node ids on 2026-07-24:
+//
+//   chatgpt.com  threads: /c/<id>                     (360 obs; id = uuid or
+//                          /g/<gpt>/c/<id>            (61 obs; project/custom-GPT
+//                          /branch/<id>/<id>          (3 obs; thread-branch view)
+//                                                     `WEB:<uuid>` also seen as id)
+//                feeds:   /  /library  /g/<gpt>  /g/<gpt>/project  /business/*
+//                          /checkout  /share/*  /new
+//   claude.ai    threads: /chat/<id>                  (21 obs)
+//                feeds:   /  /new  /login  /logout  /recents
+//   gemini.google.com
+//                threads: /app/<id>                   (129 obs; id = 16-hex)
+//                feeds:   /app (no id, 69 obs)  /  /search  /images
+//
+// The item predicate keys on the STRUCTURAL POSITION of a non-empty thread-id
+// segment, not on the id's character shape — the same choice as the HN
+// `item?id=` and reddit `/comments/<id>` predicates. Three distinct id formats
+// (uuid, `WEB:<uuid>`, 16-hex) already coexist in the vault, so a charset regex
+// would be over-fit and brittle to the next provider id format.
+
+// `chat.openai.com` (legacy ChatGPT) and `chatgpt.com` share the /c/<id> shape.
+// The `openai.com` profile covers both (registrable-domain suffix match) while a
+// bare `openai.com/*` marketing page has no /c/ or /branch/ segment → feed.
+const isChatgptThreadUrl = (parsed: URL): boolean => {
+  const segments = parsed.pathname.split('/').filter((segment) => segment.length > 0);
+  if (segments.length === 0) return false;
+  // /c/<id> and /g/<gpt>/c/<id>: a `c` segment followed by a non-empty id.
+  const cIndex = segments.indexOf('c');
+  if (cIndex !== -1 && segments[cIndex + 1] !== undefined) return true;
+  // /branch/<threadId>/<messageId>: the branch view of an existing thread.
+  if (segments[0] === 'branch' && segments[1] !== undefined) return true;
+  return false;
+};
+
+const chatgptDotComProfile: AggregatorProfile = {
+  registrableDomain: 'chatgpt.com',
+  isItemUrl: isChatgptThreadUrl,
+  siteTitleSuffixes: [],
+};
+
+const openaiProfile: AggregatorProfile = {
+  registrableDomain: 'openai.com',
+  // Only the `chat.` subdomain carries thread shapes; the predicate returns
+  // false for every marketing/root openai.com path, so those stay feed.
+  isItemUrl: isChatgptThreadUrl,
+  siteTitleSuffixes: [],
+};
+
+const claudeAiProfile: AggregatorProfile = {
+  registrableDomain: 'claude.ai',
+  // A Claude conversation is /chat/<id>. /new, /login, /recents, root → feed.
+  isItemUrl: (parsed) => {
+    const segments = parsed.pathname.split('/').filter((segment) => segment.length > 0);
+    return segments[0] === 'chat' && segments[1] !== undefined;
+  },
+  siteTitleSuffixes: [],
+};
+
+const geminiProfile: AggregatorProfile = {
+  registrableDomain: 'google.com',
+  // A Gemini conversation is gemini.google.com/app/<id>. Bare /app (no id),
+  // root, /search, /images → feed. Scoped to the gemini subdomain so no other
+  // google.com surface (search, docs, drive) is ever treated as an item.
+  isItemUrl: (parsed) => {
+    if (normalizeHost(parsed.hostname) !== 'gemini.google.com') return false;
+    const segments = parsed.pathname.split('/').filter((segment) => segment.length > 0);
+    return segments[0] === 'app' && segments[1] !== undefined;
+  },
+  siteTitleSuffixes: [],
+};
+
+// Domains with no per-page item shape (pure feeds / search surfaces). Every page
+// is a FEED — the domain-wide guard applies wholesale, which is correct for
+// these (a search results page is never a stable content object we want to group
+// by URL). Listed WITHOUT an item classifier so isItemUrl is always false.
 const FEED_ONLY_DOMAINS: readonly string[] = [
   'lobste.rs',
   'twitter.com',
@@ -139,12 +220,8 @@ const FEED_ONLY_DOMAINS: readonly string[] = [
   'tumblr.com',
   'stackoverflow.com',
   'stackexchange.com',
-  'google.com',
   'bing.com',
   'duckduckgo.com',
-  'chatgpt.com',
-  'openai.com',
-  'claude.ai',
 ];
 
 const feedOnlyProfile = (registrableDomain: string): AggregatorProfile => ({
@@ -161,6 +238,10 @@ const AGGREGATOR_PROFILES: readonly AggregatorProfile[] = [
   redditProfile,
   youtubeProfile,
   mediumProfile,
+  chatgptDotComProfile,
+  openaiProfile,
+  claudeAiProfile,
+  geminiProfile,
   ...FEED_ONLY_DOMAINS.map(feedOnlyProfile),
 ];
 

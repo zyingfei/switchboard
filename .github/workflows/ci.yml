@@ -38,6 +38,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: No stray compiled artifacts in src (shadow-artifact tripwire)
+        run: |
+          # A stray compiled artifact shadows a same-basename .ts sibling; hand-written
+          # ambient .d.ts files (no sibling source) are legitimate and pass.
+          STRAYS=""
+          for f in $(git ls-files -o --exclude-standard 'packages/*/src/**/*.js' 'packages/*/src/**/*.d.ts' 'packages/*/src/*.js' 'packages/*/src/*.d.ts'; git ls-files 'packages/*/src/**/*.js' 'packages/*/src/**/*.d.ts' 'packages/*/src/*.js' 'packages/*/src/*.d.ts'); do
+            base="${f%.d.ts}"; base="${base%.js}"
+            if [ -f "${base}.ts" ] && [ "${base}.ts" != "$f" ]; then STRAYS="$STRAYS $f"; fi
+          done
+          if [ -n "$STRAYS" ]; then echo "Stray compiled artifacts shadow .ts sources under bun test:"; echo "$STRAYS" | tr ' ' '\n'; exit 1; fi
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.14"

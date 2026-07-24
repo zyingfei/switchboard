@@ -8,3 +8,17 @@ coverage/
 # Sidetrack-owned persistent Chrome profile dirs used by the manual
 # stealth experiment runner. Live state, not source.
 .sidetrack-browser-profiles/
+
+# Shadow-artifact guard: an in-place `tsc` (wrong -p, or a stale editor task)
+# emits compiled .js/.d.ts next to the .ts sources under src/, and the test
+# runner can silently prefer those shadows over the .ts. These ignores stop a
+# stray emit from being committed; the CI tripwire (.github/workflows/ci.yml)
+# fails the build if any such file is present outside the allowlist below.
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+src/**/*.d.ts.map
+
+# Allowlist: hand-authored ambient declarations that legitimately live under
+# src/ (source, not tsc output). Keep in exact sync with the CI tripwire.
+!src/build-info.d.ts

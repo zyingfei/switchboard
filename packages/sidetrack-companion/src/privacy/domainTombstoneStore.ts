@@ -62,15 +62,25 @@ export const readDomainTombstones = async (
   }
 };
 
-// Upsert a tombstone (dedupe by kind+domain — a repeated purge is a
-// no-op that refreshes tombstonedAt). Returns the full list.
+// Upsert a tombstone. Dedup key is SCOPE-KEYED: (kind, domain, host).
+// A repeat of the SAME scope refreshes in place (no duplicate), but two
+// host-scoped tombstones for sibling hosts under one eTLD+1 must BOTH
+// persist — collapsing them silently drops a purge (doctrine rule 7:
+// a served privacy signal may not silently collapse). A family
+// (host-less) tombstone coexists distinctly with a host-scoped one for
+// the same eTLD+1. Returns the full list.
 export const upsertDomainTombstone = async (
   vaultRoot: string,
   tombstone: DomainTombstonePayload,
 ): Promise<readonly DomainTombstonePayload[]> => {
   const existing = await readDomainTombstones(vaultRoot);
   const filtered = existing.filter(
-    (candidate) => !(candidate.kind === tombstone.kind && candidate.domain === tombstone.domain),
+    (candidate) =>
+      !(
+        candidate.kind === tombstone.kind &&
+        candidate.domain === tombstone.domain &&
+        candidate.host === tombstone.host
+      ),
   );
   const next = [...filtered, tombstone];
   const artifact: DomainTombstoneArtifact = {

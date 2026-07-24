@@ -280,6 +280,32 @@ export const purgeRecallV2StoreByDomain = async (
   }
 };
 
+/** Privacy purge — HOST-SCOPED. Hard-delete recall-v2 documents/vectors/
+ *  chunks whose host equals `host` OR is a subdomain of it, leaving
+ *  sibling hosts under the same eTLD+1 untouched. Opens (or reuses) the
+ *  store so a purge lands even before the first /v2/recall. Returns the
+ *  number of document rows deleted; 0 when the store isn't openable or
+ *  the backend can't host-scope (older store without deleteDocumentsByHost). */
+export const purgeRecallV2StoreByHost = async (
+  vaultRoot: string,
+  host: string,
+): Promise<number> => {
+  const trimmed = host.trim().toLowerCase().replace(/\.$/u, '');
+  if (trimmed.length === 0) return 0;
+  let store: RecallStore;
+  try {
+    store = await getOrOpenStore(vaultRoot);
+  } catch {
+    return 0;
+  }
+  if (store.deleteDocumentsByHost === undefined) return 0;
+  try {
+    return store.deleteDocumentsByHost(trimmed);
+  } catch {
+    return 0;
+  }
+};
+
 /** Re-runs backfill phases whose source signature changed. Cheap
  *  (3 dir stats) when nothing's moved. Single-flight per vault so
  *  concurrent /v2/recall callers share one backfill pass instead of

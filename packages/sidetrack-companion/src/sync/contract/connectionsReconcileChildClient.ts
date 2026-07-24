@@ -12,11 +12,34 @@
 // materializer's buildConnectionsSnapshot allocates a lot for a big
 // vault, and forking fresh per drain means the OS reclaims it cleanly
 // on exit instead of letting it accumulate across thousands of drains.
+//
+// M7 — hang safety. The reconcile child settles the parent promise on
+// message/error/exit only. A child stuck in a native-addon deadlock
+// (usearch/onnx) posts nothing and never exits, so the promise never
+// settles, the materializer's single-flight `running=true` guard stays
+// latched forever, and drains stop permanently AND silently. Two
+// hardening layers here:
+//
+//   1. Progress-aware timeout. A boot catch-up over a real vault can
+//      legitimately run 30+ minutes, so a fixed total-duration timeout
+//      would false-positive. Instead we time out on NO PROGRESS: every
+//      heartbeat / progress message / stdout line resets a watchdog;
+//      if the child goes silent for longer than the no-progress window
+//      we SIGKILL it and settle with a typed error. The entry posts a
+//      periodic heartbeat so a live-but-quiet phase still ticks.
+//
+//   2. Lifecycle cleanup. The live child is tracked in a module set;
+//      on parent SIGTERM/SIGINT/exit we best-effort kill it. Its pid is
+//      also written to a pidfile under `_BAC/connections/`, so a
+//      `kill -9` of the PARENT (which skips our handlers) leaves a
+//      discoverable orphan that still holds the current.db write lock —
+//      the next boot detects and kills it before starting drains,
+//      closing the two-writer race observed live this week.
 
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
 
 import { withBunSmolExecArgv } from '../../process/bunMemory.js';
 import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
@@ -38,20 +61,275 @@ export const setReconcileChildScriptOverride = (path: string | undefined): void 
   childScriptPath = path;
 };
 
+// ---------------------------------------------------------------------------
+// Progress-aware timeout tuning.
+//
+// The watchdog fires only after the child has produced NO signal (no
+// heartbeat, no progress message, no stdout) for this long. Default 10
+// minutes: comfortably above the child's heartbeat cadence, below the
+// point where a truly-wedged drain has silently parked the pipeline for
+// an operator-noticeable stretch. Env-tunable for stress tests and for
+// operators debugging a genuinely slow vault.
+// ---------------------------------------------------------------------------
+const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 10 * 60_000;
+
+const noProgressTimeoutMs = (): number => {
+  const raw = process.env['SIDETRACK_CONNECTIONS_CHILD_NOPROGRESS_MS'];
+  if (raw === undefined) return DEFAULT_NO_PROGRESS_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_NO_PROGRESS_TIMEOUT_MS;
+  return parsed;
+};
+
+// ---------------------------------------------------------------------------
+// Drain diagnostics counters (module-scoped, process-lifetime). Surfaced
+// via getReconcileChildDiagnostics() so a caller (drain diagnostics) or a
+// future health assembly (canary lane) can read the timeout/orphan-kill
+// rates without this module importing either. Absent==0 semantics.
+// ---------------------------------------------------------------------------
+export interface ReconcileChildDiagnostics {
+  /** Children SIGKILLed by the no-progress watchdog. */
+  readonly timeoutKills: number;
+  /** Children killed by parent-death cleanup (SIGTERM/SIGINT/exit). */
+  readonly parentDeathKills: number;
+  /** Stale orphan children killed at boot from a prior run's pidfile. */
+  readonly orphanKillsAtBoot: number;
+  /** Timestamp (ms) of the most recent no-progress timeout, if any. */
+  readonly lastTimeoutAtMs: number | undefined;
+}
+
+const diagnostics = {
+  timeoutKills: 0,
+  parentDeathKills: 0,
+  orphanKillsAtBoot: 0,
+  lastTimeoutAtMs: undefined as number | undefined,
+};
+
+export const getReconcileChildDiagnostics = (): ReconcileChildDiagnostics => ({
+  timeoutKills: diagnostics.timeoutKills,
+  parentDeathKills: diagnostics.parentDeathKills,
+  orphanKillsAtBoot: diagnostics.orphanKillsAtBoot,
+  lastTimeoutAtMs: diagnostics.lastTimeoutAtMs,
+});
+
+/** Test seam — reset counters between cases. */
+export const resetReconcileChildDiagnostics = (): void => {
+  diagnostics.timeoutKills = 0;
+  diagnostics.parentDeathKills = 0;
+  diagnostics.orphanKillsAtBoot = 0;
+  diagnostics.lastTimeoutAtMs = undefined;
+};
+
+// ---------------------------------------------------------------------------
+// Live-child registry + parent-death cleanup. Any child we fork is tracked
+// here for the duration of its run; the process-exit handlers below kill
+// whatever is still live so a graceful parent shutdown never orphans a
+// child that holds the current.db write lock.
+// ---------------------------------------------------------------------------
+const liveChildren = new Set<ChildProcess>();
+
+const killChild = (child: ChildProcess): void => {
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* already exited */
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Signal re-raise policy (opt-in).
+//
+// On SIGTERM/SIGINT this module's handler kills live children, then — ONLY
+// if re-raise is enabled — removes itself and re-raises the signal to
+// restore the default terminate-on-signal disposition. That re-raise is
+// OFF by default and must be explicitly opted into by a programmatic
+// embedding that has NO other shutdown handler (installing a SIGTERM `on`
+// listener suppresses the default disposition, so without a re-raise the
+// signal would be swallowed and the process would hang).
+//
+// Why not infer 'am I the sole listener?' from process.listenerCount: the
+// CLI registers its graceful-shutdown handler with process.once (see
+// cli.ts), and Node removes a once-wrapper from the listeners array BEFORE
+// the wrapped fn returns. So during a real CLI SIGTERM, by the time this
+// (later-registered) `on` handler runs, listenerCount already reads 1 —
+// this handler MIS-READS itself as the sole listener, re-raises the signal
+// SYNCHRONOUSLY, and terminates the process while the CLI's async
+// `closeAll().finally(process.exit)` is still in flight, truncating the
+// graceful DB-lock-release/flush. The heuristic is therefore unsound; a
+// caller must instead declare its intent explicitly.
+//
+// The 'exit' handler below already kills children on EVERY graceful path
+// (including the CLI's process.exit), so leaving re-raise off does not
+// leak children.
+// ---------------------------------------------------------------------------
+let reRaiseSignalsOnParentDeath = false;
+
+/**
+ * Opt into re-raising SIGTERM/SIGINT after this module's cleanup runs.
+ *
+ * Call this ONLY from a programmatic embedding that installs no other
+ * shutdown handler and needs the process to terminate on signal. Do NOT
+ * call it when a CLI/host owns graceful shutdown (the default): re-raising
+ * would race and truncate that host's async close.
+ */
+export const setReconcileChildReRaiseSignalsOnParentDeath = (enabled: boolean): void => {
+  reRaiseSignalsOnParentDeath = enabled;
+};
+
+let parentHandlersInstalled = false;
+const installParentDeathHandlers = (): void => {
+  if (parentHandlersInstalled) return;
+  parentHandlersInstalled = true;
+  const cleanup = (): void => {
+    for (const child of liveChildren) {
+      diagnostics.parentDeathKills += 1;
+      killChild(child);
+    }
+    liveChildren.clear();
+  };
+  // 'exit' runs on EVERY normal termination path — a bare process end, an
+  // explicit `process.exit()`, and after any signal handler that calls
+  // exit itself. It is synchronous and the reliable seam for the kill; a
+  // `kill -9` bypasses it entirely, which is exactly what the boot
+  // pidfile sweep exists to catch.
+  process.on('exit', cleanup);
+  // Signal handlers are a best-effort supplement. They always kill live
+  // children; they re-raise the signal (restoring the default terminate
+  // disposition) ONLY when a programmatic embedding has opted in via
+  // setReconcileChildReRaiseSignalsOnParentDeath. Under the CLI (default)
+  // re-raise stays off so we never race the CLI's graceful async shutdown.
+  const makeSignalHandler = (signal: 'SIGTERM' | 'SIGINT'): (() => void) => {
+    const handler = (): void => {
+      cleanup();
+      if (reRaiseSignalsOnParentDeath) {
+        // Restore the default disposition by removing ourselves and
+        // re-raising, otherwise the signal would be swallowed and a
+        // handler-only process would hang.
+        process.removeListener(signal, handler);
+        process.kill(process.pid, signal);
+      }
+    };
+    return handler;
+  };
+  process.on('SIGTERM', makeSignalHandler('SIGTERM'));
+  process.on('SIGINT', makeSignalHandler('SIGINT'));
+};
+
+// ---------------------------------------------------------------------------
+// Orphan pidfile. The pidfile records the CURRENTLY-LIVE child's pid so a
+// `kill -9` of the parent (which skips the handlers above) leaves a
+// discoverable orphan. It lives beside the snapshot store under
+// `_BAC/connections/` — the same directory the child writes current.db
+// into, so it travels with the artifact it protects.
+// ---------------------------------------------------------------------------
+const connectionsDir = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'connections');
+const childPidfilePath = (vaultRoot: string): string =>
+  join(connectionsDir(vaultRoot), '.reconcile-child.pid');
+
+const isPidAlive = (pid: number): boolean => {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    // Signal 0 is a permission probe: sends nothing, throws if the
+    // process is gone (or owned by another user).
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const writeChildPidfile = (vaultRoot: string, pid: number): void => {
+  try {
+    mkdirSync(connectionsDir(vaultRoot), { recursive: true });
+    writeFileSync(childPidfilePath(vaultRoot), `${String(pid)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } catch {
+    // Pidfile is best-effort safety, never the drain's critical path.
+  }
+};
+
+const clearChildPidfile = (vaultRoot: string, pid: number): void => {
+  try {
+    const path = childPidfilePath(vaultRoot);
+    if (!existsSync(path)) return;
+    const current = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+    // Only clear if it's still OUR child's pidfile — a newer drain may
+    // have already overwritten it with its own child.
+    if (current === pid) unlinkSync(path);
+  } catch {
+    /* nothing to clear */
+  }
+};
+
+/**
+ * Boot-time orphan sweep. If a prior companion was `kill -9`'d mid-drain
+ * its child is still alive holding the current.db write lock. Detect it
+ * from the pidfile and SIGKILL it BEFORE starting any drains, so the new
+ * process is the sole writer. Idempotent; safe to call on every boot.
+ */
+export const cleanupOrphanReconcileChild = (
+  vaultRoot: string,
+): { readonly killed: boolean; readonly pid: number | undefined } => {
+  const path = childPidfilePath(vaultRoot);
+  let pid: number | undefined;
+  try {
+    if (!existsSync(path)) return { killed: false, pid: undefined };
+    const parsed = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) pid = parsed;
+  } catch {
+    return { killed: false, pid: undefined };
+  }
+  // A stale pidfile whose pid is our own or already dead: just remove it.
+  if (pid === undefined || pid === process.pid || !isPidAlive(pid)) {
+    try {
+      unlinkSync(path);
+    } catch {
+      /* already gone */
+    }
+    return { killed: false, pid };
+  }
+  try {
+    process.kill(pid, 'SIGKILL');
+    diagnostics.orphanKillsAtBoot += 1;
+  } catch {
+    // Owned by another user or vanished between the probe and the kill.
+  }
+  try {
+    unlinkSync(path);
+  } catch {
+    /* already gone */
+  }
+  return { killed: true, pid };
+};
+
+export const buildReconcileChildEnv = (
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv => ({ ...source });
+
 interface ReconcileChildMessage {
   readonly kind: 'reconcile';
   readonly vaultRoot: string;
   readonly seq: number;
 }
 
-export const buildReconcileChildEnv = (
-  source: NodeJS.ProcessEnv = process.env,
-): NodeJS.ProcessEnv => ({ ...source });
+// The child's heartbeat message. Distinct `kind` so the message handler
+// never mistakes a progress tick for the final result.
+interface ReconcileHeartbeatMessage {
+  readonly kind: 'heartbeat';
+}
+
+const isHeartbeat = (raw: unknown): raw is ReconcileHeartbeatMessage =>
+  typeof raw === 'object' && raw !== null && (raw as { kind?: unknown }).kind === 'heartbeat';
 
 /**
  * Fork a child process and run one reconcile pass. The promise resolves
  * with the child's result; the seq token round-trips so the caller can
  * ignore stale responses if a newer drain finished first.
+ *
+ * The promise ALWAYS settles: on message, error, exit, or — if the child
+ * wedges silently — a no-progress watchdog timeout that SIGKILLs it.
  */
 export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> =>
   new Promise<ReconcileWorkerResult>((resolve) => {
@@ -64,16 +342,39 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
       });
       return;
     }
+    installParentDeathHandlers();
     const child: ChildProcess = fork(entry, [], {
       env: buildReconcileChildEnv(),
       execArgv: withBunSmolExecArgv(process.execArgv),
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
+    liveChildren.add(child);
+    if (typeof child.pid === 'number') writeChildPidfile(job.vaultRoot, child.pid);
+
     let settled = false;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const clearWatchdog = (): void => {
+      if (watchdog !== undefined) {
+        clearTimeout(watchdog);
+        watchdog = undefined;
+      }
+    };
+    // Reset on any sign of life. If the child stays silent past the
+    // window we treat it as wedged and kill it.
+    const bumpWatchdog = (): void => {
+      if (settled) return;
+      clearWatchdog();
+      watchdog = setTimeout(onNoProgress, noProgressTimeoutMs());
+      watchdog.unref?.();
+    };
+
     const settle = (result: ReconcileWorkerResult): void => {
       if (settled) return;
       settled = true;
-      // Best-effort terminate; ignore errors from already-exited child.
+      clearWatchdog();
+      liveChildren.delete(child);
+      if (typeof child.pid === 'number') clearChildPidfile(job.vaultRoot, child.pid);
+      // Best-effort terminate; ignore errors from an already-exited child.
       try {
         child.kill('SIGTERM');
       } catch {
@@ -81,13 +382,39 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
       }
       resolve(result);
     };
+
+    function onNoProgress(): void {
+      if (settled) return;
+      diagnostics.timeoutKills += 1;
+      diagnostics.lastTimeoutAtMs = Date.now();
+      const pid = typeof child.pid === 'number' ? child.pid : -1;
+      console.warn(
+        `[reconcile.child] no-progress timeout after ${String(noProgressTimeoutMs())}ms; ` +
+          `SIGKILL pid=${String(pid)} seq=${String(job.seq)}`,
+      );
+      // SIGKILL (not SIGTERM): a child wedged in a native-addon deadlock
+      // is not running JS and will never honour a graceful signal.
+      killChild(child);
+      settle({
+        seq: job.seq,
+        ok: false,
+        error: `reconcile child timed out (no progress for ${String(noProgressTimeoutMs())}ms); killed`,
+      });
+    }
+
     child.stdout?.on('data', (buf: Buffer) => {
+      bumpWatchdog();
       process.stdout.write(`[reconcile.child] ${buf.toString('utf8')}`);
     });
     child.stderr?.on('data', (buf: Buffer) => {
+      bumpWatchdog();
       process.stderr.write(`[reconcile.child] ${buf.toString('utf8')}`);
     });
     child.on('message', (raw: unknown) => {
+      if (isHeartbeat(raw)) {
+        bumpWatchdog();
+        return;
+      }
       const receivedAtMs = Date.now();
       const result = raw as ReconcileWorkerResult;
       if (result.ok && result.snapshotRevision !== undefined) {
@@ -112,4 +439,7 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
       seq: job.seq,
     };
     child.send(message);
+    // Arm the watchdog once the fork is wired; the initial window covers
+    // the spawn-to-first-heartbeat gap.
+    bumpWatchdog();
   });

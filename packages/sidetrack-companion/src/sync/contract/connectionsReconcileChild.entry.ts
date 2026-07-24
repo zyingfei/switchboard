@@ -51,12 +51,31 @@ const post = (result: ReconcileWorkerResult): void => {
   }
 };
 
+// M7 — liveness heartbeat. catchUp is a single long await with no
+// per-phase IPC, so the parent cannot distinguish "slowly making
+// progress on a big vault" from "wedged in a native-addon deadlock".
+// A periodic heartbeat gives the parent's no-progress watchdog a signal
+// to reset while the child is genuinely alive; a wedged child stops
+// heartbeating (the event loop is blocked) and the watchdog fires.
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+const postHeartbeat = (): void => {
+  try {
+    process.send?.({ kind: 'heartbeat' });
+  } catch {
+    // Parent disappeared; nothing to keep alive for.
+  }
+};
+
 const run = async (msg: ReconcileMessage): Promise<void> => {
   if (typeof msg.vaultRoot !== 'string' || typeof msg.seq !== 'number') {
     post({ seq: -1, ok: false, error: 'invalid reconcile job payload' });
     process.exit(1);
     return;
   }
+  const heartbeat = setInterval(postHeartbeat, HEARTBEAT_INTERVAL_MS);
+  // Don't let the heartbeat timer itself keep the child alive past its work.
+  heartbeat.unref?.();
   try {
     const replica = await loadOrCreateReplica(msg.vaultRoot);
     const eventLog = createEventLog(msg.vaultRoot, replica);
@@ -69,6 +88,7 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
       store,
     });
     await materializer.catchUp(eventLog);
+    clearInterval(heartbeat);
     const metadata =
       store instanceof SqliteConnectionsStore
         ? await store.readSnapshotMetadata()
@@ -82,6 +102,7 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
     });
     process.exit(0);
   } catch (err) {
+    clearInterval(heartbeat);
     post({
       seq: msg.seq,
       ok: false,

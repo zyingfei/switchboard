@@ -77,10 +77,86 @@ describe('aggregatorProfiles', () => {
       expect(classifyAggregatorPage('https://www.youtube.com/feed/subscriptions')).toBe('feed');
     });
 
-    it('treats feed-only domains (search/chat) as always feed', () => {
+    it('treats feed-only domains (search) as always feed', () => {
       expect(classifyAggregatorPage('https://www.google.com/search?q=llm')).toBe('feed');
-      expect(classifyAggregatorPage('https://chatgpt.com/c/abc')).toBe('feed');
-      expect(classifyAggregatorPage('https://claude.ai/chat/def')).toBe('feed');
+      expect(classifyAggregatorPage('https://duckduckgo.com/?q=rust')).toBe('feed');
+      expect(classifyAggregatorPage('https://stackoverflow.com/questions/123')).toBe('feed');
+    });
+
+    // Chat-provider thread pages are ITEMS (each is one conversation = a content
+    // object), while the composer / login / history-index / root stay FEED. All
+    // URL shapes below are the real shapes observed in the test vault on
+    // 2026-07-24 (doctrine rule 1). Truth table per provider:
+    describe('chat providers — thread pages are items, everything else is feed', () => {
+      it('chatgpt.com: /c/<id>, /g/<gpt>/c/<id>, /branch/… are items', () => {
+        // Items (observed thread shapes; id may be uuid or WEB:<uuid>).
+        for (const url of [
+          'https://chatgpt.com/c/6a0611ae-92bc-8333-83d4-34c343995f73',
+          'https://chatgpt.com/c/WEB:11e1d0aa-b0bd-47cb-b15f-e25b5c3f2b24',
+          'https://chatgpt.com/g/g-p-69ec077b42948191a1fd309d64a860ae-switchboard/c/6a054c97-5548-832c-86eb-a482875f7aad',
+          'https://chatgpt.com/branch/6a5f9b18-a6c0-83ea-bf9f-cb88eaabf9e9/bdebf4c3-9d95-425a-9b0b-f0b7de1bc461',
+        ]) {
+          expect(classifyAggregatorPage(url)).toBe('item');
+        }
+        // Feeds (observed non-thread shapes: root, project landing, GPT landing,
+        // library/history, marketing, composer).
+        for (const url of [
+          'https://chatgpt.com/',
+          'https://chatgpt.com/library',
+          'https://chatgpt.com/g/g-p-69ec077b42948191a1fd309d64a860ae-switchboard/project',
+          'https://chatgpt.com/g/g-1234567',
+          'https://chatgpt.com/business/enterprise',
+          'https://chatgpt.com/new',
+        ]) {
+          expect(classifyAggregatorPage(url)).toBe('feed');
+        }
+      });
+
+      it('chat.openai.com (legacy ChatGPT): /c/<id> is item, marketing is feed', () => {
+        expect(
+          classifyAggregatorPage('https://chat.openai.com/c/6a0611ae-92bc-8333-83d4-34c343995f73'),
+        ).toBe('item');
+        // Bare openai.com marketing / product pages have no thread segment → feed.
+        expect(classifyAggregatorPage('https://openai.com/')).toBe('feed');
+        expect(classifyAggregatorPage('https://openai.com/index/gpt-4/')).toBe('feed');
+        expect(classifyAggregatorPage('https://chat.openai.com/')).toBe('feed');
+      });
+
+      it('claude.ai: /chat/<id> is item, composer/login/history are feed', () => {
+        expect(
+          classifyAggregatorPage('https://claude.ai/chat/86d59fbb-1c28-4618-8003-e457a694d342'),
+        ).toBe('item');
+        for (const url of [
+          'https://claude.ai/',
+          'https://claude.ai/new',
+          'https://claude.ai/login',
+          'https://claude.ai/login?from=logout',
+          'https://claude.ai/logout',
+          'https://claude.ai/recents',
+        ]) {
+          expect(classifyAggregatorPage(url)).toBe('feed');
+        }
+      });
+
+      it('gemini.google.com: /app/<id> is item, bare /app + search stay feed', () => {
+        expect(
+          classifyAggregatorPage('https://gemini.google.com/app/00a61b7757473b9a'),
+        ).toBe('item');
+        expect(
+          classifyAggregatorPage('https://gemini.google.com/app/43c81f5cb8e0048e?hl=en-US'),
+        ).toBe('item');
+        for (const url of [
+          'https://gemini.google.com/app', // no thread id
+          'https://gemini.google.com/', // root
+          'https://gemini.google.com/search',
+          'https://gemini.google.com/images',
+        ]) {
+          expect(classifyAggregatorPage(url)).toBe('feed');
+        }
+        // Other google.com surfaces are NOT gemini items (scoped to the subdomain).
+        expect(classifyAggregatorPage('https://www.google.com/search?q=x')).toBe('feed');
+        expect(classifyAggregatorPage('https://docs.google.com/document/d/abc/edit')).toBe('feed');
+      });
     });
 
     it('returns not-aggregator for other domains and malformed urls', () => {

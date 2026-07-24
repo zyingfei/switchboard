@@ -26,6 +26,14 @@ const similarTombstone = (
   tombstonedAt: '2026-07-11T00:00:00.000Z',
 });
 
+const hostTombstone = (domain: string, host: string): DomainTombstonePayload => ({
+  payloadVersion: 1,
+  kind: 'domain',
+  domain,
+  host,
+  tombstonedAt: '2026-07-11T00:00:00.000Z',
+});
+
 describe('registrableDomain (companion)', () => {
   it('collapses subdomains and handles multi-part TLDs', () => {
     expect(registrableDomain('secure.login.pge.com')).toBe('pge.com');
@@ -89,5 +97,52 @@ describe('buildDomainTombstoneSet.matchesPage', () => {
   it('page with no URL never matches', () => {
     const set = buildDomainTombstoneSet([domainTombstone('pge.com')]);
     expect(set.matchesPage({ title: 'pge.com' })).toBe(false);
+  });
+});
+
+describe('buildDomainTombstoneSet host-scoped matching', () => {
+  it('a host tombstone hides only the host + its own subdomains, not siblings', () => {
+    const set = buildDomainTombstoneSet([hostTombstone('google.com', 'meet.google.com')]);
+    // host itself + subdomains → hidden
+    expect(set.matchesPage({ url: 'https://meet.google.com/abc-defg-hij' })).toBe(true);
+    expect(set.matchesPage({ url: 'https://eu.meet.google.com/x' })).toBe(true);
+    // sibling host under the same eTLD+1 → SURVIVES
+    expect(set.matchesPage({ url: 'https://mail.google.com/mail/u/0' })).toBe(false);
+    // bare-family page (www) → SURVIVES (host-scoped never widens to family)
+    expect(set.matchesPage({ url: 'https://www.google.com/search?q=x' })).toBe(false);
+  });
+
+  it('is label-boundary-safe: a look-alike host is not treated as a subdomain', () => {
+    const set = buildDomainTombstoneSet([hostTombstone('google.com', 'meet.google.com')]);
+    // evilmeet.google.com is NOT under meet.google.com
+    expect(set.matchesPage({ url: 'https://evilmeet.google.com/x' })).toBe(false);
+  });
+
+  it('host-scoped matchesDomain never hides a whole family from a bare domain', () => {
+    const set = buildDomainTombstoneSet([hostTombstone('google.com', 'meet.google.com')]);
+    // A bare domain carries no host → a host-scoped rule must not over-hide.
+    expect(set.matchesDomain('google.com')).toBe(false);
+  });
+
+  it('two sibling-host tombstones coexist, each scoped to its own host', () => {
+    const set = buildDomainTombstoneSet([
+      hostTombstone('google.com', 'meet.google.com'),
+      hostTombstone('google.com', 'chat.google.com'),
+    ]);
+    expect(set.matchesPage({ url: 'https://meet.google.com/x' })).toBe(true);
+    expect(set.matchesPage({ url: 'https://chat.google.com/x' })).toBe(true);
+    expect(set.matchesPage({ url: 'https://mail.google.com/x' })).toBe(false);
+  });
+
+  it('a family tombstone coexisting with a host one still hides the whole family', () => {
+    const set = buildDomainTombstoneSet([
+      domainTombstone('pge.com'),
+      hostTombstone('google.com', 'meet.google.com'),
+    ]);
+    // family rule → whole pge.com family hidden
+    expect(set.matchesPage({ url: 'https://www.pge.com/account' })).toBe(true);
+    // host rule → only meet.google.com family member hidden
+    expect(set.matchesPage({ url: 'https://meet.google.com/x' })).toBe(true);
+    expect(set.matchesPage({ url: 'https://mail.google.com/x' })).toBe(false);
   });
 });
