@@ -947,7 +947,15 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
               ? `SUPPRESSED(${String(diagnostics.similarityFloor.previousServedEdgeCount)}->${String(
                   diagnostics.similarityFloor.builtEdgeCount,
                 )})`
-              : (diagnostics.similarityFloor.allowedResetReason ?? 'ok')
+              : diagnostics.similarityFloor.laneUnloadedReuse
+                ? `REUSE(${String(diagnostics.similarityFloor.builtEdgeCount)}->${String(
+                    diagnostics.similarityFloor.servedEdgeCount,
+                  )})`
+                : diagnostics.similarityFloor.bootstrapAdopted
+                  ? `BOOTSTRAP(${String(diagnostics.similarityFloor.builtEdgeCount)}->${String(
+                      diagnostics.similarityFloor.servedEdgeCount,
+                    )})`
+                  : (diagnostics.similarityFloor.allowedResetReason ?? 'ok')
           }`,
           `simFloorSuppressedTotal=${String(diagnostics.similarityFloor.suppressedCollapseCount)}`,
           `simFloorFlapping=${String(diagnostics.similarityFloor.flapping)}`,

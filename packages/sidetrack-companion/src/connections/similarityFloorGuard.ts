@@ -192,6 +192,23 @@ export interface SimilarityFloorDiagnostics {
   // The health surface drives its status from THIS (current state) instead
   // of the lifetime count, so a fully-recovered system returns to ok.
   readonly flapping: boolean;
+  // Round-2 build-side invariant (R1). True when this drain's builder
+  // produced an EMPTY / >90%-collapsed revision while a non-trivial corpus
+  // provably exists (HNSW store elementCount > 0 and/or a persisted
+  // non-empty revision), so the drain REUSED the latest non-empty persisted
+  // revision instead of adopting hash(empty). Distinct from
+  // `suppressedCollapse` (the publish-seam floor guard, Layer 2): this is
+  // Layer 0, upstream of the built revision entering the floor guard. When
+  // true the reused revision id is `servedRevisionId`.
+  readonly laneUnloadedReuse: boolean;
+  // Round-2 recovery bootstrap (R2). True when the previously served
+  // snapshot was empty/degenerate but a NEWER non-empty persisted revision
+  // existed, so this drain ADOPTED that persisted revision to converge the
+  // served graph back to a real corpus (self-recovery without operator
+  // surgery). Distinct from `laneUnloadedReuse`: reuse fires when the
+  // builder collapses despite a corpus; bootstrap fires when the SERVED
+  // signal is already gone and a good revision is available to restore.
+  readonly bootstrapAdopted: boolean;
 }
 
 // Reconstruct a full VisitSimilarityRevision from the previously served

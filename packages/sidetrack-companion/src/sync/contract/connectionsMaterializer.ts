@@ -183,6 +183,7 @@ import {
 } from '../../ranker/trainableEventsShard.js';
 import { trainGroupsInWorker } from '../../ranker/impressionBootstrap.js';
 import {
+  readLatestNonEmptyVisitSimilarityRevision,
   readVisitSimilarityRevision,
   writeVisitSimilarityRevision,
 } from '../../producers/visit-resembles-revision.js';
@@ -1673,13 +1674,26 @@ export const createConnectionsMaterializer = (
     readonly previousSnapshot: ConnectionsSnapshot | null;
     readonly embed: VisitSimilarityEmbedder;
     readonly evidenceByCanonicalUrl: Parameters<typeof corpusForVisitEntry>[1];
+    // Round-2 R1 — refuse to WIPE the persisted HNSW files when a full
+    // rebuild hits an EMPTY eligible corpus while a non-trivial store
+    // exists (elementCount > 0) and no legitimate reset reason applies.
+    // Resetting here would destroy the ~9k embeddings the last good
+    // revision references, so the Layer-0 reuse/bootstrap above would have
+    // nothing to hand back on a later drain. When true the empty-corpus
+    // branches return edges:[] WITHOUT resetting the files; the caller then
+    // reuses/bootstraps the persisted revision. A genuinely-empty vault
+    // (elementCount 0) passes false, so a fresh install still resets/builds
+    // empty legitimately.
+    readonly suppressResetOnEmptyCorpus: boolean;
   }): Promise<VisitSimilarityRevision> => {
     const activeEntries = input.entries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= input.config.engagementGateMs,
     );
     const currentActiveEntryVisitIds = new Set(activeEntries.map(visitKeyForVisitEntry));
     if (activeEntries.length === 0 && input.fullRebuild) {
-      if (input.fullRebuild) await resetHnswSimilarityFiles();
+      // Skip the destructive reset when a corpus exists (R1) — the caller
+      // reuses the persisted revision, so keep the store intact.
+      if (!input.suppressResetOnEmptyCorpus) await resetHnswSimilarityFiles();
       return {
         revisionId: input.revisionId,
         modelId: VISIT_SIMILARITY_MODEL_ID,
@@ -3499,6 +3513,41 @@ export const createConnectionsMaterializer = (
           pendingTimelineVisitIds.has(timelineEntryVisitKey(entry)),
         );
     const pendingHasSearchVisit = pendingEventsForDrain.some(pendingEventIsSearchTimelineVisit);
+    // Round-2 R2 — will the build-side layer (Layer 0) likely BOOTSTRAP a
+    // persisted revision this drain? Predicted here (before the publish-path
+    // choice) from signals known pre-build: the SERVED signal is already
+    // empty (the live self-perpetuation state) while a persisted HNSW store
+    // exists, with no legitimate reset reason. When true, the scoped-delta
+    // publish path would carry the (empty) similarity-family rows forward
+    // from the wiped snapshot and NEVER emit the recovered revision's edges —
+    // so force the FULL/base publish path, where `input.visitSimilarity` (the
+    // bootstrapped revision) flows into `buildConnectionsSnapshot` and lands
+    // in current.db. This is exactly how the live vault recovered "by luck"
+    // when a full-corpus drain happened to publish last; here it is
+    // deterministic. `previousServedSimilarityEdgeCount`, `hnswStoreVisitCount`,
+    // and `similarityFloorResetReasons` are all computed above.
+    //
+    // NOTE (round-2 major fix): do NOT include `similarityEligibleCount === 0`
+    // here. That disjunct fires on the COMMON warm eligible-empty drain (most
+    // drains carry a single sub-gate visit / engagement / non-eligible event,
+    // so the WINDOW has zero gate-eligible NEW visits) whenever the store is
+    // populated — i.e. steady state after any real usage. It does NOT need the
+    // base path: the builder produces the full non-empty edge set from the
+    // persisted HNSW store, so Layer 0 never fires (builtCollapsed=false). But
+    // forcing `canAttemptBoundedScopedDelta=false` there dropped the
+    // page-evidence load from the bounded set to the ENTIRE ~9k-entry corpus
+    // (`loadPageEvidenceForEntries(similarityEntries)`) on every such drain —
+    // the per-nav full-corpus-read CPU pathology. The reuse case (served
+    // non-empty, builder collapsed) is handled AFTER the build by Layer 0
+    // setting `similarityRecoveryNeedsBaseRebuild`, which forces its own base
+    // rebuild; it does not need this pre-build prediction.
+    const servedSimilaritySignalEmpty =
+      previousServedSimilarityEdgeCount === null || previousServedSimilarityEdgeCount <= 0;
+    const similarityRecoveryLikely =
+      persistentHnswSimilarityMode &&
+      similarityFloorResetReasons.length === 0 &&
+      hnswStoreVisitCount > 0 &&
+      servedSimilaritySignalEmpty;
     const canAttemptBoundedScopedDelta =
       !fullPageEvidenceEnsure &&
       persistentHnswSimilarityMode &&
@@ -3509,7 +3558,10 @@ export const createConnectionsMaterializer = (
       pendingEventsForDrain.length > 0 &&
       pendingEventsForDrain.every(isScopedTimelineDeltaEvent) &&
       !pendingHasSearchVisit &&
-      !hnswFullRebuild;
+      !hnswFullRebuild &&
+      // Force the base path when a corpus recovery is likely so the reused/
+      // bootstrapped revision actually reaches the served snapshot.
+      !similarityRecoveryLikely;
     const pageEvidenceByCanonicalUrlMutable = new Map<string, PageEvidenceRecord>();
     const pageEvidenceByCanonicalUrl: ReadonlyMap<string, PageEvidenceRecord> =
       pageEvidenceByCanonicalUrlMutable;
@@ -3689,6 +3741,14 @@ export const createConnectionsMaterializer = (
           previousSnapshot: previousSnapshotForRanker,
           embed: deps.embed ?? defaultEmbed,
           evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
+          // Round-2 R1 — don't wipe the persisted HNSW store when a full
+          // rebuild hits an empty eligible corpus but a store already
+          // exists and no legitimate reset reason applies. The Layer-0
+          // reuse/bootstrap below hands back the last good persisted
+          // revision, so the embeddings it references must survive. A
+          // genuinely-empty store (fresh vault) still resets legitimately.
+          suppressResetOnEmptyCorpus:
+            hnswStoreVisitCount > 0 && similarityFloorResetReasons.length === 0,
         });
         mark(
           `buildVisitSimilarityHnsw full=${String(hnswFullRebuild)} touched=${String(touchedVisitIds.size)} edges=${String(visitSimilarity.edges.length)}`,
@@ -3796,6 +3856,213 @@ export const createConnectionsMaterializer = (
       });
       mark(`buildVisitSimilarity pairs=${String(similarityPairBudget)}`);
     }
+    // Capture what the BUILDER actually produced BEFORE Layer 0 may replace
+    // `visitSimilarity` with a reused/bootstrapped persisted revision. The
+    // diagnostics `builtRevisionId` / `builtEdgeCount` must reflect the
+    // builder's real output (hash(empty) on the flapping drain), not the
+    // reused revision — otherwise the reuse would be invisible in forensics.
+    const builtSimilarityRevisionId = visitSimilarity.revisionId;
+    const builtSimilarityEdgeCount = visitSimilarity.edges.length;
+    // Bounded-recovery escape (blocker fix) — has THIS same low-count band
+    // been suppressed for N consecutive drains? A flap alternates high/empty
+    // (the run resets on each clean drain), so reaching the threshold means a
+    // genuine SUSTAINED collapse (real deletion / legitimate corpus shrink)
+    // that must be accepted rather than pinned to the old high revision
+    // forever. Derived from durable state so it survives the child-per-drain
+    // fork. Computed here (before Layer 0) so BOTH the Layer-0 reuse and the
+    // Layer-2 floor guard honour the SAME escape — otherwise Layer 0 would
+    // reuse the persisted revision forever and starve the escape (the HNSW
+    // store keeps the embeddings under suppression, so `hnswStoreVisitCount`
+    // stays > 0 and the corpus-evidence gate never clears).
+    const sustainedCollapseReached = similarityFloorSustainedCollapseReached(
+      similarityFloorState,
+      builtSimilarityEdgeCount,
+    );
+    // ── Round-2 build-side invariant (Layer 0 — R1/R2) ────────────────────
+    //
+    // The round-1 floor guard (Layer 2, below) protects a NON-EMPTY served
+    // snapshot from collapsing. It cannot recover once the served snapshot
+    // is already empty: `decideSimilarityFloorGuard` publishes immediately
+    // when `previousServedEdgeCount <= 0`. And it never touches the BUILT
+    // revision — so on a warm delta-only drain whose window is
+    // eligible-empty, the builder still assembles hash(empty) from the
+    // (already-wiped) `previousSnapshot` = current.db, and once current.db
+    // holds 0 edges every empty build republishes legally forever
+    // (self-perpetuation). The revision STORE, meanwhile, still holds the
+    // last good ~51k-edge revision — the materializer just never consulted
+    // it. This layer closes both holes UPSTREAM of the floor guard, at the
+    // single point every drain path funnels through:
+    //
+    //   R1 (reuse): the builder produced an empty / >90%-collapsed revision
+    //   while a non-trivial corpus PROVABLY exists (HNSW elementCount > 0
+    //   and/or a persisted non-empty revision). That is a lane-unloaded read
+    //   masquerading as an empty corpus, not a real deletion. Skip adopting
+    //   hash(empty); REUSE the latest non-empty persisted revision. Genuine
+    //   reset reasons (model change / version bump / purge / operator) still
+    //   let the collapse through — they SHOULD reset.
+    //
+    //   R2 (bootstrap): the previously served snapshot is empty/degenerate
+    //   but a newer non-empty persisted revision exists (the live wiped
+    //   vault: served=0, store has the good revision). Adopt that persisted
+    //   revision so the very next drain converges the served graph back to a
+    //   real corpus without operator surgery.
+    //
+    // Both read the persisted store lazily (once) via
+    // `latestPersistedNonEmptyRevision`. A genuinely-empty vault (fresh
+    // install: elementCount 0, no non-empty persisted revision) matches
+    // NEITHER branch, so an empty build is still adopted legitimately.
+    let laneUnloadedReuse = false;
+    let bootstrapAdopted = false;
+    if (persistentHnswSimilarityMode) {
+      const builtEdgeCountBeforeReuse = visitSimilarity.edges.length;
+      // Lazy single read of the revision store — deferred so the common
+      // healthy drain (a non-collapsing build) never pays for the dir scan.
+      let latestPersistedNonEmptyMemo: VisitSimilarityRevision | null | undefined;
+      const latestPersistedNonEmptyRevision =
+        async (): Promise<VisitSimilarityRevision | null> => {
+          if (latestPersistedNonEmptyMemo === undefined) {
+            latestPersistedNonEmptyMemo = await readLatestNonEmptyVisitSimilarityRevision(
+              deps.vaultRoot,
+            );
+          }
+          return latestPersistedNonEmptyMemo;
+        };
+      // Round-2 provenance guard (majors #3 + minors) — a reused/bootstrapped
+      // revision is served VERBATIM under its own id: Pass 7 filters its edges
+      // with the REVISION's stored `threshold` (snapshot.ts) and stamps that
+      // threshold onto each edge, and its cosines live in the model's vector
+      // space at build time. If it was built under a DIFFERENT config/model
+      // than this live drain, re-serving it re-emits stale-config /
+      // wrong-space edges under a valid-looking revisionId that was never
+      // re-hashed against the live config. The reset-reason set has no entry
+      // for a runtime config change (`SIDETRACK_SIMILARITY_{THRESHOLD,
+      // MIN_ENGAGEMENT_MS,TOP_K}` are per-drain env), and the same-dimension
+      // model-change reset only fires when durable `servedModelRevision` is
+      // non-null — a fresh/lost floor-state file leaves the guard disarmed.
+      // Enforce provenance directly on the adopted revision so a config drift
+      // or model swap disarms Layer 0 uniformly (the fresh/collapsed build
+      // then proceeds, legitimately recomputing under the live config). The
+      // engagement gate and topK do NOT change which EDGES exist in a built
+      // revision post-hoc (they gate the eligible visit set / neighbour fan
+      // at build time, already baked into `edges`), so `threshold` — the only
+      // config field Pass 7 re-applies at serve time — plus the model
+      // identity/revision/schema are the load-bearing provenance fields.
+      const persistedRevisionMatchesLiveProvenance = (
+        persisted: VisitSimilarityRevision,
+      ): boolean =>
+        persisted.threshold === similarityConfig.threshold &&
+        persisted.modelId === VISIT_SIMILARITY_MODEL_ID &&
+        persisted.modelRevision === RECALL_MODEL.revision &&
+        persisted.featureSchemaVersion === VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION;
+      // A built revision "collapsed" relative to the persisted corpus when
+      // it is empty, or dropped below 10% of the previously served edges
+      // (mirrors the floor guard's >90% threshold). We only need the reuse
+      // path when there is real corpus evidence, so evaluate lazily.
+      const builtCollapsed =
+        builtEdgeCountBeforeReuse === 0 ||
+        (previousServedSimilarityEdgeCount !== null &&
+          previousServedSimilarityEdgeCount > 0 &&
+          builtEdgeCountBeforeReuse <
+            previousServedSimilarityEdgeCount * SIMILARITY_FLOOR_MIN_RETAINED_FRACTION);
+      // Genuine reset reasons SHOULD reset — never reuse/bootstrap under one
+      // (a model swap / version bump / purge / operator rebuild legitimately
+      // empties the corpus). This keeps Layer 0 from re-serving stale edges.
+      const hasLegitimateResetReason = similarityFloorResetReasons.length > 0;
+      const servedIsEmpty =
+        previousServedSimilarityEdgeCount === null || previousServedSimilarityEdgeCount <= 0;
+      // R1 (reuse) — the builder collapsed while a corpus exists and the
+      // served signal is still non-empty (there is a live signal worth
+      // protecting). Gated on `!sustainedCollapseReached`: a genuine
+      // sustained collapse (real deletion sustained for N drains) must NOT
+      // be papered over by reuse — let it fall through to the floor guard,
+      // which accepts it via `sustained-collapse-accepted`. Also gated on no
+      // legitimate reset reason (a model swap / version bump / purge /
+      // operator rebuild legitimately empties the corpus). `hnswStoreVisitCount`
+      // (the persisted HNSW store's element count) is the primary corpus
+      // witness; the persisted revision is the secondary witness (and the
+      // source we reuse).
+      const corpusEvidenceFromStore = hnswStoreVisitCount > 0;
+      if (
+        !hasLegitimateResetReason &&
+        !sustainedCollapseReached &&
+        !servedIsEmpty &&
+        builtCollapsed &&
+        corpusEvidenceFromStore
+      ) {
+        const persisted = await latestPersistedNonEmptyRevision();
+        // Round-2 major #4 — the reused revision must itself CLEAR the floor
+        // relative to the previously served signal, not merely beat the
+        // (near-zero) built count. GC keeps only the newest 5 visit-similarity
+        // revisions, so during a flap the surviving newest non-empty revision
+        // can be a PARTIAL-corpus build (e.g. 3000 edges while current.db
+        // still serves 51941). Adopting that here would make `laneUnloadedReuse`
+        // fire, then the floor guard below would see candidate=3000 vs
+        // served=51941, detect a collapse, and carry-forward the 51941 — so
+        // BOTH `laneUnloadedReuse` and `carriedForward` end up true (breaking
+        // the "exactly one of the three flags" invariant and forcing a needless
+        // full base rebuild when the cheap carry-forward already produced the
+        // right result). Requiring the reused revision to clear the floor keeps
+        // reuse and carry-forward mutually exclusive: a below-floor persisted
+        // revision falls through to Layer 2 carry-forward (which serves the
+        // full previous signal and is cheaper). Provenance guard: never reuse a
+        // revision built under a different config/model (majors #3 + minors).
+        const reusedClearsFloor =
+          persisted !== null &&
+          previousServedSimilarityEdgeCount !== null &&
+          persisted.edges.length >=
+            previousServedSimilarityEdgeCount * SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+        if (
+          persisted !== null &&
+          persisted.edges.length > builtEdgeCountBeforeReuse &&
+          reusedClearsFloor &&
+          persistedRevisionMatchesLiveProvenance(persisted)
+        ) {
+          visitSimilarity = persisted;
+          laneUnloadedReuse = true;
+          mark(
+            `similarityFloor.laneUnloadedReuse built=${String(
+              builtEdgeCountBeforeReuse,
+            )} reused=${String(persisted.edges.length)} storeCount=${String(hnswStoreVisitCount)}`,
+          );
+        }
+      }
+      // R2 (bootstrap) — the served signal is ALREADY gone (current.db wiped
+      // to 0, the live self-perpetuation state) but a good non-empty revision
+      // is on disk. Adopt it to self-recover. NOT gated on
+      // `sustainedCollapseReached` (there is no served signal to protect, so
+      // restoring a real corpus is always correct) — only on no legitimate
+      // reset reason (a purge that emptied the served signal must stay
+      // empty). Only when R1 did not already replace the built revision.
+      if (
+        !laneUnloadedReuse &&
+        !hasLegitimateResetReason &&
+        servedIsEmpty &&
+        builtCollapsed
+      ) {
+        const persisted = await latestPersistedNonEmptyRevision();
+        // Provenance guard (majors #3 + minors #1/#2) — a bootstrap adopts the
+        // persisted revision to recover from a wiped served signal, but it is
+        // still served verbatim under its own id, so it must NOT be a
+        // stale-config / wrong-model revision. Reject a mismatch and let the
+        // legitimate (empty) build stand; the next drain under the live config
+        // rebuilds the corpus. No floor-clearing check here: there is no served
+        // signal to protect, so any non-empty in-provenance revision is a
+        // strict improvement over serving hash(empty).
+        if (
+          persisted !== null &&
+          persisted.edges.length > builtEdgeCountBeforeReuse &&
+          persistedRevisionMatchesLiveProvenance(persisted)
+        ) {
+          visitSimilarity = persisted;
+          bootstrapAdopted = true;
+          mark(
+            `similarityFloor.bootstrapAdopted built=${String(
+              builtEdgeCountBeforeReuse,
+            )} adopted=${String(persisted.edges.length)}`,
+          );
+        }
+      }
+    }
     // Served-signal floor guard (requirement B/C — flapping fix). This is
     // the single chokepoint where the freshly built `visitSimilarity` is
     // finalized and BOTH publish paths (full rebuild + scoped-delta)
@@ -3814,19 +4081,15 @@ export const createConnectionsMaterializer = (
     // `previousServedSimilarityEdgeCount`, and `similarityFloorResetReasons`
     // were computed once above (before the rebuild decision) and are reused
     // here so the drift-suppression and publish-suppression stay consistent.
-    const builtSimilarityRevisionId = visitSimilarity.revisionId;
-    const builtSimilarityEdgeCount = visitSimilarity.edges.length;
-    // Bounded-recovery escape (blocker fix) — has THIS same low-count band
-    // been suppressed for N consecutive drains? A flap alternates high/
-    // empty (the run resets on each clean drain), so reaching the threshold
-    // means a genuine SUSTAINED collapse (real deletion / legitimate corpus
-    // shrink) that must be published rather than pinned to the old high
-    // revision forever. Derived from durable state so it survives the
-    // child-per-drain fork.
-    const sustainedCollapseReached = similarityFloorSustainedCollapseReached(
-      similarityFloorState,
-      builtSimilarityEdgeCount,
-    );
+    //
+    // NOTE: `builtSimilarityRevisionId` / `builtSimilarityEdgeCount` were
+    // captured ABOVE, before the Layer-0 reuse/bootstrap could replace
+    // `visitSimilarity`. When Layer 0 fired, `visitSimilarity` is now the
+    // reused/bootstrapped persisted revision (non-empty), so the floor guard
+    // below sees a non-empty candidate and stays passive — the two layers
+    // compose without double-suppression. `sustainedCollapseReached` was
+    // computed above (before Layer 0) so the reuse and the floor guard honour
+    // the same bounded-recovery escape.
     const similarityFloorOutcome = decideSimilarityFloorGuard({
       candidate: visitSimilarity,
       previousServedEdgeCount: previousServedSimilarityEdgeCount,
@@ -3913,7 +4176,17 @@ export const createConnectionsMaterializer = (
         similarityFloorOutcome.previousServedEdgeCount *
           SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
     const nextSimilarityFloorState = foldSimilarityFloorDrain(similarityFloorState, {
-      suppressed: carriedForward,
+      // A Layer-0 lane-unloaded REUSE is a suppressed flap too: the builder
+      // collapsed and we served the persisted revision instead. Count it as
+      // `suppressed` so the sustained-collapse run advances — otherwise a
+      // GENUINE sustained deletion (which Layer 0 also reuses over, because
+      // the store still holds the embeddings) could be reused forever and the
+      // bounded-recovery escape would never fire. R4: this is exactly why
+      // reuse must NOT be folded as a "clean" empty-publish (the round-1 bug
+      // where 0→0 counted as clean). A Layer-0 BOOTSTRAP does NOT count as
+      // suppressed: the served signal was already empty (no flap to suppress),
+      // it is pure recovery, so it folds as a clean drain.
+      suppressed: carriedForward || laneUnloadedReuse,
       builtEdgeCount: builtSimilarityEdgeCount,
       nowMs: Date.now(),
       purgeObservedThisDrain,
@@ -3921,9 +4194,10 @@ export const createConnectionsMaterializer = (
       sustainedCollapseAccepted:
         similarityFloorOutcome.action === 'publish' &&
         similarityFloorOutcome.allowedResetReason === 'sustained-collapse-accepted',
-      // Record the model revision of what we actually SERVE this drain: the
-      // carried revision keeps the old model's revision; a genuine publish
-      // records the live built model revision.
+      // Record the model revision of what we actually SERVE this drain: a
+      // carried/reused/bootstrapped revision keeps the persisted revision's
+      // model; a genuine publish records the live built model revision.
+      // `visitSimilarity` already IS the served revision post-Layer-0/guard.
       servedModelRevision: visitSimilarity.modelRevision,
     });
     // Persist the durable state (best-effort — observability/guard state
@@ -3950,6 +4224,11 @@ export const createConnectionsMaterializer = (
       // state.
       suppressedCollapseCount: nextSimilarityFloorState.suppressedCollapseCount,
       flapping: similarityFloorHealthFlapping(nextSimilarityFloorState),
+      // Round-2 Layer-0 outcomes (R1/R2) — distinct from suppressedCollapse
+      // (Layer 2) so forensics can tell a build-side reuse/bootstrap from a
+      // publish-seam carry-forward. Exactly one of these three can be true.
+      laneUnloadedReuse,
+      bootstrapAdopted,
     };
     // U2 — similarity-stage wall time for HotPathDiagnostics (the
     // visitSimilarity revision is finalized here).
@@ -3962,7 +4241,13 @@ export const createConnectionsMaterializer = (
       // with the metadata-stripped, re-rounded reconstruction and refresh
       // its producedAt — corrupting content under a valid-looking id for
       // any future replay / audit / worker reconciliation that reads it.
+      // Same for a Layer-0 reuse/bootstrap: `visitSimilarity` IS the
+      // persisted revision, already on disk under its own id — re-writing it
+      // would only churn its producedAt and never write the (correctly
+      // discarded) empty built revision.
       !carriedForward &&
+      !laneUnloadedReuse &&
+      !bootstrapAdopted &&
       (persistentHnswSimilarityMode ||
         (cachedSimilarityRevision === null && !hotSimilarityDecision.shouldEmbedOnHotPath))
     ) {
@@ -4454,9 +4739,50 @@ export const createConnectionsMaterializer = (
         ? new Set(dirtyScopes)
         : undefined;
     let scopedTimelineDeltaApplied = false;
+    // Round-2 R1/R2 — when Layer 0 reused/bootstrapped a persisted revision,
+    // `input.visitSimilarity` is the recovered corpus but the warm publish
+    // paths NEVER re-apply it to a non-null previous snapshot (similarity
+    // edges only enter the graph via Pass 7 of a FULL build, the scoped
+    // timeline-delta path, or a full rebuild). Reusing the wiped
+    // `previousSnapshotForRanker` as the base would therefore keep serving 0
+    // similarity edges forever — the recovered revision would land only in
+    // diagnostics. Force a full base rebuild from the complete event log so
+    // Pass 7 emits the recovered `visit_resembles_visit` edges into
+    // current.db. This is the deterministic version of the live "recovered by
+    // luck when a full-corpus drain published last".
+    const similarityRecoveryNeedsBaseRebuild = laneUnloadedReuse || bootstrapAdopted;
+    // Rebuild from the COMPLETE event log — `merged` is only the pending
+    // WINDOW on a warm drain (both the store-backed path and the
+    // readMergedSince path set `merged = pendingEventsForDrain`), so a
+    // window-only build would still yield an empty timeline. Pass 7
+    // (visit-similarity edge emission) keys endpoints off `input.timelineDays`,
+    // so that must be the FULL timeline too, else the recovered edges have no
+    // visit nodes to attach to. Read the full log the same way the cold build
+    // does: the event store's full scan when present, else eventLog.readMerged.
+    const baseRebuildEvents = !similarityRecoveryNeedsBaseRebuild
+      ? merged
+      : storeBackedEvents !== null
+        ? storeBackedEvents.readSince({})
+        : await deps.eventLog.readMerged();
+    const baseRebuildTimelineDays = similarityRecoveryNeedsBaseRebuild
+      ? enrichTimelineDaysWithEngagement(
+          buildTimelineDays(baseRebuildEvents),
+          buildEngagementClassifierInputs(baseRebuildEvents, buildTimelineDays(baseRebuildEvents)),
+        )
+      : timelineDays;
     let baseSnapshot: ConnectionsSnapshot =
-      previousSnapshotForRanker ?? buildConnectionsSnapshot(input);
-    const baseSnapshotPrebuilt = previousSnapshotForRanker === null;
+      similarityRecoveryNeedsBaseRebuild
+        ? buildConnectionsSnapshot({
+            ...input,
+            events: baseRebuildEvents,
+            timelineDays: baseRebuildTimelineDays,
+          })
+        : (previousSnapshotForRanker ?? buildConnectionsSnapshot(input));
+    // A Layer-0 recovery rebuild produces the COMPLETE graph from the full
+    // log (same as the cold build), so treat it as prebuilt: the
+    // scoped-delta / incremental-view paths below must not run against it.
+    const baseSnapshotPrebuilt =
+      previousSnapshotForRanker === null || similarityRecoveryNeedsBaseRebuild;
     const previousSnapshotForScopedDelta = previousSnapshotForRanker;
     const replaceScopeRowsForScopedDelta = deps.store.replaceScopeRows;
     let scopedTimelineDeltaSkipDetail = 'gate';
@@ -4487,6 +4813,10 @@ export const createConnectionsMaterializer = (
       topicSame: servedTopicRevision === previousTopicRevision,
       topicSnapshotFresh: !topicSnapshotStale,
       hnswNotFull: !hnswFullRebuild,
+      // Round-2 — a Layer-0 recovery must take the full base rebuild (above),
+      // not the scoped-delta path (which carries the wiped similarity-family
+      // rows forward and would drop the recovered edges).
+      similarityRecoveryFresh: !similarityRecoveryNeedsBaseRebuild,
     };
     if (
       scopedTimelineDeltaGate.incrementalScopes &&
@@ -4499,7 +4829,8 @@ export const createConnectionsMaterializer = (
       scopedTimelineDeltaGate.allScopedEvents &&
       scopedTimelineDeltaGate.topicSame &&
       scopedTimelineDeltaGate.topicSnapshotFresh &&
-      scopedTimelineDeltaGate.hnswNotFull
+      scopedTimelineDeltaGate.hnswNotFull &&
+      scopedTimelineDeltaGate.similarityRecoveryFresh
     ) {
       const timelineVisitKeys = new Set(
         similarityEntries.map((entry) => timelineEntryVisitKey(entry)),
@@ -4860,7 +5191,21 @@ export const createConnectionsMaterializer = (
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
       );
-      if (requireScopedTimelineDeltaForDrain) {
+      if (requireScopedTimelineDeltaForDrain && !similarityRecoveryNeedsBaseRebuild) {
+        // Round-2 BLOCKER fix — a Layer-0 corpus recovery (reuse/bootstrap)
+        // DELIBERATELY takes the full base rebuild (it set
+        // `similarityRecoveryNeedsBaseRebuild`, which disarms the scoped-delta
+        // gate via `similarityRecoveryFresh=false`), so `scopedTimelineDelta`
+        // legitimately did not apply. In the chunked boot-catch-up path
+        // (`catchUpInScopedChunks` sets `requireScopedTimelineDeltaForDrain`
+        // per chunk), throwing here would abort the chunk, leave the frontier
+        // stalled, and re-enter the same >5000-scoped-event backlog forever —
+        // a hard wedge, not a one-drain miss. The recovery already produced a
+        // COMPLETE base snapshot (`baseSnapshotPrebuilt=true`, the full-log
+        // rebuild with the recovered edges), so fall through to write it
+        // (writeSnapshotWithDrainProgress advances the chunk's frontier). The
+        // throw still fires for a genuine scoped-delta failure (no recovery),
+        // preserving the original catch-up safety net.
         throw new Error(
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
