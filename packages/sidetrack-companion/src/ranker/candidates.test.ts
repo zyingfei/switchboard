@@ -633,6 +633,124 @@ describe('ranker candidate generation', () => {
     ).toEqual([]);
   });
 
+  describe('aggregator item-signals narrowing (SIDETRACK_AGGREGATOR_ITEM_SIGNALS)', () => {
+    const withItemSignals = (value: string | undefined, run: () => void): void => {
+      const previous = process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'];
+      if (value === undefined) delete process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'];
+      else process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'] = value;
+      try {
+        run();
+      } finally {
+        if (previous === undefined) delete process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'];
+        else process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'] = previous;
+      }
+    };
+
+    const twoHnItems = (): CandidateContext =>
+      context([
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-a',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48856904',
+          }),
+        }),
+        event({
+          seq: 3,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-b',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48173708',
+          }),
+        }),
+      ]);
+
+    const twoHnFeeds = (): CandidateContext =>
+      context([
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-a',
+            canonicalUrl: 'https://news.ycombinator.com/newest',
+          }),
+        }),
+        event({
+          seq: 3,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-b',
+            canonicalUrl: 'https://news.ycombinator.com/front',
+          }),
+        }),
+      ]);
+
+    it('DEFAULT-OFF: byte-identical to the blanket guard — no item grouping', () => {
+      withItemSignals(undefined, () => {
+        const ctx = twoHnItems();
+        // Regression: the 2026-07-10 false-friend shape stays suppressed by
+        // default (structural grouping keys are empty for the whole domain).
+        expect(generateSameRepoOrDomainCandidates('visit-a', ctx)).toEqual([]);
+        expect(generateSameTitlePathTokensCandidates('visit-a', ctx)).toEqual([]);
+      });
+    });
+
+    it('item narrowing ON: item↔item STILL suppresses domain: and title/path (structural keys stay noise)', () => {
+      // The redesign does NOT re-enable bare-domain / title-path grouping for
+      // items — those keys are topic-blind even for items ("item" path token,
+      // "| Hacker News" chrome). Items recover signal via CONTENT similarity, not
+      // these structural keys. So even with narrowing ON, both stay empty.
+      withItemSignals('1', () => {
+        const ctx = twoHnItems();
+        expect(generateSameRepoOrDomainCandidates('visit-a', ctx)).toEqual([]);
+        expect(generateSameTitlePathTokensCandidates('visit-a', ctx)).toEqual([]);
+      });
+    });
+
+    it('item narrowing ON: FEED↔FEED remains fully quarantined (guard still fires)', () => {
+      // This is the class the 2026-07-10 false-friend belonged to: multi-topic
+      // feed pages. They must STAY suppressed regardless of the narrowing flag.
+      withItemSignals('1', () => {
+        const ctx = twoHnFeeds();
+        expect(generateSameRepoOrDomainCandidates('visit-a', ctx)).toEqual([]);
+        expect(generateSameTitlePathTokensCandidates('visit-a', ctx)).toEqual([]);
+      });
+    });
+
+    it('non-aggregator domains keep same_repo_or_domain grouping under either flag', () => {
+      const ctx = context([
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-a',
+            canonicalUrl: 'https://blog.example.test/posts/one',
+          }),
+        }),
+        event({
+          seq: 3,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-b',
+            canonicalUrl: 'https://blog.example.test/posts/two',
+          }),
+        }),
+      ]);
+      for (const flag of [undefined, '1'] as const) {
+        withItemSignals(flag, () => {
+          expectSingleSourceCandidate(
+            generateSameRepoOrDomainCandidates,
+            'same_repo_or_domain',
+            'visit-a',
+            'visit-b',
+            ctx,
+          );
+        });
+      }
+    });
+  });
+
   it('generates same_search_query candidates', () => {
     const ctx = context([
       event({

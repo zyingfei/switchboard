@@ -48,6 +48,7 @@ export type SimilarityFloorResetReason =
   | 'store-corruption-recovery' // HNSW store recovered from corruption → rebuild is intended.
   | 'privacy-purge' // A tombstone/purge removed the visits → the empties are real.
   | 'operator-rebuild' // An explicit operator-forced rebuild.
+  | 'corpus-config-change' // A corpus-shaping flag flipped (clean-corpus / content-corpus) → every visit's embedded text changed, so the recompute is intended and legitimate.
   | 'sustained-collapse-accepted' // Bounded recovery: the low count has been rebuilt for N drains → it IS the truth.
   | 'no-previous-signal'; // No previously served edges → nothing to protect.
 

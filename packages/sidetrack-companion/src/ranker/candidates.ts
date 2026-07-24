@@ -7,6 +7,11 @@ import { SELECTION_COPIED, isSelectionCopiedPayload } from '../snippets/events.j
 import type { AcceptedEvent } from '../sync/causal.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
 import { detectSearchUrl } from '../timeline/sanitize.js';
+import {
+  aggregatorCommunityKey,
+  classifyAggregatorPageForUrl,
+  isAggregatorHost,
+} from './aggregatorProfiles.js';
 import type { Candidate, CandidateSource, GenerateCandidates } from './types.js';
 
 type CandidateContext = Parameters<GenerateCandidates>[1];
@@ -459,94 +464,80 @@ const chainGenerator = (
   };
 };
 
-// Registrable domains of large multi-author / multi-topic platforms where two
-// pages sharing the domain are NOT topically related. For these, the bare
-// `domain:` grouping key AND the shared site-chrome title/path tokens ("hacker",
-// "news", "item", "comments", "watch", …) are pure noise: they linked an
-// AI-generated-video Hacker News post to unrelated security items and placed it
-// in a linux-security workstream at 82% confidence (same_repo_or_domain scores
-// 0.65, same_title_path_tokens 0.45). GitHub/GitLab hit the same coarseness and
-// are already grouped at repo granularity instead. Matched by registrable
-// domain, so every subdomain is covered (news.ycombinator.com, old.reddit.com,
-// m.youtube.com, gemini.google.com, …). Kill-switch (absent = on):
-// SIDETRACK_AGGREGATOR_GROUPING_GUARD=0 restores the old bare-domain grouping.
-const COARSE_MULTI_TOPIC_DOMAINS: ReadonlySet<string> = new Set([
-  'ycombinator.com',
-  'reddit.com',
-  'lobste.rs',
-  'twitter.com',
-  'x.com',
-  't.co',
-  'youtube.com',
-  'youtu.be',
-  'facebook.com',
-  'instagram.com',
-  'linkedin.com',
-  'medium.com',
-  'substack.com',
-  'quora.com',
-  'pinterest.com',
-  'tumblr.com',
-  'stackoverflow.com',
-  'stackexchange.com',
-  'google.com',
-  'bing.com',
-  'duckduckgo.com',
-  'chatgpt.com',
-  'openai.com',
-  'claude.ai',
-]);
+// Large multi-author / multi-topic platforms where two pages sharing only the
+// domain are NOT topically related. For these, the bare `domain:` grouping key
+// AND the shared site-chrome title/path tokens ("hacker", "news", "item",
+// "comments", "watch", …) are noise: they linked an AI-generated-video Hacker
+// News post to unrelated security items and placed it in a linux-security
+// workstream at 82% confidence (same_repo_or_domain scores 0.65,
+// same_title_path_tokens 0.45). GitHub/GitLab hit the same coarseness and are
+// already grouped at repo granularity instead.
+//
+// The domain list, feed/item classification, community keys, and site-title
+// suffixes all live in ONE registry (aggregatorProfiles.ts), keyed by
+// registrable domain so every subdomain is covered (news.ycombinator.com,
+// old.reddit.com, m.youtube.com, gemini.google.com, …).
+//
+// FEED vs ITEM (the 2026-07-24 redesign). The blunt domain-wide guard threw out
+// item pages' real per-page content identity along with the feeds' noise. The
+// registry now distinguishes them: FEED pages stay quarantined; ITEM pages
+// (item?id=X, /r/x/comments/…, /watch?v=…) are content objects that CAN
+// participate in content-level similarity. `suppressCoarseGrouping` quarantines
+// feeds always (guard on); it quarantines items UNLESS the item-narrowing flag
+// is on — so the structural false-friend the guard exists to block stays blocked
+// for feeds regardless.
+//
+// Flags:
+//   SIDETRACK_AGGREGATOR_GROUPING_GUARD  (absent = ON) — the guard itself.
+//       =0 restores the old bare-domain grouping (disables the whole guard).
+//   SIDETRACK_AGGREGATOR_ITEM_SIGNALS    (absent = OFF) — the item-narrowing.
+//       This is a SERVING-behavior change (item pages start participating in the
+//       grouping/similarity lanes that were previously quarantined), so per the
+//       repo's serving-flip discipline (ADR-0011 / DEBUGGING_DOCTRINE) it ships
+//       DEFAULT-OFF: served candidates stay byte-identical until the
+//       connections-precision eval spine clears the flip. =1 (+ restart) enables
+//       item pages. It is designed to compose with SIDETRACK_SIMILARITY_CLEAN_
+//       CORPUS: narrowing lets item CONTENT edges through, and the clean corpus
+//       is what makes those edges trustworthy (host/path skeleton no longer
+//       inflates same-site cosine). Enable both together for the intended state.
 
-// Call-time + case-insensitive so it is togglable in tests and consistent with
-// the repo's other boolean flags (lexicalFallbackEnabled, embeddingDisabled).
+// Call-time + case-insensitive so both flags are togglable in tests and
+// consistent with the repo's other boolean flags (lexicalFallbackEnabled).
 const aggregatorGroupingGuardEnabled = (): boolean => {
   const raw = process.env['SIDETRACK_AGGREGATOR_GROUPING_GUARD']?.toLowerCase();
   return raw !== '0' && raw !== 'false';
+};
+
+// When ON, aggregator ITEM pages are treated as content objects and the grouping
+// guard does NOT quarantine them (feed pages are still quarantined). Default OFF
+// (a serving change gated on the eval spine); set to 1/true (+ restart) to let
+// item pages participate.
+export const aggregatorItemSignalsEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS']?.toLowerCase();
+  return raw === '1' || raw === 'true';
 };
 
 /**
  * True when `hostname` belongs to a large multi-topic platform — i.e. two pages
  * sharing only this domain (or its site-chrome tokens) are not topically
  * related. Matched by registrable domain, so any subdomain qualifies. Exported
- * for tests. See {@link COARSE_MULTI_TOPIC_DOMAINS}.
+ * for tests and for the resolver guard (tabsession/similarity.ts).
  */
-export const isCoarseMultiTopicDomain = (hostname: string): boolean => {
-  // Strip a trailing dot (FQDN form, e.g. `news.ycombinator.com.`) so it does
-  // not defeat the suffix match.
-  const host = hostname.toLowerCase().replace(/^www\./u, '').replace(/\.$/u, '');
-  if (host.length === 0) return false;
-  const labels = host.split('.');
-  // Test the full host and each registrable suffix, never the bare TLD.
-  for (let index = 0; index < labels.length - 1; index += 1) {
-    if (COARSE_MULTI_TOPIC_DOMAINS.has(labels.slice(index).join('.'))) return true;
-  }
-  return false;
-};
+export const isCoarseMultiTopicDomain = (hostname: string): boolean => isAggregatorHost(hostname);
 
-const suppressCoarseGrouping = (hostname: string): boolean =>
-  aggregatorGroupingGuardEnabled() && isCoarseMultiTopicDomain(hostname);
-
-// On some multi-topic platforms the URL structure encodes a coherent
-// sub-community (a subreddit, a Medium author). Grouping by that — the same way
-// GitHub groups by `repo:owner/repo` rather than `domain:github.com` — recovers
-// the legitimate signal the bare-domain suppression drops, without the
-// topic-blind fan-out of the whole platform.
-const communityGroupingKey = (
-  hostname: string,
-  segments: readonly string[],
-): string | null => {
-  if (hostname === 'reddit.com' || hostname.endsWith('.reddit.com')) {
-    return segments[0] === 'r' && segments[1] !== undefined && segments[1].length > 0
-      ? `forum:reddit.com/r/${segments[1]}`
-      : null;
-  }
-  if (hostname === 'medium.com' || hostname.endsWith('.medium.com')) {
-    const author = segments[0];
-    return author !== undefined && author.startsWith('@') && author.length > 1
-      ? `author:medium.com/${author}`
-      : null;
-  }
-  return null;
+// Whether the grouping guard should quarantine a given aggregator URL. Feed
+// pages are ALWAYS quarantined when the guard is on. Item pages are quarantined
+// only when the item-signals narrowing is disabled — otherwise they are content
+// objects and flow through to content-level similarity. A non-aggregator URL is
+// never quarantined.
+// Takes an already-parsed URL to avoid a redundant `new URL()` on the
+// per-candidate hot path (repoOrDomainKeys parses once, then passes it here).
+const suppressCoarseGrouping = (parsed: URL): boolean => {
+  if (!aggregatorGroupingGuardEnabled()) return false;
+  const pageType = classifyAggregatorPageForUrl(parsed);
+  if (pageType === 'not-aggregator') return false;
+  if (pageType === 'item' && aggregatorItemSignalsEnabled()) return false;
+  return true;
 };
 
 const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
@@ -566,10 +557,21 @@ const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
       return [`repo:${hostname}/${owner}/${repo}`];
     }
     if (hostname.length === 0) return [];
-    if (suppressCoarseGrouping(hostname)) {
-      // Coarse platform: prefer a community-level key when the URL encodes one;
-      // otherwise emit nothing (the bare domain is topic-blind).
-      const community = communityGroupingKey(hostname, segments);
+    if (suppressCoarseGrouping(parsed)) {
+      // Coarse platform (feed page, or an item page while item-narrowing is
+      // off): prefer a community-level key when the URL encodes one; otherwise
+      // emit nothing (the bare domain is topic-blind). Note `domain:` is
+      // suppressed even for item pages that pass the narrowing — an item's
+      // neighbors should come from content, never from "same domain".
+      const community = aggregatorCommunityKey(hostname, segments);
+      return community === null ? [] : [community];
+    }
+    if (aggregatorGroupingGuardEnabled() && isAggregatorHost(hostname)) {
+      // Item page that passed the narrowing (guard on): still no bare `domain:`
+      // key (the domain is topic-blind), but a community key applies when
+      // encoded. When the guard kill-switch is OFF this branch is skipped and
+      // the host falls through to `domain:` (old bare-domain grouping).
+      const community = aggregatorCommunityKey(hostname, segments);
       return community === null ? [] : [community];
     }
     return [`domain:${hostname}`];
@@ -634,8 +636,12 @@ const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
     const parsed = new URL(record.canonicalUrl);
     // On multi-topic platforms the title is dominated by site chrome ("… |
     // Hacker News") and the path is a generic stub ("item"), so title/path
-    // tokens link unrelated items. Rely on content signals for these pages.
-    if (suppressCoarseGrouping(parsed.hostname)) return [];
+    // tokens link unrelated items — this is true for FEED and ITEM pages alike
+    // (an item's path token is literally "item"). Suppressed unconditionally for
+    // any aggregator host when the guard is on; item pages recover their signal
+    // from the CONTENT-level similarity lane (a clean, host/path-free corpus),
+    // not from these lexical tokens. Rely on content signals for these pages.
+    if (aggregatorGroupingGuardEnabled() && isAggregatorHost(parsed.hostname)) return [];
     for (const part of parsed.pathname.split('/')) {
       pieces.push(safeDecode(part));
     }

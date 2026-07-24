@@ -1,6 +1,7 @@
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
-import { generateCandidates, isCoarseMultiTopicDomain } from '../ranker/candidates.js';
+import { generateCandidates } from '../ranker/candidates.js';
+import { classifyAggregatorPage } from '../ranker/aggregatorProfiles.js';
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate } from '../ranker/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -55,17 +56,29 @@ const urlWithinNodeId = (nodeIdOrUrl: string): string | null => {
   return match ? match[0] : null;
 };
 
-// True when a visit node id / raw key resolves to a large multi-topic platform
-// (Hacker News, Reddit, YouTube, …) where a shared URL skeleton is not topical
-// evidence. Reuses the ranker's registrable-domain classifier.
-const isCoarseMultiTopicVisit = (nodeIdOrUrl: string): boolean => {
+// True when the visit is ANY aggregator page (feed OR item), ignoring the
+// item-narrowing. Both chrome-only drops (the freshly-generated
+// embedding_neighborhood candidate drop AND the persisted-edge drop) key off
+// this predicate, NOT a guarded/narrowed one:
+//
+//   - `embedding_neighborhood` candidates are generated DIRECTLY from persisted
+//     `visit_resembles_visit` edges (candidates.ts embeddingNeighborhoodGenerator),
+//     so they are chrome-derived by definition. Between any two aggregator
+//     pages that source is a site-skeleton false-friend.
+//   - A `title_only` resemblance edge between two aggregator pages is likewise
+//     a skeleton artifact regardless of feed/item.
+//
+// Item pages still participate fully in content-level similarity: genuine
+// content edges arrive via the DISTINCT content_embedding_neighborhood /
+// content_term_overlap sources and content-channel (or non-title_only) persisted
+// metadata, which are NEVER dropped by either loop. So narrowing item pages OUT
+// of these drops buys nothing legitimate while it would resurrect the
+// 2026-07-10 false-friend at scale (a narrowed item target is unguarded, so a
+// guarded-predicate gate short-circuits and lets every raw neighbor through).
+const isAnyAggregatorVisit = (nodeIdOrUrl: string): boolean => {
   const url = urlWithinNodeId(nodeIdOrUrl);
   if (url === null) return false;
-  try {
-    return isCoarseMultiTopicDomain(new URL(url).hostname);
-  } catch {
-    return false;
-  }
+  return classifyAggregatorPage(url) !== 'not-aggregator';
 };
 
 // A persisted similarity edge whose signal is chrome only: a
@@ -93,6 +106,21 @@ const isChromeOnlySimilarityEdge = (
       (source) => typeof source === 'string' && CHROME_ONLY_SUPPRESSED_SOURCES.has(source),
     );
   }
+  // The DOMINANT real shape (measured: 100% of the live vault's 51,248
+  // `visit_resembles_visit` edges) carries NEITHER `channels` NOR
+  // `candidateSources` — it is a cosine-only payload
+  // `{cosine, threshold, evidenceTier:'title_only', evidenceProducedAt, simZ}`
+  // produced by the title-only similarity builder. That IS the site-skeleton
+  // false-friend the guard exists to block: `evidenceTier:'title_only'` means
+  // the pair matched on embedded title (shared "| Hacker News" chrome + host/
+  // path skeleton, pre-clean-corpus) with no content channel behind it. Treat
+  // it as chrome-only so the persisted-edge drop actually fires on the real
+  // edges (the channels/candidateSources branches above only catch the rarer
+  // ranker-built shapes). A content-backed edge carries a distinct
+  // evidenceTier (metadata_only / content_backed / indexed_chunks) and/or a
+  // content channel, so it is never dropped here.
+  const evidenceTier = metadata?.['evidenceTier'];
+  if (evidenceTier === 'title_only') return true;
   return false;
 };
 
@@ -154,10 +182,14 @@ export const buildSimilarityEvidence = ({
       canonicalVisitForNode(snapshot, targetVisitNodeId),
     ),
   );
-  // When the page being resolved is itself an aggregator item, its similarity
-  // to other aggregator items is untrustworthy (shared site skeleton, not
-  // topic). Guard both evidence loops below against that class of false-friend.
-  const targetIsCoarseMultiTopic = [...canonicalTargetVisitNodeIds].some(isCoarseMultiTopicVisit);
+  // Any-aggregator (feed OR item) target: BOTH chrome-only drops below stay in
+  // force between two aggregator pages regardless of item-narrowing. An item
+  // page is a content object, but its chrome-derived signals (raw embedding
+  // neighborhood, title-only resemblance) are still site-skeleton false-friends
+  // — its legitimate similarity flows through the content channels, which are
+  // never dropped. See isAnyAggregatorVisit for why this is not gated on the
+  // narrowed predicate.
+  const targetIsAnyAggregator = [...canonicalTargetVisitNodeIds].some(isAnyAggregatorVisit);
   const visitWorkstream = new Map<string, string>();
   for (const edge of snapshot.edges) {
     if (edge.kind !== 'visit_in_workstream' && edge.kind !== 'visit_instance_in_workstream') {
@@ -232,12 +264,23 @@ export const buildSimilarityEvidence = ({
       .slice(0, Math.max(0, Math.floor(k)));
     for (const item of scored) {
       const candidateVisitKey = visitKeyFromNodeOrRaw(item.candidate.toVisitId);
-      // Skip a chrome-derived neighbor between two aggregator pages: the only
-      // basis is `embedding_neighborhood` (built from chrome resemblance
-      // edges). Content-backed candidates carry other sources and pass.
+      // Skip a chrome-derived neighbor between two aggregator pages (feed OR
+      // item): the only basis is `embedding_neighborhood`, which is generated
+      // DIRECTLY from persisted `visit_resembles_visit` edges (candidates.ts
+      // embeddingNeighborhoodGenerator) — the exact chrome-resemblance edges
+      // that caused the 2026-07-10 82% mis-file. This drop MUST use the
+      // any-aggregator predicate, NOT `isGuardedAggregatorVisit`: with
+      // item-narrowing ON, an item target is unguarded, so gating on the
+      // guarded predicate would short-circuit and let every raw-neighbor
+      // candidate through unfiltered (resurrecting the false-friend at scale).
+      // Dropping this source between any two aggregator pages costs an item
+      // NOTHING legitimate: genuine content similarity arrives via the distinct
+      // `content_embedding_neighborhood` / `content_term_overlap` sources,
+      // which carry other candidate sources and pass. Item pages attribute
+      // from those content channels, never from the raw embedding neighborhood.
       if (
-        targetIsCoarseMultiTopic &&
-        isCoarseMultiTopicVisit(candidateVisitKey) &&
+        targetIsAnyAggregator &&
+        isAnyAggregatorVisit(candidateVisitKey) &&
         item.candidate.sources.every((source) => CHROME_PRONE_AGGREGATOR_SOURCES.has(source))
       ) {
         continue;
@@ -267,10 +310,14 @@ export const buildSimilarityEvidence = ({
               : null;
     if (other === null) continue;
     // Ignore a chrome-only persisted similarity edge between two aggregator
-    // pages (site-skeleton false-friend; see isChromeOnlySimilarityEdge).
+    // pages (site-skeleton false-friend; see isChromeOnlySimilarityEdge). This
+    // stays in force for item pages too (any-aggregator predicate): a title-only
+    // resemblance edge between two items is a skeleton artifact, not content
+    // evidence. Content-backed edges carry a content channel and are never
+    // dropped here, so narrowed item pages still attribute on their content.
     if (
-      targetIsCoarseMultiTopic &&
-      isCoarseMultiTopicVisit(other) &&
+      targetIsAnyAggregator &&
+      isAnyAggregatorVisit(other) &&
       isChromeOnlySimilarityEdge(edge.metadata)
     ) {
       continue;
