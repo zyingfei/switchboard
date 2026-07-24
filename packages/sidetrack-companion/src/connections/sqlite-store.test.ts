@@ -357,6 +357,102 @@ describe('SqliteConnectionsStore', () => {
     store.close();
   });
 
+  // The resolver cache shares current.db with the drain child's long write
+  // transactions. When the child holds the write lock, a cache read/write
+  // hits "database is locked" (SQLITE_BUSY) — that must NEVER fail the
+  // resolve. We inject the lock error at the sqlite statement seam (same
+  // Database.prototype.query spy pattern the rollback test uses) and assert
+  // the store degrades: the WRITE is skipped silently, the READ becomes a
+  // cache miss so the caller recomputes inline instead of the route 500ing.
+  const sqliteBusyError = (): Error => {
+    const error = new Error('database is locked') as Error & { code?: string };
+    error.code = 'SQLITE_BUSY';
+    return error;
+  };
+
+  sqliteIt('cacheResolverResult swallows SQLITE_BUSY writes (serves the computed result)', async () => {
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    // Force the schema + connection to exist before we start throwing.
+    await store.cacheResolverResult('https://example.test/a', 'rev-a', { primed: true });
+
+    vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithLockedWrite(
+      this: InstanceType<typeof Database>,
+      sql: string,
+    ) {
+      const statement = originalQuery.call(this, sql);
+      if (!sql.includes('INSERT INTO connections_resolver_cache')) return statement;
+      return { ...statement, run: () => { throw sqliteBusyError(); } };
+    });
+
+    // Best-effort: resolves (undefined) rather than rejecting.
+    await expect(
+      store.cacheResolverResult('https://example.test/b', 'rev-a', { blocked: true }),
+    ).resolves.toBeUndefined();
+
+    vi.restoreAllMocks();
+    // The prior successful write survived; the locked one simply didn't land.
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-a'),
+    ).resolves.toEqual({ primed: true });
+    await expect(
+      store.getCachedResolverResult('https://example.test/b', 'rev-a'),
+    ).resolves.toBeNull();
+    store.close();
+  });
+
+  sqliteIt('getCachedResolverResult degrades to a cache miss on SQLITE_BUSY reads', async () => {
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.cacheResolverResult('https://example.test/a', 'rev-a', { cached: true });
+
+    vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithLockedRead(
+      this: InstanceType<typeof Database>,
+      sql: string,
+    ) {
+      const statement = originalQuery.call(this, sql);
+      if (!sql.includes('FROM connections_resolver_cache')) return statement;
+      return { ...statement, get: () => { throw sqliteBusyError(); } };
+    });
+
+    // Degrades to a miss (null) instead of throwing, so the caller computes
+    // the result inline rather than the route returning a 500.
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-a'),
+    ).resolves.toBeNull();
+
+    vi.restoreAllMocks();
+    // The row is intact — only the read attempt was blocked.
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-a'),
+    ).resolves.toEqual({ cached: true });
+    store.close();
+  });
+
+  sqliteIt('getCachedResolverResult rethrows NON-lock read errors (never masks real corruption)', async () => {
+    const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+    const originalQuery = Database.prototype.query;
+    const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+    await store.cacheResolverResult('https://example.test/a', 'rev-a', { cached: true });
+
+    vi.spyOn(Database.prototype, 'query').mockImplementation(function queryWithCorruptRead(
+      this: InstanceType<typeof Database>,
+      sql: string,
+    ) {
+      const statement = originalQuery.call(this, sql);
+      if (!sql.includes('FROM connections_resolver_cache')) return statement;
+      return { ...statement, get: () => { throw new Error('malformed database schema'); } };
+    });
+
+    await expect(
+      store.getCachedResolverResult('https://example.test/a', 'rev-a'),
+    ).rejects.toThrow('malformed database schema');
+    vi.restoreAllMocks();
+    store.close();
+  });
+
   sqliteIt('reads snapshot metadata and individual edges without full snapshot reads', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
     const snapshot = buildTraversalSnapshot();

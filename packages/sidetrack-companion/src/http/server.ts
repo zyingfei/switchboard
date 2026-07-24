@@ -9138,6 +9138,23 @@ export const handleRequest = async (
     return;
   }
 
+  // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
+  // what the extension actually polls + per-request latency. Written
+  // to a file because the screen-session pty isn't capturable.
+  // Fire-and-forget; zero overhead when the env is unset. Declared OUT
+  // of the try/catch below so error paths (4xx/5xx) can log their status
+  // too — otherwise `grep ' 500 '` on the debug log finds nothing while
+  // the endpoint is live-500ing (busy/locked), which hid a real bug.
+  const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
+  const httpLogStartedMs = httpLog ? Date.now() : 0;
+  const logHttp = (statusForLog: number): void => {
+    if (!httpLog) return;
+    // pathname ONLY — url.search is deliberately omitted (PII).
+    void appendHttpDebugLine(
+      `${new Date().toISOString()} ${method ?? 'UNKNOWN'} ${url.pathname} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
+    ).catch(() => undefined);
+  };
+
   try {
     const match = route.pattern.exec(url.pathname);
     // F02 systemic default-deny. An mcp-key caller may only reach a
@@ -9161,12 +9178,6 @@ export const handleRequest = async (
           "extension's own bridge key.",
       );
     }
-    // Debug-only request log (SIDETRACK_HTTP_LOG=1): ground-truth of
-    // what the extension actually polls + per-request latency. Written
-    // to a file because the screen-session pty isn't capturable.
-    // Fire-and-forget; zero overhead when the env is unset.
-    const httpLog = process.env['SIDETRACK_HTTP_LOG'] === '1';
-    const httpLogStartedMs = httpLog ? Date.now() : 0;
     // F02 — bind the base audit provenance for the request so any vault
     // write it triggers records the caller class. The trust gate refines
     // this (tool / scope / trustModeActive) when it runs. Only mutating
@@ -9183,13 +9194,6 @@ export const handleRequest = async (
       route.handle(request, requestId, match?.groups ?? {}, context);
     const [status, body] =
       method === 'GET' ? await runHandler() : await runWithAuditContext(auditBase, runHandler);
-    const logHttp = (statusForLog: number): void => {
-      if (!httpLog) return;
-      // pathname ONLY — url.search is deliberately omitted (PII).
-      void appendHttpDebugLine(
-        `${new Date().toISOString()} ${method ?? 'UNKNOWN'} ${url.pathname} ${String(statusForLog)} ${String(Date.now() - httpLogStartedMs)}ms\n`,
-      ).catch(() => undefined);
-    };
     // Conditional GET / response ETag. Restricted to GET because
     // mutations (POST/PATCH/PUT/DELETE) have side effects we can't
     // skip even if a duplicate request's response matches; the
@@ -9239,6 +9243,10 @@ export const handleRequest = async (
       // eslint-disable-next-line no-console
       console.error(`[http-500] ${method} ${url.pathname}${url.search} req=${requestId}`, error);
     }
+    // Record the error response status too (4xx/5xx). Without this the
+    // debug log only ever shows 2xx, so a live 500 storm (e.g. "database
+    // is locked") is invisible to `grep ' 500 ' /tmp/sidetrack-http-debug.log`.
+    logHttp(status);
     sendJson(
       response,
       status,

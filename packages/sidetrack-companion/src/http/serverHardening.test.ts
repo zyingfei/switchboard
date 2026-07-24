@@ -193,6 +193,40 @@ describe('companion HTTP server hardening (F30/F29)', () => {
     }
   });
 
+  it('the SIDETRACK_HTTP_LOG line records NON-2xx (error) response statuses', async () => {
+    // Regression: the debug logger used to fire only on the success path,
+    // so `grep ' 500 ' /tmp/sidetrack-http-debug.log` found nothing while
+    // the endpoint was live-500ing (e.g. "database is locked"). An error
+    // that flows through the catch block (VaultUnavailable -> 503) must now
+    // leave a status line in the log.
+    const logPath = '/tmp/sidetrack-http-debug.log';
+    const markerPath = `/v1/workstreams/ws-log-error-${String(Date.now())}/bump`;
+    const prev = process.env['SIDETRACK_HTTP_LOG'];
+    process.env['SIDETRACK_HTTP_LOG'] = '1';
+    try {
+      // Deleting the vault makes ensureVaultPresent throw -> caught -> 503.
+      await rm(vaultPath, { recursive: true, force: true });
+      const result = await call(context, `${baseUrl}${markerPath}`, {
+        method: 'POST',
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      expect(result.status).toBe(503);
+      // Give the fire-and-forget append a tick to flush.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const contents = await readFile(logPath, 'utf8').catch(() => '');
+      const ourLines = contents.split('\n').filter((line) => line.includes(markerPath));
+      expect(ourLines.length).toBeGreaterThan(0);
+      // The status token (503) must be present — the whole point of the fix.
+      expect(ourLines.some((line) => line.includes(' 503 '))).toBe(true);
+    } finally {
+      if (prev === undefined) {
+        delete process.env['SIDETRACK_HTTP_LOG'];
+      } else {
+        process.env['SIDETRACK_HTTP_LOG'] = prev;
+      }
+    }
+  });
+
   it('VaultUnavailableError round-trips to a 503 with the legacy wire shape', async () => {
     // The vault writer throws the legacy stringly-typed error (via
     // ensureVaultPresent) when the vault path is gone; deleting the temp

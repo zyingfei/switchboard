@@ -783,6 +783,12 @@ button:disabled {
   color: var(--ink-3);
   font-style: italic;
 }
+/* Busy/retrying: a resolve REQUEST failed (companion catching up on a
+   drain), distinct from the empty "No signal yet" card. Reuses the warn
+   channel amber that status pills already use — no new visual language. */
+.suggestion-stats.is-busy .suggestion-stats-target {
+  color: var(--amber);
+}
 .suggestion-stats-info {
   cursor: help;
   color: var(--ink-3);
