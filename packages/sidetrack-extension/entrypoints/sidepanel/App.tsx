@@ -37,6 +37,7 @@ import {
   firstMatchingNoCaptureRule,
   noCaptureRuleDisplayLabel,
   registrableDomainFromUrl,
+  hostFromUrl,
 } from '../../src/capture/noCaptureRules';
 import { sanitizeTimelineUrl } from '../../src/timeline/sanitize';
 import {
@@ -133,6 +134,7 @@ import {
 import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAliases';
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
+import { AttributionProvenance } from '../../src/sidepanel/tabsession/AttributionProvenance';
 import {
   findSessionRestoreMatch,
   type ClosedSession,
@@ -5255,33 +5257,48 @@ const App = () => {
   // Per-kind rule state for the lamp's two per-site capture controls.
   // Each icon must be independently stateful (a site can be blocked by
   // a 'domain' rule, a 'similar' rule, both, or neither), so we resolve
-  // the EXACT rule of each kind that owns this site's family — matched
-  // on the registrable domain so the icon flips filled + offers
-  // "re-enable" the instant that specific rule exists. Distinct from
-  // `currentTabBlockingRule` (the first-any match that drives the
-  // verdict); these drive the two toggles.
+  // the EXACT rule of each kind that owns THIS site so the icon flips
+  // filled + offers "re-enable" the instant that specific rule exists.
+  // Distinct from `currentTabBlockingRule` (the first-any match that
+  // drives the verdict); these drive the two toggles.
+  //
+  // Ownership is HOST-scoped to mirror rule creation: a host-scoped rule
+  // (rule.host) owns the toggle for its exact host; a legacy family-wide
+  // rule (no host) owns it for the registrable-domain family. Matching a
+  // host-scoped rule by exact host (not subdomain containment) keeps the
+  // toggle bound to the site the user acted on — a parent-host rule is
+  // managed where it was created, not silently re-toggled here.
+  const currentSiteHost = useMemo((): string => {
+    const url = focusedUrl ?? currentSiteUrl;
+    if (typeof url !== 'string' || url.length === 0) return '';
+    return hostFromUrl(url);
+  }, [focusedUrl, currentSiteUrl]);
   const currentSiteRegistrableDomain = useMemo((): string => {
     const url = focusedUrl ?? currentSiteUrl;
     if (typeof url !== 'string' || url.length === 0) return '';
     return registrableDomainFromUrl(url);
   }, [focusedUrl, currentSiteUrl]);
+  const ownsCurrentSite = useCallback(
+    (rule: { readonly host?: string; readonly domain: string }): boolean =>
+      typeof rule.host === 'string' && rule.host.length > 0
+        ? currentSiteHost.length > 0 && rule.host === currentSiteHost
+        : currentSiteRegistrableDomain.length > 0 &&
+          rule.domain === currentSiteRegistrableDomain,
+    [currentSiteHost, currentSiteRegistrableDomain],
+  );
   const currentSiteDomainRule = useMemo(
     () =>
-      currentSiteRegistrableDomain.length === 0
-        ? null
-        : ((state.settings.noCaptureRules ?? []).find(
-            (rule) => rule.kind === 'domain' && rule.domain === currentSiteRegistrableDomain,
-          ) ?? null),
-    [currentSiteRegistrableDomain, state.settings.noCaptureRules],
+      (state.settings.noCaptureRules ?? []).find(
+        (rule) => rule.kind === 'domain' && ownsCurrentSite(rule),
+      ) ?? null,
+    [ownsCurrentSite, state.settings.noCaptureRules],
   );
   const currentSiteSimilarRule = useMemo(
     () =>
-      currentSiteRegistrableDomain.length === 0
-        ? null
-        : ((state.settings.noCaptureRules ?? []).find(
-            (rule) => rule.kind === 'similar' && rule.domain === currentSiteRegistrableDomain,
-          ) ?? null),
-    [currentSiteRegistrableDomain, state.settings.noCaptureRules],
+      (state.settings.noCaptureRules ?? []).find(
+        (rule) => rule.kind === 'similar' && ownsCurrentSite(rule),
+      ) ?? null,
+    [ownsCurrentSite, state.settings.noCaptureRules],
   );
   // Tri-state for the card: master pause wins over a per-site rule.
   const currentTabCaptureState: 'capturing' | 'paused' | 'blocked' = captureOff
@@ -6981,11 +6998,12 @@ const App = () => {
         {/* Right-side control cluster — the three capture controls the
             user asked to co-locate with the verdict they affect. */}
         <div className="lamp-controls" data-testid="capture-lamp-controls">
-          {/* Per-site control 1 — don't capture THIS domain. Stateful:
-              filled/active when a domain rule already owns this site
-              (clicking then re-enables by removing the rule). Only
-              rendered when the current tab is a capturable http(s)
-              page (currentSiteLabel is defined). */}
+          {/* Per-site control 1 — don't capture THIS site (host-scoped:
+              this host + its own subdomains, NOT the whole registrable
+              domain). Stateful: filled/active when a domain rule already
+              owns this site (clicking then re-enables by removing the
+              rule). Only rendered when the current tab is a capturable
+              http(s) page (currentSiteLabel is defined). */}
           {currentSiteLabel === undefined ? null : (
             <button
               type="button"
@@ -6995,7 +7013,7 @@ const App = () => {
               title={
                 currentSiteDomainRule !== null
                   ? `Not capturing ${currentSiteLabel} (rule active). Click to re-enable capture for this site.`
-                  : `Don't capture ${currentSiteLabel} — stop recording this whole site.`
+                  : `Don't capture ${currentSiteLabel} — stop recording this site (and its subdomains).`
               }
               aria-label={
                 currentSiteDomainRule !== null
@@ -7962,6 +7980,28 @@ const App = () => {
                         workstreams={tabSessionWorkstreams}
                       />
                     </>
+                  ) : null}
+                  {/* Auto-file / attribution provenance line. The badge above
+              shows WHAT workstream + a ✨ marker; this row makes an
+              AUTO-APPLIED decision explicit — WHERE it came from ("Auto-filed
+              · similar pages · High confidence") and that it's reversible —
+              so the user isn't left guessing whether they did it. Only
+              rendered once the URL IS attributed; the un-attributed
+              suggested/empty/loading states are owned by SuggestionStats
+              below (no double render). Reuses the same component the Inbox
+              card uses so the two surfaces speak one vocabulary. */}
+                  {focusedPageKind !== 'unknown' &&
+                  focusedTabSession !== undefined &&
+                  focusedTabSession.currentAttribution !== undefined ? (
+                    <AttributionProvenance
+                      record={focusedTabSession}
+                      suggestion={
+                        focusedTabSuggestion === undefined
+                          ? undefined
+                          : tabSessionResolutionFromUrl(focusedTabSuggestion)
+                      }
+                      workstreams={tabSessionWorkstreams}
+                    />
                   ) : null}
                   {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
               Renders for any unattributed/un-ignored focused URL — when

@@ -1,6 +1,12 @@
+import {
+  coarseConfidenceWord,
+  confidenceLevelFromProbability,
+  probabilityFromLogit,
+} from '../suggestion/confidence';
 import { formatAnchorDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import type { ConnectionNode } from '../connections/types';
 import {
+  dominantSourceLabel,
   endorsementFor,
   hostFromUrl,
   isAggregatorHost,
@@ -55,14 +61,67 @@ export function AttributionProvenance({
     const label =
       workstreams.find((workstream) => workstream.bac_id === attribution.workstreamId)?.path ??
       '(removed)';
+    // Auto-file provenance (the user's ask): when Sidetrack auto-applied
+    // this (source='inferred') and the resolver result is still available,
+    // say WHERE it came from + HOW confident — in plain words — instead of
+    // a bare "Attributed by Sidetrack". The resolver's dominantSource +
+    // fusion logit are already delivered on `suggestion`; we only map them
+    // to plain words (dominantSourceLabel) and a coarse High/Medium marker,
+    // never a raw % (the sigmoid is uncalibrated for this surface). The
+    // reason chips (content/title/graph/topic) are reused verbatim from the
+    // suggested path so the two states speak the same visual language.
+    if (attribution.source === 'inferred') {
+      const topCandidate = suggestion?.fusedCandidates[0];
+      const sourceWords =
+        topCandidate === undefined ? undefined : dominantSourceLabel(topCandidate.dominantSource);
+      const confidenceWord =
+        topCandidate === undefined
+          ? null
+          : coarseConfidenceWord(
+              confidenceLevelFromProbability(probabilityFromLogit(topCandidate.rawFusionLogit), {
+                margin: suggestion?.decision.margin ?? 0,
+              }),
+            );
+      const chips = reasonChipsFor(topCandidate, record.pageEvidence);
+      return (
+        <span
+          className="tab-session-provenance mono"
+          data-attribution-source="inferred"
+          title={
+            `Auto-filed by Sidetrack on ${formatDate(attribution.observedAt)}. ` +
+            'Reversible — “Pick another…” or “Not in any stream” below overrides it, ' +
+            'and your move always beats the inferred guess.'
+          }
+        >
+          <span className="tab-session-provenance-verb">Auto-filed</span>: {label}
+          {sourceWords !== undefined ? (
+            <span className="tab-session-provenance-num">· {sourceWords}</span>
+          ) : null}
+          {confidenceWord !== null ? (
+            <span className="tab-session-provenance-num">· {confidenceWord} confidence</span>
+          ) : null}
+          {chips.length > 0 ? (
+            <span className="tab-session-reason-chips">
+              {chips.map((chip) => (
+                <span
+                  key={chip.kind}
+                  className={`tab-session-reason-chip is-${chip.kind}`}
+                  title={chip.title}
+                >
+                  {chip.label}
+                </span>
+              ))}
+            </span>
+          ) : null}
+        </span>
+      );
+    }
     const source =
       attribution.source === 'user_asserted'
         ? 'you'
         : attribution.source === 'thread'
           ? 'thread move'
-          : attribution.source === 'inferred'
-            ? 'Sidetrack'
-            : attribution.source;
+          : attribution.source;
     return (
       <span className="tab-session-provenance mono">
         Attributed by {source} on {formatDate(attribution.observedAt)} · {label}

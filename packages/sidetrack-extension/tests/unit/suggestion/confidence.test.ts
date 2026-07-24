@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  coarseConfidenceWord,
   confidenceLevelFromProbability,
   confidenceLevelLabel,
   isActionableLevel,
@@ -72,6 +73,23 @@ describe('isActionableLevel', () => {
     expect(isActionableLevel('unlikely')).toBe(true);
     expect(isActionableLevel('no-clear-pick')).toBe(false);
     expect(isActionableLevel('not-likely')).toBe(false);
+  });
+});
+
+describe('coarseConfidenceWord', () => {
+  it('collapses the ordinal to a two-bucket High/Medium marker for compact rows', () => {
+    expect(coarseConfidenceWord('highly-likely')).toBe('High');
+    expect(coarseConfidenceWord('likely')).toBe('Medium');
+    expect(coarseConfidenceWord('possible')).toBe('Medium');
+  });
+
+  it('a tie is honestly "Unclear", never High/Medium', () => {
+    expect(coarseConfidenceWord('no-clear-pick')).toBe('Unclear');
+  });
+
+  it('returns null for below-threshold leans so the caller can omit the marker', () => {
+    expect(coarseConfidenceWord('unlikely')).toBeNull();
+    expect(coarseConfidenceWord('not-likely')).toBeNull();
   });
 });
 

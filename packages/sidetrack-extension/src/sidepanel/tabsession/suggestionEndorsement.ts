@@ -67,6 +67,31 @@ export const endorsementFor = (
   return { level: 'none', action, workstreamId: undefined, margin };
 };
 
+// ---- Plain-word provenance ----------------------------------------------
+//
+// The resolver's `dominantSource` (which signal weighed most) is a jargon
+// enum (ppr / similarity / cluster / none). The badge + provenance rows
+// speak plain words so a non-technical user understands WHERE an auto-file
+// or suggestion came from. Single source of truth so the Now card, the
+// Inbox provenance row, and any future surface all say the same thing.
+//   ppr        → "browsing path"  (related visit / link edges — PPR)
+//   similarity → "similar pages"  (page content/title resembles the stream)
+//   cluster    → "topic"          (sits in a workstream-dominated topic)
+export const dominantSourceLabel = (
+  source: 'ppr' | 'similarity' | 'cluster' | 'none',
+): string => {
+  switch (source) {
+    case 'ppr':
+      return 'browsing path';
+    case 'similarity':
+      return 'similar pages';
+    case 'cluster':
+      return 'topic';
+    case 'none':
+      return 'no clear signal';
+  }
+};
+
 // ---- Reason chips -------------------------------------------------------
 //
 // The resolver hands per-candidate reasons[] with a coarse `source`

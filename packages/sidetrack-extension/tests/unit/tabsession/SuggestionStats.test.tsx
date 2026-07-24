@@ -103,14 +103,14 @@ describe('SuggestionStats', () => {
   });
 
   it('renders loading placeholder when showEmptyPlaceholder + no suggestion', () => {
-    // No suggestion = the companion hasn't returned yet. Show
-    // "Checking signals…" so the user knows the resolver is in
+    // No suggestion = the companion hasn't returned yet. Show one clear
+    // "Checking connections…" state so the user knows the resolver is in
     // flight; the "No signal yet" copy is reserved for the
     // suggestion-arrived-but-empty case below.
     render(<SuggestionStats workstreams={workstreams} showEmptyPlaceholder />);
-    expect(screen.getByText('Checking signals…')).toBeInTheDocument();
+    expect(screen.getByText('Checking connections…')).toBeInTheDocument();
     expect(
-      screen.getByText(/Asking the companion for related visits, similarity, and topic membership/),
+      screen.getByText(/Asking the companion for related visits, similar pages, and topic membership/),
     ).toBeInTheDocument();
   });
 
@@ -263,7 +263,7 @@ describe('SuggestionStats', () => {
       expect(screen.queryByText('No signal yet')).toBeNull();
       expect(screen.queryByText(/First time seeing this URL/)).toBeNull();
       // Never the plain loading copy either — this is a failure, not pending.
-      expect(screen.queryByText('Checking signals…')).toBeNull();
+      expect(screen.queryByText('Checking connections…')).toBeNull();
     });
 
     it('renders the busy card for the "error" kind too (both map to retrying)', () => {

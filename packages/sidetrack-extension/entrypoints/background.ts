@@ -4,6 +4,13 @@ import { captureGenericTab } from '../src/capture/genericFallback';
 import {
   matchesNoCaptureRules,
   registrableDomainFromUrl,
+  // Aliased: a strict, normalized (lowercased, trailing-dot-stripped,
+  // http(s)-validated) host extractor for RULE creation. Distinct from
+  // the lax local `hostFromUrl` below (display-only; returns 'current
+  // tab' on failure and does not normalize) — a rule host MUST match the
+  // matcher's lowercased pageHost, so it needs the strict one.
+  hostFromUrl as ruleHostFromUrl,
+  noCaptureRuleScopeKey,
   detectCategoryTokens,
   type NoCaptureRule,
   type NoCaptureCategoryToken,
@@ -3789,22 +3796,38 @@ const handleRequest = async (
 
   if (request.type === messageTypes.addNoCaptureRule) {
     const domain = registrableDomainFromUrl(request.source.url);
-    if (domain.length === 0) {
+    // HOST-SCOPED by intent: the "Don't capture <site>" action targets the
+    // exact host the user acted on (e.g. meet.google.com), NOT the whole
+    // registrable-domain family (google.com). The matcher blocks the host
+    // + its own subdomains only; `domain` is retained for the label and as
+    // the eTLD+1-family fallback for legacy rules. See src/capture/
+    // noCaptureRules.ts for the matching semantics.
+    const host = ruleHostFromUrl(request.source.url);
+    if (domain.length === 0 || host.length === 0) {
       return {
         ok: false,
         error: 'This page has no capturable domain (only http/https pages can be blocked).',
       } as unknown as RuntimeResponse;
     }
     const existing = await readNoCaptureRules();
-    // De-dup: one rule per (kind, domain). Re-adding is a no-op that
-    // returns the current list so the UI stays consistent.
-    if (existing.some((rule) => rule.kind === request.kind && rule.domain === domain)) {
+    // De-dup on the SCOPE the rule actually blocks: (kind, scopeKey). New
+    // rules are host-scoped, so scopeKey === host; two sibling hosts under
+    // the same eTLD+1 (meet.google.com / mail.google.com) are now DISTINCT
+    // rules and must not be collapsed by domain. A pre-existing legacy
+    // family-wide rule (scopeKey === domain) does NOT swallow a new
+    // host-scoped add — they block different scopes.
+    if (
+      existing.some(
+        (rule) => rule.kind === request.kind && noCaptureRuleScopeKey(rule) === host,
+      )
+    ) {
       return { ok: true, noCaptureRules: existing } as unknown as RuntimeResponse;
     }
     const base = {
       id: `ncr_${crypto.randomUUID().replaceAll('-', '_')}`,
       domain,
-      label: domain,
+      host,
+      label: host,
       createdAt: new Date().toISOString(),
     };
     let rule: NoCaptureRule;

@@ -81,3 +81,26 @@ export const confidenceLevelLabel = (level: ConfidenceLevel): string => {
  * any threshold). */
 export const isActionableLevel = (level: ConfidenceLevel): boolean =>
   level !== 'no-clear-pick' && level !== 'not-likely';
+
+/** Coarse one-word confidence for compact provenance markers (the
+ * auto-filed / suggested rows), where the full "Highly likely" ordinal
+ * is too long. Deliberately coarse — the underlying sigmoid is
+ * uncalibrated (no reliability fit for this surface), so a two-bucket
+ * High/Medium reads as a lean, not a precise probability. A tie
+ * (no-clear-pick) is not "High" or "Medium" — it's honestly "Unclear".
+ * `null` for below-threshold leans (not-likely) so callers can omit the
+ * marker rather than print a misleadingly-firm word. */
+export const coarseConfidenceWord = (level: ConfidenceLevel): 'High' | 'Medium' | 'Unclear' | null => {
+  switch (level) {
+    case 'highly-likely':
+      return 'High';
+    case 'likely':
+    case 'possible':
+      return 'Medium';
+    case 'no-clear-pick':
+      return 'Unclear';
+    case 'unlikely':
+    case 'not-likely':
+      return null;
+  }
+};
