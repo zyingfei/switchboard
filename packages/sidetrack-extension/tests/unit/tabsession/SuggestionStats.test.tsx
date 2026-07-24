@@ -200,9 +200,7 @@ describe('SuggestionStats', () => {
     );
     // Revisit copy — honest about the repeat visit, no "first time" lie.
     expect(screen.getByText('No connections yet')).toBeInTheDocument();
-    expect(
-      screen.getByText(/Seen 4 times — no connections yet/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Seen 4 times — no connections yet/)).toBeInTheDocument();
     expect(screen.queryByText(/First time seeing this URL/)).toBeNull();
     // Tooltip surfaces the count too.
     expect(screen.getByText('ⓘ').getAttribute('title')).toContain('Seen 4 times');
@@ -249,5 +247,80 @@ describe('SuggestionStats', () => {
     );
     expect(screen.getByText('No signal — page access off')).toBeInTheDocument();
     expect(screen.queryByText('No connections yet')).toBeNull();
+  });
+
+  // --- Bug fix: a resolve FAILURE (500 "database is locked" during a drain,
+  // timeout, network) must render distinctly from a genuinely-empty result.
+  // The whole point is that error !== empty !== pending !== populated.
+  describe('resolve-error state (busy — retrying)', () => {
+    it('renders the busy/retrying card on error instead of "No signal yet"', () => {
+      render(
+        <SuggestionStats workstreams={workstreams} showEmptyPlaceholder error={{ kind: 'busy' }} />,
+      );
+      expect(screen.getByText('Companion is busy — retrying')).toBeInTheDocument();
+      expect(screen.getByText(/Retrying automatically/)).toBeInTheDocument();
+      // Never the empty/first-seen falsehood.
+      expect(screen.queryByText('No signal yet')).toBeNull();
+      expect(screen.queryByText(/First time seeing this URL/)).toBeNull();
+      // Never the plain loading copy either — this is a failure, not pending.
+      expect(screen.queryByText('Checking signals…')).toBeNull();
+    });
+
+    it('renders the busy card for the "error" kind too (both map to retrying)', () => {
+      render(
+        <SuggestionStats
+          workstreams={workstreams}
+          showEmptyPlaceholder
+          error={{ kind: 'error' }}
+        />,
+      );
+      expect(screen.getByText('Companion is busy — retrying')).toBeInTheDocument();
+    });
+
+    it('error takes precedence over an empty result (empty + error = busy card)', () => {
+      // A stale empty result cached from before the companion got busy must
+      // NOT re-render as "No signal yet" once the refresh errors.
+      render(
+        <SuggestionStats
+          suggestion={emptyResolution()}
+          workstreams={workstreams}
+          showEmptyPlaceholder
+          pageAccessGranted
+          error={{ kind: 'busy' }}
+        />,
+      );
+      expect(screen.getByText('Companion is busy — retrying')).toBeInTheDocument();
+      expect(screen.queryByText('No signal yet')).toBeNull();
+    });
+
+    it('a POPULATED suggestion wins over an error (show the answer we have)', () => {
+      // If the resolver DID return candidates, a later refresh error should
+      // not blank them out — the last good answer beats "busy".
+      render(
+        <SuggestionStats
+          suggestion={suggestion({ topLogit: 2.0 })}
+          workstreams={workstreams}
+          error={{ kind: 'busy' }}
+        />,
+      );
+      expect(screen.getByText(/Highly likely/)).toBeInTheDocument();
+      expect(screen.queryByText('Companion is busy — retrying')).toBeNull();
+    });
+
+    it('returns null on error when showEmptyPlaceholder is off (no placeholder callers)', () => {
+      const { container } = render(
+        <SuggestionStats workstreams={workstreams} error={{ kind: 'busy' }} />,
+      );
+      expect(container.firstChild).toBeNull();
+    });
+
+    it('applies the is-busy class (amber warn channel — not is-empty)', () => {
+      const { container } = render(
+        <SuggestionStats workstreams={workstreams} showEmptyPlaceholder error={{ kind: 'busy' }} />,
+      );
+      const root = container.querySelector('.suggestion-stats');
+      expect(root?.classList.contains('is-busy')).toBe(true);
+      expect(root?.classList.contains('is-empty')).toBe(false);
+    });
   });
 });

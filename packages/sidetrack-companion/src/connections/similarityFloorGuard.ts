@@ -209,6 +209,27 @@ export interface SimilarityFloorDiagnostics {
   // builder collapses despite a corpus; bootstrap fires when the SERVED
   // signal is already gone and a good revision is available to restore.
   readonly bootstrapAdopted: boolean;
+  // Round-3 RENDERED-edge floor (T1/T3). True when the just-rendered
+  // candidate snapshot's similarity-family rows (visit_resembles_visit /
+  // closest_visit) collapsed >90% vs the previously SERVED snapshot's
+  // rendered rows with no legitimate reset, so the render carry-forward
+  // repaired the candidate (re-added the previous rows + their missing
+  // endpoint timeline-visit nodes) BEFORE it was written to current.db.
+  // This is the terminal backstop that lives at the served artifact — the
+  // layer above (revision-level guard, Layer 0/2) measures the revision's
+  // edge count, which round 3 proved can read 51,156 while the rendered
+  // table is 0 (window-poor node set stripped every endpoint). Distinct
+  // from the three revision-level flags; mutually exclusive with them
+  // within a drain is NOT required (a revision-level reuse can still need a
+  // render repair), but `renderRepaired` reflects only the render layer.
+  readonly renderRepaired: boolean;
+  // Round-3 (T3) — the similarity-family row count actually WRITTEN to
+  // current.db this drain (post-render, post-repair). This is the number a
+  // resolver will read, distinct from `servedEdgeCount` (the adopted
+  // revision's edge count, one abstraction above). When they diverge, a
+  // window-poor render dropped endpoints; when `renderRepaired` is true this
+  // reflects the repaired (restored) count.
+  readonly renderedSimilarityFamilyEdgeCount: number;
 }
 
 // Reconstruct a full VisitSimilarityRevision from the previously served

@@ -3,8 +3,13 @@ import {
   confidenceLevelLabel,
   probabilityFromLogit,
 } from '../suggestion/confidence';
+import { suggestionStateFrom } from './resolveOutcome';
 import { endorsementFor } from './suggestionEndorsement';
-import type { TabSessionResolutionResult, TabSessionWorkstreamOption } from './types';
+import type {
+  ResolveOutcomeError,
+  TabSessionResolutionResult,
+  TabSessionWorkstreamOption,
+} from './types';
 
 // Stage 5 polish — surface the resolver's confidence in human-readable
 // terms while keeping the raw numbers available on hover. The
@@ -78,6 +83,15 @@ export interface SuggestionStatsProps {
   // visit-similarity gate never produced edges). `undefined`/≤1 keeps the
   // original first-seen copy.
   readonly visitCount?: number;
+  // The last resolve REQUEST for this URL failed (500 / timeout / network)
+  // rather than returning an empty result. Rendered as a distinct, honest
+  // "companion is busy — retrying" state instead of the misleading "No
+  // signal yet" card — during a heavy drain the batch-resolve route 500s
+  // ("database is locked") for 20+ seconds, and a page the user has
+  // visited repeatedly must not read as "First time seeing this URL". The
+  // caller retries on its existing poll cadence; no user action is needed.
+  // A populated `suggestion` still wins (see suggestionStateFrom).
+  readonly error?: ResolveOutcomeError;
 }
 
 export function SuggestionStats({
@@ -89,8 +103,41 @@ export function SuggestionStats({
   pageAccessGranted,
   onGrantAccess,
   visitCount,
+  error,
 }: SuggestionStatsProps) {
-  if (suggestion === undefined) {
+  // error !== empty !== pending !== populated — the discriminant that
+  // keeps a failed resolve from masquerading as a confident empty card.
+  const state = suggestionStateFrom({
+    ...(suggestion === undefined ? {} : { suggestion }),
+    ...(error === undefined ? {} : { error }),
+  });
+  if (state === 'error') {
+    // A resolve failure, not "no signal". Never render the placeholder-off
+    // path silently here: even callers that hide the empty placeholder want
+    // the user to know the answer is stale-because-busy, not absent.
+    if (!showEmptyPlaceholder) return null;
+    return (
+      <div className="suggestion-stats is-busy">
+        <span className="suggestion-stats-row">
+          <span className="suggestion-stats-target">Companion is busy — retrying</span>
+          <span
+            className="suggestion-stats-info"
+            title={
+              'Sidetrack couldn’t reach the resolver just now (the companion is busy ' +
+              'catching up on a capture drain). This is NOT "no signal" — the check ' +
+              'hasn’t completed. It retries automatically on the next refresh; no action needed.'
+            }
+          >
+            ⓘ
+          </span>
+        </span>
+        <span className="suggestion-stats-source mono subtle">
+          Retrying automatically — the resolver is catching up
+        </span>
+      </div>
+    );
+  }
+  if (state === 'pending') {
     // Distinct from "fetched but empty" below — the suggestion has not
     // come back from the companion yet. Saying "No signal yet" here is
     // a lie: we haven't *checked* yet. Render a loading affordance so
@@ -107,7 +154,8 @@ export function SuggestionStats({
       </div>
     );
   }
-  if (suggestion.fusedCandidates.length === 0) {
+  // From here the state is 'empty' or 'populated'; `suggestion` is defined.
+  if (suggestion !== undefined && suggestion.fusedCandidates.length === 0) {
     if (!showEmptyPlaceholder) return null;
     // Page access off → the similarity signal can't fire at all (every
     // visit fails the ≥5s engagement gate), so the resolver returns
@@ -134,7 +182,11 @@ export function SuggestionStats({
           <span className="suggestion-stats-source mono subtle">
             Attribution needs page engagement.{' '}
             {onGrantAccess !== undefined ? (
-              <button type="button" className="btn-link suggestion-stats-grant" onClick={onGrantAccess}>
+              <button
+                type="button"
+                className="btn-link suggestion-stats-grant"
+                onClick={onGrantAccess}
+              >
                 Grant access
               </button>
             ) : (
@@ -194,6 +246,10 @@ export function SuggestionStats({
       </div>
     );
   }
+  // state === 'populated' here (pending/error/empty all returned above), so
+  // `suggestion` is defined with ≥1 candidate. The explicit guard keeps the
+  // types honest without a non-null assertion.
+  if (suggestion === undefined) return null;
   const top = suggestion.fusedCandidates[0];
   if (top === undefined) return null;
   const probability = probabilityFromLogit(top.rawFusionLogit);

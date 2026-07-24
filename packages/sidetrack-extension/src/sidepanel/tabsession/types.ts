@@ -116,6 +116,20 @@ export interface TabSessionResolutionResult {
   readonly fusedCandidates: readonly TabSessionResolverCandidate[];
 }
 
+// A resolve REQUEST failed (500 / timeout / network) — NOT an empty
+// result. The panel must render these distinctly from a genuinely-empty
+// resolution ("No signal yet"): during a heavy companion drain the
+// batch-resolve route can 500 with "database is locked" for 20+ seconds,
+// and rendering that as a confident empty card is a falsehood for a page
+// the user has visited repeatedly. `kind` mirrors the down-vs-busy split
+// used elsewhere (CompanionRequestError): 'busy' = the companion is up but
+// contended (a slow/locked resolve — retry recovers it); 'error' = any
+// other failure. Both surface as a soft "companion is busy — retrying"
+// state, never as "first time seeing this URL".
+export interface ResolveOutcomeError {
+  readonly kind: 'busy' | 'error';
+}
+
 // -- Per-canonical-URL attribution (Phase B — the URL is the
 // attribution unit; tabs are just transport) ----------------------
 

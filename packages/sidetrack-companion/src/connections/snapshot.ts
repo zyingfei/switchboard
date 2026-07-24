@@ -349,6 +349,27 @@ const sortAlphaById = <T extends { id: string }>(rows: readonly T[]): T[] =>
 const compareString = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
+// SQLITE_BUSY / SQLITE_LOCKED detection. The resolver cache is a pure
+// optimization that shares current.db with the drain child's long write
+// transactions; when the child holds the write lock, a cache read/write
+// can throw "database is locked". We must never fail a resolve for that —
+// degrade to computing without the cache instead. Mirrors the predicate
+// in sync/contract/connectionsMaterializer.ts (kept local; that copy is
+// module-private).
+const isSqliteLockError = (error: unknown): boolean => {
+  if (typeof error !== 'object' || error === null) {
+    return String(error).includes('database is locked');
+  }
+  const code = 'code' in error ? (error as { code?: unknown }).code : undefined;
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('database is locked') ||
+    message.includes('SQLITE_BUSY') ||
+    message.includes('SQLITE_LOCKED')
+  );
+};
+
 const evidenceMetadataForNode = (
   input: ConnectionsInput,
   canonicalUrl: string,
@@ -3590,6 +3611,38 @@ const computeSnapshotRevision = (parts: {
   return hasher.digest('hex').slice(0, 16);
 };
 
+// Rendered-edge floor (round-3) — recompute the canonical snapshot metadata
+// (nodeCount/edgeCount/snapshotRevision) after the rendered-similarity-floor
+// carry-forward mutated the node/edge arrays. The projection key counts are
+// unchanged by that carry-forward (it only re-adds similarity-family edges +
+// their endpoint timeline-visit nodes, never touches the projections), so we
+// re-hash over the projection counts held on `base`. Exported so the pure
+// `renderedSimilarityFloor` decider can inject it without importing the
+// snapshot hashing internals.
+export const recomputeSnapshotMetadataForCarriedRows = (
+  base: Pick<ConnectionsSnapshot, 'urlProjection' | 'tabSessionProjection'>,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  updatedAt: string,
+): Pick<ConnectionsSnapshot, 'nodeCount' | 'edgeCount' | 'snapshotRevision' | 'updatedAt'> => ({
+  updatedAt,
+  nodeCount: nodes.length,
+  edgeCount: edges.length,
+  snapshotRevision: computeSnapshotRevision({
+    updatedAt,
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+    urlProjectionKeyCount:
+      base.urlProjection === undefined
+        ? 0
+        : Object.keys(base.urlProjection.byCanonicalUrl).length,
+    tabSessionProjectionKeyCount:
+      base.tabSessionProjection === undefined
+        ? 0
+        : Object.keys(base.tabSessionProjection.bySessionId).length,
+  }),
+});
+
 export const augmentConnectionsSnapshotWithClosestVisitRanker = (
   input: ConnectionsInput & { readonly closestVisitRanker: ClosestVisitRanker },
   baseSnapshot: ConnectionsSnapshot,
@@ -4527,15 +4580,24 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshotRevision: string,
     result: unknown,
   ): Promise<void> => {
-    const db = await this.#database();
-    db.query(
-      `INSERT INTO connections_resolver_cache
-        (visit_id, snapshot_revision, result_json, computed_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(visit_id, snapshot_revision) DO UPDATE SET
-         result_json = excluded.result_json,
-         computed_at = excluded.computed_at`,
-    ).run(visitId, snapshotRevision, JSON.stringify(result), new Date().toISOString());
+    // Best-effort write. The cache lives in current.db, which the drain
+    // child locks for long write transactions; a locked write must NEVER
+    // fail the resolve — the caller already has the computed result and
+    // will serve it. Skip caching this time; the next drain re-primes it.
+    try {
+      const db = await this.#database();
+      db.query(
+        `INSERT INTO connections_resolver_cache
+          (visit_id, snapshot_revision, result_json, computed_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(visit_id, snapshot_revision) DO UPDATE SET
+           result_json = excluded.result_json,
+           computed_at = excluded.computed_at`,
+      ).run(visitId, snapshotRevision, JSON.stringify(result), new Date().toISOString());
+    } catch (error) {
+      if (isSqliteLockError(error)) return;
+      throw error;
+    }
   };
 
   readonly getCachedResolverResult = async (
@@ -4555,17 +4617,25 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return null;
     }
     this.#resolverCacheCurrentRevision = snapshotRevision;
-    const db = await this.#database();
-    const row = db
-      .query(
-        `SELECT result_json
-         FROM connections_resolver_cache
-         WHERE visit_id = ? AND snapshot_revision = ?`,
-      )
-      .get(visitId, snapshotRevision);
-    this.#scheduleResolverCachePrune(snapshotRevision);
-    if (row === null || row === undefined) return null;
-    return JSON.parse(textField(row, 'result_json')) as unknown;
+    // Best-effort read. If the drain child holds the write lock, the
+    // SELECT can throw "database is locked" — degrade to a cache miss
+    // (null) so the caller computes the result inline rather than 500ing.
+    try {
+      const db = await this.#database();
+      const row = db
+        .query(
+          `SELECT result_json
+           FROM connections_resolver_cache
+           WHERE visit_id = ? AND snapshot_revision = ?`,
+        )
+        .get(visitId, snapshotRevision);
+      this.#scheduleResolverCachePrune(snapshotRevision);
+      if (row === null || row === undefined) return null;
+      return JSON.parse(textField(row, 'result_json')) as unknown;
+    } catch (error) {
+      if (isSqliteLockError(error)) return null;
+      throw error;
+    }
   };
 
   #scheduleResolverCachePrune(snapshotRevision: string): void {

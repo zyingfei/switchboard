@@ -154,6 +154,7 @@ import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBa
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
+  type ResolveOutcomeError,
   type TabSessionInboxData,
   type TabSessionPageEvidenceSummary,
   type TabSessionProjection,
@@ -165,6 +166,10 @@ import {
   type UrlResolutionResult,
   type UrlVisitRecord,
 } from '../../src/sidepanel/tabsession/types';
+import {
+  classifyResolveFailure,
+  resolveErrorForStatus,
+} from '../../src/sidepanel/tabsession/resolveOutcome';
 import {
   queryRealChromeTabCount,
   selectTabSessionCandidates,
@@ -1072,6 +1077,16 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  // Per-URL resolve FAILURES (500 "database is locked" during a drain,
+  // timeout, network), tracked separately from `urlSuggestions` so a failed
+  // request is never rendered as the confident empty "No signal yet" card.
+  // Keyed by canonical URL; an entry is set on failure and CLEARED on the
+  // next successful resolve for that URL, so it self-heals on the poll
+  // cadence with no user action. Errored URLs are deliberately NOT
+  // negative-cached (unlike empty results), so they retry promptly.
+  const [urlSuggestionErrors, setUrlSuggestionErrors] = useState<
+    Record<string, ResolveOutcomeError>
+  >({});
   // Optimistic-attribution overlay: the moment the user decides, the
   // inbox row + current-tab card show the FINAL state and stop
   // re-resolving until the server projection reconciles (then this is
@@ -1859,6 +1874,12 @@ const App = () => {
           : next[url] === undefined && !recentlyResolvedEmpty(url, emptyResolveTtlForUrl(url)),
       );
       let fetched: readonly (readonly [string, UrlResolutionResult] | null)[] = [];
+      // URLs whose resolve REQUEST failed this pass (500/timeout/network),
+      // mapped to the honest UI error kind. Distinct from a returned-empty
+      // result: a page we couldn't check must render "companion is busy —
+      // retrying", never "First time seeing this URL". Cleared per-URL below
+      // whenever a resolution DOES come back.
+      const errored = new Map<string, ResolveOutcomeError>();
       if (toFetch.length > 0) {
         const requestedUrls = new Set(toFetch);
         const eventCandidateUrls = extraCanonicalUrls.filter((url) => requestedUrls.has(url));
@@ -1875,11 +1896,22 @@ const App = () => {
             }),
           });
           if (!response.ok) {
+            // Provisionally mark the whole batch as errored with the honest
+            // busy/error kind derived from the status (500 "database is
+            // locked" during a drain => busy). The fan-out fallback below
+            // clears any URL it can resolve individually.
+            const batchError = resolveErrorForStatus(response.status);
+            for (const url of toFetch) errored.set(url, batchError);
             throw new Error(`Companion batch URL resolve failed (${String(response.status)}).`);
           }
           const body = (await response.json()) as { readonly data?: unknown };
           fetched = urlResolutionResultsFromBatch(body.data, requestedUrls);
-        } catch {
+        } catch (batchError) {
+          // If the batch fetch itself threw (network/timeout — not a non-ok
+          // status, which pre-seeded `errored` above), classify it so the
+          // fallback's own per-URL failures still land as errors, not empties.
+          const fallbackError =
+            errored.size > 0 ? undefined : classifyResolveFailure(batchError);
           // Back-compat for older companions and transient batch
           // failures: keep the old bounded fan-out path so suggestion
           // rendering degrades gracefully instead of disappearing.
@@ -1891,12 +1923,41 @@ const App = () => {
               const result = await fetchCompanionJson<unknown>(
                 `/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true${eventCandidateQuery}`,
               );
-              return isUrlResolutionResult(result) ? ([canonicalUrl, result] as const) : null;
-            } catch {
+              if (isUrlResolutionResult(result)) {
+                errored.delete(canonicalUrl);
+                return [canonicalUrl, result] as const;
+              }
+              return null;
+            } catch (fanoutError) {
+              errored.set(canonicalUrl, fallbackError ?? classifyResolveFailure(fanoutError));
               return null;
             }
           });
         }
+      }
+      if (errored.size > 0 || Object.keys(previous).length > 0) {
+        // Apply this pass's error edits: set the URLs that failed, and clear
+        // any prior error for a URL we're about to render a fresh result for.
+        const succeeded = new Set(
+          fetched.filter((e): e is readonly [string, UrlResolutionResult] => e !== null).map((e) => e[0]),
+        );
+        setUrlSuggestionErrors((current) => {
+          let changed = false;
+          const nextErrors = { ...current };
+          for (const [url, err] of errored) {
+            if (nextErrors[url]?.kind !== err.kind) {
+              nextErrors[url] = err;
+              changed = true;
+            }
+          }
+          for (const url of succeeded) {
+            if (nextErrors[url] !== undefined) {
+              delete nextErrors[url];
+              changed = true;
+            }
+          }
+          return changed ? nextErrors : current;
+        });
       }
       for (const entry of fetched) {
         if (entry === null) continue;
@@ -1934,9 +1995,24 @@ const App = () => {
         );
         if (isUrlResolutionResult(result)) {
           setUrlSuggestions((current) => ({ ...current, [canonicalUrl]: result }));
+          // A fresh result clears any prior busy/error marker for this URL.
+          setUrlSuggestionErrors((current) => {
+            if (current[canonicalUrl] === undefined) return current;
+            const next = { ...current };
+            delete next[canonicalUrl];
+            return next;
+          });
         }
-      } catch {
-        // Per-card refresh failures stay silent — the user can retry.
+      } catch (refreshError) {
+        // Per-card refresh failures no longer stay silent: record the
+        // honest busy/error state so the card shows "companion is busy —
+        // retrying" rather than reverting to the misleading empty card.
+        const classified = classifyResolveFailure(refreshError);
+        setUrlSuggestionErrors((current) =>
+          current[canonicalUrl]?.kind === classified.kind
+            ? current
+            : { ...current, [canonicalUrl]: classified },
+        );
       } finally {
         setRefreshingUrlSuggestionIds((current) => {
           if (!current.has(canonicalUrl)) return current;
@@ -1973,6 +2049,7 @@ const App = () => {
         setUrlProjection(null);
         setUrlInbox(EMPTY_URL_INBOX);
         setUrlSuggestions({});
+        setUrlSuggestionErrors({});
         return;
       }
       if (!background) {
@@ -5481,6 +5558,15 @@ const App = () => {
     hasOptimisticDecision(optimisticDecisions, focusedDisplayUrlRecord.canonicalUrl)
       ? undefined
       : urlSuggestions[focusedDisplayUrlRecord.canonicalUrl];
+  // The focused URL's last resolve FAILURE, if any — surfaces the honest
+  // "companion is busy — retrying" state on the Current Tab card instead of
+  // the misleading empty "First time seeing this URL". Only meaningful when
+  // there's no populated suggestion to show (SuggestionStats gives a
+  // populated result precedence over the error).
+  const focusedTabSuggestionError =
+    focusedDisplayUrlRecord === undefined
+      ? undefined
+      : urlSuggestionErrors[focusedDisplayUrlRecord.canonicalUrl];
   // Related strip data — /v2/recall intent='focus' (graph-neighbor
   // expansion from the focused page), debounced + cached in the hook.
   // Idle while a historical card is pinned; the strip is live-tab UI.
@@ -7906,6 +7992,15 @@ const App = () => {
                       // honest where "first time seeing this URL" would be
                       // a lie the user can spot.
                       visitCount={focusedRecordEffective.visitCount}
+                      // When the resolve REQUEST failed (500 "database is
+                      // locked" during a drain, timeout, network) rather
+                      // than returning empty, render the honest "companion
+                      // is busy — retrying" state instead of the misleading
+                      // "First time seeing this URL". A populated suggestion
+                      // still takes precedence inside SuggestionStats.
+                      {...(focusedTabSuggestionError === undefined
+                        ? {}
+                        : { error: focusedTabSuggestionError })}
                       // UX4 — Now-card variant tucks the signal/alts
                       // rows into a "Why" disclosure so the headline
                       // reads cleanly. Inbox triage keeps the full

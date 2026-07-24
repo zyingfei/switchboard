@@ -43,11 +43,16 @@ import {
   augmentConnectionsSnapshotWithClosestVisitRankerFrontier,
   buildConnectionsSnapshot,
   expandRankerFrontier,
+  recomputeSnapshotMetadataForCarriedRows,
   type ClosestVisitRanker,
   type ConnectionsInput,
   type ConnectionsSnapshot,
   type ThreadVaultRecord,
 } from '../../connections/snapshot.js';
+import {
+  applyRenderedSimilarityFloor,
+  countRenderedSimilarityFamilyEdges,
+} from '../../connections/renderedSimilarityFloor.js';
 import type {
   ConnectionsProjectionAccumulatorState,
   ConnectionsStore,
@@ -3084,13 +3089,62 @@ export const createConnectionsMaterializer = (
             appliedFrontier: drainFrontier,
             snapshotRevisionId: snapshot.snapshotRevision ?? null,
           };
+    // Round-3 RENDERED-edge floor (T1) — the terminal invariant on the
+    // SERVED ARTIFACT. Populated once the reset-reason set + previous served
+    // snapshot are computed below (both are `const`s defined later in this
+    // drain, but every writeSnapshotWithDrainProgress call happens strictly
+    // AFTER that point, so the closure reads a set value). Every FULL-snapshot
+    // publish funnels through writeSnapshotWithDrainProgress, so applying the
+    // floor here covers both call sites (base + ranker-augmented) and the
+    // chunked catch-up recovery fall-through with one shared helper — no
+    // per-path copies. The scoped-delta path writes via replaceScopeRows (not
+    // this function) and provably preserves similarity rows row-locally via
+    // carryForwardSimilarityFamilyRowsForScopedDelta, so it is exempt (it can
+    // only rewrite the touched url scopes, never wipe untouched similarity
+    // rows), and is covered by its own losslessness carry-forward.
+    let renderFloorContext:
+      | { readonly previousServedSnapshot: ConnectionsSnapshot | null; readonly resetAllowed: boolean }
+      | null = null;
+    // Whether the most recent full-snapshot write had to repair a rendered
+    // collapse, and the similarity-family row count actually written to
+    // current.db (the number resolvers read). Recorded into the diagnostic.
+    let renderFloorRepaired = false;
+    let renderedSimilarityFamilyEdgeCountWritten: number | null = null;
     const writeSnapshotWithDrainProgress = async (
       snapshot: ConnectionsSnapshot,
       dirtyScopesForWrite?: ReadonlySet<Scope>,
     ): Promise<void> => {
-      const progress = progressForDrainSnapshot(snapshot);
+      let snapshotToWrite = snapshot;
+      if (renderFloorContext !== null) {
+        const outcome = applyRenderedSimilarityFloor({
+          candidate: snapshot,
+          previous: renderFloorContext.previousServedSnapshot,
+          resetAllowed: renderFloorContext.resetAllowed,
+          recompute: (nodes, edges, updatedAt) =>
+            recomputeSnapshotMetadataForCarriedRows(snapshot, nodes, edges, updatedAt),
+        });
+        if (outcome.action === 'repair') {
+          snapshotToWrite = outcome.snapshot;
+          renderFloorRepaired = true;
+          console.warn(
+            `[connections] rendered similarity floor REPAIRED a collapse: served=${String(
+              outcome.previousServedCount,
+            )} rendered=${String(outcome.candidateCount)} restored=${String(
+              outcome.repairedCount,
+            )} — window-poor node set dropped endpoints; carried previous similarity-family rows + endpoint nodes forward`,
+          );
+          mark(
+            `renderedSimilarityFloor.repaired served=${String(
+              outcome.previousServedCount,
+            )} rendered=${String(outcome.candidateCount)} restored=${String(outcome.repairedCount)}`,
+          );
+        }
+      }
+      renderedSimilarityFamilyEdgeCountWritten =
+        countRenderedSimilarityFamilyEdges(snapshotToWrite);
+      const progress = progressForDrainSnapshot(snapshotToWrite);
       await deps.store.writeSnapshotAndProgress(
-        snapshot,
+        snapshotToWrite,
         progress,
         dirtyScopesForWrite,
         serializeProjectionAccumulatorState(progress),
@@ -4096,6 +4150,21 @@ export const createConnectionsMaterializer = (
       resetReasons: similarityFloorResetReasons,
       sustainedCollapseReached,
     });
+    // Round-3 RENDERED-edge floor (T1) — arm the terminal render-level
+    // backstop now that the reset-reason set is known. A rendered collapse is
+    // legitimate (publish as-is, no repair) under the SAME reasons the
+    // revision-level guard honours: any explicit reset reason, or the
+    // bounded-recovery sustained-collapse acceptance (a real deletion sustained
+    // for N drains). `previousSnapshotForRanker` is the previously SERVED
+    // snapshot (store.readCurrent()) — the source of truth for the rendered
+    // rows to carry forward + the endpoint nodes to complete.
+    renderFloorContext = {
+      previousServedSnapshot: previousSnapshotForRanker,
+      resetAllowed:
+        similarityFloorResetReasons.length > 0 ||
+        (similarityFloorOutcome.action === 'publish' &&
+          similarityFloorOutcome.allowedResetReason === 'sustained-collapse-accepted'),
+    };
     let carriedForward = false;
     const carriedPreviousServedEdges =
       similarityFloorOutcome.action === 'carry-forward' ? previousServedSimilarityEdges() : null;
@@ -4207,7 +4276,21 @@ export const createConnectionsMaterializer = (
     } catch {
       /* durable floor-state write is best-effort; never fail the drain */
     }
-    const similarityFloorDiagnostics: SimilarityFloorDiagnostics = {
+    // Round-3 (T3) — the similarityFloor diagnostic reports the ACTUAL
+    // adopted revision id + rendered edge count. `servedRevisionId` /
+    // `servedEdgeCount` reflect `visitSimilarity` post-Layer-0/guard (the
+    // revision resolvers key off, e.g. 51,156 edges). `renderRepaired` /
+    // `renderedSimilarityFamilyEdgeCount` are the terminal render-layer
+    // outcome, patched below AFTER the full-snapshot write actually runs the
+    // rendered-edge floor (the write happens later in the drain, so we start
+    // from honest placeholders and overwrite once the write has executed).
+    // Note: `builtRevisionId` can legitimately differ from `builtEdgeCount`'s
+    // provenance when the HNSW builder reuses persisted edges under a fresh
+    // (hash(empty)-shaped) `expectedSimilarityRevisionId` — that is a REAL
+    // revision the resolver never sees as served, and the render floor +
+    // `renderedSimilarityFamilyEdgeCount` are what make the served-artifact
+    // truth observable, one abstraction below the revision.
+    let similarityFloorDiagnostics: SimilarityFloorDiagnostics = {
       servedRevisionId: visitSimilarity.revisionId,
       builtRevisionId: builtSimilarityRevisionId,
       previousServedEdgeCount: previousServedSimilarityEdgeCount,
@@ -4229,6 +4312,10 @@ export const createConnectionsMaterializer = (
       // publish-seam carry-forward. Exactly one of these three can be true.
       laneUnloadedReuse,
       bootstrapAdopted,
+      // Round-3 render-layer placeholders — overwritten after the write below.
+      renderRepaired: false,
+      renderedSimilarityFamilyEdgeCount:
+        renderedSimilarityFamilyEdgeCountWritten ?? visitSimilarity.edges.length,
     };
     // U2 — similarity-stage wall time for HotPathDiagnostics (the
     // visitSimilarity revision is finalized here).
@@ -4750,7 +4837,46 @@ export const createConnectionsMaterializer = (
     // Pass 7 emits the recovered `visit_resembles_visit` edges into
     // current.db. This is the deterministic version of the live "recovered by
     // luck when a full-corpus drain published last".
-    const similarityRecoveryNeedsBaseRebuild = laneUnloadedReuse || bootstrapAdopted;
+    // Round-3 (T2) — the chunked boot catch-up (requireScopedTimelineDeltaForDrain)
+    // and any warm drain can adopt a non-empty similarity revision WITHOUT
+    // tripping Layer-0 R1/R2 (`laneUnloadedReuse`/`bootstrapAdopted`): the HNSW
+    // builder can return the full ~51k-edge set under a fresh
+    // hash(empty)-shaped `expectedSimilarityRevisionId` (retainedSimilarityEdges
+    // / exactHnswSimilarityEdges over a populated store), so `builtCollapsed` is
+    // false and neither flag fires. If the base then renders from an endpoint-
+    // poor node set — the previously served (already window-poor) snapshot on a
+    // scoped drain, or a window-only timeline — buildConnectionsSnapshot's Pass 7
+    // drops every similarity edge whose endpoint timeline-visit node is absent,
+    // publishing ZERO similarity rows while the revision-level guard read ~51k
+    // and passed (the round-3 defect). Detect the RENDERED gap here — cheap count
+    // comparison (T5): the adopted revision holds materially more similarity
+    // edges than the previously served snapshot currently RENDERS — and force the
+    // full-corpus base rebuild so Pass 7 has the complete timeline-visit node set
+    // to attach the recovered edges to. This is the PRIMARY mechanism (render
+    // from the full corpus node set); the T1 rendered-edge floor in
+    // writeSnapshotWithDrainProgress remains the terminal backstop for any path
+    // this predicate does not pre-empt.
+    const adoptedRevisionSimilarityEdgeCount = visitSimilarity.edges.length;
+    const renderedSimilarityRecoveryNeeded =
+      persistentHnswSimilarityMode &&
+      similarityFloorResetReasons.length === 0 &&
+      adoptedRevisionSimilarityEdgeCount > 0 &&
+      previousServedSimilarityEdgeCount !== null &&
+      // The previous served snapshot renders far fewer similarity rows than the
+      // adopted revision carries → the base (if it reuses that snapshot / a
+      // window-poor timeline) would strip the recovered edges. >10x gap mirrors
+      // the >90%-collapse floor threshold used everywhere else.
+      previousServedSimilarityEdgeCount <
+        adoptedRevisionSimilarityEdgeCount * SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+    const similarityRecoveryNeedsBaseRebuild =
+      laneUnloadedReuse || bootstrapAdopted || renderedSimilarityRecoveryNeeded;
+    if (renderedSimilarityRecoveryNeeded && !laneUnloadedReuse && !bootstrapAdopted) {
+      mark(
+        `renderedSimilarityRecovery.forceBaseRebuild adopted=${String(
+          adoptedRevisionSimilarityEdgeCount,
+        )} prevServedRendered=${String(previousServedSimilarityEdgeCount)}`,
+      );
+    }
     // Rebuild from the COMPLETE event log — `merged` is only the pending
     // WINDOW on a warm drain (both the store-backed path and the
     // readMergedSince path set `merged = pendingEventsForDrain`), so a
@@ -5609,6 +5735,21 @@ export const createConnectionsMaterializer = (
         closestVisitRanker.model.dispose();
       }
     }
+    // Round-3 (T3) — finalize the render-layer fields now that the write has
+    // executed the rendered-edge floor. `renderRepaired` reflects whether the
+    // full-snapshot write had to carry the previous similarity-family rows +
+    // endpoint nodes forward; `renderedSimilarityFamilyEdgeCount` is the count
+    // actually written to current.db (what resolvers read). On the scoped-
+    // delta path (replaceScopeRows, which does not run the render floor)
+    // `renderedSimilarityFamilyEdgeCountWritten` stays null — fall back to
+    // counting `finalSnapshot`, which the scoped path re-read from the store.
+    similarityFloorDiagnostics = {
+      ...similarityFloorDiagnostics,
+      renderRepaired: renderFloorRepaired,
+      renderedSimilarityFamilyEdgeCount:
+        renderedSimilarityFamilyEdgeCountWritten ??
+        countRenderedSimilarityFamilyEdges(finalSnapshot),
+    };
     // PR #141 — write the diagnostics artifact after publishing. Uses
     // `finalSnapshot` so the artifact reflects whichever snapshot the
     // HTTP routes will see.
