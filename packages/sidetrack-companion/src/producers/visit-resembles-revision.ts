@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { VisitSimilarityRevision } from '../connections/types.js';
@@ -64,4 +64,57 @@ export const readVisitSimilarityRevision = async (
   } catch {
     return null;
   }
+};
+
+// Round-2 corpus-flapping fix (R1/R2). Scan the visit-similarity revision
+// store and return the most-recently-written revision whose edge set is
+// non-empty. Used by the materializer to (a) REUSE the last good corpus
+// when a warm delta-only drain assembles an empty window (so it never
+// adopts hash(empty) while a corpus provably exists), and (b) BOOTSTRAP a
+// live vault whose served snapshot has already been wiped to zero back to
+// the last good persisted revision. The empty-corpus hash is a stable id
+// (`f19d…`), so every empty build overwrites the SAME file; the good
+// revisions each have distinct ids and survive alongside it. Ordering by
+// mtime (not by scanning current.db, which is the wiped surface) is what
+// lets the store be the source of truth for recovery.
+//
+// Boundary validation: each candidate file is parsed as `unknown` and
+// validated by `isVisitSimilarityRevision` before it is trusted — a
+// corrupt / partial file is skipped, never returned. Best-effort: a dir
+// read failure (missing dir on a fresh vault) degrades to `null` so a
+// genuinely-empty vault still builds empty legitimately.
+export const readLatestNonEmptyVisitSimilarityRevision = async (
+  vaultRoot: string,
+): Promise<VisitSimilarityRevision | null> => {
+  const dir = visitSimilarityRevisionDir(vaultRoot);
+  let entries: readonly string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return null; // Fresh vault (dir absent) — no persisted corpus to recover.
+  }
+  // Collect (revisionId, mtimeMs) for every finished revision file. Skip
+  // the atomic-write temp files (`<id>.<pid>.tmp`) so we never read a
+  // half-written revision mid-flight from a concurrent drain.
+  const candidates: { readonly revisionId: string; readonly mtimeMs: number }[] = [];
+  for (const name of entries) {
+    if (!name.endsWith('.json')) continue;
+    const revisionId = name.slice(0, -'.json'.length);
+    if (revisionId.length === 0) continue;
+    try {
+      const stats = await stat(join(dir, name));
+      candidates.push({ revisionId, mtimeMs: stats.mtimeMs });
+    } catch {
+      // File vanished between readdir and stat (concurrent prune) — skip.
+    }
+  }
+  // Newest first, so the FIRST non-empty revision we successfully parse is
+  // the latest good corpus. `readdir` order is unspecified, so sort
+  // explicitly rather than relying on it.
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  for (const candidate of candidates) {
+    const revision = await readVisitSimilarityRevision(vaultRoot, candidate.revisionId);
+    if (revision !== null && revision.edges.length > 0) return revision;
+  }
+  return null;
 };
