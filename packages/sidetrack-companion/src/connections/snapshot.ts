@@ -3611,6 +3611,38 @@ const computeSnapshotRevision = (parts: {
   return hasher.digest('hex').slice(0, 16);
 };
 
+// Rendered-edge floor (round-3) — recompute the canonical snapshot metadata
+// (nodeCount/edgeCount/snapshotRevision) after the rendered-similarity-floor
+// carry-forward mutated the node/edge arrays. The projection key counts are
+// unchanged by that carry-forward (it only re-adds similarity-family edges +
+// their endpoint timeline-visit nodes, never touches the projections), so we
+// re-hash over the projection counts held on `base`. Exported so the pure
+// `renderedSimilarityFloor` decider can inject it without importing the
+// snapshot hashing internals.
+export const recomputeSnapshotMetadataForCarriedRows = (
+  base: Pick<ConnectionsSnapshot, 'urlProjection' | 'tabSessionProjection'>,
+  nodes: readonly ConnectionNode[],
+  edges: readonly ConnectionEdge[],
+  updatedAt: string,
+): Pick<ConnectionsSnapshot, 'nodeCount' | 'edgeCount' | 'snapshotRevision' | 'updatedAt'> => ({
+  updatedAt,
+  nodeCount: nodes.length,
+  edgeCount: edges.length,
+  snapshotRevision: computeSnapshotRevision({
+    updatedAt,
+    nodeCount: nodes.length,
+    edgeCount: edges.length,
+    urlProjectionKeyCount:
+      base.urlProjection === undefined
+        ? 0
+        : Object.keys(base.urlProjection.byCanonicalUrl).length,
+    tabSessionProjectionKeyCount:
+      base.tabSessionProjection === undefined
+        ? 0
+        : Object.keys(base.tabSessionProjection.bySessionId).length,
+  }),
+});
+
 export const augmentConnectionsSnapshotWithClosestVisitRanker = (
   input: ConnectionsInput & { readonly closestVisitRanker: ClosestVisitRanker },
   baseSnapshot: ConnectionsSnapshot,

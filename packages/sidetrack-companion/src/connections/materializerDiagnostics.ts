@@ -957,6 +957,14 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
                     )})`
                   : (diagnostics.similarityFloor.allowedResetReason ?? 'ok')
           }`,
+          // Round-3 render-layer surface — the served-artifact truth. The
+          // rendered count is what resolvers actually read from current.db;
+          // RENDER-REPAIRED marks a drain where the terminal rendered-edge
+          // floor carried the previous similarity-family rows + endpoint nodes
+          // forward because a window-poor node set stripped them.
+          `simFloorRendered=${String(
+            diagnostics.similarityFloor.renderedSimilarityFamilyEdgeCount,
+          )}${diagnostics.similarityFloor.renderRepaired ? '(RENDER-REPAIRED)' : ''}`,
           `simFloorSuppressedTotal=${String(diagnostics.similarityFloor.suppressedCollapseCount)}`,
           `simFloorFlapping=${String(diagnostics.similarityFloor.flapping)}`,
         ]),

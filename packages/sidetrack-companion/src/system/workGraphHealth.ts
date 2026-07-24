@@ -924,10 +924,13 @@ const buildDiagnosticCandidates = (input: {
       status:
         similarityFloor === null
           ? 'unavailable'
-          : // CURRENT state only: this drain suppressed, OR the durable
-            // recent-window `flapping` signal is set. NOT the lifetime
-            // count — that would latch `alarm` forever after a single flap.
+          : // CURRENT state only: this drain suppressed, OR the terminal
+            // rendered-edge floor had to repair the served artifact (round 3),
+            // OR the durable recent-window `flapping` signal is set. NOT the
+            // lifetime count — that would latch `alarm` forever after a single
+            // flap.
             booleanOrFalse(similarityFloor['suppressedCollapse']) ||
+              booleanOrFalse(similarityFloor['renderRepaired']) ||
               booleanOrFalse(similarityFloor['flapping'])
             ? 'alarm'
             : 'ok',
@@ -936,11 +939,13 @@ const buildDiagnosticCandidates = (input: {
           ? 'similarity-floor-diagnostics-unavailable'
           : booleanOrFalse(similarityFloor['suppressedCollapse'])
             ? 'suppressed-collapse-this-drain'
-            : booleanOrFalse(similarityFloor['flapping'])
-              ? 'suppressed-collapse-recent'
-              : (stringOrNull(similarityFloor['allowedResetReason']) === null
-                  ? null
-                  : `collapse-allowed:${stringOrNull(similarityFloor['allowedResetReason'])}`),
+            : booleanOrFalse(similarityFloor['renderRepaired'])
+              ? 'rendered-collapse-repaired-this-drain'
+              : booleanOrFalse(similarityFloor['flapping'])
+                ? 'suppressed-collapse-recent'
+                : (stringOrNull(similarityFloor['allowedResetReason']) === null
+                    ? null
+                    : `collapse-allowed:${stringOrNull(similarityFloor['allowedResetReason'])}`),
       revisionId: stringOrNull(similarityFloor?.['servedRevisionId']),
       asOf: diagnosticsObservedAt,
       metrics: metrics({
@@ -956,6 +961,13 @@ const buildDiagnosticCandidates = (input: {
         servedEdgeCount: numberOrNull(similarityFloor?.['servedEdgeCount']),
         allowedResetReason: stringOrNull(similarityFloor?.['allowedResetReason']),
         builtRevisionId: stringOrNull(similarityFloor?.['builtRevisionId']),
+        // Round-3 render-layer — the served-artifact truth (what resolvers
+        // read from current.db) + whether the terminal floor repaired it.
+        renderRepaired:
+          similarityFloor === null ? null : booleanOrFalse(similarityFloor['renderRepaired']),
+        renderedSimilarityFamilyEdgeCount: numberOrNull(
+          similarityFloor?.['renderedSimilarityFamilyEdgeCount'],
+        ),
       }),
     },
     {
