@@ -54,6 +54,7 @@ These standards govern all production code. They apply per component
 | [`standards/01-api-component.md`](standards/01-api-component.md) | Any HTTP API surface (companion's localhost API, future external endpoints). Contract-first OpenAPI, resource-oriented design, error shape, idempotency, pagination, authz. |
 | [`standards/02-mcp-components.md`](standards/02-mcp-components.md) | MCP server (`bac-mcp` reader), any MCP host work, any MCP tool/resource/prompt the companion exposes. Capability registry, lifecycle, safety, consent, transport. |
 | [`standards/03-ts-browser-plugin.md`](standards/03-ts-browser-plugin.md) | The Chrome MV3 extension. Service-worker lifecycle, typed message bus, content-script isolation, permission minimization, storage migrations. |
+| [`docs/DEBUGGING_DOCTRINE.md`](docs/DEBUGGING_DOCTRINE.md) | **Any diagnosis, regression report, or fix to signal-carrying pipelines. Read BEFORE predicting behavior or closing a report as "designed this way."** Evidence-before-prediction, absent≠empty, served-signal floors, read-back acceptance tests, the signal-flow map, and the verified diagnostic toolkit. Born from the 2026-07 incident week; binding. |
 
 Per-feature documentation requirement (from `CODING_STANDARDS.md` §"Documentation required per feature"):
 

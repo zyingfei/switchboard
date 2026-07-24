@@ -4,7 +4,7 @@ import {
   probabilityFromLogit,
 } from '../suggestion/confidence';
 import { suggestionStateFrom } from './resolveOutcome';
-import { endorsementFor } from './suggestionEndorsement';
+import { dominantSourceLabel, endorsementFor } from './suggestionEndorsement';
 import type {
   ResolveOutcomeError,
   TabSessionResolutionResult,
@@ -26,19 +26,6 @@ import type {
 //     row, against the same resolver (tabsession-resolver-v1).
 //   - `dominantSource`: which signal weighed most (ppr / similarity /
 //     cluster).
-
-const sourceLabel = (source: 'ppr' | 'similarity' | 'cluster' | 'none'): string => {
-  switch (source) {
-    case 'ppr':
-      return 'related visits';
-    case 'similarity':
-      return 'similar content';
-    case 'cluster':
-      return 'topic cluster';
-    case 'none':
-      return 'no signal';
-  }
-};
 
 const workstreamLabel = (
   workstreamId: string | undefined,
@@ -146,10 +133,10 @@ export function SuggestionStats({
     return (
       <div className="suggestion-stats is-loading">
         <span className="suggestion-stats-row">
-          <span className="suggestion-stats-target subtle">Checking signals…</span>
+          <span className="suggestion-stats-target subtle">Checking connections…</span>
         </span>
         <span className="suggestion-stats-source mono subtle">
-          Asking the companion for related visits, similarity, and topic membership
+          Asking the companion for related visits, similar pages, and topic membership
         </span>
       </div>
     );
@@ -289,7 +276,7 @@ export function SuggestionStats({
     `· raw logit ${top.rawFusionLogit.toFixed(2)} ` +
     `(higher = stronger lean, typically -5 to +5).\n` +
     `· margin to runner-up ${margin.toFixed(2)} (bigger = clearer winner).\n` +
-    `· dominant signal ${top.dominantSource} — ${sourceLabel(top.dominantSource)}.`;
+    `· dominant signal ${top.dominantSource} — ${dominantSourceLabel(top.dominantSource)}.`;
   const alternatives = showAlts
     ? suggestion.fusedCandidates.slice(1, 3).map((cand) => {
         const altProbability = probabilityFromLogit(cand.rawFusionLogit);
@@ -309,7 +296,7 @@ export function SuggestionStats({
   const detail = (
     <>
       <span className="suggestion-stats-source mono">
-        signal: {top.dominantSource} ({sourceLabel(top.dominantSource)}) · margin{' '}
+        signal: {top.dominantSource} ({dominantSourceLabel(top.dominantSource)}) · margin{' '}
         {margin.toFixed(2)}
       </span>
       {alternatives.length > 0 ? (

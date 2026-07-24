@@ -111,6 +111,11 @@ describe('decideSimilarityFloorGuard', () => {
     'store-corruption-recovery',
     'privacy-purge',
     'operator-rebuild',
+    // A corpus-config flip (clean-corpus / content-corpus) legitimately
+    // recomputes every edge, so the intentional collapse MUST publish rather
+    // than carry the stale dirty revision forward (findings B4/B5). This asserts
+    // the guard honours the new reason.
+    'corpus-config-change',
   ];
 
   for (const reason of resetReasons) {

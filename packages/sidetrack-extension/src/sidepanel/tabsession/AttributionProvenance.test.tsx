@@ -137,4 +137,129 @@ describe('AttributionProvenance honesty', () => {
     );
     expect(screen.getByText('No attribution')).toBeDefined();
   });
+
+  // --- Auto-file provenance (the user's ask): when the resolver auto-applied
+  // an attribution (currentAttribution.source='inferred'), make WHERE it came
+  // from + HOW confident explicit — in plain words — instead of a bare
+  // "Attributed by Sidetrack".
+  describe('auto-file provenance (inferred attribution)', () => {
+    const inferredRecord = (): TabSessionRecord =>
+      record({
+        currentAttribution: {
+          workstreamId: 'ws-1',
+          source: 'inferred',
+          observedAt: '2026-07-24T00:00:00.000Z',
+          clientEventId: 'evt_1',
+        },
+      });
+
+    it('says "Auto-filed" with the plain-word source (similarity → similar pages)', () => {
+      render(
+        <AttributionProvenance
+          record={inferredRecord()}
+          suggestion={resolution({ action: 'auto-apply', workstreamId: 'ws-1', margin: 1.2 }, [
+            candidate({
+              dominantSource: 'similarity',
+              rawFusionLogit: 2.5,
+              reasons: [{ source: 'similarity', summary: 'Similarity top 0.9', anchors: [] }],
+            }),
+          ])}
+          workstreams={workstreams}
+        />,
+      );
+      expect(screen.getByText('Auto-filed')).toBeDefined();
+      // Plain words, not the jargon enum "similarity".
+      expect(screen.getByText(/similar pages/)).toBeDefined();
+      expect(screen.queryByText(/Attributed by Sidetrack/)).toBeNull();
+    });
+
+    it('maps ppr → "browsing path" and cluster → "topic"', () => {
+      const { rerender } = render(
+        <AttributionProvenance
+          record={inferredRecord()}
+          suggestion={resolution({ action: 'auto-apply', workstreamId: 'ws-1', margin: 1.2 }, [
+            candidate({ dominantSource: 'ppr', rawFusionLogit: 2.5 }),
+          ])}
+          workstreams={workstreams}
+        />,
+      );
+      expect(screen.getByText(/browsing path/)).toBeDefined();
+
+      rerender(
+        <AttributionProvenance
+          record={inferredRecord()}
+          suggestion={resolution({ action: 'auto-apply', workstreamId: 'ws-1', margin: 1.2 }, [
+            candidate({
+              dominantSource: 'cluster',
+              rawFusionLogit: 2.5,
+              reasons: [{ source: 'cluster', summary: 'Topic 0.8', anchors: [] }],
+            }),
+          ])}
+          workstreams={workstreams}
+        />,
+      );
+      // "· topic" is the plain-word source span (the reason chip says
+      // "topic cluster"); assert the source span specifically.
+      expect(screen.getByText('· topic')).toBeDefined();
+    });
+
+    it('shows a coarse confidence word (High for a strong logit), never a raw %', () => {
+      const { container } = render(
+        <AttributionProvenance
+          record={inferredRecord()}
+          suggestion={resolution({ action: 'auto-apply', workstreamId: 'ws-1', margin: 1.2 }, [
+            // sigmoid(2.5) ≈ 0.924 → High
+            candidate({ dominantSource: 'similarity', rawFusionLogit: 2.5 }),
+          ])}
+          workstreams={workstreams}
+        />,
+      );
+      expect(screen.getByText(/High confidence/)).toBeDefined();
+      // The uncalibrated raw % must not leak onto the card.
+      expect(container.textContent).not.toMatch(/9\d%/);
+    });
+
+    it('marks the row as reversible in the tooltip', () => {
+      const { container } = render(
+        <AttributionProvenance
+          record={inferredRecord()}
+          suggestion={resolution({ action: 'auto-apply', workstreamId: 'ws-1', margin: 1.2 }, [
+            candidate({ dominantSource: 'similarity', rawFusionLogit: 2.5 }),
+          ])}
+          workstreams={workstreams}
+        />,
+      );
+      const row = container.querySelector('[data-attribution-source="inferred"]');
+      expect(row).not.toBeNull();
+      expect(row?.getAttribute('title')).toMatch(/Reversible/);
+    });
+
+    it('degrades gracefully to just "Auto-filed" when the resolver result is gone', () => {
+      // The resolve cache can be evicted after the auto-apply; the label +
+      // "Auto-filed" verb must still render (no crash, no bare bac_id).
+      render(
+        <AttributionProvenance record={inferredRecord()} workstreams={workstreams} />,
+      );
+      expect(screen.getByText('Auto-filed')).toBeDefined();
+      expect(screen.getByText(/Research \/ Probability/)).toBeDefined();
+    });
+
+    it('keeps the plain "Attributed by you" line for a user-asserted move', () => {
+      render(
+        <AttributionProvenance
+          record={record({
+            currentAttribution: {
+              workstreamId: 'ws-1',
+              source: 'user_asserted',
+              observedAt: '2026-07-24T00:00:00.000Z',
+              clientEventId: 'evt_2',
+            },
+          })}
+          workstreams={workstreams}
+        />,
+      );
+      expect(screen.getByText(/Attributed by you/)).toBeDefined();
+      expect(screen.queryByText('Auto-filed')).toBeNull();
+    });
+  });
 });

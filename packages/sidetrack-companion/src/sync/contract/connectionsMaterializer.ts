@@ -217,6 +217,7 @@ import {
 import {
   buildVisitSimilarityIncremental,
   corpusForVisitEntry,
+  similarityCorpusConfigSignature,
   visitKeyForVisitEntry,
   VISIT_SIMILARITY_DEFAULT_THRESHOLD,
   VISIT_SIMILARITY_DEFAULT_TOP_K,
@@ -3485,6 +3486,23 @@ export const createConnectionsMaterializer = (
     if (similarityFloorOperatorRebuildRequested()) {
       similarityFloorResetReasons.push('operator-rebuild');
     }
+    // Corpus-config change — a corpus-shaping flag flipped (clean-corpus /
+    // content-corpus) since the currently served revision was built. Every
+    // visit's embedded corpus TEXT changed, so the served edges are stale and
+    // the recompute is intended (mirrors the same-dimension model-change reset
+    // above: compare the durable served signature against the live one). A null
+    // recorded signature means a pre-signature vault (upgrade); treat it as a
+    // match so an in-place upgrade never spuriously resets. This reset makes the
+    // flip LAND: it drives the full HNSW rebuild below (re-embed every visit
+    // under the clean corpus) AND lets the floor guard PUBLISH the recompute
+    // instead of carrying the dirty revision forward.
+    const liveCorpusConfigSignature = similarityCorpusConfigSignature();
+    const corpusConfigChanged =
+      similarityFloorState.servedCorpusConfigSignature !== null &&
+      similarityFloorState.servedCorpusConfigSignature !== liveCorpusConfigSignature;
+    if (corpusConfigChanged) {
+      similarityFloorResetReasons.push('corpus-config-change');
+    }
     // The drift heuristic forces a full HNSW rebuild (which RESETS the
     // persisted index + returns edges:[] on an empty eligible corpus) when
     // the eligible set collapses relative to the known store. On a warm
@@ -3515,6 +3533,11 @@ export const createConnectionsMaterializer = (
         (existingProgress !== null &&
           existingProgress.materializerVersion !== MATERIALIZER_VERSION) ||
         (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
+        // A corpus-config flip changes every visit's embedded text, so the
+        // whole corpus must be re-embedded (the persisted HNSW vectors are the
+        // OLD dirty corpus). Force the full rebuild so the clean corpus reaches
+        // the ~3k already-persisted visits, not just new ones.
+        corpusConfigChanged ||
         (driftRequiresFullRebuild && !driftWouldWipeServedSignal));
     const fullPageEvidenceEnsure =
       previousSnapshotForRanker === null ||
@@ -4001,13 +4024,39 @@ export const createConnectionsMaterializer = (
       // at build time, already baked into `edges`), so `threshold` — the only
       // config field Pass 7 re-applies at serve time — plus the model
       // identity/revision/schema are the load-bearing provenance fields.
+      // Corpus-config provenance for R1 reuse. The persisted revision does NOT
+      // carry a corpus-config signature field, so we cannot read it off the
+      // revision directly. Two guards cover the reuse hazard:
+      //   1. The COMMON case (durable signature recorded and differs from live):
+      //      `corpus-config-change` is already in `similarityFloorResetReasons`,
+      //      so `hasLegitimateResetReason` is true and the reuse branch below is
+      //      skipped entirely. No provenance check needed for this case.
+      //   2. The RESIDUAL edge case the model-change guard also warns about: a
+      //      FRESH / lost floor-state file records a null served signature, so
+      //      `corpusConfigChanged` is false and the reset reason does not fire —
+      //      yet the persisted revision may have been built under a DIFFERENT
+      //      corpus config. When the live corpus config is NON-DEFAULT (a
+      //      clean/content flag is on) and we have no recorded signature to
+      //      prove the persisted revision was built under it, we cannot vouch
+      //      for its provenance, so we must NOT reuse it (let the fresh build
+      //      recompute under the live corpus). Default config with a null
+      //      signature is safe (the persisted revision could only have been the
+      //      legacy skeleton, which IS the live config).
+      const liveCorpusConfigIsDefault = liveCorpusConfigSignature === 'legacy-skeleton|title-corpus';
+      const corpusConfigProvenanceUnknownButNonDefault =
+        similarityFloorState.servedCorpusConfigSignature === null && !liveCorpusConfigIsDefault;
       const persistedRevisionMatchesLiveProvenance = (
         persisted: VisitSimilarityRevision,
       ): boolean =>
         persisted.threshold === similarityConfig.threshold &&
         persisted.modelId === VISIT_SIMILARITY_MODEL_ID &&
         persisted.modelRevision === RECALL_MODEL.revision &&
-        persisted.featureSchemaVersion === VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION;
+        persisted.featureSchemaVersion === VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION &&
+        // Reject reuse when the corpus config changed (covered by the reset
+        // reason too, belt-and-suspenders) or its provenance is unprovable under
+        // a non-default live config.
+        !corpusConfigChanged &&
+        !corpusConfigProvenanceUnknownButNonDefault;
       // A built revision "collapsed" relative to the persisted corpus when
       // it is empty, or dropped below 10% of the previously served edges
       // (mirrors the floor guard's >90% threshold). We only need the reuse
@@ -4268,6 +4317,18 @@ export const createConnectionsMaterializer = (
       // model; a genuine publish records the live built model revision.
       // `visitSimilarity` already IS the served revision post-Layer-0/guard.
       servedModelRevision: visitSimilarity.modelRevision,
+      // Record the corpus-config signature only when this drain PUBLISHED a
+      // freshly-built revision under the live corpus config. When the served
+      // revision was carried-forward / reused / bootstrapped, the served edges
+      // are the persisted (possibly old-corpus) revision, so we leave the
+      // recorded signature UNCHANGED (pass null). This is what makes the reset
+      // fire exactly ONCE: after the corpus flip's full rebuild publishes the
+      // clean revision, the recorded signature advances to the live one and the
+      // `corpus-config-change` reset stops firing on subsequent drains.
+      servedCorpusConfigSignature:
+        !carriedForward && !laneUnloadedReuse && !bootstrapAdopted
+          ? liveCorpusConfigSignature
+          : null,
     });
     // Persist the durable state (best-effort — observability/guard state
     // must never fail a drain).

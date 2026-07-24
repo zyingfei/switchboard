@@ -21,6 +21,7 @@ import type {
   WeightedEntity,
   WeightedTerm,
 } from '../page-evidence/types.js';
+import { stripSiteTitleSuffix } from '../ranker/aggregatorProfiles.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { buildLexicalIndex, rankHybrid, type IndexEntry } from '../recall/ranker.js';
 import type { TimelineEntry } from '../timeline/projection.js';
@@ -244,6 +245,46 @@ const hostnameForUrl = (url: string): string => {
 export const similarityContentCorpusEnabled = (): boolean =>
   process.env['SIDETRACK_SIMILARITY_CONTENT_CORPUS'] === '1';
 
+// Corpus-cleaning gate (default OFF). See corpusForVisitEntry below for the
+// measured root-cause. When ON, the embedded title-only corpus drops the
+// hostname + path-token skeleton and strips known site-title suffixes, so the
+// shared URL skeleton stops inflating same-site cosine. This is a SERVING-edge
+// change: every visit's corpus TEXT changes, so every visit must be re-embedded
+// and the served edges recomputed. Per the repo's serving-flip discipline
+// (ADR-0011 / DEBUGGING_DOCTRINE) it ships DEFAULT-OFF: served edges stay
+// byte-identical until the connections-precision eval spine clears the flip.
+// Enable with SIDETRACK_SIMILARITY_CLEAN_CORPUS=1 (+ restart).
+//
+// PROPAGATION (do not repeat the earlier design error): flipping this flag does
+// NOT by itself re-embed the ~3k already-persisted visits. The FEATURE_SCHEMA_
+// VERSION is a fixed constant (it is not bumped by the flag), the HNSW store is
+// keyed by embedding DIMENSION (unchanged by a corpus flip), and the warm /
+// incremental paths are append-only + idempotent on existing visitKeys — so the
+// persisted store keeps the OLD dirty vectors and only NEW visitKeys would get
+// the clean corpus. The flip is made to actually take effect by
+// `similarityCorpusConfigSignature()` below: the materializer records the served
+// signature in durable floor state and, when it differs from the live one,
+// (a) pushes a `corpus-config-change` reset reason so the floor guard PUBLISHES
+// the recompute instead of carrying the dirty revision forward, (b) forces a
+// full HNSW rebuild so every visit re-embeds under the clean corpus, and
+// (c) rejects reusing a persisted revision built under the other corpus config.
+export const SIMILARITY_CLEAN_CORPUS_ENV = 'SIDETRACK_SIMILARITY_CLEAN_CORPUS';
+export const similarityCleanCorpusEnabled = (): boolean =>
+  process.env[SIMILARITY_CLEAN_CORPUS_ENV] === '1';
+
+// A stable signature of the CORPUS-shaping config — the set of flags that change
+// the embedded corpus TEXT for existing visits (and therefore every served
+// same-site cosine). Recorded in durable floor state so the materializer can
+// detect a config flip across restarts and drive a recorded reset (see the
+// PROPAGATION note above). Default config yields the frozen `legacy-skeleton`
+// signature so a default-OFF process is byte-identical (no reset ever fires).
+export const similarityCorpusConfigSignature = (): string => {
+  const parts: string[] = [];
+  parts.push(similarityCleanCorpusEnabled() ? 'clean-title-only' : 'legacy-skeleton');
+  parts.push(similarityContentCorpusEnabled() ? 'content-corpus' : 'title-corpus');
+  return parts.join('|');
+};
+
 // Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
 // from outside this module. They're stateless + cheap; expose as named
 // exports so the materializer can compute pre-embedding inputs.
@@ -265,6 +306,31 @@ const evidenceForEntry = (
   return evidenceByCanonicalUrl.get(visitKey);
 };
 
+// The embedded corpus for a visit when no content evidence is available
+// (the title-only skeleton path).
+//
+// ROOT-CAUSE (measured, 2026-07-24 with the real multilingual-e5-small
+// encoder over real HN item titles): appending `hostname + pathTokens`
+// (`news.ycombinator.com item`) to the title inflates same-site cosine by
+// ≈ +0.03 — enough to push unrelated HN item pairs from 0/45 above the 0.85
+// gate to ~7/45. Stripping the shared `| Hacker News` title suffix helps a
+// little more (≈ +0.02). This host/path skeleton — NOT the title suffix — is the
+// primary false-friend engine the B1–B4 aggregator guards were compensating
+// for downstream. Baking host/path into the embedding ALSO double-counts them:
+// they already flow as separate structured candidate sources
+// (same_repo_or_domain, same_title_path_tokens) with their own weights.
+//
+// The clean path therefore embeds the title ONLY, with a known site-title
+// suffix stripped. Guarded behind SIDETRACK_SIMILARITY_CLEAN_CORPUS so the flip
+// is byte-identical until the eval spine scores it (see the flag above).
+export const cleanCorpusText = (title: string, url: string): string => {
+  if (similarityCleanCorpusEnabled()) {
+    return normalizeSpaces(stripSiteTitleSuffix(title, hostnameForUrl(url)));
+  }
+  // Frozen legacy skeleton (default): title + host + path tokens.
+  return normalizeSpaces([title, hostnameForUrl(url), ...pathTokensForUrl(url)].join(' '));
+};
+
 export const corpusForVisitEntry = (
   entry: VisitSimilarityEntry,
   evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>,
@@ -272,9 +338,7 @@ export const corpusForVisitEntry = (
   const evidence = evidenceForEntry(entry, evidenceByCanonicalUrl);
   if (evidence !== undefined) return evidenceCorpusForRecord(evidence);
   const url = entry.canonicalUrl ?? entry.url;
-  return normalizeSpaces(
-    [entry.title ?? '', hostnameForUrl(url), ...pathTokensForUrl(url)].join(' '),
-  );
+  return cleanCorpusText(entry.title ?? '', url);
 };
 
 export const visitKeyForVisitEntry = (entry: VisitSimilarityEntry): string =>

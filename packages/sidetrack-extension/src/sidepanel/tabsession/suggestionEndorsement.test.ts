@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  dominantSourceLabel,
   endorsementFor,
   hostFromUrl,
   isAggregatorHost,
@@ -148,5 +149,14 @@ describe('hostFromUrl', () => {
     expect(hostFromUrl('https://news.ycombinator.com/item?id=1')).toBe('news.ycombinator.com');
     expect(hostFromUrl('not a url')).toBeUndefined();
     expect(hostFromUrl(undefined)).toBeUndefined();
+  });
+});
+
+describe('dominantSourceLabel', () => {
+  it('maps the resolver enum to plain, concrete words', () => {
+    expect(dominantSourceLabel('ppr')).toBe('browsing path');
+    expect(dominantSourceLabel('similarity')).toBe('similar pages');
+    expect(dominantSourceLabel('cluster')).toBe('topic');
+    expect(dominantSourceLabel('none')).toBe('no clear signal');
   });
 });

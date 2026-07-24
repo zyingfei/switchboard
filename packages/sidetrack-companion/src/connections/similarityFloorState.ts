@@ -90,6 +90,15 @@ export interface SimilarityFloorState {
   // legitimate model-change reset (NOT only a dimension mismatch). null
   // until the first published revision records it.
   readonly servedModelRevision: string | null;
+  // The corpus-shaping config signature (see similarityCorpusConfigSignature)
+  // that produced the currently served similarity edges. When the live
+  // signature differs, every visit's embedded corpus text has changed, so the
+  // served edges are stale and their collapse is a legitimate
+  // `corpus-config-change` reset (mirrors servedModelRevision). null until the
+  // first published revision records it — a null is treated as "matches" so a
+  // pre-existing vault (no signature recorded yet) does not spuriously reset on
+  // upgrade.
+  readonly servedCorpusConfigSignature: string | null;
 }
 
 export const EMPTY_SIMILARITY_FLOOR_STATE: SimilarityFloorState = {
@@ -102,6 +111,7 @@ export const EMPTY_SIMILARITY_FLOOR_STATE: SimilarityFloorState = {
   purgeResetArmedEpoch: 0,
   purgeResetConsumedEpoch: 0,
   servedModelRevision: null,
+  servedCorpusConfigSignature: null,
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -134,6 +144,7 @@ export const parseSimilarityFloorState = (value: unknown): SimilarityFloorState 
     purgeResetArmedEpoch: Math.max(0, numberOr(value['purgeResetArmedEpoch'], 0)),
     purgeResetConsumedEpoch: Math.max(0, numberOr(value['purgeResetConsumedEpoch'], 0)),
     servedModelRevision: stringOrNull(value['servedModelRevision']),
+    servedCorpusConfigSignature: stringOrNull(value['servedCorpusConfigSignature']),
   };
 };
 
@@ -171,12 +182,24 @@ export const foldSimilarityFloorDrain = (
     // materializer passes the carried revision's modelRevision here (not
     // the live one) to keep the recorded provenance honest.
     readonly servedModelRevision: string | null;
+    // The corpus-shaping config signature the drain PUBLISHED with. On a
+    // carry-forward / reuse the served edges keep the OLD corpus config, so the
+    // materializer passes the carried config's signature here (null when the
+    // drain does not know it, leaving the recorded value unchanged) to keep the
+    // recorded provenance honest — exactly like servedModelRevision.
+    readonly servedCorpusConfigSignature?: string | null;
   },
 ): SimilarityFloorState => {
   let next: SimilarityFloorState =
     drain.servedModelRevision === null
       ? state
       : { ...state, servedModelRevision: drain.servedModelRevision };
+  if (
+    drain.servedCorpusConfigSignature !== undefined &&
+    drain.servedCorpusConfigSignature !== null
+  ) {
+    next = { ...next, servedCorpusConfigSignature: drain.servedCorpusConfigSignature };
+  }
   // Arm the purge reset epoch when a tombstone was observed.
   if (drain.purgeObservedThisDrain) {
     next = { ...next, purgeResetArmedEpoch: next.purgeResetArmedEpoch + 1 };

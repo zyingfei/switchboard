@@ -66,6 +66,7 @@ describe('parseSimilarityFloorState', () => {
       purgeResetArmedEpoch: 3,
       purgeResetConsumedEpoch: 2,
       servedModelRevision: 'r9',
+      servedCorpusConfigSignature: 'legacy-skeleton|title-corpus',
     };
     expect(parseSimilarityFloorState(state)).toEqual(state);
   });
@@ -135,6 +136,27 @@ describe('foldSimilarityFloorDrain', () => {
     expect(s1.servedModelRevision).toBe('r-new');
     const s2 = foldSimilarityFloorDrain(s1, { ...cleanDrain, servedModelRevision: null });
     expect(s2.servedModelRevision).toBe('r-new');
+  });
+
+  it('records servedCorpusConfigSignature on a fresh publish, keeps prior when null/absent', () => {
+    // Findings B4/B5: the recorded signature is how the corpus-config reset
+    // fires exactly ONCE. A genuine publish records the live signature; a
+    // carry-forward / reuse (which serves the OLD-corpus revision) passes null
+    // and MUST leave the recorded value unchanged.
+    const s1 = foldSimilarityFloorDrain(EMPTY_SIMILARITY_FLOOR_STATE, {
+      ...cleanDrain,
+      servedCorpusConfigSignature: 'clean-title-only|title-corpus',
+    });
+    expect(s1.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+    // null (carry-forward / reuse) leaves it unchanged.
+    const s2 = foldSimilarityFloorDrain(s1, {
+      ...cleanDrain,
+      servedCorpusConfigSignature: null,
+    });
+    expect(s2.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+    // absent (older call site) also leaves it unchanged.
+    const s3 = foldSimilarityFloorDrain(s2, cleanDrain);
+    expect(s3.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
   });
 });
 

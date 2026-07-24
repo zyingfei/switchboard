@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import {
+  matchesNoCaptureRules,
+  type NoCaptureRule,
+} from '../../capture/noCaptureRules';
 import { InMemoryEventBuffer } from '../storage/in-memory-event-buffer';
 import { createTabOpenerStore } from './tabs';
 import {
@@ -177,5 +181,99 @@ describe('web-navigation capture gate (pause-bypass regression)', () => {
     });
 
     expect(await buffer.count()).toBe(1);
+  });
+});
+
+// End-to-end scope regression for the meet.google.com bug. Instead of a
+// hand-mocked gate, this wires the REAL no-capture matcher into the gate
+// exactly the way background.ts composes it
+// (`!matchesNoCaptureRules({ url }, rules)`), so it proves the listener
+// buffers/ships google.com traffic even when meet.google.com is blocked.
+describe('web-navigation capture gate × host-scoped no-capture rule', () => {
+  const gateForRules =
+    (rules: readonly NoCaptureRule[]) =>
+    async (url: string): Promise<boolean> =>
+      !matchesNoCaptureRules({ url }, rules);
+
+  // The exact shape the "Don't capture <site>" action produces for a click
+  // on meet.google.com (host-scoped: domain=eTLD+1 for the label, host=the
+  // exact host that drives matching).
+  const meetHostRule: NoCaptureRule = {
+    id: 'ncr_meet',
+    kind: 'domain',
+    domain: 'google.com',
+    host: 'meet.google.com',
+    label: 'meet.google.com',
+    createdAt: '2026-07-24T00:00:00.000Z',
+  };
+
+  it('BUFFERS NOTHING for the blocked host (meet.google.com)', async () => {
+    const { buffer, listener } = makeListener({
+      isCaptureAllowedForUrl: gateForRules([meetHostRule]),
+    });
+
+    await listener.handleCommitted({
+      tabId: 1,
+      frameId: 0,
+      url: 'https://meet.google.com/abc-defg-hij',
+      timeStamp: 100,
+      transitionType: 'typed',
+      transitionQualifiers: [],
+    });
+
+    expect(await buffer.count()).toBe(0);
+  });
+
+  it('STILL BUFFERS the rest of the google.com family (the bug: it did not)', async () => {
+    const { buffer, listener } = makeListener({
+      isCaptureAllowedForUrl: gateForRules([meetHostRule]),
+    });
+
+    // google.com apex + a sibling host — both must remain captured.
+    await listener.handleCommitted({
+      tabId: 1,
+      frameId: 0,
+      url: 'https://www.google.com/search?q=weather',
+      timeStamp: 100,
+      transitionType: 'typed',
+      transitionQualifiers: [],
+    });
+    await listener.handleCommitted({
+      tabId: 2,
+      frameId: 0,
+      url: 'https://mail.google.com/mail/u/0',
+      timeStamp: 200,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    const urls = (await payloads(buffer)).map((p) => p.url);
+    expect(urls).toContain('https://www.google.com/search?q=weather');
+    expect(urls).toContain('https://mail.google.com/mail/u/0');
+    expect(await buffer.count()).toBe(2);
+  });
+
+  it('a legacy family-wide rule (no host) still blocks the whole family', async () => {
+    const legacyFamilyRule: NoCaptureRule = {
+      id: 'ncr_legacy',
+      kind: 'domain',
+      domain: 'google.com',
+      label: 'google.com',
+      createdAt: '2026-07-11T00:00:00.000Z',
+    };
+    const { buffer, listener } = makeListener({
+      isCaptureAllowedForUrl: gateForRules([legacyFamilyRule]),
+    });
+
+    await listener.handleCommitted({
+      tabId: 1,
+      frameId: 0,
+      url: 'https://mail.google.com/mail/u/0',
+      timeStamp: 100,
+      transitionType: 'link',
+      transitionQualifiers: [],
+    });
+
+    expect(await buffer.count()).toBe(0);
   });
 });
