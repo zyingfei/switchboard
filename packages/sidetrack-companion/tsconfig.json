@@ -8,7 +8,13 @@
     "paths": {
       "@/*": ["src/*"]
     },
-    "types": ["node", "vitest"]
+    "types": ["node", "vitest"],
+    // Default typecheck config never emits — an in-place `tsc -p tsconfig.json`
+    // used to drop .js/.d.ts shadow files under src/ that `bun test` silently
+    // prefers over the .ts sources (this poisoned verification twice in the
+    // 2026-07 incident week). The build gate (tsconfig.build.json) overrides
+    // this with outDir/rootDir so dist/ emission is unaffected.
+    "noEmit": true
   },
   "include": ["src/**/*.ts", "vitest.config.ts"],
   "exclude": ["dist", "node_modules"]

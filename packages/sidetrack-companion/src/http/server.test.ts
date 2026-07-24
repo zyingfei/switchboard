@@ -2156,6 +2156,19 @@ describe('companion HTTP server', () => {
     expect(health.body).toMatchObject({
       data: { workGraph: { ann: { backend: expect.stringMatching(/^(hnsw|flat)$/u) } } },
     });
+    // Close the loop through the REAL route (envelope + auth + serialization):
+    // the reliability section — which the panel polls as data.reliability —
+    // must survive the full response, not just the assembly helpers. No canary
+    // is registered in this HTTP context, so the folded section reports
+    // 'idle', but the FIELD must be present (a served-signal that silently
+    // dropped out of the envelope would render as absent to the panel).
+    const reliability = (
+      health.body as {
+        readonly data?: { readonly reliability?: { readonly resolveCanary?: { status?: unknown } } };
+      }
+    ).data?.reliability;
+    expect(reliability?.resolveCanary).toBeDefined();
+    expect(typeof reliability?.resolveCanary?.status).toBe('string');
   });
 
   it('serves the drain-time workGraph health artifact instead of the live compute', async () => {

@@ -144,6 +144,65 @@ describe('POST /v1/privacy/domain-tombstone', () => {
     await new Promise((r) => setTimeout(r, 60));
   };
 
+  const seedSiblingHosts = async (): Promise<void> => {
+    const events = [
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 1,
+        payload: observe({
+          observedAt: '2026-07-10T10:00:00.000Z',
+          url: 'https://meet.google.com/abc-defg-hij',
+          canonicalUrl: 'https://meet.google.com/abc-defg-hij',
+          title: 'Meet',
+        }),
+      }),
+      buildEvent({
+        edgeReplicaId: 'edge_test',
+        seq: 2,
+        payload: observe({
+          observedAt: '2026-07-10T11:00:00.000Z',
+          url: 'https://mail.google.com/mail/u/0',
+          canonicalUrl: 'https://mail.google.com/mail/u/0',
+          title: 'Mail',
+        }),
+      }),
+    ];
+    await post('/v1/timeline/events', { events }, extHeaders('seed-sibling-hosts'));
+    await new Promise((r) => setTimeout(r, 60));
+  };
+
+  it('host-scoped tombstone hides only the host family; sibling host survives', async () => {
+    await seedSiblingHosts();
+    const before = await getTimeline();
+    expect(before.ids).toContain('https://meet.google.com/abc-defg-hij');
+    expect(before.ids).toContain('https://mail.google.com/mail/u/0');
+
+    // Host-scoped purge of meet.google.com only.
+    const res = await post(
+      '/v1/privacy/domain-tombstone',
+      { kind: 'domain', domain: 'google.com', host: 'meet.google.com' },
+      extHeaders('tombstone-meet-host'),
+    );
+    expect(res.status).toBe(201);
+    expect(res.data).toMatchObject({
+      data: { tombstoned: true, domain: 'google.com', host: 'meet.google.com' },
+    });
+
+    // Serve boundary: the host family is hidden, the SIBLING host SURVIVES.
+    const after = await getTimeline();
+    expect(after.ids).not.toContain('https://meet.google.com/abc-defg-hij');
+    expect(after.ids).toContain('https://mail.google.com/mail/u/0');
+  });
+
+  it('rejects a host that does not belong to the domain family', async () => {
+    const res = await post(
+      '/v1/privacy/domain-tombstone',
+      { kind: 'domain', domain: 'google.com', host: 'meet.example.com' },
+      extHeaders('tombstone-bad-host'),
+    );
+    expect(res.status).toBe(400);
+  });
+
   it('hides tombstoned-domain visits from GET /v1/timeline; leaves others', async () => {
     await seedTimeline();
     const before = await getTimeline();

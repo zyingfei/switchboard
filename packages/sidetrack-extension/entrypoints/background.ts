@@ -1,6 +1,7 @@
 import { defineBackground } from 'wxt/utils/define-background';
 
 import { captureGenericTab } from '../src/capture/genericFallback';
+import { buildDomainTombstonePurgeBody } from '../src/capture/purgePayload';
 import {
   matchesNoCaptureRules,
   registrableDomainFromUrl,
@@ -3864,11 +3865,10 @@ const handleRequest = async (
     // append-only JSONL log is not rewritten (a full offline scrub is a
     // separate future tool). Requires a configured companion.
     return await withCompanionStatus(async () => {
-      const body = {
-        kind: rule.kind,
-        domain: rule.domain,
-        ...(rule.kind === 'similar' ? { categoryTokens: rule.categoryTokens } : {}),
-      };
+      // Host-scoped rules send `host` so the companion purges only that
+      // host + its own subdomains (sibling hosts under the same eTLD+1
+      // survive); legacy family rules omit it and get eTLD+1 semantics.
+      const body = buildDomainTombstonePurgeBody(rule);
       await companionJson('/v1/privacy/domain-tombstone', {
         method: 'POST',
         headers: {

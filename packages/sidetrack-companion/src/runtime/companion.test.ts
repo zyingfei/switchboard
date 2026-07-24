@@ -17,6 +17,7 @@ import { readPageEvidence } from '../page-evidence/store.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { AppendInputObserved } from '../sync/eventLog.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import {
   WORKGRAPH_HEALTH_ARTIFACT_DEBOUNCE_MS,
   WORKGRAPH_HEALTH_ARTIFACT_MIN_INTERVAL_MS,
@@ -408,4 +409,147 @@ describe('page-evidence ingest write queue', () => {
 
     expect(evidence.record?.metadata.lastSeenAt).toBe('2026-05-22T10:04:00.000Z');
   });
+});
+
+// Acceptance (DEBUGGING_DOCTRINE rule 10): boot a real companion with the
+// resolve canary forced on, drive a real drain so the served graph has a
+// probe target, then read /v1/system/health BACK and assert the reliability
+// section carries a real canary sample — verifying the composition-root
+// wiring (createResolveCanary/register + start) AND the route folding
+// (withReliabilityHealthSection) end-to-end, not an intermediate helper.
+describe('startCompanion resolve-canary → /v1/system/health', () => {
+  let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
+  let companion: Awaited<ReturnType<typeof startCompanion>> | null = null;
+  const prevCanary = process.env['SIDETRACK_RESOLVE_CANARY'];
+  const prevInterval = process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'];
+  let port = 39_700;
+
+  beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
+    vaultRoot = await mkdtemp(join(tmpdir(), 'startcompanion-canary-'));
+    // Force the canary on despite NODE_ENV=test, with a fast cadence so a
+    // sample lands within the poll budget once the graph has a target.
+    process.env['SIDETRACK_RESOLVE_CANARY'] = '1';
+    process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'] = '50';
+  });
+
+  afterEach(async () => {
+    if (companion !== null) await companion.close();
+    companion = null;
+    stubEmbedder.restore();
+    if (prevCanary === undefined) delete process.env['SIDETRACK_RESOLVE_CANARY'];
+    else process.env['SIDETRACK_RESOLVE_CANARY'] = prevCanary;
+    if (prevInterval === undefined) delete process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'];
+    else process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'] = prevInterval;
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const post = async (url: string, bridgeKey: string, body: unknown): Promise<Response> =>
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-bac-bridge-key': bridgeKey,
+        'Idempotency-Key': `idem-${Math.random().toString(36).slice(2)}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+  const getJson = async <T>(url: string, bridgeKey: string): Promise<T> => {
+    const r = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
+    if (!r.ok) throw new Error(`GET ${url} → ${String(r.status)}`);
+    return (await r.json()) as T;
+  };
+
+  it('registers the canary at boot and folds a real sample into the health report', async () => {
+    companion = await startCompanion({ vaultPath: vaultRoot, port: port++, allowAutoUpdate: false });
+
+    // Seed a timeline visit so the connections drain materializes a
+    // timeline-visit node — the canary's pickUrl target. /v1/timeline/events
+    // is the edge-event import path, so send a full AcceptedEvent envelope
+    // (dot/deps/aggregateId/type/payload), same shape the relay path uses.
+    const visitUrl = 'https://canary.example/most-visited';
+    const observedAt = '2026-07-21T10:00:00.000Z';
+    const timelineEvent = {
+      clientEventId: 'canary-tl-1',
+      dot: { replicaId: 'edge_canary_test', seq: 1 },
+      deps: {},
+      aggregateId: observedAt.slice(0, 10),
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        eventId: 'canary-tl-1',
+        url: visitUrl,
+        canonicalUrl: visitUrl,
+        title: 'Canary target',
+        observedAt,
+        transition: 'activated',
+      },
+      acceptedAtMs: Date.parse(observedAt),
+    };
+    const tlRes = await post(`${companion.url}/v1/timeline/events`, companion.bridgeKey, {
+      events: [timelineEvent],
+    });
+    expect(tlRes.ok).toBe(true);
+
+    // Wait for the node to appear in the served graph (gives the canary a
+    // target), then poll the health surface until a sample is recorded.
+    interface ConnectionsResponse {
+      data: { snapshot: { nodes: { id: string }[] } };
+    }
+    interface HealthResponse {
+      data: {
+        reliability?: {
+          resolveCanary: {
+            sampleCount: number;
+            hasTarget: boolean;
+            status: string;
+            errorCount: number;
+            p95Ms: number | null;
+          };
+          availability: string;
+        };
+        observability?: { sections?: Record<string, string> };
+      };
+    }
+
+    const wantNode = `timeline-visit:${visitUrl}`;
+    const deadline = Date.now() + 20_000;
+    let health: HealthResponse['data'] | null = null;
+    while (Date.now() < deadline) {
+      try {
+        const c = await getJson<ConnectionsResponse>(
+          `${companion.url}/v1/connections`,
+          companion.bridgeKey,
+        );
+        const hasTarget = c.data.snapshot.nodes.some((n) => n.id === wantNode);
+        if (hasTarget) {
+          const h = await getJson<HealthResponse>(
+            `${companion.url}/v1/system/health`,
+            companion.bridgeKey,
+          );
+          if ((h.data.reliability?.resolveCanary.sampleCount ?? 0) >= 1) {
+            health = h.data;
+            break;
+          }
+        }
+      } catch {
+        // keep polling
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect(health).not.toBeNull();
+    const reliability = health?.reliability;
+    expect(reliability).toBeDefined();
+    // The reliability section is PRESENT with a real sample from the real
+    // resolve core, its target pinned, and folded into the observability
+    // board (rule 1: verified at the artifact the surface reads).
+    expect(reliability?.resolveCanary.sampleCount).toBeGreaterThanOrEqual(1);
+    expect(reliability?.resolveCanary.hasTarget).toBe(true);
+    expect(reliability?.resolveCanary.errorCount).toBe(0);
+    expect(reliability?.resolveCanary.status).toBe('ok');
+    expect(reliability?.availability).toBe('ok');
+    expect(health?.observability?.sections?.['reliability']).toBe('ok');
+  }, 30_000);
 });

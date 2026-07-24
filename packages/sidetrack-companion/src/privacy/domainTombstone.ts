@@ -37,6 +37,13 @@ export interface DomainTombstonePayload {
   // 'similar' — the eTLD+1 family OR cross-domain pages hitting a token.
   readonly kind: 'domain' | 'similar';
   readonly domain: string;
+  // Optional HOST scope. When present the purge is host-scoped (the
+  // host + its own subdomains only); sibling hosts under the same eTLD+1
+  // survive. Absent ⇒ family-wide (legacy eTLD+1 semantics). Two
+  // host-scoped tombstones for sibling hosts must coexist distinctly,
+  // and a family (host-less) tombstone coexists with a host-scoped one
+  // for the same eTLD+1 — the dedup key is (kind, domain, host).
+  readonly host?: string;
   readonly categoryTokens?: readonly DomainTombstoneCategoryToken[];
   readonly tombstonedAt: string;
   readonly dimensions?: Record<string, unknown>;
@@ -54,6 +61,12 @@ export const isDomainTombstonePayload = (value: unknown): value is DomainTombsto
   if (value['payloadVersion'] !== 1) return false;
   if (value['kind'] !== 'domain' && value['kind'] !== 'similar') return false;
   if (typeof value['domain'] !== 'string' || value['domain'].length === 0) return false;
+  if (
+    value['host'] !== undefined &&
+    (typeof value['host'] !== 'string' || value['host'].length === 0)
+  ) {
+    return false;
+  }
   if (
     value['categoryTokens'] !== undefined &&
     (!Array.isArray(value['categoryTokens']) || !value['categoryTokens'].every(isCategoryToken))
@@ -132,24 +145,69 @@ export interface DomainTombstoneSet {
   readonly matchesDomain: (domain: string) => boolean;
 }
 
+// Normalize a raw host for host-scoped matching (lowercased, trailing dot
+// stripped). Mirrors the route's + purge's normalization.
+const normalizeHost = (rawHost: string): string =>
+  rawHost.trim().toLowerCase().replace(/\.$/u, '');
+
+const hostnameFromUrl = (rawUrl: string): string => {
+  try {
+    const url = new URL(rawUrl.trim());
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    return normalizeHost(url.hostname);
+  } catch {
+    return '';
+  }
+};
+
+// Does `pageHost` fall under `tombstonedHost` — i.e. equal it, or be one of
+// its own subdomains (label-boundary-safe, so `evilmeet.google.com` is NOT
+// under `meet.google.com`)?
+const hostIsWithin = (pageHost: string, tombstonedHost: string): boolean => {
+  if (pageHost.length === 0 || tombstonedHost.length === 0) return false;
+  return pageHost === tombstonedHost || pageHost.endsWith(`.${tombstonedHost}`);
+};
+
 export const buildDomainTombstoneSet = (
   payloads: readonly DomainTombstonePayload[],
 ): DomainTombstoneSet => {
-  const domainRules: string[] = [];
+  // FAMILY rules (host-less): hide the whole eTLD+1 family.
+  const familyDomains = new Set<string>();
+  // HOST-scoped rules: hide only the host + its own subdomains. Keyed by
+  // eTLD+1 so a page's family lookup is cheap; the value is the set of
+  // tombstoned hosts under that family.
+  const hostRulesByDomain = new Map<string, Set<string>>();
   const similarRules: { domain: string; tokens: readonly DomainTombstoneCategoryToken[] }[] = [];
   for (const payload of payloads) {
+    const scopedHost =
+      typeof payload.host === 'string' && payload.host.length > 0
+        ? normalizeHost(payload.host)
+        : undefined;
     if (payload.kind === 'domain') {
-      domainRules.push(payload.domain);
+      if (scopedHost === undefined) {
+        familyDomains.add(payload.domain);
+      } else {
+        const existing = hostRulesByDomain.get(payload.domain) ?? new Set<string>();
+        existing.add(scopedHost);
+        hostRulesByDomain.set(payload.domain, existing);
+      }
     } else {
+      // 'similar' rules are inherently cross-domain / family-wide — a host
+      // scope on a 'similar' rule still hides its own family (the tokens
+      // reach across domains anyway), so treat its domain as family-blocked.
+      familyDomains.add(payload.domain);
       similarRules.push({ domain: payload.domain, tokens: payload.categoryTokens ?? [] });
     }
   }
-  const blockedDomains = new Set(domainRules.concat(similarRules.map((rule) => rule.domain)));
-  const isEmpty = domainRules.length === 0 && similarRules.length === 0;
+  const isEmpty =
+    familyDomains.size === 0 && hostRulesByDomain.size === 0 && similarRules.length === 0;
 
+  // Bare-domain boundary (no host available). A host-scoped tombstone can
+  // NOT hide a whole family from a bare domain — that would over-hide
+  // sibling hosts — so only family rules match here.
   const matchesDomain = (domain: string): boolean => {
     if (domain.length === 0) return false;
-    return blockedDomains.has(domain);
+    return familyDomains.has(domain);
   };
 
   const matchesPage = (page: { url?: string; title?: string }): boolean => {
@@ -157,10 +215,20 @@ export const buildDomainTombstoneSet = (
     if (typeof page.url !== 'string' || page.url.length === 0) return false;
     const pageDomain = registrableDomainFromUrl(page.url);
     if (pageDomain.length === 0) return false;
-    // Same-family match (covers both 'domain' and 'similar' sources).
-    if (blockedDomains.has(pageDomain)) return true;
-    // Cross-domain 'similar' — require a category-token overlap present
-    // in the page's PATH or TITLE (never the bare host).
+    // 1. Family match (covers 'domain' family rules + all 'similar' rules).
+    if (familyDomains.has(pageDomain)) return true;
+    // 2. Host-scoped match — hide only pages whose host is the tombstoned
+    //    host or a subdomain of it. Sibling hosts under the same eTLD+1
+    //    survive (label-boundary-safe).
+    const hostRules = hostRulesByDomain.get(pageDomain);
+    if (hostRules !== undefined) {
+      const pageHost = hostnameFromUrl(page.url);
+      for (const tombstonedHost of hostRules) {
+        if (hostIsWithin(pageHost, tombstonedHost)) return true;
+      }
+    }
+    // 3. Cross-domain 'similar' — require a category-token overlap present
+    //    in the page's PATH or TITLE (never the bare host).
     const similarWithTokens = similarRules.filter((rule) => rule.tokens.length > 0);
     if (similarWithTokens.length === 0) return false;
     const pageTokens = detectCategoryTokens({

@@ -200,7 +200,10 @@ import {
 } from './invalidation.js';
 import { dedupeScopeList, invalidationKeysToScopes, type Scope } from './connectionsScopes.js';
 import { runReconcileInWorker } from './connectionsReconcileWorker.js';
-import { runReconcileInChild } from './connectionsReconcileChildClient.js';
+import {
+  runReconcileInChild,
+  cleanupOrphanReconcileChild,
+} from './connectionsReconcileChildClient.js';
 import {
   createEmbedderWarmthTracker,
   decideHotPathEmbed,
@@ -6190,7 +6193,32 @@ export const createConnectionsMaterializer = (
     return runReconcileInChild;
   };
 
+  // M7 — one-time boot orphan sweep. If a prior companion was `kill -9`'d
+  // mid-drain, its reconcile child is still alive holding the current.db
+  // write lock, and the next boot would race two writers on it. Detect
+  // and SIGKILL that orphan (recorded in a pidfile the fork site keeps)
+  // BEFORE the first subprocess drain of this materializer. Runs once,
+  // guarded so it doesn't repeat on every drain.
+  let bootOrphanSweepDone = false;
+  const sweepBootOrphanChildOnce = (): void => {
+    if (bootOrphanSweepDone) return;
+    bootOrphanSweepDone = true;
+    try {
+      const result = cleanupOrphanReconcileChild(deps.vaultRoot);
+      if (result.killed) {
+        console.warn(
+          `[connections] killed orphan reconcile child pid=${String(result.pid)} at boot`,
+        );
+      }
+    } catch (err) {
+      // Never fail a drain on the safety sweep itself.
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[connections] orphan reconcile-child sweep failed: ${message}`);
+    }
+  };
+
   const drainViaWorker = async (): Promise<void> => {
+    sweepBootOrphanChildOnce();
     workerDrainSeq += 1;
     const seq = workerDrainSeq;
     const runner = pickSubprocessRunner();

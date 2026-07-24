@@ -100,6 +100,15 @@ export interface RecallStore {
    *  purge path treats absence as "no vector deletion available". */
   deleteDocumentsByHostFamily?(domain: string): number;
 
+  /** Privacy purge — HOST-SCOPED. Delete every document (and its vectors
+   *  + chunks) whose `host` equals `host` OR is a subdomain of it (host
+   *  === host OR host endsWith `.host`), label-boundary-safe. Sibling
+   *  hosts under the same eTLD+1 SURVIVE — this deletes ONLY what the
+   *  user asked, the privacy-correct direction. Returns the number of
+   *  document rows deleted; 0 when nothing matches. Optional so
+   *  lightweight test stubs don't have to implement it. */
+  deleteDocumentsByHost?(host: string): number;
+
   /** Enumerate every entity_id currently stored for `sourceKind`. Used
    *  by the backfill deletion sweep — backfill snapshots this set,
    *  upserts every record in JSON, then deletes entityIds in the

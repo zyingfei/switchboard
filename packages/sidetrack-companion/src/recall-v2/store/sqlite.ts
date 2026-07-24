@@ -25,6 +25,15 @@ import type {
   StoreSourceKind,
 } from './types.js';
 
+// LIKE metacharacter escaping for host-suffix purge patterns. A hostname
+// can legally contain none of these, but a caller-supplied/stored host
+// might, and an unescaped '_' is a single-char wildcard that would
+// over-delete a sibling ('meet_x' matching 'meetyx'). Use a backslash
+// escape char and neutralize '\', '%', '_' in the literal fragment.
+const LIKE_ESCAPE_CHAR = '\\';
+const escapeLike = (value: string): string =>
+  value.replace(/[\\%_]/gu, (ch) => `${LIKE_ESCAPE_CHAR}${ch}`);
+
 // sqlite-vec ships a loadable extension binary. We resolve its
 // platform-specific path here and call SqliteHandle.loadExtension
 // directly — that keeps the load operation flowing through the
@@ -241,9 +250,38 @@ class SqliteRecallStore implements RecallStore {
     // Match the eTLD+1 family: exact host or any subdomain of it. We
     // also defend against rows whose `host` was stored with a www.
     // prefix (host === 'www.' + domain) via the LIKE '%.'+domain arm.
-    const suffix = `%.${trimmed}`;
+    // Escape LIKE metachars ('%' '_' '\') in the host so a literal
+    // '_'/'%' in a hostname is matched literally, not as a wildcard.
+    const suffix = `%.${escapeLike(trimmed)}`;
     const rows = this.db
-      .prepare('SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ?')
+      .prepare(`SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`)
+      .all<{ entityId: string }>(trimmed, suffix);
+    if (rows.length === 0) return 0;
+    // deleteDocument cascades to chunks + vectors. Wrap in a
+    // transaction so a multi-row purge is atomic + amortizes WAL fsync.
+    this.runTransaction(() => {
+      for (const row of rows) this.deleteDocument(row.entityId);
+    });
+    return rows.length;
+  }
+
+  deleteDocumentsByHost(host: string): number {
+    const trimmed = host.trim().toLowerCase().replace(/\.$/u, '');
+    if (trimmed.length === 0) return 0;
+    // HOST-SCOPED purge: delete the exact host AND its own subdomains
+    // only (host === trimmed OR host endsWith '.'+trimmed). Sibling
+    // hosts under the same eTLD+1 (e.g. mail.google.com vs a purge of
+    // meet.google.com) SURVIVE — deleting more than asked destroys data
+    // the user wanted kept.
+    //
+    // The label boundary is the leading '.' in the suffix pattern: it
+    // makes 'us.meet.google.com' match while 'meetxgoogle.com' does NOT
+    // (no '.meet.google.com' suffix). LIKE metachars in the host are
+    // escaped so a literal '_' subdomain does not over-match a sibling
+    // ('meet_x' must not wildcard to 'meetyx').
+    const suffix = `%.${escapeLike(trimmed)}`;
+    const rows = this.db
+      .prepare(`SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`)
       .all<{ entityId: string }>(trimmed, suffix);
     if (rows.length === 0) return 0;
     // deleteDocument cascades to chunks + vectors. Wrap in a

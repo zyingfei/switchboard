@@ -2,6 +2,10 @@
   "$schema": "https://json.schemastore.org/tsconfig",
   "extends": "./tsconfig.json",
   "compilerOptions": {
+    // The base tsconfig.json sets noEmit:true (shadow-artifact guard). The build
+    // gate MUST emit dist/ (child-process integration tests spawn from
+    // dist/…/connectionsReconcileChild.entry.js), so re-enable emission here.
+    "noEmit": false,
     "outDir": "dist",
     "rootDir": "src"
   },

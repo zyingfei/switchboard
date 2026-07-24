@@ -51,7 +51,7 @@ import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
 import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
-import { createConnectionsStore } from '../connections/snapshot.js';
+import { createConnectionsStore, SqliteConnectionsStore } from '../connections/snapshot.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
 import {
@@ -68,6 +68,12 @@ import {
 } from '../page-evidence/backgroundEmbeddingLane.js';
 import { buildDomainTombstoneSet } from '../privacy/domainTombstone.js';
 import { readDomainTombstones } from '../privacy/domainTombstoneStore.js';
+import {
+  createResolveCanary,
+  registerResolveCanary,
+  unregisterResolveCanary,
+} from '../system/resolveCanary.js';
+import { resolveUrlAttribution } from '../tabsession/resolver.js';
 import type { TimelineProvider } from '../timeline/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
@@ -1431,6 +1437,95 @@ export const startCompanion = async (
     });
     const started: StartedHttpServer = await startHttpServer(server, options.port);
 
+    // --- Resolve canary (system/resolveCanary.ts) ----------------------
+    //
+    // Standing probe for the single most user-felt metric — panel resolve
+    // latency. Runs the SAME resolve core the batch-resolve route uses
+    // (resolveUrlAttribution over the served snapshot + merged log), NOT
+    // an HTTP self-call, against a stable most-visited URL from the served
+    // graph, folding p50/p95/max into a decaying window that /v1/system/
+    // health surfaces via the vaultRoot-keyed registry.
+    //
+    // Gating: default ON in normal runs; OFF under NODE_ENV=test unless the
+    // env forces it (SIDETRACK_RESOLVE_CANARY=1/true), so suites don't spin
+    // a timer while the harness acceptance test can force it on. An explicit
+    // SIDETRACK_RESOLVE_CANARY=0/false disables it everywhere.
+    const resolveCanaryEnabled = ((): boolean => {
+      const raw = process.env['SIDETRACK_RESOLVE_CANARY'];
+      if (raw !== undefined) {
+        const v = raw.trim().toLowerCase();
+        if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false;
+        if (v === '1' || v === 'true' || v === 'on' || v === 'yes') return true;
+      }
+      return process.env['NODE_ENV'] !== 'test';
+    })();
+    // Held so the returned close() can stop + unregister the canary on a
+    // normal shutdown (the teardown[] array only drains on startup failure).
+    let stopResolveCanary: (() => void) | null = null;
+    if (resolveCanaryEnabled) {
+      // pickUrl — resolve a stable canary URL from the served graph: the
+      // most-visited node carrying a canonical/url. Null on an empty vault
+      // (→ the canary stays idle, never records a synthetic sample).
+      const pickCanaryUrl = async (): Promise<string | null> => {
+        const snapshot = await connectionsStore.readCurrent().catch(() => null);
+        if (snapshot === null) return null;
+        let bestUrl: string | null = null;
+        let bestVisits = -1;
+        for (const node of snapshot.nodes) {
+          const url = node.metadata.canonicalUrl ?? node.metadata.url;
+          if (typeof url !== 'string' || url.length === 0) continue;
+          const visits = node.metadata.visitCount ?? 0;
+          if (visits > bestVisits) {
+            bestVisits = visits;
+            bestUrl = url;
+          }
+        }
+        return bestUrl;
+      };
+      // resolveOnce — run the panel's single-URL resolve core, mirroring the
+      // batch-resolve route body: on the SQLite store use the cheap resolver
+      // subgraph (events unnecessary — the subgraph carries the candidates);
+      // otherwise fall back to the full snapshot + merged log. Rejects on a
+      // missing snapshot so a genuinely broken serve boundary surfaces as an
+      // errored probe rather than silently recording an ok sample.
+      const resolveCanaryOnce = async (canonicalUrl: string): Promise<unknown> => {
+        if (connectionsStore instanceof SqliteConnectionsStore) {
+          const subgraph = await connectionsStore.readResolverSubgraphForUrl(canonicalUrl);
+          if (subgraph === null) throw new Error('CONNECTIONS_SNAPSHOT_MISSING');
+          return resolveUrlAttribution({
+            canonicalUrl,
+            snapshot: subgraph,
+            events: [],
+            useEventCandidateSimilarity: false,
+          });
+        }
+        const snapshot = await connectionsStore.readCurrent();
+        if (snapshot === null) throw new Error('CONNECTIONS_SNAPSHOT_MISSING');
+        const events = await baseEventLog.readMerged();
+        return resolveUrlAttribution({ canonicalUrl, snapshot, events });
+      };
+      const resolveCanaryIntervalMs = ((): number | undefined => {
+        const raw = process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'];
+        const n = raw === undefined ? Number.NaN : Number(raw);
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+      })();
+      const resolveCanary = createResolveCanary({
+        ports: { pickUrl: pickCanaryUrl, resolveOnce: resolveCanaryOnce },
+        ...(resolveCanaryIntervalMs === undefined ? {} : { intervalMs: resolveCanaryIntervalMs }),
+      });
+      registerResolveCanary(options.vaultPath, resolveCanary);
+      resolveCanary.start();
+      let stopped = false;
+      stopResolveCanary = () => {
+        if (stopped) return;
+        stopped = true;
+        resolveCanary.stop();
+        unregisterResolveCanary(options.vaultPath);
+      };
+      // Startup-failure rollback path (the catch below drains teardown[]).
+      teardown.push(() => stopResolveCanary?.());
+    }
+
     return {
       url: started.url,
       vaultPath: options.vaultPath,
@@ -1442,6 +1537,9 @@ export const startCompanion = async (
       replicaId: replica.replicaId,
       replicaIdCreated: replica.created,
       close: async () => {
+        // Stop the resolve canary first so its unref'd timer + registry
+        // entry are released before we tear the server down.
+        stopResolveCanary?.();
         clearInterval(idempotencyGc);
         clearInterval(auditRetention);
         if (relayTransport !== null) stopRelayTransport(relayTransport);

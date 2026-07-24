@@ -353,6 +353,8 @@ import {
   resolveServiceRunning,
   type CaptureWarningHealth,
   type HealthReport,
+  type HealthStatus,
+  type SectionAvailability,
 } from '../system/health.js';
 import {
   collectWorkGraphHealth,
@@ -372,6 +374,12 @@ import {
   readReliabilityArtifact,
 } from '../system/reliabilityArtifact.js';
 import { collectReliabilityReport } from '../calibration/reliabilityCollector.js';
+import {
+  getResolveCanary,
+  resolveCanaryStatus,
+  resolveCanaryThresholdMs,
+  type ResolveCanarySnapshot,
+} from '../system/resolveCanary.js';
 import { collectEngagementLaneHealth } from '../system/engagementLaneHealth.js';
 import {
   CHROME_SESSIONS_RESTORE,
@@ -1910,6 +1918,119 @@ const cachedCollectHealth = async (
   })();
   systemHealthInFlight.set(vaultRoot, compute);
   return compute;
+};
+
+// --- Reliability health section (resolve canary) ------------------------
+//
+// The resolve canary (system/resolveCanary.ts) is the standing probe for
+// the single most user-felt metric — panel resolve latency. This helper
+// folds its rolling-window snapshot into the health surface so a burst of
+// slow/errored resolves is visible (and DECAYS: the window prunes, so the
+// status returns to ok on its own — DEBUGGING_DOCTRINE §7, no stuck alarm).
+// The canary module owns the timing/decay; server.ts owns only the HTTP-
+// layer assembly (reading the registry + mapping to the health shape).
+
+export interface ReliabilityHealthSection {
+  // The canary's window snapshot plus its derived status. `idle` when no
+  // canary is registered or the window has no samples (absence of signal
+  // is not a failure — an empty/just-booted vault reads idle, not broken).
+  readonly resolveCanary: ResolveCanarySnapshot & { readonly status: 'ok' | 'degraded' | 'idle' };
+  // Section availability derived from the canary status: 'ok' when
+  // ok/idle, 'stale' when degraded. This is what the observability board
+  // renders for the reliability lane.
+  readonly availability: SectionAvailability;
+  // Size of the connections DB write-ahead log, bytes. A large/growing WAL
+  // is a checkpoint-starvation fingerprint. null when the WAL file is
+  // absent (fresh vault / in-memory / already checkpointed).
+  readonly walBytes: number | null;
+}
+
+const connectionsWalBytes = async (vaultRoot: string): Promise<number | null> => {
+  try {
+    const walPath = join(vaultRoot, '_BAC', 'connections', 'current.db-wal');
+    const info = await stat(walPath);
+    return info.size;
+  } catch {
+    // ENOENT (no WAL) or any stat error → null (not an error state).
+    return null;
+  }
+};
+
+export const buildReliabilityHealthSection = async (
+  vaultRoot: string,
+): Promise<ReliabilityHealthSection> => {
+  const canary = getResolveCanary(vaultRoot);
+  const thresholdMs = resolveCanaryThresholdMs();
+  const walBytes = await connectionsWalBytes(vaultRoot);
+  if (canary === undefined) {
+    // No canary registered on this path → idle, section available.
+    const idleSnapshot = {
+      sampleCount: 0,
+      p50Ms: null,
+      p95Ms: null,
+      maxMs: null,
+      errorCount: 0,
+      lastSampleAtMs: null,
+      hasTarget: false,
+    } as const;
+    return {
+      resolveCanary: { ...idleSnapshot, status: 'idle' },
+      availability: 'ok',
+      walBytes,
+    };
+  }
+  const snapshot = canary.snapshot();
+  // idle (no samples) is reported distinctly from ok so the surface can
+  // say "no probe yet" vs "probing, healthy".
+  const status: 'ok' | 'degraded' | 'idle' =
+    snapshot.sampleCount === 0 ? 'idle' : resolveCanaryStatus(snapshot, thresholdMs);
+  const availability: SectionAvailability = status === 'degraded' ? 'stale' : 'ok';
+  return {
+    resolveCanary: { ...snapshot, status },
+    availability,
+    walBytes,
+  };
+};
+
+// Worst-of over HealthStatus (ok < degraded < failed). A stale/unavailable
+// section maps to a degraded top-level status; an unavailable one to failed.
+const sectionAvailabilityToStatus = (availability: SectionAvailability): HealthStatus => {
+  if (availability === 'unavailable') return 'failed';
+  if (availability === 'stale') return 'degraded';
+  return 'ok';
+};
+
+const worseHealthStatus = (a: HealthStatus, b: HealthStatus): HealthStatus => {
+  const rank: Record<HealthStatus, number> = { ok: 0, degraded: 1, failed: 2 };
+  return rank[a] >= rank[b] ? a : b;
+};
+
+export const withReliabilityHealthSection = (
+  report: HealthReport,
+  section: ReliabilityHealthSection,
+): HealthReport & { readonly reliability: ReliabilityHealthSection } => {
+  const priorObservability = report.observability;
+  const priorSections = priorObservability?.sections ?? {};
+  const sections: Record<string, SectionAvailability> = {
+    ...priorSections,
+    reliability: section.availability,
+  };
+  // Recompute the board's worst-of over ALL sections including reliability
+  // (never just the reliability contribution — a pre-existing degraded
+  // section must survive folding in a healthy reliability lane).
+  let status: HealthStatus = 'ok';
+  for (const availability of Object.values(sections)) {
+    status = worseHealthStatus(status, sectionAvailabilityToStatus(availability));
+  }
+  return {
+    ...report,
+    reliability: section,
+    observability: {
+      asOf: priorObservability?.asOf ?? new Date().toISOString(),
+      status,
+      sections,
+    },
+  };
 };
 
 // GET /v1/connections rebuilds a ~14MB response per call: readCurrent
@@ -3767,6 +3888,29 @@ const routes: readonly RouteDefinition[] = [
         if (domain.length === 0) {
           throw new HttpRouteError(400, 'VALIDATION_ERROR', 'domain has no registrable eTLD+1.');
         }
+        // Optional HOST scope. When present, the purge is host-scoped: only
+        // the host + its own subdomains are hidden/deleted; sibling hosts
+        // under the same eTLD+1 survive (data-preserving direction —
+        // over-purging destroys data the user kept). The host must belong to
+        // the resolved eTLD+1 family (its registrable domain === domain);
+        // otherwise the scope is incoherent and we reject rather than
+        // silently widen. Absent ⇒ family-wide (legacy eTLD+1 semantics).
+        const rawHost = body?.['host'];
+        let host: string | undefined;
+        if (rawHost !== undefined) {
+          if (typeof rawHost !== 'string' || rawHost.trim().length === 0) {
+            throw new HttpRouteError(400, 'VALIDATION_ERROR', 'host must be a non-empty string.');
+          }
+          const normalizedHost = rawHost.trim().toLowerCase().replace(/\.$/u, '');
+          if (registrableDomain(normalizedHost) !== domain) {
+            throw new HttpRouteError(
+              400,
+              'VALIDATION_ERROR',
+              'host must belong to the same registrable domain family.',
+            );
+          }
+          host = normalizedHost;
+        }
         const rawTokens = body?.['categoryTokens'];
         const categoryTokens: DomainTombstoneCategoryToken[] = Array.isArray(rawTokens)
           ? (rawTokens.filter((token): token is DomainTombstoneCategoryToken =>
@@ -3777,14 +3921,19 @@ const routes: readonly RouteDefinition[] = [
           payloadVersion: 1,
           kind,
           domain,
+          ...(host === undefined ? {} : { host }),
           ...(kind === 'similar' && categoryTokens.length > 0 ? { categoryTokens } : {}),
           tombstonedAt: new Date().toISOString(),
         };
-        // 1. Append to the event log (audit + sync durability).
+        // 1. Append to the event log (audit + sync durability). The scope
+        //    (host or family) is folded into the client/aggregate ids so a
+        //    sibling-host tombstone is a DISTINCT event rather than being
+        //    idempotency-collapsed onto the family one.
+        const scopeKey = host ?? domain;
         await eventLog
           .appendServerObserved({
-            clientEventId: `${DOMAIN_TOMBSTONE}:${kind}:${domain}`,
-            aggregateId: `privacy:domain-tombstone:${domain}`,
+            clientEventId: `${DOMAIN_TOMBSTONE}:${kind}:${scopeKey}`,
+            aggregateId: `privacy:domain-tombstone:${scopeKey}`,
             type: DOMAIN_TOMBSTONE,
             payload: tombstone as unknown as Record<string, unknown>,
           })
@@ -3797,11 +3946,18 @@ const routes: readonly RouteDefinition[] = [
         //    store scrub). Best-effort — a store that can't purge just
         //    relies on the serve-boundary filter. The raw JSONL log is
         //    intentionally NOT rewritten (append indexes reject in-process
-        //    shard rewrites; a full offline scrub is a separate tool).
+        //    shard rewrites; a full offline scrub is a separate tool). A
+        //    HOST-scoped tombstone purges only the host + its subdomains so
+        //    sibling hosts under the same eTLD+1 keep their data.
         let vectorsPurged = 0;
         try {
-          const { purgeRecallV2StoreByDomain } = await import('../recall-v2/pipeline.js');
-          vectorsPurged = await purgeRecallV2StoreByDomain(vaultRoot, domain);
+          const { purgeRecallV2StoreByDomain, purgeRecallV2StoreByHost } = await import(
+            '../recall-v2/pipeline.js'
+          );
+          vectorsPurged =
+            host === undefined
+              ? await purgeRecallV2StoreByDomain(vaultRoot, domain)
+              : await purgeRecallV2StoreByHost(vaultRoot, host);
         } catch {
           vectorsPurged = 0;
         }
@@ -3811,6 +3967,7 @@ const routes: readonly RouteDefinition[] = [
             data: {
               tombstoned: true,
               domain,
+              ...(host === undefined ? {} : { host }),
               kind,
               vectorsPurged,
               tombstoneCount: all.length,
@@ -4965,10 +5122,11 @@ const routes: readonly RouteDefinition[] = [
     handle: async (_request, _requestId, _match, context) => {
       const vaultRoot = requireVaultRoot(context);
       const indexPath = recallIndexPath(vaultRoot);
-      return [
-        200,
-        {
-          data: await cachedCollectHealth(vaultRoot, () =>
+      // Fold the resolve-canary reliability section into the health
+      // response. The base report is served from the TTL'd cache; the
+      // reliability section reads the (cheap) canary snapshot + WAL stat
+      // live so it decays on its own window rather than the health TTL.
+      const baseReport = await cachedCollectHealth(vaultRoot, () =>
             collectHealth({
               startedAt: context.startedAt ?? new Date(),
               vaultRoot,
@@ -5156,7 +5314,12 @@ const routes: readonly RouteDefinition[] = [
               },
               ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
             }),
-          ),
+          );
+      const reliability = await buildReliabilityHealthSection(vaultRoot);
+      return [
+        200,
+        {
+          data: withReliabilityHealthSection(baseReport, reliability),
         },
       ];
     },
