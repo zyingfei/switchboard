@@ -3552,15 +3552,166 @@ export const createConnectionsMaterializer = (
     // marker (`forcedCorpusRebuildSignature`) — NOT `servedCorpusConfigSignature`,
     // which already equals live in this state — so it fires once per live
     // signature and does not loop while the env stays set.
-    const forceCorpusRebuildActive =
+    const forceCorpusRebuildEnvActive =
       persistentHnswSimilarityMode &&
       !liveCorpusConfigIsDefault &&
       similarityForceCorpusRebuildRequested() &&
       similarityFloorState.forcedCorpusRebuildSignature !== liveCorpusConfigSignature;
+    // Defect #5 RECOVERY — the CONSUMED-MARKER-WIPE state. The pre-fix bug let an
+    // EMPTY forced-rebuild publish (over a window-poor corpus) advance the
+    // one-shot marker to the live signature, so `forceCorpusRebuildEnvActive` is
+    // false forever even though the served signal was wiped and never re-embedded
+    // under the live config. That specific state is self-evident from durable
+    // signals: the marker is consumed (== live) AND the served signal is empty
+    // AND the persisted HNSW store is non-trivial (a genuine non-trivial publish
+    // would have left the served signal non-empty). Treat that as the reset being
+    // PENDING AGAIN so the rebuild re-fires — BUT only as a fallback when no clean
+    // revision can be bootstrapped: R2 (bootstrapAdopted, below) recovers the
+    // served signal directly from the persisted store without a rebuild whenever a
+    // provenance-matching non-empty revision exists (the child that wrote the
+    // fresh clean HNSW bin also persisted a clean revision), and re-arming the
+    // force here would set `hasLegitimateResetReason` and SKIP that bootstrap. So
+    // re-fire only when the store holds no adoptable non-empty revision. The scan
+    // is gated to exactly this narrow consumed-wipe state, so the common healthy
+    // drain never pays for it (mirrors the legacy-null witness scan above). This
+    // makes consumption recoverable retroactively: going forward the marker can
+    // only advance on a non-trivial publish (see `nonTrivialFreshPublish`), and on
+    // load a consumed-marker + served-zero + non-trivial-store is re-treated as
+    // pending.
+    const markerConsumedForLive =
+      similarityFloorState.forcedCorpusRebuildSignature === liveCorpusConfigSignature;
+    const servedSignalEmptyForRecovery =
+      previousServedSimilarityEdgeCount === null || previousServedSimilarityEdgeCount <= 0;
+    let forceCorpusRebuildConsumedWipeRecovery = false;
+    if (
+      persistentHnswSimilarityMode &&
+      !liveCorpusConfigIsDefault &&
+      markerConsumedForLive &&
+      servedSignalEmptyForRecovery &&
+      hnswStoreVisitCount > 0
+    ) {
+      const recoveryWitnessRevision = await readLatestNonEmptyVisitSimilarityRevision(
+        deps.vaultRoot,
+      );
+      // A non-empty persisted revision is available → R2 bootstrap will adopt it
+      // (no rebuild needed). Only re-fire the force when the store has NOTHING
+      // adoptable (legacy/empty revisions only), so the served signal cannot be
+      // restored by adoption alone.
+      forceCorpusRebuildConsumedWipeRecovery =
+        recoveryWitnessRevision === null || recoveryWitnessRevision.edges.length === 0;
+      if (forceCorpusRebuildConsumedWipeRecovery) {
+        mark(
+          `similarityFloor.forceCorpusRebuildConsumedWipeRecovery store=${String(
+            hnswStoreVisitCount,
+          )} — consumed marker + served-empty + no adoptable revision → reset re-fires`,
+        );
+      }
+    }
+    const forceCorpusRebuildActive =
+      forceCorpusRebuildEnvActive || forceCorpusRebuildConsumedWipeRecovery;
     const corpusConfigChanged =
       corpusConfigChangedFromRecorded || legacyNullCorpusMigration || forceCorpusRebuildActive;
     if (corpusConfigChanged) {
       similarityFloorResetReasons.push('corpus-config-change');
+    }
+    // ── Defect #5 — a reset reason must be COUPLED to corpus-complete rebuild
+    // input, else it is a WIPE PERMIT ──────────────────────────────────────
+    //
+    // A migration / operator reset reason (corpus-config-change, operator-
+    // rebuild, embedding-model-change, materializer-version-bump, store-
+    // corruption-recovery) forces the full HNSW rebuild below AND disarms every
+    // downstream floor (the revision-level guard PUBLISHES the collapse, the
+    // rendered floor's `resetAllowed=true` skips the repair, and
+    // `suppressResetOnEmptyCorpus` no longer protects the store). But the
+    // similarity BUILDER re-embeds over `similarityEntries` — the WINDOW's
+    // eligible visits — not the full corpus. On a warm window-poor drain (the
+    // standing corpus-lane assembly debt) that eligible set is trivial/empty
+    // while the persisted HNSW store still holds the whole ~9k-visit corpus. The
+    // full rebuild then runs over an EMPTY eligible corpus, resets the HNSW
+    // files, publishes revEdges=0, and — because the reset disarmed every floor
+    // — the served signal is wiped to 0 (the live 52,100 → 0 incident). Worse,
+    // the one-shot markers (`forcedCorpusRebuildSignature`, the corpus signature,
+    // the purge epoch) CONSUME themselves on that empty publish, so the migration
+    // never retries.
+    //
+    // The coupling: a reset reason may only act as a permit (force the wipe,
+    // disarm the floors, advance the consumption markers) when THIS drain can
+    // assemble a corpus-complete input — i.e. the eligible corpus is non-trivial
+    // relative to the persisted store scale. When it cannot (eligible count is
+    // trivial while the persisted HNSW store is non-trivial), the reset is
+    // DEFERRED for this drain: the recorded/operator reasons are removed from the
+    // set that flows into the rebuild decision and the floors, so the drain falls
+    // back to the SAME Layer-0 reuse / carry-forward path a no-reset window-poor
+    // drain takes (the served signal is protected, the store is not wiped). The
+    // consumption markers are NOT advanced (they key off the reasons being
+    // present AND a genuine publish), so the reset stays pending in durable state
+    // and the next corpus-complete drain finishes it. "Trivial relative to the
+    // store" reuses the >90%-collapse floor fraction used everywhere else.
+    //
+    // no-previous-signal / privacy-purge are NOT deferrable here:
+    //   - no-previous-signal is never pushed into this array (it is the guard's
+    //     internal cold-boot reason), so it cannot appear.
+    //   - a privacy-purge legitimately empties the corpus; deferring it would
+    //     re-serve purged edges. It is left in place (it never forces a
+    //     full-corpus re-embed that a window-poor drain cannot satisfy — the
+    //     purge collapse is a real deletion the store no longer holds).
+    const DEFERRABLE_RESET_REASONS: ReadonlySet<SimilarityFloorResetReason> = new Set([
+      'embedding-model-change',
+      'materializer-version-bump',
+      'store-corruption-recovery',
+      'operator-rebuild',
+      'corpus-config-change',
+    ]);
+    const persistedCorpusScaleNonTrivial = hnswStoreVisitCount > 0;
+    // "Corpus-complete" = the drain's eligible visit set COVERS the persisted
+    // store, so a reset's full rebuild re-embeds the whole corpus (not a window
+    // slice). A warm window-poor drain re-qualifies only the handful of visits
+    // its event window carried, so `similarityEligibleCount << hnswStoreVisitCount`
+    // — re-embedding that slice under a reset would reset the HNSW to the slice's
+    // (near-empty) edge set and wipe the served signal. Require the eligible set
+    // to cover the store before a reset may act. A cold boot / chunked catch-up
+    // re-qualifies the full corpus (eligible ≈ store), so it proceeds; a genuine
+    // full rebuild driven by a restart is corpus-complete by construction. The
+    // strict `<` (rather than a fraction) is deliberate: even ONE missing visit
+    // means the window did not carry the whole corpus, and a reset that rebuilds
+    // a partial corpus is precisely the wipe this guards. (A reset that
+    // legitimately SHRINKS the corpus — a real purge — is not deferrable and is
+    // excluded from DEFERRABLE_RESET_REASONS above.)
+    const eligibleCorpusIncompleteVsStore =
+      persistedCorpusScaleNonTrivial && similarityEligibleCount < hnswStoreVisitCount;
+    const deferrableResetReasonPresent = similarityFloorResetReasons.some((reason) =>
+      DEFERRABLE_RESET_REASONS.has(reason),
+    );
+    // Defer the reset when a deferrable reason fired but this drain cannot
+    // assemble a corpus-complete input. `persistentHnswSimilarityMode` gates it
+    // to the path where the persisted store scale is meaningful (the legacy
+    // pairwise path has no persisted HNSW store to protect).
+    const resetDeferredForIncompleteCorpus =
+      persistentHnswSimilarityMode &&
+      deferrableResetReasonPresent &&
+      eligibleCorpusIncompleteVsStore;
+    if (resetDeferredForIncompleteCorpus) {
+      // Strip the deferrable reasons so the rebuild decision + every floor treat
+      // this drain like a no-reset window-poor drain (protect the served signal,
+      // do not wipe the store). privacy-purge (if present) survives.
+      for (let i = similarityFloorResetReasons.length - 1; i >= 0; i -= 1) {
+        const reason = similarityFloorResetReasons[i];
+        if (reason !== undefined && DEFERRABLE_RESET_REASONS.has(reason)) {
+          similarityFloorResetReasons.splice(i, 1);
+        }
+      }
+      mark(
+        `similarityFloor.resetDeferredIncompleteCorpus eligible=${String(
+          similarityEligibleCount,
+        )} store=${String(hnswStoreVisitCount)} — reset stays pending (no wipe, no consume)`,
+      );
+      console.warn(
+        `[connections] similarity reset DEFERRED: a reset reason fired but the eligible corpus (${String(
+          similarityEligibleCount,
+        )}) is trivial vs the persisted store (${String(
+          hnswStoreVisitCount,
+        )}) — carrying the served signal forward and leaving the reset pending for a corpus-complete drain`,
+      );
     }
     // The drift heuristic forces a full HNSW rebuild (which RESETS the
     // persisted index + returns edges:[] on an empty eligible corpus) when
@@ -3586,18 +3737,29 @@ export const createConnectionsMaterializer = (
         )} prevServedEdges=${String(previousServedSimilarityEdgeCount)}`,
       );
     }
+    // Defect #5 — when the reset is deferred (a reset reason fired but the
+    // eligible corpus is trivial vs the persisted store), NONE of the deferrable
+    // reasons may force the full HNSW rebuild: the rebuild re-embeds over the
+    // trivial window corpus and would reset the store to edges:[]. Gate every
+    // deferrable trigger on `!resetDeferredForIncompleteCorpus` so the drain
+    // takes the incremental/scoped path and `suppressResetOnEmptyCorpus` (which
+    // re-arms because the reasons were stripped) protects the persisted store.
+    // The dimension-mismatch trigger is NOT gated: a mismatch physically reset
+    // the store already (resetHnswSimilarityFiles above), so there is no store
+    // left to protect and a full rebuild is the only correct path.
     const hnswFullRebuild =
       persistentHnswSimilarityMode &&
       (hnswDimensionMismatchRequiresFullRebuild ||
-        (existingProgress !== null &&
-          existingProgress.materializerVersion !== MATERIALIZER_VERSION) ||
-        (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
-        // A corpus-config flip changes every visit's embedded text, so the
-        // whole corpus must be re-embedded (the persisted HNSW vectors are the
-        // OLD dirty corpus). Force the full rebuild so the clean corpus reaches
-        // the ~3k already-persisted visits, not just new ones.
-        corpusConfigChanged ||
-        (driftRequiresFullRebuild && !driftWouldWipeServedSignal));
+        (!resetDeferredForIncompleteCorpus &&
+          ((existingProgress !== null &&
+            existingProgress.materializerVersion !== MATERIALIZER_VERSION) ||
+            (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) ||
+            // A corpus-config flip changes every visit's embedded text, so the
+            // whole corpus must be re-embedded (the persisted HNSW vectors are
+            // the OLD dirty corpus). Force the full rebuild so the clean corpus
+            // reaches the ~3k already-persisted visits, not just new ones.
+            corpusConfigChanged ||
+            (driftRequiresFullRebuild && !driftWouldWipeServedSignal))));
     const fullPageEvidenceEnsure =
       previousSnapshotForRanker === null ||
       existingProgress === null ||
@@ -4356,6 +4518,46 @@ export const createConnectionsMaterializer = (
       similarityFloorOutcome.candidateEdgeCount <
         similarityFloorOutcome.previousServedEdgeCount *
           SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+    // Defect #5 — a reset's one-shot consumption markers (corpus signature +
+    // forced-rebuild signature) may advance ONLY when a NON-TRIVIAL rebuild
+    // actually published this drain. "Non-trivial" per the doctrine (rule 7/10)
+    // = the published revision holds similarity-family rows at a floor fraction
+    // of the persisted corpus scale, so an EMPTY publish (revEdges=0) over a
+    // window-poor corpus can never consume the marker (the exact self-consuming
+    // wipe in the live incident). The upstream deferral gate
+    // (`resetDeferredForIncompleteCorpus`) already routes a window-poor reset
+    // drain to carry-forward (which sets `carriedForward`, blocking the advance
+    // below); this is the belt-and-suspenders revision-level check for any reset
+    // that reached a genuine publish. `visitSimilarity` IS the served revision
+    // post-Layer-0/guard; when the reset legitimately empties a non-trivial store
+    // (a real purge / model swap that shrank the corpus) the store count also
+    // dropped, so the floor scales with it. When there is no persisted store to
+    // scale against (fresh vault, count 0) any non-empty publish is non-trivial.
+    const resetPublishNonTrivial =
+      hnswStoreVisitCount <= 0
+        ? visitSimilarity.edges.length > 0
+        : visitSimilarity.edges.length >=
+          hnswStoreVisitCount * SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+    // A genuinely-fresh publish (not carried / reused / bootstrapped) that also
+    // cleared the non-triviality floor. The marker advances gate on THIS so an
+    // empty/degenerate publish never consumes a reset.
+    //
+    // Defect #5 — when the reset was DEFERRED (`resetDeferredForIncompleteCorpus`),
+    // the drain took the incremental/scoped path and rebuilt the served edges from
+    // the OLD (pre-flip) HNSW store — NOT a clean re-embed under the live config.
+    // At small scale that path can re-derive the FULL edge set from the persisted
+    // store (no collapse, no carry-forward), so it looks like a "fresh non-trivial
+    // publish" — but recording the live signature here would FALSELY mark the
+    // migration complete and stop it from re-firing on a later corpus-complete
+    // drain (the deferral's whole point is that the reset stays PENDING). So a
+    // deferred-reset drain never advances the consumption markers, even when its
+    // incremental publish is non-trivial.
+    const nonTrivialFreshPublish =
+      !carriedForward &&
+      !laneUnloadedReuse &&
+      !bootstrapAdopted &&
+      !resetDeferredForIncompleteCorpus &&
+      resetPublishNonTrivial;
     const nextSimilarityFloorState = foldSimilarityFloorDrain(similarityFloorState, {
       // A Layer-0 lane-unloaded REUSE is a suppressed flap too: the builder
       // collapsed and we served the persisted revision instead. Count it as
@@ -4381,28 +4583,31 @@ export const createConnectionsMaterializer = (
       // `visitSimilarity` already IS the served revision post-Layer-0/guard.
       servedModelRevision: visitSimilarity.modelRevision,
       // Record the corpus-config signature only when this drain PUBLISHED a
-      // freshly-built revision under the live corpus config. When the served
-      // revision was carried-forward / reused / bootstrapped, the served edges
-      // are the persisted (possibly old-corpus) revision, so we leave the
-      // recorded signature UNCHANGED (pass null). This is what makes the reset
-      // fire exactly ONCE: after the corpus flip's full rebuild publishes the
-      // clean revision, the recorded signature advances to the live one and the
-      // `corpus-config-change` reset stops firing on subsequent drains.
-      servedCorpusConfigSignature:
-        !carriedForward && !laneUnloadedReuse && !bootstrapAdopted
-          ? liveCorpusConfigSignature
-          : null,
+      // freshly-built NON-TRIVIAL revision under the live corpus config. When the
+      // served revision was carried-forward / reused / bootstrapped — OR the
+      // "fresh" publish was empty/degenerate (revEdges below the persisted-corpus
+      // floor) — we leave the recorded signature UNCHANGED (pass null). This is
+      // what makes the reset fire exactly ONCE and never on a wipe: after the
+      // corpus flip's full rebuild publishes the clean NON-TRIVIAL revision, the
+      // recorded signature advances to the live one and the `corpus-config-change`
+      // reset stops firing on subsequent drains. Defect #5 — gating on
+      // `nonTrivialFreshPublish` (not merely a fresh publish) is what stops an
+      // EMPTY corpus-config-change publish from self-consuming the reset over a
+      // window-poor corpus (the live incident: the recorded signature advanced to
+      // live on a revEdges=0 publish, so the migration never retried).
+      servedCorpusConfigSignature: nonTrivialFreshPublish ? liveCorpusConfigSignature : null,
       // Advance the one-shot force-corpus-rebuild consumption marker only when
-      // the FORCE hatch drove this reset AND the drain actually published a
-      // freshly-built revision (not carried/reused/bootstrapped). After this
-      // advances to the live signature, `forceCorpusRebuildActive` is false on
-      // every subsequent drain — the hatch does not loop while the env stays
-      // set. A carried/reused publish did NOT re-embed, so we leave the marker
-      // unchanged (pass null) and the hatch is free to fire again next drain.
+      // the FORCE hatch drove this reset AND the drain published a freshly-built
+      // NON-TRIVIAL revision (not carried/reused/bootstrapped, not an empty wipe).
+      // After this advances to the live signature, `forceCorpusRebuildActive` is
+      // false on every subsequent drain — the hatch does not loop while the env
+      // stays set. A carried/reused/empty publish did NOT re-embed the corpus, so
+      // we leave the marker unchanged (pass null) and the hatch is free to fire
+      // again next drain. This is the exact self-consuming-marker bug from the
+      // live incident: pre-fix the marker advanced on a revEdges=0 publish, so the
+      // migration would never retry.
       forcedCorpusRebuildConsumedSignature:
-        forceCorpusRebuildActive && !carriedForward && !laneUnloadedReuse && !bootstrapAdopted
-          ? liveCorpusConfigSignature
-          : null,
+        forceCorpusRebuildActive && nonTrivialFreshPublish ? liveCorpusConfigSignature : null,
     });
     // Persist the durable state (best-effort — observability/guard state
     // must never fail a drain).
@@ -5003,13 +5208,41 @@ export const createConnectionsMaterializer = (
       // the >90%-collapse floor threshold used everywhere else.
       previousServedSimilarityEdgeCount <
         adoptedRevisionSimilarityEdgeCount * SIMILARITY_FLOOR_MIN_RETAINED_FRACTION;
+    // Defect #5 — COUPLE a reset reason to a corpus-complete RENDER. When a
+    // deferrable reset acted this drain (it was NOT deferred, so the eligible
+    // corpus was non-trivial and the builder produced a non-trivial revision),
+    // the reset intentionally collapses/rebuilds the served signal — so
+    // `renderedSimilarityRecoveryNeeded` above is disarmed (it requires
+    // `resetReasons.length === 0`). But the reset's fresh revision must still
+    // render over the FULL corpus node set, else Pass 7 strips its edges against
+    // a window-poor timeline and the "rebuild" publishes ZERO rows (the render-
+    // level twin of the embed-level wipe). Force the same full-corpus base
+    // rebuild the recovery path uses so the reset's non-trivial revision reaches
+    // current.db intact. Gated on a non-trivial built revision: a reset that
+    // legitimately EMPTIED the corpus (a real purge / model swap that shrank it)
+    // has nothing to render and must publish its (small) result honestly.
+    const resetForcesFullCorpusRebuild =
+      persistentHnswSimilarityMode &&
+      !resetDeferredForIncompleteCorpus &&
+      deferrableResetReasonPresent &&
+      visitSimilarity.edges.length > 0;
     const similarityRecoveryNeedsBaseRebuild =
-      laneUnloadedReuse || bootstrapAdopted || renderedSimilarityRecoveryNeeded;
+      laneUnloadedReuse ||
+      bootstrapAdopted ||
+      renderedSimilarityRecoveryNeeded ||
+      resetForcesFullCorpusRebuild;
     if (renderedSimilarityRecoveryNeeded && !laneUnloadedReuse && !bootstrapAdopted) {
       mark(
         `renderedSimilarityRecovery.forceBaseRebuild adopted=${String(
           adoptedRevisionSimilarityEdgeCount,
         )} prevServedRendered=${String(previousServedSimilarityEdgeCount)}`,
+      );
+    }
+    if (resetForcesFullCorpusRebuild) {
+      mark(
+        `similarityFloor.resetForcesFullCorpusRebuild adopted=${String(
+          adoptedRevisionSimilarityEdgeCount,
+        )} — reset renders over the full corpus node set`,
       );
     }
     // Rebuild from the COMPLETE event log — `merged` is only the pending

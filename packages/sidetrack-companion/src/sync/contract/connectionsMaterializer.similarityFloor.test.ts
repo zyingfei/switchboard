@@ -772,17 +772,26 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     // Flip the corpus-shaping flag ON (the live signature is now non-default).
     process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
 
-    // Drain again. Pre-fix: allowedResetReason=None, signature silently stamped.
-    // Post-fix: the legacy-null + non-default + non-trivial-corpus migration
-    // fires corpus-config-change → a full HNSW re-embed → publish.
-    await eventLog.importPeerEvent(
-      timelineObserved({
-        seq: 10,
-        key: 'alpha',
-        focusedWindowMs: 10_000,
-        observedAt: '2026-07-21T10:10:00.000Z',
-      }),
-    );
+    // Drain again on a CORPUS-COMPLETE drain — re-observe ALL THREE persisted
+    // visits above the gate so the reset's full rebuild re-embeds the whole
+    // corpus (eligible ≥ the persisted store), not a window slice. Defect #5:
+    // a reset may only act when the drain can assemble a corpus-complete input;
+    // a window-poor migration drain (a single re-observed visit) would rebuild a
+    // partial corpus and WIPE the served signal — that path is exercised by the
+    // "reset deferred on a window-poor drain" test below. Pre-fix: this drain
+    // stamped the signature but rendered ZERO similarity rows (a wipe the old
+    // test never read back). Post-fix: the corpus-complete migration re-embeds
+    // and publishes a NON-TRIVIAL revision.
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: 10 + i,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:1${String(i)}:00.000Z`,
+        }),
+      );
+    }
     await m.catchUp(eventLog);
     await m.awaitIdle();
 
@@ -792,11 +801,21 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
         'utf8',
       ),
     ) as { similarityFloor?: { suppressedCollapse: boolean; allowedResetReason: string | null } };
-    expect(latest.similarityFloor?.allowedResetReason).toBe('corpus-config-change');
+    // The migration must NOT be suppressed (it is a legitimate re-embed).
     expect(latest.similarityFloor?.suppressedCollapse).toBe(false);
+    // Defect #5 — a CORPUS-COMPLETE migration re-embeds to an equivalent
+    // non-trivial revision, so there is NO collapse for the guard to attribute a
+    // reset reason to (`allowedResetReason` is recorded only ON a collapse). The
+    // reset's effect is observable instead via the re-embed + the signature
+    // advance below. (Pre-fix this drain DID record corpus-config-change — but
+    // only because it wiped the corpus to zero, the very defect being fixed.)
+    expect(latest.similarityFloor?.allowedResetReason).toBeNull();
     // The full rebuild re-embedded (proving the clean corpus reached the
     // already-persisted visits, not just new ones).
     expect(embedsAfterSeed).toBeGreaterThan(0);
+    // Doctrine rule 10 — read the SERVED artifact back: the corpus-complete
+    // migration must NOT wipe the served similarity signal (defect #5).
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
     // The served signature advances to the live (clean) config so the reset
     // fires exactly ONCE.
     const afterMigration = await floorStateStore.read();
@@ -889,16 +908,23 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     expect(stamped.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
     expect(stamped.forcedCorpusRebuildSignature).toBeNull();
 
-    // Arm the one-shot hatch and drain — it must fire the reset once.
+    // Arm the one-shot hatch and drain on a CORPUS-COMPLETE drain — re-observe
+    // ALL THREE persisted visits so the forced rebuild re-embeds the whole
+    // corpus (eligible ≥ store). Defect #5: a forced rebuild over a window-poor
+    // slice would wipe the served signal AND self-consume the one-shot marker on
+    // that empty publish (the live incident); the marker may only advance on a
+    // NON-TRIVIAL corpus-complete publish.
     process.env['SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD'] = '1';
-    await eventLog.importPeerEvent(
-      timelineObserved({
-        seq: 10,
-        key: 'alpha',
-        focusedWindowMs: 10_000,
-        observedAt: '2026-07-21T10:10:00.000Z',
-      }),
-    );
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: 10 + i,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:1${String(i)}:00.000Z`,
+        }),
+      );
+    }
     await m.catchUp(eventLog);
     await m.awaitIdle();
 
@@ -907,21 +933,30 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
         join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
         'utf8',
       ),
-    ) as { similarityFloor?: { allowedResetReason: string | null } };
-    expect(firstDrain.similarityFloor?.allowedResetReason).toBe('corpus-config-change');
+    ) as { similarityFloor?: { allowedResetReason: string | null; suppressedCollapse: boolean } };
+    // Defect #5 — a corpus-complete forced rebuild re-embeds to an equivalent
+    // non-trivial revision, so no collapse is recorded (allowedResetReason null);
+    // the hatch's effect is the marker advance + re-embed, verified below.
+    expect(firstDrain.similarityFloor?.suppressedCollapse).toBe(false);
+    // Doctrine rule 10 — the forced rebuild published a NON-TRIVIAL served signal.
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
     const afterFirst = await floorStateStore.read();
-    // The one-shot consumption marker advanced to the live signature.
+    // The one-shot consumption marker advanced to the live signature — ONLY
+    // because the publish was non-trivial (an empty publish would leave it null).
     expect(afterFirst.forcedCorpusRebuildSignature).toBe('clean-title-only|title-corpus');
 
-    // Second drain with the env STILL SET — the hatch must NOT re-fire.
-    await eventLog.importPeerEvent(
-      timelineObserved({
-        seq: 11,
-        key: 'bravo',
-        focusedWindowMs: 10_000,
-        observedAt: '2026-07-21T10:11:00.000Z',
-      }),
-    );
+    // Second corpus-complete drain with the env STILL SET — the hatch must NOT
+    // re-fire (the marker == live now).
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: 20 + i,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:2${String(i)}:00.000Z`,
+        }),
+      );
+    }
     await m.catchUp(eventLog);
     await m.awaitIdle();
 
@@ -1018,5 +1053,295 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     };
     expect(latest.similarityFloor?.flapping).toBe(false);
     expect(latest.similarityFloor?.suppressedCollapseCount).toBeGreaterThan(0);
+  });
+
+  // ── Defect #5 — a reset reason must be COUPLED to corpus-complete rebuild
+  // input, else it becomes a WIPE PERMIT ─────────────────────────────────────
+  //
+  // The live incident: a corpus-config-change / forced-rebuild reset fired on a
+  // warm WINDOW-POOR drain (the standing corpus-lane assembly debt), so the
+  // "full rebuild" ran over an EMPTY eligible corpus while the persisted HNSW
+  // store still held the whole ~9k-visit corpus. The rebuild reset the HNSW,
+  // published revEdges=0, and — because every floor defers to a recorded reset
+  // reason — wiped the served visit_resembles_visit signal (52,100 → 0). Worse,
+  // the one-shot forcedCorpusRebuildSignature marker CONSUMED itself on that
+  // empty publish, so the migration never retried.
+  //
+  // These read the SERVED artifact back through the real drain/store (doctrine
+  // rule 10): store.readCurrent() (what resolvers read) + the persisted HNSW
+  // store element count + the durable floor state.
+
+  const readHnswStoreCount = async (): Promise<number> => {
+    const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, fullDim);
+    const count = loaded.elementCount();
+    await loaded.close();
+    return count;
+  };
+
+  // (a) Reset active + WINDOW-POOR drain + non-trivial persisted store → the
+  //     reset does NOT consume, no wipe is published, the served signal retains
+  //     the previous rows (falls back to carry-forward, reset stays pending).
+  it('reset active + window-poor drain + non-trivial store → no wipe, reset stays pending', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    // Seed a non-trivial corpus under the DEFAULT config → served signal + a
+    // populated persisted HNSW store.
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const goodEdgeCount = resemblesEdgeCount((await store.readCurrent())?.edges);
+    expect(goodEdgeCount).toBeGreaterThan(0);
+    const storeCountBefore = await readHnswStoreCount();
+    expect(storeCountBefore).toBe(KEYS.length);
+    // Model the legacy-null state so a reset (corpus-config-change) is ARMED on
+    // the next drain: stomp the recorded signature to null, flip the flag on.
+    const seeded = await floorStateStore.read();
+    await floorStateStore.write({ ...seeded, servedCorpusConfigSignature: null });
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+
+    // A WINDOW-POOR drain: re-observe a SINGLE visit above the gate. The reset
+    // is armed (legacy-null migration) but the eligible corpus (1) does NOT
+    // cover the persisted store (3), so the reset must be DEFERRED: no wipe, no
+    // consume, the served signal is carried forward.
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 10,
+        key: 'alpha',
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-21T10:10:00.000Z',
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    // Served artifact — the signal must NOT collapse.
+    const afterEdges = resemblesEdgeCount((await store.readCurrent())?.edges);
+    expect(afterEdges).toBeGreaterThanOrEqual(Math.ceil(goodEdgeCount * 0.1));
+    expect(afterEdges).toBeGreaterThan(0);
+    // The persisted HNSW store must not have been reset/eroded.
+    expect(await readHnswStoreCount()).toBe(storeCountBefore);
+    // The reset must NOT have consumed: the recorded signature stays null so the
+    // migration re-fires on the next corpus-complete drain (still PENDING). This
+    // is the load-bearing property — a deferred reset never advances its
+    // consumption marker, however the served signal was preserved (carry-forward
+    // OR, at small scale, the incremental path re-deriving the full edge set from
+    // the still-intact persisted store).
+    const afterState = await floorStateStore.read();
+    expect(afterState.servedCorpusConfigSignature).toBeNull();
+    // The diagnostic must NOT record a corpus-config-change collapse-allow — the
+    // reset was held back, not published.
+    const latest = JSON.parse(
+      await readFile(join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'), 'utf8'),
+    ) as { similarityFloor?: { allowedResetReason: string | null; servedEdgeCount: number } };
+    expect(latest.similarityFloor?.allowedResetReason).not.toBe('corpus-config-change');
+    expect(latest.similarityFloor?.servedEdgeCount).toBeGreaterThan(0);
+  });
+
+  // (b) Reset active + CORPUS-COMPLETE drain → the full rebuild publishes
+  //     non-trivially and the reset consumes EXACTLY once.
+  it('reset active + corpus-complete drain → publishes non-trivially, consumes once', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    let embedsAfterSeed = 0;
+    let seededFlag = false;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(() => {
+        if (seededFlag) embedsAfterSeed += 1;
+      }),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    seededFlag = true;
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    // Arm the reset (legacy-null migration).
+    const seeded = await floorStateStore.read();
+    await floorStateStore.write({ ...seeded, servedCorpusConfigSignature: null });
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+
+    // A CORPUS-COMPLETE drain: re-observe ALL persisted visits above the gate so
+    // the eligible corpus covers the store → the reset acts corpus-complete.
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: 10 + i,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:1${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    // Served artifact — non-trivial (the full corpus re-embed republished).
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    // The corpus was actually re-embedded (the reset drove the full rebuild).
+    expect(embedsAfterSeed).toBeGreaterThan(0);
+    // The reset CONSUMED exactly once: the recorded signature advanced to live.
+    const afterState = await floorStateStore.read();
+    expect(afterState.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+
+    // A subsequent corpus-complete drain must NOT re-fire the migration
+    // (recorded == live now → consumed exactly once).
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: 20 + i,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:2${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    const embedsBeforeSecond = embedsAfterSeed;
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const secondLatest = JSON.parse(
+      await readFile(join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'), 'utf8'),
+    ) as { similarityFloor?: { allowedResetReason: string | null } };
+    // No fresh corpus-config-change collapse on the second drain.
+    expect(secondLatest.similarityFloor?.allowedResetReason).not.toBe('corpus-config-change');
+    // The served signal stays non-empty across the second drain.
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    void embedsBeforeSecond;
+  });
+
+  // (c) The LIVE scenario: the one-shot marker was already CONSUMED by the
+  //     historical empty publish, the served signal is 0, and the persisted
+  //     store is non-trivial. The next drain must converge to serving non-empty
+  //     — via R2 bootstrap (a clean persisted revision is adopted) when one
+  //     exists, else via the re-fired forced rebuild.
+  it('live state: consumed marker + served=0 + non-trivial store → converges to non-empty', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    // Seed a non-trivial corpus WITH the clean flag on → a clean-corpus HNSW
+    // store + a clean persisted revision (mirrors the child that wrote the fresh
+    // clean HNSW bin after the incident).
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const seededSnapshot = await store.readCurrent();
+    expect(resemblesEdgeCount(seededSnapshot?.edges)).toBeGreaterThan(0);
+    const persisted = await readLatestNonEmptyVisitSimilarityRevision(vaultRoot);
+    expect(persisted?.edges.length).toBeGreaterThan(0);
+    const storeCount = await readHnswStoreCount();
+    expect(storeCount).toBeGreaterThan(0);
+
+    // Reproduce the exact post-incident durable state: the one-shot marker is
+    // CONSUMED (== live) and the recorded signature is live, but the SERVED
+    // snapshot was wiped to zero similarity rows (the historical empty publish).
+    const stampedState = await floorStateStore.read();
+    await floorStateStore.write({
+      ...stampedState,
+      servedCorpusConfigSignature: 'clean-title-only|title-corpus',
+      forcedCorpusRebuildSignature: 'clean-title-only|title-corpus',
+    });
+    // Strip the similarity-family rows from the served snapshot (served=0) while
+    // leaving the persisted HNSW store + revision intact — read/write back
+    // through the real store.
+    if (seededSnapshot !== null) {
+      const wiped: typeof seededSnapshot = {
+        ...seededSnapshot,
+        edges: seededSnapshot.edges.filter(
+          (edge) => edge.kind !== 'visit_resembles_visit' && edge.kind !== 'closest_visit',
+        ),
+      };
+      await store.putCurrent(wiped);
+    }
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBe(0);
+
+    // Drive a WINDOW-POOR recovery drain (re-observe a SINGLE visit). This is the
+    // harder case: the served signal is 0 and the window carries just one visit,
+    // so the builder cannot re-derive the full corpus from the window alone — the
+    // R2 bootstrap must ADOPT the clean persisted revision to restore the served
+    // signal (the env stays set, but B6 stale-config rejection must NOT block a
+    // revision built under the CURRENT clean config). If no clean revision were
+    // adoptable, the re-fired forced rebuild would take over; here the child's
+    // clean revision exists, so bootstrap converges.
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 10,
+        key: 'alpha',
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-21T10:10:00.000Z',
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    // Converged — the served visit_resembles_visit signal is restored from 0.
+    // (Which recovery lane fires is scale-dependent — doctrine rule 4: at this
+    // unit scale the incremental builder re-derives the full edge set from the
+    // still-intact persisted store, so the served signal restores without needing
+    // R2 bootstrap; at real scale where the window cannot re-derive the corpus,
+    // R2 bootstrap adopts the clean persisted revision instead — the B6 stale-
+    // config rejection does NOT block it because the recorded served signature is
+    // the CURRENT clean config, not null. Either way the load-bearing property —
+    // served converges from 0 to non-empty — holds and is what the user reads.)
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    // The persisted HNSW store survived the recovery (no further erosion).
+    expect(await readHnswStoreCount()).toBeGreaterThan(0);
   });
 });

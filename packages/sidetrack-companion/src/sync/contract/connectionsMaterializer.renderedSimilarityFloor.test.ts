@@ -290,9 +290,16 @@ describe('connections materializer — RENDERED-edge floor (round-3, store-level
     expect(floor.renderRepaired).toBe(false);
   });
 
-  // A LEGITIMATE reset (operator-forced rebuild) must still allow a collapse at
-  // the RENDERED level — the floor is not a hard pin against real deletions.
-  it('allows a rendered collapse under an operator rebuild (reset reason)', async () => {
+  // Defect #5 — a reset reason is NOT an unconditional wipe permit at the
+  // rendered level either. An operator-forced rebuild over an EMPTY / window-poor
+  // corpus (eligible << the persisted store) cannot assemble a corpus-complete
+  // input, so the reset is DEFERRED and the render floor still REPAIRS the
+  // window-poor collapse — the served signal is protected, not wiped. (A
+  // corpus-complete operator rebuild — where the eligible set covers the store —
+  // still publishes its collapse honestly; that is the corpus-complete path.)
+  // Pre-fix this drain published the rendered collapse under the reset (a wipe);
+  // the fix couples the reset to corpus-complete rebuild input.
+  it('DEFERS an operator rebuild over an empty corpus and repairs the render (no wipe)', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
@@ -326,15 +333,17 @@ describe('connections materializer — RENDERED-edge floor (round-3, store-level
       goodEdgeCount * 0.1,
     ); // window-poor: a >90% rendered collapse
 
-    // Operator forces a full rebuild — a legitimate reset. The render floor must
-    // NOT repair a rendered collapse under a reset (it is intended this drain).
-    // A window-poor render under a reset legitimately publishes fewer/no edges.
+    // Operator forces a rebuild, but the drain carries an EMPTY corpus event
+    // (no timeline visit) → the eligible corpus is 0 while the persisted store is
+    // dense. The reset is deferred and the render floor repairs the collapse.
     process.env['SIDETRACK_SIMILARITY_FORCE_REBUILD'] = '1';
     await eventLog.importPeerEvent(emptyCorpusDrainEvent(30));
     await runDrain();
 
     const floor = await readFloorDiagnostics(vaultRoot);
-    // The floor deferred to the reset — no repair.
-    expect(floor.renderRepaired).toBe(false);
+    // The deferred reset did NOT wipe the served signal — the render was repaired
+    // (or otherwise kept non-empty). Read back current.db (doctrine rule 10).
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    expect(floor.servedEdgeCount).toBeGreaterThan(0);
   });
 });
