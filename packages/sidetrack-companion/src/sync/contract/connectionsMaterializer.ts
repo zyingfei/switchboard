@@ -218,6 +218,8 @@ import {
   buildVisitSimilarityIncremental,
   corpusForVisitEntry,
   similarityCorpusConfigSignature,
+  similarityForceCorpusRebuildRequested,
+  SIMILARITY_DEFAULT_CORPUS_CONFIG_SIGNATURE,
   visitKeyForVisitEntry,
   VISIT_SIMILARITY_DEFAULT_THRESHOLD,
   VISIT_SIMILARITY_DEFAULT_TOP_K,
@@ -3490,16 +3492,73 @@ export const createConnectionsMaterializer = (
     // content-corpus) since the currently served revision was built. Every
     // visit's embedded corpus TEXT changed, so the served edges are stale and
     // the recompute is intended (mirrors the same-dimension model-change reset
-    // above: compare the durable served signature against the live one). A null
-    // recorded signature means a pre-signature vault (upgrade); treat it as a
-    // match so an in-place upgrade never spuriously resets. This reset makes the
-    // flip LAND: it drives the full HNSW rebuild below (re-embed every visit
-    // under the clean corpus) AND lets the floor guard PUBLISH the recompute
-    // instead of carrying the dirty revision forward.
+    // above: compare the durable served signature against the live one). This
+    // reset makes the flip LAND: it drives the full HNSW rebuild below (re-embed
+    // every visit under the clean corpus) AND lets the floor guard PUBLISH the
+    // recompute instead of carrying the dirty revision forward.
     const liveCorpusConfigSignature = similarityCorpusConfigSignature();
-    const corpusConfigChanged =
+    const liveCorpusConfigIsDefault =
+      liveCorpusConfigSignature === SIMILARITY_DEFAULT_CORPUS_CONFIG_SIGNATURE;
+    // Case 1 — the durable signature is RECORDED and differs from live. This is
+    // the normal within-lifetime flip: a fresh publish under the OLD corpus
+    // recorded its signature, then the flag flipped.
+    const corpusConfigChangedFromRecorded =
       similarityFloorState.servedCorpusConfigSignature !== null &&
       similarityFloorState.servedCorpusConfigSignature !== liveCorpusConfigSignature;
+    // Case 2 (LEGACY-NULL MIGRATION) — the recorded signature is ABSENT (a
+    // pre-signature vault written by a build before this field existed) AND the
+    // live corpus is NON-default (a clean/content flag is on). A null recorded
+    // signature could ONLY have been produced by the default corpus (the frozen
+    // byte-identical baseline), so if live is non-default the persisted vectors
+    // predate the flip and are stale. Pre-fix this null→non-default transition
+    // silently recorded the new signature WITHOUT re-embedding — the mixed
+    // vector space the doctrine's absent≠empty rule forbids. We migrate ONLY
+    // when the persisted corpus is non-trivial: a genuinely FRESH vault (empty
+    // corpus) has nothing stale to re-embed, so it just records the signature
+    // without a pointless reset. This mirrors the B6 reuse-rejection gate
+    // (`corpusConfigProvenanceUnknownButNonDefault` below) — the two are kept
+    // consistent so a legacy vault both refuses to reuse the stale revision AND
+    // fires the migration reset. Corpus witnesses (task rounds 2/3 helpers): the
+    // persisted HNSW element count (primary, already computed) OR — only when
+    // the store is empty/unloaded on this path — a non-empty persisted revision.
+    const recordedSignatureAbsent =
+      similarityFloorState.servedCorpusConfigSignature === null;
+    let legacyNullCorpusMigration = false;
+    if (recordedSignatureAbsent && !liveCorpusConfigIsDefault && persistentHnswSimilarityMode) {
+      // Cheap witness first: the persisted HNSW store element count.
+      if (hnswStoreVisitCount > 0) {
+        legacyNullCorpusMigration = true;
+      } else {
+        // Store empty/unloaded on this path — fall back to the persisted
+        // revision witness (a filesystem scan, gated to this narrow legacy case
+        // so the common healthy drain never pays for it).
+        const legacyWitnessRevision = await readLatestNonEmptyVisitSimilarityRevision(
+          deps.vaultRoot,
+        );
+        legacyNullCorpusMigration =
+          legacyWitnessRevision !== null && legacyWitnessRevision.edges.length > 0;
+      }
+    }
+    // Case 3 (ALREADY-STAMPED STALE — operator hatch) — the state we are NOW in
+    // after the pre-fix bug: a normal warm drain already stamped the live
+    // signature into durable state WITHOUT a real re-embed, so
+    // `corpusConfigChangedFromRecorded` is false (recorded == live) and the
+    // legacy-null path above no longer applies (recorded is non-null). No
+    // in-band signal can distinguish this from a legitimately-migrated vault:
+    // the persisted revision store carries NO corpus-config provenance field
+    // (VisitSimilarityRevision — verified), so there is no data marker to detect
+    // that the recorded signature was stamped without a rebuild. The honest
+    // recovery is an explicit operator hatch. One-shot via a DEDICATED durable
+    // marker (`forcedCorpusRebuildSignature`) — NOT `servedCorpusConfigSignature`,
+    // which already equals live in this state — so it fires once per live
+    // signature and does not loop while the env stays set.
+    const forceCorpusRebuildActive =
+      persistentHnswSimilarityMode &&
+      !liveCorpusConfigIsDefault &&
+      similarityForceCorpusRebuildRequested() &&
+      similarityFloorState.forcedCorpusRebuildSignature !== liveCorpusConfigSignature;
+    const corpusConfigChanged =
+      corpusConfigChangedFromRecorded || legacyNullCorpusMigration || forceCorpusRebuildActive;
     if (corpusConfigChanged) {
       similarityFloorResetReasons.push('corpus-config-change');
     }
@@ -4027,22 +4086,26 @@ export const createConnectionsMaterializer = (
       // Corpus-config provenance for R1 reuse. The persisted revision does NOT
       // carry a corpus-config signature field, so we cannot read it off the
       // revision directly. Two guards cover the reuse hazard:
-      //   1. The COMMON case (durable signature recorded and differs from live):
-      //      `corpus-config-change` is already in `similarityFloorResetReasons`,
-      //      so `hasLegitimateResetReason` is true and the reuse branch below is
-      //      skipped entirely. No provenance check needed for this case.
+      //   1. The COMMON case (durable signature recorded and differs from live)
+      //      AND the LEGACY-NULL case (recorded null + non-default live + a
+      //      non-trivial persisted corpus): `corpus-config-change` is already in
+      //      `similarityFloorResetReasons` (see the detection seam above — the
+      //      legacy-null migration uses the SAME non-default gate this reuse
+      //      check applies, so the two stay consistent), so
+      //      `hasLegitimateResetReason` is true and the reuse branch below is
+      //      skipped entirely. No provenance check needed for those cases.
       //   2. The RESIDUAL edge case the model-change guard also warns about: a
-      //      FRESH / lost floor-state file records a null served signature, so
-      //      `corpusConfigChanged` is false and the reset reason does not fire —
-      //      yet the persisted revision may have been built under a DIFFERENT
-      //      corpus config. When the live corpus config is NON-DEFAULT (a
-      //      clean/content flag is on) and we have no recorded signature to
-      //      prove the persisted revision was built under it, we cannot vouch
-      //      for its provenance, so we must NOT reuse it (let the fresh build
-      //      recompute under the live corpus). Default config with a null
-      //      signature is safe (the persisted revision could only have been the
-      //      legacy skeleton, which IS the live config).
-      const liveCorpusConfigIsDefault = liveCorpusConfigSignature === 'legacy-skeleton|title-corpus';
+      //      FRESH / lost floor-state file records a null served signature and
+      //      the migration did NOT fire (empty/unloaded corpus on this path), so
+      //      `corpusConfigChanged` is false — yet the persisted revision we are
+      //      about to reuse may have been built under a DIFFERENT corpus config.
+      //      When the live corpus config is NON-DEFAULT and we have no recorded
+      //      signature to prove the persisted revision was built under it, we
+      //      cannot vouch for its provenance, so we must NOT reuse it (let the
+      //      fresh build recompute under the live corpus). Default config with a
+      //      null signature is safe (the persisted revision could only have been
+      //      the legacy skeleton, which IS the live config). `liveCorpusConfigIsDefault`
+      //      is computed once at the detection seam above and reused here.
       const corpusConfigProvenanceUnknownButNonDefault =
         similarityFloorState.servedCorpusConfigSignature === null && !liveCorpusConfigIsDefault;
       const persistedRevisionMatchesLiveProvenance = (
@@ -4327,6 +4390,17 @@ export const createConnectionsMaterializer = (
       // `corpus-config-change` reset stops firing on subsequent drains.
       servedCorpusConfigSignature:
         !carriedForward && !laneUnloadedReuse && !bootstrapAdopted
+          ? liveCorpusConfigSignature
+          : null,
+      // Advance the one-shot force-corpus-rebuild consumption marker only when
+      // the FORCE hatch drove this reset AND the drain actually published a
+      // freshly-built revision (not carried/reused/bootstrapped). After this
+      // advances to the live signature, `forceCorpusRebuildActive` is false on
+      // every subsequent drain — the hatch does not loop while the env stays
+      // set. A carried/reused publish did NOT re-embed, so we leave the marker
+      // unchanged (pass null) and the hatch is free to fire again next drain.
+      forcedCorpusRebuildConsumedSignature:
+        forceCorpusRebuildActive && !carriedForward && !laneUnloadedReuse && !bootstrapAdopted
           ? liveCorpusConfigSignature
           : null,
     });

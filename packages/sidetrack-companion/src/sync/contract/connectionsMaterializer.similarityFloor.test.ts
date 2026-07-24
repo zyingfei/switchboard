@@ -24,10 +24,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import { createSimilarityHnswStore } from '../../connections/visitSimilarityHnsw.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
+import { SIMILARITY_DEFAULT_CORPUS_CONFIG_SIGNATURE } from '../../connections/visitSimilarity.js';
 import {
   createSimilarityFloorStateStore,
   parseSimilarityFloorState,
 } from '../../connections/similarityFloorState.js';
+import { readLatestNonEmptyVisitSimilarityRevision } from '../../producers/visit-resembles-revision.js';
 import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
 import { collectHealth } from '../../system/health.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
@@ -136,6 +138,8 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
 
   afterEach(async () => {
     delete process.env['SIDETRACK_SIMILARITY_FORCE_REBUILD'];
+    delete process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'];
+    delete process.env['SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD'];
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
@@ -705,6 +709,229 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     // The published revision re-records the live model revision.
     const after = await floorStateStore.read();
     expect(after.servedModelRevision).toBe(RECALL_MODEL.revision);
+  });
+
+  // ── Corpus-config-change migration (fix/corpus-flip-legacy-migration) ──
+  //
+  // The live defect: a corpus-shaping flag (SIDETRACK_SIMILARITY_CLEAN_CORPUS)
+  // flipped, but the pre-existing floor-state file was written by an OLDER
+  // build with NO servedCorpusConfigSignature field. The detection fired only
+  // when a RECORDED signature differed from live, so legacy-null → new-signature
+  // silently RECORDED the new signature WITHOUT re-embedding — a mixed vector
+  // space (absent≠empty, doctrine rule 6). These read the SERVED artifact
+  // (diagnostics latest.json allowedResetReason + floor state) back through the
+  // real drain (doctrine rule 10).
+
+  it('legacy-null signature + non-default corpus flag + non-trivial corpus fires the migration reset', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    let embedsAfterSeed = 0;
+    let seeded = false;
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(() => {
+        if (seeded) embedsAfterSeed += 1;
+      }),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    // Seed a non-trivial persisted corpus under the DEFAULT (legacy) config.
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    seeded = true;
+    expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
+    const persisted = await readLatestNonEmptyVisitSimilarityRevision(vaultRoot);
+    expect(persisted?.edges.length).toBeGreaterThan(0);
+
+    // Reproduce the exact legacy-vault state: an OLD-build floor-state file with
+    // NO servedCorpusConfigSignature field (null). The default publish above
+    // recorded the DEFAULT signature; stomp it back to null to model the vault
+    // that upgraded across the field's introduction.
+    const seededState = await floorStateStore.read();
+    expect(seededState.servedCorpusConfigSignature).toBe(
+      SIMILARITY_DEFAULT_CORPUS_CONFIG_SIGNATURE,
+    );
+    await floorStateStore.write({ ...seededState, servedCorpusConfigSignature: null });
+
+    // Flip the corpus-shaping flag ON (the live signature is now non-default).
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+
+    // Drain again. Pre-fix: allowedResetReason=None, signature silently stamped.
+    // Post-fix: the legacy-null + non-default + non-trivial-corpus migration
+    // fires corpus-config-change → a full HNSW re-embed → publish.
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 10,
+        key: 'alpha',
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-21T10:10:00.000Z',
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const latest = JSON.parse(
+      await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+        'utf8',
+      ),
+    ) as { similarityFloor?: { suppressedCollapse: boolean; allowedResetReason: string | null } };
+    expect(latest.similarityFloor?.allowedResetReason).toBe('corpus-config-change');
+    expect(latest.similarityFloor?.suppressedCollapse).toBe(false);
+    // The full rebuild re-embedded (proving the clean corpus reached the
+    // already-persisted visits, not just new ones).
+    expect(embedsAfterSeed).toBeGreaterThan(0);
+    // The served signature advances to the live (clean) config so the reset
+    // fires exactly ONCE.
+    const afterMigration = await floorStateStore.read();
+    expect(afterMigration.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+  });
+
+  it('fresh vault (empty corpus) records the non-default signature WITHOUT a reset', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    // Non-default corpus flag from the very first drain, but NO prior corpus:
+    // a genuinely fresh vault (null signature, empty HNSW store, no persisted
+    // revision). There is nothing stale to re-embed → no pointless reset.
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+    expect(await readLatestNonEmptyVisitSimilarityRevision(vaultRoot)).toBeNull();
+
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const latest = JSON.parse(
+      await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+        'utf8',
+      ),
+    ) as { similarityFloor?: { allowedResetReason: string | null } };
+    // A first-ever build has no previously served signal, so the ONLY
+    // legitimate reason that could appear is no-previous-signal — never
+    // corpus-config-change (there was no old corpus to migrate).
+    expect(latest.similarityFloor?.allowedResetReason).not.toBe('corpus-config-change');
+    // The signature is still recorded so a LATER flip is detectable normally.
+    const after = await floorStateStore.read();
+    expect(after.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+  });
+
+  it('already-stamped-but-stale state: FORCE_CORPUS_REBUILD hatch fires exactly once (no loop)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+    const floorStateStore = createSimilarityFloorStateStore(vaultRoot);
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(),
+      similarityFloorStateStore: floorStateStore,
+    });
+
+    // Seed a non-trivial corpus WITH the clean flag already on, so the served
+    // signature is stamped to the live (clean) config — modelling the state we
+    // are NOW in: signature already == live, but the vault was never truly
+    // re-embedded under it. The migration/recorded-difference paths cannot fire
+    // (recorded == live). Only the operator hatch can recover this.
+    process.env['SIDETRACK_SIMILARITY_CLEAN_CORPUS'] = '1';
+    for (const [i, key] of KEYS.entries()) {
+      await eventLog.importPeerEvent(
+        timelineObserved({
+          seq: i + 1,
+          key,
+          focusedWindowMs: 10_000,
+          observedAt: `2026-07-21T10:0${String(i)}:00.000Z`,
+        }),
+      );
+    }
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    const stamped = await floorStateStore.read();
+    expect(stamped.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+    expect(stamped.forcedCorpusRebuildSignature).toBeNull();
+
+    // Arm the one-shot hatch and drain — it must fire the reset once.
+    process.env['SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD'] = '1';
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 10,
+        key: 'alpha',
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-21T10:10:00.000Z',
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const firstDrain = JSON.parse(
+      await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+        'utf8',
+      ),
+    ) as { similarityFloor?: { allowedResetReason: string | null } };
+    expect(firstDrain.similarityFloor?.allowedResetReason).toBe('corpus-config-change');
+    const afterFirst = await floorStateStore.read();
+    // The one-shot consumption marker advanced to the live signature.
+    expect(afterFirst.forcedCorpusRebuildSignature).toBe('clean-title-only|title-corpus');
+
+    // Second drain with the env STILL SET — the hatch must NOT re-fire.
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 11,
+        key: 'bravo',
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-21T10:11:00.000Z',
+      }),
+    );
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    const secondDrain = JSON.parse(
+      await readFile(
+        join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+        'utf8',
+      ),
+    ) as { similarityFloor?: { allowedResetReason: string | null } };
+    expect(secondDrain.similarityFloor?.allowedResetReason).not.toBe('corpus-config-change');
   });
 
   // Findings on the monotonic health pin — a single transient flap that

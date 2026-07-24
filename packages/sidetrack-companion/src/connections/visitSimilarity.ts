@@ -272,6 +272,31 @@ export const SIMILARITY_CLEAN_CORPUS_ENV = 'SIDETRACK_SIMILARITY_CLEAN_CORPUS';
 export const similarityCleanCorpusEnabled = (): boolean =>
   process.env[SIMILARITY_CLEAN_CORPUS_ENV] === '1';
 
+// One-shot operator escape hatch for the "signature already stamped, migration
+// never ran" state. This exists because the corpus-config-change detection
+// fires on a signature DIFFERENCE (recorded vs live); once a normal warm drain
+// has stamped the new live signature into durable floor state WITHOUT a real
+// re-embed (the legacy-null bug this file's fix closes going forward), the
+// recorded signature already equals the live one, so no difference remains to
+// detect — yet the ~3k already-persisted visits still hold OLD-corpus vectors.
+// The persisted revision store carries NO corpus-config provenance field
+// (VisitSimilarityRevision has no such field), so there is no reliable data
+// marker to detect this after the fact; an explicit operator hatch is the only
+// honest recovery. When set, the materializer forces a corpus-config-change
+// reset (full HNSW re-embed + publish) — but ONLY while the recorded served
+// signature still differs from the live one is NOT the gate here (it may match);
+// instead this is one-shot via the durable signature: after the forced rebuild
+// PUBLISHES, the served signature is re-stamped from the freshly-embedded clean
+// corpus, and the hatch guard below stops firing (the recorded signature now
+// provably reflects a real rebuild-publish under the live corpus). Leaving the
+// env set across a subsequent drain does NOT loop: a second drain finds the
+// consumption marker already advanced and does not re-fire. Distinct from
+// SIDETRACK_SIMILARITY_FORCE_REBUILD (the generic operator-rebuild hatch, which
+// re-fires every drain while set) precisely so this one is self-consuming.
+export const SIMILARITY_FORCE_CORPUS_REBUILD_ENV = 'SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD';
+export const similarityForceCorpusRebuildRequested = (): boolean =>
+  process.env[SIMILARITY_FORCE_CORPUS_REBUILD_ENV] === '1';
+
 // A stable signature of the CORPUS-shaping config — the set of flags that change
 // the embedded corpus TEXT for existing visits (and therefore every served
 // same-site cosine). Recorded in durable floor state so the materializer can
@@ -284,6 +309,18 @@ export const similarityCorpusConfigSignature = (): string => {
   parts.push(similarityContentCorpusEnabled() ? 'content-corpus' : 'title-corpus');
   return parts.join('|');
 };
+
+// The frozen default corpus-config signature — every corpus-shaping flag OFF.
+// A vault whose durable floor state has NO recorded signature (a pre-signature
+// upgrade, written by a build before this field existed) could ONLY have been
+// built under this default, because that is the byte-identical baseline the
+// serving-flip discipline guarantees while every flag is off. The materializer
+// uses this to distinguish a legacy vault mid-flip (recorded null + live
+// NON-default → the persisted corpus predates the flip → migrate) from a
+// genuinely fresh vault (recorded null + live default → nothing to migrate).
+// Keep in lockstep with similarityCorpusConfigSignature above: this MUST equal
+// the signature returned when no corpus-shaping flag is set.
+export const SIMILARITY_DEFAULT_CORPUS_CONFIG_SIGNATURE = 'legacy-skeleton|title-corpus';
 
 // Stage 5.2 W3 fast-path needs both helpers to embed + key new entries
 // from outside this module. They're stateless + cheap; expose as named
