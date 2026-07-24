@@ -99,6 +99,17 @@ export interface SimilarityFloorState {
   // pre-existing vault (no signature recorded yet) does not spuriously reset on
   // upgrade.
   readonly servedCorpusConfigSignature: string | null;
+  // One-shot consumption marker for the SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD
+  // operator hatch. Records the live corpus-config signature under which the
+  // last FORCED corpus rebuild published. The hatch fires only while this marker
+  // differs from the live signature; after a forced rebuild-publish advances it
+  // to the live signature, the hatch stops firing even if the env stays set (no
+  // loop). Null until a forced rebuild has ever been consumed. Distinct from
+  // servedCorpusConfigSignature: that advances on ANY fresh publish (including a
+  // normal warm drain), so it cannot by itself gate the hatch — the whole reason
+  // the hatch is needed is the state where servedCorpusConfigSignature already
+  // matches live but the corpus was never truly re-embedded.
+  readonly forcedCorpusRebuildSignature: string | null;
 }
 
 export const EMPTY_SIMILARITY_FLOOR_STATE: SimilarityFloorState = {
@@ -112,6 +123,7 @@ export const EMPTY_SIMILARITY_FLOOR_STATE: SimilarityFloorState = {
   purgeResetConsumedEpoch: 0,
   servedModelRevision: null,
   servedCorpusConfigSignature: null,
+  forcedCorpusRebuildSignature: null,
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -145,6 +157,7 @@ export const parseSimilarityFloorState = (value: unknown): SimilarityFloorState 
     purgeResetConsumedEpoch: Math.max(0, numberOr(value['purgeResetConsumedEpoch'], 0)),
     servedModelRevision: stringOrNull(value['servedModelRevision']),
     servedCorpusConfigSignature: stringOrNull(value['servedCorpusConfigSignature']),
+    forcedCorpusRebuildSignature: stringOrNull(value['forcedCorpusRebuildSignature']),
   };
 };
 
@@ -188,6 +201,12 @@ export const foldSimilarityFloorDrain = (
     // drain does not know it, leaving the recorded value unchanged) to keep the
     // recorded provenance honest — exactly like servedModelRevision.
     readonly servedCorpusConfigSignature?: string | null;
+    // The live corpus-config signature under which a FORCED corpus rebuild
+    // (SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD) actually published this drain.
+    // Non-null only when the hatch fired AND the drain published a fresh
+    // revision (not carried/reused). Advances the one-shot consumption marker so
+    // the hatch does not re-fire while the env stays set.
+    readonly forcedCorpusRebuildConsumedSignature?: string | null;
   },
 ): SimilarityFloorState => {
   let next: SimilarityFloorState =
@@ -199,6 +218,15 @@ export const foldSimilarityFloorDrain = (
     drain.servedCorpusConfigSignature !== null
   ) {
     next = { ...next, servedCorpusConfigSignature: drain.servedCorpusConfigSignature };
+  }
+  if (
+    drain.forcedCorpusRebuildConsumedSignature !== undefined &&
+    drain.forcedCorpusRebuildConsumedSignature !== null
+  ) {
+    next = {
+      ...next,
+      forcedCorpusRebuildSignature: drain.forcedCorpusRebuildConsumedSignature,
+    };
   }
   // Arm the purge reset epoch when a tombstone was observed.
   if (drain.purgeObservedThisDrain) {

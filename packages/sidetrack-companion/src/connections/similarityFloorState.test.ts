@@ -67,6 +67,7 @@ describe('parseSimilarityFloorState', () => {
       purgeResetConsumedEpoch: 2,
       servedModelRevision: 'r9',
       servedCorpusConfigSignature: 'legacy-skeleton|title-corpus',
+      forcedCorpusRebuildSignature: 'clean-title-only|title-corpus',
     };
     expect(parseSimilarityFloorState(state)).toEqual(state);
   });
@@ -157,6 +158,28 @@ describe('foldSimilarityFloorDrain', () => {
     // absent (older call site) also leaves it unchanged.
     const s3 = foldSimilarityFloorDrain(s2, cleanDrain);
     expect(s3.servedCorpusConfigSignature).toBe('clean-title-only|title-corpus');
+  });
+
+  it('advances forcedCorpusRebuildSignature only on a consumed forced rebuild', () => {
+    // The one-shot marker for SIDETRACK_SIMILARITY_FORCE_CORPUS_REBUILD. It
+    // advances ONLY when the drain passes a non-null consumed signature (the
+    // hatch fired AND published fresh); null/absent leaves it unchanged so the
+    // hatch is free to fire again until a real rebuild consumes it.
+    expect(EMPTY_SIMILARITY_FLOOR_STATE.forcedCorpusRebuildSignature).toBeNull();
+    const s1 = foldSimilarityFloorDrain(EMPTY_SIMILARITY_FLOOR_STATE, {
+      ...cleanDrain,
+      forcedCorpusRebuildConsumedSignature: 'clean-title-only|title-corpus',
+    });
+    expect(s1.forcedCorpusRebuildSignature).toBe('clean-title-only|title-corpus');
+    // null (hatch not fired / not a fresh publish) leaves it unchanged.
+    const s2 = foldSimilarityFloorDrain(s1, {
+      ...cleanDrain,
+      forcedCorpusRebuildConsumedSignature: null,
+    });
+    expect(s2.forcedCorpusRebuildSignature).toBe('clean-title-only|title-corpus');
+    // absent also leaves it unchanged (older call sites / non-force drains).
+    const s3 = foldSimilarityFloorDrain(s2, cleanDrain);
+    expect(s3.forcedCorpusRebuildSignature).toBe('clean-title-only|title-corpus');
   });
 });
 
