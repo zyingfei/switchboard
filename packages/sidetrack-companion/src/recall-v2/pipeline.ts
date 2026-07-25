@@ -35,8 +35,12 @@ import { analyzeQuery, composeLexicalQuery, type QueryAnalysis } from './query-a
 import {
   applyLearnedRerank,
   type LearnedRerankContext,
-  recallLearnedRerankEnabled,
+  rankerServeV6Enabled,
 } from './learnedRerank.js';
+import {
+  rankerShadowDiffEnabled,
+  recordRankerShadowDiff,
+} from './rankerShadowDiff.js';
 import { peekServedFeatureModel } from './servedFeatureModel.js';
 import { computeServedFeatureVectors } from '../ranker/retrain-impressions.js';
 import {
@@ -1401,14 +1405,18 @@ export const runRecall = async (
     timings['rerank'] = rerankLatencyMs;
     rerankApplied = true;
   }
-  // P3 — learned re-rank AFTER the cross-encoder (so it consumes
-  // cross_encoder_score / cross_encoder_rank_delta). Serve-on-PASS-only +
-  // background-built model (never blocks this request). A no-op unless
-  // the active ranker is an impression-trained, ship-gate-passed model.
+  // P3 — v6 learned re-rank AFTER the cross-encoder (so it consumes
+  // cross_encoder_score / cross_encoder_rank_delta). Runs whenever
+  // enforcement (SIDETRACK_RANKER_SERVE_V6) OR shadow-diff measurement
+  // (SIDETRACK_RANKER_SHADOW_DIFF, default ON) is active. The v6 order is
+  // ALWAYS computed when a warm ship-gate-passed model is available; it is
+  // only SERVED under enforcement. Background-built model (never blocks this
+  // request); a no-op unless the active ranker is an impression-trained,
+  // ship-gate-passed model.
   let learnedRerankApplied = false;
   let learnedRerankRevisionId: string | null = null;
   if (
-    recallLearnedRerankEnabled() &&
+    (rankerServeV6Enabled() || rankerShadowDiffEnabled()) &&
     deps.learnedRerankContext !== undefined &&
     resultsAfterRerank.length > 1
   ) {
@@ -1426,6 +1434,9 @@ export const runRecall = async (
       typeof sessionCurrentUrl === 'string' && sessionCurrentUrl.length > 0
         ? sessionCurrentUrl
         : req.q;
+    // The served (cross-encoder) order BEFORE any v6 replacement — this is
+    // the shadow-diff baseline (how far v6 would move the served order).
+    const servedOrderBeforeV6 = resultsAfterRerank.map((cand) => cand.entityId);
     const learned = await applyLearnedRerank(
       {
         vaultRoot: deps.vaultRoot,
@@ -1437,6 +1448,17 @@ export const runRecall = async (
       rankDeltaByEntity,
     );
     timings['learnedRerank'] = (deps.now ?? Date.now)() - learnedStart;
+    // Record divergence (read-only) whenever the model produced a v6 order,
+    // whether or not it was served. Cheap metric math over the served
+    // candidate list — no model work here (already done above).
+    if (learned.v6Order !== null) {
+      recordRankerShadowDiff(
+        deps.vaultRoot,
+        servedOrderBeforeV6,
+        learned.v6Order,
+        (deps.now ?? Date.now)(),
+      );
+    }
     if (learned.applied) {
       resultsAfterRerank = learned.results;
       learnedRerankApplied = true;
@@ -1601,7 +1623,10 @@ export const runRecall = async (
     const servingConfig: ServingConfigFingerprint = {
       chunkVectors: retrievalArms.chunkVectors,
       provenanceDownweight: retrievalArms.provenanceDownweight,
-      learnedRerank: recallLearnedRerankEnabled(),
+      // The ACTUAL serve-time decision for this impression: true only when the
+      // v6 order replaced the served order (enforcement on + gate passed +
+      // warm model), not merely whether the env flag is set.
+      learnedRerank: learnedRerankApplied,
       crossEncoderRerank: rerankApplied,
     };
     const payload: RecallServedPayload = {

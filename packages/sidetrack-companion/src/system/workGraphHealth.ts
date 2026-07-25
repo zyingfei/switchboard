@@ -33,6 +33,11 @@ import {
 } from '../connections/hotPathMode.js';
 import { projectFeedback } from '../feedback/projection.js';
 import { loadDefaultUsearch } from '../recall/ann-index.js';
+// Pure module (no imports) — safe to static-import into this
+// status-reachable module. Surfaces the request-driven shadow-diff window;
+// the enforcement flag itself is read inline from process.env below to keep
+// the heavy learnedRerank.ts graph out of the status path (statusContract).
+import { peekRankerShadowDiff } from '../recall-v2/rankerShadowDiff.js';
 import {
   RECALL_IMPRESSION_SHIP_GATE_REASON_PREFIX,
   minRecallImpressionPositiveGroups,
@@ -106,6 +111,26 @@ export interface WorkGraphHealthReport {
       readonly activeMrr: number;
       readonly baselineMrr: number;
       readonly explicitRejectPrecisionDelta: number;
+      // True when serving actually uses the v6 order — i.e. the enforcement
+      // flag SIDETRACK_RANKER_SERVE_V6 is on AND this gate passes. A passing
+      // gate with `servingGateEnforced: false` is an EARNED-BUT-INERT pass:
+      // the model beat the baseline on labeled impressions but serving still
+      // uses RRF + cross-encoder. Read live at health-serve time (folded on
+      // in server.ts) so it reflects the current env, not the drain-time
+      // artifact.
+      readonly servingGateEnforced: boolean;
+      // Read-only divergence between the served order and the v6-reranked
+      // order, accumulated per /v2 recall request into a rolling window.
+      // Null until a request records a sample (shadow off, cold model, or no
+      // traffic since boot). Folded on live in server.ts — never present in
+      // the drain-time artifact.
+      readonly shadowDiff: {
+        readonly requests: number;
+        readonly meanTopKOverlap: number;
+        readonly meanKendallTau: number;
+        readonly topK: number;
+        readonly lastComputedAt: string | null;
+      } | null;
     } | null;
     readonly methodologySpine: MaterializerRankerMethodologySpineDiagnostics | null;
     // Honest training mix (plan TODO-R5/X1). `negativeLabelCount`
@@ -1062,6 +1087,51 @@ const buildDiagnosticCandidates = (input: {
   return allCandidates.filter((c) => !isStaleDiagnostic(c));
 };
 
+/**
+ * True when v6 serving enforcement is live: the enforcement flag
+ * (`SIDETRACK_RANKER_SERVE_V6`, or the legacy `SIDETRACK_RECALL_LEARNED_RERANK`
+ * alias) is on AND the impression ship gate PASSED. Read inline from
+ * process.env — the enforcement source of truth is learnedRerank.ts, but that
+ * module pulls the heavy ranker/embedder graph the statusContract rule keeps
+ * out of this status-reachable module, so the two-flag check is duplicated
+ * here (and unit-tested against the enforcement path).
+ */
+export const rankerServingGateEnforced = (
+  shipGateV2Status: 'pass' | 'fail' | 'unavailable' | null,
+): boolean =>
+  (process.env['SIDETRACK_RANKER_SERVE_V6'] === '1' ||
+    process.env['SIDETRACK_RECALL_LEARNED_RERANK'] === '1') &&
+  shipGateV2Status === 'pass';
+
+/**
+ * Overlay the LIVE, request-driven enforcement + shadow-diff signals onto a
+ * workGraph report's `shipGateV2`. Needed because those two fields are read
+ * at health-serve time (current env + the in-process rolling window), NOT at
+ * drain time — so a report served from the drain-time artifact would
+ * otherwise carry a frozen `servingGateEnforced` and a null `shadowDiff`. The
+ * live `collectWorkGraphHealth` path already sets both, so this is idempotent
+ * there; it exists so the artifact path (server.ts) refreshes them without a
+ * full recompute. Returns the report unchanged when `shipGateV2` is null.
+ */
+export const withLiveShipGateV2Serving = (
+  report: WorkGraphHealthReport,
+  vaultRoot: string,
+): WorkGraphHealthReport => {
+  const shipGateV2 = report.ranker.shipGateV2;
+  if (shipGateV2 === null) return report;
+  return {
+    ...report,
+    ranker: {
+      ...report.ranker,
+      shipGateV2: {
+        ...shipGateV2,
+        servingGateEnforced: rankerServingGateEnforced(shipGateV2.status),
+        shadowDiff: peekRankerShadowDiff(vaultRoot),
+      },
+    },
+  };
+};
+
 export const collectWorkGraphHealth = async ({
   vaultRoot,
   eventLog,
@@ -1166,6 +1236,11 @@ export const collectWorkGraphHealth = async ({
           baselineMrr: impressionRetrainState.shipGateDecision.baseline.mrr,
           explicitRejectPrecisionDelta:
             impressionRetrainState.shipGateDecision.deltas.explicitRejectPrecision,
+          // Enforcement is live only when the flag is on AND this gate passed.
+          servingGateEnforced: rankerServingGateEnforced(
+            impressionRetrainState.shipGateDecision.status,
+          ),
+          shadowDiff: peekRankerShadowDiff(vaultRoot),
         };
   const activeRevisionId =
     activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null;
