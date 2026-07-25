@@ -24,8 +24,18 @@
 // full-log read / model-build that is this codebase's documented freeze
 // cause, while preserving exact feature parity once warm.
 //
-// Flag-gated: `SIDETRACK_RECALL_LEARNED_RERANK` (default OFF). TTL via
-// `SIDETRACK_RECALL_LEARNED_RERANK_TTL_MS` (default 120s).
+// Serving is gated by the ENFORCEMENT flag `SIDETRACK_RANKER_SERVE_V6`
+// (default OFF — flipping it is an eval decision made after the shadow-diff
+// window shows the v6 order is safe to serve). When the flag is OFF the
+// reranker still EVALUATES the v6 order (so shadow-diff can measure the
+// divergence read-only) but leaves the served order untouched. When it is ON
+// AND the gate passes, the served order becomes the v6 order and health
+// reports `servingGateEnforced: true`; on gate-fail / model-missing it falls
+// back to the served order with a recorded reason.
+//
+// The legacy `SIDETRACK_RECALL_LEARNED_RERANK` flag is retained as an alias
+// for `SIDETRACK_RANKER_SERVE_V6` so existing dogfood configs keep working.
+// TTL via `SIDETRACK_RECALL_LEARNED_RERANK_TTL_MS` (default 120s).
 
 import type { ConnectionsSnapshot } from '../connections/snapshot.js';
 import {
@@ -54,8 +64,20 @@ import type { RecallCandidate } from './types.js';
 
 const DEFAULT_TTL_MS = 120_000;
 
-export const recallLearnedRerankEnabled = (): boolean =>
+/**
+ * Enforcement flag — when true (and the v6 gate passes) the served /v2 order
+ * is REPLACED by the v6 rerank order. Default OFF: flipping it is an eval
+ * decision, not a build-time default. Honours the new
+ * `SIDETRACK_RANKER_SERVE_V6` flag and the legacy
+ * `SIDETRACK_RECALL_LEARNED_RERANK` alias so existing configs keep serving.
+ */
+export const rankerServeV6Enabled = (): boolean =>
+  process.env['SIDETRACK_RANKER_SERVE_V6'] === '1' ||
   process.env['SIDETRACK_RECALL_LEARNED_RERANK'] === '1';
+
+/** @deprecated Kept for call-site compatibility; identical to
+ *  {@link rankerServeV6Enabled}. */
+export const recallLearnedRerankEnabled = rankerServeV6Enabled;
 
 const ttlMs = (): number => {
   const raw = Number(process.env['SIDETRACK_RECALL_LEARNED_RERANK_TTL_MS']);
@@ -86,10 +108,20 @@ export type LearnedRerankReason =
   | 'disabled';
 
 export interface LearnedRerankResult {
+  /** The result order to SERVE. Equal to the input order when enforcement is
+   *  off or the model is unavailable; the v6 order when `applied` is true. */
   readonly results: readonly RecallCandidate[];
+  /** True only when the served order was REPLACED by the v6 order (the
+   *  enforcement flag is on AND a warm ship-gate-passed model reordered). */
   readonly applied: boolean;
   readonly revisionId: string | null;
   readonly reason: LearnedRerankReason;
+  /** The v6 rerank order as entityIds, present whenever a warm ship-gate-
+   *  passed model was available — INDEPENDENT of whether it was served.
+   *  Null when the model is cold / building / not-serveable / too-few.
+   *  Used by shadow-diff to measure divergence read-only even when
+   *  enforcement is off. */
+  readonly v6Order: readonly string[] | null;
 }
 
 interface ServeableModel {
@@ -215,9 +247,15 @@ export const reorderByLearnedScore = (
     .map((entry) => entry.candidate);
 };
 
-// Re-rank `results` (post cross-encoder) with the learned model when one
-// is warm + serveable. Never blocks on the model build — kicks a
-// background refresh when stale and serves the existing order meanwhile.
+const entityOrder = (results: readonly RecallCandidate[]): readonly string[] =>
+  results.map((candidate) => candidate.entityId);
+
+// EVALUATE (always) + optionally SERVE the v6 learned re-rank. When a warm,
+// ship-gate-passed model is available this ALWAYS computes the v6 order so
+// the shadow-diff can measure divergence read-only — but it only REPLACES
+// the served order (`applied: true`) when the enforcement flag
+// `SIDETRACK_RANKER_SERVE_V6` is on. Never blocks on the model build — kicks
+// a background refresh when stale and serves the existing order meanwhile.
 export const applyLearnedRerank = async (
   deps: LearnedRerankDeps,
   anchorId: string,
@@ -226,7 +264,7 @@ export const applyLearnedRerank = async (
 ): Promise<LearnedRerankResult> => {
   const nowMs = (deps.now ?? Date.now)();
   if (results.length <= 1) {
-    return { results, applied: false, revisionId: null, reason: 'too-few' };
+    return { results, applied: false, revisionId: null, reason: 'too-few', v6Order: null };
   }
 
   const cached = modelByVault.get(deps.vaultRoot);
@@ -237,13 +275,20 @@ export const applyLearnedRerank = async (
 
   if (cached === undefined) {
     if (gate?.serveable === false) {
-      return { results, applied: false, revisionId: gate.revisionId, reason: 'not-serveable' };
+      return {
+        results,
+        applied: false,
+        revisionId: gate.revisionId,
+        reason: 'not-serveable',
+        v6Order: null,
+      };
     }
     return {
       results,
       applied: false,
       revisionId: null,
       reason: refreshing.has(deps.vaultRoot) ? 'building' : 'cold',
+      v6Order: null,
     };
   }
 
@@ -255,7 +300,25 @@ export const applyLearnedRerank = async (
     cached.handle,
     nowMs,
   );
-  return { results: reordered, applied: true, revisionId: cached.revisionId, reason: 'applied' };
+  const v6Order = entityOrder(reordered);
+  // Serve the v6 order only under enforcement; otherwise keep the served
+  // (cross-encoder) order and expose v6Order for read-only measurement.
+  if (rankerServeV6Enabled()) {
+    return {
+      results: reordered,
+      applied: true,
+      revisionId: cached.revisionId,
+      reason: 'applied',
+      v6Order,
+    };
+  }
+  return {
+    results,
+    applied: false,
+    revisionId: cached.revisionId,
+    reason: 'disabled',
+    v6Order,
+  };
 };
 
 /**
