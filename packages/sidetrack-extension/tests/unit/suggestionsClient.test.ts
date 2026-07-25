@@ -49,4 +49,60 @@ describe('SuggestionsClient', () => {
       },
     ]);
   });
+
+  it('parses the recurring-thread self-nomination block from the response', async () => {
+    vi.stubGlobal('fetch', () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [],
+            selfNomination: {
+              eligible: true,
+              visitCount: 7,
+              distinctDays: 3,
+              suggestedTitle: 'Phantom与Shadow v2架构',
+            },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await createSuggestionsClient({
+      port: 17373,
+      bridgeKey: 'k',
+    }).forThreadWithNomination('thread-1');
+
+    expect(result.suggestions).toEqual([]);
+    expect(result.selfNomination).toEqual({
+      eligible: true,
+      visitCount: 7,
+      distinctDays: 3,
+      suggestedTitle: 'Phantom与Shadow v2架构',
+    });
+  });
+
+  it('omits self-nomination when the block is absent or ineligible', async () => {
+    vi.stubGlobal('fetch', () =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [{ workstreamId: 'ws-1', score: 0.9 }],
+            selfNomination: { eligible: false, visitCount: 1, distinctDays: 1 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await createSuggestionsClient({
+      port: 17373,
+      bridgeKey: 'k',
+    }).forThreadWithNomination('thread-1');
+
+    // The block still parses (eligible:false) so the caller can reason
+    // about it, but the extension UI only renders when eligible.
+    expect(result.selfNomination).toEqual({ eligible: false, visitCount: 1, distinctDays: 1 });
+    expect(result.suggestions).toEqual([{ workstreamId: 'ws-1', score: 0.9 }]);
+  });
 });

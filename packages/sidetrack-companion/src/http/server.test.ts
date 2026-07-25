@@ -2581,6 +2581,226 @@ describe('companion HTTP server', () => {
     });
   });
 
+  // Recurring-thread self-nomination: a thread the user keeps returning
+  // to but the resolver can't home (diffuse similarity neighborhood)
+  // must offer "start a workstream from this thread" instead of an empty
+  // card. These read the served artifact (the HTTP response) back per
+  // doctrine rule 10 — visitCount + distinctDays are derived through the
+  // real event-log / URL-projection path, not stubbed.
+  describe('thread self-nomination in /v1/suggestions/thread', () => {
+    const threadUrl = 'https://chatgpt.com/c/phantom-shadow-v2';
+
+    // Seed a bare thread node (no workstream edge, no similarity path) so
+    // resolveThreadAttribution honestly abstains — the exact shape of the
+    // live case. The route then falls through to self-nomination.
+    const bareThreadSnapshot = (bacId: string): ConnectionsSnapshot => ({
+      scope: {},
+      nodes: [
+        {
+          id: `thread:${bacId}`,
+          kind: 'thread',
+          label: 'Phantom与Shadow v2架构',
+          originReplicaIds: [],
+          metadata: { canonicalUrl: threadUrl, threadId: `provider_${bacId}`, url: threadUrl },
+        },
+      ],
+      edges: [],
+      updatedAt: '2026-07-24T00:00:00.000Z',
+      nodeCount: 1,
+      edgeCount: 0,
+    });
+
+    const seedThreadRecord = async (
+      bacId: string,
+      extra: Record<string, unknown> = {},
+    ): Promise<void> => {
+      await mkdir(join(vaultPath, '_BAC', 'threads'), { recursive: true });
+      await writeFile(
+        join(vaultPath, '_BAC', 'threads', `${bacId}.json`),
+        `${JSON.stringify({
+          bac_id: bacId,
+          title: 'Phantom与Shadow v2架构 - ChatGPT',
+          provider: 'chatgpt',
+          threadId: `provider_${bacId}`,
+          threadUrl,
+          ...extra,
+        })}\n`,
+        'utf8',
+      );
+    };
+
+    // Append browser.timeline.observed events for the thread URL, one per
+    // supplied ISO timestamp, through the real event log (so both the URL
+    // projection's visitCount and the distinct-day scan see them).
+    const seedVisits = async (
+      bacId: string,
+      observedAts: readonly string[],
+    ): Promise<void> => {
+      const replica = await loadOrCreateReplica(vaultPath);
+      const eventLog = createEventLog(vaultPath, replica);
+      let seq = 0;
+      for (const observedAt of observedAts) {
+        seq += 1;
+        const payload: BrowserTimelineObservedPayload = {
+          eventId: `visit-${bacId}-${String(seq)}`,
+          observedAt,
+          url: threadUrl,
+          canonicalUrl: threadUrl,
+          title: 'Phantom与Shadow v2架构',
+          provider: 'chatgpt',
+          transition: 'activated',
+        };
+        await eventLog.appendClientObserved({
+          clientEventId: `visit-${bacId}-${String(seq)}`,
+          aggregateId: observedAt.slice(0, 10),
+          type: BROWSER_TIMELINE_OBSERVED,
+          baseVector: {},
+          payload: { ...payload },
+        });
+      }
+    };
+
+    const fetchSelfNomination = async (
+      bacId: string,
+    ): Promise<{
+      readonly status: number;
+      readonly data: readonly unknown[];
+      readonly selfNomination: {
+        readonly eligible: boolean;
+        readonly visitCount: number;
+        readonly distinctDays: number;
+        readonly suggestedTitle?: string;
+        readonly reason?: string;
+      };
+    }> => {
+      const replica = await loadOrCreateReplica(vaultPath);
+      const connectionsStore: ConnectionsStore = {
+        putCurrent: async () => undefined,
+        readCurrent: async () => bareThreadSnapshot(bacId),
+        putDay: async () => undefined,
+        readDay: async () => null,
+        listDays: async () => [],
+      };
+      context = {
+        ...context,
+        replica,
+        eventLog: createEventLog(vaultPath, replica),
+        connectionsStore,
+      };
+      const result = await jsonFetch(context, `${baseUrl}/v1/suggestions/thread/${bacId}`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      const body = result.body as {
+        readonly data: readonly unknown[];
+        readonly selfNomination: {
+          readonly eligible: boolean;
+          readonly visitCount: number;
+          readonly distinctDays: number;
+          readonly suggestedTitle?: string;
+          readonly reason?: string;
+        };
+      };
+      return { status: result.status, data: body.data, selfNomination: body.selfNomination };
+    };
+
+    it('nominates a 3-visit / 2-day thread with no home and no suggestion', async () => {
+      const bacId = 'bac_thread_nominate';
+      await seedThreadRecord(bacId);
+      await seedVisits(bacId, [
+        '2026-07-20T09:00:00.000Z',
+        '2026-07-20T14:00:00.000Z',
+        '2026-07-22T10:00:00.000Z',
+      ]);
+
+      const { status, data, selfNomination } = await fetchSelfNomination(bacId);
+
+      expect(status).toBe(200);
+      expect(data).toEqual([]); // resolver abstained — empty suggestion list
+      expect(selfNomination.eligible).toBe(true);
+      expect(selfNomination.visitCount).toBe(3);
+      expect(selfNomination.distinctDays).toBe(2);
+      // Provider chrome stripped for the pre-filled workstream name.
+      expect(selfNomination.suggestedTitle).toBe('Phantom与Shadow v2架构');
+    });
+
+    it('does NOT nominate a 1-visit thread (below recurrence floor)', async () => {
+      const bacId = 'bac_thread_onevisit';
+      await seedThreadRecord(bacId);
+      await seedVisits(bacId, ['2026-07-20T09:00:00.000Z']);
+
+      const { selfNomination } = await fetchSelfNomination(bacId);
+
+      expect(selfNomination.eligible).toBe(false);
+      expect(selfNomination.reason).toBe('below-visit-threshold');
+      expect(selfNomination.visitCount).toBe(1);
+    });
+
+    it('does NOT nominate a recurring thread visited within a single day', async () => {
+      const bacId = 'bac_thread_oneday';
+      await seedThreadRecord(bacId);
+      await seedVisits(bacId, [
+        '2026-07-20T09:00:00.000Z',
+        '2026-07-20T12:00:00.000Z',
+        '2026-07-20T18:00:00.000Z',
+      ]);
+
+      const { selfNomination } = await fetchSelfNomination(bacId);
+
+      expect(selfNomination.eligible).toBe(false);
+      expect(selfNomination.reason).toBe('below-day-threshold');
+      expect(selfNomination.visitCount).toBe(3);
+      expect(selfNomination.distinctDays).toBe(1);
+    });
+
+    it('does NOT nominate a thread already filed into a workstream', async () => {
+      const bacId = 'bac_thread_filed';
+      await seedThreadRecord(bacId, { primaryWorkstreamId: 'ws_home' });
+      await seedVisits(bacId, [
+        '2026-07-20T09:00:00.000Z',
+        '2026-07-21T09:00:00.000Z',
+        '2026-07-22T09:00:00.000Z',
+      ]);
+
+      const { selfNomination } = await fetchSelfNomination(bacId);
+
+      expect(selfNomination.eligible).toBe(false);
+      expect(selfNomination.reason).toBe('already-filed');
+    });
+
+    it('does NOT nominate a thread whose URL the user ignored', async () => {
+      const bacId = 'bac_thread_ignored';
+      await seedThreadRecord(bacId);
+      await seedVisits(bacId, [
+        '2026-07-20T09:00:00.000Z',
+        '2026-07-21T09:00:00.000Z',
+        '2026-07-22T09:00:00.000Z',
+      ]);
+      // Persist an explicit ignore for the thread URL through the real
+      // route so the URL projection carries currentIgnored.
+      const replica = await loadOrCreateReplica(vaultPath);
+      context = { ...context, replica, eventLog: createEventLog(vaultPath, replica) };
+      const ignored = await jsonFetch(
+        context,
+        `${baseUrl}/v1/visits/${encodeURIComponent(threadUrl)}/ignore`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-bac-bridge-key': bridgeKey,
+            'idempotency-key': `ignore-${bacId}`,
+          },
+          body: JSON.stringify({ reason: 'noise' }),
+        },
+      );
+      expect(ignored.status).toBe(201);
+
+      const { selfNomination } = await fetchSelfNomination(bacId);
+
+      expect(selfNomination.eligible).toBe(false);
+      expect(selfNomination.reason).toBe('ignored');
+    });
+  });
+
   it('derives provider health rows and warnings from capture event logs', async () => {
     const capturedAt = new Date().toISOString();
     await mkdir(join(vaultPath, '_BAC', 'events'), { recursive: true });
