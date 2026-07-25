@@ -967,6 +967,13 @@ export const summarizeMaterializerDiagnostics = (diagnostics: MaterializerDiagno
           )}${diagnostics.similarityFloor.renderRepaired ? '(RENDER-REPAIRED)' : ''}`,
           `simFloorSuppressedTotal=${String(diagnostics.similarityFloor.suppressedCollapseCount)}`,
           `simFloorFlapping=${String(diagnostics.similarityFloor.flapping)}`,
+          // W3 (window-poverty fix) — count of window-poverty COMPENSATION
+          // guards that fired this drain (carry-forward / lane-reuse /
+          // bootstrap / reset-defer / drift-suppress / render-repair). Trends
+          // to 0 on normal drains once W1 makes the corpus path-independent; a
+          // persistently non-zero value on non-reset drains means a guard is
+          // still compensating for a window-poor corpus.
+          `simFloorGuards=${String(diagnostics.similarityFloor.guardActivationsPerDrain)}`,
         ]),
     `topics=${String(diagnostics.topics.topicCount)}`,
     `topicMembers=${String(diagnostics.topics.memberCount)}`,

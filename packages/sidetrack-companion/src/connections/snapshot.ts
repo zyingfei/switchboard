@@ -98,6 +98,7 @@ import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import { anisotropyZScore } from './visitSimilarity.js';
+import { SIMILARITY_FAMILY_RENDER_EDGE_KINDS } from './renderedSimilarityFloor.js';
 import {
   edgeIdFor,
   nodeIdFor,
@@ -3870,6 +3871,18 @@ export interface StoredConnectionsMetadata {
   readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
   readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
   readonly snapshotRevision?: string;
+  // W2 — the served visit-similarity revision id + eligible-corpus signature
+  // (see ConnectionsSnapshot). The resolve SWR graph signature keys on these
+  // (server.ts sqliteSig) instead of the volatile node/edge counts, so benign
+  // node-count fluctuations no longer rotate the resolve cache key. Optional:
+  // pre-W2 snapshots carry neither, and the signature falls back to
+  // snapshotRevision.
+  readonly visitSimilarityRevisionId?: string;
+  readonly similarityCorpusSignature?: string;
+  // W2 — non-similarity-family edge count (edgeCount minus the rendered
+  // similarity-family rows). The stable non-similarity structural discriminator
+  // for the resolve SWR graph signature (see ConnectionsSnapshot).
+  readonly nonSimilarityEdgeCount?: number;
 }
 
 export interface ConnectionsProjectionAccumulatorState {
@@ -3880,6 +3893,30 @@ export interface ConnectionsProjectionAccumulatorState {
   readonly urlAccumulator: SerializedUrlProjectionAccumulator;
   readonly tabSessionAccumulator: SerializedTabSessionProjectionAccumulator;
 }
+
+// W2 — the similarity-family edge-id prefixes, DERIVED from the single-source
+// SIMILARITY_FAMILY_RENDER_EDGE_KINDS set (renderedSimilarityFloor.ts) so the
+// two never drift. edgeIdFor emits `edge:${kind}:${from}:${to}`, so a family
+// membership check is a cheap prefix test on the id string, no edge-object
+// needed — this is what lets replaceScopeRows count non-family edges straight
+// from edge_order (id list) without decoding edge rows.
+const SIMILARITY_FAMILY_EDGE_ID_PREFIXES: readonly string[] = [
+  ...SIMILARITY_FAMILY_RENDER_EDGE_KINDS,
+].map((kind) => `edge:${kind}:`);
+
+const isSimilarityFamilyEdgeId = (edgeId: string): boolean =>
+  SIMILARITY_FAMILY_EDGE_ID_PREFIXES.some((prefix) => edgeId.startsWith(prefix));
+
+// W2 — count the NON-similarity-family edges from an edge-id list (edge_order).
+// This is the stable structural discriminator for the resolve SWR graph
+// signature: it changes on a real non-similarity graph mutation (a new
+// thread_references_url / attribution / topic edge) but does NOT move on the
+// Pass-7 similarity edge oscillation. O(edges), zero allocation.
+const countNonSimilarityFamilyEdgeIds = (edgeIds: readonly string[]): number => {
+  let count = 0;
+  for (const id of edgeIds) if (!isSimilarityFamilyEdgeId(id)) count += 1;
+  return count;
+};
 
 const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMetadata => ({
   scope: snapshot.scope,
@@ -3893,6 +3930,22 @@ const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMe
   ...(snapshot.snapshotRevision === undefined
     ? {}
     : { snapshotRevision: snapshot.snapshotRevision }),
+  ...(snapshot.visitSimilarityRevisionId === undefined
+    ? {}
+    : { visitSimilarityRevisionId: snapshot.visitSimilarityRevisionId }),
+  ...(snapshot.similarityCorpusSignature === undefined
+    ? {}
+    : { similarityCorpusSignature: snapshot.similarityCorpusSignature }),
+  // W2 — always derive the non-similarity edge count from the snapshot's own
+  // edges at the persistence seam (single source of truth), so a full-snapshot
+  // write always carries a fresh, correct value. This is a METADATA-ONLY
+  // discriminator (see StoredConnectionsMetadata) — not surfaced on the
+  // reconstructed snapshot. The scoped-delta path recomputes it independently
+  // from edge_order (replaceScopeRows).
+  nonSimilarityEdgeCount: snapshot.edges.reduce(
+    (n, edge) => (SIMILARITY_FAMILY_RENDER_EDGE_KINDS.has(edge.kind) ? n : n + 1),
+    0,
+  ),
 });
 
 const snapshotFromParts = (
@@ -3914,6 +3967,17 @@ const snapshotFromParts = (
   ...(metadata.snapshotRevision === undefined
     ? {}
     : { snapshotRevision: metadata.snapshotRevision }),
+  ...(metadata.visitSimilarityRevisionId === undefined
+    ? {}
+    : { visitSimilarityRevisionId: metadata.visitSimilarityRevisionId }),
+  ...(metadata.similarityCorpusSignature === undefined
+    ? {}
+    : { similarityCorpusSignature: metadata.similarityCorpusSignature }),
+  // NOTE: nonSimilarityEdgeCount is deliberately NOT surfaced on the
+  // reconstructed snapshot — it is a metadata-only SWR-signature discriminator
+  // (read via readSnapshotMetadata()), not part of the served graph. Surfacing
+  // it here would diverge SqliteConnectionsStore.readCurrent() from the JSON
+  // store (which persists the raw snapshot with no such field).
 });
 
 const edgeBucketKey = (edge: ConnectionEdge): string => `${edge.fromNodeId}\u0000${edge.toNodeId}`;
@@ -4145,12 +4209,25 @@ const metadataForSnapshotWrite = (
             : Object.keys(tabSessionProjection.bySessionId).length,
       })
     : incoming.snapshotRevision;
+  // W2 — preserve the last-served similarity signature fields when the
+  // incoming (scoped-delta) snapshot does not carry them. The scoped-delta
+  // path re-asserts graph rows WITHOUT recomputing similarity, so its snapshot
+  // has no fresh similarity revision id / corpus signature; keeping the
+  // existing metadata's values means the resolve SWR signature stays stable
+  // across a scoped drain (no benign rotation). A full-snapshot write always
+  // stamps fresh values (materializer), so `incoming` wins when present.
+  const visitSimilarityRevisionId =
+    incoming.visitSimilarityRevisionId ?? existing.visitSimilarityRevisionId;
+  const similarityCorpusSignature =
+    incoming.similarityCorpusSignature ?? existing.similarityCorpusSignature;
   return {
     ...incoming,
     updatedAt,
     ...(urlProjection === undefined ? {} : { urlProjection }),
     ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
     ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+    ...(visitSimilarityRevisionId === undefined ? {} : { visitSimilarityRevisionId }),
+    ...(similarityCorpusSignature === undefined ? {} : { similarityCorpusSignature }),
   };
 };
 
@@ -5108,6 +5185,16 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         updatedAt,
         nodeCount: nodeOrder.length,
         edgeCount: edgeOrder.length,
+        // W2 — recompute the non-similarity structural discriminator from the
+        // post-delta edge_order. A scoped-delta write can add/remove
+        // NON-similarity edges (that is its job), so carrying the previous
+        // value would go stale and the resolve SWR sig would miss the change;
+        // computing it here from the id list keeps it correct on every write
+        // path (edge ids encode kind, so no edge-row decode needed). Similarity
+        // fields (visitSimilarityRevisionId / similarityCorpusSignature) are
+        // preserved via `...previousMetadata` — scoped drains do not recompute
+        // similarity, so the last full drain's values remain the served truth.
+        nonSimilarityEdgeCount: countNonSimilarityFamilyEdgeIds(edgeOrder),
         ...(urlProjection === undefined ? {} : { urlProjection }),
         ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
         snapshotRevision,

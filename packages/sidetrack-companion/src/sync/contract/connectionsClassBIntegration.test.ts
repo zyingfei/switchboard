@@ -157,11 +157,22 @@ const eventSequence = (replicaId: string): readonly AcceptedEvent[] => [
   }),
 ];
 
-const normalizeGeneratedSnapshot = (snapshot: ConnectionsSnapshot): ConnectionsSnapshot => ({
-  ...snapshot,
-  updatedAt: '<updatedAt>',
-  snapshotRevision: '<snapshotRevision>',
-});
+const normalizeGeneratedSnapshot = (snapshot: ConnectionsSnapshot): ConnectionsSnapshot => {
+  // W2 — the served similarity revision id + eligible-corpus signature are
+  // drain-path-dependent signature metadata (like snapshotRevision), not graph
+  // content. The scoped-incremental path and the full-rebuild path can stamp
+  // them differently (one goes through the full-snapshot write seam, one
+  // re-asserts row-local scopes and may omit them), so STRIP them here: this
+  // test asserts GRAPH (nodes/edges) equivalence, not signature-field parity.
+  const { visitSimilarityRevisionId: _rev, similarityCorpusSignature: _sig, ...rest } = snapshot;
+  void _rev;
+  void _sig;
+  return {
+    ...rest,
+    updatedAt: '<updatedAt>',
+    snapshotRevision: '<snapshotRevision>',
+  };
+};
 
 const normalizeReplicaIds = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(normalizeReplicaIds);
