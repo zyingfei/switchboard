@@ -22,6 +22,7 @@ import {
   type AuditContext,
 } from '../vault/auditContext.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
+import { dayBucketFor } from '../timeline/projection.js';
 import { sanitizeTimelinePayload } from '../timeline/sanitize.js';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
@@ -114,6 +115,11 @@ import { gcInventoryCached } from '../gc/plan.js';
 import { readHealthHistory } from '../connections/healthHistory.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
+import {
+  DEFAULT_SELF_NOMINATION_MIN_VISITS,
+  evaluateThreadSelfNomination,
+  type ThreadSelfNomination,
+} from '../threads/selfNomination.js';
 import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../workstreams/events.js';
 import { projectWorkstream } from '../workstreams/projection.js';
 import { QUEUE_CREATED } from '../queue/events.js';
@@ -2816,6 +2822,132 @@ const readThreadWorkstreamId = async (
     return typeof parsed.primaryWorkstreamId === 'string' ? parsed.primaryWorkstreamId : undefined;
   } catch {
     return undefined;
+  }
+};
+
+// Read the thread record fields the self-nomination signal needs
+// (membership + title/provider for the suggested name). Keyed on the
+// bac_id (`_BAC/threads/<bac_id>.json`), the same identity the resolver
+// target carries. Best-effort: a missing / malformed record yields no
+// membership and no title so the nomination degrades to ineligible.
+const readThreadNominationRecord = async (
+  vaultRoot: string,
+  threadBacId: string,
+): Promise<{
+  readonly primaryWorkstreamId?: string;
+  readonly title?: string;
+  readonly provider?: string;
+}> => {
+  try {
+    const parsed = JSON.parse(
+      await readFile(join(vaultRoot, '_BAC', 'threads', `${threadBacId}.json`), 'utf8'),
+    ) as {
+      readonly primaryWorkstreamId?: unknown;
+      readonly title?: unknown;
+      readonly provider?: unknown;
+    };
+    return {
+      ...(typeof parsed.primaryWorkstreamId === 'string'
+        ? { primaryWorkstreamId: parsed.primaryWorkstreamId }
+        : {}),
+      ...(typeof parsed.title === 'string' ? { title: parsed.title } : {}),
+      ...(typeof parsed.provider === 'string' ? { provider: parsed.provider } : {}),
+    };
+  } catch {
+    return {};
+  }
+};
+
+// Env-tunable recurrence floor for thread self-nomination. Falls back
+// to the domain default (3) when unset / non-numeric.
+const threadSelfNominationMinVisits = (): number => {
+  const raw = Number(process.env['SIDETRACK_THREAD_SELF_NOMINATION_MIN_VISITS']);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DEFAULT_SELF_NOMINATION_MIN_VISITS;
+};
+
+// Count how many distinct UTC calendar days a thread URL was visited,
+// from `browser.timeline.observed` events (the same events that feed
+// the URL projection's visitCount). Reads only that event type via the
+// typed index — O(matching rows), not the whole log.
+const distinctVisitDaysForUrl = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+  canonicalUrl: string,
+): Promise<number> => {
+  const events = await readEventsFromStoreOrLog(
+    context,
+    eventLog,
+    (event) => {
+      if (event.type !== BROWSER_TIMELINE_OBSERVED) return false;
+      if (!isBrowserTimelineObservedPayload(event.payload)) return false;
+      const key = event.payload.canonicalUrl ?? event.payload.url;
+      return key === canonicalUrl;
+    },
+    [BROWSER_TIMELINE_OBSERVED],
+  );
+  const days = new Set<string>();
+  for (const event of events) {
+    if (!isBrowserTimelineObservedPayload(event.payload)) continue;
+    days.add(dayBucketFor(event.payload.observedAt));
+  }
+  return days.size;
+};
+
+// Assemble the recurring-thread self-nomination block for the thread
+// suggestions route. The expensive signals (URL projection lookup +
+// distinct-day scan) are only computed when the cheap gates already
+// point to eligibility — no suggestion survived the threshold AND the
+// thread has no workstream home — so an already-organized or already-
+// suggested thread costs nothing extra. Best-effort: any failure
+// degrades to an ineligible block rather than failing the route.
+const computeThreadSelfNomination = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+  vaultRoot: string,
+  target: ThreadSuggestionTarget,
+  hasSuggestionAboveThreshold: boolean,
+): Promise<ThreadSelfNomination> => {
+  const ineligible = (
+    reason: ThreadSelfNomination['reason'],
+    visitCount = 0,
+    distinctDays = 0,
+  ): ThreadSelfNomination => ({ eligible: false, visitCount, distinctDays, ...(reason ? { reason } : {}) });
+  try {
+    const record = await readThreadNominationRecord(vaultRoot, target.threadId);
+    if (record.primaryWorkstreamId !== undefined) return ineligible('already-filed');
+    if (hasSuggestionAboveThreshold) return ineligible('has-suggestion');
+    if (target.threadUrl === undefined || target.threadUrl.length === 0) {
+      return ineligible('below-visit-threshold');
+    }
+    let canonicalUrl: string;
+    try {
+      canonicalUrl = canonicalizePageUrl(target.threadUrl);
+    } catch {
+      canonicalUrl = target.threadUrl;
+    }
+    const { projection } = await loadUrlProjection(context, eventLog);
+    const visitRecord = projection.byCanonicalUrl.get(canonicalUrl);
+    const visitCount = visitRecord?.visitCount ?? 0;
+    const isIgnored = visitRecord?.currentIgnored !== undefined;
+    // Distinct-day scan is the one unbounded read; skip it unless the
+    // visit count already clears the floor.
+    const minVisits = threadSelfNominationMinVisits();
+    const distinctDays =
+      visitCount >= minVisits
+        ? await distinctVisitDaysForUrl(context, eventLog, canonicalUrl)
+        : 0;
+    return evaluateThreadSelfNomination({
+      title: record.title ?? '',
+      ...(record.provider === undefined ? {} : { provider: record.provider }),
+      visitCount,
+      distinctDays,
+      hasWorkstream: false,
+      hasSuggestionAboveThreshold,
+      isIgnored,
+      minVisits,
+    });
+  } catch {
+    return ineligible('below-visit-threshold');
   }
 };
 
@@ -7534,7 +7666,19 @@ const routes: readonly RouteDefinition[] = [
             threadId,
             resultCount: suggestions.length,
           });
-          return [200, { data: suggestions }];
+          // Recurring-thread self-nomination: when the resolver
+          // abstained (no candidate cleared the threshold) but the user
+          // keeps returning to this thread, offer to start a workstream
+          // from it instead of rendering a dead-end empty card. See
+          // threads/selfNomination.ts for the eligibility policy.
+          const selfNomination = await computeThreadSelfNomination(
+            context,
+            eventLog,
+            vaultRoot,
+            target,
+            suggestions.length > 0,
+          );
+          return [200, { data: suggestions, selfNomination }];
         },
       );
     },

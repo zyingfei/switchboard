@@ -6,6 +6,23 @@ export interface WorkstreamSuggestion {
   readonly breakdown?: Readonly<Record<string, number>>;
 }
 
+// Recurring-thread self-nomination block (companion
+// threads/selfNomination.ts). Present on /v1/suggestions/thread
+// responses. `eligible` is true only when the thread is a home-less,
+// un-suggested recurring thread; the panel then offers to start a
+// workstream from it, pre-filled with `suggestedTitle`.
+export interface ThreadSelfNomination {
+  readonly eligible: boolean;
+  readonly visitCount: number;
+  readonly distinctDays: number;
+  readonly suggestedTitle?: string;
+}
+
+export interface ThreadSuggestionsResult {
+  readonly suggestions: readonly WorkstreamSuggestion[];
+  readonly selfNomination?: ThreadSelfNomination;
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
@@ -49,6 +66,23 @@ const readSuggestionItems = (value: unknown): readonly unknown[] => {
   return [];
 };
 
+const readSelfNomination = (value: unknown): ThreadSelfNomination | undefined => {
+  if (!isRecord(value)) return undefined;
+  const raw = value['selfNomination'];
+  if (!isRecord(raw)) return undefined;
+  if (typeof raw['eligible'] !== 'boolean') return undefined;
+  const visitCount = typeof raw['visitCount'] === 'number' ? raw['visitCount'] : 0;
+  const distinctDays = typeof raw['distinctDays'] === 'number' ? raw['distinctDays'] : 0;
+  const suggestedTitle =
+    typeof raw['suggestedTitle'] === 'string' ? raw['suggestedTitle'] : undefined;
+  return {
+    eligible: raw['eligible'],
+    visitCount,
+    distinctDays,
+    ...(suggestedTitle === undefined ? {} : { suggestedTitle }),
+  };
+};
+
 export class SuggestionsClient {
   private readonly baseUrl: string;
 
@@ -56,10 +90,22 @@ export class SuggestionsClient {
     this.baseUrl = `http://127.0.0.1:${String(settings.port)}/v1`;
   }
 
+  // Ranked workstream suggestions only (compose scope picker). Kept for
+  // callers that don't need the self-nomination block.
   async forThread(
     threadId: string,
     opts: { readonly limit?: number } = {},
   ): Promise<readonly WorkstreamSuggestion[]> {
+    return (await this.forThreadWithNomination(threadId, opts)).suggestions;
+  }
+
+  // Suggestions + the recurring-thread self-nomination block. One fetch;
+  // the thread card uses `selfNomination` to offer "start a workstream
+  // from this thread" when the resolver abstained.
+  async forThreadWithNomination(
+    threadId: string,
+    opts: { readonly limit?: number } = {},
+  ): Promise<ThreadSuggestionsResult> {
     const params = new URLSearchParams();
     if (opts.limit !== undefined) params.set('limit', String(opts.limit));
     const suffix = params.size > 0 ? `?${params.toString()}` : '';
@@ -75,7 +121,11 @@ export class SuggestionsClient {
       throw new Error(parseProblemMessage(value) ?? `Companion HTTP ${String(response.status)}`);
     }
     const body = (await response.json()) as unknown;
-    return readSuggestionItems(body).filter(isWorkstreamSuggestion);
+    const selfNomination = readSelfNomination(body);
+    return {
+      suggestions: readSuggestionItems(body).filter(isWorkstreamSuggestion),
+      ...(selfNomination === undefined ? {} : { selfNomination }),
+    };
   }
 }
 

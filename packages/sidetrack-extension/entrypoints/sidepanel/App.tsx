@@ -67,6 +67,7 @@ import {
   WorkstreamDetailPanel,
   TurnText,
   NeedsOrganizeSuggestion,
+  ThreadSelfNomination,
   type LinkedNote,
   type TrustEntry,
   type TrustTool,
@@ -1127,6 +1128,14 @@ const App = () => {
   // Per-row dismissals for the Needs-Organize inline suggestion. Local
   // (per-session) — survives panel close but not extension reload.
   const [dismissedSuggestions, setDismissedSuggestions] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+  // Per-thread dismissals for the recurring-thread self-nomination
+  // affordance. Sticky per thread per session (mirrors
+  // dismissedSuggestions): once the user dismisses "start a workstream
+  // from this thread", it stays hidden for this panel session so we
+  // nominate at most once per thread per session.
+  const [dismissedSelfNominations, setDismissedSelfNominations] = useState<ReadonlySet<string>>(
     () => new Set<string>(),
   );
   // Which thread row's action overflow menu (⋯) is open. One at a
@@ -3228,6 +3237,47 @@ const App = () => {
       }
     }
     return next;
+  };
+
+  // Recurring-thread self-nomination confirm: create a workstream from
+  // the (user-editable) suggested title, then file the thread into it.
+  // Reuses the SAME create + move endpoints as the "Pick another… →
+  // Create" flow (handleMoveTarget) — no new backend route. Updates
+  // state on success and re-throws on failure so the affordance can
+  // stay editable for a retry (the caller shows a pending → filed
+  // transition and surfaces errors via the app's error banner).
+  const createWorkstreamFromThread = async (
+    threadId: string,
+    title: string,
+  ): Promise<void> => {
+    const trimmed = title.trim();
+    if (trimmed.length === 0) throw new Error('Workstream name is required.');
+    setBusy(true);
+    setError(null);
+    try {
+      const afterCreate = await sendRequest({
+        type: messageTypes.createWorkstream,
+        // Match handleMoveTarget: companion defaults new workstreams to
+        // 'private'; don't hardcode a privacy mode here.
+        workstream: { title: trimmed },
+      });
+      const created = afterCreate.workstreams.find(
+        (workstream) => workstream.title === trimmed && workstream.parentId === undefined,
+      );
+      if (created === undefined) {
+        throw new Error('Companion did not return the new workstream.');
+      }
+      const next = await moveThreadToWorkstream(threadId, created.bac_id);
+      setState(next);
+      setError(next.lastError ?? null);
+    } catch (moveError) {
+      setError(
+        moveError instanceof Error ? moveError.message : 'Could not start the workstream.',
+      );
+      throw moveError instanceof Error ? moveError : new Error('Could not start the workstream.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const attributeTabSessionToWorkstream = async (
@@ -6132,6 +6182,15 @@ const App = () => {
             }}
             onDismiss={() => {
               setDismissedSuggestions((prev) => {
+                const next = new Set(prev);
+                next.add(thread.bac_id);
+                return next;
+              });
+            }}
+            onStartWorkstream={(title) => createWorkstreamFromThread(thread.bac_id, title)}
+            selfNominationDismissed={dismissedSelfNominations.has(thread.bac_id)}
+            onDismissSelfNomination={() => {
+              setDismissedSelfNominations((prev) => {
                 const next = new Set(prev);
                 next.add(thread.bac_id);
                 return next;
@@ -10199,6 +10258,15 @@ interface NeedsOrganizeSuggestionRowProps {
   readonly onAccept: (workstreamId: string) => void;
   readonly onPickManual: () => void;
   readonly onDismiss: () => void;
+  // Recurring-thread self-nomination: this same fetch also carries the
+  // companion's `selfNomination` block. When the resolver abstained but
+  // the user keeps returning to the thread, we offer to start a
+  // workstream from it (pre-filled, editable title). Confirm creates the
+  // workstream + files the thread through the existing move path. The
+  // dismissal is sticky per thread per session (owned by the parent).
+  readonly onStartWorkstream: (title: string) => Promise<void>;
+  readonly selfNominationDismissed: boolean;
+  readonly onDismissSelfNomination: () => void;
 }
 
 function NeedsOrganizeSuggestionRow({
@@ -10214,6 +10282,9 @@ function NeedsOrganizeSuggestionRow({
   onAccept,
   onPickManual,
   onDismiss,
+  onStartWorkstream,
+  selfNominationDismissed,
+  onDismissSelfNomination,
 }: NeedsOrganizeSuggestionRowProps) {
   // Render the cached value immediately; the fetch effect below
   // always runs (stale-while-revalidate) so a subsequent mutation
@@ -10228,6 +10299,17 @@ function NeedsOrganizeSuggestionRow({
   } | null>(cached ?? null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
+  // Recurring-thread self-nomination, read from the SAME fetch below
+  // (no extra request). Null until the companion answers; set to the
+  // block only when `eligible`.
+  const [selfNomination, setSelfNomination] = useState<{
+    readonly visitCount: number;
+    readonly distinctDays: number;
+    readonly suggestedTitle: string;
+  } | null>(null);
+  // Confirm round-trip state for the self-nomination affordance.
+  const [selfNomPending, setSelfNomPending] = useState(false);
+  const [selfNomFiledTitle, setSelfNomFiledTitle] = useState<string | null>(null);
 
   // Latest-ref pattern. onCache / resolveLabel are recreated by the
   // parent every render; the effect calls onCache() on success →
@@ -10289,10 +10371,35 @@ function NeedsOrganizeSuggestionRow({
             // way (see src/sidepanel/suggestion/confidence.ts).
             readonly breakdown?: { readonly margin?: number };
           }[];
+          // Recurring-thread self-nomination (companion
+          // threads/selfNomination.ts) — piggybacks on this fetch.
+          readonly selfNomination?: {
+            readonly eligible?: boolean;
+            readonly visitCount?: number;
+            readonly distinctDays?: number;
+            readonly suggestedTitle?: string;
+          };
         };
-        const top = body.data?.[0];
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
         if (cancelled) return;
+        // Self-nomination is independent of whether a suggestion ranked:
+        // it fires precisely when the resolver abstained, so parse it
+        // before the early return below.
+        const nom = body.selfNomination;
+        if (
+          nom?.eligible === true &&
+          typeof nom.suggestedTitle === 'string' &&
+          nom.suggestedTitle.length > 0
+        ) {
+          setSelfNomination({
+            visitCount: typeof nom.visitCount === 'number' ? nom.visitCount : 0,
+            distinctDays: typeof nom.distinctDays === 'number' ? nom.distinctDays : 0,
+            suggestedTitle: nom.suggestedTitle,
+          });
+        } else {
+          setSelfNomination(null);
+        }
+        const top = body.data?.[0];
         if (top === undefined) {
           // No suggestion above threshold any more — clear so the
           // row falls back to the manual-pick affordance.
@@ -10343,31 +10450,69 @@ function NeedsOrganizeSuggestionRow({
     : hasAuto
       ? suggestion.label
       : 'Pick a workstream…';
+  // Show the "start a workstream from this thread" affordance when the
+  // companion nominated it, the user hasn't dismissed it this session,
+  // and the recall index isn't mid-rebuild (scores would be noisy). It
+  // stacks ABOVE the manual picker: for a recurring, home-less thread
+  // the resolver abstained on, starting a workstream FROM it is the
+  // action that matches the signal; "pick an existing workstream" stays
+  // available below.
+  const showSelfNomination =
+    selfNomination !== null && !selfNominationDismissed && !indexRebuilding;
   return (
-    <NeedsOrganizeSuggestion
-      suggestedLabel={suggestedLabel}
-      confidence={hasAuto && !indexRebuilding ? suggestion.confidence : 0}
-      {...(hasAuto && !indexRebuilding && suggestion.margin !== undefined
-        ? { margin: suggestion.margin }
-        : {})}
-      pending={pending || indexRebuilding}
-      onAccept={() => {
-        if (hasAuto && suggestion.workstreamId.length > 0) {
-          onAccept(suggestion.workstreamId);
-        } else {
-          onPickManual();
-        }
-      }}
-      onPickManual={onPickManual}
-      onRefresh={() => {
-        // Clearing the parent cache then bumping refreshTick forces
-        // the effect to re-run with no cached fallback to render.
-        onClearCache();
-        setSuggestion(null);
-        setRefreshTick((tick) => tick + 1);
-      }}
-      onDismiss={onDismiss}
-    />
+    <>
+      {showSelfNomination ? (
+        <ThreadSelfNomination
+          visitCount={selfNomination.visitCount}
+          distinctDays={selfNomination.distinctDays}
+          suggestedTitle={selfNomination.suggestedTitle}
+          pending={selfNomPending}
+          {...(selfNomFiledTitle === null ? {} : { filedTitle: selfNomFiledTitle })}
+          onConfirm={(title) => {
+            setSelfNomPending(true);
+            void onStartWorkstream(title)
+              .then(() => {
+                // Optimistic filed state until the parent refresh drops
+                // the row (the thread now has a home → no longer
+                // eligible). Keeps the confirmation visible in between.
+                setSelfNomFiledTitle(title);
+              })
+              .catch(() => {
+                // Leave the editable affordance in place so the user can
+                // retry; the move path surfaces its own error toast.
+              })
+              .finally(() => {
+                setSelfNomPending(false);
+              });
+          }}
+          onDismiss={onDismissSelfNomination}
+        />
+      ) : null}
+      <NeedsOrganizeSuggestion
+        suggestedLabel={suggestedLabel}
+        confidence={hasAuto && !indexRebuilding ? suggestion.confidence : 0}
+        {...(hasAuto && !indexRebuilding && suggestion.margin !== undefined
+          ? { margin: suggestion.margin }
+          : {})}
+        pending={pending || indexRebuilding}
+        onAccept={() => {
+          if (hasAuto && suggestion.workstreamId.length > 0) {
+            onAccept(suggestion.workstreamId);
+          } else {
+            onPickManual();
+          }
+        }}
+        onPickManual={onPickManual}
+        onRefresh={() => {
+          // Clearing the parent cache then bumping refreshTick forces
+          // the effect to re-run with no cached fallback to render.
+          onClearCache();
+          setSuggestion(null);
+          setRefreshTick((tick) => tick + 1);
+        }}
+        onDismiss={onDismiss}
+      />
+    </>
   );
 }
 

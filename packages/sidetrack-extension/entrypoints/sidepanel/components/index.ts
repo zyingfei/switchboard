@@ -95,6 +95,8 @@ export type { TrustEntry, TrustTool } from './TrustToggles';
 export { SafetyChainSummary } from './SafetyChainSummary';
 export type { SafetyCheck, CheckStatus } from './SafetyChainSummary';
 export { NeedsOrganizeSuggestion } from './NeedsOrganizeSuggestion';
+export { ThreadSelfNomination } from './ThreadSelfNomination';
+export type { ThreadSelfNominationProps } from './ThreadSelfNomination';
 export { WorkstreamDetailPanel } from './WorkstreamDetailPanel';
 export {
   AppearanceSection,

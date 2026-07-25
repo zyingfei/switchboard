@@ -8615,6 +8615,45 @@ pre.diff {
   padding: 2px 6px;
   color: var(--ink-3);
 }
+.nx-suggest .acts button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Recurring-thread self-nomination — reuses the .nx-suggest shell but
+   adds an inline editable workstream name and a solid (not dashed)
+   accent border, since this is an offered ACTION ("start a workstream
+   from this thread"), not a passive suggestion. */
+.nx-suggest.thread-selfnom.is-eligible {
+  border-style: solid;
+  border-color: var(--green-tint);
+}
+.nx-suggest.thread-selfnom .selfnom-why {
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.nx-suggest.thread-selfnom .selfnom-edit {
+  display: flex;
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+.nx-suggest.thread-selfnom .selfnom-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--paper-light);
+  color: var(--ink);
+}
+.nx-suggest.thread-selfnom .selfnom-title:disabled {
+  opacity: 0.6;
+}
+.nx-suggest.thread-selfnom.is-filed .ws-sug {
+  background: var(--green-bg);
+}
 
 /* Settings v2 — TOC + section blocks. Coexists with the existing
    .settings-panel structure; new sections live inside .settings-sec. */
