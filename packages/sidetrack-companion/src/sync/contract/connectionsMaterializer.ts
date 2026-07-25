@@ -301,6 +301,11 @@ import {
   type VisitSimilarityRevision,
 } from '../../connections/types.js';
 import {
+  buildEligibleSimilarityCorpus,
+  CORPUS_SOURCE_TYPES,
+  type EligibleSimilarityCorpus,
+} from '../../connections/similarityCorpus.js';
+import {
   addDotsToIntervals,
   EMPTY_PROGRESS,
   frontierFromIntervals,
@@ -366,13 +371,14 @@ const EMPTY_VISIT_ID_SET: ReadonlySet<string> = new Set<string>();
 // lineage). Every other type is ignored by both builders, so a typed
 // store read over these is byte-equivalent to filtering readMerged() to
 // them — but O(matching rows) via events_type_idx, not O(all events).
-export const REQUALIFY_ENGAGEMENT_SOURCE_TYPES: readonly string[] = [
-  BROWSER_TIMELINE_OBSERVED,
-  NAVIGATION_COMMITTED,
-  ENGAGEMENT_SESSION_AGGREGATED,
-  SELECTION_COPIED,
-  SELECTION_PASTED,
-];
+// Aliased to CORPUS_SOURCE_TYPES (connections/similarityCorpus.ts) so the
+// requalify splice and the W1 full-corpus assembly read EXACTLY the same
+// typed set — the byte-equivalence argument (both readers vs readMerged())
+// holds only while the two lists are identical. A single source of truth
+// makes a future 6th consumed type a one-line change that both readers pick
+// up, and the SIDETRACK_SIMILARITY_CORPUS_VERIFY drift check below asserts
+// the equivalence against the legacy full walk on real data.
+export const REQUALIFY_ENGAGEMENT_SOURCE_TYPES: readonly string[] = CORPUS_SOURCE_TYPES;
 
 // Permanent-gap sealing (default OFF). A "permanent gap" is a per-replica
 // event seq the log/store skip forever (a rejected/never-emitted seq). It
@@ -544,6 +550,32 @@ const similarityRequalifyEnabled = (): boolean =>
 // this requalify is a cheap no-op re-derive against the title skeleton.
 const contentRequalifyEnabled = (): boolean =>
   process.env['SIDETRACK_SIMILARITY_CONTENT_REQUALIFY'] !== '0';
+// W1 path-independent similarity corpus (window-poverty fix). Default ON;
+// disable with env=0 + restart for instant rollback. ON, the similarity
+// eligible-corpus seed is assembled from the event store's typed indexes
+// (connections/similarityCorpus.ts) on EVERY drain, so it no longer depends
+// on which drain path ran (window-poor warm drains previously seeded 0…few
+// visits, driving the visitSimilarity flapping / migration wipes / Pass-7
+// endpoint-drop cascade). Only ACTIVATES on the event-store path
+// (SIDETRACK_EVENT_STORE=1 — the live/test companion); with the event store
+// off, the module falls back to the window `merged`, so the default-off
+// runtime stays byte-unchanged. OFF restores the pre-fix window seed
+// unconditionally.
+const similarityFullCorpusEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_FULL_CORPUS'] !== '0';
+// Drift verify (default OFF; opt-in for verification / drift alerts). When on
+// AND the full corpus was assembled from the typed store, compare the typed
+// corpus entries against the legacy window seed on this drain and warn on any
+// divergence — mirrors SIDETRACK_TIMELINE_FACTS_VERIFY. This is the byte-
+// equivalence guardrail for the CORPUS_SOURCE_TYPES invariant (a future 6th
+// consumed type would surface here).
+// COST NOTE: when enabled this runs a SECOND builder pipeline (buildTimelineDays
+// + buildEngagementClassifierInputs + enrichTimelineDaysWithEngagement) over
+// `merged` purely to diff visit keys, roughly doubling the build cost of a
+// full-read drain (where `merged` is the whole log). Use it for a bounded
+// verification pass; do NOT leave it enabled during sustained live browsing.
+const similarityCorpusVerifyEnabled = (): boolean =>
+  process.env['SIDETRACK_SIMILARITY_CORPUS_VERIFY'] === '1';
 // Source engagement classifier inputs from the persistent SQLite fact
 // store instead of re-walking the full AcceptedEvent[] every drain.
 // Kill-switch to the legacy in-memory path (drift/replay) via env=0.
@@ -3116,21 +3148,50 @@ export const createConnectionsMaterializer = (
     // current.db (the number resolvers read). Recorded into the diagnostic.
     let renderFloorRepaired = false;
     let renderedSimilarityFamilyEdgeCountWritten: number | null = null;
+    // W2 — the SERVED visit-similarity revision id + eligible-corpus signature
+    // stamped onto every written snapshot's metadata (StoredConnectionsMetadata)
+    // so the resolve SWR graph signature keys on them instead of the volatile
+    // node/edge counts. Assigned once `visitSimilarity` is finalized below
+    // (both writes happen strictly after, same closure-reads-a-set-value
+    // pattern as renderFloorContext). `similarityCorpusResult.corpusSignature`
+    // is already `const` above; the revision id lands once the floor guard /
+    // Layer 0 picks the served revision.
+    // Assigned once the served revision is finalized (line ~4659), read by the
+    // write-stamp closure below. Explicit `undefined` initializers (a genuine
+    // deferred-assignment `let`, mirroring `renderFloorContext = null` above).
+    let servedSimilarityRevisionIdForWrite: string | undefined = undefined;
+    let servedSimilarityCorpusSignatureForWrite: string | undefined = undefined;
+    const stampSimilaritySignatureFields = (
+      snapshot: ConnectionsSnapshot,
+    ): ConnectionsSnapshot =>
+      servedSimilarityRevisionIdForWrite === undefined
+        ? snapshot
+        : {
+            ...snapshot,
+            visitSimilarityRevisionId: servedSimilarityRevisionIdForWrite,
+            ...(servedSimilarityCorpusSignatureForWrite === undefined
+              ? {}
+              : { similarityCorpusSignature: servedSimilarityCorpusSignatureForWrite }),
+          };
     const writeSnapshotWithDrainProgress = async (
       snapshot: ConnectionsSnapshot,
       dirtyScopesForWrite?: ReadonlySet<Scope>,
     ): Promise<void> => {
-      let snapshotToWrite = snapshot;
+      let snapshotToWrite = stampSimilaritySignatureFields(snapshot);
       if (renderFloorContext !== null) {
         const outcome = applyRenderedSimilarityFloor({
-          candidate: snapshot,
+          candidate: snapshotToWrite,
           previous: renderFloorContext.previousServedSnapshot,
           resetAllowed: renderFloorContext.resetAllowed,
           recompute: (nodes, edges, updatedAt) =>
-            recomputeSnapshotMetadataForCarriedRows(snapshot, nodes, edges, updatedAt),
+            recomputeSnapshotMetadataForCarriedRows(snapshotToWrite, nodes, edges, updatedAt),
         });
         if (outcome.action === 'repair') {
-          snapshotToWrite = outcome.snapshot;
+          // Re-stamp: the repair recomputes metadata (nodeCount/edgeCount/
+          // snapshotRevision) but preserves the similarity signature fields
+          // via the spread base; stamp again defensively so a repaired write
+          // still carries the served revision id + corpus signature.
+          snapshotToWrite = stampSimilaritySignatureFields(outcome.snapshot);
           renderFloorRepaired = true;
           console.warn(
             `[connections] rendered similarity floor REPAIRED a collapse: served=${String(
@@ -3297,6 +3358,86 @@ export const createConnectionsMaterializer = (
     // processed, the on-disk revision is reusable byte-for-byte — no
     // need to re-embed.
     const windowSimilarityEntries = timelineDays.flatMap((day) => day.entries);
+    // W1 — path-independent similarity eligible-corpus assembly (window-
+    // poverty fix). The window seed above is the drain-path-dependent input
+    // (0…thousands of visits depending on which drain ran) that drove the
+    // visitSimilarity flapping, the corpus-config migration wipes, and the
+    // Pass-7 endpoint-drop cascade. Replace it with the FULL corpus assembled
+    // from the event store's typed indexes (connections/similarityCorpus.ts),
+    // so `similarityEntries` covers every eligible visit on EVERY drain path.
+    //
+    // Cost (runtime-agility bar, doctrine rule 9): the assembly is a typed
+    // read over exactly CORPUS_SOURCE_TYPES via events_type_idx (~26k of 741k
+    // rows on the live store) — measured ~309ms warm on the 741k-event vault,
+    // 88x cheaper than the ~14.3s full readMerged() it replaces on the paths
+    // that walk, chunked with an event-loop yield between chunks so it is never
+    // a single multi-second synchronous phase. It runs on EVERY store-backed
+    // drain and is NOT cost-gated: the production runtime forks a fresh
+    // reconcile child per drain (connectionsReconcileChildClient.ts —
+    // "forking fresh per drain"), so any per-instance reuse cache is ALWAYS
+    // cold at drain start (a `let` closure cannot survive process.exit(0)). A
+    // cost-gate keyed on such a cache would be dead in production while passing
+    // in-process tests — a test/prod divergence that hides, not removes, the
+    // read (see the historical per-nav CPU class in project memory). Since the
+    // corpus is deterministic from the store, the freshly-assembled revisionId
+    // is identical every drain and served state still converges; the honest
+    // design is to pay the sub-second read on every reconcile drain. Only
+    // activates on the event-store path; with the store off, the module returns
+    // the window seed (byte-unchanged, W5).
+    const similarityCorpusResult: EligibleSimilarityCorpus =
+      similarityFullCorpusEnabled() && storeBackedEvents !== null
+        ? await (async (): Promise<EligibleSimilarityCorpus> => {
+            const corpus = await buildEligibleSimilarityCorpus({
+              typedEventSource: storeBackedEvents,
+              fallbackMerged: merged,
+              builders: {
+                buildTimelineDays,
+                buildEngagementClassifierInputs,
+                enrichTimelineDaysWithEngagement,
+              },
+            });
+            mark(
+              `similarityCorpus.assembled entries=${String(corpus.entries.length)} sourceEvents=${String(corpus.sourceEventCount)} typed=${String(corpus.assembledFromTypedStore)} sig=${corpus.corpusSignature}`,
+            );
+            if (similarityCorpusVerifyEnabled() && corpus.assembledFromTypedStore) {
+              const legacyDays = buildTimelineDays(merged);
+              const legacyEngagement = buildEngagementClassifierInputs(merged, legacyDays);
+              const legacyWindowKeys = new Set(
+                enrichTimelineDaysWithEngagement(legacyDays, legacyEngagement)
+                  .flatMap((day) => day.entries)
+                  .map(visitKeyForVisitEntry),
+              );
+              const corpusKeys = new Set(corpus.entries.map(visitKeyForVisitEntry));
+              const windowMissingFromCorpus = [...legacyWindowKeys].filter(
+                (key) => !corpusKeys.has(key),
+              );
+              console.warn(
+                `[similarity-corpus] verify corpus=${String(corpusKeys.size)} window=${String(
+                  legacyWindowKeys.size,
+                )} windowMissingFromCorpus=${String(windowMissingFromCorpus.length)}`,
+              );
+            }
+            return corpus;
+          })()
+        : {
+            entries: windowSimilarityEntries,
+            enrichedDays: timelineDays,
+            corpusSignature: `window:${String(windowSimilarityEntries.length)}`,
+            assembledFromTypedStore: false,
+            sourceEventCount: merged.length,
+          };
+    const corpusSimilarityEntries = similarityCorpusResult.entries;
+    // W2 part 1 — the timeline days that feed the FULL-snapshot build (Pass 1
+    // timeline nodes + Pass 7 similarity endpoint completion). With W1 active
+    // this is the full-corpus timeline, so `visitObservedAtByKey` covers every
+    // corpus visit and Pass 7 stops dropping similarity edges whose endpoint
+    // timeline-visit node fell out of the drain window (the served
+    // edgeCount 20k↔74k oscillation + the chronic renderRepaired activations).
+    // When W1 is inactive this equals the window `timelineDays` (byte-
+    // unchanged). Only the FULL base build uses this; the scoped-delta path
+    // keeps its window-filtered days (it re-asserts row-local scopes and
+    // carries similarity rows forward independently).
+    const fullBuildTimelineDays = similarityCorpusResult.enrichedDays;
     // PR #141 — resolve the similarity config once so the same
     // (threshold / topK / engagementGateMs / lexical fallback) values
     // feed both the revision id + the build call. Honors env overrides:
@@ -3342,19 +3483,26 @@ export const createConnectionsMaterializer = (
             ...requalifyCandidateEngagementVisitIds,
             ...contentRequalifyCandidateVisitKeys,
           ]);
+    // Requalify splice — kept as defense-in-depth. With W1 active,
+    // `corpusSimilarityEntries` already covers every eligible visit, so the
+    // splice's `missingVisitKeys` (candidates ABSENT from the base entries) is
+    // empty and loadRequalifiedSimilarityEntries returns [] via its early
+    // guard — the redundant full read is skipped. When W1 is inactive (event
+    // store off / flag off) `corpusSimilarityEntries === windowSimilarityEntries`
+    // and this is the exact pre-fix window-splice behavior.
     const requalifiedSimilarityEntries =
       combinedRequalifyCandidateVisitIds.size > 0
         ? await loadRequalifiedSimilarityEntries(
             combinedRequalifyCandidateVisitIds,
-            windowSimilarityEntries,
+            corpusSimilarityEntries,
             similarityConfig.engagementGateMs,
             storeBackedEvents,
           )
         : [];
     const similarityEntries =
       requalifiedSimilarityEntries.length > 0
-        ? [...windowSimilarityEntries, ...requalifiedSimilarityEntries]
-        : windowSimilarityEntries;
+        ? [...corpusSimilarityEntries, ...requalifiedSimilarityEntries]
+        : corpusSimilarityEntries;
     const requalifiedVisitKeys = new Set(
       requalifiedSimilarityEntries.map(visitKeyForVisitEntry),
     );
@@ -4499,6 +4647,12 @@ export const createConnectionsMaterializer = (
         )} built=${String(builtSimilarityEdgeCount)}`,
       );
     }
+    // W2 — `visitSimilarity.revisionId` is now the definitively SERVED revision
+    // (post-Layer-0 reuse/bootstrap + post floor-guard carry-forward). Record
+    // it + the eligible-corpus signature so every snapshot write stamps them
+    // into StoredConnectionsMetadata for the resolve SWR graph signature.
+    servedSimilarityRevisionIdForWrite = visitSimilarity.revisionId;
+    servedSimilarityCorpusSignatureForWrite = similarityCorpusResult.corpusSignature;
     // Fold this drain's outcome into the durable cross-drain floor state.
     // This is what makes the health surface reflect CURRENT state (not a
     // process-lifetime latch), arms/consumes the durable privacy-purge
@@ -4659,6 +4813,14 @@ export const createConnectionsMaterializer = (
       renderRepaired: false,
       renderedSimilarityFamilyEdgeCount:
         renderedSimilarityFamilyEdgeCountWritten ?? visitSimilarity.edges.length,
+      // W3 placeholder (renderRepaired unknown until the write) — finalized in
+      // the post-write patch below with the terminal render outcome added.
+      guardActivationsPerDrain:
+        Number(carriedForward) +
+        Number(laneUnloadedReuse) +
+        Number(bootstrapAdopted) +
+        Number(resetDeferredForIncompleteCorpus) +
+        Number(driftWouldWipeServedSignal),
     };
     // U2 — similarity-stage wall time for HotPathDiagnostics (the
     // visitSimilarity revision is finalized here).
@@ -5150,7 +5312,10 @@ export const createConnectionsMaterializer = (
     const input: ConnectionsInput = {
       events: merged,
       ...vault,
-      timelineDays,
+      // W2 part 1 — the FULL-corpus timeline days (== `timelineDays` when W1 is
+      // off) so Pass 1 emits every corpus visit's timeline-visit node and Pass
+      // 7 finds both endpoints of every similarity edge (no window-poor drop).
+      timelineDays: fullBuildTimelineDays,
       tabSessionProjection,
       urlProjection,
       visitSimilarity,
@@ -6120,6 +6285,17 @@ export const createConnectionsMaterializer = (
       renderedSimilarityFamilyEdgeCount:
         renderedSimilarityFamilyEdgeCountWritten ??
         countRenderedSimilarityFamilyEdges(finalSnapshot),
+      // W3 — finalize the window-poverty guard-activation counter now that the
+      // render layer has run. Adds `renderFloorRepaired` (Layer 3) to the
+      // Layer-0/2 + reset-deferral/drift terms recorded above. Trends to 0 on
+      // normal drains once W1 makes the corpus path-independent.
+      guardActivationsPerDrain:
+        Number(carriedForward) +
+        Number(laneUnloadedReuse) +
+        Number(bootstrapAdopted) +
+        Number(resetDeferredForIncompleteCorpus) +
+        Number(driftWouldWipeServedSignal) +
+        Number(renderFloorRepaired),
     };
     // PR #141 — write the diagnostics artifact after publishing. Uses
     // `finalSnapshot` so the artifact reflects whichever snapshot the
@@ -6784,6 +6960,23 @@ export const createConnectionsMaterializer = (
           ordered.length,
         )} chunkSize=${String(BACKLOG_FALLBACK_THRESHOLD)}`,
       );
+    }
+    // W1 path-independence during chunked catch-up. Each chunk drives
+    // buildAndWrite via the forcedPendingEventWindow branch, which SKIPS the
+    // per-drain storeBackedEvents.catchUpFromJsonl (that branch only runs on
+    // the normal store-backed path). buildEligibleSimilarityCorpus reads the
+    // typed event store, so without this the first chunk could assemble the
+    // corpus from an event-store.db that has not yet ingested the pending
+    // backlog — reintroducing window-poverty during the catch-up window (the
+    // eligibleCorpusIncompleteVsStore reset-defer guard would then have to
+    // compensate). Catch the store up from the JSONL log ONCE before the loop
+    // so it mirrors the full log before any chunk assembles the corpus. This
+    // is idempotent + ~0 on a warm store (watermark-gated append).
+    if (eventStoreEnabled()) {
+      const storeForCatchUp = await ensureEventStore();
+      if (storeForCatchUp !== null) {
+        await storeForCatchUp.catchUpFromJsonl(join(deps.vaultRoot, '_BAC', 'log'));
+      }
     }
     for (let offset = 0; offset < ordered.length; offset += BACKLOG_FALLBACK_THRESHOLD) {
       const progress = await deps.store.readMaterializerProgress(MATERIALIZER_NAME);

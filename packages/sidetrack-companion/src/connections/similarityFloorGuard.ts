@@ -231,6 +231,19 @@ export interface SimilarityFloorDiagnostics {
   // window-poor render dropped endpoints; when `renderRepaired` is true this
   // reflects the repaired (restored) count.
   readonly renderedSimilarityFamilyEdgeCount: number;
+  // W3 (window-poverty fix) — the number of window-poverty COMPENSATION
+  // guards that activated on THIS drain: carriedForward (Layer 2) +
+  // laneUnloadedReuse / bootstrapAdopted (Layer 0) + renderRepaired (Layer 3)
+  // + resetDeferredForIncompleteCorpus + driftWouldWipeServedSignal. These
+  // guards exist ONLY to compensate for the window-dependent corpus lane; with
+  // the path-independent corpus (W1) a normal warm drain assembles the full
+  // eligible corpus, so none should fire. This counter proves the fix landed:
+  // guardActivationsPerDrain trends to 0 on normal drains (a persistently
+  // non-zero value on non-reset drains means a guard is still compensating —
+  // i.e. the corpus lane regressed). Genuine reset drains (model change /
+  // purge / operator rebuild) legitimately activate the reset path and are NOT
+  // counted here (they are intended, not compensation).
+  readonly guardActivationsPerDrain: number;
 }
 
 // Reconstruct a full VisitSimilarityRevision from the previously served

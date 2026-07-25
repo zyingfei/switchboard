@@ -289,6 +289,18 @@ export interface ConnectionsSnapshot {
   // snapshot contents). Side panel uses this to detect stale reads
   // and decide whether to refetch.
   readonly snapshotRevision?: string;
+  // W2 (window-poverty fix) — the visit-similarity revision id SERVED in this
+  // snapshot (the revision Pass 7 materialized edges from). Threaded into
+  // StoredConnectionsMetadata so the resolve SWR graph signature keys on the
+  // similarity revision + corpus signature instead of the volatile
+  // nodeCount/edgeCount, which oscillated on window-poor renders and busted
+  // the resolve cache ~35/40 drains. Stable across drains once the corpus is
+  // path-independent (W1). Optional for pre-W2 snapshots.
+  readonly visitSimilarityRevisionId?: string;
+  // The corpus signature (connections/similarityCorpus.ts) of the eligible
+  // similarity corpus this snapshot was built from. Additive stability term
+  // for the graph signature: advances only when the corpus content changes.
+  readonly similarityCorpusSignature?: string;
 }
 
 // Helper id minters — exported so the materializer / tests / HTTP

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createConnectionsStore, SqliteConnectionsStore } from './snapshot.js';
+import { connectionsGraphSig } from '../http/server.js';
 import {
   edgeIdFor,
   type ConnectionEdge,
@@ -244,6 +245,112 @@ describe('SqliteConnectionsStore', () => {
     expect(c?.snapshotRevision).toBe('rev-changed');
     store.close();
   });
+
+  // W2 (window-poverty fix) — the served similarity revision id + eligible-
+  // corpus signature round-trip through StoredConnectionsMetadata so the
+  // resolve SWR graph signature (server.ts) can key on them instead of the
+  // volatile node/edge counts.
+  sqliteIt(
+    'round-trips visitSimilarityRevisionId + similarityCorpusSignature through metadata',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      const snapshot: ConnectionsSnapshot = {
+        ...buildTraversalSnapshot(),
+        visitSimilarityRevisionId: 'rev-sim-abc',
+        similarityCorpusSignature: 'corpus:9:deadbeef',
+      };
+      await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot));
+      const metadata = await store.readSnapshotMetadata();
+      expect(metadata?.visitSimilarityRevisionId).toBe('rev-sim-abc');
+      expect(metadata?.similarityCorpusSignature).toBe('corpus:9:deadbeef');
+      // W2 — the non-similarity structural discriminator is derived + persisted
+      // from the snapshot's edges (buildTraversalSnapshot has 4 edges, none in
+      // the similarity family). Metadata-only: NOT surfaced on readCurrent().
+      expect(metadata?.nonSimilarityEdgeCount).toBe(4);
+      const current = await store.readCurrent();
+      expect(current?.visitSimilarityRevisionId).toBe('rev-sim-abc');
+      expect(current?.similarityCorpusSignature).toBe('corpus:9:deadbeef');
+      expect(
+        (current as unknown as { nonSimilarityEdgeCount?: number }).nonSimilarityEdgeCount,
+      ).toBeUndefined();
+      store.close();
+    },
+  );
+
+  // W2 — the resolve SWR graph signature (connectionsGraphSig → sqliteSig)
+  // must NOT rotate on the SIMILARITY-family edge oscillation (the window-poor
+  // render flux that busted the resolve cache ~35/40 drains), but MUST rotate
+  // when (a) the served similarity revision / corpus signature changes OR (b) a
+  // NON-similarity graph row changes (a new thread/attribution/topic edge or
+  // node). Part (b) is the missed-bust the pure similarity-revision key would
+  // have swallowed — the non-similarity structural discriminator
+  // (nodeCount:nonSimilarityEdgeCount) closes it.
+  sqliteIt(
+    'graph signature ignores similarity-family flux but rotates on similarity-revision AND non-similarity graph changes',
+    async () => {
+      // All snapshots share the same updatedAt, so the sig's mtime BUCKET term
+      // is constant across the writes — only the graph TERM can differ.
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      const base = buildTraversalSnapshot();
+      // Two similarity-family edges (visit_resembles_visit) between the visit
+      // and thread nodes present in the traversal snapshot. These are the rows
+      // Pass-7 drops/restores on a window-poor render.
+      const visitId = 'timeline-visit:https://example.test/page';
+      const threadId = 'thread:alpha';
+      const simEdgeA = edge('visit_resembles_visit', visitId, threadId, '2026-05-01T00:00:04.000Z');
+      const withSim: ConnectionsSnapshot = {
+        ...base,
+        nodes: base.nodes,
+        edges: [...base.edges, simEdgeA],
+        nodeCount: base.nodeCount,
+        edgeCount: base.edges.length + 1,
+        visitSimilarityRevisionId: 'rev-sim-1',
+        similarityCorpusSignature: 'corpus:9:aaaa',
+      };
+      await store.writeSnapshotAndProgress(withSim, progressFor(withSim));
+      const sig1 = await connectionsGraphSig(store, '/unused/current.json');
+
+      // (benign) DROP the similarity-family edge — the Pass-7 window-poor flux.
+      // The similarity revision + corpus signature + non-similarity rows are
+      // unchanged, so the sig MUST be stable (no cache bust).
+      const simDropped: ConnectionsSnapshot = {
+        ...withSim,
+        edges: base.edges,
+        edgeCount: base.edges.length,
+      };
+      await store.writeSnapshotAndProgress(simDropped, progressFor(simDropped));
+      const sig2 = await connectionsGraphSig(store, '/unused/current.json');
+      expect(sig2).toBe(sig1); // stable — no cache bust on similarity-family flux
+
+      // (real change) ADD a NON-similarity edge (a new thread↔workstream link)
+      // WITHOUT touching the similarity revision — the missed-bust the pure
+      // similarity key would swallow. The sig MUST rotate.
+      const nonSimEdge = edge(
+        'thread_in_workstream',
+        threadId,
+        'workstream:other',
+        '2026-05-01T00:00:05.000Z',
+      );
+      const nonSimChanged: ConnectionsSnapshot = {
+        ...simDropped,
+        edges: [...base.edges, nonSimEdge],
+        edgeCount: base.edges.length + 1,
+      };
+      await store.writeSnapshotAndProgress(nonSimChanged, progressFor(nonSimChanged));
+      const sig3 = await connectionsGraphSig(store, '/unused/current.json');
+      expect(sig3).not.toBe(sig2); // non-similarity structural change busts the cache
+
+      // (real change) rotate the similarity revision — the sig MUST rotate.
+      const revChanged: ConnectionsSnapshot = {
+        ...nonSimChanged,
+        visitSimilarityRevisionId: 'rev-sim-2',
+      };
+      await store.writeSnapshotAndProgress(revChanged, progressFor(revChanged));
+      const sig4 = await connectionsGraphSig(store, '/unused/current.json');
+      expect(sig4).not.toBe(sig3);
+      store.close();
+    },
+  );
 
   sqliteIt('applies projection event overlays without rewriting graph rows', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });

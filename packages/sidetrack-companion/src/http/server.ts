@@ -2113,9 +2113,34 @@ const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> => {
   // self-perpetuating flood that pegged the companion under live
   // browsing. Bucket `updatedAt` so a burst of drains within one bucket
   // collapses to a single key (the documented "≤bucket dry-run-preview
-  // staleness acceptable" tradeoff); nodeCount/edgeCount still rotate the
-  // key on a real graph change, and user mutations call
+  // staleness acceptable" tradeoff); user mutations call
   // invalidateResolveCaches() for immediate freshness.
+  //
+  // W2 (window-poverty fix) — the term after the bucket was
+  // `nodeCount:edgeCount`, which oscillated on window-poor snapshot renders
+  // (Pass-7 dropped/restored ~20k↔74k similarity edges when endpoint
+  // timeline-visit nodes fell out of window) and busted the SWR cache on
+  // ~35/40 drains → the chronic slow-resolve tail. Rekey on the SERVED
+  // visit-similarity revision id + the eligible-corpus signature (both STABLE
+  // across benign node-count fluctuations — they advance only when the
+  // similarity corpus content actually changes, now that W1 makes the corpus
+  // path-independent) PLUS a stable NON-similarity structural discriminator:
+  // `nodeCount:nonSimilarityEdgeCount`. The non-similarity term is edgeCount
+  // minus the oscillating similarity family (visit_resembles_visit /
+  // closest_visit), recomputed on every write path (full + scoped-delta), so
+  // it rotates on a REAL non-similarity graph mutation (a new
+  // thread_references_url / attribution / topic / organized-item edge) that
+  // lands in the same mtime bucket without moving the similarity revision —
+  // which the pure similarity-revision term would silently swallow (a
+  // missed-bust of up to one ROUTE_CACHE_TTL_MS window). It does NOT oscillate
+  // on the Pass-7 similarity flux the similarity terms already absorb, so it
+  // reintroduces no false busts. `nodeCount` is included as a coarse node-set
+  // discriminator (stable once W1 stabilizes the timeline-visit node set). Fall
+  // back to nodeCount:edgeCount for pre-W2 snapshots that carry neither the
+  // similarity revision nor the non-sim count (the fields are absent until the
+  // first post-deploy drain writes them — one benign rotation, not a mass
+  // bust). The bucket (mtime) term is retained so invalidateResolveCaches() +
+  // user mutations still force freshness.
   const m = await store.readSnapshotMetadata();
   if (m === null) return 'none';
   const updatedMs = Date.parse(m.updatedAt);
@@ -2125,9 +2150,20 @@ const sqliteSig = async (store: SqliteConnectionsStore): Promise<string> => {
       : Number.isFinite(updatedMs)
         ? updatedMs
         : (m.snapshotRevision ?? 'none');
-  return `${String(bucket)}:${String(m.nodeCount)}:${String(m.edgeCount)}`;
+  // The non-similarity structural term: prefer the persisted
+  // nonSimilarityEdgeCount, falling back to raw edgeCount only for pre-W2
+  // snapshots that predate the field.
+  const nonSimEdgeTerm = String(m.nonSimilarityEdgeCount ?? m.edgeCount);
+  const graphTerm =
+    m.visitSimilarityRevisionId !== undefined
+      ? `${m.visitSimilarityRevisionId}:${m.similarityCorpusSignature ?? 'nocorpus'}:${String(m.nodeCount)}:${nonSimEdgeTerm}`
+      : (m.snapshotRevision ?? `${String(m.nodeCount)}:${String(m.edgeCount)}`);
+  return `${String(bucket)}:${graphTerm}`;
 };
-const connectionsGraphSig = async (store: ConnectionsStore, jsonPath: string): Promise<string> =>
+export const connectionsGraphSig = async (
+  store: ConnectionsStore,
+  jsonPath: string,
+): Promise<string> =>
   store instanceof SqliteConnectionsStore ? await sqliteSig(store) : await resolveSig(jsonPath);
 // NOTE: deliberately NOT keyed on replica.peekSeq()/event-log
 // position. The feedback + page-content overlays do depend on the
