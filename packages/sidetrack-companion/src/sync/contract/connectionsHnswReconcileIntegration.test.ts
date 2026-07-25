@@ -605,17 +605,28 @@ describe('HNSW reconcile child integration', () => {
     expect(afterTargetRows.length).toBeGreaterThan(0);
   });
 
-  it('requalifies a late-engagement visit via the typed event-store read (no full-log rebuild)', async () => {
-    // Fix regression: the requalify re-derive used a full-log readMerged()
-    // + full timeline + full engagement rebuild ON THE DRAIN THREAD. On the
-    // 452k-event vault a routine session aggregate firing ~30s after a
-    // visit (past the drain interval, so the visit has left the window)
-    // triggered that per-drain full-log scan. With the event store on, the
-    // re-derive now sources ONLY the requalify-relevant event types via the
-    // type index (events_type_idx). This test drives the exact same late-
-    // engagement requalify scenario with the store ENABLED, so the typed-
-    // read branch runs, and asserts the requalified edge still forms —
-    // proving the typed source is byte-equivalent to the readMerged path.
+  it('requalifies a late-engagement visit via the typed event-store corpus (no full-log rebuild)', async () => {
+    // Fix regression: a late-engagement visit that has left the drain window
+    // used to be reformed only by a bespoke requalify re-derive, which on the
+    // pre-W1 path meant a full-log readMerged() + full timeline + full
+    // engagement rebuild ON THE DRAIN THREAD. On the 452k-event vault a routine
+    // session aggregate firing ~30s after a visit (past the drain interval, so
+    // the visit has left the window) triggered that per-drain full-log scan.
+    //
+    // W1 (path-independent similarity corpus, similarityCorpus.ts) subsumes
+    // the requalify splice when the event store is on: the eligible corpus is
+    // assembled from events_type_idx over CORPUS_SOURCE_TYPES on EVERY drain,
+    // so the late-engagement visit is ALREADY in `similarityEntries` before the
+    // splice runs. The splice's missing-key set is therefore empty and the
+    // dedicated requalify re-derive is a no-op (requalified=0) — its work has
+    // moved into the corpus assembly. This test drives the exact same late-
+    // engagement scenario with the store ENABLED and pins the NEW contract:
+    //   1. the corpus is assembled from the TYPED store (typed=true) — the
+    //      path-independent source that carries the out-of-window visit,
+    //   2. the drain does NOT fall back to a full-log readMerged walk, and
+    //   3. the late-engagement visit's similarity edges still form.
+    // The original protective intent — late-engagement visit requalifies
+    // WITHOUT a full-log O(all-events) rebuild — is preserved by (1)+(2)+(3).
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
     process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'] = '0';
     process.env['SIDETRACK_EVENT_STORE'] = '1';
@@ -643,7 +654,8 @@ describe('HNSW reconcile child integration', () => {
     ).toBe(0);
 
     // Late engagement aggregate only — no fresh BROWSER_TIMELINE_OBSERVED,
-    // so the target is out-of-window and hits the requalify re-derive.
+    // so the target is out-of-window. Under W1 it is picked up by the typed
+    // corpus assembly rather than the (now no-op) requalify splice.
     await appendEngagementAggregate(eventLog, { index: 8, focusedWindowMs: 60_000 });
 
     const output: string[] = [];
@@ -656,10 +668,20 @@ describe('HNSW reconcile child integration', () => {
     } finally {
       writeSpy.mockRestore();
     }
-    expect(output.join('')).toContain('requalified=1');
+    const phaseOutput = output.join('');
+    // (1) The eligible corpus is assembled from the TYPED event store — the
+    // path-independent source that carries the out-of-window late-engagement
+    // visit into similarityEntries (this is what subsumes the requalify splice).
+    expect(phaseOutput).toContain('similarityCorpus.assembled');
+    expect(phaseOutput).toMatch(/similarityCorpus\.assembled entries=\d+ sourceEvents=\d+ typed=true/u);
+    // (2) No full-log O(all-events) readMerged() walk on this drain — the
+    // original protective intent. (`readMergedSince` bounded-tail is fine; the
+    // banned marker is the unbounded `readMerged events=` full walk.)
+    expect(phaseOutput).not.toContain('readMerged events=');
 
     const after = await createConnectionsStore(vaultRoot).readCurrent();
     if (after === null) throw new Error('expected reconciled snapshot');
+    // (3) The late-engagement visit's similarity edges still form.
     expect(
       similarityRows(after).filter((row) => rowTouchesVisit(row, new Set([targetVisitKey]))).length,
     ).toBeGreaterThan(0);
