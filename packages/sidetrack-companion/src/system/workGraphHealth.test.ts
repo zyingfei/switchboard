@@ -17,10 +17,25 @@ import {
 } from '../producers/topic-revision.js';
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
 import { fingerprintFeedbackTrainingLabels } from '../ranker/retrain.js';
+import {
+  writeRecallImpressionRetrainState,
+  type RecallImpressionTrainingStats,
+} from '../ranker/retrain-impressions.js';
+import {
+  shipGateV2Decide,
+  type ImpressionMetrics,
+} from '../ranker/shipGateV2.js';
 import { RANKER_MODEL_VERSION } from '../ranker/train.js';
+import {
+  __resetRankerShadowDiffForTests,
+  recordRankerShadowDiff,
+} from '../recall-v2/rankerShadowDiff.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog } from '../sync/eventLog.js';
-import { collectWorkGraphHealth } from './workGraphHealth.js';
+import {
+  collectWorkGraphHealth,
+  withLiveShipGateV2Serving,
+} from './workGraphHealth.js';
 
 describe('work graph diagnostic candidates', () => {
   let vaultRoot = '';
@@ -539,5 +554,178 @@ describe('work graph diagnostic candidates', () => {
     expect(health.labelChannels.rejectedRelations.bySurface).toEqual({ connections: 1 });
     // Weak-negative densification defaults ON (SIDETRACK_RANKER_WEAK_NEGATIVES).
     expect(health.labelChannels.weakNegativesEnabled).toBe(true);
+  });
+
+  describe('shipGateV2 serving-gate enforcement + shadow-diff (read-back)', () => {
+    const priorServeV6 = process.env['SIDETRACK_RANKER_SERVE_V6'];
+    const priorLegacy = process.env['SIDETRACK_RECALL_LEARNED_RERANK'];
+
+    const impressionMetrics = (
+      overrides: Partial<ImpressionMetrics> = {},
+    ): ImpressionMetrics => ({
+      nDcgAt5: 0.5,
+      nDcgAt10: 0.5,
+      mrr: 0.5,
+      recallAt5: 0.5,
+      recallAt10: 0.5,
+      explicitRejectPrecision: 0.5,
+      falsePositiveRateOnRejectedContexts: 0,
+      impressionCount: 80,
+      impressionsWithPositiveCount: 80,
+      ...overrides,
+    });
+
+    const stats: RecallImpressionTrainingStats = {
+      rawPositiveCount: 80,
+      rawNegativeCount: 200,
+      groupCount: 80,
+      positiveGroupCount: 80,
+      groupCountWithPositives: 80,
+      avgCandidatesPerGroup: 4,
+      positivesPerGroup: 1,
+      explicitRejectsPerGroup: 1,
+      unjudgedCandidatesPerGroup: 2,
+      candidateSourceDistribution: {},
+    };
+
+    // A real PASS decision from the gate machinery (do not re-derive the
+    // gate — feed it metrics that clear every check).
+    const passingDecision = shipGateV2Decide({
+      activeMetrics: impressionMetrics({ nDcgAt10: 0.62, mrr: 0.62 }),
+      baselineMetrics: impressionMetrics({ nDcgAt10: 0.5, mrr: 0.5 }),
+      expandedNegativeCount: 0,
+      labelDriftWithoutFeedback: 0,
+      reservedTestUsedExactlyOnce: true,
+    });
+
+    beforeEach(() => {
+      __resetRankerShadowDiffForTests();
+      delete process.env['SIDETRACK_RANKER_SERVE_V6'];
+      delete process.env['SIDETRACK_RECALL_LEARNED_RERANK'];
+    });
+    afterEach(() => {
+      __resetRankerShadowDiffForTests();
+      const restore = (key: string, value: string | undefined): void => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      restore('SIDETRACK_RANKER_SERVE_V6', priorServeV6);
+      restore('SIDETRACK_RECALL_LEARNED_RERANK', priorLegacy);
+    });
+
+    it('gate PASSES but is INERT by default (flag off): servingGateEnforced=false', async () => {
+      expect(passingDecision.status).toBe('pass');
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: 1,
+        status: 'promoted',
+        revisionId: 'rev-v6-passing',
+        updatedAt: Date.parse('2026-05-16T15:00:00.000Z'),
+        stats,
+        shipGateDecision: passingDecision,
+      });
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-05-16T15:05:00.000Z'),
+      });
+
+      expect(health.ranker.shipGateV2?.status).toBe('pass');
+      // Earned-but-inert: the flag is off, so serving still uses the baseline.
+      expect(health.ranker.shipGateV2?.servingGateEnforced).toBe(false);
+      // No request recorded a shadow sample yet.
+      expect(health.ranker.shipGateV2?.shadowDiff).toBeNull();
+    });
+
+    it('flips servingGateEnforced=true and reads back the shadow-diff window', async () => {
+      process.env['SIDETRACK_RANKER_SERVE_V6'] = '1';
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: 1,
+        status: 'promoted',
+        revisionId: 'rev-v6-passing',
+        updatedAt: Date.parse('2026-05-16T15:00:00.000Z'),
+        stats,
+        shipGateDecision: passingDecision,
+      });
+
+      // Two /v2 requests recorded divergence into the in-process window.
+      recordRankerShadowDiff(vaultRoot, ['a', 'b', 'c'], ['a', 'b', 'c'], 1_000);
+      recordRankerShadowDiff(vaultRoot, ['a', 'b', 'c'], ['c', 'b', 'a'], 2_000);
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-05-16T15:05:00.000Z'),
+      });
+
+      expect(health.ranker.shipGateV2?.status).toBe('pass');
+      // Flag on + gate passed → serving now uses v6.
+      expect(health.ranker.shipGateV2?.servingGateEnforced).toBe(true);
+      // The rolling window is surfaced back to the health reader.
+      expect(health.ranker.shipGateV2?.shadowDiff?.requests).toBe(2);
+      expect(health.ranker.shipGateV2?.shadowDiff?.meanTopKOverlap).toBe(1);
+      expect(health.ranker.shipGateV2?.shadowDiff?.meanKendallTau).toBe(0);
+      expect(health.ranker.shipGateV2?.shadowDiff?.lastComputedAt).toBe(
+        new Date(2_000).toISOString(),
+      );
+    });
+
+    it('does NOT enforce when the gate FAILS even with the flag on', async () => {
+      process.env['SIDETRACK_RANKER_SERVE_V6'] = '1';
+      const failingDecision = shipGateV2Decide({
+        activeMetrics: impressionMetrics({ nDcgAt10: 0.4, mrr: 0.4 }),
+        baselineMetrics: impressionMetrics({ nDcgAt10: 0.5, mrr: 0.5 }),
+        expandedNegativeCount: 0,
+        labelDriftWithoutFeedback: 0,
+        reservedTestUsedExactlyOnce: true,
+      });
+      expect(failingDecision.status).toBe('fail');
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: 1,
+        status: 'ship_gate_failed',
+        revisionId: 'rev-v6-failing',
+        updatedAt: Date.parse('2026-05-16T15:00:00.000Z'),
+        stats,
+        shipGateDecision: failingDecision,
+      });
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-05-16T15:05:00.000Z'),
+      });
+
+      expect(health.ranker.shipGateV2?.status).toBe('fail');
+      // Flag on but gate failed → automatic fallback, enforcement stays false.
+      expect(health.ranker.shipGateV2?.servingGateEnforced).toBe(false);
+    });
+
+    it('withLiveShipGateV2Serving overlays live enforcement + shadow-diff onto a frozen (artifact) report', async () => {
+      // Collect a report with the flag OFF and no shadow samples — this is the
+      // shape the drain-time artifact would freeze.
+      await writeRecallImpressionRetrainState(vaultRoot, {
+        schemaVersion: 1,
+        status: 'promoted',
+        revisionId: 'rev-v6-passing',
+        updatedAt: Date.parse('2026-05-16T15:00:00.000Z'),
+        stats,
+        shipGateDecision: passingDecision,
+      });
+      const frozen = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-05-16T15:05:00.000Z'),
+      });
+      expect(frozen.ranker.shipGateV2?.servingGateEnforced).toBe(false);
+      expect(frozen.ranker.shipGateV2?.shadowDiff).toBeNull();
+
+      // Now the env flips on and requests record divergence — the artifact
+      // path must reflect this WITHOUT a recompute.
+      process.env['SIDETRACK_RANKER_SERVE_V6'] = '1';
+      recordRankerShadowDiff(vaultRoot, ['a', 'b'], ['b', 'a'], 5_000);
+      const live = withLiveShipGateV2Serving(frozen, vaultRoot);
+
+      expect(live.ranker.shipGateV2?.servingGateEnforced).toBe(true);
+      expect(live.ranker.shipGateV2?.shadowDiff?.requests).toBe(1);
+      // The rest of the report is preserved (same status/revision).
+      expect(live.ranker.shipGateV2?.status).toBe('pass');
+      expect(live.ranker.shipGateV2?.revisionId).toBe('rev-v6-passing');
+    });
   });
 });

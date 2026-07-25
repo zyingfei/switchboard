@@ -358,6 +358,7 @@ import {
 } from '../system/health.js';
 import {
   collectWorkGraphHealth,
+  withLiveShipGateV2Serving,
   type ConnectionsDiagnosticSnapshot,
 } from '../system/workGraphHealth.js';
 import {
@@ -5291,7 +5292,12 @@ const routes: readonly RouteDefinition[] = [
                 if (eventStoreEnabled()) {
                   const artifact = await readWorkGraphHealthArtifact(vaultRoot);
                   if (artifact !== null && isWorkGraphHealthArtifactFresh(artifact)) {
-                    return artifact.report;
+                    // The drain-time artifact froze shipGateV2.servingGateEnforced
+                    // + shadowDiff at drain time (before requests ran / under a
+                    // stale env). Overlay the LIVE enforcement flag + the
+                    // in-process shadow-diff window so the served surface
+                    // reflects the current serving decision and measurement.
+                    return withLiveShipGateV2Serving(artifact.report, vaultRoot);
                   }
                 }
                 // Phase 4 — peek the canonical SQLite recall store so
