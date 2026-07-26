@@ -561,8 +561,18 @@ const contentRequalifyEnabled = (): boolean =>
 // off, the module falls back to the window `merged`, so the default-off
 // runtime stays byte-unchanged. OFF restores the pre-fix window seed
 // unconditionally.
+// M3 corpus-lane kill switch. The path-independent full-corpus assembly
+// (connections/similarityCorpus.ts) is the M3 (PR #277) lane — default ON.
+// EITHER env set to '0' reverts to the legacy window-assembly seed
+// (byte-unchanged rollback path). `SIDETRACK_SIMILARITY_CORPUS_LANE` is the
+// name the M3 review should have required as the documented rollback; it is
+// kept as an alias of the pre-existing `SIDETRACK_SIMILARITY_FULL_CORPUS` gate
+// so a single operator flip disables the lane if it ever regresses under live
+// browsing (the M3 rebuild-storm class). OFF restores the pre-M3 window seed
+// unconditionally.
 const similarityFullCorpusEnabled = (): boolean =>
-  process.env['SIDETRACK_SIMILARITY_FULL_CORPUS'] !== '0';
+  process.env['SIDETRACK_SIMILARITY_FULL_CORPUS'] !== '0' &&
+  process.env['SIDETRACK_SIMILARITY_CORPUS_LANE'] !== '0';
 // Drift verify (default OFF; opt-in for verification / drift alerts). When on
 // AND the full corpus was assembled from the typed store, compare the typed
 // corpus entries against the legacy window seed on this drain and warn on any
@@ -1438,6 +1448,12 @@ export const createConnectionsMaterializer = (
   );
   const hnswSimilarityStore = createSimilarityHnswStore();
   let loadedHnswSimilarityStore: LoadedSimilarityHnswStore | null = null;
+  // Drain-path observability (M3 rebuild-storm fix): the number of embeddings
+  // buildHnswVisitSimilarity inserted/updated on the LAST call. On an
+  // incremental drain this is the delta size (new/reconciled visits); on a
+  // full rebuild it is the whole eligible corpus. Surfaced in the drain
+  // diagnostics artifact so acceptance tests can assert the delta-only embed.
+  let lastHnswInsertedCount = 0;
   const pageEvidenceRecordCache = new Map<string, PageEvidenceRecord>();
   let pending = false;
   let running = false;
@@ -1729,6 +1745,11 @@ export const createConnectionsMaterializer = (
     // empty legitimately.
     readonly suppressResetOnEmptyCorpus: boolean;
   }): Promise<VisitSimilarityRevision> => {
+    // Observability (M3 rebuild-storm fix): reset the per-call embed counter up
+    // front so the empty-corpus early returns below report 0 (nothing
+    // embedded), not a stale count from a prior drain. The accurate value is
+    // set at the embed site below.
+    lastHnswInsertedCount = 0;
     const activeEntries = input.entries.filter(
       (entry) => focusedWindowMsFromEntry(entry) >= input.config.engagementGateMs,
     );
@@ -1786,6 +1807,11 @@ export const createConnectionsMaterializer = (
         ? new Set([...activeVisitIds, ...staleKnownVisitIds])
         : incrementalHnswMutationVisitIds;
 
+    // Observability (M3 rebuild-storm fix): record the embed count for this
+    // call so the drain can surface it in diagnostics. This is the number of
+    // vectors we will insert/update — the delta size on an incremental drain,
+    // the whole eligible corpus on a full rebuild.
+    lastHnswInsertedCount = entriesToEmbed.length;
     const embeddingsByVisitKey = new Map<string, Float32Array>();
     if (entriesToEmbed.length > 0) {
       const texts = entriesToEmbed.map(
@@ -6296,6 +6322,24 @@ export const createConnectionsMaterializer = (
         Number(resetDeferredForIncompleteCorpus) +
         Number(driftWouldWipeServedSignal) +
         Number(renderFloorRepaired),
+      // Drain-path observability (M3 rebuild-storm fix). These name the path
+      // the drain took so acceptance tests read the served forensics artifact
+      // (latest.json) instead of scraping the phase log. `similarityRevisionChanged`
+      // compares the served revision against the PREVIOUSLY SERVED snapshot's
+      // revision (the artifact resolvers read), so it is correct under the
+      // production child-per-drain fork where the in-memory
+      // lastAcceptedSimilarityRevisionId starts null.
+      scopedTimelineDeltaApplied,
+      similarityRevisionChanged:
+        previousSnapshotForRanker === null
+          ? true
+          : previousSimilarityRevisionIdFromSnapshot(previousSnapshotForRanker) !==
+            visitSimilarity.revisionId,
+      hnswFullRebuild,
+      hnswInsertedCount: persistentHnswSimilarityMode ? lastHnswInsertedCount : 0,
+      ...(scopedTimelineDeltaApplied
+        ? {}
+        : { scopedTimelineDeltaSkipDetail }),
     };
     // PR #141 — write the diagnostics artifact after publishing. Uses
     // `finalSnapshot` so the artifact reflects whichever snapshot the

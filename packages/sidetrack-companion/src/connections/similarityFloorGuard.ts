@@ -244,6 +244,34 @@ export interface SimilarityFloorDiagnostics {
   // purge / operator rebuild) legitimately activate the reset path and are NOT
   // counted here (they are intended, not compensation).
   readonly guardActivationsPerDrain: number;
+  // ── Drain-path observability (M3 rebuild-storm fix) ─────────────────────
+  // These name the path the drain actually took so acceptance tests can read
+  // the served forensics artifact (latest.json) instead of scraping the phase
+  // log. Optional so the pure floor-guard unit constructors stay unchanged;
+  // only the materializer populates them.
+  //
+  // True when the cheap scoped-delta snapshot path applied (replaceScopeRows),
+  // false when the drain fell through to a full/base rebuild. An engagement-
+  // tick-only active-browsing drain MUST keep this true (the M3 regression was
+  // it flipping false every drain via revision churn → topicSame=false).
+  readonly scopedTimelineDeltaApplied?: boolean;
+  // When scopedTimelineDeltaApplied is false, the skip reason (the same detail
+  // string the phase-log `scopedTimelineDelta skip reason=` mark carries) so
+  // the failing gate is nameable from forensics.
+  readonly scopedTimelineDeltaSkipDetail?: string;
+  // True when the served visitSimilarity revision id changed vs the previously
+  // served snapshot's revision. Under active browsing this must stay false on
+  // engagement-tick-only drains (the churn the fix removes) and flip true only
+  // when the eligible-set membership or corpus text actually changed.
+  readonly similarityRevisionChanged?: boolean;
+  // True when the HNSW similarity producer did a full re-embed of the whole
+  // eligible corpus (reserved for resets/drift/version bumps). Active-browsing
+  // small-delta drains must be false (incremental embed of the delta only).
+  readonly hnswFullRebuild?: boolean;
+  // The number of embeddings the HNSW producer inserted/updated this drain.
+  // On an incremental drain this equals the delta size (new/reconciled
+  // visits), NOT the corpus size — the load-bearing assertion for fix (b).
+  readonly hnswInsertedCount?: number;
 }
 
 // Reconstruct a full VisitSimilarityRevision from the previously served
