@@ -957,7 +957,14 @@ describe('SqliteConnectionsStore', () => {
       await jsonStore.putCurrent(snapshot);
 
       expect(await sqliteStore.readCurrent()).toEqual(await jsonStore.readCurrent());
-      expect(await stat(join(sqliteRoot, '_BAC', 'connections', 'current.db'))).toBeDefined();
+      // M4 — under double-buffer (default ON) the SQLite store persists to a
+      // published generation file named by the POINTER, not a fixed
+      // `current.db`. Assert the pointer + its generation db exist on disk.
+      const { readPointer, generationDbPath } = await import('./generationBuffer.js');
+      const connectionsDir = join(sqliteRoot, '_BAC', 'connections');
+      const gen = readPointer(connectionsDir);
+      expect(gen).not.toBeNull();
+      expect(await stat(generationDbPath(connectionsDir, gen!))).toBeDefined();
       if (sqliteStore instanceof SqliteConnectionsStore) sqliteStore.close();
     },
   );

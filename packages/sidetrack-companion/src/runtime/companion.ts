@@ -563,7 +563,14 @@ export const startCompanion = async (
     // failure-cooldown pattern as timeline. Reads vault stores
     // (threads, workstreams, dispatches, queue, reminders, coding
     // sessions) + timeline daily projections at snapshot time.
-    const connectionsStore = createConnectionsStore(options.vaultPath);
+    // M4 — the companion runtime is the PARENT: a readonly reader on the
+    // published connections generation. The fork-per-drain child is the sole
+    // writer (see connectionsReconcileChild.entry.ts). Under double-buffer this
+    // means the parent never holds a current.db write lock, so a drain can
+    // never stall a resolve.
+    const connectionsStore = createConnectionsStore(options.vaultPath, {
+      role: 'parent-reader',
+    });
     teardown.push(
       scheduleSqliteVacuumGc(connectionsStore, hygieneStatus, { everyMs: sqliteVacuumEveryMs }),
     );

@@ -80,7 +80,10 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
     const replica = await loadOrCreateReplica(msg.vaultRoot);
     const eventLog = createEventLog(msg.vaultRoot, replica);
     const timelineStore = createTimelineStore(msg.vaultRoot);
-    const store = createConnectionsStore(msg.vaultRoot);
+    // M4 — the reconcile child is the WRITER: it builds into a shadow
+    // generation and publishes via checkpoint + pointer-flip on exit. The
+    // parent reads the published generation readonly.
+    const store = createConnectionsStore(msg.vaultRoot, { role: 'child-writer' });
     const materializer = createConnectionsMaterializer({
       vaultRoot: msg.vaultRoot,
       eventLog,
@@ -100,6 +103,15 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
         ? {}
         : { snapshotRevision: metadata.snapshotRevision }),
     });
+    // Close the store explicitly BEFORE process.exit — exit runs no cleanup, so
+    // relying on abrupt OS teardown of the writer handle is fragile. The
+    // child's writer handle is already closed at publish (pre-flip), so this is
+    // belt-and-suspenders: it also releases any residual metadata-read handle.
+    try {
+      store.close?.();
+    } catch {
+      /* best-effort */
+    }
     process.exit(0);
   } catch (err) {
     clearInterval(heartbeat);

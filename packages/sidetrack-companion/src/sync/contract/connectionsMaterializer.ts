@@ -3970,6 +3970,33 @@ export const createConnectionsMaterializer = (
             // reaches the ~3k already-persisted visits, not just new ones.
             corpusConfigChanged ||
             (driftRequiresFullRebuild && !driftWouldWipeServedSignal))));
+    // D4 (M4) boot persisted-revision reuse — the RESET-side guards are
+    // computed here (they depend only on locals available above); the corpus +
+    // revision-id match (which needs expectedSimilarityRevisionId) is composed
+    // later, next to that id. Splitting keeps each half beside its inputs.
+    // The reuse must LOSE to: a genuine drift rebuild, a corpus-config flip,
+    // ANY floor reset reason, the legacy-null migration, a dimension mismatch,
+    // a corruption recovery, or a materializer-version bump — and WIN over the
+    // benign "fresh HNSW derivation" path (the only remaining driver once all
+    // the above are false).
+    const bootReuseNoReset =
+      persistentHnswSimilarityMode &&
+      similarityFloorResetReasons.length === 0 &&
+      !legacyNullCorpusMigration &&
+      !corpusConfigChanged &&
+      !(driftRequiresFullRebuild && !driftWouldWipeServedSignal) &&
+      !hnswDimensionMismatchRequiresFullRebuild &&
+      !(loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) &&
+      !(
+        existingProgress !== null &&
+        existingProgress.materializerVersion !== MATERIALIZER_VERSION
+      );
+    // Guard 3 — the served corpus-config signature must equal live (a flip
+    // would have set corpusConfigChanged, already excluded above; this asserts
+    // it explicitly and auditably).
+    const bootReuseConfigStable =
+      similarityFloorState.servedCorpusConfigSignature === null ||
+      similarityFloorState.servedCorpusConfigSignature === liveCorpusConfigSignature;
     const fullPageEvidenceEnsure =
       previousSnapshotForRanker === null ||
       existingProgress === null ||
@@ -4195,8 +4222,45 @@ export const createConnectionsMaterializer = (
     const cachedSimilarityRevision = persistentHnswSimilarityMode
       ? null
       : await readVisitSimilarityRevision(deps.vaultRoot, expectedSimilarityRevisionId);
+    // D4 — the revision-id match half of the boot-reuse decision (the
+    // reset-side guards were computed above next to their inputs).
+    //
+    // `expectedSimilarityRevisionId` is the PURE-INPUT hash (visitSimilarity.ts
+    // computeVisitSimilarityRevisionId) — the #278 membership-hash over the
+    // corpus entries + config + model. It is the exact key the persisted
+    // revision store keys on (and the same key the non-HNSW path reuses under,
+    // unconditionally, once matched). So a match means THIS drain's similarity
+    // inputs are identical to the persisted revision's: reusing it is correct
+    // by construction, and re-deriving would only reproduce the same edges
+    // (the 143s jitter). The SERVED revision id must also equal it — this
+    // asserts we're carrying the CURRENTLY-served output forward (continuity),
+    // not resurrecting an arbitrary older on-disk revision.
+    //
+    // NOTE the corpus-CONTENT signature (`similarityCorpusResult.corpusSignature`,
+    // which folds volatile engagement fields) is deliberately NOT required to
+    // match: a benign engagement tick rotates it WITHOUT changing the
+    // membership-hash revision id (that is the whole point of #278 excluding
+    // volatile focusedWindowMs from the revision id). Requiring the content
+    // signature to match would defeat the reuse on every engagement tick — the
+    // exact churn D4 exists to stop. The revision id is the authoritative,
+    // similarity-determining key.
+    const bootReuseRevisionMatches =
+      persistentHnswSimilarityMode &&
+      previousSnapshotForRanker?.visitSimilarityRevisionId !== undefined &&
+      previousSnapshotForRanker.visitSimilarityRevisionId === expectedSimilarityRevisionId;
+    const bootReuseSimilarityRevision =
+      bootReuseRevisionMatches && bootReuseNoReset && bootReuseConfigStable;
+    // In HNSW mode, when the boot-reuse conditions hold, load the persisted
+    // revision keyed by the pure-input id. It equals the served revision, so
+    // reusing it verbatim skips the full re-embed + ANN rebuild (the 143s boot
+    // jitter). null if the reuse conditions don't hold OR the on-disk revision
+    // is genuinely absent (then we fall through to the normal build).
+    const bootReusableHnswRevision =
+      persistentHnswSimilarityMode && bootReuseSimilarityRevision
+        ? await readVisitSimilarityRevision(deps.vaultRoot, expectedSimilarityRevisionId)
+        : null;
     mark(
-      `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)}`,
+      `similarity probe entries=${String(similarityEntries.length)} cacheHit=${String(cachedSimilarityRevision !== null)} bootReuse=${String(bootReusableHnswRevision !== null)} revMatch=${String(bootReuseRevisionMatches)} noReset=${String(bootReuseNoReset)}`,
     );
     const similarityStartedAtMs = Date.now();
     // Stage 5.2 W3 fast path — when SIDETRACK_CONNECTIONS_HOT_SIMILARITY=1
@@ -4215,7 +4279,19 @@ export const createConnectionsMaterializer = (
     let usedHotSimilarityPath = false;
     let hotSimNewEmbedded: number | null = null;
     let visitSimilarity: VisitSimilarityRevision;
-    if (persistentHnswSimilarityMode) {
+    if (persistentHnswSimilarityMode && bootReusableHnswRevision !== null) {
+      // D4 — the served revision's corpus + config + pure-input id all match
+      // and no reset reason applies: the persisted revision IS the correct
+      // output. Reuse it verbatim and skip the re-embed + ANN rebuild. This
+      // kills the 143s boot re-derivation and its ~464-component jitter; the
+      // drain's similarity cost drops to the corpus-assembly read.
+      usedHotSimilarityPath = true;
+      hotSimNewEmbedded = 0;
+      visitSimilarity = bootReusableHnswRevision;
+      mark(
+        `buildVisitSimilarityHnsw.bootReuse edges=${String(bootReusableHnswRevision.edges.length)} revision=${expectedSimilarityRevisionId}`,
+      );
+    } else if (persistentHnswSimilarityMode) {
       const touchedVisitIds = hnswTouchedVisitIds;
       const reconcileVisitIds = hnswReconcileVisitIds;
       usedHotSimilarityPath = true;
@@ -6866,6 +6942,20 @@ export const createConnectionsMaterializer = (
 
   const scheduleProjectionOverlay = (event: AcceptedEvent): void => {
     if (!PROJECTION_OVERLAY_HANDLES.has(event.type)) return;
+    // M4 correctness: NEVER apply a parent overlay while a drain is active. The
+    // authoritative drain (in-process buildAndWrite OR the forked child, which
+    // the parent awaits — so `running` covers BOTH) supersedes overlays anyway,
+    // and firing an overlay publish concurrently with the drain's publish races
+    // the generation pointer: an overlay seeded from the PRE-drain gen could
+    // land AFTER the child publishes the freshly-drained gen and revert the
+    // whole graph to the pre-drain snapshot. The CAS in #overlayViaShadowPublish
+    // is the last-line defence (it discards a superseded shadow), but suppressing
+    // the overlay outright while the drain runs avoids the wasted work AND the
+    // window entirely. The same invariant is stated for the foreground-nav
+    // overlay coalescer (see the "skip entirely while a drain is pending/running"
+    // note) — this applies it to the projection overlay too. A drain flips
+    // dirty=true, so any overlay skipped here is folded by that drain.
+    if (running || pending) return;
     const applyProjectionEventOverlay = deps.store.applyProjectionEventOverlay;
     if (applyProjectionEventOverlay === undefined) return;
     projectionOverlayQueue = projectionOverlayQueue
@@ -6887,6 +6977,13 @@ export const createConnectionsMaterializer = (
       return;
     }
     if (deps.store.replaceScopeRows === undefined) return;
+    // M4 correctness (same invariant as scheduleProjectionOverlay): skip the
+    // scoped-delta overlay entirely while a drain is pending/running. The
+    // drain's replaceScopeRows/full publish supersedes it, and a concurrent
+    // scoped-delta publish would race the child drain's pointer flip. The
+    // coalescer note above ("skip entirely while a drain is pending/running")
+    // is now enforced HERE at schedule time, not just relied upon downstream.
+    if (running || pending) return;
     // Coalesce: a tab-burst fires many NAVIGATION_COMMITTED events in quick
     // succession. Queuing one overlay (one full readMerged) per event chains
     // dozens of O(whole-log) merges in the microtask queue, starving the

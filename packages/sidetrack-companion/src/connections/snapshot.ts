@@ -96,6 +96,20 @@ import {
 } from '../workstreams/events.js';
 import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
+import {
+  casPublish,
+  checkpointTruncate,
+  composeGenId,
+  createShadowGeneration,
+  discardShadowGeneration,
+  generationDbPath,
+  generationExists,
+  migrateLegacyToGeneration,
+  reconcileLegacyToPublished,
+  readPointer,
+  residentGenerations,
+  type SqliteLikeDb,
+} from './generationBuffer.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import { anisotropyZScore } from './visitSimilarity.js';
 import { SIMILARITY_FAMILY_RENDER_EDGE_KINDS } from './renderedSimilarityFloor.js';
@@ -3819,12 +3833,23 @@ export interface ConnectionsStore {
   readonly putDay: (date: string, snapshot: ConnectionsSnapshot) => Promise<void>;
   readonly readDay: (date: string) => Promise<ConnectionsSnapshot | null>;
   readonly listDays: () => Promise<readonly string[]>;
+  /** Release open db handles (graph + resolver-cache + retired readers). The
+   *  reconcile child calls this before process.exit so the writer handle is
+   *  torn down cleanly rather than by abrupt OS teardown. Optional: some store
+   *  impls (JSON) have nothing to close. */
+  readonly close?: () => void;
 }
 
 const SNAPSHOTS_DIR = 'snapshots';
 const CONNECTIONS_STORE_JSON_FLAG = 'json';
 const projectionAccumulatorMetadataKey = (name: string): string =>
   `projection_accumulators:${name}`;
+
+// M4 double-buffer kill-switch (D6). Default ON; `=0` reverts to the legacy
+// single-file current.db with in-place writes+reads. Mirrors the
+// SIDETRACK_CONNECTIONS_STORE convention.
+const doubleBufferEnabled = (): boolean =>
+  process.env['SIDETRACK_CONNECTIONS_DOUBLE_BUFFER'] !== '0';
 
 interface SqliteStatement {
   readonly run: (...params: readonly unknown[]) => unknown;
@@ -3841,7 +3866,14 @@ interface SqliteDatabase {
 interface SqliteModule {
   readonly Database: new (
     filename: string,
-    options?: { readonly create?: boolean; readonly readwrite?: boolean },
+    // bun:sqlite supports `readonly` natively; the interface just didn't
+    // declare it. The M4 parent readers open the published generation
+    // `{ readonly: true }`.
+    options?: {
+      readonly create?: boolean;
+      readonly readwrite?: boolean;
+      readonly readonly?: boolean;
+    },
   ) => SqliteDatabase;
 }
 
@@ -4278,6 +4310,35 @@ const maxObservedAtForRows = (
   return updatedAt;
 };
 
+// M4 — the store's role in the double-buffer topology.
+//   - 'legacy'        : single-file current.db, in-place writes+reads (the
+//                       pre-M4 behavior; env kill-switch / :memory: / JSON).
+//   - 'child-writer'  : forks per drain, builds into a shadow generation and
+//                       publishes via checkpoint+pointer-flip.
+//   - 'parent-reader' : opens the published generation READONLY and reopens on
+//                       pointer change (cheap POINTER stat each read).
+//   - 'single-buffer' : one process both writes and reads through the
+//                       generation pointer (standalone tests / non-forking
+//                       programmatic embeddings). Writes publish a new gen; the
+//                       same handle reopens on the pointer it just wrote.
+export type ConnectionsStoreRole =
+  | 'legacy'
+  | 'child-writer'
+  | 'parent-reader'
+  | 'single-buffer';
+
+export interface ConnectionsDoubleBufferDiagnostics {
+  readonly enabled: boolean;
+  readonly role: ConnectionsStoreRole;
+  readonly generation: string | null;
+  readonly swapCount: number;
+  readonly lastSwapAtMs: number | null;
+  readonly residentGenerations: readonly string[];
+  readonly lastCheckpointTruncatedPages: number | null;
+  readonly lastCheckpointOk: boolean | null;
+  readonly lastGcUnlinked: number;
+}
+
 export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #root: string;
   readonly #snapshotsDir: string;
@@ -4285,6 +4346,70 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   readonly #currentJsonPath: string;
   #db: SqliteDatabase | null = null;
   #initialized = false;
+  // D3 — the SWR resolver cache lives in its OWN db file (resolver-cache.db),
+  // parent-owned single-writer, entirely off the graph read path. It was the
+  // last writer on current.db; moving it out lets the parent open the graph
+  // generation purely readonly. Keying already includes snapshot_revision so
+  // entries self-invalidate on a graph change, and living apart means a
+  // generation swap no longer wipes parent-written cache rows (the last-writer
+  // race is gone). Null until the first cache access opens it.
+  #resolverCacheDb: SqliteDatabase | null = null;
+  #resolverCacheInitialized = false;
+  // Set on close() so a deferred resolver-cache prune timer that fires after
+  // shutdown (or after the vault dir is torn down) doesn't reopen a handle and
+  // hit a disk I/O error on a removed file. Best-effort — never load-bearing.
+  #closed = false;
+  // M4 double-buffer state.
+  readonly #role: ConnectionsStoreRole;
+  readonly #doubleBuffer: boolean;
+  // The generation id the currently-open #db handle is bound to. For a reader
+  // this is the gen it opened; a POINTER change → close + reopen. For a writer
+  // this is the shadow gen being built. null in legacy mode.
+  #openGenId: string | null = null;
+  // For a writable double-buffer handle (child-writer / single-buffer) whose
+  // shadow was cloned from a published gen: the gen id it was SEEDED from. The
+  // publish CAS only flips the pointer if it still names this seed (nobody
+  // published underneath the shadow while it was being built), so a concurrent
+  // full drain and a parent overlay can never clobber each other's flip.
+  #seedGenId: string | null = null;
+  // Set true by #acquireGraphWriteHandle for the child-writer so #openHandleFor
+  // Role opens a fresh writable SHADOW (not a readonly-on-pointer handle). A
+  // child READ leaves this false → it opens the published gen readonly and
+  // never clones an orphan shadow.
+  #childWantsWrite = false;
+  // Retired readonly generation handles awaiting close. A parent-reader reopen
+  // on a pointer change must NOT close the OLD handle while a concurrent
+  // in-flight read (e.g. a canary probe or /v1/connections traversal that
+  // captured `this.#db` and yielded across event-loop turns) is still using
+  // it — closing it under an in-flight read throws "no such table" / "disk I/O
+  // error" on its next query. Instead the old handle is retired here and
+  // closed only once the in-flight read count returns to zero (single-writer,
+  // single-user: at most a couple handles ever coexist).
+  #retiredDbHandles: Array<{ readonly handle: SqliteDatabase; readonly genId: string | null }> = [];
+  // Generation ids of write shadows currently open in THIS process (added on
+  // shadow create, removed on finalize/discard). A GC that runs while a
+  // concurrent overlay/scoped-delta shadow is mid-build must NOT unlink that
+  // shadow's file (bun:sqlite throws "disk I/O error" on the next query of a
+  // handle whose file was unlinked). Every publish's GC keep-set unions this
+  // set so no in-flight shadow is ever collected out from under its writer.
+  readonly #inFlightShadowGenIds = new Set<string>();
+  #inFlightReads = 0;
+  // Single-flight guard for #database(). Opening a handle is async
+  // (loadSqlite/mkdir/reopen await), so two concurrent callers on a fresh
+  // store would BOTH observe `#db === null` and each open a handle — the
+  // second overwriting the first, in the worst case leaving an un-schema'd
+  // in-memory placeholder that a concurrent read then hits ("no such table").
+  // Serialize the open so concurrent callers await the same in-flight open.
+  #databaseOpenInFlight: Promise<SqliteDatabase> | null = null;
+  // True when the currently-open #db is a writable handle (legacy, writer,
+  // single-buffer, OR a parent-reader's transient empty in-memory placeholder
+  // that must still carry the schema so metadata reads return null cleanly).
+  #openHandleWritable = true;
+  #swapCount = 0;
+  #lastSwapAtMs: number | null = null;
+  #lastCheckpointTruncatedPages: number | null = null;
+  #lastCheckpointOk: boolean | null = null;
+  #lastGcUnlinked = 0;
   #resolverCachePruneScheduledFor: string | null = null;
   #resolverCacheCurrentRevision: string | null = null;
   readonly #resolverCacheStaleRevisions = new Set<string>();
@@ -4332,22 +4457,434 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     this.#cachedSnapshotSweepTimer = t;
   };
 
-  constructor(vaultRoot: string, options?: { readonly databasePath?: string }) {
+  constructor(
+    vaultRoot: string,
+    options?: {
+      readonly databasePath?: string;
+      readonly role?: ConnectionsStoreRole;
+    },
+  ) {
     this.#root = join(vaultRoot, '_BAC', 'connections');
     this.#snapshotsDir = join(this.#root, SNAPSHOTS_DIR);
     this.#databasePath = options?.databasePath ?? join(this.#root, 'current.db');
     this.#currentJsonPath = join(this.#root, 'current.json');
+    // Double-buffer is OFF for :memory: (no filesystem generations possible)
+    // and when the kill-switch env reverts to legacy single-file mode.
+    // Otherwise the role decides the open semantics.
+    const explicitRole = options?.role;
+    if (this.#databasePath === ':memory:' || !doubleBufferEnabled()) {
+      this.#role = 'legacy';
+      this.#doubleBuffer = false;
+    } else {
+      this.#role = explicitRole ?? 'single-buffer';
+      this.#doubleBuffer = true;
+    }
+  }
+
+  // Cache of residentGenerations() keyed on the swap counter. /status polls
+  // doubleBufferDiagnostics() at panel + menu-bar cadence; residentGenerations
+  // is a blocking readdirSync — new unconditional fs work on the hot parent loop
+  // is exactly what M4 keeps OFF it. The resident set only changes on a swap
+  // (publish/reopen bump #swapCount), so a readdir on an unchanged swapCount is
+  // wasted: memoize it and only re-scan when the swap counter advances.
+  #residentGensCache: { readonly swapCount: number; readonly gens: readonly string[] } | null =
+    null;
+  readonly #residentGenerationsMemo = (): readonly string[] => {
+    if (this.#residentGensCache !== null && this.#residentGensCache.swapCount === this.#swapCount) {
+      return this.#residentGensCache.gens;
+    }
+    const gens = residentGenerations(this.#root);
+    this.#residentGensCache = { swapCount: this.#swapCount, gens };
+    return gens;
+  };
+
+  /** M4 diagnostics — surfaced via the reliability health section (D6). Reads
+   *  only in-memory state plus a swap-counter-gated resident-gen memo, so a
+   *  /status poll on an idle store does ZERO fs syscalls. */
+  readonly doubleBufferDiagnostics = (): ConnectionsDoubleBufferDiagnostics => ({
+    enabled: this.#doubleBuffer,
+    role: this.#role,
+    // #openGenId in steady state (no fs); the readPointer fallback fires only
+    // in the transient pre-first-read window (#openGenId still null), never on
+    // the hot poll path.
+    generation: this.#doubleBuffer ? (this.#openGenId ?? readPointer(this.#root)) : null,
+    swapCount: this.#swapCount,
+    lastSwapAtMs: this.#lastSwapAtMs,
+    residentGenerations: this.#doubleBuffer ? this.#residentGenerationsMemo() : [],
+    lastCheckpointTruncatedPages: this.#lastCheckpointTruncatedPages,
+    lastCheckpointOk: this.#lastCheckpointOk,
+    lastGcUnlinked: this.#lastGcUnlinked,
+  });
+
+  /** True when the currently-open handle can execute the schema DDL / writes.
+   *  Reflects the ACTUAL open handle mode (a parent-reader's transient
+   *  empty-vault in-memory placeholder is writable so metadata reads work). */
+  #roleIsWritable(): boolean {
+    return this.#openHandleWritable;
+  }
+
+  /** Open a fresh handle for the resolved generation (readonly for the parent
+   *  reader, readwrite otherwise) via bun:sqlite, recording the bound gen id. */
+  async #openHandleForRole(): Promise<void> {
+    const sqlite = await loadSqlite();
+    if (!this.#doubleBuffer) {
+      if (this.#databasePath !== ':memory:') await mkdir(this.#root, { recursive: true });
+      // Kill-switch downgrade (D6 rollback): if double-buffer previously
+      // advanced generations, current.db is frozen at the migration seed. Before
+      // opening it legacy, refresh current.db from the latest PUBLISHED gen so
+      // the downgrade serves the current graph, not an arbitrarily-old snapshot.
+      // Only for the real current.db path (not :memory: / explicit test dbs).
+      if (this.#databasePath === join(this.#root, 'current.db')) {
+        reconcileLegacyToPublished(this.#root);
+      }
+      this.#db = new sqlite.Database(this.#databasePath, { create: true, readwrite: true });
+      this.#openGenId = null;
+      this.#openHandleWritable = true;
+      return;
+    }
+    await mkdir(this.#root, { recursive: true });
+    if (this.#role === 'child-writer') {
+      // A child READ after it has published (#db was closed at the pre-flip)
+      // opens the PUBLISHED gen READONLY — NOT a fresh shadow. Without this,
+      // the child's post-drain readSnapshotMetadata() would clone a whole new
+      // shadow generation just to read metadata, leaving an orphan gen file on
+      // disk until the parent's next GC. Reads never need a writable shadow;
+      // only #acquireGraphWriteHandle (which sets #childWantsWrite) does.
+      if (!this.#childWantsWrite) {
+        const pub = readPointer(this.#root);
+        if (pub !== null && generationExists(this.#root, pub)) {
+          this.#db = new sqlite.Database(generationDbPath(this.#root, pub), { readonly: true });
+          this.#openGenId = pub;
+          this.#seedGenId = pub;
+          this.#openHandleWritable = false;
+          return;
+        }
+      }
+      // The child builds into a fresh SHADOW generation cloned from the
+      // published gen. The gen id is provisional until publish rewrites the
+      // pointer; a unique per-process id avoids colliding with a resident gen.
+      const provisional = composeGenId(
+        Date.now(),
+        `${String(process.pid)}${createRevision().slice(0, 8)}`,
+      );
+      const shadow = createShadowGeneration(this.#root, provisional);
+      this.#db = new sqlite.Database(shadow.path, { create: true, readwrite: true });
+      this.#openGenId = shadow.genId;
+      this.#seedGenId = shadow.seededFrom;
+      this.#inFlightShadowGenIds.add(shadow.genId);
+      this.#openHandleWritable = true;
+      return;
+    }
+    // parent-reader / single-buffer: resolve the published generation. Migrate
+    // a legacy current.db → gen0 on first boot (idempotent).
+    const resolved =
+      migrateLegacyToGeneration(this.#root, (path) =>
+        this.#openReadwriteLike(sqlite, path),
+      ) ??
+      ((): { path: string; genId: string } | null => {
+        const gen = readPointer(this.#root);
+        return gen === null ? null : { path: generationDbPath(this.#root, gen), genId: gen };
+      })();
+    if (this.#role === 'parent-reader') {
+      const gen = resolved?.genId ?? readPointer(this.#root);
+      if (gen === null) {
+        // No published generation yet (fresh vault, child hasn't published).
+        // Open an empty in-memory placeholder WITH the schema so metadata reads
+        // return null cleanly; the next #database() call reopens onto the real
+        // gen once the pointer appears (#reopenIfPointerChanged).
+        this.#db = new sqlite.Database(':memory:', { create: true, readwrite: true });
+        this.#openGenId = null;
+        this.#openHandleWritable = true; // schema-init the placeholder
+        return;
+      }
+      this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
+      this.#openGenId = gen;
+      this.#openHandleWritable = false;
+      return;
+    }
+    // single-buffer: one handle both reads + writes through the pointer. Seed a
+    // gen0 if none exists so the first write publishes over a known generation.
+    if (resolved === null) {
+      const gen0 = composeGenId(0, 'seed');
+      this.#db = new sqlite.Database(generationDbPath(this.#root, gen0), {
+        create: true,
+        readwrite: true,
+      });
+      this.#openGenId = gen0;
+      // Fresh gen0: NO pointer is published yet, so the CAS seed is null (the
+      // first publish flips a null pointer → gen0). After that publish the seed
+      // advances to gen0 (see #publishGeneration), so subsequent in-place
+      // re-flips CAS against pointer === gen0.
+      this.#seedGenId = null;
+      this.#openHandleWritable = true;
+      return;
+    }
+    this.#db = new sqlite.Database(resolved.path, { create: true, readwrite: true });
+    this.#openGenId = resolved.genId;
+    // The resolved gen IS the current pointer, so the CAS seed matches it.
+    this.#seedGenId = resolved.genId;
+    this.#openHandleWritable = true;
+  }
+
+  #openReadwriteLike(
+    sqlite: SqliteModule,
+    path: string,
+  ): SqliteLikeDb {
+    return new sqlite.Database(path, { create: true, readwrite: true }) as unknown as SqliteLikeDb;
+  }
+
+  /** Reopen check: if the POINTER now names a different generation than the
+   *  open handle, close the old handle and reopen the new one. Cheap: a single
+   *  ~40-byte file read. Returns true if it reopened.
+   *
+   *  Applies to the parent-reader (readonly reopen on a child publish) AND to
+   *  single-buffer (a forked child can publish a new gen while an in-process
+   *  single-buffer store holds an older one — e.g. drainViaWorker's post-drain
+   *  readMaterializerProgress on the parent store in tests). Single-buffer
+   *  reopens READWRITE so it can keep writing after picking up the child's gen;
+   *  its own publishes leave #openGenId == pointer, so they don't self-trigger.
+   *  The child-writer never reopens (it owns its private shadow until exit). */
+  async #reopenIfPointerChanged(): Promise<boolean> {
+    if (!this.#doubleBuffer) return false;
+    if (this.#role !== 'parent-reader' && this.#role !== 'single-buffer') return false;
+    const gen = readPointer(this.#root);
+    if (gen === null) return false;
+    if (gen === this.#openGenId) return false;
+    if (!generationExists(this.#root, gen)) return false;
+    // Pointer advanced (or a gen appeared where we had the empty in-memory
+    // placeholder). RETIRE the old handle (do not close it — a concurrent
+    // in-flight read may still be traversing it across event-loop turns) and
+    // open the new generation. Retired handles close once reads are quiescent.
+    if (this.#db !== null) {
+      this.#retiredDbHandles.push({ handle: this.#db, genId: this.#openGenId });
+      this.#db = null;
+      this.#initialized = false;
+    }
+    const sqlite = await loadSqlite();
+    if (this.#role === 'parent-reader') {
+      this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
+      this.#openHandleWritable = false;
+    } else {
+      this.#db = new sqlite.Database(generationDbPath(this.#root, gen), {
+        create: true,
+        readwrite: true,
+      });
+      this.#openHandleWritable = true;
+    }
+    this.#openGenId = gen;
+    // A single-buffer writer that reopened onto a gen a forked child published
+    // will re-flip to that gen on its next write; advance the CAS seed so the
+    // flip matches (the parent-reader never publishes, so its seed is moot).
+    this.#seedGenId = gen;
+    this.#swapCount += 1;
+    this.#lastSwapAtMs = Date.now();
+    this.#dropCachedSnapshot();
+    return true;
+  }
+
+  #closeDbHandle(): void {
+    try {
+      this.#db?.close?.();
+    } catch {
+      /* already closed / detached vnode */
+    }
+    this.#db = null;
+    this.#initialized = false;
+  }
+
+  /** Close any retired readonly handles once no read is in flight. A retired
+   *  handle is an OLD generation the parent reopened past; it is only closed
+   *  when the in-flight read count is zero, so no concurrent traversal that
+   *  captured it can hit a closed handle. */
+  #closeRetiredHandlesIfQuiescent(): void {
+    if (this.#inFlightReads > 0 || this.#retiredDbHandles.length === 0) return;
+    const handles = this.#retiredDbHandles;
+    this.#retiredDbHandles = [];
+    for (const { handle } of handles) {
+      try {
+        handle.close?.();
+      } catch {
+        /* already closed / detached */
+      }
+    }
+  }
+
+  /** Every generation a live handle in THIS process still holds — the open
+   *  reader gen, retired-but-not-yet-closed reader gens, and in-flight write
+   *  shadows. A publish GC must keep ALL of these resident or a concurrent
+   *  read/write hits "disk I/O error" on an unlinked file (blocker: GC of a
+   *  live gen). Fed into every casPublish keep-alive set. */
+  #liveHeldGenIds(): readonly string[] {
+    const ids: string[] = [];
+    if (this.#openGenId !== null) ids.push(this.#openGenId);
+    for (const { genId } of this.#retiredDbHandles) {
+      if (genId !== null) ids.push(genId);
+    }
+    for (const genId of this.#inFlightShadowGenIds) ids.push(genId);
+    return ids;
+  }
+
+  /** Wrap a read so retired handles only close when reads are quiescent, and a
+   *  pointer-change reopen retires (never closes) a handle an in-flight read
+   *  might still hold. Every public graph READ goes through this. */
+  async #withRead<T>(fn: () => Promise<T>): Promise<T> {
+    this.#inFlightReads += 1;
+    try {
+      return await fn();
+    } finally {
+      this.#inFlightReads -= 1;
+      this.#closeRetiredHandlesIfQuiescent();
+    }
+  }
+
+  /** D3 — open (once) the standalone resolver-cache db. Its own WAL file,
+   *  single writer (this process). For :memory: graphs / legacy the cache
+   *  stays in current.db (no separate file), so this returns the graph db. */
+  async #resolverCacheDatabase(): Promise<SqliteDatabase> {
+    // Legacy single-file + :memory: keep the resolver cache in the graph db
+    // (it's created by the graph schema init). Only the double-buffer roles
+    // split it out — the graph gen is immutable/readonly there.
+    if (!this.#doubleBuffer) {
+      return await this.#database();
+    }
+    // D3 single-writer invariant, ENFORCED (not merely by convention): only the
+    // parent-reader / single-buffer roles own resolver-cache.db. The child-
+    // writer must NEVER open it readwrite — two processes with the same file
+    // open readwrite would resurrect the exact cross-process lock contention D3
+    // eliminates. Today the reconcile child never calls the cache methods; this
+    // guard makes a future child-side resolve fail LOUDLY instead of silently
+    // reintroducing contention.
+    if (this.#role === 'child-writer') {
+      throw new Error(
+        'resolver-cache.db is parent-owned (single-writer); the child-writer must not open it',
+      );
+    }
+    if (this.#resolverCacheDb === null) {
+      await mkdir(this.#root, { recursive: true });
+      const sqlite = await loadSqlite();
+      this.#resolverCacheDb = new sqlite.Database(join(this.#root, 'resolver-cache.db'), {
+        create: true,
+        readwrite: true,
+      });
+    }
+    if (!this.#resolverCacheInitialized) {
+      this.#resolverCacheDb.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 2500;
+        CREATE TABLE IF NOT EXISTS connections_resolver_cache (
+          visit_id TEXT NOT NULL,
+          snapshot_revision TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          computed_at TEXT NOT NULL,
+          PRIMARY KEY (visit_id, snapshot_revision)
+        );
+      `);
+      this.#resolverCacheInitialized = true;
+    }
+    return this.#resolverCacheDb;
+  }
+
+  /**
+   * M4 publish tail (D1/D5). Called by every writer AFTER its transaction
+   * commits. For a writable double-buffer role (child-writer / single-buffer):
+   *   1. checkpoint-TRUNCATE the shadow so it is self-contained + readonly-
+   *      openable and its -wal stats ~0 (D5, structurally required — a WAL-mode
+   *      gen with un-checkpointed frames is not safely readonly-openable);
+   *   2. for the child-writer, CLOSE the writable handle BEFORE the flip so the
+   *      published gen is fully quiescent (no open writer, no live -shm) the
+   *      instant the pointer names it — a reader opening it readonly at that
+   *      instant never sees a torn -wal/-shm (mirrors the parent write path);
+   *   3. atomically CAS-flip POINTER → this shadow's gen id UNDER the cross-
+   *      process publish lock: the flip only lands if the pointer still names
+   *      the gen this shadow was seeded from, so a concurrent full drain and a
+   *      parent overlay can never clobber each other's publish;
+   *   4. GC only generations no live handle (this process) holds AND that the
+   *      pointer no longer names — the keep-set unions #liveHeldGenIds().
+   * A no-op in legacy mode and for the parent-reader (which never writes).
+   */
+  #publishGeneration(db: SqliteDatabase): void {
+    if (!this.#doubleBuffer || this.#openGenId === null || !this.#roleIsWritable()) return;
+    const genId = this.#openGenId;
+    const seedGenId = this.#seedGenId;
+    const checkpoint = checkpointTruncate(db as unknown as SqliteLikeDb);
+    this.#lastCheckpointTruncatedPages = checkpoint.checkpointed;
+    this.#lastCheckpointOk = checkpoint.busy === 0;
+    // Child-writer publishes then exits — close its writable handle BEFORE the
+    // flip so the gen the pointer names is quiescent (no open writer / live
+    // -shm). Single-buffer keeps writing in place on this gen, so it must NOT
+    // close its handle here (it re-flips the pointer to its own gen id and
+    // keeps serving through it).
+    if (this.#role === 'child-writer') {
+      try {
+        db.close?.();
+      } catch {
+        /* already detached */
+      }
+      if (this.#db === db) {
+        this.#db = null;
+        this.#initialized = false;
+      }
+    }
+    // CAS publish under the cross-process lock: flip only if the pointer still
+    // names our seed gen. keepAlive protects every gen a live handle holds so
+    // GC never unlinks a file an open reader/retired handle/in-flight shadow
+    // still uses. A single-buffer whose seed == its own gen still publishes
+    // (CAS accepts pointer === seed); if a child advanced the pointer meanwhile
+    // the CAS is superseded and single-buffer keeps its gen (reopens on next
+    // read) rather than clobbering the child's fresh drain.
+    const result = casPublish(this.#root, {
+      seedGenId,
+      newGenId: genId,
+      keepAlive: this.#liveHeldGenIds(),
+    });
+    this.#inFlightShadowGenIds.delete(genId);
+    if (result.outcome === 'published') {
+      // The pointer now names genId; a single-buffer writer stays on this gen
+      // and re-flips to it on its NEXT write, so advance the CAS seed to match.
+      this.#seedGenId = genId;
+      this.#swapCount += 1;
+      this.#lastSwapAtMs = Date.now();
+      this.#lastGcUnlinked = result.unlinked.length;
+    }
   }
 
   async #database(): Promise<SqliteDatabase> {
-    if (this.#db === null) {
-      if (this.#databasePath !== ':memory:') {
-        await mkdir(this.#root, { recursive: true });
-      }
-      const sqlite = await loadSqlite();
-      this.#db = new sqlite.Database(this.#databasePath, { create: true, readwrite: true });
+    // Single-flight: concurrent callers on a fresh/reopening store must await
+    // ONE open, not each open a rival handle. Fast path: an initialized handle
+    // with no pending pointer swap serves directly (the steady state — a cheap
+    // synchronous POINTER stat, no promise churn per read).
+    if (this.#db !== null && this.#initialized && !this.#pointerChangedSync()) {
+      return this.#db;
     }
-    if (!this.#initialized) {
+    if (this.#databaseOpenInFlight !== null) return await this.#databaseOpenInFlight;
+    this.#databaseOpenInFlight = this.#openDatabaseSerialized();
+    try {
+      return await this.#databaseOpenInFlight;
+    } finally {
+      this.#databaseOpenInFlight = null;
+    }
+  }
+
+  /** Cheap synchronous check: does the POINTER now name a different gen than
+   *  the open handle? Only meaningful for the reopen-capable roles. */
+  #pointerChangedSync(): boolean {
+    if (!this.#doubleBuffer) return false;
+    if (this.#role !== 'parent-reader' && this.#role !== 'single-buffer') return false;
+    const gen = readPointer(this.#root);
+    return gen !== null && gen !== this.#openGenId && generationExists(this.#root, gen);
+  }
+
+  async #openDatabaseSerialized(): Promise<SqliteDatabase> {
+    // Parent reader / single-buffer: pick up a published generation swap.
+    if (this.#db !== null) {
+      await this.#reopenIfPointerChanged();
+    }
+    if (this.#db === null) {
+      await this.#openHandleForRole();
+    }
+    // A readonly handle cannot run the schema DDL and never needs to (the
+    // published generation already carries the schema). Skip init for it.
+    if (!this.#initialized && this.#roleIsWritable() && this.#db !== null) {
       this.#db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA busy_timeout = 2500;
@@ -4458,6 +4995,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           FROM edges, json_each(edges.data) e;
         `);
       }
+      this.#initialized = true;
+    }
+    if (this.#db === null) throw new Error('connections store handle failed to open');
+    // A READONLY parent-reader handle needs no DDL — but it IS ready to serve
+    // the instant it opens. Mark it initialized so the #database() fast path
+    // (line ~4779) short-circuits to a single synchronous POINTER stat, instead
+    // of falling through to #openDatabaseSerialized (promise alloc + a redundant
+    // second pointer stat) on EVERY parent read. Only the DDL is gated on
+    // writability; readiness is not. (The empty in-memory placeholder is
+    // writable and already schema-init'd above, so this only newly covers the
+    // readonly-on-a-published-gen case.)
+    if (!this.#initialized && this.#db !== null) {
       this.#initialized = true;
     }
     return this.#db;
@@ -4580,6 +5129,15 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     seedNodeIds: readonly string[],
     options: { readonly hops?: number; readonly preserveMetadataCounts?: boolean },
   ): Promise<ConnectionsSnapshot | null> {
+    return await this.#withRead(() =>
+      this.#readTraversedSubgraphInner(seedNodeIds, options),
+    );
+  }
+
+  async #readTraversedSubgraphInner(
+    seedNodeIds: readonly string[],
+    options: { readonly hops?: number; readonly preserveMetadataCounts?: boolean },
+  ): Promise<ConnectionsSnapshot | null> {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
@@ -4631,23 +5189,37 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     );
   }
 
-  readonly readSnapshotMetadata = async (): Promise<StoredConnectionsMetadata | null> => {
-    const db = await this.#database();
-    return await this.#readMetadata(db);
-  };
+  readonly readSnapshotMetadata = async (): Promise<StoredConnectionsMetadata | null> =>
+    await this.#withRead(async () => {
+      const db = await this.#database();
+      return await this.#readMetadata(db);
+    });
 
   readonly readProjectionAccumulatorState = async (
     name: string,
-  ): Promise<ConnectionsProjectionAccumulatorState | null> => {
-    const db = await this.#database();
-    const row = db
-      .query('SELECT data FROM metadata WHERE key = ?')
-      .get(projectionAccumulatorMetadataKey(name));
-    if (row === null || row === undefined) return null;
-    return JSON.parse(textField(row, 'data')) as ConnectionsProjectionAccumulatorState;
-  };
+  ): Promise<ConnectionsProjectionAccumulatorState | null> =>
+    await this.#withRead(async () => {
+      const db = await this.#database();
+      const row = db
+        .query('SELECT data FROM metadata WHERE key = ?')
+        .get(projectionAccumulatorMetadataKey(name));
+      if (row === null || row === undefined) return null;
+      return JSON.parse(textField(row, 'data')) as ConnectionsProjectionAccumulatorState;
+    });
 
   readonly vacuum = async (): Promise<void> => {
+    // Under double-buffer, each published generation is already compacted by
+    // its publish-time checkpoint-TRUNCATE, and the parent's graph handle is
+    // readonly (VACUUM would fail). Vacuuming the served generation in place
+    // would also mutate the file readers hold. So the only vacuum-able db is
+    // the standalone resolver cache; scoped/full gens self-compact on publish.
+    if (this.#doubleBuffer) {
+      if (this.#role === 'parent-reader') {
+        const cacheDb = await this.#resolverCacheDatabase();
+        cacheDb.exec('VACUUM');
+      }
+      return;
+    }
     const db = await this.#database();
     db.exec('VACUUM');
   };
@@ -4657,12 +5229,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshotRevision: string,
     result: unknown,
   ): Promise<void> => {
-    // Best-effort write. The cache lives in current.db, which the drain
-    // child locks for long write transactions; a locked write must NEVER
-    // fail the resolve — the caller already has the computed result and
-    // will serve it. Skip caching this time; the next drain re-primes it.
+    // Best-effort write. D3 — the cache now lives in its OWN db
+    // (resolver-cache.db), off the graph read path, so a graph drain never
+    // locks it. Kept best-effort anyway: a locked write must NEVER fail the
+    // resolve — the caller already has the computed result and will serve it.
     try {
-      const db = await this.#database();
+      const db = await this.#resolverCacheDatabase();
       db.query(
         `INSERT INTO connections_resolver_cache
           (visit_id, snapshot_revision, result_json, computed_at)
@@ -4698,7 +5270,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // SELECT can throw "database is locked" — degrade to a cache miss
     // (null) so the caller computes the result inline rather than 500ing.
     try {
-      const db = await this.#database();
+      const db = await this.#resolverCacheDatabase();
       const row = db
         .query(
           `SELECT result_json
@@ -4721,7 +5293,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     setTimeout(() => {
       void (async (): Promise<void> => {
         try {
-          const db = await this.#database();
+          if (this.#closed) return;
+          const db = await this.#resolverCacheDatabase();
           db.query('DELETE FROM connections_resolver_cache WHERE snapshot_revision != ?').run(
             snapshotRevision,
           );
@@ -4738,8 +5311,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   }
 
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
-    const db = await this.#database();
-    this.#writeCurrentRows(db, snapshot, null);
+    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    try {
+      this.#writeCurrentRows(db, snapshot, null);
+      finalize(true);
+    } catch (error) {
+      finalize(false);
+      throw error;
+    }
   };
 
   readonly writeSnapshotAndProgress = async (
@@ -4748,26 +5327,62 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     dirtyScopes?: ReadonlySet<Scope>,
     projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ): Promise<void> => {
-    const db = await this.#database();
-    const shouldBootstrapScopeMembership = this.#writeCurrentRows(
-      db,
-      snapshot,
-      progress,
-      dirtyScopes,
-      projectionAccumulatorState,
-    );
-    if (shouldBootstrapScopeMembership) {
-      setImmediate(() => {
-        void this.#bootstrapScopeMembership(snapshot).catch(() => undefined);
-      });
+    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    try {
+      const shouldBootstrapScopeMembership = this.#writeCurrentRows(
+        db,
+        snapshot,
+        progress,
+        dirtyScopes,
+        projectionAccumulatorState,
+      );
+      // M4 — under double-buffer the scope bootstrap must land in the SAME
+      // generation the pointer flips to (before finalize): the child exits
+      // right after publish, so a deferred setImmediate would race the process
+      // exit and lose the write. The parent-reader write shadow is closed by
+      // finalize, so its bootstrap must also complete first. Write the scope
+      // rows directly on THIS handle (not via a fresh #database() call, which
+      // would reopen a different one). Legacy keeps the fire-and-forget timing.
+      if (shouldBootstrapScopeMembership) {
+        if (this.#doubleBuffer) {
+          this.#bootstrapScopeMembershipOn(db, snapshot);
+        } else {
+          setImmediate(() => {
+            void this.#bootstrapScopeMembership(snapshot).catch(() => undefined);
+          });
+        }
+      }
+      finalize(true);
+    } catch (error) {
+      finalize(false);
+      throw error;
     }
   };
 
   readonly applyProjectionEventOverlay = async (event: AcceptedEvent): Promise<string | null> => {
+    // M4 — the parent runs this overlay to keep projection titles fresh
+    // between drains, but under double-buffer the parent's graph handle is
+    // READONLY (it can never hold a writable current.db lock — that is the
+    // whole point). So the parent applies the overlay as a MINI SHADOW-PUBLISH:
+    // clone the published generation, apply the metadata-only overlay in a
+    // short transaction on the private shadow, checkpoint + flip the pointer.
+    // The reader reopens onto the new generation on its next request. No writer
+    // ever touches the served file, so the read path stays lock-free (D3's "no
+    // writer on the read path" invariant holds for the overlay too).
+    if (this.#doubleBuffer && this.#role === 'parent-reader') {
+      return await this.#overlayViaShadowPublish(event);
+    }
     const db = await this.#database();
     const bootstrapped = await this.#readMetadata(db);
     if (bootstrapped === null) return null;
+    const result = await this.#applyOverlayOnDb(db, event);
+    this.#publishGeneration(db);
+    return result;
+  };
 
+  /** The overlay transaction body, factored so both the in-place (writer/
+   *  single-buffer) path and the shadow-publish (parent-reader) path share it. */
+  async #applyOverlayOnDb(db: SqliteDatabase, event: AcceptedEvent): Promise<string | null> {
     db.exec('BEGIN IMMEDIATE');
     try {
       const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
@@ -4838,18 +5453,270 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       db.exec('ROLLBACK');
       throw error;
     }
-  };
+  }
+
+  /**
+   * Acquire a WRITABLE graph handle + its publish finalizer.
+   *
+   * For legacy / child-writer / single-buffer roles the open handle is already
+   * writable: return it with `#publishGeneration` as the finalizer.
+   *
+   * For the parent-reader (whose graph handle is READONLY under double-buffer)
+   * a graph write — a foreground-nav scoped delta (`replaceScopeRows`) or a
+   * progress-only advance (`writeMaterializerProgress`) — is applied to a
+   * PRIVATE shadow generation cloned from the published gen and published via
+   * checkpoint + pointer-flip, so the served file is never written by the
+   * parent (D3 "no writer on the read path" holds for parent-side writes too).
+   * The shadow handle is closed by the finalizer.
+   *
+   * `finalize(committed)` publishes the shadow when committed, or discards it
+   * (no pointer flip) on rollback.
+   */
+  async #acquireGraphWriteHandle(): Promise<{
+    readonly db: SqliteDatabase;
+    readonly finalize: (committed: boolean) => void;
+  }> {
+    if (!(this.#doubleBuffer && this.#role === 'parent-reader')) {
+      // Child-writer: force a fresh WRITABLE shadow open (a prior read may have
+      // left a readonly-on-pointer handle). #childWantsWrite routes
+      // #openHandleForRole to the shadow branch; if the current handle is
+      // readonly, drop it first so #database() re-opens writable.
+      if (this.#role === 'child-writer') {
+        this.#childWantsWrite = true;
+        if (this.#db !== null && !this.#openHandleWritable) {
+          this.#closeDbHandle();
+        }
+      }
+      try {
+        const db = await this.#database();
+        return {
+          db,
+          finalize: (committed: boolean): void => {
+            if (committed) this.#publishGeneration(db);
+          },
+        };
+      } finally {
+        this.#childWantsWrite = false;
+      }
+    }
+    // Parent-reader: build on a private shadow, then publish.
+    const sqlite = await loadSqlite();
+    const shadowGenId = composeGenId(
+      Date.now(),
+      `pw${String(process.pid)}${createRevision().slice(0, 6)}`,
+    );
+    // Seed from the published gen (or legacy db / empty if none yet). The
+    // CAS at publish uses shadow.seededFrom (the gen actually cloned) as the
+    // seed, so we don't need a separate pre-read of the pointer here.
+    const shadow = createShadowGeneration(this.#root, shadowGenId);
+    // Track the in-flight shadow so a CONCURRENT publish's GC keep-set includes
+    // it — two parent overlay queues (projection + foreground-nav) can build
+    // shadows at once and neither may unlink the other's file mid-build.
+    this.#inFlightShadowGenIds.add(shadowGenId);
+    const shadowDb = new sqlite.Database(shadow.path, {
+      create: true,
+      readwrite: true,
+    }) as unknown as SqliteDatabase;
+    // Ensure the shadow carries the full schema (a fresh empty seed needs it;
+    // a cloned published gen already has it — CREATE IF NOT EXISTS is a no-op).
+    this.#initSchemaOn(shadowDb);
+    return {
+      db: shadowDb,
+      finalize: (committed: boolean): void => {
+        if (!committed) {
+          // Rolled back — discard the shadow, leave the pointer untouched.
+          try {
+            shadowDb.close?.();
+          } catch {
+            /* ignore */
+          }
+          this.#inFlightShadowGenIds.delete(shadowGenId);
+          // Discard ONLY this orphaned shadow (never the pointer target / other
+          // live gens). Broad GC here would risk unlinking a concurrent
+          // overlay's in-flight shadow.
+          discardShadowGeneration(this.#root, shadowGenId);
+          return;
+        }
+        // Checkpoint-TRUNCATE folds the WAL, THEN close the writer, THEN CAS-
+        // flip the pointer under the cross-process publish lock. Ordering
+        // matters: the pointer must only ever name a FULLY QUIESCENT generation
+        // (checkpointed, no open writer, no live -wal/-shm) so a concurrent
+        // parent reader that opens it readonly the instant the pointer flips
+        // sees a complete, self-contained file — not a gen with an in-flight
+        // writer whose sidecar it can't create.
+        const checkpoint = checkpointTruncate(shadowDb as unknown as SqliteLikeDb);
+        this.#lastCheckpointTruncatedPages = checkpoint.checkpointed;
+        this.#lastCheckpointOk = checkpoint.busy === 0;
+        try {
+          shadowDb.close?.();
+        } catch {
+          /* ignore */
+        }
+        // CAS: only flip if the pointer still names the gen we seeded from. If a
+        // child drain (or the other parent overlay queue) advanced the pointer
+        // meanwhile, discard this shadow rather than reverting the newer graph.
+        const result = casPublish(this.#root, {
+          seedGenId: shadow.seededFrom,
+          newGenId: shadowGenId,
+          keepAlive: this.#liveHeldGenIds(),
+        });
+        this.#inFlightShadowGenIds.delete(shadowGenId);
+        if (result.outcome === 'published') {
+          this.#swapCount += 1;
+          this.#lastSwapAtMs = Date.now();
+          this.#lastGcUnlinked = result.unlinked.length;
+        } else {
+          // Superseded: our shadow lost the CAS. Unlink ONLY our now-orphaned
+          // shadow; the winner's gen + pointer are untouched.
+          discardShadowGeneration(this.#root, shadowGenId);
+        }
+      },
+    };
+  }
+
+  /** Run the connections schema DDL on an arbitrary writable handle (used to
+   *  schema-init a parent-reader's write shadow). Mirrors the DDL in
+   *  #database() so a freshly-seeded empty shadow is queryable. */
+  #initSchemaOn(db: SqliteDatabase): void {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 2500;
+      CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS edges (
+        src TEXT NOT NULL, dst TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (src, dst));
+      CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
+      CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+      CREATE TABLE IF NOT EXISTS edges_index (
+        edge_id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_edges_index_kind ON edges_index(kind);
+      CREATE TRIGGER IF NOT EXISTS trg_edges_index_ai AFTER INSERT ON edges BEGIN
+        INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
+        SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
+        FROM json_each(NEW.data) e;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_edges_index_au AFTER UPDATE ON edges BEGIN
+        DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst;
+        INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
+        SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
+        FROM json_each(NEW.data) e;
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_edges_index_ad AFTER DELETE ON edges BEGIN
+        DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst;
+      END;
+      CREATE TABLE IF NOT EXISTS connections_scope_nodes (
+        scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id, node_id));
+      CREATE INDEX IF NOT EXISTS idx_scope_nodes_node ON connections_scope_nodes (node_id);
+      CREATE TABLE IF NOT EXISTS connections_scope_edges (
+        scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, edge_src TEXT NOT NULL, edge_dst TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id, edge_src, edge_dst));
+      CREATE INDEX IF NOT EXISTS idx_scope_edges_edge ON connections_scope_edges (edge_src, edge_dst);
+      CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS connections_materializer_meta (
+        materializer_name TEXT PRIMARY KEY, version TEXT NOT NULL, snapshot_revision_id TEXT,
+        applied_frontier TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS connections_applied_intervals (
+        materializer_name TEXT NOT NULL, replica_id TEXT NOT NULL, start_seq INTEGER NOT NULL,
+        end_seq INTEGER NOT NULL, PRIMARY KEY (materializer_name, replica_id, start_seq));
+      CREATE INDEX IF NOT EXISTS idx_applied_intervals_lookup
+        ON connections_applied_intervals (materializer_name, replica_id, start_seq, end_seq);
+      CREATE TABLE IF NOT EXISTS connections_resolver_cache (
+        visit_id TEXT NOT NULL, snapshot_revision TEXT NOT NULL, result_json TEXT NOT NULL,
+        computed_at TEXT NOT NULL, PRIMARY KEY (visit_id, snapshot_revision));
+    `);
+  }
+
+  /** Parent-reader overlay path (M4): apply the metadata-only projection
+   *  overlay on a private shadow generation and publish it, so the served file
+   *  is never written by the parent. Returns the new snapshotRevision (or null
+   *  if there's nothing to overlay). */
+  async #overlayViaShadowPublish(event: AcceptedEvent): Promise<string | null> {
+    // Nothing published yet → nothing to overlay (the first child drain will
+    // fold the event into the base snapshot).
+    const publishedGen = readPointer(this.#root);
+    if (publishedGen === null) return null;
+    const sqlite = await loadSqlite();
+    const shadowGenId = composeGenId(
+      Date.now(),
+      `overlay${String(process.pid)}${createRevision().slice(0, 6)}`,
+    );
+    const shadow = createShadowGeneration(this.#root, shadowGenId);
+    this.#inFlightShadowGenIds.add(shadowGenId);
+    const shadowDb = new sqlite.Database(shadow.path, {
+      create: true,
+      readwrite: true,
+    }) as unknown as SqliteDatabase;
+    let closed = false;
+    const closeShadow = (): void => {
+      if (closed) return;
+      closed = true;
+      try {
+        shadowDb.close?.();
+      } catch {
+        /* ignore */
+      }
+    };
+    try {
+      const metadata = await this.#readMetadata(shadowDb);
+      if (metadata === null) {
+        closeShadow();
+        this.#inFlightShadowGenIds.delete(shadowGenId);
+        discardShadowGeneration(this.#root, shadowGenId);
+        return null;
+      }
+      const result = await this.#applyOverlayOnDb(shadowDb, event);
+      if (result === null) {
+        // No projection to fold (metadata carries neither url nor tab-session
+        // projection). Discard the shadow — do NOT flip the pointer.
+        closeShadow();
+        this.#inFlightShadowGenIds.delete(shadowGenId);
+        discardShadowGeneration(this.#root, shadowGenId);
+        return null;
+      }
+      const checkpoint = checkpointTruncate(shadowDb as unknown as SqliteLikeDb);
+      this.#lastCheckpointTruncatedPages = checkpoint.checkpointed;
+      this.#lastCheckpointOk = checkpoint.busy === 0;
+      // Close the writer BEFORE the flip so the published gen is quiescent, then
+      // CAS-flip under the publish lock: land only if the pointer still names
+      // our seed (a concurrent child drain / other overlay didn't win first).
+      closeShadow();
+      const cas = casPublish(this.#root, {
+        seedGenId: shadow.seededFrom,
+        newGenId: shadowGenId,
+        keepAlive: this.#liveHeldGenIds(),
+      });
+      this.#inFlightShadowGenIds.delete(shadowGenId);
+      if (cas.outcome === 'published') {
+        this.#swapCount += 1;
+        this.#lastSwapAtMs = Date.now();
+        this.#lastGcUnlinked = cas.unlinked.length;
+        return result;
+      }
+      // Superseded: a newer publish won. Discard our orphaned shadow and report
+      // no overlay revision (the winner's graph already reflects fresher state).
+      discardShadowGeneration(this.#root, shadowGenId);
+      return null;
+    } finally {
+      closeShadow();
+      this.#inFlightShadowGenIds.delete(shadowGenId);
+    }
+  }
 
   readonly writeMaterializerProgress = async (progress: MaterializerProgress): Promise<void> => {
-    const db = await this.#database();
+    // Progress rows live with the graph generation (instant-boot invariant),
+    // so a progress-only write publishes its generation too. On the parent
+    // this routes through a write shadow (parent's graph handle is readonly).
+    const { db, finalize } = await this.#acquireGraphWriteHandle();
     db.exec('BEGIN IMMEDIATE');
     try {
       this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
     } catch (error) {
       db.exec('ROLLBACK');
+      finalize(false);
       throw error;
     }
+    finalize(true);
   };
 
   readonly readScopesForNode = async (nodeId: string): Promise<Scope[]> => {
@@ -4924,7 +5791,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
     readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
-    const db = await this.#database();
+    const { db, finalize } = await this.#acquireGraphWriteHandle();
     const edgeBuckets = new Map<string, ConnectionEdge[]>();
     for (const edge of input.edges) {
       const key = edgeBucketKey(edge);
@@ -5210,12 +6077,28 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       }
       const baseProgress =
         input.progressMode === 'snapshot-revision-only'
-          ? // Read persisted progress INSIDE this transaction so we don't
-            // regress applied dot intervals on top of a concurrent drain
-            // that committed between the caller's pre-transaction read of
-            // input.progress and our BEGIN IMMEDIATE acquisition. Falls
-            // back to input.progress if nothing is persisted yet (i.e.
-            // the overlay is the very first writer for this materializer).
+          ? // Read persisted progress INSIDE this transaction and merge it with
+            // input.progress.
+            //
+            // LEGACY single-file path: this guards a REAL race — a concurrent
+            // drain that committed to the SAME current.db between the caller's
+            // pre-transaction read of input.progress and our BEGIN IMMEDIATE.
+            //
+            // DOUBLE-BUFFER path: each writer builds on an ISOLATED shadow clone
+            // of the published gen and a concurrent child drain commits to a
+            // DIFFERENT file, so this in-tx read can only ever see the SEEDED
+            // progress, never a concurrent committer's — the race this guards is
+            // structurally absent here. It is still correct (and cheap) to keep:
+            // cross-generation consistency is guaranteed instead by (a) each
+            // generation being written as one self-consistent rows+frontier+
+            // intervals transaction and (b) idempotent replay of any events a
+            // superseding generation's frontier did not yet cover (applied
+            // intervals are mergeable; any frontier regression across gens just
+            // re-drains the uncovered events safely). So under double-buffer
+            // generation ISOLATION — not this read — is what makes it safe.
+            //
+            // Falls back to input.progress if nothing is persisted yet (the
+            // overlay is the very first writer for this materializer).
             (this.#readPersistedProgressInTx(db, input.progress.materializerName) ?? input.progress)
           : input.progress;
       this.#writeProgressRows(db, {
@@ -5230,8 +6113,16 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       this.#dropCachedSnapshot();
     } catch (error) {
       db.exec('ROLLBACK');
+      finalize(false);
       throw error;
     }
+    // D2 — scoped-delta publishes via the SAME shadow+swap path as a full
+    // drain (the child forks per drain regardless of full-vs-scoped, so its
+    // store is already a private shadow). On the parent (foreground-nav overlay
+    // scoped delta) this publishes a fresh shadow generation; the parent never
+    // holds a lock on the served file because it is a pure reader on a
+    // different generation.
+    finalize(true);
   };
 
   /** Monotonic commit token used by `readCurrent`'s pre/post check.
@@ -5250,6 +6141,15 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   }
 
   async #bootstrapScopeMembership(snapshot: ConnectionsSnapshot): Promise<void> {
+    const db = await this.#database();
+    this.#bootstrapScopeMembershipOn(db, snapshot);
+  }
+
+  /** Scope-membership bootstrap on a GIVEN writable handle (used by the
+   *  double-buffer write path so the rows land in the same shadow generation
+   *  being published, before the handle is closed). Synchronous — no
+   *  #database() reopen mid-write. */
+  #bootstrapScopeMembershipOn(db: SqliteDatabase, snapshot: ConnectionsSnapshot): void {
     const scopes = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
     const scopeKeys = new Set<string>();
     for (const nodeScopes of scopes.nodeScopes.values()) {
@@ -5258,7 +6158,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     for (const edgeScopes of scopes.edgeScopes.values()) {
       for (const scope of edgeScopes) scopeKeys.add(`${scope.kind}\u0000${scope.id}`);
     }
-    const db = await this.#database();
     db.exec('BEGIN IMMEDIATE');
     try {
       const insertScopeNode = db.query(
@@ -5615,23 +6514,24 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     };
   };
 
-  readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> => {
-    // Retry loop for the rare write-interleave: if the writer commits
-    // a new snapshot revision between our metadata-read and the final
-    // page, we restart. In steady state this never fires (one writer,
-    // single reader); during a heavy drain it might retry once.
-    const MAX_ATTEMPTS = 3;
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-      const result = await this.#readCurrentAttempt();
-      if (result !== 'stale') return result;
-    }
-    // After max attempts, fall back to the "honest stale" read: take
-    // whatever the latest committed metadata says, accept mild
-    // inconsistency in flight. No worse than the pre-paged version.
-    const fallback = await this.#readCurrentAttempt(true);
-    // acceptStale=true never returns the 'stale' sentinel.
-    return fallback === 'stale' ? null : fallback;
-  };
+  readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> =>
+    await this.#withRead(async () => {
+      // Retry loop for the rare write-interleave: if the writer commits
+      // a new snapshot revision between our metadata-read and the final
+      // page, we restart. In steady state this never fires (one writer,
+      // single reader); during a heavy drain it might retry once.
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+        const result = await this.#readCurrentAttempt();
+        if (result !== 'stale') return result;
+      }
+      // After max attempts, fall back to the "honest stale" read: take
+      // whatever the latest committed metadata says, accept mild
+      // inconsistency in flight. No worse than the pre-paged version.
+      const fallback = await this.#readCurrentAttempt(true);
+      // acceptStale=true never returns the 'stale' sentinel.
+      return fallback === 'stale' ? null : fallback;
+    });
 
   /** One attempt at reading the current snapshot.
    *
@@ -5773,7 +6673,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   readonly readSubgraph = async (
     nodeIds: readonly string[],
-  ): Promise<ConnectionsSnapshot | null> => {
+  ): Promise<ConnectionsSnapshot | null> =>
+    await this.#withRead(() => this.#readSubgraphInner(nodeIds));
+
+  async #readSubgraphInner(nodeIds: readonly string[]): Promise<ConnectionsSnapshot | null> {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
@@ -5808,7 +6711,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
 
     return snapshotFromParts(metadata, sortAlphaById([...nodeById.values()]), sortAlphaById(edges));
-  };
+  }
 
   readonly readSubgraphForNode = async (
     nodeId: string,
@@ -5907,9 +6810,26 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   };
 
   close(): void {
+    this.#closed = true;
     this.#db?.close?.();
     this.#db = null;
     this.#initialized = false;
+    // Close any retired readonly handles the reopen path left pending.
+    for (const { handle } of this.#retiredDbHandles) {
+      try {
+        handle.close?.();
+      } catch {
+        /* already closed / detached */
+      }
+    }
+    this.#retiredDbHandles = [];
+    try {
+      this.#resolverCacheDb?.close?.();
+    } catch {
+      /* already closed */
+    }
+    this.#resolverCacheDb = null;
+    this.#resolverCacheInitialized = false;
   }
 }
 
@@ -5927,9 +6847,20 @@ const writeConnectionsSnapshotJson = async (
   await writeAtomic(path, JSON.stringify(snapshot, null, 2));
 };
 
-export const createConnectionsStore = (vaultRoot: string): ConnectionsStore => {
+export const createConnectionsStore = (
+  vaultRoot: string,
+  // M4 — the caller declares the store's double-buffer role. The PARENT
+  // (companion runtime) is a readonly reader; the CHILD (reconcile fork) is
+  // the writer. Omitted → 'single-buffer' (standalone tests / non-forking
+  // embeddings both read + write through the pointer). Ignored in legacy /
+  // :memory: / JSON modes.
+  options?: { readonly role?: ConnectionsStoreRole },
+): ConnectionsStore => {
   if (process.env['SIDETRACK_CONNECTIONS_STORE'] !== CONNECTIONS_STORE_JSON_FLAG) {
-    return new SqliteConnectionsStore(vaultRoot);
+    return new SqliteConnectionsStore(
+      vaultRoot,
+      options?.role === undefined ? undefined : { role: options.role },
+    );
   }
 
   const root = join(vaultRoot, '_BAC', 'connections');
