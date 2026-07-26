@@ -589,7 +589,23 @@ const revisionIdFor = (input: {
       visits: input.visits.map((visit) => ({
         visitKey: visit.visitKey,
         corpus: visit.corpus,
-        focusedWindowMs: visit.focusedWindowMs,
+        // M3 rebuild-storm fix — hash the eligibility-set MEMBERSHIP bit, NOT
+        // the volatile focusedWindowMs value. The revision identity must cover
+        // only similarity-RELEVANT inputs: corpus text per visit + which
+        // visits are past the engagement gate + config/model. An engagement
+        // tick that RAISES focus on an already-eligible visit (or an
+        // already-ineligible one) does not flip this bit, so it no longer
+        // churns the revisionId — which was cascading through the topic
+        // revision (topicSame=false) into a per-drain full base rebuild under
+        // the M3 path-independent corpus (which folds full engagement onto
+        // every visit on every drain). Crossing the gate (a NEW eligible
+        // member) still flips the bit → a new revision, exactly as before,
+        // because `engagementGateMs` is also hashed so gate-config tuning still
+        // invalidates. Nothing downstream reads `focusedWindowMs` off the
+        // revision id (edges are gated at build time; the topic + shadow +
+        // leiden ids are pure functions of THIS id); the engagement VALUE still
+        // flows to consumers via the entries, only the HASH excludes it.
+        eligible: visit.focusedWindowMs >= input.engagementGateMs,
         evidenceRevision:
           visit.evidence?.semanticFeatureRevision ?? visit.evidence?.evidenceRevision,
         indexedChunkSignature: chunkSignatureFor(visit.visitKey),

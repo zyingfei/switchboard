@@ -8,6 +8,7 @@ import { createEmptyTabSessionProjection } from '../tabsession/projection.js';
 import { buildConnectionsSnapshot } from './snapshot.js';
 import {
   buildVisitSimilarity,
+  computeVisitSimilarityRevisionId,
   resolveVisitSimilarityConfig,
   type VisitSimilarityEmbedder,
   type VisitSimilarityEntry,
@@ -883,5 +884,54 @@ describe('buildVisitSimilarity — Stage 5.0 follow-up: revision identity', () =
     expect(lexical.producer).toBe('lexical');
     expect(embedding.producer).toBe('embedding');
     expect(lexical.revisionId).not.toBe(embedding.revisionId);
+  });
+
+  // M3 rebuild-storm fix — the revision identity must exclude the volatile
+  // focusedWindowMs VALUE and cover only eligibility-set MEMBERSHIP. An
+  // engagement tick that raises focus on an ALREADY-eligible visit must NOT
+  // change the revision id (that churn cascaded into per-drain full rebuilds
+  // under the M3 corpus lane).
+  it('does NOT change the revision id when an already-eligible visit gains more focus', () => {
+    const before = computeVisitSimilarityRevisionId([
+      visit('alpha', { focusedWindowMs: 10_000 }),
+      visit('bravo', { focusedWindowMs: 10_000 }),
+    ]);
+    const after = computeVisitSimilarityRevisionId([
+      // alpha's focus jumped 10s -> 30s; still eligible, same corpus text.
+      visit('alpha', { focusedWindowMs: 30_000 }),
+      visit('bravo', { focusedWindowMs: 10_000 }),
+    ]);
+    expect(after).toBe(before);
+  });
+
+  // ... but crossing the engagement gate (a NEW eligible member) MUST change
+  // the revision id, because the eligible set — and therefore the edge set —
+  // changed. This is the membership half of the invariant.
+  it('DOES change the revision id when a visit crosses the engagement gate', () => {
+    const belowGate = computeVisitSimilarityRevisionId([
+      visit('alpha', { focusedWindowMs: 10_000 }),
+      visit('bravo', { focusedWindowMs: 4_999 }),
+    ]);
+    const atGate = computeVisitSimilarityRevisionId([
+      visit('alpha', { focusedWindowMs: 10_000 }),
+      // bravo crosses 5000ms — a new eligible member joins the set.
+      visit('bravo', { focusedWindowMs: 5_000 }),
+    ]);
+    expect(atGate).not.toBe(belowGate);
+  });
+
+  // A sub-gate focus bump on an INELIGIBLE visit (still below the gate) must
+  // also NOT change the revision — membership is unchanged.
+  it('does NOT change the revision id when an ineligible visit gains sub-gate focus', () => {
+    const before = computeVisitSimilarityRevisionId([
+      visit('alpha', { focusedWindowMs: 10_000 }),
+      visit('bravo', { focusedWindowMs: 1_000 }),
+    ]);
+    const after = computeVisitSimilarityRevisionId([
+      visit('alpha', { focusedWindowMs: 10_000 }),
+      // bravo 1000 -> 4000: still below the 5000 gate.
+      visit('bravo', { focusedWindowMs: 4_000 }),
+    ]);
+    expect(after).toBe(before);
   });
 });
