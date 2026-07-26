@@ -279,7 +279,13 @@ const urlRecordFromLiveTab = (input: {
 // a TabSessionResolutionResult ({ tabSessionId, … }). Same wire shape
 // apart from the key — surface-rename to keep the UI components
 // unaware of the underlying attribution unit.
-const tabSessionResolutionFromUrl = (result: UrlResolutionResult): TabSessionResolutionResult => ({
+// Exported for the client-parse acceptance test: this adapter is a verbatim
+// passthrough of `fusedCandidates` — it must NEVER truncate the resolver's
+// ranked list (the user's whole ask is to SEE all of it). The panel then
+// renders the full list via SuggestionStats' Possibilities.
+export const tabSessionResolutionFromUrl = (
+  result: UrlResolutionResult,
+): TabSessionResolutionResult => ({
   tabSessionId: result.canonicalUrl,
   dryRun: true,
   decision: result.decision,
@@ -378,7 +384,10 @@ const isTabSessionInboxData = (value: unknown): value is TabSessionInboxData =>
 const isResolverAction = (value: unknown): value is 'auto-apply' | 'suggest' | 'inbox' =>
   value === 'auto-apply' || value === 'suggest' || value === 'inbox';
 
-const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult =>
+// Exported for the client-parse acceptance test. The guard accepts the WHOLE
+// `fusedCandidates` array (Array.isArray) — it does not cap or slice, so every
+// ranked candidate the resolver returned survives the parse to the panel.
+export const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult =>
   isPlainRecord(value) &&
   typeof value['tabSessionId'] === 'string' &&
   value['dryRun'] === true &&
@@ -8317,6 +8326,22 @@ const App = () => {
                       // reads cleanly. Inbox triage keeps the full
                       // breakdown (no compact prop there).
                       compact
+                      // The user's ask — "I want to see ALL possibilities
+                      // when a page is indexed." Each ranked possibility is
+                      // one-click filable through the EXISTING attribution
+                      // flow (handleUrlAttribute), the same handler the
+                      // "Yes, that's right" / "Pick another…" actions use.
+                      // Only wired when there's a canonical URL to file to.
+                      {...(focusedDisplayUrlRecord === undefined
+                        ? {}
+                        : {
+                            onFileHere: (workstreamId: string) => {
+                              handleUrlAttribute(
+                                focusedDisplayUrlRecord.canonicalUrl,
+                                workstreamId,
+                              );
+                            },
+                          })}
                     />
                   ) : null}
                   {/* Stage 5 polish — the legacy "Change…" button used to live

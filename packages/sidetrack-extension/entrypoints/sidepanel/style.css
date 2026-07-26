@@ -829,6 +829,70 @@ button:disabled {
   font-weight: 500;
 }
 
+/* Ranked "Possibilities" — the resolver's FULL candidate list, one-click
+   filable. Collapsed under a confident primary ("Other possibilities (N)")
+   or expanded when only weak guesses exist ("Below confidence bar —
+   possibilities:"). Sits under the primary stats line; reuses the muted
+   ink ramp so it reads as secondary to the headline pick. */
+.suggestion-possibilities {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--hair-soft);
+}
+.suggestion-possibilities-summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--ink-3);
+  user-select: none;
+  list-style: none;
+}
+.suggestion-possibilities-summary::-webkit-details-marker {
+  display: none;
+}
+/* Rotating disclosure triangle so the summary reads "▸ Other possibilities"
+   collapsed, "▾" open — mirrors the current-tab card's own ▸/▾ toggle. */
+.suggestion-possibilities-summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 4px;
+  transition: transform 0.12s ease;
+}
+.suggestion-possibilities.is-collapsible[open] .suggestion-possibilities-summary::before {
+  transform: rotate(90deg);
+}
+.suggestion-possibilities-header {
+  display: block;
+  font-size: 10px;
+  padding-bottom: 2px;
+}
+.suggestion-possibilities-list {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.suggestion-possibility {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 11px;
+}
+.suggestion-possibility-name {
+  color: var(--ink-1);
+  font-weight: 500;
+}
+.suggestion-possibility-source,
+.suggestion-possibility-confidence {
+  font-size: 10px;
+}
+.suggestion-possibility-file {
+  margin-left: auto;
+  font-size: 10px;
+}
+
 /* Action bar under the Current Tab badge. Flex-wrap so the row
    collapses cleanly across the 3-vs-4 cases:
      - 4 buttons (suggestion present + URL unattributed): wrap 2+2.
