@@ -1248,6 +1248,25 @@ button:disabled {
   text-decoration: underline;
 }
 
+/* Indexing has been pending past the deadline (companion busy catching up
+   on a drain, or a page that won't extract). Amber = the same reversible
+   "busy — retrying" channel the resolve card uses; rendered as a <button>
+   that re-kicks the summary fetch. Reuses the busy affordance so there's no
+   new visual language for the stuck-pending class of defect. */
+.tab-session-capture-badge.is-busy {
+  max-width: 220px;
+  cursor: pointer;
+  background: var(--amber-bg);
+  color: var(--amber);
+  border-color: var(--amber-tint);
+}
+
+.tab-session-capture-badge.is-busy:hover,
+.tab-session-capture-badge.is-busy:focus-visible {
+  filter: brightness(0.97);
+  text-decoration: underline;
+}
+
 /* Card head DE-DUP (R1, §5.1): the header lamp strip now owns the
    capture verdict. The card's tri-state badges stay (testid-stable
    secondary echo) but read as a quiet, smaller footnote — the lamp is

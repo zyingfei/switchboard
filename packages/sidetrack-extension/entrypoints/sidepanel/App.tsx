@@ -170,7 +170,10 @@ import {
   type UrlVisitRecord,
 } from '../../src/sidepanel/tabsession/types';
 import {
+  PENDING_DEADLINE_MS,
   classifyResolveFailure,
+  nextPendingSince,
+  pendingDeadlineExceeded,
   resolveErrorForStatus,
 } from '../../src/sidepanel/tabsession/resolveOutcome';
 import {
@@ -1099,6 +1102,18 @@ const App = () => {
     Record<string, TabSessionPageEvidenceSummary>
   >({});
   const [livePageEvidenceRetryTick, setLivePageEvidenceRetryTick] = useState(0);
+  // Pending-deadline guard for the "Indexing…" badge. The page-evidence
+  // summary fetch retries every 3s while the companion returns
+  // pageEvidence: null, and the badge shows "Indexing…" for the whole time.
+  // A page that never indexes (companion wedged mid-drain, or a page that
+  // genuinely won't extract) would show "Indexing…" forever. We record when
+  // indexing started per canonical URL; once it exceeds PENDING_DEADLINE_MS
+  // the badge flips to the same amber busy/retry affordance the resolve card
+  // uses. A late-arriving evidence result still supersedes it (the URL lands
+  // in livePageEvidenceByUrl → PageEvidenceBadge renders). Keyed by canonical
+  // URL so it resets on navigation.
+  const indexingPendingSinceRef = useRef<Record<string, number>>({});
+  const [indexingDeadlineTick, setIndexingDeadlineTick] = useState(0);
   // Stage 5 follow-up — refs let loadTabSessions read the latest
   // suggestion cache without listing it as a dep (which would
   // re-create the callback + tear down the 4s interval on every
@@ -5358,6 +5373,88 @@ const App = () => {
       : 'capturing';
   const currentTabCaptureSuppressed = currentTabCaptureState !== 'capturing';
 
+  // Pending-deadline for the "Indexing…" badge (same class of stuck-forever
+  // bug as the resolve card). The badge reads "Indexing…" while auto-extract
+  // is on and the focused tab has no page evidence yet; the summary fetch
+  // above retries every 3s. If the companion never produces evidence the
+  // badge is stuck. Track when indexing started for the focused URL and, once
+  // past PENDING_DEADLINE_MS, expose a flag the badge uses to render the amber
+  // busy/retry affordance. A late evidence result supersedes it naturally
+  // (the URL lands in livePageEvidenceByUrl → focusedTabSession.pageEvidence
+  // is defined → this predicate goes false).
+  const focusedIsIndexingPending =
+    currentTabCaptureState === 'capturing' &&
+    state.settings.pageEvidenceAutoExtractEnabled &&
+    focusedTabSession !== undefined &&
+    focusedTabSession.pageEvidence === undefined &&
+    focusedTabUrl !== null;
+  useEffect(() => {
+    if (!focusedIsIndexingPending || focusedTabUrl === null) {
+      // Not indexing (or no URL): drop any stale clock for the focused URL so
+      // a fresh navigation restarts the deadline.
+      if (focusedTabUrl !== null && indexingPendingSinceRef.current[focusedTabUrl] !== undefined) {
+        const { [focusedTabUrl]: _dropped, ...rest } = indexingPendingSinceRef.current;
+        indexingPendingSinceRef.current = rest;
+      }
+      return undefined;
+    }
+    const nowMs = Date.now();
+    const startedAt = indexingPendingSinceRef.current[focusedTabUrl] ?? nowMs;
+    if (indexingPendingSinceRef.current[focusedTabUrl] === undefined) {
+      indexingPendingSinceRef.current = {
+        ...indexingPendingSinceRef.current,
+        [focusedTabUrl]: startedAt,
+      };
+    }
+    if (
+      pendingDeadlineExceeded({
+        pendingSinceMs: startedAt,
+        hasResult: false,
+        hasError: false,
+        nowMs,
+      })
+    ) {
+      // Already past the deadline — the badge renders the busy state from the
+      // predicate below; nothing to schedule.
+      return undefined;
+    }
+    const remainingMs = Math.max(0, startedAt + PENDING_DEADLINE_MS - nowMs);
+    const timer = window.setTimeout(() => {
+      setIndexingDeadlineTick((tick) => tick + 1);
+    }, remainingMs);
+    return () => {
+      window.clearTimeout(timer);
+    };
+    // indexingDeadlineTick re-runs the effect after the timer so the render
+    // below re-reads the (now-exceeded) deadline.
+  }, [focusedIsIndexingPending, focusedTabUrl, indexingDeadlineTick]);
+  // Whether the focused tab's indexing has been pending past the deadline —
+  // read in the badge render to swap "Indexing…" for the retryable busy card.
+  const focusedIndexingDeadlineExceeded =
+    focusedIsIndexingPending &&
+    focusedTabUrl !== null &&
+    pendingDeadlineExceeded({
+      pendingSinceMs: indexingPendingSinceRef.current[focusedTabUrl],
+      hasResult: false,
+      hasError: false,
+      nowMs: Date.now(),
+    });
+  // Retry a stuck index: clear the deadline clock + the cached null-evidence
+  // so the summary fetch re-kicks, and restart the deadline. Reuses the
+  // existing retry-tick machinery — no new fetch path.
+  const retryFocusedIndexing = useCallback(() => {
+    if (focusedTabUrl === null) return;
+    const { [focusedTabUrl]: _cleared, ...rest } = indexingPendingSinceRef.current;
+    indexingPendingSinceRef.current = rest;
+    setLivePageEvidenceByUrl((current) => {
+      if (current[focusedTabUrl] === undefined) return current;
+      const { [focusedTabUrl]: _drop, ...remaining } = current;
+      return remaining;
+    });
+    setLivePageEvidenceRetryTick((tick) => tick + 1);
+    setIndexingDeadlineTick((tick) => tick + 1);
+  }, [focusedTabUrl]);
+
   // ── Capture-lamp derivation (Row A of the persistent header). The
   // lamp is the ONE living signature element: it reuses the SAME
   // tri-state invariant above (currentTabCaptureState — the URL-only
@@ -5470,6 +5567,19 @@ const App = () => {
     attempts: number;
   } | null>(null);
   const [focusedResolveRetryTick, setFocusedResolveRetryTick] = useState(0);
+  // When the focused URL's resolve went PENDING (no result AND no error yet),
+  // keyed by canonicalUrl. A resolve that neither fails fast nor settles — the
+  // live 304-after-200s case — would otherwise leave the card in "Checking
+  // connections…" forever. Once this exceeds PENDING_DEADLINE_MS the deadline
+  // effect writes a synthetic 'busy' entry into urlSuggestionErrors so the
+  // EXISTING self-heal path (busy card + retry loop) owns recovery; a late
+  // success clears it and supersedes the busy card. Reset on URL change (new
+  // navigation restarts the deadline) and cleared once a result/error lands.
+  const focusedResolvePendingSinceRef = useRef<{
+    readonly canonicalUrl: string;
+    readonly pendingSinceMs: number;
+  } | null>(null);
+  const [focusedResolveDeadlineTick, setFocusedResolveDeadlineTick] = useState(0);
 
   useEffect(() => {
     if (currentTabCanonicalUrl === null) {
@@ -5634,6 +5744,87 @@ const App = () => {
     focusedDisplayUrlRecord === undefined
       ? undefined
       : urlSuggestionErrors[focusedDisplayUrlRecord.canonicalUrl];
+  // Pending-deadline guard for the resolve family. The card renders
+  // SuggestionStats' pending "Checking connections…" whenever the focused URL
+  // is unattributed/un-ignored and has neither a result nor an error yet. A
+  // resolve that hangs (served late as a 304 after a 200s+ drain) never trips
+  // the transport-error path, so without this the card is stuck pending
+  // forever. We time how long the URL has been pending (reset on navigation)
+  // and, once past PENDING_DEADLINE_MS, write a synthetic 'busy' entry into
+  // the SAME urlSuggestionErrors map the transport failures use — so the
+  // existing retry loop + self-heal (clear-on-success) own recovery and a
+  // late success still supersedes the busy card. No new visual language.
+  const focusedResolveIsPendingEligible =
+    focusedPageKind !== 'unknown' &&
+    focusedRecordEffective !== undefined &&
+    focusedRecordEffective.currentAttribution === undefined &&
+    focusedRecordEffective.currentIgnored === undefined &&
+    focusedDisplayUrlRecord !== undefined;
+  const focusedResolveHasResult =
+    focusedTabSuggestion !== undefined && focusedTabSuggestion.fusedCandidates.length > 0;
+  useEffect(() => {
+    const canonicalUrl = focusedDisplayUrlRecord?.canonicalUrl;
+    // Not asking (attributed/ignored/unknown kind, or no focused URL): clear
+    // the pending clock so a later ask restarts the deadline cleanly.
+    if (!focusedResolveIsPendingEligible || canonicalUrl === undefined) {
+      focusedResolvePendingSinceRef.current = null;
+      return undefined;
+    }
+    // A settled result or an already-recorded error means we are no longer in
+    // the pending state — stop the clock (the busy card / populated card owns
+    // the display now, and a fresh ask will restart the deadline).
+    if (focusedResolveHasResult || focusedTabSuggestionError !== undefined) {
+      focusedResolvePendingSinceRef.current = null;
+      return undefined;
+    }
+    const nowMs = Date.now();
+    const previous = focusedResolvePendingSinceRef.current;
+    // Keyed to the current URL so a new navigation restarts the deadline
+    // instead of inheriting a stale clock (reset-on-navigation invariant).
+    const pendingSinceMs = nextPendingSince({
+      previous:
+        previous === null
+          ? null
+          : { key: previous.canonicalUrl, pendingSinceMs: previous.pendingSinceMs },
+      key: canonicalUrl,
+      nowMs,
+    });
+    focusedResolvePendingSinceRef.current = { canonicalUrl, pendingSinceMs };
+    if (
+      pendingDeadlineExceeded({
+        pendingSinceMs,
+        hasResult: false,
+        hasError: false,
+        nowMs,
+      })
+    ) {
+      // Deadline reached. Record the flip as a 'busy' error entry — the same
+      // shape the transport path writes — so precisely one self-heal path
+      // owns recovery. A concurrent real success clears the entry; a real
+      // transport error would already be present (handled above).
+      setUrlSuggestionErrors((current) =>
+        current[canonicalUrl]?.kind === 'busy'
+          ? current
+          : { ...current, [canonicalUrl]: { kind: 'busy' } },
+      );
+      return undefined;
+    }
+    // Re-check exactly when the deadline elapses (plus the tick dep so a
+    // navigation / new result reschedules).
+    const remainingMs = Math.max(0, pendingSinceMs + PENDING_DEADLINE_MS - nowMs);
+    const timer = window.setTimeout(() => {
+      setFocusedResolveDeadlineTick((tick) => tick + 1);
+    }, remainingMs);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    focusedDisplayUrlRecord?.canonicalUrl,
+    focusedResolveIsPendingEligible,
+    focusedResolveHasResult,
+    focusedTabSuggestionError,
+    focusedResolveDeadlineTick,
+  ]);
   // Related strip data — /v2/recall intent='focus' (graph-neighbor
   // expansion from the focused page), debounced + cached in the hook.
   // Idle while a historical card is pinned; the strip is live-tab UI.
@@ -7914,14 +8105,35 @@ const App = () => {
                     </button>
                   ) : focusedTabSession.pageEvidence === undefined ? (
                     state.settings.pageEvidenceAutoExtractEnabled ? (
-                      <span
-                        className="tab-session-capture-badge is-unknown"
-                        title="Indexing this page's text in the background — updates automatically when the companion finishes (the first pass can take a bit)."
-                        aria-label="Capture status: indexing in background"
-                        data-testid="page-evidence-capture-badge"
-                      >
-                        Indexing…
-                      </span>
+                      focusedIndexingDeadlineExceeded ? (
+                        // Stuck-indexing deadline hit: the summary fetch has
+                        // been returning "not indexed yet" past the deadline
+                        // (companion busy catching up on a drain, or this page
+                        // just won't extract). Flip to the SAME amber busy
+                        // affordance the resolve card uses — retryable, not a
+                        // perpetual "Indexing…" lie. A late evidence result
+                        // still supersedes this (the URL lands in
+                        // livePageEvidenceByUrl → PageEvidenceBadge renders).
+                        <button
+                          type="button"
+                          className="tab-session-capture-badge is-busy"
+                          title="Indexing is taking longer than expected — the companion is busy catching up on a capture drain. Click to retry; it also retries automatically."
+                          aria-label="Capture status: indexing is busy — click to retry"
+                          data-testid="page-evidence-capture-badge"
+                          onClick={retryFocusedIndexing}
+                        >
+                          Indexing is busy — retry
+                        </button>
+                      ) : (
+                        <span
+                          className="tab-session-capture-badge is-unknown"
+                          title="Indexing this page's text in the background — updates automatically when the companion finishes (the first pass can take a bit)."
+                          aria-label="Capture status: indexing in background"
+                          data-testid="page-evidence-capture-badge"
+                        >
+                          Indexing…
+                        </span>
+                      )
                     ) : (
                       // Auto page-text capture is OFF by default: just
                       // viewing a page never extracts evidence, so an
