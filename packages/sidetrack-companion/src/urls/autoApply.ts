@@ -2,9 +2,9 @@ import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
 import {
   inferredUrlAttributionPayloadFromResolution,
-  resolveUrlAttribution,
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
+import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -99,7 +99,15 @@ export const autoApplyUrlAttribution = async (
         : projectUrls(beforeEvents)
       : deserializeUrlProjection(input.urlProjection);
   const existing = beforeProjection.byCanonicalUrl.get(input.canonicalUrl)?.currentAttribution;
-  const resolution = resolveUrlAttribution({
+  // Resolve under the configured serving arm (SIDETRACK_ATTRIBUTION_ARM). The
+  // vote arm reads the drain-time AttributionV1State from vaultRoot; absent that
+  // (or the artifact) it fails safe to the incumbent resolver. Either arm
+  // returns a UrlResolutionResult, so the auto-apply round-guard stack below
+  // (grace-window / ignored / existing-attribution / idempotency) composes
+  // unchanged — the vote arm's >= 3-vote 'auto-apply' decision flows through the
+  // same inferredUrlAttributionPayloadFromResolution + precedence path.
+  const resolution = await resolveUrlAttributionArmed({
+    ...(input.vaultRoot === undefined ? {} : { vaultRoot: input.vaultRoot }),
     canonicalUrl: input.canonicalUrl,
     snapshot: input.snapshot,
     events: beforeEvents,

@@ -67,6 +67,21 @@ export const ATTRIBUTION_PREQUENTIAL_ARMS = [
   'title-lexical',
   'recency',
   'vote4',
+  // vote3 — the SERVABLE equivalent of vote4 (M6). vote4's session-majority
+  // signal reads a per-visit tab-session-to-URL binding that exists only in the
+  // eval's replayed timeline history and is NOT reconstructable per-request at
+  // serve time (the resolver gets a canonicalUrl, not a live session join), nor
+  // is it persisted in the drain-time AttributionV1State artifact. vote3 drops
+  // that vote and keeps the three signals the served state DOES carry: title
+  // (venue-suppressed plain overlap), domain-majority, recency. Its domain vote
+  // is GATED on the domain's learned discriminativeness (>= neutral) — unlike
+  // vote4's unconditional domainMajorityWorkstream — so the B1/B4 aggregator-hub
+  // suppression that lives in domainDiscriminativeness fires on the serving path
+  // too. This arm is what src/attribution-v1/serve.ts serves; scoring it here
+  // makes the eval artifact the read-back that proves the served arm's numbers
+  // (doctrine rule 10) and locks vote3 ≈ vote4 so a future state change can't
+  // silently break the equivalence.
+  'vote3',
   'majority',
 ] as const;
 
@@ -201,7 +216,10 @@ const foldSimpleArmState = (state: SimpleArmState, label: PrequentialLabel): voi
 // family — no separate IDF/BM25 model, no parallel term index — so the frozen
 // baseline scores the challenger's own primitive (brand suppression included)
 // and the two cannot drift.
-const titleNearestWorkstream = (
+// EXPORTED (M6): serve.ts reads the SAME venue-suppressed title primitive the
+// eval's vote arm uses, so the served title vote and the scored title vote are
+// one implementation — the arm and its yardstick cannot drift.
+export const titleNearestWorkstream = (
   state: AttributionV1State,
   title: string | null,
   domain: string | null,
@@ -290,6 +308,104 @@ const vote4Predict = (
   }
   return { workstreamId: winner, votes: winnerVotes };
 };
+
+// ---- vote3: the SERVABLE arm (M6) -------------------------------------
+//
+// vote3 is vote4 minus the session vote, with the domain vote GATED on
+// discriminativeness. It reads ONLY signals the drain-time AttributionV1State
+// artifact carries, so the serve path (src/attribution-v1/serve.ts) can
+// reproduce it per-request with no timeline replay. Scoring it here as an arm
+// proves the served number against the same harness the shipped arms use.
+
+// The GATED domain vote — the serving-path domain signal. Unlike the eval's
+// unconditional domainMajorityWorkstream (which votes even on hubs), this reads
+// the LEARNED discriminativeness winner and ABSTAINS the vote when the domain is
+// below neutral discriminativeness (a dispersed aggregator hub or a listed-prior
+// domain with no overriding evidence). That is where B1/B4 fire: a hub like
+// news.ycombinator.com sits far below neutral, so its domain vote is withheld
+// and the aggregator false-friend cannot ride the domain channel. Reads exactly
+// domainDiscriminativeness(state, domain) — byte-identical to what serve.ts and
+// the v1 scorer's conditional-domain family use — so the arm and the served code
+// share one implementation of the gate.
+export const gatedDomainWorkstream = (
+  v1State: AttributionV1State,
+  domain: string | null,
+): string | null => {
+  if (domain === null) return null;
+  const discrim = domainDiscriminativeness(v1State, domain);
+  if (discrim.discriminativeness < NEUTRAL_DISCRIMINATIVENESS) return null;
+  return discrim.winnerWorkstreamId;
+};
+
+// The three servable signals, tallied identically to vote4 (plurality vote, one
+// each; ties broken by priority title > domain > recency then lexicographic id).
+// EXPORTED so serve.ts scores the exact same tally the eval measures — the arm
+// and the served decision are one function of the same three signals.
+export const VOTE3_PRIORITY: readonly ('title' | 'domain' | 'recency')[] = [
+  'title',
+  'domain',
+  'recency',
+];
+
+export interface Vote3Signals {
+  readonly title: string | null;
+  readonly domain: string | null;
+  readonly recency: string | null;
+}
+
+export interface Vote3Prediction {
+  readonly workstreamId: string | null;
+  // How many of the three signals voted for the winner (the vote-count gate the
+  // serve threshold ladder keys on: >= 1 suggest, >= 3 auto-apply).
+  readonly votes: number;
+}
+
+// Tally the three servable signals into a plurality winner + its vote count.
+// Pure over the signal triple so serve.ts and the eval call the identical rule.
+export const tallyVote3 = (signals: Vote3Signals): Vote3Prediction => {
+  const bySignal: Record<'title' | 'domain' | 'recency', string | null> = {
+    title: signals.title,
+    domain: signals.domain,
+    recency: signals.recency,
+  };
+  const tally = new Map<string, number>();
+  const bestPriority = new Map<string, number>();
+  VOTE3_PRIORITY.forEach((signal, priorityIndex) => {
+    const vote = bySignal[signal];
+    if (vote === null) return;
+    tally.set(vote, (tally.get(vote) ?? 0) + 1);
+    if (!bestPriority.has(vote)) bestPriority.set(vote, priorityIndex);
+  });
+  let winner: string | null = null;
+  let winnerVotes = 0;
+  let winnerPriority = Number.POSITIVE_INFINITY;
+  for (const [workstreamId, votes] of tally) {
+    const priority = bestPriority.get(workstreamId) ?? Number.POSITIVE_INFINITY;
+    if (
+      votes > winnerVotes ||
+      (votes === winnerVotes && priority < winnerPriority) ||
+      (votes === winnerVotes &&
+        priority === winnerPriority &&
+        (winner === null || workstreamId < winner))
+    ) {
+      winner = workstreamId;
+      winnerVotes = votes;
+      winnerPriority = priority;
+    }
+  }
+  return { workstreamId: winner, votes: winnerVotes };
+};
+
+const vote3Predict = (
+  state: SimpleArmState,
+  v1State: AttributionV1State,
+  label: PrequentialLabel,
+): Vote3Prediction =>
+  tallyVote3({
+    title: titleNearestWorkstream(v1State, label.title, label.domain),
+    domain: gatedDomainWorkstream(v1State, label.domain),
+    recency: state.lastFiledWorkstreamId,
+  });
 
 // v1 top-k over the current v1 state, for either combiner. Returns the ranked
 // workstream ids and whether the scorer abstained (so the abstention arm can be
@@ -440,11 +556,23 @@ export interface PrequentialReport {
   readonly tailLabelCount: number;
 }
 
+// One vote3 prediction observation: how many of the three signals voted for the
+// winner (0 = abstain) and whether that winner was the true workstream. Fed to
+// an optional sink so the vote-count precision curve is measured on the SAME
+// replay as the arm metrics (no drift between the served ladder and the eval).
+export interface Vote3Observation {
+  readonly votes: number;
+  readonly hit: boolean;
+}
+
 // Options for the replay. `v1MinSuggestScore` overrides the scorer's evidence
 // gate for BOTH v1 arms — the CLI sweeps it to report the abstention/precision
-// tradeoff curve; the default run uses the shipping constant.
+// tradeoff curve; the default run uses the shipping constant. `vote3Sink`
+// receives every vote3 observation so the vote-count curve (the SERVED
+// threshold ladder's read-back) can be built without a second replay.
 export interface RunPrequentialOptions {
   readonly v1MinSuggestScore?: number;
+  readonly vote3Sink?: (observation: Vote3Observation) => void;
 }
 
 // Run the full prequential replay. `events` is the raw (any-order) event
@@ -512,6 +640,7 @@ export const runAttributionPrequential = (
     'title-lexical': createArmTally(),
     recency: createArmTally(),
     vote4: createArmTally(),
+    vote3: createArmTally(),
     majority: createArmTally(),
   };
 
@@ -589,6 +718,16 @@ export const runAttributionPrequential = (
     const vote = vote4Predict(simple, v1State, label);
     scoreArm('vote4', label, vote.workstreamId === null ? [] : [vote.workstreamId], isHead);
 
+    const vote3 = vote3Predict(simple, v1State, label);
+    scoreArm('vote3', label, vote3.workstreamId === null ? [] : [vote3.workstreamId], isHead);
+    // Feed the vote-count curve sink: the winner's vote count + whether it hit.
+    // This is the SERVED ladder's read-back — the same tally serve.ts keys the
+    // suggest (>= 1) / auto-apply (>= 3) thresholds on.
+    options.vote3Sink?.({
+      votes: vote3.votes,
+      hit: vote3.workstreamId !== null && vote3.workstreamId === label.workstreamId,
+    });
+
     const majority = simple.majorityWorkstreamId;
     scoreArm('majority', label, majority === null ? [] : [majority], isHead);
 
@@ -656,6 +795,65 @@ export const runV1ThresholdCurve = (
       precisionWhenSuggesting: v1?.precisionWhenSuggesting ?? 0,
     };
   });
+
+// ---- vote3 vote-count curve (the SERVED ladder's read-back) -----------
+//
+// The vote arm has no continuous score — its natural gate is how many of the
+// three signals agree (>= 1 suggest, >= 3 auto-apply in serve.ts). This curve
+// is the doctrine-rule-10 read-back for that ladder: at each minimum vote count
+// it reports COVERAGE (fraction of labels that reach the tier) and
+// PRECISION-WHEN-SUGGESTING (of the labels that reach the tier, the fraction the
+// vote arm gets right) — the two numbers the serve.ts threshold comment cites to
+// justify suggest-at-1 (coverage tier) and auto-apply-at-3 (precision tier).
+
+export interface Vote3VoteCountCurvePoint {
+  // The minimum winning vote count for this tier (1, 2, 3).
+  readonly minVotes: number;
+  // Fraction of ALL labels whose vote3 winner had >= minVotes votes.
+  readonly coverage: number;
+  // Of the labels that reached this tier, the fraction the winner was correct.
+  readonly precisionWhenSuggesting: number;
+  // top-1 over ALL labels restricted to this tier (coverage × precision) — the
+  // served top1 if the arm suggested only at/above this tier.
+  readonly top1: number;
+  // Raw tallies for auditability.
+  readonly labelCount: number;
+  readonly suggestedCount: number;
+  readonly hitCount: number;
+}
+
+export const VOTE3_VOTE_COUNT_CURVE_POINTS: readonly number[] = [1, 2, 3];
+
+// Run a single prequential replay and bucket the vote3 observations by winning
+// vote count, then emit the coverage/precision curve at each minimum-vote tier.
+// Cheap: one replay, O(labels) accumulation.
+export const runVote3VoteCountCurve = (
+  events: readonly AcceptedEvent[],
+  thresholds: readonly number[] = VOTE3_VOTE_COUNT_CURVE_POINTS,
+): readonly Vote3VoteCountCurvePoint[] => {
+  const observations: Vote3Observation[] = [];
+  runAttributionPrequential(events, { vote3Sink: (o) => observations.push(o) });
+  const labelCount = observations.length;
+  return thresholds.map((minVotes) => {
+    let suggestedCount = 0;
+    let hitCount = 0;
+    for (const obs of observations) {
+      if (obs.votes >= minVotes) {
+        suggestedCount += 1;
+        if (obs.hit) hitCount += 1;
+      }
+    }
+    return {
+      minVotes,
+      coverage: labelCount === 0 ? 0 : suggestedCount / labelCount,
+      precisionWhenSuggesting: suggestedCount === 0 ? 0 : hitCount / suggestedCount,
+      top1: labelCount === 0 ? 0 : hitCount / labelCount,
+      labelCount,
+      suggestedCount,
+      hitCount,
+    };
+  });
+};
 
 // ---- verdict ----------------------------------------------------------
 

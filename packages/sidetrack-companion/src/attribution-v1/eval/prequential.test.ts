@@ -4,14 +4,23 @@ import {
   ATTRIBUTION_PREQUENTIAL_ARMS,
   HEAD_WORKSTREAM_LABEL_THRESHOLD,
   buildPrequentialVerdict,
+  gatedDomainWorkstream,
   runAttributionPrequential,
   runV1ThresholdCurve,
+  runVote3VoteCountCurve,
+  tallyVote3,
   type ArmMetrics,
   type AttributionPrequentialArm,
 } from './prequential.js';
+import { VOTE3_AUTO_APPLY_MIN_VOTES, VOTE3_SUGGEST_MIN_VOTES } from '../serve.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { USER_ORGANIZED_ITEM } from '../../feedback/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
+import {
+  buildAttributionV1State,
+  domainDiscriminativeness,
+  NEUTRAL_DISCRIMINATIVENESS,
+} from '../state.js';
 
 // ---- synthetic vault fixture builders ---------------------------------
 
@@ -177,6 +186,20 @@ describe('runAttributionPrequential — hand-computable fixture', () => {
     expect(arm.abstentions).toBe(1);
     expect(arm.precisionWhenSuggesting).toBeCloseTo(2 / 3, 6);
   });
+
+  it('vote3 (servable) matches vote4 on this hub-free fixture', () => {
+    // No aggregator-hub domains here (a/b/c/d.example are single-workstream on
+    // asserted labels ⇒ high discriminativeness), so the gated domain vote
+    // votes identically to vote4's unconditional one, and dropping the session
+    // vote changes nothing on this trace. vote3 must reproduce vote4 exactly.
+    const report = runAttributionPrequential(handComputableEvents());
+    const vote3 = armOf(report.arms, 'vote3');
+    const vote4 = armOf(report.arms, 'vote4');
+    expect(vote3.top1Hits).toBe(vote4.top1Hits);
+    expect(vote3.abstentions).toBe(vote4.abstentions);
+    expect(vote3.top1Hits).toBe(2);
+    expect(vote3.abstentions).toBe(1);
+  });
 });
 
 // ---- no-peeking guarantee ---------------------------------------------
@@ -325,6 +348,243 @@ describe('runV1ThresholdCurve', () => {
     // A very high gate abstains on everything.
     expect(curve[2]!.abstainRate).toBeCloseTo(1.0, 6);
     expect(curve[2]!.top1).toBeCloseTo(0, 6);
+  });
+});
+
+// ---- vote3: the SERVABLE arm (M6) -------------------------------------
+
+describe('vote3 — servable arm equivalence + hub gating', () => {
+  it('gatedDomainWorkstream withholds the domain vote on a below-neutral hub', () => {
+    // Build a state where an aggregator hub (news.ycombinator.com — in the
+    // coarse-multi-topic listed-prior set) has filed labels spread across two
+    // workstreams, so its learned discriminativeness sits below neutral. The
+    // gated domain vote must return null there (B1/B4 firing on the serve path),
+    // even though a raw domain-majority argmax would return a workstream.
+    resetSeq();
+    const events: AcceptedEvent[] = [
+      timelineEvent('https://news.ycombinator.com/item?id=1', 'thread one', 1, 's1'),
+      timelineEvent('https://news.ycombinator.com/item?id=2', 'thread two', 2, 's2'),
+      organizeEvent('https://news.ycombinator.com/item?id=1', 'wsAlpha', 10),
+      organizeEvent('https://news.ycombinator.com/item?id=2', 'wsBeta', 11),
+    ];
+    const state = buildAttributionV1State(events);
+    // The hub is below neutral discriminativeness (listed-prior + 2-way spread).
+    const discrim = domainDiscriminativeness(state, 'news.ycombinator.com');
+    expect(discrim.discriminativeness).toBeLessThan(NEUTRAL_DISCRIMINATIVENESS);
+    // So the gated domain vote is WITHHELD — the aggregator hub cannot cast a
+    // domain vote even though a raw argmax (wsAlpha, the lexicographically-first
+    // of the tied pair) exists.
+    expect(gatedDomainWorkstream(state, 'news.ycombinator.com')).toBeNull();
+    // A single-workstream domain, by contrast, is fully discriminative and DOES
+    // cast its vote.
+    const single = buildAttributionV1State([
+      organizeEvent('https://rust-lang.org/a', 'wsRust', 20),
+      organizeEvent('https://rust-lang.org/b', 'wsRust', 21),
+    ]);
+    expect(gatedDomainWorkstream(single, 'rust-lang.org')).toBe('wsRust');
+  });
+
+  it('vote3 beats vote4 when the hub domain vote is a wrong vote (gate suppresses it)', () => {
+    // The scenario the gated domain vote fixes: a dispersed aggregator hub whose
+    // domain-majority argmax points at the WRONG workstream for a fresh visit
+    // whose TITLE clearly matches the right one. At the probe:
+    //   - title vote  = wsRust     (its member carries the probe's terms)
+    //   - domain vote = wsHubHeavy  (the hub's ungated argmax — WRONG)
+    //   - recency     = wsHubHeavy  (the last label before the probe was a hub
+    //                                label ⇒ recency also points at the hub)
+    // vote4 (ungated) tallies wsHubHeavy 2 : wsRust 1 ⇒ WRONG. vote3 withholds
+    // the hub domain vote, leaving wsRust 1 : wsHubHeavy 1 (recency) — tie broken
+    // by priority title > recency ⇒ wsRust ⇒ RIGHT. So vote3 gets the probe that
+    // vote4 misses.
+    resetSeq();
+    const events: AcceptedEvent[] = [];
+    let t = 1;
+    // Seed distractor workstreams so title terms have cross-workstream context.
+    for (let d = 0; d < 4; d += 1) {
+      events.push(timelineEvent(`https://d${d}.example/1`, `junk${d} filler${d}`, t, `sd${d}`));
+      t += 1;
+    }
+    // wsRust member whose title carries the probe's terms (observed early, so a
+    // later hub visit with the same title matches wsRust on the title vote).
+    events.push(timelineEvent('https://d0.example/2', 'distributed consensus raft', t, 'sr'));
+    t += 1;
+    // The hub: labels concentrated on wsHubHeavy (the argmax) plus one on
+    // wsOther, so the hub is dispersed (below-neutral) but its argmax is
+    // wsHubHeavy. Observed before their labels.
+    for (let i = 0; i < 4; i += 1) {
+      events.push(
+        timelineEvent(`https://news.ycombinator.com/item?id=h${i}`, `hubword${i}`, t, `sh${i}`),
+      );
+      t += 1;
+    }
+    events.push(
+      timelineEvent('https://news.ycombinator.com/item?id=o1', 'other topic here', t, 'so'),
+    );
+    t += 1;
+    // The PROBE visit: a hub URL whose title matches wsRust, filed to wsRust.
+    events.push(
+      timelineEvent(
+        'https://news.ycombinator.com/item?id=probe',
+        'distributed consensus raft',
+        t,
+        'sp',
+      ),
+    );
+    t += 1;
+
+    // Labels, in time order. wsRust and wsOther first, then the hub-heavy block
+    // LAST before the probe so recency points at wsHubHeavy at probe time.
+    for (let d = 0; d < 4; d += 1) {
+      events.push(organizeEvent(`https://d${d}.example/1`, `wsd${d}`, t));
+      t += 1;
+    }
+    events.push(organizeEvent('https://d0.example/2', 'wsRust', t));
+    t += 1;
+    events.push(organizeEvent('https://news.ycombinator.com/item?id=o1', 'wsOther', t));
+    t += 1;
+    for (let i = 0; i < 4; i += 1) {
+      events.push(organizeEvent(`https://news.ycombinator.com/item?id=h${i}`, 'wsHubHeavy', t));
+      t += 1;
+    }
+    // The probe label: the true target is wsRust (title match), NOT the hub
+    // argmax wsHubHeavy. Recency now points at wsHubHeavy (last label).
+    events.push(
+      organizeEvent('https://news.ycombinator.com/item?id=probe', 'wsRust', t),
+    );
+
+    const report = runAttributionPrequential(events);
+    const vote3 = armOf(report.arms, 'vote3');
+    const vote4 = armOf(report.arms, 'vote4');
+    // vote3 must score at least as many top-1 as vote4 (the gate never hurts on
+    // this fixture) AND strictly more (it gets the probe right where the hub
+    // domain vote drags vote4 off the title-correct answer).
+    expect(vote3.top1Hits).toBeGreaterThanOrEqual(vote4.top1Hits);
+    expect(vote3.top1Hits).toBeGreaterThan(vote4.top1Hits);
+  });
+
+  it('tallyVote3 breaks ties by title > domain > recency then id', () => {
+    // Three distinct single-vote signals ⇒ 3-way tie at 1 vote each; title wins
+    // by priority.
+    expect(tallyVote3({ title: 'wsT', domain: 'wsD', recency: 'wsR' })).toEqual({
+      workstreamId: 'wsT',
+      votes: 1,
+    });
+    // Two signals agree ⇒ that workstream wins with 2 votes (the >= 2 tier).
+    expect(tallyVote3({ title: 'wsX', domain: 'wsX', recency: 'wsR' })).toEqual({
+      workstreamId: 'wsX',
+      votes: 2,
+    });
+    // Unanimous ⇒ 3 votes (the auto-apply tier).
+    expect(tallyVote3({ title: 'wsX', domain: 'wsX', recency: 'wsX' })).toEqual({
+      workstreamId: 'wsX',
+      votes: 3,
+    });
+    // All null ⇒ no winner.
+    expect(tallyVote3({ title: null, domain: null, recency: null })).toEqual({
+      workstreamId: null,
+      votes: 0,
+    });
+  });
+
+  it('gatedDomainWorkstream returns null for a null domain', () => {
+    // Sanity: no domain ⇒ no domain vote (used by serve.ts for un-parseable urls).
+    expect(gatedDomainWorkstream(buildAttributionV1State([]), null)).toBeNull();
+  });
+});
+
+// ---- vote3 SERVED numbers: the doctrine-rule-10 read-back (F2/F5) ------
+//
+// A synthetic label set exercising title+domain+recency agreement across enough
+// labels to produce a STABLE top1 and a monotone vote-count precision curve.
+// This is the in-test proof the serve.ts default-flip (default 'vote3', gated
+// on ">= 0.40 top1 on the eval harness") and the auto-apply precision bar rest
+// on — replacing the hand-run 45.9% live-vault number with a CI'd absolute
+// floor on a fixture whose numbers the test itself asserts.
+//
+// Shape: WS_COUNT single-workstream domains, each accruing MEMBERS_PER_WS labels
+// that share a distinctive per-workstream title. Every domain is fully
+// discriminative (single workstream ⇒ gated domain vote fires), and after the
+// first member of a workstream is filed, subsequent same-workstream labels get:
+//   - title vote  (shared distinctive terms → that workstream)
+//   - domain vote  (single-workstream domain → that workstream)
+//   - recency vote  IF the previous label was the same workstream.
+// We file each workstream's members in a contiguous block so within a block the
+// recency vote aligns on the 2nd..Mth member ⇒ 3 votes (auto-apply tier). The
+// FIRST member of each block has an empty/led-astray prior ⇒ fewer votes. This
+// yields a high but not perfect top1 and a genuine >=3-vote precision tier.
+const votedFixtureEvents = (
+  wsCount: number,
+  membersPerWs: number,
+): readonly AcceptedEvent[] => {
+  resetSeq();
+  const events: AcceptedEvent[] = [];
+  let t = 1;
+  // Observe all titles first (timeline before labels), then file in blocks.
+  const plan: { url: string; ws: string; domain: string; title: string }[] = [];
+  for (let w = 0; w < wsCount; w += 1) {
+    const domain = `ws${w}.example`;
+    const ws = `wsN${w}`;
+    const title = `topicword${w} subjectword${w} themeword${w}`;
+    for (let m = 0; m < membersPerWs; m += 1) {
+      plan.push({ url: `https://${domain}/${m}`, ws, domain, title });
+    }
+  }
+  for (const p of plan) {
+    events.push(timelineEvent(p.url, p.title, t, `s${t}`));
+    t += 1;
+  }
+  // File each workstream's block contiguously so recency aligns within a block.
+  for (const p of plan) {
+    events.push(organizeEvent(p.url, p.ws, t));
+    t += 1;
+  }
+  return events;
+};
+
+describe('vote3 SERVED numbers — eval read-back (F2/F5)', () => {
+  it('reproduces >= 0.40 top1 on a fixture vault AND beats vote4 (the default-flip guard)', () => {
+    // 6 workstreams × 6 members = 36 labels. Enough that the top1 is stable and
+    // not an artifact of a 4-label hand trace. The vote arm should clear the
+    // 0.40 bar the serve.ts default cites, and match-or-beat vote4 (the frozen
+    // baseline the servable arm must not regress below).
+    const report = runAttributionPrequential(votedFixtureEvents(6, 6));
+    const vote3 = armOf(report.arms, 'vote3');
+    const vote4 = armOf(report.arms, 'vote4');
+    expect(report.labelCount).toBe(36);
+    // The absolute floor the serve.ts default-flip comment claims (>= 40%).
+    expect(vote3.top1).toBeGreaterThanOrEqual(0.4);
+    // The servable arm must not regress below the frozen 4-signal baseline.
+    expect(vote3.top1).toBeGreaterThanOrEqual(vote4.top1);
+  });
+
+  it('the vote-count curve backs the SERVED ladder: precision rises with votes, auto-apply tier is high-precision', () => {
+    const curve = runVote3VoteCountCurve(votedFixtureEvents(6, 6));
+    // One point per configured tier (1, 2, 3).
+    expect(curve.map((p) => p.minVotes)).toEqual([1, 2, 3]);
+    const at = (minVotes: number) => {
+      const p = curve.find((c) => c.minVotes === minVotes);
+      if (p === undefined) throw new Error(`missing curve point ${minVotes}`);
+      return p;
+    };
+    // Coverage is monotone NON-INCREASING as the bar rises (a stricter tier can
+    // only cover fewer labels).
+    expect(at(1).coverage).toBeGreaterThanOrEqual(at(2).coverage);
+    expect(at(2).coverage).toBeGreaterThanOrEqual(at(3).coverage);
+    // Precision is monotone NON-DECREASING as the bar rises (more agreement =
+    // more reliable) — the tradeoff the served ladder exploits.
+    expect(at(1).precisionWhenSuggesting).toBeLessThanOrEqual(at(2).precisionWhenSuggesting);
+    expect(at(2).precisionWhenSuggesting).toBeLessThanOrEqual(at(3).precisionWhenSuggesting);
+    // The SUGGEST tier (>= VOTE3_SUGGEST_MIN_VOTES) is the coverage tier: it
+    // covers (nearly) every label.
+    expect(at(VOTE3_SUGGEST_MIN_VOTES).coverage).toBeGreaterThan(0.9);
+    // The AUTO-APPLY tier (>= VOTE3_AUTO_APPLY_MIN_VOTES) is the high-precision
+    // conservative tier the user's "don't be wrong" bar rides on. On this
+    // clean single-workstream-domain fixture the unanimous tier is ~perfect;
+    // assert it clears the ~0.6 auto-apply bar the serve.ts comment names.
+    expect(at(VOTE3_AUTO_APPLY_MIN_VOTES).precisionWhenSuggesting).toBeGreaterThanOrEqual(0.6);
+    // And the auto-apply tier actually fires on some labels (a non-empty tier —
+    // the "file a neighbor, then the fresh visit auto-applies" behaviour).
+    expect(at(VOTE3_AUTO_APPLY_MIN_VOTES).suggestedCount).toBeGreaterThan(0);
   });
 });
 

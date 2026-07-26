@@ -174,13 +174,66 @@ import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabse
 import {
   resolveAttribution,
   resolveThreadAttribution,
-  resolveUrlAttribution,
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import {
+  currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
   incumbentTopFromResolution,
+  loadAttributionV1State,
 } from '../attribution-v1/emit.js';
+import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
+import { attributionArm } from '../attribution-v1/serve.js';
+
+// Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
+// cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
+// quantities the bare snapshotRevision misses:
+//   1. The SERVING ARM. Flipping SIDETRACK_ATTRIBUTION_ARM (env + restart)
+//      must not serve entries computed under the other arm — otherwise a
+//      v1->vote flip keeps serving the incumbent's abstain (and vice-versa)
+//      for every URL whose snapshotRevision has not rolled.
+//   2. The AttributionV1State revision (vote arm only). The vote decision is a
+//      pure function of the drain-time state (recency/domain/title), which
+//      changes on EVERY filing — but the connections snapshotRevision is
+//      W1c-floored / M3-sticky and may not roll on a re-file, so a
+//      snapshot-only key serves a stale vote ("file a neighbor, fresh visit
+//      lights up" would break). Fold the state mtime in so a state drain busts.
+// The incumbent arm ('v1') is a pure function of the snapshot, so its key does
+// NOT include the state revision (only the arm tag) — no false busts there.
+//
+// Async because the vote arm's state revision comes from the memoized state,
+// which must be REFRESHED before the cache read (a cheap fs.stat when warm) so
+// the read key reflects the CURRENT drain, not whatever a prior resolve loaded.
+// loadAttributionV1State is idempotent + mtime-memoized, and the served vote
+// arm calls it again inside armedResolve — so this pre-warm costs at most one
+// extra fs.stat, never a re-parse.
+const resolverCacheRevision = async (
+  snapshotRevision: string,
+  vaultRoot: string,
+): Promise<string> => {
+  const arm = attributionArm();
+  if (arm === 'v1') return `${snapshotRevision}|arm=v1`;
+  await loadAttributionV1State(vaultRoot);
+  return `${snapshotRevision}|arm=${arm}|st=${currentAttributionV1StateRevision()}`;
+};
+
+// The SWR staleness signature for the resolve routes (F4). The in-memory SWR
+// cache keys the STALENESS check on the connections graph sig, which is
+// deliberately W1c-floored / M3-sticky (stable between graph-moving drains). But
+// the served VOTE arm's answer depends on the AttributionV1State, which changes
+// on every filing WITHOUT necessarily rolling the graph sig — so a bare graph
+// sig would keep serving the pre-filing vote from the SWR entry. Append the arm
+// + state revision so a v1<->vote flip and every attribution-state drain move
+// the sig and trigger the background refresh. For the incumbent arm this only
+// appends the constant `|arm=v1` (no false busts — the incumbent is a pure
+// function of the graph). Async for the same cheap-stat state warm-up as
+// resolverCacheRevision.
+const armedResolveSig = async (graphSig: string, vaultRoot: string): Promise<string> => {
+  const arm = attributionArm();
+  if (arm === 'v1') return `${graphSig}|arm=v1`;
+  await loadAttributionV1State(vaultRoot);
+  return `${graphSig}|arm=${arm}|st=${currentAttributionV1StateRevision()}`;
+};
 import {
   createEmptyUrlProjectionAccumulator,
   deserializeUrlProjection,
@@ -3249,15 +3302,24 @@ const buildBatchResolveRefresh =
       (event) => event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
       RESOLVER_SIGNAL_EVENT_TYPES,
     );
-    const result = resolveUrlAttribution({
+    const result = await resolveUrlAttributionArmed({
+      vaultRoot: requireVaultRoot(context),
       canonicalUrl,
       snapshot,
       events: resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl]),
+      // F1 privacy gate (mirrors the GET + batch inline paths).
+      tombstones: await domainTombstoneSetFor(context),
       useEventCandidateSimilarity: false,
     });
     // Keep the sqlite per-revision cache warm too so a same-revision GET hits.
+    // Arm + state-aware key (F3/F4) so this warm-write matches the GET route's
+    // read key and a stale-arm/stale-state entry is never served.
     if (snapshotRevision !== undefined) {
-      await sqliteStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+      await sqliteStore.cacheResolverResult(
+        canonicalUrl,
+        await resolverCacheRevision(snapshotRevision, requireVaultRoot(context)),
+        result,
+      );
     }
     return [200, result];
   };
@@ -4707,9 +4769,12 @@ const routes: readonly RouteDefinition[] = [
         context.connectionsStore,
         join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
       );
+      // Arm + state-aware SWR sig (F4): a vote-arm state drain (or a v1<->vote
+      // flip) busts the SWR entry even when the sticky graph sig is unchanged.
+      const resolveSwrSig = await armedResolveSig(graphSig, requireVaultRoot(context));
       return serveResolveSwr(
         visResKey,
-        graphSig,
+        resolveSwrSig,
         async (): Promise<readonly [number, unknown]> => {
           const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
           const expandEventCandidates =
@@ -4765,7 +4830,7 @@ const routes: readonly RouteDefinition[] = [
           ) {
             const cached = await sqliteStore.getCachedResolverResult(
               canonicalUrl,
-              snapshotRevision,
+              await resolverCacheRevision(snapshotRevision, requireVaultRoot(context)),
             );
             if (cached !== null) {
               return [
@@ -4800,10 +4865,23 @@ const routes: readonly RouteDefinition[] = [
               : usesSqliteSubgraph
                 ? resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl])
                 : merged;
-          const result = resolveUrlAttribution({
+          // Attribution ARM switch (SIDETRACK_ATTRIBUTION_ARM, default
+          // 'vote3'). 'v1' keeps the incumbent graph-resolver serving; the
+          // vote arm returns the servable vote3 decision (reproducing the
+          // frozen-baseline win the incumbent leaves dark — see
+          // attribution-v1/serve.ts). Same UrlResolutionResult shape either
+          // way, so caching + the round-guard stack compose unchanged. When
+          // the vote arm serves it ALSO runs the incumbent for the reverse
+          // shadow (gated behind the v1-shadow flag) inside armedResolve.
+          const result = await resolveUrlAttributionArmed({
+            vaultRoot: requireVaultRoot(context),
             canonicalUrl,
             snapshot,
             events: resolverEvents,
+            // F1 privacy gate: hand the vote arm the served tombstone set so a
+            // purged URL/domain never re-enters attribution through the new
+            // serve boundary (no-op for the incumbent arm).
+            tombstones: await domainTombstoneSetFor(context),
             ...(usesSqliteSubgraph && !expandEventCandidates
               ? { useEventCandidateSimilarity: false }
               : {}),
@@ -4815,24 +4893,28 @@ const routes: readonly RouteDefinition[] = [
           ) {
             await sqliteStore.cacheResolverResult(
               canonicalUrl,
-              snapshotRevision,
+              await resolverCacheRevision(snapshotRevision, requireVaultRoot(context)),
               result,
             );
           }
           // Attribution v1 SHADOW lane (SIDETRACK_ATTRIBUTION_V1_SHADOW,
-          // default ON). Runs the v1 scorer beside the incumbent and
+          // default ON). Runs the v1 scorer beside whatever serves and
           // records a compact comparison. Best-effort + fully self-
           // contained: it never throws and never touches `result`, so the
           // served response is byte-identical with the flag on or off.
           // The O(nodes) title lookup runs LAZILY inside emit — only after
           // its flag + fresh-state gates pass — so with the shadow flag off
-          // this call is a cheap no-op and no snapshot scan happens.
-          await emitAttributionV1Shadow({
-            vaultRoot: requireVaultRoot(context),
-            canonicalUrl,
-            snapshot,
-            incumbentTop: incumbentTopFromResolution(result),
-          });
+          // this call is a cheap no-op and no snapshot scan happens. Skipped
+          // when the vote arm serves (armedResolve already records the
+          // reverse arm-shadow) to avoid double state loads on the hot path.
+          if (attributionArm() === 'v1') {
+            await emitAttributionV1Shadow({
+              vaultRoot: requireVaultRoot(context),
+              canonicalUrl,
+              snapshot,
+              incumbentTop: incumbentTopFromResolution(result),
+            });
+          }
           return [
             200,
             {
@@ -4909,22 +4991,36 @@ const routes: readonly RouteDefinition[] = [
         // Current graph sig for the SWR staleness check (per-URL, sig-checked
         // separately — mirrors the GET resolve routes so a drain serves the
         // stale item instantly + refreshes in the background instead of
-        // recomputing the whole visible set cold on the single loop).
-        const batchGraphSig = await connectionsGraphSig(
-          sqliteStore,
-          join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+        // recomputing the whole visible set cold on the single loop). Arm +
+        // state-aware (F4) so a vote-arm state drain / flip busts the SWR entry.
+        const batchGraphSig = await armedResolveSig(
+          await connectionsGraphSig(
+            sqliteStore,
+            join(requireVaultRoot(context), '_BAC', 'connections', 'current.json'),
+          ),
+          requireVaultRoot(context),
         );
         const results: Record<string, UrlResolutionResult> = {};
         const misses: string[] = [];
+        // Arm + state-aware resolver-cache key (F3/F4), computed ONCE per batch
+        // (the arm + state revision are request-constant) so every per-URL
+        // read/write matches the GET route's key and a v1<->vote flip / state
+        // drain busts the persisted cache.
+        const batchCacheRevision =
+          snapshotRevision === undefined
+            ? undefined
+            : await resolverCacheRevision(snapshotRevision, requireVaultRoot(context));
+        // F1 privacy gate: the served tombstone set, loaded once for the batch.
+        const batchTombstones = await domainTombstoneSetFor(context);
         for (const canonicalUrl of uniqueUrls) {
           if (eventCandidateTargetSet.has(canonicalUrl)) {
             misses.push(canonicalUrl);
             continue;
           }
-          if (snapshotRevision !== undefined) {
+          if (batchCacheRevision !== undefined) {
             const cached = await sqliteStore.getCachedResolverResult(
               canonicalUrl,
-              snapshotRevision,
+              batchCacheRevision,
             );
             if (cached !== null) {
               results[canonicalUrl] = cached as UrlResolutionResult;
@@ -5008,15 +5104,17 @@ const routes: readonly RouteDefinition[] = [
                 ),
               ]
             : missedEvents;
-          const result = resolveUrlAttribution({
+          const result = await resolveUrlAttributionArmed({
+            vaultRoot: requireVaultRoot(context),
             canonicalUrl,
             snapshot,
             events: resolverEvents,
+            tombstones: batchTombstones,
             ...(expandEventCandidates ? {} : { useEventCandidateSimilarity: false }),
           });
           results[canonicalUrl] = result;
-          if (snapshotRevision !== undefined && !expandEventCandidates) {
-            await sqliteStore.cacheResolverResult(canonicalUrl, snapshotRevision, result);
+          if (batchCacheRevision !== undefined && !expandEventCandidates) {
+            await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
             // Seed the SWR cache so a later drain can serve this item stale +
             // refresh in the background rather than recomputing it inline in
             // the next convoy. eventCandidate items are intentionally excluded
@@ -5043,11 +5141,14 @@ const routes: readonly RouteDefinition[] = [
       const snapshotRevision = snapshot.snapshotRevision;
       const results: Record<string, UrlResolutionResult> = {};
       const merged = await context.eventLog.readMerged();
+      const fallbackTombstones = await domainTombstoneSetFor(context);
       for (const canonicalUrl of uniqueUrls) {
-        const result = resolveUrlAttribution({
+        const result = await resolveUrlAttributionArmed({
+          vaultRoot: requireVaultRoot(context),
           canonicalUrl,
           snapshot,
           events: merged,
+          tombstones: fallbackTombstones,
         });
         results[canonicalUrl] = result;
       }

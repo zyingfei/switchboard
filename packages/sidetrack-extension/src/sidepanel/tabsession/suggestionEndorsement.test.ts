@@ -123,6 +123,21 @@ describe('reasonChipsFor', () => {
     expect(chips.map((c) => c.kind)).toEqual(['graph', 'content', 'topic']);
   });
 
+  it('maps the vote arm source → an HONEST recent/same-domain chip, NOT "topic cluster" (F6)', () => {
+    const chips = reasonChipsFor(
+      candidate({
+        dominantSource: 'vote',
+        reasons: [{ source: 'vote', summary: '2-signal agreement (domain, recency)', anchors: [] }],
+      }),
+      undefined,
+    );
+    expect(chips.map((c) => c.kind)).toEqual(['vote']);
+    // The chip must NOT claim a topic cluster — the vote arm has no cluster
+    // channel. It names the real reason (recent + same-domain filing).
+    expect(chips[0]?.label).toBe('recent + same-domain filing');
+    expect(chips[0]?.label).not.toBe('topic cluster');
+  });
+
   it('returns no chips for an undefined candidate', () => {
     expect(reasonChipsFor(undefined, undefined)).toEqual([]);
   });
@@ -157,6 +172,9 @@ describe('dominantSourceLabel', () => {
     expect(dominantSourceLabel('ppr')).toBe('browsing path');
     expect(dominantSourceLabel('similarity')).toBe('similar pages');
     expect(dominantSourceLabel('cluster')).toBe('topic');
+    // The vote arm (M6) — an HONEST label, never mislabeled as a topic (F6).
+    expect(dominantSourceLabel('vote')).toBe('recent + same-domain filing');
+    expect(dominantSourceLabel('vote')).not.toBe('topic');
     expect(dominantSourceLabel('none')).toBe('no clear signal');
   });
 });

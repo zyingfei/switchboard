@@ -97,9 +97,11 @@ export interface AttributionAnchor {
 export interface TabSessionResolverCandidate {
   readonly workstreamId: string;
   readonly rawFusionLogit: number;
-  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'none';
+  // 'vote' (M6): the servable vote arm's decision (title/domain/recency
+  // plurality), distinct from 'cluster' so provenance copy is honest.
+  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'vote' | 'none';
   readonly reasons: readonly {
-    readonly source: 'ppr' | 'similarity' | 'cluster';
+    readonly source: 'ppr' | 'similarity' | 'cluster' | 'vote';
     readonly summary: string;
     readonly anchors: readonly (string | AttributionAnchor)[];
   }[];

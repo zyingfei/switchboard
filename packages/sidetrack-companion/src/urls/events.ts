@@ -33,7 +33,10 @@ export interface UrlAttributionInferredPayload {
   readonly canonicalUrl: string;
   readonly workstreamId: string;
   readonly policyMode: 'conservative' | 'balanced' | 'aggressive';
-  readonly dominantSource: 'ppr' | 'similarity' | 'cluster';
+  // 'vote' (M6): a >= 3-vote auto-apply from the servable vote arm. Persisted so
+  // the attribution provenance is honest ("recent + same-domain filing"), not
+  // mislabeled as a topic cluster. The lenient validator accepts it.
+  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'vote';
   readonly rawFusionLogit: number;
   readonly margin: number;
   readonly corroborationCount: number;
@@ -56,7 +59,7 @@ const isPolicyMode = (value: unknown): value is UrlAttributionInferredPayload['p
 const isDominantSource = (
   value: unknown,
 ): value is UrlAttributionInferredPayload['dominantSource'] =>
-  value === 'ppr' || value === 'similarity' || value === 'cluster';
+  value === 'ppr' || value === 'similarity' || value === 'cluster' || value === 'vote';
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);

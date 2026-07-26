@@ -12,7 +12,12 @@ export interface CandidateEvidence {
 
 export interface FusedCandidate extends CandidateEvidence {
   readonly rawFusionLogit: number;
-  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'none';
+  // 'vote' (M6) is NOT produced by fuseCandidates (the incumbent fusion argmax
+  // over ppr/similarity/cluster) — it is set directly by the servable vote arm
+  // (attribution-v1/serve.ts) so the panel labels a vote decision honestly. It
+  // lives in the union because a ResolverCandidate (which the vote arm builds)
+  // extends this shape.
+  readonly dominantSource: 'ppr' | 'similarity' | 'cluster' | 'vote' | 'none';
 }
 
 // Hand-set log-likelihood ratios. These are priors, not learned

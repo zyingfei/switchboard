@@ -47,9 +47,15 @@ let memoizedState: MemoizedState | null = null;
 // it is observability, never a gate on serving). The stat is the only I/O on
 // the hot path once the memo is warm; a missing/unreadable file falls
 // through to null.
-const loadStateForShadow = async (
+//
+// EXPORTED (M6): the servable vote3 arm (serve.ts) reads the SAME memoized
+// state — the drain-time AttributionV1State artifact — so the arm switch adds
+// no per-resolve disk cost beyond the shared cheap fs.stat this already pays.
+// Both the shadow lane and the served arm share this one memo, so a warm
+// resolve is allocation-free for either.
+export const loadAttributionV1State = async (
   vaultRoot: string,
-  now: () => Date,
+  now: () => Date = () => new Date(),
 ): Promise<AttributionV1State | null> => {
   let mtimeMs: number;
   try {
@@ -91,6 +97,19 @@ export const resetShadowStateMemoForTest = (): void => {
   memoizedState = null;
 };
 
+// A cheap identity for the currently-loaded AttributionV1State — the artifact
+// file's mtime (advances on EVERY drain that rewrites the state). Used to key
+// the resolver cache under the vote arm (F3/F4): the vote decision is a pure
+// function of this state, so a drain that changes the state MUST bust the
+// cache even when the connections snapshotRevision is unchanged (the graph is
+// W1c-floored / M3-sticky). Returns 'none' when no state is loaded — the caller
+// treats that as an unresolvable arm and falls back to the incumbent anyway, so
+// a stable 'none' key never serves a stale vote. Synchronous: reads only the
+// in-process memo populated by the preceding loadAttributionV1State call on the
+// same resolve.
+export const currentAttributionV1StateRevision = (): string =>
+  memoizedState === null ? 'none' : `mt${String(memoizedState.mtimeMs)}`;
+
 // Snapshot shape the title lookup needs — structurally typed so this module
 // does not import the connections types. Matches both readCurrent() and the
 // resolver-subgraph reads (both expose `.nodes`).
@@ -121,7 +140,7 @@ export const emitAttributionV1Shadow = async (
   try {
     if (!attributionV1ShadowEnabled()) return;
     const now = input.now ?? (() => new Date());
-    const state = await loadStateForShadow(input.vaultRoot, now);
+    const state = await loadAttributionV1State(input.vaultRoot, now);
     if (state === null) return;
     // Only now — past the flag + fresh-state gates — pay for the O(nodes)
     // title scan, exactly once.
