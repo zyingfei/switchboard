@@ -1,5 +1,15 @@
+import {
+  type ConfidenceLevel,
+  confidenceLevelFromProbability,
+  probabilityFromLogit,
+} from '../suggestion/confidence';
 import { CompanionRequestError } from '../../companion/client';
-import type { ResolveOutcomeError, TabSessionResolutionResult } from './types';
+import { endorsementFor } from './suggestionEndorsement';
+import type {
+  ResolveOutcomeError,
+  TabSessionResolutionResult,
+  TabSessionResolverCandidate,
+} from './types';
 
 // The four distinguishable outcomes of a resolve consumption. Error is a
 // FIRST-CLASS state, separate from empty and pending — that separation is
@@ -117,4 +127,93 @@ const httpStatusFromError = (error: unknown): number | undefined => {
   const match = /\((\d{3})\)/u.exec(message);
   if (match?.[1] !== undefined) return Number.parseInt(match[1], 10);
   return undefined;
+};
+
+// ---- Ranked "Possibilities" (the user's ask: SEE all the resolver's
+// ranked candidates, not just the single top pick) --------------------------
+//
+// The resolver hands a FULL ranked `fusedCandidates[]` — it survives the
+// client parse verbatim (isTabSessionResolutionResult / the URL-batch guard
+// pass the whole array through). Only the RENDER truncated it: the card
+// showed top-1 and hid the rest behind the manual "Pick another…" browse.
+// This helper turns the ranked list into the rows the card renders, and — the
+// key honesty case — tells the card whether a PRIMARY suggestion is already
+// shown prominently above (endorsed suggest/auto-apply, or a top weak-guess
+// lean), so the list can decide collapsed-under-a-disclosure vs expanded.
+//
+// The genuinely-empty resolve (fusedCandidates.length === 0) is NOT a
+// possibilities case — it stays the existing "No signal yet" card. The case
+// the user means by "shows nothing" is: candidates DO exist but sit below the
+// policy's confidence bar (action='inbox'), so the top reads as a weak guess
+// and the rest were invisible. Those get surfaced as
+// "Below confidence bar — possibilities:".
+
+export interface PossibilityRow {
+  readonly workstreamId: string;
+  readonly dominantSource: TabSessionResolverCandidate['dominantSource'];
+  readonly level: ConfidenceLevel;
+  // The candidate's position in the resolver's ranked list (0 = top). Kept
+  // so the row can carry a stable key and the caller can tell the primary
+  // (rank 0) from the rest.
+  readonly rank: number;
+}
+
+export interface Possibilities {
+  // Every ranked candidate as a row, top-first. Empty when the resolver
+  // returned zero candidates.
+  readonly rows: readonly PossibilityRow[];
+  // True when a CONFIDENT primary suggestion is shown prominently above the
+  // list — an endorsed pick (policy suggest/auto-apply). When true the list is
+  // the "Other possibilities (N)" tail (rows after the primary) and collapses
+  // under a disclosure. When false (weak guess or nothing endorsed), NO
+  // confident primary is shown and the rows ARE the whole story — surface them
+  // expanded ("Below confidence bar — possibilities:").
+  readonly hasPrimary: boolean;
+  // The rows to list UNDER the primary. When hasPrimary, this drops rank 0
+  // (already shown as the headline); otherwise it is every row.
+  readonly others: readonly PossibilityRow[];
+}
+
+// Cap so the list stays scannable on the compact Now card. The resolver can
+// hand a long tail; 4 rows is the visible budget (the rest remain reachable
+// via "Pick another…").
+export const MAX_POSSIBILITY_ROWS = 4;
+
+// Build the possibility rows from a resolution. Non-top candidates are scored
+// individually from their own logit WITHOUT the decision.margin tie gate —
+// that gate is a property of the top-1/top-2 separation, not of a mid-list
+// row (mirrors SuggestionStats' existing `alternatives` handling). The top
+// row keeps the margin gate so a near-tie reads honestly as "no clear pick".
+export const possibilitiesFrom = (
+  suggestion: TabSessionResolutionResult | undefined,
+  options?: { readonly limit?: number },
+): Possibilities => {
+  const empty: Possibilities = { rows: [], hasPrimary: false, others: [] };
+  if (suggestion === undefined || suggestion.fusedCandidates.length === 0) return empty;
+  const limit = options?.limit ?? MAX_POSSIBILITY_ROWS;
+  const margin = suggestion.decision.margin;
+  const rows: PossibilityRow[] = suggestion.fusedCandidates
+    .slice(0, limit)
+    .map((candidate, index) => ({
+      workstreamId: candidate.workstreamId,
+      dominantSource: candidate.dominantSource,
+      // Only the leader carries the tie gate (margin to the runner-up).
+      level: confidenceLevelFromProbability(probabilityFromLogit(candidate.rawFusionLogit), {
+        ...(index === 0 ? { margin } : {}),
+      }),
+      rank: index,
+    }));
+  // "Primary" means a CONFIDENT pick the card shows prominently — an endorsed
+  // (policy suggest/auto-apply) suggestion. A weak guess (action='inbox') is
+  // NOT a confident primary: the whole top of the list is below the policy's
+  // bar, so the ranked possibilities ARE the answer and should surface
+  // EXPANDED (rank 0 included) rather than collapse behind a disclosure —
+  // that is exactly the case the user means by "shows nothing when there were
+  // ranked possibilities". endorsementFor() is the single source of truth.
+  const endorsement = endorsementFor(suggestion);
+  const hasPrimary = endorsement.level === 'endorsed';
+  // With a confident primary, the list is the tail after the headline (drop
+  // rank 0). Without one, every ranked row is a possibility to show.
+  const others = hasPrimary ? rows.slice(1) : rows;
+  return { rows, hasPrimary, others };
 };

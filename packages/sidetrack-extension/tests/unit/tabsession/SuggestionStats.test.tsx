@@ -93,8 +93,10 @@ describe('SuggestionStats', () => {
       />,
     );
     expect(screen.getByText(/Other candidates/)).toBeInTheDocument();
-    expect(screen.getByText(/sideproject/)).toBeInTheDocument();
-    expect(screen.getByText(/cloud/)).toBeInTheDocument();
+    // The possibilities list may also render these workstream names —
+    // this test asserts the legacy alternatives row shows them at all.
+    expect(screen.getAllByText(/sideproject/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/cloud/).length).toBeGreaterThanOrEqual(1);
   });
 
   it('returns null when no suggestion is provided (default)', () => {

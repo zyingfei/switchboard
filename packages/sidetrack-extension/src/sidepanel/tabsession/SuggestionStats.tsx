@@ -1,9 +1,10 @@
 import {
+  coarseConfidenceWord,
   confidenceLevelFromProbability,
   confidenceLevelLabel,
   probabilityFromLogit,
 } from '../suggestion/confidence';
-import { suggestionStateFrom } from './resolveOutcome';
+import { type Possibilities, possibilitiesFrom, suggestionStateFrom } from './resolveOutcome';
 import { dominantSourceLabel, endorsementFor } from './suggestionEndorsement';
 import type {
   ResolveOutcomeError,
@@ -34,6 +35,81 @@ const workstreamLabel = (
   workstreamId === undefined
     ? '?'
     : (workstreams.find((w) => w.bac_id === workstreamId)?.path ?? '(removed)');
+
+// Compact rendering of the resolver's ranked "Possibilities" — one row per
+// candidate: workstream name · plain-word source (dominantSourceLabel) ·
+// coarse confidence word (coarseConfidenceWord) · one-click "File here"
+// (the EXISTING pick/move flow, passed as onFileHere). No new backend: every
+// row files through the same handler the "Yes, that's right" / "Pick
+// another…" actions use.
+//
+// Two shapes, driven by possibilities.hasPrimary:
+//   - hasPrimary → a "▸ Other possibilities (N)" <details> disclosure that
+//     sits under the prominent endorsed suggestion (already shown above).
+//     Collapsed by default so the card stays scannable.
+//   - !hasPrimary → the key honesty case the user means: NO confident primary
+//     is shown (every candidate is below the policy's confidence bar), so the
+//     ranked possibilities ARE the whole story. Surface them openly under
+//     "Below confidence bar — possibilities:" instead of the misleading
+//     "No signal yet".
+function PossibilitiesList({
+  possibilities,
+  workstreams,
+  onFileHere,
+}: {
+  readonly possibilities: Possibilities;
+  readonly workstreams: readonly TabSessionWorkstreamOption[];
+  readonly onFileHere?: (workstreamId: string) => void;
+}) {
+  const { others, hasPrimary } = possibilities;
+  if (others.length === 0) return null;
+  const rows = others.map((row) => {
+    const label = workstreamLabel(row.workstreamId, workstreams);
+    const sourceWords = dominantSourceLabel(row.dominantSource);
+    const confidenceWord = coarseConfidenceWord(row.level);
+    return (
+      <li key={`${row.workstreamId}-${String(row.rank)}`} className="suggestion-possibility">
+        <span className="suggestion-possibility-name">{label}</span>
+        <span className="suggestion-possibility-source mono subtle">· {sourceWords}</span>
+        {confidenceWord !== null ? (
+          <span className="suggestion-possibility-confidence mono subtle">· {confidenceWord}</span>
+        ) : null}
+        {onFileHere !== undefined ? (
+          <button
+            type="button"
+            className="btn-link suggestion-possibility-file"
+            onClick={() => {
+              onFileHere(row.workstreamId);
+            }}
+            title={`File this page to ${label}`}
+          >
+            File here
+          </button>
+        ) : null}
+      </li>
+    );
+  });
+  if (hasPrimary) {
+    // Collapsed tail under the prominent primary suggestion.
+    return (
+      <details className="suggestion-possibilities is-collapsible">
+        <summary className="suggestion-possibilities-summary">
+          Other possibilities ({String(others.length)})
+        </summary>
+        <ul className="suggestion-possibilities-list">{rows}</ul>
+      </details>
+    );
+  }
+  // Expanded — no primary; the possibilities are the whole answer.
+  return (
+    <div className="suggestion-possibilities is-below-bar">
+      <span className="suggestion-possibilities-header mono subtle">
+        Below confidence bar — possibilities:
+      </span>
+      <ul className="suggestion-possibilities-list">{rows}</ul>
+    </div>
+  );
+}
 
 export interface SuggestionStatsProps {
   readonly suggestion?: TabSessionResolutionResult;
@@ -79,6 +155,15 @@ export interface SuggestionStatsProps {
   // caller retries on its existing poll cadence; no user action is needed.
   // A populated `suggestion` still wins (see suggestionStateFrom).
   readonly error?: ResolveOutcomeError;
+  // The user's ask ("I want to see ALL possibilities when a page is
+  // indexed"): render the resolver's FULL ranked candidate list — not just
+  // the single top pick — as a compact "Possibilities" list, each row
+  // one-click filable via this callback (the EXISTING pick/move flow;
+  // handleUrlAttribute on the Current Tab card). When omitted the list still
+  // renders read-only (no "File here" button), so the surface degrades
+  // cleanly for callers that don't wire filing. `undefined` on the whole
+  // prop = the legacy single-suggestion card (list suppressed).
+  readonly onFileHere?: (workstreamId: string) => void;
 }
 
 export function SuggestionStats({
@@ -91,6 +176,7 @@ export function SuggestionStats({
   onGrantAccess,
   visitCount,
   error,
+  onFileHere,
 }: SuggestionStatsProps) {
   // error !== empty !== pending !== populated — the discriminant that
   // keeps a failed resolve from masquerading as a confident empty card.
@@ -251,6 +337,12 @@ export function SuggestionStats({
   // (the live -0.62-margin bug where an inbox decision rendered as a
   // suggestion). Confidence numbers stay visible for power users.
   const isWeakGuess = endorsementFor(suggestion).level === 'weak-guess';
+  // The user's ask — the FULL ranked possibilities, one-click filable. With a
+  // confident (endorsed) primary this is the collapsed "Other possibilities
+  // (N)" tail; for a weak guess (top below the bar) it expands to "Below
+  // confidence bar — possibilities:" so the ranked list the resolver had is
+  // visible instead of buried behind the single de-emphasised guess.
+  const possibilities = possibilitiesFrom(suggestion);
   // Calibration honesty (R2): there is no calibrated attribution-surface
   // reliability fit (the only /v1/system/reliability surface is `dejavu`,
   // and its raw ECE is ~0.61 — badly miscalibrated). So the fusion-logit
@@ -343,6 +435,15 @@ export function SuggestionStats({
       ) : (
         detail
       )}
+      {/* The user's ask: the FULL ranked possibilities, each one-click
+          filable. Collapsed under the endorsed primary; expanded when the
+          top is only a weak guess (below the confidence bar). Renders
+          nothing when there is a single candidate. */}
+      <PossibilitiesList
+        possibilities={possibilities}
+        workstreams={workstreams}
+        {...(onFileHere === undefined ? {} : { onFileHere })}
+      />
     </div>
   );
 }
