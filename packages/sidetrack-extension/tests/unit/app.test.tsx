@@ -7,6 +7,7 @@ import App, {
 } from '../../entrypoints/sidepanel/App';
 import { messageTypes, type WorkboardRequest } from '../../src/messages';
 import type { NoCaptureRule } from '../../src/capture/noCaptureRules';
+import { PENDING_DEADLINE_MS } from '../../src/sidepanel/tabsession/resolveOutcome';
 import {
   createEmptyWorkboardState,
   defaultSettings,
@@ -1101,6 +1102,269 @@ describe('live side-panel App wiring', () => {
         }),
       }),
     );
+  });
+
+  // Pending-deadline guard (live-verified defect): a resolve that neither
+  // fails fast nor settles (served late as a 304 after a 200s+ drain) leaves
+  // the current-tab card in "Checking connections…" FOREVER — the
+  // transport-error mapping only fires on a real HTTP error/network failure.
+  // After PENDING_DEADLINE_MS (20s) the still-pending card must flip to the
+  // EXISTING amber "Companion is busy — retrying" state, and a late success
+  // must still supersede it (populated > busy). We drive the clock with fake
+  // timers + advanceTimersByTimeAsync so React effects + microtasks flush
+  // deterministically.
+  it('flips the current-tab card to "busy — retrying" when a resolve hangs past the deadline, then a late success wins', async () => {
+    const currentUrl = 'https://news.ycombinator.com/item?id=48300001';
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: currentUrl,
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} };
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [currentUrl]: {
+          canonicalUrl: currentUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 3,
+          tabSessionIds: ['tses_hang'],
+          latestUrl: currentUrl,
+          latestTitle: 'A page mid-drain',
+          attributionHistory: [],
+        },
+      },
+    };
+    const lateSuggestion = {
+      canonicalUrl: currentUrl,
+      dryRun: true,
+      decision: { action: 'suggest', workstreamId: 'bac_workstream_sibling', margin: 1.4 },
+      fusedCandidates: [
+        {
+          workstreamId: 'bac_workstream_sibling',
+          rawFusionLogit: 2.4,
+          dominantSource: 'similarity',
+          reasons: [],
+        },
+      ],
+    };
+    // Every batch-resolve HANGS (its promise is held open) while
+    // `holdResolves` is true — the exact 304-after-200s shape: the resolve
+    // neither fails fast nor settles, so the transport path never trips and
+    // the card is stuck pending. We release them late, AFTER the deadline has
+    // flipped the card to busy, to prove a late success supersedes the busy
+    // card (populated > busy).
+    let releaseResolves: (() => void) | undefined;
+    const resolveGate = new Promise<void>((resolve) => {
+      releaseResolves = resolve;
+    });
+    let holdResolves = true;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/page-evidence/summary')) {
+        // Page evidence present so the card is in the resolve-pending state
+        // (not the indexing-pending state); the resolve retry loop only fires
+        // once pageEvidence exists.
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              canonicalUrl: currentUrl,
+              pageEvidence: {
+                tier: 'content_features_only',
+                evidenceRevision: 'evidence-hang',
+                semanticFeatureRevision: 'semantic-hang',
+                updatedAt: NOW,
+                termCount: 40,
+                keyphraseCount: 20,
+                entityCount: 5,
+                quality: 'medium',
+              },
+              stale: false,
+            },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        // Held until the test releases it (the late 304); this keeps the card
+        // pending through the deadline flip.
+        if (holdResolves) await resolveGate;
+        const rawBody = typeof init?.body === 'string' ? init.body : '{}';
+        const body = JSON.parse(rawBody) as { readonly canonicalUrls?: readonly string[] };
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              results: Object.fromEntries(
+                (body.canonicalUrls ?? []).map((canonicalUrl) => [canonicalUrl, lateSuggestion]),
+              ),
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      render(<App />);
+      await goToTab('Now');
+      const card = await screen.findByLabelText('Current tab attribution');
+      // Pending state while the resolve is in flight (hanging): "Checking
+      // connections…", NOT the "No signal"/"no connections yet" empty lie.
+      await waitFor(() => {
+        expect(card).toHaveTextContent('Checking connections…');
+      });
+      expect(card).not.toHaveTextContent('Companion is busy — retrying');
+
+      // Advance past the 20s deadline: the still-pending card flips to the
+      // existing amber busy-retry state.
+      await vi.advanceTimersByTimeAsync(PENDING_DEADLINE_MS + 500);
+      await waitFor(() => {
+        expect(card).toHaveTextContent('Companion is busy — retrying');
+      });
+      expect(card).not.toHaveTextContent('Checking connections…');
+
+      // Late success: release the held resolves (the 304 finally arrives). It
+      // lands the real suggestion, clears the busy error, and supersedes the
+      // busy card (populated > busy).
+      holdResolves = false;
+      releaseResolves?.();
+      await vi.advanceTimersByTimeAsync(6_000);
+      await waitFor(() => {
+        expect(card).toHaveTextContent('Sibling');
+      });
+      expect(card).not.toHaveTextContent('Companion is busy — retrying');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Same stuck-pending class for page-text indexing: the summary fetch
+  // retries every 3s while the companion returns pageEvidence: null, and the
+  // badge reads "Indexing…" the whole time. Past the deadline it must flip to
+  // the retryable amber busy affordance.
+  it('flips the "Indexing…" badge to a retryable busy state when indexing hangs past the deadline', async () => {
+    const currentUrl = 'https://news.ycombinator.com/item?id=48300002';
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: currentUrl,
+        settings: {
+          ...defaultSettings,
+          companion: { port: 17_373, bridgeKey: 'bridge-test-key' },
+          pageEvidenceAutoExtractEnabled: true,
+        },
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const projection = { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} };
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [currentUrl]: {
+          canonicalUrl: currentUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_idx'],
+          latestUrl: currentUrl,
+          latestTitle: 'A page that never indexes',
+          attributionHistory: [],
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/page-evidence/summary')) {
+        // Always "not indexed yet" — the wedged-indexing shape.
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { canonicalUrl: currentUrl, pageEvidence: null, stale: false } }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        return { ok: true, status: 200, json: async () => ({ data: { results: {} } }) };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      render(<App />);
+      await goToTab('Now');
+      const card = await screen.findByLabelText('Current tab attribution');
+      // "Indexing…" while within the deadline.
+      await waitFor(() => {
+        expect(within(card).getByTestId('page-evidence-capture-badge')).toHaveTextContent(
+          'Indexing…',
+        );
+      });
+
+      // Past the deadline the badge flips to the retryable busy affordance
+      // (a real <button> — click retries).
+      await vi.advanceTimersByTimeAsync(PENDING_DEADLINE_MS + 500);
+      await waitFor(() => {
+        expect(within(card).getByTestId('page-evidence-capture-badge')).toHaveTextContent(
+          'Indexing is busy — retry',
+        );
+      });
+      const badge = within(card).getByTestId('page-evidence-capture-badge');
+      expect(badge.tagName).toBe('BUTTON');
+      expect(badge).not.toHaveTextContent('Indexing…');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('matches the focused tab cue by tabSessionId before falling back to URL', async () => {
