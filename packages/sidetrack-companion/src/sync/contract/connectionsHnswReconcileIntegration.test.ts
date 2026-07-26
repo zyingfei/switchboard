@@ -842,4 +842,72 @@ describe('HNSW reconcile child integration', () => {
       await rm(pairwiseRoot, { recursive: true, force: true });
     }
   });
+
+  // D4 (M4) — boot persisted-revision reuse. After a drain persists a
+  // similarity revision, a SUBSEQUENT drain over the SAME similarity corpus
+  // (a graph-dirtying event that does not change the eligible-visit set) must
+  // REUSE the persisted revision verbatim instead of re-deriving it — the
+  // named fix for the 143s boot rebuild + its ~464-component jitter. We prove
+  // it via the phase mark (`buildVisitSimilarityHnsw.bootReuse`) AND by reading
+  // back the served similarity rows: they must be byte-identical (no jitter).
+  it('reuses the persisted similarity revision on a re-drain over an unchanged corpus (D4)', async () => {
+    process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
+    // D4 targets the FULL-corpus assembly (event-store backed) — the path that
+    // re-derives the whole ~9k-visit corpus at boot and produces the 143s
+    // rebuild jitter. Enable the event store so both drains assemble the same
+    // full corpus (with it off, the second drain is window-poor — a genuinely
+    // different corpus that D4 correctly refuses to reuse).
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let index = 0; index < 8; index += 1) {
+      await appendVisit(eventLog, {
+        index,
+        observedAt: `2026-05-22T10:0${String(index)}:00.000Z`,
+        focusedWindowMs: 10_000, // already past the >=5000ms similarity gate
+      });
+    }
+    // First drain — builds + persists the similarity revision.
+    const firstOutput: string[] = [];
+    const firstSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      firstOutput.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 1 })).toMatchObject({ seq: 1, ok: true });
+    } finally {
+      firstSpy.mockRestore();
+    }
+    // The first drain genuinely BUILDS (no persisted revision to reuse yet).
+    expect(firstOutput.join('')).toContain('buildVisitSimilarityHnsw.start');
+    expect(firstOutput.join('')).not.toContain('buildVisitSimilarityHnsw.bootReuse');
+    const servedBefore = similarityRows(
+      (await createConnectionsStore(vaultRoot).readCurrent())!,
+    );
+    expect(servedBefore.length).toBeGreaterThan(0);
+
+    // A graph-dirtying event over an ALREADY-eligible visit: it forces a
+    // similarity drain but leaves the eligible-visit corpus (and therefore its
+    // signature + revision id) unchanged — the boot-reuse precondition.
+    await appendEngagementAggregate(eventLog, { index: 0, focusedWindowMs: 60_000 });
+
+    const secondOutput: string[] = [];
+    const secondSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      secondOutput.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      return true;
+    });
+    try {
+      expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
+    } finally {
+      secondSpy.mockRestore();
+    }
+    const secondPhase = secondOutput.join('');
+    // The second drain REUSES the persisted revision (no re-embed / ANN rebuild).
+    expect(secondPhase).toContain('buildVisitSimilarityHnsw.bootReuse');
+    expect(secondPhase).not.toContain('buildVisitSimilarityHnsw.start');
+    // Read back the SERVED similarity rows — byte-identical (no jitter): the
+    // reuse produced the same revision, so Pass-7 rendered the same edges.
+    const servedAfter = similarityRows((await createConnectionsStore(vaultRoot).readCurrent())!);
+    expect(servedAfter).toEqual(servedBefore);
+  });
 });

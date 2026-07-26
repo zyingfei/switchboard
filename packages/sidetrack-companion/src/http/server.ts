@@ -1948,27 +1948,89 @@ export interface ReliabilityHealthSection {
   readonly availability: SectionAvailability;
   // Size of the connections DB write-ahead log, bytes. A large/growing WAL
   // is a checkpoint-starvation fingerprint. null when the WAL file is
-  // absent (fresh vault / in-memory / already checkpointed).
+  // absent (fresh vault / in-memory / already checkpointed). Under M4
+  // double-buffer this stats the live PUBLISHED generation's -wal, which the
+  // publish-time wal_checkpoint(TRUNCATE) drives to ~0 (a near-zero steady
+  // value is the health signal, vs the pre-M4 91MB swing).
   readonly walBytes: number | null;
+  // M4 double-buffer (D5/D6). Absent (undefined) when double-buffer is off
+  // (legacy single-file mode) so the surface can distinguish "not enabled"
+  // from "enabled, zero swaps yet".
+  readonly connectionsDoubleBuffer?: {
+    readonly enabled: boolean;
+    readonly generation: string | null;
+    readonly swapCount: number;
+    readonly lastSwapAtMs: number | null;
+    readonly residentGenerations: readonly string[];
+    // The last publish-time checkpoint outcome: pages folded + whether the
+    // checkpoint was un-blocked (busy==0). Together with walBytes≈0 this is
+    // the "checkpoint is keeping up" signal.
+    readonly lastCheckpointTruncatedPages: number | null;
+    readonly lastCheckpointOk: boolean | null;
+    readonly lastGcUnlinked: number;
+  };
 }
 
-const connectionsWalBytes = async (vaultRoot: string): Promise<number | null> => {
+// M4 — the connections WAL now lives beside the PUBLISHED generation
+// (`current.<gen>.db-wal`), not a fixed `current.db-wal`. Read the pointer to
+// find the live gen; fall back to the legacy path for single-file mode.
+const connectionsWalBytes = async (
+  vaultRoot: string,
+  doubleBuffer?: ConnectionsDoubleBufferHealth,
+): Promise<number | null> => {
+  const dir = join(vaultRoot, '_BAC', 'connections');
   try {
-    const walPath = join(vaultRoot, '_BAC', 'connections', 'current.db-wal');
+    const walPath =
+      doubleBuffer?.enabled === true && doubleBuffer.generation !== null
+        ? join(dir, `current.${doubleBuffer.generation}.db-wal`)
+        : join(dir, 'current.db-wal');
     const info = await stat(walPath);
     return info.size;
   } catch {
-    // ENOENT (no WAL) or any stat error → null (not an error state).
+    // ENOENT (no WAL — the common post-checkpoint case) or any stat error →
+    // null (not an error state).
     return null;
   }
 };
 
+// M4 — the double-buffer diagnostics the store surfaces (structurally mirrors
+// SqliteConnectionsStore.doubleBufferDiagnostics; kept local so this module
+// doesn't import the store type into its health builder signature).
+export interface ConnectionsDoubleBufferHealth {
+  readonly enabled: boolean;
+  readonly generation: string | null;
+  readonly swapCount: number;
+  readonly lastSwapAtMs: number | null;
+  readonly residentGenerations: readonly string[];
+  readonly lastCheckpointTruncatedPages: number | null;
+  readonly lastCheckpointOk: boolean | null;
+  readonly lastGcUnlinked: number;
+}
+
 export const buildReliabilityHealthSection = async (
   vaultRoot: string,
+  // M4 — the parent store's live double-buffer diagnostics (generation, swap
+  // counts, last checkpoint outcome). Omitted → double-buffer section absent.
+  doubleBuffer?: ConnectionsDoubleBufferHealth,
 ): Promise<ReliabilityHealthSection> => {
   const canary = getResolveCanary(vaultRoot);
   const thresholdMs = resolveCanaryThresholdMs();
-  const walBytes = await connectionsWalBytes(vaultRoot);
+  const walBytes = await connectionsWalBytes(vaultRoot, doubleBuffer);
+  const doubleBufferSection =
+    doubleBuffer !== undefined && doubleBuffer.enabled
+      ? {
+          connectionsDoubleBuffer: {
+            enabled: doubleBuffer.enabled,
+            generation: doubleBuffer.generation,
+            swapCount: doubleBuffer.swapCount,
+            lastSwapAtMs: doubleBuffer.lastSwapAtMs,
+            residentGenerations: doubleBuffer.residentGenerations,
+            lastCheckpointTruncatedPages: doubleBuffer.lastCheckpointTruncatedPages,
+            lastCheckpointOk: doubleBuffer.lastCheckpointOk,
+            lastGcUnlinked: doubleBuffer.lastGcUnlinked,
+          },
+        }
+      : {};
   if (canary === undefined) {
     // No canary registered on this path → idle, section available.
     const idleSnapshot = {
@@ -1984,6 +2046,7 @@ export const buildReliabilityHealthSection = async (
       resolveCanary: { ...idleSnapshot, status: 'idle' },
       availability: 'ok',
       walBytes,
+      ...doubleBufferSection,
     };
   }
   const snapshot = canary.snapshot();
@@ -1996,6 +2059,7 @@ export const buildReliabilityHealthSection = async (
     resolveCanary: { ...snapshot, status },
     availability,
     walBytes,
+    ...doubleBufferSection,
   };
 };
 
@@ -5489,7 +5553,11 @@ const routes: readonly RouteDefinition[] = [
               ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
             }),
           );
-      const reliability = await buildReliabilityHealthSection(vaultRoot);
+      const doubleBufferHealth =
+        context.connectionsStore instanceof SqliteConnectionsStore
+          ? context.connectionsStore.doubleBufferDiagnostics()
+          : undefined;
+      const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
       return [
         200,
         {

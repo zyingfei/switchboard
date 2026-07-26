@@ -412,6 +412,46 @@ describe('resolve canary acceptance — real core + health read-back', () => {
     expect(section.resolveCanary.sampleCount).toBe(0);
     expect(section.availability).toBe('ok');
   });
+
+  // D5/D6 — the reliability section surfaces the M4 double-buffer diagnostics
+  // (generation, swap count, last checkpoint outcome). Absent when double-buffer
+  // is off; present with the store's live counters when on.
+  it('surfaces M4 double-buffer generation + checkpoint diagnostics when enabled', async () => {
+    const withoutDb = await buildReliabilityHealthSection(vaultRoot);
+    expect(withoutDb.connectionsDoubleBuffer).toBeUndefined();
+
+    const enabled = await buildReliabilityHealthSection(vaultRoot, {
+      enabled: true,
+      generation: 'gen-123-abc',
+      swapCount: 4,
+      lastSwapAtMs: 1_700_000_000_000,
+      residentGenerations: ['gen-123-abc', 'gen-122-def'],
+      lastCheckpointTruncatedPages: 0,
+      lastCheckpointOk: true,
+      lastGcUnlinked: 1,
+    });
+    expect(enabled.connectionsDoubleBuffer?.enabled).toBe(true);
+    expect(enabled.connectionsDoubleBuffer?.generation).toBe('gen-123-abc');
+    expect(enabled.connectionsDoubleBuffer?.swapCount).toBe(4);
+    expect(enabled.connectionsDoubleBuffer?.lastCheckpointOk).toBe(true);
+    expect(enabled.connectionsDoubleBuffer?.residentGenerations).toEqual([
+      'gen-123-abc',
+      'gen-122-def',
+    ]);
+
+    // Disabled double-buffer (legacy) reports no section.
+    const legacy = await buildReliabilityHealthSection(vaultRoot, {
+      enabled: false,
+      generation: null,
+      swapCount: 0,
+      lastSwapAtMs: null,
+      residentGenerations: [],
+      lastCheckpointTruncatedPages: null,
+      lastCheckpointOk: null,
+      lastGcUnlinked: 0,
+    });
+    expect(legacy.connectionsDoubleBuffer).toBeUndefined();
+  });
 });
 
 // Minimal valid HealthReport to fold the reliability section onto. Only the
