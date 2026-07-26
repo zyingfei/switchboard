@@ -251,6 +251,10 @@ describe('the coarse-multi-topic list as a PRIOR (not a gate)', () => {
     expect(isCoarseMultiTopicPriorDomain('ycombinator.com')).toBe(true);
     expect(isCoarseMultiTopicPriorDomain('old.reddit.com')).toBe(true);
     expect(isCoarseMultiTopicPriorDomain('gemini.google.com')).toBe(true);
+    // github.com / gitlab.com — restored hub prior (fix/vote-arm-precision) so
+    // the vote arm's domain vote is withheld on a lightly-filed github hub.
+    expect(isCoarseMultiTopicPriorDomain('github.com')).toBe(true);
+    expect(isCoarseMultiTopicPriorDomain('gitlab.com')).toBe(true);
     expect(isCoarseMultiTopicPriorDomain('lwn.net')).toBe(false);
     expect(registrableDomainOf('news.ycombinator.com')).toBe('ycombinator.com');
   });

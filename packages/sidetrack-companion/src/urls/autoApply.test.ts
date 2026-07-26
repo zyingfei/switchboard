@@ -11,7 +11,7 @@ import { URL_PROJECTION_SCHEMA_VERSION, type SerializedUrlProjection } from './p
 import { URL_ATTRIBUTION_INFERRED } from './events.js';
 import { writeAttributionV1Artifact } from '../attribution-v1/artifact.js';
 import { resetShadowStateMemoForTest } from '../attribution-v1/emit.js';
-import { ATTRIBUTION_ARM_ENV } from '../attribution-v1/serve.js';
+import { ATTRIBUTION_ARM_ENV, VOTE_ARM_AUTO_APPLY_ENV } from '../attribution-v1/serve.js';
 import { ATTRIBUTION_V1_SHADOW_ENV } from '../attribution-v1/shadow.js';
 import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
@@ -169,11 +169,14 @@ describe('autoApplyUrlAttribution — vote arm (SIDETRACK_ATTRIBUTION_ARM=vote3)
   let vaultRoot: string;
   const prevArm = process.env[ATTRIBUTION_ARM_ENV];
   const prevShadow = process.env[ATTRIBUTION_V1_SHADOW_ENV];
+  const prevAutoApply = process.env[VOTE_ARM_AUTO_APPLY_ENV];
 
   beforeEach(async () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'autoapply-vote-'));
     resetShadowStateMemoForTest();
     process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    // Auto-apply OFF by default (rule 2b) — the tests that need it flip it on.
+    delete process.env[VOTE_ARM_AUTO_APPLY_ENV];
     // Turn the reverse shadow OFF so the incumbent PPR isn't computed in-test.
     process.env[ATTRIBUTION_V1_SHADOW_ENV] = '0';
     await writeAttributionV1Artifact({
@@ -187,15 +190,20 @@ describe('autoApplyUrlAttribution — vote arm (SIDETRACK_ATTRIBUTION_ARM=vote3)
     else process.env[ATTRIBUTION_ARM_ENV] = prevArm;
     if (prevShadow === undefined) delete process.env[ATTRIBUTION_V1_SHADOW_ENV];
     else process.env[ATTRIBUTION_V1_SHADOW_ENV] = prevShadow;
+    if (prevAutoApply === undefined) delete process.env[VOTE_ARM_AUTO_APPLY_ENV];
+    else process.env[VOTE_ARM_AUTO_APPLY_ENV] = prevAutoApply;
     resetShadowStateMemoForTest();
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  it('auto-applies the vote arm decision through the round-guard stack (unanimous 3-vote)', async () => {
+  it('auto-applies the vote arm decision through the round-guard stack (unanimous 3-vote, flag ON)', async () => {
     // Title (raft) + domain (single-workstream rust-lang ⇒ gate passes) +
-    // recency (wsRust) all vote wsRust ⇒ 3 votes ⇒ vote arm auto-applies, and
-    // the round guards (revisit, not-ignored, no existing attribution) let it
-    // commit an inferred URL-attribution event.
+    // recency (wsRust) all vote wsRust ⇒ 3 votes, title participates. Auto-apply
+    // is now flag-gated (rule 2b: SIDETRACK_VOTE_ARM_AUTO_APPLY default OFF), so
+    // this exercises the commit path with the flag explicitly ON — the round
+    // guards (revisit, not-ignored, no existing attribution) then let it commit an
+    // inferred URL-attribution event.
+    process.env[VOTE_ARM_AUTO_APPLY_ENV] = '1';
     const appended: AcceptedEvent[] = [];
     const eventLog = {
       readMerged: async () => [],

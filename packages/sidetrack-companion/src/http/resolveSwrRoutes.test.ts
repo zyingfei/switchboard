@@ -284,6 +284,9 @@ describe('resolve arm switch — flag changes the served body under a fixed grap
           observedAt: '2026-05-07T10:00:00.000Z',
           url: u,
           canonicalUrl: u,
+          // Title vocabulary so the guarded vote arm's TITLE vote can participate
+          // (rule 2a) when the probe carries an overlapping title.
+          title: 'armadillo taxonomy field notes',
           transition: 'updated',
         },
         baseVector: {},
@@ -324,7 +327,21 @@ describe('resolve arm switch — flag changes the served body under a fixed grap
       eventLog,
       connectionsStore,
     };
-    currentConnectionsSnapshot = snapshotForUrls([canonicalUrl], 'rev-fixed');
+    // The probe snapshot carries a title that overlaps the seeded vocabulary so
+    // the guarded vote arm's title vote participates (rule 2a) — otherwise the
+    // arm abstains on domain+recency alone (the correlated-prior guard).
+    currentConnectionsSnapshot = {
+      ...snapshotForUrls([canonicalUrl], 'rev-fixed'),
+      nodes: [
+        {
+          id: `timeline-visit:${canonicalUrl}`,
+          kind: 'timeline-visit' as const,
+          label: canonicalUrl,
+          originReplicaIds: [],
+          metadata: { canonicalUrl, title: 'armadillo taxonomy field notes' },
+        },
+      ],
+    };
     await writeFile(join(vaultRoot, '_BAC', 'connections', 'current.json'), 'x'.repeat(10));
     const server = createCompanionHttpServer(config);
     const started = await startHttpServer(server, 0);

@@ -106,16 +106,20 @@ describe('resolveUrlAttributionArmed', () => {
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
-  it('serves the vote arm (default) and returns a vote3 decision', async () => {
-    delete process.env[ATTRIBUTION_ARM_ENV]; // default = vote arm
+  it('serves the vote arm (opt-in) and returns a guarded vote3 decision', async () => {
+    // The vote arm is now OPT-IN (default reverted to v1, fix/vote-arm-precision);
+    // set the arm explicitly. A probe title that overlaps wsRust's vocabulary
+    // makes the TITLE vote participate (rule 2a), joined by domain + recency.
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
     const probeUrl = 'https://blog.rust-lang.org/c';
     const result = await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
-    // Domain (wsRust, single-workstream) + recency (wsRust) ⇒ 2 votes ⇒ suggest.
+    // Title (wsRust) + domain (wsRust) + recency (wsRust) ⇒ 3 votes, title
+    // participates ⇒ suggest (auto-apply is flag-gated OFF by default).
     expect(result.decision.action).toBe('suggest');
     expect(result.decision.workstreamId).toBe('wsRust');
     expect(result.reasons.modelRevision).toBe('attribution-vote3-v1');
@@ -128,7 +132,7 @@ describe('resolveUrlAttributionArmed', () => {
     await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
     const snap = armShadowSnapshot();
@@ -146,7 +150,7 @@ describe('resolveUrlAttributionArmed', () => {
     await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
     expect(armShadowSnapshot().requests).toBe(0);
@@ -158,7 +162,7 @@ describe('resolveUrlAttributionArmed', () => {
     const result = await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
     // The incumbent graph-resolver on an edgeless snapshot abstains (inbox), and
@@ -178,7 +182,7 @@ describe('resolveUrlAttributionArmed', () => {
       const result = await resolveUrlAttributionArmed({
         vaultRoot: bareVault,
         canonicalUrl: probeUrl,
-        snapshot: snapshot(probeUrl, 'unrelated headline words'),
+        snapshot: snapshot(probeUrl, 'rust release notes'),
         events: [],
       });
       // No artifact ⇒ incumbent result (not the vote arm's model revision).
@@ -193,17 +197,17 @@ describe('resolveUrlAttributionArmed', () => {
     const probeUrl = 'https://blog.rust-lang.org/c';
     const result = await resolveUrlAttributionArmed({
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
     expect(result.reasons.modelRevision).not.toBe('attribution-vote3-v1');
   });
 
   it('honors the domain-tombstone gate: a purged URL is not attributed (F1)', async () => {
-    // The vote arm SUGGESTS blog.rust-lang.org/c ungated (domain + recency). A
-    // rust-lang.org tombstone threaded through the arm switch must flip it to
-    // inbox — the new serve boundary honors the same HIDE gate the incumbent
-    // gets for free.
+    // The vote arm SUGGESTS blog.rust-lang.org/c ungated (title + domain +
+    // recency all wsRust). A rust-lang.org tombstone threaded through the arm
+    // switch must flip it to inbox — the new serve boundary honors the same HIDE
+    // gate the incumbent gets for free.
     process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
     const probeUrl = 'https://blog.rust-lang.org/c';
     const rustTombstone = {
@@ -214,7 +218,7 @@ describe('resolveUrlAttributionArmed', () => {
     const result = await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
-      snapshot: snapshot(probeUrl, 'unrelated headline words'),
+      snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
       tombstones: rustTombstone,
     });

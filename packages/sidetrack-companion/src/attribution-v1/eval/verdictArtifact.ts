@@ -127,6 +127,7 @@ const ARM_LABELS: Record<string, string> = {
   recency: 'recency alone',
   vote4: '4-signal vote (baseline)',
   vote3: '3-signal vote (servable)',
+  'vote3-guarded': '3-signal vote (guarded)',
   majority: 'majority-class',
 };
 
