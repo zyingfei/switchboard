@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_POSSIBILITY_ROWS, possibilitiesFrom, suggestionStateFrom } from './resolveOutcome';
+import {
+  MAX_POSSIBILITY_ROWS,
+  PENDING_DEADLINE_MS,
+  THREAD_SUGGESTION_RETRY_WINDOW_MS,
+  pendingDeadlineExceeded,
+  possibilitiesFrom,
+  suggestionStateFrom,
+  threadRetryDelayMs,
+  threadRetryExhausted,
+} from './resolveOutcome';
 import type { TabSessionResolutionResult, TabSessionResolverCandidate } from './types';
 
 const candidate = (
@@ -116,5 +125,72 @@ describe('possibilitiesFrom — the full ranked list survives to the render laye
   it('is empty for a zero-candidate or undefined resolution', () => {
     expect(possibilitiesFrom(undefined).rows).toHaveLength(0);
     expect(possibilitiesFrom(resolution({ action: 'inbox', margin: 0 }, [])).rows).toHaveLength(0);
+  });
+});
+
+describe('thread-suggestion self-heal cadence (All-Threads "Needs organize")', () => {
+  it('threadRetryDelayMs ramps 1s → capped 5s, matching the URL surface', () => {
+    // Early attempts probe at 1s.
+    expect(threadRetryDelayMs(0)).toBe(1_000);
+    expect(threadRetryDelayMs(7)).toBe(1_000);
+    // From attempt 8 it ramps by 1s/attempt…
+    expect(threadRetryDelayMs(8)).toBe(2_000);
+    expect(threadRetryDelayMs(9)).toBe(3_000);
+    // …and caps at 5s so a busy companion isn't hammered.
+    expect(threadRetryDelayMs(11)).toBe(5_000);
+    expect(threadRetryDelayMs(50)).toBe(5_000);
+  });
+
+  it('threadRetryExhausted flips exactly at the retry window', () => {
+    const startedAtMs = 1_000;
+    // Inside the window → keep retrying.
+    expect(
+      threadRetryExhausted({ startedAtMs, nowMs: startedAtMs + THREAD_SUGGESTION_RETRY_WINDOW_MS }),
+    ).toBe(false);
+    // One tick past the window → stop rescheduling (busy card stays honest).
+    expect(
+      threadRetryExhausted({
+        startedAtMs,
+        nowMs: startedAtMs + THREAD_SUGGESTION_RETRY_WINDOW_MS + 1,
+      }),
+    ).toBe(true);
+  });
+
+  it('a hanging thread fetch flips to busy at the shared pending deadline', () => {
+    const pendingSinceMs = 5_000;
+    // Just before the deadline the still-pending fetch stays pending (no flip).
+    expect(
+      pendingDeadlineExceeded({
+        pendingSinceMs,
+        hasResult: false,
+        hasError: false,
+        nowMs: pendingSinceMs + PENDING_DEADLINE_MS - 1,
+      }),
+    ).toBe(false);
+    // At the deadline it flips — the row synthesizes the 'busy' state so the
+    // retry loop owns recovery (same 20s deadline the URL surface uses).
+    expect(
+      pendingDeadlineExceeded({
+        pendingSinceMs,
+        hasResult: false,
+        hasError: false,
+        nowMs: pendingSinceMs + PENDING_DEADLINE_MS,
+      }),
+    ).toBe(true);
+    // A late-arriving result (or a real error) is never overridden by the flip.
+    expect(
+      pendingDeadlineExceeded({
+        pendingSinceMs,
+        hasResult: true,
+        hasError: false,
+        nowMs: pendingSinceMs + PENDING_DEADLINE_MS + 5_000,
+      }),
+    ).toBe(false);
+  });
+
+  it('the retry window outlasts the pending deadline (loop still driving at the flip)', () => {
+    // The busy flip fires at PENDING_DEADLINE_MS; the retry window must still be
+    // open then so a probe actually re-fetches after the flip.
+    expect(THREAD_SUGGESTION_RETRY_WINDOW_MS).toBeGreaterThan(PENDING_DEADLINE_MS);
   });
 });
