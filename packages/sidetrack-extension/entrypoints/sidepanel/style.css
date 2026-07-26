@@ -893,6 +893,95 @@ button:disabled {
   font-size: 10px;
 }
 
+/* Guess-lanes — the resolver's SIX per-lane guesses behind a click-to-expand
+   disclosure. Same muted, secondary-to-the-headline treatment as the
+   Possibilities list; shared across the Now/Inbox SuggestionStats and the
+   NeedsOrganizeSuggestion thread card. All six lanes always list when present
+   (empty ones muted) so the breakdown is an honest full accounting. */
+.guess-lanes {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--hair-soft);
+}
+.guess-lanes-summary {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--ink-3);
+  user-select: none;
+  list-style: none;
+}
+.guess-lanes-summary::-webkit-details-marker {
+  display: none;
+}
+/* Rotating disclosure triangle — ▸ collapsed, ▾ open — matching the
+   Possibilities and current-tab card toggles. */
+.guess-lanes-summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 4px;
+  transition: transform 0.12s ease;
+}
+.guess-lanes[open] .guess-lanes-summary::before {
+  transform: rotate(90deg);
+}
+.guess-lanes-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.guess-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11px;
+}
+.guess-lane-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px;
+}
+/* Fixed-width lane label so the names line up down the column, the way the
+   six lanes read as a scannable table rather than a ragged list. */
+.guess-lane-label {
+  flex: 0 0 auto;
+  min-width: 84px;
+  color: var(--ink-2);
+  font-size: 10px;
+}
+.guess-lane-name {
+  color: var(--ink-1);
+  font-weight: 500;
+}
+.guess-lane-score {
+  font-size: 10px;
+}
+.guess-lane-file {
+  margin-left: auto;
+  font-size: 10px;
+}
+.guess-lane-why {
+  font-size: 10px;
+  padding-left: 88px;
+}
+.guess-lane.is-empty .guess-lane-empty {
+  font-size: 10px;
+}
+.guess-lane-more {
+  list-style: none;
+  margin: 1px 0 0;
+  padding-left: 88px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.guess-lane-more-row {
+  font-size: 10px;
+}
+
 /* Action bar under the Current Tab badge. Flex-wrap so the row
    collapses cleanly across the 3-vs-4 cases:
      - 4 buttons (suggestion present + URL unattributed): wrap 2+2.

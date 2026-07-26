@@ -177,10 +177,16 @@ import {
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
 import {
+  guessLanesEnabled,
+  voteSignalsFor,
+  type GuessLaneVoteSignals,
+} from '../tabsession/guessLanes.js';
+import {
   currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
   incumbentTopFromResolution,
   loadAttributionV1State,
+  titleForCanonicalUrl,
 } from '../attribution-v1/emit.js';
 import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import { attributionArm } from '../attribution-v1/serve.js';
@@ -2707,6 +2713,25 @@ const resolverSignalEventsForCanonicalUrls = (
 
 const resolverCanonicalUrlKey = (raw: string): string => raw.replace(/#.*$/u, '').replace(/\/+$/u, '');
 
+// Guess-lane vote signals (title/domain/recency) for a canonical URL, for the
+// resolve routes that call the resolver DIRECTLY (thread suggestions,
+// tab-session resolve) rather than through the armed URL resolver. Reuses the
+// SAME memoized AttributionV1State the shadow/vote arm load — a warm memo is a
+// single fs.stat — plus the O(nodes) title lookup. Returns undefined when guess
+// lanes are off or there is no fresh state artifact (the vote lanes then report
+// typed emptiness), so this is a cheap no-op on the flag-off / no-artifact path.
+const guessLaneVoteSignalsForUrl = async (
+  vaultRoot: string,
+  snapshot: Parameters<typeof titleForCanonicalUrl>[0] | null,
+  canonicalUrl: string | undefined,
+): Promise<GuessLaneVoteSignals | undefined> => {
+  if (!guessLanesEnabled() || snapshot === null || canonicalUrl === undefined) return undefined;
+  const state = await loadAttributionV1State(vaultRoot);
+  if (state === null) return undefined;
+  const title = titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+  return voteSignalsFor(state, canonicalUrl, title);
+};
+
 const candidateSourceWeight = (sources: readonly string[]): number => {
   if (sources.includes('same_canonical_url')) return 0.9;
   if (sources.includes('opener_chain')) return 0.85;
@@ -4462,9 +4487,27 @@ const routes: readonly RouteDefinition[] = [
             : await context.eventLog!.readMerged();
           // Stage 5.2 R2 — snapshot-first via loadTabSessionProjection.
           const { projection } = await loadTabSessionProjection(context, context.eventLog!);
-          if (!projection.bySessionId.has(tabSessionId)) {
+          const sessionRecord = projection.bySessionId.get(tabSessionId);
+          if (sessionRecord === undefined) {
             throw new HttpRouteError(404, 'TAB_SESSION_NOT_FOUND', 'Tab session was not found.');
           }
+          // Guess-lane vote signals for the session's latest URL/title (its most
+          // representative page). Fills the title/domain/recency lanes; the
+          // graph lanes come from the resolver's own evidence. Absent latest URL
+          // ⇒ those three lanes report typed emptiness.
+          const tabVoteSignals =
+            guessLanesEnabled() && sessionRecord.latestUrl !== undefined
+              ? await (async (): Promise<GuessLaneVoteSignals | undefined> => {
+                  const state = await loadAttributionV1State(requireVaultRoot(context));
+                  return state === null
+                    ? undefined
+                    : voteSignalsFor(
+                        state,
+                        sessionRecord.latestUrl!,
+                        sessionRecord.latestTitle ?? null,
+                      );
+                })()
+              : undefined;
           return [
             200,
             {
@@ -4474,6 +4517,7 @@ const routes: readonly RouteDefinition[] = [
                 projection,
                 events: resolverEvents,
                 ...(usesSqliteSubgraph ? { useEventCandidateSimilarity: false } : {}),
+                ...(tabVoteSignals === undefined ? {} : { guessLaneVoteSignals: tabVoteSignals }),
               }),
               ...(snapshot.snapshotRevision === undefined
                 ? {}
@@ -7829,6 +7873,15 @@ const routes: readonly RouteDefinition[] = [
             (event) => event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
             RESOLVER_SIGNAL_EVENT_TYPES,
           );
+          // Guess-lane vote signals (title/domain/recency) for the thread's own
+          // URL, keyed off the memoized v1 state the shadow already loads. The
+          // graph/similarity/topic lanes come from the resolver's own evidence;
+          // these three fill the vote lanes so a graph-empty thread still shows
+          // the title/domain/recency opinions instead of "No signal yet".
+          const threadVoteSignals =
+            target.threadUrl === undefined
+              ? undefined
+              : await guessLaneVoteSignalsForUrl(vaultRoot, snapshot, target.threadUrl);
           const resolution = resolveThreadAttribution({
             threadId: target.threadId,
             ...(target.providerThreadId === undefined
@@ -7837,6 +7890,7 @@ const routes: readonly RouteDefinition[] = [
             ...(target.threadUrl === undefined ? {} : { threadUrl: target.threadUrl }),
             snapshot,
             events: merged,
+            ...(threadVoteSignals === undefined ? {} : { guessLaneVoteSignals: threadVoteSignals }),
           });
           // Compatibility route: callers still receive a ranked
           // Suggestion[] array, but the score now comes from the same
@@ -7883,7 +7937,17 @@ const routes: readonly RouteDefinition[] = [
             target,
             suggestions.length > 0,
           );
-          return [200, { data: suggestions, selfNomination }];
+          // Guess lanes ride as a TOP-LEVEL field (alongside data +
+          // selfNomination), not inside the Suggestion[] data array —
+          // resolution.lanes is present iff SIDETRACK_GUESS_LANES is on.
+          return [
+            200,
+            {
+              data: suggestions,
+              selfNomination,
+              ...(resolution.lanes === undefined ? {} : { lanes: resolution.lanes }),
+            },
+          ];
         },
       );
     },

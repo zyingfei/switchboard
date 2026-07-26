@@ -46,6 +46,12 @@ import {
   type ResolveUrlAttributionInput,
   type UrlResolutionResult,
 } from '../tabsession/resolver.js';
+import {
+  buildGuessLanes,
+  guessLanesEnabled,
+  voteSignalsFor,
+  type GuessLaneVoteSignals,
+} from '../tabsession/guessLanes.js';
 
 export interface ArmedResolveInput extends ResolveUrlAttributionInput {
   // The vault root — needed to load the drain-time AttributionV1State the vote
@@ -74,14 +80,35 @@ export const resolveUrlAttributionArmed = async (
 ): Promise<UrlResolutionResult> => {
   const { vaultRoot, now, tombstones, skipReverseShadow, ...resolverInput } = input;
 
+  // Guess lanes (SIDETRACK_GUESS_LANES, default ON) need the cheap vote signals
+  // (title/domain/recency) which read the memoized AttributionV1State. Load it
+  // once here — the SAME memoized load the vote arm + shadow already pay — so
+  // BOTH the incumbent and vote paths surface the vote lanes without a second
+  // state read. When lanes are off (or there's no vault root) we skip the load
+  // entirely on the pure-incumbent fast path.
+  const wantLanes = guessLanesEnabled();
+
   if (attributionArm() === 'v1' || vaultRoot === undefined) {
-    return resolveUrlAttribution(resolverInput);
+    // Incumbent serves. When lanes are on and we have a vault root, load the
+    // state and hand the vote signals to the resolver so it builds all six
+    // lanes (graph/similarity/topic from its own evidence + title/domain/recency
+    // from these signals). No vault root ⇒ no state ⇒ the three vote lanes
+    // report typed emptiness (the resolver still emits the graph lanes).
+    const voteSignals =
+      wantLanes && vaultRoot !== undefined
+        ? await voteSignalsForResolve(vaultRoot, now, resolverInput.snapshot, resolverInput.canonicalUrl)
+        : undefined;
+    return resolveUrlAttribution({
+      ...resolverInput,
+      ...(voteSignals === undefined ? {} : { guessLaneVoteSignals: voteSignals }),
+    });
   }
 
   const state = await loadAttributionV1State(vaultRoot, now ?? (() => new Date()));
   if (state === null) {
     // No fresh artifact — fail safe to the incumbent (same defensive posture as
-    // the shadow lane's null-state skip).
+    // the shadow lane's null-state skip). Lanes still emit (graph lanes from the
+    // incumbent; the vote lanes report "no attribution state loaded").
     return resolveUrlAttribution(resolverInput);
   }
 
@@ -107,5 +134,34 @@ export const resolveUrlAttributionArmed = async (
     }
   }
 
-  return voteResult;
+  // Attach the six guess lanes to the served vote result. The vote arm has no
+  // graph/similarity/topic channel (those lanes report typed emptiness on this
+  // path), but it DOES have the title/domain/recency vote signals — the same
+  // state + title just used to decide the vote — so those three lanes are
+  // populated from evidence already in hand. Gated on the flag; omitted when off.
+  if (!wantLanes) return voteResult;
+  const lanes = buildGuessLanes({
+    candidateEvidence: [],
+    voteSignals: voteSignalsFor(state, resolverInput.canonicalUrl, title),
+    ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }),
+  });
+  return { ...voteResult, lanes };
+};
+
+// Load the memoized AttributionV1State and assemble the vote-lane signals for a
+// resolve (title looked up from the snapshot exactly as the vote arm + shadow
+// do). Returns undefined when there is no fresh state — the caller then omits
+// the vote signals and the three vote lanes report typed emptiness. Cheap: a
+// warm memo is a single fs.stat plus the O(nodes) title scan the shadow already
+// pays.
+const voteSignalsForResolve = async (
+  vaultRoot: string,
+  now: (() => Date) | undefined,
+  snapshot: ResolveUrlAttributionInput['snapshot'],
+  canonicalUrl: string,
+): Promise<GuessLaneVoteSignals | undefined> => {
+  const state = await loadAttributionV1State(vaultRoot, now ?? (() => new Date()));
+  if (state === null) return undefined;
+  const title = titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+  return voteSignalsFor(state, canonicalUrl, title);
 };

@@ -1,8 +1,12 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { NeedsOrganizeSuggestion } from '../../entrypoints/sidepanel/components/NeedsOrganizeSuggestion';
-import type { ResolveOutcomeError } from '../../src/sidepanel/tabsession/types';
+import type {
+  GuessLaneResult,
+  ResolveOutcomeError,
+  TabSessionWorkstreamOption,
+} from '../../src/sidepanel/tabsession/types';
 
 // The presentational half of the thread card's self-heal contract. The busy
 // flip + retry loop live in NeedsOrganizeSuggestionRow (App.tsx); this proves
@@ -76,5 +80,62 @@ describe('NeedsOrganizeSuggestion — thread busy/self-heal render', () => {
     render(<NeedsOrganizeSuggestion {...base({ confidence: 0, error: undefined })} />);
     expect(screen.queryByText('Companion is busy — retrying')).not.toBeInTheDocument();
     expect(screen.getByText('No auto-suggestion — pick a workstream:')).toBeInTheDocument();
+  });
+});
+
+describe('NeedsOrganizeSuggestion — guess-lanes on the thread surface', () => {
+  const laneWorkstreams: readonly TabSessionWorkstreamOption[] = [
+    { bac_id: 'ws-1', path: 'Research / Probability' },
+    { bac_id: 'ws-2', path: 'Infra / Deploy' },
+  ];
+  const lanes: readonly GuessLaneResult[] = [
+    {
+      lane: 'graph',
+      candidates: [{ workstreamId: 'ws-1', score: 0.4, why: 'linked from a Research thread' }],
+    },
+    { lane: 'similarity', candidates: [], emptyReason: 'no similar pages' },
+    { lane: 'topic', candidates: [] },
+    { lane: 'title', candidates: [] },
+    { lane: 'domain', candidates: [] },
+    {
+      lane: 'recency',
+      candidates: [{ workstreamId: 'ws-2', score: 0.2, why: 'recently filed to Deploy' }],
+    },
+  ];
+
+  it('shows the lanes disclosure in the NO-suggestion state', () => {
+    render(
+      <NeedsOrganizeSuggestion {...base({ confidence: 0, lanes, laneWorkstreams })} />,
+    );
+    // Ordinary empty picker headline …
+    expect(screen.getByText('No auto-suggestion — pick a workstream:')).toBeInTheDocument();
+    // … PLUS the shared lanes disclosure (2 of 6 with signal).
+    expect(screen.getByText('Guess lanes · 2 of 6 with signal')).toBeInTheDocument();
+    expect(screen.getByText('linked from a Research thread')).toBeInTheDocument();
+    expect(screen.getByText('recently filed to Deploy')).toBeInTheDocument();
+  });
+
+  it('does NOT show the lanes disclosure once there is a confident recommendation', () => {
+    render(
+      <NeedsOrganizeSuggestion
+        {...base({ confidence: 0.85, margin: 0.5, lanes, laneWorkstreams })}
+      />,
+    );
+    // With a confident pick the lanes are redundant noise → suppressed.
+    expect(screen.queryByText(/Guess lanes/u)).not.toBeInTheDocument();
+  });
+
+  it('files a lane candidate through onFileLane (the EXISTING accept path)', () => {
+    const onFileLane = vi.fn();
+    render(
+      <NeedsOrganizeSuggestion
+        {...base({ confidence: 0, lanes, laneWorkstreams, onFileLane })}
+      />,
+    );
+    const laneRow = screen.getByText('Infra / Deploy').closest('li');
+    expect(laneRow).not.toBeNull();
+    fireEvent.click(within(laneRow as HTMLElement).getByRole('button', { name: 'File here' }));
+    expect(onFileLane).toHaveBeenCalledTimes(1);
+    expect(onFileLane).toHaveBeenCalledWith('ws-2');
   });
 });

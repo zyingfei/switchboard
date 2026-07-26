@@ -106,6 +106,57 @@ describe('resolveUrlAttributionArmed', () => {
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
+  it('attaches all six guess lanes on the vote-arm path (vote lanes populated, graph lanes empty)', async () => {
+    // The vote arm has no graph/similarity/topic channel, so those lanes report
+    // typed emptiness — but the SAME state + title it voted on populate the
+    // title/domain/recency lanes.
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    const probeUrl = 'https://blog.rust-lang.org/c';
+    const result = await resolveUrlAttributionArmed({
+      vaultRoot,
+      canonicalUrl: probeUrl,
+      snapshot: snapshot(probeUrl, 'rust release notes'),
+      events: [],
+    });
+    expect(result.lanes).toBeDefined();
+    expect(result.lanes!.map((lane) => lane.lane)).toEqual([
+      'graph',
+      'similarity',
+      'topic',
+      'title',
+      'domain',
+      'recency',
+    ]);
+    // Graph channels empty (the vote arm never touched them) with reasons.
+    for (const laneName of ['graph', 'similarity', 'topic'] as const) {
+      const lane = result.lanes!.find((l) => l.lane === laneName);
+      expect(lane?.candidates).toHaveLength(0);
+      expect(lane?.emptyReason).toBeDefined();
+    }
+    // Title/recency vote lanes populated toward wsRust.
+    const recency = result.lanes!.find((l) => l.lane === 'recency');
+    expect(recency?.candidates[0]?.workstreamId).toBe('wsRust');
+  });
+
+  it('omits lanes when SIDETRACK_GUESS_LANES is off', async () => {
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    const prevLanes = process.env['SIDETRACK_GUESS_LANES'];
+    process.env['SIDETRACK_GUESS_LANES'] = '0';
+    try {
+      const probeUrl = 'https://blog.rust-lang.org/c';
+      const result = await resolveUrlAttributionArmed({
+        vaultRoot,
+        canonicalUrl: probeUrl,
+        snapshot: snapshot(probeUrl, 'rust release notes'),
+        events: [],
+      });
+      expect(result.lanes).toBeUndefined();
+    } finally {
+      if (prevLanes === undefined) delete process.env['SIDETRACK_GUESS_LANES'];
+      else process.env['SIDETRACK_GUESS_LANES'] = prevLanes;
+    }
+  });
+
   it('serves the vote arm (opt-in) and returns a guarded vote3 decision', async () => {
     // The vote arm is now OPT-IN (default reverted to v1, fix/vote-arm-precision);
     // set the arm explicitly. A probe title that overlaps wsRust's vocabulary

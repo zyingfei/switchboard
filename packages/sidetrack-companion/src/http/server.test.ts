@@ -2568,6 +2568,20 @@ describe('companion HTTP server', () => {
     });
 
     expect(suggestions.status).toBe(200);
+    // Guess lanes ride as a TOP-LEVEL field on the thread suggestions response
+    // (alongside data + selfNomination), not inside the Suggestion[] data array.
+    // Present ⇒ all six lanes, fixed order (SIDETRACK_GUESS_LANES default ON).
+    const suggestionsBody = suggestions.body as {
+      readonly lanes?: readonly { readonly lane: string }[];
+    };
+    expect(suggestionsBody.lanes?.map((lane) => lane.lane)).toEqual([
+      'graph',
+      'similarity',
+      'topic',
+      'title',
+      'domain',
+      'recency',
+    ]);
     expect(health.body).toMatchObject({
       data: {
         recall: {

@@ -22,7 +22,12 @@ import {
   confidenceLevelLabel,
   isActionableLevel,
 } from '../../../src/sidepanel/suggestion/confidence';
-import type { ResolveOutcomeError } from '../../../src/sidepanel/tabsession/types';
+import { GuessLanes } from '../../../src/sidepanel/tabsession/GuessLanes';
+import type {
+  GuessLaneResult,
+  ResolveOutcomeError,
+  TabSessionWorkstreamOption,
+} from '../../../src/sidepanel/tabsession/types';
 
 interface NeedsOrganizeSuggestionProps {
   readonly suggestedLabel: string;
@@ -47,6 +52,16 @@ interface NeedsOrganizeSuggestionProps {
   readonly error?: ResolveOutcomeError;
   readonly onAccept: () => void;
   readonly onPickManual: () => void;
+  // Guess-lanes (feat/guess-lanes) — the resolver's six per-lane guesses for
+  // this thread, surfaced behind the shared GuessLanes disclosure in the
+  // NO-SUGGESTION state so an abstaining fusion still shows what each lane
+  // thought (parallel to the URL/tab SuggestionStats). Absent on older
+  // companions; when omitted the card is unchanged. `laneWorkstreams` is the
+  // id→name mapping GuessLanes needs; `onFileLane` files a lane candidate
+  // through the EXISTING accept path (same handler as the primary Accept).
+  readonly lanes?: readonly GuessLaneResult[];
+  readonly laneWorkstreams?: readonly TabSessionWorkstreamOption[];
+  readonly onFileLane?: (workstreamId: string) => void;
   // Optional explicit re-fetch handle. Lets the user force the
   // companion to recompute the suggestion (e.g. after renaming a
   // workstream the panel hasn't picked up yet, or to verify that a
@@ -65,6 +80,9 @@ export function NeedsOrganizeSuggestion({
   onPickManual,
   onRefresh,
   onDismiss,
+  lanes,
+  laneWorkstreams,
+  onFileLane,
 }: NeedsOrganizeSuggestionProps) {
   // Busy/error outranks the empty "pick a workstream" fallback but NOT a
   // populated suggestion: only surface the amber busy card when the fetch
@@ -172,6 +190,19 @@ export function NeedsOrganizeSuggestion({
           ×
         </button>
       </div>
+      {/* Guess-lanes — surface the resolver's per-lane guesses behind the
+          shared disclosure ONLY when the fusion has no confident pick (the
+          honesty case the feature is for). With a recommendation the lanes are
+          redundant noise; without one, they show that "no auto-suggestion"
+          doesn't mean every signal was silent. Absent on old companions →
+          GuessLanes never mounts. */}
+      {!hasRecommendation && lanes !== undefined && laneWorkstreams !== undefined ? (
+        <GuessLanes
+          lanes={lanes}
+          workstreams={laneWorkstreams}
+          {...(onFileLane === undefined ? {} : { onFileHere: onFileLane })}
+        />
+      ) : null}
     </div>
   );
 }

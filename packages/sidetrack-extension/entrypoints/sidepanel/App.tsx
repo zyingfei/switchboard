@@ -157,6 +157,8 @@ import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBa
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
+  parseGuessLanes,
+  type GuessLaneResult,
   type ResolveOutcomeError,
   type TabSessionInboxData,
   type TabSessionPageEvidenceSummary,
@@ -292,6 +294,9 @@ export const tabSessionResolutionFromUrl = (
   dryRun: true,
   decision: result.decision,
   fusedCandidates: result.fusedCandidates,
+  // Guess-lanes pass through verbatim (already lenient-parsed by the guard)
+  // so the tab-session-shaped SuggestionStats can render the lane breakdown.
+  ...(result.lanes === undefined ? {} : { lanes: result.lanes }),
 });
 
 const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
@@ -386,19 +391,47 @@ const isTabSessionInboxData = (value: unknown): value is TabSessionInboxData =>
 const isResolverAction = (value: unknown): value is 'auto-apply' | 'suggest' | 'inbox' =>
   value === 'auto-apply' || value === 'suggest' || value === 'inbox';
 
+// Normalize the additive guess-lanes field on a resolution that has already
+// passed the structural guard. `parseGuessLanes` is lenient: absent → absent,
+// malformed → absent, a bad lane/candidate dropped while good ones survive. We
+// rewrite the field in place so EVERY consumer of the narrowed result (the
+// four storage sites, the URL→tabSession adapter, GuessLanes) sees only
+// well-formed-or-absent lanes — the "malformed lanes → treat as absent, never
+// reject the whole result" contract, applied once at the parse choke point
+// instead of at each render site. Deleting an absent key is a no-op.
+const normalizeResolutionLanes = (value: Record<string, unknown>): void => {
+  const lanes = parseGuessLanes(value['lanes']);
+  if (lanes === undefined) {
+    delete value['lanes'];
+  } else {
+    value['lanes'] = lanes;
+  }
+};
+
 // Exported for the client-parse acceptance test. The guard accepts the WHOLE
 // `fusedCandidates` array (Array.isArray) — it does not cap or slice, so every
-// ranked candidate the resolver returned survives the parse to the panel.
-export const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult =>
-  isPlainRecord(value) &&
-  typeof value['tabSessionId'] === 'string' &&
-  value['dryRun'] === true &&
-  isPlainRecord(value['decision']) &&
-  isResolverAction(value['decision']['action']) &&
-  (value['decision']['workstreamId'] === undefined ||
-    typeof value['decision']['workstreamId'] === 'string') &&
-  typeof value['decision']['margin'] === 'number' &&
-  Array.isArray(value['fusedCandidates']);
+// ranked candidate the resolver returned survives the parse to the panel. On a
+// match it also normalizes the additive `lanes` field (see above) so malformed
+// guess-lanes degrade to absent without failing the whole resolution.
+export const isTabSessionResolutionResult = (value: unknown): value is TabSessionResolutionResult => {
+  if (
+    !(
+      isPlainRecord(value) &&
+      typeof value['tabSessionId'] === 'string' &&
+      value['dryRun'] === true &&
+      isPlainRecord(value['decision']) &&
+      isResolverAction(value['decision']['action']) &&
+      (value['decision']['workstreamId'] === undefined ||
+        typeof value['decision']['workstreamId'] === 'string') &&
+      typeof value['decision']['margin'] === 'number' &&
+      Array.isArray(value['fusedCandidates'])
+    )
+  ) {
+    return false;
+  }
+  normalizeResolutionLanes(value);
+  return true;
+};
 
 const isUrlProjection = (value: unknown): value is UrlProjection =>
   isPlainRecord(value) && value['schemaVersion'] === 1 && isPlainRecord(value['byCanonicalUrl']);
@@ -410,16 +443,27 @@ const isUrlInboxData = (value: unknown): value is UrlInboxData =>
   typeof value['limit'] === 'number' &&
   typeof value['offset'] === 'number';
 
-const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult =>
-  isPlainRecord(value) &&
-  typeof value['canonicalUrl'] === 'string' &&
-  value['dryRun'] === true &&
-  isPlainRecord(value['decision']) &&
-  isResolverAction(value['decision']['action']) &&
-  (value['decision']['workstreamId'] === undefined ||
-    typeof value['decision']['workstreamId'] === 'string') &&
-  typeof value['decision']['margin'] === 'number' &&
-  Array.isArray(value['fusedCandidates']);
+const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult => {
+  if (
+    !(
+      isPlainRecord(value) &&
+      typeof value['canonicalUrl'] === 'string' &&
+      value['dryRun'] === true &&
+      isPlainRecord(value['decision']) &&
+      isResolverAction(value['decision']['action']) &&
+      (value['decision']['workstreamId'] === undefined ||
+        typeof value['decision']['workstreamId'] === 'string') &&
+      typeof value['decision']['margin'] === 'number' &&
+      Array.isArray(value['fusedCandidates'])
+    )
+  ) {
+    return false;
+  }
+  // Normalize the additive guess-lanes field (see normalizeResolutionLanes) so
+  // malformed lanes degrade to absent rather than failing the resolution.
+  normalizeResolutionLanes(value);
+  return true;
+};
 
 const urlResolutionResultsFromBatch = (
   value: unknown,
@@ -10616,6 +10660,11 @@ export function NeedsOrganizeSuggestionRow({
   // Confirm round-trip state for the self-nomination affordance.
   const [selfNomPending, setSelfNomPending] = useState(false);
   const [selfNomFiledTitle, setSelfNomFiledTitle] = useState<string | null>(null);
+  // Guess-lanes for this thread, read from the SAME fetch (no extra request).
+  // Undefined until the companion answers (or on an old companion / malformed
+  // field). Surfaced under the NeedsOrganizeSuggestion card so an abstaining
+  // resolver still shows what each lane guessed.
+  const [lanes, setLanes] = useState<readonly GuessLaneResult[] | undefined>(undefined);
 
   // Latest-ref pattern. onCache / resolveLabel are recreated by the
   // parent every render; the effect calls onCache() on success →
@@ -10691,11 +10740,20 @@ export function NeedsOrganizeSuggestionRow({
             readonly distinctDays?: number;
             readonly suggestedTitle?: string;
           };
+          // Guess-lanes (feat/guess-lanes) — top-level on the thread response,
+          // additive/absent on older companions. Parsed leniently below; a
+          // malformed field degrades to "no lanes" (legacy behavior).
+          readonly lanes?: unknown;
         };
         if (isCancelled()) return;
         // A successful fetch clears any busy/error state — late data wins, and
         // the retry loop (which only runs while `error` is set) shuts off.
         setError(null);
+        // Guess-lanes survive the same lenient parse as the URL/tab surfaces:
+        // absent or malformed → undefined (legacy no-lanes path). Stored
+        // independently of whether a suggestion ranked, so the thread card can
+        // show them under an abstaining resolver.
+        setLanes(parseGuessLanes(body.lanes));
         // Self-nomination is independent of whether a suggestion ranked:
         // it fires precisely when the resolver abstained, so parse it
         // before the early return below.
@@ -10882,6 +10940,19 @@ export function NeedsOrganizeSuggestionRow({
   // available below.
   const showSelfNomination =
     selfNomination !== null && !selfNominationDismissed && !indexRebuilding;
+  // Build the workstream name mapping GuessLanes needs from the lane
+  // candidates themselves — the thread row only has `resolveLabel(id)`, not the
+  // full options array the URL/tab surfaces pass. Resolve every workstream id
+  // that appears across the lanes to its display path so the lane rows show
+  // names, not raw bac_ids. Suppress lanes entirely while the index rebuilds
+  // (scores/guesses are noisy) — they return when the rebuild settles.
+  const laneWorkstreamOptions: readonly TabSessionWorkstreamOption[] =
+    lanes === undefined
+      ? []
+      : Array.from(
+          new Set(lanes.flatMap((lane) => lane.candidates.map((c) => c.workstreamId))),
+        ).map((bac_id) => ({ bac_id, path: resolveLabel(bac_id) }));
+  const showLanes = lanes !== undefined && !indexRebuilding;
   return (
     <>
       {showSelfNomination ? (
@@ -10919,6 +10990,9 @@ export function NeedsOrganizeSuggestionRow({
           : {})}
         pending={pending || indexRebuilding}
         {...(error !== null && !indexRebuilding ? { error } : {})}
+        {...(showLanes && lanes !== undefined
+          ? { lanes, laneWorkstreams: laneWorkstreamOptions, onFileLane: onAccept }
+          : {})}
         onAccept={() => {
           if (hasAuto && suggestion.workstreamId.length > 0) {
             onAccept(suggestion.workstreamId);

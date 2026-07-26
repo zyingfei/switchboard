@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { ClosestVisitRanker } from '../connections/snapshot.js';
@@ -791,5 +791,91 @@ describe('tab-session resolver', () => {
 
     expect(result.decision.action).toBe('suggest');
     expect(inferredAttributionPayloadFromResolution(result)).toBeNull();
+  });
+});
+
+describe('resolver guess lanes (SIDETRACK_GUESS_LANES)', () => {
+  const GUESS_LANES_ENV = 'SIDETRACK_GUESS_LANES';
+  const prev = process.env[GUESS_LANES_ENV];
+  afterEach(() => {
+    if (prev === undefined) delete process.env[GUESS_LANES_ENV];
+    else process.env[GUESS_LANES_ENV] = prev;
+  });
+
+  // A URL with a graph path to a workstream (visit_in_workstream), so the graph
+  // lane populates from the resolver's own PPR/similarity evidence.
+  const laneSnapshot = (): ConnectionsSnapshot => {
+    const targetUrl = 'https://example.test/target';
+    const anchorUrl = 'https://example.test/anchor';
+    return snapshot(
+      [`timeline-visit:${targetUrl}`, `timeline-visit:${anchorUrl}`, 'workstream:ws_security'],
+      [
+        { kind: 'closest_visit', from: `timeline-visit:${targetUrl}`, to: `timeline-visit:${anchorUrl}` },
+        { kind: 'visit_in_workstream', from: `timeline-visit:${anchorUrl}`, to: 'workstream:ws_security' },
+      ],
+    );
+  };
+
+  it('omits the lanes field entirely when the flag is off', () => {
+    process.env[GUESS_LANES_ENV] = '0';
+    const result = resolveUrlAttribution({
+      canonicalUrl: 'https://example.test/target',
+      snapshot: laneSnapshot(),
+      events: [observed(1, 'tses_target', 'https://example.test/target', 'Target')],
+      policyMode: 'balanced',
+    });
+    expect(result.lanes).toBeUndefined();
+    expect('lanes' in result).toBe(false);
+  });
+
+  it('emits all six lanes in the fixed order when the flag is on', () => {
+    delete process.env[GUESS_LANES_ENV];
+    const result = resolveUrlAttribution({
+      canonicalUrl: 'https://example.test/target',
+      snapshot: laneSnapshot(),
+      events: [observed(1, 'tses_target', 'https://example.test/target', 'Target')],
+      policyMode: 'balanced',
+    });
+    expect(result.lanes).toBeDefined();
+    expect(result.lanes!.map((lane) => lane.lane)).toEqual([
+      'graph',
+      'similarity',
+      'topic',
+      'title',
+      'domain',
+      'recency',
+    ]);
+    // The graph lane populates from the resolver's own evidence (a path exists),
+    // and its top candidate is the connected workstream.
+    const graph = result.lanes!.find((lane) => lane.lane === 'graph');
+    expect(graph?.candidates.some((c) => c.workstreamId === 'ws_security')).toBe(true);
+    // With no vote signals supplied, the vote lanes report typed emptiness.
+    for (const laneName of ['title', 'domain', 'recency'] as const) {
+      const lane = result.lanes!.find((l) => l.lane === laneName);
+      expect(lane?.candidates).toHaveLength(0);
+      expect(lane?.emptyReason).toBeDefined();
+    }
+  });
+
+  it('carries lanes on the thread and tab-session result shapes too', () => {
+    delete process.env[GUESS_LANES_ENV];
+    const snap = laneSnapshot();
+    const events = [observed(1, 'tses_target', 'https://example.test/target', 'Target')];
+    const threadResult = resolveThreadAttribution({
+      threadId: 'thread_x',
+      threadUrl: 'https://example.test/target',
+      snapshot: snap,
+      events,
+      policyMode: 'balanced',
+    });
+    expect(threadResult.lanes).toHaveLength(6);
+    const tabResult = resolveAttribution({
+      tabSessionId: 'tses_target',
+      snapshot: snap,
+      projection: projectTabSessions(events),
+      events,
+      policyMode: 'balanced',
+    });
+    expect(tabResult.lanes).toHaveLength(6);
   });
 });
