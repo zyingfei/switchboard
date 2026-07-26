@@ -96,6 +96,19 @@ export interface ReconcileChildDiagnostics {
   readonly orphanKillsAtBoot: number;
   /** Timestamp (ms) of the most recent no-progress timeout, if any. */
   readonly lastTimeoutAtMs: number | undefined;
+  /**
+   * Concurrent reconcile requests that rode an in-flight child instead of
+   * forking a rival (single-flight coalescing). This is belt-and-suspenders:
+   * in the current single-materializer-per-process topology it stays 0 (the
+   * materializer's module-scope `running` flag already single-flights catchUp
+   * vs drain, and a rival parent for the same vault is blocked by the port
+   * bind), so it is NOT the source of the measured boot double-CPU — that was
+   * a prior-deploy orphan child (covered by the boot orphan sweep) and/or the
+   * parent running its own heavy boot phases alongside the single child. A
+   * non-zero value would only appear if a future refactor embedded a second
+   * materializer for the same vault in one process.
+   */
+  readonly coalescedForks: number;
 }
 
 const diagnostics = {
@@ -103,6 +116,7 @@ const diagnostics = {
   parentDeathKills: 0,
   orphanKillsAtBoot: 0,
   lastTimeoutAtMs: undefined as number | undefined,
+  coalescedForks: 0,
 };
 
 export const getReconcileChildDiagnostics = (): ReconcileChildDiagnostics => ({
@@ -110,6 +124,7 @@ export const getReconcileChildDiagnostics = (): ReconcileChildDiagnostics => ({
   parentDeathKills: diagnostics.parentDeathKills,
   orphanKillsAtBoot: diagnostics.orphanKillsAtBoot,
   lastTimeoutAtMs: diagnostics.lastTimeoutAtMs,
+  coalescedForks: diagnostics.coalescedForks,
 });
 
 /** Test seam — reset counters between cases. */
@@ -118,6 +133,7 @@ export const resetReconcileChildDiagnostics = (): void => {
   diagnostics.parentDeathKills = 0;
   diagnostics.orphanKillsAtBoot = 0;
   diagnostics.lastTimeoutAtMs = undefined;
+  diagnostics.coalescedForks = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -331,7 +347,7 @@ const isHeartbeat = (raw: unknown): raw is ReconcileHeartbeatMessage =>
  * The promise ALWAYS settles: on message, error, exit, or — if the child
  * wedges silently — a no-progress watchdog timeout that SIGKILLs it.
  */
-export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> =>
+const forkReconcileChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> =>
   new Promise<ReconcileWorkerResult>((resolve) => {
     const entry = childScriptPath ?? defaultEntryPath();
     if (!existsSync(entry)) {
@@ -443,3 +459,52 @@ export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileW
     // the spawn-to-first-heartbeat gap.
     bumpWatchdog();
   });
+
+// ---------------------------------------------------------------------------
+// Single-flight coalescing — belt-and-suspenders, NOT the root of the measured
+// boot double-CPU. Two live reconcile children (both holding the current.db
+// write lock) would saturate every core and starve the parent event loop. But
+// in the current topology that pair cannot arise from ONE materializer: the
+// module-scope `running` flag single-flights catchUp vs drain within an
+// instance, so drainViaWorker is never entered concurrently from it; a rival
+// parent for the same vault is blocked by the :17374 port bind; and an ORPHAN
+// child from a prior kill-9 is SIGKILLed by sweepBootOrphanChildOnce before the
+// first fork. So the measured "two children at ~95% CPU" was a prior-deploy
+// orphan (the sweep covers it) and/or the single child pegging while the parent
+// runs its own heavy boot phases — offenders #1/#2, not a rival fork. This
+// guard is kept only for the future case where a second materializer for the
+// same vault is embedded in one process. It coalesces per-vaultRoot: while a
+// child is live, a concurrent request rides its promise instead of forking a
+// rival. The winner's `seq` round-trips, and the materializer's own
+// `seq <= lastWorkerDrainSeqCompleted` staleness check (drainViaWorker) drops
+// the piggybacking caller's now-stale view exactly as it drops a superseded
+// drain — so coalescing is invisible to correctness, it only removes the
+// duplicate fork. Fan-out-on-failure: forkReconcileChild never rejects (it
+// resolves `{ok:false}` on timeout/exit/error), so a rider inherits the
+// winner's failure verbatim; both riders then set dirty=true in drainViaWorker
+// and retry (a retry forks a FRESH child, since the map entry is cleared in
+// `.finally`), so a transient single-child failure self-heals. Disable with
+// SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT=0 to restore independent forks.
+// ---------------------------------------------------------------------------
+const inFlightReconcileByVault = new Map<string, Promise<ReconcileWorkerResult>>();
+
+const reconcileChildSingleFlightEnabled = (): boolean =>
+  process.env['SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT'] !== '0';
+
+export const runReconcileInChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerResult> => {
+  if (!reconcileChildSingleFlightEnabled()) return forkReconcileChild(job);
+  const existing = inFlightReconcileByVault.get(job.vaultRoot);
+  if (existing !== undefined) {
+    diagnostics.coalescedForks += 1;
+    // Return the in-flight child's result but stamp THIS caller's seq so the
+    // materializer's stale-drain check keys off the seq it dispatched.
+    return existing.then((result) => ({ ...result, seq: job.seq }));
+  }
+  const started = forkReconcileChild(job).finally(() => {
+    if (inFlightReconcileByVault.get(job.vaultRoot) === started) {
+      inFlightReconcileByVault.delete(job.vaultRoot);
+    }
+  });
+  inFlightReconcileByVault.set(job.vaultRoot, started);
+  return started;
+};

@@ -641,6 +641,21 @@ const rankerFullAugmentationOnScopedDeltaEnabled = (): boolean =>
 // without an O(N) leiden pass. Instant rollback via env unset + restart.
 const incrementalTopicMembershipEnabled = (): boolean =>
   process.env['SIDETRACK_CONNECTIONS_TOPIC_INCREMENTAL_MEMBERSHIP'] === '1';
+// Instant boot (default ON; disable with SIDETRACK_INSTANT_BOOT=0 + restart to
+// revert to the legacy full-recompute boot). Measured on a live-vault clone
+// (744k events, a few-hundred-event delta since the persisted frontier): a normal
+// restart re-folded ALL events to seed the URL + tab-session projection
+// accumulators (~20-39s of pure recompute) even though current.db already holds
+// a frontier-matched projection_accumulators blob. When ON, the store-backed
+// catchUp path consults tryLoadProjectionAccumulatorState (the SAME typed-
+// validity check the no-store path already uses: progress version +
+// appliedFrontier + appliedDotIntervals must equal the persisted blob) and
+// resume-folds only the pending delta — the 39s seed becomes a ~2ms fold. A
+// torn shutdown that left the blob stale (frontier mismatch) fails the load and
+// falls through to the full seed, so kill-9 resilience is intact. No serving
+// change: the reused accumulator is byte-identical to a fresh fold at the same
+// frontier (pinned by connectionsMaterializer.instantBoot.test.ts).
+const instantBootEnabled = (): boolean => process.env['SIDETRACK_INSTANT_BOOT'] !== '0';
 const resolvePositiveIntegerEnv = (name: string, fallback: number): number => {
   const raw = process.env[name];
   const parsed = raw === undefined ? Number.NaN : Number(raw);
@@ -3018,6 +3033,24 @@ export const createConnectionsMaterializer = (
       drainFrontier = frontierFromIntervals(drainProgressDotIntervals);
       mark(`catchUp.chunk scopedWindow events=${String(forcedPendingEventWindow.length)}`);
     } else if (storeBackedEvents !== null) {
+      // Instant boot — reuse the frontier-matched projection accumulator blob
+      // persisted in current.db instead of re-folding ALL events (~20-39s at
+      // 744k). Attempt BEFORE the pending window is computed so the resume-fold
+      // below applies only the delta. The no-store branch already does exactly
+      // this; the store-backed boot path never consulted it, so every restart
+      // paid the full fold even for a minutes-behind frontier.
+      // tryLoadProjectionAccumulatorState enforces the typed-validity check
+      // (progress version + appliedFrontier + appliedDotIntervals must equal the
+      // persisted blob's), so a torn shutdown that left the blob stale simply
+      // fails the load and falls through to the full seed — B4 kill-9 intact.
+      loadedProjectionAccumulatorState =
+        instantBootEnabled() &&
+        !projectionAccumulatorsInitialized &&
+        (await tryLoadProjectionAccumulatorState(existingProgress));
+      // Own phase mark so the blob read/deserialize cost is attributed to the
+      // load — not silently folded into the eventStore.catchUp phase below —
+      // keeping boot attribution honest per the B1 phase-log doctrine.
+      mark(`projectionAccumulators.load reused=${String(loadedProjectionAccumulatorState)}`);
       const ingested = await storeBackedEvents.catchUpFromJsonl(
         join(deps.vaultRoot, '_BAC', 'log'),
       );
@@ -6407,6 +6440,10 @@ export const createConnectionsMaterializer = (
     vaultRoot: string;
     seq: number;
   }) => Promise<{ seq: number; ok: boolean; snapshotRevision?: string; error?: string }>) => {
+    // NOTE the asymmetry: runReconcileInChild is single-flight coalesced
+    // (SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT), the worker_thread flavour is
+    // NOT. Acceptable because the worker path is documented stress-test-only
+    // (SIDETRACK_CONNECTIONS_WORKER=1); do not assume both paths are guarded.
     if (process.env['SIDETRACK_CONNECTIONS_WORKER'] === '1') {
       return runReconcileInWorker;
     }
@@ -6724,6 +6761,16 @@ export const createConnectionsMaterializer = (
     }
   };
 
+  // NOTE (instant-boot invariant): this fast path advances materializer
+  // progress WITHOUT rewriting the projection_accumulators blob (content-only
+  // + URL_IGNORED overlays don't touch the URL/tab-session accumulators). That
+  // deliberately leaves the persisted blob's frontier BEHIND progress, so the
+  // next-boot tryLoadProjectionAccumulatorState equality check refuses reuse
+  // and re-seeds — never serving an accumulator that is missing events progress
+  // claims applied. Same contract holds for the bare writeMaterializerProgress
+  // gap-seal path (line ~6666). If a future change makes these paths advance
+  // progress AND keep the blob current, they may (correctly) enable reuse — but
+  // must then rewrite the blob atomically with progress (see snapshot.ts).
   const tryAdvanceNoGraphEvents = async (
     progress: MaterializerProgress,
     ordered: readonly AcceptedEvent[],

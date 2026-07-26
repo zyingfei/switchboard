@@ -5313,6 +5313,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return { src, dst };
     });
 
+    // INSTANT-BOOT INVARIANT: nodes/edges/metadata + the projection_accumulators
+    // blob + the materializer progress rows commit in this ONE transaction. Boot
+    // reuse (tryLoadProjectionAccumulatorState) trusts the blob only when its
+    // frontier EQUALS progress's; that equality is safe precisely because a
+    // kill-9 leaves both at frontier N or rolls both back to N-1 — never a torn
+    // blob-vs-progress pair. If a future refactor splits the blob and progress
+    // into separate transactions, instant boot could start reusing a torn blob;
+    // keep them atomic here (or invalidate the reuse check accordingly).
     db.exec('BEGIN IMMEDIATE');
     try {
       const upsertNode = db.query(
