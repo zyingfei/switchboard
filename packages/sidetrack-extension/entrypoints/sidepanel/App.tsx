@@ -5844,6 +5844,24 @@ const App = () => {
   );
   useEffect(() => {
     const canonicalUrl = focusedDisplayUrlRecord?.canonicalUrl;
+    // The focused-resolve retry loop drives recovery in TWO cases:
+    //   1. a resolve came back empty for an INDEXED page (pageEvidence
+    //      present) — keep re-asking briefly, the corpus may still be
+    //      catching up; OR
+    //   2. the card is showing the honest BUSY state (a transport error or
+    //      the pending-deadline flip wrote a { kind } into urlSuggestionErrors)
+    //      — heal it regardless of pageEvidence.
+    // Case 2 is the chat-thread fix (THIRD unhealed surface). A chat captured
+    // through the dispatch path has NO pageEvidence, so the old
+    // `pageEvidence === undefined` guard shut this loop off — yet the
+    // pending-deadline effect (which has no pageEvidence gate) still flipped
+    // the Now card to busy at PENDING_DEADLINE_MS, leaving a frozen
+    // "Companion is busy — retrying" with nothing ever re-asking. Gate the
+    // loop on "there is something to heal" (a busy error present, OR an
+    // indexed-but-empty page), NOT on the presence of page evidence — so ALL
+    // page kinds (page / workstream / chat) self-heal through the SAME loop and
+    // the SAME busy channel a late success supersedes.
+    const hasBusyToHeal = focusedTabSuggestionError !== undefined;
     if (
       canonicalUrl === undefined ||
       port.length === 0 ||
@@ -5851,7 +5869,7 @@ const App = () => {
       focusedRecordEffective === undefined ||
       focusedRecordEffective.currentAttribution !== undefined ||
       focusedRecordEffective.currentIgnored !== undefined ||
-      focusedRecordEffective.pageEvidence === undefined ||
+      (!hasBusyToHeal && focusedRecordEffective.pageEvidence === undefined) ||
       (focusedTabSuggestion !== undefined && focusedTabSuggestion.fusedCandidates.length > 0)
     ) {
       focusedResolveRetryRef.current = null;
@@ -5892,6 +5910,19 @@ const App = () => {
               preservePositiveOnEmpty: true,
             }),
           );
+          // Clear the busy marker for THIS url on any successful resolve —
+          // late data wins, and the busy card heals to the real result
+          // (populated OR the honest empty "No signal" card). `loadUrlSuggestions`
+          // only clears errors when it had a prior suggestion / errored set to
+          // reconcile, so for a chat thread whose suggestions map was empty the
+          // marker could otherwise linger; clearing it here makes recovery
+          // unconditional, matching the NeedsOrganizeSuggestionRow contract.
+          setUrlSuggestionErrors((current) => {
+            if (current[canonicalUrl] === undefined) return current;
+            const nextErrors = { ...current };
+            delete nextErrors[canonicalUrl];
+            return nextErrors;
+          });
         })
         .catch(() => undefined)
         .finally(() => {
@@ -5908,6 +5939,10 @@ const App = () => {
     focusedRecordEffective,
     focusedResolveRetryTick,
     focusedTabSuggestion,
+    // Re-arm the loop when the busy state appears (pending-deadline flip /
+    // transport error) or clears (late success) so a chat thread with no
+    // pageEvidence still starts + stops the self-heal loop.
+    focusedTabSuggestionError,
     loadUrlSuggestions,
     port,
   ]);
