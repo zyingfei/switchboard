@@ -14,6 +14,7 @@ import type {
   PrequentialReport,
   PrequentialVerdict,
   ThresholdCurvePoint,
+  Vote3VoteCountCurvePoint,
 } from './prequential.js';
 
 export const ATTRIBUTION_PREQUENTIAL_VERDICT_SCHEMA_VERSION = 1;
@@ -41,12 +42,18 @@ export interface AttributionPrequentialArtifact {
   // The evidence-gate tradeoff curve (v1 weighted-sum) — the calibration
   // evidence for MIN_SUGGEST_SCORE. Optional (older artifacts omit it).
   readonly thresholdCurve?: readonly ThresholdCurvePoint[];
+  // The vote3 vote-count curve (M6) — the SERVED ladder's read-back: coverage +
+  // precision-when-suggesting at each minimum vote count (>= 1 suggest tier,
+  // >= 3 auto-apply tier). This is the doctrine-rule-10 evidence for the
+  // serve.ts threshold comment. Optional (pre-M6 artifacts omit it).
+  readonly vote3VoteCountCurve?: readonly Vote3VoteCountCurvePoint[];
   readonly reportOnly: true;
 }
 
 export interface BuildArtifactOptions {
   readonly generatedAt?: number;
   readonly thresholdCurve?: readonly ThresholdCurvePoint[];
+  readonly vote3VoteCountCurve?: readonly Vote3VoteCountCurvePoint[];
 }
 
 export const buildAttributionPrequentialArtifact = (
@@ -65,6 +72,9 @@ export const buildAttributionPrequentialArtifact = (
   arms: report.arms,
   verdict,
   ...(options.thresholdCurve === undefined ? {} : { thresholdCurve: options.thresholdCurve }),
+  ...(options.vote3VoteCountCurve === undefined
+    ? {}
+    : { vote3VoteCountCurve: options.vote3VoteCountCurve }),
   reportOnly: true,
 });
 
@@ -116,6 +126,7 @@ const ARM_LABELS: Record<string, string> = {
   'title-lexical': 'title-lexical alone',
   recency: 'recency alone',
   vote4: '4-signal vote (baseline)',
+  vote3: '3-signal vote (servable)',
   majority: 'majority-class',
 };
 
@@ -167,6 +178,22 @@ export const formatPrequentialReport = (
           num(point.minSuggestScore.toString(), 8) +
           num(pct(point.top1), 8) +
           num(pct(point.abstainRate), 10) +
+          num(pct(point.precisionWhenSuggesting), 10),
+      );
+    }
+  }
+  // vote3 vote-count curve (M6) — the SERVED ladder's read-back: coverage +
+  // precision at each minimum vote count. Justifies serve.ts suggest(>=1) /
+  // auto-apply(>=3).
+  if (artifact.vote3VoteCountCurve !== undefined && artifact.vote3VoteCountCurve.length > 0) {
+    curve.push('', 'vote3 vote-count curve (SERVED ladder — >=1 suggest, >=3 auto-apply):');
+    curve.push('  ' + num('minVotes', 10) + num('coverage', 10) + num('top1', 8) + num('prec@sug', 10));
+    for (const point of artifact.vote3VoteCountCurve) {
+      curve.push(
+        '  ' +
+          num(point.minVotes.toString(), 10) +
+          num(pct(point.coverage), 10) +
+          num(pct(point.top1), 8) +
           num(pct(point.precisionWhenSuggesting), 10),
       );
     }

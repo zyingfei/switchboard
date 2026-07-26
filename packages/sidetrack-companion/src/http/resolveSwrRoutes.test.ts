@@ -13,9 +13,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ConnectionsSnapshot, ConnectionsStore } from '../connections/snapshot.js';
 import { resolveUrlAttribution } from '../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { createVaultWriter } from '../vault/writer.js';
+import { writeAttributionV1Artifact } from '../attribution-v1/artifact.js';
+import { resetShadowStateMemoForTest } from '../attribution-v1/emit.js';
+import { ATTRIBUTION_ARM_ENV } from '../attribution-v1/serve.js';
 import { createIdempotencyStore } from './idempotency.js';
 import {
   createCompanionHttpServer,
@@ -238,6 +242,148 @@ describe('resolve-family SWR HTTP wiring', () => {
     // The additive marker lives at the TOP level, never inside `data`.
     expect((body.data as Record<string, unknown>)['resolveFreshness']).toBeUndefined();
     expect(body.resolveFreshness).toBe('fresh');
+  });
+});
+
+// ---- F4: the resolve cache/sig is arm + state aware -------------------
+//
+// The SWR staleness sig (and the SQLite resolver cache key) fold in the serving
+// arm + the AttributionV1State revision. So flipping SIDETRACK_ATTRIBUTION_ARM
+// (env) under a FIXED graph sig must change the served response — the flag is
+// not inert for cached URLs. This is the non-sqlite path (the store stub), so
+// the persistent sqlite cache is not exercised; the SWR in-memory sig change is.
+describe('resolve arm switch — flag changes the served body under a fixed graph sig (F4)', () => {
+  let vaultRoot: string;
+  let serverUrl: string;
+  let eventLog: EventLog;
+  let currentConnectionsSnapshot: ConnectionsSnapshot | null = null;
+  let close: (() => Promise<void>) | null = null;
+  let priorBucket: string | undefined;
+  const priorArm = process.env[ATTRIBUTION_ARM_ENV];
+
+  const canonicalUrl = 'https://arm.test/probe';
+
+  beforeEach(async () => {
+    priorBucket = process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'];
+    process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'] = '0';
+    resetStatusCatchUpStateForTest();
+    resetShadowStateMemoForTest();
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-resolve-arm-'));
+    await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
+    const replica = await loadOrCreateReplica(vaultRoot);
+    eventLog = createEventLog(vaultRoot, replica);
+    // Seed a filing history so the vote arm has a domain + recency vote for the
+    // probe's domain, and materialize the drain-time AttributionV1State artifact.
+    for (const [i, u] of ['https://arm.test/a', 'https://arm.test/b'].entries()) {
+      await eventLog.appendClient({
+        clientEventId: `tl-arm-${String(i)}`,
+        aggregateId: '2026-05-07',
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: `tl-arm-${String(i)}`,
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: u,
+          canonicalUrl: u,
+          transition: 'updated',
+        },
+        baseVector: {},
+      });
+      await eventLog.appendClient({
+        clientEventId: `org-arm-${String(i)}`,
+        aggregateId: `canonical-url:${u}`,
+        type: USER_ORGANIZED_ITEM,
+        payload: {
+          payloadVersion: 1,
+          itemKind: 'canonical-url',
+          itemId: u,
+          action: 'move',
+          toContainer: 'wsArm',
+        },
+        baseVector: {},
+      });
+    }
+    await writeAttributionV1Artifact({ vaultRoot, eventLog });
+
+    const connectionsStore: ConnectionsStore = {
+      putCurrent: async (snapshot) => {
+        currentConnectionsSnapshot = snapshot;
+      },
+      readCurrent: async () => currentConnectionsSnapshot,
+      putDay: async () => undefined,
+      readDay: async () => null,
+      listDays: async () => [],
+      writeSnapshotAndProgress: async () => {},
+      readMaterializerProgress: async () => null,
+    };
+    const config: CompanionHttpConfig = {
+      bridgeKey,
+      vaultWriter: createVaultWriter(vaultRoot),
+      vaultRoot,
+      idempotencyStore: createIdempotencyStore(vaultRoot),
+      replica,
+      eventLog,
+      connectionsStore,
+    };
+    currentConnectionsSnapshot = snapshotForUrls([canonicalUrl], 'rev-fixed');
+    await writeFile(join(vaultRoot, '_BAC', 'connections', 'current.json'), 'x'.repeat(10));
+    const server = createCompanionHttpServer(config);
+    const started = await startHttpServer(server, 0);
+    serverUrl = started.url;
+    close = started.close;
+  });
+
+  afterEach(async () => {
+    if (close !== null) await close();
+    close = null;
+    if (priorBucket === undefined) delete process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'];
+    else process.env['SIDETRACK_RESOLVE_SIG_BUCKET_MS'] = priorBucket;
+    if (priorArm === undefined) delete process.env[ATTRIBUTION_ARM_ENV];
+    else process.env[ATTRIBUTION_ARM_ENV] = priorArm;
+    resetShadowStateMemoForTest();
+    resetStatusCatchUpStateForTest();
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const resolveOnce = async (): Promise<{ action: string; modelRevision?: string }> => {
+    const res = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/resolve?dryRun=true`,
+      { headers: reqHeaders() },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      data: { decision: { action: string }; reasons: { modelRevision?: string } };
+    };
+    return {
+      action: body.data.decision.action,
+      ...(body.data.reasons.modelRevision === undefined
+        ? {}
+        : { modelRevision: body.data.reasons.modelRevision }),
+    };
+  };
+
+  it('the incumbent (v1) abstains where the vote arm suggests — under the SAME fixed graph sig', async () => {
+    // Graph sig is fixed (file untouched). First serve under the incumbent: the
+    // edgeless snapshot abstains (inbox).
+    process.env[ATTRIBUTION_ARM_ENV] = 'v1';
+    const asV1 = await resolveOnce();
+    expect(asV1.action).toBe('inbox');
+    expect(asV1.modelRevision).not.toBe('attribution-vote3-v1');
+
+    // Flip to the vote arm WITHOUT touching the graph. The arm-aware SWR sig
+    // now differs (arm=v1 -> arm=vote3), so the entry is stale: the first
+    // post-flip request serves the stale v1 value INSTANTLY and refreshes in the
+    // background (the SWR contract), then a subsequent request serves the fresh
+    // vote-arm body. The point is the flag is NOT inert — the served body
+    // converges to the vote arm under the fixed graph sig (pre-fix it would stay
+    // the incumbent's abstain forever until the graph sig rolled).
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    let asVote = await resolveOnce();
+    for (let i = 0; i < 20 && asVote.modelRevision !== 'attribution-vote3-v1'; i += 1) {
+      await new Promise((r) => setTimeout(r, 25));
+      asVote = await resolveOnce();
+    }
+    expect(asVote.modelRevision).toBe('attribution-vote3-v1');
+    expect(asVote.action).not.toBe('inbox');
   });
 });
 

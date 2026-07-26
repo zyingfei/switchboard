@@ -77,8 +77,11 @@ export const endorsementFor = (
 //   ppr        → "browsing path"  (related visit / link edges — PPR)
 //   similarity → "similar pages"  (page content/title resembles the stream)
 //   cluster    → "topic"          (sits in a workstream-dominated topic)
+//   vote       → "recent + same-domain filing" (M6 vote arm: title/domain/
+//                recency plurality — NOT a topic cluster, so it must not say
+//                "topic" or the provenance is falsified)
 export const dominantSourceLabel = (
-  source: 'ppr' | 'similarity' | 'cluster' | 'none',
+  source: 'ppr' | 'similarity' | 'cluster' | 'vote' | 'none',
 ): string => {
   switch (source) {
     case 'ppr':
@@ -87,6 +90,8 @@ export const dominantSourceLabel = (
       return 'similar pages';
     case 'cluster':
       return 'topic';
+    case 'vote':
+      return 'recent + same-domain filing';
     case 'none':
       return 'no clear signal';
   }
@@ -102,7 +107,7 @@ export const dominantSourceLabel = (
 // gets deeper access). This mirrors the honesty already in
 // SuggestionStats' empty states.
 
-export type ReasonChipKind = 'graph' | 'content' | 'title' | 'topic';
+export type ReasonChipKind = 'graph' | 'content' | 'title' | 'topic' | 'vote';
 
 export interface ReasonChip {
   readonly kind: ReasonChipKind;
@@ -115,6 +120,7 @@ const CHIP_LABEL: Record<ReasonChipKind, string> = {
   content: 'content match',
   title: 'title match',
   topic: 'topic cluster',
+  vote: 'recent + same-domain filing',
 };
 
 const CHIP_TITLE: Record<ReasonChipKind, string> = {
@@ -122,6 +128,7 @@ const CHIP_TITLE: Record<ReasonChipKind, string> = {
   content: 'Page content resembles pages already in this workstream.',
   title: 'Only the title/URL resembles this workstream (no deeper page content indexed yet).',
   topic: 'This page sits in a topic cluster dominated by this workstream.',
+  vote: 'You recently filed to this workstream and/or it owns this domain and title.',
 };
 
 /** True when the page has an indexed content vector — the resolver's
@@ -149,9 +156,12 @@ export const reasonChipsFor = (
       case 'cluster':
         kinds.add('topic');
         break;
+      case 'vote':
+        kinds.add('vote');
+        break;
     }
   }
-  const order: readonly ReasonChipKind[] = ['graph', 'content', 'title', 'topic'];
+  const order: readonly ReasonChipKind[] = ['graph', 'content', 'title', 'topic', 'vote'];
   return order
     .filter((kind) => kinds.has(kind))
     .map((kind) => ({ kind, label: CHIP_LABEL[kind], title: CHIP_TITLE[kind] }));

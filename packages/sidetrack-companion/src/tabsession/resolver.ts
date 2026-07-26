@@ -46,7 +46,11 @@ export interface AttributionAnchor {
 }
 
 export interface AttributionReason {
-  readonly source: 'ppr' | 'similarity' | 'cluster';
+  // 'vote' (M6): the servable vote arm's decision (title/domain/recency
+  // plurality). Distinct from 'cluster' (topic-cluster) so the panel does not
+  // falsely tell the user their page was filed "via topic cluster" when the
+  // real reason is a recent/same-domain filing.
+  readonly source: 'ppr' | 'similarity' | 'cluster' | 'vote';
   readonly summary: string;
   readonly anchors: readonly AttributionAnchor[];
 }
@@ -702,7 +706,13 @@ export const inferredAttributionPayloadFromResolution = (
   const top = result.fusedCandidates.find(
     (candidate) => candidate.workstreamId === result.decision.workstreamId,
   );
-  if (top === undefined || top.dominantSource === 'none') return null;
+  // 'vote' is the URL vote arm's source (M6); it never reaches the tab-session
+  // resolver (which uses the incumbent fusion, not the vote arm), so a 'vote'
+  // here is unreachable — narrow it out alongside 'none' so the tab-session
+  // persisted payload's dominantSource enum (ppr/similarity/cluster) is honored.
+  if (top === undefined || top.dominantSource === 'none' || top.dominantSource === 'vote') {
+    return null;
+  }
   return {
     payloadVersion: 1,
     tabSessionId: result.tabSessionId,

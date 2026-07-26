@@ -10,9 +10,11 @@ import {
   buildPrequentialVerdict,
   runAttributionPrequential,
   runV1ThresholdCurve,
+  runVote3VoteCountCurve,
   type PrequentialReport,
   type PrequentialVerdict,
   type ThresholdCurvePoint,
+  type Vote3VoteCountCurvePoint,
 } from './prequential.js';
 import {
   attributionPrequentialVerdictPath,
@@ -62,8 +64,13 @@ export const runAttributionPrequentialEval = async (
   // The evidence-gate tradeoff curve — the calibration evidence for
   // MIN_SUGGEST_SCORE (north-star §2 abstention-first). Report-only.
   const thresholdCurve: readonly ThresholdCurvePoint[] = runV1ThresholdCurve(events);
+  // The vote3 vote-count curve — the SERVED ladder's read-back (M6): coverage +
+  // precision at each vote-count tier, so the serve.ts suggest(>=1)/auto(>=3)
+  // thresholds cite a harness number, not prose (doctrine rule 10).
+  const vote3VoteCountCurve: readonly Vote3VoteCountCurvePoint[] = runVote3VoteCountCurve(events);
   const artifact = buildAttributionPrequentialArtifact(report, verdict, {
     thresholdCurve,
+    vote3VoteCountCurve,
     ...(options.generatedAt === undefined ? {} : { generatedAt: options.generatedAt }),
   });
   let artifactPath: string | null = null;

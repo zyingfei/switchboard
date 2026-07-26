@@ -45,6 +45,7 @@ import { writeSection15Artifact } from '../system/section15Artifact.js';
 import { writeReliabilityArtifact } from '../system/reliabilityArtifact.js';
 import { writeAttributionV1Artifact } from '../attribution-v1/artifact.js';
 import { flushShadowBuffer } from '../attribution-v1/shadow.js';
+import { flushArmShadow } from '../attribution-v1/armShadow.js';
 import { anyLaneCounterNonZero } from '../system/health.js';
 import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
@@ -74,6 +75,7 @@ import {
   unregisterResolveCanary,
 } from '../system/resolveCanary.js';
 import { resolveUrlAttribution } from '../tabsession/resolver.js';
+import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import type { TimelineProvider } from '../timeline/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
@@ -1228,6 +1230,10 @@ export const startCompanion = async (
         // Flush the serve-time shadow ring buffer to the bounded JSONL log.
         // Best-effort: a flush failure must not fail the drain.
         await flushShadowBuffer(options.vaultPath).catch(() => 0);
+        // M6: flush the reverse arm-shadow gauge ({requests, agreeRate}) — the
+        // served-vote3-vs-incumbent agreement the arm switch records. Same
+        // best-effort discipline (observability never fails a drain).
+        await flushArmShadow(options.vaultPath).catch(() => null);
         return true;
       } catch {
         return false;
@@ -1489,27 +1495,39 @@ export const startCompanion = async (
         }
         return bestUrl;
       };
-      // resolveOnce — run the panel's single-URL resolve core, mirroring the
+      // resolveOnce — run the panel's single-URL resolve core through the ARM
+      // that actually serves (resolveUrlAttributionArmed), mirroring the
       // batch-resolve route body: on the SQLite store use the cheap resolver
       // subgraph (events unnecessary — the subgraph carries the candidates);
       // otherwise fall back to the full snapshot + merged log. Rejects on a
       // missing snapshot so a genuinely broken serve boundary surfaces as an
-      // errored probe rather than silently recording an ok sample.
+      // errored probe rather than silently recording an ok sample. The reverse
+      // arm-shadow is SKIPPED so the gauge times the served arm's cost, not the
+      // served arm PLUS the shadow incumbent (which would inflate the p50/p95
+      // the panel-resolve health surfaces and mis-attribute the shape).
       const resolveCanaryOnce = async (canonicalUrl: string): Promise<unknown> => {
         if (connectionsStore instanceof SqliteConnectionsStore) {
           const subgraph = await connectionsStore.readResolverSubgraphForUrl(canonicalUrl);
           if (subgraph === null) throw new Error('CONNECTIONS_SNAPSHOT_MISSING');
-          return resolveUrlAttribution({
+          return resolveUrlAttributionArmed({
+            vaultRoot: options.vaultPath,
             canonicalUrl,
             snapshot: subgraph,
             events: [],
             useEventCandidateSimilarity: false,
+            skipReverseShadow: true,
           });
         }
         const snapshot = await connectionsStore.readCurrent();
         if (snapshot === null) throw new Error('CONNECTIONS_SNAPSHOT_MISSING');
         const events = await baseEventLog.readMerged();
-        return resolveUrlAttribution({ canonicalUrl, snapshot, events });
+        return resolveUrlAttributionArmed({
+          vaultRoot: options.vaultPath,
+          canonicalUrl,
+          snapshot,
+          events,
+          skipReverseShadow: true,
+        });
       };
       const resolveCanaryIntervalMs = ((): number | undefined => {
         const raw = process.env['SIDETRACK_RESOLVE_CANARY_INTERVAL_MS'];
