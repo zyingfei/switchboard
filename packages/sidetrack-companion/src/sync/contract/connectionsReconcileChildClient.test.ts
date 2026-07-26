@@ -398,6 +398,99 @@ describe('reconcile child diagnostics getter (M7)', () => {
       parentDeathKills: 0,
       orphanKillsAtBoot: 0,
       lastTimeoutAtMs: undefined,
+      coalescedForks: 0,
     });
+  });
+});
+
+describe('reconcile child single-flight coalescing (instant boot offender #4)', () => {
+  // The boot doubled-CPU runaway: a boot-time catchUp and a request-driven
+  // refreshConnections both reach runReconcileInChild, forking TWO children
+  // that both hold the current.db write lock and saturate every core, starving
+  // the parent event loop. Single-flight coalesces concurrent requests for the
+  // same vault onto ONE child. Each caller's own seq is stamped on the result
+  // so the materializer's stale-drain check keys off the seq it dispatched.
+  itUnlessCI('two concurrent requests for one vault fork ONE child and coalesce', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'sidetrack-reconcile-coalesce-'));
+    tempDirs.push(dir);
+    // The child writes a marker file per spawn so we can count real forks,
+    // then replies after a delay long enough for the second caller to arrive.
+    const marker = join(dir, 'spawns');
+    const entry = join(dir, 'coalesce.cjs');
+    await writeFile(
+      entry,
+      [
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        // Append one byte per spawned process (each fork runs this once).
+        `fs.appendFileSync(${JSON.stringify(marker)}, 'x');`,
+        "process.on('message', (message) => {",
+        '  setTimeout(() => {',
+        "    process.send({ seq: message.seq, ok: true, snapshotRevision: 'rev-coalesce' });",
+        '  }, 150);',
+        '});',
+      ].join('\n'),
+    );
+    setReconcileChildScriptOverride(entry);
+    resetReconcileChildDiagnostics();
+
+    // Fire two overlapping requests with DISTINCT seqs (the boot catchUp vs the
+    // request-driven refresh).
+    const [a, b] = await Promise.all([
+      runReconcileInChild({ vaultRoot: dir, seq: 11 }),
+      runReconcileInChild({ vaultRoot: dir, seq: 22 }),
+    ]);
+
+    // Exactly ONE child was forked (one marker byte).
+    const spawnCount = existsSync(marker) ? (await import('node:fs')).readFileSync(marker).length : 0;
+    expect(spawnCount).toBe(1);
+    // Both callers resolved successfully, each stamped with ITS OWN seq.
+    expect(a).toEqual({ seq: 11, ok: true, snapshotRevision: 'rev-coalesce' });
+    expect(b).toEqual({ seq: 22, ok: true, snapshotRevision: 'rev-coalesce' });
+    // The guard recorded the coalesced ride.
+    expect(getReconcileChildDiagnostics().coalescedForks).toBe(1);
+
+    // A request AFTER the in-flight child settled forks a fresh child (the
+    // guard is per-in-flight, not a permanent lock).
+    const c = await runReconcileInChild({ vaultRoot: dir, seq: 33 });
+    expect(c).toEqual({ seq: 33, ok: true, snapshotRevision: 'rev-coalesce' });
+    const spawnCountAfter = (await import('node:fs')).readFileSync(marker).length;
+    expect(spawnCountAfter).toBe(2);
+  });
+
+  itUnlessCI('SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT=0 forks independently', async () => {
+    const prior = process.env['SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT'];
+    process.env['SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT'] = '0';
+    try {
+      const dir = await mkdtemp(join(tmpdir(), 'sidetrack-reconcile-nocoalesce-'));
+      tempDirs.push(dir);
+      const marker = join(dir, 'spawns');
+      const entry = join(dir, 'nocoalesce.cjs');
+      await writeFile(
+        entry,
+        [
+          "const fs = require('node:fs');",
+          `fs.appendFileSync(${JSON.stringify(marker)}, 'x');`,
+          "process.on('message', (message) => {",
+          '  setTimeout(() => {',
+          "    process.send({ seq: message.seq, ok: true, snapshotRevision: 'rev-nocoalesce' });",
+          '  }, 150);',
+          '});',
+        ].join('\n'),
+      );
+      setReconcileChildScriptOverride(entry);
+      resetReconcileChildDiagnostics();
+      await Promise.all([
+        runReconcileInChild({ vaultRoot: dir, seq: 1 }),
+        runReconcileInChild({ vaultRoot: dir, seq: 2 }),
+      ]);
+      const spawnCount = (await import('node:fs')).readFileSync(marker).length;
+      // Legacy behavior: two independent forks.
+      expect(spawnCount).toBe(2);
+      expect(getReconcileChildDiagnostics().coalescedForks).toBe(0);
+    } finally {
+      if (prior === undefined) delete process.env['SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT'];
+      else process.env['SIDETRACK_RECONCILE_CHILD_SINGLE_FLIGHT'] = prior;
+    }
   });
 });
