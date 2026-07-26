@@ -5771,8 +5771,16 @@ const App = () => {
     focusedRecordEffective.currentAttribution === undefined &&
     focusedRecordEffective.currentIgnored === undefined &&
     focusedDisplayUrlRecord !== undefined;
-  const focusedResolveHasResult =
-    focusedTabSuggestion !== undefined && focusedTabSuggestion.fusedCandidates.length > 0;
+  // A SETTLED resolve — populated OR empty — stops the pending clock. The
+  // deadline exists to catch "the companion never answered"; an empty
+  // fusedCandidates response IS an answer (suggestionStateFrom renders it as
+  // the terminal honest-empty card). Requiring length > 0 here contradicted
+  // that state machine: every legitimately-empty resolve (chat threads,
+  // genuinely unconnected pages) kept the clock running → synthetic busy at
+  // 20s → heal → clock restart → re-flip, and once the 30s retry window
+  // closed, a permanently frozen "Companion is busy — retrying" over a page
+  // the companion had answered in ~1s.
+  const focusedResolveHasResult = focusedTabSuggestion !== undefined;
   useEffect(() => {
     const canonicalUrl = focusedDisplayUrlRecord?.canonicalUrl;
     // Not asking (attributed/ignored/unknown kind, or no focused URL): clear

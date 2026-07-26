@@ -129,10 +129,15 @@ const lateSuggestionFor = (canonicalUrl: string) => ({
 // self-heal loop. `probes` counts batch-resolve calls; the second+ call answers
 // with the confident pick. Without a working retry loop (the chat freeze) the
 // card stays busy indefinitely — there is no second probe.
+// `settledEmpty` models the OTHER live failure shape (the GCP-thread freeze,
+// round four): the companion ANSWERS quickly with zero candidates. A settled
+// empty answer is a terminal state — the pending-deadline clock must stop, so
+// the card stays the honest empty card and never flips to the synthetic busy.
 const nowCardFetchMock = (
   canonicalUrl: string,
   hasPageEvidence: boolean,
   probes: { count: number },
+  options?: { readonly settledEmpty?: boolean },
 ) =>
   vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -199,6 +204,34 @@ const nowCardFetchMock = (
     }
     if (url.includes('/v1/visits/batch-resolve')) {
       probes.count += 1;
+      if (options?.settledEmpty === true) {
+        // Every probe answers immediately with ZERO candidates — the honest
+        // "the resolver checked and found nothing" response (live shape:
+        // the GCP thread's resolve settles empty in ~1s).
+        const rawEmptyBody = typeof init?.body === 'string' ? init.body : '{}';
+        const emptyBody = JSON.parse(rawEmptyBody) as {
+          readonly canonicalUrls?: readonly string[];
+        };
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              results: Object.fromEntries(
+                (emptyBody.canonicalUrls ?? []).map((u) => [
+                  u,
+                  {
+                    canonicalUrl: u,
+                    dryRun: true,
+                    decision: { action: 'inbox', margin: 0 },
+                    fusedCandidates: [],
+                  },
+                ]),
+              ),
+            },
+          }),
+        };
+      }
       // First probe hangs forever (never settles) — only a fresh retry-loop
       // probe can rescue the card.
       if (probes.count === 1) {
@@ -294,6 +327,49 @@ describe('busy-heal conformance — every busy surface flips at the deadline and
     // chatgpt.com host → classifyPageKind returns 'chat'; the summary route
     // returns pageEvidence: null (chat captured via dispatch, not page-text).
     await runNowCardHeal('https://chatgpt.com/c/6a666809-aaaa-bbbb-cccc-dddddddddddd', false, true);
+  });
+
+  it('current-tab Now card — a resolve that SETTLES EMPTY stays the honest empty card, never flips busy [the fourth face]', async () => {
+    // The GCP-thread live failure (round four of the frozen-card saga): the
+    // companion answered "no candidates" in ~1s, but the pending clock treated
+    // settled-empty as still-pending (`hasResult` required length > 0) →
+    // synthetic busy at 20s → heal → clock restart → re-flip → frozen busy
+    // once the 30s retry window closed. The contract under test: an ANSWER —
+    // even an empty one — stops the deadline clock for good.
+    const canonicalUrl = 'https://chatgpt.com/c/6a666809-eeee-ffff-0000-111111111111';
+    installChromeMock({ ...baseState(), activeTabUrl: canonicalUrl }, canonicalUrl);
+    const probes = { count: 0 };
+    vi.stubGlobal('fetch', nowCardFetchMock(canonicalUrl, false, probes, { settledEmpty: true }));
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<App />);
+    await goToNow();
+    const card = await screen.findByLabelText('Current tab attribution');
+
+    // The companion ANSWERED (empty) — the honest empty card renders.
+    await waitFor(() => {
+      expect(card).toHaveTextContent('No connections yet');
+    });
+    expect(card).not.toHaveTextContent('Companion is busy — retrying');
+
+    // Continuous 1s-step scan well past the deadline AND the retry window.
+    // Traced on the broken build (settled-empty treated as still-pending):
+    // the card is NOT frozen at one instant — it OSCILLATES on a 30s period
+    // (busy flip at each 20s deadline → heal probe clears it → clock
+    // restarts), flashing the amber busy card and issuing a fresh
+    // batch-resolve every cycle, forever. Coarse spot-checks slip between
+    // the flashes, so scan every simulated second and assert busy NEVER
+    // renders at any step.
+    for (let elapsedS = 0; elapsedS < 150; elapsedS += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(card).not.toHaveTextContent('Companion is busy — retrying');
+    }
+    // Terminal state is still the honest empty card…
+    expect(card).toHaveTextContent('No connections yet');
+    // …and the settled answer also SILENCED the probe loop: exactly the one
+    // initial batch-resolve, no 30s re-probe churn against the companion
+    // (the oscillation's hidden runtime cost).
+    expect(probes.count).toBe(1);
   });
 
   it('NeedsOrganizeSuggestionRow (Chat → Threads "Needs organize") heals', async () => {
