@@ -57,3 +57,60 @@ describe('resolve client parse — the full ranked candidate list survives', () 
     expect(adapted.fusedCandidates).toHaveLength(3);
   });
 });
+
+describe('resolve client parse — guess-lanes normalization', () => {
+  it('preserves well-formed lanes through the guard', () => {
+    const wire = {
+      tabSessionId: 'tses_1',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [candidate('ws-1')],
+      lanes: [
+        {
+          lane: 'graph',
+          candidates: [{ workstreamId: 'ws-1', score: 0.5, why: 'edge' }],
+        },
+        { lane: 'domain', candidates: [], emptyReason: 'unseen' },
+      ],
+    };
+    expect(isTabSessionResolutionResult(wire)).toBe(true);
+    if (isTabSessionResolutionResult(wire)) {
+      expect(wire.lanes).toBeDefined();
+      expect(wire.lanes).toHaveLength(2);
+      expect(wire.lanes?.[0]?.lane).toBe('graph');
+    }
+  });
+
+  it('degrades MALFORMED lanes to absent WITHOUT rejecting the whole resolution', () => {
+    const wire = {
+      tabSessionId: 'tses_1',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [candidate('ws-1')],
+      // Not an array → the whole lanes field is treated as absent.
+      lanes: 'garbage',
+    };
+    // The resolution itself is still accepted — a bad lanes field never
+    // sinks the result (the "handle undefined gracefully" contract).
+    expect(isTabSessionResolutionResult(wire)).toBe(true);
+    if (isTabSessionResolutionResult(wire)) {
+      expect(wire.lanes).toBeUndefined();
+      expect(wire.fusedCandidates).toHaveLength(1);
+    }
+  });
+
+  it('carries lanes through the URL→tabSession adapter', () => {
+    const url: UrlResolutionResult = {
+      canonicalUrl: 'https://example.com/a',
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [candidate('ws-1')],
+      lanes: [
+        { lane: 'recency', candidates: [{ workstreamId: 'ws-1', score: 0.3, why: 'recent' }] },
+      ],
+    };
+    const adapted = tabSessionResolutionFromUrl(url);
+    expect(adapted.lanes).toBe(url.lanes);
+    expect(adapted.lanes).toHaveLength(1);
+  });
+});

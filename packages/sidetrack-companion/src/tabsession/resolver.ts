@@ -14,6 +14,12 @@ import { buildClusterEvidence } from './clusterEvidence.js';
 import type { TabSessionAttributionInferredPayload } from './events.js';
 import { buildEvidenceGraph } from './evidenceGraph.js';
 import { fuseCandidates, type CandidateEvidence, type FusedCandidate } from './fusion.js';
+import {
+  buildGuessLanes,
+  guessLanesEnabled,
+  type GuessLaneResult,
+  type GuessLaneVoteSignals,
+} from './guessLanes.js';
 import type { UrlAttributionInferredPayload } from '../urls/events.js';
 import {
   decideAttribution,
@@ -77,6 +83,9 @@ export interface ResolutionResult {
     readonly targetAnchors: readonly string[];
     readonly topContributingAnchors: readonly string[];
   };
+  // Every lane's own view (SIDETRACK_GUESS_LANES, default ON). Present ⇒ ALWAYS
+  // all six lanes in the fixed GUESS_LANE_ORDER; omitted when the flag is off.
+  readonly lanes?: readonly GuessLaneResult[];
 }
 
 export interface ResolveAttributionInput {
@@ -89,6 +98,10 @@ export interface ResolveAttributionInput {
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
   readonly closestVisitRanker?: ClosestVisitRanker;
+  // Cheap vote signals for the title/domain/recency guess lanes. The tab-session
+  // route can supply the memoized AttributionV1State + best-effort title; absent
+  // ⇒ those three lanes report typed emptiness (no state loaded).
+  readonly guessLaneVoteSignals?: GuessLaneVoteSignals;
 }
 
 interface ResolveTargetAttributionInput {
@@ -122,6 +135,12 @@ interface ResolvedTargetAttribution {
     readonly targetAnchors: readonly string[];
     readonly topContributingAnchors: readonly string[];
   };
+  // The PRE-FILTER per-workstream evidence (before the corroborationCount>0
+  // fusion filter). Carried out of resolveTargetAttribution ONLY so the wrapper
+  // can assemble the graph/similarity/topic guess lanes from evidence the
+  // resolver already computed — no new traversal. Not serialized on the wire
+  // (the wrapper reads it, builds `lanes`, and drops it).
+  readonly candidateEvidence: readonly CandidateEvidence[];
 }
 
 const compareString = (left: string, right: string): number =>
@@ -367,7 +386,42 @@ const resolveTargetAttribution = (
       targetAnchors: anchors,
       topContributingAnchors: anchors.slice(0, 3),
     },
+    candidateEvidence,
   };
+};
+
+// The wrapper-facing shape of a resolved target: the serialized result fields
+// (candidateEvidence stripped) plus the optional `lanes` wire field. The three
+// public result shapes (Url/Thread/tab-session) spread this after adding their
+// own id + dryRun.
+interface ResolvedWithLanes {
+  readonly policyMode: AttributionPolicyMode;
+  readonly decision: ResolvedTargetAttribution['decision'];
+  readonly fusedCandidates: readonly ResolverCandidate[];
+  readonly reasons: ResolvedTargetAttribution['reasons'];
+  readonly lanes?: readonly GuessLaneResult[];
+}
+
+// Strip the internal candidateEvidence and attach the six guess lanes, gated on
+// SIDETRACK_GUESS_LANES (default ON). Reads the PRE-FILTER candidateEvidence the
+// resolver already computed for the graph/similarity/topic lanes, and the
+// caller-supplied vote signals (title/domain/recency) for the vote lanes. When
+// the flag is off the `lanes` key is omitted entirely (undefined on the wire).
+// candidateEvidence is dropped either way — it never rides the wire or the
+// resolver cache.
+const withGuessLanes = (
+  resolved: ResolvedTargetAttribution,
+  voteSignals: GuessLaneVoteSignals | undefined,
+  nowMs: number | undefined,
+): ResolvedWithLanes => {
+  const { candidateEvidence, ...rest } = resolved;
+  if (!guessLanesEnabled()) return rest;
+  const lanes = buildGuessLanes({
+    candidateEvidence,
+    ...(voteSignals === undefined ? {} : { voteSignals }),
+    ...(nowMs === undefined ? {} : { nowMs }),
+  });
+  return { ...rest, lanes };
 };
 
 // Per-canonical-URL resolver. Anchors are every visit-instance and
@@ -383,6 +437,10 @@ export interface ResolveUrlAttributionInput {
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
   readonly closestVisitRanker?: ClosestVisitRanker;
+  // Cheap vote signals for the title/domain/recency guess lanes. The armed
+  // resolver supplies the memoized AttributionV1State + best-effort title it
+  // already loaded; absent ⇒ those three lanes report typed emptiness.
+  readonly guessLaneVoteSignals?: GuessLaneVoteSignals;
 }
 
 export interface UrlResolutionResult {
@@ -403,6 +461,9 @@ export interface UrlResolutionResult {
     readonly targetAnchors: readonly string[];
     readonly topContributingAnchors: readonly string[];
   };
+  // Every lane's own view (SIDETRACK_GUESS_LANES, default ON). Present ⇒ ALWAYS
+  // all six lanes in the fixed GUESS_LANE_ORDER; omitted when the flag is off.
+  readonly lanes?: readonly GuessLaneResult[];
 }
 
 const urlNegativeSeeds = (input: ResolveUrlAttributionInput): Map<string, number> => {
@@ -556,15 +617,17 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
       : { closestVisitRanker: input.closestVisitRanker }),
   });
 
+  const withLanes = withGuessLanes(resolved, input.guessLaneVoteSignals, input.nowMs);
   if (urlUserDeclinedNoWorkstream(input)) {
     // Respect the user's "Not in any stream": settle as no-suggestion
     // (the projection already records currentAttribution{ws:null}, so
     // it's out of the inbox list — this stops the active-tab card from
-    // re-asking with a fresh best-guess).
+    // re-asking with a fresh best-guess). Lanes still ride along: the
+    // per-channel views are informational and independent of this settle.
     return {
       canonicalUrl: input.canonicalUrl,
       dryRun: true,
-      ...resolved,
+      ...withLanes,
       decision: { action: 'inbox', margin: 0 },
       fusedCandidates: [],
     };
@@ -572,7 +635,7 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
   return {
     canonicalUrl: input.canonicalUrl,
     dryRun: true,
-    ...resolved,
+    ...withLanes,
   };
 };
 
@@ -587,6 +650,10 @@ export interface ResolveThreadAttributionInput {
   readonly policyTelemetry?: AttributionPolicyTelemetry;
   readonly nowMs?: number;
   readonly closestVisitRanker?: ClosestVisitRanker;
+  // Cheap vote signals for the title/domain/recency guess lanes. The thread
+  // suggestions route can supply the memoized AttributionV1State + best-effort
+  // title; absent ⇒ those three lanes report typed emptiness.
+  readonly guessLaneVoteSignals?: GuessLaneVoteSignals;
 }
 
 export interface ThreadResolutionResult {
@@ -607,6 +674,9 @@ export interface ThreadResolutionResult {
     readonly targetAnchors: readonly string[];
     readonly topContributingAnchors: readonly string[];
   };
+  // Every lane's own view (SIDETRACK_GUESS_LANES, default ON). Present ⇒ ALWAYS
+  // all six lanes in the fixed GUESS_LANE_ORDER; omitted when the flag is off.
+  readonly lanes?: readonly GuessLaneResult[];
 }
 
 const threadNegativeSeeds = (input: ResolveThreadAttributionInput): Map<string, number> => {
@@ -664,7 +734,7 @@ export const resolveThreadAttribution = (
   return {
     threadId: input.threadId,
     dryRun: true,
-    ...resolved,
+    ...withGuessLanes(resolved, input.guessLaneVoteSignals, input.nowMs),
   };
 };
 
@@ -693,7 +763,7 @@ export const resolveAttribution = (input: ResolveAttributionInput): ResolutionRe
   return {
     tabSessionId: input.tabSessionId,
     dryRun: true,
-    ...resolved,
+    ...withGuessLanes(resolved, input.guessLaneVoteSignals, input.nowMs),
   };
 };
 

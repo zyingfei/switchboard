@@ -660,7 +660,13 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(await second.json()).toEqual(await first.json());
+    const firstBody = (await first.json()) as { data?: { lanes?: readonly unknown[] } };
+    const secondBody = (await second.json()) as { data?: { lanes?: readonly unknown[] } };
+    expect(secondBody).toEqual(firstBody);
+    // The guess lanes ride the resolver-cache seam: the SECOND response is
+    // served from the persisted (JSON.stringify → JSON.parse) cache entry, and
+    // it still carries the six lanes just like the freshly-computed first.
+    expect(secondBody.data?.lanes).toHaveLength(6);
     expect(readMerged).toHaveBeenCalledTimes(1);
   });
 
@@ -682,7 +688,15 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      data: { results: Record<string, { canonicalUrl: string }> };
+      data: {
+        results: Record<
+          string,
+          {
+            canonicalUrl: string;
+            lanes?: readonly { readonly lane: string; readonly emptyReason?: string }[];
+          }
+        >;
+      };
     };
     expect(Object.keys(body.data.results).sort()).toEqual([...urls].sort());
     expect(
@@ -690,6 +704,22 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
         .map((result) => result.canonicalUrl)
         .sort(),
     ).toEqual([...urls].sort());
+    // Guess lanes (SIDETRACK_GUESS_LANES, default ON) ride each per-URL result:
+    // all six lanes, fixed order, present on the wire. This batch has no graph
+    // path and no v1 state artifact, so every lane is empty WITH a reason
+    // (typed emptiness).
+    const oneResult = body.data.results[urls[0]!]!;
+    expect(oneResult.lanes?.map((lane) => lane.lane)).toEqual([
+      'graph',
+      'similarity',
+      'topic',
+      'title',
+      'domain',
+      'recency',
+    ]);
+    for (const lane of oneResult.lanes ?? []) {
+      expect(lane.emptyReason, `empty lane ${lane.lane} must carry a reason`).toBeDefined();
+    }
     expect(readResolverSubgraphForUrls).toHaveBeenCalledTimes(1);
     expect(readResolverSubgraphForUrls).toHaveBeenCalledWith(urls);
     expect(readCurrent).not.toHaveBeenCalled();

@@ -4,12 +4,14 @@ import {
   confidenceLevelLabel,
   probabilityFromLogit,
 } from '../suggestion/confidence';
+import { GuessLanes } from './GuessLanes';
 import { type Possibilities, possibilitiesFrom, suggestionStateFrom } from './resolveOutcome';
 import { dominantSourceLabel, endorsementFor } from './suggestionEndorsement';
-import type {
-  ResolveOutcomeError,
-  TabSessionResolutionResult,
-  TabSessionWorkstreamOption,
+import {
+  guessLaneSignalCount,
+  type ResolveOutcomeError,
+  type TabSessionResolutionResult,
+  type TabSessionWorkstreamOption,
 } from './types';
 
 // Stage 5 polish — surface the resolver's confidence in human-readable
@@ -288,6 +290,49 @@ export function SuggestionStats({
     // ≥5s-engagement visit-similarity gate never yielded edges). First
     // visits keep the original copy.
     const isRevisit = typeof visitCount === 'number' && visitCount > 1;
+    // Guess-lanes honesty (the feature's b-part): the FUSION abstained
+    // (zero fused candidates), but that does NOT mean every lane was silent —
+    // the graph lane may have a weak edge, the recency lane a recent filing,
+    // etc. When at least one lane produced a candidate, a bare "No signal
+    // yet"/"No connections yet" headline is a falsehood the user can spot:
+    // there IS a lane guess, just not one the fusion was confident enough to
+    // stand behind. Replace the headline with an honest partial-guess line and
+    // render the lane breakdown right under it. Only when EVERY lane is empty
+    // (or lanes are absent — an old companion) does the legacy copy stand.
+    const lanes = suggestion.lanes;
+    const laneSignal = guessLaneSignalCount(lanes);
+    if (laneSignal > 0 && lanes !== undefined) {
+      return (
+        <div className="suggestion-stats is-empty has-lane-guesses">
+          <span className="suggestion-stats-row">
+            <span className="suggestion-stats-target subtle">
+              No confident pick — lane guesses below
+            </span>
+            <span
+              className="suggestion-stats-info"
+              title={
+                (isRevisit
+                  ? `Seen ${String(visitCount)} times. `
+                  : '') +
+                'The combined resolver wasn’t confident enough to suggest a workstream, ' +
+                'but individual signals below did have guesses. Expand "Guess lanes" to see ' +
+                'what each signal thought, and file directly to any of them.'
+              }
+            >
+              ⓘ
+            </span>
+          </span>
+          <span className="suggestion-stats-source mono subtle">
+            No single confident pick — expand the lanes to see each signal’s best guess
+          </span>
+          <GuessLanes
+            lanes={lanes}
+            workstreams={workstreams}
+            {...(onFileHere === undefined ? {} : { onFileHere })}
+          />
+        </div>
+      );
+    }
     return (
       <div className="suggestion-stats is-empty">
         <span className="suggestion-stats-row">
@@ -316,6 +361,16 @@ export function SuggestionStats({
             ? `Seen ${String(visitCount)} times — no connections yet, hover ⓘ for what was checked`
             : 'First time seeing this URL — hover ⓘ for what was checked'}
         </span>
+        {/* All-lanes-empty (or an old companion, lanes absent) still shows the
+            breakdown when lanes ARE present so the user sees every lane's own
+            "nothing here because …" reason. GuessLanes renders null on []. */}
+        {lanes !== undefined ? (
+          <GuessLanes
+            lanes={lanes}
+            workstreams={workstreams}
+            {...(onFileHere === undefined ? {} : { onFileHere })}
+          />
+        ) : null}
       </div>
     );
   }
@@ -444,6 +499,16 @@ export function SuggestionStats({
         workstreams={workstreams}
         {...(onFileHere === undefined ? {} : { onFileHere })}
       />
+      {/* Guess-lanes — even when the fusion HAS a confident pick, the user
+          asked to see what every individual lane thought behind a click.
+          Renders null when lanes are absent (old companion). */}
+      {suggestion.lanes !== undefined ? (
+        <GuessLanes
+          lanes={suggestion.lanes}
+          workstreams={workstreams}
+          {...(onFileHere === undefined ? {} : { onFileHere })}
+        />
+      ) : null}
     </div>
   );
 }
