@@ -69,6 +69,43 @@ export const nextPendingSince = (input: {
     ? input.previous.pendingSinceMs
     : input.nowMs;
 
+// ---- Thread-suggestion retry cadence (All-Threads "Needs organize" card) --
+//
+// The thread card (NeedsOrganizeSuggestionRow) fetches GET
+// /v1/suggestions/thread/{id} once on mount and re-fetches only on real input
+// changes (threadId / workstream mutation / index-rebuild settle / manual ↻).
+// It had NO retry loop and NO error state: a hung or failed fetch cleared the
+// in-flight flag and rendered "Pick a workstream…" as if the resolver had
+// abstained, with nothing ever re-asking — a thread card stayed stuck for 10+
+// minutes while the endpoint answered 200 in ~2.4s. These helpers give it the
+// URL surface's self-heal contract (a bounded retry window + the shared
+// pending-deadline busy flip) so ONE self-heal path owns recovery for both.
+//
+// Window kept identical to the URL surface's FOCUSED_RESOLVE_RETRY_WINDOW_MS so
+// the retry loop is still driving refetches well past the 20s pending-deadline
+// flip — a late success supersedes the busy card.
+export const THREAD_SUGGESTION_RETRY_WINDOW_MS = 30_000;
+
+// Backoff for the visible thread card's retry loop, mirroring the URL surface's
+// escalation: a gentle ramp capped at 5s so a busy companion isn't hammered.
+// `attempts` is the number of retries already issued for the CURRENT thread
+// (0 = the first retry after the initial fetch).
+//   - attempts <8  → 1s
+//   - attempts ≥8  → 2s + (attempts-8)*1s, capped at 5s
+export const threadRetryDelayMs = (attempts: number): number =>
+  attempts < 8 ? 1_000 : Math.min(2_000 + (attempts - 8) * 1_000, 5_000);
+
+// True once the visible thread card's retry loop has been running for longer
+// than the window — the loop stops rescheduling (the busy card stays, and any
+// real input change or manual ↻ restarts a fresh window). Mirrors the URL
+// surface's `nowMs - startedAt > FOCUSED_RESOLVE_RETRY_WINDOW_MS` guard.
+export const threadRetryExhausted = (input: {
+  readonly startedAtMs: number;
+  readonly nowMs: number;
+  readonly windowMs?: number;
+}): boolean =>
+  input.nowMs - input.startedAtMs > (input.windowMs ?? THREAD_SUGGESTION_RETRY_WINDOW_MS);
+
 // Pure state mapping shared by SuggestionStats and its tests. Precedence is
 // deliberate:
 //   1. A populated result always wins — if the resolver DID return

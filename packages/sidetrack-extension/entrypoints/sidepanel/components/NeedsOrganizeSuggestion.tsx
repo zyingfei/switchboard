@@ -22,6 +22,7 @@ import {
   confidenceLevelLabel,
   isActionableLevel,
 } from '../../../src/sidepanel/suggestion/confidence';
+import type { ResolveOutcomeError } from '../../../src/sidepanel/tabsession/types';
 
 interface NeedsOrganizeSuggestionProps {
   readonly suggestedLabel: string;
@@ -37,6 +38,13 @@ interface NeedsOrganizeSuggestionProps {
   // True while a background fetch is in flight so the refresh button
   // can show its spinning state without blocking the existing UI.
   readonly pending?: boolean;
+  // The last thread-suggestion fetch FAILED (transport error) or hung
+  // past the pending deadline — NOT "the resolver abstained". Surfaced as
+  // the SAME honest amber "busy — retrying" state the URL/current-tab card
+  // uses, so a contended companion never reads as a confident "pick a
+  // workstream…". The card's own retry loop owns recovery (clear-on-success,
+  // late data wins); a populated `confidence` still supersedes this.
+  readonly error?: ResolveOutcomeError;
   readonly onAccept: () => void;
   readonly onPickManual: () => void;
   // Optional explicit re-fetch handle. Lets the user force the
@@ -52,11 +60,58 @@ export function NeedsOrganizeSuggestion({
   confidence,
   margin,
   pending = false,
+  error,
   onAccept,
   onPickManual,
   onRefresh,
   onDismiss,
 }: NeedsOrganizeSuggestionProps) {
+  // Busy/error outranks the empty "pick a workstream" fallback but NOT a
+  // populated suggestion: only surface the amber busy card when the fetch
+  // failed/hung AND we have no confident pick to show (a late success still
+  // supersedes it via `confidence > 0`). Mirrors suggestionStateFrom's
+  // populated-wins precedence on the URL surface.
+  if (error !== undefined && confidence <= 0) {
+    return (
+      <div className="nx-suggest is-busy" role="group" aria-label="Workstream suggestion">
+        <span className="lead">Companion is busy — retrying</span>
+        <span className="ws-sug">
+          <span className="hp-dot amber" />
+          <span
+            className="conf"
+            title={
+              'Sidetrack couldn’t reach the resolver for this thread just now (the ' +
+              'companion is busy catching up on a capture drain). This is NOT "no ' +
+              'suggestion" — the check hasn’t completed. It retries automatically; ' +
+              'no action needed.'
+            }
+          >
+            Retrying automatically — the resolver is catching up
+          </span>
+        </span>
+        <div className="acts">
+          <button type="button" className="primary" onClick={onPickManual}>
+            Pick…
+          </button>
+          {onRefresh !== undefined ? (
+            <button
+              type="button"
+              className="ghost"
+              onClick={onRefresh}
+              aria-label="Recompute suggestion"
+              title={pending ? 'Refreshing…' : 'Retry now'}
+              disabled={pending}
+            >
+              {pending ? '⟳' : '↻'}
+            </button>
+          ) : null}
+          <button type="button" className="dismiss" onClick={onDismiss} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      </div>
+    );
+  }
   const hasNonZeroConfidence = confidence > 0;
   const level = confidenceLevelFromProbability(
     confidence,

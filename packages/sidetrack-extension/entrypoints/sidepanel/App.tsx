@@ -175,6 +175,8 @@ import {
   nextPendingSince,
   pendingDeadlineExceeded,
   resolveErrorForStatus,
+  threadRetryDelayMs,
+  threadRetryExhausted,
 } from '../../src/sidepanel/tabsession/resolveOutcome';
 import {
   queryRealChromeTabCount,
@@ -10506,7 +10508,9 @@ interface NeedsOrganizeSuggestionRowProps {
   readonly onDismissSelfNomination: () => void;
 }
 
-function NeedsOrganizeSuggestionRow({
+// Exported for the self-heal integration test (the busy flip + retry-on-cadence
+// contract lives here, not in the presentational NeedsOrganizeSuggestion).
+export function NeedsOrganizeSuggestionRow({
   threadId,
   companionPort,
   bridgeKey,
@@ -10536,6 +10540,28 @@ function NeedsOrganizeSuggestionRow({
   } | null>(cached ?? null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [pending, setPending] = useState(false);
+  // The thread-suggestion fetch FAILED or hung past the deadline — a
+  // first-class state, distinct from "resolver abstained" (suggestion === null)
+  // and "in flight" (pending). Cleared on ANY successful fetch (late data
+  // wins) so the busy card self-heals the moment the endpoint answers. Mirrors
+  // the URL surface's urlSuggestionErrors map, scoped to this single row.
+  const [error, setError] = useState<ResolveOutcomeError | null>(null);
+  // Retry-loop tick: bumping it re-runs the retry-scheduler effect. The retry
+  // loop only runs while `error` is set (the card is busy) and within the
+  // THREAD_SUGGESTION_RETRY_WINDOW, so a healthy fetch never polls.
+  const [retryTick, setRetryTick] = useState(0);
+  // Wall-clock the busy window opened at (reset when the busy state clears or
+  // the thread changes) so the retry loop can bound itself to the window and a
+  // fresh input restarts a clean window.
+  const retryStartedAtRef = useRef<number | null>(null);
+  const retryAttemptsRef = useRef(0);
+  // When the in-flight fetch STARTED, so a hung request (no HTTP error, served
+  // late as a 304/slow 200 during a drain) can be flipped to 'busy' at the
+  // shared pending deadline instead of hanging "Indexing…" forever.
+  const pendingSinceRef = useRef<number | null>(null);
+  // Latch: whether a fetch is currently in flight for this row, so the retry
+  // loop coalesces with the mount/refresh fetch instead of racing it.
+  const fetchInFlightRef = useRef(false);
   // Recurring-thread self-nomination, read from the SAME fetch below
   // (no extra request). Null until the companion answers; set to the
   // block only when `eligible`.
@@ -10563,33 +10589,39 @@ function NeedsOrganizeSuggestionRow({
   const resolveLabelRef = useRef(resolveLabel);
   resolveLabelRef.current = resolveLabel;
 
-  useEffect(() => {
-    if (companionPort === null || bridgeKey === null) return undefined;
-    // Suppress fetches while the recall index is rebuilding —
-    // partially-rebuilt index gives oscillating scores and the user
-    // reads the flicker as instability. The deps below include
-    // `indexRebuilding`, so the fetch fires automatically the
-    // moment the rebuild settles to 'ready'.
-    if (indexRebuilding) {
+  // The single fetch, factored out so BOTH the input-driven effect and the
+  // self-heal retry loop drive the same code (one place clears the error /
+  // updates state → late data always wins). `isCancelled` lets the caller
+  // abort its own state writes when the row unmounts or its inputs change.
+  const runFetch = useCallback(
+    async (isCancelled: () => boolean): Promise<void> => {
+      if (companionPort === null || bridgeKey === null) return;
+      // Coalesce: never overlap the mount fetch and a retry probe.
+      if (fetchInFlightRef.current) return;
+      fetchInFlightRef.current = true;
+      pendingSinceRef.current = Date.now();
       setPending(true);
-      return undefined;
-    }
-    let cancelled = false;
-    setPending(true);
-    void (async () => {
-      // Throttle: acquire a global slot before issuing the fetch so
-      // the simultaneous mount of N suggestion rows can't exhaust
-      // Chrome's per-origin socket pool. Slot releases on finally.
+      // Throttle: acquire a global slot before issuing the fetch so the
+      // simultaneous mount of N suggestion rows can't exhaust Chrome's
+      // per-origin socket pool. Slot releases on finally.
       const release = await acquireCompanionFetchSlot();
-      if (cancelled) {
+      if (isCancelled()) {
         release();
+        fetchInFlightRef.current = false;
         return;
       }
       try {
         const url = `http://127.0.0.1:${String(companionPort)}/v1/suggestions/thread/${threadId}?limit=1`;
         const response = await fetch(url, { headers: { 'x-bac-bridge-key': bridgeKey } });
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
-        if (cancelled || !response.ok) return;
+        if (isCancelled()) return;
+        if (!response.ok) {
+          // A resolve REQUEST failure (500 "database is locked" during a
+          // drain, 408/429) is NOT "the resolver abstained". Record the honest
+          // busy/error state so the retry loop owns recovery — the SAME
+          // contract the URL surface uses (resolveErrorForStatus).
+          setError(resolveErrorForStatus(response.status));
+          return;
+        }
         // Server shape: { data: Suggestion[] } — `data` is the
         // ranked array DIRECTLY, not `{ items: Suggestion[] }`.
         // The previous parser unwrapped `body.data?.items?.[0]`,
@@ -10617,8 +10649,10 @@ function NeedsOrganizeSuggestionRow({
             readonly suggestedTitle?: string;
           };
         };
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
-        if (cancelled) return;
+        if (isCancelled()) return;
+        // A successful fetch clears any busy/error state — late data wins, and
+        // the retry loop (which only runs while `error` is set) shuts off.
+        setError(null);
         // Self-nomination is independent of whether a suggestion ranked:
         // it fires precisely when the resolver abstained, so parse it
         // before the early return below.
@@ -10657,20 +10691,129 @@ function NeedsOrganizeSuggestionRow({
         };
         setSuggestion(next);
         onCacheRef.current(next);
-      } catch {
-        // Silent — empty render
+      } catch (caught) {
+        // A network/transport failure — up-but-slow (timeout) reads as busy,
+        // unreachable as error; both render the same soft busy-retry card and
+        // the retry loop recovers when the companion answers.
+        if (!isCancelled()) setError(classifyResolveFailure(caught));
       } finally {
         release();
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- cancelled mutated by cleanup
-        if (!cancelled) setPending(false);
+        fetchInFlightRef.current = false;
+        pendingSinceRef.current = null;
+        if (!isCancelled()) setPending(false);
       }
-    })();
+    },
+    [companionPort, bridgeKey, threadId],
+  );
+
+  // Input-driven fetch (mount + real input changes). Suppressed while the
+  // recall index rebuilds; the dep list re-fires the fetch the moment the
+  // rebuild settles. A new thread / workstream mutation / manual ↻ restarts a
+  // clean run (and, below, a clean retry window).
+  useEffect(() => {
+    if (companionPort === null || bridgeKey === null) return undefined;
+    // A new input run resets the busy/retry bookkeeping so a stale window from
+    // the previous thread never leaks into this one.
+    retryStartedAtRef.current = null;
+    retryAttemptsRef.current = 0;
+    if (indexRebuilding) {
+      setPending(true);
+      return undefined;
+    }
+    let cancelled = false;
+    void runFetch(() => cancelled);
     return () => {
       cancelled = true;
     };
     // onCache / resolveLabel intentionally excluded — called via
     // refs above to break the fetch-on-render loop.
-  }, [companionPort, bridgeKey, threadId, workstreamFingerprint, indexRebuilding, refreshTick]);
+  }, [
+    companionPort,
+    bridgeKey,
+    threadId,
+    workstreamFingerprint,
+    indexRebuilding,
+    refreshTick,
+    runFetch,
+  ]);
+
+  // Pending-deadline flip. A fetch that hangs (served late as a 304/slow 200
+  // during a long drain) never trips the HTTP-error path above, so without
+  // this the card is stuck pending forever. Once a request has been in flight
+  // past PENDING_DEADLINE_MS with no result and no error yet, synthesize the
+  // 'busy' state so the retry loop owns recovery — the SAME 20s deadline the
+  // URL surface uses (pendingDeadlineExceeded). A late success still clears it.
+  useEffect(() => {
+    if (!pending || error !== null || indexRebuilding) return undefined;
+    const pendingSince = pendingSinceRef.current;
+    if (pendingSince === null) return undefined;
+    const nowMs = Date.now();
+    if (
+      pendingDeadlineExceeded({
+        pendingSinceMs: pendingSince,
+        hasResult: false,
+        hasError: false,
+        nowMs,
+      })
+    ) {
+      setError({ kind: 'busy' });
+      return undefined;
+    }
+    const remainingMs = Math.max(0, pendingSince + PENDING_DEADLINE_MS - nowMs);
+    const timer = window.setTimeout(() => {
+      setRetryTick((tick) => tick + 1);
+    }, remainingMs);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [pending, error, indexRebuilding, retryTick]);
+
+  // Self-heal retry loop for the visible thread card. Runs ONLY while the card
+  // is busy (`error` set) and within THREAD_SUGGESTION_RETRY_WINDOW_MS — a
+  // healthy card never polls. Each tick re-issues the fetch (which clears the
+  // error on success → the loop stops), so a card that flipped busy while the
+  // endpoint answers 200 in ~2.4s recovers on the next probe instead of
+  // hanging for 10 minutes. Mirrors the URL surface's focused-resolve retry.
+  useEffect(() => {
+    if (companionPort === null || bridgeKey === null || indexRebuilding) return undefined;
+    if (error === null) {
+      // Not busy → no polling; reset the window so the next busy flip starts
+      // a fresh one.
+      retryStartedAtRef.current = null;
+      retryAttemptsRef.current = 0;
+      return undefined;
+    }
+    const nowMs = Date.now();
+    if (retryStartedAtRef.current === null) {
+      retryStartedAtRef.current = nowMs;
+      retryAttemptsRef.current = 0;
+    }
+    if (
+      threadRetryExhausted({ startedAtMs: retryStartedAtRef.current, nowMs })
+    ) {
+      // Window elapsed — stop rescheduling. The busy card stays (honest) until
+      // a real input change or manual ↻ opens a fresh window.
+      return undefined;
+    }
+    const delayMs = threadRetryDelayMs(retryAttemptsRef.current);
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      if (fetchInFlightRef.current) {
+        // Coalesce with an in-flight fetch: reschedule without a new probe.
+        setRetryTick((tick) => tick + 1);
+        return;
+      }
+      retryAttemptsRef.current += 1;
+      void runFetch(() => cancelled).finally(() => {
+        if (!cancelled) setRetryTick((tick) => tick + 1);
+      });
+    }, delayMs);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [companionPort, bridgeKey, indexRebuilding, error, retryTick, runFetch]);
 
   // Always render the row even when the companion has no automatic
   // suggestion above threshold — surface the manual picker so the
@@ -10732,6 +10875,7 @@ function NeedsOrganizeSuggestionRow({
           ? { margin: suggestion.margin }
           : {})}
         pending={pending || indexRebuilding}
+        {...(error !== null && !indexRebuilding ? { error } : {})}
         onAccept={() => {
           if (hasAuto && suggestion.workstreamId.length > 0) {
             onAccept(suggestion.workstreamId);
@@ -10745,6 +10889,11 @@ function NeedsOrganizeSuggestionRow({
           // the effect to re-run with no cached fallback to render.
           onClearCache();
           setSuggestion(null);
+          // Clear the busy/error state and reset the retry window so the
+          // manual retry starts a clean run (the input-effect re-fetches).
+          setError(null);
+          retryStartedAtRef.current = null;
+          retryAttemptsRef.current = 0;
           setRefreshTick((tick) => tick + 1);
         }}
         onDismiss={onDismiss}
