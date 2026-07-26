@@ -534,6 +534,15 @@ export const LISTED_PRIOR_PSEUDO_MASS = 4.5;
 // (this module must not depend on the ranker).
 export const COARSE_MULTI_TOPIC_DOMAIN_PRIOR: ReadonlySet<string> = new Set<string>([
   'ycombinator.com',
+  // github.com — a multi-topic hub (many repos across unrelated topics). It was
+  // dropped from the ranker registry in PR #274 and never had a discriminativeness
+  // prior here, so the vote arm's domain vote fired UNMUTED on github: on a
+  // lightly-filed vault github's single domain-argmax mis-filed unrelated repos
+  // (2026-07-26 vote-arm failure). Listed here so gatedDomainWorkstream withholds
+  // the github domain vote until real per-repo filing evidence overrides the prior.
+  // Kept in sync BY INTENT with ranker/aggregatorProfiles.ts githubProfile.
+  'github.com',
+  'gitlab.com',
   'reddit.com',
   'lobste.rs',
   'twitter.com',

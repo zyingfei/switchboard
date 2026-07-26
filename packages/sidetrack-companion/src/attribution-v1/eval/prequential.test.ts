@@ -4,6 +4,7 @@ import {
   ATTRIBUTION_PREQUENTIAL_ARMS,
   HEAD_WORKSTREAM_LABEL_THRESHOLD,
   buildPrequentialVerdict,
+  decideVoteArm,
   gatedDomainWorkstream,
   runAttributionPrequential,
   runV1ThresholdCurve,
@@ -490,6 +491,51 @@ describe('vote3 — servable arm equivalence + hub gating', () => {
     // Sanity: no domain ⇒ no domain vote (used by serve.ts for un-parseable urls).
     expect(gatedDomainWorkstream(buildAttributionV1State([]), null)).toBeNull();
   });
+
+  it('decideVoteArm — correlated-prior guard (rule 2a) + auto-apply cap (rule 2b)', () => {
+    // rule 2a: domain + recency agree WITHOUT title ⇒ inbox (the near-global
+    // priors are not page evidence).
+    const priorsOnly = decideVoteArm(
+      { title: null, domain: 'wsA', recency: 'wsA' },
+      { autoApplyEnabled: false },
+    );
+    expect(priorsOnly.tier).toBe('inbox');
+    expect(priorsOnly.abstainReason).toBe('no-title-evidence');
+    expect(priorsOnly.workstreamId).toBe('wsA'); // the winner is reported, but not served
+
+    // recency alone (single prior) ⇒ inbox.
+    expect(decideVoteArm({ title: null, domain: null, recency: 'wsA' }, { autoApplyEnabled: false }).tier).toBe(
+      'inbox',
+    );
+
+    // Title participates (title vote in the winning plurality) ⇒ suggest.
+    const withTitle = decideVoteArm(
+      { title: 'wsA', domain: 'wsA', recency: 'wsB' },
+      { autoApplyEnabled: false },
+    );
+    expect(withTitle.tier).toBe('suggest');
+    expect(withTitle.workstreamId).toBe('wsA');
+    expect(withTitle.voters).toContain('title');
+
+    // Unanimous 3-vote WITH the flag OFF ⇒ still only suggest (rule 2b cap).
+    expect(
+      decideVoteArm({ title: 'wsA', domain: 'wsA', recency: 'wsA' }, { autoApplyEnabled: false }).tier,
+    ).toBe('suggest');
+    // Unanimous 3-vote WITH the flag ON ⇒ auto-apply.
+    expect(
+      decideVoteArm({ title: 'wsA', domain: 'wsA', recency: 'wsA' }, { autoApplyEnabled: true }).tier,
+    ).toBe('auto-apply');
+    // A 2-vote (title+domain) tier stays suggest even with the flag ON (not
+    // unanimous).
+    expect(
+      decideVoteArm({ title: 'wsA', domain: 'wsA', recency: 'wsB' }, { autoApplyEnabled: true }).tier,
+    ).toBe('suggest');
+
+    // No winner ⇒ inbox / no-winner.
+    const none = decideVoteArm({ title: null, domain: null, recency: null }, { autoApplyEnabled: true });
+    expect(none.tier).toBe('inbox');
+    expect(none.abstainReason).toBe('no-winner');
+  });
 });
 
 // ---- vote3 SERVED numbers: the doctrine-rule-10 read-back (F2/F5) ------
@@ -585,6 +631,23 @@ describe('vote3 SERVED numbers — eval read-back (F2/F5)', () => {
     // And the auto-apply tier actually fires on some labels (a non-empty tier —
     // the "file a neighbor, then the fresh visit auto-applies" behaviour).
     expect(at(VOTE3_AUTO_APPLY_MIN_VOTES).suggestedCount).toBeGreaterThan(0);
+  });
+
+  it('the GUARDED arm (rule 2a) abstains more but never scores fewer top-1 than it suggests', () => {
+    // The guarded arm is scored on the SAME replay. The correlated-prior guard
+    // (title must participate) can only REMOVE suggestions relative to the
+    // unguarded arm — it never invents a hit. So on any fixture: guarded abstain
+    // >= unguarded abstain, and guarded top1Hits <= unguarded top1Hits. This is
+    // the invariant the serve-side guard rests on (abstain rises, precision must
+    // not fall below the suggestions it keeps).
+    const report = runAttributionPrequential(votedFixtureEvents(6, 6));
+    const vote3 = armOf(report.arms, 'vote3');
+    const guarded = armOf(report.arms, 'vote3-guarded');
+    expect(guarded.abstainRate).toBeGreaterThanOrEqual(vote3.abstainRate);
+    expect(guarded.top1Hits).toBeLessThanOrEqual(vote3.top1Hits);
+    // Every kept suggestion HAS the title vote participating, so on this
+    // title-rich fixture the guarded precision is at least the unguarded's.
+    expect(guarded.precisionWhenSuggesting).toBeGreaterThanOrEqual(vote3.precisionWhenSuggesting);
   });
 });
 

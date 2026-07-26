@@ -63,10 +63,14 @@ describe('attributionArm — flag parsing', () => {
     }
   };
 
-  it('defaults to the vote arm (vote3) when unset', () => {
-    expect(DEFAULT_ATTRIBUTION_ARM).toBe('vote3');
-    withEnv(undefined, () => expect(attributionArm()).toBe('vote3'));
-    withEnv('', () => expect(attributionArm()).toBe('vote3'));
+  it('defaults to the incumbent (v1) when unset', () => {
+    // REVERTED 2026-07-26 (fix/vote-arm-precision): the guarded vote arm does not
+    // clear the 0.55 precision-when-suggesting bar (48.6% on the live vault), so
+    // the serve default is the incumbent graph-resolver. The vote arm stays
+    // opt-in via SIDETRACK_ATTRIBUTION_ARM=vote3.
+    expect(DEFAULT_ATTRIBUTION_ARM).toBe('v1');
+    withEnv(undefined, () => expect(attributionArm()).toBe('v1'));
+    withEnv('', () => expect(attributionArm()).toBe('v1'));
   });
 
   it('accepts both vote3 and vote4 spellings for the vote arm', () => {
@@ -79,18 +83,52 @@ describe('attributionArm — flag parsing', () => {
     withEnv('incumbent', () => expect(attributionArm()).toBe('v1'));
   });
 
-  it('unknown values fall back to the default (vote arm)', () => {
-    withEnv('garbage', () => expect(attributionArm()).toBe('vote3'));
+  it('unknown values fall back to the default (incumbent v1)', () => {
+    withEnv('garbage', () => expect(attributionArm()).toBe('v1'));
   });
 });
 
 describe('resolveUrlAttributionVote3 — the 0.088-vs-0.436 abstain case', () => {
-  it('suggests where the incumbent v1 scorer abstains (fresh workstream-tied neighbor)', () => {
-    // Build state so wsAlpha has strong recency + a domain history on a
-    // single-workstream domain. A fresh visit on that domain (no title overlap
-    // strong enough to clear the incumbent's MIN_SUGGEST_SCORE=14 evidence gate)
-    // makes the incumbent scoreVisit ABSTAIN — the shipped-v1 86%-abstain
-    // behaviour. The vote arm, keying off the domain vote + recency, SUGGESTS.
+  it('suggests where the incumbent v1 scorer abstains (title participates)', () => {
+    // Build state so wsRust has strong recency + a single-workstream domain AND a
+    // stored title vocabulary. A fresh visit whose title OVERLAPS that vocabulary
+    // still falls under the incumbent's MIN_SUGGEST_SCORE=14 evidence gate (a
+    // short title over two members) ⇒ the incumbent scoreVisit ABSTAINS — the
+    // shipped-v1 86%-abstain behaviour. The GUARDED vote arm suggests because the
+    // TITLE vote participates (rule 2a: title in the winning plurality), joined
+    // by domain + recency.
+    seq = 0;
+    const events: AcceptedEvent[] = [
+      timeline('https://blog.rust-lang.org/a', 'rust async runtime tokio', 1),
+      timeline('https://blog.rust-lang.org/b', 'rust async runtime tokio', 2),
+      organize('https://blog.rust-lang.org/a', 'wsRust', 10),
+      organize('https://blog.rust-lang.org/b', 'wsRust', 11),
+    ];
+    const state = buildAttributionV1State(events);
+
+    // A fresh visit on the SAME single-workstream domain WITH an overlapping
+    // title ⇒ the title vote points at wsRust and participates in the plurality.
+    const freshUrl = 'https://blog.rust-lang.org/c';
+    const freshTitle = 'rust async runtime tokio';
+
+    const incumbent = scoreVisit({ title: freshTitle, url: freshUrl }, state);
+    expect(incumbent.action).toBe('abstain');
+
+    // The vote arm: title (wsRust) + domain (wsRust) + recency (wsRust) ⇒ 3 votes,
+    // title participates ⇒ SUGGEST (auto-apply is flag-gated OFF by default).
+    const vote = resolveUrlAttributionVote3({ state, canonicalUrl: freshUrl, title: freshTitle });
+    expect(vote.decision.action).toBe('suggest');
+    expect(vote.decision.workstreamId).toBe('wsRust');
+    expect(vote.fusedCandidates).toHaveLength(1);
+    expect(vote.fusedCandidates[0]!.corroborationCount).toBe(3);
+  });
+
+  it('correlated-prior guard: domain + recency alone (no title) does NOT suggest', () => {
+    // rule 2a — the live monotony failure encoded. A fresh visit on a
+    // single-workstream domain whose recency ALSO points there, but with a title
+    // that overlaps NOTHING filed. Without the title vote the winner rests only
+    // on the correlated domain + recency priors — the guard abstains to inbox
+    // rather than suggesting the recent/dominant workstream.
     seq = 0;
     const events: AcceptedEvent[] = [
       timeline('https://blog.rust-lang.org/a', 'rust release notes', 1),
@@ -99,29 +137,22 @@ describe('resolveUrlAttributionVote3 — the 0.088-vs-0.436 abstain case', () =>
       organize('https://blog.rust-lang.org/b', 'wsRust', 11),
     ];
     const state = buildAttributionV1State(events);
-
-    // A fresh visit on the SAME single-workstream domain, but a title with no
-    // overlap against wsRust's stored member terms ⇒ the incumbent title family
-    // scores 0 and abstains under the evidence gate.
-    const freshUrl = 'https://blog.rust-lang.org/c';
-    const freshTitle = 'completely unrelated headline words here';
-
-    const incumbent = scoreVisit({ title: freshTitle, url: freshUrl }, state);
-    expect(incumbent.action).toBe('abstain');
-
-    // The vote arm: domain vote = wsRust (single-workstream, fully
-    // discriminative ⇒ gate passes) + recency = wsRust ⇒ 2 votes ⇒ SUGGEST.
-    const vote = resolveUrlAttributionVote3({ state, canonicalUrl: freshUrl, title: freshTitle });
-    expect(vote.decision.action).toBe('suggest');
-    expect(vote.decision.workstreamId).toBe('wsRust');
-    expect(vote.fusedCandidates).toHaveLength(1);
-    expect(vote.fusedCandidates[0]!.corroborationCount).toBe(2);
+    const vote = resolveUrlAttributionVote3({
+      state,
+      canonicalUrl: 'https://blog.rust-lang.org/c',
+      // No overlap ⇒ title vote null; only domain + recency (both wsRust) vote.
+      title: 'completely unrelated headline words here',
+    });
+    expect(vote.decision.action).toBe('inbox');
+    expect(vote.fusedCandidates).toHaveLength(0);
+    expect(inferredUrlAttributionPayloadFromResolution(vote)).toBeNull();
   });
 
-  it('auto-applies only on unanimous 3-signal agreement', () => {
-    // Title + domain + recency ALL point at wsRust ⇒ 3 votes ⇒ auto-apply, and
-    // the inferred-payload builder produces a valid payload (dominantSource !=
-    // none), so the round-guard/auto-apply path can commit it.
+  it('auto-applies only when the flag is ON and agreement is unanimous', () => {
+    // Title + domain + recency ALL point at wsRust ⇒ 3 votes, title participates.
+    // With SIDETRACK_VOTE_ARM_AUTO_APPLY OFF (the default), the arm caps at
+    // SUGGEST (rule 2b). With autoApplyEnabled forced on, it auto-applies and the
+    // inferred-payload builder produces a valid payload (dominantSource != none).
     seq = 0;
     const events: AcceptedEvent[] = [
       timeline('https://rust-lang.org/a', 'distributed consensus raft protocol', 1),
@@ -130,10 +161,24 @@ describe('resolveUrlAttributionVote3 — the 0.088-vs-0.436 abstain case', () =>
       organize('https://rust-lang.org/b', 'wsRust', 11),
     ];
     const state = buildAttributionV1State(events);
+
+    // Default (flag OFF) ⇒ capped at suggest even at 3 unanimous votes.
+    const capped = resolveUrlAttributionVote3({
+      state,
+      canonicalUrl: 'https://rust-lang.org/c',
+      title: 'distributed consensus raft protocol',
+      autoApplyEnabled: false,
+    });
+    expect(capped.decision.action).toBe('suggest');
+    expect(capped.decision.workstreamId).toBe('wsRust');
+    expect(capped.fusedCandidates[0]!.corroborationCount).toBe(VOTE3_AUTO_APPLY_MIN_VOTES);
+
+    // Flag ON ⇒ auto-apply (the earned-tier path).
     const vote = resolveUrlAttributionVote3({
       state,
       canonicalUrl: 'https://rust-lang.org/c',
       title: 'distributed consensus raft protocol',
+      autoApplyEnabled: true,
     });
     expect(vote.decision.action).toBe('auto-apply');
     expect(vote.decision.workstreamId).toBe('wsRust');
@@ -265,14 +310,16 @@ describe('resolveUrlAttributionVote3 — domain-tombstone gate', () => {
 
   it('withholds a tombstoned domain’s vote (purged labels do not contribute)', () => {
     // A purged domain whose labels populate its domain history must NOT cast its
-    // learned domain vote once tombstoned. Here the ONLY vote for a fresh
-    // purged-domain URL (empty title, no recency toward it) is the domain vote;
-    // withholding it drops the resolve to inbox rather than voting off purged
-    // data.
+    // learned domain vote once tombstoned. Under the correlated-prior guard the
+    // title vote must participate for a suggestion at all, so the fresh URL
+    // carries a title that overlaps the purged workstream: ungated, title +
+    // domain both vote wsPurged (2 votes, title participates ⇒ suggest); gated,
+    // the domain vote is withheld so the vote count drops — proving the purged
+    // domain no longer contributes its learned argmax.
     seq = 0;
     const events: AcceptedEvent[] = [
-      timeline('https://purged.example/a', 'alpha alpha alpha', 1),
-      timeline('https://purged.example/b', 'beta beta beta', 2),
+      timeline('https://purged.example/a', 'alpha keyword topic', 1),
+      timeline('https://purged.example/b', 'alpha keyword topic', 2),
       organize('https://purged.example/a', 'wsPurged', 10),
       organize('https://purged.example/b', 'wsPurged', 11),
       // A LAST filing on a different domain so recency points away from wsPurged.
@@ -281,25 +328,39 @@ describe('resolveUrlAttributionVote3 — domain-tombstone gate', () => {
     ];
     const state = buildAttributionV1State(events);
     const url = 'https://purged.example/c';
+    const title = 'alpha keyword topic';
 
-    // Ungated: the single-workstream purged domain casts a vote ⇒ wsPurged in
-    // the candidate set (suggest or better).
-    const ungated = resolveUrlAttributionVote3({
+    // Ungated: title (wsPurged) + domain (wsPurged) ⇒ 2 votes, title
+    // participates ⇒ suggests wsPurged with a 2-vote corroboration.
+    const ungated = resolveUrlAttributionVote3({ state, canonicalUrl: url, title });
+    expect(ungated.decision.workstreamId).toBe('wsPurged');
+    expect(ungated.fusedCandidates[0]!.corroborationCount).toBe(2);
+
+    // Gated: a purged.example tombstone hides the page entirely (a tombstoned
+    // domain tombstones its own pages), and independently withholds the domain
+    // vote for siblings — so the purged workstream is never surfaced.
+    const gated = resolveUrlAttributionVote3({
       state,
       canonicalUrl: url,
-      title: 'no overlap headline here',
+      title,
+      tombstones: tombstoneGate(['purged.example']),
     });
-    expect(ungated.decision.workstreamId).toBe('wsPurged');
+    expect(gated.decision.action).toBe('inbox');
+    expect(gated.decision.workstreamId).not.toBe('wsPurged');
 
-    // Gated: the tombstoned domain's vote is withheld. The only remaining vote
-    // is recency = wsGarden — so the resolve NEVER cites the purged workstream.
-    const gated = resolveUrlAttributionVote3({
+    // Domain-vote-withholding in isolation: a NON-tombstoned sibling page that
+    // draws its ONLY signal from the purged domain's argmax (no title overlap, no
+    // recency toward it) must not surface wsPurged when a domain-only tombstone
+    // applies. We reach the domain-only path by tombstoning a DIFFERENT
+    // registrable so the page itself is not hidden, then asserting the domain
+    // argmax cannot alone carry a suggestion under the guard (title absent).
+    const sibling = resolveUrlAttributionVote3({
       state,
       canonicalUrl: url,
       title: 'no overlap headline here',
       tombstones: tombstoneGate(['purged.example']),
     });
-    expect(gated.decision.workstreamId).not.toBe('wsPurged');
+    expect(sibling.decision.workstreamId).not.toBe('wsPurged');
   });
 });
 

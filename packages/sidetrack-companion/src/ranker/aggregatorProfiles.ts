@@ -67,6 +67,129 @@ const hnProfile: AggregatorProfile = {
   siteTitleSuffixes: [' | Hacker News'],
 };
 
+// GitHub reserved first-path segments — routes that are NOT a user/org and so
+// never begin an `/owner/repo` item. Derived from the live vault (doctrine
+// rule 1): `search`, `sessions` (OAuth/2FA), `login`, `orgs` all appeared as
+// github.com first segments alongside the owner/repo pages. The rest of the
+// list is GitHub's well-known reserved-route set so a future capture of e.g.
+// /settings or /notifications also classifies as a feed rather than a phantom
+// `owner=settings` repo. Lowercased for case-insensitive comparison.
+const GITHUB_RESERVED_ROUTES: ReadonlySet<string> = new Set<string>([
+  'search',
+  'sessions',
+  'login',
+  'logout',
+  'join',
+  'orgs',
+  'users',
+  'settings',
+  'notifications',
+  'dashboard',
+  'marketplace',
+  'explore',
+  'topics',
+  'trending',
+  'collections',
+  'sponsors',
+  'about',
+  'pricing',
+  'features',
+  'new',
+  'codespaces',
+  'apps',
+  'issues',
+  'pulls',
+  'watching',
+  'stars',
+  'account',
+]);
+
+// Shared code-forge item predicate: `/owner/repo…` where the first segment is a
+// user/org (not a reserved route) and a non-empty repo segment follows.
+const codeForgeIsItemUrl = (parsed: URL, reserved: ReadonlySet<string>): boolean => {
+  const segments = parsed.pathname.split('/').filter((segment) => segment.length > 0);
+  const owner = segments[0];
+  const repo = segments[1];
+  if (owner === undefined || repo === undefined) return false;
+  return !reserved.has(owner.toLowerCase());
+};
+
+// Shared code-forge community key: `repo:<host>/<owner>/<repo>` (the repo IS the
+// sub-community). Null for reserved-route or shape-less paths.
+const codeForgeCommunityKey = (
+  hostname: string,
+  segments: readonly string[],
+  reserved: ReadonlySet<string>,
+): string | null => {
+  const owner = segments[0];
+  const repo = segments[1];
+  if (owner === undefined || repo === undefined) return null;
+  if (reserved.has(owner.toLowerCase())) return null;
+  const normRepo = repo.replace(/\.git$/iu, '');
+  return `repo:${hostname}/${owner.toLowerCase()}/${normRepo.toLowerCase()}`;
+};
+
+// github.com — a multi-topic HUB in the same sense HN is: the domain hosts one
+// FEED surface (root, /search, user/org profiles, /trending, auth) plus many
+// distinct ITEM pages, each a stable content object keyed by `/owner/repo`
+// (and every sub-page under it: /pull/N, /issues, /blob/…, /tree/…,
+// /releases/…). WHY THIS EXISTS: github.com was DROPPED from this registry in
+// the COARSE_MULTI_TOPIC_DOMAINS→registry migration (PR #274) — only the
+// `repo:owner/repo` comment survived — so the hub-domain discriminativeness
+// gate never muted the `domain:github.com` vote. On the lightly-filed live
+// vault that let github's domain vote (one global argmax over a handful of
+// filed repos) mis-file unrelated repos (2026-07-26 vote-arm failure). Adding
+// the profile restores isAggregatorHost(github.com)=true (candidates.ts /
+// similarity.ts guard); the parallel COARSE_MULTI_TOPIC_DOMAIN_PRIOR entry in
+// attribution-v1/state.ts is what actually gates the vote arm's domain signal
+// (the two lists are kept in sync BY INTENT — see that file's note).
+//
+// URL shapes DERIVED FROM THE LIVE TEST VAULT (247 github.com timeline visits,
+// read-only 2026-07-26): item `/owner/repo` (120 obs, the dominant shape) plus
+// its sub-pages (/pull/N ×many, /blob, /tree, /issues, /releases, /graphs,
+// /pulls); feed `/` (root), `/search?q=…` (5), single-segment user/org
+// profiles (/zyingfei, /statewright, 17 obs), `/sessions/…` auth (3),
+// `/login`, `/orgs`.
+const githubProfile: AggregatorProfile = {
+  registrableDomain: 'github.com',
+  // An item is `/owner/repo…`: a first segment that is a user/org (NOT a
+  // reserved route) followed by a non-empty repo segment. Single-segment paths
+  // (user/org profiles), `/search`, auth, and root are feeds. Keys on the
+  // STRUCTURAL POSITION of owner+repo, not on any charset — same choice as the
+  // HN `item?id=` and reddit `/comments/<id>` predicates.
+  isItemUrl: (parsed) => codeForgeIsItemUrl(parsed, GITHUB_RESERVED_ROUTES),
+  siteTitleSuffixes: [' · GitHub', ' - GitHub'],
+  // A repo IS the sub-community grouping key — mirrors candidates.ts's
+  // `repo:github.com/owner/repo` (the ad-hoc key that survived the migration).
+  communityKey: (hostname, segments) => codeForgeCommunityKey(hostname, segments, GITHUB_RESERVED_ROUTES),
+};
+
+// GitLab is the same code-forge shape as GitHub (`/owner/repo…`, every sub-page
+// under it) with its own reserved-route set. candidates.ts / features.ts already
+// treat gitlab.com as a repo host; the profile makes it a hub-gated aggregator
+// too (kept in sync with COARSE_MULTI_TOPIC_DOMAIN_PRIOR).
+const GITLAB_RESERVED_ROUTES: ReadonlySet<string> = new Set<string>([
+  'search',
+  'users',
+  'dashboard',
+  'explore',
+  'help',
+  'admin',
+  'groups',
+  'projects',
+  'sign_in',
+  'sign_up',
+  'oauth',
+  '-',
+]);
+
+const gitlabProfile: AggregatorProfile = {
+  registrableDomain: 'gitlab.com',
+  isItemUrl: (parsed) => codeForgeIsItemUrl(parsed, GITLAB_RESERVED_ROUTES),
+  siteTitleSuffixes: [' · GitLab', ' - GitLab'],
+  communityKey: (hostname, segments) => codeForgeCommunityKey(hostname, segments, GITLAB_RESERVED_ROUTES),
+};
+
 const redditProfile: AggregatorProfile = {
   registrableDomain: 'reddit.com',
   // A reddit content object is a comments thread: /r/<sub>/comments/<id>/…
@@ -235,6 +358,8 @@ const feedOnlyProfile = (registrableDomain: string): AggregatorProfile => ({
 // (candidates.ts and similarity.ts both consume it).
 const AGGREGATOR_PROFILES: readonly AggregatorProfile[] = [
   hnProfile,
+  githubProfile,
+  gitlabProfile,
   redditProfile,
   youtubeProfile,
   mediumProfile,

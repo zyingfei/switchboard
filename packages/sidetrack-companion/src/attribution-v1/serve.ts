@@ -20,30 +20,44 @@
 // (514 asserted labels, 2026-07-26 read-back), vs vote4's 43.6% and the
 // incumbent-shadow v1's 8.8%. See eval/prequential.test.ts for the in-test proof.
 //
-// THRESHOLD LADDER (the vote-count gate — the vote arm has no continuous score,
-// so its natural gate is how many of the three signals agree). The vote-count
-// sweep is a HARNESS PRODUCER now — eval/prequential.ts runVote3VoteCountCurve,
-// emitted into the prequential artifact — so these are read-back numbers, not
-// prose (doctrine rule 10). Measured on ~/.sidetrack-vault-test (514 labels,
-// gated domain vote, 2026-07-26 read-only run):
-//   >= 1 vote : coverage 99.8%  top1 45.9%  precision-when-suggesting 46.0%  -> SUGGEST
-//   >= 2 votes: coverage 35.0%  top1 22.4%  precision 63.9%
-//   >= 3 votes: coverage  7.8%  top1  6.4%  precision 82.5%                  -> AUTO-APPLY
-// The user values not-being-wrong, so auto-apply takes the most conservative,
-// near-certain tier (unanimous 3-signal agreement, 82.5% precision); suggest
-// takes the coverage tier (46.0% precision at ~100% coverage) to light the §13
-// demo that the incumbent leaves dark (it abstains 86% of the time). This maps
-// the sweep's precision tiers onto the existing decideAttribution action ladder:
-// auto needs the high-precision bar, suggest earns the coverage. The
-// eval/prequential.test.ts "vote3 SERVED numbers" fixture asserts the curve is
-// monotone (precision rises with votes) and the auto-apply tier clears the
-// ~0.6 bar, backing this ladder with a passing CI test.
+// THE CORRELATED-PRIOR GUARD (fix/vote-arm-precision, 2026-07-26). The
+// unguarded vote arm degenerated to MONOTONE suggestions on live diverse
+// browsing: three unrelated pages (a design essay, an economics article, a
+// GitHub security blog) resolved to the SAME workstream, one at AUTO-APPLY. Root
+// cause: on a lightly-filed vault the domain + recency votes are near-GLOBAL
+// PRIORS, not page evidence — `recency` is ONE global lastFiledWorkstreamId and
+// `domain` collapses to a handful of argmaxes — so when the per-page title vote
+// abstained, the two correlated priors plurality-won and swept fresh browsing
+// onto the recent/dominant workstream. The prequential's 45.9% top1 MASKED this
+// because historical labels cluster in temporal bursts where recency IS
+// predictive. The fix threads decideVoteArm (eval/prequential.ts): SUGGEST now
+// requires the TITLE vote to participate in the winning plurality — two priors
+// agreeing is not page evidence. Re-scored on the same harness
+// (~/.sidetrack-vault-test, 514 labels, 2026-07-26 read-only, github domain vote
+// now hub-gated):
+//   unguarded          top1 45.9%  abstain  0.2%  precision-when-suggesting 46.0%
+//   title-participates  top1 37.4%  abstain 23.2%  precision 48.6%   <- served guard (2a)
+//   title + >= 2 votes  top1 20.6%  abstain 67.9%  precision 64.2%
+// Abstain rises substantially — that is CORRECT (the user's bar: never-wrong >
+// always-present). But the guarded arm's precision-when-suggesting (48.6%) does
+// NOT clear the 0.55 default-flip bar, and the stricter title+>=2 variant clears
+// precision only by abstaining 67.9% (> the 0.6 abstain cap). So the SERVE
+// DEFAULT reverts to 'v1' (DEFAULT_ATTRIBUTION_ARM below) — the vote arm stays a
+// scored, servable, opt-in arm, not the default, until it earns the precision
+// bar on live reverse-shadow agreement data.
+//
+// AUTO-APPLY (rule 2b) is DISABLED by default: the eval's 82.5%-precision
+// 3-vote tier was HISTORICAL (temporal-burst leakage), and the live monotony
+// failure landed one collapse at auto-apply. The vote arm caps at SUGGEST unless
+// SIDETRACK_VOTE_ARM_AUTO_APPLY=1 (see voteArmAutoApplyEnabled). The vote-count
+// sweep (eval/prequential.ts runVote3VoteCountCurve, emitted into the
+// prequential artifact) remains the read-back for the >= 3-vote tier's precision.
 
 import { domainOfUrl } from './state.js';
 import type { AttributionV1State } from './state.js';
 import {
+  decideVoteArm,
   gatedDomainWorkstream,
-  tallyVote3,
   titleNearestWorkstream,
 } from './eval/prequential.js';
 // Type-only import: serve.ts must not pull the resolver's PPR/similarity/cluster
@@ -60,18 +74,39 @@ export const ATTRIBUTION_ARM_ENV = 'SIDETRACK_ATTRIBUTION_ARM';
 // 'vote3' has the URL resolver return this vote arm's decision instead.
 export type AttributionArm = 'v1' | 'vote3';
 
-// Default 'vote3': the servable arm reproduces the frozen-baseline win on the
-// eval harness — 45.9% top1 on ~/.sidetrack-vault-test (514 asserted labels,
-// gated domain vote, 2026-07-26 read-only run), clearing the >= 40% bar and
-// beating both vote4 (43.6%) and the incumbent-shadow v1 (8.8%, abstains 86%).
-// This default-flip guard is CI'd: eval/prequential.test.ts "vote3 SERVED
-// numbers" runs runAttributionPrequential over a fixture vault and asserts
-// vote3.top1 >= 0.40 AND >= vote4.top1 — so a regression below the bar (or a
-// methodology drift) fails a test rather than silently shipping. The live-vault
-// 45.9% is the flag-comment citation; the fixture floor is the doctrine-rule-10
-// read-back. Set SIDETRACK_ATTRIBUTION_ARM=v1 to fall back to the incumbent
-// instantly (env + restart, no data migration).
-export const DEFAULT_ATTRIBUTION_ARM: AttributionArm = 'vote3';
+// Default 'v1' (REVERTED 2026-07-26, fix/vote-arm-precision). M6 shipped 'vote3'
+// as the default on the strength of its 45.9% prequential top1, but the arm
+// degenerated to monotone suggestions on live diverse browsing (see the header's
+// correlated-prior-guard note). The correlated-prior guard (rule 2a) fixes the
+// monotony, but the GUARDED arm's precision-when-suggesting (48.6% on
+// ~/.sidetrack-vault-test, 514 labels, 2026-07-26 read-only) does NOT clear the
+// 0.55 default-flip bar, and the stricter title+>=2 variant clears precision
+// (64.2%) only by abstaining 67.9% (> the 0.6 abstain cap). Under the rule-2c
+// decision (precision >= 0.55 AND abstain <= 0.6 to stay on vote3), the default
+// reverts to the incumbent graph-resolver. The vote arm remains fully servable
+// and CI-scored — set SIDETRACK_ATTRIBUTION_ARM=vote3 to opt in (it now serves
+// the GUARDED, auto-apply-capped decision). The re-flip criterion is the vote
+// arm clearing the precision bar on live reverse-shadow agreement data.
+export const DEFAULT_ATTRIBUTION_ARM: AttributionArm = 'v1';
+
+// SIDETRACK_VOTE_ARM_AUTO_APPLY (default OFF) — rule 2b. The vote arm's
+// auto-apply tier (unanimous 3-signal agreement) measured 82.5% precision on the
+// eval, but that number is HISTORICAL: the prequential's temporal-burst leakage
+// inflates the recency signal, and the live monotony failure landed one wrongful
+// collapse AT the auto-apply tier. So the vote arm caps at SUGGEST — it never
+// auto-applies — until this flag is explicitly set.
+//
+// RE-ENABLE CRITERION (do not flip on a hunch): turn this ON only after the
+// reverse-shadow (armShadow.ts) shows the vote arm's auto-apply tier AGREES with
+// the incumbent at >= 0.9 agree-rate over >= 50 live auto-apply-eligible
+// resolves AND a spot-audit of those live confirms >= 20 correct auto-applies
+// with zero wrongful landings. Until both hold, historical eval precision does
+// not license live auto-apply.
+export const VOTE_ARM_AUTO_APPLY_ENV = 'SIDETRACK_VOTE_ARM_AUTO_APPLY';
+
+export const voteArmAutoApplyEnabled = (): boolean =>
+  process.env[VOTE_ARM_AUTO_APPLY_ENV] === '1' ||
+  process.env[VOTE_ARM_AUTO_APPLY_ENV] === 'true';
 
 // The task's flag values are 'v1' | 'vote4'; 'vote4' selects the servable vote
 // arm (vote3, its serving equivalent — see the module header for why the
@@ -85,9 +120,15 @@ export const attributionArm = (): AttributionArm => {
   return DEFAULT_ATTRIBUTION_ARM;
 };
 
-// Vote-count -> action thresholds. Suggest at >= 1 (any signal agrees — the
-// coverage tier that lights the demo); auto-apply at >= 3 (unanimous — the
-// 82.5%-precision conservative tier the user's "don't be wrong" bar demands).
+// Vote-count -> action thresholds. The suggest/auto tier decision now lives in
+// decideVoteArm (eval/prequential.ts) so the served rule and the eval arm are one
+// function — the guard (title must participate) and the auto-apply cap are
+// applied there. These constants document the vote-count floors decideVoteArm
+// keys on: a winner needs >= VOTE3_SUGGEST_MIN_VOTES votes at all (the
+// coverage-tier floor the vote-count curve reports); auto-apply additionally
+// requires unanimous 3-signal agreement AND the auto-apply flag; and — the guard
+// on top of the vote count — suggest requires the title vote in the winning
+// plurality.
 export const VOTE3_SUGGEST_MIN_VOTES = 1;
 export const VOTE3_AUTO_APPLY_MIN_VOTES = 3;
 
@@ -156,6 +197,10 @@ export interface ResolveUrlAttributionVote3Input {
   // tombstone the arm abstains (inbox), and a tombstoned domain never casts its
   // domain vote. Absent ⇒ no tombstones (the empty-set fast path).
   readonly tombstones?: Vote3TombstoneGate;
+  // rule 2b override: when set, forces the auto-apply gate on/off instead of
+  // reading SIDETRACK_VOTE_ARM_AUTO_APPLY. Absent ⇒ read the env flag (default
+  // OFF). Tests inject this so they do not depend on process env.
+  readonly autoApplyEnabled?: boolean;
 }
 
 // Resolve a URL's attribution under the servable vote3 arm. Pure over the state
@@ -206,30 +251,32 @@ export const resolveUrlAttributionVote3 = (
       ? null
       : gatedDomainWorkstream(input.state, domain);
   const recencyVote = input.state.lastFiledWorkstreamId;
-  const prediction = tallyVote3({ title: titleVote, domain: domainVote, recency: recencyVote });
 
-  const base = inboxBase(prediction.votes, prediction.workstreamId);
+  // The GUARDED tier decision — the single rule the eval harness also scores.
+  // rule 2a: suggest requires the title vote in the winning plurality (recency +
+  // domain alone are near-global priors, not page evidence). rule 2b: auto-apply
+  // only when SIDETRACK_VOTE_ARM_AUTO_APPLY is on AND the vote is unanimous.
+  const decision = decideVoteArm(
+    { title: titleVote, domain: domainVote, recency: recencyVote },
+    { autoApplyEnabled: input.autoApplyEnabled ?? voteArmAutoApplyEnabled() },
+  );
 
-  // Below the suggest floor (no signal voted) ⇒ inbox / abstain.
-  if (prediction.workstreamId === null || prediction.votes < VOTE3_SUGGEST_MIN_VOTES) {
+  const base = inboxBase(decision.votes, decision.workstreamId);
+
+  // Guard fired (no winner, or the correlated-prior guard abstained) ⇒ inbox.
+  if (decision.tier === 'inbox' || decision.workstreamId === null) {
     return { ...base, decision: { action: 'inbox', margin: 0 }, fusedCandidates: [] };
   }
 
-  const voters = [
-    titleVote === prediction.workstreamId ? 'title' : null,
-    domainVote === prediction.workstreamId ? 'domain' : null,
-    recencyVote === prediction.workstreamId ? 'recency' : null,
-  ].filter((v): v is string => v !== null);
   const candidate = voteCandidate(
-    prediction.workstreamId,
-    prediction.votes,
-    `${String(prediction.votes)}-signal agreement (${voters.join(', ')})`,
+    decision.workstreamId,
+    decision.votes,
+    `${String(decision.votes)}-signal agreement (${decision.voters.join(', ')})`,
   );
 
-  const action = prediction.votes >= VOTE3_AUTO_APPLY_MIN_VOTES ? 'auto-apply' : 'suggest';
   return {
     ...base,
-    decision: { action, workstreamId: prediction.workstreamId, margin: prediction.votes },
+    decision: { action: decision.tier, workstreamId: decision.workstreamId, margin: decision.votes },
     fusedCandidates: [candidate],
   };
 };

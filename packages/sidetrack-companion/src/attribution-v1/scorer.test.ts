@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  FAMILY_WEIGHTS,
   HEAD_LABEL_THRESHOLD,
   MIN_SUGGEST_SCORE,
   MIN_TITLE_TERMS_ON_LOW_DISCRIM_DOMAIN,
@@ -14,6 +15,7 @@ import {
   applyOrganizingObservation,
   createEmptyAttributionV1State,
   domainDiscriminativeness,
+  NEUTRAL_DISCRIMINATIVENESS,
   type AttributionV1State,
   type OrganizingObservation,
 } from './state.js';
@@ -158,20 +160,32 @@ describe('scoreVisit conditional-domain family', () => {
     expect(top!.reasons.some((r) => r.family === 'conditional-domain')).toBe(true);
   });
 
-  it('suppresses the domain family on an ambiguous hub (github)', () => {
+  it('all-but-suppresses the domain family on an ambiguous hub (github)', () => {
     const state = buildScorerState();
     const result = scoreVisit(
       { title: 'Linux kernel scheduler paging', url: 'https://github.com/some/repo' },
       state,
       { minSuggestScore: 0 },
     );
-    // github is filed ~evenly across two workstreams ⇒ its learned
-    // discriminativeness is ~0 ⇒ the continuous domain multiplier contributes 0
-    // for every candidate. The continuous score lands on the old binary
-    // "ambiguous hub ⇒ suppressed" behavior for a maximally-even split.
-    expect(domainDiscriminativeness(state, 'github.com').discriminativeness).toBeCloseTo(0, 6);
+    // github is filed ~evenly across two workstreams AND is now a listed hub
+    // prior (fix/vote-arm-precision: github.com added to
+    // COARSE_MULTI_TOPIC_DOMAIN_PRIOR). Its learned discriminativeness sits FAR
+    // below neutral (~0.05 — the even split plus the diffuse list prior), so the
+    // continuous domain multiplier scales the domain contribution to a VESTIGIAL
+    // value that decays smoothly toward zero — the design's "hub → prior, not a
+    // gate". Compare with a single-workstream domain (lwn.net, D~1) below, whose
+    // contribution is an order of magnitude larger.
+    const githubD = domainDiscriminativeness(state, 'github.com');
+    expect(githubD.discriminativeness).toBeLessThan(NEUTRAL_DISCRIMINATIVENESS);
+    expect(githubD.discriminativeness).toBeLessThan(0.1);
+    expect(githubD.listedPrior).toBe(true);
+    // The domain contribution tracks the multiplier: on this near-zero-D hub it
+    // is a small fraction of the full conditional-domain weight, never a
+    // confident domain vote.
     for (const candidate of result.candidates) {
-      expect(candidate.contributions.conditionalDomain).toBe(0);
+      expect(candidate.contributions.conditionalDomain).toBeLessThan(
+        FAMILY_WEIGHTS.conditionalDomain * 0.1,
+      );
     }
   });
 

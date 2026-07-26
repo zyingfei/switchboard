@@ -553,11 +553,12 @@ describe('ranker candidate generation', () => {
       'news.ycombinator.com.', // trailing-dot FQDN form
       'stackoverflow.com',
       'claude.ai',
+      'github.com', // restored PR#274-dropped hub (fix/vote-arm-precision)
+      'gitlab.com',
     ]) {
       expect(isCoarseMultiTopicDomain(host)).toBe(true);
     }
     for (const host of [
-      'github.com',
       'blog.example.test',
       'kernel.org',
       'en.wikipedia.org',

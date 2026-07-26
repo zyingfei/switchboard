@@ -82,6 +82,14 @@ export const ATTRIBUTION_PREQUENTIAL_ARMS = [
   // (doctrine rule 10) and locks vote3 ≈ vote4 so a future state change can't
   // silently break the equivalence.
   'vote3',
+  // vote3-guarded — the SERVED arm after fix/vote-arm-precision. Same three
+  // signals as vote3, but the correlated-prior GUARD (decideVoteArm rule 2a)
+  // abstains whenever the title vote did NOT participate in the winning
+  // plurality: recency + domain agreeing without title are near-global priors on
+  // a lightly-filed vault, not page evidence, and they collapsed three unrelated
+  // live pages onto one workstream (2026-07-26). This is what serve.ts serves;
+  // scoring it here is the doctrine-rule-10 read-back for the guarded ladder.
+  'vote3-guarded',
   'majority',
 ] as const;
 
@@ -407,6 +415,78 @@ const vote3Predict = (
     recency: state.lastFiledWorkstreamId,
   });
 
+// ---- vote-arm GUARD: the correlated-prior precision rule (fix/vote-arm-precision) ----
+//
+// WHY (live failure, 2026-07-26). On a lightly-filed vault the domain + recency
+// votes are near-GLOBAL PRIORS, not page evidence: `recency` is a SINGLE global
+// lastFiledWorkstreamId, and `domain` on a vault with few filed domains collapses
+// to one or two argmaxes. When title abstains (a new/unseen page), those two
+// correlated priors alone plurality-win and every fresh, unrelated page files to
+// the SAME recent/dominant workstream (three unrelated pages → two to one
+// workstream, one at auto-apply). The prequential top1 masked this because
+// historical labels cluster in temporal bursts where recency IS predictive.
+//
+// THE GUARD (rule 2a). Suggest requires the TITLE vote — the only per-page
+// content signal — to participate in the winning plurality. Recency + domain
+// agreeing WITHOUT title cannot reach suggest: they are priors, and two priors
+// agreeing is not page evidence. This is the missing-page-evidence gate the
+// unguarded arm lacked. Measured on the harness (rule 2c) — abstain rises, which
+// is CORRECT (the user's bar: never-wrong > always-present).
+
+export type VoteArmTier = 'auto-apply' | 'suggest' | 'inbox';
+
+export interface VoteArmDecision {
+  readonly workstreamId: string | null;
+  // Number of the three signals that voted for the winner (0 = no winner).
+  readonly votes: number;
+  // Which of the three signals voted for the winner (for provenance + the guard).
+  readonly voters: readonly ('title' | 'domain' | 'recency')[];
+  readonly tier: VoteArmTier;
+  // Why the arm abstained despite a plurality winner (audit): 'no-winner' when
+  // nothing voted, 'no-title-evidence' when the correlated-prior guard fired.
+  readonly abstainReason: 'none' | 'no-winner' | 'no-title-evidence';
+}
+
+// The auto-apply floor (unanimous 3-signal agreement). Only reachable when
+// auto-apply is ENABLED; otherwise the arm caps at suggest (rule 2b).
+export const VOTE_ARM_AUTO_APPLY_MIN_VOTES = 3;
+
+// Decide the vote arm's served tier from the three signals, applying the
+// correlated-prior guard (rule 2a) and the auto-apply cap (rule 2b). The SINGLE
+// source of truth the serve path and the eval harness both call, so the measured
+// number IS the served rule (doctrine rule 10).
+export const decideVoteArm = (
+  signals: Vote3Signals,
+  options: { readonly autoApplyEnabled: boolean },
+): VoteArmDecision => {
+  const prediction = tallyVote3(signals);
+  const winner = prediction.workstreamId;
+  if (winner === null) {
+    return { workstreamId: null, votes: 0, voters: [], tier: 'inbox', abstainReason: 'no-winner' };
+  }
+  const voters = VOTE3_PRIORITY.filter((signal) => signals[signal] === winner);
+  const titleParticipates = voters.includes('title');
+  // GUARD (2a): without the title vote, the winner rests only on the correlated
+  // recency/domain priors — not page evidence. Abstain to inbox.
+  if (!titleParticipates) {
+    return {
+      workstreamId: winner,
+      votes: prediction.votes,
+      voters,
+      tier: 'inbox',
+      abstainReason: 'no-title-evidence',
+    };
+  }
+  // Title participates → at least suggest. Auto-apply only when enabled AND the
+  // vote is unanimous (rule 2b: the vote-arm auto-apply tier is earned, not
+  // assumed — see SIDETRACK_VOTE_ARM_AUTO_APPLY in serve.ts).
+  const tier: VoteArmTier =
+    options.autoApplyEnabled && prediction.votes >= VOTE_ARM_AUTO_APPLY_MIN_VOTES
+      ? 'auto-apply'
+      : 'suggest';
+  return { workstreamId: winner, votes: prediction.votes, voters, tier, abstainReason: 'none' };
+};
+
 // v1 top-k over the current v1 state, for either combiner. Returns the ranked
 // workstream ids and whether the scorer abstained (so the abstention arm can be
 // measured). `combiner` selects the weighted-sum (scoreVisit) or ordered
@@ -641,6 +721,7 @@ export const runAttributionPrequential = (
     recency: createArmTally(),
     vote4: createArmTally(),
     vote3: createArmTally(),
+    'vote3-guarded': createArmTally(),
     majority: createArmTally(),
   };
 
@@ -720,6 +801,28 @@ export const runAttributionPrequential = (
 
     const vote3 = vote3Predict(simple, v1State, label);
     scoreArm('vote3', label, vote3.workstreamId === null ? [] : [vote3.workstreamId], isHead);
+
+    // vote3-guarded — the same three signals through the correlated-prior guard.
+    // The guard abstains (empty ranked) whenever the title vote did not
+    // participate in the winning plurality; otherwise the served prediction is
+    // the plurality winner. The auto-apply tier does not change the RANKED
+    // prediction (auto and suggest both surface the same workstream), so the arm
+    // metric is measured tier-agnostically here — the auto/suggest split is the
+    // vote-count curve's job.
+    const guarded = decideVoteArm(
+      {
+        title: titleNearestWorkstream(v1State, label.title, label.domain),
+        domain: gatedDomainWorkstream(v1State, label.domain),
+        recency: simple.lastFiledWorkstreamId,
+      },
+      { autoApplyEnabled: false },
+    );
+    scoreArm(
+      'vote3-guarded',
+      label,
+      guarded.tier === 'inbox' || guarded.workstreamId === null ? [] : [guarded.workstreamId],
+      isHead,
+    );
     // Feed the vote-count curve sink: the winner's vote count + whether it hit.
     // This is the SERVED ladder's read-back — the same tally serve.ts keys the
     // suggest (>= 1) / auto-apply (>= 3) thresholds on.

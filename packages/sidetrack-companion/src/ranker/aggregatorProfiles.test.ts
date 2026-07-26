@@ -24,6 +24,8 @@ describe('aggregatorProfiles', () => {
         'stackoverflow.com',
         'claude.ai',
         'medium.com',
+        'github.com', // restored PR#274-dropped hub (fix/vote-arm-precision)
+        'gitlab.com',
       ]) {
         expect(isAggregatorHost(host)).toBe(true);
       }
@@ -31,7 +33,6 @@ describe('aggregatorProfiles', () => {
 
     it('does not match look-alikes, non-aggregators, or bare TLDs', () => {
       for (const host of [
-        'github.com',
         'blog.example.test',
         'kernel.org',
         'en.wikipedia.org',
@@ -81,6 +82,35 @@ describe('aggregatorProfiles', () => {
       expect(classifyAggregatorPage('https://www.google.com/search?q=llm')).toBe('feed');
       expect(classifyAggregatorPage('https://duckduckgo.com/?q=rust')).toBe('feed');
       expect(classifyAggregatorPage('https://stackoverflow.com/questions/123')).toBe('feed');
+    });
+
+    it('classifies github /owner/repo (and sub-pages) as item, profiles/search/auth as feed', () => {
+      // Item = a repo content object. URL shapes derived from the live test vault
+      // (247 github.com visits, 2026-07-26 read-only): /owner/repo is the
+      // dominant shape (120 obs), plus every sub-page under it.
+      expect(classifyAggregatorPage('https://github.com/torvalds/linux')).toBe('item');
+      expect(classifyAggregatorPage('https://github.com/duckdb/duckdb')).toBe('item');
+      expect(classifyAggregatorPage('https://github.com/zyingfei/switchboard/pull/170/commits')).toBe(
+        'item',
+      );
+      expect(classifyAggregatorPage('https://github.com/sqlite/sqlite/blob/master/src/btree.c')).toBe(
+        'item',
+      );
+      // Feed = root, user/org profiles (single segment), search, and auth routes.
+      expect(classifyAggregatorPage('https://github.com')).toBe('feed');
+      expect(classifyAggregatorPage('https://github.com/')).toBe('feed');
+      expect(classifyAggregatorPage('https://github.com/statewright')).toBe('feed'); // user/org profile
+      expect(classifyAggregatorPage('https://github.com/search?q=raft')).toBe('feed');
+      expect(classifyAggregatorPage('https://github.com/sessions/social/google/callback')).toBe('feed');
+      expect(classifyAggregatorPage('https://github.com/login')).toBe('feed');
+      expect(classifyAggregatorPage('https://github.com/orgs/anthropics')).toBe('feed');
+    });
+
+    it('classifies gitlab the same code-forge shape (item = /owner/repo)', () => {
+      expect(classifyAggregatorPage('https://gitlab.com/gitlab-org/gitlab')).toBe('item');
+      expect(classifyAggregatorPage('https://gitlab.com/explore')).toBe('feed');
+      expect(classifyAggregatorPage('https://gitlab.com/users/sign_in')).toBe('feed');
+      expect(classifyAggregatorPage('https://gitlab.com/')).toBe('feed');
     });
 
     // Chat-provider thread pages are ITEMS (each is one conversation = a content
@@ -161,7 +191,7 @@ describe('aggregatorProfiles', () => {
 
     it('returns not-aggregator for other domains and malformed urls', () => {
       expect(classifyAggregatorPage('https://kernel.org/doc/security')).toBe('not-aggregator');
-      expect(classifyAggregatorPage('https://github.com/owner/repo')).toBe('not-aggregator');
+      expect(classifyAggregatorPage('https://bitbucket.org/owner/repo')).toBe('not-aggregator');
       expect(classifyAggregatorPage('not a url')).toBe('not-aggregator');
     });
   });
@@ -226,6 +256,22 @@ describe('aggregatorProfiles', () => {
       expect(aggregatorCommunityKey('medium.com', ['@jane', 'essay-abc'])).toBe(
         'author:medium.com/@jane',
       );
+    });
+
+    it('keys github/gitlab by repo (repo:host/owner/repo)', () => {
+      expect(aggregatorCommunityKey('github.com', ['torvalds', 'linux'])).toBe(
+        'repo:github.com/torvalds/linux',
+      );
+      // .git suffix stripped, lowercased.
+      expect(aggregatorCommunityKey('github.com', ['Acme', 'Infra-Tools.git'])).toBe(
+        'repo:github.com/acme/infra-tools',
+      );
+      expect(aggregatorCommunityKey('gitlab.com', ['gitlab-org', 'gitlab'])).toBe(
+        'repo:gitlab.com/gitlab-org/gitlab',
+      );
+      // A reserved route (search / a profile) is not a repo ⇒ null.
+      expect(aggregatorCommunityKey('github.com', ['search'])).toBeNull();
+      expect(aggregatorCommunityKey('github.com', ['statewright'])).toBeNull();
     });
 
     it('returns null for HN (no sub-community) and non-aggregators', () => {
