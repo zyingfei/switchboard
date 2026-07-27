@@ -1345,8 +1345,10 @@ export function HealthPanel({
         {/* Browser-local capability (not a companion candidate lane): the
             built-in Prompt API / Gemini Nano state for THIS browser. Feeds
             the title-synthesis experiment's go/no-go — see
-            poc/nano-title-synthesis/README.md. */}
-        <OnDeviceAiRow />
+            poc/nano-title-synthesis/README.md. Companion access powers the
+            observe-only title-synthesis eval on browsers where the model
+            is ready. */}
+        <OnDeviceAiRow companionPort={companionPort ?? null} bridgeKey={bridgeKey ?? null} />
 
         {candidates.length === 0 ? (
           <div className="sx-callout warn">
