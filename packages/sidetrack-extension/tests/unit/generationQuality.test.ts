@@ -357,3 +357,49 @@ describe('generation options — the anti-degeneracy params are actually passed'
     ).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Prompt echo — the verbatim case is caught; the PARAPHRASED case is a known,
+// measured gap. Both are pinned so the boundary is explicit rather than
+// discovered later in production.
+// ---------------------------------------------------------------------------
+describe('prompt echo', () => {
+  const PROMPT = [
+    'You summarize documents for a personal research organizer.',
+    'Use ONLY facts present in the text.',
+    'If the text is too thin to summarize faithfully, reply exactly: SKIP',
+    '',
+    'Content:',
+    '---',
+  ].join('\n');
+
+  it('rejects a VERBATIM echo of the instructions', () => {
+    const echoed =
+      'You summarize documents for a personal research organizer. Use ONLY facts present in the text. If the text is too thin to summarize faithfully, reply exactly: SKIP';
+    const verdict = validateGeneration(echoed, { kind: 'gist', language: 'en', prompt: PROMPT });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toBe('prompt-echo');
+  });
+
+  it('does NOT reject a real gist that happens to share instruction words', () => {
+    const real =
+      'The page documents Chrome built-in AI summarization APIs, covering the Summarizer and Prompt interfaces and how to summarize long content in chunks.';
+    const verdict = validateGeneration(real, { kind: 'gist', language: 'en', prompt: PROMPT });
+    expect(verdict.ok).toBe(true);
+  });
+
+  it('KNOWN GAP: a PARAPHRASED echo is not caught by lexical overlap (live 2026-07-27)', () => {
+    // Verbatim from the corpus. Overlap with the prompt measures ~0.01 at
+    // n=3 — no threshold separates it from real gists. The structural fix is
+    // chat-message input in engine.ts, not this rule; this test exists so the
+    // gap is documented and a future improvement has a target to flip.
+    const paraphrased =
+      'The question answering system will be used to answer all questions and provide answers that are relevant to the content provided. The system will use only information from the text provided.';
+    const verdict = validateGeneration(paraphrased, {
+      kind: 'gist',
+      language: 'en',
+      prompt: PROMPT,
+    });
+    expect(verdict.ok).toBe(true);
+  });
+});

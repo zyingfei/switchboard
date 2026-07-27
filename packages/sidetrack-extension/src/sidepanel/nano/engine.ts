@@ -337,13 +337,35 @@ export const loadWebGpuEngine = async ({
       const engine: GenerationEngine = {
         kind: 'webgpu',
         generate: async (prompt, opts) => {
-          // The full anti-degeneracy set: cold sampling + repetition penalty +
-          // n-gram ban + a sane token budget. This engine used to run GREEDY
-          // with no repetition control at 220 tokens, which is precisely how a
-          // 1B q4 model produces "2 224 6 224 6 …" for 61 seconds.
-          const out = await generate(prompt, transformersGenerationArgs(opts));
+          // CHAT MESSAGES, not a raw string. gemma-3-1b-IT is
+          // instruction-tuned: handed a bare string, a text-generation
+          // pipeline does pure CONTINUATION — the model keeps writing the
+          // prompt instead of answering it. That is exactly what the live
+          // corpus showed (2026-07-27): a saved gist that read "The system
+          // will use only information from the text provided. If the text
+          // cannot be summarized accurately, please skip. # Content: # ---"
+          // — our own instructions, echoed back and then looped. The
+          // original PoC used chat messages and produced clean output; the
+          // regression happened on the way from PoC to product.
+          //
+          // With a message array transformers.js applies the model's chat
+          // template and returns ONLY the assistant turn, so there is a real
+          // answer boundary and no instruction echo. The response shape
+          // differs too: generated_text is the message ARRAY, so the reply is
+          // its last entry's content (string form kept as a fallback for
+          // pipelines that still flatten).
+          const out = await generate(
+            [{ role: 'user', content: prompt }] as never,
+            transformersGenerationArgs(opts),
+          );
           const first = out[0];
-          const text = typeof first?.generated_text === 'string' ? first.generated_text : '';
+          const raw = first?.generated_text;
+          const text =
+            typeof raw === 'string'
+              ? raw
+              : Array.isArray(raw)
+                ? String((raw[raw.length - 1] as { content?: unknown } | undefined)?.content ?? '')
+                : '';
           return cleanGeneratedText(text, resolveGenerationOptions(opts).maxChars);
         },
       };
