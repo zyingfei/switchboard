@@ -34,7 +34,7 @@ import {
   CODING_TICK_OBSERVED,
 } from '../../coding/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
-import { ENTITY_TITLE_ENRICHED } from '../../enrichment/events.js';
+import { ENTITY_CONTENT_ENRICHED, ENTITY_TITLE_ENRICHED } from '../../enrichment/events.js';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
@@ -355,6 +355,27 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // function of the event stream). peerFreshnessMs mirrors capture.recorded.
   {
     eventType: ENTITY_TITLE_ENRICHED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'recall-index',
+        class: 'derived-cache',
+        materializer: 'recall',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Content enrichment — entity.content.enriched. Sibling of the title event:
+  // the panel synthesizes a paragraph-scale GIST on-device (WebGPU) for an
+  // entity and POSTs it; the companion appends this event. The served surface
+  // is DERIVED by folding these events (contentEnrichment.ts) and injecting the
+  // gist into the recall lexical (FTS) index at query time (via the enrichment
+  // signature cache-bust) + the content lane's embed text. Routes to the
+  // 'recall' materializer so a landed gist re-drives the recall serve. Recovery
+  // is replay-event-log (fold is a pure function of the event stream).
+  {
+    eventType: ENTITY_CONTENT_ENRICHED,
     currentPayloadVersion: 1,
     surfaces: [
       {

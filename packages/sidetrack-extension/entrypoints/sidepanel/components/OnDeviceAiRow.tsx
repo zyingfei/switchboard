@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   builtinLanguageModel,
-  createBilingualSession,
   TITLE_PROMPT_PREFIX,
 } from '../../../src/sidepanel/nano/titleSynthesis';
 import {
@@ -10,6 +9,12 @@ import {
   selectJunkTitledThreads,
   type TitleEnrichmentStats,
 } from '../../../src/sidepanel/nano/enrichmentWorker';
+import {
+  loadWebGpuEngine,
+  resolveReadyEngine,
+  webGpuSupported,
+  type WebGpuLoadProgress,
+} from '../../../src/sidepanel/nano/engine';
 
 // On-device AI (Gemini Nano / Chrome built-in Prompt API) availability row
 // for the Health panel's Experiments drill.
@@ -85,6 +90,12 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   const [enrichRunning, setEnrichRunning] = useState(false);
   const [enrichStats, setEnrichStats] = useState<TitleEnrichmentStats | null>(null);
   const [enrichNote, setEnrichNote] = useState<string | null>(null);
+  // WebGPU (transformers.js) fallback engine — used when Nano is NOT
+  // 'available'. STRICT: the ~800MB model is fetched ONLY by the explicit
+  // "Load local model" button below (loadWebGpuEngine); never as a side effect.
+  const [webGpuState, setWebGpuState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [webGpuProgress, setWebGpuProgress] = useState<WebGpuLoadProgress | null>(null);
+  const [webGpuError, setWebGpuError] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   const probe = useCallback(async (): Promise<void> => {
@@ -151,10 +162,38 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
     setState('downloading');
   }, [probe]);
 
+  // EXPLICIT WebGPU load — the ONLY path that fetches the ~800MB model, and
+  // only reachable via the button below (rendered when Nano is unavailable).
+  const loadWebGpu = useCallback(async (): Promise<void> => {
+    if (companionPort === null || companionPort === undefined) return;
+    if (!webGpuSupported()) {
+      setWebGpuState('error');
+      setWebGpuError('WebGPU not available in this browser');
+      return;
+    }
+    setWebGpuState('loading');
+    setWebGpuError(null);
+    setWebGpuProgress(null);
+    try {
+      await loadWebGpuEngine({
+        port: companionPort,
+        onProgress: (p) => {
+          if (mountedRef.current) setWebGpuProgress(p);
+        },
+      });
+      if (mountedRef.current) setWebGpuState('ready');
+    } catch (err) {
+      if (mountedRef.current) {
+        setWebGpuState('error');
+        setWebGpuError(String(err));
+      }
+    }
+  }, [companionPort]);
+
   const runTitleEval = useCallback(async (): Promise<void> => {
-    const lm = builtinLanguageModel();
+    const engine = await resolveReadyEngine();
     if (
-      lm === undefined ||
+      engine === null ||
       companionPort === null ||
       companionPort === undefined ||
       bridgeKey === null ||
@@ -208,12 +247,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         const started = Date.now();
         let after: string;
         try {
-          const session = await createBilingualSession(lm);
-          try {
-            after = (await session.prompt(`${TITLE_PROMPT_PREFIX}\n${markdown}`)).trim();
-          } finally {
-            session.destroy();
-          }
+          after = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${markdown}`, { maxNewTokens: 32 });
         } catch (err) {
           after = `(error: ${String(err)})`;
         }
@@ -231,7 +265,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // synthesized titles via the companion (POST /v1/enrichment/titles) so they
   // feed the recommendation corpus. User-intent only — the button IS the run.
   const runEnrichment = useCallback(async (): Promise<void> => {
+    const engine = await resolveReadyEngine();
     if (
+      engine === null ||
       companionPort === null ||
       companionPort === undefined ||
       bridgeKey === null ||
@@ -247,6 +283,11 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         port: companionPort,
         bridgeKey,
         budget: ENRICH_BUDGET,
+        // Route through whichever engine is ready. When it's the Nano-direct
+        // path resolveReadyEngine returns a nano engine; passing it explicitly
+        // is equivalent to the old default, and lets a loaded WebGPU engine
+        // drive the persisting run too.
+        engine,
       });
       if (!mountedRef.current) return;
       if (stats.generated === 0) {
@@ -261,12 +302,28 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
     }
   }, [companionPort, bridgeKey]);
 
-  const evalAvailable =
-    state === 'available' &&
+  const companionConnected =
     companionPort !== null &&
     companionPort !== undefined &&
     bridgeKey !== null &&
     bridgeKey !== undefined;
+  // Nano is preferred; a loaded WebGPU engine is the fallback. Labels reflect
+  // which is active so the user knows what produced the text.
+  const nanoReady = state === 'available';
+  const webGpuReady = webGpuState === 'ready';
+  const activeEngineLabel: 'Nano' | 'WebGPU' | null = nanoReady
+    ? 'Nano'
+    : webGpuReady
+      ? 'WebGPU'
+      : null;
+  const engineReady = activeEngineLabel !== null;
+  const evalAvailable = engineReady && companionConnected;
+  // Offer the WebGPU load ONLY when Nano is not available (Nano is cheaper —
+  // already resident, no download) AND the companion is connected (the model
+  // host lives there). If the browser has no WebGPU adapter, we show an honest
+  // "not available" line instead of a button that would only ever error.
+  const showWebGpuLoad = !nanoReady && companionConnected && webGpuState !== 'ready';
+  const webGpuSupportedHere = webGpuSupported();
 
   return (
     <div className="sx-callout" data-testid="hp-ondevice-ai">
@@ -286,6 +343,46 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           Download model
         </button>
       ) : null}
+      {/* WebGPU fallback — shown when Nano isn't available and the companion
+          (the model host) is connected. The load is EXPLICIT (this button is
+          the only trigger for the ~800MB fetch). No adapter → honest line. */}
+      {showWebGpuLoad ? (
+        webGpuSupportedHere ? (
+          <button
+            type="button"
+            className="sx-btn"
+            style={{ marginLeft: 8 }}
+            disabled={webGpuState === 'loading'}
+            onClick={() => {
+              void loadWebGpu();
+            }}
+            data-testid="hp-ondevice-ai-webgpu-load"
+          >
+            {webGpuState === 'loading'
+              ? 'Loading local model…'
+              : 'Load local model (WebGPU · ~800MB, from companion)'}
+          </button>
+        ) : (
+          <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-webgpu-unsupported">
+            WebGPU not available in this browser
+          </span>
+        )
+      ) : null}
+      {webGpuState === 'loading' && webGpuProgress !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-webgpu-progress" style={{ marginTop: 4 }}>
+          {webGpuProgress.file} · {String(webGpuProgress.percent)}%
+        </div>
+      ) : null}
+      {webGpuReady ? (
+        <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-webgpu-state">
+          local model ready (WebGPU)
+        </span>
+      ) : null}
+      {webGpuState === 'error' && webGpuError !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-webgpu-error" style={{ marginTop: 4 }}>
+          {webGpuError}
+        </div>
+      ) : null}
       {evalAvailable ? (
         <button
           type="button"
@@ -297,7 +394,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           }}
           data-testid="hp-ondevice-ai-eval"
         >
-          {evalRunning ? 'Evaluating…' : 'Run title-synthesis eval'}
+          {evalRunning
+            ? 'Evaluating…'
+            : `Run title-synthesis eval · ${String(activeEngineLabel)}`}
         </button>
       ) : null}
       {evalAvailable ? (
@@ -311,7 +410,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           }}
           data-testid="hp-ondevice-ai-enrich"
         >
-          {enrichRunning ? 'Enriching…' : `Enrich titles (${String(ENRICH_BUDGET)})`}
+          {enrichRunning
+            ? 'Enriching…'
+            : `Enrich titles (${String(ENRICH_BUDGET)}) · ${String(activeEngineLabel)}`}
         </button>
       ) : null}
       {enrichNote !== null ? <div className="mono">{enrichNote}</div> : null}

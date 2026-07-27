@@ -9,6 +9,11 @@ coverage/
 # stealth experiment runner. Live state, not source.
 .sidetrack-browser-profiles/
 
+# onnxruntime-web WASM for the WebGPU generation engine, copied into
+# public/ort/ from node_modules by scripts/copy-ort-wasm.mjs at build time
+# (wired from wxt.config.ts). Regenerated artifact (~26MB), not source.
+public/ort/
+
 # Shadow-artifact guard: an in-place `tsc` (wrong -p, or a stale editor task)
 # emits compiled .js/.d.ts next to the .ts sources under src/, and the test
 # runner can silently prefer those shadows over the .ts. These ignores stop a

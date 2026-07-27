@@ -210,6 +210,12 @@ export interface GuessLaneVoteSignals {
   readonly state: AttributionV1State | null;
   readonly title: string | null;
   readonly domain: string | null;
+  // True when `title` came from the enrichment overlay (a SYNTHESIZED title),
+  // not a real snapshot title/label. Drives the ' · synthesized title' suffix
+  // on the title lane why so the provenance is explicit. Absent/false ⇒ the
+  // title is a real one (or there is none). Optional so existing callers that
+  // don't thread it keep the prior (real-title) rendering.
+  readonly titleSynthesized?: boolean;
 }
 
 // A saturating confidence for a raw overlap/count: strength/(strength+k) maps
@@ -240,11 +246,15 @@ const titleLane = (signals: GuessLaneVoteSignals): GuessLaneResult => {
   const strength = overlap.scores.get(winner) ?? 0;
   const matched = overlap.matchedTerms.get(winner) ?? [];
   const terms = matched.length === 0 ? '' : ` (${matched.slice(0, 3).join(', ')})`;
+  // Provenance: when the matched title was SYNTHESIZED (enrichment overlay, not
+  // a real page title) the user must see that explicitly — the match rode on an
+  // on-device-generated title, not the raw one.
+  const synthesizedSuffix = signals.titleSynthesized === true ? ' · synthesized title' : '';
   return populated('title', [
     {
       workstreamId: winner,
       score: saturate(strength, TITLE_SATURATION_K),
-      why: `title words match${terms}`,
+      why: `title words match${terms}${synthesizedSuffix}`,
     },
   ]);
 };
@@ -364,8 +374,12 @@ export const voteSignalsFor = (
   state: AttributionV1State | null,
   canonicalUrl: string,
   title: string | null,
+  // True when `title` was the synthesized (enrichment overlay) fallback. Absent
+  // ⇒ false (a real title, or none). See GuessLaneVoteSignals.titleSynthesized.
+  titleSynthesized = false,
 ): GuessLaneVoteSignals => ({
   state,
   title,
   domain: domainOfUrl(canonicalUrl),
+  titleSynthesized,
 });

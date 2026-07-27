@@ -387,6 +387,51 @@ describe('buildContentLane', () => {
     expect(store.queryVector).toHaveBeenCalledTimes(1);
     expect(lane.candidates.map((c) => c.workstreamId)).toEqual(['ws_alpha']);
   });
+
+  it('gist: why marks " · gist" and the gist reaches the embed/FTS query text', async () => {
+    const embed = vi.fn(async () => vecOf(9));
+    const store = fakeStore({
+      // A title-only (bodyIndexed=0) hit so the why also carries · title-vector,
+      // proving both provenance suffixes compose.
+      vectorHits: [vhit('g1', 'https://alpha.test/one', 'Alpha One', 0)],
+      ftsHits: [fhit('g1', 'https://alpha.test/one', 'Alpha One', { bodyIndexed: 0 })],
+    });
+    const lane = await buildContentLane({
+      canonicalUrl: 'https://query.test/gist',
+      snapshot: snapshot(),
+      title: 'Alpha',
+      gist: 'A deep dive into distributed consensus and Raft leader election.',
+      store,
+      embed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates.map((c) => c.workstreamId)).toEqual(['ws_alpha']);
+    expect(lane.candidates[0]!.why).toContain('· gist');
+    // The gist text must have been folded into the embed text (query side).
+    const embedArg = embed.mock.calls[0]?.[0] as string | undefined;
+    expect(embedArg).toContain('distributed consensus');
+    // And into the FTS query.
+    const ftsArg = store.queryFts.mock.calls[0]?.[0]?.q as string | undefined;
+    expect(ftsArg).toContain('distributed consensus');
+  });
+
+  it('no gist → no " · gist" suffix', async () => {
+    const embed = vi.fn(async () => vecOf(4));
+    const store = fakeStore({
+      vectorHits: [vhit('n1', 'https://alpha.test/one', 'Alpha One', 1)],
+    });
+    const lane = await buildContentLane({
+      canonicalUrl: 'https://query.test/nogist',
+      snapshot: snapshot(),
+      title: 'Alpha',
+      gist: null,
+      store,
+      embed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates).toHaveLength(1);
+    expect(lane.candidates[0]!.why).not.toContain('gist');
+  });
 });
 
 describe('appendContentLane', () => {

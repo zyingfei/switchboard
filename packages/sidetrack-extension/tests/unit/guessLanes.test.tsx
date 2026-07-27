@@ -14,6 +14,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { SuggestionStats } from '../../src/sidepanel/tabsession/SuggestionStats';
+import { GuessLanes } from '../../src/sidepanel/tabsession/GuessLanes';
 import {
   guessLaneSignalCount,
   parseGuessLanes,
@@ -385,5 +386,46 @@ describe('guess-lanes — lenient wire parse (parseGuessLanes)', () => {
     expect(guessLaneSignalCount(undefined)).toBe(0);
     expect(guessLaneSignalCount(lanesWithSomeSignal)).toBe(3); // 2 (graph) + 1 (topic)
     expect(guessLaneSignalCount(allEmptyLanes)).toBe(0);
+  });
+});
+
+// feat/webgpu-enrichment — the companion appends provenance to a lane `why`
+// when the winning signal came from an enriched title/gist (' · synthesized
+// title', ' · gist'). `why` is free text on the extension side (no parsing),
+// but the row must render the longer string verbatim and gracefully — no
+// truncation, no overflow class swallowing it. This reads back that render.
+describe('guess-lanes — enriched provenance in why renders verbatim', () => {
+  it('renders a lane why annotated with "· synthesized title"', () => {
+    const lanes: readonly GuessLaneResult[] = [
+      {
+        lane: 'content',
+        candidates: [
+          {
+            workstreamId: 'ws-1',
+            score: 0.71,
+            why: 'content vector cosine 0.71 · synthesized title',
+          },
+        ],
+      },
+    ];
+    render(<GuessLanes lanes={lanes} workstreams={workstreams} />);
+    // The disclosure is collapsed by default; open it, then assert the full
+    // annotated why is present (free text rendered verbatim).
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    expect(
+      screen.getByText('content vector cosine 0.71 · synthesized title'),
+    ).toBeInTheDocument();
+  });
+
+  it('renders a lane why annotated with "· gist"', () => {
+    const lanes: readonly GuessLaneResult[] = [
+      {
+        lane: 'content',
+        candidates: [{ workstreamId: 'ws-2', score: 0.64, why: 'semantic match 0.64 · gist' }],
+      },
+    ];
+    render(<GuessLanes lanes={lanes} workstreams={workstreams} />);
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    expect(screen.getByText('semantic match 0.64 · gist')).toBeInTheDocument();
   });
 });

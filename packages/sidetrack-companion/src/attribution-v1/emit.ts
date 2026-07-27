@@ -188,7 +188,21 @@ export const incumbentTopFromResolution = (resolution: {
 // so a real page title always wins. Callers resolve it from the folded
 // enrichment lookup (loadEnrichmentLookup + effectiveUrlTitle); passing
 // undefined preserves the exact prior behavior (flag off / no enrichment).
-export const titleForCanonicalUrl = (
+// Where a resolved title came from — a REAL snapshot title/label, or the
+// panel's SYNTHESIZED (enrichment overlay) fallback. Threaded into the title
+// lane so its `why` can say "· synthesized title" when the match was on a
+// synthesized (not raw) title — the provenance the user must see explicitly.
+export type TitleSource = 'real' | 'synthesized';
+
+export interface TitleWithSource {
+  readonly title: string;
+  readonly source: TitleSource;
+}
+
+// Full-provenance variant of titleForCanonicalUrl: returns the title AND whether
+// it was the synthesized fallback. `titleForCanonicalUrl` below is the
+// value-only wrapper (unchanged signature for its existing callers).
+export const titleForCanonicalUrlWithSource = (
   snapshot: {
     readonly nodes: readonly {
       readonly label?: string;
@@ -197,7 +211,7 @@ export const titleForCanonicalUrl = (
   },
   canonicalUrl: string,
   synthesizedTitle?: string,
-): string | undefined => {
+): TitleWithSource | undefined => {
   let labelFallback: string | undefined;
   for (const node of snapshot.nodes) {
     const meta = node.metadata;
@@ -209,7 +223,9 @@ export const titleForCanonicalUrl = (
           ? meta.url
           : undefined;
     if (nodeUrl !== canonicalUrl) continue;
-    if (typeof meta.title === 'string' && meta.title.length > 0) return meta.title;
+    if (typeof meta.title === 'string' && meta.title.length > 0) {
+      return { title: meta.title, source: 'real' };
+    }
     if (labelFallback === undefined && typeof node.label === 'string' && node.label.length > 0) {
       labelFallback = node.label;
     }
@@ -221,10 +237,24 @@ export const titleForCanonicalUrl = (
   // one; a URL-shaped label is junk, so the synthesized title fills here
   // (before we would otherwise return undefined).
   if (labelFallback !== undefined && !/^https?:\/\//iu.test(labelFallback.trim())) {
-    return labelFallback;
+    return { title: labelFallback, source: 'real' };
   }
   // No real title/label — fall back to the panel's synthesized title if one
   // exists, else report honest typed emptiness ("no page title to match").
-  if (synthesizedTitle !== undefined && synthesizedTitle.length > 0) return synthesizedTitle;
+  if (synthesizedTitle !== undefined && synthesizedTitle.length > 0) {
+    return { title: synthesizedTitle, source: 'synthesized' };
+  }
   return undefined;
 };
+
+export const titleForCanonicalUrl = (
+  snapshot: {
+    readonly nodes: readonly {
+      readonly label?: string;
+      readonly metadata?: { readonly canonicalUrl?: unknown; readonly url?: unknown; readonly title?: unknown };
+    }[];
+  },
+  canonicalUrl: string,
+  synthesizedTitle?: string,
+): string | undefined =>
+  titleForCanonicalUrlWithSource(snapshot, canonicalUrl, synthesizedTitle)?.title;

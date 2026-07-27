@@ -33,7 +33,11 @@
 // cost regardless of this flag.
 
 import { recordArmShadow } from './armShadow.js';
-import { loadAttributionV1State, titleForCanonicalUrl } from './emit.js';
+import {
+  loadAttributionV1State,
+  titleForCanonicalUrlWithSource,
+  type TitleWithSource,
+} from './emit.js';
 import { attributionV1ShadowEnabled } from './shadow.js';
 import {
   attributionArm,
@@ -132,10 +136,17 @@ export const resolveUrlAttributionArmed = async (
     return resolveUrlAttribution(resolverInput);
   }
 
-  const title =
-    normalizeTitleHint(titleHint) ??
-    titleForCanonicalUrl(resolverInput.snapshot, resolverInput.canonicalUrl, synthesizedTitle) ??
-    null;
+  // Resolve the title AND its provenance. A live titleHint (always a real page
+  // title) wins first; else the snapshot lookup reports whether the value was
+  // the synthesized (enrichment) fallback so the title lane can mark it.
+  const resolved = resolveTitleWithSource(
+    titleHint,
+    resolverInput.snapshot,
+    resolverInput.canonicalUrl,
+    synthesizedTitle,
+  );
+  const title = resolved?.title ?? null;
+  const titleSynthesized = resolved?.source === 'synthesized';
   const voteResult = resolveUrlAttributionVote3({
     state,
     canonicalUrl: resolverInput.canonicalUrl,
@@ -164,10 +175,25 @@ export const resolveUrlAttributionArmed = async (
   if (!wantLanes) return voteResult;
   const lanes = buildGuessLanes({
     candidateEvidence: [],
-    voteSignals: voteSignalsFor(state, resolverInput.canonicalUrl, title),
+    voteSignals: voteSignalsFor(state, resolverInput.canonicalUrl, title, titleSynthesized),
     ...(input.nowMs === undefined ? {} : { nowMs: input.nowMs }),
   });
   return { ...voteResult, lanes };
+};
+
+// Resolve the best-effort title AND its provenance for a resolve. A live
+// titleHint (always a real page title) wins first; else the snapshot lookup —
+// which reports 'synthesized' when the value is the enrichment overlay fallback.
+// Returns undefined when there is no title at all (typed-empty title lane).
+const resolveTitleWithSource = (
+  titleHint: string | undefined,
+  snapshot: ResolveUrlAttributionInput['snapshot'],
+  canonicalUrl: string,
+  synthesizedTitle: string | undefined,
+): TitleWithSource | undefined => {
+  const hint = normalizeTitleHint(titleHint);
+  if (hint !== null) return { title: hint, source: 'real' };
+  return titleForCanonicalUrlWithSource(snapshot, canonicalUrl, synthesizedTitle);
 };
 
 // Load the memoized AttributionV1State and assemble the vote-lane signals for a
@@ -186,11 +212,10 @@ const voteSignalsForResolve = async (
 ): Promise<GuessLaneVoteSignals | undefined> => {
   const state = await loadAttributionV1State(vaultRoot, now ?? (() => new Date()));
   if (state === null) return undefined;
-  const title =
-    normalizeTitleHint(titleHint) ??
-    titleForCanonicalUrl(snapshot, canonicalUrl, synthesizedTitle) ??
-    null;
-  return voteSignalsFor(state, canonicalUrl, title);
+  const resolved = resolveTitleWithSource(titleHint, snapshot, canonicalUrl, synthesizedTitle);
+  const title = resolved?.title ?? null;
+  const titleSynthesized = resolved?.source === 'synthesized';
+  return voteSignalsFor(state, canonicalUrl, title, titleSynthesized);
 };
 
 // Trim + reject an empty title hint so the title fallback order (hint → snapshot
