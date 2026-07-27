@@ -31,6 +31,7 @@ export type GenerationKind = 'title' | 'gist' | 'chunk-gist';
 
 /** Every way generated text can be unusable. One reason, one honest sentence. */
 export type GenerationRejectionReason =
+  | 'prompt-echo'
   | 'empty'
   | 'too-short'
   | 'too-long'
@@ -56,6 +57,18 @@ export interface ValidationContext {
    * poisons the multilingual retrieval corpus.
    */
   readonly language: ContentLanguage;
+  /**
+   * The instruction text handed to the model, when the caller has it. An
+   * instruction-tuned model given a bare string CONTINUES it instead of
+   * answering, so the "gist" comes back as our own prompt, echoed. That
+   * output is fluent, non-repetitive English — every other rule here passes
+   * it — but it is worthless as retrieval evidence and it silently poisons
+   * the corpus. Live case (2026-07-27): a saved gist reading "The system
+   * will use only information from the text provided. If the text cannot be
+   * summarized accurately, please skip. # Content: # ---". Optional: when
+   * absent the echo check is skipped rather than guessed at.
+   */
+  readonly prompt?: string;
 }
 
 // --- Shape budgets per kind -------------------------------------------------
@@ -160,6 +173,49 @@ const languageDisagrees = (text: string, requested: ContentLanguage): boolean =>
  *
  * Pure — no I/O, no model, no clock.
  */
+
+// ---- prompt echo -------------------------------------------------------
+//
+// Detect output that is substantially OUR INSTRUCTIONS rather than a summary
+// of the source. Measured as the share of the output's distinct word 4-grams
+// that also occur in the prompt: a real gist about the page shares few exact
+// 4-grams with the instruction text, while a verbatim echo shares most.
+// Threshold deliberately high (0.30) — a gist may legitimately reuse a
+// handful of instruction words ("summary", "content") without being an echo.
+//
+// KNOWN LIMIT, measured not assumed. This catches VERBATIM echo only. The
+// live 2026-07-27 case was a PARAPHRASED echo ("The system will use only
+// information from the text provided" against a prompt saying "Use ONLY
+// facts present in the text") and its overlap with the prompt is ~0.01 at
+// n=3 — far below any threshold that would not also reject real gists. No
+// lexical rule recovers that case, so do NOT treat this as the defence
+// against instruction echo. The structural fix is feeding the model CHAT
+// MESSAGES instead of a raw string (engine.ts): an instruction-tuned model
+// handed a bare string continues it, which is what produced the echo in the
+// first place. This rule is defence-in-depth for the verbatim variant.
+const PROMPT_ECHO_NGRAM = 4;
+const PROMPT_ECHO_THRESHOLD = 0.3;
+
+const wordNgrams = (text: string, n: number): Set<string> => {
+  const words = text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length > 0);
+  const out = new Set<string>();
+  for (let i = 0; i + n <= words.length; i += 1) out.add(words.slice(i, i + n).join(' '));
+  return out;
+};
+
+const looksLikePromptEcho = (text: string, prompt: string): boolean => {
+  const outGrams = wordNgrams(text, PROMPT_ECHO_NGRAM);
+  if (outGrams.size === 0) return false;
+  const promptGrams = wordNgrams(prompt, PROMPT_ECHO_NGRAM);
+  if (promptGrams.size === 0) return false;
+  let shared = 0;
+  for (const g of outGrams) if (promptGrams.has(g)) shared += 1;
+  return shared / outGrams.size > PROMPT_ECHO_THRESHOLD;
+};
+
 export const validateGeneration = (raw: string, ctx: ValidationContext): GenerationVerdict => {
   const text = raw.trim();
   const budget = SHAPE[ctx.kind];
@@ -167,6 +223,9 @@ export const validateGeneration = (raw: string, ctx: ValidationContext): Generat
   if (text.length === 0) return { ok: false, reason: 'empty' };
   if (hasControlChars(text)) return { ok: false, reason: 'control-chars' };
   if (looksLikeMarkup(text)) return { ok: false, reason: 'markup' };
+  if (ctx.prompt !== undefined && looksLikePromptEcho(text, ctx.prompt)) {
+    return { ok: false, reason: 'prompt-echo' };
+  }
   if (budget.singleLine && /[\r\n]/u.test(text)) return { ok: false, reason: 'multi-line' };
   if (text.length > budget.maxChars) return { ok: false, reason: 'too-long' };
   if (text.length < budget.minChars) return { ok: false, reason: 'too-short' };
@@ -193,6 +252,8 @@ export const validateGeneration = (raw: string, ctx: ValidationContext): Generat
 /** Short human copy per reason — what the row tells the user, verbatim. */
 export const rejectionCopy = (reason: GenerationRejectionReason): string => {
   switch (reason) {
+    case 'prompt-echo':
+      return 'the model repeated the instructions instead of summarizing';
     case 'empty':
       return 'the model returned nothing';
     case 'too-short':

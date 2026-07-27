@@ -119,7 +119,7 @@ export const synthesizeGist = async (
     );
     const meta = metaOf(plan, 0, 1);
     if (isAbstention(raw)) return { ok: false, kind: 'abstained', meta };
-    const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language });
+    const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language, prompt: GIST_PROMPT_PREFIX });
     if (!verdict.ok) return { ok: false, kind: 'rejected', reason: verdict.reason, meta };
     return { ok: true, gist: verdict.text, meta };
   }
@@ -133,7 +133,7 @@ export const synthesizeGist = async (
       CHUNK_GIST_GENERATION,
     );
     if (isAbstention(raw)) continue;
-    const verdict = validateGeneration(raw, { kind: 'chunk-gist', language });
+    const verdict = validateGeneration(raw, { kind: 'chunk-gist', language, prompt: CHUNK_GIST_PROMPT_PREFIX });
     if (!verdict.ok) {
       firstRejection ??= verdict.reason;
       continue;
@@ -155,7 +155,7 @@ export const synthesizeGist = async (
   const joined = sliceForSynthesis(notes.map((n) => `- ${n}`).join('\n'));
   const raw = await engine.generate(`${GIST_SYNTHESIS_PROMPT_PREFIX}\n${joined}`, GIST_GENERATION);
   if (isAbstention(raw)) return { ok: false, kind: 'abstained', meta };
-  const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language });
+  const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language, prompt: GIST_PROMPT_PREFIX });
   if (!verdict.ok) return { ok: false, kind: 'rejected', reason: verdict.reason, meta };
   return { ok: true, gist: verdict.text, meta };
 };
