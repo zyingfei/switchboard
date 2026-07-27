@@ -5713,11 +5713,40 @@ const App = () => {
   const fetchEnrichmentText = useCallback(
     async (target: EnrichmentTarget): Promise<string | null> => {
       if (target.kind === 'thread') {
+        // The markdown route answers { path, content } at the TOP level — no
+        // `data` envelope and the field is `content`, not `markdown`. The old
+        // code read `.markdown` through fetchCompanionJson (which THROWS when
+        // there is no `data` key), so every thread silently returned null and
+        // the card said "no page text" even for threads with 10k+ chars of
+        // body (live, 2026-07-27). Fetch raw and accept both shapes.
         try {
-          const md = await fetchCompanionJson<{ readonly markdown?: string }>(
-            `/v1/threads/${encodeURIComponent(target.bacId)}/markdown`,
+          const response = await fetch(
+            `http://127.0.0.1:${String(port)}/v1/threads/${encodeURIComponent(target.bacId)}/markdown`,
+            { headers: { 'x-bac-bridge-key': bridgeKey } },
           );
-          return typeof md.markdown === 'string' && md.markdown.length > 0 ? md.markdown : null;
+          if (!response.ok) return null;
+          const body = (await response.json()) as {
+            readonly content?: unknown;
+            readonly data?: { readonly markdown?: unknown; readonly content?: unknown };
+          };
+          const raw =
+            typeof body.content === 'string'
+              ? body.content
+              : typeof body.data?.markdown === 'string'
+                ? body.data.markdown
+                : typeof body.data?.content === 'string'
+                  ? body.data.content
+                  : '';
+          // Strip the YAML frontmatter: it is metadata (bac_id, revision,
+          // tags…), not conversation, and feeding it to the model wastes
+          // budget and invites it to "summarize" the header. A thread whose
+          // whole file is frontmatter + a title + an "Open thread" link has
+          // no captured turns, so it correctly resolves to null (thin).
+          const withoutFrontmatter = /^---\r?\n/u.test(raw)
+            ? raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/u, '')
+            : raw;
+          const body_text = withoutFrontmatter.trim();
+          return body_text.length > 0 ? body_text : null;
         } catch {
           return null;
         }
