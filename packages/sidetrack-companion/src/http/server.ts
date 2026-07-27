@@ -7562,7 +7562,7 @@ const routes: readonly RouteDefinition[] = [
       // the cached FTS index and rebuilds it with the overlaid title.
       const indexStat = await stat(indexFilePath).catch(() => undefined);
       const indexMtime = indexStat?.mtimeMs ?? 0;
-      const lexicalCacheKey = `${indexFilePath} ${recallEnrichSig}`;
+      const lexicalCacheKey = `${indexFilePath}\u0000${recallEnrichSig}`;
       const cached = lexicalIndexCache.get(lexicalCacheKey);
       const lexical: HybridLexicalIndex =
         cached?.mtimeMs === indexMtime && cached.entryCount === indexItems.length
@@ -8077,7 +8077,7 @@ const routes: readonly RouteDefinition[] = [
         // for the same (kind,id) is a distinct clientEventId ⇒ a new event
         // that supersedes in the fold.
         const clientEventId = `enrich-${createHash('sha256')
-          .update(`${candidate.kind} ${candidate.id} ${candidate.sourceContentHash}`)
+          .update(`${candidate.kind}\u0000${candidate.id}\u0000${candidate.sourceContentHash}`)
           .digest('hex')
           .slice(0, 32)}`;
         const existing = await eventLog.findByClientEventId(clientEventId).catch(() => null);
