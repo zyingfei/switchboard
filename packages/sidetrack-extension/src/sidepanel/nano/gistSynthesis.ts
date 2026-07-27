@@ -25,8 +25,12 @@
 // so it is unit-testable with a stub.
 
 import { planChunks, type ChunkPlan } from './chunking';
-import { CHUNK_GIST_GENERATION, GIST_GENERATION } from './generationOptions';
-import { detectContentLanguage } from './language';
+import {
+  CHUNK_GIST_GENERATION,
+  GIST_GENERATION,
+  type GenerationOptions,
+} from './generationOptions';
+import { detectContentLanguage, type ContentLanguage } from './language';
 import {
   CHUNK_GIST_PROMPT_PREFIX,
   GIST_PROMPT_PREFIX,
@@ -34,6 +38,7 @@ import {
   MAX_GIST_CHARS,
   MIN_CONTENT_CHARS,
   sliceForSynthesis,
+  stripGistPreamble,
 } from './titleSynthesis';
 import { validateGeneration, type GenerationRejectionReason } from './validateGeneration';
 import type { GenerationEngine } from './engine';
@@ -95,6 +100,60 @@ const isAbstention = (raw: string): boolean => {
  * `ok`, saves NOTHING. Engine errors are not caught here: they are the caller's
  * existing 'engine' failure path.
  */
+
+// ---- fast-success / fast-fail generation --------------------------------
+//
+// One attempt is not enough and ten is too many. A 1B model on a hard
+// document fails in ways that are often NOT deterministic — the same input
+// resampled usually comes back clean. So: generate, validate, and on
+// rejection retry ONCE with a deterministic decode (greedy), which is a
+// genuinely different draw rather than the same dice rolled again.
+//
+// FAST SUCCESS: the first attempt that validates is returned immediately —
+// no extra model calls, no scoring pass, nothing speculative.
+// FAST FAIL: an abstention (SKIP) is final and never retried — the model
+// saying "this text cannot be summarized" is an answer, not a failure. Only
+// a VALIDATION rejection earns the second attempt, and only one.
+//
+// Retry cost is bounded and visible: at most 2 calls per gist, and the
+// caller sees which attempt won via `attempts` in the meta.
+// The retry is a genuinely DIFFERENT draw, not the same dice re-rolled: near
+// -zero temperature makes the second attempt effectively deterministic, so a
+// rejection caused by an unlucky sample does not simply recur.
+const RETRY_GENERATION: GenerationOptions = { ...GIST_GENERATION, temperature: 0.05, topP: 1 };
+
+interface AttemptOutcome {
+  readonly text: string | null;
+  readonly reason: GenerationRejectionReason | null;
+  readonly abstained: boolean;
+  readonly attempts: number;
+}
+
+const generateValidated = async (
+  engine: Pick<GenerationEngine, 'generate'>,
+  prompt: string,
+  language: ContentLanguage,
+  kind: 'gist' | 'chunk-gist',
+  primary: GenerationOptions,
+  retry: GenerationOptions | null,
+  maxChars: number,
+): Promise<AttemptOutcome> => {
+  let firstReason: GenerationRejectionReason | null = null;
+  const passes = retry === null ? [primary] : [primary, retry];
+  for (let i = 0; i < passes.length; i += 1) {
+    const options = passes[i];
+    if (options === undefined) continue;
+    const raw = await engine.generate(prompt, options);
+    // SKIP is a decision, not a defect — stop immediately.
+    if (isAbstention(raw)) return { text: null, reason: null, abstained: true, attempts: i + 1 };
+    const cleaned = stripGistPreamble(raw).slice(0, maxChars);
+    const verdict = validateGeneration(cleaned, { kind, language, prompt });
+    if (verdict.ok) return { text: verdict.text, reason: null, abstained: false, attempts: i + 1 };
+    firstReason ??= verdict.reason;
+  }
+  return { text: null, reason: firstReason, abstained: false, attempts: passes.length };
+};
+
 export const synthesizeGist = async (
   engine: Pick<GenerationEngine, 'generate'>,
   content: string,
@@ -113,15 +172,21 @@ export const synthesizeGist = async (
   // --- Single pass: the document fits in one chunk. ------------------------
   if (plan.singlePass) {
     const only = plan.chunks[0];
-    const raw = await engine.generate(
-      `${GIST_PROMPT_PREFIX}\n${only === undefined ? '' : only.text}`,
-      GIST_GENERATION,
-    );
     const meta = metaOf(plan, 0, 1);
-    if (isAbstention(raw)) return { ok: false, kind: 'abstained', meta };
-    const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language, prompt: GIST_PROMPT_PREFIX });
-    if (!verdict.ok) return { ok: false, kind: 'rejected', reason: verdict.reason, meta };
-    return { ok: true, gist: verdict.text, meta };
+    const outcome = await generateValidated(
+      engine,
+      `${GIST_PROMPT_PREFIX}\n${only === undefined ? '' : only.text}`,
+      language,
+      'gist',
+      GIST_GENERATION,
+      RETRY_GENERATION,
+      MAX_GIST_CHARS,
+    );
+    if (outcome.abstained) return { ok: false, kind: 'abstained', meta };
+    if (outcome.text === null) {
+      return { ok: false, kind: 'rejected', reason: outcome.reason ?? 'empty', meta };
+    }
+    return { ok: true, gist: outcome.text, meta };
   }
 
   // --- Chunk pass: one validated sentence per chunk. -----------------------

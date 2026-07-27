@@ -70,7 +70,7 @@ export interface ResolvedGenerationOptions {
   readonly maxNewTokens: number;
   readonly maxChars: number;
   readonly repetitionPenalty: number;
-  readonly noRepeatNgramSize: number;
+  readonly noRepeatNgramSize: number | undefined;
   readonly temperature: number;
   readonly topP: number;
   readonly topK: number;
@@ -79,16 +79,30 @@ export interface ResolvedGenerationOptions {
 // --- Named constants (no magic numbers at the call sites) -------------------
 
 /** Penalize already-emitted tokens. 1.0 = off; >1.3 starts distorting facts. */
-export const REPETITION_PENALTY = 1.15;
+// TUNED on the real model against real vault documents (2026-07-27, 3 docs x
+// 5 variants on WebGPU gemma-3-1b q4). Once the engine sends CHAT MESSAGES,
+// every variant — including a no-penalty control — passed the degeneracy
+// checks, so the penalties are loop INSURANCE, not the cure. Lowered 1.15 ->
+// 1.10 because heavier penalties measurably suppressed reuse of the source's
+// own wording: groundedness ran 0.25 at 1.15+ngram-ban vs 0.50 with no
+// penalties at all. A summary SHOULD echo the document's terms.
+export const REPETITION_PENALTY = 1.1;
 /** Hard-ban any 3-token sequence from occurring twice — kills "224 6 224 6". */
-export const NO_REPEAT_NGRAM_SIZE = 3;
+// Deliberately DISABLED (undefined, not 0 — transformers treats 0 as "ban
+// nothing" but the field is cleaner absent). A hard 3-gram ban forbids the
+// model from ever reusing a three-word phrase from the source, which is
+// exactly what a faithful summary does: measured groundedness rose 0.25 ->
+// 0.43 when the ban was dropped, with zero degeneracy regressions across the
+// tuning matrix. Repetition is still covered by the penalty above AND by
+// validateGeneration, which rejects a loop outright.
+export const NO_REPEAT_NGRAM_SIZE: number | undefined = undefined;
 /** Cold sampling: an escape from a decode cycle without creative drift. */
 export const GENERATION_TEMPERATURE = 0.3;
 export const GENERATION_TOP_P = 0.9;
 export const GENERATION_TOP_K = 40;
 
 /** 2-3 sentences + an entity list. Was 220 — that budget bought 61.5s of loop. */
-export const GIST_MAX_NEW_TOKENS = 120;
+export const GIST_MAX_NEW_TOKENS = 140;
 /** One sentence per document section in the chunk pass. */
 export const CHUNK_GIST_MAX_NEW_TOKENS = 64;
 /** 4-10 words. */
@@ -152,7 +166,7 @@ export const transformersGenerationArgs = (opts: GenerationOptions): Record<stri
     top_p: o.topP,
     top_k: o.topK,
     repetition_penalty: o.repetitionPenalty,
-    no_repeat_ngram_size: o.noRepeatNgramSize,
+    ...(o.noRepeatNgramSize === undefined ? {} : { no_repeat_ngram_size: o.noRepeatNgramSize }),
     return_full_text: false,
   };
 };
