@@ -36,6 +36,7 @@
 //      the next boot detects and kills it before starting drains,
 //      closing the two-writer race observed live this week.
 
+import { setPriority } from 'node:os';
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -358,6 +359,38 @@ const forkReconcileChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerRes
       });
       return;
     }
+// The drain child is CPU-BOUND and long: it runs ONNX embedding for the visit
+// -similarity corpus (visitSimilarity.ts embeds passage+query texts for every
+// eligible visit), which on a real vault means minutes of full-core work —
+// measured live 2026-07-27: connectionsReconcileChild at ~100% CPU for 11+
+// minutes straight. At equal scheduling priority that starves the PARENT,
+// whose only job is answering the panel: resolve p95 went to 17.5s against
+// the extension's 15s timeout, and the user saw "Companion did not respond
+// within 15s" during normal browsing.
+//
+// Serving beats batch. Dropping the child to background priority lets the OS
+// preempt it whenever the parent has an HTTP request to answer; the drain
+// still finishes (it is not throttled, just yielded), and on an otherwise
+// idle machine it runs at the same speed because nothing competes.
+//
+// Best-effort by construction: os.setPriority can throw (unsupported
+// platform, insufficient permission for negative values). A failure must
+// never break a drain, so it is swallowed. SIDETRACK_DRAIN_NICE overrides the
+// value; 0 disables the demotion entirely.
+const DEFAULT_DRAIN_NICE = 10;
+
+const lowerChildPriority = (pid: number): void => {
+  const raw = process.env['SIDETRACK_DRAIN_NICE'];
+  const parsed = raw === undefined ? DEFAULT_DRAIN_NICE : Number.parseInt(raw, 10);
+  const nice = Number.isFinite(parsed) ? parsed : DEFAULT_DRAIN_NICE;
+  if (nice === 0) return;
+  try {
+    setPriority(pid, nice);
+  } catch {
+    // Priority is an optimisation, never a correctness requirement.
+  }
+};
+
     installParentDeathHandlers();
     const child: ChildProcess = fork(entry, [], {
       env: buildReconcileChildEnv(),
@@ -365,7 +398,10 @@ const forkReconcileChild = (job: ReconcileWorkerJob): Promise<ReconcileWorkerRes
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
     liveChildren.add(child);
-    if (typeof child.pid === 'number') writeChildPidfile(job.vaultRoot, child.pid);
+    if (typeof child.pid === 'number') {
+      writeChildPidfile(job.vaultRoot, child.pid);
+      lowerChildPriority(child.pid);
+    }
 
     let settled = false;
     let watchdog: ReturnType<typeof setTimeout> | undefined;
