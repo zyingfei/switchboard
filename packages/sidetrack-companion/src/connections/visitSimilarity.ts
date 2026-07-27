@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { buildAnnIndex } from '../recall/ann-index.js';
+import { createEmbeddingCache } from '../recall/embeddingCache.js';
 import { evidenceCorpusForRecord } from '../page-evidence/extract.js';
 import {
   DEFAULT_UNKNOWN_IDF,
@@ -51,6 +52,20 @@ export interface BuildVisitSimilarityOptions {
   // that simulate "embedder is unavailable, no edges expected." Default
   // honors the env var (enabled unless explicitly disabled).
   readonly lexicalFallbackEnabled?: boolean;
+  /**
+   * Vault root. When present the FULL-corpus embed path consults the shared
+   * on-disk embedding cache (recall/embeddingCache.ts) instead of re-embedding
+   * text it has already seen. Absent (tests, library callers) = no cache, exact
+   * prior behaviour.
+   *
+   * WHY: this function embeds passage+query text for EVERY eligible visit. On a
+   * real vault that is minutes of ONNX per call — measured live 2026-07-27 at
+   * ~100% CPU for 11+ minutes in the reconcile child, which starved the parent
+   * serving the panel and pushed resolve p95 to 17.5s against a 15s client
+   * timeout. The corpus barely changes between drains, so almost all of that
+   * work is recomputing identical vectors.
+   */
+  readonly vaultRoot?: string;
   readonly evidenceByCanonicalUrl?: ReadonlyMap<string, PageEvidenceRecord>;
   readonly evidenceVectorsByVectorId?: ReadonlyMap<string, Float32Array>;
   readonly pageContentChunksByCanonicalUrl?: ReadonlyMap<
@@ -1239,6 +1254,71 @@ export const buildVisitSimilarityIncremental = (
   };
 };
 
+
+// ---- cached corpus embedding -------------------------------------------
+//
+// Embed only what we have not embedded before. Keyed by a hash of the exact
+// embed text (prefix included, so PASSAGE_ and QUERY_ variants never collide)
+// under the active model id + revision, so a model change invalidates cleanly
+// rather than serving stale vectors. Cache misses are embedded in ONE batch to
+// preserve the existing batching behaviour.
+//
+// Failure posture: the cache is an optimisation. Any read/write error falls
+// back to embedding, never throws into the drain.
+const embedWithCache = async (
+  texts: readonly string[],
+  embed: VisitSimilarityEmbedder,
+  vaultRoot: string | undefined,
+  modelId: string,
+  modelRevision: string,
+): Promise<readonly Float32Array[]> => {
+  if (vaultRoot === undefined) return embed(texts);
+  let cache: ReturnType<typeof createEmbeddingCache> | undefined;
+  try {
+    cache = createEmbeddingCache(vaultRoot);
+  } catch {
+    return embed(texts);
+  }
+  const out = new Array<Float32Array | undefined>(texts.length);
+  const missIndexes: number[] = [];
+  const missTexts: string[] = [];
+  const hashes = texts.map((t) => createHash('sha256').update(t).digest('hex'));
+  for (let i = 0; i < texts.length; i += 1) {
+    const hash = hashes[i];
+    let hit: Float32Array | null = null;
+    try {
+      hit = hash === undefined ? null : await cache.get({ modelId, modelRevision, embedTextHash: hash });
+    } catch {
+      hit = null;
+    }
+    if (hit === null) {
+      missIndexes.push(i);
+      missTexts.push(texts[i] ?? '');
+    } else {
+      out[i] = hit;
+    }
+  }
+  if (missTexts.length > 0) {
+    const fresh = await embed(missTexts);
+    for (let m = 0; m < missIndexes.length; m += 1) {
+      const target = missIndexes[m];
+      const vec = fresh[m];
+      if (target === undefined || vec === undefined) continue;
+      out[target] = vec;
+      const hash = hashes[target];
+      if (hash !== undefined) {
+        try {
+          await cache.put({ modelId, modelRevision, embedTextHash: hash }, vec);
+        } catch {
+          // best-effort: a cache write failure must not fail the drain
+        }
+      }
+    }
+  }
+  // Any hole (defensive) falls back to whatever embed returned for it.
+  return out.map((v) => v ?? new Float32Array(0));
+};
+
 export const buildVisitSimilarity = async (
   entries: readonly VisitSimilarityEntry[],
   embed: VisitSimilarityEmbedder,
@@ -1332,7 +1412,13 @@ export const buildVisitSimilarity = async (
   const queryTexts = eligible.map((visit) => `${QUERY_PREFIX}${visit.corpus}`);
   let embedded: readonly Float32Array[];
   try {
-    embedded = await embed([...passageTexts, ...queryTexts]);
+    embedded = await embedWithCache(
+      [...passageTexts, ...queryTexts],
+      embed,
+      options.vaultRoot,
+      RECALL_MODEL.modelId,
+      RECALL_MODEL.revision,
+    );
   } catch (error) {
     logMaterializerError(error);
     if (fallbackAllowed) return lexicalRevision();
