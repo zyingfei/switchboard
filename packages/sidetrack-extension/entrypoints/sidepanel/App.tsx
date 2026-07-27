@@ -116,6 +116,11 @@ import {
   type FocusGroupSaveInput,
 } from '../../src/sidepanel/connections/ConnectionsView';
 import { PageTextPanel } from '../../src/sidepanel/connections/PageTextPanel';
+import {
+  ContentEnrichmentAction,
+  type EnrichmentTarget,
+} from '../../src/sidepanel/nano/ContentEnrichmentAction';
+import { nanoEngineIfAvailable, isWebGpuLoaded } from '../../src/sidepanel/nano/engine';
 import { sendMessageWithWatchdog } from '../../src/sidepanel/connections/sendMessageWithWatchdog';
 import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
@@ -5662,6 +5667,69 @@ const App = () => {
     readonly PageContentOpenTabPreview[] | null
   >(null);
   const [currentTabPageContentError, setCurrentTabPageContentError] = useState<string | null>(null);
+  // On-device generation-engine readiness for the "Enrich content" action.
+  // Nano when the built-in Prompt API is 'available'; WebGPU only when
+  // explicitly loaded in Health (never auto-loaded from here). Probed passively
+  // and refreshed when the Now card's focused URL changes so the button
+  // reflects a model loaded mid-session.
+  const [enrichEngineLabel, setEnrichEngineLabel] = useState<'Nano' | 'WebGPU' | null>(null);
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const nano = await nanoEngineIfAvailable();
+      if (!active) return;
+      setEnrichEngineLabel(nano !== null ? 'Nano' : isWebGpuLoaded() ? 'WebGPU' : null);
+    })();
+    return () => {
+      active = false;
+    };
+  }, [currentTabCanonicalUrl]);
+  // Fetch the target's raw text for enrichment: page text via the SAME
+  // extract path PageTextPanel's indexer uses for URLs, thread markdown via
+  // the companion route for chat threads. Null when nothing is obtainable.
+  const fetchEnrichmentText = useCallback(
+    async (target: EnrichmentTarget): Promise<string | null> => {
+      if (target.kind === 'thread') {
+        try {
+          const md = await fetchCompanionJson<{ readonly markdown?: string }>(
+            `/v1/threads/${encodeURIComponent(target.bacId)}/markdown`,
+          );
+          return typeof md.markdown === 'string' && md.markdown.length > 0 ? md.markdown : null;
+        } catch {
+          return null;
+        }
+      }
+      // URL page: extract readable text through the background (same source the
+      // page-text indexer reads). The extract message returns the payload with
+      // content.text; no indexing side effect.
+      if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return null;
+      return await new Promise<string | null>((resolve) => {
+        try {
+          sendMessageWithWatchdog(
+            { type: messageTypes.pageContentExtract, mode: 'page', trigger: 'manual' },
+            ({ response, error }) => {
+              if (error !== null) {
+                resolve(null);
+                return;
+              }
+              const parsed = response as
+                | { readonly ok?: boolean; readonly payload?: { readonly content?: { readonly text?: string; readonly markdown?: string } } }
+                | undefined;
+              if (parsed?.ok !== true) {
+                resolve(null);
+                return;
+              }
+              const text = parsed.payload?.content?.markdown ?? parsed.payload?.content?.text ?? null;
+              resolve(typeof text === 'string' && text.length > 0 ? text : null);
+            },
+          );
+        } catch {
+          resolve(null);
+        }
+      });
+    },
+    [fetchCompanionJson],
+  );
   const currentTabCardRef = useRef<HTMLElement | null>(null);
   const [currentTabFocusing, setCurrentTabFocusing] = useState(false);
   const focusedResolveRetryRef = useRef<{
@@ -8540,6 +8608,44 @@ const App = () => {
                     }}
                   />
                   ) : null}
+                  {/* feat/webgpu-enrichment — on-demand content enrichment.
+              Sits next to the ▸ Page-text disclosure, matching style.
+              Generates a factual gist on-device (Nano or an explicitly-
+              loaded WebGPU model) and saves it to the companion so the
+              lanes/categories re-resolve with the new signal. The engine
+              is NEVER loaded here — disabled with a Health hint when no
+              engine is ready. URL pages POST kind 'url'; chat threads POST
+              kind 'thread' by bac id. */}
+                  {!isCardPinned &&
+                  port.length > 0 &&
+                  bridgeKey.length > 0 &&
+                  (() => {
+                    const target: EnrichmentTarget | null =
+                      (focusedPageKind === 'page' || focusedPageKind === 'workstream') &&
+                      currentTabCanonicalUrl !== null
+                        ? { kind: 'url', canonicalUrl: currentTabCanonicalUrl }
+                        : focusedPageKind === 'chat' &&
+                            typeof state.currentTab?.bac_id === 'string' &&
+                            state.currentTab.bac_id.length > 0
+                          ? { kind: 'thread', bacId: state.currentTab.bac_id }
+                          : null;
+                    if (target === null) return null;
+                    return (
+                      <ContentEnrichmentAction
+                        target={target}
+                        port={Number(port)}
+                        bridgeKey={bridgeKey}
+                        engineReady={enrichEngineLabel !== null}
+                        activeEngineLabel={enrichEngineLabel}
+                        fetchText={fetchEnrichmentText}
+                        onEnriched={() => {
+                          if (currentTabCanonicalUrl !== null) {
+                            void refreshUrlSuggestion(currentTabCanonicalUrl);
+                          }
+                        }}
+                      />
+                    );
+                  })()}
                 </div>
                 {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the

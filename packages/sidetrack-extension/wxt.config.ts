@@ -5,6 +5,15 @@ import { dirname, join } from 'node:path';
 
 import { defineConfig } from 'wxt';
 
+import { copyOrtWasm } from './scripts/copy-ort-wasm';
+
+// Populate public/ort/ with the onnxruntime-web WASM the WebGPU generation
+// engine (transformers.js) needs, so wxt bundles it into the MV3 package and
+// the extension loads it from its OWN origin (chrome-extension://…/ort/) —
+// never from a CDN. Preserves the zero-outbound guarantee. Runs at config eval
+// so it precedes both `wxt dev` and `wxt build`.
+copyOrtWasm();
+
 // Build-time identity injected as __BUILD_INFO__ into the bundle.
 // Used by the side panel's footer line so the user can confirm the
 // loaded extension matches their git state at a glance.
@@ -121,8 +130,16 @@ export default defineConfig({
     //    in the following Content Security Policy directive."
     // `wasm-unsafe-eval` is the MV3-approved keyword (per the Chrome
     // extension CSP allowlist) — narrower than `unsafe-eval`. The
-    // WASM blob is bundled in our extension (sqlite-wasm package),
-    // not pulled remotely, so the risk surface is what we already ship.
+    // WASM blobs are bundled in our extension, not pulled remotely, so
+    // the risk surface is what we already ship. Two consumers now:
+    //   1. sqlite-wasm — the local-recall OPFS-SQLite fallback.
+    //   2. onnxruntime-web (public/ort/*.wasm) — the WebGPU generation
+    //      engine's JSEP backend. transformers.js loads the `.jsep.mjs`
+    //      glue as a same-origin dynamic import (covered by 'self') and
+    //      instantiates the `.wasm` under 'wasm-unsafe-eval'. Model FILES
+    //      come from the LOCAL companion host over connect-src (default
+    //      unrestricted for extension_pages) — no CDN, no outbound.
+    // No new CSP token is required for the WebGPU path.
     content_security_policy: {
       extension_pages:
         "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';",

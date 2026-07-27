@@ -138,6 +138,56 @@ describe('resolveUrlAttributionArmed', () => {
     expect(recency?.candidates[0]?.workstreamId).toBe('wsRust');
   });
 
+  it('title lane why marks " · synthesized title" when the match rode on a synthesized title', async () => {
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    const probeUrl = 'https://blog.rust-lang.org/untitled';
+    // A snapshot node whose only label is its URL (structurally junk) with NO
+    // real title — so titleForCanonicalUrl falls back to the synthesizedTitle.
+    const junkSnapshot: ConnectionsSnapshot = {
+      scope: {},
+      nodes: [
+        {
+          id: `timeline-visit:${probeUrl}`,
+          kind: 'timeline-visit',
+          label: probeUrl,
+          originReplicaIds: [],
+          metadata: { canonicalUrl: probeUrl },
+        },
+      ],
+      edges: [],
+      updatedAt: '2026-07-27T00:00:00.000Z',
+      nodeCount: 1,
+      edgeCount: 0,
+    };
+    const result = await resolveUrlAttributionArmed({
+      vaultRoot,
+      canonicalUrl: probeUrl,
+      snapshot: junkSnapshot,
+      events: [],
+      // The on-device synthesized title — overlaps wsRust's folded vocabulary.
+      synthesizedTitle: 'rust async release notes',
+    });
+    const title = result.lanes!.find((l) => l.lane === 'title');
+    expect(title?.candidates).toHaveLength(1);
+    expect(title?.candidates[0]?.why).toContain('· synthesized title');
+  });
+
+  it('title lane why has NO synthesized suffix when a real title matched', async () => {
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    const probeUrl = 'https://blog.rust-lang.org/c';
+    const result = await resolveUrlAttributionArmed({
+      vaultRoot,
+      canonicalUrl: probeUrl,
+      // A real snapshot title — the synthesized fallback is never consulted.
+      snapshot: snapshot(probeUrl, 'rust async release notes'),
+      events: [],
+      synthesizedTitle: 'ignored because a real title exists',
+    });
+    const title = result.lanes!.find((l) => l.lane === 'title');
+    expect(title?.candidates).toHaveLength(1);
+    expect(title?.candidates[0]?.why).not.toContain('synthesized title');
+  });
+
   it('omits lanes when SIDETRACK_GUESS_LANES is off', async () => {
     process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
     const prevLanes = process.env['SIDETRACK_GUESS_LANES'];

@@ -1,4 +1,13 @@
-import { builtinLanguageModel, contentHashOf, synthesizeTitle } from './titleSynthesis';
+import {
+  builtinLanguageModel,
+  contentHashOf,
+  MAX_TITLE_CHARS,
+  MIN_CONTENT_CHARS,
+  sliceForSynthesis,
+  synthesizeTitle,
+  TITLE_PROMPT_PREFIX,
+} from './titleSynthesis';
+import { cleanGeneratedTitle, type GenerationEngine } from './engine';
 
 // Budgeted background worker that PERSISTS Nano-synthesized titles via the
 // companion, feeding the recommendation corpus (title lane, FTS, title
@@ -74,15 +83,50 @@ export interface EnrichmentItem {
   readonly id: string;
   readonly synthesizedTitle: string;
   readonly sourceContentHash: string;
-  readonly model: 'gemini-nano';
+  readonly model: 'gemini-nano' | 'gemma-3-1b-it';
   readonly generatedAt: string;
 }
+
+// The provenance string the companion records for each engine, so the served
+// lane `why` can distinguish "synthesized on Nano" from "on WebGPU/Gemma".
+const MODEL_ID_FOR_ENGINE: Record<GenerationEngine['kind'], EnrichmentItem['model']> = {
+  nano: 'gemini-nano',
+  webgpu: 'gemma-3-1b-it',
+};
 
 export interface TitleEnrichmentRun {
   readonly port: number;
   readonly bridgeKey: string;
   readonly budget?: number;
+  /**
+   * The engine to synthesize with. When omitted the run uses Nano directly
+   * (the original path — availability-gated), so existing callers are
+   * unchanged. When provided (e.g. an explicitly-loaded WebGPU engine) it
+   * generates through the engine interface and records that engine's model id.
+   */
+  readonly engine?: GenerationEngine;
 }
+
+// Synthesize a title through a GenerationEngine (nano OR webgpu), mirroring the
+// Nano-direct synthesizeTitle discipline: thin-content gate, slice, SKIP/empty
+// → null, cleanup + cap. Kept here so the enrichment worker has one engine-
+// agnostic synthesis path.
+const synthesizeTitleWithEngine = async (
+  engine: GenerationEngine,
+  content: string,
+): Promise<string | null> => {
+  if (content.trim().length < MIN_CONTENT_CHARS) return null;
+  const sample = sliceForSynthesis(content);
+  try {
+    const raw = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${sample}`, { maxNewTokens: 32 });
+    const cleaned = cleanGeneratedTitle(raw);
+    if (cleaned.length === 0) return null;
+    if (cleaned === 'SKIP') return null;
+    return cleaned.slice(0, MAX_TITLE_CHARS);
+  } catch {
+    return null;
+  }
+};
 
 export interface TitleEnrichmentStats {
   readonly generated: number;
@@ -92,26 +136,34 @@ export interface TitleEnrichmentStats {
 
 /**
  * Run one budgeted pass: pick junk-titled threads, synthesize titles for up to
- * `budget` of them on Nano (skipping content whose hash was already
- * submitted), POST the batch to the companion, and record the accepted hashes.
- * Returns { generated, accepted, skipped }. Requires Nano 'available' and a
+ * `budget` of them (skipping content whose hash was already submitted), POST
+ * the batch to the companion, and record the accepted hashes. Returns
+ * { generated, accepted, skipped }. Synthesizes on the provided engine, or —
+ * when none is passed — on Nano directly (availability-gated). Requires a
  * connected companion.
  */
 export const runTitleEnrichment = async ({
   port,
   bridgeKey,
   budget = 10,
+  engine,
 }: TitleEnrichmentRun): Promise<TitleEnrichmentStats> => {
   const empty: TitleEnrichmentStats = { generated: 0, accepted: 0, skipped: 0 };
+  // Engine selection: an explicit engine (e.g. loaded WebGPU) wins; otherwise
+  // fall back to Nano-direct, which requires the built-in API 'available'.
   const lm = builtinLanguageModel();
-  if (lm === undefined) return empty;
-  let availability: string;
-  try {
-    availability = await lm.availability();
-  } catch {
-    return empty;
+  if (engine === undefined) {
+    if (lm === undefined) return empty;
+    let availability: string;
+    try {
+      availability = await lm.availability();
+    } catch {
+      return empty;
+    }
+    if (availability !== 'available') return empty;
   }
-  if (availability !== 'available') return empty;
+  const modelId: EnrichmentItem['model'] =
+    engine !== undefined ? MODEL_ID_FOR_ENGINE[engine.kind] : 'gemini-nano';
 
   const base = `http://127.0.0.1:${String(port)}`;
   const headers = { 'x-bac-bridge-key': bridgeKey };
@@ -145,7 +197,12 @@ export const runTitleEnrichment = async ({
       skipped += 1;
       continue;
     }
-    const title = await synthesizeTitle(lm, content);
+    const title =
+      engine !== undefined
+        ? await synthesizeTitleWithEngine(engine, content)
+        : lm !== undefined
+          ? await synthesizeTitle(lm, content)
+          : null;
     if (title === null) {
       skipped += 1;
       continue;
@@ -155,7 +212,7 @@ export const runTitleEnrichment = async ({
       id: t.bac_id,
       synthesizedTitle: title,
       sourceContentHash: hash,
-      model: 'gemini-nano',
+      model: modelId,
       generatedAt: new Date().toISOString(),
     });
     newHashes.push(hash);

@@ -67,6 +67,29 @@ export const TITLE_PROMPT_PREFIX = [
   '---',
 ].join('\n');
 
+// Content-only GIST prompt (feat/webgpu-enrichment): a short factual summary
+// used by the on-demand content-enrichment action, POSTed to the companion's
+// /v1/enrichment/content endpoint to enrich the recommendation corpus with a
+// dense semantic gist (title lane gets a title; content lane gets this). Same
+// same-language + content-only + SKIP discipline as the title prompt; the
+// generated gist is capped to the contract's ≤2000 chars by the caller.
+export const GIST_PROMPT_PREFIX = [
+  'You summarize documents for a personal research organizer.',
+  'Write a factual 2 to 3 sentence summary of the content below, then list',
+  'the key entities (people, products, technologies, questions) it covers.',
+  'Write in the SAME language the content is mostly written in',
+  '(English content → English summary, 中文内容 → 中文摘要).',
+  'Use ONLY facts present in the text. No opinions, no meta-commentary about',
+  'the document itself, no quotes of these instructions.',
+  'If the text is too thin to summarize faithfully, reply exactly: SKIP',
+  '',
+  'Content:',
+  '---',
+].join('\n');
+
+// A synthesized gist is capped to the content contract's ≤2000 chars.
+export const MAX_GIST_CHARS = 2000;
+
 // Content thinner than this cannot be titled faithfully — matches the eval's
 // gate so the worker skips the same threads the human eval marks "too thin".
 export const MIN_CONTENT_CHARS = 80;

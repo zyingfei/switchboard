@@ -317,6 +317,11 @@ interface QueryVectorResult {
 const acquireQueryVector = async (input: {
   readonly canonicalUrl: string;
   readonly title: string | null;
+  // The RESOLVED page's own synthesized gist (content enrichment), when present.
+  // Prepended to the embed text: a paragraph-scale gist carries far more topical
+  // signal than the title+url tokens, so it dominates the query vector when the
+  // page has one (the user's directive — gist beats title+url).
+  readonly gist: string | null;
   readonly embed: ContentLaneEmbed | undefined;
   readonly embedderUsable: boolean;
   readonly ownEntityIds: ReadonlySet<string>;
@@ -325,11 +330,15 @@ const acquireQueryVector = async (input: {
     return { vector: undefined, embedded: false, ownEntityIds: input.ownEntityIds };
   }
   const title = input.title ?? '';
-  const embedText = `${title} ${urlTokens(input.canonicalUrl)}`.trim();
+  const gist = input.gist ?? '';
+  // gist FIRST (dominant topical signal), then title, then url tokens.
+  const embedText = `${gist} ${title} ${urlTokens(input.canonicalUrl)}`.trim();
   if (embedText.length === 0) {
     return { vector: undefined, embedded: false, ownEntityIds: input.ownEntityIds };
   }
-  const key = hashKey(input.canonicalUrl, title);
+  // Key the LRU on (url,title,gist) so a page that later gains a gist re-embeds
+  // rather than reusing the pre-gist query vector.
+  const key = hashKey(input.canonicalUrl, `${title} ${gist}`);
   const cached = lruGet(key);
   if (cached !== undefined) {
     return { vector: cached, embedded: false, ownEntityIds: input.ownEntityIds };
@@ -353,6 +362,12 @@ export interface BuildContentLaneInput {
   // Best-effort page title (titleHint → visit-record latestTitle → snapshot
   // lookup already resolved by the caller). Null ⇒ no title known.
   readonly title: string | null;
+  // The RESOLVED page's own synthesized gist (content enrichment), or null. When
+  // present it is folded into the embed + FTS query text (gist beats title+url
+  // tokens) and the lane `why` is marked ' · gist' so the provenance is
+  // explicit. NEIGHBOR hits are NOT gist-looked-up (would need a per-hit
+  // entity→gist lookup on the hot path) — only the query side benefits for now.
+  readonly gist?: string | null;
   // The already-open /v2 recall store handle. Undefined ⇒ typed-empty lane.
   readonly store: ContentLaneStore | undefined;
   // Query-time embed, or undefined when the embedder is not usable.
@@ -388,6 +403,10 @@ export const buildContentLane = async (
   input: BuildContentLaneInput,
 ): Promise<GuessLaneResult> => {
   const { store, canonicalUrl, snapshot, title } = input;
+  // Whether the resolved page's own gist was used in the query text — drives the
+  // ' · gist' provenance suffix on the lane why.
+  const gist = input.gist ?? null;
+  const gistUsed = gist !== null && gist.length > 0;
   if (store === undefined) {
     return typedEmpty('recall store unavailable');
   }
@@ -410,6 +429,7 @@ export const buildContentLane = async (
     ? await acquireQueryVector({
         canonicalUrl,
         title,
+        gist,
         embed: input.embed,
         embedderUsable: input.embedderUsable,
         ownEntityIds,
@@ -447,7 +467,7 @@ export const buildContentLane = async (
     }
   }
 
-  const ftsQuery = composeFtsQuery(title, canonicalUrl);
+  const ftsQuery = composeFtsQuery(title, canonicalUrl, gist);
   let ftsRanking: RankedDoc[] = [];
   if (ftsQuery.length > 0) {
     try {
@@ -536,7 +556,7 @@ export const buildContentLane = async (
   const candidates: GuessLaneCandidate[] = [...perWorkstream.entries()].map(([workstreamId, agg]) => ({
     workstreamId,
     score: maxSum > 0 ? Math.min(1, agg.sum / maxSum) : 0,
-    why: renderWhy(agg.count, agg.titles, agg.anyContent),
+    why: renderWhy(agg.count, agg.titles, agg.anyContent, gistUsed),
   }));
   void droppedUnattributed; // counted for diagnostics; not surfaced in `why`
 
@@ -555,28 +575,38 @@ export const buildContentLane = async (
   return { lane: 'content', candidates: top };
 };
 
-// Compose the FTS query from title + URL tokens. Lexical only — no vector.
-// Uses the same non-punctuation URL-token slug the embed sees.
-const composeFtsQuery = (title: string | null, canonicalUrl: string): string => {
+// Compose the FTS query from gist + title + URL tokens. Lexical only — no
+// vector. Uses the same non-punctuation URL-token slug the embed sees. The gist
+// (when present) leads so its content terms drive the BM25 match.
+const composeFtsQuery = (
+  title: string | null,
+  canonicalUrl: string,
+  gist: string | null,
+): string => {
   const parts: string[] = [];
+  if (gist !== null && gist.length > 0) parts.push(gist);
   if (title !== null && title.length > 0) parts.push(title);
   const toks = urlTokens(canonicalUrl);
   if (toks.length > 0) parts.push(toks);
   return parts.join(' ').trim();
 };
 
-// Render the honest `why`: match count + up to 2 doc titles, and title-vector
-// provenance when NO content-derived vector backed any of this workstream's
-// hits (chat_turn / timeline_visit title-only embeds).
+// Render the honest `why`: match count + up to 2 doc titles, a title-vector
+// provenance suffix when NO content-derived vector backed any of this
+// workstream's hits (chat_turn / timeline_visit title-only embeds), and a
+// ' · gist' suffix when the QUERY side used the resolved page's synthesized
+// gist (the match was driven by the gist, not the raw title/url).
 const renderWhy = (
   count: number,
   titles: readonly string[],
   anyContent: boolean,
+  gistUsed: boolean,
 ): string => {
   const provenance = anyContent ? '' : ' · title-vector';
+  const gistSuffix = gistUsed ? ' · gist' : '';
   const named = titles.length === 0 ? '' : ` (${titles.join(', ')})`;
   const plural = count === 1 ? 'match' : 'matches';
-  return `${count} ${plural}${named}${provenance}`;
+  return `${count} ${plural}${named}${provenance}${gistSuffix}`;
 };
 
 // ---- serve-side orchestration -----------------------------------------
@@ -617,6 +647,9 @@ export const appendContentLane = async <T extends ResultWithLanes>(
     readonly canonicalUrl: string;
     readonly snapshot: ConnectionsSnapshot;
     readonly title: string | null;
+    // The resolved page's own synthesized gist (content enrichment), or null.
+    // Threaded into the embed + FTS query text and the ' · gist' why suffix.
+    readonly gist?: string | null;
   },
   deps: AppendContentLaneDeps,
 ): Promise<T> => {
@@ -631,6 +664,7 @@ export const appendContentLane = async <T extends ResultWithLanes>(
       canonicalUrl: input.canonicalUrl,
       snapshot: input.snapshot,
       title: input.title,
+      ...(input.gist === undefined ? {} : { gist: input.gist }),
       store: deps.store,
       ...(deps.embed === undefined ? {} : { embed: deps.embed }),
       embedderUsable: deps.embedderUsable,

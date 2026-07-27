@@ -271,4 +271,30 @@ describe('buildGuessLanes', () => {
     const signals = voteSignalsFor(null, 'https://news.ycombinator.com/item', null);
     expect(signals.domain).toBe('news.ycombinator.com');
   });
+
+  it('title lane why marks " · synthesized title" when the title was synthesized', () => {
+    const state = buildRustState();
+    const canonicalUrl = 'https://blog.rust-lang.org/c';
+    // Same overlapping title, but flagged as synthesized (came from the
+    // enrichment overlay, not a raw page title).
+    const signals = voteSignalsFor(state, canonicalUrl, 'rust async release', true);
+    expect(signals.titleSynthesized).toBe(true);
+    const lanes = buildGuessLanes({ candidateEvidence: [], voteSignals: signals });
+    const title = laneOf(lanes, 'title');
+    expect(title.candidates).toHaveLength(1);
+    expect(title.candidates[0]!.why).toContain('title words match');
+    expect(title.candidates[0]!.why).toContain('· synthesized title');
+  });
+
+  it('title lane why has NO synthesized suffix for a real title', () => {
+    const state = buildRustState();
+    const canonicalUrl = 'https://blog.rust-lang.org/c';
+    // Default (titleSynthesized false) — a real title.
+    const signals = voteSignalsFor(state, canonicalUrl, 'rust async release');
+    expect(signals.titleSynthesized).toBe(false);
+    const lanes = buildGuessLanes({ candidateEvidence: [], voteSignals: signals });
+    const title = laneOf(lanes, 'title');
+    expect(title.candidates).toHaveLength(1);
+    expect(title.candidates[0]!.why).not.toContain('synthesized title');
+  });
 });

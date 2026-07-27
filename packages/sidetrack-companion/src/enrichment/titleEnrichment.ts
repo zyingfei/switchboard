@@ -312,23 +312,41 @@ export const enrichmentLookupFromMerged = (
 // already persisted by the panel-POST path dedupe correctly here.
 const NUL_SEP = String.fromCharCode(0);
 
+// The enrichment event FAMILY — 'title' (entity.title.enriched) or 'content'
+// (entity.content.enriched). The two families share the (kind,id) key space and
+// this ONE clientEventId helper, so the family MUST be part of the idempotency
+// key: a title event and a content event for the same (kind,id,hash) would
+// otherwise collide on the SAME clientEventId and the second POST would be
+// wrongly deduped as a replay of the first.
+export type EnrichmentFamily = 'title' | 'content';
+
 // The idempotency key for an enrichment event = a deterministic hash of the
-// (kind,id,sourceContentHash) triple. Re-posting the same triple binds to the
-// existing event ⇒ the append is a no-op; a NEW hash for the same (kind,id) is
-// a distinct clientEventId ⇒ a new event that supersedes in the fold. This is
-// the SINGLE definition of the dedupe key — both the panel-POST route
-// (/v1/enrichment/titles) and the companion-side sweep append through
-// appendEnrichmentEvent so the two producers can never drift on how they
-// derive it.
+// (family,kind,id,sourceContentHash) tuple. Re-posting the same tuple binds to
+// the existing event ⇒ the append is a no-op; a NEW hash for the same
+// (family,kind,id) is a distinct clientEventId ⇒ a new event that supersedes in
+// the fold. This is the SINGLE definition of the dedupe key — the title POST
+// route AND the content POST route both append through this helper so no two
+// producers drift on how the key is derived.
+//
+// BACK-COMPAT: `family` defaults to 'title', and the title hash input is
+// UNCHANGED from before this parameter existed (the family segment is appended
+// ONLY for non-title families). So every title event already persisted by the
+// pre-content POST path keeps its exact clientEventId and still dedupes here.
 export const enrichmentClientEventId = (
   kind: EntityTitleEnrichedKind,
   id: string,
   sourceContentHash: string,
-): string =>
-  `enrich-${createHash('sha256')
-    .update([kind, id, sourceContentHash].join(NUL_SEP))
-    .digest('hex')
-    .slice(0, 32)}`;
+  family: EnrichmentFamily = 'title',
+): string => {
+  // Title: hash [kind,id,hash] verbatim (byte-identical with pre-content
+  // events). Content: append the family segment so its keys never collide with
+  // a title event's keys.
+  const parts =
+    family === 'title'
+      ? [kind, id, sourceContentHash]
+      : [kind, id, sourceContentHash, family];
+  return `enrich-${createHash('sha256').update(parts.join(NUL_SEP)).digest('hex').slice(0, 32)}`;
+};
 
 export type EnrichmentAppendOutcome = 'accepted' | 'skipped' | 'invalid';
 
