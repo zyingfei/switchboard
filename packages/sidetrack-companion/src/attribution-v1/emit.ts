@@ -181,6 +181,13 @@ export const incumbentTopFromResolution = (resolution: {
 // object (nodes with metadata.canonicalUrl/url/title and a label fallback).
 // Structurally typed so this module does not import the connections types;
 // undefined when no matching node carries a title.
+//
+// TITLE ENRICHMENT SEAM (url kind): the optional `synthesizedTitle` is the
+// panel's on-device title for a junk-titled visit. It applies ONLY as a
+// FALLBACK — after real metadata/label titles, before returning undefined —
+// so a real page title always wins. Callers resolve it from the folded
+// enrichment lookup (loadEnrichmentLookup + effectiveUrlTitle); passing
+// undefined preserves the exact prior behavior (flag off / no enrichment).
 export const titleForCanonicalUrl = (
   snapshot: {
     readonly nodes: readonly {
@@ -189,6 +196,7 @@ export const titleForCanonicalUrl = (
     }[];
   },
   canonicalUrl: string,
+  synthesizedTitle?: string,
 ): string | undefined => {
   let labelFallback: string | undefined;
   for (const node of snapshot.nodes) {
@@ -209,10 +217,14 @@ export const titleForCanonicalUrl = (
   // Untitled visits carry their URL as the display label. A URL is not a
   // title: feeding it to the title matcher degenerates into scheme/TLD-token
   // matching (live false-friend: title lane scored 0.88 on "https, com").
-  // Callers that get undefined report honest typed emptiness ("no page
-  // title to match") instead.
-  if (labelFallback !== undefined && /^https?:\/\//iu.test(labelFallback.trim())) {
-    return undefined;
+  // A non-URL label fallback is a real title and wins over any synthesized
+  // one; a URL-shaped label is junk, so the synthesized title fills here
+  // (before we would otherwise return undefined).
+  if (labelFallback !== undefined && !/^https?:\/\//iu.test(labelFallback.trim())) {
+    return labelFallback;
   }
-  return labelFallback;
+  // No real title/label — fall back to the panel's synthesized title if one
+  // exists, else report honest typed emptiness ("no page title to match").
+  if (synthesizedTitle !== undefined && synthesizedTitle.length > 0) return synthesizedTitle;
+  return undefined;
 };

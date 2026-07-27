@@ -74,6 +74,13 @@ export interface ArmedResolveInput extends ResolveUrlAttributionInput {
   // snapshot lookup) so the title lane matches on the CURRENT page title even
   // before the snapshot has recorded it. Absent ⇒ snapshot lookup as before.
   readonly titleHint?: string;
+  // Title-enrichment overlay (url kind): the panel's on-device synthesized
+  // title for a junk-titled visit. LAST in the title fallback order — used
+  // only when neither a live titleHint nor a real snapshot title/label exists
+  // (titleForCanonicalUrl applies it before returning undefined). The caller
+  // resolves it once per batch from the folded enrichment lookup; absent ⇒
+  // exact prior behavior. Never overwrites a real title.
+  readonly synthesizedTitle?: string;
 }
 
 // Resolve a URL under the configured serving arm. Async because the vote arm
@@ -83,7 +90,8 @@ export interface ArmedResolveInput extends ResolveUrlAttributionInput {
 export const resolveUrlAttributionArmed = async (
   input: ArmedResolveInput,
 ): Promise<UrlResolutionResult> => {
-  const { vaultRoot, now, tombstones, skipReverseShadow, titleHint, ...resolverInput } = input;
+  const { vaultRoot, now, tombstones, skipReverseShadow, titleHint, synthesizedTitle, ...resolverInput } =
+    input;
 
   // Guess lanes (SIDETRACK_GUESS_LANES, default ON) need the cheap vote signals
   // (title/domain/recency) which read the memoized AttributionV1State. Load it
@@ -107,6 +115,7 @@ export const resolveUrlAttributionArmed = async (
             resolverInput.snapshot,
             resolverInput.canonicalUrl,
             titleHint,
+            synthesizedTitle,
           )
         : undefined;
     return resolveUrlAttribution({
@@ -125,7 +134,7 @@ export const resolveUrlAttributionArmed = async (
 
   const title =
     normalizeTitleHint(titleHint) ??
-    titleForCanonicalUrl(resolverInput.snapshot, resolverInput.canonicalUrl) ??
+    titleForCanonicalUrl(resolverInput.snapshot, resolverInput.canonicalUrl, synthesizedTitle) ??
     null;
   const voteResult = resolveUrlAttributionVote3({
     state,
@@ -173,11 +182,14 @@ const voteSignalsForResolve = async (
   snapshot: ResolveUrlAttributionInput['snapshot'],
   canonicalUrl: string,
   titleHint: string | undefined,
+  synthesizedTitle: string | undefined,
 ): Promise<GuessLaneVoteSignals | undefined> => {
   const state = await loadAttributionV1State(vaultRoot, now ?? (() => new Date()));
   if (state === null) return undefined;
   const title =
-    normalizeTitleHint(titleHint) ?? titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+    normalizeTitleHint(titleHint) ??
+    titleForCanonicalUrl(snapshot, canonicalUrl, synthesizedTitle) ??
+    null;
   return voteSignalsFor(state, canonicalUrl, title);
 };
 

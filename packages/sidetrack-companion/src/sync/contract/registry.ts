@@ -34,6 +34,7 @@ import {
   CODING_TICK_OBSERVED,
 } from '../../coding/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import { ENTITY_TITLE_ENRICHED } from '../../enrichment/events.js';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
@@ -339,6 +340,28 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
         surface: 'ranker-training-labels',
         class: 'derived-cache',
         materializer: 'connections',
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Title enrichment — entity.title.enriched. The panel synthesizes a
+  // descriptive title on-device for a junk-titled entity (empty/URL-shaped
+  // raw title) and POSTs it; the companion appends this event. The overlay
+  // is served by folding these events at the title seams (titleForCanonicalUrl,
+  // url/thread projections, recall FTS) — a DERIVED cache. It routes to the
+  // 'recall' materializer so a landed enrichment re-drives ingestIncremental,
+  // which rebuilds the cached lexical (FTS) index with the enriched title on
+  // the next recall query. Recovery is replay-event-log (fold is a pure
+  // function of the event stream). peerFreshnessMs mirrors capture.recorded.
+  {
+    eventType: ENTITY_TITLE_ENRICHED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'recall-index',
+        class: 'derived-cache',
+        materializer: 'recall',
+        peerFreshnessMs: 30_000,
         recovery: 'replay-event-log',
       },
     ],
