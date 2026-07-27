@@ -99,6 +99,31 @@ describe('tokenizeTitle', () => {
   it('returns empty for an empty title', () => {
     expect(tokenizeTitle('')).toEqual([]);
   });
+
+  // URL material is stripped STRUCTURALLY (scheme anchoring + the Public
+  // Suffix List), never by enumerating scheme/TLD vocabulary. Live
+  // false-friend this pins: the title lane scored 0.88 against a workstream
+  // on the terms "https, com" (2026-07-27) because untitled visits fold
+  // their URL-as-label into the term index.
+  it('strips scheme-anchored URLs entirely (a URL-as-title folds to nothing)', () => {
+    expect(tokenizeTitle('https://www.beyondloom.com/decker/index.html')).toEqual([]);
+    // A TLD no hand-list would have carried — structure covers it anyway.
+    expect(tokenizeTitle('Read https://foo.dev/x then enjoy')).toEqual(['read', 'enjoy']);
+  });
+
+  it('collapses bare hostnames to their registrable label via the PSL, leaving non-hostname dotted tokens alone', () => {
+    // example.org has a real public suffix → keep the brand label only (the
+    // measured venue-suppression IDF governs it like any other term).
+    expect(tokenizeTitle('Decker docs at example.org (mirror)')).toEqual([
+      'decker',
+      'docs',
+      'example',
+      'mirror',
+    ]);
+    // "Node.js" is not a hostname (.js is not a public suffix) → ordinary
+    // punctuation split, nothing swallowed.
+    expect(tokenizeTitle('Node.js streams guide')).toEqual(['node', 'streams', 'guide']);
+  });
 });
 
 describe('domainOfUrl', () => {

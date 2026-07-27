@@ -48,7 +48,13 @@ export type GuessLane =
   | 'topic'
   | 'title'
   | 'domain'
-  | 'recency';
+  | 'recency'
+  // Lane 7 (additive, FROZEN CONTRACT). Query-time full-vector + BM25
+  // comparison per-workstream — computed OUTSIDE buildGuessLanes (async, needs
+  // the recall store handle) and APPENDED to the lanes array after 'recency'.
+  // It is intentionally NOT in GUESS_LANE_ORDER (that is the six synchronous,
+  // I/O-free lanes); see tabsession/contentLane.ts.
+  | 'content';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;

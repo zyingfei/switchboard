@@ -80,6 +80,21 @@ const allEmptyLanes: readonly GuessLaneResult[] = [
   { lane: 'recency', candidates: [], emptyReason: 'no recent filing' },
 ];
 
+// feat/content-lane — the 7th lane appended AFTER recency. Two shapes: a
+// POPULATED content lane (with a candidate + why) and an EMPTY one (its own
+// emptyReason). Both must render as their own disclosure row in array order.
+const lanesWithContentSignal: readonly GuessLaneResult[] = [
+  ...lanesWithSomeSignal,
+  {
+    lane: 'content',
+    candidates: [{ workstreamId: 'ws-2', score: 0.55, why: 'page text overlaps an Infra note' }],
+  },
+];
+const lanesWithContentEmpty: readonly GuessLaneResult[] = [
+  ...lanesWithSomeSignal,
+  { lane: 'content', candidates: [], emptyReason: 'no indexed page text yet' },
+];
+
 describe('guess-lanes — SuggestionStats render', () => {
   it('(1) renders the lanes behind a disclosure with workstream names + why', () => {
     render(
@@ -221,6 +236,54 @@ describe('guess-lanes — SuggestionStats render', () => {
     expect(screen.queryByRole('button', { name: 'File here' })).toBeNull();
   });
 
+  it('(7) renders the Content lane row when the payload carries it — populated', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithContentSignal)}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
+    // The summary counts the 7 lanes (graph + topic + content = 3 with signal).
+    expect(screen.getByText('Guess lanes · 3 of 7 with signal')).toBeDefined();
+    // The full label + the candidate + the why line all render.
+    expect(screen.getByText('Content match')).toBeDefined();
+    expect(screen.getByText('page text overlaps an Infra note')).toBeDefined();
+    // ws-2 resolves to a NAME in the content lane row.
+    const contentRow = screen.getByText('Content match').closest('li');
+    expect(contentRow).not.toBeNull();
+    expect(within(contentRow as HTMLElement).getByText('Infra / Deploy')).toBeDefined();
+  });
+
+  it('(7b) renders the Content lane row with its emptyReason when the payload carries it empty', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithContentEmpty)}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
+    // 7 lanes, still only graph + topic with signal (content is empty).
+    expect(screen.getByText('Guess lanes · 2 of 7 with signal')).toBeDefined();
+    expect(screen.getByText('Content match')).toBeDefined();
+    expect(screen.getByText('no indexed page text yet')).toBeDefined();
+  });
+
+  it('(7c) 6-lane payload (old companion / lane disabled) shows NO Content row', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithSomeSignal)}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
+    expect(screen.getByText('Guess lanes · 2 of 6 with signal')).toBeDefined();
+    expect(screen.queryByText('Content match')).toBeNull();
+  });
+
   it('surfaces the lanes disclosure under a CONFIDENT (populated) suggestion too', () => {
     render(
       <SuggestionStats
@@ -293,6 +356,19 @@ describe('guess-lanes — lenient wire parse (parseGuessLanes)', () => {
     expect(parsed).toHaveLength(1);
     expect(parsed?.[0]?.lane).toBe('recency');
     expect(parsed?.[0]?.candidates).toHaveLength(3);
+  });
+
+  it("parses the 7th 'content' lane as valid while still dropping unknown lanes", () => {
+    const parsed = parseGuessLanes([
+      { lane: 'recency', candidates: [], emptyReason: 'no recent filing' },
+      { lane: 'content', candidates: [{ workstreamId: 'ws-1', score: 0.5, why: 'text overlap' }] },
+      // Anything beyond the known 7 is still dropped leniently.
+      { lane: 'brand-new-lane', candidates: [{ workstreamId: 'ws-9', score: 0.9, why: 'x' }] },
+    ]);
+    expect(parsed).toHaveLength(2);
+    expect(parsed?.map((lane) => lane.lane)).toEqual(['recency', 'content']);
+    expect(parsed?.[1]?.candidates).toHaveLength(1);
+    expect(guessLaneSignalCount(parsed)).toBe(1);
   });
 
   it('keeps an empty lane with its emptyReason (all-empty lanes still parse)', () => {

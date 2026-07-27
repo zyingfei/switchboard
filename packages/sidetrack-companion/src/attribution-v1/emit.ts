@@ -206,5 +206,13 @@ export const titleForCanonicalUrl = (
       labelFallback = node.label;
     }
   }
+  // Untitled visits carry their URL as the display label. A URL is not a
+  // title: feeding it to the title matcher degenerates into scheme/TLD-token
+  // matching (live false-friend: title lane scored 0.88 on "https, com").
+  // Callers that get undefined report honest typed emptiness ("no page
+  // title to match") instead.
+  if (labelFallback !== undefined && /^https?:\/\//iu.test(labelFallback.trim())) {
+    return undefined;
+  }
   return labelFallback;
 };

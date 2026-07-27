@@ -31,6 +31,8 @@
 // this. Keep every field order-independent (accumulate into Maps, never
 // depend on iteration order) so replay-order does not change the artifact.
 
+import { parse as tldtsParse } from 'tldts';
+
 import {
   BROWSER_TIMELINE_OBSERVED,
   isBrowserTimelineObservedPayload,
@@ -70,12 +72,35 @@ const STOPWORDS = new Set<string>([
 
 const MIN_TOKEN_LEN = 3;
 
-// Word-level tokenizer. Lowercased, punctuation-split, stopword- and
-// length-filtered. No trigrams here: BM25 term weighting wants discrete
-// document terms, and trigram inflation would distort the IDF the venue-
-// suppression relies on.
+// URL material inside a "title" is STRUCTURAL noise, handled structurally —
+// never by enumerating scheme/TLD vocabulary (unenumerable; there is a new
+// TLD every week). Two shapes, two structural tools:
+//   1. Scheme-anchored URLs (`https://…`, `www.…`) — the whole substring is
+//      removed. Untitled visits fold their URL-as-label into the term index,
+//      which degenerated the title match into "which workstream has the most
+//      untitled pages" (live false-friend: 0.88 on "https, com", 2026-07-27).
+//   2. Bare dotted hostnames ("example.org" mid-sentence) — resolved against
+//      the open-source Public Suffix List (tldts, bundled snapshot, offline):
+//      a dotted token whose suffix is a real public suffix collapses to its
+//      registrable label ("example.org" → "example" — the brand term stays
+//      and the measured venue-suppression IDF governs it like any other
+//      term); a dotted token that is NOT a hostname ("Node.js") is left for
+//      the ordinary punctuation split (→ node, js).
+const SCHEMED_URL_RE = /(?:https?:\/\/|www\.)\S+/giu;
+const DOTTED_TOKEN_RE = /[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/giu;
+const collapseHostnames = (text: string): string =>
+  text.replace(DOTTED_TOKEN_RE, (dotted) => {
+    const parsed = tldtsParse(dotted, { allowPrivateDomains: true });
+    if (parsed.publicSuffix === null || parsed.domainWithoutSuffix === null) return dotted;
+    return parsed.domainWithoutSuffix;
+  });
+
+// Word-level tokenizer. URL-material stripped structurally (above), then
+// lowercased, punctuation-split, stopword- and length-filtered. No trigrams
+// here: BM25 term weighting wants discrete document terms, and trigram
+// inflation would distort the IDF the venue-suppression relies on.
 export const tokenizeTitle = (title: string): readonly string[] =>
-  title
+  collapseHostnames(title.replace(SCHEMED_URL_RE, ' '))
     .toLowerCase()
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .split(/\s+/u)

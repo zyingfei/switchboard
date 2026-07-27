@@ -6,11 +6,13 @@
 //
 //   Line 1 — lane dots: six fixed-order chips (Graph · Similar · Topic · Title
 //     · Domain · Recent), a FILLED dot when that lane produced ≥1 candidate, a
-//     HOLLOW dot when it was empty/absent. The whole row is a BUTTON that
-//     toggles the GuessLanes disclosure it sits above (controls co-located
-//     with state — this repo's UI taste rule). Each chip's title/aria carries
-//     the lane's top candidate (filled) or emptyReason (hollow) for hover +
-//     screen readers.
+//     HOLLOW dot when it was empty/absent. A 7th chip (Content) is appended
+//     ONLY when the payload actually carries a 'content' lane (feat/content-
+//     lane) — on an old companion / a disabled lane it's simply absent, never a
+//     phantom hollow dot. The whole row is a BUTTON that toggles the GuessLanes
+//     disclosure it sits above (controls co-located with state — this repo's UI
+//     taste rule). Each chip's title/aria carries the lane's top candidate
+//     (filled) or emptyReason (hollow) for hover + screen readers.
 //
 //   Line 2 — verdict: one arrow line derived from decision.gate
 //     (pipelineVerdictLine): "→ auto-filed" / "→ suggested" / "→ held: {why}",
@@ -27,12 +29,14 @@ import {
   pipelineVerdictLine,
 } from './types';
 
-// Fixed render order + short labels for the six lanes. This is the frozen wire
-// order (graph → recency); the strip renders ALL six in this order regardless
-// of which lanes the payload happens to include, so the dots row is a stable,
-// scannable shape. Short labels (vs GuessLanes' longer LANE_LABEL) keep the row
-// on one wrap-line in the narrow panel.
-const LANE_ORDER: readonly GuessLane[] = [
+// Fixed render order + short labels for the base six lanes. This is the frozen
+// wire order (graph → recency); the strip ALWAYS renders these six in this
+// order regardless of which the payload happens to include, so the dots row is
+// a stable, scannable shape. The optional 'content' lane (feat/content-lane) is
+// appended AFTER these six ONLY when the payload carries it — see the render.
+// Short labels (vs GuessLanes' longer LANE_LABEL) keep the row on one wrap-line
+// in the narrow panel.
+const BASE_LANE_ORDER: readonly GuessLane[] = [
   'graph',
   'similarity',
   'topic',
@@ -47,6 +51,7 @@ const LANE_SHORT_LABEL: Record<GuessLane, string> = {
   title: 'Title',
   domain: 'Domain',
   recency: 'Recent',
+  content: 'Content',
 };
 
 const workstreamLabel = (
@@ -93,11 +98,17 @@ export function PipelineStrip({
   open,
   onToggle,
 }: PipelineStripProps) {
-  // Index the payload's lanes by name so we can render the FIXED six-lane order
-  // even when the payload omits a lane (defensive — the wire contract sends all
-  // six, but a lenient parse can drop a malformed one).
+  // Index the payload's lanes by name so we can render the FIXED base six-lane
+  // order even when the payload omits a lane (defensive — the wire contract
+  // sends all six, but a lenient parse can drop a malformed one).
   const byLane = new Map<GuessLane, GuessLaneResult>();
   for (const lane of lanes) byLane.set(lane.lane, lane);
+  // The 7th 'content' chip is appended ONLY when the payload actually carries
+  // that lane — an old companion / a disabled lane never gets a phantom hollow
+  // dot, so the row is exactly six then and exactly seven when content arrives.
+  const laneOrder = byLane.has('content')
+    ? [...BASE_LANE_ORDER, 'content' as GuessLane]
+    : BASE_LANE_ORDER;
   const verdict = pipelineVerdictLine(gate, fusedCount);
   return (
     <div className="pipeline-strip">
@@ -109,7 +120,7 @@ export function PipelineStrip({
         aria-label={open ? 'Hide lane breakdown' : 'Show lane breakdown'}
         title={open ? 'Hide lane breakdown' : 'Show lane breakdown'}
       >
-        {LANE_ORDER.map((laneName) => {
+        {laneOrder.map((laneName) => {
           const lane = byLane.get(laneName);
           const label = LANE_SHORT_LABEL[laneName];
           const filled = lane !== undefined && lane.candidates.length > 0;

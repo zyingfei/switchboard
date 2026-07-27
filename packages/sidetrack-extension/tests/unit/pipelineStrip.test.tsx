@@ -45,6 +45,20 @@ const lanesWithSomeSignal: readonly GuessLaneResult[] = [
   { lane: 'recency', candidates: [], emptyReason: 'no recent filing' },
 ];
 
+// feat/content-lane — the 7th lane, appended AFTER recency. One populated
+// (Content dot filled) and one empty (Content dot hollow but PRESENT).
+const lanesWithContentFilled: readonly GuessLaneResult[] = [
+  ...lanesWithSomeSignal,
+  {
+    lane: 'content',
+    candidates: [{ workstreamId: 'ws-2', score: 0.55, why: 'page text overlaps an Infra note' }],
+  },
+];
+const lanesWithContentEmpty: readonly GuessLaneResult[] = [
+  ...lanesWithSomeSignal,
+  { lane: 'content', candidates: [], emptyReason: 'no indexed page text yet' },
+];
+
 const fusedCandidate = (
   over: Partial<TabSessionResolverCandidate> = {},
 ): TabSessionResolverCandidate => ({
@@ -101,6 +115,68 @@ describe('PipelineStrip — lane dots', () => {
       .filter((i) => i >= 0);
     // graph = index 0, topic = index 2.
     expect(filledIndexes).toEqual([0, 2]);
+  });
+
+  it('(1b) 7-lane payload (content present, populated) renders a 7th filled Content dot', () => {
+    render(
+      <PipelineStrip
+        lanes={lanesWithContentFilled}
+        workstreams={workstreams}
+        fusedCount={0}
+        open={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    const button = getDotsButton();
+    const renderedLabels = Array.from(button.querySelectorAll('.pipeline-chip-label')).map(
+      (el) => el.textContent,
+    );
+    // Exactly SEVEN chips, Content appended last.
+    expect(renderedLabels).toEqual(['Graph', 'Similar', 'Topic', 'Title', 'Domain', 'Recent', 'Content']);
+    const chips = Array.from(button.querySelectorAll('.pipeline-chip'));
+    expect(chips).toHaveLength(7);
+    // graph (0), topic (2), content (6) populated → filled.
+    const filledIndexes = chips
+      .map((c, i) => (c.classList.contains('is-filled') ? i : -1))
+      .filter((i) => i >= 0);
+    expect(filledIndexes).toEqual([0, 2, 6]);
+    // The content chip's aria names its top candidate's workstream.
+    expect(screen.getByLabelText('Content: Infra / Deploy')).toBeDefined();
+  });
+
+  it('(1c) 7-lane payload (content present, EMPTY) still renders the Content dot, hollow', () => {
+    render(
+      <PipelineStrip
+        lanes={lanesWithContentEmpty}
+        workstreams={workstreams}
+        fusedCount={0}
+        open={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    const button = getDotsButton();
+    const chips = Array.from(button.querySelectorAll('.pipeline-chip'));
+    expect(chips).toHaveLength(7);
+    // Content is the 7th chip, hollow, and names its own emptyReason.
+    expect(within(button).getByText('Content')).toBeDefined();
+    expect(chips[6]?.classList.contains('is-empty')).toBe(true);
+    expect(screen.getByLabelText('Content: no indexed page text yet')).toBeDefined();
+  });
+
+  it('(1d) 6-lane payload (old companion / lane disabled) renders exactly 6 dots — no phantom Content', () => {
+    render(
+      <PipelineStrip
+        lanes={lanesWithSomeSignal}
+        workstreams={workstreams}
+        fusedCount={0}
+        open={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    const button = getDotsButton();
+    const chips = Array.from(button.querySelectorAll('.pipeline-chip'));
+    expect(chips).toHaveLength(6);
+    expect(within(button).queryByText('Content')).toBeNull();
   });
 
   it('a filled chip aria/title names the lane top candidate; a hollow one names the emptyReason', () => {

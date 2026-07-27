@@ -69,6 +69,11 @@ export interface ArmedResolveInput extends ResolveUrlAttributionInput {
   // the served arm PLUS the shadow incumbent (which would inflate the gauge and
   // mis-attribute the shape). The served result is identical either way.
   readonly skipReverseShadow?: boolean;
+  // The live page title supplied by the panel (batch-resolve `titleHints`).
+  // FIRST in the title fallback order (titleHint → visit-record latestTitle /
+  // snapshot lookup) so the title lane matches on the CURRENT page title even
+  // before the snapshot has recorded it. Absent ⇒ snapshot lookup as before.
+  readonly titleHint?: string;
 }
 
 // Resolve a URL under the configured serving arm. Async because the vote arm
@@ -78,7 +83,7 @@ export interface ArmedResolveInput extends ResolveUrlAttributionInput {
 export const resolveUrlAttributionArmed = async (
   input: ArmedResolveInput,
 ): Promise<UrlResolutionResult> => {
-  const { vaultRoot, now, tombstones, skipReverseShadow, ...resolverInput } = input;
+  const { vaultRoot, now, tombstones, skipReverseShadow, titleHint, ...resolverInput } = input;
 
   // Guess lanes (SIDETRACK_GUESS_LANES, default ON) need the cheap vote signals
   // (title/domain/recency) which read the memoized AttributionV1State. Load it
@@ -96,7 +101,13 @@ export const resolveUrlAttributionArmed = async (
     // report typed emptiness (the resolver still emits the graph lanes).
     const voteSignals =
       wantLanes && vaultRoot !== undefined
-        ? await voteSignalsForResolve(vaultRoot, now, resolverInput.snapshot, resolverInput.canonicalUrl)
+        ? await voteSignalsForResolve(
+            vaultRoot,
+            now,
+            resolverInput.snapshot,
+            resolverInput.canonicalUrl,
+            titleHint,
+          )
         : undefined;
     return resolveUrlAttribution({
       ...resolverInput,
@@ -113,7 +124,9 @@ export const resolveUrlAttributionArmed = async (
   }
 
   const title =
-    titleForCanonicalUrl(resolverInput.snapshot, resolverInput.canonicalUrl) ?? null;
+    normalizeTitleHint(titleHint) ??
+    titleForCanonicalUrl(resolverInput.snapshot, resolverInput.canonicalUrl) ??
+    null;
   const voteResult = resolveUrlAttributionVote3({
     state,
     canonicalUrl: resolverInput.canonicalUrl,
@@ -159,9 +172,22 @@ const voteSignalsForResolve = async (
   now: (() => Date) | undefined,
   snapshot: ResolveUrlAttributionInput['snapshot'],
   canonicalUrl: string,
+  titleHint: string | undefined,
 ): Promise<GuessLaneVoteSignals | undefined> => {
   const state = await loadAttributionV1State(vaultRoot, now ?? (() => new Date()));
   if (state === null) return undefined;
-  const title = titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+  const title =
+    normalizeTitleHint(titleHint) ?? titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
   return voteSignalsFor(state, canonicalUrl, title);
+};
+
+// Trim + reject an empty title hint so the title fallback order (hint → snapshot
+// lookup) treats "" the same as absent. URL-shaped hints are rejected too —
+// a page whose "title" is its own URL gives the matcher only scheme/TLD
+// tokens (same rule titleForCanonicalUrl applies to label fallbacks).
+const normalizeTitleHint = (titleHint: string | undefined): string | null => {
+  if (titleHint === undefined) return null;
+  const trimmed = titleHint.trim();
+  if (trimmed.length === 0 || /^https?:\/\//iu.test(trimmed)) return null;
+  return trimmed;
 };

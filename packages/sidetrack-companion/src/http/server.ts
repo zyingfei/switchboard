@@ -182,6 +182,12 @@ import {
   type GuessLaneVoteSignals,
 } from '../tabsession/guessLanes.js';
 import {
+  appendContentLane,
+  contentLaneEnabled,
+  type AppendContentLaneDeps,
+  type ContentLaneStore,
+} from '../tabsession/contentLane.js';
+import {
   currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
   incumbentTopFromResolution,
@@ -2732,6 +2738,73 @@ const guessLaneVoteSignalsForUrl = async (
   return voteSignalsFor(state, canonicalUrl, title);
 };
 
+// Parse the optional `titleHints` map (canonicalUrl → live page title) from a
+// batch-resolve body. FROZEN CONTRACT validation, TOLERANT: string values,
+// each ≤ 500 chars, at most 100 entries — invalid entries / shapes are dropped
+// silently (never a 400). Returns an empty map for any non-object input so
+// callers can `.get` unconditionally.
+const TITLE_HINT_MAX_LEN = 500;
+const TITLE_HINT_MAX_ENTRIES = 100;
+const parseTitleHints = (raw: unknown): ReadonlyMap<string, string> => {
+  const out = new Map<string, string>();
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [url, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (out.size >= TITLE_HINT_MAX_ENTRIES) break;
+    if (typeof url !== 'string' || url.length === 0) continue;
+    if (typeof value !== 'string' || value.length === 0 || value.length > TITLE_HINT_MAX_LEN) {
+      continue;
+    }
+    out.set(url, value);
+  }
+  return out;
+};
+
+// Content-lane (guess lane 7) deps, assembled ONCE per batch-resolve request so
+// the store handle + embedder state are read a single time and shared across
+// every URL in the batch. Reuses the ALREADY-OPEN /v2 recall store via
+// peekRecallV2Store (undefined when no /v2 query has opened it yet — the lane
+// then degrades to a typed-empty 'recall store unavailable', never opening a
+// second connection). The embed fn routes through the recall embedder lazily
+// (kept out of the static import graph — statusContract ban) and is only ever
+// invoked inside the content lane's bounded Promise.race. No-op returning
+// content-lane-off deps when either flag is off.
+const buildContentLaneDeps = async (
+  context: CompanionHttpConfig,
+  vaultRoot: string,
+): Promise<AppendContentLaneDeps> => {
+  const guessOn = guessLanesEnabled();
+  if (!guessOn || !contentLaneEnabled()) {
+    return { store: undefined, embedderUsable: false, guessLanesEnabled: guessOn };
+  }
+  let store: ContentLaneStore | undefined;
+  try {
+    const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+    // peekRecallV2Store returns the cached handle only — never opens a new one.
+    store = (await peekRecallV2Store(vaultRoot)) as ContentLaneStore | undefined;
+  } catch {
+    store = undefined;
+  }
+  const embedderState = context.getEmbedderStatus?.()?.state;
+  const embedderUsable = embedderState === 'ready' || embedderState === 'disabled';
+  const embed = embedderUsable
+    ? async (text: string): Promise<Float32Array | undefined> => {
+        try {
+          const { embed: embedFn } = await import('../recall/embedder.js');
+          const [vec] = await embedFn([text]);
+          return vec;
+        } catch {
+          return undefined;
+        }
+      }
+    : undefined;
+  return {
+    store,
+    ...(embed === undefined ? {} : { embed }),
+    embedderUsable,
+    guessLanesEnabled: guessOn,
+  };
+};
+
 const candidateSourceWeight = (sources: readonly string[]): number => {
   if (sources.includes('same_canonical_url')) return 0.9;
   if (sources.includes('opener_chain')) return 0.85;
@@ -5020,6 +5093,10 @@ const routes: readonly RouteDefinition[] = [
           uniqueUrls.includes(candidateUrl),
         ),
       );
+      // Optional per-URL live page titles from the panel (canonicalUrl → title).
+      // FROZEN CONTRACT: string values, each ≤ 500 chars, max 100 entries;
+      // INVALID SHAPES ARE IGNORED SILENTLY (never a 400 — additive + tolerant).
+      const titleHints = parseTitleHints(body?.['titleHints']);
       const sqliteStore =
         context.connectionsStore instanceof SqliteConnectionsStore ? context.connectionsStore : null;
       if (sqliteStore !== null) {
@@ -5154,16 +5231,60 @@ const routes: readonly RouteDefinition[] = [
             snapshot,
             events: resolverEvents,
             tombstones: batchTombstones,
+            ...(titleHints.has(canonicalUrl) ? { titleHint: titleHints.get(canonicalUrl)! } : {}),
             ...(expandEventCandidates ? {} : { useEventCandidateSimilarity: false }),
           });
           results[canonicalUrl] = result;
           if (batchCacheRevision !== undefined && !expandEventCandidates) {
+            // Cache the SIX-lane result only. The content lane (lane 7) is
+            // query-time + titleHint-dependent, so it is appended to the served
+            // copy AFTER the cache read/write (see the final pass below) and is
+            // never persisted — a titleHint change never stales the cache.
             await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
             // Seed the SWR cache so a later drain can serve this item stale +
             // refresh in the background rather than recomputing it inline in
             // the next convoy. eventCandidate items are intentionally excluded
             // (they must always resolve fresh).
             primeBatchSwrEntry(canonicalUrl, batchGraphSig, result);
+          }
+        }
+        // Content lane (lane 7) — appended query-time to EVERY served result
+        // (cache hit, SWR stale, and fresh compute alike), decoupled from the
+        // resolver cache. Deps (recall store handle + embedder) are read once
+        // for the whole batch. Snapshot for the workstream join: reuse the
+        // resolver subgraph already loaded for the misses; when the batch was
+        // all cache/stale hits (no misses ⇒ no subgraph) load the subgraph for
+        // the queried URLs once. No-op when guess lanes / the content lane are
+        // off (the results keep their six-lane arrays untouched).
+        const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
+        if (contentDeps.guessLanesEnabled && contentLaneEnabled()) {
+          const contentStartMs = Date.now();
+          const joinSnapshot =
+            missedSnapshot ??
+            (Object.keys(results).length > 0
+              ? await sqliteStore.readResolverSubgraphForUrls(uniqueUrls)
+              : null);
+          if (joinSnapshot !== null) {
+            for (const canonicalUrl of Object.keys(results)) {
+              const title =
+                titleHints.get(canonicalUrl) ??
+                titleForCanonicalUrl(joinSnapshot, canonicalUrl) ??
+                null;
+              results[canonicalUrl] = await appendContentLane(
+                results[canonicalUrl]!,
+                { canonicalUrl, snapshot: joinSnapshot, title },
+                contentDeps,
+              );
+            }
+          }
+          // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
+          // pass duration + how many URLs it decorated — so the ≤~50ms indexed /
+          // ≤~450ms embed-race budget is observable on the box, PII-free.
+          if (process.env['SIDETRACK_HTTP_LOG'] === '1') {
+            const durMs = Date.now() - contentStartMs;
+            await appendHttpDebugLine(
+              `content-lane batch=${String(Object.keys(results).length)} dur=${String(durMs)}ms\n`,
+            ).catch(() => undefined);
           }
         }
         return [
@@ -5186,6 +5307,7 @@ const routes: readonly RouteDefinition[] = [
       const results: Record<string, UrlResolutionResult> = {};
       const merged = await context.eventLog.readMerged();
       const fallbackTombstones = await domainTombstoneSetFor(context);
+      const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
       for (const canonicalUrl of uniqueUrls) {
         const result = await resolveUrlAttributionArmed({
           vaultRoot: requireVaultRoot(context),
@@ -5193,8 +5315,15 @@ const routes: readonly RouteDefinition[] = [
           snapshot,
           events: merged,
           tombstones: fallbackTombstones,
+          ...(titleHints.has(canonicalUrl) ? { titleHint: titleHints.get(canonicalUrl)! } : {}),
         });
-        results[canonicalUrl] = result;
+        const title =
+          titleHints.get(canonicalUrl) ?? titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+        results[canonicalUrl] = await appendContentLane(
+          result,
+          { canonicalUrl, snapshot, title },
+          contentDeps,
+        );
       }
       return [
         200,
