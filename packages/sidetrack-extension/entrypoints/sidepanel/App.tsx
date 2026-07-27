@@ -120,7 +120,15 @@ import {
   ContentEnrichmentAction,
   type EnrichmentTarget,
 } from '../../src/sidepanel/nano/ContentEnrichmentAction';
-import { nanoEngineIfAvailable, isWebGpuLoaded } from '../../src/sidepanel/nano/engine';
+import {
+  engineAvailabilitySnapshot,
+  subscribeWebGpuLoadStatus,
+} from '../../src/sidepanel/nano/engine';
+import {
+  detectContentLanguage,
+  type ContentLanguage,
+  type EngineAvailability,
+} from '../../src/sidepanel/nano/language';
 import { sendMessageWithWatchdog } from '../../src/sidepanel/connections/sendMessageWithWatchdog';
 import type { PageContentCoverage } from '../../src/companion/pageContentClient';
 import { hostOf, type EntityDisplayCtx } from '../../src/sidepanel/entityDisplay/format';
@@ -1053,6 +1061,10 @@ const App = () => {
     setSettingsOpen(true);
   }, []);
   const [healthPanelOpen, setHealthPanelOpen] = useState(false);
+  // Which Health drill to land on. 'topics' is the panel's own default; the Now
+  // card's on-device-AI row opens 'experiments' so "Load in Health" puts the
+  // model-load button under the cursor instead of making the user hunt for it.
+  const [healthPanelStage, setHealthPanelStage] = useState<'topics' | 'experiments'>('topics');
   // Deeper-page-access banner: engagement + future content-extraction
   // subsystems need `https://*/*` host permission. Default `true` so the
   // first paint is clean; useEffect below corrects it after the
@@ -5667,23 +5679,34 @@ const App = () => {
     readonly PageContentOpenTabPreview[] | null
   >(null);
   const [currentTabPageContentError, setCurrentTabPageContentError] = useState<string | null>(null);
-  // On-device generation-engine readiness for the "Enrich content" action.
+  // On-device generation-engine availability for the Now card's AI row.
   // Nano when the built-in Prompt API is 'available'; WebGPU only when
-  // explicitly loaded in Health (never auto-loaded from here). Probed passively
-  // and refreshed when the Now card's focused URL changes so the button
-  // reflects a model loaded mid-session.
-  const [enrichEngineLabel, setEnrichEngineLabel] = useState<'Nano' | 'WebGPU' | null>(null);
+  // explicitly loaded in Health (never auto-loaded from here). The whole
+  // snapshot — not just a label — because the row has to STATE the reason when
+  // nothing is ready ("model not loaded", "downloading 41%", "no WebGPU here")
+  // instead of showing a grey button with no explanation. Probed passively, on
+  // the focused URL and on every load-status change, so a model loaded from
+  // Health mid-session shows up here without a reopen.
+  const [enrichAvailability, setEnrichAvailability] = useState<EngineAvailability | null>(null);
+  const [enrichProbeNonce, setEnrichProbeNonce] = useState(0);
+  useEffect(
+    () =>
+      subscribeWebGpuLoadStatus(() => {
+        setEnrichProbeNonce((n) => n + 1);
+      }),
+    [],
+  );
   useEffect(() => {
     let active = true;
     void (async () => {
-      const nano = await nanoEngineIfAvailable();
+      const snapshot = await engineAvailabilitySnapshot();
       if (!active) return;
-      setEnrichEngineLabel(nano !== null ? 'Nano' : isWebGpuLoaded() ? 'WebGPU' : null);
+      setEnrichAvailability(snapshot);
     })();
     return () => {
       active = false;
     };
-  }, [currentTabCanonicalUrl]);
+  }, [currentTabCanonicalUrl, enrichProbeNonce]);
   // Fetch the target's raw text for enrichment: page text via the SAME
   // extract path PageTextPanel's indexer uses for URLs, thread markdown via
   // the companion route for chat threads. Null when nothing is obtainable.
@@ -7851,6 +7874,7 @@ const App = () => {
               connect-dot popover below. */}
           <ToolbarOverflowMenu
             onOpenHealth={() => {
+              setHealthPanelStage('topics');
               setHealthPanelOpen(true);
             }}
             onDumpState={handleDumpPanelState}
@@ -8562,6 +8586,65 @@ const App = () => {
                           })}
                     />
                   ) : null}
+                  {/* On-device AI row (feat/enrich-visibility) — sits HERE, in
+              the suggestion area under SuggestionStats' pipeline strip and
+              lanes, because an enriched gist is another signal feeding the
+              same guess. It ALWAYS states what the on-device model is doing
+              (ready on Nano / ready on the local WebGPU model / not loaded +
+              "Load in Health" / downloading N% / unavailable here / Chinese
+              needs the local model) so the Enrich button is never a grey
+              control with no reason. The model is NEVER loaded from here —
+              the row LINKS to Health → Experiments, which owns the only load
+              button. URL pages POST kind 'url'; chat threads kind 'thread'. */}
+                  {!isCardPinned &&
+                  port.length > 0 &&
+                  bridgeKey.length > 0 &&
+                  (() => {
+                    const target: EnrichmentTarget | null =
+                      (focusedPageKind === 'page' || focusedPageKind === 'workstream') &&
+                      currentTabCanonicalUrl !== null
+                        ? { kind: 'url', canonicalUrl: currentTabCanonicalUrl }
+                        : focusedPageKind === 'chat' &&
+                            typeof state.currentTab?.bac_id === 'string' &&
+                            state.currentTab.bac_id.length > 0
+                          ? { kind: 'thread', bacId: state.currentTab.bac_id }
+                          : null;
+                    if (target === null) return null;
+                    // Pre-run language hint from the focused title — enough to
+                    // say "Chinese needs the local model" BEFORE the click. The
+                    // run re-detects on the real text, which is what actually
+                    // decides the engine.
+                    const focusedTitleForLanguage =
+                      focusedTabSession === undefined
+                        ? ''
+                        : tabSessionDisplayTitle(focusedTabSession);
+                    const hintedLanguage: ContentLanguage =
+                      detectContentLanguage(focusedTitleForLanguage);
+                    return (
+                      <ContentEnrichmentAction
+                        target={target}
+                        port={Number(port)}
+                        bridgeKey={bridgeKey}
+                        contentLanguage={hintedLanguage}
+                        {...(enrichAvailability === null
+                          ? {}
+                          : { availability: enrichAvailability })}
+                        fetchText={fetchEnrichmentText}
+                        onOpenHealth={() => {
+                          // The ONE place the local model loads. Open Health
+                          // directly on its Experiments drill so the button is
+                          // right there, not two clicks away.
+                          setHealthPanelStage('experiments');
+                          setHealthPanelOpen(true);
+                        }}
+                        onEnriched={() => {
+                          if (currentTabCanonicalUrl !== null) {
+                            void refreshUrlSuggestion(currentTabCanonicalUrl);
+                          }
+                        }}
+                      />
+                    );
+                  })()}
                   {/* Stage 5 polish — the legacy "Change…" button used to live
               here. Removed because the flat 4-action bar below already
               has "Pick another…" with the same behavior (opens the
@@ -8621,44 +8704,6 @@ const App = () => {
                     }}
                   />
                   ) : null}
-                  {/* feat/webgpu-enrichment — on-demand content enrichment.
-              Sits next to the ▸ Page-text disclosure, matching style.
-              Generates a factual gist on-device (Nano or an explicitly-
-              loaded WebGPU model) and saves it to the companion so the
-              lanes/categories re-resolve with the new signal. The engine
-              is NEVER loaded here — disabled with a Health hint when no
-              engine is ready. URL pages POST kind 'url'; chat threads POST
-              kind 'thread' by bac id. */}
-                  {!isCardPinned &&
-                  port.length > 0 &&
-                  bridgeKey.length > 0 &&
-                  (() => {
-                    const target: EnrichmentTarget | null =
-                      (focusedPageKind === 'page' || focusedPageKind === 'workstream') &&
-                      currentTabCanonicalUrl !== null
-                        ? { kind: 'url', canonicalUrl: currentTabCanonicalUrl }
-                        : focusedPageKind === 'chat' &&
-                            typeof state.currentTab?.bac_id === 'string' &&
-                            state.currentTab.bac_id.length > 0
-                          ? { kind: 'thread', bacId: state.currentTab.bac_id }
-                          : null;
-                    if (target === null) return null;
-                    return (
-                      <ContentEnrichmentAction
-                        target={target}
-                        port={Number(port)}
-                        bridgeKey={bridgeKey}
-                        engineReady={enrichEngineLabel !== null}
-                        activeEngineLabel={enrichEngineLabel}
-                        fetchText={fetchEnrichmentText}
-                        onEnriched={() => {
-                          if (currentTabCanonicalUrl !== null) {
-                            void refreshUrlSuggestion(currentTabCanonicalUrl);
-                          }
-                        }}
-                      />
-                    );
-                  })()}
                 </div>
                 {/* Action bar: shows up when there's a focused URL. All four
             choices flat — no overflow menu — so every state from the
@@ -10498,6 +10543,7 @@ const App = () => {
             // Health moved into Settings' Diagnostics group. Close
             // Settings first so HealthPanel isn't stacked behind it.
             setSettingsOpen(false);
+            setHealthPanelStage('topics');
             setHealthPanelOpen(true);
           }}
           theme={theme}
@@ -10522,6 +10568,7 @@ const App = () => {
           onClose={() => {
             setHealthPanelOpen(false);
           }}
+          initialStage={healthPanelStage}
           companionPort={port.length > 0 ? Number(port) : null}
           bridgeKey={bridgeKey.length > 0 ? bridgeKey : null}
           queuedCaptureCount={state.queuedCaptureCount}

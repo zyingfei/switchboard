@@ -19,9 +19,15 @@
 
 import {
   builtinLanguageModel,
-  createBilingualSession,
+  createNanoSession,
   type BuiltinLanguageModel,
 } from './titleSynthesis';
+import {
+  routeEnrichmentEngine,
+  type ContentLanguage,
+  type EngineAvailability,
+  type EnrichmentRoute,
+} from './language';
 
 // ---------------------------------------------------------------------------
 // The one interface.
@@ -75,7 +81,7 @@ export const nanoEngineIfAvailable = async (
   return {
     kind: 'nano',
     generate: async (prompt) => {
-      const session = await createBilingualSession(lm);
+      const session = await createNanoSession(lm);
       try {
         return cleanGeneratedTitle(await session.prompt(prompt));
       } finally {
@@ -128,6 +134,46 @@ let webGpuLoadInFlight: Promise<GenerationEngine> | null = null;
 
 /** Whether the WebGPU engine has been explicitly loaded this session. */
 export const isWebGpuLoaded = (): boolean => webGpuEngineSingleton !== null;
+
+// --- Observable load status -------------------------------------------------
+//
+// The Health row owns the load BUTTON, but the Now card has to tell the user
+// what the model is doing ("downloading 41%") without owning — or being able to
+// start — the load. So the single load funnel below publishes its status at
+// module scope and any surface can subscribe. Read-only: subscribing never
+// probes and never loads.
+
+export interface WebGpuLoadStatus {
+  readonly phase: 'idle' | 'loading' | 'ready' | 'error';
+  /** Best-effort download percent while loading; null when not reported. */
+  readonly percent: number | null;
+  readonly file: string | null;
+  readonly error: string | null;
+}
+
+let webGpuLoadStatusValue: WebGpuLoadStatus = {
+  phase: 'idle',
+  percent: null,
+  file: null,
+  error: null,
+};
+const webGpuLoadListeners = new Set<() => void>();
+
+const publishWebGpuLoadStatus = (next: WebGpuLoadStatus): void => {
+  webGpuLoadStatusValue = next;
+  for (const listener of webGpuLoadListeners) listener();
+};
+
+/** Current load status — a plain read, safe to call in render. */
+export const webGpuLoadStatus = (): WebGpuLoadStatus => webGpuLoadStatusValue;
+
+/** Subscribe to load-status changes; returns the unsubscribe. */
+export const subscribeWebGpuLoadStatus = (listener: () => void): (() => void) => {
+  webGpuLoadListeners.add(listener);
+  return () => {
+    webGpuLoadListeners.delete(listener);
+  };
+};
 
 /** Whether this browser exposes a WebGPU adapter at all (navigator.gpu). A
  * cheap synchronous presence check; the real adapter request happens at load
@@ -241,12 +287,25 @@ export const loadWebGpuEngine = async ({
   if (webGpuEngineSingleton !== null) return webGpuEngineSingleton;
   if (webGpuLoadInFlight !== null) return webGpuLoadInFlight;
   if (pipelineFactory === undefined && !webGpuSupported()) {
-    throw new Error('WebGPU is not available in this browser.');
+    const message = 'WebGPU is not available in this browser.';
+    publishWebGpuLoadStatus({ phase: 'error', percent: null, file: null, error: message });
+    throw new Error(message);
   }
   const factory = pipelineFactory ?? realPipelineFactory(port);
+  publishWebGpuLoadStatus({ phase: 'loading', percent: null, file: null, error: null });
   webGpuLoadInFlight = (async () => {
     try {
-      const { generate } = await factory(onProgress);
+      const { generate } = await factory((p) => {
+        // Mirror every progress tick into the module-level status so surfaces
+        // that did NOT start the load (the Now card) can show it honestly.
+        publishWebGpuLoadStatus({
+          phase: 'loading',
+          percent: p.percent,
+          file: p.file,
+          error: null,
+        });
+        onProgress?.(p);
+      });
       const engine: GenerationEngine = {
         kind: 'webgpu',
         generate: async (prompt, opts) => {
@@ -261,7 +320,16 @@ export const loadWebGpuEngine = async ({
         },
       };
       webGpuEngineSingleton = engine;
+      publishWebGpuLoadStatus({ phase: 'ready', percent: 100, file: null, error: null });
       return engine;
+    } catch (err) {
+      publishWebGpuLoadStatus({
+        phase: 'error',
+        percent: null,
+        file: null,
+        error: String(err),
+      });
+      throw err;
     } finally {
       webGpuLoadInFlight = null;
     }
@@ -273,6 +341,7 @@ export const loadWebGpuEngine = async ({
 export const __resetWebGpuEngineForTest = (): void => {
   webGpuEngineSingleton = null;
   webGpuLoadInFlight = null;
+  publishWebGpuLoadStatus({ phase: 'idle', percent: null, file: null, error: null });
 };
 
 // ---------------------------------------------------------------------------
@@ -312,4 +381,68 @@ export const resolveReadyEngine = async (
   if (nano !== null) return nano;
   if (webGpuEngineSingleton !== null) return webGpuEngineSingleton;
   return null;
+};
+
+// ---------------------------------------------------------------------------
+// Language-aware routing (see language.ts for the capability rationale).
+// ---------------------------------------------------------------------------
+
+/**
+ * Snapshot what is ready right now, for the UI to render an honest state. Reads
+ * only: `availability()` on the built-in API (passive) plus module state. Never
+ * creates a session, never loads the WebGPU model.
+ */
+export const engineAvailabilitySnapshot = async (
+  lm: BuiltinLanguageModel | undefined = builtinLanguageModel(),
+): Promise<EngineAvailability> => {
+  const status = webGpuLoadStatus();
+  let nanoReady = false;
+  if (lm !== undefined) {
+    try {
+      nanoReady = (await lm.availability()) === 'available';
+    } catch {
+      nanoReady = false;
+    }
+  }
+  return {
+    nanoReady,
+    webGpuLoaded: isWebGpuLoaded(),
+    webGpuLoading: status.phase === 'loading',
+    webGpuPercent: status.percent,
+    webGpuSupported: webGpuSupported(),
+  };
+};
+
+export interface RoutedEngine {
+  /** The engine to generate with, or null when the route is blocked. */
+  readonly engine: GenerationEngine | null;
+  /** The routing decision — carries the typed reason when engine is null. */
+  readonly route: EnrichmentRoute;
+}
+
+/**
+ * Resolve the engine for content in `language`, honoring the capability routing
+ * (Chinese never reaches Nano) and NEVER loading anything. A blocked route
+ * comes back with a typed reason the caller renders instead of failing silently
+ * or, worse, generating in the wrong language.
+ */
+export const resolveEngineForLanguage = async (
+  language: ContentLanguage,
+  lm: BuiltinLanguageModel | undefined = builtinLanguageModel(),
+): Promise<RoutedEngine> => {
+  const availability = await engineAvailabilitySnapshot(lm);
+  const route = routeEnrichmentEngine(language, availability);
+  if (route.engine === 'nano') {
+    const nano = await nanoEngineIfAvailable(lm);
+    // Defensive: availability flipped between the two passive reads.
+    if (nano === null) return { engine: null, route: { engine: null, reason: 'no-engine' } };
+    return { engine: nano, route };
+  }
+  if (route.engine === 'webgpu' && webGpuEngineSingleton !== null) {
+    return { engine: webGpuEngineSingleton, route };
+  }
+  if (route.engine === 'webgpu') {
+    return { engine: null, route: { engine: null, reason: 'model-not-loaded' } };
+  }
+  return { engine: null, route };
 };

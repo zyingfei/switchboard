@@ -426,6 +426,13 @@ interface HealthPanelProps {
   readonly bridgeKey?: string | null;
   readonly queuedCaptureCount?: number;
   readonly droppedCaptureCount?: number;
+  /**
+   * Which pipeline stage's drill to open on. Defaults to 'topics'. The Now
+   * card's on-device-AI row passes 'experiments' so "Load in Health" lands
+   * directly on the drill that owns the model-load button, instead of dropping
+   * the user on Topics to hunt for it.
+   */
+  readonly initialStage?: string;
 }
 
 const isHealthReport = (value: unknown): value is HealthReport => {
@@ -717,6 +724,7 @@ export function HealthPanel({
   bridgeKey,
   queuedCaptureCount,
   droppedCaptureCount,
+  initialStage,
 }: HealthPanelProps) {
   const [copied, setCopied] = useState(false);
   const [report, setReport] = useState<HealthReport | null>(null);
@@ -728,7 +736,7 @@ export function HealthPanel({
       ? 'not-configured'
       : 'loading',
   );
-  const [stage, setStage] = useState<string>('topics');
+  const [stage, setStage] = useState<string>(initialStage ?? 'topics');
   const [toast, setToast] = useState<string | null>(null);
   type RebuildState = { kind: 'idle' } | { kind: 'accepted' } | { kind: 'error'; message: string };
   const [rebuildState, setRebuildState] = useState<RebuildState>({ kind: 'idle' });

@@ -1,4 +1,5 @@
 import { fnv1a32Hex } from '../../graph/fnv1a';
+import { NANO_SESSION_LANGUAGES, detectContentLanguage, nanoCanServe } from './language';
 
 // Title synthesis on Gemini Nano (Chrome built-in Prompt API), extracted from
 // the OnDeviceAiRow eval so the observe-only eval AND the budgeted background
@@ -34,13 +35,17 @@ export const builtinLanguageModel = (): BuiltinLanguageModel | undefined => {
   return candidate as BuiltinLanguageModel;
 };
 
-// The vault is bilingual (English + Chinese threads); declaring both as
-// expected input AND output languages lets Chrome fetch any language pack it
-// needs and keeps output quality honest for zh content. Older Chromes that
-// reject the language options fall back to a plain create().
-export const SESSION_LANGUAGES: readonly string[] = ['en', 'zh'];
+// A Nano session declares ONLY languages Chrome's built-in Prompt API actually
+// supports (en, ja, es, de, fr — see language.ts). It used to declare
+// ['en','zh']: the vault IS bilingual, but Chinese is not on that list, so the
+// declaration was a promise the model cannot keep — fed zh it answers in the
+// wrong language or refuses. Chinese now routes to the multilingual WebGPU
+// engine instead (routeEnrichmentEngine), and this session declares 'en', the
+// only bucket ever routed here. Older Chromes that reject the language options
+// fall back to a plain create().
+export const SESSION_LANGUAGES: readonly string[] = NANO_SESSION_LANGUAGES;
 
-export const createBilingualSession = async (lm: BuiltinLanguageModel): Promise<NanoSession> => {
+export const createNanoSession = async (lm: BuiltinLanguageModel): Promise<NanoSession> => {
   try {
     return await lm.create({
       expectedInputs: [{ type: 'text', languages: SESSION_LANGUAGES }],
@@ -131,19 +136,22 @@ export const contentHashOf = (content: string): string => fnv1a32Hex(content);
 
 /**
  * Synthesize a title from raw content on Gemini Nano. Returns null on thin
- * content (< MIN_CONTENT_CHARS after trim), an explicit SKIP, an empty reply,
- * or any error — the caller treats null as "no title, don't persist". The
- * returned title is trimmed and capped to MAX_TITLE_CHARS.
+ * content (< MIN_CONTENT_CHARS after trim), content Nano cannot serve (Chinese
+ * — see language.ts; a wrong-language title is worse than no title), an
+ * explicit SKIP, an empty reply, or any error — the caller treats null as "no
+ * title, don't persist". The returned title is trimmed and capped to
+ * MAX_TITLE_CHARS.
  */
 export const synthesizeTitle = async (
   lm: BuiltinLanguageModel,
   content: string,
 ): Promise<string | null> => {
   if (content.trim().length < MIN_CONTENT_CHARS) return null;
+  if (!nanoCanServe(detectContentLanguage(content))) return null;
   const sample = sliceForSynthesis(content);
   let session: NanoSession;
   try {
-    session = await createBilingualSession(lm);
+    session = await createNanoSession(lm);
   } catch {
     return null;
   }
