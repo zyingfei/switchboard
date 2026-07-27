@@ -174,6 +174,32 @@ describe('resolveUrlAttributionArmed', () => {
     expect(result.decision.action).toBe('suggest');
     expect(result.decision.workstreamId).toBe('wsRust');
     expect(result.reasons.modelRevision).toBe('attribution-vote3-v1');
+    // Pipeline-gate: a served suggest carries cleared-suggest with the vote
+    // vocabulary in detail (N-signal plurality + the voters), never the graph
+    // resolver's logit vocabulary.
+    expect(result.decision.gate?.reason).toBe('cleared-suggest');
+    expect(result.decision.gate?.detail).toContain('signal plurality');
+    expect(result.decision.gate?.detail).toContain('title');
+  });
+
+  it('maps the correlated-prior guard to a corroboration gate (plurality lacks title vote)', async () => {
+    // A probe on the same (learned-discriminative) rust-lang.org domain but with
+    // a title that shares NO vocabulary with wsRust: the title vote abstains,
+    // while domain + recency (near-global priors) still vote wsRust and win the
+    // plurality. The correlated-prior guard (rule 2a) abstains to inbox because
+    // the winning plurality has no page-evidence (title) vote — and the gate
+    // reports 'corroboration' with a vote-specific detail.
+    process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
+    const probeUrl = 'https://blog.rust-lang.org/c';
+    const result = await resolveUrlAttributionArmed({
+      vaultRoot,
+      canonicalUrl: probeUrl,
+      snapshot: snapshot(probeUrl, 'quarterly financial earnings report'),
+      events: [],
+    });
+    expect(result.decision.action).toBe('inbox');
+    expect(result.decision.gate?.reason).toBe('corroboration');
+    expect(result.decision.gate?.detail).toContain('lacks title vote');
   });
 
   it('records the reverse arm-shadow (incumbent vs served vote3) when serving the vote arm', async () => {
@@ -275,5 +301,10 @@ describe('resolveUrlAttributionArmed', () => {
     });
     expect(result.decision.action).toBe('inbox');
     expect(result.decision.workstreamId).toBeUndefined();
+    // Pipeline-gate: a privacy HIDE reports 'no-candidates' (nothing to promote)
+    // with a tombstone-specific detail so an auditor can tell it apart from a
+    // genuine no-signal abstain.
+    expect(result.decision.gate?.reason).toBe('no-candidates');
+    expect(result.decision.gate?.detail).toContain('tombstoned');
   });
 });

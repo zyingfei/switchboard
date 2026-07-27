@@ -105,8 +105,10 @@ describe('guess-lanes — SuggestionStats render', () => {
     // All six lanes are listed — empty ones surface their own emptyReason.
     expect(screen.getByText('no similar pages indexed')).toBeDefined();
     expect(screen.getByText('domain unseen')).toBeDefined();
-    // The lane label text is present for every lane.
-    expect(screen.getByText('Graph')).toBeDefined();
+    // The lane label text is present for every lane. ("Graph" now appears
+    // twice — the pipeline-strip chip AND the disclosure's lane label — so
+    // assert at least one; "Recently active" is unique to the disclosure.)
+    expect(screen.getAllByText('Graph').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('Recently active')).toBeDefined();
   });
 

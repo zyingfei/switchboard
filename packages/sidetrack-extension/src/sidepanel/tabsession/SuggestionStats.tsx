@@ -1,3 +1,5 @@
+import { useState } from 'react';
+
 import {
   coarseConfidenceWord,
   confidenceLevelFromProbability,
@@ -5,14 +7,61 @@ import {
   probabilityFromLogit,
 } from '../suggestion/confidence';
 import { GuessLanes } from './GuessLanes';
+import { PipelineStrip } from './PipelineStrip';
 import { type Possibilities, possibilitiesFrom, suggestionStateFrom } from './resolveOutcome';
 import { dominantSourceLabel, endorsementFor } from './suggestionEndorsement';
 import {
+  type GuessGate,
+  type GuessLaneResult,
   guessLaneSignalCount,
+  parseGuessGate,
   type ResolveOutcomeError,
   type TabSessionResolutionResult,
   type TabSessionWorkstreamOption,
 } from './types';
+
+// The pipeline strip + the GuessLanes disclosure it controls, sharing one
+// open-state. Rendered wherever the resolver returned lanes: the compact strip
+// (dots row + verdict line) sits ABOVE the disclosure, and its dots row is the
+// disclosure's toggle button. Kept as one local component so all three
+// SuggestionStats render paths (has-lane-guesses empty, all-empty, populated)
+// wire the strip identically.
+function LanePipeline({
+  lanes,
+  workstreams,
+  gate,
+  fusedCount,
+  onFileHere,
+}: {
+  readonly lanes: readonly GuessLaneResult[];
+  readonly workstreams: readonly TabSessionWorkstreamOption[];
+  readonly gate?: GuessGate;
+  readonly fusedCount: number;
+  readonly onFileHere?: (workstreamId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <PipelineStrip
+        lanes={lanes}
+        workstreams={workstreams}
+        {...(gate === undefined ? {} : { gate })}
+        fusedCount={fusedCount}
+        open={open}
+        onToggle={() => {
+          setOpen((prev) => !prev);
+        }}
+      />
+      <GuessLanes
+        lanes={lanes}
+        workstreams={workstreams}
+        open={open}
+        onToggle={setOpen}
+        {...(onFileHere === undefined ? {} : { onFileHere })}
+      />
+    </>
+  );
+}
 
 // Stage 5 polish — surface the resolver's confidence in human-readable
 // terms while keeping the raw numbers available on hover. The
@@ -301,6 +350,10 @@ export function SuggestionStats({
     // (or lanes are absent — an old companion) does the legacy copy stand.
     const lanes = suggestion.lanes;
     const laneSignal = guessLaneSignalCount(lanes);
+    // Pipeline-strip verdict source. Parsed leniently here (idempotent on an
+    // already-normalized gate; drops a raw malformed one) so the strip never
+    // fabricates a verdict from garbage. Absent → count-based fallback.
+    const emptyGate = parseGuessGate(suggestion.decision.gate);
     if (laneSignal > 0 && lanes !== undefined) {
       return (
         <div className="suggestion-stats is-empty has-lane-guesses">
@@ -325,9 +378,11 @@ export function SuggestionStats({
           <span className="suggestion-stats-source mono subtle">
             No single confident pick — expand the lanes to see each signal’s best guess
           </span>
-          <GuessLanes
+          <LanePipeline
             lanes={lanes}
             workstreams={workstreams}
+            {...(emptyGate === undefined ? {} : { gate: emptyGate })}
+            fusedCount={suggestion.fusedCandidates.length}
             {...(onFileHere === undefined ? {} : { onFileHere })}
           />
         </div>
@@ -362,12 +417,14 @@ export function SuggestionStats({
             : 'First time seeing this URL — hover ⓘ for what was checked'}
         </span>
         {/* All-lanes-empty (or an old companion, lanes absent) still shows the
-            breakdown when lanes ARE present so the user sees every lane's own
-            "nothing here because …" reason. GuessLanes renders null on []. */}
+            strip + breakdown when lanes ARE present so the user sees every
+            lane's own "nothing here because …" reason and the verdict line. */}
         {lanes !== undefined ? (
-          <GuessLanes
+          <LanePipeline
             lanes={lanes}
             workstreams={workstreams}
+            {...(emptyGate === undefined ? {} : { gate: emptyGate })}
+            fusedCount={suggestion.fusedCandidates.length}
             {...(onFileHere === undefined ? {} : { onFileHere })}
           />
         ) : null}
@@ -499,13 +556,18 @@ export function SuggestionStats({
         workstreams={workstreams}
         {...(onFileHere === undefined ? {} : { onFileHere })}
       />
-      {/* Guess-lanes — even when the fusion HAS a confident pick, the user
-          asked to see what every individual lane thought behind a click.
-          Renders null when lanes are absent (old companion). */}
+      {/* Pipeline strip + guess-lanes — even when the fusion HAS a confident
+          pick, the user asked to see the compact signal/verdict strip and the
+          per-lane breakdown behind a click. Renders null when lanes are absent
+          (old companion). */}
       {suggestion.lanes !== undefined ? (
-        <GuessLanes
+        <LanePipeline
           lanes={suggestion.lanes}
           workstreams={workstreams}
+          {...(parseGuessGate(suggestion.decision.gate) === undefined
+            ? {}
+            : { gate: parseGuessGate(suggestion.decision.gate) })}
+          fusedCount={suggestion.fusedCandidates.length}
           {...(onFileHere === undefined ? {} : { onFileHere })}
         />
       ) : null}

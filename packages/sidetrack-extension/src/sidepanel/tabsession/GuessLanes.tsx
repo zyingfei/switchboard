@@ -55,6 +55,13 @@ export interface GuessLanesProps {
   // When omitted the lane rows render read-only (no "File here" button), so
   // the surface degrades cleanly for callers that don't wire filing.
   readonly onFileHere?: (workstreamId: string) => void;
+  // Pipeline-strip control (feat/pipeline-strip). When BOTH are provided the
+  // disclosure becomes CONTROLLED — its open state is driven by the strip's
+  // dots-row button (controls co-located with state) rather than the native
+  // <details> toggle. When absent it stays uncontrolled (the original
+  // click-the-summary behavior), so existing callers are unchanged.
+  readonly open?: boolean;
+  readonly onToggle?: (open: boolean) => void;
 }
 
 // One lane's row: label · (top candidate | empty reason). The additional
@@ -123,11 +130,31 @@ function LaneRow({
  * old companion passes no lanes; the caller shouldn't mount this then, but the
  * guard keeps it safe). All six lanes are always listed when present —
  * empty lanes included — so the breakdown is an honest full accounting. */
-export function GuessLanes({ lanes, workstreams, onFileHere }: GuessLanesProps) {
+export function GuessLanes({
+  lanes,
+  workstreams,
+  onFileHere,
+  open,
+  onToggle,
+}: GuessLanesProps) {
   if (lanes.length === 0) return null;
   const withSignal = lanesWithSignal(lanes);
+  // Controlled iff the strip wired both open + onToggle. In that mode we pin
+  // the `open` attribute and mirror the native toggle event back up so a click
+  // on the summary (not just the strip's dots button) still stays in sync.
+  const controlled = open !== undefined && onToggle !== undefined;
   return (
-    <details className="guess-lanes">
+    <details
+      className="guess-lanes"
+      {...(controlled ? { open } : {})}
+      {...(onToggle !== undefined
+        ? {
+            onToggle: (event) => {
+              onToggle((event.currentTarget as HTMLDetailsElement).open);
+            },
+          }
+        : {})}
+    >
       <summary className="guess-lanes-summary">
         Guess lanes · {String(withSignal)} of {String(lanes.length)} with signal
       </summary>

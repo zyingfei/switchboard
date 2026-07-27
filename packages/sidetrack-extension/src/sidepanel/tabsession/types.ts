@@ -127,6 +127,33 @@ export interface GuessLaneResult {
   readonly emptyReason?: string;
 }
 
+// Pipeline strip (feat/pipeline-strip) — the resolver now reports WHY the
+// fused decision landed where it did as a compact { reason, detail } gate,
+// so the panel can show a one-line verdict ("→ held: top 0.82 < 1.2 suggest
+// bar") instead of leaving the user to infer it from the raw margin. Additive
+// on the wire, nested under `decision`: ABSENT on older companions, and a
+// lenient parse (parseGuessGate) drops it entirely on any malformed shape —
+// the strip then falls back to a candidate-count-derived verdict. The six
+// reasons cover the resolver's gate ladder: no-candidates (nothing fused),
+// corroboration / below-suggest / margin-tie / regret-budget (fused but held
+// to inbox), cleared-suggest (surfaced as a suggestion), cleared-auto
+// (auto-filed).
+export type GuessGateReason =
+  | 'no-candidates'
+  | 'corroboration'
+  | 'below-suggest'
+  | 'margin-tie'
+  | 'regret-budget'
+  | 'cleared-suggest'
+  | 'cleared-auto';
+
+export interface GuessGate {
+  readonly reason: GuessGateReason;
+  // Human one-liner carrying the numbers, e.g. "top 0.82 < 1.2 suggest bar".
+  // Rendered verbatim in the held-verdict line — the companion owns the copy.
+  readonly detail: string;
+}
+
 export interface TabSessionResolverCandidate {
   readonly workstreamId: string;
   readonly rawFusionLogit: number;
@@ -147,6 +174,10 @@ export interface TabSessionResolutionResult {
     readonly action: 'auto-apply' | 'suggest' | 'inbox';
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-strip gate (see GuessGate). Absent on older companions; a
+    // lenient parse drops it on any malformed shape → the strip verdict
+    // falls back to a candidate-count read.
+    readonly gate?: GuessGate;
   };
   readonly fusedCandidates: readonly TabSessionResolverCandidate[];
   // Guess-lanes — always all 6 lanes when present, in the fixed order
@@ -229,6 +260,9 @@ export interface UrlResolutionResult {
     readonly action: 'auto-apply' | 'suggest' | 'inbox';
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-strip gate — see TabSessionResolutionResult.decision.gate.
+    // Same additive, may-be-absent, lenient-parse contract on the URL wire.
+    readonly gate?: GuessGate;
   };
   readonly fusedCandidates: readonly TabSessionResolverCandidate[];
   // Guess-lanes — see TabSessionResolutionResult.lanes. Same additive,
@@ -319,4 +353,61 @@ export const guessLaneSignalCount = (
   let count = 0;
   for (const lane of lanes) count += lane.candidates.length;
   return count;
+};
+
+// ---- Pipeline-strip gate parse (lenient) --------------------------------
+//
+// `decision.gate` is additive on every resolve wire shape. It may be absent
+// (old companion) or malformed (partial deploy / companion bug). Same rule as
+// `lanes`: parse leniently, and on ANY structural surprise treat the gate as
+// ABSENT (return undefined) rather than reject the whole resolution. The strip
+// then derives its verdict from the fused-candidate count instead.
+
+const VALID_GATE_REASONS: ReadonlySet<GuessGateReason> = new Set<GuessGateReason>([
+  'no-candidates',
+  'corroboration',
+  'below-suggest',
+  'margin-tie',
+  'regret-budget',
+  'cleared-suggest',
+  'cleared-auto',
+]);
+
+/** Lenient parse of a wire `decision.gate` field. Returns the well-formed gate,
+ * or undefined when absent or malformed — the caller then behaves exactly as a
+ * pre-gate companion (verdict falls back to the fused-candidate count). */
+export const parseGuessGate = (value: unknown): GuessGate | undefined => {
+  if (!isRecord(value)) return undefined;
+  const { reason, detail } = value;
+  if (typeof reason !== 'string' || !VALID_GATE_REASONS.has(reason as GuessGateReason)) {
+    return undefined;
+  }
+  if (typeof detail !== 'string') return undefined;
+  return { reason: reason as GuessGateReason, detail };
+};
+
+// The verdict arrow-line rendered by the PipelineStrip. Derived from the gate
+// when present; otherwise a fused-candidate-count fallback (old companion).
+//
+//   cleared-auto    → "→ auto-filed"  (the name is shown elsewhere on the card)
+//   cleared-suggest → "→ suggested"
+//   any inbox gate  → "→ held: {gate.detail}"  (detail carries the numbers)
+//   gate absent     → fusedCount > 0 ? "→ held below the bar" : "→ nothing corroborated"
+export const pipelineVerdictLine = (
+  gate: GuessGate | undefined,
+  fusedCount: number,
+): string => {
+  if (gate === undefined) {
+    return fusedCount > 0 ? '→ held below the bar' : '→ nothing corroborated';
+  }
+  switch (gate.reason) {
+    case 'cleared-auto':
+      return '→ auto-filed';
+    case 'cleared-suggest':
+      return '→ suggested';
+    default:
+      // no-candidates / corroboration / below-suggest / margin-tie /
+      // regret-budget — all held-to-inbox reasons; detail carries the numbers.
+      return `→ held: ${gate.detail}`;
+  }
 };

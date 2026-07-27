@@ -982,6 +982,67 @@ button:disabled {
   font-size: 10px;
 }
 
+/* Pipeline strip (feat/pipeline-strip) — a COMPACT two-line pipeline
+   visualization sized for the narrow side panel (~340px, degrading to ~300px
+   via flex-wrap; no fixed widths, no horizontal scroll). Sits ABOVE the
+   guess-lanes disclosure it controls, sharing the same muted, secondary
+   treatment. Line 1 is the lane-dots toggle button; line 2 the verdict. */
+.pipeline-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: var(--hair-soft);
+}
+/* The dots row is a button (toggles the lanes disclosure) but must read as a
+   plain inline row — strip the native button chrome. Flex-wrap so the six
+   chips reflow onto a second line at ~300px instead of scrolling. */
+.pipeline-strip-dots {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 8px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+.pipeline-strip-dots:hover .pipeline-chip.is-filled .pipeline-chip-label {
+  color: var(--ink-1);
+}
+.pipeline-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.pipeline-dot {
+  font-size: 9px;
+  line-height: 1;
+}
+/* Filled = the lane produced a candidate; hollow/muted = empty or absent. No
+   animation (this repo's UI taste rule). */
+.pipeline-chip.is-filled .pipeline-dot {
+  color: var(--accent);
+}
+.pipeline-chip.is-filled .pipeline-chip-label {
+  color: var(--ink-2);
+}
+.pipeline-chip.is-empty .pipeline-dot,
+.pipeline-chip.is-empty .pipeline-chip-label {
+  color: var(--ink-3);
+}
+.pipeline-strip-verdict {
+  font-size: 10px;
+}
+
 /* Action bar under the Current Tab badge. Flex-wrap so the row
    collapses cleanly across the 3-vs-4 cases:
      - 4 buttons (suggestion present + URL unattributed): wrap 2+2.

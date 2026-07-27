@@ -157,7 +157,9 @@ import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBa
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
+  parseGuessGate,
   parseGuessLanes,
+  type GuessGate,
   type GuessLaneResult,
   type ResolveOutcomeError,
   type TabSessionInboxData,
@@ -405,6 +407,19 @@ const normalizeResolutionLanes = (value: Record<string, unknown>): void => {
     delete value['lanes'];
   } else {
     value['lanes'] = lanes;
+  }
+  // Pipeline-strip gate lives under `decision`. Same lenient contract as
+  // `lanes`: a malformed gate degrades to absent (deleted) so the strip falls
+  // back to its count-based verdict rather than rendering garbage. The caller
+  // already verified `decision` is a plain record before invoking this.
+  const decision = value['decision'];
+  if (isPlainRecord(decision)) {
+    const gate = parseGuessGate(decision['gate']);
+    if (gate === undefined) {
+      delete decision['gate'];
+    } else {
+      decision['gate'] = gate;
+    }
   }
 };
 
@@ -10665,6 +10680,10 @@ export function NeedsOrganizeSuggestionRow({
   // field). Surfaced under the NeedsOrganizeSuggestion card so an abstaining
   // resolver still shows what each lane guessed.
   const [lanes, setLanes] = useState<readonly GuessLaneResult[] | undefined>(undefined);
+  // Pipeline-strip gate for this thread, read from the SAME fetch. Undefined
+  // until the companion answers (or on an old companion / malformed field);
+  // the strip then derives a count-based verdict.
+  const [gate, setGate] = useState<GuessGate | undefined>(undefined);
 
   // Latest-ref pattern. onCache / resolveLabel are recreated by the
   // parent every render; the effect calls onCache() on success →
@@ -10744,6 +10763,11 @@ export function NeedsOrganizeSuggestionRow({
           // additive/absent on older companions. Parsed leniently below; a
           // malformed field degrades to "no lanes" (legacy behavior).
           readonly lanes?: unknown;
+          // Pipeline-strip gate (feat/pipeline-strip) — the resolver's verdict
+          // for this thread, mirrored top-level on the thread response the same
+          // way `lanes` is. Additive/absent on older companions; parsed
+          // leniently below (malformed → absent → count-based verdict).
+          readonly gate?: unknown;
         };
         if (isCancelled()) return;
         // A successful fetch clears any busy/error state — late data wins, and
@@ -10754,6 +10778,10 @@ export function NeedsOrganizeSuggestionRow({
         // independently of whether a suggestion ranked, so the thread card can
         // show them under an abstaining resolver.
         setLanes(parseGuessLanes(body.lanes));
+        // Pipeline-strip gate — same lenient parse as lanes (absent/malformed →
+        // undefined → count-based verdict). Stored independently of whether a
+        // suggestion ranked, so the strip can show the held verdict.
+        setGate(parseGuessGate(body.gate));
         // Self-nomination is independent of whether a suggestion ranked:
         // it fires precisely when the resolver abstained, so parse it
         // before the early return below.
@@ -10991,7 +11019,15 @@ export function NeedsOrganizeSuggestionRow({
         pending={pending || indexRebuilding}
         {...(error !== null && !indexRebuilding ? { error } : {})}
         {...(showLanes && lanes !== undefined
-          ? { lanes, laneWorkstreams: laneWorkstreamOptions, onFileLane: onAccept }
+          ? {
+              lanes,
+              laneWorkstreams: laneWorkstreamOptions,
+              onFileLane: onAccept,
+              // Pipeline-strip verdict for this thread. Only meaningful when the
+              // strip mounts (no-suggestion + lanes present); absent gate → the
+              // strip derives a count-based verdict.
+              ...(gate === undefined ? {} : { gate }),
+            }
           : {})}
         onAccept={() => {
           if (hasAuto && suggestion.workstreamId.length > 0) {
