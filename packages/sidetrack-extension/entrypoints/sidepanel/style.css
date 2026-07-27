@@ -970,6 +970,16 @@ button:disabled {
 .guess-lane.is-empty .guess-lane-empty {
   font-size: 10px;
 }
+/* Guess → gist. The companion marks a content-lane `why` with ' · gist' when
+   the page's saved gist went into that lane's query text; this row says it in
+   words, aligned under the why so it reads as that lane's second evidence line
+   and points at the AI row on the same card. */
+.guess-lane-gist {
+  font-size: 10px;
+  padding-left: 88px;
+  color: var(--accent);
+  opacity: 0.85;
+}
 .guess-lane-more {
   list-style: none;
   margin: 1px 0 0;
@@ -1087,6 +1097,46 @@ button:disabled {
 .enrich-row-link:hover {
   color: var(--ink-1);
 }
+/* The run control. A secondary-weight pill in the panel's own idiom (the
+   pipeline-strip / guess-lane family), not a plain bordered box: the row is a
+   quiet signal strip, and its one action should read as part of it. Sits at the
+   end of the head row; the row wraps at ~300px, and the pill never sets a width
+   or a nowrap that could overflow the 340px panel. */
+.enrich-run-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+  max-width: 100%;
+  padding: 2px 9px;
+  border: var(--hair-soft);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.6;
+  cursor: pointer;
+  text-align: left;
+}
+.enrich-run-btn:hover:enabled {
+  color: var(--ink-1);
+  border-color: var(--accent);
+}
+.enrich-run-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.enrich-run-btn-label {
+  overflow-wrap: anywhere;
+}
+/* The engine name is context, not the verb — smaller and dimmer than the
+   action it qualifies, inside the same control. */
+.enrich-run-btn-engine {
+  font-size: 9px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
 /* Indeterminate progress — on-device generation reports no percent, so the bar
    says "working", not "37% done". Motion is suppressed under
    prefers-reduced-motion (the bar stays a static tinted track). */
@@ -1123,6 +1173,15 @@ button:disabled {
     opacity: 0.4;
   }
 }
+/* The run report + (only when nothing was extractable) the inline index
+   action, on one wrapping line so the fix sits next to the reason. */
+.enrich-row-statusline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  min-width: 0;
+}
 .enrich-row-status {
   font-size: 10px;
   color: var(--ink-2);
@@ -1132,7 +1191,46 @@ button:disabled {
 .enrich-row-status.is-settled {
   color: var(--ink-3);
 }
+/* THE GIST BLOCK. Persistent: it renders whenever this page has a gist (fresh
+   or remembered) and never hides itself on a timer — the generated text is the
+   thing the user asked for. Compact by default (two-line clamp + more/less),
+   so "persistent" costs the card two lines, not the whole card. */
+.enrich-gist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
 .enrich-row-gist {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.enrich-row-gist.is-expanded {
+  display: block;
+  overflow: visible;
+}
+.enrich-gist-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  min-width: 0;
+}
+/* When it was made, on what, and — the honest part — whether the model only
+   ever saw the page's extracted features rather than its text. */
+.enrich-gist-origin {
+  font-size: 9px;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+/* Gist → guess. Which guess this gist is feeding, and the framing that keeps
+   the claim honest (query text, not ranking). */
+.enrich-gist-provenance {
   font-size: 10px;
   line-height: 1.35;
   color: var(--ink-2);

@@ -17,6 +17,7 @@
 // — no new backend. Renders inside SuggestionStats (Now/Inbox card) and the
 // NeedsOrganizeSuggestion thread card, sharing one disclosure idiom.
 
+import { GIST_LANE_MARKER, GIST_LANE_MARKER_TITLE, whyUsedGist } from './gistProvenance';
 import type { GuessLaneResult, TabSessionWorkstreamOption } from './types';
 
 // Human labels for the six lanes — the resolver's arm names are jargon
@@ -117,7 +118,23 @@ function LaneRow({
           </button>
         ) : null}
       </span>
+      {/* The lane's raw `why`, verbatim — free text from the companion, never
+          parsed for display. */}
       <span className="guess-lane-why subtle">{top.why}</span>
+      {/* Provenance, guess → gist. The companion marks a content-lane `why`
+          with ' · gist' when the resolved page's saved gist went into that
+          lane's query text; that marker is jargon on its own, so the row says
+          it in words and points at the gist shown on the same card. The claim
+          stops at "used" — the ranking is not attributed to the gist. */}
+      {lane.lane === 'content' && whyUsedGist(top.why) ? (
+        <span
+          className="guess-lane-gist mono subtle"
+          title={GIST_LANE_MARKER_TITLE}
+          data-testid="guess-lane-gist-marker"
+        >
+          {GIST_LANE_MARKER}
+        </span>
+      ) : null}
       {rest.length > 0 ? (
         <ul className="guess-lane-more">
           {rest.map((cand, index) => (

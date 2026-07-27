@@ -8,7 +8,20 @@ import {
   limitsFor,
   type EngineLimits,
 } from './engineLimits';
+import {
+  normalizeEnrichmentText,
+  sourceNoteOf,
+  type EnrichmentInputSource,
+  type EnrichmentText,
+} from './enrichmentInput';
 import { synthesizeGist, type GistMeta } from './gistSynthesis';
+import { readStoredGist, writeStoredGist } from './gistStore';
+import {
+  gistInfluenceFrom,
+  gistProvenanceLine,
+  GIST_LANE_MARKER_TITLE,
+} from '../tabsession/gistProvenance';
+import type { GuessLaneResult, TabSessionWorkstreamOption } from '../tabsession/types';
 import { remotePrivacyDetail, remotePrivacyMarker } from './remoteConfig';
 import { remoteFailureCopy, remoteFailureKindOf, type RemoteFailureKind } from './remoteEngine';
 import { rejectionCopy, type GenerationRejectionReason } from './validateGeneration';
@@ -32,6 +45,21 @@ import {
 //      (/v1/enrichment/content, authenticated with the bridge key),
 //   4. shows the saved gist and asks the host to force-refresh the focused
 //      URL's resolution so the lanes/categories pick up the new signal.
+//
+// THE GIST STAYS ON SCREEN. It used to collapse into a subtle "gist saved"
+// marker 8 seconds after the run and the text vanished — a deliberate choice,
+// and the wrong one ("the gist just shows for a few seconds? why?", 2026-07-27).
+// The generated text is what the user asked for, so it persists for the focused
+// surface across re-renders and resolve refreshes, comes BACK when the user
+// returns to a page that already has one (gistStore.ts), and is clamped to two
+// lines with a more/less affordance rather than auto-hidden.
+//
+// AND IT SAYS WHAT IT IS DOING. Under the gist sits its provenance line: which
+// workstream guess(es) the gist is currently feeding, or that it is feeding
+// none yet — always with the honest framing that the gist is part of the
+// Content lane's QUERY TEXT, never a claim that it produced the ranking
+// (gistProvenance.ts, which the Content lane row shares so both directions of
+// the connection tell one story).
 //
 // THE STATE IS ALWAYS RENDERED. The old version was a bare button that went
 // grey whenever no engine was ready, with no way to find out why — on a browser
@@ -92,12 +120,17 @@ export interface ContentEnrichmentActionProps {
   /** Legacy: 'Nano' | 'WebGPU' for the button label; null when none is ready. */
   readonly activeEngineLabel?: 'Nano' | 'WebGPU' | null;
   /**
-   * Fetch the target's raw text. Injected so the host wires the SAME source the
-   * page-text indexer uses (a page-content extract message) for URLs and the
-   * /v1/threads/{id}/markdown route for threads — and so tests can stub it.
-   * Returns null when no text is obtainable (button then reads disabled).
+   * Fetch the target's raw text. Injected so the host wires the SAME sources the
+   * page-text indexer uses — the already-indexed text, then the already-
+   * extracted page features, then a live extract (enrichmentInput.ts) — and so
+   * tests can stub it. Returns the typed {text, source} so the row can LABEL a
+   * thin input honestly; a bare `string | null` is still accepted and read as
+   * full text. Null/'none' means nothing exists, and only then does the row ask
+   * the user to index.
    */
-  readonly fetchText: (target: EnrichmentTarget) => Promise<string | null>;
+  readonly fetchText: (
+    target: EnrichmentTarget,
+  ) => Promise<string | null | EnrichmentText>;
   /** Called after a gist is saved so the host force-re-resolves the focused
    *  URL (the lanes/categories update). Best-effort; failures don't block. */
   readonly onEnriched?: () => void;
@@ -105,6 +138,21 @@ export interface ContentEnrichmentActionProps {
    *  model is loaded. Rendered as the row's action when the route is blocked on
    *  a loadable model. Absent → the row states the reason without an action. */
   readonly onOpenHealth?: () => void;
+  /**
+   * Index this page's text — the SAME action the page-text panel's "Index page"
+   * button runs. Offered INLINE, and only when the input chain came back with
+   * nothing at all: a page that was already extracted must never be asked to
+   * index again (the 2026-07-27 "features only" report).
+   */
+  readonly onIndexPage?: () => void;
+  /**
+   * The focused resolve's guess lanes + workstream options, for the gist's
+   * provenance line ("which guess is this gist feeding?"). Absent → the line
+   * states there is no Content lane to report on, which is the honest reading
+   * of an old companion or a disabled lane.
+   */
+  readonly lanes?: readonly GuessLaneResult[];
+  readonly workstreams?: readonly TabSessionWorkstreamOption[];
   readonly testIdPrefix?: string;
 }
 
@@ -237,9 +285,14 @@ interface ContentEnrichmentPayloadItem {
 const targetKeyOf = (target: EnrichmentTarget): string =>
   target.kind === 'url' ? `url:${target.canonicalUrl}` : `thread:${target.bacId}`;
 
-// How long the full "done — gist saved · WebGPU · 1.2s" line stays before it
-// settles into the persistent, subtle "gist saved · WebGPU" marker.
+// How long the full "done — gist saved · WebGPU · 1.2s" STATUS line stays
+// before it settles into the quieter "gist saved · WebGPU" marker. This governs
+// the one-line run report ONLY. The gist body itself never settles away — see
+// the header note; hiding the generated text on a timer was the bug.
 const RESULT_SETTLE_MS = 8000;
+
+/** Lines of gist shown collapsed, before "more". Matches the CSS line clamp. */
+const GIST_COLLAPSED_LINES = 2;
 
 export function ContentEnrichmentAction({
   target,
@@ -252,10 +305,22 @@ export function ContentEnrichmentAction({
   fetchText,
   onEnriched,
   onOpenHealth,
+  onIndexPage,
+  lanes,
+  workstreams,
   testIdPrefix = 'now',
 }: ContentEnrichmentActionProps): ReactElement {
   const [phase, setPhase] = useState<EnrichmentPhase>('idle');
   const [gist, setGist] = useState<string | null>(null);
+  // Which link of the input chain fed the model — drives the honest "gist from
+  // page features" caveat. Null when unknown (a legacy string fetcher).
+  const [gistSource, setGistSource] = useState<EnrichmentInputSource | null>(null);
+  // True when the displayed gist came back from device storage rather than from
+  // a run in this session — the row says "saved earlier" rather than implying
+  // it was just generated.
+  const [gistFromStore, setGistFromStore] = useState(false);
+  const [gistEngine, setGistEngine] = useState<string | null>(null);
+  const [gistExpanded, setGistExpanded] = useState(false);
   const [failure, setFailure] = useState<EnrichmentFailure | null>(null);
   // Which engine actually ran, and how long it took — the result line names
   // both so "gist saved" is attributable, not anonymous.
@@ -308,23 +373,54 @@ export function ContentEnrichmentAction({
 
   const targetKey = targetKeyOf(target);
   const targetKeyRef = useRef(targetKey);
+  // The key whose gist THIS session generated. The device-store read is async,
+  // so a slow read that lands after a fast run must not overwrite the fresher
+  // text with the older remembered one.
+  const freshRunKeyRef = useRef<string | null>(null);
   const busy = phase === 'fetching' || phase === 'generating' || phase === 'saving';
-  // A new surface must not keep the previous one's result. An in-flight run
-  // notices the key change after its next await and reports 'cancelled'.
+  // A new surface must not keep the previous one's result, and must pick up
+  // whatever gist that surface already has. An in-flight run notices the key
+  // change after its next await and reports 'cancelled'.
+  //
+  // The remembered gist is read on MOUNT too — returning to an enriched page
+  // shows its gist without generating anything, which is half of "make the gist
+  // persist" (the other half is that it never auto-hides).
   useEffect(() => {
-    if (targetKeyRef.current === targetKey) return;
-    targetKeyRef.current = targetKey;
-    setGist(null);
-    setFailure(null);
-    setRanOn(null);
-    setRanRemoteHost(null);
-    setRanLimits(null);
-    setElapsedMs(null);
-    setSettled(false);
-    setMeta(null);
-    setPhase((prev) =>
-      prev === 'fetching' || prev === 'generating' || prev === 'saving' ? prev : 'idle',
-    );
+    if (targetKeyRef.current !== targetKey) {
+      targetKeyRef.current = targetKey;
+      freshRunKeyRef.current = null;
+      setGist(null);
+      setGistSource(null);
+      setGistFromStore(false);
+      setGistEngine(null);
+      setGistExpanded(false);
+      setFailure(null);
+      setRanOn(null);
+      setRanRemoteHost(null);
+      setRanLimits(null);
+      setElapsedMs(null);
+      setSettled(false);
+      setMeta(null);
+      setPhase((prev) =>
+        prev === 'fetching' || prev === 'generating' || prev === 'saving' ? prev : 'idle',
+      );
+    }
+    let active = true;
+    void readStoredGist(targetKey)
+      .then((stored) => {
+        if (!active || targetKeyRef.current !== targetKey) return;
+        // A run in this session already answered for this surface — keep it.
+        if (freshRunKeyRef.current === targetKey) return;
+        if (stored === null || stored.gist.trim().length === 0) return;
+        setGist(stored.gist);
+        setGistSource(stored.source ?? null);
+        setGistEngine(stored.engine ?? null);
+        setGistFromStore(true);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
   }, [targetKey]);
 
   // The success line fades to a compact persistent marker rather than
@@ -344,7 +440,9 @@ export function ContentEnrichmentAction({
     const myKey = targetKeyRef.current;
     const startedAt = Date.now();
     setPhase('fetching');
-    setGist(null);
+    // The gist on screen is NOT cleared here. It is the page's current saved
+    // gist until a new one replaces it — a regenerate that fails must not also
+    // take away the text the user already had.
     setFailure(null);
     setRanOn(null);
     setRanRemoteHost(null);
@@ -357,7 +455,12 @@ export function ContentEnrichmentAction({
       setFailure({ kind: 'cancelled' });
     };
     try {
-      const text = await fetchText(target);
+      // The chain (indexed text → already-extracted page features → live
+      // extract) lives in the host's fetcher; what comes back tells us WHICH
+      // link answered, so a thin input can be labelled instead of passed off as
+      // a read of the page.
+      const input = normalizeEnrichmentText(await fetchText(target));
+      const text = input.text;
       if (stale()) {
         cancel();
         return;
@@ -459,8 +562,23 @@ export function ContentEnrichmentAction({
         return;
       }
       setGist(generated);
+      setGistSource(input.source);
+      setGistFromStore(false);
+      setGistEngine(RUN_LABEL[engine.kind]);
+      freshRunKeyRef.current = myKey;
       setElapsedMs(Date.now() - startedAt);
       setPhase('done');
+      // Remember it on THIS device so returning to the page shows the gist
+      // again. The companion owns the gist (it feeds the content lane) but
+      // exposes no read-back route, so the panel keeps its own copy rather than
+      // showing the user nothing on the next visit. Best-effort, never blocks.
+      void writeStoredGist(myKey, {
+        gist: generated,
+        engine: RUN_LABEL[engine.kind],
+        model: item.model,
+        source: input.source,
+        savedAt: item.generatedAt,
+      });
       // Nudge the host to re-resolve the focused URL so lanes/categories
       // reflect the new gist. Best-effort — a throw here must not surface.
       try {
@@ -486,9 +604,24 @@ export function ContentEnrichmentAction({
     : blockReason !== null
       ? blockedHint(blockReason)
       : 'Summarize this page on-device and save the gist to the companion';
-  const buttonLabel = busy
-    ? PHASE_COPY[phase]
-    : `Enrich content${engineLabel !== null ? ` · ${engineLabel}` : ''}`;
+  // The button's own words. The ACTION is the label; the engine is a
+  // subordinate, dimmer suffix inside the same control (it is context, not the
+  // verb). Busy states replace the whole thing with the live phase.
+  const buttonAction = busy ? PHASE_COPY[phase] : gist === null ? 'Enrich content' : 'Regenerate gist';
+  // Origin of the gist on screen: when it was made, on what, and — the honest
+  // part — whether the model only ever saw the page's features.
+  const gistOriginNote = sourceNoteOf(gistSource);
+  const gistOrigin = [
+    gistFromStore ? 'saved earlier' : 'just generated',
+    gistFromStore ? gistEngine : (ranOn ?? gistEngine),
+    gistOriginNote,
+  ]
+    .filter((part): part is string => typeof part === 'string' && part.length > 0)
+    .join(' · ');
+  // The gist ↔ guess connection, from the gist's side. Reads the SAME '· gist'
+  // marker the Content lane row reads, so the two directions cannot disagree.
+  const influence = gistInfluenceFrom(lanes, workstreams ?? []);
+  const provenanceLine = gistProvenanceLine(influence);
   // The status line, one element for every non-idle state so a run always ends
   // somewhere legible: the live phase, the typed failure, or the result.
   const statusText = busy
@@ -532,9 +665,16 @@ export function ContentEnrichmentAction({
             Load in Health
           </button>
         ) : null}
+        {/* The run control. Secondary weight — a pill in the panel's own idiom
+            (the pipeline strip / guess-lane family), not a plain bordered box —
+            with the engine name as a smaller, dimmer suffix INSIDE the button
+            so "which model would run this" stays attached to the action without
+            competing with it. Narrow-panel safe: the head row wraps, the pill
+            never sets a width. Disabled still carries the reason (title) and is
+            still described by the state line (aria-describedby). */}
         <button
           type="button"
-          className="cx-mini-btn"
+          className="enrich-run-btn"
           onClick={() => {
             void run();
           }}
@@ -543,7 +683,13 @@ export function ContentEnrichmentAction({
           aria-describedby={stateId}
           data-testid={`${testIdPrefix}-enrich-content-btn`}
         >
-          {buttonLabel}
+          <span className="enrich-run-btn-label">{buttonAction}</span>
+          {!busy && engineLabel !== null ? (
+            <span className="enrich-run-btn-engine mono">
+              {' · '}
+              {engineLabel}
+            </span>
+          ) : null}
         </button>
       </div>
       {/* THE PRIVACY MARKER. Rendered whenever the remote engine is the routed
@@ -572,16 +718,76 @@ export function ContentEnrichmentAction({
         </div>
       ) : null}
       {phase !== 'idle' ? (
-        <span
-          className={`enrich-row-status mono${settled && phase === 'done' ? ' is-settled' : ''}`}
-          data-testid={`${testIdPrefix}-enrich-content-status`}
-        >
-          {statusText}
-        </span>
+        <div className="enrich-row-statusline">
+          <span
+            className={`enrich-row-status mono${settled && phase === 'done' ? ' is-settled' : ''}`}
+            data-testid={`${testIdPrefix}-enrich-content-status`}
+          >
+            {statusText}
+          </span>
+          {/* The ONLY place the user is asked to index — after the chain found
+              no stored text AND no extracted features. The action is offered
+              right here rather than described, so the fix is one click from the
+              reason. */}
+          {phase === 'error' &&
+          failure?.kind === 'no-text' &&
+          target.kind === 'url' &&
+          onIndexPage !== undefined ? (
+            <button
+              type="button"
+              className="enrich-row-link"
+              onClick={onIndexPage}
+              title="Extract and index this page's text, then enrichment can read it"
+              data-testid={`${testIdPrefix}-enrich-index-page`}
+            >
+              Index this page
+            </button>
+          ) : null}
+        </div>
       ) : null}
-      {phase === 'done' && gist !== null && !settled ? (
-        <div className="enrich-row-gist mono" data-testid={`${testIdPrefix}-enrich-content-gist`}>
-          {gist}
+      {/* THE GIST. Rendered whenever there is one — from this run or from the
+          last one on this page — and it does NOT go away on a timer. Clamped to
+          two lines with a more/less toggle so a long gist stays compact in a
+          340px panel without hiding itself. */}
+      {gist !== null ? (
+        <div className="enrich-gist" data-testid={`${testIdPrefix}-enrich-gist-block`}>
+          <div
+            className={`enrich-row-gist mono${gistExpanded ? ' is-expanded' : ''}`}
+            style={{ WebkitLineClamp: gistExpanded ? 'unset' : GIST_COLLAPSED_LINES }}
+            data-testid={`${testIdPrefix}-enrich-content-gist`}
+          >
+            {gist}
+          </div>
+          <div className="enrich-gist-foot">
+            <button
+              type="button"
+              className="enrich-row-link"
+              onClick={() => {
+                setGistExpanded((prev) => !prev);
+              }}
+              aria-expanded={gistExpanded}
+              title={gistExpanded ? 'Collapse the gist' : 'Show the whole gist'}
+              data-testid={`${testIdPrefix}-enrich-gist-toggle`}
+            >
+              {gistExpanded ? 'less' : 'more'}
+            </button>
+            <span
+              className="enrich-gist-origin mono"
+              data-testid={`${testIdPrefix}-enrich-gist-origin`}
+            >
+              {gistOrigin}
+            </span>
+          </div>
+          {/* Provenance, gist → guess. States which guess(es) this gist is
+              feeding (or that it feeds none yet) and refuses the causal
+              upgrade: the gist is part of the lane's QUERY TEXT. */}
+          <div
+            className="enrich-gist-provenance"
+            title={GIST_LANE_MARKER_TITLE}
+            data-testid={`${testIdPrefix}-enrich-gist-provenance`}
+          >
+            {provenanceLine}
+          </div>
         </div>
       ) : null}
     </div>
