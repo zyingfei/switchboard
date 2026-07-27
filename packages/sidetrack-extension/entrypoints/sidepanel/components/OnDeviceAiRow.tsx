@@ -10,6 +10,7 @@ import {
   type TitleEnrichmentStats,
 } from '../../../src/sidepanel/nano/enrichmentWorker';
 import {
+  isWebGpuLoaded,
   loadWebGpuEngine,
   resolveReadyEngine,
   webGpuSupported,
@@ -93,7 +94,12 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // WebGPU (transformers.js) fallback engine — used when Nano is NOT
   // 'available'. STRICT: the ~800MB model is fetched ONLY by the explicit
   // "Load local model" button below (loadWebGpuEngine); never as a side effect.
-  const [webGpuState, setWebGpuState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  // Seeded from the module singleton: the engine outlives this row (the Health
+  // panel is opened and closed repeatedly), so a model loaded earlier this
+  // session must read "ready" here instead of re-offering the ~800MB load.
+  const [webGpuState, setWebGpuState] = useState<'idle' | 'loading' | 'ready' | 'error'>(
+    isWebGpuLoaded() ? 'ready' : 'idle',
+  );
   const [webGpuProgress, setWebGpuProgress] = useState<WebGpuLoadProgress | null>(null);
   const [webGpuError, setWebGpuError] = useState<string | null>(null);
   const mountedRef = useRef(true);

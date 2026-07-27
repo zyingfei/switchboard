@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   contentHashOf,
-  createBilingualSession,
+  createNanoSession,
   SESSION_LANGUAGES,
   SLICE_THRESHOLD_CHARS,
   sliceForSynthesis,
@@ -52,17 +52,21 @@ describe('contentHashOf', () => {
   });
 });
 
-describe('createBilingualSession', () => {
-  it('pins en+zh for both input and output', async () => {
+describe('createNanoSession', () => {
+  // Capability truth (see language.ts): Chrome's built-in Prompt API supports
+  // en/ja/es/de/fr — NOT Chinese. The session used to declare ['en','zh'],
+  // a promise Nano cannot keep. Chinese now routes to the WebGPU engine.
+  it('declares ONLY languages Nano supports — never zh', async () => {
     const session = { destroy: vi.fn(), prompt: vi.fn() };
     const create = vi.fn(async () => session);
     const lm = { availability: vi.fn(), create } as unknown as BuiltinLanguageModel;
-    await createBilingualSession(lm);
+    await createNanoSession(lm);
     expect(create).toHaveBeenCalledWith({
       expectedInputs: [{ type: 'text', languages: SESSION_LANGUAGES }],
       expectedOutputs: [{ type: 'text', languages: SESSION_LANGUAGES }],
     });
-    expect(SESSION_LANGUAGES).toEqual(['en', 'zh']);
+    expect(SESSION_LANGUAGES).toEqual(['en']);
+    expect(SESSION_LANGUAGES).not.toContain('zh');
   });
 
   it('falls back to a plain create() when the language options are rejected', async () => {
@@ -72,7 +76,7 @@ describe('createBilingualSession', () => {
       .mockRejectedValueOnce(new Error('language options unsupported'))
       .mockResolvedValueOnce(session);
     const lm = { availability: vi.fn(), create } as unknown as BuiltinLanguageModel;
-    const got = await createBilingualSession(lm);
+    const got = await createNanoSession(lm);
     expect(got).toBe(session);
     expect(create).toHaveBeenCalledTimes(2);
     expect(create).toHaveBeenLastCalledWith();
@@ -100,6 +104,14 @@ describe('synthesizeTitle', () => {
     const create = vi.fn();
     const lm = { availability: vi.fn(), create } as unknown as BuiltinLanguageModel;
     expect(await synthesizeTitle(lm, 'too short')).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('refuses Chinese content outright — Nano cannot serve it, so no session', async () => {
+    const create = vi.fn();
+    const lm = { availability: vi.fn(), create } as unknown as BuiltinLanguageModel;
+    const zh = '用户：请问如何在多个账户之间分析云端审计日志？这是一个关于安全与合规的问题。'.repeat(4);
+    expect(await synthesizeTitle(lm, zh)).toBeNull();
     expect(create).not.toHaveBeenCalled();
   });
 

@@ -129,7 +129,12 @@ describe('ContentEnrichmentAction', () => {
     );
     const btn = screen.getByTestId('now-enrich-content-btn');
     expect(btn).toBeDisabled();
-    expect(btn).toHaveAttribute('title', 'load the local model in Health first');
+    // The disabled control now carries the SAME reason the row states — a grey
+    // button with no explanation was the bug.
+    expect(btn).toHaveAttribute(
+      'title',
+      'No on-device model is loaded. Open Health → Experiments and load the local model.',
+    );
     // Clicking a disabled button does nothing — no text fetch, no POST.
     fireEvent.click(btn);
     expect(fetchText).not.toHaveBeenCalled();

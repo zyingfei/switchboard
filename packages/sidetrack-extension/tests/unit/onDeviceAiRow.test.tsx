@@ -134,13 +134,15 @@ describe('OnDeviceAiRow', () => {
     // the unique real title untouched.
     expect(prompt).toHaveBeenCalledTimes(3);
     expect(destroy).toHaveBeenCalledTimes(3);
-    // Bilingual session settings: en+zh declared for input AND output.
+    // Session settings declare ONLY what Nano can actually serve. It used to
+    // declare en+zh; Chrome's built-in Prompt API does not support Chinese, so
+    // that was a promise the model cannot keep (zh routes to WebGPU instead).
     const lm = (globalThis as { LanguageModel?: { create: ReturnType<typeof vi.fn> } })
       .LanguageModel;
     expect(lm?.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        expectedInputs: [{ type: 'text', languages: ['en', 'zh'] }],
-        expectedOutputs: [{ type: 'text', languages: ['en', 'zh'] }],
+        expectedInputs: [{ type: 'text', languages: ['en'] }],
+        expectedOutputs: [{ type: 'text', languages: ['en'] }],
       }),
     );
     // Observe-only: nothing but GETs — no POST/PUT anywhere.
