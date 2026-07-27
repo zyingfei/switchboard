@@ -205,20 +205,24 @@ struct MenuContent: View {
                 Circle()
                     .fill(controller.testBrowserRunning ? Color.green : Color.gray)
                     .frame(width: 7, height: 7)
-                if controller.testBrowserRunning {
-                    Text("Test browser running (CDP :9222)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Button {
-                        controller.startTestBrowser()
-                    } label: {
-                        Label("Start test browser", systemImage: "globe")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Chrome for Testing + the unpacked extension, CDP on :9222")
+                // The button stays visible in BOTH states (a vanishing
+                // button reads as "the menu is missing"); it disables with
+                // an honest label when :9222 already answers.
+                Button {
+                    controller.startTestBrowser()
+                } label: {
+                    Label(
+                        controller.testBrowserRunning
+                            ? "Test browser running" : "Start test browser",
+                        systemImage: "globe")
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(controller.testBrowserRunning)
+                .help(
+                    controller.testBrowserRunning
+                        ? "Chrome for Testing is up — CDP answering on :9222"
+                        : "Chrome for Testing + the unpacked extension, CDP on :9222")
                 Spacer()
             }
             pairingRow
