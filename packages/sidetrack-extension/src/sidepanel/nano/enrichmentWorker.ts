@@ -1,0 +1,184 @@
+import { builtinLanguageModel, contentHashOf, synthesizeTitle } from './titleSynthesis';
+
+// Budgeted background worker that PERSISTS Nano-synthesized titles via the
+// companion, feeding the recommendation corpus (title lane, FTS, title
+// vectors → content lane). Triggered by explicit user intent (a button in the
+// Health panel's On-device AI row) — NOT an auto loop — while the serving-side
+// quality gate is still being observed. The button IS the budgeted run.
+//
+// Threads only this pass. URL-kind items are in the frozen contract for later
+// (visits need a different content source), but out of scope here.
+
+// Structural junk selection: a thread title is junk when it is empty,
+// URL-shaped, or recurs verbatim across ≥3 distinct threads (provider defaults
+// recur; real titles don't). No vocabulary lists. Shared by the observe-only
+// eval and this worker so both target the same threads.
+export interface ThreadListItem {
+  readonly bac_id: string;
+  readonly title?: string;
+}
+
+const JUNK_RECURRENCE_THRESHOLD = 3;
+
+export const selectJunkTitledThreads = (
+  threads: readonly ThreadListItem[],
+  limit: number,
+): readonly ThreadListItem[] => {
+  const titleCounts = new Map<string, number>();
+  for (const t of threads) {
+    const title = (t.title ?? '').trim();
+    titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
+  }
+  return threads
+    .filter((t) => {
+      const title = (t.title ?? '').trim();
+      return (
+        title.length === 0 ||
+        /^https?:\/\//iu.test(title) ||
+        (titleCounts.get(title) ?? 0) >= JUNK_RECURRENCE_THRESHOLD
+      );
+    })
+    .slice(0, limit);
+};
+
+// Persistent dedup: content hashes already submitted, so a re-run doesn't
+// re-synthesize or re-POST the same content. Capped; oldest pruned first
+// (insertion order is preserved by the stored array).
+export const SUBMITTED_STORAGE_KEY = 'sidetrack:titleEnrichmentSubmitted';
+export const SUBMITTED_CAP = 500;
+
+const readSubmittedHashes = async (): Promise<string[]> => {
+  try {
+    const got = await chrome.storage.local.get(SUBMITTED_STORAGE_KEY);
+    const v = got[SUBMITTED_STORAGE_KEY];
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeSubmittedHashes = async (hashes: readonly string[]): Promise<void> => {
+  try {
+    // Keep the newest SUBMITTED_CAP; prune oldest (front of the array).
+    const capped = hashes.slice(Math.max(0, hashes.length - SUBMITTED_CAP));
+    await chrome.storage.local.set({ [SUBMITTED_STORAGE_KEY]: capped });
+  } catch {
+    // chrome.storage missing in test harness; dedup is best-effort.
+  }
+};
+
+const MAX_BATCH_ITEMS = 50;
+
+export interface EnrichmentItem {
+  readonly kind: 'thread' | 'url';
+  readonly id: string;
+  readonly synthesizedTitle: string;
+  readonly sourceContentHash: string;
+  readonly model: 'gemini-nano';
+  readonly generatedAt: string;
+}
+
+export interface TitleEnrichmentRun {
+  readonly port: number;
+  readonly bridgeKey: string;
+  readonly budget?: number;
+}
+
+export interface TitleEnrichmentStats {
+  readonly generated: number;
+  readonly accepted: number;
+  readonly skipped: number;
+}
+
+/**
+ * Run one budgeted pass: pick junk-titled threads, synthesize titles for up to
+ * `budget` of them on Nano (skipping content whose hash was already
+ * submitted), POST the batch to the companion, and record the accepted hashes.
+ * Returns { generated, accepted, skipped }. Requires Nano 'available' and a
+ * connected companion.
+ */
+export const runTitleEnrichment = async ({
+  port,
+  bridgeKey,
+  budget = 10,
+}: TitleEnrichmentRun): Promise<TitleEnrichmentStats> => {
+  const empty: TitleEnrichmentStats = { generated: 0, accepted: 0, skipped: 0 };
+  const lm = builtinLanguageModel();
+  if (lm === undefined) return empty;
+  let availability: string;
+  try {
+    availability = await lm.availability();
+  } catch {
+    return empty;
+  }
+  if (availability !== 'available') return empty;
+
+  const base = `http://127.0.0.1:${String(port)}`;
+  const headers = { 'x-bac-bridge-key': bridgeKey };
+
+  const listRes = await fetch(`${base}/v1/threads`, { headers });
+  if (!listRes.ok) return empty;
+  const listBody = (await listRes.json().catch(() => null)) as {
+    readonly data?: readonly ThreadListItem[];
+  } | null;
+  const threads = listBody?.data ?? [];
+  const junk = selectJunkTitledThreads(threads, budget);
+  if (junk.length === 0) return empty;
+
+  const submitted = await readSubmittedHashes();
+  const submittedSet = new Set(submitted);
+
+  const items: EnrichmentItem[] = [];
+  const newHashes: string[] = [];
+  let skipped = 0;
+  for (const t of junk) {
+    if (items.length >= MAX_BATCH_ITEMS) break;
+    const mdRes = await fetch(`${base}/v1/threads/${encodeURIComponent(t.bac_id)}/markdown`, {
+      headers,
+    });
+    const mdBody = mdRes.ok
+      ? ((await mdRes.json().catch(() => null)) as { data?: { markdown?: string } } | null)
+      : null;
+    const content = mdBody?.data?.markdown ?? '';
+    const hash = contentHashOf(content);
+    if (submittedSet.has(hash)) {
+      skipped += 1;
+      continue;
+    }
+    const title = await synthesizeTitle(lm, content);
+    if (title === null) {
+      skipped += 1;
+      continue;
+    }
+    items.push({
+      kind: 'thread',
+      id: t.bac_id,
+      synthesizedTitle: title,
+      sourceContentHash: hash,
+      model: 'gemini-nano',
+      generatedAt: new Date().toISOString(),
+    });
+    newHashes.push(hash);
+  }
+
+  if (items.length === 0) return { generated: 0, accepted: 0, skipped };
+
+  const postRes = await fetch(`${base}/v1/enrichment/titles`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+  if (!postRes.ok) return { generated: items.length, accepted: 0, skipped };
+
+  const postBody = (await postRes.json().catch(() => null)) as {
+    accepted?: number;
+    skipped?: number;
+  } | null;
+  const accepted = typeof postBody?.accepted === 'number' ? postBody.accepted : items.length;
+  const serverSkipped = typeof postBody?.skipped === 'number' ? postBody.skipped : 0;
+
+  // Record hashes we successfully submitted so a re-run won't resubmit them.
+  await writeSubmittedHashes([...submitted, ...newHashes]);
+
+  return { generated: items.length, accepted, skipped: skipped + serverSkipped };
+};

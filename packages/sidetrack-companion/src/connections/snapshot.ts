@@ -80,6 +80,11 @@ import {
 } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
 import {
+  effectiveThreadTitle,
+  foldEnrichmentEvents,
+  titleEnrichmentEnabled,
+} from '../enrichment/titleEnrichment.js';
+import {
   BROWSER_TIMELINE_OBSERVED,
   isBrowserTimelineObservedPayload,
   type TimelineTransition,
@@ -1607,16 +1612,35 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     }
   }
 
+  // Title enrichment (thread + url kind). Fold the sparse enrichment events
+  // from the SAME merged input.events stream (no source-set expansion — a
+  // rebuild-storm risk the M3 work flagged) into a lookup used to OVERLAY
+  // junk thread labels/titles as this drain-time graph is built. The graph
+  // label is what thread suggestions + recall's join read, so overlaying here
+  // is the highest-leverage thread seam. Never overwrites a real title (the
+  // effectiveThreadTitle junk rule); flag-off ⇒ null lookup ⇒ raw titles.
+  const enrichmentLookup = titleEnrichmentEnabled()
+    ? foldEnrichmentEvents(input.events)
+    : null;
   for (const threadId of [...threadEventsByBacId.keys()].sort()) {
     const projection = projectThread(threadId, threadEventsByBacId.get(threadId) ?? []);
     if (projection.deleted) continue;
     const observedAtIso = new Date(projection.updatedAtMs).toISOString();
     trackObservedAt(observedAtIso);
-    const record =
+    const rawRecord =
       projection.record.status === 'resolved'
         ? projection.record.value
         : projection.record.candidates[0]?.value;
-    if (record === undefined) continue;
+    if (rawRecord === undefined) continue;
+    // Overlay the synthesized title only where the raw thread title is junk
+    // (empty / URL-shaped). Rebind `record` to the overlaid view so every
+    // downstream node build (label + metadata.title, both the resolved node
+    // and the conflict-candidate nodes below) reads the effective title.
+    const overlaidTitle = effectiveThreadTitle(enrichmentLookup, rawRecord.bac_id, rawRecord.title);
+    const record =
+      overlaidTitle === rawRecord.title
+        ? rawRecord
+        : { ...rawRecord, ...(overlaidTitle === undefined ? {} : { title: overlaidTitle }) };
     trackObservedAt(record.lastSeenAt);
     const candidateEvents =
       projection.record.status === 'resolved'

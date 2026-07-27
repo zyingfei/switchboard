@@ -8,9 +8,29 @@ import { OnDeviceAiRow } from '../../entrypoints/sidepanel/components/OnDeviceAi
 // trigger the multi-GB model download passively: create() only fires from
 // the explicit button.
 
+// The enrichment worker persists dedup hashes in chrome.storage.local; stub it
+// so the button path (which POSTs) works under jsdom.
+const installChromeStub = (): void => {
+  const backing: Record<string, unknown> = {};
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    storage: {
+      local: {
+        get: async (key: string) => (key in backing ? { [key]: backing[key] } : {}),
+        set: async (entries: Record<string, unknown>) => {
+          for (const [k, v] of Object.entries(entries)) backing[k] = v;
+        },
+        remove: async (key: string) => {
+          delete backing[key];
+        },
+      },
+    },
+  };
+};
+
 afterEach(() => {
   cleanup();
   delete (globalThis as { LanguageModel?: unknown }).LanguageModel;
+  delete (globalThis as Record<string, unknown>)['chrome'];
   vi.restoreAllMocks();
 });
 
@@ -130,6 +150,63 @@ describe('OnDeviceAiRow', () => {
     ][]) {
       expect(call[1]?.method ?? 'GET').toBe('GET');
     }
+    vi.unstubAllGlobals();
+  });
+
+  it('ready + companion access → "Enrich titles" button runs the persisting worker and shows stats', async () => {
+    installChromeStub();
+    const prompt = vi.fn(async () => 'CloudTrail cross-account log analysis');
+    const destroy = vi.fn();
+    (globalThis as { LanguageModel?: unknown }).LanguageModel = {
+      availability: async () => 'available',
+      create: vi.fn(async () => ({ prompt, destroy })),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/threads')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              { bac_id: 't1', title: '' },
+              { bac_id: 't2', title: '' },
+            ],
+          }),
+        };
+      }
+      if (url.includes('/markdown')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { markdown: `${url}\nUser: how do I analyze CloudTrail logs?\n`.repeat(6) },
+          }),
+        };
+      }
+      if (url.endsWith('/v1/enrichment/titles')) {
+        return { ok: true, status: 200, json: async () => ({ accepted: 2, skipped: 0 }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<OnDeviceAiRow companionPort={17_374} bridgeKey="bridge-test-key" />);
+    const button = await screen.findByTestId('hp-ondevice-ai-enrich');
+    expect(button).toHaveTextContent('Enrich titles (10)');
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-ondevice-ai-enrich-stats')).toHaveTextContent(
+        '2 generated · 2 accepted',
+      );
+    });
+    // The worker PERSISTS: exactly one POST to the enrichment endpoint.
+    const posts = (
+      fetchMock.mock.calls as unknown as readonly [RequestInfo | URL, RequestInit | undefined][]
+    ).filter(
+      (c) => String(c[0]).endsWith('/v1/enrichment/titles') && (c[1]?.method ?? 'GET') === 'POST',
+    );
+    expect(posts).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 

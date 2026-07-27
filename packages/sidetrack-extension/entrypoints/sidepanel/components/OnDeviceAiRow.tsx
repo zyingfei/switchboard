@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import {
+  builtinLanguageModel,
+  createBilingualSession,
+  TITLE_PROMPT_PREFIX,
+} from '../../../src/sidepanel/nano/titleSynthesis';
+import {
+  runTitleEnrichment,
+  selectJunkTitledThreads,
+  type TitleEnrichmentStats,
+} from '../../../src/sidepanel/nano/enrichmentWorker';
+
 // On-device AI (Gemini Nano / Chrome built-in Prompt API) availability row
 // for the Health panel's Experiments drill.
 //
@@ -14,43 +25,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // The multi-GB model download starts ONLY from the explicit button —
 // availability() is a passive read; create() is the download trigger and is
 // never called without user intent.
-
-// Minimal ambient shape for the built-in Prompt API — not yet in TS's DOM
-// lib. Feature-detected at runtime; every call is guarded.
-interface BuiltinLanguageModel {
-  availability: () => Promise<string>;
-  create: (options?: {
-    monitor?: (m: {
-      addEventListener: (type: 'downloadprogress', cb: (e: { loaded: number }) => void) => void;
-    }) => void;
-    expectedInputs?: readonly { type: 'text'; languages: readonly string[] }[];
-    expectedOutputs?: readonly { type: 'text'; languages: readonly string[] }[];
-  }) => Promise<{ destroy: () => void; prompt: (text: string) => Promise<string> }>;
-}
-
-// The vault is bilingual (English + Chinese threads); declaring both as
-// expected input AND output languages lets Chrome fetch any language pack it
-// needs and keeps output quality honest for zh content. Older Chromes that
-// reject the language options fall back to a plain create().
-const EVAL_LANGUAGES: readonly string[] = ['en', 'zh'];
-const createEvalSession = async (
-  lm: BuiltinLanguageModel,
-): Promise<{ destroy: () => void; prompt: (text: string) => Promise<string> }> => {
-  try {
-    return await lm.create({
-      expectedInputs: [{ type: 'text', languages: EVAL_LANGUAGES }],
-      expectedOutputs: [{ type: 'text', languages: EVAL_LANGUAGES }],
-    });
-  } catch {
-    return await lm.create();
-  }
-};
-
-const builtinLanguageModel = (): BuiltinLanguageModel | undefined => {
-  const candidate = (globalThis as { LanguageModel?: unknown }).LanguageModel;
-  if (candidate === undefined || candidate === null) return undefined;
-  return candidate as BuiltinLanguageModel;
-};
+//
+// Session settings, the title prompt, junk selection, and the budgeted
+// persisting worker live in ../../../../src/sidepanel/nano/* so the
+// observe-only eval below and the "Enrich titles" run share one synthesis
+// path.
 
 export type OnDeviceAiState =
   | 'no-api'
@@ -80,18 +59,9 @@ const STATE_COPY: Record<OnDeviceAiState, string> = {
 
 const EVAL_MAX_ITEMS = 8;
 const EVAL_MARKDOWN_CHARS = 2200;
-const EVAL_PROMPT_PREFIX = [
-  'You title documents for a personal research organizer.',
-  'Write ONE descriptive title, 4 to 10 words, for the conversation below.',
-  'Write the title in the SAME language the conversation is mostly written',
-  'in (English conversation → English title, 中文对话 → 中文标题).',
-  'Use ONLY facts present in the text. Name the specific technology,',
-  'product, or question discussed. No quotes, no trailing punctuation.',
-  'If the text is too thin to title faithfully, reply exactly: SKIP',
-  '',
-  'Conversation:',
-  '---',
-].join('\n');
+// The budgeted enrichment run titles up to this many junk-titled threads per
+// click and PERSISTS them (unlike the observe-only eval above).
+const ENRICH_BUDGET = 10;
 
 export interface TitleEvalResult {
   readonly threadId: string;
@@ -112,6 +82,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   const [evalRunning, setEvalRunning] = useState(false);
   const [evalResults, setEvalResults] = useState<readonly TitleEvalResult[] | null>(null);
   const [evalNote, setEvalNote] = useState<string | null>(null);
+  const [enrichRunning, setEnrichRunning] = useState(false);
+  const [enrichStats, setEnrichStats] = useState<TitleEnrichmentStats | null>(null);
+  const [enrichNote, setEnrichNote] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   const probe = useCallback(async (): Promise<void> => {
@@ -205,24 +178,10 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         readonly data?: readonly { readonly bac_id: string; readonly title?: string }[];
       };
       const threads = listBody.data ?? [];
-      // Structural junk selection: empty, URL-shaped, or a title recurring
-      // verbatim across ≥3 distinct threads (provider defaults recur; real
-      // titles don't).
-      const titleCounts = new Map<string, number>();
-      for (const t of threads) {
-        const title = (t.title ?? '').trim();
-        titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
-      }
-      const junk = threads
-        .filter((t) => {
-          const title = (t.title ?? '').trim();
-          return (
-            title.length === 0 ||
-            /^https?:\/\//iu.test(title) ||
-            (titleCounts.get(title) ?? 0) >= 3
-          );
-        })
-        .slice(0, EVAL_MAX_ITEMS);
+      // Structural junk selection (shared with the enrichment worker): empty,
+      // URL-shaped, or a title recurring verbatim across ≥3 distinct threads
+      // (provider defaults recur; real titles don't).
+      const junk = selectJunkTitledThreads(threads, EVAL_MAX_ITEMS);
       if (junk.length === 0) {
         setEvalNote('no junk-titled threads found — nothing to evaluate');
         return;
@@ -249,9 +208,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         const started = Date.now();
         let after: string;
         try {
-          const session = await createEvalSession(lm);
+          const session = await createBilingualSession(lm);
           try {
-            after = (await session.prompt(`${EVAL_PROMPT_PREFIX}\n${markdown}`)).trim();
+            after = (await session.prompt(`${TITLE_PROMPT_PREFIX}\n${markdown}`)).trim();
           } finally {
             session.destroy();
           }
@@ -265,6 +224,40 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       setEvalResults(results);
     } finally {
       if (mountedRef.current) setEvalRunning(false);
+    }
+  }, [companionPort, bridgeKey]);
+
+  // The budgeted enrichment run: unlike the observe-only eval, this PERSISTS
+  // synthesized titles via the companion (POST /v1/enrichment/titles) so they
+  // feed the recommendation corpus. User-intent only — the button IS the run.
+  const runEnrichment = useCallback(async (): Promise<void> => {
+    if (
+      companionPort === null ||
+      companionPort === undefined ||
+      bridgeKey === null ||
+      bridgeKey === undefined
+    ) {
+      return;
+    }
+    setEnrichRunning(true);
+    setEnrichStats(null);
+    setEnrichNote(null);
+    try {
+      const stats = await runTitleEnrichment({
+        port: companionPort,
+        bridgeKey,
+        budget: ENRICH_BUDGET,
+      });
+      if (!mountedRef.current) return;
+      if (stats.generated === 0) {
+        setEnrichNote('nothing to enrich — no new junk-titled threads');
+      } else {
+        setEnrichStats(stats);
+      }
+    } catch (err) {
+      if (mountedRef.current) setEnrichNote(`enrichment failed: ${String(err)}`);
+    } finally {
+      if (mountedRef.current) setEnrichRunning(false);
     }
   }, [companionPort, bridgeKey]);
 
@@ -306,6 +299,27 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         >
           {evalRunning ? 'Evaluating…' : 'Run title-synthesis eval'}
         </button>
+      ) : null}
+      {evalAvailable ? (
+        <button
+          type="button"
+          className="sx-btn"
+          style={{ marginLeft: 8 }}
+          disabled={enrichRunning}
+          onClick={() => {
+            void runEnrichment();
+          }}
+          data-testid="hp-ondevice-ai-enrich"
+        >
+          {enrichRunning ? 'Enriching…' : `Enrich titles (${String(ENRICH_BUDGET)})`}
+        </button>
+      ) : null}
+      {enrichNote !== null ? <div className="mono">{enrichNote}</div> : null}
+      {enrichStats !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-enrich-stats" style={{ marginTop: 4 }}>
+          {String(enrichStats.generated)} generated · {String(enrichStats.accepted)} accepted
+          {enrichStats.skipped > 0 ? ` · ${String(enrichStats.skipped)} skipped` : ''}
+        </div>
       ) : null}
       {evalNote !== null ? <div className="mono">{evalNote}</div> : null}
       {evalResults !== null ? (

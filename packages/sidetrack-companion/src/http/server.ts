@@ -196,6 +196,20 @@ import {
 } from '../attribution-v1/emit.js';
 import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import { attributionArm } from '../attribution-v1/serve.js';
+import {
+  ENTITY_TITLE_ENRICHED,
+  effectiveThreadTitle,
+  effectiveUrlTitle,
+  enrichmentLookupFromMerged,
+  isEntityTitleEnrichedPayload,
+  loadEnrichmentLookup,
+  loadEnrichmentLookupWithSignature,
+  lookupSynthesizedTitle,
+  titleEnrichmentEnabled,
+  type EnrichmentLookup,
+  type EntityTitleEnrichedKind,
+  type EntityTitleEnrichedPayload,
+} from '../enrichment/titleEnrichment.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -266,7 +280,13 @@ import {
   upsertEntries as upsertEntriesRaw,
 } from '../recall/indexFile.js';
 import type { RecallLifecycle } from '../recall/lifecycle.js';
-import { buildLexicalIndex, rank, rankHybrid, type HybridLexicalIndex } from '../recall/ranker.js';
+import {
+  buildLexicalIndex,
+  rank,
+  rankHybrid,
+  type HybridLexicalIndex,
+  type IndexEntry,
+} from '../recall/ranker.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { redact } from '../safety/redaction.js';
@@ -2730,11 +2750,15 @@ const guessLaneVoteSignalsForUrl = async (
   vaultRoot: string,
   snapshot: Parameters<typeof titleForCanonicalUrl>[0] | null,
   canonicalUrl: string | undefined,
+  // Title-enrichment overlay (url kind) for this URL, resolved by the caller
+  // from the folded lookup. Last-resort title fallback (titleForCanonicalUrl
+  // applies it before returning undefined). undefined ⇒ prior behavior.
+  synthesizedTitle?: string,
 ): Promise<GuessLaneVoteSignals | undefined> => {
   if (!guessLanesEnabled() || snapshot === null || canonicalUrl === undefined) return undefined;
   const state = await loadAttributionV1State(vaultRoot);
   if (state === null) return undefined;
-  const title = titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+  const title = titleForCanonicalUrl(snapshot, canonicalUrl, synthesizedTitle) ?? null;
   return voteSignalsFor(state, canonicalUrl, title);
 };
 
@@ -4863,7 +4887,25 @@ const routes: readonly RouteDefinition[] = [
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
       const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
-      const items = urlInbox(projection, { limit, offset });
+      const rawItems = urlInbox(projection, { limit, offset });
+      // Title enrichment (url kind): overlay each visit's displayed
+      // latestTitle where the raw title is structurally junk (empty /
+      // URL-shaped). Folded lookup is memoized on the event-log signature;
+      // effectiveUrlTitle never overwrites a real title. Flag-off ⇒ null
+      // lookup ⇒ raw items returned unchanged.
+      const inboxLookup = await loadEnrichmentLookup(
+        requireVaultRoot(context),
+        context.eventLog,
+      );
+      const items =
+        inboxLookup === null
+          ? rawItems
+          : rawItems.map((item) => {
+              const overlaid = effectiveUrlTitle(inboxLookup, item.canonicalUrl, item.latestTitle);
+              return overlaid === item.latestTitle
+                ? item
+                : { ...item, ...(overlaid === undefined ? {} : { latestTitle: overlaid }) };
+            });
       return [
         200,
         {
@@ -4990,8 +5032,10 @@ const routes: readonly RouteDefinition[] = [
                   context,
                   context.eventLog!,
                   (event) =>
-                    event.type === USER_FLOW_REJECTED || event.type === USER_ORGANIZED_ITEM,
-                  RESOLVER_SIGNAL_EVENT_TYPES,
+                    event.type === USER_FLOW_REJECTED ||
+                    event.type === USER_ORGANIZED_ITEM ||
+                    event.type === ENTITY_TITLE_ENRICHED,
+                  [...RESOLVER_SIGNAL_EVENT_TYPES, ENTITY_TITLE_ENRICHED],
                 )
               : await context.eventLog!.readMerged());
           const resolverEvents =
@@ -5014,6 +5058,19 @@ const routes: readonly RouteDefinition[] = [
           // way, so caching + the round-guard stack compose unchanged. When
           // the vote arm serves it ALSO runs the incumbent for the reverse
           // shadow (gated behind the v1-shadow flag) inside armedResolve.
+          // Title enrichment (url kind): last-resort synthesized title for a
+          // junk-titled visit, folded from the SAME merged log this resolve
+          // already read (the ENTITY_TITLE_ENRICHED type was added to the
+          // read filter above) — no extra scan. undefined ⇒ prior behavior.
+          const singleEnrichmentSynthesized = lookupSynthesizedTitle(
+            enrichmentLookupFromMerged(
+              requireVaultRoot(context),
+              await context.eventLog!.logSignature(),
+              merged,
+            ),
+            'url',
+            canonicalUrl,
+          );
           const result = await resolveUrlAttributionArmed({
             vaultRoot: requireVaultRoot(context),
             canonicalUrl,
@@ -5023,6 +5080,9 @@ const routes: readonly RouteDefinition[] = [
             // purged URL/domain never re-enters attribution through the new
             // serve boundary (no-op for the incumbent arm).
             tombstones: await domainTombstoneSetFor(context),
+            ...(singleEnrichmentSynthesized === undefined
+              ? {}
+              : { synthesizedTitle: singleEnrichmentSynthesized }),
             ...(usesSqliteSubgraph && !expandEventCandidates
               ? { useEventCandidateSimilarity: false }
               : {}),
@@ -5121,6 +5181,17 @@ const routes: readonly RouteDefinition[] = [
       // FROZEN CONTRACT: string values, each ≤ 500 chars, max 100 entries;
       // INVALID SHAPES ARE IGNORED SILENTLY (never a 400 — additive + tolerant).
       const titleHints = parseTitleHints(body?.['titleHints']);
+      // Title enrichment (url kind): the panel's on-device synthesized titles
+      // are the LAST-resort title fallback for a junk-titled visit — parallel
+      // to titleHints, only ever filling where a real title is absent. The
+      // lookup is folded from the SAME merged log each resolver path already
+      // reads (see the `mergedForEnrichment` assignments below), so it adds no
+      // extra readMerged; `synthesizedTitleFor` reads a mutable lookup handle
+      // that is populated once merged is in hand. null lookup (flag off) ⇒
+      // undefined ⇒ prior behavior.
+      let enrichmentLookup: EnrichmentLookup | null = null;
+      const synthesizedTitleFor = (canonicalUrl: string): string | undefined =>
+        lookupSynthesizedTitle(enrichmentLookup, 'url', canonicalUrl);
       const sqliteStore =
         context.connectionsStore instanceof SqliteConnectionsStore ? context.connectionsStore : null;
       if (sqliteStore !== null) {
@@ -5199,9 +5270,20 @@ const routes: readonly RouteDefinition[] = [
                 (event) =>
                   event.type === BROWSER_TIMELINE_OBSERVED ||
                   event.type === USER_FLOW_REJECTED ||
-                  event.type === USER_ORGANIZED_ITEM,
-                RESOLVER_EXPAND_EVENT_TYPES,
+                  event.type === USER_ORGANIZED_ITEM ||
+                  event.type === ENTITY_TITLE_ENRICHED,
+                [...RESOLVER_EXPAND_EVENT_TYPES, ENTITY_TITLE_ENRICHED],
               );
+        // Fold enrichment from the merged log just read (no extra scan),
+        // memoized on the event-log signature. When misses === 0 the convoy
+        // was all cache/stale hits and no fresh title lane is computed, so an
+        // empty fold is correct — those served results already carry their
+        // cached title lane.
+        enrichmentLookup = enrichmentLookupFromMerged(
+          requireVaultRoot(context),
+          await context.eventLog.logSignature(),
+          merged,
+        );
         const expandedCandidateUrlsByTarget =
           eventCandidateTargetSet.size === 0
             ? new Map<string, readonly string[]>()
@@ -5249,6 +5331,7 @@ const routes: readonly RouteDefinition[] = [
                 ),
               ]
             : missedEvents;
+          const synthesizedForMiss = synthesizedTitleFor(canonicalUrl);
           const result = await resolveUrlAttributionArmed({
             vaultRoot: requireVaultRoot(context),
             canonicalUrl,
@@ -5256,6 +5339,7 @@ const routes: readonly RouteDefinition[] = [
             events: resolverEvents,
             tombstones: batchTombstones,
             ...(titleHints.has(canonicalUrl) ? { titleHint: titleHints.get(canonicalUrl)! } : {}),
+            ...(synthesizedForMiss === undefined ? {} : { synthesizedTitle: synthesizedForMiss }),
             ...(expandEventCandidates ? {} : { useEventCandidateSimilarity: false }),
           });
           results[canonicalUrl] = result;
@@ -5292,7 +5376,7 @@ const routes: readonly RouteDefinition[] = [
             for (const canonicalUrl of Object.keys(results)) {
               const title =
                 titleHints.get(canonicalUrl) ??
-                titleForCanonicalUrl(joinSnapshot, canonicalUrl) ??
+                titleForCanonicalUrl(joinSnapshot, canonicalUrl, synthesizedTitleFor(canonicalUrl)) ??
                 null;
               results[canonicalUrl] = await appendContentLane(
                 results[canonicalUrl]!,
@@ -5330,9 +5414,16 @@ const routes: readonly RouteDefinition[] = [
       const snapshotRevision = snapshot.snapshotRevision;
       const results: Record<string, UrlResolutionResult> = {};
       const merged = await context.eventLog.readMerged();
+      // Fold enrichment from the full merged log just read (no extra scan).
+      enrichmentLookup = enrichmentLookupFromMerged(
+        requireVaultRoot(context),
+        await context.eventLog.logSignature(),
+        merged,
+      );
       const fallbackTombstones = await domainTombstoneSetFor(context);
       const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
       for (const canonicalUrl of uniqueUrls) {
+        const synthesizedForUrl = synthesizedTitleFor(canonicalUrl);
         const result = await resolveUrlAttributionArmed({
           vaultRoot: requireVaultRoot(context),
           canonicalUrl,
@@ -5340,9 +5431,12 @@ const routes: readonly RouteDefinition[] = [
           events: merged,
           tombstones: fallbackTombstones,
           ...(titleHints.has(canonicalUrl) ? { titleHint: titleHints.get(canonicalUrl)! } : {}),
+          ...(synthesizedForUrl === undefined ? {} : { synthesizedTitle: synthesizedForUrl }),
         });
         const title =
-          titleHints.get(canonicalUrl) ?? titleForCanonicalUrl(snapshot, canonicalUrl) ?? null;
+          titleHints.get(canonicalUrl) ??
+          titleForCanonicalUrl(snapshot, canonicalUrl, synthesizedForUrl) ??
+          null;
         results[canonicalUrl] = await appendContentLane(
           result,
           { canonicalUrl, snapshot, title },
@@ -7426,23 +7520,58 @@ const routes: readonly RouteDefinition[] = [
         query.workstreamId === undefined
           ? undefined
           : await readWorkstreamThreadIds(vaultRoot, query.workstreamId);
+      // Title enrichment (thread kind): overlay each recall chunk's
+      // metadata.title where the thread's raw title is junk (empty /
+      // URL-shaped). This is the recall TITLE LANE — the overlaid title feeds
+      // the FTS lexical index (title is 2x-boosted) AND every ranked result's
+      // metadata.title. ingestIncremental cannot update existing chunk titles
+      // (it dedups by thread-role-textHash), so overlaying at this read seam
+      // is what actually surfaces the enriched title in recall. Cheap: a warm
+      // lookup is a stat; the item map only allocates when enrichment exists.
+      const { lookup: recallEnrichment, signature: recallEnrichSig } =
+        await loadEnrichmentLookupWithSignature(vaultRoot, context.eventLog);
+      const indexItems: readonly IndexEntry[] =
+        recallEnrichment === null
+          ? index.items
+          : index.items.map((item): IndexEntry => {
+              // Only chunks that carry metadata (V3 entries) can be overlaid;
+              // V2 holdovers with no metadata pass through untouched.
+              if (item.metadata === undefined) return item;
+              const overlaid = effectiveThreadTitle(
+                recallEnrichment,
+                item.threadId,
+                item.metadata.title,
+              );
+              if (overlaid === item.metadata.title) return item;
+              return {
+                ...item,
+                metadata:
+                  overlaid === undefined
+                    ? item.metadata
+                    : { ...item.metadata, title: overlaid },
+              };
+            });
       // Resolve the lexical index from cache. If the on-disk file
       // mtime + entry count haven't changed, reuse the prior
       // MiniSearch instance — building it from scratch on every
       // query is wasteful for large indexes. Falls back to vector-
       // only ranking when the index has zero entries that carry
-      // chunk metadata (V2 holdovers post-rebuild).
+      // chunk metadata (V2 holdovers post-rebuild). The enrichment
+      // signature is folded into the cache key so a landed title
+      // enrichment (which does NOT change the index file mtime) busts
+      // the cached FTS index and rebuilds it with the overlaid title.
       const indexStat = await stat(indexFilePath).catch(() => undefined);
       const indexMtime = indexStat?.mtimeMs ?? 0;
-      const cached = lexicalIndexCache.get(indexFilePath);
+      const lexicalCacheKey = `${indexFilePath} ${recallEnrichSig}`;
+      const cached = lexicalIndexCache.get(lexicalCacheKey);
       const lexical: HybridLexicalIndex =
-        cached?.mtimeMs === indexMtime && cached.entryCount === index.items.length
+        cached?.mtimeMs === indexMtime && cached.entryCount === indexItems.length
           ? cached.index
-          : buildLexicalIndex(index.items);
-      if (cached?.mtimeMs !== indexMtime || cached.entryCount !== index.items.length) {
-        lexicalIndexCache.set(indexFilePath, {
+          : buildLexicalIndex(indexItems);
+      if (cached?.mtimeMs !== indexMtime || cached.entryCount !== indexItems.length) {
+        lexicalIndexCache.set(lexicalCacheKey, {
           mtimeMs: indexMtime,
-          entryCount: index.items.length,
+          entryCount: indexItems.length,
           index: lexical,
         });
       }
@@ -7454,7 +7583,7 @@ const routes: readonly RouteDefinition[] = [
       const hybridRanked = rankHybrid(
         query.q,
         queryEmbedding ?? new Float32Array(384),
-        index.items,
+        indexItems,
         new Date(),
         {
           limit: query.limit,
@@ -7471,7 +7600,7 @@ const routes: readonly RouteDefinition[] = [
       const ranked =
         hybridRanked.length > 0
           ? hybridRanked
-          : rank(queryEmbedding ?? new Float32Array(384), index.items, new Date(), {
+          : rank(queryEmbedding ?? new Float32Array(384), indexItems, new Date(), {
               limit: query.limit,
               ...(threadIds === undefined
                 ? {}
@@ -7507,8 +7636,19 @@ const routes: readonly RouteDefinition[] = [
             }
             meta.set(item.threadId, info);
           }
+          // Title enrichment (thread kind): overlay the served label where
+          // the thread's raw title (from thread.json) is junk. Same junk rule
+          // as the FTS overlay above so the label the panel shows matches
+          // what recall matched on.
+          const effectiveLabel = effectiveThreadTitle(
+            recallEnrichment,
+            item.threadId,
+            info.title.length > 0 ? info.title : undefined,
+          );
           const additions: Record<string, string> = {};
-          if (info.title.length > 0) additions['title'] = info.title;
+          if (effectiveLabel !== undefined && effectiveLabel.length > 0) {
+            additions['title'] = effectiveLabel;
+          }
           if (info.threadUrl.length > 0) additions['threadUrl'] = info.threadUrl;
           return Object.keys(additions).length > 0 ? { ...item, ...additions } : item;
         }),
@@ -7846,6 +7986,124 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // Title enrichment — POST /v1/enrichment/titles. The panel synthesizes
+    // descriptive titles ON-DEVICE (Gemini Nano) for junk-titled entities
+    // (chat threads titled "ChatGPT", visits whose only "title" is the URL)
+    // and POSTs a batch here. Each ACCEPTED item appends one
+    // ENTITY_TITLE_ENRICHED event; the served overlay is DERIVED by folding
+    // those events at the title seams (titleForCanonicalUrl, url/thread
+    // projections, recall FTS) — never a mutable side table.
+    //
+    // FROZEN CONTRACT: { items: [{ kind, id, synthesizedTitle,
+    // sourceContentHash, model, generatedAt }] } → 200 { accepted, skipped }.
+    // ≤50 items/request; item-level problems are SKIPPED (counted), never a
+    // 400 (only a non-object body / non-array items is a 400). Idempotent per
+    // (kind,id,sourceContentHash): the clientEventId is a deterministic hash
+    // of that triple, so re-posting the same hash returns the existing event
+    // and is counted as `skipped`; a new hash for the same (kind,id)
+    // supersedes.
+    //
+    // KILL SWITCH SIDETRACK_TITLE_ENRICHMENT (default ON): '0'/'false'
+    // disables ingestion — the route 200s with { accepted: 0, skipped: n,
+    // disabled: true } and appends nothing (the overlay is disabled in the
+    // same flag).
+    method: 'POST',
+    pattern: /^\/v1\/enrichment\/titles$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'event log not configured for this companion',
+        );
+      }
+      const body = await readBody(request);
+      const items =
+        typeof body === 'object' && body !== null && Array.isArray((body as { items?: unknown }).items)
+          ? (body as { items: readonly unknown[] }).items
+          : null;
+      if (items === null) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must be an object with an `items` array.',
+        );
+      }
+      // ≤50 items/request. Over-cap requests are truncated (the excess is
+      // counted as skipped) rather than 400'd — tolerant + additive, same
+      // posture as the titleHints cap.
+      const MAX_ENRICHMENT_ITEMS = 50;
+      const overCap = Math.max(0, items.length - MAX_ENRICHMENT_ITEMS);
+      const considered = items.slice(0, MAX_ENRICHMENT_ITEMS);
+
+      // Flag off: accept the request, persist nothing. Everything (incl. the
+      // over-cap remainder) counts as skipped so the panel sees its POST was
+      // received but no-op'd.
+      if (!titleEnrichmentEnabled()) {
+        return [
+          200,
+          { data: { accepted: 0, skipped: items.length, disabled: true } },
+        ];
+      }
+
+      let accepted = 0;
+      let skipped = overCap;
+      for (const raw of considered) {
+        // Build a candidate payload and validate it with the SAME guard the
+        // fold uses (single source of truth for "what is a valid enrichment").
+        if (typeof raw !== 'object' || raw === null) {
+          skipped += 1;
+          continue;
+        }
+        const item = raw as Record<string, unknown>;
+        const candidate: EntityTitleEnrichedPayload = {
+          payloadVersion: 1,
+          kind: item['kind'] as EntityTitleEnrichedKind,
+          id: item['id'] as string,
+          synthesizedTitle: item['synthesizedTitle'] as string,
+          sourceContentHash: item['sourceContentHash'] as string,
+          model: item['model'] as string,
+          generatedAt: item['generatedAt'] as string,
+        };
+        if (!isEntityTitleEnrichedPayload(candidate)) {
+          skipped += 1;
+          continue;
+        }
+        // Idempotency key = hash of (kind,id,sourceContentHash). Re-posting
+        // the same triple binds to the existing event ⇒ skipped; a new hash
+        // for the same (kind,id) is a distinct clientEventId ⇒ a new event
+        // that supersedes in the fold.
+        const clientEventId = `enrich-${createHash('sha256')
+          .update(`${candidate.kind} ${candidate.id} ${candidate.sourceContentHash}`)
+          .digest('hex')
+          .slice(0, 32)}`;
+        const existing = await eventLog.findByClientEventId(clientEventId).catch(() => null);
+        if (existing !== null) {
+          skipped += 1;
+          continue;
+        }
+        try {
+          await eventLog.appendServerObserved({
+            clientEventId,
+            // Aggregate the event under the entity it enriches so the
+            // per-aggregate frontier groups an entity's enrichment history.
+            aggregateId: `enrichment:${candidate.kind}:${candidate.id}`,
+            type: ENTITY_TITLE_ENRICHED,
+            payload: { ...candidate },
+          });
+          accepted += 1;
+        } catch {
+          // A durable-write failure for one item must not fail the batch.
+          skipped += 1;
+        }
+      }
+      return [200, { data: { accepted, skipped } }];
+    },
+  },
+  {
     // Phase 0 — POST /v1/recall/action. The extension echoes a user
     // action (click / open-new-tab / explicit feedback) on a served
     // candidate back to the companion. The companion appends a
@@ -8034,7 +8292,16 @@ const routes: readonly RouteDefinition[] = [
           const threadVoteSignals =
             target.threadUrl === undefined
               ? undefined
-              : await guessLaneVoteSignalsForUrl(vaultRoot, snapshot, target.threadUrl);
+              : await guessLaneVoteSignalsForUrl(
+                  vaultRoot,
+                  snapshot,
+                  target.threadUrl,
+                  lookupSynthesizedTitle(
+                    await loadEnrichmentLookup(vaultRoot, eventLog),
+                    'url',
+                    target.threadUrl,
+                  ),
+                );
           const resolution = resolveThreadAttribution({
             threadId: target.threadId,
             ...(target.providerThreadId === undefined
