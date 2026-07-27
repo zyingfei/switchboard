@@ -358,7 +358,22 @@ export interface BuildContentLaneInput {
   // Query-time embed, or undefined when the embedder is not usable.
   readonly embed?: ContentLaneEmbed | undefined;
   readonly embedderUsable: boolean;
+  // AUTHORITATIVE workstream lookup for NEIGHBOR urls — backed by the URL
+  // attribution projection (user_asserted + inferred filings). The snapshot
+  // the resolver holds is SCOPED to the query URL, so neighbors' membership
+  // edges are usually NOT in it — joining on the snapshot alone reported
+  // "none filed" while hatchet.run/blog/postgres-survival-guide (a live
+  // neighbor) was user-filed (caught by the user, 2026-07-27). The lookup is
+  // consulted FIRST; the snapshot join remains as a fallback for callers
+  // that cannot supply a projection.
+  readonly lookupWorkstreamByUrl?: (canonicalUrl: string) => string | undefined;
 }
+
+// Exact-URL keyed lookups drift on trailing slashes across stores (the
+// projection vs recall-store key shapes) — try both spellings, the same
+// urlSlashVariants discipline the panel uses.
+const slashVariants = (url: string): readonly string[] =>
+  url.endsWith('/') ? [url, url.slice(0, -1)] : [url, `${url}/`];
 
 const typedEmpty = (emptyReason: string): GuessLaneResult => ({
   lane: 'content',
@@ -475,7 +490,20 @@ export const buildContentLane = async (
   let droppedUnattributed = 0;
   for (const hit of fused) {
     let workstreamId: string | undefined;
-    if (hit.canonicalUrl !== undefined) workstreamId = join.byUrl.get(hit.canonicalUrl);
+    if (hit.canonicalUrl !== undefined) {
+      // Projection lookup FIRST (authoritative filings, full-vault scope);
+      // scoped-snapshot edges only as fallback. Slash variants on both.
+      for (const variant of slashVariants(hit.canonicalUrl)) {
+        workstreamId = input.lookupWorkstreamByUrl?.(variant);
+        if (workstreamId !== undefined) break;
+      }
+      if (workstreamId === undefined) {
+        for (const variant of slashVariants(hit.canonicalUrl)) {
+          workstreamId = join.byUrl.get(variant);
+          if (workstreamId !== undefined) break;
+        }
+      }
+    }
     if (workstreamId === undefined && hit.threadId !== undefined) {
       workstreamId = join.byThread.get(hit.threadId);
     }
@@ -574,6 +602,9 @@ export interface AppendContentLaneDeps {
   // Whether the parent SIDETRACK_GUESS_LANES flag is on. When off the result
   // carries no lanes and the content lane is omitted (nothing to append to).
   readonly guessLanesEnabled: boolean;
+  // Authoritative neighbor-URL → workstream lookup (URL attribution
+  // projection). See BuildContentLaneInput.lookupWorkstreamByUrl.
+  readonly lookupWorkstreamByUrl?: (canonicalUrl: string) => string | undefined;
 }
 
 // Append the query-time content lane to a resolve result. Pure w.r.t. its
@@ -603,6 +634,9 @@ export const appendContentLane = async <T extends ResultWithLanes>(
       store: deps.store,
       ...(deps.embed === undefined ? {} : { embed: deps.embed }),
       embedderUsable: deps.embedderUsable,
+      ...(deps.lookupWorkstreamByUrl === undefined
+        ? {}
+        : { lookupWorkstreamByUrl: deps.lookupWorkstreamByUrl }),
     });
   } catch (err) {
     lane = typedEmpty('recall store unavailable');
