@@ -28,6 +28,8 @@
 // typed store path (forEachChunkOfTypes over events_type_idx) exactly like
 // readAttributionV1SourceEvents.
 
+import { createHash } from 'node:crypto';
+
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
@@ -35,6 +37,7 @@ import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import {
   ENTITY_TITLE_ENRICHED,
   type EntityTitleEnrichedKind,
+  type EntityTitleEnrichedPayload,
   isEntityTitleEnrichedPayload,
 } from './events.js';
 
@@ -293,6 +296,80 @@ export const enrichmentLookupFromMerged = (
   const lookup = foldEnrichmentEvents(events);
   memoized = { vaultRoot, signature, lookup };
   return lookup;
+};
+
+// ---- idempotent event append (single source of truth) ----------------
+
+// Field separator for the idempotency-key hash. A control char (U+0000) so it
+// can never appear inside a kind/id/hash and collide two distinct triples.
+// Built via String.fromCharCode(0) DELIBERATELY: the equivalent U+0000
+// string-escape, when written into this source file by tooling, has repeatedly
+// landed
+// as a LITERAL NUL byte (a standing review check bans raw NULs in source —
+// they make files grep-hostile). This constant produces the identical runtime
+// char without any NUL byte living in the file, and stays byte-identical with
+// the delimiter the POST /v1/enrichment/titles route used inline so events
+// already persisted by the panel-POST path dedupe correctly here.
+const NUL_SEP = String.fromCharCode(0);
+
+// The idempotency key for an enrichment event = a deterministic hash of the
+// (kind,id,sourceContentHash) triple. Re-posting the same triple binds to the
+// existing event ⇒ the append is a no-op; a NEW hash for the same (kind,id) is
+// a distinct clientEventId ⇒ a new event that supersedes in the fold. This is
+// the SINGLE definition of the dedupe key — both the panel-POST route
+// (/v1/enrichment/titles) and the companion-side sweep append through
+// appendEnrichmentEvent so the two producers can never drift on how they
+// derive it.
+export const enrichmentClientEventId = (
+  kind: EntityTitleEnrichedKind,
+  id: string,
+  sourceContentHash: string,
+): string =>
+  `enrich-${createHash('sha256')
+    .update([kind, id, sourceContentHash].join(NUL_SEP))
+    .digest('hex')
+    .slice(0, 32)}`;
+
+export type EnrichmentAppendOutcome = 'accepted' | 'skipped' | 'invalid';
+
+// Idempotently append ONE ENTITY_TITLE_ENRICHED event. Returns:
+//   - 'invalid'  — the candidate failed the payload guard (caller counts as
+//                  skipped; never appends).
+//   - 'skipped'  — an event already exists for this (kind,id,sourceContentHash)
+//                  triple (idempotent no-op) OR the durable write failed (one
+//                  item's write failure must not fail the batch).
+//   - 'accepted' — a fresh event was durably appended.
+// This is the EXACT append logic the POST /v1/enrichment/titles route used to
+// inline; extracted here so the companion-side title sweep reuses it verbatim
+// (same guard, same idempotency key, same aggregate grouping). Callers still
+// gate on titleEnrichmentEnabled() themselves — the append itself is
+// flag-agnostic so a test can exercise it directly.
+export const appendEnrichmentEvent = async (
+  eventLog: EventLog,
+  candidate: EntityTitleEnrichedPayload,
+): Promise<EnrichmentAppendOutcome> => {
+  if (!isEntityTitleEnrichedPayload(candidate)) return 'invalid';
+  const clientEventId = enrichmentClientEventId(
+    candidate.kind,
+    candidate.id,
+    candidate.sourceContentHash,
+  );
+  const existing = await eventLog.findByClientEventId(clientEventId).catch(() => null);
+  if (existing !== null) return 'skipped';
+  try {
+    await eventLog.appendServerObserved({
+      clientEventId,
+      // Aggregate the event under the entity it enriches so the per-aggregate
+      // frontier groups an entity's enrichment history.
+      aggregateId: `enrichment:${candidate.kind}:${candidate.id}`,
+      type: ENTITY_TITLE_ENRICHED,
+      payload: { ...candidate },
+    });
+    return 'accepted';
+  } catch {
+    // A durable-write failure for one item must not fail the batch.
+    return 'skipped';
+  }
 };
 
 export const resetEnrichmentLookupMemoForTest = (): void => {
