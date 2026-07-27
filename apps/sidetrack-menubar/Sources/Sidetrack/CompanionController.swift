@@ -70,6 +70,19 @@ final class CompanionController: ObservableObject {
     @Published private(set) var version: VersionData?
     @Published private(set) var lastPolledAt: Date?
     @Published private(set) var lastActionMessage: String?
+    /// The TEST instance's status, polled every cycle regardless of which
+    /// instance the picker watches — the "tick" in the Test rig section
+    /// supervises the test companion even while the app watches daily.
+    /// When the picker IS on test, this mirrors `status` (one probe, not
+    /// two, against the same port).
+    @Published private(set) var testStatus: CompanionStatus = .unknown
+    /// Whether a test-companion start/stop issued from the tick is still
+    /// settling — the Toggle renders disabled during the transition so a
+    /// slow daemon boot doesn't read as "the tick didn't take".
+    @Published private(set) var testTransitioning = false
+    /// Whether the CDP endpoint of the test BROWSER (:9222) answers — the
+    /// green dot next to "Start test browser".
+    @Published private(set) var testBrowserRunning = false
     @Published var config: CompanionConfig {
         didSet {
             guard config != oldValue else { return }
@@ -124,6 +137,41 @@ final class CompanionController: ObservableObject {
             status = .unreachable
         case .error(let message):
             status = .error(message)
+        }
+        await pollTestRig()
+    }
+
+    /// Probe the fixed TEST instance + the test browser's CDP port. The
+    /// test-rig section renders from these regardless of the watched
+    /// instance. When the picker is on test, reuse the main probe result
+    /// instead of a second identical request.
+    private func pollTestRig() async {
+        if config.instance == .test {
+            testStatus = status
+        } else {
+            let testClient = CompanionClient(
+                config: CompanionConfig(instance: .test))
+            switch await testClient.probe() {
+            case .running: testStatus = .running
+            case .stopped: testStatus = .stopped
+            case .unreachable: testStatus = .unreachable
+            case .error(let message): testStatus = .error(message)
+            }
+        }
+        testBrowserRunning = await Self.probeCdpPort()
+    }
+
+    /// True when http://127.0.0.1:9222/json/version answers — the test
+    /// browser's DevTools endpoint. Unauthenticated by design (CDP), so a
+    /// bare GET with a short timeout is the whole probe.
+    private nonisolated static func probeCdpPort() async -> Bool {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:9222/json/version")!)
+        request.timeoutInterval = 2
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
         }
     }
 
@@ -221,23 +269,97 @@ final class CompanionController: ObservableObject {
         lastActionMessage = "Diagnostics copied"
     }
 
+    // MARK: - Test rig actions
+
+    /// The "tick": start/stop the TEST companion by intent, independent
+    /// of which instance the picker watches. Same screen recipe as the
+    /// watched-instance actions, pinned to the test config.
+    func setTestCompanion(running: Bool) {
+        let test = CompanionConfig(instance: .test)
+        testTransitioning = true
+        if running {
+            runManaged(
+                steps: [startScreenCommand(for: test)],
+                actionName: "Start test companion",
+                settle: { [weak self] in await self?.settleTestTransition() })
+        } else {
+            runManaged(
+                steps: [quitScreenCommand(for: test), pkillCommand(for: test)],
+                actionName: "Stop test companion",
+                settle: { [weak self] in await self?.settleTestTransition() })
+        }
+    }
+
+    private func settleTestTransition() async {
+        // A cold companion boot takes ~15-25s before /v1/version answers;
+        // keep the toggle disabled through a few polls so it doesn't
+        // bounce back visually before the daemon is up.
+        for _ in 0..<8 {
+            try? await Task.sleep(for: .seconds(3))
+            await pollTestRig()
+            if testStatus == .running || testStatus == .stopped { break }
+        }
+        testTransitioning = false
+    }
+
+    /// Launch the test BROWSER (Chrome for Testing + the unpacked
+    /// extension + CDP :9222) via the repo's own launcher, detached in a
+    /// screen session so quitting this app never kills the browser.
+    /// bun lives in ~/.bun/bin which login shells do NOT put on PATH
+    /// (it's added in .zshrc, interactive-only) — prepend it explicitly.
+    func startTestBrowser() {
+        runManaged(
+            steps: [
+                "screen -dmS sidetrack-test-browser /bin/zsh -lc 'cd packages/sidetrack-extension && PATH=\"$HOME/.bun/bin:$PATH\" exec bun run e2e:chrome-debug'"
+            ],
+            actionName: "Start test browser",
+            settle: { [weak self] in await self?.pollTestRig() })
+    }
+
+    /// The one-paste pairing token for the TEST companion
+    /// (st-pair://17374/<key>), written by the daemon to
+    /// <vault>/_BAC/.config/pair.txt. Read at call time — never cached,
+    /// never hardcoded. Nil when the companion hasn't written it yet.
+    func testPairToken() -> String? {
+        let path = CompanionConfig(instance: .test).vaultRoot
+            + "/_BAC/.config/pair.txt"
+        guard
+            let raw = try? String(contentsOfFile: path, encoding: .utf8)
+        else { return nil }
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    func copyTestPairToken() {
+        guard let token = testPairToken() else {
+            lastActionMessage = "No pair token yet — start the test companion once"
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(token, forType: .string)
+        lastActionMessage = "Pairing URL copied"
+    }
+
     // MARK: - Shell-out plumbing
 
-    private func screenSessionName() -> String {
-        "sidetrack-companion-\(config.label)"
+    private func screenSessionName(for target: CompanionConfig) -> String {
+        "sidetrack-companion-\(target.label)"
     }
 
     /// `screen -S <name> -X quit` — ends the managed session if present.
-    private func quitScreenCommand() -> String {
-        "screen -S \(screenSessionName()) -X quit || true"
+    private func quitScreenCommand(for target: CompanionConfig? = nil) -> String {
+        let target = target ?? config
+        return "screen -S \(screenSessionName(for: target)) -X quit || true"
     }
 
     /// `pkill -9 -f cli.js.*<port>` — hard-kills the daemon bound to
     /// this instance's port. The `.*<port>` pattern matches the
     /// `dist/cli.js --vault … --port <port>` argv, so it never touches
     /// the OTHER instance.
-    private func pkillCommand() -> String {
-        "pkill -9 -f 'cli.js.*\(config.port)' || true"
+    private func pkillCommand(for target: CompanionConfig? = nil) -> String {
+        let target = target ?? config
+        return "pkill -9 -f 'cli.js.*\(target.port)' || true"
     }
 
     /// `screen -dmS <name> zsh -lc scripts/run-test-companion.sh` —
@@ -245,13 +367,14 @@ final class CompanionController: ObservableObject {
     /// so PATH resolves bun/npx. run-test-companion.sh derives its port
     /// from SIDETRACK_TEST_PORT, so we pass it for the non-default
     /// instance.
-    private func startScreenCommand() -> String {
-        let portEnv = "SIDETRACK_TEST_PORT=\(config.port)"
-        let vaultEnv = "SIDETRACK_TEST_VAULT=\(shellQuote(config.vaultRoot))"
+    private func startScreenCommand(for target: CompanionConfig? = nil) -> String {
+        let target = target ?? config
+        let portEnv = "SIDETRACK_TEST_PORT=\(target.port)"
+        let vaultEnv = "SIDETRACK_TEST_VAULT=\(shellQuote(target.vaultRoot))"
         // scripts/run-test-companion.sh is invoked relative to the repo
         // root (set as the process cwd below).
         return
-            "\(portEnv) \(vaultEnv) screen -dmS \(screenSessionName()) /bin/zsh -lc 'exec scripts/run-test-companion.sh'"
+            "\(portEnv) \(vaultEnv) screen -dmS \(screenSessionName(for: target)) /bin/zsh -lc 'exec scripts/run-test-companion.sh'"
     }
 
     private func shellQuote(_ value: String) -> String {
@@ -260,12 +383,22 @@ final class CompanionController: ObservableObject {
 
     /// Run a sequence of shell commands from the repo root, off the main
     /// thread, and refresh state afterward. Requires the repo root to be
-    /// discoverable; surfaces a clear message if not.
-    private func runManaged(steps: [String], actionName: String) {
+    /// discoverable; surfaces a clear message if not. `settle` (when
+    /// given) replaces the default single re-poll — the test-rig tick
+    /// uses it to keep its toggle disabled until the slow daemon boot
+    /// resolves to running/stopped.
+    private func runManaged(
+        steps: [String],
+        actionName: String,
+        settle: (@MainActor () async -> Void)? = nil
+    ) {
         guard let repoRoot = RepoLocator.resolve(codePath: version?.codePath)
         else {
             lastActionMessage =
                 "\(actionName) failed: repo not found (set it in Settings)"
+            if let settle {
+                Task { await settle() }
+            }
             return
         }
         let script = steps.joined(separator: " ; ")
@@ -283,7 +416,11 @@ final class CompanionController: ObservableObject {
             }
             // Give the daemon a moment, then re-poll so the UI updates.
             try? await Task.sleep(for: .seconds(1))
-            await self?.pollOnce()
+            if let settle {
+                await settle()
+            } else {
+                await self?.pollOnce()
+            }
         }
     }
 
