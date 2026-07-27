@@ -4355,6 +4355,9 @@ export const createConnectionsMaterializer = (
           similarityEntries,
           deps.embed ?? defaultEmbed,
           {
+            // Consult the shared on-disk embedding cache: this path re-embeds the
+            // whole eligible corpus, which is the measured 11-minute drain.
+            vaultRoot: deps.vaultRoot,
             ...similarityConfig,
             evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
             evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
@@ -4411,6 +4414,9 @@ export const createConnectionsMaterializer = (
             similarityEntries,
             deps.embed ?? defaultEmbed,
             {
+              // Consult the shared on-disk embedding cache: this path re-embeds the
+              // whole eligible corpus, which is the measured 11-minute drain.
+              vaultRoot: deps.vaultRoot,
               ...similarityConfig,
               evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
               evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
@@ -4440,6 +4446,9 @@ export const createConnectionsMaterializer = (
       // (threshold / topK / engagementGateMs / lexical fallback).
       const extras = await readSimilarityEvidenceExtras();
       visitSimilarity = await buildVisitSimilarity(similarityEntries, deps.embed ?? defaultEmbed, {
+        // Consult the shared on-disk embedding cache: this path re-embeds the
+        // whole eligible corpus, which is the measured 11-minute drain.
+        vaultRoot: deps.vaultRoot,
         ...similarityConfig,
         evidenceByCanonicalUrl: pageEvidenceByCanonicalUrl,
         evidenceVectorsByVectorId: extras.evidenceVectorsByVectorId,
