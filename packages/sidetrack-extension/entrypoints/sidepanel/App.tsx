@@ -121,6 +121,11 @@ import {
   type EnrichmentTarget,
 } from '../../src/sidepanel/nano/ContentEnrichmentAction';
 import {
+  resolveUrlEnrichmentText,
+  type EnrichmentText,
+  type PageEvidenceFeatureSummary,
+} from '../../src/sidepanel/nano/enrichmentInput';
+import {
   engineAvailabilitySnapshot,
   subscribeWebGpuLoadStatus,
 } from '../../src/sidepanel/nano/engine';
@@ -5707,11 +5712,28 @@ const App = () => {
       active = false;
     };
   }, [currentTabCanonicalUrl, enrichProbeNonce]);
-  // Fetch the target's raw text for enrichment: page text via the SAME
-  // extract path PageTextPanel's indexer uses for URLs, thread markdown via
-  // the companion route for chat threads. Null when nothing is obtainable.
+  // The title the features-only brief is built around. Read through a ref so
+  // the fetcher's identity does not churn on every projection update (it is a
+  // dependency of the enrichment row's run callback).
+  const titleForEnrichment = useCallback(
+    (canonicalUrl: string): string | null => {
+      const record = urlProjection?.byCanonicalUrl[canonicalUrl];
+      const filed = typeof record?.latestTitle === 'string' ? record.latestTitle.trim() : '';
+      if (filed.length > 0) return filed;
+      const live = state.currentTab?.tabSnapshot?.title;
+      return typeof live === 'string' && live.trim().length > 0 ? live.trim() : null;
+    },
+    [urlProjection, state.currentTab],
+  );
+  const titleForEnrichmentRef = useRef(titleForEnrichment);
+  titleForEnrichmentRef.current = titleForEnrichment;
+  // Fetch the target's text for enrichment. For a chat thread that is the
+  // captured markdown; for a URL it is the input CHAIN — already-indexed text,
+  // then the page's already-extracted features, then a live extract — returning
+  // {text, source} so the row can label a thin input honestly and only ask the
+  // user to index when literally nothing exists (enrichmentInput.ts).
   const fetchEnrichmentText = useCallback(
-    async (target: EnrichmentTarget): Promise<string | null> => {
+    async (target: EnrichmentTarget): Promise<string | null | EnrichmentText> => {
       if (target.kind === 'thread') {
         // The markdown route answers { path, content } at the TOP level — no
         // `data` envelope and the field is `content`, not `markdown`. The old
@@ -5751,46 +5773,67 @@ const App = () => {
           return null;
         }
       }
-      // URL page: PREFER the text the companion ALREADY indexed. A page that
-      // shows "Indexed chunks" has its full extracted text stored at index
-      // time (_BAC/page-content/raw/*), so we read it straight back — no
-      // second live browser extract, no deeper-page-access requirement (which
-      // failed with "no obtainable text" on an already-indexed page). Only if
-      // the page is NOT indexed (404) do we fall back to a live extract.
-      try {
-        const indexed = await fetchCompanionJson<{ readonly text?: string }>(
-          `/v1/page-content/text?canonicalUrl=${encodeURIComponent(target.canonicalUrl)}`,
-        );
-        if (typeof indexed.text === 'string' && indexed.text.length > 0) return indexed.text;
-      } catch {
-        // Not indexed (404) or transport error — fall through to a live extract.
-      }
-      // Fallback: extract readable text through the background (same source the
-      // page-text indexer reads) for pages that were never indexed.
-      if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return null;
-      return await new Promise<string | null>((resolve) => {
-        try {
-          sendMessageWithWatchdog(
-            { type: messageTypes.pageContentExtract, mode: 'page', trigger: 'manual' },
-            ({ response, error }) => {
-              if (error !== null) {
-                resolve(null);
-                return;
-              }
-              const parsed = response as
-                | { readonly ok?: boolean; readonly payload?: { readonly content?: { readonly text?: string; readonly markdown?: string } } }
-                | undefined;
-              if (parsed?.ok !== true) {
-                resolve(null);
-                return;
-              }
-              const text = parsed.payload?.content?.markdown ?? parsed.payload?.content?.text ?? null;
-              resolve(typeof text === 'string' && text.length > 0 ? text : null);
-            },
+      // URL page: use what already exists BEFORE asking the user for anything.
+      // The chain lives in enrichmentInput.ts (indexed text → the page's
+      // already-extracted features → a live extract); this only supplies the
+      // three transports. The features link is the 2026-07-27 fix: a page whose
+      // evidence tier is `content_features_only` has BEEN extracted — telling
+      // its owner to "index this page first" was the product forgetting that.
+      return await resolveUrlEnrichmentText(target.canonicalUrl, {
+        // 1. The full text stored at index time (_BAC/page-content/raw/*).
+        fetchIndexedText: async (canonicalUrl) => {
+          const indexed = await fetchCompanionJson<{ readonly text?: string }>(
+            `/v1/page-content/text?canonicalUrl=${encodeURIComponent(canonicalUrl)}`,
           );
-        } catch {
-          resolve(null);
-        }
+          return typeof indexed.text === 'string' && indexed.text.length > 0 ? indexed.text : null;
+        },
+        // 2. The evidence record for the page — its tier and feature counts say
+        //    whether extraction already ran (the payload carries counts, not the
+        //    feature strings; enrichmentInput.ts builds the brief accordingly).
+        fetchEvidenceSummary: async (canonicalUrl): Promise<PageEvidenceFeatureSummary | null> => {
+          const payload = await fetchCompanionJson<unknown>(
+            `/v1/page-evidence/summary?canonicalUrl=${encodeURIComponent(canonicalUrl)}`,
+          );
+          return isPageEvidenceSummaryLookup(payload) ? payload.pageEvidence : null;
+        },
+        // 3. LAST resort: a live extract through the background (the same source
+        //    the page-text indexer reads), for pages never extracted at all.
+        extractLiveText: async () => {
+          if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) {
+            return null;
+          }
+          return await new Promise<string | null>((resolve) => {
+            try {
+              sendMessageWithWatchdog(
+                { type: messageTypes.pageContentExtract, mode: 'page', trigger: 'manual' },
+                ({ response, error }) => {
+                  if (error !== null) {
+                    resolve(null);
+                    return;
+                  }
+                  const parsed = response as
+                    | {
+                        readonly ok?: boolean;
+                        readonly payload?: {
+                          readonly content?: { readonly text?: string; readonly markdown?: string };
+                        };
+                      }
+                    | undefined;
+                  if (parsed?.ok !== true) {
+                    resolve(null);
+                    return;
+                  }
+                  const text =
+                    parsed.payload?.content?.markdown ?? parsed.payload?.content?.text ?? null;
+                  resolve(typeof text === 'string' && text.length > 0 ? text : null);
+                },
+              );
+            } catch {
+              resolve(null);
+            }
+          });
+        },
+        titleFor: (canonicalUrl) => titleForEnrichmentRef.current(canonicalUrl),
       });
     },
     [fetchCompanionJson],
@@ -8649,6 +8692,14 @@ const App = () => {
                         : tabSessionDisplayTitle(focusedTabSession);
                     const hintedLanguage: ContentLanguage =
                       detectContentLanguage(focusedTitleForLanguage);
+                    // The focused resolve's lanes, so the gist can say which
+                    // guess it is feeding (and the Content lane row can point
+                    // back at the gist). Same parsed resolution SuggestionStats
+                    // renders above — one source, two directions of one story.
+                    const focusedLanes =
+                      focusedTabSuggestion === undefined
+                        ? undefined
+                        : tabSessionResolutionFromUrl(focusedTabSuggestion).lanes;
                     return (
                       <ContentEnrichmentAction
                         target={target}
@@ -8658,6 +8709,20 @@ const App = () => {
                         {...(enrichAvailability === null
                           ? {}
                           : { availability: enrichAvailability })}
+                        {...(focusedLanes === undefined ? {} : { lanes: focusedLanes })}
+                        workstreams={tabSessionWorkstreams}
+                        {...(target.kind === 'url'
+                          ? {
+                              onIndexPage: () => {
+                                // The SAME action the page-text panel's "Index
+                                // page" button runs — offered inline, and only
+                                // reachable when nothing was extractable.
+                                runCurrentTabPageContentAction(
+                                  messageTypes.pageContentIndexCurrent,
+                                );
+                              },
+                            }
+                          : {})}
                         fetchText={fetchEnrichmentText}
                         onOpenHealth={() => {
                           // The ONE place the local model loads. Open Health
