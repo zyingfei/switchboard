@@ -450,15 +450,25 @@ export const startTitleSweep = async (
       });
       hasCompletedOnce = true;
 
+      if (result.loadError !== undefined) {
+        // The model never loaded — an ERROR, not a quiet zero-title 'done'.
+        job.state = 'error';
+        job.error = `model load failed: ${result.loadError.slice(0, 300)}`;
+        job.finishedAt = now().toISOString();
+        return;
+      }
+
       const rawTitleByBacId = new Map<string, string>(
         candidates.map((c) => [c.bacId, c.rawTitle]),
       );
       for (const r of result.results) {
-        job.generated += 1;
+        // `generated` counts REAL titles only — a null (SKIP/thin/error)
+        // row is skipped, not generated.
         if (r.title === null || r.title.length === 0) {
           job.skipped += 1;
           continue;
         }
+        job.generated += 1;
         const content = contentByBacId.get(r.id);
         if (content === undefined) {
           job.skipped += 1;

@@ -151,6 +151,16 @@ const loadGenerator = async (modelId: string): Promise<TextGenerator> => {
         const pipe = (await module.pipeline('text-generation', modelId, {
           device: 'cpu',
           dtype,
+          // The 1B+ instruct ONNX exports ship the graph and the weights as
+          // SEPARATE files (model_q4.onnx + model_q4.onnx_data — ONNX
+          // "external data", required past the 2GB protobuf limit and used
+          // for all sizes in onnx-community exports). Without this option
+          // the runtime loads the tiny graph and never maps the weights —
+          // every dtype "load failed" while 4.9GB sat correctly in the
+          // cache (live incident, first sweep 2026-07-27). The embedder
+          // never needed it (e5-small is single-file), which is why the
+          // mirrored conventions missed it.
+          use_external_data_format: true,
         } as Parameters<typeof module.pipeline>[2])) as unknown as TextGenerator;
         // eslint-disable-next-line no-console
         console.info(
@@ -243,8 +253,13 @@ const runJob = async (jobPath: string): Promise<void> => {
         error instanceof Error ? error.message : String(error)
       }\n`,
     );
-    for (const item of items) results.push({ id: item.id, title: null, ms: 0 });
-    await writeFile(`${jobPath}.result.json`, JSON.stringify({ results } satisfies LocalLlmResult));
+    await writeFile(
+      `${jobPath}.result.json`,
+      JSON.stringify({
+        results: [],
+        loadError: error instanceof Error ? error.message : String(error),
+      } satisfies LocalLlmResult),
+    );
     return;
   }
   for (const item of items) {

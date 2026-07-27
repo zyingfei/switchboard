@@ -328,7 +328,11 @@ describe('local-llm — startTitleSweep', () => {
     expect(getTitleSweepStatus().error).toContain('child boom');
   });
 
-  it('a null title (SKIP) is counted generated + skipped, never accepted', async () => {
+  it('a null title (SKIP) is counted skipped only — generated means a REAL title', async () => {
+    // `generated` is the honest count of titles the model actually
+    // produced; a null (SKIP / thin / per-item error) row must not
+    // inflate it (the first live sweep reported "generated: 4" with the
+    // model never loaded — the accounting this pins down).
     const { eventLog, appended } = makeFakeEventLog([threadUpsert('t-1', '')]);
     const { runner } = makeFakeRunner(() => null);
     await startTitleSweep({
@@ -340,9 +344,29 @@ describe('local-llm — startTitleSweep', () => {
     });
     await waitFor(() => getTitleSweepStatus().state === 'done');
     const final = getTitleSweepStatus();
-    expect(final.generated).toBe(1);
+    expect(final.generated).toBe(0);
     expect(final.accepted).toBe(0);
     expect(final.skipped).toBeGreaterThanOrEqual(1);
+    expect(appended.filter((e) => e.type === ENTITY_TITLE_ENRICHED)).toHaveLength(0);
+  });
+
+  it('a child load failure surfaces as state=error, never a quiet zero-title done', async () => {
+    const { eventLog, appended } = makeFakeEventLog([threadUpsert('t-1', '')]);
+    const loadFailRunner = async () => ({
+      results: [],
+      loadError: 'could not load model on any dtype',
+    });
+    await startTitleSweep({
+      vaultRoot: '/tmp/x',
+      eventLog,
+      childRunner: loadFailRunner,
+      contentFor: async () => longContent,
+      hashOf,
+    });
+    await waitFor(() => getTitleSweepStatus().state !== 'running');
+    const final = getTitleSweepStatus();
+    expect(final.state).toBe('error');
+    expect(final.error).toContain('model load failed');
     expect(appended.filter((e) => e.type === ENTITY_TITLE_ENRICHED)).toHaveLength(0);
   });
 });

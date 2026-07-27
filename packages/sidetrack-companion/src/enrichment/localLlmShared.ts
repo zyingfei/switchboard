@@ -30,6 +30,11 @@ export interface LocalLlmResultItem {
 
 export interface LocalLlmResult {
   readonly results: readonly LocalLlmResultItem[];
+  // Present when the model itself failed to load — the parent surfaces
+  // this as job state 'error', never as a quiet all-skipped 'done' (the
+  // first live sweep reported "done, generated: 4" while the model had
+  // never loaded — dishonest accounting this field exists to prevent).
+  readonly loadError?: string;
 }
 
 // Content thinner than this cannot be titled faithfully — matches the
