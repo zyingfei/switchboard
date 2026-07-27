@@ -137,17 +137,24 @@ export const TITLE_PROMPT_PREFIX = [
 // dense semantic gist (title lane gets a title; content lane gets this). Same
 // same-language + content-only + SKIP discipline as the title prompt; the
 // generated gist is capped to the contract's ≤2000 chars by the caller.
+// TUNED on the real model (2026-07-27). The previous wording asked for "no
+// meta-commentary" and the model ignored it: every single tuning run opened
+// with "Here's a summarized overview of the provided content..." plus
+// markdown headers. Naming the failure explicitly ("do NOT write a preamble",
+// "begin immediately with the subject") removed it in 3/3 documents. Asking
+// for plain sentences also dropped the markdown scaffolding that was ending
+// up in the retrieval corpus.
 export const GIST_PROMPT_PREFIX = [
-  'You summarize documents for a personal research organizer.',
-  'Write a factual 2 to 3 sentence summary of the content below, then list',
-  'the key entities (people, products, technologies, questions) it covers.',
-  'Write in the SAME language the content is mostly written in',
-  '(English content → English summary, 中文内容 → 中文摘要).',
-  'Use ONLY facts present in the text. No opinions, no meta-commentary about',
-  'the document itself, no quotes of these instructions.',
-  'If the text is too thin to summarize faithfully, reply exactly: SKIP',
+  'Summarize the document below in 2 to 3 plain sentences.',
+  'Begin immediately with the subject matter.',
+  'Do NOT write an introduction, a preamble, or a phrase like "Here is a summary".',
+  'Do NOT use markdown, headings, bullet points, or bold text.',
+  'Write in the SAME language the document is mostly written in',
+  '(English document → English summary, 中文内容 → 中文摘要).',
+  'Use ONLY facts stated in the document. Do not invent names or products.',
+  'If the document is too thin to summarize, reply exactly: SKIP',
   '',
-  'Content:',
+  'Document:',
   '---',
 ].join('\n');
 
@@ -265,4 +272,19 @@ export const synthesizeTitle = async (
   } finally {
     session.destroy();
   }
+};
+
+
+// Deterministic preamble/markdown stripper. Prompting alone got the model to
+// 0/3 preambles in tuning, but a 1B model is not reliable across every
+// document, and a leaked "Here's a summary:" pollutes retrieval text. Belt
+// and braces: strip the opener and the bold/heading scaffolding after the
+// fact. Pure + exported so it is unit-testable.
+export const stripGistPreamble = (raw: string): string => {
+  let out = raw.trim();
+  out = out.replace(/^\s*(?:here(?:'|\u2019)?s|here is|below is|this is)\b[^\n.]*[:.]\s*/iu, '');
+  out = out.replace(/^\s*(?:\*\*)?(?:overall\s+)?summary(?:\*\*)?\s*:?\s*/iu, '');
+  out = out.replace(/^[#>\s*_-]+/u, '');
+  out = out.replace(/\*\*/gu, '');
+  return out.trim();
 };

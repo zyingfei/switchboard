@@ -403,3 +403,43 @@ describe('prompt echo', () => {
     expect(verdict.ok).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tuned constants — pinned to the measurements that chose them (2026-07-27,
+// 3 real vault documents x 5 variants on the real WebGPU model).
+// ---------------------------------------------------------------------------
+describe('tuned generation constants', () => {
+  it('drops the hard n-gram ban (it suppressed source reuse: groundedness 0.25 -> 0.43)', async () => {
+    const { NO_REPEAT_NGRAM_SIZE, transformersGenerationArgs, GIST_GENERATION } = await import(
+      '../../src/sidepanel/nano/generationOptions'
+    );
+    expect(NO_REPEAT_NGRAM_SIZE).toBeUndefined();
+    // The arg must be OMITTED entirely, not sent as 0/undefined.
+    expect('no_repeat_ngram_size' in transformersGenerationArgs(GIST_GENERATION)).toBe(false);
+  });
+
+  it('keeps a mild repetition penalty as loop insurance', async () => {
+    const { REPETITION_PENALTY } = await import('../../src/sidepanel/nano/generationOptions');
+    expect(REPETITION_PENALTY).toBeGreaterThan(1);
+    expect(REPETITION_PENALTY).toBeLessThanOrEqual(1.1);
+  });
+});
+
+describe('preamble stripping', () => {
+  it('removes the "Here is a summary" opener the model produced in every tuning run', async () => {
+    const { stripGistPreamble } = await import('../../src/sidepanel/nano/titleSynthesis');
+    const raw =
+      "Here's a summarized overview of the provided content, presented as a detailed organizational structure:\n\n**Overall Summary:**\n\nNetflix leverages AWS Elemental MediaConnect to transmit live video.";
+    const out = stripGistPreamble(raw);
+    expect(out.startsWith('Netflix leverages AWS Elemental MediaConnect')).toBe(true);
+    expect(out).not.toContain('**');
+    expect(out.toLowerCase()).not.toContain("here's a summarized");
+  });
+
+  it('leaves a clean summary untouched', async () => {
+    const { stripGistPreamble } = await import('../../src/sidepanel/nano/titleSynthesis');
+    const clean =
+      'Netflix utilizes AWS Elemental MediaConnect to reliably transmit live video streams from its production facilities.';
+    expect(stripGistPreamble(clean)).toBe(clean);
+  });
+});
