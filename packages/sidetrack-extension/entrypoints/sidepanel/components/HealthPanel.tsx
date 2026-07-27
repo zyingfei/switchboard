@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { formatRelative } from '../../../src/util/time';
 import { Icons } from './icons';
+import { OnDeviceAiRow } from './OnDeviceAiRow';
 
 interface CaptureProviderHealth {
   readonly provider: string;
@@ -1340,6 +1341,12 @@ export function HealthPanel({
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <h2 className="sx-drill-title">Experiments</h2>
+
+        {/* Browser-local capability (not a companion candidate lane): the
+            built-in Prompt API / Gemini Nano state for THIS browser. Feeds
+            the title-synthesis experiment's go/no-go — see
+            poc/nano-title-synthesis/README.md. */}
+        <OnDeviceAiRow />
 
         {candidates.length === 0 ? (
           <div className="sx-callout warn">
