@@ -147,8 +147,11 @@ export const blockedHint = (reason: EnrichmentBlockReason): string => {
   }
 };
 
-/** Short failure line for a run that ended badly — one typed reason each. */
-const failureCopy = (failure: EnrichmentFailure): string => {
+/** Short failure line for a run that ended badly — one typed reason each.
+ *  Takes the TARGET kind: a chat thread has no "page" to index, so its
+ *  no-text reason must not tell the user to index a page (live report,
+ *  2026-07-27 — a chat card said "index this page first"). */
+const failureCopy = (failure: EnrichmentFailure, kind: EnrichmentTarget['kind']): string => {
   switch (failure.kind) {
     case 'blocked':
       return failure.reason === 'language-needs-local-model'
@@ -159,7 +162,9 @@ const failureCopy = (failure: EnrichmentFailure): string => {
             ? 'no on-device model in this browser'
             : 'no model loaded — load it in Health';
     case 'no-text':
-      return 'no page text — index this page first';
+      return kind === 'thread'
+        ? 'no captured conversation in this thread yet'
+        : 'no page text — index this page first';
     case 'cancelled':
       return 'cancelled — the page changed';
     case 'engine':
@@ -404,7 +409,7 @@ export function ContentEnrichmentAction({
   const statusText = busy
     ? `${PHASE_COPY[phase]}${ranOn !== null ? ` · ${ranOn}` : ''}`
     : phase === 'error'
-      ? (failure === null ? 'enrichment failed' : failureCopy(failure))
+      ? (failure === null ? 'enrichment failed' : failureCopy(failure, target.kind))
       : phase === 'done'
         ? settled
           ? `gist saved${ranOn !== null ? ` · ${ranOn}` : ''}`
