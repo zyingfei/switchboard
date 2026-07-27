@@ -102,9 +102,20 @@ export interface AttributionAnchor {
 // reader must treat `lanes === undefined` as "old companion, keep legacy
 // behavior" (never reject the whole result over a missing/malformed lanes).
 //
-// The six lanes and their human labels are the resolver's independent
-// arms; the fused decision is a weighted combination of them.
-export type GuessLane = 'graph' | 'similarity' | 'topic' | 'title' | 'domain' | 'recency';
+// The lanes and their human labels are the resolver's independent arms; the
+// fused decision is a weighted combination of them. 'content' (feat/content-
+// lane) is the 7th, appended AFTER 'recency' — it arrives on newer companions
+// and is ABSENT on older ones, so like the whole `lanes` field it is additive
+// on the wire: a reader that renders lanes in array order picks it up
+// automatically, and one that doesn't send it stays at six.
+export type GuessLane =
+  | 'graph'
+  | 'similarity'
+  | 'topic'
+  | 'title'
+  | 'domain'
+  | 'recency'
+  | 'content';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -180,10 +191,11 @@ export interface TabSessionResolutionResult {
     readonly gate?: GuessGate;
   };
   readonly fusedCandidates: readonly TabSessionResolverCandidate[];
-  // Guess-lanes — always all 6 lanes when present, in the fixed order
-  // graph, similarity, topic, title, domain, recency. Absent on older
-  // companions (see GuessLaneResult); a lenient client parse drops it
-  // entirely rather than reject the result when it's malformed.
+  // Guess-lanes — the resolver arms in the fixed wire order graph, similarity,
+  // topic, title, domain, recency, with 'content' appended as an optional 7th
+  // on newer companions (feat/content-lane). Absent on older companions (see
+  // GuessLaneResult); a lenient client parse drops it entirely rather than
+  // reject the result when it's malformed. Readers render in array order.
   readonly lanes?: readonly GuessLaneResult[];
 }
 
@@ -293,6 +305,7 @@ const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>([
   'title',
   'domain',
   'recency',
+  'content',
 ]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>

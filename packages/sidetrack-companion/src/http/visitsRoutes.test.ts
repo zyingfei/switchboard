@@ -665,7 +665,9 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     expect(secondBody).toEqual(firstBody);
     // The guess lanes ride the resolver-cache seam: the SECOND response is
     // served from the persisted (JSON.stringify → JSON.parse) cache entry, and
-    // it still carries the six lanes just like the freshly-computed first.
+    // it still carries the six lanes just like the freshly-computed first. (The
+    // content lane, lane 7, is a batch-resolve-only addition; the single-URL GET
+    // resolve route is unchanged and stays six.)
     expect(secondBody.data?.lanes).toHaveLength(6);
     expect(readMerged).toHaveBeenCalledTimes(1);
   });
@@ -705,9 +707,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
         .sort(),
     ).toEqual([...urls].sort());
     // Guess lanes (SIDETRACK_GUESS_LANES, default ON) ride each per-URL result:
-    // all six lanes, fixed order, present on the wire. This batch has no graph
-    // path and no v1 state artifact, so every lane is empty WITH a reason
-    // (typed emptiness).
+    // all six base lanes in fixed order PLUS the query-time content lane (lane 7,
+    // SIDETRACK_CONTENT_LANE default ON) appended after 'recency'. This batch has
+    // no graph path, no v1 state artifact, and the recall store was never opened,
+    // so every lane is empty WITH a reason (typed emptiness).
     const oneResult = body.data.results[urls[0]!]!;
     expect(oneResult.lanes?.map((lane) => lane.lane)).toEqual([
       'graph',
@@ -716,7 +719,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'title',
       'domain',
       'recency',
+      'content',
     ]);
+    const contentLane = oneResult.lanes?.find((lane) => lane.lane === 'content');
+    expect(contentLane?.emptyReason).toBe('recall store unavailable');
     for (const lane of oneResult.lanes ?? []) {
       expect(lane.emptyReason, `empty lane ${lane.lane} must carry a reason`).toBeDefined();
     }
@@ -776,6 +782,83 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'rev-event-candidates',
       expect.anything(),
     );
+  });
+
+  it('POST /v1/visits/batch-resolve accepts titleHints and appends the content lane', async () => {
+    const url = 'https://titlehint.test/page';
+    await connectionsStore.putCurrent(snapshotForUrls([url], 'rev-title-hint'));
+
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({
+        canonicalUrls: [url],
+        // Valid hint for the resolved URL + assorted invalid shapes that must be
+        // ignored silently (never a 400): oversize (>500), wrong type, empty.
+        titleHints: {
+          [url]: 'Live Panel Title',
+          'https://titlehint.test/other': 'x'.repeat(600),
+          'https://titlehint.test/wrongtype': 42,
+          'https://titlehint.test/empty': '',
+        },
+      }),
+    });
+
+    // Invalid titleHint shapes are dropped silently — the request still succeeds.
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: {
+        results: Record<
+          string,
+          { lanes?: readonly { readonly lane: string; readonly emptyReason?: string }[] }
+        >;
+      };
+    };
+    const lanes = body.data.results[url]?.lanes;
+    // Lane 7 'content' is appended after 'recency'. The recall store was never
+    // opened in this harness, so it is typed-empty 'recall store unavailable'.
+    expect(lanes?.map((lane) => lane.lane)).toEqual([
+      'graph',
+      'similarity',
+      'topic',
+      'title',
+      'domain',
+      'recency',
+      'content',
+    ]);
+    expect(lanes?.find((lane) => lane.lane === 'content')?.emptyReason).toBe(
+      'recall store unavailable',
+    );
+  });
+
+  it('POST /v1/visits/batch-resolve omits the content lane when SIDETRACK_CONTENT_LANE=0', async () => {
+    const prior = process.env['SIDETRACK_CONTENT_LANE'];
+    process.env['SIDETRACK_CONTENT_LANE'] = '0';
+    try {
+      const url = 'https://contentoff.test/page';
+      await connectionsStore.putCurrent(snapshotForUrls([url], 'rev-content-off'));
+      const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+        method: 'POST',
+        headers: reqHeaders(),
+        body: JSON.stringify({ canonicalUrls: [url] }),
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        data: { results: Record<string, { lanes?: readonly { readonly lane: string }[] }> };
+      };
+      // Content lane disabled ⇒ the six base lanes only, no 'content' entry.
+      expect(body.data.results[url]?.lanes?.map((lane) => lane.lane)).toEqual([
+        'graph',
+        'similarity',
+        'topic',
+        'title',
+        'domain',
+        'recency',
+      ]);
+    } finally {
+      if (prior === undefined) delete process.env['SIDETRACK_CONTENT_LANE'];
+      else process.env['SIDETRACK_CONTENT_LANE'] = prior;
+    }
   });
 
   // Attribution v1 SHADOW parity: the served resolve response must be

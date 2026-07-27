@@ -996,8 +996,9 @@ button:disabled {
   border-top: var(--hair-soft);
 }
 /* The dots row is a button (toggles the lanes disclosure) but must read as a
-   plain inline row — strip the native button chrome. Flex-wrap so the six
-   chips reflow onto a second line at ~300px instead of scrolling. */
+   plain inline row — strip the native button chrome. Flex-wrap so the chips
+   (six, or seven when the content lane arrives) reflow onto a second line at
+   ~300px instead of scrolling — no fixed chip widths, so the count is free. */
 .pipeline-strip-dots {
   display: flex;
   flex-wrap: wrap;

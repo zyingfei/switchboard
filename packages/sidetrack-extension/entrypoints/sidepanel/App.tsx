@@ -1097,6 +1097,11 @@ const App = () => {
     | null
   >(null);
   const [liveActiveTabTitle, setLiveActiveTabTitle] = useState<string | undefined>(undefined);
+  // Latest-ref handle for the focused tab's live title, so loadUrlSuggestions
+  // (called from background polls) can attach it as a titleHint for the
+  // batch-resolve without rebuilding the callback on every title change.
+  const liveActiveTabTitleRef = useRef(liveActiveTabTitle);
+  liveActiveTabTitleRef.current = liveActiveTabTitle;
   const [designPreviewOpen, setDesignPreviewOpen] = useState(false);
   const [workstreamDetailOpen, setWorkstreamDetailOpen] = useState(false);
   const [workstreamDetailLinkedNotes, setWorkstreamDetailLinkedNotes] = useState<
@@ -1979,6 +1984,33 @@ const App = () => {
       if (toFetch.length > 0) {
         const requestedUrls = new Set(toFetch);
         const eventCandidateUrls = extraCanonicalUrls.filter((url) => requestedUrls.has(url));
+        // Live page titles for the URLs we're about to resolve — feeds the
+        // companion's title lane AND the new content lane for pages it has no
+        // server-side record of yet. Best-effort, built ONLY from panel state
+        // (no new chrome API calls): the inbox items' own titles plus the
+        // focused tab's live title (keyed by its comparable URL, matching how
+        // focusedExtras are canonicalised). Only non-empty titles, each capped
+        // at 500 chars (the wire contract), and at most 100 entries.
+        const titleHints: Record<string, string> = {};
+        const addTitleHint = (canonicalUrl: string, rawTitle: string | undefined): void => {
+          if (!requestedUrls.has(canonicalUrl)) return;
+          if (rawTitle === undefined) return;
+          const title = rawTitle.slice(0, 500);
+          if (title.length === 0) return;
+          if (titleHints[canonicalUrl] !== undefined) return;
+          if (Object.keys(titleHints).length >= 100) return;
+          titleHints[canonicalUrl] = title;
+        };
+        // Focused tab first — it's the URL the user is looking at, so it wins
+        // the cap if it's contended (though 100 is far above the batch size).
+        const focusedTitleUrl = comparableTabUrl(liveActiveTabUrlRef.current);
+        if (focusedTitleUrl !== null) {
+          addTitleHint(focusedTitleUrl, liveActiveTabTitleRef.current);
+        }
+        for (const item of inbox.items) {
+          addTitleHint(item.canonicalUrl, item.latestTitle);
+        }
+        const hasTitleHints = Object.keys(titleHints).length > 0;
         try {
           const response = await fetch(`http://127.0.0.1:${port}/v1/visits/batch-resolve`, {
             method: 'POST',
@@ -1989,6 +2021,7 @@ const App = () => {
             body: JSON.stringify({
               canonicalUrls: toFetch,
               ...(eventCandidateUrls.length === 0 ? {} : { eventCandidateUrls }),
+              ...(hasTitleHints ? { titleHints } : {}),
             }),
           });
           if (!response.ok) {

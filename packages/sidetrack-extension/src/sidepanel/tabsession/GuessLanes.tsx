@@ -1,5 +1,8 @@
-// Guess-lanes (feat/guess-lanes) — the resolver's SIX independent arms, each
-// with its own ranked guess, surfaced behind a click-to-expand disclosure.
+// Guess-lanes (feat/guess-lanes) — the resolver's independent arms, each with
+// its own ranked guess, surfaced behind a click-to-expand disclosure. Six on
+// older companions (graph → recency); a 7th 'content' arm is appended on newer
+// ones (feat/content-lane) — the list renders in array order so the count is
+// data-driven, never hard-coded.
 //
 // The fused decision is a weighted combination of these lanes; when it
 // abstains (action='inbox' / no confident pick) the user used to see a bare
@@ -19,8 +22,9 @@ import type { GuessLaneResult, TabSessionWorkstreamOption } from './types';
 // Human labels for the six lanes — the resolver's arm names are jargon
 // ('graph', 'similarity', …); these are the plain words the user reads. Kept
 // here (not in suggestionEndorsement) because they're specific to the lane
-// breakdown surface. Order is the frozen wire order (graph → recency), so a
-// lanes array rendered in-order reads strongest-structural-signal first.
+// breakdown surface. Order is the frozen wire order (graph → recency, then the
+// optional 'content'), so a lanes array rendered in-order reads
+// strongest-structural-signal first.
 const LANE_LABEL: Record<GuessLaneResult['lane'], string> = {
   graph: 'Graph',
   similarity: 'Similar pages',
@@ -28,6 +32,10 @@ const LANE_LABEL: Record<GuessLaneResult['lane'], string> = {
   title: 'Title match',
   domain: 'Domain history',
   recency: 'Recently active',
+  // 'content' (feat/content-lane) — the 7th arm, appended after recency; the
+  // disclosure renders lanes in array order so it slots in automatically when
+  // a newer companion sends it, and is simply never listed on older ones.
+  content: 'Content match',
 };
 
 const workstreamLabel = (
@@ -128,8 +136,9 @@ function LaneRow({
 
 /** The lane breakdown disclosure. Renders nothing when `lanes` is empty (an
  * old companion passes no lanes; the caller shouldn't mount this then, but the
- * guard keeps it safe). All six lanes are always listed when present —
- * empty lanes included — so the breakdown is an honest full accounting. */
+ * guard keeps it safe). Every lane in the payload is listed — empty lanes
+ * included, and the optional 'content' lane when present — so the breakdown is
+ * an honest full accounting. */
 export function GuessLanes({
   lanes,
   workstreams,

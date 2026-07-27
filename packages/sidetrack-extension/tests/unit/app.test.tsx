@@ -810,6 +810,10 @@ describe('live side-panel App wiring', () => {
       { timeout: 3000 },
     );
     expect(banner).toHaveTextContent('Sibling');
+    // feat/content-lane — the batch-resolve body now carries titleHints: live
+    // page titles for the URLs being resolved, feeding the companion's title
+    // AND content lanes. Here the inbox item's latestTitle is the source, and
+    // it doubles as the focused tab's title (activeTabUrl == the inbox URL).
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:17373/v1/visits/batch-resolve',
       expect.objectContaining({
@@ -817,6 +821,7 @@ describe('live side-panel App wiring', () => {
         body: JSON.stringify({
           canonicalUrls: ['https://example.test/research'],
           eventCandidateUrls: ['https://example.test/research'],
+          titleHints: { 'https://example.test/research': 'Open research' },
         }),
       }),
     );
@@ -1102,6 +1107,121 @@ describe('live side-panel App wiring', () => {
         }),
       }),
     );
+  });
+
+  // feat/content-lane — the focused tab's LIVE title (from chrome.tabs, the
+  // same source the Now card renders) is attached to the batch-resolve as a
+  // titleHint, keyed by the focused tab's comparable URL. This feeds the
+  // companion's title + content lanes for a page it may have no server record
+  // of yet. We assert the request BODY carries titleHints with that live title.
+  it('attaches the focused tab live title as a titleHint on the batch-resolve body', async () => {
+    const currentUrl = 'https://news.ycombinator.com/item?id=48311111';
+    const liveTitle = 'A live page title from chrome.tabs';
+    installChromeMock(
+      {
+        ...liveState(),
+        companionStatus: 'connected',
+        activeTabUrl: currentUrl,
+      },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    // Override the harness's title-less tab query with one that carries a
+    // live title (installChromeMock's default query returns { url } only).
+    (globalThis as unknown as { chrome: typeof chrome }).chrome.tabs.query = vi.fn(
+      (
+        _query: unknown,
+        callback?: (tabs: readonly chrome.tabs.Tab[]) => void,
+      ): Promise<readonly chrome.tabs.Tab[]> => {
+        const tabs = [
+          { active: true, url: currentUrl, title: liveTitle },
+        ] as unknown as readonly chrome.tabs.Tab[];
+        if (typeof callback === 'function') callback(tabs);
+        return Promise.resolve(tabs);
+      },
+    ) as unknown as typeof chrome.tabs.query;
+
+    const projection = { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} };
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [currentUrl]: {
+          canonicalUrl: currentUrl,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 2,
+          tabSessionIds: ['tses_hn'],
+          latestUrl: currentUrl,
+          latestTitle: 'server-side stale title',
+          attributionHistory: [],
+        },
+      },
+    };
+    const emptySuggestion = {
+      canonicalUrl: currentUrl,
+      dryRun: true,
+      decision: { action: 'inbox', margin: 0 },
+      fusedCandidates: [],
+    };
+    const titleHintsSeen: (Record<string, string> | undefined)[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: projection }) };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        // Empty inbox → the ONLY titleHint source is the focused tab's live title.
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        const rawBody = typeof init?.body === 'string' ? init.body : '{}';
+        const body = JSON.parse(rawBody) as {
+          readonly canonicalUrls?: readonly string[];
+          readonly titleHints?: Record<string, string>;
+        };
+        titleHintsSeen.push(body.titleHints);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              results: Object.fromEntries(
+                (body.canonicalUrls ?? []).map((canonicalUrl) => [canonicalUrl, emptySuggestion]),
+              ),
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+
+    await waitFor(
+      () => {
+        expect(titleHintsSeen.some((hints) => hints?.[currentUrl] === liveTitle)).toBe(true);
+      },
+      { timeout: 5_000 },
+    );
+    // And it never fell back to the stale server-side title.
+    expect(
+      titleHintsSeen.some((hints) => hints?.[currentUrl] === 'server-side stale title'),
+    ).toBe(false);
   });
 
   // Pending-deadline guard (live-verified defect): a resolve that neither
