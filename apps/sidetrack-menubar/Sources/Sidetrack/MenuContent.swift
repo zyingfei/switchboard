@@ -17,6 +17,8 @@ struct MenuContent: View {
                 detailBlock
             }
             Divider()
+            testRig
+            Divider()
             actions
             if let message = controller.lastActionMessage {
                 Text(message)
@@ -168,6 +170,102 @@ struct MenuContent: View {
             return "~" + path.dropFirst(home.count)
         }
         return path
+    }
+
+    // MARK: - Test rig
+
+    /// The test-rig block: supervise the TEST companion with a tick
+    /// (independent of which instance the picker watches), launch the
+    /// test browser, and surface the one-paste st-pair:// URL so ANY
+    /// browser's extension can be pointed at the test companion.
+    private var testRig: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("TEST RIG")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Toggle(isOn: testCompanionBinding) {
+                HStack(spacing: 6) {
+                    Text("Test companion (17374)")
+                        .font(.callout)
+                    if controller.testTransitioning {
+                        ProgressView().controlSize(.mini)
+                    } else if controller.testStatus == .unreachable {
+                        Text("busy")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .toggleStyle(.checkbox)
+            .disabled(
+                controller.testTransitioning
+                    || controller.testStatus == .unknown)
+            .help("Tick to start the test companion, untick to stop it")
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(controller.testBrowserRunning ? Color.green : Color.gray)
+                    .frame(width: 7, height: 7)
+                if controller.testBrowserRunning {
+                    Text("Test browser running (CDP :9222)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button {
+                        controller.startTestBrowser()
+                    } label: {
+                        Label("Start test browser", systemImage: "globe")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Chrome for Testing + the unpacked extension, CDP on :9222")
+                }
+                Spacer()
+            }
+            pairingRow
+        }
+    }
+
+    /// One-paste pairing URL for the test companion. Shown truncated
+    /// (the full token is a secret-bearing URL — keep it one click away,
+    /// not fully on screen), copied whole via the button. Paste it into
+    /// any browser's Sidetrack Settings → Connection to point that
+    /// extension at the test companion.
+    private var pairingRow: some View {
+        HStack(spacing: 6) {
+            if let token = controller.testPairToken() {
+                Text(truncatedToken(token))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Button {
+                    controller.copyTestPairToken()
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.mini)
+                .help("Copy the st-pair:// URL — paste into Settings → Connection in any browser")
+            } else {
+                Text("Pairing URL appears after the test companion first runs")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    private func truncatedToken(_ token: String) -> String {
+        token.count <= 28 ? token : String(token.prefix(24)) + "…"
+    }
+
+    private var testCompanionBinding: Binding<Bool> {
+        Binding(
+            get: {
+                controller.testStatus == .running
+                    || controller.testStatus == .unreachable
+            },
+            set: { controller.setTestCompanion(running: $0) }
+        )
     }
 
     // MARK: - Actions
