@@ -785,6 +785,11 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     ).toMatchObject({ workstreamId: 'ws-1' });
   });
 
+  // CI budget: this materializer test runs ~0.6s locally but repeatedly hit
+  // bun's 5s DEFAULT timeout on the shared runner (observed failing at exactly
+  // 5000.6ms across PRs that touched no companion code at all). It is loaded-
+  // runner slowness, not a hang, so give it an explicit budget rather than
+  // letting a false failure block unrelated merges. The assertions are unchanged.
   it('mixed timeline navigation and engagement batches use scoped delta', async () => {
     const canonicalUrl = 'https://news.ycombinator.com/newest?sidetrack_probe=test';
     const tabSessionId = 'tses_hn';
@@ -998,7 +1003,7 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     const scopedDelta = replacements[1];
     expect(scopedDelta?.scopes).toContainEqual({ kind: 'url', id: canonicalUrl });
     expect(scopedDelta?.scopes).toContainEqual({ kind: 'tab-session', id: tabSessionId });
-  });
+  }, 30_000);
 
   it('does not expand a scoped timeline delta to every historical visit in the tab-session', async () => {
     const tabSessionId = 'tses_hn';
