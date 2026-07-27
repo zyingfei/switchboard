@@ -24,7 +24,12 @@
 // No React, no fetch, no chrome.* — pure orchestration over an injected engine
 // so it is unit-testable with a stub.
 
-import { planChunks, type ChunkPlan } from './chunking';
+import { CHUNK_MAX_CHARS, planChunks, type ChunkPlan } from './chunking';
+import {
+  limitsFor,
+  prepareInput,
+  type EngineLimits,
+} from './engineLimits';
 import {
   CHUNK_GIST_GENERATION,
   GIST_GENERATION,
@@ -55,6 +60,14 @@ export interface GistMeta {
   readonly keptChunkGists: number;
   /** 1 = single-pass; 2 = chunk pass + final synthesis pass. Never more. */
   readonly passes: 1 | 2;
+  /** Characters in the source document, before any cap applied. */
+  readonly inputChars: number;
+  /** Characters actually handed to the model across the run. */
+  readonly processedChars: number;
+  /** True when the engine's input cap reduced the document. NEVER hidden. */
+  readonly inputReduced: boolean;
+  /** The per-call input cap that applied (engineLimits.ts). */
+  readonly maxInputChars: number;
 }
 
 export type GistOutcome =
@@ -71,21 +84,41 @@ export type GistOutcome =
       readonly meta: GistMeta;
     };
 
-const metaOf = (plan: ChunkPlan, keptChunkGists: number, passes: 1 | 2): GistMeta => ({
-  totalChunks: plan.totalChunks,
-  usedChunks: plan.usedChunks,
-  droppedChunks: plan.droppedChunks,
-  keptChunkGists,
-  passes,
-});
+const metaOf = (
+  plan: ChunkPlan,
+  keptChunkGists: number,
+  passes: 1 | 2,
+  inputChars: number,
+  maxInputChars: number,
+): GistMeta => {
+  // What the model actually SAW: the sum of the chunks this run processed. The
+  // difference from the document length is the reduction — reported, never
+  // implied by a shorter-than-expected gist.
+  const processedChars = plan.chunks.reduce((sum, c) => sum + c.text.length, 0);
+  return {
+    totalChunks: plan.totalChunks,
+    usedChunks: plan.usedChunks,
+    droppedChunks: plan.droppedChunks,
+    keptChunkGists,
+    passes,
+    inputChars,
+    processedChars,
+    inputReduced: processedChars < inputChars,
+    maxInputChars,
+  };
+};
 
-const EMPTY_META: GistMeta = {
+const emptyMeta = (inputChars: number, maxInputChars: number): GistMeta => ({
   totalChunks: 0,
   usedChunks: 0,
   droppedChunks: 0,
   keptChunkGists: 0,
   passes: 1,
-};
+  inputChars,
+  processedChars: 0,
+  inputReduced: false,
+  maxInputChars,
+});
 
 /** A model reply that means "I have nothing" rather than "here is my answer". */
 const isAbstention = (raw: string): boolean => {
@@ -155,24 +188,36 @@ const generateValidated = async (
 };
 
 export const synthesizeGist = async (
-  engine: Pick<GenerationEngine, 'generate'>,
+  engine: Pick<GenerationEngine, 'generate'> & Partial<Pick<GenerationEngine, 'kind' | 'limits'>>,
   content: string,
+  limitsOverride?: EngineLimits,
 ): Promise<GistOutcome> => {
+  // The engine's own limits win; a bare stub falls back to its kind's table,
+  // and a kindless stub to the permissive local default. An explicit override
+  // is the test seam AND the way a caller pins limits it already resolved.
+  const limits: EngineLimits =
+    limitsOverride ?? engine.limits ?? limitsFor(engine.kind ?? 'webgpu');
+  const inputChars = content.length;
   if (content.trim().length < MIN_CONTENT_CHARS) {
-    return { ok: false, kind: 'thin', meta: EMPTY_META };
+    return { ok: false, kind: 'thin', meta: emptyMeta(inputChars, limits.maxInputChars) };
   }
   // The gist must come back in the language the SOURCE is written in; the
   // validator enforces it on every pass.
   const language = detectContentLanguage(content);
-  const plan = planChunks(content);
+  // ENFORCE the per-call input cap by NARROWING THE CHUNK WIDTH — the same
+  // paragraph-aligned chunking the pipeline already uses. An engine with a cap
+  // below the standard 1800-char chunk therefore gets more, smaller chunks
+  // rather than one silently truncated one.
+  const chunkWidth = Math.min(CHUNK_MAX_CHARS, limits.maxInputChars);
+  const plan = planChunks(content, { maxChars: chunkWidth });
   if (plan.chunks.length === 0) {
-    return { ok: false, kind: 'thin', meta: metaOf(plan, 0, 1) };
+    return { ok: false, kind: 'thin', meta: metaOf(plan, 0, 1, inputChars, limits.maxInputChars) };
   }
 
   // --- Single pass: the document fits in one chunk. ------------------------
   if (plan.singlePass) {
     const only = plan.chunks[0];
-    const meta = metaOf(plan, 0, 1);
+    const meta = metaOf(plan, 0, 1, inputChars, limits.maxInputChars);
     const outcome = await generateValidated(
       engine,
       `${GIST_PROMPT_PREFIX}\n${only === undefined ? '' : only.text}`,
@@ -206,7 +251,7 @@ export const synthesizeGist = async (
     notes.push(verdict.text);
   }
   if (notes.length === 0) {
-    const meta = metaOf(plan, 0, 2);
+    const meta = metaOf(plan, 0, 2, inputChars, limits.maxInputChars);
     return firstRejection === null
       ? { ok: false, kind: 'abstained', meta }
       : { ok: false, kind: 'rejected', reason: firstRejection, meta };
@@ -216,8 +261,14 @@ export const synthesizeGist = async (
   // The input is only ever the chunk sentences. If they somehow exceed a single
   // prompt budget we SLICE them (the existing head/middle/tail reducer) rather
   // than chunking again — that is what caps recursion at one extra level.
-  const meta = metaOf(plan, notes.length, 2);
-  const joined = sliceForSynthesis(notes.map((n) => `- ${n}`).join('\n'));
+  const meta = metaOf(plan, notes.length, 2, inputChars, limits.maxInputChars);
+  // The notes go through the existing head/middle/tail reducer AND the engine's
+  // own cap — a final prompt that overruns the cap would fail the same way a
+  // too-long chunk would, and prepareInput reduces through the chunking path.
+  const joined = prepareInput(
+    sliceForSynthesis(notes.map((n) => `- ${n}`).join('\n')),
+    limits.maxInputChars,
+  ).text;
   const raw = await engine.generate(`${GIST_SYNTHESIS_PROMPT_PREFIX}\n${joined}`, GIST_GENERATION);
   if (isAbstention(raw)) return { ok: false, kind: 'abstained', meta };
   const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language, prompt: GIST_PROMPT_PREFIX });

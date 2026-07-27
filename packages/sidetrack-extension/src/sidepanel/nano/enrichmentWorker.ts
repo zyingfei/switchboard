@@ -7,7 +7,7 @@ import {
   synthesizeTitle,
   TITLE_PROMPT_PREFIX,
 } from './titleSynthesis';
-import { cleanGeneratedTitle, type GenerationEngine } from './engine';
+import { cleanGeneratedTitle, engineIdentityOf, type GenerationEngine } from './engine';
 import { TITLE_GENERATION } from './generationOptions';
 import { detectContentLanguage } from './language';
 import { validateGeneration } from './validateGeneration';
@@ -86,16 +86,16 @@ export interface EnrichmentItem {
   readonly id: string;
   readonly synthesizedTitle: string;
   readonly sourceContentHash: string;
-  readonly model: 'gemini-nano' | 'gemma-3-1b-it';
+  /**
+   * Provenance the companion records, so the served lane `why` can distinguish
+   * "synthesized on Nano" from "on the local 1B model" from "on a 4B model" or
+   * a remote provider's. A free string since the local model is now SELECTABLE
+   * (modelRegistry.ts) — pinning it to a two-value union would have silently
+   * mislabeled every non-default model as the default one.
+   */
+  readonly model: string;
   readonly generatedAt: string;
 }
-
-// The provenance string the companion records for each engine, so the served
-// lane `why` can distinguish "synthesized on Nano" from "on WebGPU/Gemma".
-const MODEL_ID_FOR_ENGINE: Record<GenerationEngine['kind'], EnrichmentItem['model']> = {
-  nano: 'gemini-nano',
-  webgpu: 'gemma-3-1b-it',
-};
 
 export interface TitleEnrichmentRun {
   readonly port: number;
@@ -172,8 +172,10 @@ export const runTitleEnrichment = async ({
     }
     if (availability !== 'available') return empty;
   }
+  // Provenance comes from the engine's DECLARED identity (modelRegistry.ts), so
+  // a 4B local model is recorded as a 4B local model rather than as the default.
   const modelId: EnrichmentItem['model'] =
-    engine !== undefined ? MODEL_ID_FOR_ENGINE[engine.kind] : 'gemini-nano';
+    engine !== undefined ? engineIdentityOf(engine).modelName : 'gemini-nano';
 
   const base = `http://127.0.0.1:${String(port)}`;
   const headers = { 'x-bac-bridge-key': bridgeKey };

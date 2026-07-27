@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 
 import { contentHashOf } from './titleSynthesis';
-import { resolveEngineForLanguage } from './engine';
+import { engineIdentityOf, engineLimitsOf, resolveEngineForLanguage } from './engine';
+import {
+  formatEngineLimits,
+  formatReduction,
+  limitsFor,
+  type EngineLimits,
+} from './engineLimits';
 import { synthesizeGist, type GistMeta } from './gistSynthesis';
+import { remotePrivacyDetail, remotePrivacyMarker } from './remoteConfig';
+import { remoteFailureCopy, remoteFailureKindOf, type RemoteFailureKind } from './remoteEngine';
 import { rejectionCopy, type GenerationRejectionReason } from './validateGeneration';
 import {
   detectContentLanguage,
@@ -60,6 +68,8 @@ export type EnrichmentFailure =
   | { readonly kind: 'no-text' }
   | { readonly kind: 'cancelled' }
   | { readonly kind: 'engine'; readonly detail: string }
+  /** The optional remote provider failed, with its typed reason. */
+  | { readonly kind: 'remote'; readonly reason: RemoteFailureKind }
   /** The model produced text and the text was unusable — nothing was saved. */
   | { readonly kind: 'rejected'; readonly reason: GenerationRejectionReason }
   | { readonly kind: 'save'; readonly status: number };
@@ -115,6 +125,12 @@ export const engineStateLine = (
 ): string => {
   if (route.engine === 'nano') return 'AI: Nano ready';
   if (route.engine === 'webgpu') return 'AI: local model ready (WebGPU)';
+  if (route.engine === 'remote') {
+    const host = availability?.remoteHost;
+    return `AI: remote model (${
+      typeof host === 'string' && host.length > 0 ? host : 'user-configured provider'
+    })`;
+  }
   switch (route.reason) {
     case 'model-loading': {
       const pct = availability?.webGpuPercent;
@@ -167,6 +183,10 @@ const failureCopy = (failure: EnrichmentFailure, kind: EnrichmentTarget['kind'])
       return 'cancelled — the page changed';
     case 'engine':
       return `model error — ${failure.detail.slice(0, 120)}`;
+    case 'remote':
+      // The provider's typed failure, in the same shape every other reason
+      // uses. The API key is never part of this string.
+      return `remote engine — ${remoteFailureCopy(failure.reason)} · nothing saved`;
     case 'rejected':
       // The 2026-07-27 lesson said out loud: unusable output is a REPORTED
       // outcome, not a silent save.
@@ -176,10 +196,29 @@ const failureCopy = (failure: EnrichmentFailure, kind: EnrichmentTarget['kind'])
   }
 };
 
-/** "6 of 14 sections" — the chunk cap is stated, never applied silently. */
+/**
+ * "6/14 sections · 10.8k/42k chars" — every reduction the run applied, stated.
+ * The chunk cap and the engine's INPUT cap are two different reductions and both
+ * are reported in the same vocabulary; a summary shorter than the page deserves
+ * an explanation, not a shrug.
+ */
 export const coverageCopy = (meta: GistMeta | null): string => {
-  if (meta === null || meta.passes === 1 || meta.totalChunks <= 1) return '';
-  return ` · ${String(meta.usedChunks)}/${String(meta.totalChunks)} sections`;
+  if (meta === null) return '';
+  const parts: string[] = [];
+  if (meta.passes !== 1 && meta.totalChunks > 1) {
+    parts.push(`${String(meta.usedChunks)}/${String(meta.totalChunks)} sections`);
+  }
+  if (meta.inputReduced) parts.push(formatReduction(meta.processedChars, meta.inputChars));
+  return parts.length === 0 ? '' : ` · ${parts.join(' · ')}`;
+};
+
+/** The short engine name the row shows on the button and in the result line. */
+export type EngineRunLabel = 'Nano' | 'WebGPU' | 'Remote';
+
+const RUN_LABEL: Record<'nano' | 'webgpu' | 'remote', EngineRunLabel> = {
+  nano: 'Nano',
+  webgpu: 'WebGPU',
+  remote: 'Remote',
 };
 
 /** A blocked route the user can actually fix from Health. */
@@ -220,7 +259,13 @@ export function ContentEnrichmentAction({
   const [failure, setFailure] = useState<EnrichmentFailure | null>(null);
   // Which engine actually ran, and how long it took — the result line names
   // both so "gist saved" is attributable, not anonymous.
-  const [ranOn, setRanOn] = useState<'Nano' | 'WebGPU' | null>(null);
+  const [ranOn, setRanOn] = useState<EngineRunLabel | null>(null);
+  // Set for the duration of a REMOTE run so the privacy marker keeps naming the
+  // host even after the run ends. Content that left the device stays disclosed.
+  const [ranRemoteHost, setRanRemoteHost] = useState<string | null>(null);
+  // The limits of the engine that actually ran, so the row states real numbers
+  // rather than the pre-run guess.
+  const [ranLimits, setRanLimits] = useState<EngineLimits | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [settled, setSettled] = useState(false);
   // How much of the document the run actually covered — stated, not implied.
@@ -240,14 +285,26 @@ export function ContentEnrichmentAction({
           ? { engine: 'webgpu' }
           : { engine: 'nano' }
         : { engine: null, reason: 'model-not-loaded' };
-  const engineLabel: 'Nano' | 'WebGPU' | null =
+  const engineLabel: EngineRunLabel | null =
     availability === undefined && activeEngineLabel !== undefined
       ? activeEngineLabel
-      : route.engine === 'nano'
-        ? 'Nano'
-        : route.engine === 'webgpu'
-          ? 'WebGPU'
-          : null;
+      : route.engine === null
+        ? null
+        : RUN_LABEL[route.engine];
+  // The limits shown BEFORE a run: the routed engine's, from the same table the
+  // run will use. After a run, the engine that actually ran wins.
+  const routedLimits: EngineLimits | null =
+    ranLimits ?? (route.engine === null ? null : limitsFor(route.engine));
+  // The host the row must name whenever text would leave — or has left — the
+  // device. Pre-run it comes from the availability snapshot; post-run from the
+  // run itself, so the disclosure outlives the routing state.
+  const remoteHost: string | null =
+    ranRemoteHost ??
+    (route.engine === 'remote' && typeof availability?.remoteHost === 'string'
+      ? availability.remoteHost
+      : route.engine === 'remote'
+        ? 'the configured provider'
+        : null);
 
   const targetKey = targetKeyOf(target);
   const targetKeyRef = useRef(targetKey);
@@ -260,6 +317,8 @@ export function ContentEnrichmentAction({
     setGist(null);
     setFailure(null);
     setRanOn(null);
+    setRanRemoteHost(null);
+    setRanLimits(null);
     setElapsedMs(null);
     setSettled(false);
     setMeta(null);
@@ -288,6 +347,8 @@ export function ContentEnrichmentAction({
     setGist(null);
     setFailure(null);
     setRanOn(null);
+    setRanRemoteHost(null);
+    setRanLimits(null);
     setElapsedMs(null);
     setMeta(null);
     const stale = (): boolean => targetKeyRef.current !== myKey;
@@ -324,20 +385,37 @@ export function ContentEnrichmentAction({
         });
         return;
       }
-      setRanOn(engine.kind === 'nano' ? 'Nano' : 'WebGPU');
+      const engineLimits = engineLimitsOf(engine);
+      setRanOn(RUN_LABEL[engine.kind]);
+      setRanLimits(engineLimits);
+      // A remote run is DISCLOSED from the moment it starts, not after it ends:
+      // the marker must be on screen while the text is in flight.
+      if (engine.kind === 'remote') {
+        setRanRemoteHost(
+          typeof availability?.remoteHost === 'string' && availability.remoteHost.length > 0
+            ? availability.remoteHost
+            : 'the configured provider',
+        );
+      }
       setPhase('generating');
       // Chunk-then-synthesize + output validation. NOTHING generated here
       // reaches the companion unvalidated (gistSynthesis.ts / validateGeneration.ts).
+      // The engine's own input/output caps are enforced by the synthesis path.
       let outcome: Awaited<ReturnType<typeof synthesizeGist>>;
       try {
-        outcome = await synthesizeGist(engine, text);
+        outcome = await synthesizeGist(engine, text, engineLimits);
       } catch (err) {
         if (stale()) {
           cancel();
           return;
         }
         setPhase('error');
-        setFailure({ kind: 'engine', detail: String(err) });
+        const remoteKind = remoteFailureKindOf(err);
+        setFailure(
+          remoteKind === null
+            ? { kind: 'engine', detail: String(err) }
+            : { kind: 'remote', reason: remoteKind },
+        );
         return;
       }
       if (stale()) {
@@ -361,7 +439,9 @@ export function ContentEnrichmentAction({
         id: target.kind === 'url' ? target.canonicalUrl : target.bacId,
         gist: generated,
         sourceContentHash: contentHashOf(text),
-        model: engine.kind === 'nano' ? 'gemini-nano' : 'gemma-3-1b-it',
+        // Provenance from the engine's DECLARED identity — the local model is
+        // selectable now, so a hardcoded 'gemma-3-1b-it' would mislabel a 4B run.
+        model: engineIdentityOf(engine).modelName,
         generatedAt: new Date().toISOString(),
       };
       const res = await fetch(`http://127.0.0.1:${String(port)}/v1/enrichment/content`, {
@@ -392,7 +472,7 @@ export function ContentEnrichmentAction({
       setPhase('error');
       setFailure({ kind: 'engine', detail: String(err) });
     }
-  }, [target, port, bridgeKey, fetchText, onEnriched]);
+  }, [target, port, bridgeKey, fetchText, onEnriched, availability?.remoteHost]);
 
   const blocked = probing || route.engine === null;
   const blockReason: EnrichmentBlockReason | null =
@@ -429,6 +509,18 @@ export function ContentEnrichmentAction({
         <span className="enrich-row-state mono" id={stateId} data-testid={stateId}>
           {stateLine}
         </span>
+        {/* The active engine's caps, stated up front. "limits: 2k in / 140 tok
+            out" — so a two-sentence summary of a 40k-char page is explicable
+            before the user wonders whether the model read the whole thing. */}
+        {routedLimits !== null ? (
+          <span
+            className="enrich-row-limits mono"
+            title={routedLimits.note}
+            data-testid={`${testIdPrefix}-enrich-limits`}
+          >
+            {formatEngineLimits(routedLimits)}
+          </span>
+        ) : null}
         {blockReason !== null && isLoadableInHealth(blockReason) && onOpenHealth !== undefined ? (
           <button
             type="button"
@@ -454,6 +546,20 @@ export function ContentEnrichmentAction({
           {buttonLabel}
         </button>
       </div>
+      {/* THE PRIVACY MARKER. Rendered whenever the remote engine is the routed
+          engine (text is about to leave) or actually ran (text has left). It
+          names the host, never disappears while that is true, and is not a
+          tooltip — an off-device transfer must be readable without hovering. */}
+      {remoteHost !== null ? (
+        <div
+          className="enrich-row-remote-warning mono"
+          role="note"
+          title={remotePrivacyDetail(remoteHost)}
+          data-testid={`${testIdPrefix}-enrich-remote-warning`}
+        >
+          {remotePrivacyMarker(remoteHost)}
+        </div>
+      ) : null}
       {busy ? (
         <div
           className="enrich-row-bar"
