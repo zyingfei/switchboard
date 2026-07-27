@@ -57,10 +57,6 @@ export const TITLE_PROMPT_PREFIX = [
   '---',
 ].join('\n');
 
-// Content thinner than this cannot be titled faithfully — matches the eval's
-// gate so the worker skips the same threads the human eval marks "too thin".
-export const MIN_CONTENT_CHARS = 80;
-
 // A synthesized title is capped to the contract's ≤200 chars.
 export const MAX_TITLE_CHARS = 200;
 
@@ -92,26 +88,20 @@ export const sliceForSynthesis = (content: string): string => {
 
 // ---- job / result contract --------------------------------------------
 
-export interface LocalLlmJobItem {
-  readonly id: string;
-  readonly content: string;
-}
-
-export interface LocalLlmJob {
-  readonly modelId: string;
-  readonly maxItems: number;
-  readonly items: readonly LocalLlmJobItem[];
-}
-
-export interface LocalLlmResultItem {
-  readonly id: string;
-  readonly title: string | null;
-  readonly ms: number;
-}
-
-export interface LocalLlmResult {
-  readonly results: readonly LocalLlmResultItem[];
-}
+export {
+  MIN_CONTENT_CHARS,
+  type LocalLlmJob,
+  type LocalLlmJobItem,
+  type LocalLlmResult,
+  type LocalLlmResultItem,
+} from './localLlmShared.js';
+import {
+  LOCAL_LLM_CHILD_ENV,
+  MIN_CONTENT_CHARS,
+  type LocalLlmJob,
+  type LocalLlmResult,
+  type LocalLlmResultItem,
+} from './localLlmShared.js';
 
 // ---- text-generation pipeline (mirrors embedder.ts conventions) -------
 
@@ -265,11 +255,19 @@ const runJob = async (jobPath: string): Promise<void> => {
   await writeFile(`${jobPath}.result.json`, JSON.stringify({ results } satisfies LocalLlmResult));
 };
 
-// process.argv: [node, entry, jobPath]. Only run when invoked as a forked
-// entry with a job path — importing this module (tests) must NOT kick off a
-// job or exit the process.
+// process.argv: [node, entry, jobPath]. Only run when THIS process is the
+// forked child — the parent stamps LOCAL_LLM_CHILD_ENV on the fork. argv
+// alone is NOT a safe discriminator: the companion's own argv[2] is
+// '--vault', and a value import of this module during server boot ran the
+// job main inside the daemon and killed the boot (live incident,
+// 2026-07-27). Importing this module (tests, the parent's type re-exports)
+// must never kick off a job or exit the process.
 const jobPathArg = process.argv[2];
-if (jobPathArg !== undefined && jobPathArg.length > 0) {
+if (
+  process.env[LOCAL_LLM_CHILD_ENV] === '1' &&
+  jobPathArg !== undefined &&
+  jobPathArg.length > 0
+) {
   void runJob(jobPathArg)
     .then(() => {
       process.exit(0);

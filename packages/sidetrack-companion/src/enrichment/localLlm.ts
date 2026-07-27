@@ -48,7 +48,12 @@ import {
   isJunkTitle,
   type EntityTitleEnrichedPayload,
 } from './titleEnrichment.js';
-import { MIN_CONTENT_CHARS, type LocalLlmJob, type LocalLlmResult } from './localLlmChild.entry.js';
+import {
+  LOCAL_LLM_CHILD_ENV,
+  MIN_CONTENT_CHARS,
+  type LocalLlmJob,
+  type LocalLlmResult,
+} from './localLlmShared.js';
 
 // ---- flag + model id --------------------------------------------------
 
@@ -134,7 +139,7 @@ export const forkChildRunner: ChildRunner = async (input) => {
     }, input.timeoutMs);
 
     child = fork(entryPath, [jobPath], {
-      env: process.env,
+      env: { ...process.env, [LOCAL_LLM_CHILD_ENV]: '1' },
       execArgv: withBunSmolExecArgv(process.execArgv),
       // No IPC channel needed (file handoff) — just capture stdio for the log.
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
