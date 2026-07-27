@@ -30,6 +30,11 @@ const ZH_TEXT =
   '用户：如何在多个账户之间分析云端审计日志？组织级追踪会把事件写入中心化的存储桶，' +
   '然后使用查询引擎按分区投影表进行检索，这样能显著降低扫描成本与查询延迟。'.repeat(3);
 
+// A Chinese gist for the Chinese-routing case.
+const ZH_GIST =
+  '这篇文档讲述了如何跨多个账户分析审计日志，并使用分区投影表降低扫描成本。' +
+  '关键实体：组织级追踪、中心化存储桶、查询引擎。';
+
 const availability = (over: Partial<EngineAvailability> = {}): EngineAvailability => ({
   nanoReady: false,
   webGpuLoaded: false,
@@ -244,7 +249,13 @@ describe('Now-card enrichment row — a run is legible from start to finish', ()
     installNano('THIS NANO REPLY MUST NEVER BE SAVED');
     const fetchMock = okPost();
     vi.stubGlobal('fetch', fetchMock);
-    await loadWebGpuEngine({ port: 17_373, pipelineFactory: fakePipeline() });
+    // The stubbed model must answer IN CHINESE: validateGeneration() now
+    // rejects an English gist for Chinese source outright (wrong-language),
+    // so a lazy English fixture here would test the validator, not routing.
+    await loadWebGpuEngine({
+      port: 17_373,
+      pipelineFactory: fakePipeline(ZH_GIST),
+    });
     renderRow({
       availability: availability({ nanoReady: true, webGpuLoaded: true }),
       contentLanguage: 'zh',

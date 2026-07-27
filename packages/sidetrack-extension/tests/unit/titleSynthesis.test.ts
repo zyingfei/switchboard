@@ -149,11 +149,29 @@ describe('synthesizeTitle', () => {
   });
 
   it('caps the title to 200 chars', async () => {
+    // A long but NON-degenerate reply. The fixture used to be 'z'.repeat(500):
+    // since validateGeneration() landed, a 500-character run of one letter is
+    // (correctly) rejected as a decode loop, so the cap has to be proven on
+    // text a real model could plausibly emit.
+    const longReply = Array.from({ length: 60 }, (_, i) => `subject${String(i)}`).join(' ');
+    const lm = {
+      availability: vi.fn(),
+      create: vi.fn(async () => ({ prompt: async () => longReply, destroy: vi.fn() })),
+    } as unknown as BuiltinLanguageModel;
+    const title = await synthesizeTitle(lm, contentOf(200));
+    expect(longReply.length).toBeGreaterThan(200);
+    // Capped at the contract's 200 (a trailing space at the cut is trimmed).
+    expect((title ?? '').length).toBeLessThanOrEqual(200);
+    expect((title ?? '').length).toBeGreaterThanOrEqual(199);
+  });
+
+  it('returns null when the model degenerates — validated output never persists', async () => {
+    // The 2026-07-27 failure shape, on the title lane: a decode loop must not
+    // become a stored title (it would feed the title lane, FTS and vectors).
     const lm = {
       availability: vi.fn(),
       create: vi.fn(async () => ({ prompt: async () => 'z'.repeat(500), destroy: vi.fn() })),
     } as unknown as BuiltinLanguageModel;
-    const title = await synthesizeTitle(lm, contentOf(200));
-    expect(title).toHaveLength(200);
+    expect(await synthesizeTitle(lm, contentOf(200))).toBeNull();
   });
 });

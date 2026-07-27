@@ -20,8 +20,14 @@
 import {
   builtinLanguageModel,
   createNanoSession,
+  nanoSamplingFor,
   type BuiltinLanguageModel,
 } from './titleSynthesis';
+import {
+  resolveGenerationOptions,
+  transformersGenerationArgs,
+  type GenerationOptions,
+} from './generationOptions';
 import {
   routeEnrichmentEngine,
   type ContentLanguage,
@@ -35,27 +41,41 @@ import {
 
 export interface GenerationEngine {
   readonly kind: 'nano' | 'webgpu';
-  generate: (prompt: string, opts: { readonly maxNewTokens: number }) => Promise<string>;
+  /**
+   * Generate from `prompt`. Every decoding field except `maxNewTokens` is
+   * optional and defaults to the anti-degeneracy values in
+   * generationOptions.ts — an unsafe decoder must not be reachable by
+   * forgetting a field at a call site.
+   */
+  generate: (prompt: string, opts: GenerationOptions) => Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
-// Title cleanup — the PoC showed the WebGPU model wraps titles in markdown
+// Output cleanup — the PoC showed the WebGPU model wraps titles in markdown
 // ("**title**") and sometimes in quotes; Nano stays cleaner but the same
 // cleanup is harmless there. Strip surrounding asterisks/quotes, collapse
-// stray inner ** emphasis, trim, and cap to ≤200 chars. Pure + unit-tested.
+// stray inner ** emphasis, trim, and cap. Pure + unit-tested.
+//
+// The cap is a PARAMETER, not a constant: this cleanup runs on gists too, and
+// capping a gist at the 200-char title limit was silently truncating every
+// multi-sentence summary mid-word before it was ever saved.
 // ---------------------------------------------------------------------------
 
 export const MAX_GENERATED_CHARS = 200;
 
-export const cleanGeneratedTitle = (raw: string): string => {
+export const cleanGeneratedText = (raw: string, maxChars: number): string => {
   let text = raw.trim();
   // Strip a leading/trailing run of markdown emphasis / quote chars, then any
   // inner ** emphasis markers the model sprinkles mid-line.
   text = text.replace(/^[*_"'“”‘’\s]+/u, '').replace(/[*_"'“”‘’\s]+$/u, '');
   text = text.replace(/\*\*/gu, '').replace(/__/gu, '');
   text = text.trim();
-  return text.slice(0, MAX_GENERATED_CHARS);
+  return text.slice(0, maxChars);
 };
+
+/** Title-shaped cleanup: the same pass capped at the title contract's 200. */
+export const cleanGeneratedTitle = (raw: string): string =>
+  cleanGeneratedText(raw, MAX_GENERATED_CHARS);
 
 // ---------------------------------------------------------------------------
 // Nano engine.
@@ -80,10 +100,18 @@ export const nanoEngineIfAvailable = async (
   if (availability !== 'available') return null;
   return {
     kind: 'nano',
-    generate: async (prompt) => {
-      const session = await createNanoSession(lm);
+    generate: async (prompt, opts) => {
+      // Nano's ONLY decoding controls are temperature + topK at create() time
+      // (clamped to this device's reported bounds); there is no repetition
+      // penalty, no n-gram ban and no token budget on the Prompt API. The
+      // caller's validateGeneration() pass is what actually guarantees quality
+      // on this engine. See generationOptions.ts.
+      const session = await createNanoSession(lm, await nanoSamplingFor(lm, opts));
       try {
-        return cleanGeneratedTitle(await session.prompt(prompt));
+        return cleanGeneratedText(
+          await session.prompt(prompt),
+          resolveGenerationOptions(opts).maxChars,
+        );
       } finally {
         session.destroy();
       }
@@ -309,14 +337,14 @@ export const loadWebGpuEngine = async ({
       const engine: GenerationEngine = {
         kind: 'webgpu',
         generate: async (prompt, opts) => {
-          const out = await generate(prompt, {
-            max_new_tokens: opts.maxNewTokens,
-            do_sample: false,
-            return_full_text: false,
-          });
+          // The full anti-degeneracy set: cold sampling + repetition penalty +
+          // n-gram ban + a sane token budget. This engine used to run GREEDY
+          // with no repetition control at 220 tokens, which is precisely how a
+          // 1B q4 model produces "2 224 6 224 6 …" for 61 seconds.
+          const out = await generate(prompt, transformersGenerationArgs(opts));
           const first = out[0];
           const text = typeof first?.generated_text === 'string' ? first.generated_text : '';
-          return cleanGeneratedTitle(text);
+          return cleanGeneratedText(text, resolveGenerationOptions(opts).maxChars);
         },
       };
       webGpuEngineSingleton = engine;

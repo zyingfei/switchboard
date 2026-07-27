@@ -143,6 +143,35 @@ describe('ContentEnrichmentAction', () => {
     ).toBe(false);
   });
 
+  it('REJECTS degenerate output — the live 2026-07-27 failure is never POSTed', async () => {
+    // Verbatim shape of the gist that took 61.5s and was saved to the
+    // companion: a repetition loop. It must now end the run as a reported
+    // failure with nothing written.
+    installNano('2 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6');
+    const fetchMock = enrichPostMock();
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <ContentEnrichmentAction
+        target={{ kind: 'url', canonicalUrl: 'https://example.com/a' }}
+        port={17_373}
+        bridgeKey="k"
+        engineReady
+        activeEngineLabel="Nano"
+        fetchText={async () => LONG_TEXT}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('now-enrich-content-btn'));
+    await waitFor(() => {
+      expect(screen.getByTestId('now-enrich-content-status')).toHaveTextContent(
+        'unusable summary — the model got stuck repeating itself · nothing saved',
+      );
+    });
+    expect(
+      fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/v1/enrichment/content')),
+    ).toBe(false);
+    expect(screen.queryByTestId('now-enrich-content-gist')).toBeNull();
+  });
+
   it('skips (nothing saved) when the model abstains on thin content', async () => {
     const fetchMock = enrichPostMock();
     vi.stubGlobal('fetch', fetchMock);

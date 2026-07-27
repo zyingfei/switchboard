@@ -152,6 +152,59 @@ describe('OnDeviceAiRow', () => {
     ][]) {
       expect(call[1]?.method ?? 'GET').toBe('GET');
     }
+    // Quality is MEASURED, not eyeballed: every generated row carries the
+    // deterministic scores plus the verdict the write-path validator would give.
+    const scoreRow = screen.getByTestId('hp-ondevice-ai-eval-scores-t1');
+    for (const key of ['rep', 'loop', 'letters', 'uniq', 'ground']) {
+      expect(scoreRow).toHaveTextContent(key);
+    }
+    expect(scoreRow).toHaveTextContent('accepted');
+    vi.unstubAllGlobals();
+  });
+
+  it('eval marks a degenerate output REJECTED with its reason, next to the scores', async () => {
+    // The 2026-07-27 live failure shape. The eval stays observe-only, but it
+    // must SAY that this output would never be persisted.
+    const prompt = vi.fn(async () => '2 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6 224 6');
+    (globalThis as { LanguageModel?: unknown }).LanguageModel = {
+      availability: async () => 'available',
+      create: vi.fn(async () => ({ prompt, destroy: vi.fn() })),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/v1/threads')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              { bac_id: 't1', title: '' },
+              { bac_id: 't2', title: '' },
+            ],
+          }),
+        };
+      }
+      if (url.includes('/markdown')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { markdown: 'User: how do I analyze CloudTrail logs?\n'.repeat(10) },
+          }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<OnDeviceAiRow companionPort={17_373} bridgeKey="bridge-test-key" />);
+    fireEvent.click(await screen.findByTestId('hp-ondevice-ai-eval'));
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-ondevice-ai-eval-scores-t1')).toHaveTextContent(
+        'REJECTED: repetitive',
+      );
+    });
+    expect(screen.getByTestId('hp-ondevice-ai-eval-scores-t1')).toHaveTextContent('letters 0.00');
     vi.unstubAllGlobals();
   });
 

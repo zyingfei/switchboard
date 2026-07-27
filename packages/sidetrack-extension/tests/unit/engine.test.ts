@@ -11,6 +11,15 @@ import {
   type GenerationEngine,
   type PipelineFactory,
 } from '../../src/sidepanel/nano/engine';
+import {
+  GENERATION_TEMPERATURE,
+  GENERATION_TOP_P,
+  GIST_GENERATION,
+  GIST_MAX_NEW_TOKENS,
+  NO_REPEAT_NGRAM_SIZE,
+  REPETITION_PENALTY,
+  TITLE_GENERATION,
+} from '../../src/sidepanel/nano/generationOptions';
 import type { BuiltinLanguageModel } from '../../src/sidepanel/nano/titleSynthesis';
 
 // A LanguageModel stub whose availability + prompt are controllable per case.
@@ -115,6 +124,80 @@ describe('loadWebGpuEngine — explicit-load gating', () => {
     });
     const out = await engine.generate('prompt', { maxNewTokens: 24 });
     expect(out).toBe('wrapped title');
+  });
+});
+
+describe('generation options actually reach the models', () => {
+  it('passes the anti-degeneracy decoding config to transformers.js — never greedy', async () => {
+    // The 2026-07-27 failure ("2 224 6 224 6 …" for 61.5s) was greedy decoding
+    // with no repetition control. Assert the exact args, not the intent.
+    const generate = vi.fn(async () => [{ generated_text: 'a webgpu gist about logs' }]);
+    const engine = await loadWebGpuEngine({
+      port: 17_373,
+      pipelineFactory: async () => ({ generate }),
+    });
+    await engine.generate('prompt', GIST_GENERATION);
+    const args = (generate.mock.calls[0] as unknown as [string, Record<string, unknown>])[1];
+    expect(args.do_sample).toBe(true);
+    expect(args.temperature).toBe(GENERATION_TEMPERATURE);
+    expect(args.top_p).toBe(GENERATION_TOP_P);
+    expect(args.repetition_penalty).toBe(REPETITION_PENALTY);
+    expect(args.no_repeat_ngram_size).toBe(NO_REPEAT_NGRAM_SIZE);
+    expect(args.max_new_tokens).toBe(GIST_MAX_NEW_TOKENS);
+  });
+
+  it('applies the defaults even when a caller passes only a token budget', async () => {
+    const generate = vi.fn(async () => [{ generated_text: 'x' }]);
+    const engine = await loadWebGpuEngine({
+      port: 17_373,
+      pipelineFactory: async () => ({ generate }),
+    });
+    await engine.generate('prompt', { maxNewTokens: 24 });
+    const args = (generate.mock.calls[0] as unknown as [string, Record<string, unknown>])[1];
+    expect(args.repetition_penalty).toBe(REPETITION_PENALTY);
+    expect(args.no_repeat_ngram_size).toBe(NO_REPEAT_NGRAM_SIZE);
+  });
+
+  it('caps a gist at 2000 chars, not at the 200-char title limit', async () => {
+    // Long, non-degenerate output: capping a multi-sentence gist at the title
+    // limit was truncating every summary mid-word before it was ever saved.
+    const long = Array.from({ length: 400 }, (_, i) => `topic${String(i)}`).join(' ');
+    const engine = await loadWebGpuEngine({
+      port: 17_373,
+      pipelineFactory: fakePipeline(long),
+    });
+    expect((await engine.generate('p', GIST_GENERATION)).length).toBe(2000);
+    expect((await engine.generate('p', TITLE_GENERATION)).length).toBe(200);
+  });
+
+  it('gives Nano its temperature/topK, clamped to the device bounds', async () => {
+    const create = vi.fn(async () => ({ prompt: async () => 'a nano title', destroy: vi.fn() }));
+    const lm = {
+      availability: async () => 'available',
+      params: async () => ({ maxTopK: 8, maxTemperature: 2 }),
+      create,
+    } as unknown as BuiltinLanguageModel;
+    const engine = (await nanoEngineIfAvailable(lm)) as GenerationEngine;
+    await engine.generate('p', TITLE_GENERATION);
+    const opts = (create.mock.calls[0] as unknown as [{ temperature: number; topK: number }])[0];
+    expect(opts.temperature).toBe(GENERATION_TEMPERATURE);
+    expect(opts.topK).toBe(8);
+  });
+
+  it('falls back to a plain session when Chrome rejects the sampling params', async () => {
+    const session = { prompt: async () => 'a nano title', destroy: vi.fn() };
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('topK out of range'))
+      .mockResolvedValueOnce(session);
+    const lm = {
+      availability: async () => 'available',
+      create,
+    } as unknown as BuiltinLanguageModel;
+    const engine = (await nanoEngineIfAvailable(lm)) as GenerationEngine;
+    // Generation still happens — losing the knobs must not lose the output.
+    expect(await engine.generate('p', TITLE_GENERATION)).toBe('a nano title');
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });
 
