@@ -2797,11 +2797,35 @@ const buildContentLaneDeps = async (
         }
       }
     : undefined;
+  // Authoritative neighbor-URL → workstream lookup for the lane's join. The
+  // resolver's snapshot is SCOPED to the batch's query URLs, so a neighbor's
+  // membership edges are usually absent from it — joining on the snapshot
+  // alone reported "none filed to a workstream" while live neighbors were
+  // user-filed. The URL projection is the filing record of truth. STRICTLY
+  // the metadata-only read (SqliteConnectionsStore.readSnapshotMetadata):
+  // batch-resolve must never pay a full readCurrent / event-log fold for a
+  // lane (the route's perf contract, asserted in visitsRoutes.test.ts) — on
+  // any other store shape the lane keeps its snapshot-join fallback.
+  let lookupWorkstreamByUrl: ((canonicalUrl: string) => string | undefined) | undefined;
+  if (context.connectionsStore instanceof SqliteConnectionsStore) {
+    try {
+      const metadata = await context.connectionsStore.readSnapshotMetadata();
+      if (metadata?.urlProjection !== undefined) {
+        const projection = deserializeUrlProjection(metadata.urlProjection);
+        lookupWorkstreamByUrl = (canonicalUrl: string): string | undefined =>
+          projection.byCanonicalUrl.get(canonicalUrl)?.currentAttribution?.workstreamId ??
+          undefined;
+      }
+    } catch {
+      lookupWorkstreamByUrl = undefined;
+    }
+  }
   return {
     store,
     ...(embed === undefined ? {} : { embed }),
     embedderUsable,
     guessLanesEnabled: guessOn,
+    ...(lookupWorkstreamByUrl === undefined ? {} : { lookupWorkstreamByUrl }),
   };
 };
 

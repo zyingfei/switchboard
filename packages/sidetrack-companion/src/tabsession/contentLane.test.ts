@@ -324,6 +324,40 @@ describe('buildContentLane', () => {
     expect(lane.emptyReason).toBe('2 similar pages found, none filed to a workstream yet');
   });
 
+  it('(6c) joins neighbors through the PROJECTION lookup even when the scoped snapshot has no edges for them [the hatchet.run case]', async () => {
+    // Live falsification (user-caught, 2026-07-27): hatchet.run/blog/
+    // postgres-survival-guide was user-filed, yet the lane said "none filed"
+    // — the resolver's snapshot is scoped to the QUERY url, so neighbor
+    // membership edges are absent from it. The authoritative URL projection
+    // lookup must be consulted first; slash variants must both hit.
+    const embed = vi.fn(async () => vecOf(5));
+    const store = fakeStore({
+      vectorHits: [
+        vhit('u1', 'https://hatchet.run/blog/postgres-survival-guide', 'Postgres survival guide', 1),
+        // Projection stores the trailing-slash spelling for this one — the
+        // slash-variant discipline must still join it.
+        vhit('u2', 'https://openai.com/index/scaling-postgresql', 'Scaling PostgreSQL', 1),
+      ],
+    });
+    const filed = new Map<string, string>([
+      ['https://hatchet.run/blog/postgres-survival-guide', 'ws_pg'],
+      ['https://openai.com/index/scaling-postgresql/', 'ws_pg'],
+    ]);
+    const lane = await buildContentLane({
+      canonicalUrl: 'https://github.com/NikolayS/PGSimCity',
+      // Deliberately an EMPTY snapshot: the scoped subgraph carries no
+      // neighbor membership edges — the projection lookup must carry the join.
+      snapshot: snapshot(),
+      title: 'PGSimCity postgres',
+      store,
+      embed,
+      embedderUsable: true,
+      lookupWorkstreamByUrl: (url) => filed.get(url),
+    });
+    expect(lane.candidates.map((c) => c.workstreamId)).toEqual(['ws_pg']);
+    expect(lane.candidates[0]!.why).toContain('2 matches');
+  });
+
   it('recall store unavailable → typed empty', async () => {
     const lane = await buildContentLane({
       canonicalUrl: 'https://x.test/y',
