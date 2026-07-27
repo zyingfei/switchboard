@@ -17,13 +17,17 @@
 //  - "No auto" (confidence === 0): plain manual-picker affordance,
 //    no fake recommendation.
 
+import { useState } from 'react';
+
 import {
   confidenceLevelFromProbability,
   confidenceLevelLabel,
   isActionableLevel,
 } from '../../../src/sidepanel/suggestion/confidence';
 import { GuessLanes } from '../../../src/sidepanel/tabsession/GuessLanes';
+import { PipelineStrip } from '../../../src/sidepanel/tabsession/PipelineStrip';
 import type {
+  GuessGate,
   GuessLaneResult,
   ResolveOutcomeError,
   TabSessionWorkstreamOption,
@@ -62,6 +66,10 @@ interface NeedsOrganizeSuggestionProps {
   readonly lanes?: readonly GuessLaneResult[];
   readonly laneWorkstreams?: readonly TabSessionWorkstreamOption[];
   readonly onFileLane?: (workstreamId: string) => void;
+  // Pipeline-strip gate (feat/pipeline-strip) — the resolver's verdict for
+  // this thread, rendered as the compact strip's arrow line above the lanes.
+  // Absent on older companions; the strip then derives a count-based verdict.
+  readonly gate?: GuessGate;
   // Optional explicit re-fetch handle. Lets the user force the
   // companion to recompute the suggestion (e.g. after renaming a
   // workstream the panel hasn't picked up yet, or to verify that a
@@ -83,7 +91,12 @@ export function NeedsOrganizeSuggestion({
   lanes,
   laneWorkstreams,
   onFileLane,
+  gate,
 }: NeedsOrganizeSuggestionProps) {
+  // Open-state for the pipeline strip's dots-row toggle over the lanes
+  // disclosure (controls co-located with state). Hooks run unconditionally,
+  // before the busy-card early return below.
+  const [lanesOpen, setLanesOpen] = useState(false);
   // Busy/error outranks the empty "pick a workstream" fallback but NOT a
   // populated suggestion: only surface the amber busy card when the fetch
   // failed/hung AND we have no confident pick to show (a late success still
@@ -190,18 +203,33 @@ export function NeedsOrganizeSuggestion({
           ×
         </button>
       </div>
-      {/* Guess-lanes — surface the resolver's per-lane guesses behind the
-          shared disclosure ONLY when the fusion has no confident pick (the
-          honesty case the feature is for). With a recommendation the lanes are
-          redundant noise; without one, they show that "no auto-suggestion"
-          doesn't mean every signal was silent. Absent on old companions →
-          GuessLanes never mounts. */}
+      {/* Pipeline strip + guess-lanes — surface the resolver's compact verdict
+          strip and per-lane guesses behind the shared disclosure ONLY when the
+          fusion has no confident pick (the honesty case the feature is for).
+          With a recommendation the lanes are redundant noise; without one, they
+          show that "no auto-suggestion" doesn't mean every signal was silent.
+          Absent on old companions → neither mounts. Same placement rule as the
+          original lanes block. */}
       {!hasRecommendation && lanes !== undefined && laneWorkstreams !== undefined ? (
-        <GuessLanes
-          lanes={lanes}
-          workstreams={laneWorkstreams}
-          {...(onFileLane === undefined ? {} : { onFileHere: onFileLane })}
-        />
+        <>
+          <PipelineStrip
+            lanes={lanes}
+            workstreams={laneWorkstreams}
+            {...(gate === undefined ? {} : { gate })}
+            fusedCount={hasNonZeroConfidence ? 1 : 0}
+            open={lanesOpen}
+            onToggle={() => {
+              setLanesOpen((prev) => !prev);
+            }}
+          />
+          <GuessLanes
+            lanes={lanes}
+            workstreams={laneWorkstreams}
+            open={lanesOpen}
+            onToggle={setLanesOpen}
+            {...(onFileLane === undefined ? {} : { onFileHere: onFileLane })}
+          />
+        </>
       ) : null}
     </div>
   );

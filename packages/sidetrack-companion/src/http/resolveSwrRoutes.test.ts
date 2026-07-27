@@ -242,6 +242,12 @@ describe('resolve-family SWR HTTP wiring', () => {
     // The additive marker lives at the TOP level, never inside `data`.
     expect((body.data as Record<string, unknown>)['resolveFreshness']).toBeUndefined();
     expect(body.resolveFreshness).toBe('fresh');
+    // Cache-seam (pipeline-gate): the additive decision.gate rides the resolver
+    // cache untouched — it is a plain JSON object on the decision, so the SWR
+    // JSON round-trip serves it byte-identically. This edgeless single-URL probe
+    // has no candidate, so the gate is 'no-candidates'.
+    const served = body.data as { decision: { gate?: { reason: string } } };
+    expect(served.decision.gate?.reason).toBe('no-candidates');
   });
 });
 

@@ -7940,12 +7940,19 @@ const routes: readonly RouteDefinition[] = [
           // Guess lanes ride as a TOP-LEVEL field (alongside data +
           // selfNomination), not inside the Suggestion[] data array —
           // resolution.lanes is present iff SIDETRACK_GUESS_LANES is on.
+          // The policy gate rides the same way: this compatibility route
+          // projects Suggestion[] and never exposed the decision object, so
+          // the panel's pipeline strip reads the gate top-level here (it
+          // reads decision.gate on the URL/tab-session routes).
           return [
             200,
             {
               data: suggestions,
               selfNomination,
               ...(resolution.lanes === undefined ? {} : { lanes: resolution.lanes }),
+              ...(resolution.decision.gate === undefined
+                ? {}
+                : { gate: resolution.decision.gate }),
             },
           ];
         },

@@ -26,6 +26,7 @@ import {
   type AttributionAction,
   type AttributionPolicyMode,
   type AttributionPolicyTelemetry,
+  type PolicyGate,
 } from './policy.js';
 import { buildSimilarityEvidence } from './similarity.js';
 import type { TabSessionProjection } from './projection.js';
@@ -73,6 +74,11 @@ export interface ResolutionResult {
     readonly action: AttributionAction;
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-gate: WHICH policy gate decided this outcome (additive wire
+    // field). Always present on decisions from decideAttribution; optional here
+    // only because the round-guard's declined-URL settle builds its own inbox
+    // decision (which also carries a gate — see resolveUrlAttribution).
+    readonly gate?: PolicyGate;
   };
   readonly fusedCandidates: readonly ResolverCandidate[];
   readonly reasons: {
@@ -125,6 +131,11 @@ interface ResolvedTargetAttribution {
     readonly action: AttributionAction;
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-gate: WHICH policy gate decided this outcome (additive wire
+    // field). Always present on decisions from decideAttribution; optional here
+    // only because the round-guard's declined-URL settle builds its own inbox
+    // decision (which also carries a gate — see resolveUrlAttribution).
+    readonly gate?: PolicyGate;
   };
   readonly fusedCandidates: readonly ResolverCandidate[];
   readonly reasons: {
@@ -451,6 +462,11 @@ export interface UrlResolutionResult {
     readonly action: AttributionAction;
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-gate: WHICH policy gate decided this outcome (additive wire
+    // field). Always present on decisions from decideAttribution; optional here
+    // only because the round-guard's declined-URL settle builds its own inbox
+    // decision (which also carries a gate — see resolveUrlAttribution).
+    readonly gate?: PolicyGate;
   };
   readonly fusedCandidates: readonly ResolverCandidate[];
   readonly reasons: {
@@ -628,7 +644,15 @@ export const resolveUrlAttribution = (input: ResolveUrlAttributionInput): UrlRes
       canonicalUrl: input.canonicalUrl,
       dryRun: true,
       ...withLanes,
-      decision: { action: 'inbox', margin: 0 },
+      // The user explicitly declined a workstream for this URL — not a gate
+      // failure, a settled decision. Report 'no-candidates' (the strip's
+      // "nothing to promote" reason) with a detail that names the settle so a
+      // reader does not mistake it for a weak-signal inbox.
+      decision: {
+        action: 'inbox',
+        margin: 0,
+        gate: { reason: 'no-candidates', detail: 'user declined — not in any stream' },
+      },
       fusedCandidates: [],
     };
   }
@@ -664,6 +688,11 @@ export interface ThreadResolutionResult {
     readonly action: AttributionAction;
     readonly workstreamId?: string;
     readonly margin: number;
+    // Pipeline-gate: WHICH policy gate decided this outcome (additive wire
+    // field). Always present on decisions from decideAttribution; optional here
+    // only because the round-guard's declined-URL settle builds its own inbox
+    // decision (which also carries a gate — see resolveUrlAttribution).
+    readonly gate?: PolicyGate;
   };
   readonly fusedCandidates: readonly ResolverCandidate[];
   readonly reasons: {

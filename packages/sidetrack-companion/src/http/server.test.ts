@@ -2573,6 +2573,7 @@ describe('companion HTTP server', () => {
     // Present ⇒ all six lanes, fixed order (SIDETRACK_GUESS_LANES default ON).
     const suggestionsBody = suggestions.body as {
       readonly lanes?: readonly { readonly lane: string }[];
+      readonly gate?: { readonly reason: string; readonly detail: string };
     };
     expect(suggestionsBody.lanes?.map((lane) => lane.lane)).toEqual([
       'graph',
@@ -2582,6 +2583,11 @@ describe('companion HTTP server', () => {
       'domain',
       'recency',
     ]);
+    // The policy gate rides top-level the same way (this compatibility route
+    // never exposed the decision object) — the panel's pipeline strip reads
+    // it here to say WHY the pipeline stopped where it did.
+    expect(typeof suggestionsBody.gate?.reason).toBe('string');
+    expect(typeof suggestionsBody.gate?.detail).toBe('string');
     expect(health.body).toMatchObject({
       data: {
         recall: {

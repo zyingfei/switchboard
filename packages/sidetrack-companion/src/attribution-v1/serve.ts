@@ -59,6 +59,7 @@ import {
   decideVoteArm,
   gatedDomainWorkstream,
   titleNearestWorkstream,
+  type VoteArmDecision,
 } from './eval/prequential.js';
 // Type-only import: serve.ts must not pull the resolver's PPR/similarity/cluster
 // runtime graph onto its (light) import path — it only needs the result shapes.
@@ -66,6 +67,7 @@ import type {
   ResolverCandidate,
   UrlResolutionResult,
 } from '../tabsession/resolver.js';
+import type { PolicyGate } from '../tabsession/policy.js';
 
 export const ATTRIBUTION_ARM_ENV = 'SIDETRACK_ATTRIBUTION_ARM';
 
@@ -203,6 +205,67 @@ export interface ResolveUrlAttributionVote3Input {
   readonly autoApplyEnabled?: boolean;
 }
 
+// Map the vote arm's own gate logic onto the FROZEN pipeline-gate enum (the same
+// `decision.gate` the incumbent policy emits from decideAttribution). The enum is
+// shared with the graph resolver so the strip pattern-matches one vocabulary; the
+// vote arm's specificity lives in the detail line, in VOTE vocabulary (plurality,
+// signals) not graph vocabulary (logit, PPR). The mapping:
+//
+//   vote-arm situation                         →  gate.reason     detail vocabulary
+//   ------------------------------------------    -------------      -----------------
+//   no signal voted (abstainReason no-winner)  →  no-candidates   "no vote signal"
+//   privacy tombstone abstain (page/domain)    →  no-candidates   "tombstoned — no vote"
+//   title missing from winning plurality (2a)  →  corroboration   "plurality lacks title vote (…)"
+//   winner below the suggest vote floor        →  below-suggest   "1 vote < N-vote suggest floor"
+//   tier === 'suggest'                         →  cleared-suggest "cleared: N-signal plurality (…)"
+//   tier === 'auto-apply'                      →  cleared-auto    "cleared: N-signal unanimous (…)"
+//
+// 'margin-tie' and 'regret-budget' are graph-resolver-only gates; the vote arm has
+// no continuous margin or per-source regret telemetry, so it never emits them.
+const voteArmGate = (decision: VoteArmDecision): PolicyGate => {
+  // Abstained — the vote arm surfaced nothing. Distinguish the correlated-prior
+  // guard (title absent from the plurality) from a bare no-winner: the guard
+  // maps to 'corroboration' (the same "needs a corroborating page-evidence
+  // signal" shape the incumbent's corroboration gate has), the no-winner to
+  // 'no-candidates'.
+  if (decision.abstainReason === 'no-title-evidence') {
+    const priors = decision.voters.join(', ');
+    return {
+      reason: 'corroboration',
+      detail: `plurality lacks title vote (${String(decision.votes)} prior${decision.votes === 1 ? '' : 's'}: ${priors})`,
+    };
+  }
+  if (decision.tier === 'inbox' || decision.workstreamId === null) {
+    return { reason: 'no-candidates', detail: 'no vote signal' };
+  }
+  // A winner below the suggest vote floor — not reachable today (a plurality
+  // winner has >= 1 vote and the floor is 1) but mapped so the enum is complete
+  // and a future floor lift (VOTE3_SUGGEST_MIN_VOTES > 1) reports honestly.
+  if (decision.votes < VOTE3_SUGGEST_MIN_VOTES) {
+    return {
+      reason: 'below-suggest',
+      detail: `${String(decision.votes)} vote${decision.votes === 1 ? '' : 's'} < ${String(VOTE3_SUGGEST_MIN_VOTES)}-vote suggest floor`,
+    };
+  }
+  const voters = decision.voters.join(', ');
+  if (decision.tier === 'auto-apply') {
+    return {
+      reason: 'cleared-auto',
+      detail: `cleared: ${String(decision.votes)}-signal unanimous (${voters})`,
+    };
+  }
+  return {
+    reason: 'cleared-suggest',
+    detail: `cleared: ${String(decision.votes)}-signal plurality (${voters})`,
+  };
+};
+
+// The privacy-tombstone abstain gate — a purged page/domain is withheld before
+// any vote runs. Distinct detail from the no-winner case so an auditor can tell
+// a HIDE apart from a genuine no-signal abstain, but the SAME 'no-candidates'
+// reason (both mean "nothing to promote").
+const TOMBSTONE_GATE: PolicyGate = { reason: 'no-candidates', detail: 'tombstoned — no vote' };
+
 // Resolve a URL's attribution under the servable vote3 arm. Pure over the state
 // + visit triple (no I/O, no clock) — the caller supplies the loaded state and
 // the title. Returns a UrlResolutionResult so the arm switch is a drop-in for
@@ -238,7 +301,11 @@ export const resolveUrlAttributionVote3 = (
       ...(input.title === null ? {} : { title: input.title }),
     })
   ) {
-    return { ...inboxBase(0, null), decision: { action: 'inbox', margin: 0 }, fusedCandidates: [] };
+    return {
+      ...inboxBase(0, null),
+      decision: { action: 'inbox', margin: 0, gate: TOMBSTONE_GATE },
+      fusedCandidates: [],
+    };
   }
 
   const titleVote = titleNearestWorkstream(input.state, input.title, domain);
@@ -262,10 +329,13 @@ export const resolveUrlAttributionVote3 = (
   );
 
   const base = inboxBase(decision.votes, decision.workstreamId);
+  const gate = voteArmGate(decision);
 
   // Guard fired (no winner, or the correlated-prior guard abstained) ⇒ inbox.
+  // The gate carries WHICH: 'corroboration' when the title vote was missing from
+  // the plurality (rule 2a), 'no-candidates' when nothing voted.
   if (decision.tier === 'inbox' || decision.workstreamId === null) {
-    return { ...base, decision: { action: 'inbox', margin: 0 }, fusedCandidates: [] };
+    return { ...base, decision: { action: 'inbox', margin: 0, gate }, fusedCandidates: [] };
   }
 
   const candidate = voteCandidate(
@@ -276,7 +346,12 @@ export const resolveUrlAttributionVote3 = (
 
   return {
     ...base,
-    decision: { action: decision.tier, workstreamId: decision.workstreamId, margin: decision.votes },
+    decision: {
+      action: decision.tier,
+      workstreamId: decision.workstreamId,
+      margin: decision.votes,
+      gate,
+    },
     fusedCandidates: [candidate],
   };
 };

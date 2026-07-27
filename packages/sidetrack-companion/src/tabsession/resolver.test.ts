@@ -62,6 +62,31 @@ const snapshot = (
   edgeCount: edges.length,
 });
 
+// A single-channel CandidateEvidence for the gate tests: zeros everywhere the
+// caller does not override, with corroborationCount DERIVED exactly as the
+// resolver derives it (ppr > 0.01, sim > 0, cluster > 0 each contribute one) so
+// the fused pick's corroboration matches a real resolve rather than a magic
+// number. The gate tests then read the ACTUAL fused logit rather than a
+// hand-computed one, so a fusion-weight change re-derives the fixtures instead
+// of silently breaking them.
+const lone = (over: Partial<CandidateEvidence> & { readonly workstreamId: string }): CandidateEvidence => {
+  const pprScore = over.pprScore ?? 0;
+  const simTopScore = over.simTopScore ?? 0;
+  const clusterPosterior = over.clusterPosterior ?? 0;
+  return {
+    workstreamId: over.workstreamId,
+    pprScore,
+    simTopScore,
+    simMeanScore: over.simMeanScore ?? 0,
+    simAgreement: over.simAgreement ?? 0,
+    simMargin: over.simMargin ?? 0,
+    clusterPosterior,
+    corroborationCount:
+      over.corroborationCount ??
+      (pprScore > 0.01 ? 1 : 0) + (simTopScore > 0 ? 1 : 0) + (clusterPosterior > 0 ? 1 : 0),
+  };
+};
+
 const observed = (
   seq: number,
   tabSessionId: string,
@@ -534,6 +559,112 @@ describe('tab-session resolver', () => {
     expect(candidate!.rawFusionLogit).toBeGreaterThanOrEqual(1.2); // would otherwise 'suggest'
     // Guard still fires despite the flip → held in inbox, not suggested.
     expect(decideAttribution([candidate!], 'balanced').action).toBe('inbox');
+  });
+
+  // ---- pipeline-gate: decision.gate names WHICH policy gate decided ----
+  //
+  // Every decision carries a `gate` (frozen wire contract). Inbox outcomes name
+  // the FIRST failing gate in evaluation order (corroboration → suggest-logit →
+  // margin); cleared outcomes carry cleared-suggest/cleared-auto; the regret
+  // budget demotes an auto-eligible pick to suggest and says so. The detail line
+  // carries the actual numbers so the strip can explain the outcome to a human.
+  describe('decision.gate (pipeline-gate)', () => {
+    it('no-candidates when nothing reaches fusion', () => {
+      const decision = decideAttribution([], 'balanced');
+      expect(decision.action).toBe('inbox');
+      expect(decision.gate.reason).toBe('no-candidates');
+    });
+
+    it('cleared-auto for a strong pick clearing the auto bar, with the numbers in detail', () => {
+      // ppr 1.0 → logit ~3.8 (>= 2.8 auto), single candidate so margin is the
+      // logit itself (>= 0.35), corroboration 1 (ppr contributes), regret 0.
+      const fused = fuseCandidates([lone({ workstreamId: 'ws', pprScore: 1.0 })]);
+      const decision = decideAttribution(fused, 'balanced');
+      expect(decision.action).toBe('auto-apply');
+      expect(decision.gate.reason).toBe('cleared-auto');
+      expect(decision.gate.detail).toContain('2.8 auto bar');
+    });
+
+    it('cleared-suggest for a pick in the suggest band (below the auto bar)', () => {
+      // ppr 0.5 → logit ~1.65 (>= 1.2 suggest, < 2.8 auto), margin = logit.
+      const fused = fuseCandidates([lone({ workstreamId: 'ws', pprScore: 0.5 })]);
+      const decision = decideAttribution(fused, 'balanced');
+      expect(decision.action).toBe('suggest');
+      expect(decision.gate.reason).toBe('cleared-suggest');
+      expect(decision.gate.detail).toContain('1.2 suggest bar');
+    });
+
+    it('below-suggest when corroboration clears but the logit is under the suggest bar', () => {
+      // A weak cluster-only pick: cluster 0.5 → logit ~-0.25 (< 1.2 suggest),
+      // corroboration 1 (cluster contributes), requiredCorroboration 1 (cluster
+      // is the top raw channel, not similarity — the lift never fires).
+      const fused = fuseCandidates([lone({ workstreamId: 'ws', clusterPosterior: 0.5 })]);
+      const decision = decideAttribution(fused, 'balanced');
+      expect(decision.action).toBe('inbox');
+      expect(decision.gate.reason).toBe('below-suggest');
+      expect(decision.gate.detail).toContain('suggest bar');
+    });
+
+    it('corroboration (similarity-dominant) for a lone thin-similarity false-friend', () => {
+      // The false-friend shape: simTop the top raw channel, weak agreement,
+      // corroboration 1 < the lifted requirement of 2.
+      const [candidate] = fuseCandidates([
+        {
+          workstreamId: 'ws_agg',
+          pprScore: 0.0006,
+          simTopScore: 0.65,
+          simMeanScore: 0.65,
+          simAgreement: 0.2,
+          simMargin: 0.65,
+          clusterPosterior: 0,
+          corroborationCount: 1,
+        },
+      ]);
+      const decision = decideAttribution([candidate!], 'balanced');
+      expect(decision.action).toBe('inbox');
+      expect(decision.gate.reason).toBe('corroboration');
+      expect(decision.gate.detail).toContain('(similarity-dominant)');
+      expect(decision.gate.detail).toContain('< 2');
+    });
+
+    it('margin-tie when logit + corroboration clear but the runner-up is too close', () => {
+      // Two ppr picks a hair apart: top logit ~1.65, second ~1.55 → margin 0.10
+      // < 0.35. Top clears the suggest logit and corroboration, so margin is the
+      // first failing gate.
+      const fused = fuseCandidates([
+        lone({ workstreamId: 'ws_top', pprScore: 0.5 }),
+        lone({ workstreamId: 'ws_second', pprScore: 0.48 }),
+      ]);
+      const decision = decideAttribution(fused, 'balanced');
+      expect(decision.action).toBe('inbox');
+      expect(decision.gate.reason).toBe('margin-tie');
+      expect(decision.gate.detail).toContain('< 0.35');
+    });
+
+    it('reports the FIRST failing gate: both below-suggest AND margin failing → below-suggest', () => {
+      // Two weak cluster picks: top logit ~-0.25 (< 1.2 suggest) AND margin tiny.
+      // The suggest-logit gate is earlier in the order, so it wins the reason.
+      const fused = fuseCandidates([
+        lone({ workstreamId: 'ws_top', clusterPosterior: 0.5 }),
+        lone({ workstreamId: 'ws_second', clusterPosterior: 0.49 }),
+      ]);
+      const decision = decideAttribution(fused, 'balanced');
+      expect(decision.action).toBe('inbox');
+      expect(decision.gate.reason).toBe('below-suggest');
+    });
+
+    it('regret-budget demotes an auto-eligible pick to suggest (auto→suggest)', () => {
+      // ppr 1.0 → logit ~3.8 clears the auto bar with margin + corroboration,
+      // but the per-source (ppr) online regret rate 0.5 exceeds the 0.08 budget,
+      // so the pick surfaces as SUGGEST and the gate names the regret budget.
+      const fused = fuseCandidates([lone({ workstreamId: 'ws', pprScore: 1.0 })]);
+      const decision = decideAttribution(fused, 'balanced', {
+        regretRateBySource: { ppr: 0.5 },
+      });
+      expect(decision.action).toBe('suggest');
+      expect(decision.gate.reason).toBe('regret-budget');
+      expect(decision.gate.detail).toContain('auto→suggest');
+    });
   });
 
   it('resolves a strong causal session with explainable candidates and no writes', () => {
