@@ -153,6 +153,8 @@ if (junkThreads.length === 0) {
 const PROMPT_PREFIX = [
   'You title documents for a personal research organizer.',
   'Write ONE descriptive title, 4 to 10 words, for the conversation below.',
+  'Write the title in the SAME language the conversation is mostly written',
+  'in (English conversation → English title, 中文对话 → 中文标题).',
   'Use ONLY facts present in the text. Name the specific technology,',
   'product, or question discussed. No quotes, no trailing punctuation.',
   'If the text is too thin to title faithfully, reply exactly: SKIP',
@@ -171,7 +173,13 @@ for (const t of junkThreads) {
   }
   const started = Date.now();
   const out = await cdpEval(ws, `(async () => {
-    const session = await LanguageModel.create();
+    // Bilingual vault: declare en+zh expected input/output (lets Chrome pull
+    // language packs; keeps zh output honest). Fallback: plain create().
+    const langOpts = {
+      expectedInputs: [{ type: 'text', languages: ['en', 'zh'] }],
+      expectedOutputs: [{ type: 'text', languages: ['en', 'zh'] }],
+    };
+    const session = await LanguageModel.create(langOpts).catch(() => LanguageModel.create());
     try {
       const reply = await session.prompt(${JSON.stringify(`${PROMPT_PREFIX}\n${'-'.repeat(3)}\n`)} + ${JSON.stringify(md)});
       return String(reply).trim();

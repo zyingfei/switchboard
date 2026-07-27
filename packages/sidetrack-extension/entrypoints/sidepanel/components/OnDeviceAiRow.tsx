@@ -23,8 +23,28 @@ interface BuiltinLanguageModel {
     monitor?: (m: {
       addEventListener: (type: 'downloadprogress', cb: (e: { loaded: number }) => void) => void;
     }) => void;
+    expectedInputs?: readonly { type: 'text'; languages: readonly string[] }[];
+    expectedOutputs?: readonly { type: 'text'; languages: readonly string[] }[];
   }) => Promise<{ destroy: () => void; prompt: (text: string) => Promise<string> }>;
 }
+
+// The vault is bilingual (English + Chinese threads); declaring both as
+// expected input AND output languages lets Chrome fetch any language pack it
+// needs and keeps output quality honest for zh content. Older Chromes that
+// reject the language options fall back to a plain create().
+const EVAL_LANGUAGES: readonly string[] = ['en', 'zh'];
+const createEvalSession = async (
+  lm: BuiltinLanguageModel,
+): Promise<{ destroy: () => void; prompt: (text: string) => Promise<string> }> => {
+  try {
+    return await lm.create({
+      expectedInputs: [{ type: 'text', languages: EVAL_LANGUAGES }],
+      expectedOutputs: [{ type: 'text', languages: EVAL_LANGUAGES }],
+    });
+  } catch {
+    return await lm.create();
+  }
+};
 
 const builtinLanguageModel = (): BuiltinLanguageModel | undefined => {
   const candidate = (globalThis as { LanguageModel?: unknown }).LanguageModel;
@@ -63,6 +83,8 @@ const EVAL_MARKDOWN_CHARS = 2200;
 const EVAL_PROMPT_PREFIX = [
   'You title documents for a personal research organizer.',
   'Write ONE descriptive title, 4 to 10 words, for the conversation below.',
+  'Write the title in the SAME language the conversation is mostly written',
+  'in (English conversation → English title, 中文对话 → 中文标题).',
   'Use ONLY facts present in the text. Name the specific technology,',
   'product, or question discussed. No quotes, no trailing punctuation.',
   'If the text is too thin to title faithfully, reply exactly: SKIP',
@@ -227,7 +249,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         const started = Date.now();
         let after: string;
         try {
-          const session = await lm.create();
+          const session = await createEvalSession(lm);
           try {
             after = (await session.prompt(`${EVAL_PROMPT_PREFIX}\n${markdown}`)).trim();
           } finally {
