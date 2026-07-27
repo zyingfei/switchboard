@@ -16,6 +16,17 @@ import {
   webGpuSupported,
   type WebGpuLoadProgress,
 } from '../../../src/sidepanel/nano/engine';
+import { TITLE_GENERATION } from '../../../src/sidepanel/nano/generationOptions';
+import { detectContentLanguage } from '../../../src/sidepanel/nano/language';
+import {
+  formatScores,
+  scoreGeneration,
+  type GenerationScores,
+} from '../../../src/sidepanel/nano/scoreGeneration';
+import {
+  validateGeneration,
+  type GenerationRejectionReason,
+} from '../../../src/sidepanel/nano/validateGeneration';
 
 // On-device AI (Gemini Nano / Chrome built-in Prompt API) availability row
 // for the Health panel's Experiments drill.
@@ -74,6 +85,18 @@ export interface TitleEvalResult {
   readonly before: string;
   readonly after: string;
   readonly ms: number;
+  /**
+   * Deterministic quality signals for `after`, measured against the source
+   * markdown (scoreGeneration.ts). Null for rows that never generated (thin
+   * content, engine error). Observe-only — the eval still writes nothing.
+   */
+  readonly scores: GenerationScores | null;
+  /**
+   * What the write-path validator WOULD have done with this output. Null means
+   * it would have been accepted. This is the number the user asked for: quality
+   * judged numerically, not by eyeball.
+   */
+  readonly rejection: GenerationRejectionReason | null;
 }
 
 export interface OnDeviceAiRowProps {
@@ -247,17 +270,36 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
             before: t.title ?? '',
             after: '(content too thin — skipped)',
             ms: 0,
+            scores: null,
+            rejection: null,
           });
           continue;
         }
         const started = Date.now();
         let after: string;
+        let failed = false;
         try {
-          after = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${markdown}`, { maxNewTokens: 32 });
+          after = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${markdown}`, TITLE_GENERATION);
         } catch (err) {
           after = `(error: ${String(err)})`;
+          failed = true;
         }
-        results.push({ threadId: t.bac_id, before: t.title ?? '', after, ms: Date.now() - started });
+        // Score EVERY generated row and show what the write-path validator
+        // would say about it. Still observe-only: nothing is persisted.
+        const verdict = failed
+          ? null
+          : validateGeneration(after, {
+              kind: 'title',
+              language: detectContentLanguage(markdown),
+            });
+        results.push({
+          threadId: t.bac_id,
+          before: t.title ?? '',
+          after,
+          ms: Date.now() - started,
+          scores: failed ? null : scoreGeneration(after, markdown),
+          rejection: verdict === null || verdict.ok ? null : verdict.reason,
+        });
         if (!mountedRef.current) return;
         setEvalResults([...results]);
       }
@@ -432,8 +474,16 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       {evalResults !== null ? (
         <div data-testid="hp-ondevice-ai-eval-results" style={{ marginTop: 6 }}>
           {evalResults.map((r) => (
-            <div key={r.threadId} className="mono" style={{ marginTop: 4 }}>
-              [{String(r.ms)}ms] “{r.before.length === 0 ? '(untitled)' : r.before}” → “{r.after}”
+            <div key={r.threadId} style={{ marginTop: 4 }}>
+              <div className="mono">
+                [{String(r.ms)}ms] “{r.before.length === 0 ? '(untitled)' : r.before}” → “{r.after}”
+              </div>
+              {r.scores !== null ? (
+                <div className="mono" data-testid={`hp-ondevice-ai-eval-scores-${r.threadId}`}>
+                  {formatScores(r.scores)}
+                  {r.rejection === null ? ' · accepted' : ` · REJECTED: ${r.rejection}`}
+                </div>
+              ) : null}
             </div>
           ))}
         </div>

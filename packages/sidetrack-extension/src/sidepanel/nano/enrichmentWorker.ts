@@ -8,6 +8,9 @@ import {
   TITLE_PROMPT_PREFIX,
 } from './titleSynthesis';
 import { cleanGeneratedTitle, type GenerationEngine } from './engine';
+import { TITLE_GENERATION } from './generationOptions';
+import { detectContentLanguage } from './language';
+import { validateGeneration } from './validateGeneration';
 
 // Budgeted background worker that PERSISTS Nano-synthesized titles via the
 // companion, feeding the recommendation corpus (title lane, FTS, title
@@ -109,20 +112,27 @@ export interface TitleEnrichmentRun {
 
 // Synthesize a title through a GenerationEngine (nano OR webgpu), mirroring the
 // Nano-direct synthesizeTitle discipline: thin-content gate, slice, SKIP/empty
-// → null, cleanup + cap. Kept here so the enrichment worker has one engine-
-// agnostic synthesis path.
+// → null, cleanup + cap, and — since 2026-07-27 — OUTPUT VALIDATION. A
+// persisted title feeds the title lane, FTS and title vectors, so a degenerate
+// one is corpus damage, not a cosmetic defect. Kept here so the enrichment
+// worker has one engine-agnostic synthesis path.
 const synthesizeTitleWithEngine = async (
   engine: GenerationEngine,
   content: string,
 ): Promise<string | null> => {
   if (content.trim().length < MIN_CONTENT_CHARS) return null;
+  const language = detectContentLanguage(content);
   const sample = sliceForSynthesis(content);
   try {
-    const raw = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${sample}`, { maxNewTokens: 32 });
+    const raw = await engine.generate(`${TITLE_PROMPT_PREFIX}\n${sample}`, TITLE_GENERATION);
     const cleaned = cleanGeneratedTitle(raw);
     if (cleaned.length === 0) return null;
     if (cleaned === 'SKIP') return null;
-    return cleaned.slice(0, MAX_TITLE_CHARS);
+    const verdict = validateGeneration(cleaned.slice(0, MAX_TITLE_CHARS), {
+      kind: 'title',
+      language,
+    });
+    return verdict.ok ? verdict.text : null;
   } catch {
     return null;
   }

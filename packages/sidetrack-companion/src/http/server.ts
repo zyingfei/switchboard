@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
+import { getDrainDegradation, type DrainDegradationSnapshot } from '../connections/drainDegradation.js';
 import { bridgeKeysMatch, isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import {
@@ -2039,6 +2040,13 @@ export interface ReliabilityHealthSection {
   // canary is registered or the window has no samples (absence of signal
   // is not a failure — an empty/just-booted vault reads idle, not broken).
   readonly resolveCanary: ResolveCanarySnapshot & { readonly status: 'ok' | 'degraded' | 'idle' };
+  // Drain degradation: times the HNSW delta-embedding similarity path threw
+  // and the drain fell back to re-embedding the WHOLE eligible corpus
+  // (minutes of ONNX instead of seconds — the measured cause of resolve
+  // p95 blowing past the extension's client timeout). Silent before this:
+  // the fallback only emitted a phase mark, and phase marks are off by
+  // default. Non-zero here means at least one drain ran the slow path.
+  readonly drainDegradation: DrainDegradationSnapshot;
   // Section availability derived from the canary status: 'ok' when
   // ok/idle, 'stale' when degraded. This is what the observability board
   // renders for the reliability lane.
@@ -2141,6 +2149,7 @@ export const buildReliabilityHealthSection = async (
     } as const;
     return {
       resolveCanary: { ...idleSnapshot, status: 'idle' },
+      drainDegradation: getDrainDegradation(),
       availability: 'ok',
       walBytes,
       ...doubleBufferSection,
@@ -2154,6 +2163,7 @@ export const buildReliabilityHealthSection = async (
   const availability: SectionAvailability = status === 'degraded' ? 'stale' : 'ok';
   return {
     resolveCanary: { ...snapshot, status },
+    drainDegradation: getDrainDegradation(),
     availability,
     walBytes,
     ...doubleBufferSection,

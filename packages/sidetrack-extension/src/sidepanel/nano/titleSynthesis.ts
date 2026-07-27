@@ -1,5 +1,12 @@
 import { fnv1a32Hex } from '../../graph/fnv1a';
 import { NANO_SESSION_LANGUAGES, detectContentLanguage, nanoCanServe } from './language';
+import {
+  TITLE_GENERATION,
+  clampNanoSampling,
+  type NanoModelParams,
+  type NanoSamplingParams,
+} from './generationOptions';
+import { validateGeneration } from './validateGeneration';
 
 // Title synthesis on Gemini Nano (Chrome built-in Prompt API), extracted from
 // the OnDeviceAiRow eval so the observe-only eval AND the budgeted background
@@ -15,12 +22,20 @@ import { NANO_SESSION_LANGUAGES, detectContentLanguage, nanoCanServe } from './l
 // Minimal ambient shape for the built-in Prompt API — not yet in TS's DOM lib.
 export interface BuiltinLanguageModel {
   availability: () => Promise<string>;
+  /**
+   * Sampling bounds for this device. Optional: older Chromes do not expose it,
+   * and when it is missing we clamp to conservative fallbacks instead.
+   */
+  params?: () => Promise<NanoModelParams | undefined>;
   create: (options?: {
     monitor?: (m: {
       addEventListener: (type: 'downloadprogress', cb: (e: { loaded: number }) => void) => void;
     }) => void;
     expectedInputs?: readonly { type: 'text'; languages: readonly string[] }[];
     expectedOutputs?: readonly { type: 'text'; languages: readonly string[] }[];
+    /** Prompt-API decoding controls. Must be passed together or create throws. */
+    temperature?: number;
+    topK?: number;
   }) => Promise<{ destroy: () => void; prompt: (text: string) => Promise<string> }>;
 }
 
@@ -45,12 +60,56 @@ export const builtinLanguageModel = (): BuiltinLanguageModel | undefined => {
 // fall back to a plain create().
 export const SESSION_LANGUAGES: readonly string[] = NANO_SESSION_LANGUAGES;
 
-export const createNanoSession = async (lm: BuiltinLanguageModel): Promise<NanoSession> => {
+/**
+ * Read this device's Prompt-API sampling bounds, best-effort. Never throws; a
+ * browser without `params()` yields null and the caller clamps to fallbacks.
+ */
+export const readNanoParams = async (lm: BuiltinLanguageModel): Promise<NanoModelParams | null> => {
   try {
-    return await lm.create({
-      expectedInputs: [{ type: 'text', languages: SESSION_LANGUAGES }],
-      expectedOutputs: [{ type: 'text', languages: SESSION_LANGUAGES }],
-    });
+    return (await lm.params?.()) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+/** Resolve the sampling params to hand Nano for one generation preset. */
+export const nanoSamplingFor = async (
+  lm: BuiltinLanguageModel,
+  opts: Parameters<typeof clampNanoSampling>[0],
+): Promise<NanoSamplingParams> => clampNanoSampling(opts, await readNanoParams(lm));
+
+/**
+ * Create a Nano session, optionally with explicit decoding params.
+ *
+ * The Prompt API's ONLY anti-degeneracy lever is `temperature` + `topK` at
+ * create() time (no repetition penalty, no n-gram ban — see
+ * generationOptions.ts). Chrome REJECTS out-of-range values, so the request
+ * degrades in three steps rather than failing the whole generation:
+ * sampling+languages → languages → plain. Callers that pass no sampling get
+ * exactly the previous behavior.
+ */
+export const createNanoSession = async (
+  lm: BuiltinLanguageModel,
+  sampling?: NanoSamplingParams,
+): Promise<NanoSession> => {
+  const languageOptions = {
+    expectedInputs: [{ type: 'text' as const, languages: SESSION_LANGUAGES }],
+    expectedOutputs: [{ type: 'text' as const, languages: SESSION_LANGUAGES }],
+  };
+  if (sampling !== undefined) {
+    try {
+      return await lm.create({
+        ...languageOptions,
+        temperature: sampling.temperature,
+        topK: sampling.topK,
+      });
+    } catch {
+      // Out-of-range or unsupported sampling params — keep the session, lose
+      // the knobs. validateGeneration() is the backstop either way.
+    }
+  }
+  try {
+    return await lm.create(languageOptions);
   } catch {
     return await lm.create();
   }
@@ -89,6 +148,41 @@ export const GIST_PROMPT_PREFIX = [
   'If the text is too thin to summarize faithfully, reply exactly: SKIP',
   '',
   'Content:',
+  '---',
+].join('\n');
+
+// CHUNK pass of the chunk-then-synthesize gist path (chunking.ts): one factual
+// sentence about ONE section of a document. Deliberately narrower than the gist
+// prompt — asking a 1B model for "2-3 sentences + entities" about a 1800-char
+// fragment invites padding, and padding is where the repetition loops start.
+export const CHUNK_GIST_PROMPT_PREFIX = [
+  'You summarize documents for a personal research organizer.',
+  'Write ONE factual sentence describing what this SECTION of a document says.',
+  'Write in the SAME language the section is mostly written in',
+  '(English section → English sentence, 中文段落 → 中文句子).',
+  'Use ONLY facts present in the text. No preamble, no meta-commentary, no',
+  'quotes of these instructions.',
+  'If the section is too thin to summarize faithfully, reply exactly: SKIP',
+  '',
+  'Section:',
+  '---',
+].join('\n');
+
+// FINAL pass of the chunk-then-synthesize gist path: merge the per-section
+// sentences into the 2-3 sentence gist. Its input is only ever the chunk gists,
+// never raw page text — that is what caps the recursion at one extra level.
+export const GIST_SYNTHESIS_PROMPT_PREFIX = [
+  'You summarize documents for a personal research organizer.',
+  'Below are one-sentence notes taken from consecutive sections of ONE',
+  'document, in reading order. Merge them into a factual 2 to 3 sentence',
+  'summary of the whole document, then list the key entities (people,',
+  'products, technologies, questions) it covers.',
+  'Write in the SAME language the notes are mostly written in',
+  '(English notes → English summary, 中文笔记 → 中文摘要).',
+  'Use ONLY facts present in the notes. Do not mention the notes, the',
+  'sections, or these instructions.',
+  '',
+  'Notes:',
   '---',
 ].join('\n');
 
@@ -138,20 +232,25 @@ export const contentHashOf = (content: string): string => fnv1a32Hex(content);
  * Synthesize a title from raw content on Gemini Nano. Returns null on thin
  * content (< MIN_CONTENT_CHARS after trim), content Nano cannot serve (Chinese
  * — see language.ts; a wrong-language title is worse than no title), an
- * explicit SKIP, an empty reply, or any error — the caller treats null as "no
- * title, don't persist". The returned title is trimmed and capped to
- * MAX_TITLE_CHARS.
+ * explicit SKIP, an empty reply, output that FAILS VALIDATION (repetition
+ * loops, digit soup, markup — validateGeneration.ts), or any error. The caller
+ * treats null as "no title, don't persist". The returned title is trimmed and
+ * capped to MAX_TITLE_CHARS.
+ *
+ * Nano has no repetition penalty and no n-gram ban; the sampling params below
+ * are the only decoding lever, so the validator is the real guarantee here.
  */
 export const synthesizeTitle = async (
   lm: BuiltinLanguageModel,
   content: string,
 ): Promise<string | null> => {
   if (content.trim().length < MIN_CONTENT_CHARS) return null;
-  if (!nanoCanServe(detectContentLanguage(content))) return null;
+  const language = detectContentLanguage(content);
+  if (!nanoCanServe(language)) return null;
   const sample = sliceForSynthesis(content);
   let session: NanoSession;
   try {
-    session = await createNanoSession(lm);
+    session = await createNanoSession(lm, await nanoSamplingFor(lm, TITLE_GENERATION));
   } catch {
     return null;
   }
@@ -159,7 +258,8 @@ export const synthesizeTitle = async (
     const raw = (await session.prompt(`${TITLE_PROMPT_PREFIX}\n${sample}`)).trim();
     if (raw.length === 0) return null;
     if (raw === 'SKIP') return null;
-    return raw.slice(0, MAX_TITLE_CHARS);
+    const verdict = validateGeneration(raw.slice(0, MAX_TITLE_CHARS), { kind: 'title', language });
+    return verdict.ok ? verdict.text : null;
   } catch {
     return null;
   } finally {

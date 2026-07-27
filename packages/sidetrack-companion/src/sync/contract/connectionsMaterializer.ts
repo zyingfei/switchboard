@@ -6,6 +6,7 @@ import {
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
 } from '../../annotations/events.js';
+import { recordSimilarityFullRebuildFallback } from '../../connections/drainDegradation.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
 import { createIncrementalConnectionsGraphView } from '../../connections/incrementalView.js';
 import { readVaultStores } from '../../connections/loader.js';
@@ -4343,6 +4344,12 @@ export const createConnectionsMaterializer = (
             err instanceof Error ? err.message : String(err)
           }`,
         );
+        // Make the degradation LOUD. The fallback below re-embeds the whole
+        // eligible corpus (minutes of ONNX) instead of the HNSW delta, and
+        // the phase mark above is invisible unless phase logs are enabled.
+        // Health reads this counter, so a drain that silently went from
+        // seconds to minutes now reports itself.
+        recordSimilarityFullRebuildFallback(err);
         const extras = await readSimilarityEvidenceExtras();
         visitSimilarity = await buildVisitSimilarity(
           similarityEntries,

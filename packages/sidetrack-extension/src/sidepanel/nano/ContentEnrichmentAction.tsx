@@ -1,13 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 
-import {
-  GIST_PROMPT_PREFIX,
-  MAX_GIST_CHARS,
-  MIN_CONTENT_CHARS,
-  contentHashOf,
-  sliceForSynthesis,
-} from './titleSynthesis';
+import { contentHashOf } from './titleSynthesis';
 import { resolveEngineForLanguage } from './engine';
+import { synthesizeGist, type GistMeta } from './gistSynthesis';
+import { rejectionCopy, type GenerationRejectionReason } from './validateGeneration';
 import {
   detectContentLanguage,
   routeEnrichmentEngine,
@@ -64,6 +60,8 @@ export type EnrichmentFailure =
   | { readonly kind: 'no-text' }
   | { readonly kind: 'cancelled' }
   | { readonly kind: 'engine'; readonly detail: string }
+  /** The model produced text and the text was unusable — nothing was saved. */
+  | { readonly kind: 'rejected'; readonly reason: GenerationRejectionReason }
   | { readonly kind: 'save'; readonly status: number };
 
 export interface ContentEnrichmentActionProps {
@@ -169,9 +167,19 @@ const failureCopy = (failure: EnrichmentFailure, kind: EnrichmentTarget['kind'])
       return 'cancelled — the page changed';
     case 'engine':
       return `model error — ${failure.detail.slice(0, 120)}`;
+    case 'rejected':
+      // The 2026-07-27 lesson said out loud: unusable output is a REPORTED
+      // outcome, not a silent save.
+      return `unusable summary — ${rejectionCopy(failure.reason)} · nothing saved`;
     case 'save':
       return `save failed (${String(failure.status)})`;
   }
+};
+
+/** "6 of 14 sections" — the chunk cap is stated, never applied silently. */
+export const coverageCopy = (meta: GistMeta | null): string => {
+  if (meta === null || meta.passes === 1 || meta.totalChunks <= 1) return '';
+  return ` · ${String(meta.usedChunks)}/${String(meta.totalChunks)} sections`;
 };
 
 /** A blocked route the user can actually fix from Health. */
@@ -186,22 +194,6 @@ interface ContentEnrichmentPayloadItem {
   readonly model: string;
   readonly generatedAt: string;
 }
-
-/**
- * Generate a gist from raw content through a ready engine, mirroring the title
- * synthesis discipline: thin-content gate, slice, SKIP/empty → null, cap to the
- * contract's ≤2000 chars.
- */
-const generateGist = async (
-  engine: { generate: (p: string, o: { maxNewTokens: number }) => Promise<string> },
-  content: string,
-): Promise<string | null> => {
-  if (content.trim().length < MIN_CONTENT_CHARS) return null;
-  const sample = sliceForSynthesis(content);
-  const raw = (await engine.generate(`${GIST_PROMPT_PREFIX}\n${sample}`, { maxNewTokens: 220 })).trim();
-  if (raw.length === 0 || raw === 'SKIP') return null;
-  return raw.slice(0, MAX_GIST_CHARS);
-};
 
 const targetKeyOf = (target: EnrichmentTarget): string =>
   target.kind === 'url' ? `url:${target.canonicalUrl}` : `thread:${target.bacId}`;
@@ -231,6 +223,8 @@ export function ContentEnrichmentAction({
   const [ranOn, setRanOn] = useState<'Nano' | 'WebGPU' | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [settled, setSettled] = useState(false);
+  // How much of the document the run actually covered — stated, not implied.
+  const [meta, setMeta] = useState<GistMeta | null>(null);
 
   // Pre-run routing: what the row can say BEFORE anything is clicked. Uses the
   // host's language hint (page title) — the run re-detects on the real text.
@@ -268,6 +262,7 @@ export function ContentEnrichmentAction({
     setRanOn(null);
     setElapsedMs(null);
     setSettled(false);
+    setMeta(null);
     setPhase((prev) =>
       prev === 'fetching' || prev === 'generating' || prev === 'saving' ? prev : 'idle',
     );
@@ -294,6 +289,7 @@ export function ContentEnrichmentAction({
     setFailure(null);
     setRanOn(null);
     setElapsedMs(null);
+    setMeta(null);
     const stale = (): boolean => targetKeyRef.current !== myKey;
     const cancel = (): void => {
       setPhase('error');
@@ -330,9 +326,11 @@ export function ContentEnrichmentAction({
       }
       setRanOn(engine.kind === 'nano' ? 'Nano' : 'WebGPU');
       setPhase('generating');
-      let generated: string | null;
+      // Chunk-then-synthesize + output validation. NOTHING generated here
+      // reaches the companion unvalidated (gistSynthesis.ts / validateGeneration.ts).
+      let outcome: Awaited<ReturnType<typeof synthesizeGist>>;
       try {
-        generated = await generateGist(engine, text);
+        outcome = await synthesizeGist(engine, text);
       } catch (err) {
         if (stale()) {
           cancel();
@@ -346,10 +344,17 @@ export function ContentEnrichmentAction({
         cancel();
         return;
       }
-      if (generated === null) {
+      setMeta(outcome.meta);
+      if (!outcome.ok) {
+        if (outcome.kind === 'rejected') {
+          setPhase('error');
+          setFailure({ kind: 'rejected', reason: outcome.reason });
+          return;
+        }
         setPhase('skipped');
         return;
       }
+      const generated = outcome.gist;
       setPhase('saving');
       const item: ContentEnrichmentPayloadItem = {
         kind: target.kind,
@@ -415,7 +420,7 @@ export function ContentEnrichmentAction({
           ? `gist saved${ranOn !== null ? ` · ${ranOn}` : ''}`
           : `${PHASE_COPY.done}${ranOn !== null ? ` · ${ranOn}` : ''}${
               elapsedMs === null ? '' : ` · ${(elapsedMs / 1000).toFixed(1)}s`
-            }`
+            }${coverageCopy(meta)}`
         : PHASE_COPY[phase];
 
   return (
