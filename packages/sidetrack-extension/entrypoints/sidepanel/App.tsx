@@ -5699,9 +5699,22 @@ const App = () => {
           return null;
         }
       }
-      // URL page: extract readable text through the background (same source the
-      // page-text indexer reads). The extract message returns the payload with
-      // content.text; no indexing side effect.
+      // URL page: PREFER the text the companion ALREADY indexed. A page that
+      // shows "Indexed chunks" has its full extracted text stored at index
+      // time (_BAC/page-content/raw/*), so we read it straight back — no
+      // second live browser extract, no deeper-page-access requirement (which
+      // failed with "no obtainable text" on an already-indexed page). Only if
+      // the page is NOT indexed (404) do we fall back to a live extract.
+      try {
+        const indexed = await fetchCompanionJson<{ readonly text?: string }>(
+          `/v1/page-content/text?canonicalUrl=${encodeURIComponent(target.canonicalUrl)}`,
+        );
+        if (typeof indexed.text === 'string' && indexed.text.length > 0) return indexed.text;
+      } catch {
+        // Not indexed (404) or transport error — fall through to a live extract.
+      }
+      // Fallback: extract readable text through the background (same source the
+      // page-text indexer reads) for pages that were never indexed.
       if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return null;
       return await new Promise<string | null>((resolve) => {
         try {

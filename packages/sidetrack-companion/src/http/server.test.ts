@@ -214,6 +214,47 @@ describe('companion HTTP server', () => {
     expect((list.body as { data: unknown[] }).data).toEqual([]);
   });
 
+  it('GET /v1/page-content/text reads back the ALREADY-INDEXED page text (no re-extract)', async () => {
+    // The user's point: the page is already indexed, so the on-demand gist
+    // must read the stored text back, not trigger a second live extract.
+    const canonicalUrl = 'https://www.vincentschmalbach.com/ai-can';
+    const text = 'AI cannot do the last mile of judgment. '.repeat(40);
+    const { writePageContentExtracted } = await import('../page-content/store.js');
+    await writePageContentExtracted(vaultPath, {
+      payloadVersion: 1,
+      canonicalUrl,
+      url: canonicalUrl,
+      title: 'What AI Can and Cannot Do',
+      extractedAt: '2026-07-27T00:00:00.000Z',
+      extractionSource: 'reader-mode',
+      extractionPolicy: { trigger: 'manual' },
+      quality: 'high',
+      qualitySignals: {
+        extractedWordCount: 320,
+        contentToDomRatio: 0.99,
+        boilerplateFraction: 0,
+        extractionStrategy: 'reader-mode',
+        headingSignatureHash: 'abc',
+      },
+      content: { text, contentHash: 'hash-ai-can', charCount: text.length },
+    });
+
+    const got = await jsonFetch(
+      context,
+      `${baseUrl}/v1/page-content/text?canonicalUrl=${encodeURIComponent(canonicalUrl)}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(got.status).toBe(200);
+    expect((got.body as { data: { text: string } }).data.text).toContain('last mile of judgment');
+
+    const missing = await jsonFetch(
+      context,
+      `${baseUrl}/v1/page-content/text?canonicalUrl=${encodeURIComponent('https://never.indexed/x')}`,
+      { headers: { 'x-bac-bridge-key': bridgeKey } },
+    );
+    expect(missing.status).toBe(404);
+  });
+
   it('dedupes duplicate clientEventIds before batched timeline ingest', async () => {
     const payload = (input: {
       readonly eventId: string;

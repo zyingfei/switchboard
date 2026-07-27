@@ -107,6 +107,7 @@ import {
   queryPageContent,
   readPageContentCoverage,
   readPageContentCoverageMap,
+  readPageContentExtractedPayloadForEvidence,
   scanForOverCollapsedPageContent,
   type OverCollapsedRecord,
   writePageContentExtracted,
@@ -7808,6 +7809,53 @@ const routes: readonly RouteDefinition[] = [
           error instanceof Error ? error.message : 'Invalid canonicalUrl.',
         );
       }
+    },
+  },
+  {
+    // Read back the ALREADY-INDEXED page text for a canonical URL:
+    // { data: { canonicalUrl, title, text } } or 404 when not indexed.
+    // The panel's on-demand content enrichment generates a gist from this
+    // — the page is already extracted + stored at index time
+    // (_BAC/page-content/raw/<hash>.json), so there is no reason to trigger
+    // a SECOND live browser extract (which needs deeper page access and
+    // failed with "no obtainable text" on an already-indexed page). Reuses
+    // the exact reader page-evidence already uses; text only, no side
+    // effects. (User-caught, 2026-07-27: "you can index the page, why do
+    // you need another api?")
+    method: 'GET',
+    pattern: /^\/v1\/page-content\/text(?:\?.*)?$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      const canonicalUrl = url.searchParams.get('canonicalUrl');
+      if (canonicalUrl === null || canonicalUrl.length === 0) {
+        throw new HttpRouteError(
+          400,
+          'MISSING_PARAMETER',
+          'canonicalUrl query parameter is required.',
+          'GET /v1/page-content/text requires a canonicalUrl query parameter.',
+        );
+      }
+      const payload = await readPageContentExtractedPayloadForEvidence(vaultRoot, canonicalUrl);
+      if (payload === null) {
+        throw new HttpRouteError(
+          404,
+          'PAGE_NOT_INDEXED',
+          'No indexed page content for this URL.',
+          'The page has not been indexed (or its content was purged).',
+        );
+      }
+      return [
+        200,
+        {
+          data: {
+            canonicalUrl: payload.canonicalUrl,
+            ...(payload.title === undefined ? {} : { title: payload.title }),
+            text: payload.content.markdown ?? payload.content.text,
+          },
+        },
+      ];
     },
   },
   {
