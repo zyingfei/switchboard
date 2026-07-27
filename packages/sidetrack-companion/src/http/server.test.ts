@@ -182,6 +182,38 @@ describe('companion HTTP server', () => {
     expect(result.body).toMatchObject({ status: 'ok' });
   });
 
+  it('GET /v1/threads lists thread id+title, skips deleted, never 404s empty', async () => {
+    // Regression: the panel enrichment worker + WebGPU eval enumerate
+    // threads via GET /v1/threads; the route did not exist (only POST +
+    // per-thread projection/markdown), so the worker 404'd live.
+    const { mkdir, writeFile } = await import('node:fs/promises');
+    const threadsDir = join(vaultPath, '_BAC', 'threads');
+    await mkdir(threadsDir, { recursive: true });
+    await writeFile(
+      join(threadsDir, 'bac_a.json'),
+      JSON.stringify({ bac_id: 'bac_a', title: 'GCP Scale vs AWS' }),
+    );
+    await writeFile(
+      join(threadsDir, 'bac_b.json'),
+      JSON.stringify({ bac_id: 'bac_b', title: 'ChatGPT', deleted: true }),
+    );
+
+    const list = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(list.status).toBe(200);
+    const data = (list.body as { data: readonly { bac_id: string; title: string }[] }).data;
+    expect(data).toEqual([{ bac_id: 'bac_a', title: 'GCP Scale vs AWS' }]);
+  });
+
+  it('GET /v1/threads returns an empty list (not 404) when the threads dir is absent', async () => {
+    const list = await jsonFetch(context, `${baseUrl}/v1/threads`, {
+      headers: { 'x-bac-bridge-key': bridgeKey },
+    });
+    expect(list.status).toBe(200);
+    expect((list.body as { data: unknown[] }).data).toEqual([]);
+  });
+
   it('dedupes duplicate clientEventIds before batched timeline ingest', async () => {
     const payload = (input: {
       readonly eventId: string;

@@ -8651,6 +8651,44 @@ const routes: readonly RouteDefinition[] = [
     },
   },
   {
+    // List all chat threads: { data: [{ bac_id, title }] }. The panel's
+    // enrichment worker + eval enumerate threads to select junk-titled
+    // ones for on-device title synthesis; there was no GET list route
+    // (only the per-thread projection/markdown ones), so the worker's
+    // GET /v1/threads 404'd — caught live driving the WebGPU eval
+    // (2026-07-27). Reads the same `_BAC/threads/*.json` records
+    // buildSignals/readThreads already use; title/id only (no bodies —
+    // callers fetch markdown per thread on demand).
+    method: 'GET',
+    pattern: /^\/v1\/threads$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const { readFile: readFileFs, readdir: readdirFs } = await import('node:fs/promises');
+      const dir = join(vaultRoot, '_BAC', 'threads');
+      const names = await readdirFs(dir).catch(() => [] as string[]);
+      const records = await Promise.all(
+        names
+          .filter((name) => name.endsWith('.json'))
+          .map(async (name) => {
+            try {
+              const parsed = JSON.parse(
+                await readFileFs(join(dir, name), 'utf8'),
+              ) as { readonly bac_id?: unknown; readonly title?: unknown; readonly deleted?: unknown };
+              if (typeof parsed.bac_id !== 'string' || parsed.deleted === true) return null;
+              return {
+                bac_id: parsed.bac_id,
+                title: typeof parsed.title === 'string' ? parsed.title : '',
+              };
+            } catch {
+              return null;
+            }
+          }),
+      );
+      return [200, { data: records.filter((r): r is { bac_id: string; title: string } => r !== null) }];
+    },
+  },
+  {
     // Read the causal projection for a thread. Optional: existing
     // callers continue to read `_BAC/threads/<bac_id>.json` via
     // markdown / list endpoints. This endpoint exposes register

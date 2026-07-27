@@ -15,21 +15,28 @@
 // numeric-abort failure mode the PoC hit with 3.8.1). Idempotent; run from
 // wxt.config.ts before every build/dev.
 
-import { existsSync, mkdirSync, copyFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, copyFileSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = join(here, '..');
 
-// The files ORT's JSEP/WebGPU backend resolves at runtime. Base wasm is the
-// fallback proxy; jsep.{mjs,wasm} is the WebGPU-capable build.
-const ORT_FILES = [
-  'ort-wasm-simd-threaded.mjs',
-  'ort-wasm-simd-threaded.wasm',
-  'ort-wasm-simd-threaded.jsep.mjs',
-  'ort-wasm-simd-threaded.jsep.wasm',
-];
+// Which ORT glue/wasm files to bundle. ORT-web picks ONE build variant at
+// runtime from the capabilities it detects — jsep (WebGPU), jspi (JS Promise
+// Integration), asyncify (single-thread/proxy fallback), or the base build —
+// and dynamically imports the matching `ort-wasm-simd-threaded.<variant>.mjs`
+// (which in turn fetches its `.wasm`). Shipping only the jsep pair looked
+// right in the PoC (an http page), but the REAL extension load fell through
+// to the asyncify variant and 404'd on a module we had not copied
+// (chrome-extension://…/ort/ort-wasm-simd-threaded.asyncify.mjs — live MV3,
+// 2026-07-27). So copy the WHOLE `ort-wasm-simd-threaded.*` family (8 small
+// files) by prefix; ORT then finds whichever variant it resolves, all from
+// our own origin, and a new ORT variant on upgrade is picked up automatically.
+const ORT_FILE_PREFIX = 'ort-wasm-simd-threaded.';
+const ORT_FILE_SUFFIXES = ['.mjs', '.wasm'];
+const isOrtRuntimeFile = (name: string): boolean =>
+  name.startsWith(ORT_FILE_PREFIX) && ORT_FILE_SUFFIXES.some((s) => name.endsWith(s));
 
 const candidateDirs = [
   // transformers' pinned transitive onnxruntime-web (preferred — exact match).
@@ -55,9 +62,9 @@ export const copyOrtWasm = () => {
   }
   mkdirSync(destDir, { recursive: true });
   let copied = 0;
-  for (const file of ORT_FILES) {
+  const files = readdirSync(srcDir).filter(isOrtRuntimeFile);
+  for (const file of files) {
     const src = join(srcDir, file);
-    if (!existsSync(src)) continue;
     const dest = join(destDir, file);
     // Skip if already present with the same size (idempotent, fast on rebuilds).
     if (existsSync(dest) && statSync(dest).size === statSync(src).size) {
