@@ -83,6 +83,18 @@ final class CompanionController: ObservableObject {
     /// Whether the CDP endpoint of the test BROWSER (:9222) answers — the
     /// green dot next to "Start test browser".
     @Published private(set) var testBrowserRunning = false
+    /// Opt-in for the companion-side local LLM (SIDETRACK_LOCAL_LLM=1 on
+    /// the test companion's start command). Persisted; takes effect on
+    /// the NEXT start/restart of the test companion — the first sweep
+    /// downloads a ~1GB open model (Gemma-class) into the companion's
+    /// model cache, hence explicit opt-in, never a default.
+    @Published var localLlmOptIn: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                localLlmOptIn, forKey: Self.localLlmDefaultsKey)
+        }
+    }
+    static let localLlmDefaultsKey = "SidetrackLocalLlmOptIn"
     @Published var config: CompanionConfig {
         didSet {
             guard config != oldValue else { return }
@@ -102,6 +114,8 @@ final class CompanionController: ObservableObject {
 
     init(config: CompanionConfig = .load()) {
         self.config = config
+        self.localLlmOptIn = UserDefaults.standard.bool(
+            forKey: Self.localLlmDefaultsKey)
     }
 
     func start() {
@@ -330,6 +344,81 @@ final class CompanionController: ObservableObject {
         return token.isEmpty ? nil : token
     }
 
+    /// Trigger a companion-side title-synthesis sweep on the TEST
+    /// companion (POST /v1/enrichment/titles/sweep) and follow the job
+    /// status briefly. The sweep runs in the daemon's background — a
+    /// cold first run downloads the model (minutes); we surface that
+    /// honestly instead of spinning forever.
+    func runTitleSweep() {
+        let test = CompanionConfig(instance: .test)
+        lastActionMessage = "Title sweep…"
+        Task { [weak self] in
+            guard let self else { return }
+            guard let first = await Self.sweepRequest(config: test, method: "POST")
+            else {
+                self.lastActionMessage = "Sweep failed: companion not answering"
+                return
+            }
+            if first["disabled"] as? Bool == true {
+                self.lastActionMessage =
+                    "Local AI is off in the running companion — tick the box, then restart the test companion"
+                return
+            }
+            // Follow the job for up to ~60s; beyond that (cold model
+            // download) hand off to the user with an honest message.
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .seconds(5))
+                guard
+                    let status = await Self.sweepRequest(
+                        config: test, method: "GET")
+                else { continue }
+                let state = status["state"] as? String ?? "?"
+                let generated = status["generated"] as? Int ?? 0
+                let accepted = status["accepted"] as? Int ?? 0
+                if state == "done" {
+                    self.lastActionMessage =
+                        "Sweep done — \(generated) generated · \(accepted) accepted"
+                    return
+                }
+                if state == "error" {
+                    let message = status["error"] as? String ?? "unknown"
+                    self.lastActionMessage = "Sweep error: \(message)"
+                    return
+                }
+                self.lastActionMessage =
+                    "Sweep running… (\(generated) generated so far)"
+            }
+            self.lastActionMessage =
+                "Sweep still running (first run downloads the model — check Health later)"
+        }
+    }
+
+    /// One authenticated request against the sweep route. Returns the
+    /// decoded top-level JSON object (the companion wraps in `data`; we
+    /// unwrap when present), or nil on transport failure.
+    private nonisolated static func sweepRequest(
+        config: CompanionConfig, method: String
+    ) async -> [String: Any]? {
+        var request = URLRequest(
+            url: config.baseURL.appendingPathComponent("v1/enrichment/titles/sweep"))
+        request.httpMethod = method
+        request.timeoutInterval = 10
+        if let raw = try? String(
+            contentsOfFile: config.bridgeKeyPath, encoding: .utf8)
+        {
+            let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty {
+                request.setValue(key, forHTTPHeaderField: "x-bac-bridge-key")
+            }
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let json = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any]
+        else { return nil }
+        return (json["data"] as? [String: Any]) ?? json
+    }
+
     func copyTestPairToken() {
         guard let token = testPairToken() else {
             lastActionMessage = "No pair token yet — start the test companion once"
@@ -371,10 +460,16 @@ final class CompanionController: ObservableObject {
         let target = target ?? config
         let portEnv = "SIDETRACK_TEST_PORT=\(target.port)"
         let vaultEnv = "SIDETRACK_TEST_VAULT=\(shellQuote(target.vaultRoot))"
+        // The local-LLM opt-in rides the start command for the TEST
+        // instance only (the daily companion is never opted in from
+        // here) — flipping the box takes effect on the next start.
+        let llmEnv =
+            (target.instance == .test && localLlmOptIn)
+            ? "SIDETRACK_LOCAL_LLM=1 " : ""
         // scripts/run-test-companion.sh is invoked relative to the repo
         // root (set as the process cwd below).
         return
-            "\(portEnv) \(vaultEnv) screen -dmS \(screenSessionName(for: target)) /bin/zsh -lc 'exec scripts/run-test-companion.sh'"
+            "\(portEnv) \(vaultEnv) \(llmEnv)screen -dmS \(screenSessionName(for: target)) /bin/zsh -lc 'exec scripts/run-test-companion.sh'"
     }
 
     private func shellQuote(_ value: String) -> String {

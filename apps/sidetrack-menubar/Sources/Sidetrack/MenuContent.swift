@@ -225,7 +225,46 @@ struct MenuContent: View {
                         : "Chrome for Testing + the unpacked extension, CDP on :9222")
                 Spacer()
             }
+            localLlmRow
             pairingRow
+        }
+    }
+
+    /// Opt-in box for the companion-side local LLM (option 2 of the
+    /// small-LLM plan: an open Gemma-class sibling in the companion, so
+    /// title synthesis works with NO browser dependency — the test rig's
+    /// answer to Chrome-for-Testing's Nano wall). Applies to the TEST
+    /// companion's start command; needs a restart to take effect.
+    private var localLlmRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $controller.localLlmOptIn) {
+                Text("Local AI titles (test companion)")
+                    .font(.callout)
+            }
+            .toggleStyle(.checkbox)
+            .help(
+                "Runs an open Gemma-class model INSIDE the test companion for title synthesis — no browser needed. Downloads ~1GB on first sweep. Takes effect on the next test-companion start."
+            )
+            HStack(spacing: 6) {
+                if controller.localLlmOptIn {
+                    Button {
+                        controller.runTitleSweep()
+                    } label: {
+                        Label("Synthesize titles now", systemImage: "sparkles")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(controller.testStatus != .running)
+                    .help(
+                        controller.testStatus == .running
+                            ? "Run one budgeted title sweep in the test companion (first run downloads the model)"
+                            : "Start the test companion first")
+                    Text("restart companion after ticking")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
         }
     }
 

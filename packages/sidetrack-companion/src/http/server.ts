@@ -198,10 +198,10 @@ import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import { attributionArm } from '../attribution-v1/serve.js';
 import {
   ENTITY_TITLE_ENRICHED,
+  appendEnrichmentEvent,
   effectiveThreadTitle,
   effectiveUrlTitle,
   enrichmentLookupFromMerged,
-  isEntityTitleEnrichedPayload,
   loadEnrichmentLookup,
   loadEnrichmentLookupWithSignature,
   lookupSynthesizedTitle,
@@ -210,6 +210,13 @@ import {
   type EntityTitleEnrichedKind,
   type EntityTitleEnrichedPayload,
 } from '../enrichment/titleEnrichment.js';
+import {
+  LOCAL_LLM_ENV,
+  LOCAL_LLM_MODEL_ID,
+  getTitleSweepStatus,
+  localLlmEnabled,
+  startTitleSweep,
+} from '../enrichment/localLlm.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -5950,10 +5957,31 @@ const routes: readonly RouteDefinition[] = [
           ? context.connectionsStore.doubleBufferDiagnostics()
           : undefined;
       const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
+      // Local-LLM title-synthesis surface. Cheap + LIVE (an in-memory read of
+      // the sweep singleton, not the TTL'd base report): flag on/off, model
+      // id, and the last sweep summary (counts + finished-at). Skipped for
+      // staleness reasons is NOT a concern here — the read is O(1) and current.
+      const localLlm = ((): Record<string, unknown> => {
+        const sweep = getTitleSweepStatus();
+        return {
+          enabled: localLlmEnabled(),
+          flag: LOCAL_LLM_ENV,
+          modelId: LOCAL_LLM_MODEL_ID,
+          sweep: {
+            state: sweep.state,
+            ...(sweep.startedAt === undefined ? {} : { startedAt: sweep.startedAt }),
+            ...(sweep.finishedAt === undefined ? {} : { finishedAt: sweep.finishedAt }),
+            generated: sweep.generated,
+            accepted: sweep.accepted,
+            skipped: sweep.skipped,
+            ...(sweep.error === undefined ? {} : { error: sweep.error }),
+          },
+        };
+      })();
       return [
         200,
         {
-          data: withReliabilityHealthSection(baseReport, reliability),
+          data: { ...withReliabilityHealthSection(baseReport, reliability), localLlm },
         },
       ];
     },
@@ -8068,39 +8096,85 @@ const routes: readonly RouteDefinition[] = [
           model: item['model'] as string,
           generatedAt: item['generatedAt'] as string,
         };
-        if (!isEntityTitleEnrichedPayload(candidate)) {
-          skipped += 1;
-          continue;
-        }
-        // Idempotency key = hash of (kind,id,sourceContentHash). Re-posting
-        // the same triple binds to the existing event ⇒ skipped; a new hash
-        // for the same (kind,id) is a distinct clientEventId ⇒ a new event
-        // that supersedes in the fold.
-        const clientEventId = `enrich-${createHash('sha256')
-          .update(`${candidate.kind}\u0000${candidate.id}\u0000${candidate.sourceContentHash}`)
-          .digest('hex')
-          .slice(0, 32)}`;
-        const existing = await eventLog.findByClientEventId(clientEventId).catch(() => null);
-        if (existing !== null) {
-          skipped += 1;
-          continue;
-        }
-        try {
-          await eventLog.appendServerObserved({
-            clientEventId,
-            // Aggregate the event under the entity it enriches so the
-            // per-aggregate frontier groups an entity's enrichment history.
-            aggregateId: `enrichment:${candidate.kind}:${candidate.id}`,
-            type: ENTITY_TITLE_ENRICHED,
-            payload: { ...candidate },
-          });
-          accepted += 1;
-        } catch {
-          // A durable-write failure for one item must not fail the batch.
-          skipped += 1;
-        }
+        // Hand the candidate to the shared idempotent append helper — the
+        // SAME path the companion-side title sweep uses, so the two producers
+        // never drift on the payload guard, the (kind,id,sourceContentHash)
+        // idempotency key, or the aggregate grouping. A guard failure /
+        // duplicate hash / durable-write failure all count as skipped; the
+        // batch never fails on one bad item.
+        const outcome = await appendEnrichmentEvent(eventLog, candidate);
+        if (outcome === 'accepted') accepted += 1;
+        else skipped += 1;
       }
       return [200, { data: { accepted, skipped } }];
+    },
+  },
+  {
+    // POST /v1/enrichment/titles/sweep — kick off the companion-side
+    // local-LLM title sweep (the browser-INDEPENDENT title synthesis path).
+    // The companion generates descriptive titles for junk-titled threads
+    // ITSELF with a small open model, off the main loop in a forked child,
+    // and appends the SAME ENTITY_TITLE_ENRICHED events the panel POST path
+    // does (via the shared appendEnrichmentEvent helper).
+    //
+    // FLAG SIDETRACK_LOCAL_LLM (default OFF): when off, 200 {disabled:true}
+    // and nothing is spawned. When on, start the sweep (or report the
+    // already-running one) and return the current status IMMEDIATELY — the
+    // sweep runs in the background because the first-run model download can
+    // take minutes. NEVER block the request on generation.
+    //
+    // Body: { budget?: number } — how many junk threads to synthesize this
+    // sweep (default 10). Idempotent-ish: a second POST while a sweep runs
+    // returns the running job's status without starting a second.
+    method: 'POST',
+    pattern: /^\/v1\/enrichment\/titles\/sweep$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      if (!localLlmEnabled()) {
+        return [200, { data: { disabled: true, flag: LOCAL_LLM_ENV } }];
+      }
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'event log not configured for this companion',
+        );
+      }
+      const vaultRoot = requireVaultRoot(context);
+      const body = await readBody(request).catch(() => null);
+      const budgetRaw =
+        typeof body === 'object' && body !== null
+          ? (body as { budget?: unknown }).budget
+          : undefined;
+      const budget =
+        typeof budgetRaw === 'number' && Number.isFinite(budgetRaw) && budgetRaw > 0
+          ? Math.floor(budgetRaw)
+          : undefined;
+      const status = await startTitleSweep({
+        vaultRoot,
+        eventLog,
+        ...(budget === undefined ? {} : { budget }),
+      });
+      return [200, { data: status }];
+    },
+  },
+  {
+    // GET /v1/enrichment/titles/sweep — the current sweep status object
+    // (state, counts, capped before→after results). Flag-off ⇒ the status
+    // still returns (state idle) with disabled:true so the panel can render
+    // the flag state without a second call.
+    method: 'GET',
+    pattern: /^\/v1\/enrichment\/titles\/sweep$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, _context) => {
+      const status = getTitleSweepStatus();
+      return [
+        200,
+        {
+          data: localLlmEnabled() ? status : { ...status, disabled: true, flag: LOCAL_LLM_ENV },
+        },
+      ];
     },
   },
   {
