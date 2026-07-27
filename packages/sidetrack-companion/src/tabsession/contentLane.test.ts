@@ -299,6 +299,31 @@ describe('buildContentLane', () => {
     expect(lane.candidates[0]!.why).toContain('1 match');
   });
 
+  it('(6b) ALL hits unattributed → typed empty says matches were found (not "nothing matches")', async () => {
+    // The live beyondloom probe hit this: /v2 finds real neighbors (the HN
+    // Decker thread) but none are filed anywhere, and the lane reported
+    // "nothing indexed matches this page yet" — conflating a retrieval miss
+    // with label sparsity. The reason must count the matches and point at
+    // filing, not indexing.
+    const embed = vi.fn(async () => vecOf(5));
+    const store = fakeStore({
+      vectorHits: [
+        vhit('u1', 'https://unattributed.test/a', 'Orphan A', 1),
+        vhit('u2', 'https://unattributed.test/b', 'Orphan B', 1),
+      ],
+    });
+    const lane = await buildContentLane({
+      canonicalUrl: 'https://query.test/all-dropped',
+      snapshot: snapshot(),
+      title: 'topic',
+      store,
+      embed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates).toEqual([]);
+    expect(lane.emptyReason).toBe('2 similar pages found, none filed to a workstream yet');
+  });
+
   it('recall store unavailable → typed empty', async () => {
     const lane = await buildContentLane({
       canonicalUrl: 'https://x.test/y',

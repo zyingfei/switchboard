@@ -182,9 +182,12 @@ const voteSignalsForResolve = async (
 };
 
 // Trim + reject an empty title hint so the title fallback order (hint → snapshot
-// lookup) treats "" the same as absent.
+// lookup) treats "" the same as absent. URL-shaped hints are rejected too —
+// a page whose "title" is its own URL gives the matcher only scheme/TLD
+// tokens (same rule titleForCanonicalUrl applies to label fallbacks).
 const normalizeTitleHint = (titleHint: string | undefined): string | null => {
   if (titleHint === undefined) return null;
   const trimmed = titleHint.trim();
-  return trimmed.length === 0 ? null : trimmed;
+  if (trimmed.length === 0 || /^https?:\/\//iu.test(trimmed)) return null;
+  return trimmed;
 };
