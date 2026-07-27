@@ -173,6 +173,14 @@ export interface EngineAvailability {
   /** This browser exposes a WebGPU adapter (navigator.gpu) — i.e. the local
    *  model COULD be loaded from Health. */
   readonly webGpuSupported: boolean;
+  /**
+   * The OPTIONAL remote engine is explicitly enabled AND has a key. Default
+   * false/absent. This is the only field whose truth means content can leave
+   * the device, so it is never inferred — it comes from remoteConfigReady().
+   */
+  readonly remoteReady?: boolean;
+  /** Host the remote engine would send to, for the privacy marker. */
+  readonly remoteHost?: string | null;
 }
 
 /** Why no engine can serve this content — typed so the UI renders one honest
@@ -186,6 +194,7 @@ export type EnrichmentBlockReason =
 export type EnrichmentRoute =
   | { readonly engine: 'nano' }
   | { readonly engine: 'webgpu' }
+  | { readonly engine: 'remote' }
   | { readonly engine: null; readonly reason: EnrichmentBlockReason };
 
 /**
@@ -194,14 +203,24 @@ export type EnrichmentRoute =
  * NEVER selected for 'zh' or 'mixed-en-zh' because the built-in API does not
  * support Chinese.
  *
+ * PRECEDENCE IS LOCAL-FIRST, ALWAYS: nano → local WebGPU model → remote. The
+ * remote engine is last not because it is worst but because it is the only one
+ * that sends page text off the device; it is reached only when no on-device
+ * engine can serve, and only when the user explicitly enabled it with a key
+ * (`remoteReady`, which is remoteConfigReady()). It DOES outrank the "wait for
+ * the local download" block reasons — a user who turned it on asked for an
+ * answer now, and the surface marks every remote run in their face.
+ *
  * The full table (language × availability):
  *
  *   en    · nano ready                        → nano
  *   en    · webgpu loaded                     → webgpu
+ *   en    · remote enabled + key              → remote
  *   en    · webgpu loading                    → none: model-loading
  *   en    · webgpu supported, not loaded      → none: model-not-loaded
  *   en    · no nano, no webgpu adapter        → none: no-engine
  *   zh/mx · webgpu loaded                     → webgpu   (even if nano ready)
+ *   zh/mx · remote enabled + key              → remote   (multilingual provider)
  *   zh/mx · webgpu loading                    → none: model-loading
  *   zh/mx · nano ready, webgpu loadable       → none: language-needs-local-model
  *   zh/mx · no nano, webgpu loadable          → none: model-not-loaded
@@ -214,6 +233,7 @@ export const routeEnrichmentEngine = (
   const nanoUsable = availability.nanoReady && nanoCanServe(language);
   if (nanoUsable) return { engine: 'nano' };
   if (availability.webGpuLoaded) return { engine: 'webgpu' };
+  if (availability.remoteReady === true) return { engine: 'remote' };
   if (availability.webGpuLoading === true) return { engine: null, reason: 'model-loading' };
   if (!availability.webGpuSupported) return { engine: null, reason: 'no-engine' };
   // The local model is loadable from Health. Distinguish "you never loaded it"

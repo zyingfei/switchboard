@@ -23,59 +23,71 @@ import {
   nanoSamplingFor,
   type BuiltinLanguageModel,
 } from './titleSynthesis';
-import {
-  resolveGenerationOptions,
-  transformersGenerationArgs,
-  type GenerationOptions,
-} from './generationOptions';
+import { transformersGenerationArgs } from './generationOptions';
 import {
   routeEnrichmentEngine,
   type ContentLanguage,
   type EngineAvailability,
   type EnrichmentRoute,
 } from './language';
+import {
+  cleanGeneratedText,
+  outputCharCapOf,
+  type GenerationEngine,
+} from './generationEngine';
+import {
+  cachedNanoLimits,
+  limitsFor,
+  localModelLimits,
+  observeNanoSessionLimits,
+  type EngineLimits,
+} from './engineLimits';
+import {
+  DEFAULT_LOCAL_MODEL_ID,
+  NANO_IDENTITY,
+  localModelIdentity,
+  localModelSpec,
+  readSelectedLocalModelId,
+  type EngineIdentity,
+  type EngineKind,
+  type LocalModelSpec,
+} from './modelRegistry';
+import { readRemoteConfig, remoteConfigReady, remoteHostOf } from './remoteConfig';
+import { remoteEngineFrom } from './remoteEngine';
 
 // ---------------------------------------------------------------------------
-// The one interface.
+// The one interface — defined in generationEngine.ts (so the adapters can
+// depend on it without importing this wiring module) and re-exported here so
+// every existing `from './engine'` import keeps working.
 // ---------------------------------------------------------------------------
 
-export interface GenerationEngine {
-  readonly kind: 'nano' | 'webgpu';
-  /**
-   * Generate from `prompt`. Every decoding field except `maxNewTokens` is
-   * optional and defaults to the anti-degeneracy values in
-   * generationOptions.ts — an unsafe decoder must not be reachable by
-   * forgetting a field at a call site.
-   */
-  generate: (prompt: string, opts: GenerationOptions) => Promise<string>;
-}
+export {
+  cleanGeneratedText,
+  cleanGeneratedTitle,
+  MAX_GENERATED_CHARS,
+  type GenerationEngine,
+} from './generationEngine';
 
-// ---------------------------------------------------------------------------
-// Output cleanup — the PoC showed the WebGPU model wraps titles in markdown
-// ("**title**") and sometimes in quotes; Nano stays cleaner but the same
-// cleanup is harmless there. Strip surrounding asterisks/quotes, collapse
-// stray inner ** emphasis, trim, and cap. Pure + unit-tested.
-//
-// The cap is a PARAMETER, not a constant: this cleanup runs on gists too, and
-// capping a gist at the 200-char title limit was silently truncating every
-// multi-sentence summary mid-word before it was ever saved.
-// ---------------------------------------------------------------------------
+/** The identity to render for an engine, defaulting by kind for bare stubs. */
+export const engineIdentityOf = (engine: GenerationEngine): EngineIdentity =>
+  engine.identity ??
+  (engine.kind === 'nano'
+    ? NANO_IDENTITY
+    : engine.kind === 'webgpu'
+      ? localModelIdentity(localModelSpec(DEFAULT_LOCAL_MODEL_ID))
+      : {
+          kind: 'remote',
+          label: 'remote',
+          modelName: 'remote model',
+          params: 'provider-side',
+          paramsBillions: null,
+          quantization: 'unknown',
+          approxBytesOnDisk: null,
+        });
 
-export const MAX_GENERATED_CHARS = 200;
-
-export const cleanGeneratedText = (raw: string, maxChars: number): string => {
-  let text = raw.trim();
-  // Strip a leading/trailing run of markdown emphasis / quote chars, then any
-  // inner ** emphasis markers the model sprinkles mid-line.
-  text = text.replace(/^[*_"'“”‘’\s]+/u, '').replace(/[*_"'“”‘’\s]+$/u, '');
-  text = text.replace(/\*\*/gu, '').replace(/__/gu, '');
-  text = text.trim();
-  return text.slice(0, maxChars);
-};
-
-/** Title-shaped cleanup: the same pass capped at the title contract's 200. */
-export const cleanGeneratedTitle = (raw: string): string =>
-  cleanGeneratedText(raw, MAX_GENERATED_CHARS);
+/** The limits for an engine, defaulting by kind for bare stubs. */
+export const engineLimitsOf = (engine: GenerationEngine): EngineLimits =>
+  engine.limits ?? limitsFor(engine.kind);
 
 // ---------------------------------------------------------------------------
 // Nano engine.
@@ -100,6 +112,11 @@ export const nanoEngineIfAvailable = async (
   if (availability !== 'available') return null;
   return {
     kind: 'nano',
+    identity: NANO_IDENTITY,
+    // The REAL quota once a session has reported it (see the generate() body);
+    // the documented constant until then. Reading it here costs nothing — no
+    // extra session is created just to ask.
+    limits: cachedNanoLimits(),
     generate: async (prompt, opts) => {
       // Nano's ONLY decoding controls are temperature + topK at create() time
       // (clamped to this device's reported bounds); there is no repetition
@@ -108,10 +125,11 @@ export const nanoEngineIfAvailable = async (
       // on this engine. See generationOptions.ts.
       const session = await createNanoSession(lm, await nanoSamplingFor(lm, opts));
       try {
-        return cleanGeneratedText(
-          await session.prompt(prompt),
-          resolveGenerationOptions(opts).maxChars,
-        );
+        // Learn this device's REAL input quota from the session we just had to
+        // create anyway (inputQuota / measureInputUsage, both guarded). Memoized
+        // after the first success — no extra session, no extra round trip.
+        await observeNanoSessionLimits(session);
+        return cleanGeneratedText(await session.prompt(prompt), outputCharCapOf(opts));
       } finally {
         session.destroy();
       }
@@ -120,10 +138,32 @@ export const nanoEngineIfAvailable = async (
 };
 
 // ---------------------------------------------------------------------------
+// Remote engine (OPTIONAL, default OFF) — see remoteConfig.ts for the privacy
+// contract. This resolver is the ONLY place the panel builds a remote engine.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the remote engine if — and only if — the user explicitly enabled it AND
+ * supplied a key. Returns null in every other case, including "enabled but no
+ * key" and "key stored but never enabled". Reads chrome.storage.local; never
+ * makes a network call (no key validation, no model list — those would be
+ * outbound traffic the user did not ask for).
+ */
+export const remoteEngineIfConfigured = async (): Promise<GenerationEngine | null> =>
+  remoteEngineFrom(await readRemoteConfig());
+
+// ---------------------------------------------------------------------------
 // WebGPU engine (transformers.js) — explicit-load singleton.
 // ---------------------------------------------------------------------------
 
-export const WEBGPU_MODEL_ID = 'onnx-community/gemma-3-1b-it-ONNX';
+/**
+ * The DEFAULT local model. The full selectable set (and the declared parameter
+ * count / quantization / on-disk size of each) lives in modelRegistry.ts — the
+ * id is no longer hardcoded here because a 1B-vs-3.25B comparison that does not
+ * say so is misleading, and the fix is letting the user pick a size-matched
+ * model. Kept exported under the old name so existing imports keep resolving.
+ */
+export const WEBGPU_MODEL_ID = DEFAULT_LOCAL_MODEL_ID;
 export const WEBGPU_MODEL_REVISION = 'main';
 
 export interface WebGpuLoadProgress {
@@ -136,6 +176,12 @@ export interface WebGpuLoadProgress {
 export interface LoadWebGpuOptions {
   /** Companion port — the model host lives at http://127.0.0.1:{port}. */
   readonly port: number;
+  /**
+   * Which registry model to load. Absent → the stored selection, else the
+   * default. Selecting a model never downloads anything; THIS call does, and
+   * only this call.
+   */
+  readonly modelId?: string;
   readonly onProgress?: (p: WebGpuLoadProgress) => void;
   /**
    * Test seam ONLY: inject a fake pipeline factory so the load path is
@@ -159,9 +205,13 @@ export type PipelineFactory = (onProgress?: (p: WebGpuLoadProgress) => void) => 
 
 let webGpuEngineSingleton: GenerationEngine | null = null;
 let webGpuLoadInFlight: Promise<GenerationEngine> | null = null;
+let webGpuLoadedSpec: LocalModelSpec | null = null;
 
 /** Whether the WebGPU engine has been explicitly loaded this session. */
 export const isWebGpuLoaded = (): boolean => webGpuEngineSingleton !== null;
+
+/** WHICH local model is loaded, or null when none is. Read-only. */
+export const loadedLocalModel = (): LocalModelSpec | null => webGpuLoadedSpec;
 
 // --- Observable load status -------------------------------------------------
 //
@@ -250,7 +300,7 @@ const normalizeProgress = (raw: unknown): WebGpuLoadProgress | null => {
  * bundlers keep it a separate chunk.
  */
 const realPipelineFactory =
-  (port: number): PipelineFactory =>
+  (port: number, spec: LocalModelSpec): PipelineFactory =>
   async (onProgress) => {
     const mod = (await import('@huggingface/transformers')) as unknown as {
       pipeline: (
@@ -288,11 +338,11 @@ const realPipelineFactory =
     } catch {
       // Non-extension context (tests) — leave transformers' default.
     }
-    const generate = await pipeline('text-generation', WEBGPU_MODEL_ID, {
+    const generate = await pipeline('text-generation', spec.id, {
       device: 'webgpu',
-      dtype: 'q4',
+      dtype: spec.quantization,
       use_external_data_format: true,
-      revision: WEBGPU_MODEL_REVISION,
+      revision: spec.revision,
       progress_callback: (raw: unknown) => {
         const p = normalizeProgress(raw);
         if (p !== null && onProgress !== undefined) onProgress(p);
@@ -309,6 +359,7 @@ const realPipelineFactory =
  */
 export const loadWebGpuEngine = async ({
   port,
+  modelId,
   onProgress,
   pipelineFactory,
 }: LoadWebGpuOptions): Promise<GenerationEngine> => {
@@ -319,7 +370,8 @@ export const loadWebGpuEngine = async ({
     publishWebGpuLoadStatus({ phase: 'error', percent: null, file: null, error: message });
     throw new Error(message);
   }
-  const factory = pipelineFactory ?? realPipelineFactory(port);
+  const spec = localModelSpec(modelId ?? (await readSelectedLocalModelId()));
+  const factory = pipelineFactory ?? realPipelineFactory(port, spec);
   publishWebGpuLoadStatus({ phase: 'loading', percent: null, file: null, error: null });
   webGpuLoadInFlight = (async () => {
     try {
@@ -336,6 +388,8 @@ export const loadWebGpuEngine = async ({
       });
       const engine: GenerationEngine = {
         kind: 'webgpu',
+        identity: localModelIdentity(spec),
+        limits: localModelLimits(spec),
         generate: async (prompt, opts) => {
           // CHAT MESSAGES, not a raw string. gemma-3-1b-IT is
           // instruction-tuned: handed a bare string, a text-generation
@@ -366,10 +420,11 @@ export const loadWebGpuEngine = async ({
               : Array.isArray(raw)
                 ? String((raw[raw.length - 1] as { content?: unknown } | undefined)?.content ?? '')
                 : '';
-          return cleanGeneratedText(text, resolveGenerationOptions(opts).maxChars);
+          return cleanGeneratedText(text, outputCharCapOf(opts));
         },
       };
       webGpuEngineSingleton = engine;
+      webGpuLoadedSpec = spec;
       publishWebGpuLoadStatus({ phase: 'ready', percent: 100, file: null, error: null });
       return engine;
     } catch (err) {
@@ -391,6 +446,7 @@ export const loadWebGpuEngine = async ({
 export const __resetWebGpuEngineForTest = (): void => {
   webGpuEngineSingleton = null;
   webGpuLoadInFlight = null;
+  webGpuLoadedSpec = null;
   publishWebGpuLoadStatus({ phase: 'idle', percent: null, file: null, error: null });
 };
 
@@ -398,15 +454,18 @@ export const __resetWebGpuEngineForTest = (): void => {
 // Policy: which engine to use RIGHT NOW, never auto-loading anything.
 // ---------------------------------------------------------------------------
 
-export type EngineChoice = 'nano' | 'webgpu' | 'none';
+export type EngineChoice = EngineKind | 'none';
 
 /**
  * Decide the active engine WITHOUT any side effects:
  *   - 'nano'   when the built-in Prompt API is 'available',
  *   - 'webgpu' when the WebGPU engine was EXPLICITLY loaded this session,
+ *   - 'remote' when the user explicitly enabled the remote engine WITH a key,
  *   - 'none'   otherwise.
- * Nano is preferred (no download, already resident). WebGPU is only ever
- * chosen after an explicit loadWebGpuEngine() — never auto-loaded here.
+ * Local-first precedence, always: nano (no download, already resident) beats
+ * the loaded local model, which beats the remote engine — the only one that
+ * sends text off the device. WebGPU is only ever chosen after an explicit
+ * loadWebGpuEngine(); remote is only ever chosen after an explicit opt-in.
  */
 export const enginePolicy = async (
   lm: BuiltinLanguageModel | undefined = builtinLanguageModel(),
@@ -414,15 +473,16 @@ export const enginePolicy = async (
   const nano = await nanoEngineIfAvailable(lm);
   if (nano !== null) return 'nano';
   if (isWebGpuLoaded()) return 'webgpu';
+  if (remoteConfigReady(await readRemoteConfig())) return 'remote';
   return 'none';
 };
 
 /**
  * Resolve the engine to generate with, honoring the policy and NEVER loading.
- * Returns null when no engine is ready (nano unavailable AND webgpu not
- * explicitly loaded). This is the seam the eval / enrichment paths call —
- * generate() without a prior explicit WebGPU load yields null (no generation),
- * satisfying the "never auto-load" gate.
+ * Returns null when no engine is ready (nano unavailable, webgpu not explicitly
+ * loaded, remote not explicitly enabled with a key). This is the seam the eval /
+ * enrichment paths call — generate() without a prior explicit WebGPU load yields
+ * null (no generation), satisfying the "never auto-load" gate.
  */
 export const resolveReadyEngine = async (
   lm: BuiltinLanguageModel | undefined = builtinLanguageModel(),
@@ -430,7 +490,24 @@ export const resolveReadyEngine = async (
   const nano = await nanoEngineIfAvailable(lm);
   if (nano !== null) return nano;
   if (webGpuEngineSingleton !== null) return webGpuEngineSingleton;
-  return null;
+  return await remoteEngineIfConfigured();
+};
+
+/**
+ * EVERY engine that could run RIGHT NOW, local-first, for the comparison
+ * surface. Reads only — no probe starts a download and no remote request is
+ * made. An engine absent from this list simply cannot run this session.
+ */
+export const readyEngines = async (
+  lm: BuiltinLanguageModel | undefined = builtinLanguageModel(),
+): Promise<readonly GenerationEngine[]> => {
+  const engines: GenerationEngine[] = [];
+  const nano = await nanoEngineIfAvailable(lm);
+  if (nano !== null) engines.push(nano);
+  if (webGpuEngineSingleton !== null) engines.push(webGpuEngineSingleton);
+  const remote = await remoteEngineIfConfigured();
+  if (remote !== null) engines.push(remote);
+  return engines;
 };
 
 // ---------------------------------------------------------------------------
@@ -454,12 +531,17 @@ export const engineAvailabilitySnapshot = async (
       nanoReady = false;
     }
   }
+  // Remote readiness is a STORAGE read, never a network probe: asking the
+  // provider whether the key works would itself be outbound traffic.
+  const remote = await readRemoteConfig();
   return {
     nanoReady,
     webGpuLoaded: isWebGpuLoaded(),
     webGpuLoading: status.phase === 'loading',
     webGpuPercent: status.percent,
     webGpuSupported: webGpuSupported(),
+    remoteReady: remoteConfigReady(remote),
+    remoteHost: remoteConfigReady(remote) ? remoteHostOf(remote.baseUrl) : null,
   };
 };
 
@@ -493,6 +575,14 @@ export const resolveEngineForLanguage = async (
   }
   if (route.engine === 'webgpu') {
     return { engine: null, route: { engine: null, reason: 'model-not-loaded' } };
+  }
+  if (route.engine === 'remote') {
+    // Re-read the config rather than trusting the snapshot: the user may have
+    // cleared the key between the probe and the click, and a stale "ready" must
+    // never turn into an outbound request.
+    const remote = await remoteEngineIfConfigured();
+    if (remote === null) return { engine: null, route: { engine: null, reason: 'no-engine' } };
+    return { engine: remote, route };
   }
   return { engine: null, route };
 };

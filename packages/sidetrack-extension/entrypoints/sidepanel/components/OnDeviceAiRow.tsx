@@ -12,10 +12,38 @@ import {
 import {
   isWebGpuLoaded,
   loadWebGpuEngine,
+  readyEngines,
   resolveReadyEngine,
   webGpuSupported,
   type WebGpuLoadProgress,
 } from '../../../src/sidepanel/nano/engine';
+import {
+  compareEngines,
+  compareStatusCopy,
+  type CompareOutcome,
+} from '../../../src/sidepanel/nano/compareEngines';
+import {
+  formatEngineLimits,
+  formatReduction,
+  limitsFor,
+  probeNanoLimits,
+} from '../../../src/sidepanel/nano/engineLimits';
+import {
+  DEFAULT_LOCAL_MODEL_ID,
+  LOCAL_MODELS,
+  formatModelSize,
+  localModelSpec,
+  readSelectedLocalModelId,
+  writeSelectedLocalModelId,
+} from '../../../src/sidepanel/nano/modelRegistry';
+import {
+  readRemoteConfig,
+  remoteConfigReady,
+  remoteHostOf,
+  remotePrivacyDetail,
+  remotePrivacyMarker,
+} from '../../../src/sidepanel/nano/remoteConfig';
+import { RemoteEngineRow } from './RemoteEngineRow';
 import { TITLE_GENERATION } from '../../../src/sidepanel/nano/generationOptions';
 import { detectContentLanguage } from '../../../src/sidepanel/nano/language';
 import {
@@ -76,6 +104,13 @@ const STATE_COPY: Record<OnDeviceAiState, string> = {
 
 const EVAL_MAX_ITEMS = 8;
 const EVAL_MARKDOWN_CHARS = 2200;
+// The comparison feeds every engine the SAME document. It is deliberately NOT
+// truncated to the eval's 2200 chars: each engine reduces the document to its
+// OWN input cap through the chunking path, and the row reports the reduction —
+// that difference is part of what is being compared.
+const COMPARE_MARKDOWN_CHARS = 20_000;
+/** A document thinner than this cannot discriminate between two engines. */
+const COMPARE_MIN_CHARS = 400;
 // The budgeted enrichment run titles up to this many junk-titled threads per
 // click and PERSISTS them (unlike the observe-only eval above).
 const ENRICH_BUDGET = 10;
@@ -125,6 +160,18 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   );
   const [webGpuProgress, setWebGpuProgress] = useState<WebGpuLoadProgress | null>(null);
   const [webGpuError, setWebGpuError] = useState<string | null>(null);
+  // WHICH local model the load button will fetch. Selecting is free — it writes
+  // a preference and downloads nothing (modelRegistry.ts).
+  const [localModelId, setLocalModelId] = useState<string>(DEFAULT_LOCAL_MODEL_ID);
+  // The optional remote engine's armed state + destination, for the privacy
+  // marker and the engine-precedence label. A storage read, never a network one.
+  const [remoteArmed, setRemoteArmed] = useState(false);
+  const [remoteHost, setRemoteHost] = useState<string | null>(null);
+  const [remoteNonce, setRemoteNonce] = useState(0);
+  // Comparative generation — observe-only, like the eval above it.
+  const [compareRunning, setCompareRunning] = useState(false);
+  const [compareOutcome, setCompareOutcome] = useState<CompareOutcome | null>(null);
+  const [compareNote, setCompareNote] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
   const probe = useCallback(async (): Promise<void> => {
@@ -156,6 +203,26 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       mountedRef.current = false;
     };
   }, [probe]);
+
+  // Stored local-model selection. A read; never a load.
+  useEffect(() => {
+    void (async () => {
+      const stored = await readSelectedLocalModelId();
+      if (mountedRef.current) setLocalModelId(stored);
+    })();
+  }, []);
+
+  // Remote-engine armed state. Re-read whenever the config block reports a
+  // change, so the marker and the precedence label never lag the setting.
+  useEffect(() => {
+    void (async () => {
+      const config = await readRemoteConfig();
+      if (!mountedRef.current) return;
+      const armed = remoteConfigReady(config);
+      setRemoteArmed(armed);
+      setRemoteHost(armed ? remoteHostOf(config.baseUrl) : null);
+    })();
+  }, [remoteNonce]);
 
   // While a download is in flight, refresh the availability read on a slow
   // cadence so the row converges to 'available' without a manual reopen.
@@ -206,6 +273,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
     try {
       await loadWebGpuEngine({
         port: companionPort,
+        // The SELECTED model — the same explicit button, whichever size the user
+        // picked. Nothing else in the product can start this fetch.
+        modelId: localModelId,
         onProgress: (p) => {
           if (mountedRef.current) setWebGpuProgress(p);
         },
@@ -217,7 +287,73 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         setWebGpuError(String(err));
       }
     }
-  }, [companionPort]);
+  }, [companionPort, localModelId]);
+
+  // COMPARATIVE GENERATION — the same document through every available engine,
+  // rendered side by side with scores. STRICTLY OBSERVE-ONLY: two GETs to read a
+  // document, then pure in-memory generation. Nothing is POSTed, nothing is
+  // stored, nothing feeds serving.
+  const runCompare = useCallback(async (): Promise<void> => {
+    if (
+      companionPort === null ||
+      companionPort === undefined ||
+      bridgeKey === null ||
+      bridgeKey === undefined
+    ) {
+      return;
+    }
+    setCompareRunning(true);
+    setCompareOutcome(null);
+    setCompareNote(null);
+    try {
+      // Measure Chrome's REAL input quota before printing anyone's limits —
+      // this is the one user-initiated surface that shows them side by side.
+      await probeNanoLimits(builtinLanguageModel());
+      const engines = await readyEngines();
+      if (engines.length === 0) {
+        setCompareNote('no engine is available to compare');
+        return;
+      }
+      const headers = { 'x-bac-bridge-key': bridgeKey };
+      const listRes = await fetch(`http://127.0.0.1:${String(companionPort)}/v1/threads`, {
+        headers,
+      });
+      if (!listRes.ok) {
+        setCompareNote(`thread list failed (${String(listRes.status)})`);
+        return;
+      }
+      const listBody = (await listRes.json()) as {
+        readonly data?: readonly { readonly bac_id: string }[];
+      };
+      const threads = listBody.data ?? [];
+      let document = '';
+      for (const t of threads.slice(0, EVAL_MAX_ITEMS)) {
+        const mdRes = await fetch(
+          `http://127.0.0.1:${String(companionPort)}/v1/threads/${encodeURIComponent(t.bac_id)}/markdown`,
+          { headers },
+        );
+        const mdBody = mdRes.ok
+          ? ((await mdRes.json().catch(() => null)) as { data?: { markdown?: string } } | null)
+          : null;
+        const markdown = (mdBody?.data?.markdown ?? '').slice(0, COMPARE_MARKDOWN_CHARS);
+        if (markdown.trim().length >= COMPARE_MIN_CHARS) {
+          document = markdown;
+          break;
+        }
+      }
+      if (document.length === 0) {
+        setCompareNote('no document long enough to compare on');
+        return;
+      }
+      const outcome = await compareEngines({ document, engines });
+      if (!mountedRef.current) return;
+      setCompareOutcome(outcome);
+    } catch (err) {
+      if (mountedRef.current) setCompareNote(`comparison failed: ${String(err)}`);
+    } finally {
+      if (mountedRef.current) setCompareRunning(false);
+    }
+  }, [companionPort, bridgeKey]);
 
   const runTitleEval = useCallback(async (): Promise<void> => {
     const engine = await resolveReadyEngine();
@@ -359,12 +495,31 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // which is active so the user knows what produced the text.
   const nanoReady = state === 'available';
   const webGpuReady = webGpuState === 'ready';
-  const activeEngineLabel: 'Nano' | 'WebGPU' | null = nanoReady
+  // Engine precedence, LOCAL-FIRST and identical to routing (language.ts):
+  // Nano → the loaded local model → the opt-in remote engine. Remote is last
+  // because it is the only one that sends text off the device.
+  const activeEngineLabel: 'Nano' | 'WebGPU' | 'Remote' | null = nanoReady
     ? 'Nano'
     : webGpuReady
       ? 'WebGPU'
-      : null;
+      : remoteArmed
+        ? 'Remote'
+        : null;
   const engineReady = activeEngineLabel !== null;
+  const selectedSpec = localModelSpec(localModelId);
+  // The limits of whatever would run right now — stated before anything runs.
+  const activeLimits =
+    activeEngineLabel === 'Nano'
+      ? limitsFor('nano')
+      : activeEngineLabel === 'WebGPU'
+        ? limitsFor('webgpu', localModelId)
+        : activeEngineLabel === 'Remote'
+          ? limitsFor('remote')
+          : null;
+  // The marker is tied to the ACTIVE engine, not merely to the setting: if a
+  // local model is ready, remote is not what runs, and claiming text leaves the
+  // device would be as dishonest as hiding it when it does.
+  const remoteIsActive = activeEngineLabel === 'Remote' && remoteHost !== null;
   const evalAvailable = engineReady && companionConnected;
   // Offer the WebGPU load ONLY when Nano is not available (Nano is cheaper —
   // already resident, no download) AND the companion is connected (the model
@@ -391,6 +546,37 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           Download model
         </button>
       ) : null}
+      {/* WHICH local model. Selecting is free — it stores a preference and
+          downloads nothing; the load button below states the size of whatever
+          is selected before the user commits to it. Locked once a model is
+          loaded: swapping mid-session would need a panel reload. */}
+      {companionConnected && !nanoReady ? (
+        <div className="mono" style={{ marginTop: 4 }}>
+          <label>
+            Local model{' '}
+            <select
+              value={localModelId}
+              disabled={webGpuState === 'loading' || webGpuReady}
+              onChange={(e) => {
+                const next = e.target.value;
+                setLocalModelId(next);
+                void writeSelectedLocalModelId(next);
+              }}
+              data-testid="hp-ondevice-ai-model-select"
+            >
+              {LOCAL_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label} · ~{formatModelSize(m.approxBytesOnDisk)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-model-note">
+            {selectedSpec.status === 'verified' ? '' : 'unverified · '}
+            {selectedSpec.statusNote}
+          </span>
+        </div>
+      ) : null}
       {/* WebGPU fallback — shown when Nano isn't available and the companion
           (the model host) is connected. The load is EXPLICIT (this button is
           the only trigger for the ~800MB fetch). No adapter → honest line. */}
@@ -408,7 +594,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           >
             {webGpuState === 'loading'
               ? 'Loading local model…'
-              : 'Load local model (WebGPU · ~800MB, from companion)'}
+              : `Load local model (WebGPU · ~${formatModelSize(selectedSpec.approxBytesOnDisk)}, from companion)`}
           </button>
         ) : (
           <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-webgpu-unsupported">
@@ -429,6 +615,26 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       {webGpuState === 'error' && webGpuError !== null ? (
         <div className="mono" data-testid="hp-ondevice-ai-webgpu-error" style={{ marginTop: 4 }}>
           {webGpuError}
+        </div>
+      ) : null}
+      {/* The active engine's caps, so "2-3 sentences from a 40k-char page" is
+          explicable up front rather than a mystery after the fact. */}
+      {activeLimits !== null ? (
+        <div className="mono" title={activeLimits.note} data-testid="hp-ondevice-ai-limits">
+          {String(activeEngineLabel)} · {formatEngineLimits(activeLimits)}
+          {activeLimits.inputSource === 'measured' ? ' (real quota)' : ''}
+        </div>
+      ) : null}
+      {/* THE PRIVACY MARKER — persistent, unmissable, host-named, and shown
+          exactly when the remote engine is the one that would run. */}
+      {remoteIsActive && remoteHost !== null ? (
+        <div
+          className="mono"
+          role="note"
+          title={remotePrivacyDetail(remoteHost)}
+          data-testid="hp-ondevice-ai-remote-warning"
+        >
+          {remotePrivacyMarker(remoteHost)}
         </div>
       ) : null}
       {evalAvailable ? (
@@ -463,6 +669,23 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
             : `Enrich titles (${String(ENRICH_BUDGET)}) · ${String(activeEngineLabel)}`}
         </button>
       ) : null}
+      {/* COMPARATIVE GENERATION. Same document, every available engine, scores
+          side by side — because one engine's 0.43 groundedness means nothing on
+          its own. Observe-only: no POST, nothing saved. */}
+      {evalAvailable ? (
+        <button
+          type="button"
+          className="sx-btn"
+          style={{ marginLeft: 8 }}
+          disabled={compareRunning}
+          onClick={() => {
+            void runCompare();
+          }}
+          data-testid="hp-ondevice-ai-compare"
+        >
+          {compareRunning ? 'Comparing…' : 'Compare engines'}
+        </button>
+      ) : null}
       {enrichNote !== null ? <div className="mono">{enrichNote}</div> : null}
       {enrichStats !== null ? (
         <div className="mono" data-testid="hp-ondevice-ai-enrich-stats" style={{ marginTop: 4 }}>
@@ -488,6 +711,56 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           ))}
         </div>
       ) : null}
+      {compareNote !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-compare-note">
+          {compareNote}
+        </div>
+      ) : null}
+      {compareOutcome !== null ? (
+        <div data-testid="hp-ondevice-ai-compare-results" style={{ marginTop: 6 }}>
+          <div className="mono" data-testid="hp-ondevice-ai-compare-headline">
+            {compareOutcome.headline}
+          </div>
+          {/* THE CAVEAT. Rendered whenever the engines that ran are not the same
+              parameter class — a 1B-vs-3.25B "winner" measures model size, not
+              engine quality, and saying so is the point of the feature. */}
+          {compareOutcome.sizeCaveat !== null ? (
+            <div className="mono" data-testid="hp-ondevice-ai-compare-caveat">
+              {compareOutcome.sizeCaveat}
+            </div>
+          ) : null}
+          {compareOutcome.rows.map((row) => (
+            <div
+              key={row.kind}
+              style={{ marginTop: 4 }}
+              data-testid={`hp-ondevice-ai-compare-row-${row.kind}`}
+            >
+              <div className="mono">
+                {compareOutcome.winnerKind === row.kind ? '★ ' : ''}
+                {row.matchup} · {formatEngineLimits(row.limits)} · {String(row.ms)}ms
+                {row.sendsTextOffDevice && remoteHost !== null
+                  ? ` · ${remotePrivacyMarker(remoteHost)}`
+                  : ''}
+                {row.inputReduced
+                  ? ` · ${formatReduction(row.processedChars, row.inputChars)}`
+                  : ''}
+              </div>
+              <div className="mono" data-testid={`hp-ondevice-ai-compare-text-${row.kind}`}>
+                {row.text ?? '(no output)'}
+              </div>
+              <div className="mono" data-testid={`hp-ondevice-ai-compare-verdict-${row.kind}`}>
+                {compareStatusCopy(row)}
+                {row.scores === null ? '' : ` · ${formatScores(row.scores)}`}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <RemoteEngineRow
+        onChanged={() => {
+          setRemoteNonce((n) => n + 1);
+        }}
+      />
     </div>
   );
 }
