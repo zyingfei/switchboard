@@ -51,6 +51,8 @@ export type { RecentDispatchesProps, DispatchEvent, DispatchStatus } from './Rec
 export { SendToDropdown } from './SendToDropdown';
 export type { SendToDropdownProps, SendToTarget } from './SendToDropdown';
 export { AutoSendQueueRow } from './AutoSendQueueRow';
+export { OnDeviceAiRow } from './OnDeviceAiRow';
+export type { OnDeviceAiState } from './OnDeviceAiRow';
 export type { AutoSendQueueRowProps } from './AutoSendQueueRow';
 
 // M1 polish
