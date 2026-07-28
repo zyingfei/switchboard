@@ -222,8 +222,14 @@ describe('SuggestionStats — lane-fallback pick (unconfirmed, page-content only
     const { container } = render(
       <SuggestionStats suggestion={jfrogResolution()} workstreams={workstreams} showEmptyPlaceholder />,
     );
-    // The headline keeps the honest tie read (margin 0 ⇒ no clear pick) …
-    expect(screen.getByText('No clear pick')).toBeDefined();
+    // The headline shows NO confidence word at all when the uncertainty chip
+    // is up. It used to print the level label ("No clear pick") beside the
+    // chip; on a real weak-guess page that same slot rendered "WEAK GUESS —
+    // FILED TO INBOX  ai  Highly likely" — a contradiction on one line (live
+    // screenshot, 2026-07-28). The chip is the whole statement now; the level
+    // survives only in the ⓘ tooltip.
+    expect(screen.queryByText('No clear pick')).toBeNull();
+    expect(container.querySelector('.suggestion-stats-confidence')).toBeNull();
     // … and every possibility row says "unconfirmed" rather than a calibrated
     // word ("Medium") derived from a lane score sitting in the logit field.
     const words = Array.from(

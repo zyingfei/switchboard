@@ -95,11 +95,13 @@ export const PageTextPanel = ({
         data-testid={`${testIdPrefix}-summary-toggle`}
       >
         {open ? '▾' : '▸'} Page text
+        {/* Mid-dot separators: without them the header read "Page text HIGH
+            60 CHUNKS" as one run of caps (live screenshot, 2026-07-28). */}
         <span className="cx-page-content-state">
-          {captureDisabled ? 'not captured' : pageContentStatusLabel(coverage)}
+          · {captureDisabled ? 'not captured' : pageContentStatusLabel(coverage)}
         </span>
         {!captureDisabled && coverage?.chunkCount !== undefined ? (
-          <span className="cx-page-content-meta">{String(coverage.chunkCount)} chunks</span>
+          <span className="cx-page-content-meta">· {String(coverage.chunkCount)} chunks</span>
         ) : null}
       </button>
       <div className="cx-page-content-actions">

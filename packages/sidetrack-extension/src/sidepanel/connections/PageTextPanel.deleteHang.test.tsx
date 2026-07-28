@@ -63,7 +63,7 @@ describe('PageTextPanel — delete-hang regression', () => {
     fireEvent.click(del);
     expect(onDelete).toHaveBeenCalledTimes(1);
     // And the state DISPLAY is suppressed (no stale tier/chunk leak).
-    expect(screen.getByText('not captured')).toBeTruthy();
+    expect(screen.getByText(/not captured/)).toBeTruthy();
     expect(screen.queryByText('2 chunks')).toBeNull();
   });
 

@@ -576,8 +576,15 @@ export function SuggestionStats({
         ) : null}
         <span className="suggestion-stats-target">{label}</span>
         {/* Qualitative lean only — the raw % is uncalibrated and lives in
-            the ⓘ tooltip labelled as diagnostics (see above). */}
-        <span className="suggestion-stats-confidence">{confidenceLevelLabel(level)}</span>
+            the ⓘ tooltip labelled as diagnostics (see above).
+            SUPPRESSED whenever an uncertainty chip is showing: "WEAK GUESS —
+            FILED TO INBOX  ai  Highly likely" put a contradiction on one line
+            (live screenshot, 2026-07-28) — the policy HELD this pick, so the
+            headline must not simultaneously assert high confidence. The word
+            survives in the ⓘ tooltip for the curious. */}
+        {isWeakGuess || isLaneFallback ? null : (
+          <span className="suggestion-stats-confidence">{confidenceLevelLabel(level)}</span>
+        )}
         <span className="suggestion-stats-info" title={tooltip} aria-label={tooltip}>
           ⓘ
         </span>
