@@ -1,3 +1,4 @@
+import { isLaneFallbackCandidate, LANE_FALLBACK_PICK_TITLE } from './laneFallbackPick';
 import { endorsementFor } from './suggestionEndorsement';
 import type {
   TabSessionRecord,
@@ -53,7 +54,19 @@ const variantFor = (
   return 'empty';
 };
 
-const titleFor = (variant: BadgeVariant, label: string): string => {
+const titleFor = (
+  variant: BadgeVariant,
+  label: string,
+  // The weak lean came from the companion's lane fallback (no fusion at all,
+  // page-content evidence only). Same muted 'weak-guess' variant — the badge
+  // must not gain a new visual state for it — but the hover text has to tell
+  // the truth about WHERE the name came from, because "isn't confident enough
+  // to suggest it" implies a fusion score that never existed here.
+  laneFallback = false,
+): string => {
+  if (variant === 'weak-guess' && laneFallback) {
+    return `Unconfirmed: ${label} — ${LANE_FALLBACK_PICK_TITLE}`;
+  }
   switch (variant) {
     case 'user-asserted':
       return `Moved here by you: ${label}`;
@@ -117,6 +130,9 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
         : 'none';
   const variant = variantFor(attribution, ignored, guess);
   const marker = markerFor(variant);
+  // Only meaningful for the un-endorsed lean (a real attribution or an endorsed
+  // suggestion never carries a synthesized candidate).
+  const laneFallback = isLaneFallbackCandidate(suggestion?.fusedCandidates[0]);
   // No attribution and no guess: show a muted dash, not a confusing "?" — the
   // tooltip and the provenance row already say "No attribution".
   const label =
@@ -128,7 +144,7 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
   return (
     <span
       className={`tab-session-badge is-${variant}`}
-      title={titleFor(variant, label)}
+      title={titleFor(variant, label, laneFallback)}
       data-attribution-variant={variant}
     >
       {marker !== null ? (

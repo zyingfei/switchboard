@@ -59,6 +59,23 @@ const lanesWithContentEmpty: readonly GuessLaneResult[] = [
   { lane: 'content', candidates: [], emptyReason: 'no indexed page text yet' },
 ];
 
+// feat/ai-lane — the 8th lane, appended AFTER content. This is the live JFrog
+// shape (2026-07-27): six structural lanes empty, content + ai both carrying
+// candidates. The strip rendered SEVEN dots for it — no AI dot at all — because
+// the client parse dropped the unknown 'ai' lane (types.ts VALID_LANES) and the
+// strip had no branch to append an 8th chip. Both are pinned below.
+const lanesWithAiFilled: readonly GuessLaneResult[] = [
+  ...lanesWithContentFilled,
+  {
+    lane: 'ai',
+    candidates: [{ workstreamId: 'ws-3', score: 0.48, why: '3 matches (CVE triage)' }],
+  },
+];
+const lanesWithAiEmpty: readonly GuessLaneResult[] = [
+  ...lanesWithContentFilled,
+  { lane: 'ai', candidates: [], emptyReason: 'no gist for this page yet' },
+];
+
 const fusedCandidate = (
   over: Partial<TabSessionResolverCandidate> = {},
 ): TabSessionResolverCandidate => ({
@@ -161,6 +178,59 @@ describe('PipelineStrip — lane dots', () => {
     expect(within(button).getByText('Content')).toBeDefined();
     expect(chips[6]?.classList.contains('is-empty')).toBe(true);
     expect(screen.getByLabelText('Content: no indexed page text yet')).toBeDefined();
+  });
+
+  it('(1e) 8-lane payload renders an 8th AI dot after Content — the live missing-dot bug', () => {
+    render(
+      <PipelineStrip
+        lanes={lanesWithAiFilled}
+        workstreams={workstreams}
+        fusedCount={0}
+        open={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    const button = getDotsButton();
+    const renderedLabels = Array.from(button.querySelectorAll('.pipeline-chip-label')).map(
+      (el) => el.textContent,
+    );
+    // Exactly EIGHT chips, AI appended last (after Content).
+    expect(renderedLabels).toEqual([
+      'Graph',
+      'Similar',
+      'Topic',
+      'Title',
+      'Domain',
+      'Recent',
+      'Content',
+      'AI',
+    ]);
+    const chips = Array.from(button.querySelectorAll('.pipeline-chip'));
+    expect(chips).toHaveLength(8);
+    // graph (0), topic (2), content (6), ai (7) populated → filled.
+    const filledIndexes = chips
+      .map((c, i) => (c.classList.contains('is-filled') ? i : -1))
+      .filter((i) => i >= 0);
+    expect(filledIndexes).toEqual([0, 2, 6, 7]);
+    // The AI chip's aria names its top candidate's workstream.
+    expect(screen.getByLabelText('AI: Reading / Longform')).toBeDefined();
+  });
+
+  it('(1f) an EMPTY ai lane still renders its dot, hollow, naming its own reason', () => {
+    render(
+      <PipelineStrip
+        lanes={lanesWithAiEmpty}
+        workstreams={workstreams}
+        fusedCount={0}
+        open={false}
+        onToggle={vi.fn()}
+      />,
+    );
+    const button = getDotsButton();
+    const chips = Array.from(button.querySelectorAll('.pipeline-chip'));
+    expect(chips).toHaveLength(8);
+    expect(chips[7]?.classList.contains('is-empty')).toBe(true);
+    expect(screen.getByLabelText('AI: no gist for this page yet')).toBeDefined();
   });
 
   it('(1d) 6-lane payload (old companion / lane disabled) renders exactly 6 dots — no phantom Content', () => {

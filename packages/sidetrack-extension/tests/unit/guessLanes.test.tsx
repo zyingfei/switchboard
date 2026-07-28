@@ -96,6 +96,18 @@ const lanesWithContentEmpty: readonly GuessLaneResult[] = [
   { lane: 'content', candidates: [], emptyReason: 'no indexed page text yet' },
 ];
 
+// feat/ai-lane — the 8th lane appended AFTER content. The disclosure renders in
+// array order, so it needs no per-lane branch; what it DID need was for the
+// client parse to stop dropping the lane (types.ts VALID_LANES), which is why
+// the live 8-lane payload showed no AI row at all.
+const lanesWithAiSignal: readonly GuessLaneResult[] = [
+  ...lanesWithContentSignal,
+  {
+    lane: 'ai',
+    candidates: [{ workstreamId: 'ws-3', score: 0.48, why: '3 matches (CVE triage)' }],
+  },
+];
+
 describe('guess-lanes — SuggestionStats render', () => {
   it('(1) renders the lanes behind a disclosure with workstream names + why', () => {
     render(
@@ -272,6 +284,31 @@ describe('guess-lanes — SuggestionStats render', () => {
     expect(screen.getByText('no indexed page text yet')).toBeDefined();
   });
 
+  it('(7d) renders the AI lane row as the 8th entry when the payload carries it', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithAiSignal)}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        pageAccessGranted
+      />,
+    );
+    // 8 lanes now, 4 of them with signal (graph + topic + content + ai).
+    expect(screen.getByText('Guess lanes · 4 of 8 with signal')).toBeDefined();
+    // The lane's own label + why + workstream name all render …
+    const aiRow = screen.getByText('AI gist match').closest('li');
+    expect(aiRow).not.toBeNull();
+    expect(within(aiRow as HTMLElement).getByText('Reading / Longform')).toBeDefined();
+    expect(within(aiRow as HTMLElement).getByText('3 matches (CVE triage)')).toBeDefined();
+    // … and it sits LAST, after the Content row (the disclosure renders in
+    // array order, which is the wire order).
+    const rows = Array.from(
+      (aiRow as HTMLElement).closest('ul')?.querySelectorAll('.guess-lane-label') ?? [],
+    ).map((el) => el.textContent);
+    expect(rows[rows.length - 2]).toBe('Content match');
+    expect(rows[rows.length - 1]).toBe('AI gist match');
+  });
+
   it('(7c) 6-lane payload (old companion / lane disabled) shows NO Content row', () => {
     render(
       <SuggestionStats
@@ -359,17 +396,21 @@ describe('guess-lanes — lenient wire parse (parseGuessLanes)', () => {
     expect(parsed?.[0]?.candidates).toHaveLength(3);
   });
 
-  it("parses the 7th 'content' lane as valid while still dropping unknown lanes", () => {
+  it("parses the 7th 'content' and 8th 'ai' lanes as valid while still dropping unknown lanes", () => {
+    // THE MISSING-DOT BUG: 'ai' was absent from VALID_LANES, so this parse
+    // silently deleted the lane the companion had sent and every renderer
+    // downstream (strip AND disclosure) saw a 7-lane array.
     const parsed = parseGuessLanes([
       { lane: 'recency', candidates: [], emptyReason: 'no recent filing' },
       { lane: 'content', candidates: [{ workstreamId: 'ws-1', score: 0.5, why: 'text overlap' }] },
-      // Anything beyond the known 7 is still dropped leniently.
+      { lane: 'ai', candidates: [{ workstreamId: 'ws-2', score: 0.48, why: 'gist match' }] },
+      // Anything beyond the known 8 is still dropped leniently.
       { lane: 'brand-new-lane', candidates: [{ workstreamId: 'ws-9', score: 0.9, why: 'x' }] },
     ]);
-    expect(parsed).toHaveLength(2);
-    expect(parsed?.map((lane) => lane.lane)).toEqual(['recency', 'content']);
-    expect(parsed?.[1]?.candidates).toHaveLength(1);
-    expect(guessLaneSignalCount(parsed)).toBe(1);
+    expect(parsed).toHaveLength(3);
+    expect(parsed?.map((lane) => lane.lane)).toEqual(['recency', 'content', 'ai']);
+    expect(parsed?.[2]?.candidates).toHaveLength(1);
+    expect(guessLaneSignalCount(parsed)).toBe(2);
   });
 
   it('keeps an empty lane with its emptyReason (all-empty lanes still parse)', () => {

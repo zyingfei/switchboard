@@ -7,6 +7,11 @@ import {
   probabilityFromLogit,
 } from '../suggestion/confidence';
 import { GuessLanes } from './GuessLanes';
+import {
+  isLaneFallbackCandidate,
+  LANE_FALLBACK_PICK_LABEL,
+  LANE_FALLBACK_PICK_TITLE,
+} from './laneFallbackPick';
 import { PipelineStrip } from './PipelineStrip';
 import { type Possibilities, possibilitiesFrom, suggestionStateFrom } from './resolveOutcome';
 import { dominantSourceLabel, endorsementFor } from './suggestionEndorsement';
@@ -122,7 +127,13 @@ function PossibilitiesList({
       <li key={`${row.workstreamId}-${String(row.rank)}`} className="suggestion-possibility">
         <span className="suggestion-possibility-name">{label}</span>
         <span className="suggestion-possibility-source mono subtle">· {sourceWords}</span>
-        {confidenceWord !== null ? (
+        {/* A lane-fallback row's `level` was computed from a lane score sitting
+            in the rawFusionLogit field, so printing a confidence word ("Medium")
+            would be a calibration claim nothing supports. Say what it actually
+            is instead. */}
+        {row.unconfirmed ? (
+          <span className="suggestion-possibility-confidence mono subtle">· unconfirmed</span>
+        ) : confidenceWord !== null ? (
           <span className="suggestion-possibility-confidence mono subtle">· {confidenceWord}</span>
         ) : null}
         {onFileHere !== undefined ? (
@@ -449,6 +460,13 @@ export function SuggestionStats({
   // (the live -0.62-margin bug where an inbox decision rendered as a
   // suggestion). Confidence numbers stay visible for power users.
   const isWeakGuess = endorsementFor(suggestion).level === 'weak-guess';
+  // Lane-fallback pick (companion tabsession/laneFallback.ts): fusion produced
+  // NOTHING and the displayed pick was synthesized from the content + ai lanes.
+  // It is a weak guess in the policy's terms (action stays 'inbox'), but "weak
+  // guess — filed to inbox" understates it: there was no fusion at all, and the
+  // logit behind the confidence word is a lane score wearing a logit's field.
+  // So the chip says UNCONFIRMED and names where the evidence came from.
+  const isLaneFallback = isLaneFallbackCandidate(top);
   // The user's ask — the FULL ranked possibilities, one-click filable. With a
   // confident (endorsed) primary this is the collapsed "Other possibilities
   // (N)" tail; for a weak guess (top below the bar) it expands to "Below
@@ -469,10 +487,12 @@ export function SuggestionStats({
   // so the user sees the near-ties instead of an invented winner.
   const showAlts = showAlternatives || isTied;
   const tooltip =
-    (isWeakGuess
-      ? 'Weak guess — filed to inbox. The model has a lean but it fell ' +
-        'below the resolver’s confidence bar, so nothing was suggested.\n\n'
-      : '') +
+    (isLaneFallback
+      ? `${LANE_FALLBACK_PICK_TITLE}\n\n`
+      : isWeakGuess
+        ? 'Weak guess — filed to inbox. The model has a lean but it fell ' +
+          'below the resolver’s confidence bar, so nothing was suggested.\n\n'
+        : '') +
     'Uncalibrated diagnostics — these numbers are raw model internals, ' +
     'not a calibrated probability (no reliability fit for this surface). ' +
     'Read them as a rough lean, not a % chance:\n' +
@@ -519,11 +539,26 @@ export function SuggestionStats({
     <div
       className={`suggestion-stats is-${level}${compact ? ' is-compact' : ''}${
         isWeakGuess ? ' is-weak-guess' : ''
-      }`}
-      data-endorsement={isWeakGuess ? 'weak-guess' : 'endorsed'}
+      }${isLaneFallback ? ' is-lane-fallback' : ''}`}
+      data-endorsement={
+        isLaneFallback ? 'lane-fallback' : isWeakGuess ? 'weak-guess' : 'endorsed'
+      }
     >
       <span className="suggestion-stats-row">
-        {isWeakGuess ? (
+        {/* The uncertainty chip. A lane-fallback pick takes precedence over the
+            weak-guess wording: both are un-endorsed, but only one of them had
+            no fusion behind it at all, and the reader has to be able to tell.
+            Reuses the .suggestion-stats-weak muted styling so it can never
+            read as the confident (endorsed) headline. */}
+        {isLaneFallback ? (
+          <span
+            className="suggestion-stats-weak suggestion-stats-unconfirmed"
+            title={LANE_FALLBACK_PICK_TITLE}
+            data-testid="lane-fallback-pick"
+          >
+            {LANE_FALLBACK_PICK_LABEL}
+          </span>
+        ) : isWeakGuess ? (
           <span
             className="suggestion-stats-weak"
             title="Below the resolver's confidence bar — filed to inbox, not suggested. Confirm to teach it."
