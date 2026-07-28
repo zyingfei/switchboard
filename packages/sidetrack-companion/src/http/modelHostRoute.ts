@@ -55,12 +55,21 @@ export const MODEL_HOST_PATH_PREFIX = '/v1/models/';
 const MODEL_HOST_PATTERN =
   /^\/v1\/models\/([^/]+)\/([^/]+)\/resolve\/([^/]+)\/(.+)$/u;
 
-// A GET (or HEAD) request whose pathname is under the model-host prefix. Used by
-// the server to know it must intercept this request for streaming BEFORE the
-// JSON route dispatch (the JSON dispatch can only return an in-memory body). The
+// A GET (or HEAD) request the STREAMING serve route claims. Used by the server
+// to know it must intercept this request BEFORE the auth gate and the JSON
+// route dispatch (the JSON dispatch can only return an in-memory body). The
 // method check lives at the call site (GET/HEAD only).
+//
+// SHAPE-MATCHED, not prefix-matched. It used to claim the whole `/v1/models/`
+// prefix; it now claims only the `/resolve/{revision}/{file}` shape. That
+// matters because a SECOND, AUTHENTICATED family of routes now lives under the
+// same prefix — GET/POST /v1/models/{org}/{repo}/fetch (modelFetchRoute.ts) —
+// and a prefix match would swallow the status GET into the unauthenticated
+// streaming path. Anything else under the prefix falls through to the normal
+// auth gate, which is the stricter outcome (401, no route-table signal) rather
+// than the 400 the serve route used to emit.
 export const isModelHostPath = (pathname: string): boolean =>
-  pathname.startsWith(MODEL_HOST_PATH_PREFIX);
+  pathname.startsWith(MODEL_HOST_PATH_PREFIX) && MODEL_HOST_PATTERN.test(pathname);
 
 export interface ModelFileTarget {
   readonly org: string;
@@ -74,19 +83,54 @@ export interface ModelFileTarget {
   readonly absolutePath: string;
 }
 
+// THE TRAVERSAL DEFENSE — one implementation, shared by every route that turns
+// caller-supplied strings into a path under modelsDir (the GET serve route
+// below and the POST fetch route in modelFetchRoute.ts). Kept here, exported,
+// so the two can never drift into two different notions of "safe path".
+//
+// Takes ALREADY-DECODED segments. Decoding is the caller's job precisely
+// because it is direction-sensitive: the serve route decodes each URL segment
+// (so `%2e%2e` becomes `..` and is caught here), while the fetch route's paths
+// arrive as literal JSON strings and must NOT be decoded (decoding them would
+// CREATE traversal that the caller never wrote).
+//
+// Two independent layers:
+//   1. Reject any segment that is empty, '.', '..', contains a raw '/' or '\',
+//      or embeds a NUL (the classic path-truncation trick).
+//   2. After join+normalize, require the result to sit under `modelsDir + sep`
+//      (or equal modelsDir). Belt-and-suspenders: layer 1 alone would suffice,
+//      but the prefix check is the invariant that must hold no matter how the
+//      segments were spelled.
+export const confineUnderModelsDir = (
+  modelsDir: string,
+  segments: readonly string[],
+): string | null => {
+  // Layer 1 — reject traversal / empty / boundary-smuggling segments up front.
+  for (const seg of segments) {
+    if (seg.length === 0) return null;
+    if (seg === '.' || seg === '..') return null;
+    // A decoded segment must not itself contain a path separator — that would
+    // mean an encoded slash/backslash slipped through and could re-introduce a
+    // boundary the caller's split already accounted for.
+    if (seg.includes('/') || seg.includes('\\')) return null;
+    // Raw NUL inside a segment is a classic path-truncation trick — reject. The
+    // control char is produced via fromCharCode so no literal NUL byte lives in
+    // this source (standing review check).
+    if (seg.includes(String.fromCharCode(0))) return null;
+  }
+
+  const absolutePath = normalize(join(modelsDir, ...segments));
+  // Layer 2 — the confinement invariant. Must be modelsDir itself or strictly
+  // beneath it.
+  const root = normalize(modelsDir);
+  const rootWithSep = root.endsWith(sep) ? root : `${root}${sep}`;
+  if (absolutePath !== root && !absolutePath.startsWith(rootWithSep)) return null;
+  return absolutePath;
+};
+
 // Parse + confine a model-host pathname to an absolute file path under
 // modelsDir, or return null when the request is malformed OR would escape the
-// models directory.
-//
-// TRAVERSAL DEFENSE (two independent layers):
-//   1. Reject any decoded segment that is exactly '..' (or contains a raw '/'
-//      or '\' after decode) BEFORE joining. `%2e%2e%2f`-style attacks decode to
-//      '../' here and are caught.
-//   2. After join+normalize, require the result to sit under `modelsDir + sep`
-//      (or equal modelsDir). A normalized path that climbed out via any residual
-//      `..` fails the prefix check. Belt-and-suspenders: layer 1 alone would
-//      suffice, but the prefix check is the invariant that must hold no matter
-//      how the tail was spelled.
+// models directory. Confinement itself is confineUnderModelsDir above.
 export const resolveModelFileTarget = (
   pathname: string,
   modelsDir: string,
@@ -105,27 +149,8 @@ export const resolveModelFileTarget = (
   if (tailSegments.some((seg) => seg === null)) return null;
   const decodedTail = tailSegments as readonly string[];
 
-  // Layer 1 — reject traversal / empty / boundary-smuggling segments up front.
-  const allSegments = [org, repo, ...decodedTail];
-  for (const seg of allSegments) {
-    if (seg.length === 0) return null;
-    if (seg === '.' || seg === '..') return null;
-    // A decoded segment must not itself contain a path separator — that would
-    // mean an encoded slash/backslash slipped through and could re-introduce a
-    // boundary the split above already accounted for on the wire.
-    if (seg.includes('/') || seg.includes('\\')) return null;
-    // Raw NUL inside a segment is a classic path-truncation trick — reject. The
-    // control char is produced via fromCharCode so no literal NUL byte lives in
-    // this source (standing review check).
-    if (seg.includes(String.fromCharCode(0))) return null;
-  }
-
-  const absolutePath = normalize(join(modelsDir, org, repo, ...decodedTail));
-  // Layer 2 — the confinement invariant. Must be modelsDir itself or strictly
-  // beneath it.
-  const root = normalize(modelsDir);
-  const rootWithSep = root.endsWith(sep) ? root : `${root}${sep}`;
-  if (absolutePath !== root && !absolutePath.startsWith(rootWithSep)) return null;
+  const absolutePath = confineUnderModelsDir(modelsDir, [org, repo, ...decodedTail]);
+  if (absolutePath === null) return null;
 
   return {
     org,

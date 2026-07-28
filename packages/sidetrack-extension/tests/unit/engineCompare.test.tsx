@@ -280,12 +280,14 @@ describe('Health → Experiments · Compare engines', () => {
     expect(screen.getByTestId('hp-ondevice-ai-compare-caveat')).toHaveTextContent(
       'not purely engine quality',
     );
-    // OBSERVE-ONLY. Two GETs to read a document; no POST, ever.
+    // OBSERVE-ONLY. Two GETs to read a document, plus the row's HEAD probe of
+    // the companion's model host (transfers nothing, changes nothing). No POST,
+    // ever — a POST here would mean the comparison wrote or acquired something.
     for (const call of fetchMock.mock.calls as unknown as readonly [
       RequestInfo | URL,
       RequestInit | undefined,
     ][]) {
-      expect(call[1]?.method ?? 'GET').toBe('GET');
+      expect(['GET', 'HEAD']).toContain(call[1]?.method ?? 'GET');
       expect(String(call[0])).not.toContain('/v1/enrichment/');
     }
     vi.unstubAllGlobals();

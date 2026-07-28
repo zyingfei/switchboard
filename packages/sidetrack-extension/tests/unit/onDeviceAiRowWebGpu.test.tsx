@@ -109,7 +109,13 @@ describe('OnDeviceAiRow — WebGPU fallback', () => {
     render(<OnDeviceAiRow companionPort={17_373} bridgeKey="k" />);
     const btn = await screen.findByTestId('hp-ondevice-ai-webgpu-load');
     fireEvent.click(btn);
-    expect(loadWebGpuEngineMock).toHaveBeenCalledTimes(1);
+    // The click is now ASYNC before it loads anything: it first asks the
+    // companion whether the model is cached, so that a load which cannot
+    // succeed is never started. With no companion in jsdom the probe is
+    // indeterminate and the load proceeds exactly as before.
+    await waitFor(() => {
+      expect(loadWebGpuEngineMock).toHaveBeenCalledTimes(1);
+    });
     // Ready line renders once loaded…
     await waitFor(() => {
       expect(screen.getByTestId('hp-ondevice-ai-webgpu-state')).toHaveTextContent(

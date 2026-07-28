@@ -37,6 +37,16 @@ import {
   writeSelectedLocalModelId,
 } from '../../../src/sidepanel/nano/modelRegistry';
 import {
+  downloadButtonLabel,
+  fetchProgressLabel,
+  isNotCachedError,
+  notCachedMessage,
+  probeModelCached,
+  readModelFetchStatus,
+  startModelFetch,
+  type ModelFetchStatus,
+} from '../../../src/sidepanel/nano/modelFetch';
+import {
   readRemoteConfig,
   remoteConfigReady,
   remoteHostOf,
@@ -114,6 +124,10 @@ const COMPARE_MIN_CHARS = 400;
 // The budgeted enrichment run titles up to this many junk-titled threads per
 // click and PERSISTS them (unlike the observe-only eval above).
 const ENRICH_BUDGET = 10;
+// How often the row asks the companion how its download is going. A multi-GB
+// transfer is minutes long, so a slow poll is plenty — and each poll is a
+// loopback GET of a tiny JSON body.
+const MODEL_FETCH_POLL_MS = 1500;
 
 export interface TitleEvalResult {
   readonly threadId: string;
@@ -163,6 +177,17 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // WHICH local model the load button will fetch. Selecting is free — it writes
   // a preference and downloads nothing (modelRegistry.ts).
   const [localModelId, setLocalModelId] = useState<string>(DEFAULT_LOCAL_MODEL_ID);
+  // Is the SELECTED model actually on the companion? Until this landed, the row
+  // offered a load for models the companion had never heard of and the click
+  // died on transformers.js' raw "Could not locate file: http://127.0.0.1:…".
+  // 'unknown' before the probe answers; 'missing' swaps the load button for the
+  // download that would make the load possible.
+  const [cacheState, setCacheState] = useState<'unknown' | 'cached' | 'missing'>('unknown');
+  const [fetchStatus, setFetchStatus] = useState<ModelFetchStatus | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  // Bumped whenever the cache answer may have changed (download finished), so
+  // the probe below re-runs without the user reopening the panel.
+  const [cacheNonce, setCacheNonce] = useState(0);
   // The optional remote engine's armed state + destination, for the privacy
   // marker and the engine-precedence label. A storage read, never a network one.
   const [remoteArmed, setRemoteArmed] = useState(false);
@@ -258,13 +283,92 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
     setState('downloading');
   }, [probe]);
 
-  // EXPLICIT WebGPU load — the ONLY path that fetches the ~800MB model, and
-  // only reachable via the button below (rendered when Nano is unavailable).
+  // IS THE SELECTED MODEL ON THE COMPANION? A HEAD against the companion's own
+  // model host — loopback, no auth, no bytes. Re-runs on selection change and
+  // after a download completes. An indeterminate answer (companion hiccup)
+  // leaves the state alone rather than guessing "missing" and hiding a load
+  // that would have worked.
+  useEffect(() => {
+    if (companionPort === null || companionPort === undefined) return;
+    void (async () => {
+      const cached = await probeModelCached({
+        port: companionPort,
+        spec: localModelSpec(localModelId),
+      });
+      if (!mountedRef.current || cached === null) return;
+      setCacheState(cached ? 'cached' : 'missing');
+    })();
+  }, [companionPort, localModelId, cacheNonce]);
+
+  // EXPLICIT COMPANION DOWNLOAD — the only path that pulls model weights across
+  // the public internet, and a SEPARATE consent from the load below. The button
+  // states the size and names huggingface.co before this can run.
+  const downloadToCompanion = useCallback(async (): Promise<void> => {
+    if (companionPort === null || companionPort === undefined) return;
+    if (bridgeKey === null || bridgeKey === undefined) return;
+    setFetchError(null);
+    try {
+      const started = await startModelFetch({
+        port: companionPort,
+        bridgeKey,
+        spec: localModelSpec(localModelId),
+      });
+      if (mountedRef.current) setFetchStatus(started);
+    } catch (err) {
+      if (mountedRef.current) setFetchError(String(err instanceof Error ? err.message : err));
+    }
+  }, [companionPort, bridgeKey, localModelId]);
+
+  // Follow the companion's background job while it runs. Multi-GB transfers take
+  // minutes, so the panel polls rather than holding a request open.
+  useEffect(() => {
+    if (fetchStatus === null || fetchStatus.state !== 'running') return undefined;
+    if (companionPort === null || companionPort === undefined) return undefined;
+    if (bridgeKey === null || bridgeKey === undefined) return undefined;
+    const modelId = fetchStatus.modelId;
+    let stopped = false;
+    const tick = async (): Promise<void> => {
+      const next = await readModelFetchStatus({ port: companionPort, bridgeKey, modelId });
+      if (stopped || !mountedRef.current) return;
+      setFetchStatus(next);
+      if (next.state === 'done') {
+        // The companion can now serve it — re-probe so the Load button appears
+        // through the SAME check that hid it, not through a local assumption.
+        setCacheNonce((n) => n + 1);
+      }
+      if (next.state === 'error') setFetchError(next.error ?? 'download failed');
+    };
+    void tick();
+    const timer = window.setInterval(() => {
+      void tick();
+    }, MODEL_FETCH_POLL_MS);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [fetchStatus, companionPort, bridgeKey]);
+
+  // EXPLICIT WebGPU load — the ONLY path that pulls the model into the browser,
+  // and only reachable via the button below (rendered when Nano is unavailable).
+  // Loads from the LOCAL companion; never from huggingface.co.
   const loadWebGpu = useCallback(async (): Promise<void> => {
     if (companionPort === null || companionPort === undefined) return;
     if (!webGpuSupported()) {
       setWebGpuState('error');
       setWebGpuError('WebGPU not available in this browser');
+      return;
+    }
+    const spec = localModelSpec(localModelId);
+    // PRE-CHECK. Loading a model the companion does not have fails deep inside
+    // transformers.js with a raw URL the user cannot act on. Ask first, and if
+    // the answer is "not cached" say the actionable thing instead — the row's
+    // download button appears in the same render.
+    const cached = await probeModelCached({ port: companionPort, spec });
+    if (cached === false) {
+      if (!mountedRef.current) return;
+      setCacheState('missing');
+      setWebGpuState('error');
+      setWebGpuError(notCachedMessage(spec));
       return;
     }
     setWebGpuState('loading');
@@ -274,7 +378,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       await loadWebGpuEngine({
         port: companionPort,
         // The SELECTED model — the same explicit button, whichever size the user
-        // picked. Nothing else in the product can start this fetch.
+        // picked. Nothing else in the product can start this load.
         modelId: localModelId,
         onProgress: (p) => {
           if (mountedRef.current) setWebGpuProgress(p);
@@ -282,9 +386,17 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       });
       if (mountedRef.current) setWebGpuState('ready');
     } catch (err) {
-      if (mountedRef.current) {
-        setWebGpuState('error');
-        setWebGpuError(String(err));
+      if (!mountedRef.current) return;
+      const raw = String(err);
+      setWebGpuState('error');
+      // Belt for the pre-check's braces: a file deleted mid-session, or a cache
+      // holding config.json but not the weights, still surfaces as the step the
+      // user can take rather than as the missing URL.
+      if (isNotCachedError(raw)) {
+        setCacheState('missing');
+        setWebGpuError(notCachedMessage(spec));
+      } else {
+        setWebGpuError(raw);
       }
     }
   }, [companionPort, localModelId]);
@@ -527,6 +639,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // "not available" line instead of a button that would only ever error.
   const showWebGpuLoad = !nanoReady && companionConnected && webGpuState !== 'ready';
   const webGpuSupportedHere = webGpuSupported();
+  const downloadInFlight = fetchStatus !== null && fetchStatus.state === 'running';
 
   return (
     <div className="sx-callout" data-testid="hp-ondevice-ai">
@@ -560,6 +673,12 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
               onChange={(e) => {
                 const next = e.target.value;
                 setLocalModelId(next);
+                // Every per-model answer is now stale: the new selection has its
+                // own cache state and its own (possibly absent) download job.
+                setCacheState('unknown');
+                setFetchStatus(null);
+                setFetchError(null);
+                setWebGpuError(null);
                 void writeSelectedLocalModelId(next);
               }}
               data-testid="hp-ondevice-ai-model-select"
@@ -578,29 +697,65 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
         </div>
       ) : null}
       {/* WebGPU fallback — shown when Nano isn't available and the companion
-          (the model host) is connected. The load is EXPLICIT (this button is
-          the only trigger for the ~800MB fetch). No adapter → honest line. */}
+          (the model host) is connected. TWO buttons, never both: the model has
+          to be ON THE COMPANION before it can be loaded into the browser, and
+          offering a load that cannot succeed is what produced the raw
+          "Could not locate file" error this row now prevents. No adapter →
+          honest line instead of either button. */}
       {showWebGpuLoad ? (
         webGpuSupportedHere ? (
-          <button
-            type="button"
-            className="sx-btn"
-            style={{ marginLeft: 8 }}
-            disabled={webGpuState === 'loading'}
-            onClick={() => {
-              void loadWebGpu();
-            }}
-            data-testid="hp-ondevice-ai-webgpu-load"
-          >
-            {webGpuState === 'loading'
-              ? 'Loading local model…'
-              : `Load local model (WebGPU · ~${formatModelSize(selectedSpec.approxBytesOnDisk)}, from companion)`}
-          </button>
+          downloadInFlight ? (
+            <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-model-download-busy">
+              Downloading to companion…
+            </span>
+          ) : cacheState === 'missing' ? (
+            // NOT ON THE COMPANION. State the full cost — how much, and from
+            // which non-loopback host — because this is the one step that
+            // leaves the machine.
+            <button
+              type="button"
+              className="sx-btn"
+              style={{ marginLeft: 8 }}
+              onClick={() => {
+                void downloadToCompanion();
+              }}
+              data-testid="hp-ondevice-ai-model-download"
+            >
+              {downloadButtonLabel(selectedSpec)}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="sx-btn"
+              style={{ marginLeft: 8 }}
+              disabled={webGpuState === 'loading'}
+              onClick={() => {
+                void loadWebGpu();
+              }}
+              data-testid="hp-ondevice-ai-webgpu-load"
+            >
+              {webGpuState === 'loading'
+                ? 'Loading local model…'
+                : `Load local model (WebGPU · ~${formatModelSize(selectedSpec.approxBytesOnDisk)}, from companion)`}
+            </button>
+          )
         ) : (
           <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-ondevice-ai-webgpu-unsupported">
             WebGPU not available in this browser
           </span>
         )
+      ) : null}
+      {/* Companion-download progress, straight from the job status: files,
+          percent, and which file is moving. */}
+      {downloadInFlight && fetchStatus !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-model-download-progress" style={{ marginTop: 4 }}>
+          {fetchProgressLabel(fetchStatus)}
+        </div>
+      ) : null}
+      {fetchError !== null ? (
+        <div className="mono" data-testid="hp-ondevice-ai-model-download-error" style={{ marginTop: 4 }}>
+          Download failed: {fetchError}
+        </div>
       ) : null}
       {webGpuState === 'loading' && webGpuProgress !== null ? (
         <div className="mono" data-testid="hp-ondevice-ai-webgpu-progress" style={{ marginTop: 4 }}>

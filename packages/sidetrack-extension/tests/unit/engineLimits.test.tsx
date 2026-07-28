@@ -15,8 +15,9 @@ import {
 } from '../../src/sidepanel/nano/engineLimits';
 import {
   LOCAL_MODELS,
+  NANO_CLASS_LOCAL_MODEL_ID,
   WEBGPU_1B_MAX_INPUT_CHARS,
-  WEBGPU_4B_MAX_INPUT_CHARS,
+  WEBGPU_3B_MAX_INPUT_CHARS,
   formatModelSize,
   localModelSpec,
 } from '../../src/sidepanel/nano/modelRegistry';
@@ -88,14 +89,14 @@ describe('the limit table — one place, per MODEL for the local engine', () => 
     expect(limitsFor('remote').maxInputChars).toBe(REMOTE_MAX_INPUT_CHARS);
   });
 
-  it('follows the SELECTED local model: a 4B model gets a smaller input slice', () => {
-    const fourB = LOCAL_MODELS.find((m) => m.paramsBillions === 4);
-    expect(fourB).toBeDefined();
-    expect(limitsFor('webgpu', fourB?.id).maxInputChars).toBe(WEBGPU_4B_MAX_INPUT_CHARS);
-    expect(WEBGPU_4B_MAX_INPUT_CHARS).toBeLessThan(WEBGPU_1B_MAX_INPUT_CHARS);
+  it('follows the SELECTED local model: the Nano-class model gets a smaller input slice', () => {
+    const threeB = LOCAL_MODELS.find((m) => m.paramsBillions === 3);
+    expect(threeB).toBeDefined();
+    expect(limitsFor('webgpu', threeB?.id).maxInputChars).toBe(WEBGPU_3B_MAX_INPUT_CHARS);
+    expect(WEBGPU_3B_MAX_INPUT_CHARS).toBeLessThan(WEBGPU_1B_MAX_INPUT_CHARS);
     // Every cap carries the derivation, so nobody "tunes" it blind later.
     expect(limitsFor('webgpu').note).toContain('2000-char inputs at ~13s');
-    expect(limitsFor('webgpu', fourB?.id).note).toContain('not measured');
+    expect(limitsFor('webgpu', threeB?.id).note).toContain('not measured');
   });
 
   it('renders compactly: "limits: 2k in / 140 tok out"', () => {
@@ -283,11 +284,11 @@ describe('DISPLAY — the limits appear in BOTH rows', () => {
     expect(select.options).toHaveLength(LOCAL_MODELS.length);
     expect(select.options[0]?.textContent).toContain('1B q4 (fast)');
     expect(select.options[0]?.textContent).toContain('~800MB');
-    expect(select.options[1]?.textContent).toContain('4B q4 (matched to Nano)');
+    expect(select.options[1]?.textContent).toContain('3B q4 (matched to Nano)');
     expect(select.options[1]?.textContent).toContain('~3.3GB');
     // The default is the verified one, so no "unverified" prefix up front.
     expect(screen.getByTestId('hp-ondevice-ai-model-note')).not.toHaveTextContent('unverified');
-    // …but the 4B entry declares itself unverified rather than pretending.
-    expect(localModelSpec('onnx-community/gemma-3-4b-it-ONNX').status).toBe('unverified');
+    // …but the Nano-class entry declares itself unverified rather than pretending.
+    expect(localModelSpec(NANO_CLASS_LOCAL_MODEL_ID).status).toBe('unverified');
   });
 });

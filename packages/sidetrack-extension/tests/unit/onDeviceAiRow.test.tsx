@@ -145,12 +145,15 @@ describe('OnDeviceAiRow', () => {
         expectedOutputs: [{ type: 'text', languages: ['en'] }],
       }),
     );
-    // Observe-only: nothing but GETs — no POST/PUT anywhere.
+    // Observe-only: nothing but safe reads — no POST/PUT anywhere. HEAD counts
+    // as a read: the row probes the companion's model host with a HEAD to learn
+    // whether the selected model is cached, which transfers nothing and changes
+    // nothing. A POST here would mean the eval acquired something.
     for (const call of fetchMock.mock.calls as unknown as readonly [
       RequestInfo | URL,
       RequestInit | undefined,
     ][]) {
-      expect(call[1]?.method ?? 'GET').toBe('GET');
+      expect(['GET', 'HEAD']).toContain(call[1]?.method ?? 'GET');
     }
     // Quality is MEASURED, not eyeballed: every generated row carries the
     // deterministic scores plus the verdict the write-path validator would give.

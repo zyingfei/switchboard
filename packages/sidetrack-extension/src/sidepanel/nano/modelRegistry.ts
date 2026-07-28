@@ -18,9 +18,15 @@
 // so a size-matched fight is possible at all.
 //
 // STRICT LOAD GATING IS UNCHANGED. Selecting a model here writes a preference;
-// it never downloads anything. The ~800MB (or ~3.3GB) fetch stays reachable
-// from exactly one place — the explicit Health → Experiments load button — and
-// that button states the selected model's size before the user commits.
+// it never downloads anything, and it never reaches the network. Acquisition is
+// TWO separately-consented buttons in Health → Experiments, each stating its
+// own cost:
+//   1. "Download to companion" — the companion pulls the bundle from
+//      huggingface.co into its model cache (modelFetch.ts). Names the size and
+//      the host.
+//   2. "Load local model" — the browser loads the bundle from the LOCAL
+//      companion into WebGPU. Never touches HF.
+// Nothing else in the product can start either one.
 //
 // Pure data + pure helpers, plus a two-function preference accessor over
 // chrome.storage.local. No model, no network, no React.
@@ -86,7 +92,11 @@ export const NANO_IDENTITY: EngineIdentity = {
  * input slice to land in the same latency band as the 1B default.
  */
 export interface LocalModelSpec {
-  /** HF-layout id, served by the local companion (never fetched from HF). */
+  /**
+   * HF-layout id. The BROWSER only ever loads it from the local companion's
+   * model host; the companion may fetch it once from huggingface.co through
+   * the explicit "Download to companion" step (modelFetch.ts).
+   */
   readonly id: string;
   readonly revision: string;
   readonly label: string;
@@ -112,7 +122,34 @@ export interface LocalModelSpec {
   readonly maxOutputChars: number;
   /** How the input cap was arrived at — stated, never a bare magic number. */
   readonly limitsNote: string;
+  /**
+   * EXACTLY the repo-relative files this model needs to load, declared here
+   * because only the registry knows the export's layout. The companion never
+   * enumerates the repo or guesses: POST /v1/models/{id}/fetch sends this list
+   * verbatim and downloads precisely these paths.
+   *
+   * This is also the field that encodes the lesson behind this entry set: a
+   * SINGLE-GRAPH text-generation export (model_q4.onnx + its external-data
+   * shards) is what our WebGPU pipeline can load. A multimodal, multi-graph
+   * export — separate embed_tokens/decoder/vision graphs — is not a drop-in
+   * however good the model is, so it does not belong in this list at all.
+   */
+  readonly files: readonly string[];
 }
+
+/**
+ * The file set a single-graph transformers.js text-generation export needs:
+ * the config pair, the tokenizer pair, and the ONNX graph plus however many
+ * external-data shards the export was split into.
+ */
+const singleGraphFiles = (dataShards: readonly string[]): readonly string[] => [
+  'config.json',
+  'generation_config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'onnx/model_q4.onnx',
+  ...dataShards,
+];
 
 /** The default: unchanged behavior from before the registry existed. */
 export const DEFAULT_LOCAL_MODEL_ID = 'onnx-community/gemma-3-1b-it-ONNX';
@@ -126,13 +163,41 @@ export const DEFAULT_LOCAL_MODEL_ID = 'onnx-community/gemma-3-1b-it-ONNX';
  */
 export const WEBGPU_1B_MAX_INPUT_CHARS = 2000;
 /**
- * The 4B option's input cap. DECLARED, NOT MEASURED — no live run of this model
- * exists in this repo. Scaled from the 1B measurement by parameter count: ~4x
- * the compute per token, so half the input slice keeps a single gist in the
- * same order of magnitude as the measured ~13s rather than pushing it into
- * minutes. Re-measure and update this number once the model has actually run.
+ * The Nano-class option's input cap. DECLARED, NOT MEASURED — no live run of
+ * this model exists in this repo. Scaled from the 1B measurement by parameter
+ * count: ~3x the compute per token, so half the input slice keeps a single gist
+ * in the same order of magnitude as the measured ~13s rather than pushing it
+ * into minutes. Re-measure and update this number once the model has actually
+ * run.
  */
-export const WEBGPU_4B_MAX_INPUT_CHARS = 1000;
+export const WEBGPU_3B_MAX_INPUT_CHARS = 1000;
+
+/**
+ * The Nano-class local model. WHY THIS ID AND NOT gemma-3-4b:
+ *
+ * `onnx-community/gemma-3-4b-it-ONNX` used to sit in this slot and could never
+ * have worked. It exists on HF (53 files) but it is a MULTIMODAL, MULTI-GRAPH
+ * export: `onnx/decoder_model_merged_q4.onnx` plus two external-data shards,
+ * plus separate `embed_tokens*.onnx` and vision-encoder graphs. Our WebGPU
+ * pipeline loads ONE text-generation graph (`onnx/model_q4.onnx` + its data
+ * shards) — the 4B export is not a drop-in at any size, so the entry was a
+ * promise the loader could not keep. It is REMOVED, not fixed.
+ *
+ * `onnx-community/Llama-3.2-3B-Instruct-ONNX` is the verified-shape
+ * replacement: HTTP 200, text-only, single-graph (`onnx/model_q4.onnx`
+ * present), and 3B against Chrome Nano's ~3.25B — a genuine class match, which
+ * is the entire point of offering a second model.
+ */
+export const NANO_CLASS_LOCAL_MODEL_ID = 'onnx-community/Llama-3.2-3B-Instruct-ONNX';
+
+/**
+ * The q4 bundle size, MEASURED from the HF blobs API rather than rounded off a
+ * model card: model_q4.onnx 0.2MB + model_q4.onnx_data 1997.0MB +
+ * model_q4.onnx_data_1 1250.6MB + tokenizer.json 11.0MB + the three small JSON
+ * configs. This is the number the download button states before the user
+ * commits to it, so it has to be the real one.
+ */
+export const NANO_CLASS_BYTES_ON_DISK = 3_260_000_000;
 
 export const LOCAL_MODELS: readonly LocalModelSpec[] = [
   {
@@ -150,23 +215,31 @@ export const LOCAL_MODELS: readonly LocalModelSpec[] = [
     maxOutputChars: GIST_OUTPUT_MAX_CHARS,
     limitsNote:
       'Latency-derived: the 2026-07-27 tuning run used 2000-char inputs at ~13s per gist.',
+    // One external-data shard at this size.
+    files: singleGraphFiles(['onnx/model_q4.onnx_data']),
   },
   {
-    id: 'onnx-community/gemma-3-4b-it-ONNX',
+    id: NANO_CLASS_LOCAL_MODEL_ID,
     revision: 'main',
-    label: '4B q4 (matched to Nano)',
-    params: '4B',
-    paramsBillions: 4,
+    label: '3B q4 (matched to Nano)',
+    params: '3B',
+    paramsBillions: 3,
     quantization: 'q4',
-    approxBytesOnDisk: 3_300_000_000,
+    approxBytesOnDisk: NANO_CLASS_BYTES_ON_DISK,
+    // UNVERIFIED still: the layout and the file sizes were checked against HF,
+    // but nobody has loaded this model into a browser here. Verified means
+    // "actually ran in this repo" and nothing weaker.
     status: 'unverified',
     statusNote:
-      'Declared from the model card, NOT yet loaded here. If the id does not resolve against the companion model host the load reports that error — no substitute id is guessed.',
-    maxInputChars: WEBGPU_4B_MAX_INPUT_CHARS,
+      'Layout + sizes checked against HF (text-only, single-graph, 3.3GB at q4), but NOT yet loaded here. Download to the companion first; the load then reports the honest reason if anything is still missing — no substitute id is guessed.',
+    maxInputChars: WEBGPU_3B_MAX_INPUT_CHARS,
     maxNewTokens: GIST_MAX_NEW_TOKENS,
     maxOutputChars: GIST_OUTPUT_MAX_CHARS,
     limitsNote:
-      'Declared, not measured: scaled from the 1B latency measurement by parameter count (~4x compute per token).',
+      'Declared, not measured: scaled from the 1B latency measurement by parameter count (~3x compute per token).',
+    // TWO external-data shards — the q4 weights are split across
+    // model_q4.onnx_data (1997.0MB) and model_q4.onnx_data_1 (1250.6MB).
+    files: singleGraphFiles(['onnx/model_q4.onnx_data', 'onnx/model_q4.onnx_data_1']),
   },
 ];
 
