@@ -55,8 +55,33 @@ export const APPLE_CHARS_PER_TOKEN = 4;
  */
 export const APPLE_CONTEXT_HEADROOM = 0.6;
 
-/** How long to wait on the probe. A local port answers in ms or is not there. */
+/**
+ * Liveness timeout — for the GET that asks "is anything there?". A local port
+ * answers in under a millisecond or is not there at all (measured: 0.0006s).
+ */
 export const APPLE_PROBE_TIMEOUT_MS = 1500;
+
+/**
+ * Timeout for the GENERATION probe, which is a completely different animal and
+ * was the cause of a live failure worth writing down.
+ *
+ * The generation probe was added to catch an origin-blocked service (a GET
+ * returns 200 while every POST 403s). But it inherited the liveness timeout,
+ * and a COLD Apple Foundation Models session has to be spun up by the OS:
+ *
+ *     POST cold   6.96s      <-- first call after idle
+ *     POST warm   0.33s
+ *     GET         0.0006s
+ *
+ * At 1500ms the cold probe aborted every time, the service was reported
+ * 'not-running', routing skipped Apple entirely, and the panel said "model not
+ * loaded" while apfel's own log showed the request completing 200. The engine
+ * was unreachable in exactly the state it is always in when the panel opens.
+ *
+ * 15s is generous on purpose: this runs at most once per APPLE_PROBE_TTL_MS,
+ * only when something asks, and being slow once beats being invisible always.
+ */
+export const APPLE_GENERATION_PROBE_TIMEOUT_MS = 15_000;
 
 export interface AppleServiceInfo {
   /** True when a service answered /v1/models AND advertises the Apple model. */
@@ -141,20 +166,37 @@ export const probeAppleService = async (
   baseUrl: string = APPLE_SERVICE_BASE_URL,
   fetchImpl: FetchLike = globalFetch,
   timeoutMs: number = APPLE_PROBE_TIMEOUT_MS,
+  generationTimeoutMs: number = APPLE_GENERATION_PROBE_TIMEOUT_MS,
 ): Promise<AppleServiceInfo> => {
   const root = baseUrl.replace(/\/+$/u, '');
-  const controller = new AbortController();
-  const timer = setTimeout(() => { controller.abort(); }, timeoutMs);
+  // TWO BUDGETS, because the two steps are not the same kind of request. Using
+  // one controller for both is precisely the bug that made this engine
+  // unreachable: the cold generation takes ~7s and the liveness budget is 1.5s.
+  const liveness = new AbortController();
+  const livenessTimer = setTimeout(() => { liveness.abort(); }, timeoutMs);
+  let entry: { id: string; contextTokens: number } | null = null;
   try {
-    const res = await fetchImpl(`${root}/models`, { method: 'GET', signal: controller.signal });
+    const res = await fetchImpl(`${root}/models`, { method: 'GET', signal: liveness.signal });
     if (res.status === 403) return { ...APPLE_SERVICE_ABSENT, reason: 'origin-blocked' };
     if (!res.ok) return { ...APPLE_SERVICE_ABSENT, reason: 'probe-failed' };
-    const entry = appleModelEntry(await res.json());
+    entry = appleModelEntry(await res.json());
     if (entry === null) return { ...APPLE_SERVICE_ABSENT, reason: 'wrong-service' };
+  } catch {
+    // Connection refused, DNS, abort — all the same to the caller: not there.
+    return APPLE_SERVICE_ABSENT;
+  } finally {
+    clearTimeout(livenessTimer);
+  }
 
-    // Step 2 — the smallest real generation, purely to prove the POST path is
-    // open to this origin. One token, so the cost is a session round-trip
-    // (~0.6s measured) and it only runs once per probe TTL.
+  // Step 2 — the smallest real generation, purely to prove the POST path is
+  // open to this origin. One token, but on its OWN budget: a cold Apple session
+  // is spun up by the OS and takes seconds, not milliseconds.
+  const generation = new AbortController();
+  const generationTimer = setTimeout(
+    () => { generation.abort(); },
+    generationTimeoutMs,
+  );
+  try {
     const gen = await fetchImpl(`${root}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -163,7 +205,7 @@ export const probeAppleService = async (
         messages: [{ role: 'user', content: 'ok' }],
         max_tokens: 1,
       }),
-      signal: controller.signal,
+      signal: generation.signal,
     });
     if (gen.status === 403) {
       return { ...APPLE_SERVICE_ABSENT, contextTokens: entry.contextTokens, reason: 'origin-blocked' };
@@ -178,10 +220,9 @@ export const probeAppleService = async (
       reason: 'ok',
     };
   } catch {
-    // Connection refused, DNS, abort — all the same to the caller: not there.
-    return APPLE_SERVICE_ABSENT;
+    return { ...APPLE_SERVICE_ABSENT, contextTokens: entry.contextTokens, reason: 'probe-failed' };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(generationTimer);
   }
 };
 
