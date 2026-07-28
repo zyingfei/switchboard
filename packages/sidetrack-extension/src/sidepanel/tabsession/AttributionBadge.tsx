@@ -129,10 +129,15 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
         ? 'weak'
         : 'none';
   const variant = variantFor(attribution, ignored, guess);
-  const marker = markerFor(variant);
   // Only meaningful for the un-endorsed lean (a real attribution or an endorsed
   // suggestion never carries a synthesized candidate).
   const laneFallback = isLaneFallbackCandidate(suggestion?.fusedCandidates[0]);
+  // The lane-fallback pick already renders a full "Unconfirmed — from page
+  // content (AI-assisted)" chip immediately beside this badge; keeping the '?'
+  // marker too made the header read "?ai" — two hedges for one fact (live
+  // report, 2026-07-28). The marker stays for the ORDINARY weak-guess, where
+  // it is the only uncertainty signal.
+  const marker = laneFallback ? null : markerFor(variant);
   // No attribution and no guess: show a muted dash, not a confusing "?" — the
   // tooltip and the provenance row already say "No attribution".
   const label =

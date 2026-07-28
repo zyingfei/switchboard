@@ -10144,6 +10144,13 @@ pre.diff {
   opacity: 0.55;
   cursor: default;
 }
+/* page-text tidy 2026-07-28 */
+/* The destructive action sits apart from the constructive ones — pushed to
+   the row's far edge so "Delete text" can never be mistaken for the next
+   step after "Index page". */
+.cx-page-content-actions .cx-mini-btn.danger {
+  margin-left: auto;
+}
 .cx-mini-btn.danger {
   color: var(--signal);
   border-color: color-mix(in srgb, var(--danger) 25%, transparent);

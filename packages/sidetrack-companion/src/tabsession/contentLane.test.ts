@@ -334,14 +334,17 @@ describe('buildContentLane', () => {
     const store = fakeStore({
       vectorHits: [
         vhit('u1', 'https://hatchet.run/blog/postgres-survival-guide', 'Postgres survival guide', 1),
+        // (Host moved off openai.com when the hub guard landed — that domain
+        // is in the coarse-multi-topic set and its hits no longer vote; this
+        // test is about slash variants, not hub domains.)
         // Projection stores the trailing-slash spelling for this one — the
         // slash-variant discipline must still join it.
-        vhit('u2', 'https://openai.com/index/scaling-postgresql', 'Scaling PostgreSQL', 1),
+        vhit('u2', 'https://pganalyze.example/scaling-postgresql', 'Scaling PostgreSQL', 1),
       ],
     });
     const filed = new Map<string, string>([
       ['https://hatchet.run/blog/postgres-survival-guide', 'ws_pg'],
-      ['https://openai.com/index/scaling-postgresql/', 'ws_pg'],
+      ['https://pganalyze.example/scaling-postgresql/', 'ws_pg'],
     ]);
     const lane = await buildContentLane({
       canonicalUrl: 'https://github.com/NikolayS/PGSimCity',

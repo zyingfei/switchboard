@@ -126,7 +126,15 @@ function PossibilitiesList({
     return (
       <li key={`${row.workstreamId}-${String(row.rank)}`} className="suggestion-possibility">
         <span className="suggestion-possibility-name">{label}</span>
-        <span className="suggestion-possibility-source mono subtle">· {sourceWords}</span>
+        {/* A lane-fallback row has dominantSource 'none', which renders as
+            "no clear signal" — stacked with "· unconfirmed" that read as two
+            hedges saying the same thing ("· no clear signal · unconfirmed",
+            live report 2026-07-28). One honest marker is enough; the
+            provenance line under the pick already says where the name came
+            from. */}
+        {row.unconfirmed ? null : (
+          <span className="suggestion-possibility-source mono subtle">· {sourceWords}</span>
+        )}
         {/* A lane-fallback row's `level` was computed from a lane score sitting
             in the rawFusionLogit field, so printing a confidence word ("Medium")
             would be a calibration claim nothing supports. Say what it actually

@@ -80,6 +80,13 @@ export const PageTextPanel = ({
       className={'cx-page-content-card' + (open ? '' : ' is-collapsed')}
       data-testid={`${testIdPrefix}-page-content-card`}
     >
+      {/* ONE header line, not two. This used to render the toggle ("▾ Page
+          text") AND a second row repeating "Page text" with the status beside
+          it — so the section read "Page text / Page text / metadata only"
+          (live report, 2026-07-28). The status and chunk count are facts ABOUT
+          the header, so they live ON the header, visible collapsed or open —
+          which also means the collapsed row already answers "is this page
+          indexed?" without a click. */}
       <button
         type="button"
         className="cx-summary-toggle cx-mono cx-dim"
@@ -88,16 +95,13 @@ export const PageTextPanel = ({
         data-testid={`${testIdPrefix}-summary-toggle`}
       >
         {open ? '▾' : '▸'} Page text
-      </button>
-      <div className="cx-page-content-main">
-        <span className="cx-page-content-label">Page text</span>
         <span className="cx-page-content-state">
           {captureDisabled ? 'not captured' : pageContentStatusLabel(coverage)}
         </span>
         {!captureDisabled && coverage?.chunkCount !== undefined ? (
           <span className="cx-page-content-meta">{String(coverage.chunkCount)} chunks</span>
         ) : null}
-      </div>
+      </button>
       <div className="cx-page-content-actions">
         <button
           type="button"

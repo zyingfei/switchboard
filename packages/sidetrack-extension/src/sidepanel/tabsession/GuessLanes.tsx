@@ -111,7 +111,13 @@ function LaneRow({
       <span className="guess-lane-head">
         <span className="guess-lane-label">{label}</span>
         <span className="guess-lane-name">{topName}</span>
-        <span className="guess-lane-score mono subtle">· {scorePercent(top.score)}</span>
+        {/* NO score on the top row. Lane scores are normalized to the lane's
+            own max, so the top candidate is 1.0 BY CONSTRUCTION — rendering it
+            as "· 100%" printed false certainty on every lane of every page,
+            directly beside "unconfirmed" copy (live report, 2026-07-28). The
+            honest evidence is the why line (match count + named documents);
+            runner-up rows keep their percents, which ARE informative because
+            they are relative to this top. */}
         {onFileHere !== undefined ? (
           <button
             type="button"
