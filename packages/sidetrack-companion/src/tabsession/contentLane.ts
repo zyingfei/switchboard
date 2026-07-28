@@ -28,8 +28,20 @@
 // Promise.race). An in-memory LRU caps repeated on-the-fly embeds. Any failure
 // (no store, embed timeout, empty corpus) degrades to a typed-empty lane — it
 // never throws into the resolve.
+//
+// BLOCKING. Bounded ≠ non-blocking. Everything above is SYNCHRONOUS on the
+// thread that serves HTTP (bun:sqlite has no async API), and a batch-resolve
+// runs this twice — lane 7 and lane 8 — for EVERY url it returns; the measured
+// diag `content-lane batch=1 dur=966ms` is one URL's pair. So the three
+// internal phases (query-vector acquisition / KNN / FTS / workstream join) are
+// separated by `await yieldToEventLoop()`. That does not make the lane cheaper;
+// it stops the lane from being one uninterruptible tick, which is what a
+// client's "Companion did not respond within 15s" actually measures. Adding a
+// yield inside a lane whose whole job is to be cheap looks redundant until you
+// see the 250ms watchdog threshold and the batch multiplier.
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
+import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
 import type { GuessLane, GuessLaneCandidate, GuessLaneResult } from './guessLanes.js';
 
 // ---- env flag ---------------------------------------------------------
@@ -460,6 +472,12 @@ export const buildContentLane = async (
       })
     : { vector: undefined, embedded: false, ownEntityIds };
 
+  // PHASE BREAK — see the block comment above `buildContentLane`. Phases (2)
+  // and (4) below are synchronous sqlite / synchronous O(snapshot) JS, run
+  // back-to-back, twice per URL (lanes 7 and 8), for every URL in a batch.
+  // Without these breaks the whole lane is one uninterruptible tick.
+  await yieldToEventLoop();
+
   // (2) retrieval — vector KNN + FTS, each top-12.
   const vectorRanking: RankedDoc[] = [];
   if (qv.vector !== undefined) {
@@ -490,6 +508,12 @@ export const buildContentLane = async (
       });
     }
   }
+
+  // PHASE BREAK — KNN done, FTS next. These are two independent sqlite round
+  // trips (an HNSW/vec scan then an FTS5 BM25 match); the native `sample` of a
+  // live batch-resolve found main-thread frames in BOTH (BtreeTableMoveto and
+  // the FTS functions), so they are two separately-chargeable blocks, not one.
+  await yieldToEventLoop();
 
   // AI lane: the gist is the whole query. No title, no URL tokens — those
   // are what the OTHER lanes already contribute, and mixing them back in would
@@ -526,6 +550,14 @@ export const buildContentLane = async (
     }
     return typedEmpty('nothing indexed matches this page yet', laneId);
   }
+
+  // PHASE BREAK — retrieval done, join next. buildWorkstreamJoin walks EVERY
+  // node and EVERY edge of the resolver subgraph to build its two indexes; it
+  // is pure JS rather than sqlite, but it is O(snapshot) and it is rebuilt per
+  // lane per URL, so on a batch it is the phase most likely to be the tick that
+  // outlives the 250ms watchdog threshold. Placed after the early typed-empty
+  // returns above so a lane with nothing to join costs no extra scheduling.
+  await yieldToEventLoop();
 
   // (4) workstream join + per-workstream aggregation.
   const join = buildWorkstreamJoin(snapshot);

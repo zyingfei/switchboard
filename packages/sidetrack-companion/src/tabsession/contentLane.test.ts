@@ -504,3 +504,69 @@ describe('appendContentLane', () => {
 // (8) titleHints validation is exercised end-to-end in http/visitsRoutes.test.ts
 // (the parse+validate lives on the batch-resolve route). Kept there so the
 // oversize/invalid-ignored behavior is asserted against the real request path.
+
+// ---- (9) blocking contract --------------------------------------------
+//
+// The lane is bounded (~50ms indexed, ~450ms worst case) but bounded is not the
+// same as non-blocking: every store call is synchronous sqlite on the thread
+// that serves HTTP, and a batch-resolve runs the lane TWICE per URL for every
+// URL it returns. These tests assert the phase yields exist, because they are
+// invisible in the lane's own output and a future refactor would silently drop
+// them.
+
+/** Count how many macrotask turns a setImmediate chain gets while `run` runs. */
+const countInterleavedTicks = async (run: () => Promise<unknown>): Promise<number> => {
+  let ticks = 0;
+  let running = true;
+  const beat = (): void => {
+    if (!running) return;
+    ticks += 1;
+    setImmediate(beat);
+  };
+  setImmediate(beat);
+  await run();
+  running = false;
+  return ticks;
+};
+
+describe('buildContentLane blocking contract', () => {
+  it('(9) hands the loop back between its phases — never one uninterruptible tick', async () => {
+    // Lexical-only (vector backend off) with FTS hits that join to a
+    // workstream, so the lane runs to completion through all three phase
+    // breaks: qv -> KNN, KNN -> FTS, retrieval -> workstream join.
+    const store = fakeStore({
+      vectorBackendAvailable: false,
+      ftsHits: [fhit('e1', 'https://alpha.test/two', 'Alpha Two', { bodyIndexed: 1 })],
+    });
+    let lane: GuessLaneResult | undefined;
+    const ticks = await countInterleavedTicks(async () => {
+      lane = await buildContentLane({
+        canonicalUrl: 'https://query.test/blocking',
+        snapshot: snapshot(),
+        title: 'Alpha topic',
+        store,
+        embedderUsable: false,
+      });
+    });
+    // The lane produced a real answer (this is not a degenerate early return).
+    expect(lane?.candidates.map((c) => c.workstreamId)).toEqual(['ws_alpha']);
+    // Three phase yields ⇒ at least three turns for anything else on the loop.
+    expect(ticks).toBeGreaterThanOrEqual(3);
+  });
+
+  it('(9b) an early typed-empty return costs no extra scheduling it does not need', async () => {
+    // `store === undefined` returns before any phase runs, so the yields must
+    // not be paid by a lane that has nothing to do — a batch of cache hits on a
+    // companion without a recall store would otherwise pay 2 * N of them.
+    const ticks = await countInterleavedTicks(async () => {
+      await buildContentLane({
+        canonicalUrl: 'https://query.test/none',
+        snapshot: snapshot(),
+        title: 'x',
+        store: undefined,
+        embedderUsable: false,
+      });
+    });
+    expect(ticks).toBeLessThanOrEqual(1);
+  });
+});

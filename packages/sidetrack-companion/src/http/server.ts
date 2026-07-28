@@ -237,19 +237,22 @@ import {
   type EntityEnrichmentRetractedPayload,
 } from '../enrichment/events.js';
 
-// Hand the event loop back for one macrotask.
-//
-// bun:sqlite is fully SYNCHRONOUS, so a route that touches sqlite N times in a
-// loop holds the thread that serves every other request for the whole run.
-// Awaiting this between iterations does not make the work cheaper — it caps
-// how long a single tick can hold the loop, which is what a client timeout
-// actually measures. setImmediate (not a microtask) so pending I/O callbacks
-// genuinely get a turn. Mirrors the reconcile phase yields in
-// connectionsMaterializer.ts.
-const yieldToEventLoop = (): Promise<void> =>
-  new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
+// Hand the event loop back for one macrotask. MOVED to runtime/eventLoopYield.ts
+// (same helper, same reasoning, full comment there) because the content/ai lane
+// phases and the deferred resolver-cache drain need the identical primitive on
+// the identical hot path, and three copies of a scheduling primitive is how
+// they drift apart.
+import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
+import {
+  queueResolverCacheWrite,
+  resolverCacheDeferEnabled,
+  scheduleResolverCacheFlush,
+} from './resolverCacheDefer.js';
+import {
+  completeInflight,
+  registerInflight,
+  routeLabelFromPattern,
+} from '../runtime/inflightRegistry.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -5474,6 +5477,14 @@ const routes: readonly RouteDefinition[] = [
               ]
             : missedEvents;
           const synthesizedForMiss = synthesizedTitleFor(canonicalUrl);
+          // PHASE BREAK: events-prep -> resolve. In the event-candidate case the
+          // lines above are two O(merged) filters over the whole read window
+          // (signal + timeline events for the target and every expanded
+          // candidate) — pure JS, but on a real vault `merged` is hundreds of
+          // thousands of events, so the prep alone is a tick worth of work
+          // BEFORE the resolver's sqlite reads start. Splitting them keeps
+          // "slowest single URL" from meaning "prep AND resolve back to back".
+          await yieldToEventLoop();
           const result = await resolveUrlAttributionArmed({
             vaultRoot: requireVaultRoot(context),
             canonicalUrl,
@@ -5490,7 +5501,28 @@ const routes: readonly RouteDefinition[] = [
             // query-time + titleHint-dependent, so it is appended to the served
             // copy AFTER the cache read/write (see the final pass below) and is
             // never persisted — a titleHint change never stales the cache.
-            await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
+            //
+            // DEFERRED OFF THE REQUEST PATH (SIDETRACK_RESOLVER_CACHE_DEFER,
+            // default ON). This INSERT is the sqlite3BtreeInsert frame that
+            // showed up in the native `sample` of a live batch-resolve — a
+            // WRITE inside a read request, once per resolved URL, synchronous
+            // because bun:sqlite has no async API. Queuing it costs a Map set;
+            // the HTTP dispatch drains the queue AFTER the response is written
+            // (see resolverCacheDefer.ts for the full safety argument: this
+            // request serves from its own in-memory `results`, never reads the
+            // entry back, and the key already folds arm + state revision so a
+            // late landing under a superseded key is inert).
+            if (resolverCacheDeferEnabled()) {
+              queueResolverCacheWrite(
+                async (visitId, revision, value) =>
+                  await sqliteStore.cacheResolverResult(visitId, revision, value),
+                canonicalUrl,
+                batchCacheRevision,
+                result,
+              );
+            } else {
+              await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
+            }
             // Seed the SWR cache so a later drain can serve this item stale +
             // refresh in the background rather than recomputing it inline in
             // the next convoy. eventCandidate items are intentionally excluded
@@ -5531,6 +5563,14 @@ const routes: readonly RouteDefinition[] = [
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
+              // PHASE BREAK: lane 7 -> lane 8. Each lane is an independent
+              // KNN + FTS + workstream join; running both without a break makes
+              // one URL cost two full lane computations in a single tick, and
+              // the measured `content-lane batch=1 dur=966ms` diag says that
+              // pair is ~1s of the route on its own. buildContentLane also
+              // yields BETWEEN its own phases now (contentLane.ts) — this break
+              // is the one it cannot make for itself.
+              await yieldToEventLoop();
               // Lane 8, same inputs, gist-only query — see appendAiLane.
               results[canonicalUrl] = await appendAiLane(
                 results[canonicalUrl]!,
@@ -10652,6 +10692,28 @@ export const handleRequest = async (
     ).catch(() => undefined);
   };
 
+  // STALL ATTRIBUTION (always on, not debug-gated — an operator does not get to
+  // reproduce a stall on demand, so the field has to already be in the log).
+  // The event-loop watchdog could only ever say `[api.stall]
+  // eventLoopBlockedMs=3008` — never WHICH route held the thread — so every
+  // stall investigation in this repo began by guessing the endpoint.
+  // Registering here and completing in the `finally` below lets the monitor
+  // name the routes that were still running when it noticed the block.
+  //
+  // PLACEMENT is deliberate: this is after the 404, the model-host stream and
+  // the /v1/vault/changes SSE early-returns, so only DISPATCHED JSON routes are
+  // tracked. The SSE connection in particular is open for the entire session —
+  // tracking it would make it permanently the longest-running request and it
+  // would head every suspect list forever, drowning the actual culprit.
+  //
+  // The recorded string is the route PATTERN from the matched route table entry
+  // — `POST:/v1/visits/batch-resolve`, `GET:/v1/visits/{canonicalUrl}/resolve` —
+  // NOT url.pathname. The http-log line above strips url.search for PII; for
+  // the resolve routes the PATHNAME ITSELF carries the encoded canonical URL,
+  // so a stall line built from it would leak browsing history into a log the
+  // user is asked to paste. The pattern cannot.
+  const inflightId = registerInflight(routeLabelFromPattern(route.method, route.pattern));
+
   try {
     const match = route.pattern.exec(url.pathname);
     // F02 systemic default-deny. An mcp-key caller may only reach a
@@ -10784,6 +10846,16 @@ export const handleRequest = async (
         ...(issues === undefined ? {} : { issues }),
       }),
     );
+  } finally {
+    completeInflight(inflightId);
+    // AFTER the response — both branches above have already called sendJson /
+    // send304 by the time this runs, so the queued resolver-cache upserts drain
+    // on a tick the client is no longer waiting on. This is the PRIMARY drain
+    // trigger (resolverCacheDefer's own fallback timer exists only for a
+    // companion that goes completely idle with a queued write). No-op, and no
+    // scheduling at all, when the queue is empty — which is every request that
+    // is not a batch-resolve with fresh misses.
+    scheduleResolverCacheFlush();
   }
 };
 

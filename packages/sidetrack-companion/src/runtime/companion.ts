@@ -1062,8 +1062,12 @@ export const startCompanion = async (
     // /v1/status can report `eventLoop.maxRecentStallMs` etc. independent
     // of whether the materializer or recall lifecycle is doing work.
     // Any synchronous-CPU phase that pins the main thread for >250 ms
-    // prints `[api.stall] eventLoopBlockedMs=… note=…` so the operator
-    // can locate the blocking phase without re-running with profilers.
+    // prints `[api.stall] eventLoopBlockedMs=… inflight=… note=…` so the
+    // operator can locate the blocking phase without re-running with
+    // profilers. `inflight=` names the HTTP routes still running when the
+    // stall was noticed (runtime/inflightRegistry.ts) — the line used to
+    // carry a magnitude and no suspect, which is why every investigation
+    // started by guessing the endpoint.
     const eventLoopMonitor = startEventLoopMonitor();
     teardown.push(() => {
       eventLoopMonitor.stop();
