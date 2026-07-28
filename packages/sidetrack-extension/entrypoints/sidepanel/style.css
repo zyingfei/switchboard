@@ -828,6 +828,20 @@ button:disabled {
   color: var(--ink-3);
   font-weight: 500;
 }
+/* Lane-fallback pick (companion tabsession/laneFallback.ts): fusion produced
+   NOTHING and the shown pick was synthesized from the content + AI guess lanes.
+   Same muted pill — it must never read as a suggestion — but its label is a
+   short sentence rather than two words, so the row wraps (the pill takes the
+   first line, the workstream name the next) instead of squeezing the name, and
+   the sentence is not shouted in uppercase. */
+.suggestion-stats.is-lane-fallback .suggestion-stats-row {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.suggestion-stats-unconfirmed {
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
 
 /* Ranked "Possibilities" — the resolver's FULL candidate list, one-click
    filable. Collapsed under a confident primary ("Other possibilities (N)")

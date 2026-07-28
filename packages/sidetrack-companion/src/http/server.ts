@@ -197,6 +197,7 @@ import {
   type AppendContentLaneDeps,
   type ContentLaneStore,
 } from '../tabsession/contentLane.js';
+import { applyLaneFallbackGuess } from '../tabsession/laneFallback.js';
 import {
   currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
@@ -5488,6 +5489,14 @@ const routes: readonly RouteDefinition[] = [
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
+              // Lane-fallback guess. Only when fusion produced NOTHING and the
+              // gate says so ('no-candidates'): the displayed pick is filled
+              // from the content + ai lanes just appended, marked unconfirmed.
+              // Never overrides real fusion output, never touches the decision
+              // action/margin (so auto-apply is unreachable from here), and —
+              // like the lanes themselves — runs AFTER the resolver-cache write
+              // above, so nothing synthesized is ever persisted.
+              results[canonicalUrl] = applyLaneFallbackGuess(results[canonicalUrl]!);
             }
           }
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
@@ -5556,6 +5565,10 @@ const routes: readonly RouteDefinition[] = [
           { canonicalUrl, snapshot, title, gist },
           contentDeps,
         );
+        // Lane-fallback guess — see the sqlite-store path above for the full
+        // boundary. Same call, same position (after both lanes are appended),
+        // so the two batch-resolve paths serve identically.
+        results[canonicalUrl] = applyLaneFallbackGuess(results[canonicalUrl]!);
       }
       return [
         200,
