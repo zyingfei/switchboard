@@ -40,6 +40,13 @@
 //
 // Pure except for the Nano quota probe, which is memoized and never throws.
 
+import {
+  APPLE_CONTEXT_HEADROOM,
+  APPLE_FALLBACK_CONTEXT_TOKENS,
+  APPLE_SERVICE_ABSENT,
+  appleMaxInputChars,
+  type AppleServiceInfo,
+} from './appleService';
 import { planChunks } from './chunking';
 import { GIST_MAX_NEW_TOKENS, GIST_OUTPUT_MAX_CHARS } from './generationOptions';
 import {
@@ -137,8 +144,33 @@ export const localModelLimits = (spec: LocalModelSpec): EngineLimits => ({
 export const limitsFor = (kind: EngineKind, modelId?: string | null): EngineLimits => {
   if (kind === 'webgpu') return localModelLimits(localModelSpec(modelId));
   if (kind === 'remote') return remoteLimits;
+  // Without a live probe the Apple window is not known, so this returns the
+  // DOCUMENTED macOS 26 fallback. The engine itself always carries probed
+  // limits (appleLimits(info)); this branch only serves pure render paths.
+  if (kind === 'apple') return appleLimits(APPLE_SERVICE_ABSENT);
   return cachedNanoLimits();
 };
+
+/**
+ * Limits for the Apple on-device engine, derived from the window the local
+ * service actually REPORTED rather than from a constant. macOS 26 reports 4096
+ * tokens and macOS 27 reports 8192, so a hardcoded number would silently throw
+ * away half the window on a newer OS — which is why `inputSource` is
+ * 'measured' whenever the probe succeeded and 'declared' when it did not.
+ *
+ * `maxOutputTokens` is OUR gist budget, not a service limit: apfel accepts
+ * `max_tokens`, so unlike Nano we can genuinely bound the output and say so.
+ */
+export const appleLimits = (info: AppleServiceInfo): EngineLimits => ({
+  kind: 'apple',
+  maxInputChars: appleMaxInputChars(info.contextTokens),
+  maxOutputTokens: GIST_MAX_NEW_TOKENS,
+  maxOutputChars: GIST_OUTPUT_MAX_CHARS,
+  inputSource: info.available ? 'measured' : 'declared',
+  note: info.available
+    ? `Apple's on-device model reported a ${String(info.contextTokens)}-token window; ${String(Math.round(APPLE_CONTEXT_HEADROOM * 100))}% is left for input so the answer still fits.`
+    : `No local Apple AI service answered — using the documented ${String(APPLE_FALLBACK_CONTEXT_TOKENS)}-token macOS 26 window.`,
+});
 
 // ---------------------------------------------------------------------------
 // The Nano quota probe — the one place that asks the runtime for a real number.

@@ -30,6 +30,8 @@ import {
   type EngineAvailability,
   type EnrichmentRoute,
 } from './language';
+import { appleEngineFrom } from './appleEngine';
+import { probeAppleService, type AppleServiceInfo } from './appleService';
 import {
   cleanGeneratedText,
   outputCharCapOf,
@@ -152,6 +154,76 @@ export const nanoEngineIfAvailable = async (
  */
 export const remoteEngineIfConfigured = async (): Promise<GenerationEngine | null> =>
   remoteEngineFrom(await readRemoteConfig());
+
+// ---------------------------------------------------------------------------
+// Apple Foundation Models — on-device, through a local service.
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe result cache. The probe is a loopback GET that answers in milliseconds
+ * or not at all, but routing asks for availability on every enrichment, and
+ * hammering a port on every keystroke is rude even when it is local.
+ *
+ * Cached for APPLE_PROBE_TTL_MS, NOT for the session: the user can start or
+ * stop `apfel --serve` at any moment, and an engine that stayed "ready" for an
+ * hour after the service died would fail every generation with a confusing
+ * error instead of quietly routing elsewhere.
+ */
+export const APPLE_PROBE_TTL_MS = 30_000;
+
+let appleProbeCache: { at: number; info: AppleServiceInfo } | null = null;
+
+/**
+ * Probe override. WHY THIS EXISTS, and why the default is "absent" under test:
+ *
+ * The real probe is a GET to a loopback port. That makes a UNIT TEST'S RESULT
+ * DEPEND ON WHETHER A DAEMON HAPPENS TO BE RUNNING ON THE DEVELOPER'S MACHINE —
+ * caught for real on 2026-07-28, when five unrelated engine/remote tests started
+ * failing with "expected 'apple' to be 'none'" purely because `apfel --serve`
+ * was up in another terminal. CI would have been green, which is worse: the
+ * suite would be lying about what it verified.
+ *
+ * So tests/setup.ts installs an ABSENT probe globally, making hermeticity the
+ * default and any Apple-available test an explicit, visible opt-in.
+ */
+let appleProbeOverride: (() => Promise<AppleServiceInfo>) | null = null;
+
+/**
+ * Replace the probe (tests only). Pass null to restore the real one.
+ * Always clears the cache, so an override can never be shadowed by a result
+ * captured before it was installed.
+ */
+export const setAppleProbeForTest = (
+  probe: (() => Promise<AppleServiceInfo>) | null,
+): void => {
+  appleProbeOverride = probe;
+  appleProbeCache = null;
+};
+
+/** Drop the cached probe — test seam, and the hook for a manual Health re-check. */
+export const resetAppleProbeCache = (): void => {
+  appleProbeCache = null;
+};
+
+/**
+ * Current Apple-service status, cached. Never throws, never starts anything.
+ * `force` bypasses the cache for an explicit user-initiated re-check.
+ */
+export const appleServiceStatus = async (
+  force = false,
+  now: number = Date.now(),
+): Promise<AppleServiceInfo> => {
+  if (!force && appleProbeCache !== null && now - appleProbeCache.at < APPLE_PROBE_TTL_MS) {
+    return appleProbeCache.info;
+  }
+  const info = await (appleProbeOverride ?? probeAppleService)();
+  appleProbeCache = { at: now, info };
+  return info;
+};
+
+/** The Apple engine when the local service is up, else null. */
+export const appleEngineIfAvailable = async (): Promise<GenerationEngine | null> =>
+  appleEngineFrom(await appleServiceStatus());
 
 // ---------------------------------------------------------------------------
 // WebGPU engine (transformers.js) — explicit-load singleton.
@@ -477,6 +549,7 @@ export const enginePolicy = async (
 ): Promise<EngineChoice> => {
   const nano = await nanoEngineIfAvailable(lm);
   if (nano !== null) return 'nano';
+  if ((await appleServiceStatus()).available) return 'apple';
   if (isWebGpuLoaded()) return 'webgpu';
   if (remoteConfigReady(await readRemoteConfig())) return 'remote';
   return 'none';
@@ -494,6 +567,8 @@ export const resolveReadyEngine = async (
 ): Promise<GenerationEngine | null> => {
   const nano = await nanoEngineIfAvailable(lm);
   if (nano !== null) return nano;
+  const apple = await appleEngineIfAvailable();
+  if (apple !== null) return apple;
   if (webGpuEngineSingleton !== null) return webGpuEngineSingleton;
   return await remoteEngineIfConfigured();
 };
@@ -539,8 +614,14 @@ export const engineAvailabilitySnapshot = async (
   // Remote readiness is a STORAGE read, never a network probe: asking the
   // provider whether the key works would itself be outbound traffic.
   const remote = await readRemoteConfig();
+  // Apple readiness IS a probe, and that is fine precisely because it is the
+  // opposite of the remote case: a GET to a loopback port, which cannot leave
+  // the machine and cannot be observed by anyone. It is cached (TTL above) so
+  // a re-render does not re-ask.
+  const apple = await appleServiceStatus();
   return {
     nanoReady,
+    appleReady: apple.available,
     webGpuLoaded: isWebGpuLoaded(),
     webGpuLoading: status.phase === 'loading',
     webGpuPercent: status.percent,
@@ -574,6 +655,19 @@ export const resolveEngineForLanguage = async (
     // Defensive: availability flipped between the two passive reads.
     if (nano === null) return { engine: null, route: { engine: null, reason: 'no-engine' } };
     return { engine: nano, route };
+  }
+  if (route.engine === 'apple') {
+    // Re-probe rather than trusting the snapshot: `apfel --serve` can be
+    // stopped between the availability read and the click, and a stale "ready"
+    // must degrade to a routed fallback, never to a failed generation.
+    const apple = await appleEngineIfAvailable();
+    if (apple !== null) return { engine: apple, route };
+    // The service went away. Fall through to whatever else is loaded rather
+    // than reporting no-engine — WebGPU may well be sitting right there.
+    if (webGpuEngineSingleton !== null) {
+      return { engine: webGpuEngineSingleton, route: { engine: 'webgpu' } };
+    }
+    return { engine: null, route: { engine: null, reason: 'model-not-loaded' } };
   }
   if (route.engine === 'webgpu' && webGpuEngineSingleton !== null) {
     return { engine: webGpuEngineSingleton, route };

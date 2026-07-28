@@ -22,6 +22,8 @@ import {
   GIST_LANE_MARKER_TITLE,
 } from '../tabsession/gistProvenance';
 import type { GuessLaneResult, TabSessionWorkstreamOption } from '../tabsession/types';
+import { appleFailureCopy, appleFailureKindOf, type AppleFailureKind } from './appleEngine';
+import type { EngineKind } from './modelRegistry';
 import { remotePrivacyDetail, remotePrivacyMarker } from './remoteConfig';
 import { remoteFailureCopy, remoteFailureKindOf, type RemoteFailureKind } from './remoteEngine';
 import { rejectionCopy, type GenerationRejectionReason } from './validateGeneration';
@@ -98,6 +100,8 @@ export type EnrichmentFailure =
   | { readonly kind: 'engine'; readonly detail: string }
   /** The optional remote provider failed, with its typed reason. */
   | { readonly kind: 'remote'; readonly reason: RemoteFailureKind }
+  /** The local Apple service failed, with its typed reason. */
+  | { readonly kind: 'apple'; readonly reason: AppleFailureKind }
   /** The model produced text and the text was unusable — nothing was saved. */
   | { readonly kind: 'rejected'; readonly reason: GenerationRejectionReason }
   | { readonly kind: 'save'; readonly status: number };
@@ -172,6 +176,10 @@ export const engineStateLine = (
   availability: EngineAvailability | undefined,
 ): string => {
   if (route.engine === 'nano') return 'AI: Nano ready';
+  // Named as Apple's own on-device model, and marked on-device, because the
+  // whole reason it outranks WebGPU is that it is already resident in macOS —
+  // the user should be able to tell it apart from the remote lane at a glance.
+  if (route.engine === 'apple') return 'AI: Apple on-device model ready';
   if (route.engine === 'webgpu') return 'AI: local model ready (WebGPU)';
   if (route.engine === 'remote') {
     const host = availability?.remoteHost;
@@ -235,6 +243,13 @@ const failureCopy = (failure: EnrichmentFailure, kind: EnrichmentTarget['kind'])
       // The provider's typed failure, in the same shape every other reason
       // uses. The API key is never part of this string.
       return `remote engine — ${remoteFailureCopy(failure.reason)} · nothing saved`;
+    case 'apple':
+      // 'unsupported-language' is the one worth spelling out: Apple ADVERTISES
+      // Chinese and then refuses it, so a user watching a Chinese page fail
+      // deserves the actual reason and the actual fix rather than a shrug.
+      return failure.reason === 'unsupported-language'
+        ? 'Apple’s on-device model refused this language — load the local model in Health for Chinese'
+        : `Apple on-device — ${appleFailureCopy(failure.reason)} · nothing saved`;
     case 'rejected':
       // The 2026-07-27 lesson said out loud: unusable output is a REPORTED
       // outcome, not a silent save.
@@ -261,10 +276,14 @@ export const coverageCopy = (meta: GistMeta | null): string => {
 };
 
 /** The short engine name the row shows on the button and in the result line. */
-export type EngineRunLabel = 'Nano' | 'WebGPU' | 'Remote';
+export type EngineRunLabel = 'Nano' | 'Apple' | 'WebGPU' | 'Remote';
 
-const RUN_LABEL: Record<'nano' | 'webgpu' | 'remote', EngineRunLabel> = {
+// Keyed by EngineKind (not a hand-listed subset) so adding an engine is a type
+// error here until the surface can NAME it. A run the user cannot attribute to
+// an engine is exactly the anonymity this row exists to prevent.
+const RUN_LABEL: Record<EngineKind, EngineRunLabel> = {
   nano: 'Nano',
+  apple: 'Apple',
   webgpu: 'WebGPU',
   remote: 'Remote',
 };
@@ -514,10 +533,13 @@ export function ContentEnrichmentAction({
         }
         setPhase('error');
         const remoteKind = remoteFailureKindOf(err);
+        const appleKind = appleFailureKindOf(err);
         setFailure(
-          remoteKind === null
-            ? { kind: 'engine', detail: String(err) }
-            : { kind: 'remote', reason: remoteKind },
+          remoteKind !== null
+            ? { kind: 'remote', reason: remoteKind }
+            : appleKind !== null
+              ? { kind: 'apple', reason: appleKind }
+              : { kind: 'engine', detail: String(err) },
         );
         return;
       }
