@@ -396,6 +396,21 @@ export function ContentEnrichmentAction({
   // so a slow read that lands after a fast run must not overwrite the fresher
   // text with the older remembered one.
   const freshRunKeyRef = useRef<string | null>(null);
+  /**
+   * Mirror of what the row is CURRENTLY showing, so an optimistic display can
+   * be rolled back. A run callback outlives the render that built it, so
+   * reading `gist` from the closure would restore whatever was on screen when
+   * the callback was created — not what is there when the save fails.
+   */
+  const shownGistRef = useRef<{
+    gist: string | null;
+    source: EnrichmentInputSource | null;
+    fromStore: boolean;
+    engine: string | null;
+  } | null>(null);
+  // Kept in sync on every render — cheap, and it cannot go stale the way a
+  // closure capture would.
+  shownGistRef.current = { gist, source: gistSource, fromStore: gistFromStore, engine: gistEngine };
   const busy = phase === 'fetching' || phase === 'generating' || phase === 'saving';
   // A new surface must not keep the previous one's result, and must pick up
   // whatever gist that surface already has. An in-flight run notices the key
@@ -558,6 +573,26 @@ export function ContentEnrichmentAction({
         return;
       }
       const generated = outcome.gist;
+      // What is on screen right now, so a FAILED save can put it back. Captured
+      // through refs rather than closure state because this callback outlives
+      // the render that created it.
+      const displacedGist = shownGistRef.current;
+      // SHOW THE GIST BEFORE SAVING IT, not after.
+      //
+      // The text is fully known the instant generation returns; the save is a
+      // round-trip to the companion that the reader has no stake in. Holding
+      // the answer back until the POST resolved meant staring at "saving…"
+      // while the thing you asked for already existed in memory.
+      //
+      // The engine label goes up with it so the line is attributable from the
+      // first frame rather than becoming attributable a moment later. What is
+      // deliberately NOT set yet is the SAVED state (gistFromStore /
+      // freshRunKeyRef / stored copy): those say "this is durably filed", which
+      // is not true until the POST returns. Showing early must not claim early.
+      setGist(generated);
+      setGistSource(input.source);
+      setGistFromStore(false);
+      setGistEngine(RUN_LABEL[engine.kind]);
       setPhase('saving');
       const item: ContentEnrichmentPayloadItem = {
         kind: target.kind,
@@ -579,14 +614,21 @@ export function ContentEnrichmentAction({
         return;
       }
       if (!res.ok) {
+        // A FAILURE TAKES NOTHING AWAY. The new gist was shown optimistically
+        // while the save was in flight; the save did not land, so it is not
+        // durable and must not be left standing in place of a gist that IS.
+        // Put the previous one back rather than leaving the user looking at
+        // text that silently will not survive a reload.
+        setGist(displacedGist?.gist ?? null);
+        setGistSource(displacedGist?.source ?? null);
+        setGistFromStore(displacedGist?.fromStore ?? false);
+        setGistEngine(displacedGist?.engine ?? null);
         setPhase('error');
         setFailure({ kind: 'save', status: res.status });
         return;
       }
-      setGist(generated);
-      setGistSource(input.source);
-      setGistFromStore(false);
-      setGistEngine(RUN_LABEL[engine.kind]);
+      // The gist is already on screen (set before the POST). What becomes true
+      // only NOW is that it is durably saved.
       freshRunKeyRef.current = myKey;
       setElapsedMs(Date.now() - startedAt);
       setPhase('done');

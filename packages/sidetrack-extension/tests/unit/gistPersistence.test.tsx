@@ -210,6 +210,39 @@ describe('gist persistence — a remembered gist comes back', () => {
     expect(screen.getByTestId('now-enrich-content-gist')).toHaveTextContent('Remembered gist');
   });
 
+  it('shows the gist while it is SAVING, not only after the save lands', async () => {
+    // The user asked for this directly: the gist text is fully known the moment
+    // generation returns, and the save is a companion round-trip they have no
+    // stake in. Holding the answer back until the POST resolved meant staring
+    // at saving… while the thing you asked for already existed in memory.
+    installStorage({});
+    installNano();
+    let releasePost: (() => void) | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Promise((resolve) => {
+            releasePost = () => {
+              resolve({ ok: true, status: 200, json: async () => ({ data: { accepted: 1 } }) });
+            };
+          }),
+      ),
+    );
+    renderRow();
+    fireEvent.click(screen.getByTestId('now-enrich-content-btn'));
+    // The POST is still in flight and the gist is ALREADY on screen.
+    await waitFor(() => {
+      expect(screen.getByTestId('now-enrich-content-gist')).toHaveTextContent(GIST);
+    });
+    act(() => {
+      releasePost?.();
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('now-enrich-content-status')).toHaveTextContent('gist saved');
+    });
+  });
+
   it('swaps the gist when the focused surface changes, and clears it when the new one has none', async () => {
     installStorage({
       [STORE_KEY]: {
