@@ -278,18 +278,21 @@ describe('DISPLAY — the limits appear in BOTH rows', () => {
     });
   });
 
-  it('the Health AI row offers the model choice with its declared size, and says what is unverified', async () => {
+  it('the Health AI row offers each model choice with its MEASURED size', async () => {
     render(<OnDeviceAiRow companionPort={17_373} bridgeKey="k" />);
     const select: HTMLSelectElement = await screen.findByTestId('hp-ondevice-ai-model-select');
     expect(select.options).toHaveLength(LOCAL_MODELS.length);
     expect(select.options[0]?.textContent).toContain('1B q4 (fast)');
     expect(select.options[0]?.textContent).toContain('~800MB');
-    expect(select.options[1]?.textContent).toContain('3B q4 (matched to Nano)');
-    expect(select.options[1]?.textContent).toContain('~3.3GB');
-    // The default is the verified one, so no "unverified" prefix up front.
+    // q4f16, not q4: the q4 build (3.17GB) traps with "memory access out of
+    // bounds" in the browser's 32-bit WASM space. Size is the measured 2.42GB
+    // download, not a model-card round number.
+    expect(select.options[1]?.textContent).toContain('3B q4f16 (matched to Nano)');
+    expect(select.options[1]?.textContent).toContain('~2.4GB');
     expect(screen.getByTestId('hp-ondevice-ai-model-note')).not.toHaveTextContent('unverified');
-    // …but the Nano-class entry declares itself unverified rather than pretending.
-    expect(localModelSpec(NANO_CLASS_LOCAL_MODEL_ID).status).toBe('unverified');
+    // Now genuinely loaded here (3.8 min to ready, ~61s per gist on an M2), so
+    // it claims 'verified' — earned by a real load, not by assumption.
+    expect(localModelSpec(NANO_CLASS_LOCAL_MODEL_ID).status).toBe('verified');
   });
 });
 
@@ -343,5 +346,40 @@ describe('external data chunk count', () => {
     for (const spec of LOCAL_MODELS) {
       expect(externalDataChunkCount(spec)).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Nano-class model's quantization is MEASURED, not chosen for tidiness:
+// q4 (3.17GB) traps with "memory access out of bounds" in the browser's 32-bit
+// WASM address space; q4f16 (2.42GB) loads in ~3.8 min and generates in ~61s.
+// These assertions stop a future edit from quietly reverting to the variant
+// that cannot load.
+// ---------------------------------------------------------------------------
+describe('Nano-class model quantization', () => {
+  it('uses q4f16 (q4 does not fit in the browser)', async () => {
+    const { LOCAL_MODELS, NANO_CLASS_LOCAL_MODEL_ID } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    const spec = LOCAL_MODELS.find((m) => m.id === NANO_CLASS_LOCAL_MODEL_ID);
+    expect(spec?.quantization).toBe('q4f16');
+  });
+
+  it('declares the q4f16 artefacts, never the q4 graph or shards', async () => {
+    const { LOCAL_MODELS, NANO_CLASS_LOCAL_MODEL_ID } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    const spec = LOCAL_MODELS.find((m) => m.id === NANO_CLASS_LOCAL_MODEL_ID);
+    const onnx = (spec?.files ?? []).filter((f) => f.startsWith('onnx/'));
+    expect(onnx.every((f) => f.includes('q4f16'))).toBe(true);
+    expect(onnx.some((f) => /model_q4\.onnx/u.test(f))).toBe(false);
+  });
+
+  it('still counts two external-data shards after the dtype switch', async () => {
+    const { LOCAL_MODELS, NANO_CLASS_LOCAL_MODEL_ID, externalDataChunkCount } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    const spec = LOCAL_MODELS.find((m) => m.id === NANO_CLASS_LOCAL_MODEL_ID);
+    expect(externalDataChunkCount(spec!)).toBe(2);
   });
 });
