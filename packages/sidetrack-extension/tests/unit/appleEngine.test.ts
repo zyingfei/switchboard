@@ -10,6 +10,8 @@ import {
 } from '../../src/sidepanel/nano/appleEngine';
 import {
   APPLE_FALLBACK_CONTEXT_TOKENS,
+  APPLE_GENERATION_PROBE_TIMEOUT_MS,
+  APPLE_PROBE_TIMEOUT_MS,
   APPLE_SERVICE_ABSENT,
   appleMaxInputChars,
   appleModelEntry,
@@ -142,6 +144,59 @@ describe('apple service probe', () => {
 
   it('tells the user the actual fix when the origin is blocked', () => {
     expect(appleUnavailableCopy('origin-blocked')).toContain('--allowed-origins');
+  });
+
+  it('gives the COLD generation probe its own, much longer budget', async () => {
+    // THE SECOND LIVE TRAP, and it was self-inflicted. The generation probe was
+    // added to catch an origin-blocked service, but it inherited the LIVENESS
+    // timeout (1500ms). A cold Apple Foundation Models session is spun up by
+    // the OS on first use:
+    //
+    //     GET         0.0006s
+    //     POST cold   6.96s
+    //     POST warm   0.33s
+    //
+    // So the probe aborted every time the panel opened, reported
+    // 'not-running', and the engine was invisible — while apfel's own log
+    // showed the request completing 200. Verifying the ENDPOINT is not the
+    // same as verifying the SHIPPED CODE PATH.
+    expect(APPLE_GENERATION_PROBE_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
+    expect(APPLE_PROBE_TIMEOUT_MS).toBeLessThan(APPLE_GENERATION_PROBE_TIMEOUT_MS);
+
+    // And the budgets must be SEPARATE signals, not one shared controller:
+    // a 7s POST under a 1.5s liveness deadline is exactly the original bug.
+    const signals: (AbortSignal | undefined)[] = [];
+    const fetchImpl = vi.fn((url: string, init: RequestInit) => {
+      signals.push(init.signal ?? undefined);
+      return Promise.resolve(
+        url.endsWith('/models')
+          ? okResponse({ data: [{ id: 'apple-foundationmodel', context_window: 4096 }] })
+          : okResponse({ choices: [{ message: { content: 'k' } }] }),
+      );
+    });
+    await probeAppleService('http://localhost:11434/v1', fetchImpl);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).not.toBe(signals[1]);
+  });
+
+  it('survives a slow cold start that exceeds the LIVENESS budget', async () => {
+    // The regression in one case: the generation takes longer than the
+    // liveness timeout and the service must still come back available.
+    const fetchImpl = vi.fn((url: string) => {
+      if (url.endsWith('/models')) {
+        return Promise.resolve(
+          okResponse({ data: [{ id: 'apple-foundationmodel', context_window: 4096 }] }),
+        );
+      }
+      return new Promise<Response>((resolve) => {
+        setTimeout(() => { resolve(okResponse({ choices: [{ message: { content: 'k' } }] })); }, 60);
+      });
+    });
+    // Liveness 10ms (would have killed the 60ms generation under one budget),
+    // generation 5000ms.
+    const info = await probeAppleService('http://x/v1', fetchImpl, 10, 5_000);
+    expect(info.available).toBe(true);
+    expect(info.reason).toBe('ok');
   });
 
   it('prints a PASTEABLE command when it knows the extension id', () => {
