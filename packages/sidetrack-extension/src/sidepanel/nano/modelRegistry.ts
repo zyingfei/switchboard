@@ -34,8 +34,19 @@
 import { readDeviceValue, writeDeviceValue } from './deviceStore';
 import { GIST_MAX_NEW_TOKENS, GIST_OUTPUT_MAX_CHARS } from './generationOptions';
 
-/** The three backends a generation can run on. 'remote' is opt-in and off by default. */
-export type EngineKind = 'nano' | 'webgpu' | 'remote';
+/**
+ * The backends a generation can run on.
+ *
+ *   nano   — Chrome's built-in Gemini Nano. Resident, zero setup, English only.
+ *   apple  — macOS 26's on-device Foundation Model, reached through a local
+ *            OpenAI-compatible service (appleService.ts). On-device; needs that
+ *            service running. English only in practice — see appleCanServe.
+ *   webgpu — a model we download and run in the tab. The only lane that handles
+ *            Chinese, so it stays the fallback rather than being superseded.
+ *   remote — a hosted provider. Opt-in, off by default, and the ONLY kind that
+ *            sends page text off the device.
+ */
+export type EngineKind = 'nano' | 'apple' | 'webgpu' | 'remote';
 
 /**
  * What a row in the comparison says about the model that produced it. Every
@@ -336,6 +347,23 @@ export function shortModelName(id: string): string {
   const tail = id.split('/').pop() ?? id;
   return tail.replace(/-ONNX$/iu, '');
 }
+
+/**
+ * Apple's on-device model, as it presents itself. Apple has DISCLOSED roughly
+ * 3B parameters with aggressive on-device quantization (down to 2-bit in parts
+ * of the stack), but does not publish a file size and the weights are managed
+ * by the OS rather than downloaded by us — so approxBytesOnDisk is null, which
+ * is the honest answer, not zero.
+ */
+export const appleIdentity = (modelName: string): EngineIdentity => ({
+  kind: 'apple',
+  label: 'Apple on-device',
+  modelName,
+  params: '~3B (Apple-disclosed)',
+  paramsBillions: 3,
+  quantization: 'Apple-managed',
+  approxBytesOnDisk: null,
+});
 
 /** The identity a hosted provider presents. Size is genuinely unknown to us. */
 export const remoteIdentity = (modelName: string): EngineIdentity => ({
