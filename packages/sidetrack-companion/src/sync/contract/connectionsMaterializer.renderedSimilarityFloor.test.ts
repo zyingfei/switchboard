@@ -153,6 +153,29 @@ const readFloorDiagnostics = async (
   return floor as never;
 };
 
+// The diagnostics artifact's `snapshot` block reports the PRE-repair candidate
+// (collectMaterializerDiagnostics is handed `finalSnapshot`, not the repaired
+// snapshot the write path produced), which is exactly what makes it the honest
+// witness for "did the rebuild render the complete graph, or did the floor guard
+// paper over a window-only one?".
+const readSnapshotDiagnostics = async (
+  vaultRoot: string,
+): Promise<{
+  nodeCount: number;
+  edgeCount: number;
+  nodeCountByKind: Record<string, number>;
+  edgeCountByKind: Record<string, number>;
+}> => {
+  const raw = await readFile(
+    join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+    'utf8',
+  );
+  const latest = JSON.parse(raw) as { snapshot?: Record<string, unknown> };
+  const snapshot = latest.snapshot;
+  if (snapshot === undefined) throw new Error('expected snapshot diagnostics');
+  return snapshot as never;
+};
+
 const seedDenseCorpus = async (
   m: { catchUp: (log: ReturnType<typeof createEventLog>) => Promise<unknown>; awaitIdle: () => Promise<unknown> },
   eventLog: ReturnType<typeof createEventLog>,
@@ -345,5 +368,116 @@ describe('connections materializer — RENDERED-edge floor (round-3, store-level
     // (or otherwise kept non-empty). Read back current.db (doctrine rule 10).
     expect(resemblesEdgeCount((await store.readCurrent())?.edges)).toBeGreaterThan(0);
     expect(floor.servedEdgeCount).toBeGreaterThan(0);
+  });
+
+  // 2026-07-28 — the WARM full-rebuild fallback. A healthy vault (served rows
+  // intact, adopted revision intact) still armed the render-repair guard on
+  // EVERY drain that missed the scoped-delta fast path, which pinned
+  // `renderRepaired: true` → workGraph candidate `similarity.served-signal-floor`
+  // = alarm → `observability.status=degraded` permanently.
+  //
+  // Live evidence (test companion, ~/.sidetrack-vault-test, 2026-07-28):
+  //   [connections] rendered similarity floor REPAIRED a collapse:
+  //       served=56137 rendered=0 restored=56137            (twice per drain)
+  //   latest.json: nodeCount 1045 / edgeCount 985 / renderRepaired true /
+  //       builtEdgeCount 56179 / NO visit_resembles_visit row at all /
+  //       scopedTimelineDeltaApplied false, skip "unknown-inner"
+  //
+  // Mechanism: with the event store OFF (the production default) a warm drain
+  // reads only the pending tail (`readMergedSince`), so `merged` — and the
+  // timeline days derived from it — cover the WINDOW. When the scoped-delta gate
+  // misses, the `!baseSnapshotPrebuilt` fallback rebuilt the WHOLE snapshot from
+  // that window; snapshot.ts Pass 7 resolves similarity endpoints through
+  // `visitObservedAtByKey`, which is built from `input.timelineDays` alone, so
+  // every `visit_resembles_visit` row was dropped and the terminal floor had to
+  // carry ~56k rows forward — correctly, but every single drain.
+  //
+  // The guard is NOT the thing under test here: it must stay armed (the tests
+  // above cover a genuine collapse). What must change is that an HONEST drain
+  // no longer collapses, so the guard stays passive and the alarm can clear.
+  it('warm full-rebuild fallback renders the complete similarity family (guard stays passive)', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    const store = createConnectionsStore(vaultRoot);
+
+    // Fresh materializer per drain — the production child-per-drain fork. This
+    // is load-bearing for the repro: a fresh instance has
+    // `projectionAccumulatorsInitialized === false`, so it takes the instant-boot
+    // path (persisted accumulator blob + `readMergedSince`) and `merged` becomes
+    // the TAIL. An in-process second drain would keep the accumulators warm and
+    // hide the window read entirely.
+    const runDrain = async (): Promise<void> => {
+      const m = createConnectionsMaterializer({
+        vaultRoot,
+        eventLog,
+        timelineStore,
+        store,
+        embed: embedFullDim(),
+      });
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+    };
+
+    const seedM = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed: embedFullDim(),
+    });
+    await seedDenseCorpus(seedM, eventLog);
+    const fullRenderedCount = resemblesEdgeCount((await store.readCurrent())?.edges);
+    expect(fullRenderedCount).toBeGreaterThanOrEqual(10);
+    expect(timelineVisitNodeCount((await store.readCurrent())?.nodes)).toBe(KEYS.length);
+
+    // The served state is HEALTHY — nothing is window-poor on disk. This is the
+    // difference from the tests above: no makeServedSnapshotWindowPoor, no
+    // forced reset. The collapse has to come from the drain's own rebuild.
+    //
+    // Window contents, both needed:
+    //  - one re-observed KNOWN visit above the gate, so the eligible corpus is
+    //    non-empty and Layer 0 (lane-unloaded reuse / bootstrap adopt) stays
+    //    disarmed. Layer 0 sets `similarityRecoveryNeedsBaseRebuild`, which
+    //    routes to the ALREADY-widened recovery rebuild and would bypass the
+    //    fallback under test.
+    //  - one WORKSTREAM_UPSERTED, which is not a scoped-timeline-delta event, so
+    //    `scopedTimelineDeltaGate.allScopedEvents` fails and the drain lands in
+    //    the `!baseSnapshotPrebuilt` full-rebuild fallback (the live vault gets
+    //    there via `skip reason=unknown-inner`; the branch reached is the same).
+    // The window therefore knows exactly ONE of the six similarity endpoints —
+    // pre-fix that rendered 0 of the corpus's edges.
+    await eventLog.importPeerEvent(
+      timelineObserved({
+        seq: 30,
+        key: KEYS[0],
+        focusedWindowMs: 10_000,
+        observedAt: '2026-07-24T10:30:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(emptyCorpusDrainEvent(31));
+    await runDrain();
+
+    // The rebuilt snapshot the drain published must be the COMPLETE graph, not
+    // the window's. `snapshot` in the artifact is the pre-repair candidate, so
+    // this assertion fails pre-fix even though the floor guard restored
+    // current.db behind it.
+    const snapshotDiag = await readSnapshotDiagnostics(vaultRoot);
+    expect(snapshotDiag.edgeCountByKind['visit_resembles_visit'] ?? 0).toBe(fullRenderedCount);
+    expect(snapshotDiag.nodeCountByKind['timeline-visit'] ?? 0).toBe(KEYS.length);
+
+    // …and because the render was honest, the terminal floor had nothing to
+    // repair: no `renderRepaired`, no window-poverty guard activation. This is
+    // the bit health reads (`similarity.served-signal-floor`).
+    const floor = await readFloorDiagnostics(vaultRoot);
+    expect(floor.renderRepaired).toBe(false);
+    expect(floor.suppressedCollapse).toBe(false);
+    expect(floor.renderedSimilarityFamilyEdgeCount).toBeGreaterThanOrEqual(fullRenderedCount);
+
+    // Read back current.db (doctrine rule 10) — the served artifact still holds
+    // the full family, and holds it because it was RENDERED, not carried.
+    const afterCurrent = await store.readCurrent();
+    expect(resemblesEdgeCount(afterCurrent?.edges)).toBe(fullRenderedCount);
+    expect(timelineVisitNodeCount(afterCurrent?.nodes)).toBe(KEYS.length);
   });
 });
