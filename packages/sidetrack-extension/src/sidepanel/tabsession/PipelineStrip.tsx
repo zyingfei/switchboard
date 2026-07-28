@@ -6,10 +6,11 @@
 //
 //   Line 1 — lane dots: six fixed-order chips (Graph · Similar · Topic · Title
 //     · Domain · Recent), a FILLED dot when that lane produced ≥1 candidate, a
-//     HOLLOW dot when it was empty/absent. A 7th chip (Content) is appended
-//     ONLY when the payload actually carries a 'content' lane (feat/content-
-//     lane) — on an old companion / a disabled lane it's simply absent, never a
-//     phantom hollow dot. The whole row is a BUTTON that toggles the GuessLanes
+//     HOLLOW dot when it was empty/absent. The optional tail chips (Content,
+//     then AI) are appended in that order, each ONLY when the payload actually
+//     carries that lane (feat/content-lane, feat/ai-lane) — on an old companion
+//     / a disabled lane it's simply absent, never a phantom hollow dot. The
+//     whole row is a BUTTON that toggles the GuessLanes
 //     disclosure it sits above (controls co-located with state — this repo's UI
 //     taste rule). Each chip's title/aria carries the lane's top candidate
 //     (filled) or emptyReason (hollow) for hover + screen readers.
@@ -32,10 +33,10 @@ import {
 // Fixed render order + short labels for the base six lanes. This is the frozen
 // wire order (graph → recency); the strip ALWAYS renders these six in this
 // order regardless of which the payload happens to include, so the dots row is
-// a stable, scannable shape. The optional 'content' lane (feat/content-lane) is
-// appended AFTER these six ONLY when the payload carries it — see the render.
-// Short labels (vs GuessLanes' longer LANE_LABEL) keep the row on one wrap-line
-// in the narrow panel.
+// a stable, scannable shape. The optional tail lanes are appended AFTER these
+// six ONLY when the payload carries them — see OPTIONAL_LANE_ORDER + the
+// render. Short labels (vs GuessLanes' longer LANE_LABEL) keep the row on one
+// wrap-line in the narrow panel.
 const BASE_LANE_ORDER: readonly GuessLane[] = [
   'graph',
   'similarity',
@@ -44,6 +45,18 @@ const BASE_LANE_ORDER: readonly GuessLane[] = [
   'domain',
   'recency',
 ];
+// The optional TAIL lanes, in wire order after the base six: 'content' (lane 7,
+// query-time retrieval) then 'ai' (lane 8, the same retrieval asked with the
+// gist alone). Each is rendered only when the payload actually carries it, so
+// an old companion / a disabled lane never gets a phantom hollow dot.
+//
+// WHY A LIST, not a hard-coded `has('content')` check: the previous shape
+// appended exactly one optional chip and had no branch for 'ai', so a live
+// 8-lane payload rendered seven dots and the AI lane was invisible on the strip
+// even once the client parse kept it. A lane added to GuessLane that can arrive
+// after 'recency' belongs in this array — that is the single place the strip's
+// tail order is decided.
+const OPTIONAL_LANE_ORDER: readonly GuessLane[] = ['content', 'ai'];
 const LANE_SHORT_LABEL: Record<GuessLane, string> = {
   graph: 'Graph',
   similarity: 'Similar',
@@ -104,12 +117,14 @@ export function PipelineStrip({
   // sends all six, but a lenient parse can drop a malformed one).
   const byLane = new Map<GuessLane, GuessLaneResult>();
   for (const lane of lanes) byLane.set(lane.lane, lane);
-  // The 7th 'content' chip is appended ONLY when the payload actually carries
-  // that lane — an old companion / a disabled lane never gets a phantom hollow
-  // dot, so the row is exactly six then and exactly seven when content arrives.
-  const laneOrder = byLane.has('content')
-    ? [...BASE_LANE_ORDER, 'content' as GuessLane]
-    : BASE_LANE_ORDER;
+  // The optional tail chips (Content, then AI) are appended ONLY for lanes the
+  // payload actually carries — an old companion / a disabled lane never gets a
+  // phantom hollow dot, so the row is exactly six then, seven with content, and
+  // eight once the AI lane rides along.
+  const laneOrder: readonly GuessLane[] = [
+    ...BASE_LANE_ORDER,
+    ...OPTIONAL_LANE_ORDER.filter((laneName) => byLane.has(laneName)),
+  ];
   const verdict = pipelineVerdictLine(gate, fusedCount);
   return (
     <div className="pipeline-strip">

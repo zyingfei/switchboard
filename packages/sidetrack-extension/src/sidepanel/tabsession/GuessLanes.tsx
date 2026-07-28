@@ -1,8 +1,11 @@
 // Guess-lanes (feat/guess-lanes) — the resolver's independent arms, each with
 // its own ranked guess, surfaced behind a click-to-expand disclosure. Six on
-// older companions (graph → recency); a 7th 'content' arm is appended on newer
-// ones (feat/content-lane) — the list renders in array order so the count is
-// data-driven, never hard-coded.
+// older companions (graph → recency); a 7th 'content' arm and an 8th 'ai' arm
+// are appended on newer ones (feat/content-lane, feat/ai-lane) — the list
+// renders in array order (see the `lanes.map` in GuessLanes) so the count and
+// the order are data-driven, never hard-coded. That is why the disclosure needs
+// no change per lane: the ONLY thing that can hide a lane here is the client
+// parse dropping it (types.ts VALID_LANES) before it reaches this component.
 //
 // The fused decision is a weighted combination of these lanes; when it
 // abstains (action='inbox' / no confident pick) the user used to see a bare
