@@ -52,6 +52,7 @@ const LANE_SHORT_LABEL: Record<GuessLane, string> = {
   domain: 'Domain',
   recency: 'Recent',
   content: 'Content',
+  ai: 'AI',
 };
 
 const workstreamLabel = (

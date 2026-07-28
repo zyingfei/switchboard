@@ -190,6 +190,12 @@ const generateValidated = async (
    * rejected as an echo of itself.
    */
   instructions: string,
+  /**
+   * The source this generation must be made OF — the chunk for a chunk-gist,
+   * the notes for the synthesis, the document for a single pass. Enables the
+   * groundedness rule, the only one that catches a fluent invented summary.
+   */
+  source: string,
 ): Promise<AttemptOutcome> => {
   let firstReason: GenerationRejectionReason | null = null;
   const passes = retry === null ? [primary] : [primary, retry];
@@ -200,7 +206,7 @@ const generateValidated = async (
     // SKIP is a decision, not a defect — stop immediately.
     if (isAbstention(raw)) return { text: null, reason: null, abstained: true, attempts: i + 1 };
     const cleaned = stripGistPreamble(raw).slice(0, maxChars);
-    const verdict = validateGeneration(cleaned, { kind, language, prompt: instructions });
+    const verdict = validateGeneration(cleaned, { kind, language, prompt: instructions, source });
     if (verdict.ok) return { text: verdict.text, reason: null, abstained: false, attempts: i + 1 };
     firstReason ??= verdict.reason;
   }
@@ -258,6 +264,7 @@ export const synthesizeGist = async (
       RETRY_GENERATION,
       MAX_GIST_CHARS,
       GIST_PROMPT_PREFIX,
+      only === undefined ? '' : only.text,
     );
     if (outcome.abstained) return { ok: false, kind: 'abstained', meta };
     if (outcome.text === null) {
@@ -287,6 +294,7 @@ export const synthesizeGist = async (
       null,
       CHUNK_GIST_OUTPUT_MAX_CHARS,
       CHUNK_GIST_PROMPT_PREFIX,
+      chunk.text,
     );
     if (outcome.abstained) continue;
     if (outcome.text === null) {
@@ -341,6 +349,7 @@ export const synthesizeGist = async (
     RETRY_GENERATION,
     MAX_GIST_CHARS,
     GIST_SYNTHESIS_PROMPT_PREFIX,
+    joined,
   );
   if (outcome.abstained) return { ok: false, kind: 'abstained', meta };
   if (outcome.text === null) {

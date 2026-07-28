@@ -54,7 +54,15 @@ export type GuessLane =
   // the recall store handle) and APPENDED to the lanes array after 'recency'.
   // It is intentionally NOT in GUESS_LANE_ORDER (that is the six synchronous,
   // I/O-free lanes); see tabsession/contentLane.ts.
-  | 'content';
+  | 'content'
+  // Lane 8 (additive, FROZEN CONTRACT). The AI lane: the SAME query-time
+  // retrieval as 'content', but asked with the on-device gist ALONE as the
+  // query text — no title, no URL tokens. Where 'content' answers "what does
+  // this page's text resemble?", 'ai' answers "where does the model's READING
+  // of this page point?", and the difference between them is exactly the
+  // AI's marginal contribution. Present only when a gist exists; typed-empty
+  // (with the reason) otherwise, never silently absent.
+  | 'ai';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
