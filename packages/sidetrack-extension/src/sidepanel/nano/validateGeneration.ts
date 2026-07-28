@@ -42,7 +42,9 @@ export type GenerationRejectionReason =
   | 'repetitive'
   | 'low-diversity'
   | 'low-letter-ratio'
-  | 'wrong-language';
+  | 'wrong-language'
+  /** Fluent, well-formed — and not made of the source. An invented summary. */
+  | 'ungrounded';
 
 export type GenerationVerdict =
   | { readonly ok: true; readonly text: string }
@@ -69,6 +71,16 @@ export interface ValidationContext {
    * absent the echo check is skipped rather than guessed at.
    */
   readonly prompt?: string;
+  /**
+   * The SOURCE text the gist is supposed to be about. When present, the gist
+   * must actually be made of it — see GROUNDEDNESS below.
+   *
+   * Optional because not every caller has a single source string (and a
+   * missing source must skip the check rather than guess). But callers that
+   * DO have it should pass it: this is the only rule that catches a fluent,
+   * well-formed, entirely INVENTED summary.
+   */
+  readonly source?: string;
 }
 
 // --- Shape budgets per kind -------------------------------------------------
@@ -196,6 +208,61 @@ const languageDisagrees = (text: string, requested: ContentLanguage): boolean =>
 const PROMPT_ECHO_NGRAM = 4;
 const PROMPT_ECHO_THRESHOLD = 0.3;
 
+// ---- groundedness ------------------------------------------------------
+//
+// Is the gist actually MADE OF the source, or did the model invent it?
+//
+// Every other rule here checks the output's SHAPE. A confidently hallucinated
+// summary passes all of them: it is fluent, non-repetitive, single-language,
+// well-formed English that shares almost nothing with the prompt. Live case,
+// 2026-07-28 — an arXiv paper page summarized from METADATA ONLY produced:
+//
+//   "Subject matter: Hacker News. Hacker News is a platform where users
+//    discuss and share news ... The site is hosted on the arXiv.org website"
+//
+// which is not a summary of anything, and it was SAVED and fed to retrieval.
+// The same page, once its text was actually indexed, produced an accurate
+// paragraph about Kimi Delta Attention and KV-cache reduction.
+//
+// So: measure the share of the gist's CONTENT words that occur in the source.
+// Short/function words are excluded because they overlap with everything and
+// would mask an invented summary; CJK is included per-character since it is
+// tokenized that way throughout this file.
+//
+// THRESHOLD, from measurement rather than taste (2026-07-28, real vault docs):
+//
+//     good gists         0.50 – 0.78
+//     the Kimi gist      high (near-verbatim technical terms)
+//     invented/wrong     0.02 – 0.14
+//
+// 0.20 sits in the empty band between those populations. Deliberately closer
+// to the bad population than the good one: this rule REJECTS a gist outright,
+// so it must be near-certain. A borderline-but-real gist surviving is a much
+// cheaper mistake than a real one being thrown away.
+const GROUNDEDNESS_THRESHOLD = 0.2;
+/** Words this short carry no topical evidence — they overlap with anything. */
+const GROUNDEDNESS_MIN_WORD_LENGTH = 4;
+/** Below this the ratio is noise, not signal, so the rule abstains. */
+const GROUNDEDNESS_MIN_WORDS = 8;
+
+const contentWords = (text: string): string[] =>
+  tokenizeForScoring(text).filter(
+    (w) => w.length >= GROUNDEDNESS_MIN_WORD_LENGTH || /[一-鿿]/u.test(w),
+  );
+
+/**
+ * Share of the output's content words that appear in the source. Returns null
+ * when there is too little to judge — an abstention, never a rejection.
+ */
+export const groundednessScore = (text: string, source: string): number | null => {
+  const words = contentWords(text);
+  if (words.length < GROUNDEDNESS_MIN_WORDS) return null;
+  const sourceWords = new Set(contentWords(source));
+  if (sourceWords.size === 0) return null;
+  const hits = words.filter((w) => sourceWords.has(w)).length;
+  return hits / words.length;
+};
+
 const wordNgrams = (text: string, n: number): Set<string> => {
   const words = text
     .toLowerCase()
@@ -245,6 +312,14 @@ export const validateGeneration = (raw: string, ctx: ValidationContext): Generat
   }
   if (letterRatio(text) < MIN_LETTER_RATIO) return { ok: false, reason: 'low-letter-ratio' };
   if (languageDisagrees(text, ctx.language)) return { ok: false, reason: 'wrong-language' };
+  // LAST, and only with a source to check against: every rule above tests the
+  // output's shape, and a confident hallucination passes all of them.
+  if (ctx.source !== undefined) {
+    const grounded = groundednessScore(text, ctx.source);
+    if (grounded !== null && grounded < GROUNDEDNESS_THRESHOLD) {
+      return { ok: false, reason: 'ungrounded' };
+    }
+  }
 
   return { ok: true, text };
 };
@@ -274,6 +349,8 @@ export const rejectionCopy = (reason: GenerationRejectionReason): string => {
       return 'the model repeated the same few words';
     case 'low-letter-ratio':
       return 'the model returned mostly digits and punctuation';
+    case 'ungrounded':
+      return 'the summary was not about the page — the model invented it';
     case 'wrong-language':
       return 'the model answered in the wrong language';
   }

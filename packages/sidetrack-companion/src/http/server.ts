@@ -191,6 +191,7 @@ import {
   type GuessLaneVoteSignals,
 } from '../tabsession/guessLanes.js';
 import {
+  appendAiLane,
   appendContentLane,
   contentLaneEnabled,
   type AppendContentLaneDeps,
@@ -5481,6 +5482,12 @@ const routes: readonly RouteDefinition[] = [
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
+              // Lane 8, same inputs, gist-only query — see appendAiLane.
+              results[canonicalUrl] = await appendAiLane(
+                results[canonicalUrl]!,
+                { canonicalUrl, snapshot: joinSnapshot, title, gist },
+                contentDeps,
+              );
             }
           }
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
@@ -5541,6 +5548,11 @@ const routes: readonly RouteDefinition[] = [
         const gist = gistFor(canonicalUrl) ?? null;
         results[canonicalUrl] = await appendContentLane(
           result,
+          { canonicalUrl, snapshot, title, gist },
+          contentDeps,
+        );
+        results[canonicalUrl] = await appendAiLane(
+          results[canonicalUrl]!,
           { canonicalUrl, snapshot, title, gist },
           contentDeps,
         );

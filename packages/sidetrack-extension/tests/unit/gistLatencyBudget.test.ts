@@ -67,9 +67,12 @@ describe('gist latency budget — the chunk width actually reaches the engine', 
     const engine = {
       generate: vi.fn(async (prompt: string, opts: { maxNewTokens: number }) => {
         calls.push({ prompt, maxNewTokens: opts.maxNewTokens });
+        // Made of the fixture document's own words: the groundedness rule
+        // rejects a summary that shares no content vocabulary with its source,
+        // and an arbitrary stub reply is exactly that.
         return prompt.startsWith(CHUNK_GIST_PROMPT_PREFIX)
-          ? 'CloudTrail writes organization events into one central S3 bucket for later analysis.'
-          : 'CloudTrail writes organization events into one bucket, and Athena queries them cheaply.';
+          ? 'This section contains content words filling the paragraph body.'
+          : 'The document sections contain content words filling each paragraph body.';
       }),
     };
     const outcome = await synthesizeGist(engine, doc);

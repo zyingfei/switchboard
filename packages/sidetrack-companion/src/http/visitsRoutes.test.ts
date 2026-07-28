@@ -720,6 +720,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'domain',
       'recency',
       'content',
+      'ai',
     ]);
     const contentLane = oneResult.lanes?.find((lane) => lane.lane === 'content');
     expect(contentLane?.emptyReason).toBe('recall store unavailable');
@@ -825,6 +826,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'domain',
       'recency',
       'content',
+      'ai',
     ]);
     expect(lanes?.find((lane) => lane.lane === 'content')?.emptyReason).toBe(
       'recall store unavailable',

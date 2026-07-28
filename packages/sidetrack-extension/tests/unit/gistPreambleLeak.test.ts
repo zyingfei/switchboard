@@ -41,7 +41,7 @@ const preambleEngine = (chunkReply: string, finalReply: string) => {
 describe('the multi-chunk path strips preambles too', () => {
   it('removes "Summary:" from the FINAL synthesis — the reported leak', async () => {
     const { engine } = preambleEngine(
-      'The section describes the subject matter in factual terms.',
+      'The section describes substantive prose about the subject matter.',
       'Summary: The document explains the subject matter and names the parties involved.',
     );
     const outcome = await synthesizeGist(engine, longDoc);
@@ -53,7 +53,7 @@ describe('the multi-chunk path strips preambles too', () => {
 
   it('removes "Here is ..." and markdown bold from the final gist', async () => {
     const { engine } = preambleEngine(
-      'The section describes the subject matter in factual terms.',
+      'The section describes substantive prose about the subject matter.',
       "Here's a summary: The **document** explains the subject matter clearly.",
     );
     const outcome = await synthesizeGist(engine, longDoc);
@@ -111,8 +111,8 @@ describe('echo detection compares against INSTRUCTIONS, not the source', () => {
     // gist against the NOTES — text the gist exists to restate — so a correct
     // answer was rejected as an echo of itself. Every sentence here is lifted
     // almost verbatim from the notes, which is exactly what merging looks like.
-    const note = 'CloudTrail writes organization events into one central bucket for analysis.';
-    const { engine } = preambleEngine(note, `${note} Athena then queries that bucket cheaply.`);
+    const note = 'The section describes substantive prose about the subject matter here.';
+    const { engine } = preambleEngine(note, `${note} The prose covers the subject matter throughout.`);
     const outcome = await synthesizeGist(engine, longDoc);
     expect(outcome.ok).toBe(true);
   });
@@ -121,7 +121,7 @@ describe('echo detection compares against INSTRUCTIONS, not the source', () => {
     // The protection has to survive the fix, or degenerate instruction-echo
     // walks back in.
     const { engine } = preambleEngine(
-      'The section describes the subject matter in factual terms.',
+      'The section describes substantive prose about the subject matter.',
       GIST_SYNTHESIS_PROMPT_PREFIX.slice(0, 200),
     );
     const outcome = await synthesizeGist(engine, longDoc);

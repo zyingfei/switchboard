@@ -30,7 +30,7 @@
 // never throws into the resolve.
 
 import type { ConnectionsSnapshot } from '../connections/types.js';
-import type { GuessLaneCandidate, GuessLaneResult } from './guessLanes.js';
+import type { GuessLane, GuessLaneCandidate, GuessLaneResult } from './guessLanes.js';
 
 // ---- env flag ---------------------------------------------------------
 
@@ -325,20 +325,25 @@ const acquireQueryVector = async (input: {
   readonly embed: ContentLaneEmbed | undefined;
   readonly embedderUsable: boolean;
   readonly ownEntityIds: ReadonlySet<string>;
+  /** AI lane: embed the GIST ALONE — no title, no URL tokens. */
+  readonly gistOnly?: boolean;
 }): Promise<QueryVectorResult> => {
   if (!input.embedderUsable || input.embed === undefined) {
     return { vector: undefined, embedded: false, ownEntityIds: input.ownEntityIds };
   }
   const title = input.title ?? '';
   const gist = input.gist ?? '';
-  // gist FIRST (dominant topical signal), then title, then url tokens.
-  const embedText = `${gist} ${title} ${urlTokens(input.canonicalUrl)}`.trim();
+  // gist FIRST (dominant topical signal), then title, then url tokens — except
+  // in AI mode, where the gist IS the query and nothing else may dilute it.
+  const embedText = (
+    input.gistOnly === true ? gist : `${gist} ${title} ${urlTokens(input.canonicalUrl)}`
+  ).trim();
   if (embedText.length === 0) {
     return { vector: undefined, embedded: false, ownEntityIds: input.ownEntityIds };
   }
   // Key the LRU on (url,title,gist) so a page that later gains a gist re-embeds
   // rather than reusing the pre-gist query vector.
-  const key = hashKey(input.canonicalUrl, `${title} ${gist}`);
+  const key = hashKey(input.canonicalUrl, `${input.gistOnly === true ? 'ai' : 'content'} ${title} ${gist}`);
   const cached = lruGet(key);
   if (cached !== undefined) {
     return { vector: cached, embedded: false, ownEntityIds: input.ownEntityIds };
@@ -368,6 +373,12 @@ export interface BuildContentLaneInput {
   // explicit. NEIGHBOR hits are NOT gist-looked-up (would need a per-hit
   // entity→gist lookup on the hot path) — only the query side benefits for now.
   readonly gist?: string | null;
+  /**
+   * Which lane this run IS. 'content' (default) queries with gist+title+url;
+   * 'ai' queries with the GIST ALONE. Same retrieval, different question —
+   * see the GuessLane union.
+   */
+  readonly laneId?: GuessLane;
   // The already-open /v2 recall store handle. Undefined ⇒ typed-empty lane.
   readonly store: ContentLaneStore | undefined;
   // Query-time embed, or undefined when the embedder is not usable.
@@ -390,8 +401,8 @@ export interface BuildContentLaneInput {
 const slashVariants = (url: string): readonly string[] =>
   url.endsWith('/') ? [url, url.slice(0, -1)] : [url, `${url}/`];
 
-const typedEmpty = (emptyReason: string): GuessLaneResult => ({
-  lane: 'content',
+const typedEmpty = (emptyReason: string, lane: GuessLane = 'content'): GuessLaneResult => ({
+  lane,
   candidates: [],
   emptyReason,
 });
@@ -407,8 +418,15 @@ export const buildContentLane = async (
   // ' · gist' provenance suffix on the lane why.
   const gist = input.gist ?? null;
   const gistUsed = gist !== null && gist.length > 0;
+  const laneId: GuessLane = input.laneId ?? 'content';
+  // The AI lane is the gist's OWN opinion, so it has nothing to say without
+  // one — and says so, rather than quietly degrading into the content lane.
+  const gistOnly = laneId === 'ai';
+  if (gistOnly && !gistUsed) {
+    return typedEmpty('no AI gist for this page yet — generate one to see this lane', laneId);
+  }
   if (store === undefined) {
-    return typedEmpty('recall store unavailable');
+    return typedEmpty('recall store unavailable', laneId);
   }
 
   // The page's own stored rows (indexed pages) — used as the KNN exclude set +
@@ -428,8 +446,9 @@ export const buildContentLane = async (
   const qv = store.vectorBackendAvailable
     ? await acquireQueryVector({
         canonicalUrl,
-        title,
+        title: gistOnly ? '' : title,
         gist,
+        ...(gistOnly ? { gistOnly: true } : {}),
         embed: input.embed,
         embedderUsable: input.embedderUsable,
         ownEntityIds,
@@ -467,7 +486,12 @@ export const buildContentLane = async (
     }
   }
 
-  const ftsQuery = composeFtsQuery(title, canonicalUrl, gist);
+  // AI lane: the gist is the whole query. No title, no URL tokens — those
+  // are what the OTHER lanes already contribute, and mixing them back in would
+  // make this lane a duplicate of 'content' wearing a different label.
+  const ftsQuery = gistOnly
+    ? composeFtsQuery('', '', gist)
+    : composeFtsQuery(title, canonicalUrl, gist);
   let ftsRanking: RankedDoc[] = [];
   if (ftsQuery.length > 0) {
     try {
@@ -490,12 +514,12 @@ export const buildContentLane = async (
   const fused = rrfCombine([vectorRanking, ftsRanking]);
   if (fused.length === 0) {
     if (!isIndexed && (title === null || title.length === 0)) {
-      return typedEmpty('no title to compare and page not indexed');
+      return typedEmpty('no title to compare and page not indexed', laneId);
     }
     if (qv.vector === undefined && !input.embedderUsable) {
-      return typedEmpty('embedder cold — no lexical matches');
+      return typedEmpty('embedder cold — no lexical matches', laneId);
     }
-    return typedEmpty('nothing indexed matches this page yet');
+    return typedEmpty('nothing indexed matches this page yet', laneId);
   }
 
   // (4) workstream join + per-workstream aggregation.
@@ -572,7 +596,7 @@ export const buildContentLane = async (
     )
     .slice(0, MAX_LANE_CANDIDATES);
 
-  return { lane: 'content', candidates: top };
+  return { lane: laneId, candidates: top };
 };
 
 // Compose the FTS query from gist + title + URL tokens. Lexical only — no
@@ -680,4 +704,61 @@ export const appendContentLane = async <T extends ResultWithLanes>(
   // carried one) rather than appending a duplicate.
   const withoutContent = result.lanes.filter((existing) => existing.lane !== 'content');
   return { ...result, lanes: [...withoutContent, lane] };
+};
+
+/**
+ * Lane 8 — 'ai'. The SAME retrieval as the content lane, asked with the
+ * on-device gist ALONE.
+ *
+ * WHY IT IS ITS OWN LANE rather than a detail of 'content'. The gist was
+ * already folded into the content lane's query text, which made the AI's
+ * contribution real but INVISIBLE: the lane reported "8 matches (...)" and the
+ * reader could not tell what the model's reading had added, or whether it had
+ * helped at all. Asking the same corpus with the gist alone makes that
+ * contribution something you can look at — the difference between lane 7 and
+ * lane 8 is precisely the AI's marginal effect.
+ *
+ * WHAT TO EXPECT, stated plainly because it is easy to over-read:
+ *   - It is a RETRIEVAL signal, not a judgement. It says "pages whose text
+ *     matches this page's gist are filed under X", and nothing stronger.
+ *   - No gist yet ⇒ typed-empty NAMING that, never a silent absence.
+ *   - It should agree with 'content' on a well-indexed page. It earns its
+ *     place on pages whose title/URL say little but whose content is
+ *     distinctive — an arXiv id, a bare docs URL, a numbered forum item.
+ *   - Like every guess lane it is DISCLOSURE: lanes do not feed fusion, so
+ *     this cannot by itself file anything.
+ */
+export const appendAiLane = async <T extends ResultWithLanes>(
+  result: T,
+  input: {
+    readonly canonicalUrl: string;
+    readonly snapshot: ConnectionsSnapshot;
+    readonly title: string | null;
+    readonly gist?: string | null;
+  },
+  deps: AppendContentLaneDeps,
+): Promise<T> => {
+  if (!deps.guessLanesEnabled || !contentLaneEnabled() || result.lanes === undefined) {
+    return result;
+  }
+  let lane: GuessLaneResult;
+  try {
+    lane = await buildContentLane({
+      canonicalUrl: input.canonicalUrl,
+      snapshot: input.snapshot,
+      title: input.title,
+      laneId: 'ai',
+      ...(input.gist === undefined ? {} : { gist: input.gist }),
+      store: deps.store,
+      ...(deps.embed === undefined ? {} : { embed: deps.embed }),
+      embedderUsable: deps.embedderUsable,
+      ...(deps.lookupWorkstreamByUrl === undefined
+        ? {}
+        : { lookupWorkstreamByUrl: deps.lookupWorkstreamByUrl }),
+    });
+  } catch {
+    lane = typedEmpty('recall store unavailable', 'ai');
+  }
+  const withoutAi = result.lanes.filter((existing) => existing.lane !== 'ai');
+  return { ...result, lanes: [...withoutAi, lane] };
 };

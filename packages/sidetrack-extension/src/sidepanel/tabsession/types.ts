@@ -115,7 +115,10 @@ export type GuessLane =
   | 'title'
   | 'domain'
   | 'recency'
-  | 'content';
+  | 'content'
+  // Lane 8 — the AI lane: the same query-time retrieval as 'content', asked
+  // with the on-device gist ALONE. Present only when a gist exists.
+  | 'ai';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;

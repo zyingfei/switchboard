@@ -37,6 +37,10 @@ const LANE_LABEL: Record<GuessLaneResult['lane'], string> = {
   // disclosure renders lanes in array order so it slots in automatically when
   // a newer companion sends it, and is simply never listed on older ones.
   content: 'Content match',
+  // Lane 8 — the AI's own reading. Named for what it IS rather than how it is
+  // computed, because the whole point of splitting it out from 'content' is
+  // that a reader can see what the on-device model contributed.
+  ai: 'AI gist match',
 };
 
 const workstreamLabel = (
