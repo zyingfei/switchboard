@@ -273,7 +273,7 @@ describe('Health → Experiments · Compare engines', () => {
     }
     // Each row states the limits it ran under.
     expect(screen.getByTestId('hp-ondevice-ai-compare-row-webgpu')).toHaveTextContent(
-      'limits: 2k in / 140 tok out',
+      'limits: 3.6k in / 140 tok out',
     );
     // The winner is starred, and the size mismatch is called out.
     expect(screen.getByTestId('hp-ondevice-ai-compare-row-nano')).toHaveTextContent('★');

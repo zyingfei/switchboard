@@ -103,8 +103,13 @@ export const GENERATION_TOP_K = 40;
 
 /** 2-3 sentences + an entity list. Was 220 — that budget bought 61.5s of loop. */
 export const GIST_MAX_NEW_TOKENS = 140;
-/** One sentence per document section in the chunk pass. */
-export const CHUNK_GIST_MAX_NEW_TOKENS = 64;
+// One sentence per document section in the chunk pass. Lowered 64 -> 40 to
+// match the "at most 20 words" bound now stated in CHUNK_GIST_PROMPT_PREFIX.
+// The ORDER matters: the prompt does the work and this is the backstop. With
+// the old prompt the notes averaged 38 tokens, so cutting the cap alone would
+// have truncated sentences rather than shortened them; with the bound in the
+// instruction the cap is slack that only catches a runaway.
+export const CHUNK_GIST_MAX_NEW_TOKENS = 40;
 /** 4-10 words. */
 export const TITLE_MAX_NEW_TOKENS = 32;
 

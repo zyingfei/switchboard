@@ -41,11 +41,34 @@ export interface ChunkPlan {
   readonly singlePass: boolean;
 }
 
-/** Upper bound on one chunk. Sized so a 1B model's context is never the limit. */
-export const CHUNK_MAX_CHARS = 1800;
+// Upper bound on one chunk. MEASURED, not reasoned about (2026-07-28, WebGPU
+// gemma-3-1b q4, 3 real vault documents x 2 repetitions):
+//
+//   1800 chars/chunk   5.7 generations   26.4s median   groundedness 0.49
+//   3600 chars/chunk   3.3 generations   17.3s median   groundedness 0.47
+//   6000 chars/chunk   1.0 generation    78.1s          groundedness 0.36
+//                      ...and then a HARD CRASH on the next document:
+//                      "failed to call OrtRun() ... webgpu/buffer_manager.cc
+//                      Download(WGPUBuffer...)"
+//
+// Two things fall out of that. Wider is faster up to a point, because latency
+// on this stack is ~3.9ms per input token but ~37.5ms per OUTPUT token, and a
+// wider chunk removes whole generations. And past that point prefill goes
+// SUPERLINEAR and then the WebGPU backend fails outright — 6000 chars cost 6x
+// what a linear model predicts before it crashed. So the ceiling here is not a
+// context-window limit (the model has 8k); it is a GPU buffer limit, and it is
+// found by measurement.
+//
+// 3600 is the widest value observed clean, across 8 runs, with a 1.7x margin to
+// the width that crashed. Do not raise it without re-running that sweep.
+export const CHUNK_MAX_CHARS = 3600;
 /** Target floor — the packer fills greedily, so chunks land near the max. */
-export const CHUNK_MIN_CHARS = 1200;
-/** Chunks processed per gist run. 6 x ~1800 = ~10.8k chars of real coverage. */
+export const CHUNK_MIN_CHARS = 2400;
+/**
+ * Chunks processed per gist run. 6 x ~3600 = ~21.6k chars of real coverage —
+ * the width increase DOUBLED coverage at the same cap, rather than trading it
+ * away for speed.
+ */
 export const MAX_PROCESSED_CHUNKS = 6;
 
 /** Separator used when several paragraphs are packed into one chunk. */

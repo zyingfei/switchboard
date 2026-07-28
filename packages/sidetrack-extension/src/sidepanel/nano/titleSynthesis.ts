@@ -162,9 +162,19 @@ export const GIST_PROMPT_PREFIX = [
 // sentence about ONE section of a document. Deliberately narrower than the gist
 // prompt — asking a 1B model for "2-3 sentences + entities" about a 1800-char
 // fragment invites padding, and padding is where the repetition loops start.
+// The "at most 20 words" bound is LOAD-BEARING for latency, and it has to live
+// in the instruction rather than in max_new_tokens. Measured (2026-07-28): with
+// only "ONE factual sentence" the notes averaged 38 tokens against a 64-token
+// cap — the model was nowhere near its cap, so lowering the cap alone would
+// merely have truncated mid-sentence. Adding the explicit bound cut the whole
+// pipeline's output tokens 338 -> 206 and its median latency 26.4s -> 20.2s
+// with groundedness UNCHANGED at 0.49 and 6/6 outputs still passing validation.
+// These sentences are intermediate notes the user never reads; they only feed
+// the final synthesis, so length beyond a sentence is pure cost.
 export const CHUNK_GIST_PROMPT_PREFIX = [
   'You summarize documents for a personal research organizer.',
-  'Write ONE factual sentence describing what this SECTION of a document says.',
+  'Write ONE factual sentence, at most 20 words, describing what this SECTION',
+  'of a document says.',
   'Write in the SAME language the section is mostly written in',
   '(English section → English sentence, 中文段落 → 中文句子).',
   'Use ONLY facts present in the text. No preamble, no meta-commentary, no',
