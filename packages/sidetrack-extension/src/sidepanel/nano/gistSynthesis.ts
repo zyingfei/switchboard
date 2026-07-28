@@ -37,6 +37,7 @@ import {
 } from './engineLimits';
 import {
   CHUNK_GIST_GENERATION,
+  CHUNK_GIST_OUTPUT_MAX_CHARS,
   GIST_GENERATION,
   type GenerationOptions,
 } from './generationOptions';
@@ -175,6 +176,20 @@ const generateValidated = async (
   primary: GenerationOptions,
   retry: GenerationOptions | null,
   maxChars: number,
+  /**
+   * The INSTRUCTION text only — never the source — for echo detection.
+   *
+   * looksLikePromptEcho flags an output that shares >30% of its 3-grams with
+   * whatever string it is given. Handing it the full prompt means comparing the
+   * summary against the DOCUMENT, and a faithful summary reuses the document's
+   * wording by definition. The rule's own message says what it is for: "the
+   * model repeated the instructions instead of summarizing".
+   *
+   * This bit for real on the synthesis pass, where the "source" is the chunk
+   * notes — text the final gist exists to restate — so a correct gist was
+   * rejected as an echo of itself.
+   */
+  instructions: string,
 ): Promise<AttemptOutcome> => {
   let firstReason: GenerationRejectionReason | null = null;
   const passes = retry === null ? [primary] : [primary, retry];
@@ -185,7 +200,7 @@ const generateValidated = async (
     // SKIP is a decision, not a defect — stop immediately.
     if (isAbstention(raw)) return { text: null, reason: null, abstained: true, attempts: i + 1 };
     const cleaned = stripGistPreamble(raw).slice(0, maxChars);
-    const verdict = validateGeneration(cleaned, { kind, language, prompt });
+    const verdict = validateGeneration(cleaned, { kind, language, prompt: instructions });
     if (verdict.ok) return { text: verdict.text, reason: null, abstained: false, attempts: i + 1 };
     firstReason ??= verdict.reason;
   }
@@ -242,6 +257,7 @@ export const synthesizeGist = async (
       GIST_GENERATION,
       RETRY_GENERATION,
       MAX_GIST_CHARS,
+      GIST_PROMPT_PREFIX,
     );
     if (outcome.abstained) return { ok: false, kind: 'abstained', meta };
     if (outcome.text === null) {
@@ -251,20 +267,33 @@ export const synthesizeGist = async (
   }
 
   // --- Chunk pass: one validated sentence per chunk. -----------------------
+  // Through generateValidated so each note is STRIPPED before it is validated
+  // and before it is handed to the synthesis. A note that still says
+  // "Summary: ..." becomes part of the final pass's input and invites the model
+  // to echo the shape straight back out.
+  //
+  // retry = null on purpose: a bad chunk note is DROPPED, not retried. One bad
+  // section must not lose the document, and retrying every chunk would double
+  // the cost of the most expensive pass for the least valuable output.
   const notes: string[] = [];
   let firstRejection: GenerationRejectionReason | null = null;
   for (const chunk of plan.chunks) {
-    const raw = await engine.generate(
+    const outcome = await generateValidated(
+      engine,
       `${CHUNK_GIST_PROMPT_PREFIX}\n${chunk.text}`,
+      language,
+      'chunk-gist',
       CHUNK_GIST_GENERATION,
+      null,
+      CHUNK_GIST_OUTPUT_MAX_CHARS,
+      CHUNK_GIST_PROMPT_PREFIX,
     );
-    if (isAbstention(raw)) continue;
-    const verdict = validateGeneration(raw, { kind: 'chunk-gist', language, prompt: CHUNK_GIST_PROMPT_PREFIX });
-    if (!verdict.ok) {
-      firstRejection ??= verdict.reason;
+    if (outcome.abstained) continue;
+    if (outcome.text === null) {
+      firstRejection ??= outcome.reason;
       continue;
     }
-    notes.push(verdict.text);
+    notes.push(outcome.text);
   }
   if (notes.length === 0) {
     const meta = metaOf(plan, 0, 2, inputChars, limits.maxInputChars);
@@ -285,9 +314,37 @@ export const synthesizeGist = async (
     sliceForSynthesis(notes.map((n) => `- ${n}`).join('\n')),
     limits.maxInputChars,
   ).text;
-  const raw = await engine.generate(`${GIST_SYNTHESIS_PROMPT_PREFIX}\n${joined}`, GIST_GENERATION);
-  if (isAbstention(raw)) return { ok: false, kind: 'abstained', meta };
-  const verdict = validateGeneration(raw.slice(0, MAX_GIST_CHARS), { kind: 'gist', language, prompt: GIST_PROMPT_PREFIX });
-  if (!verdict.ok) return { ok: false, kind: 'rejected', reason: verdict.reason, meta };
-  return { ok: true, gist: verdict.text, meta };
+  // THROUGH THE SAME HELPER AS THE SINGLE-PASS PATH. This used to be bespoke
+  // inline code, and it drifted in three ways that all reached the user
+  // (reported live 2026-07-28: a saved gist reading "Summary: Anthropic CEO
+  // has decided..."):
+  //
+  //   1. NO stripGistPreamble — so "Summary: ", "Here is ...", and markdown
+  //      bold survived into the saved gist. The stripper existed and was only
+  //      ever wired into the single-pass path, so every MULTI-CHUNK document
+  //      leaked exactly what it was written to remove.
+  //   2. NO retry — the single-pass path retries once with a near-deterministic
+  //      decode, so a long document got strictly fewer chances than a short one
+  //      for no defensible reason.
+  //   3. The WRONG prompt for echo-detection: it validated against
+  //      GIST_PROMPT_PREFIX while generating from GIST_SYNTHESIS_PROMPT_PREFIX,
+  //      so prompt-echo of the synthesis instructions could not be detected.
+  //
+  // Two code paths doing "the same thing" is how all three happened. There is
+  // now one.
+  const outcome = await generateValidated(
+    engine,
+    `${GIST_SYNTHESIS_PROMPT_PREFIX}\n${joined}`,
+    language,
+    'gist',
+    GIST_GENERATION,
+    RETRY_GENERATION,
+    MAX_GIST_CHARS,
+    GIST_SYNTHESIS_PROMPT_PREFIX,
+  );
+  if (outcome.abstained) return { ok: false, kind: 'abstained', meta };
+  if (outcome.text === null) {
+    return { ok: false, kind: 'rejected', reason: outcome.reason ?? 'empty', meta };
+  }
+  return { ok: true, gist: outcome.text, meta };
 };
