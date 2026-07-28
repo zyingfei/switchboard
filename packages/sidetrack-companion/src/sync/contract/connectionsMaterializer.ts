@@ -3017,6 +3017,15 @@ export const createConnectionsMaterializer = (
     let drainFrontier: VersionVector;
     let drainProgressDotIntervals: MaterializerProgress['appliedDotIntervals'] | null = null;
     let loadedProjectionAccumulatorState = false;
+    // Is `merged` the COMPLETE event log, or only this drain's pending WINDOW?
+    // Three of the four read paths below set it to the window (catch-up chunk,
+    // event-store readSince, instant-boot readMergedSince); only the cold
+    // `readMerged()` path makes it the full log. The full-rebuild fallback far
+    // below (`!baseSnapshotPrebuilt`) MUST know the difference: rebuilding the
+    // whole snapshot from a window publishes a window-only graph over the
+    // served one. Default false — a path that forgets to set it pays a correct
+    // (widening) rebuild, never a silent shrink.
+    let mergedIsFullLog = false;
     const existingProgressMatches =
       existingProgress !== null && existingProgress.materializerVersion === MATERIALIZER_VERSION;
     const forcedPendingEventWindow = catchUpPendingEventWindow;
@@ -3167,6 +3176,7 @@ export const createConnectionsMaterializer = (
         mark(`readMergedSince events=${String(pendingEventsForDrain.length)}`);
       } else {
         merged = await deps.eventLog.readMerged();
+        mergedIsFullLog = true;
         pendingEventsForDrain =
           effectiveLastFrontier === undefined
             ? merged
@@ -6031,25 +6041,81 @@ export const createConnectionsMaterializer = (
       }
       if (!baseSnapshotPrebuilt) {
         // Full-rebuild fallback (scoped-delta could not apply; NOT a catch-up,
-        // which threw above). In the store-backed path `input.events` (= merged)
-        // is only the pending WINDOW, so buildConnectionsSnapshot would yield a
+        // which threw above). `input.events` (= merged) is only the pending
+        // WINDOW on every warm path, so buildConnectionsSnapshot would yield a
         // window-only graph that then OVERWRITES the full snapshot — a shrink
         // (e.g. a search-visit drain on a small window collapsing ~9k nodes to a
-        // few hundred). The non-store-backed path already rebuilds from the full
-        // log (merged = eventLog.readMerged()); mirror that here so the fallback
-        // produces the COMPLETE graph. Every other input field (timelineDays,
-        // projections, similarity, topics) is already full-scope, so only the
-        // event set needs widening. The view is seeded from this base and is not
-        // re-folded with `merged` in this path, so there is no double-apply.
-        // Use storeBackedEvents.readSince({}) — the SAME full-event source the
-        // cold build uses (proven to yield the complete graph) — not
-        // deps.eventLog.readMerged(), which is partial in the store-backed setup.
-        const fullBuildEvents =
-          storeBackedEvents !== null ? storeBackedEvents.readSince({}) : merged;
+        // few hundred). Rebuild from the SAME full-event source the cold build
+        // uses so the fallback produces the COMPLETE graph. The view is seeded
+        // from this base and is not re-folded with `merged` in this path, so
+        // there is no double-apply.
+        //
+        // 2026-07-28 — the previous form asserted "the non-store-backed path
+        // already rebuilds from the full log (merged = eventLog.readMerged())"
+        // and widened ONLY the store-backed branch. That premise died when the
+        // instant-boot warm read (`readMergedSince`, above) landed: with the
+        // event store OFF — the production default — a warm drain also carries
+        // `merged` = the tail. Live evidence (test companion, vault-test,
+        // 2026-07-28 latest.json): every `scopedTimelineDelta skip
+        // reason=unknown-inner` drain published nodeCount=1045 / edgeCount=985
+        // with ZERO `visit_resembles_visit` rows while the adopted revision held
+        // 56,179 — "rendered similarity floor REPAIRED a collapse: served=56137
+        // rendered=0" on EVERY drain, pinning `renderRepaired: true` →
+        // `similarity.served-signal-floor` alarm → observability=degraded.
+        // `mergedIsFullLog` now carries the fact instead of an assumption.
+        //
+        // COST (runtime-agility bar): with the store off and a warm window this
+        // now pays a full `readMerged()` on the fallback. That is the honest
+        // price of the rebuild this branch already claims to do — it is the same
+        // read the cold build pays, and the store-backed branch has always paid
+        // its `readSince({})` equivalent here. It gets its own phase mark so the
+        // cost is attributed to the widen, not smeared into the build (B1
+        // phase-log doctrine). The way to stop paying it is to stop MISSING the
+        // scoped-delta fast path (the `skip reason=unknown-inner` class), not to
+        // publish a window-only graph.
+        let fullBuildEvents: readonly AcceptedEvent[];
+        if (storeBackedEvents !== null) {
+          fullBuildEvents = storeBackedEvents.readSince({});
+        } else if (mergedIsFullLog) {
+          fullBuildEvents = merged;
+        } else {
+          fullBuildEvents = await deps.eventLog.readMerged();
+          mark(`baseRebuild.widenedEvents events=${String(fullBuildEvents.length)}`);
+        }
+        // Widening the EVENT set alone is not enough. Pass 7 (similarity edge
+        // emission) resolves both endpoints through `visitObservedAtByKey`,
+        // which snapshot.ts builds from `input.timelineDays` ONLY — never from
+        // the node set — so window-derived days strip every similarity edge no
+        // matter how wide the event set is. With the event store on, W1 hands us
+        // the full-corpus days already (`assembledFromTypedStore`); with it off
+        // (or the corpus lane killed) `fullBuildTimelineDays` IS the window's
+        // days, so re-derive them from the widened event set — the same shape
+        // the Layer-0 recovery rebuild above uses. Built once and shared by both
+        // builders (the recovery block's triple `buildTimelineDays` is left
+        // alone; this path runs on ordinary browsing drains).
+        const fullBuildDaysAreCorpusWide =
+          fullBuildEvents === merged || similarityCorpusResult.assembledFromTypedStore;
+        let fullBuildDays = fullBuildTimelineDays;
+        if (!fullBuildDaysAreCorpusWide) {
+          const widenedRawDays = buildTimelineDays(fullBuildEvents);
+          fullBuildDays = enrichTimelineDaysWithEngagement(
+            widenedRawDays,
+            buildEngagementClassifierInputs(fullBuildEvents, widenedRawDays),
+          );
+          mark(
+            `baseRebuild.widenedTimelineDays events=${String(fullBuildEvents.length)} days=${String(
+              fullBuildDays.length,
+            )} entries=${String(fullBuildDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
+          );
+        }
         baseSnapshot =
-          fullBuildEvents === merged
+          fullBuildEvents === merged && fullBuildDays === fullBuildTimelineDays
             ? buildConnectionsSnapshot(input)
-            : buildConnectionsSnapshot({ ...input, events: fullBuildEvents });
+            : buildConnectionsSnapshot({
+                ...input,
+                events: fullBuildEvents,
+                timelineDays: fullBuildDays,
+              });
       }
       incrementalGraphView.seed(baseSnapshot);
       if (incrementalGraphPlan.pendingEventCount > 0) {
