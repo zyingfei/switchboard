@@ -292,7 +292,14 @@ export const synthesizeTitle = async (
 // fact. Pure + exported so it is unit-testable.
 export const stripGistPreamble = (raw: string): string => {
   let out = raw.trim();
-  out = out.replace(/^\s*(?:here(?:'|\u2019)?s|here is|below is|this is)\b[^\n.]*[:.]\s*/iu, '');
+  // The character class EXCLUDES ':' as well as '.', which is load-bearing.
+  // With `[^\n.]*` this was greedy up to the LAST period on the line, so
+  //   "Here is a summary: A factual sentence."
+  // matched in its entirety and stripped to "" \u2014 the stripper DELETED the gist
+  // instead of its preamble, and validateGeneration then rejected the empty
+  // result, so the run saved nothing at all. Stopping at the first ':' or '.'
+  // bounds the match to the actual preamble.
+  out = out.replace(/^\s*(?:here(?:'|\u2019)?s|here is|below is|this is)\b[^\n.:]*[:.]\s*/iu, '');
   out = out.replace(/^\s*(?:\*\*)?(?:overall\s+)?summary(?:\*\*)?\s*:?\s*/iu, '');
   out = out.replace(/^[#>\s*_-]+/u, '');
   out = out.replace(/\*\*/gu, '');
