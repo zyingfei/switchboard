@@ -34,7 +34,11 @@ import {
   CODING_TICK_OBSERVED,
 } from '../../coding/events.js';
 import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
-import { ENTITY_CONTENT_ENRICHED, ENTITY_TITLE_ENRICHED } from '../../enrichment/events.js';
+import {
+  ENTITY_CONTENT_ENRICHED,
+  ENTITY_ENRICHMENT_RETRACTED,
+  ENTITY_TITLE_ENRICHED,
+} from '../../enrichment/events.js';
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
@@ -376,6 +380,27 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // is replay-event-log (fold is a pure function of the event stream).
   {
     eventType: ENTITY_CONTENT_ENRICHED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'recall-index',
+        class: 'derived-cache',
+        materializer: 'recall',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Enrichment retraction — entity.enrichment.retracted. WITHDRAWS a
+  // synthesized title or gist that should never have served (a degenerate
+  // generation, a wrong summary). The log is append-only, so the delete is an
+  // append and the FOLDS honor it — TOMBSTONE + HIDE, as privacy.domain.tombstone
+  // does. Deliberately carries the SAME surface + materializer as the two events
+  // it withdraws: a retraction must re-drive the recall serve exactly as the
+  // enrichment did, or the bad gist would keep serving from a warm index until
+  // something unrelated invalidated it.
+  {
+    eventType: ENTITY_ENRICHMENT_RETRACTED,
     currentPayloadVersion: 1,
     surfaces: [
       {

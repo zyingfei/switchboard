@@ -35,9 +35,12 @@ import type { EventLog } from '../sync/eventLog.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 
 import {
+  ENTITY_ENRICHMENT_RETRACTED,
   ENTITY_TITLE_ENRICHED,
+  type EnrichmentFamily,
   type EntityTitleEnrichedKind,
   type EntityTitleEnrichedPayload,
+  isEntityEnrichmentRetractedPayload,
   isEntityTitleEnrichedPayload,
 } from './events.js';
 
@@ -46,15 +49,21 @@ import {
 export {
   ENTITY_TITLE_ENRICHED,
   ENTITY_TITLE_ENRICHED_KINDS,
+  ENTITY_ENRICHMENT_RETRACTED,
   ENRICHED_TITLE_MAX_LENGTH,
   ENRICHED_SOURCE_HASH_MAX_LENGTH,
   ENRICHED_ID_MAX_LENGTH,
+  ENRICHMENT_FAMILIES,
+  RETRACTION_REASON_MAX_LENGTH,
   isEntityTitleEnrichedPayload,
+  isEntityEnrichmentRetractedPayload,
 } from './events.js';
 export type {
   EntityTitleEnrichedEventType,
   EntityTitleEnrichedKind,
   EntityTitleEnrichedPayload,
+  EntityEnrichmentRetractedPayload,
+  EnrichmentFamily,
 } from './events.js';
 
 // ---- flag -------------------------------------------------------------
@@ -109,6 +118,12 @@ export const effectiveTitle = (
 export interface EnrichmentEntry {
   readonly title: string;
   readonly sourceContentHash: string;
+  /**
+   * When the panel synthesized this title (the payload's own `generatedAt`).
+   * Carried through the fold because an UNSCOPED retraction is resolved
+   * against it — see foldEnrichmentEvents.
+   */
+  readonly generatedAt: string;
 }
 
 // kind:id → {title, hash}. A pure fold over ENTITY_TITLE_ENRICHED events:
@@ -154,11 +169,37 @@ export const effectiveUrlTitle = (
 // change the entry. A NEW hash for a key supersedes (content changed → newer
 // synthesis wins). Non-enrichment / malformed events are skipped. Exported so
 // the fold can be unit-tested without touching the event store.
+//
+// RETRACTIONS (family 'title') are honored with the SAME two-pass, timestamp-
+// resolved semantics the content fold uses — see foldContentEnrichmentEvents
+// for the full rationale. The short version: the typed store read is
+// replica-major, not global log order, so a retraction resolved by stream
+// position could silently fail to apply. Hash-scoped retractions withdraw an
+// exact revision with no clock involved; unscoped ones withdraw anything not
+// generated after the retraction.
 export const foldEnrichmentEvents = (
   events: Iterable<AcceptedEvent>,
 ): EnrichmentLookup => {
   const map = new Map<string, EnrichmentEntry>();
+  const retractions = new Map<
+    string,
+    { sourceContentHash: string | undefined; retractedAt: string }[]
+  >();
   for (const event of events) {
+    if (event.type === ENTITY_ENRICHMENT_RETRACTED) {
+      if (!isEntityEnrichmentRetractedPayload(event.payload)) continue;
+      const payload = event.payload;
+      if (payload.family !== 'title') continue;
+      const key = foldKey(payload.kind, payload.id);
+      const entry = {
+        sourceContentHash: payload.sourceContentHash,
+        retractedAt: payload.retractedAt,
+      };
+      const list = retractions.get(key);
+      if (list === undefined) retractions.set(key, [entry]);
+      else list.push(entry);
+      continue;
+    }
     if (event.type !== ENTITY_TITLE_ENRICHED) continue;
     if (!isEntityTitleEnrichedPayload(event.payload)) continue;
     const payload = event.payload;
@@ -172,7 +213,20 @@ export const foldEnrichmentEvents = (
     map.set(key, {
       title: payload.synthesizedTitle,
       sourceContentHash: payload.sourceContentHash,
+      generatedAt: payload.generatedAt,
     });
+  }
+  for (const [key, list] of retractions) {
+    const standing = map.get(key);
+    if (standing === undefined) continue;
+    for (const retraction of list) {
+      if (retraction.sourceContentHash !== undefined) {
+        if (retraction.sourceContentHash === standing.sourceContentHash) map.delete(key);
+        continue;
+      }
+      if (standing.generatedAt > retraction.retractedAt) continue;
+      map.delete(key);
+    }
   }
   return map;
 };
@@ -193,17 +247,25 @@ const emptyEvents: readonly AcceptedEvent[] = [];
 // the hot batch path that already hold the merged log should prefer
 // foldEnrichmentEvents over the passed array (see server batch-resolve) to
 // avoid even the extra readMerged INVOCATION.
+// BOTH types, always. A read that fetched only ENTITY_TITLE_ENRICHED would
+// fold a retracted title straight back into serving — the retraction would sit
+// in the log and change nothing.
+const TITLE_FOLD_TYPES = [ENTITY_TITLE_ENRICHED, ENTITY_ENRICHMENT_RETRACTED] as const;
+
+const isTitleFoldType = (type: string): boolean =>
+  type === ENTITY_TITLE_ENRICHED || type === ENTITY_ENRICHMENT_RETRACTED;
+
 const readEnrichmentEvents = async (
   vaultRoot: string,
   eventLog: EventLog,
 ): Promise<readonly AcceptedEvent[]> => {
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) {
-    return (await eventLog.readMerged()).filter((event) => event.type === ENTITY_TITLE_ENRICHED);
+    return (await eventLog.readMerged()).filter((event) => isTitleFoldType(event.type));
   }
   const events: AcceptedEvent[] = [];
   await store.forEachChunkOfTypes(
-    [ENTITY_TITLE_ENRICHED],
+    [...TITLE_FOLD_TYPES],
     (chunk) => {
       for (const event of chunk) events.push(event);
     },
@@ -318,7 +380,12 @@ const NUL_SEP = String.fromCharCode(0);
 // key: a title event and a content event for the same (kind,id,hash) would
 // otherwise collide on the SAME clientEventId and the second POST would be
 // wrongly deduped as a replay of the first.
-export type EnrichmentFamily = 'title' | 'content';
+//
+// The type is DECLARED in events.ts (derived from the ENRICHMENT_FAMILIES
+// tuple that the retraction guard validates against) and re-exported above.
+// It used to be hand-written here as a second, independent literal union —
+// two declarations of one closed set, free to drift the moment a third family
+// is added. One source now.
 
 // The idempotency key for an enrichment event = a deterministic hash of the
 // (family,kind,id,sourceContentHash) tuple. Re-posting the same tuple binds to
