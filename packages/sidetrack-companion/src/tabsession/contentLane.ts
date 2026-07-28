@@ -343,7 +343,12 @@ const acquireQueryVector = async (input: {
   }
   // Key the LRU on (url,title,gist) so a page that later gains a gist re-embeds
   // rather than reusing the pre-gist query vector.
-  const key = hashKey(input.canonicalUrl, `${input.gistOnly === true ? 'ai' : 'content'} ${title} ${gist}`);
+  // Key on the TEXT THAT IS EMBEDDED, not on which lane asked. Lane 7 and
+  // lane 8 send different text on a page with a title (so they get different
+  // vectors, correctly), but IDENTICAL text on a junk-titled page — which is
+  // exactly the case lane 8 exists for. Keying on the lane made those pages
+  // embed the same string twice per resolve, on the thread that serves HTTP.
+  const key = hashKey(input.canonicalUrl, embedText);
   const cached = lruGet(key);
   if (cached !== undefined) {
     return { vector: cached, embedded: false, ownEntityIds: input.ownEntityIds };

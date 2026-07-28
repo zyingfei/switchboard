@@ -237,6 +237,20 @@ import {
   type EntityEnrichmentRetractedPayload,
 } from '../enrichment/events.js';
 
+// Hand the event loop back for one macrotask.
+//
+// bun:sqlite is fully SYNCHRONOUS, so a route that touches sqlite N times in a
+// loop holds the thread that serves every other request for the whole run.
+// Awaiting this between iterations does not make the work cheaper — it caps
+// how long a single tick can hold the loop, which is what a client timeout
+// actually measures. setImmediate (not a microtask) so pending I/O callbacks
+// genuinely get a turn. Mirrors the reconcile phase yields in
+// connectionsMaterializer.ts.
+const yieldToEventLoop = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
 // quantities the bare snapshotRevision misses:
@@ -2842,9 +2856,21 @@ const buildContentLaneDeps = async (
   }
   let store: ContentLaneStore | undefined;
   try {
-    const { peekRecallV2Store } = await import('../recall-v2/pipeline.js');
+    const { peekRecallV2Store, warmRecallV2Store } = await import('../recall-v2/pipeline.js');
     // peekRecallV2Store returns the cached handle only — never opens a new one.
     store = (await peekRecallV2Store(vaultRoot)) as ContentLaneStore | undefined;
+    if (store === undefined) {
+      // NOBODY ELSE OPENS IT FOR US. The only opener is POST /v2/recall (the
+      // Related strip), so after every companion restart the content and AI
+      // lanes report "recall store unavailable" until the panel happens to fire
+      // a /v2 query — an unbounded window in which the two lanes that depend on
+      // page CONTENT are silently dead. Observed repeatedly on 2026-07-28.
+      //
+      // Warm it in the BACKGROUND: open only, no backfill (that is the ~7000-row
+      // loop that starves /v1/status), and deliberately not awaited. This
+      // resolve still returns a typed-empty lane; the next one finds a handle.
+      warmRecallV2Store(vaultRoot);
+    }
   } catch {
     store = undefined;
   }
@@ -5410,6 +5436,24 @@ const routes: readonly RouteDefinition[] = [
         }
         const missedEvents = resolverSignalEventsForCanonicalUrls(merged, misses);
         for (const canonicalUrl of misses) {
+          // BREATHE BETWEEN URLS. Everything below — the resolver, the lane
+          // joins, the resolver-cache write — is SYNCHRONOUS sqlite on the
+          // thread that serves HTTP (bun:sqlite has no async API). Native
+          // sampling during one batch-resolve put ~90% of main-thread samples
+          // inside sqlite3: VdbeExec, BtreeTableMoveto, FTS, BtreeInsert.
+          //
+          // With N urls per batch those runs concatenate into a single
+          // uninterruptible tick, so /v1/status, /v1/page-content and every
+          // other request queue behind the whole batch — measured 425 stalls
+          // in one run, p95 6.4s, max 89.7s, which is exactly the "Companion
+          // did not respond within 15s" the panel reports.
+          //
+          // Yielding does NOT reduce the work; it caps how long any one tick
+          // holds the loop, so P99 becomes "slowest single URL" instead of
+          // "whole batch". Same reasoning, and the same helper, as the
+          // reconcile's phase yields (connectionsMaterializer.ts) — the
+          // lower-risk first step before moving sqlite off-thread entirely.
+          await yieldToEventLoop();
           const snapshot = missedSnapshot;
           if (snapshot === null) {
             throw new HttpRouteError(
@@ -5472,6 +5516,11 @@ const routes: readonly RouteDefinition[] = [
               : null);
           if (joinSnapshot !== null) {
             for (const canonicalUrl of Object.keys(results)) {
+              // Two lanes per URL now (content + ai), each a vector KNN plus an
+              // FTS query plus a workstream join — all synchronous sqlite. This
+              // loop runs for EVERY url in the batch including cache hits, so
+              // it is the longest uninterrupted stretch in the route.
+              await yieldToEventLoop();
               const title =
                 titleHints.get(canonicalUrl) ??
                 titleForCanonicalUrl(joinSnapshot, canonicalUrl, synthesizedTitleFor(canonicalUrl)) ??
