@@ -5322,9 +5322,29 @@ const routes: readonly RouteDefinition[] = [
           }
           misses.push(canonicalUrl);
         }
+        // When every URL was a resolver-cache hit there is no attribution work
+        // to do — but the CONTENT lane still runs (it is decoupled from that
+        // cache by design and recomputes at query time), and it needs the gist.
+        // Reading NOTHING here used to fold an empty gist lookup and memoize it
+        // under the real log signature, so a page whose gist the user had just
+        // generated contributed nothing to any guess.
+        //
+        // So this branch still reads — but ONLY the enrichment types, through
+        // events_type_idx. Those events are sparse, it stays a SINGLE read (the
+        // batch path's one-scan promise is load-bearing; this route has a
+        // history of per-request full scans costing tens of seconds), and it is
+        // strictly cheaper than the miss path's resolver-expand read.
         const merged =
           misses.length === 0
-            ? []
+            ? await readEventsFromStoreOrLog(
+                context,
+                context.eventLog,
+                (event) =>
+                  event.type === ENTITY_TITLE_ENRICHED ||
+                  event.type === ENTITY_CONTENT_ENRICHED ||
+                  event.type === ENTITY_ENRICHMENT_RETRACTED,
+                [ENTITY_TITLE_ENRICHED, ENTITY_CONTENT_ENRICHED, ENTITY_ENRICHMENT_RETRACTED],
+              )
             : await readEventsFromStoreOrLog(
                 context,
                 context.eventLog,
@@ -5358,6 +5378,8 @@ const routes: readonly RouteDefinition[] = [
           batchEnrichSig,
           merged,
         );
+        // Folds from `merged`, which now always carries the enrichment types —
+        // see the read above for why the all-cache-hit branch cannot be [].
         gistLookup = gistLookupFromMerged(requireVaultRoot(context), batchEnrichSig, merged);
         const expandedCandidateUrlsByTarget =
           eventCandidateTargetSet.size === 0
