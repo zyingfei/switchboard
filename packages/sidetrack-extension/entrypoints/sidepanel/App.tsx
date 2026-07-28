@@ -897,6 +897,11 @@ const writeCachedCompanionStatus = (status: WorkboardState['companionStatus']): 
   }
 };
 
+// How often to re-check engine availability WHILE nothing can serve. Matches
+// the Apple probe TTL (30s) so a retry actually re-probes rather than reading
+// the same cached answer back.
+const ENRICH_REPROBE_WHILE_BLOCKED_MS = 30_000;
+
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => {
     const cached = readCachedCompanionStatus();
@@ -5712,6 +5717,37 @@ const App = () => {
       active = false;
     };
   }, [currentTabCanonicalUrl, enrichProbeNonce]);
+  // A NEGATIVE availability result must not be permanent.
+  //
+  // The snapshot above only re-runs when the focused URL changes or something
+  // explicitly bumps the nonce. The Apple probe caches for 30s — but nothing
+  // RE-READS it, so a transient failure (the local service restarting, a cold
+  // session that lost a race) pins the row to "model not loaded" until the user
+  // happens to navigate. Reported live 2026-07-28: the row said the model was
+  // not loaded while the service was healthy and answering, and navigating to
+  // any other page fixed it instantly.
+  //
+  // So: while NOTHING can serve, re-check on a timer. When an engine is ready
+  // this does nothing at all — the interval is only armed in the blocked state,
+  // which is the only state where a stale negative is harmful. That keeps the
+  // cost at zero on the happy path, and matters because the Apple probe is a
+  // real (if tiny) on-device generation, not a free ping.
+  const enrichBlocked =
+    enrichAvailability !== null &&
+    !enrichAvailability.nanoReady &&
+    enrichAvailability.appleReady !== true &&
+    !enrichAvailability.webGpuLoaded &&
+    enrichAvailability.remoteReady !== true &&
+    enrichAvailability.webGpuLoading !== true;
+  useEffect(() => {
+    if (!enrichBlocked) return;
+    const timer = setInterval(() => {
+      setEnrichProbeNonce((n) => n + 1);
+    }, ENRICH_REPROBE_WHILE_BLOCKED_MS);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [enrichBlocked]);
   // The title the features-only brief is built around. Read through a ref so
   // the fetcher's identity does not churn on every projection update (it is a
   // dependency of the enrichment row's run callback).
