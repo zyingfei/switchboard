@@ -12,8 +12,20 @@
 // becomes a 500 ms-ish max sample. We persist the max-since-last-
 // read and clear on read so a long-tail spike isn't masked by the
 // next non-blocked window's stats.
+//
+// The logged lines carry `inflight=` — the route patterns still running
+// when the stall/busy window was noticed (see inflightRegistry.ts). The
+// magnitude alone was never actionable: it proved the thread was pinned
+// but not by what, so the answer always had to be re-derived from the
+// SIDETRACK_HTTP_LOG timings by hand.
 
 import { monitorEventLoopDelay, performance, type IntervalHistogram } from 'node:perf_hooks';
+
+// Self-attribution for the stall/busy lines. Imported DIRECTLY (not injected)
+// because inflightRegistry has zero imports of its own — there is no cycle to
+// create — and because a diagnostic that has to be wired up is a diagnostic
+// that will be missing on the box where it is needed.
+import { formatInflightForLog } from './inflightRegistry.js';
 
 export interface EventLoopSnapshot {
   /** Sampling resolution in ms (=histogram resolution). */
@@ -94,8 +106,20 @@ export const startEventLoopMonitor = (options: EventLoopMonitorOptions = {}): Ev
       lastStallAt = new Date().toISOString();
       lastStallMs = Math.round(maxMs);
       stallCount += 1;
+      // WHICH ROUTE. Until this field existed the line named a magnitude and
+      // nothing else, so every stall investigation started by guessing the
+      // endpoint — and guessing has failed repeatedly here. `inflight=` lists
+      // the three longest-running requests AT DETECTION TIME as
+      // `<METHOD:/route/{pattern}>:<ageMs>ms`, pipe-separated, or `none`.
+      //
+      // Read it as a suspect list, not a proof: the histogram reports a stall
+      // on the tick AFTER the block, so a handler that blocked and RETURNED
+      // inside that tick is already gone and shows `none`. The case this is
+      // built for is the opposite one — a multi-second route (batch-resolve)
+      // that is still running while the watchdog fires, which is exactly the
+      // stall shape the panel reports as a timeout.
       log(
-        `[api.stall] eventLoopBlockedMs=${String(lastStallMs)} thresholdMs=${String(warnThresholdMs)} resolutionMs=${String(resolutionMs)} note=single-tick max blocked time`,
+        `[api.stall] eventLoopBlockedMs=${String(lastStallMs)} thresholdMs=${String(warnThresholdMs)} resolutionMs=${String(resolutionMs)} inflight=${formatInflightForLog(3)} note=single-tick max blocked time`,
       );
     }
     const elu = performance.eventLoopUtilization(utilizationBaseline);
@@ -103,8 +127,12 @@ export const startEventLoopMonitor = (options: EventLoopMonitorOptions = {}): Ev
     if (elu.utilization >= sustainedUtilizationThreshold) {
       lastBusyWindowAt = new Date().toISOString();
       busyWindowCount += 1;
+      // Same attribution on the sustained-busy line. This is the failure mode
+      // where NO single tick trips the stall threshold but the loop never
+      // idles, so the suspect list is if anything more useful here: a route
+      // that appears on consecutive busy windows is the convoy.
       log(
-        `[api.busy] utilization=${elu.utilization.toFixed(3)} windowMs=${String(Math.round(elu.idle + elu.active))} activeMs=${String(Math.round(elu.active))} idleMs=${String(Math.round(elu.idle))} note=main thread near-100% busy; HTTP accept queue likely stalling`,
+        `[api.busy] utilization=${elu.utilization.toFixed(3)} windowMs=${String(Math.round(elu.idle + elu.active))} activeMs=${String(Math.round(elu.active))} idleMs=${String(Math.round(elu.idle))} inflight=${formatInflightForLog(3)} note=main thread near-100% busy; HTTP accept queue likely stalling`,
       );
     }
   }, tickMs);

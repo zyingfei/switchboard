@@ -863,6 +863,94 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     }
   });
 
+  // ---- deferred resolver-cache write (SIDETRACK_RESOLVER_CACHE_DEFER) ----
+  //
+  // The per-URL `cacheResolverResult` upsert is the sqlite3BtreeInsert frame
+  // that showed up in a native `sample` of a live batch-resolve — a WRITE on
+  // the request path, once per resolved URL, synchronous because bun:sqlite has
+  // no async API. It is now queued during the request and drained by the HTTP
+  // dispatch AFTER the response is written. These two tests pin the end-to-end
+  // behaviour of both switch positions; the queue's own semantics (last-wins,
+  // single-flight, failure containment, overflow) live in
+  // http/resolverCacheDefer.test.ts.
+
+  it('POST /v1/visits/batch-resolve persists the resolver cache AFTER responding', async () => {
+    const urls = ['https://defer.test/a', 'https://defer.test/b'];
+    await connectionsStore.putCurrent(snapshotForUrls(urls, 'rev-defer-on'));
+    const cacheWrite = vi.spyOn(connectionsStore, 'cacheResolverResult');
+
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: urls }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { results: Record<string, { canonicalUrl: string }> };
+    };
+    // The response is complete and correct without the write having to land:
+    // the request serves from its own in-memory results, so deferring the
+    // upsert cannot change what the panel sees.
+    expect(Object.keys(body.data.results).sort()).toEqual([...urls].sort());
+
+    // ...and the write is NOT lost — it drains on the dispatch `finally`.
+    // Polled rather than asserted immediately because "after the response" is
+    // a scheduling guarantee (setImmediate), not a wall-clock one; the client
+    // may observe the body before the drain tick has run.
+    const deadline = Date.now() + 2_000;
+    while (cacheWrite.mock.calls.length < urls.length && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(cacheWrite.mock.calls.length).toBe(urls.length);
+    for (const url of urls) {
+      expect(cacheWrite).toHaveBeenCalledWith(
+        url,
+        expect.stringContaining('rev-defer-on'),
+        expect.anything(),
+      );
+    }
+    // The deferred entry is really in the cache: a second batch on the same
+    // revision is served from it (a lost write would just recompute, so this
+    // is the assertion that proves the queue actually reached sqlite).
+    const cacheRead = vi.spyOn(connectionsStore, 'getCachedResolverResult');
+    const second = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: urls }),
+    });
+    expect(second.status).toBe(200);
+    expect(cacheRead.mock.results.every((result) => result.type === 'return')).toBe(true);
+    // No NEW computes ⇒ no new writes queued for the same (url, revision).
+    expect(cacheWrite.mock.calls.length).toBe(urls.length);
+  });
+
+  it('SIDETRACK_RESOLVER_CACHE_DEFER=0 writes the resolver cache inline', async () => {
+    const prior = process.env['SIDETRACK_RESOLVER_CACHE_DEFER'];
+    process.env['SIDETRACK_RESOLVER_CACHE_DEFER'] = '0';
+    try {
+      const url = 'https://defer-off.test/a';
+      await connectionsStore.putCurrent(snapshotForUrls([url], 'rev-defer-off'));
+      const cacheWrite = vi.spyOn(connectionsStore, 'cacheResolverResult');
+      const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+        method: 'POST',
+        headers: reqHeaders(),
+        body: JSON.stringify({ canonicalUrls: [url] }),
+      });
+      expect(response.status).toBe(200);
+      await response.json();
+      // No polling: with the switch off the write is awaited inside the handler,
+      // so it has necessarily happened before the response could be sent.
+      expect(cacheWrite).toHaveBeenCalledWith(
+        url,
+        expect.stringContaining('rev-defer-off'),
+        expect.anything(),
+      );
+    } finally {
+      if (prior === undefined) delete process.env['SIDETRACK_RESOLVER_CACHE_DEFER'];
+      else process.env['SIDETRACK_RESOLVER_CACHE_DEFER'] = prior;
+    }
+  });
+
   // Attribution v1 SHADOW parity: the served resolve response must be
   // byte-identical whether the shadow lane runs (flag ON, default) or is
   // disabled (SIDETRACK_ATTRIBUTION_V1_SHADOW=0). The scorer runs in shadow
