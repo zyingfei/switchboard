@@ -229,6 +229,12 @@ import {
   type EntityContentEnrichedPayload,
   type GistLookup,
 } from '../enrichment/contentEnrichment.js';
+import { appendEnrichmentRetractionEvent } from '../enrichment/enrichmentRetraction.js';
+import {
+  ENTITY_ENRICHMENT_RETRACTED,
+  type EnrichmentFamily,
+  type EntityEnrichmentRetractedPayload,
+} from '../enrichment/events.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -5327,8 +5333,18 @@ const routes: readonly RouteDefinition[] = [
                   event.type === USER_FLOW_REJECTED ||
                   event.type === USER_ORGANIZED_ITEM ||
                   event.type === ENTITY_TITLE_ENRICHED ||
-                  event.type === ENTITY_CONTENT_ENRICHED,
-                [...RESOLVER_EXPAND_EVENT_TYPES, ENTITY_TITLE_ENRICHED, ENTITY_CONTENT_ENRICHED],
+                  event.type === ENTITY_CONTENT_ENRICHED ||
+                  // Retractions travel WITH the enrichments they withdraw.
+                  // Dropping them here would fold a retracted title/gist back
+                  // into serving on the batch path only — the exact silent
+                  // half-applied delete this event type exists to prevent.
+                  event.type === ENTITY_ENRICHMENT_RETRACTED,
+                [
+                  ...RESOLVER_EXPAND_EVENT_TYPES,
+                  ENTITY_TITLE_ENRICHED,
+                  ENTITY_CONTENT_ENRICHED,
+                  ENTITY_ENRICHMENT_RETRACTED,
+                ],
               );
         // Fold enrichment from the merged log just read (no extra scan),
         // memoized on the event-log signature. When misses === 0 the convoy
@@ -8339,6 +8355,101 @@ const routes: readonly RouteDefinition[] = [
         // duplicate hash / durable-write failure all count as skipped; the
         // batch never fails on one bad item.
         const outcome = await appendContentEnrichmentEvent(eventLog, candidate);
+        if (outcome === 'accepted') accepted += 1;
+        else skipped += 1;
+      }
+      return [200, { data: { accepted, skipped } }];
+    },
+  },
+  {
+    // Enrichment retraction — POST /v1/enrichment/retract. WITHDRAW a
+    // synthesized title or gist that should never have been served.
+    //
+    // WHY IT EXISTS (live, 2026-07-27). Five gists produced before the
+    // generation path was fixed are in the vault feeding retrieval: three
+    // repetition loops, one paraphrased prompt-echo, one led by nav
+    // boilerplate. A gist is injected into the recall lexical index and the
+    // content lane's embed text, so a degenerate one is WORSE than no gist —
+    // it actively pollutes retrieval for its entity. There was no way to take
+    // one back; this is that way.
+    //
+    // The event log is append-only, so this appends a RETRACTION and lets the
+    // folds honor it (TOMBSTONE + HIDE, as the privacy domain tombstone does).
+    // The original event survives for forensics; what changes is what serves.
+    //
+    // FROZEN CONTRACT: { items: [{ family, kind, id, sourceContentHash?,
+    // reason }] } → 200 { accepted, skipped }. Same discipline as the two
+    // enrichment routes: ≤50 items/request, item-level problems SKIPPED and
+    // counted rather than failing the batch, idempotent per
+    // (family,kind,id,hash-or-'*') so re-running a purge is safe.
+    //
+    // `sourceContentHash` OPTIONAL and meaningful: present ⇒ withdraw only
+    // that exact revision (no clock involved, cannot eat a fresh re-synthesis);
+    // omitted ⇒ withdraw whatever stands, unless it was generated after the
+    // retraction. `reason` is REQUIRED — an unexplained deletion in an audit
+    // log is the thing this design is trying not to be.
+    //
+    // DELIBERATELY NOT flag-gated. SIDETRACK_TITLE_ENRICHMENT switching
+    // ingestion off must not block cleaning up what ingestion already wrote;
+    // an operator turning the feature off is MORE likely to want the purge,
+    // not less.
+    method: 'POST',
+    pattern: /^\/v1\/enrichment\/retract$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const eventLog = context.eventLog;
+      if (eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'event log not configured for this companion',
+        );
+      }
+      const body = await readBody(request);
+      const items =
+        typeof body === 'object' && body !== null && Array.isArray((body as { items?: unknown }).items)
+          ? (body as { items: readonly unknown[] }).items
+          : null;
+      if (items === null) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must be an object with an `items` array.',
+        );
+      }
+      const MAX_RETRACTION_ITEMS = 50;
+      const overCap = Math.max(0, items.length - MAX_RETRACTION_ITEMS);
+      const considered = items.slice(0, MAX_RETRACTION_ITEMS);
+      const retractedAt = new Date().toISOString();
+
+      let accepted = 0;
+      let skipped = overCap;
+      for (const raw of considered) {
+        if (typeof raw !== 'object' || raw === null) {
+          skipped += 1;
+          continue;
+        }
+        const item = raw as Record<string, unknown>;
+        const hash = item['sourceContentHash'];
+        const candidate: EntityEnrichmentRetractedPayload = {
+          payloadVersion: 1,
+          family: item['family'] as EnrichmentFamily,
+          kind: item['kind'] as EntityTitleEnrichedKind,
+          id: item['id'] as string,
+          // Only set the key when the caller scoped it — an explicit
+          // `undefined` and an absent field must mean the same thing.
+          ...(typeof hash === 'string' && hash.length > 0
+            ? { sourceContentHash: hash }
+            : {}),
+          reason: item['reason'] as string,
+          // Server-stamped, NOT caller-supplied: the retraction timestamp is
+          // load-bearing for unscoped retractions, so it comes from the
+          // process doing the durable write rather than from a client whose
+          // clock we cannot check.
+          retractedAt,
+        };
+        const outcome = await appendEnrichmentRetractionEvent(eventLog, candidate);
         if (outcome === 'accepted') accepted += 1;
         else skipped += 1;
       }

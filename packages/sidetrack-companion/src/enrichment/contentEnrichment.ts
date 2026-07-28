@@ -30,9 +30,11 @@ import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 
 import {
   ENTITY_CONTENT_ENRICHED,
+  ENTITY_ENRICHMENT_RETRACTED,
   type EntityContentEnrichedPayload,
   type EntityTitleEnrichedKind,
   isEntityContentEnrichedPayload,
+  isEntityEnrichmentRetractedPayload,
 } from './events.js';
 import {
   enrichmentClientEventId,
@@ -57,6 +59,12 @@ export type {
 export interface GistEntry {
   readonly gist: string;
   readonly sourceContentHash: string;
+  /**
+   * When the panel synthesized this gist (the payload's own `generatedAt`).
+   * Carried through the fold because an UNSCOPED retraction is resolved
+   * against it — see foldContentEnrichmentEvents.
+   */
+  readonly generatedAt: string;
 }
 
 // kind:id → {gist, hash}. A pure fold over ENTITY_CONTENT_ENRICHED events: last
@@ -80,11 +88,58 @@ export const lookupGist = (
 // Fold a stream of events into the gist lookup. Idempotent per
 // (kind,id,sourceContentHash); a new hash supersedes. Non-content / malformed
 // events are skipped. Exported for unit tests.
+//
+// RETRACTIONS are honored here, and deliberately NOT by stream position.
+//
+// The typed store read returns `ORDER BY replica_id, seq` — replica-major, not
+// global log order. So "delete the entry standing at this point in the stream"
+// would make a retraction's effect depend on which replica happened to sort
+// first: a retraction could silently fail to apply, which is the worst outcome
+// available (an operator told the system to forget something and it kept it).
+//
+// Instead a retraction is resolved against the SEMANTIC timestamps the two
+// payloads already carry — `generatedAt` vs `retractedAt` — in a second pass
+// over the folded map. That is order-independent and says exactly what a
+// retraction means: withdraw the enrichment that existed when I retracted it.
+// A gist generated AFTER the retraction survives, so re-running synthesis
+// against a fixed model works and a retraction never blacklists an entity.
+//
+// The hash-scoped form is stronger still and carries no clock dependence at
+// all: it withdraws only if the standing entry came from that exact source
+// revision. That is the form the purge route uses whenever the caller knows
+// the hash, and the reason a retraction racing a fresh re-enrichment cannot
+// eat the new, good gist.
+//
+// Only family 'content' applies here; a title retraction in the same stream is
+// inert (titleEnrichment.ts honors those, symmetrically).
+interface PendingRetraction {
+  readonly sourceContentHash: string | undefined;
+  readonly retractedAt: string;
+}
+
 export const foldContentEnrichmentEvents = (
   events: Iterable<AcceptedEvent>,
 ): GistLookup => {
   const map = new Map<string, GistEntry>();
+  // key → retractions seen for it. Kept as a list, not a last-wins slot: a
+  // hash-scoped and an unscoped retraction for the same entity are different
+  // statements and both must get their say.
+  const retractions = new Map<string, PendingRetraction[]>();
   for (const event of events) {
+    if (event.type === ENTITY_ENRICHMENT_RETRACTED) {
+      if (!isEntityEnrichmentRetractedPayload(event.payload)) continue;
+      const payload = event.payload;
+      if (payload.family !== 'content') continue;
+      const key = foldKey(payload.kind, payload.id);
+      const list = retractions.get(key);
+      const entry: PendingRetraction = {
+        sourceContentHash: payload.sourceContentHash,
+        retractedAt: payload.retractedAt,
+      };
+      if (list === undefined) retractions.set(key, [entry]);
+      else list.push(entry);
+      continue;
+    }
     if (event.type !== ENTITY_CONTENT_ENRICHED) continue;
     if (!isEntityContentEnrichedPayload(event.payload)) continue;
     const payload = event.payload;
@@ -93,7 +148,29 @@ export const foldContentEnrichmentEvents = (
     if (existing !== undefined && existing.sourceContentHash === payload.sourceContentHash) {
       continue;
     }
-    map.set(key, { gist: payload.gist, sourceContentHash: payload.sourceContentHash });
+    map.set(key, {
+      gist: payload.gist,
+      sourceContentHash: payload.sourceContentHash,
+      generatedAt: payload.generatedAt,
+    });
+  }
+  // Second pass: apply retractions to what actually stands.
+  for (const [key, list] of retractions) {
+    const standing = map.get(key);
+    if (standing === undefined) continue;
+    for (const retraction of list) {
+      if (retraction.sourceContentHash !== undefined) {
+        // Hash-scoped: exact revision or nothing. No clock involved.
+        if (retraction.sourceContentHash === standing.sourceContentHash) map.delete(key);
+        continue;
+      }
+      // Unscoped: withdraw unless the standing gist post-dates the retraction.
+      // ISO-8601 UTC strings compare lexicographically as instants; a missing
+      // or unparseable timestamp is treated as OLD (retract), because failing
+      // to honor a retraction is worse than withdrawing one gist too many.
+      if (standing.generatedAt > retraction.retractedAt) continue;
+      map.delete(key);
+    }
   }
   return map;
 };
@@ -102,17 +179,27 @@ export const foldContentEnrichmentEvents = (
 
 const emptyEvents: readonly AcceptedEvent[] = [];
 
+// BOTH types, always. A read that fetched only ENTITY_CONTENT_ENRICHED would
+// fold a retracted gist straight back into serving — the retraction would
+// exist in the log and change nothing, which is the worst failure mode
+// available (an operator told the system to forget something and it silently
+// kept it). The two types are read together and folded in log order.
+const CONTENT_FOLD_TYPES = [ENTITY_CONTENT_ENRICHED, ENTITY_ENRICHMENT_RETRACTED] as const;
+
+const isContentFoldType = (type: string): boolean =>
+  type === ENTITY_CONTENT_ENRICHED || type === ENTITY_ENRICHMENT_RETRACTED;
+
 const readContentEnrichmentEvents = async (
   vaultRoot: string,
   eventLog: EventLog,
 ): Promise<readonly AcceptedEvent[]> => {
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) {
-    return (await eventLog.readMerged()).filter((event) => event.type === ENTITY_CONTENT_ENRICHED);
+    return (await eventLog.readMerged()).filter((event) => isContentFoldType(event.type));
   }
   const events: AcceptedEvent[] = [];
   await store.forEachChunkOfTypes(
-    [ENTITY_CONTENT_ENRICHED],
+    [...CONTENT_FOLD_TYPES],
     (chunk) => {
       for (const event of chunk) events.push(event);
     },
