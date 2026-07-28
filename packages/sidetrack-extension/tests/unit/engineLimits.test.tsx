@@ -292,3 +292,56 @@ describe('DISPLAY — the limits appear in BOTH rows', () => {
     expect(localModelSpec(NANO_CLASS_LOCAL_MODEL_ID).status).toBe('unverified');
   });
 });
+
+// ---------------------------------------------------------------------------
+// External-data chunk count. transformers.js types use_external_data_format as
+// boolean|number where `true` means EXACTLY ONE chunk. Passing `true` for a
+// model whose graph is split across more shards preloads only the first and
+// dies deserializing a tensor from the rest — live 2026-07-27 on the 3B:
+//   Failed to load external data file "model_q4.onnx_data_1",
+//   error: File not found in preloaded files.
+// The shards were on disk and served fine; nothing had asked for the second.
+// ---------------------------------------------------------------------------
+describe('external data chunk count', () => {
+  it('counts one chunk for the single-shard 1B', async () => {
+    const { LOCAL_MODELS, externalDataChunkCount, DEFAULT_LOCAL_MODEL_ID } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    const oneB = LOCAL_MODELS.find((m) => m.id === DEFAULT_LOCAL_MODEL_ID);
+    expect(oneB).toBeDefined();
+    expect(externalDataChunkCount(oneB!)).toBe(1);
+  });
+
+  it('counts TWO chunks for the Nano-class 3B (the live failure)', async () => {
+    const { LOCAL_MODELS, externalDataChunkCount, NANO_CLASS_LOCAL_MODEL_ID } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    const threeB = LOCAL_MODELS.find((m) => m.id === NANO_CLASS_LOCAL_MODEL_ID);
+    expect(threeB).toBeDefined();
+    expect(externalDataChunkCount(threeB!)).toBe(2);
+  });
+
+  it('counts only .onnx_data shards, never the graph or the tokenizer', async () => {
+    const { externalDataChunkCount } = await import('../../src/sidepanel/nano/modelRegistry');
+    const spec = {
+      files: [
+        'config.json',
+        'tokenizer.json',
+        'onnx/model_q4.onnx',
+        'onnx/model_q4.onnx_data',
+        'onnx/model_q4.onnx_data_1',
+        'onnx/model_q4.onnx_data_2',
+      ],
+    } as never;
+    expect(externalDataChunkCount(spec)).toBe(3);
+  });
+
+  it('every declared model has at least one shard (a zero would disable external data)', async () => {
+    const { LOCAL_MODELS, externalDataChunkCount } = await import(
+      '../../src/sidepanel/nano/modelRegistry'
+    );
+    for (const spec of LOCAL_MODELS) {
+      expect(externalDataChunkCount(spec)).toBeGreaterThan(0);
+    }
+  });
+});

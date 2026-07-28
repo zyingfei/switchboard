@@ -199,6 +199,26 @@ export const NANO_CLASS_LOCAL_MODEL_ID = 'onnx-community/Llama-3.2-3B-Instruct-O
  */
 export const NANO_CLASS_BYTES_ON_DISK = 3_260_000_000;
 
+
+/**
+ * How many EXTERNAL DATA CHUNKS a model's graph is split across.
+ *
+ * transformers.js types this precisely (utils/hub.js): `use_external_data_format`
+ * is `false` = none, `true` = EXACTLY ONE chunk, or a NUMBER = that many chunks.
+ * We passed `true` for every model, which is correct for the 1B (a single
+ * `model_q4.onnx_data`) and silently wrong for anything bigger: the 3B ships
+ * `model_q4.onnx_data` AND `model_q4.onnx_data_1`, so the runtime preloaded only
+ * the first and died deserializing a tensor that lives in the second —
+ * live 2026-07-27: `Failed to load external data file "model_q4.onnx_data_1",
+ * error: File not found in preloaded files.` The files were on disk and served
+ * fine; nobody had told the runtime to fetch the second shard.
+ *
+ * Derived from the declared file list rather than hand-maintained, so adding a
+ * model with N shards cannot forget to update a second constant.
+ */
+export const externalDataChunkCount = (spec: LocalModelSpec): number =>
+  spec.files.filter((f) => /\.onnx_data(_\d+)?$/u.test(f)).length;
+
 export const LOCAL_MODELS: readonly LocalModelSpec[] = [
   {
     id: DEFAULT_LOCAL_MODEL_ID,

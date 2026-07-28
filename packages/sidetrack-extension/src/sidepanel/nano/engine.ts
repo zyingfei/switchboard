@@ -51,6 +51,7 @@ import {
   type EngineIdentity,
   type EngineKind,
   type LocalModelSpec,
+  externalDataChunkCount,
 } from './modelRegistry';
 import { readRemoteConfig, remoteConfigReady, remoteHostOf } from './remoteConfig';
 import { remoteEngineFrom } from './remoteEngine';
@@ -341,7 +342,11 @@ const realPipelineFactory =
     const generate = await pipeline('text-generation', spec.id, {
       device: 'webgpu',
       dtype: spec.quantization,
-      use_external_data_format: true,
+      // NOT `true`: that means exactly ONE external-data chunk (transformers.js
+      // types it boolean|number). A model whose graph is split across more
+      // shards needs the COUNT, or the runtime preloads only the first and
+      // fails deserializing tensors that live in the rest.
+      use_external_data_format: externalDataChunkCount(spec),
       revision: spec.revision,
       progress_callback: (raw: unknown) => {
         const p = normalizeProgress(raw);
