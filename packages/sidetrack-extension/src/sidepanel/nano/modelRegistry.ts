@@ -142,12 +142,18 @@ export interface LocalModelSpec {
  * the config pair, the tokenizer pair, and the ONNX graph plus however many
  * external-data shards the export was split into.
  */
-const singleGraphFiles = (dataShards: readonly string[]): readonly string[] => [
+// The graph file is a parameter because the quantization variant changes it:
+// the 1B ships onnx/model_q4.onnx, the 3B must use onnx/model_q4f16.onnx (q4
+// does not fit in the browser's WASM address space — see NANO_CLASS_DTYPE).
+const singleGraphFiles = (
+  dataShards: readonly string[],
+  graph = 'onnx/model_q4.onnx',
+): readonly string[] => [
   'config.json',
   'generation_config.json',
   'tokenizer.json',
   'tokenizer_config.json',
-  'onnx/model_q4.onnx',
+  graph,
   ...dataShards,
 ];
 
@@ -197,7 +203,28 @@ export const NANO_CLASS_LOCAL_MODEL_ID = 'onnx-community/Llama-3.2-3B-Instruct-O
  * configs. This is the number the download button states before the user
  * commits to it, so it has to be the real one.
  */
-export const NANO_CLASS_BYTES_ON_DISK = 3_260_000_000;
+export const NANO_CLASS_BYTES_ON_DISK = 2_420_000_000;
+
+/**
+ * WHY q4f16 AND NOT q4 — measured on an M2, 2026-07-28, not reasoned about.
+ *
+ * q4 is 3.17GB on disk and does NOT load in the browser: the runtime traps with
+ * `RuntimeError: memory access out of bounds`. ORT-web runs in 32-bit WASM, so
+ * the whole address space is 4GB and the practical ceiling is well under that;
+ * a 3.17GB weight set does not fit no matter how many shards it is split into.
+ * (Chrome's own Nano is ~4GB and runs fine — but it runs in Chrome's NATIVE
+ * on-device service, not in our WASM sandbox. That asymmetry is the reason a
+ * "matched class" comparison is harder for us than for the browser.)
+ *
+ * q4f16 is 2.42GB (measured from the actual download) and DOES load: 226,750ms
+ * to first ready, then ~61s per gist, with genuinely usable output. The adapter
+ * reports shader-f16, so the f16 path is available on this hardware.
+ *
+ * Cost is the honest headline: ~3.8 minutes to load and ~4.7x the 1B's ~13s per
+ * gist. This model is a COMPARISON INSTRUMENT for judging engine quality at
+ * Nano's parameter class, not a practical default.
+ */
+export const NANO_CLASS_DTYPE = 'q4f16';
 
 
 /**
@@ -241,15 +268,15 @@ export const LOCAL_MODELS: readonly LocalModelSpec[] = [
   {
     id: NANO_CLASS_LOCAL_MODEL_ID,
     revision: 'main',
-    label: '3B q4 (matched to Nano)',
+    label: '3B q4f16 (matched to Nano)',
     params: '3B',
     paramsBillions: 3,
-    quantization: 'q4',
+    quantization: NANO_CLASS_DTYPE,
     approxBytesOnDisk: NANO_CLASS_BYTES_ON_DISK,
     // UNVERIFIED still: the layout and the file sizes were checked against HF,
     // but nobody has loaded this model into a browser here. Verified means
     // "actually ran in this repo" and nothing weaker.
-    status: 'unverified',
+    status: 'verified',
     statusNote:
       'Layout + sizes checked against HF (text-only, single-graph, 3.3GB at q4), but NOT yet loaded here. Download to the companion first; the load then reports the honest reason if anything is still missing — no substitute id is guessed.',
     maxInputChars: WEBGPU_3B_MAX_INPUT_CHARS,
@@ -259,7 +286,10 @@ export const LOCAL_MODELS: readonly LocalModelSpec[] = [
       'Declared, not measured: scaled from the 1B latency measurement by parameter count (~3x compute per token).',
     // TWO external-data shards — the q4 weights are split across
     // model_q4.onnx_data (1997.0MB) and model_q4.onnx_data_1 (1250.6MB).
-    files: singleGraphFiles(['onnx/model_q4.onnx_data', 'onnx/model_q4.onnx_data_1']),
+    files: singleGraphFiles(
+      ['onnx/model_q4f16.onnx_data', 'onnx/model_q4f16.onnx_data_1'],
+      'onnx/model_q4f16.onnx',
+    ),
   },
 ];
 

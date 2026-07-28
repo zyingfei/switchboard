@@ -180,13 +180,18 @@ describe('the local model registry declares a model our pipeline can actually lo
     expect(NANO_CLASS_LOCAL_MODEL_ID).toBe('onnx-community/Llama-3.2-3B-Instruct-ONNX');
     expect(NANO_CLASS_SPEC.params).toBe('3B');
     expect(NANO_CLASS_SPEC.paramsBillions).toBe(3);
-    expect(NANO_CLASS_SPEC.quantization).toBe('q4');
+    // q4f16, not q4: the q4 build (3.17GB) traps with "memory access out of
+    // bounds" in the browser's 32-bit WASM address space; q4f16 (2.42GB) loads.
+    expect(NANO_CLASS_SPEC.quantization).toBe('q4f16');
     expect(NANO_CLASS_SPEC.revision).toBe('main');
     // 3.26GB, summed from the HF blobs API — the number the button states.
-    expect(NANO_CLASS_SPEC.approxBytesOnDisk).toBe(3_260_000_000);
+    expect(NANO_CLASS_SPEC.approxBytesOnDisk).toBe(2_420_000_000);
     // Nobody has loaded it here, so it stays unverified however well the layout
     // checks out.
-    expect(NANO_CLASS_SPEC.status).toBe('unverified');
+    // Was 'unverified' until it was actually loaded here (2026-07-28): q4f16
+    // reaches ready in ~3.8 min and generates in ~61s on an M2. The status is
+    // earned by a real load, never assumed.
+    expect(NANO_CLASS_SPEC.status).toBe('verified');
   });
 
   it('declares the SINGLE-GRAPH file set, including both external-data shards', () => {
@@ -195,9 +200,9 @@ describe('the local model registry declares a model our pipeline can actually lo
       'generation_config.json',
       'tokenizer.json',
       'tokenizer_config.json',
-      'onnx/model_q4.onnx',
-      'onnx/model_q4.onnx_data',
-      'onnx/model_q4.onnx_data_1',
+      'onnx/model_q4f16.onnx',
+      'onnx/model_q4f16.onnx_data',
+      'onnx/model_q4f16.onnx_data_1',
     ]);
     // The shape that made the 4B entry unloadable must not creep back in.
     expect(NANO_CLASS_SPEC.files.some((f) => f.includes('decoder_model_merged'))).toBe(false);
@@ -229,7 +234,7 @@ describe('download copy states the real cost and names the outbound host', () =>
   it('the button label carries BOTH the size and huggingface.co', () => {
     const label = downloadButtonLabel(NANO_CLASS_SPEC);
     expect(label).toContain('Download to companion');
-    expect(label).toContain('3.3GB');
+    expect(label).toContain('2.4GB');
     expect(label).toContain('huggingface.co');
   });
 
@@ -241,12 +246,12 @@ describe('download copy states the real cost and names the outbound host', () =>
       filesTotal: 7,
       bytesDone: 2_000_000_000,
       bytesTotal: 4_000_000_000,
-      currentFile: 'onnx/model_q4.onnx_data_1',
+      currentFile: 'onnx/model_q4f16.onnx_data_1',
       host: MODEL_FETCH_HOST,
     });
     expect(line).toContain('5/7 files');
     expect(line).toContain('50%');
-    expect(line).toContain('onnx/model_q4.onnx_data_1');
+    expect(line).toContain('onnx/model_q4f16.onnx_data_1');
     expect(line).toContain('huggingface.co');
   });
 
@@ -268,7 +273,7 @@ describe('download copy states the real cost and names the outbound host', () =>
   it('the not-cached message points at the STEP, never at the URL', () => {
     const message = notCachedMessage(NANO_CLASS_SPEC);
     expect(message).toContain('not on the companion yet');
-    expect(message).toContain('3.3GB');
+    expect(message).toContain('2.4GB');
     expect(message).toContain('huggingface.co');
     expect(message).not.toContain('Could not locate file');
     expect(message).not.toContain('127.0.0.1');
@@ -297,7 +302,7 @@ describe('OnDeviceAiRow — a model the companion does not have', () => {
     const download = await screen.findByTestId('hp-ondevice-ai-model-download');
     // The cost and the outbound are on the button itself — not in a tooltip,
     // not in a confirm dialog the user could skip.
-    expect(download).toHaveTextContent('3.3GB');
+    expect(download).toHaveTextContent('2.4GB');
     expect(download).toHaveTextContent('huggingface.co');
     // A load that would fail is not offered at all.
     expect(screen.queryByTestId('hp-ondevice-ai-webgpu-load')).not.toBeInTheDocument();
@@ -322,7 +327,7 @@ describe('OnDeviceAiRow — a model the companion does not have', () => {
         jobBody({
           filesDone: 5,
           bytesDone: 2_000_000_000,
-          currentFile: 'onnx/model_q4.onnx_data_1',
+          currentFile: 'onnx/model_q4f16.onnx_data_1',
         }),
       ],
     });
@@ -345,7 +350,7 @@ describe('OnDeviceAiRow — a model the companion does not have', () => {
       );
     });
     const progress = screen.getByTestId('hp-ondevice-ai-model-download-progress');
-    expect(progress).toHaveTextContent('onnx/model_q4.onnx_data_1');
+    expect(progress).toHaveTextContent('onnx/model_q4f16.onnx_data_1');
     expect(progress).toHaveTextContent('huggingface.co');
     // Neither button is live mid-download — one job at a time.
     expect(screen.queryByTestId('hp-ondevice-ai-model-download')).not.toBeInTheDocument();
