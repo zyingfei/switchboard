@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { MAX_PROCESSED_CHUNKS, planChunks } from '../../src/sidepanel/nano/chunking';
+import { CHUNK_MAX_CHARS, MAX_PROCESSED_CHUNKS, planChunks } from '../../src/sidepanel/nano/chunking';
 import {
   CHUNK_GIST_MAX_NEW_TOKENS,
   GIST_MAX_NEW_TOKENS,
@@ -80,6 +80,23 @@ describe('synthesizeGist — single pass', () => {
   });
 });
 
+// synthesizeGist chunks at min(CHUNK_MAX_CHARS, limits.maxInputChars), so a
+// test that plans with the bare default while the engine's cap is tighter
+// counts a different number of chunks than the code does — which is exactly
+// how this test broke when the WebGPU cap moved. These limits are deliberately
+// permissive on input so CHUNK_MAX_CHARS is the binding width and
+// planChunks(doc) here is the SAME plan the code builds. What the test is
+// really asserting — one call per chunk plus exactly one synthesis — is a
+// property of the pipeline, not of any engine's table.
+const PLAN_MATCHING_LIMITS = {
+  kind: 'webgpu',
+  maxInputChars: CHUNK_MAX_CHARS,
+  maxOutputTokens: GIST_MAX_NEW_TOKENS,
+  maxOutputChars: 2000,
+  inputSource: 'declared',
+  note: 'test seam — pins chunk width to CHUNK_MAX_CHARS',
+} as const;
+
 describe('synthesizeGist — chunk then synthesize', () => {
   it('gists each chunk, then runs exactly ONE final synthesis pass', async () => {
     const doc = longDoc(4);
@@ -88,7 +105,7 @@ describe('synthesizeGist — chunk then synthesize', () => {
     const { engine, calls } = scriptedEngine((prompt) =>
       prompt.startsWith(GIST_SYNTHESIS_PROMPT_PREFIX) ? FINAL_GIST : CHUNK_SENTENCE,
     );
-    const outcome = await synthesizeGist(engine, doc);
+    const outcome = await synthesizeGist(engine, doc, PLAN_MATCHING_LIMITS);
     expect(outcome.ok).toBe(true);
     expect(outcome.ok ? outcome.gist : '').toBe(FINAL_GIST);
     // One call per used chunk + one synthesis call. No more — the depth cap.

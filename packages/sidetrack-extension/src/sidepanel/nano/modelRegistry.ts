@@ -161,13 +161,28 @@ const singleGraphFiles = (
 export const DEFAULT_LOCAL_MODEL_ID = 'onnx-community/gemma-3-1b-it-ONNX';
 
 /**
- * The 1B default's input cap. LATENCY-DERIVED, not context-derived: the
- * 2026-07-27 tuning run on an M-series GPU fed 2000-character inputs and took
- * roughly 13 seconds per gist. The model's context window is far larger; 2000
- * is the point where a single on-demand summary still feels like an action
- * rather than a background job.
+ * The 1B default's per-call input cap. LATENCY-DERIVED, not context-derived —
+ * the model's window is 8k tokens and never the binding constraint here.
+ *
+ * This is the number that actually sets chunk width: synthesizeGist uses
+ * min(CHUNK_MAX_CHARS, limits.maxInputChars), so whichever is smaller decides
+ * how many generations a gist costs. It was 2000, chosen on 2026-07-27 from a
+ * single-input timing.
+ *
+ * RAISED to 3600 on 2026-07-28 after measuring the FULL pipeline rather than
+ * one call (3 real vault documents x 2 repetitions, WebGPU gemma-3-1b q4):
+ *
+ *   1800-char chunks   5.7 generations   26.4s median   groundedness 0.49
+ *   3600-char chunks   3.3 generations   17.3s median   groundedness 0.47
+ *
+ * The narrower cap was making gists SLOWER, not faster. Latency on this stack
+ * is ~3.9ms per input token but ~37.5ms per OUTPUT token, so the cost is driven
+ * by how many generations a document needs, and a tighter input slice buys more
+ * generations than it saves prefill. See CHUNK_MAX_CHARS in chunking.ts for the
+ * upper bound — 6000 chars went superlinear and then crashed the WebGPU backend
+ * outright, so 3600 is the widest MEASURED-clean value, not a guess.
  */
-export const WEBGPU_1B_MAX_INPUT_CHARS = 2000;
+export const WEBGPU_1B_MAX_INPUT_CHARS = 3600;
 /**
  * The Nano-class option's input cap. DECLARED, NOT MEASURED — no live run of
  * this model exists in this repo. Scaled from the 1B measurement by parameter

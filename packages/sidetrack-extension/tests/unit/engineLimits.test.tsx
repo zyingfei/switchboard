@@ -99,8 +99,8 @@ describe('the limit table — one place, per MODEL for the local engine', () => 
     expect(limitsFor('webgpu', threeB?.id).note).toContain('not measured');
   });
 
-  it('renders compactly: "limits: 2k in / 140 tok out"', () => {
-    expect(formatEngineLimits(limitsFor('webgpu'))).toBe('limits: 2k in / 140 tok out');
+  it('renders compactly: "limits: 3.6k in / 140 tok out"', () => {
+    expect(formatEngineLimits(limitsFor('webgpu'))).toBe('limits: 3.6k in / 140 tok out');
     expect(formatEngineLimits(limitsFor('nano'))).toBe('limits: 4k in / 2k chars out');
     expect(formatEngineLimits(limitsFor('remote'))).toBe('limits: 24k in / 140 tok out');
     expect(compactCount(1800)).toBe('1.8k');
@@ -246,7 +246,7 @@ describe('DISPLAY — the limits appear in BOTH rows', () => {
       />,
     );
     expect(screen.getByTestId('now-enrich-limits')).toHaveTextContent(
-      'limits: 2k in / 140 tok out',
+      'limits: 3.6k in / 140 tok out',
     );
   });
 
