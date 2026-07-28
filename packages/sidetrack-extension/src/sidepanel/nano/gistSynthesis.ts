@@ -24,7 +24,12 @@
 // No React, no fetch, no chrome.* — pure orchestration over an injected engine
 // so it is unit-testable with a stub.
 
-import { CHUNK_MAX_CHARS, planChunks, type ChunkPlan } from './chunking';
+import {
+  CHUNK_MAX_CHARS,
+  chunkWidthForLanguage,
+  planChunks,
+  type ChunkPlan,
+} from './chunking';
 import {
   limitsFor,
   prepareInput,
@@ -206,9 +211,20 @@ export const synthesizeGist = async (
   const language = detectContentLanguage(content);
   // ENFORCE the per-call input cap by NARROWING THE CHUNK WIDTH — the same
   // paragraph-aligned chunking the pipeline already uses. An engine with a cap
-  // below the standard 1800-char chunk therefore gets more, smaller chunks
-  // rather than one silently truncated one.
-  const chunkWidth = Math.min(CHUNK_MAX_CHARS, limits.maxInputChars);
+  // below the standard chunk therefore gets more, smaller chunks rather than
+  // one silently truncated one.
+  //
+  // The width is also LANGUAGE-AWARE (chunking.ts). CHUNK_MAX_CHARS is a
+  // character budget tuned on English at ~4 chars/token; Chinese runs ~1
+  // char/token, so the same character count is four times the tokens and
+  // crashed the WebGPU backend on the first Chinese document every time. The
+  // language width converts a token budget into characters, so English is
+  // unchanged and Chinese is narrowed to something that actually runs.
+  const chunkWidth = Math.min(
+    CHUNK_MAX_CHARS,
+    limits.maxInputChars,
+    chunkWidthForLanguage(language),
+  );
   const plan = planChunks(content, { maxChars: chunkWidth });
   if (plan.chunks.length === 0) {
     return { ok: false, kind: 'thin', meta: metaOf(plan, 0, 1, inputChars, limits.maxInputChars) };

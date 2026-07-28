@@ -485,10 +485,31 @@ export const loadWebGpuEngine = async ({
           // differs too: generated_text is the message ARRAY, so the reply is
           // its last entry's content (string form kept as a fallback for
           // pipelines that still flatten).
-          const out = await generate(
-            [{ role: 'user', content: prompt }] as never,
-            transformersGenerationArgs(opts),
-          );
+          let out;
+          try {
+            out = await generate(
+              [{ role: 'user', content: prompt }] as never,
+              transformersGenerationArgs(opts),
+            );
+          } catch (err) {
+            // A FATAL BACKEND ERROR POISONS THE SESSION, so it must not leave
+            // the engine sitting there looking ready.
+            //
+            // Measured 2026-07-28: one over-long chunk produced
+            //   "failed to call OrtRun() ... buffer_manager.cc Download(...)"
+            // and from then on EVERY subsequent generation failed the same way
+            // — including documents that had just succeeded moments earlier.
+            // The WebGPU context is gone, but the singleton still answers
+            // isWebGpuLoaded(), so routing kept choosing it and the user saw
+            // the local model "stop working" for the rest of the session with
+            // no explanation and no way back short of reopening the panel.
+            //
+            // Dropping the singleton makes the next attempt route elsewhere
+            // and makes the Health button able to load a fresh context, which
+            // is the only actual recovery.
+            if (isFatalBackendError(err)) unloadWebGpuEngine(String(err));
+            throw err;
+          }
           const first = out[0];
           const raw = first?.generated_text;
           const text =
@@ -517,6 +538,49 @@ export const loadWebGpuEngine = async ({
     }
   })();
   return webGpuLoadInFlight;
+};
+
+/**
+ * Errors that mean the WebGPU CONTEXT itself is dead, not that this one
+ * generation went wrong.
+ *
+ * All three shapes were observed live on 2026-07-28 driving real vault
+ * documents through the shipped chunker:
+ *
+ *   failed to call OrtRun() ... webgpu/buffer_manager.cc Download(...)
+ *   RuntimeError: memory access out of bounds
+ *   RuntimeError: null function
+ *
+ * Matched on message text because that is genuinely all ORT gives us — there
+ * is no typed error class to narrow on. Deliberately NARROW: a mis-match here
+ * unloads a perfectly good engine and costs the user a reload, so it only
+ * catches the phrases that have actually been seen to be terminal.
+ */
+export const isFatalBackendError = (err: unknown): boolean => {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    /failed to call OrtRun/iu.test(message) ||
+    /memory access out of bounds/iu.test(message) ||
+    /null function/iu.test(message) ||
+    /device is lost/iu.test(message)
+  );
+};
+
+/**
+ * Drop the loaded engine after its backend died. Not a user action and not an
+ * error path of its own — it is how the session becomes recoverable. The load
+ * status goes to 'error' with the reason so Health shows what happened instead
+ * of quietly reverting to "not loaded".
+ */
+export const unloadWebGpuEngine = (reason: string): void => {
+  webGpuEngineSingleton = null;
+  webGpuLoadedSpec = null;
+  publishWebGpuLoadStatus({
+    phase: 'error',
+    percent: null,
+    file: null,
+    error: `the local model's GPU context was lost and it has been unloaded — load it again to retry (${reason.slice(0, 160)})`,
+  });
 };
 
 /** Test-only: forget the loaded engine so gating tests start clean. */

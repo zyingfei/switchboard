@@ -71,6 +71,69 @@ export const CHUNK_MIN_CHARS = 2400;
  */
 export const MAX_PROCESSED_CHUNKS = 6;
 
+// ---------------------------------------------------------------------------
+// Language-aware chunk width — the fix for "Chinese pages crash the engine".
+// ---------------------------------------------------------------------------
+//
+// THE BUG (measured 2026-07-28, live vault). CHUNK_MAX_CHARS is a CHARACTER
+// budget, tuned on English. But the thing that actually blows up the WebGPU
+// backend is TOKENS, and the two are not proportional across languages:
+//
+//     English  ~4 characters per token
+//     Chinese  ~1 character per token
+//
+// So a 3600-character chunk is ~900 tokens of English and ~3600 tokens of
+// Chinese — four times the load, straight past the context cliff. Feeding a
+// real Chinese page from the vault to the shipped 3600-char chunker produced,
+// on the FIRST document every time:
+//
+//     failed to call OrtRun() ... webgpu/buffer_manager.cc Download(...)
+//
+// This was not cumulative wear: running the Chinese documents FIRST crashed
+// immediately, and running them last crashed too. The lane that exists
+// specifically to handle Chinese — because Nano and Apple both refuse it —
+// could not process Chinese at all.
+//
+// THE FIX. Budget in TOKENS and convert to characters per language. The
+// English behaviour is unchanged by construction (900 x 4 = 3600, exactly the
+// measured-clean width); Chinese lands near 1100, and 1200 was measured to
+// complete all three Chinese documents cleanly where 1800 still crashed one.
+
+/**
+ * Token budget for one chunk. Derived, not invented: it is the measured-clean
+ * English width (CHUNK_MAX_CHARS) divided by English's ~4 chars/token. Every
+ * language's character width is this number times its own density, so the
+ * cliff is respected in the unit that actually causes it.
+ */
+export const TARGET_CHUNK_TOKENS = 900;
+
+/**
+ * Characters per token, per content language. Approximate by nature — a real
+ * tokenizer count would be exact but is not available at planning time without
+ * loading the model, and being conservative costs a little coverage while being
+ * wrong costs a crash that poisons the whole session.
+ *
+ * 'mixed-en-zh' deliberately takes the CHINESE-leaning value rather than an
+ * average: a document the detector calls mixed can still be locally dense with
+ * Chinese, and the failure is asymmetric — too narrow is slower, too wide is
+ * fatal.
+ */
+export const CHARS_PER_TOKEN: Readonly<Record<'en' | 'zh' | 'mixed-en-zh', number>> = {
+  en: 4,
+  zh: 1.2,
+  'mixed-en-zh': 2,
+};
+
+/**
+ * The chunk width to use for this content language, in characters. Never wider
+ * than CHUNK_MAX_CHARS — this only ever NARROWS, so no language can push the
+ * planner past the width that was measured safe.
+ */
+export const chunkWidthForLanguage = (
+  language: 'en' | 'zh' | 'mixed-en-zh',
+): number =>
+  Math.min(CHUNK_MAX_CHARS, Math.floor(TARGET_CHUNK_TOKENS * CHARS_PER_TOKEN[language]));
+
 /** Separator used when several paragraphs are packed into one chunk. */
 const CHUNK_JOIN = '\n\n';
 
