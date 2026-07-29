@@ -39,7 +39,21 @@
 // Applied to the SERVED copy only (server.ts calls it after appendAiLane, which
 // is itself after the resolver-cache write), so nothing synthesized here is ever
 // persisted or replayed as if the resolver had produced it.
+//
+// DECLINE VETO (2026-07-29, review §G5/E6). One trigger condition above turned
+// out to be too broad. `resolveUrlAttribution` settles a URL the user answered
+// "Not in any stream" on with EXACTLY the shape this module fires on —
+// `fusedCandidates: []` plus gate `no-candidates` / detail `user declined — not
+// in any stream` (resolver.ts). So the fallback read a refusal as an empty
+// fusion and synthesized a pick anyway: the card re-suggested a workstream on a
+// page whose own verdict line said the user had just refused one. The caller
+// now passes the folded decline memory (tabsession/declineMemory.ts) and this
+// module declines outright for a declined URL. See that module for why the
+// check is a folded lookup and not a match on the detail string (the DEFAULT
+// vote arm never emits that detail at all).
 
+import type { DeclineLookup } from './declineMemory.js';
+import { isUrlDeclined } from './declineMemory.js';
 import type { GuessLaneResult } from './guessLanes.js';
 import type { AttributionAction, PolicyGate } from './policy.js';
 import type { ResolverCandidate } from './resolver.js';
@@ -207,12 +221,27 @@ const fallbackCandidate = (row: LaneAgreement): ResolverCandidate => ({
 
 // ---- the entry point ---------------------------------------------------
 
+/** The serve-time context this module consults beyond the result itself. */
+export interface LaneFallbackContext {
+  /** The URL being resolved — the key for the decline lookup. */
+  readonly canonicalUrl: string;
+  /**
+   * Folded "not in any stream" decline memory (declineMemory.ts). Absent/null
+   * ⇒ no decline knowledge ⇒ prior behavior. A caller that CAN supply it
+   * always should: without it, the settled-decline shape is indistinguishable
+   * from a genuinely empty fusion and the guess fires on a refusal.
+   */
+  readonly declines?: DeclineLookup | null;
+}
+
 /**
  * Fill an EMPTY fusion's displayed pick from the content + ai guess lanes.
  *
  * Returns `result` unchanged — by identity, so a caller can assert on it —
  * whenever any of these hold:
  *   - the kill switch is off (SIDETRACK_LANE_FALLBACK_GUESS=0/false);
+ *   - the user DECLINED this URL ("Not in any stream") and the caller supplied
+ *     the decline memory — a refusal is an answer, not an empty fusion;
  *   - fusion produced ≥1 candidate (never override real fusion output);
  *   - the gate reason is anything other than 'no-candidates' (a held-but-real
  *     decision, or an old/absent gate we must not reinterpret);
@@ -223,9 +252,25 @@ const fallbackCandidate = (row: LaneAgreement): ResolverCandidate => ({
  * Otherwise it returns a copy whose `fusedCandidates` are up to 3 synthesized,
  * provenance-marked candidates and whose `decision` differs ONLY by the gate
  * detail suffix.
+ *
+ * `context` is optional so the existing single-argument call shape (and every
+ * test that uses it) keeps working; omitting it only forgoes the decline veto.
  */
-export const applyLaneFallbackGuess = <T extends ResultWithFusion>(result: T): T => {
+export const applyLaneFallbackGuess = <T extends ResultWithFusion>(
+  result: T,
+  context?: LaneFallbackContext,
+): T => {
   if (!laneFallbackGuessEnabled()) return result;
+  // The user already answered this question with "no". Checked FIRST — before
+  // the emptiness tests — because a declined URL reaches here wearing exactly
+  // the empty-fusion shape, and ordering the check after them would leave the
+  // veto dependent on the very ambiguity it exists to resolve.
+  if (
+    context !== undefined &&
+    isUrlDeclined(context.declines, context.canonicalUrl)
+  ) {
+    return result;
+  }
   // Fusion had an opinion (any candidate at all) ⇒ hands off, unconditionally.
   if (result.fusedCandidates.length > 0) return result;
   // Only the "nothing reached fusion" gate qualifies. 'corroboration' &c. mean
