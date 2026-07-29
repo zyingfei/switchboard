@@ -74,6 +74,23 @@ export type GistLookup = ReadonlyMap<string, GistEntry>;
 
 const foldKey = (kind: EntityTitleEnrichedKind, id: string): string => `${kind}:${id}`;
 
+// The INVERSE of foldKey, exported so downstream folds (entityIndex.ts) can
+// walk a GistLookup back to the (kind,id) it came from without re-deriving
+// the key shape — one place owns "how a gist entry is keyed", so the two can
+// never drift. Split on the FIRST colon only: a 'url' id is a canonicalUrl
+// and carries its own colons ("https://…"). Returns null for a key whose
+// prefix is not a known kind, which is a corrupt key rather than a missing
+// entry — callers skip it instead of inventing an entity.
+export const parseGistLookupKey = (
+  key: string,
+): { readonly kind: EntityTitleEnrichedKind; readonly id: string } | null => {
+  const at = key.indexOf(':');
+  if (at <= 0 || at + 1 >= key.length) return null;
+  const kind = key.slice(0, at);
+  if (kind !== 'url' && kind !== 'thread') return null;
+  return { kind, id: key.slice(at + 1) };
+};
+
 // Look up the synthesized gist for a (kind,id). Returns undefined when there is
 // no enrichment OR the flag is off (the lookup is null then).
 export const lookupGist = (
