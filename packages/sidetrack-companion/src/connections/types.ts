@@ -19,6 +19,7 @@
 import type { SerializedTabSessionProjection } from '../tabsession/projection.js';
 import type { SerializedUrlProjection } from '../urls/projection.js';
 import type { PageEvidenceSimilarityMetadata } from '../page-evidence/types.js';
+import type { RECALL_MODEL } from '../recall/modelManifest.js';
 
 export type ConnectionNodeKind =
   | 'thread'
@@ -251,7 +252,10 @@ export type VisitSimilarityProducer = 'embedding' | 'lexical';
 
 export interface VisitSimilarityRevision {
   readonly revisionId: string;
-  readonly modelId: 'Xenova/multilingual-e5-small';
+  // E2 (single model identity): derived from the manifest, not a second copy
+  // of the literal. modelManifest.ts is a dependency-free leaf, so this import
+  // adds no cycle and no runtime weight.
+  readonly modelId: typeof RECALL_MODEL.modelId;
   readonly modelRevision: string;
   readonly featureSchemaVersion: number;
   readonly threshold: number;

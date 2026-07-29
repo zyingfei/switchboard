@@ -15,6 +15,15 @@ import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { getDrainDegradation, type DrainDegradationSnapshot } from '../connections/drainDegradation.js';
+import {
+  getGenerationRecovery,
+  type GenerationRecoverySnapshot,
+} from '../connections/generationRecovery.js';
+// E2 — shared embed substrate. Both are dependency-free leaves (fs + crypto,
+// pure data): importing them here does NOT pull recall/embedder.js (ONNX) onto
+// the server's static graph, which the /v1/status availability contract forbids.
+import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
+import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { bridgeKeysMatch, isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import {
@@ -2080,6 +2089,17 @@ export interface ReliabilityHealthSection {
   // the fallback only emitted a phase mark, and phase marks are off by
   // default. Non-zero here means at least one drain ran the slow path.
   readonly drainDegradation: DrainDegradationSnapshot;
+  // Generation-swap recovery: reads that hit bun:sqlite's "disk I/O error" —
+  // the signature of a handle whose double-buffer generation file was
+  // unlinked/swapped underneath it — and were recovered by a reopen-and-retry
+  // (or were not). This was the 2026-07-29 P0: a publish in ONE process GC'd a
+  // write shadow open in ANOTHER, and the victim's next query threw an error
+  // that was neither a lock nor corruption, so nothing retried it and it
+  // surfaced as sync.materializers.connections 'failed'. The structural fix is
+  // cross-process in-flight markers (generationBuffer.ts); these counters are
+  // how a regression announces itself instead of being absorbed silently.
+  // Absent == zero (process-lifetime counters, never persisted).
+  readonly generationRecovery: GenerationRecoverySnapshot;
   // Section availability derived from the canary status: 'ok' when
   // ok/idle, 'stale' when degraded. This is what the observability board
   // renders for the reliability lane.
@@ -2183,6 +2203,7 @@ export const buildReliabilityHealthSection = async (
     return {
       resolveCanary: { ...idleSnapshot, status: 'idle' },
       drainDegradation: getDrainDegradation(),
+      generationRecovery: getGenerationRecovery(),
       availability: 'ok',
       walBytes,
       ...doubleBufferSection,
@@ -2197,6 +2218,7 @@ export const buildReliabilityHealthSection = async (
   return {
     resolveCanary: { ...snapshot, status },
     drainDegradation: getDrainDegradation(),
+    generationRecovery: getGenerationRecovery(),
     availability,
     walBytes,
     ...doubleBufferSection,
@@ -2880,8 +2902,32 @@ const buildContentLaneDeps = async (
   }
   const embedderState = context.getEmbedderStatus?.()?.state;
   const embedderUsable = embedderState === 'ready' || embedderState === 'disabled';
+  // E2 — the lane's query embed consults the SHARED (model, sha256(text))
+  // cache before paying for an ONNX pass. This is the same file the
+  // visit-similarity materializer and the recall-v2 chunk backfill write, so a
+  // query whose exact text has been embedded anywhere on this machine is free,
+  // and it survives restarts (contentLane's own LRU does not — its emptiness
+  // after a restart is part of the §G2 seam).
+  //
+  // READ-THROUGH ONLY, deliberately. A `put` rewrites the whole cache file;
+  // at full corpus that is ~97MB, and doing it once per resolved URL would put
+  // exactly the kind of unbounded I/O back on the request path that the resolve
+  // work keeps taking off it. The lane's bounded in-process LRU stays the write
+  // side for query vectors. Documented in the substrate map as the boundary.
   const embed = embedderUsable
     ? async (text: string): Promise<Float32Array | undefined> => {
+        try {
+          const cached = await createEmbeddingCache(
+            vaultRoot,
+            RECALL_MODEL.embeddingDim,
+          ).getMany({ modelId: RECALL_MODEL.modelId, modelRevision: RECALL_MODEL.revision }, [
+            embedTextHash(text),
+          ]);
+          const hit = cached.get(embedTextHash(text));
+          if (hit !== undefined) return hit;
+        } catch {
+          /* cache is an optimisation — fall through to a real embed */
+        }
         try {
           const { embed: embedFn } = await import('../recall/embedder.js');
           const [vec] = await embedFn([text]);
@@ -5514,9 +5560,22 @@ const routes: readonly RouteDefinition[] = [
             // entry back, and the key already folds arm + state revision so a
             // late landing under a superseded key is inert).
             if (resolverCacheDeferEnabled()) {
+              // LATE-BOUND, not captured. The thunk re-reads
+              // `context.connectionsStore` on the FLUSH tick, so the write goes
+              // through whatever store — and therefore whatever sqlite handle —
+              // is live when it actually happens. A queued write can drain on
+              // the far side of a connections-generation publish, and a handle
+              // captured here would by then name a file the publish may have
+              // unlinked, which bun:sqlite reports as "disk I/O error" (neither
+              // a lock nor corruption, so nothing retries it).
               queueResolverCacheWrite(
-                async (visitId, revision, value) =>
-                  await sqliteStore.cacheResolverResult(visitId, revision, value),
+                () => {
+                  const live = context.connectionsStore;
+                  return live instanceof SqliteConnectionsStore
+                    ? async (visitId, revision, value): Promise<void> =>
+                        await live.cacheResolverResult(visitId, revision, value)
+                    : null;
+                },
                 canonicalUrl,
                 batchCacheRevision,
                 result,

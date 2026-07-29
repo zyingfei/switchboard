@@ -29,6 +29,29 @@
 //      unlinks a generation the parent has already REOPENED past — the child
 //      GCs on its NEXT publish, keeping (pointer target + one prior) resident,
 //      by which time the parent has long moved its handle forward.
+//
+// CROSS-PROCESS IN-FLIGHT SHADOWS (live P0, 2026-07-29). Measurement (3) has a
+// hole that bit in production: the GC keep-set was assembled from the
+// publisher's OWN in-process state (SqliteConnectionsStore#inFlightShadowGenIds
+// + its open/retired handle gens). A WRITE SHADOW is a `current.<gen>.db` like
+// any other generation, so a publisher in ANOTHER process readdir's it, finds
+// it in neither its keep-set nor the pointer, and unlinks it — out from under a
+// live writer. Both directions happen on the real vault:
+//   - the parent's projection-overlay / scoped-delta shadow-publish (seconds)
+//     is GC'd by the fork-per-drain child's publish;
+//   - the child's drain shadow (MINUTES — it is open for the whole reconcile)
+//     is GC'd by any parent overlay publish that lands mid-drain.
+// The victim's next query throws literally "disk I/O error", which is neither a
+// lock error nor corruption, so nothing retried it: it surfaced as
+// `sync.materializers.connections {status:'failed', lastError:'disk I/O error'}`
+// recurring AFTER successful drains (lastSuccessAt advances, a later attempt
+// dies) with both dbs passing `PRAGMA quick_check` and 20GB free.
+// FIX: every shadow registers an on-disk IN-FLIGHT MARKER (`current.<gen>.db
+// .inflight`, holding the writer's pid) at creation and clears it at
+// publish/discard. gcOldGenerations keeps any generation whose marker names a
+// LIVE foreign pid. The marker is deliberately outside this process's memory —
+// that is the entire point; an in-memory set can never be seen by the other
+// process.
 
 import {
   closeSync,
@@ -57,6 +80,11 @@ const PUBLISH_LOCK_FILENAME = 'current.publish.lock';
 const GEN_PREFIX = 'current.';
 const GEN_SUFFIX = '.db';
 const LEGACY_DB_FILENAME = 'current.db';
+/** Suffix of a shadow generation's cross-process in-flight marker. Appended to
+ *  the generation FILENAME (`current.<gen>.db.inflight`) so it sorts beside its
+ *  db and can never itself be mistaken for a generation: isGenerationFilename
+ *  requires the name to END in `.db`, and this does not. */
+const INFLIGHT_SUFFIX = '.inflight';
 
 export interface SqliteLikeDb {
   readonly exec: (sql: string) => unknown;
@@ -130,6 +158,87 @@ const safeUnlink = (path: string): void => {
   } catch {
     /* best-effort */
   }
+};
+
+// ---------------------------------------------------------------------------
+// Cross-process in-flight shadow markers (see the CROSS-PROCESS IN-FLIGHT
+// SHADOWS note in the header). A marker is `current.<gen>.db.inflight` holding
+// `<pid> <epochMs>`; its ONLY consumer is gcOldGenerations.
+// ---------------------------------------------------------------------------
+
+const inflightMarkerPath = (connectionsDir: string, genId: string): string =>
+  `${genFilePath(connectionsDir, genId)}${INFLIGHT_SUFFIX}`;
+
+/**
+ * Absolute ceiling on how long a marker pins a generation, as a LEAK backstop
+ * only — liveness is decided by pid, not age. It exists purely for pid reuse:
+ * if a long-dead writer's pid is recycled by an unrelated process, its marker
+ * would otherwise pin a ~300MB generation forever.
+ *
+ * The asymmetry is deliberate and this number is chosen for it: a false KEEP
+ * costs one stale file that the next GC (once the pid dies) collects, while a
+ * false COLLECT is the P0 "disk I/O error" this whole mechanism exists to
+ * prevent. So the ceiling is set far above any legitimate writer lifetime — a
+ * drain child is watchdogged at 10 min of no progress
+ * (DEFAULT_NO_PROGRESS_TIMEOUT_MS in connectionsReconcileChildClient.ts) and a
+ * parent overlay shadow lives milliseconds — rather than tuned tight.
+ */
+const INFLIGHT_MARKER_MAX_AGE_MS = 6 * 60 * 60_000;
+
+/** Does this pid name a live process? `kill(pid, 0)` sends no signal; it only
+ *  probes existence. EPERM means the pid EXISTS but belongs to another user —
+ *  alive for our purposes. Any other throw (ESRCH) means dead. */
+const processAlive = (pid: number): boolean => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code === 'EPERM';
+  }
+};
+
+/** Register a shadow generation as in-flight for THIS process. Best-effort: a
+ *  marker that fails to write only restores the pre-fix behaviour for that one
+ *  shadow — it must never fail the write that is about to happen. */
+export const markShadowInFlight = (connectionsDir: string, genId: string): void => {
+  try {
+    writeFileSync(inflightMarkerPath(connectionsDir, genId), `${String(process.pid)} ${String(Date.now())}`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+  } catch {
+    /* best-effort */
+  }
+};
+
+/** Drop a shadow's in-flight marker (published, discarded, or superseded). */
+export const clearShadowInFlight = (connectionsDir: string, genId: string): void => {
+  safeUnlink(inflightMarkerPath(connectionsDir, genId));
+};
+
+/**
+ * Is `genId` claimed by a live writer in ANOTHER process?
+ *
+ * Own-pid markers deliberately return false: within one process the store
+ * already tracks its live shadows exactly (#inFlightShadowGenIds feeds every
+ * casPublish keep-set), so honouring our own marker would add nothing and would
+ * make a same-process GC unable to collect a shadow the caller has already
+ * finalized. The marker's whole job is the blind spot BETWEEN processes.
+ */
+const foreignWriterHoldsGeneration = (connectionsDir: string, genId: string): boolean => {
+  let raw: string;
+  try {
+    raw = readFileSync(inflightMarkerPath(connectionsDir, genId), 'utf8');
+  } catch {
+    return false; // absent == not in flight (the overwhelmingly common case)
+  }
+  const [pidText, atText] = raw.trim().split(/\s+/u);
+  const pid = Number.parseInt(pidText ?? '', 10);
+  const atMs = Number.parseInt(atText ?? '', 10);
+  if (pid === process.pid) return false;
+  if (Number.isFinite(atMs) && Date.now() - atMs > INFLIGHT_MARKER_MAX_AGE_MS) return false;
+  return processAlive(pid);
 };
 
 const publishLockPath = (connectionsDir: string): string =>
@@ -236,6 +345,12 @@ export const casPublish = (
       return { outcome: 'superseded' as const, unlinked: [] as readonly string[] };
     }
     writePointer(connectionsDir, input.newGenId);
+    // The shadow is now the SERVED generation, not an in-flight write target.
+    // Clearing here (inside the publish lock, before the GC readdir) keeps the
+    // marker's lifetime exactly equal to the window in which unlinking the file
+    // would break a writer, and stops published gens accumulating markers that
+    // would pin them past their usefulness.
+    clearShadowInFlight(connectionsDir, input.newGenId);
     const keep = new Set<string>([input.newGenId, ...(input.keepAlive ?? [])]);
     if (input.seedGenId !== null) keep.add(input.seedGenId);
     const unlinked = gcOldGenerations(connectionsDir, [...keep]);
@@ -388,7 +503,14 @@ export const createShadowGeneration = (
     safeUnlink(shadowPath);
     safeUnlink(`${shadowPath}-wal`);
     safeUnlink(`${shadowPath}-shm`);
+    clearShadowInFlight(connectionsDir, newGenId);
   }
+  // Claim the shadow BEFORE any bytes land in it, so there is no window in
+  // which the file is visible to another process's readdir-driven GC while
+  // unclaimed. Marking here (rather than at each call site) means EVERY shadow
+  // — child drain, parent overlay, parent scoped-delta — is covered by
+  // construction, which is what makes the invariant hold.
+  markShadowInFlight(connectionsDir, newGenId);
   if (seedPath !== null) {
     copyFileSync(seedPath, shadowPath);
     // The seed may carry an un-checkpointed -wal (if it was the legacy db); the
@@ -430,14 +552,42 @@ export const gcOldGenerations = (
   } catch {
     return unlinked;
   }
+  const survivors = new Set<string>();
   for (const name of entries) {
     const genId = genIdFromFilename(name);
-    if (genId === null || keep.has(genId)) continue;
+    if (genId === null) continue;
+    if (keep.has(genId)) {
+      survivors.add(genId);
+      continue;
+    }
+    // CROSS-PROCESS INVARIANT (the live P0 fix). `keep` only knows what THIS
+    // process holds. A shadow being written by the fork-per-drain child (open
+    // for the whole reconcile — minutes) or by the parent's overlay publish is
+    // an ordinary `current.<gen>.db` to this readdir, and unlinking it makes
+    // its owner's next query throw "disk I/O error". The on-disk marker is the
+    // only channel through which that other process can say "mine, still open".
+    if (foreignWriterHoldsGeneration(connectionsDir, genId)) {
+      survivors.add(genId);
+      continue;
+    }
     const base = genFilePath(connectionsDir, genId);
     safeUnlink(base);
     safeUnlink(`${base}-wal`);
     safeUnlink(`${base}-shm`);
+    // The gen is gone; its marker (from a dead writer, or already cleared) must
+    // not outlive it as a file-less orphan.
+    clearShadowInFlight(connectionsDir, genId);
     unlinked.push(genId);
+  }
+  // Sweep markers whose generation file no longer exists at all (a writer killed
+  // between markShadowInFlight and the clone, or a gen removed by an older
+  // build). Same readdir, no extra syscall to find them.
+  for (const name of entries) {
+    if (!name.endsWith(INFLIGHT_SUFFIX)) continue;
+    const genId = genIdFromFilename(name.slice(0, name.length - INFLIGHT_SUFFIX.length));
+    if (genId === null || survivors.has(genId)) continue;
+    if (existsSync(genFilePath(connectionsDir, genId))) continue;
+    safeUnlink(join(connectionsDir, name));
   }
   return unlinked;
 };
@@ -452,6 +602,7 @@ export const discardShadowGeneration = (connectionsDir: string, genId: string): 
   safeUnlink(base);
   safeUnlink(`${base}-wal`);
   safeUnlink(`${base}-shm`);
+  clearShadowInFlight(connectionsDir, genId);
 };
 
 /** List resident generation ids (for diagnostics). */

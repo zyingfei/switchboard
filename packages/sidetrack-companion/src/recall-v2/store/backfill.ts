@@ -20,7 +20,10 @@ import type { PageEvidenceRecord } from '../../page-evidence/types.js';
 import { mapInChunks } from '../../domain/asyncChunks.js';
 import { readIndex } from '../../recall/indexFile.js';
 import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
-import { RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
+import { RECALL_MODEL, RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
+// Dependency-free leaf (fs + crypto only) — safe on the server's static graph,
+// unlike recall/embedder.js which is imported lazily below.
+import { createEmbeddingCache, embedTextHash } from '../../recall/embeddingCache.js';
 import type { PageEvidenceEmbedder } from '../../page-evidence/embedding.js';
 
 // Lazy embedder: this module sits in http/server.ts's static import
@@ -413,6 +416,116 @@ const chunkEmbedText = (chunk: PageContentChunk): string => {
   return `passage: ${title === undefined || title.length === 0 ? chunk.text : `${title}\n\n${chunk.text}`}`;
 };
 
+// ---------------------------------------------------------------------------
+// E2 — shared embed cache (see recall/embeddingCache.ts).
+//
+// The cache is an OPTIMISATION on a best-effort path: every failure here must
+// degrade to "embed it again", never abort a backfill. The model key is read
+// from the manifest, which is the same identity the materializer's cache
+// entries carry — that is what makes a hit possible across the two substrates.
+// ---------------------------------------------------------------------------
+
+const EMBED_CACHE_MODEL = {
+  modelId: RECALL_MODEL.modelId,
+  modelRevision: RECALL_MODEL.revision,
+} as const;
+
+type SharedEmbedCache = ReturnType<typeof createEmbeddingCache> | null;
+
+const embedCacheFor = (vaultRoot: string): SharedEmbedCache => {
+  try {
+    return createEmbeddingCache(vaultRoot, RECALL_MODEL.embeddingDim);
+  } catch {
+    return null;
+  }
+};
+
+const cacheGetMany = async (
+  cache: SharedEmbedCache,
+  hashes: readonly string[],
+): Promise<ReadonlyMap<string, Float32Array>> => {
+  if (cache === null) return new Map();
+  try {
+    return await cache.getMany(EMBED_CACHE_MODEL, hashes);
+  } catch {
+    return new Map();
+  }
+};
+
+const cachePutMany = async (
+  cache: SharedEmbedCache,
+  entries: readonly (readonly [string, Float32Array])[],
+): Promise<void> => {
+  if (cache === null || entries.length === 0) return;
+  try {
+    await cache.putMany(EMBED_CACHE_MODEL, entries);
+  } catch {
+    /* best-effort */
+  }
+};
+
+/** Batch size for chunk embedding. Unchanged by E2 — the shared cache is
+ *  consulted ONCE per batch (one read, one write), never per chunk. */
+const EMBED_BATCH_SIZE = 32;
+
+/**
+ * Embed the chunks that have no vector yet and upsert them, consulting the
+ * shared embed cache first. The single implementation for both chunk-vector
+ * paths in this file (the full backfill and the per-record delta ingest) so
+ * they cannot drift in what they hash or which model key they use.
+ *
+ * Returns the number of chunk vectors written.
+ */
+const embedAndUpsertChunkVectors = async (input: {
+  readonly vaultRoot: string;
+  readonly store: RecallStore;
+  readonly embedder: PageEvidenceEmbedder;
+  readonly items: readonly {
+    readonly chunk: { readonly id: string };
+    readonly embedText: string;
+  }[];
+}): Promise<number> => {
+  let vectors = 0;
+  const cache = embedCacheFor(input.vaultRoot);
+  for (let start = 0; start < input.items.length; start += EMBED_BATCH_SIZE) {
+    const batch = input.items.slice(start, start + EMBED_BATCH_SIZE);
+    const hashes = batch.map((item) => embedTextHash(item.embedText));
+    // eslint-disable-next-line no-await-in-loop -- one cache read per batch
+    const cached = await cacheGetMany(cache, hashes);
+    const missIndexes: number[] = [];
+    for (let index = 0; index < batch.length; index += 1) {
+      if (!cached.has(hashes[index] ?? '')) missIndexes.push(index);
+    }
+    const freshTexts = missIndexes.map((index) => batch[index]?.embedText ?? '');
+    // eslint-disable-next-line no-await-in-loop -- embedder is batched
+    const fresh = freshTexts.length === 0 ? [] : await input.embedder(freshTexts);
+    const toPersist: [string, Float32Array][] = [];
+    const vectorByIndex = new Map<number, Float32Array>();
+    for (let m = 0; m < missIndexes.length; m += 1) {
+      const index = missIndexes[m];
+      const vector = fresh[m];
+      if (index === undefined || vector === undefined || vector.length === 0) continue;
+      vectorByIndex.set(index, vector);
+      const hash = hashes[index];
+      if (hash !== undefined) toPersist.push([hash, vector]);
+    }
+    input.store.runTransaction(() => {
+      for (let index = 0; index < batch.length; index += 1) {
+        const item = batch[index];
+        const vector = vectorByIndex.get(index) ?? cached.get(hashes[index] ?? '');
+        if (item === undefined || vector === undefined || vector.length === 0) continue;
+        input.store.upsertChunkVector(item.chunk.id, vector);
+        vectors += 1;
+      }
+    });
+    // eslint-disable-next-line no-await-in-loop -- one cache write per batch
+    await cachePutMany(cache, toPersist);
+    // eslint-disable-next-line no-await-in-loop -- yield between embed batches
+    if (start + EMBED_BATCH_SIZE < input.items.length) await yieldToEventLoop();
+  }
+  return vectors;
+};
+
 /** Backfill canonical page-content chunk rows and per-chunk vectors.
  *  This is idempotent: chunk rows are replaced per document, existing
  *  chunk vectors are skipped, and stale chunk rows/vectors are swept at
@@ -476,22 +589,18 @@ export const backfillChunkVectors = async (
   let tEmbed = 0;
   if (store.vectorBackendAvailable) {
     const tEmbedStart = Date.now();
-    const missing = items.filter((item) => !existingVectors.has(item.chunk.id));
-    const EMBED_BATCH_SIZE = 32;
-    for (let start = 0; start < missing.length; start += EMBED_BATCH_SIZE) {
-      const batch = missing.slice(start, start + EMBED_BATCH_SIZE);
-      const embedded = await embedder(batch.map((item) => item.embedText));
-      store.runTransaction(() => {
-        for (let index = 0; index < batch.length; index += 1) {
-          const item = batch[index];
-          const vector = embedded[index];
-          if (item === undefined || vector === undefined || vector.length === 0) continue;
-          store.upsertChunkVector(item.chunk.id, vector);
-          vectors += 1;
-        }
-      });
-      if (start + EMBED_BATCH_SIZE < missing.length) await yieldToEventLoop();
-    }
+    // E2 — routed through the SAME sha-keyed embed cache the visit-similarity
+    // materializer uses, so one (model, text) pair costs one ONNX pass
+    // machine-wide. A real overlap, not a theoretical one: `chunkEmbedText`
+    // produces exactly the string page-evidence's doc-embedding chunker
+    // produces (`passage: ${title}\n\n${text}` from the same splitter), so
+    // before this the two substrates embedded byte-identical text separately.
+    vectors = await embedAndUpsertChunkVectors({
+      vaultRoot,
+      store,
+      embedder,
+      items: items.filter((item) => !existingVectors.has(item.chunk.id)),
+    });
     tEmbed = Date.now() - tEmbedStart;
   }
 
@@ -608,23 +717,9 @@ const ingestChunksForRecords = async (
   }
   let vectors = 0;
   if (store.vectorBackendAvailable && toEmbed.length > 0) {
-    const EMBED_BATCH_SIZE = 32;
-    for (let start = 0; start < toEmbed.length; start += EMBED_BATCH_SIZE) {
-      const batch = toEmbed.slice(start, start + EMBED_BATCH_SIZE);
-      // eslint-disable-next-line no-await-in-loop -- embedder is batched
-      const embedded = await embedder(batch.map((item) => item.embedText));
-      store.runTransaction(() => {
-        for (let index = 0; index < batch.length; index += 1) {
-          const item = batch[index];
-          const vector = embedded[index];
-          if (item === undefined || vector === undefined || vector.length === 0) continue;
-          store.upsertChunkVector(item.chunk.id, vector);
-          vectors += 1;
-        }
-      });
-      // eslint-disable-next-line no-await-in-loop -- yield between embed batches
-      if (start + EMBED_BATCH_SIZE < toEmbed.length) await yieldToEventLoop();
-    }
+    // Same shared-cache path as the full backfill (see E2 note above) — one
+    // implementation so the two can never disagree on the hash or model key.
+    vectors = await embedAndUpsertChunkVectors({ vaultRoot, store, embedder, items: toEmbed });
   }
   return { chunks: chunksN, vectors };
 };

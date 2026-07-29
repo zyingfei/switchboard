@@ -13,6 +13,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SqliteConnectionsStore } from './snapshot.js';
 import { readPointer, generationDbPath } from './generationBuffer.js';
 import {
+  __resetResolverCacheDeferQueue,
+  flushResolverCacheWrites,
+  pendingResolverCacheWriteCount,
+  queueResolverCacheWrite,
+  resolverCacheDeferStats,
+} from '../http/resolverCacheDefer.js';
+import {
   edgeIdFor,
   type ConnectionEdge,
   type ConnectionNode,
@@ -410,5 +417,83 @@ describe('M4 double-buffer acceptance', () => {
     // Legacy current.db retained as a rollback seed.
     expect(existsSync(join(connectionsDir(), 'current.db'))).toBe(true);
     store.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // Deferred resolver-cache write ACROSS a generation publish (2026-07-29 P0).
+  //
+  // Deferral moves the sqlite write off the request path, which also moves it
+  // across an unbounded amount of wall clock — and a drain publishes a whole
+  // new generation in that window. If the enqueue had captured a store (or,
+  // worse, a Database), the flush would write through a handle whose file the
+  // publish may have unlinked, and bun:sqlite answers that with the literal
+  // message "disk I/O error": not a lock, not corruption, so nothing retries
+  // it. The queue therefore stores a THUNK resolved at flush time; this test
+  // pins that by rotating both the generation AND the store object between the
+  // enqueue and the flush.
+  // -------------------------------------------------------------------------
+  sqliteIt('a deferred resolver-cache write flushed after a generation publish lands via the CURRENT store', async () => {
+    __resetResolverCacheDeferQueue();
+    const child = new SqliteConnectionsStore(vaultRoot!, { role: 'child-writer' });
+    await child.writeSnapshotAndProgress(buildGraph(6, 'rev-1'), progressFor('rev-1'));
+    child.close();
+    const genAtEnqueue = readPointer(connectionsDir());
+
+    // The store the "request" was served by.
+    let liveStore = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
+    expect((await liveStore.readSnapshotMetadata())?.snapshotRevision).toBe('rev-1');
+
+    // Enqueue exactly as the batch-resolve route does: a thunk, never a bound
+    // writer. Reading `liveStore` INSIDE the thunk is the whole contract.
+    queueResolverCacheWrite(
+      () =>
+        async (visitId, revision, value): Promise<void> =>
+          await liveStore.cacheResolverResult(visitId, revision, value),
+      'https://defer.test/a',
+      'cache-rev-1',
+      { action: 'inbox' },
+    );
+    expect(pendingResolverCacheWriteCount()).toBe(1);
+
+    // ...now a drain publishes a NEW generation and the parent rotates onto it,
+    // all while the write is still sitting in the queue.
+    const child2 = new SqliteConnectionsStore(vaultRoot!, { role: 'child-writer' });
+    await child2.writeSnapshotAndProgress(buildGraph(9, 'rev-2'), progressFor('rev-2'));
+    child2.close();
+    const genAtFlush = readPointer(connectionsDir());
+    expect(genAtFlush).not.toBe(genAtEnqueue);
+
+    liveStore.close();
+    liveStore = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
+    expect((await liveStore.readSnapshotMetadata())?.snapshotRevision).toBe('rev-2');
+
+    await flushResolverCacheWrites();
+
+    // No "disk I/O error" (or anything else) — the flush bound to the store
+    // that is live NOW, not the one the request saw.
+    expect(resolverCacheDeferStats().writeFailures).toBe(0);
+    expect(resolverCacheDeferStats().droppedNoWriter).toBe(0);
+    expect(pendingResolverCacheWriteCount()).toBe(0);
+    // Read back through the CURRENT store (doctrine rule 10 — assert the
+    // served artifact, not the layer under change).
+    expect(await liveStore.getCachedResolverResult('https://defer.test/a', 'cache-rev-1')).toEqual({
+      action: 'inbox',
+    });
+    liveStore.close();
+    __resetResolverCacheDeferQueue();
+  });
+
+  sqliteIt('a deferred write whose store is gone at flush time is dropped, not thrown', async () => {
+    __resetResolverCacheDeferQueue();
+    // Shutdown ordering: the queue can outlive the store. Dropping is the
+    // contract (a lost cache write costs one recompute) and it must be
+    // COUNTED, not silent — the same absent==zero discipline as every other
+    // degradation counter in this package.
+    queueResolverCacheWrite(() => null, 'https://defer.test/gone', 'cache-rev-1', { a: 1 });
+    await flushResolverCacheWrites();
+    expect(resolverCacheDeferStats().droppedNoWriter).toBe(1);
+    expect(resolverCacheDeferStats().writeFailures).toBe(0);
+    expect(pendingResolverCacheWriteCount()).toBe(0);
+    __resetResolverCacheDeferQueue();
   });
 });

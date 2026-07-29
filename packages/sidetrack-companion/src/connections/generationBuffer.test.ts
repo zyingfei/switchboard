@@ -8,10 +8,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   casPublish,
   checkpointTruncate,
+  clearShadowInFlight,
   composeGenId,
   createShadowGeneration,
   discardShadowGeneration,
   gcOldGenerations,
+  markShadowInFlight,
   generationDbPath,
   generationExists,
   migrateLegacyToGeneration,
@@ -323,5 +325,140 @@ describe('generationBuffer', () => {
     expect(readMarker(join(dir, 'current.db'), false)).toBe('served-new');
     // Idempotent: a second call on the unchanged pointer is a no-op.
     expect(reconcileLegacyToPublished(dir)).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-process in-flight shadow markers (the 2026-07-29 "disk I/O error" P0).
+  //
+  // The GC keep-set is assembled from the publisher's OWN process state, but a
+  // write SHADOW is an ordinary `current.<gen>.db` on disk. So a publish in one
+  // process readdir'd, found another process's live shadow in neither its
+  // keep-set nor the pointer, and unlinked it — after which the victim's next
+  // query threw "disk I/O error" (bun:sqlite's vnode-detached signature). Both
+  // directions happened live: the fork-per-drain child's shadow is open for the
+  // whole reconcile (minutes) and the parent's overlay publishes land inside it.
+  // -------------------------------------------------------------------------
+
+  /** Write an in-flight marker as if some OTHER process owned the shadow. */
+  const writeForeignMarker = (
+    dirPath: string,
+    genId: string,
+    pid: number,
+    atMs = Date.now(),
+  ): void => {
+    writeFileSync(`${generationDbPath(dirPath, genId)}.inflight`, `${String(pid)} ${String(atMs)}`);
+  };
+  // Our parent process: a real, live pid that is definitively not us.
+  const LIVE_FOREIGN_PID = process.ppid;
+  // Above macOS' default pid_max (99998) ⇒ guaranteed ESRCH, i.e. dead.
+  const DEAD_PID = 999_999;
+
+  sqliteIt('gcOldGenerations does NOT unlink a shadow a LIVE foreign process holds', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-live-'));
+    const live = composeGenId(1, 'live');
+    const childShadow = composeGenId(2, 'childshadow');
+    for (const id of [live, childShadow]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // The child claimed its shadow before writing a byte into it.
+    writeForeignMarker(dir, childShadow, LIVE_FOREIGN_PID);
+
+    // A parent overlay publishes mid-drain. Its keep-set cannot mention the
+    // child's shadow — it has never heard of it. Pre-fix, this unlinked it.
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).not.toContain(childShadow);
+    expect(generationExists(dir, childShadow)).toBe(true);
+    expect(existsSync(`${generationDbPath(dir, childShadow)}.inflight`)).toBe(true);
+  });
+
+  sqliteIt('gcOldGenerations collects a shadow whose owning process DIED (no leak)', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-dead-'));
+    const live = composeGenId(1, 'live');
+    const abandoned = composeGenId(2, 'abandoned');
+    for (const id of [live, abandoned]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // A child that was SIGKILLed mid-drain leaves its marker behind. Honouring
+    // it forever would trade the P0 for an unbounded disk leak (each generation
+    // is ~330MB on the real vault).
+    writeForeignMarker(dir, abandoned, DEAD_PID);
+
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).toContain(abandoned);
+    expect(generationExists(dir, abandoned)).toBe(false);
+    // The orphaned marker goes with the file it named.
+    expect(existsSync(`${generationDbPath(dir, abandoned)}.inflight`)).toBe(false);
+  });
+
+  sqliteIt('an OWN-process marker does not block this process own GC', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-self-'));
+    const live = composeGenId(1, 'live');
+    const mine = composeGenId(2, 'mine');
+    for (const id of [live, mine]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // markShadowInFlight always stamps OUR pid.
+    markShadowInFlight(dir, mine);
+
+    // Within one process the store already tracks its live shadows exactly
+    // (#inFlightShadowGenIds feeds keepAlive), so a self-marker must not add a
+    // second, weaker authority that outlives finalize().
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).toContain(mine);
+    expect(generationExists(dir, mine)).toBe(false);
+  });
+
+  sqliteIt('createShadowGeneration claims the shadow and casPublish releases it', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-lifecycle-'));
+    const gen0 = composeGenId(0, 'seed');
+    seedDb(generationDbPath(dir, gen0), 'served-v1');
+    writePointer(dir, gen0);
+
+    const shadowGen = composeGenId(1, 'shadow');
+    createShadowGeneration(dir, shadowGen);
+    // Claimed at creation — there is no window in which the file exists on disk
+    // unclaimed, which is what a foreign readdir would have collected.
+    expect(existsSync(`${generationDbPath(dir, shadowGen)}.inflight`)).toBe(true);
+
+    const res = casPublish(dir, { seedGenId: gen0, newGenId: shadowGen });
+    expect(res.outcome).toBe('published');
+    // Published ⇒ no longer a write target ⇒ claim released, so it cannot pin
+    // itself once the pointer moves on.
+    expect(existsSync(`${generationDbPath(dir, shadowGen)}.inflight`)).toBe(false);
+  });
+
+  sqliteIt('discardShadowGeneration and an aged-out marker both release the claim', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-release-'));
+    const live = composeGenId(1, 'live');
+    seedDb(generationDbPath(dir, live), live);
+    writePointer(dir, live);
+
+    const lost = composeGenId(2, 'lostcas');
+    createShadowGeneration(dir, lost);
+    discardShadowGeneration(dir, lost);
+    expect(existsSync(`${generationDbPath(dir, lost)}.inflight`)).toBe(false);
+
+    // Pid-reuse backstop: a marker older than the ceiling is ignored even
+    // though its pid is alive, so a recycled pid cannot pin a gen forever.
+    const ancient = composeGenId(3, 'ancient');
+    seedDb(generationDbPath(dir, ancient), ancient);
+    writeForeignMarker(dir, ancient, LIVE_FOREIGN_PID, Date.now() - 7 * 60 * 60_000);
+    expect(gcOldGenerations(dir, [live])).toContain(ancient);
+    expect(generationExists(dir, ancient)).toBe(false);
+  });
+
+  sqliteIt('clearShadowInFlight is idempotent and sweeps file-less orphan markers', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-sweep-'));
+    const live = composeGenId(1, 'live');
+    seedDb(generationDbPath(dir, live), live);
+    writePointer(dir, live);
+    // Double-clear must not throw (publish clears, then the finally clears).
+    clearShadowInFlight(dir, composeGenId(9, 'never'));
+    clearShadowInFlight(dir, composeGenId(9, 'never'));
+
+    // A writer killed between the claim and the clone leaves a marker with no
+    // db beside it. GC sweeps it in the same readdir it already does.
+    const ghost = composeGenId(4, 'ghost');
+    writeForeignMarker(dir, ghost, LIVE_FOREIGN_PID);
+    expect(generationExists(dir, ghost)).toBe(false);
+    gcOldGenerations(dir, [live]);
+    expect(existsSync(`${generationDbPath(dir, ghost)}.inflight`)).toBe(false);
   });
 });
