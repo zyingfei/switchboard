@@ -318,9 +318,31 @@ export const ensurePageEvidenceForTimelineEntries = async (
     byCanonical.set(canonicalUrl, next);
   }
   const out = new Map<string, PageEvidenceRecord>();
+  // PROGRESS IS PART OF THE CONTRACT for a big ensure. The 2026-07-29 vault
+  // freeze: the widened full-rebuild fallback handed this loop ~2.7k entries
+  // (it used to see the event window, single digits), each one paying an
+  // unconditional metadata write + an indexed-payload read — ~100% CPU inside
+  // sqlite for over ten minutes with ZERO output. The reconcile child's
+  // no-progress watchdog SIGKILLed it every time (seq=1..11+, 18 hours, not
+  // one successful drain), and it died HERE, before the similarity embed's
+  // own progress lines could ever start.
+  //
+  // A plain console line every ENSURE_PROGRESS_EVERY records keeps the phase
+  // observably alive: child stdout provably reaches the parent and provably
+  // bumps the watchdog. Threshold-gated so an ordinary window-sized ensure
+  // (single digits) stays silent. The per-record writes are already durable,
+  // so a killed run resumes at full speed — this line is what stops it being
+  // killed at all.
+  const ENSURE_PROGRESS_EVERY = 200;
+  const ensureTotal = byCanonical.size;
+  let ensured = 0;
   for (const input of [...byCanonical.values()].sort((left, right) =>
     compareText(left.canonicalUrl, right.canonicalUrl),
   )) {
+    ensured += 1;
+    if (ensureTotal > ENSURE_PROGRESS_EVERY && ensured % ENSURE_PROGRESS_EVERY === 0) {
+      console.log(`[page-evidence] ensure ${String(ensured)}/${String(ensureTotal)}`);
+    }
     let record = await writeMetadataOnlyPageEvidence(vaultRoot, input, {
       rebuildManifestAfterWrite: false,
     });
