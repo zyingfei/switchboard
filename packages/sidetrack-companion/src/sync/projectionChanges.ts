@@ -23,10 +23,38 @@ import type { VersionVector } from './causal.js';
 //   _BAC/.sync/projection-changes-seq     single integer (max seq)
 //   _BAC/.sync/projection-changes.jsonl   one JSON line per change
 //
-// The JSONL grows over time. Rotation/pruning of sealed lines is left
-// as a future optimisation (see the followups) — no rotation discipline
-// exists on this feed yet, so this module only CURSOR-SKIPS already-read
-// lines rather than deleting them.
+// ROTATION (2026-07-29). The JSONL used to grow forever: MEASURED at 98.6 MB
+// on the dogfood vault, the third-largest object in a 2.9 GB vault and the
+// largest with NO retention policy at all. The module previously only
+// CURSOR-SKIPPED read lines. It now rotates, mirroring
+// tabsession/lanePrequential.ts: at a byte cap, `rename(live, live + '.1')`,
+// keeping exactly ONE prior generation which the reader still reads. Cap from
+// SIDETRACK_SYNC_CHANGELOG_MAX_BYTES (default 32 MB), so steady-state disk is
+// bounded at ~2x the cap instead of unbounded.
+//
+// THREE THINGS ROTATION MUST NOT BREAK, all handled below:
+//   1. THE SEQ HIGH-WATER. `projection-changes-seq` is written atomically on
+//      every append and is authoritative; ensureSeqLoaded takes the MAX of it
+//      and the logged max, so losing log lines can never rewind the counter
+//      (a rewind would re-issue a seq and silently strand every client cursor).
+//      Rotation deliberately never touches that file.
+//   2. THE BYTE CHECKPOINT. readSince keeps an in-memory {scannedBytes,
+//      maxScannedSeq} offset into the LIVE file. Its only invalidation was
+//      `size < scannedBytes` — a shrink. That is NOT sufficient across a
+//      rename: if the fresh live file grew back past the old offset before the
+//      next poll, the resume path would seek to a stale mid-line offset in a
+//      DIFFERENT file and silently mangle/drop lines. So rotation resets the
+//      checkpoint explicitly, inside the same `enqueue` chain that serialises
+//      appends and reads — there is no window in which a reader can observe
+//      the rename without the reset.
+//   3. GAP HONESTY. A client resuming from a cursor whose lines were rotated
+//      away gets a silent hole: readSince can only return what is retained.
+//      One rotated generation is kept and READ, so a gap needs two rotations
+//      past the client's cursor — but "unlikely" is not "impossible", so the
+//      generation that gets clobbered has its high-water recorded in
+//      `projection-changes-floor` and surfaced as `retainedFromSeq`. A caller
+//      with sinceSeq < retainedFromSeq now KNOWS it must full-resync instead
+//      of believing an incomplete answer.
 //
 // Read fast path: readSince previously read + JSON.parsed the ENTIRE
 // file on every /changes poll — an O(total-history) cost on a hot polled
@@ -43,10 +71,41 @@ import type { VersionVector } from './causal.js';
 const SYNC_DIR_SEGMENTS = ['_BAC', '.sync'] as const;
 const SEQ_FILE = 'projection-changes-seq';
 const LOG_FILE = 'projection-changes.jsonl';
+/** One rotated generation, `.1` — same convention as lanePrequential. A plain
+ *  rename onto this name CLOBBERS the previous one, which is how "exactly one
+ *  prior generation" is enforced without any bookkeeping. */
+const ROTATED_LOG_FILE = `${LOG_FILE}.1`;
+/** Lowest seq still retained after a clobbering rotation (see note 3 above). */
+const FLOOR_FILE = 'projection-changes-floor';
 
 const syncDir = (vaultPath: string): string => join(vaultPath, ...SYNC_DIR_SEGMENTS);
 const seqPath = (vaultPath: string): string => join(syncDir(vaultPath), SEQ_FILE);
 const logPath = (vaultPath: string): string => join(syncDir(vaultPath), LOG_FILE);
+export const rotatedLogPath = (vaultPath: string): string =>
+  join(syncDir(vaultPath), ROTATED_LOG_FILE);
+const floorPath = (vaultPath: string): string => join(syncDir(vaultPath), FLOOR_FILE);
+
+/**
+ * Byte cap on the LIVE changelog. 32 MB default: the measured 98.6 MB file was
+ * ~460k lines, so 32 MB still retains ~150k changes per generation (~300k
+ * across both) — orders of magnitude more than any client cursor lag, while
+ * bounding cold-start `readMaxLoggedSeq` (which parses the whole file once per
+ * process) to a 2x-cap read instead of an unbounded one.
+ *
+ * Only a positive finite override is honoured; a garbage value falls back to
+ * the default rather than disabling rotation by accident. Set it very large to
+ * effectively disable rotation — this is a retention knob, not a kill switch,
+ * because the rotation itself deletes only the SECOND-oldest generation and
+ * readers are taught to read both.
+ */
+export const SYNC_CHANGELOG_MAX_BYTES_DEFAULT = 32 * 1024 * 1024;
+
+export const syncChangelogMaxBytes = (): number => {
+  const raw = process.env['SIDETRACK_SYNC_CHANGELOG_MAX_BYTES'];
+  if (raw === undefined) return SYNC_CHANGELOG_MAX_BYTES_DEFAULT;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : SYNC_CHANGELOG_MAX_BYTES_DEFAULT;
+};
 
 export type ProjectionChangeKind = 'upsert' | 'delete';
 
@@ -68,11 +127,21 @@ export interface AppendChangeInput {
   readonly kind: ProjectionChangeKind;
 }
 
+export interface ReadSinceResult {
+  readonly cursor: number;
+  readonly changed: readonly ProjectionChange[];
+  /**
+   * Lowest seq the feed can still serve. 0 means nothing has ever been rotated
+   * away (the whole history is retained). A caller whose `sinceSeq` is BELOW
+   * this lost lines to rotation and must full-resync from the projection dir
+   * rather than trust `changed` to be complete.
+   */
+  readonly retainedFromSeq: number;
+}
+
 export interface ProjectionChangeFeed {
   readonly appendChange: (input: AppendChangeInput) => Promise<ProjectionChange>;
-  readonly readSince: (
-    sinceSeq: number,
-  ) => Promise<{ readonly cursor: number; readonly changed: readonly ProjectionChange[] }>;
+  readonly readSince: (sinceSeq: number) => Promise<ReadSinceResult>;
   /**
    * Test-only observability: total number of JSONL lines this feed has
    * PARSED across all readSince calls. The cursor fast path exists to
@@ -154,6 +223,9 @@ export const createProjectionChangeFeed = (
   // file shrinks or is replaced, forcing a safe full re-scan.
   let scannedBytes = 0;
   let maxScannedSeq = 0;
+  // Retained floor (see header note 3). null = not yet read from disk; 0 = read
+  // and nothing has ever been rotated away. Typed emptiness, not a sentinel.
+  let cachedFloor: number | null = null;
   // Test-only: total JSONL lines parsed across all readSince calls.
   let parsedLineCount = 0;
 
@@ -168,12 +240,61 @@ export const createProjectionChangeFeed = (
 
   const ensureSeqLoaded = async (): Promise<number> => {
     if (cachedSeq !== null) return cachedSeq;
-    const [storedSeq, loggedSeq] = await Promise.all([
+    // Read BOTH generations' logged max, not just the live one: after a
+    // rotation the live file can be a few lines long while the rotated
+    // generation holds the real high-water. The persisted seq file is
+    // authoritative in practice; this is the belt for a vault where it is
+    // missing or corrupt, and it must not rewind across a rotation.
+    const [storedSeq, loggedSeq, rotatedSeq] = await Promise.all([
       readSeq(seqPath(vaultPath)),
       readMaxLoggedSeq(logPath(vaultPath)),
+      readMaxLoggedSeq(rotatedLogPath(vaultPath)),
     ]);
-    cachedSeq = Math.max(storedSeq, loggedSeq);
+    cachedSeq = Math.max(storedSeq, loggedSeq, rotatedSeq);
     return cachedSeq;
+  };
+
+  const ensureFloorLoaded = async (): Promise<number> => {
+    if (cachedFloor !== null) return cachedFloor;
+    cachedFloor = await readSeq(floorPath(vaultPath));
+    return cachedFloor;
+  };
+
+  /**
+   * Rotate the live log if it is at/over the cap. Runs INSIDE the enqueue chain
+   * (called only from appendChange) so no reader can observe the rename without
+   * the checkpoint reset that follows it.
+   *
+   * Rotate BEFORE appending, like lanePrequential, so the cap is a real ceiling
+   * on the live file rather than "the cap plus whatever the last batch was".
+   * Best-effort: a failed rename degrades to an over-cap append, never a lost
+   * change — the changelog's job is to not lose lines, and a rotation that
+   * cannot happen is strictly less bad than an append that does not.
+   */
+  const rotateIfNeeded = async (): Promise<void> => {
+    const live = logPath(vaultPath);
+    const info = await stat(live).catch(() => null);
+    if (info === null || info.size < syncChangelogMaxBytes()) return;
+    // The generation currently at `.1` is about to be CLOBBERED by this
+    // rename, so its high-water becomes the retained floor. Read it before the
+    // rename (bounded by the cap; happens once per cap's worth of appends).
+    const doomed = await readMaxLoggedSeq(rotatedLogPath(vaultPath));
+    try {
+      await rename(live, rotatedLogPath(vaultPath));
+    } catch {
+      return; // over-cap append is fine; try again next time
+    }
+    if (doomed > 0) {
+      cachedFloor = doomed;
+      // Best-effort persist: an unwritten floor understates what was lost,
+      // which is why the in-memory value is set first (this process stays
+      // honest even if the write fails).
+      await writeAtomic(floorPath(vaultPath), `${String(doomed)}\n`).catch(() => undefined);
+    }
+    // See note 2 in the header: a shrink check alone cannot detect a rename,
+    // so invalidate the byte checkpoint explicitly.
+    scannedBytes = 0;
+    maxScannedSeq = 0;
   };
 
   const appendChange = (input: AppendChangeInput): Promise<ProjectionChange> =>
@@ -189,6 +310,7 @@ export const createProjectionChangeFeed = (
         localWrittenAtMs: now(),
       };
       await mkdir(syncDir(vaultPath), { recursive: true });
+      await rotateIfNeeded();
       await writeFile(logPath(vaultPath), `${JSON.stringify(change)}\n`, {
         encoding: 'utf8',
         flag: 'a',
@@ -235,10 +357,9 @@ export const createProjectionChangeFeed = (
   // Serialised through the same chain as appendChange so the checkpoint
   // is never advanced against a mid-append file and never races a
   // concurrent poll.
-  const readSince = (
-    sinceSeq: number,
-  ): Promise<{ readonly cursor: number; readonly changed: readonly ProjectionChange[] }> =>
+  const readSince = (sinceSeq: number): Promise<ReadSinceResult> =>
     enqueue(async () => {
+      const retainedFromSeq = await ensureFloorLoaded();
       const path = logPath(vaultPath);
       let size: number;
       try {
@@ -247,13 +368,15 @@ export const createProjectionChangeFeed = (
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
           scannedBytes = 0;
           maxScannedSeq = 0;
-          return { cursor: await ensureSeqLoaded(), changed: [] };
+          return { cursor: await ensureSeqLoaded(), changed: [], retainedFromSeq };
         }
         throw error;
       }
 
-      // File shrank or was replaced (rotation/truncation/fresh vault):
-      // the checkpoint is no longer valid — re-scan from the start.
+      // File shrank or was replaced (truncation/fresh vault): the checkpoint is
+      // no longer valid — re-scan from the start. Rotation ALSO invalidates it,
+      // but rotateIfNeeded resets it directly rather than relying on this check
+      // (a rename need not shrink the file the next poll observes).
       if (size < scannedBytes) {
         scannedBytes = 0;
         maxScannedSeq = 0;
@@ -265,9 +388,21 @@ export const createProjectionChangeFeed = (
       const canResume = sinceSeq >= maxScannedSeq && scannedBytes > 0;
       const startOffset = canResume ? scannedBytes : 0;
 
+      // THE ROTATED GENERATION. Read it only on the FULL-SCAN path, and this is
+      // sound for exactly the reason the byte checkpoint is sound: on the resume
+      // path every rotated line has seq <= maxScannedSeq <= sinceSeq, so it
+      // would be filtered out anyway. A cold start or an old cursor takes the
+      // full-scan path, and that is precisely when the prefix matters — so "the
+      // reader reads both generations" holds whenever it can change an answer,
+      // without paying for the prefix on the hot steady-state poll.
+      const rotatedChanges = canResume
+        ? []
+        : await readRotatedChanges(rotatedLogPath(vaultPath), sinceSeq);
+
       if (startOffset >= size) {
-        // Nothing new since the checkpoint.
-        return { cursor: sinceSeq, changed: [] };
+        // Nothing new in the live file since the checkpoint — but a rotated
+        // prefix read above can still carry matches on the full-scan path.
+        return finishRead(rotatedChanges, sinceSeq, retainedFromSeq);
       }
 
       const length = size - startOffset;
@@ -288,11 +423,37 @@ export const createProjectionChangeFeed = (
       if (newScanned > scannedBytes) scannedBytes = newScanned;
       if (maxSeq > maxScannedSeq) maxScannedSeq = maxSeq;
 
-      changes.sort((a, b) => a.seq - b.seq);
-      const lastChange = changes.at(-1);
-      const cursor = lastChange === undefined ? sinceSeq : lastChange.seq;
-      return { cursor, changed: changes };
+      return finishRead([...rotatedChanges, ...changes], sinceSeq, retainedFromSeq);
     });
+
+  /** Parse the rotated generation in full (only ever on the full-scan path).
+   *  Bounded by the byte cap, so this is a ≤32 MB read, not an unbounded one. */
+  const readRotatedChanges = async (
+    path: string,
+    sinceSeq: number,
+  ): Promise<readonly ProjectionChange[]> => {
+    let raw: string;
+    try {
+      raw = await readFile(path, 'utf8');
+    } catch {
+      return []; // no rotated generation yet — the common case
+    }
+    return parseChunk(raw, sinceSeq).changes;
+  };
+
+  const finishRead = (
+    changes: readonly ProjectionChange[],
+    sinceSeq: number,
+    retainedFromSeq: number,
+  ): ReadSinceResult => {
+    const sorted = [...changes].sort((a, b) => a.seq - b.seq);
+    const lastChange = sorted.at(-1);
+    return {
+      cursor: lastChange === undefined ? sinceSeq : lastChange.seq,
+      changed: sorted,
+      retainedFromSeq,
+    };
+  };
 
   return { appendChange, readSince, __parsedLineCount: () => parsedLineCount };
 };

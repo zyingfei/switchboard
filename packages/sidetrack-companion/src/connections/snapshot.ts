@@ -4930,10 +4930,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       this.#lastSwapAtMs = Date.now();
       this.#lastGcUnlinked = result.unlinked.length;
     } else {
-      // Superseded: this shadow is an orphan we no longer write. Release the
-      // cross-process claim or ANOTHER process's GC would refuse to collect the
-      // file for as long as this pid lives (a keep is safe, a leak is not free).
-      clearShadowInFlight(this.#root, genId);
+      // Superseded: this shadow is an orphan we no longer write.
+      //
+      // MEASURED LEAK (live vault, 2026-07-29): this branch used to ONLY clear
+      // the marker, delegating the FILE to "another process's GC". On the
+      // dogfood vault that left THREE ~323 MB child-writer clones resident
+      // (their genIds carry this path's `<epochMs>-<pid><rev8>` shape) because
+      // gcOldGenerations only ever runs inside a *winning* casPublish — so the
+      // handoff had no guaranteed taker. The three parent-side shadow paths all
+      // discard their own lost-CAS shadow; the child must too.
+      //
+      // Safe by construction: a shadow that LOST the CAS is provably not the
+      // pointer target (the pointer names the winner), and
+      // discardShadowGeneration re-checks the live pointer anyway before
+      // unlinking. It also clears the marker, so this subsumes the old
+      // clear-only behaviour rather than replacing it.
+      discardShadowGeneration(this.#root, genId);
     }
   }
 
