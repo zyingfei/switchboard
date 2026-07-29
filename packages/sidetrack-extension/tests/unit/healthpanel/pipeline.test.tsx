@@ -33,10 +33,11 @@ const mkHealth = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-// The component now issues three GETs — /v1/system/health,
-// /v1/system/focus-health, /v1/system/hygiene-status — plus a POST to
+// The component issues four GETs — /v1/system/health,
+// /v1/system/focus-health, /v1/system/hygiene-status,
+// /v1/system/vault-ledger — plus a POST to
 // /v1/connections/ranker/retrain on "Force retrain". This helper routes
-// by URL so a test can stub the health body and let the two best-effort
+// by URL so a test can stub the health body and let the best-effort
 // drill-down fetches resolve to honest "no data" (so drills render the
 // unavailable state rather than fabricating values).
 const stubFetch = (
@@ -45,6 +46,7 @@ const stubFetch = (
     focus?: unknown;
     hygiene?: unknown;
     retrain?: unknown;
+    vaultLedger?: unknown;
   } = {},
 ) => {
   vi.stubGlobal(
@@ -76,6 +78,15 @@ const stubFetch = (
               gc: null,
               pageContent: null,
             },
+          }),
+        };
+      }
+      if (url.includes('/v1/system/vault-ledger')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: opts.vaultLedger ?? { asOf: null, availability: 'unavailable', ledger: null },
           }),
         };
       }
@@ -839,6 +850,163 @@ describe('HealthPanel pipeline strip', () => {
     });
     // 1h window also surfaces on the capture drill tiles.
     expect(screen.getByText('Captures · 1h')).toBeInTheDocument();
+  });
+
+  // THE VAULT LEDGER on the Vault drill. The old drill showed only the GC plan
+  // ("GC-tracked 10.7 MB / 1 file" against a 3.02 GB vault — 99.6% invisible).
+  // These tests pin that the ledger's families render with PLAIN-WORD statuses,
+  // that "not assessed" never renders as 0, and that v1 offers no delete.
+  const mkLedger = () => ({
+    asOf: '2026-07-29T22:00:00.000Z',
+    availability: 'ok' as const,
+    ledger: {
+      totalBytes: 2_902_798_877,
+      totalFiles: 5611,
+      reclaimableBytes: 0,
+      families: [
+        {
+          family: 'event-store',
+          bytes: 741_572_664,
+          files: 3,
+          status: 'unused-under-config',
+          reclaimable: 0,
+          reclaimableAssessed: false,
+          note: 'nothing reads it with the event store off',
+        },
+        {
+          family: 'connections-generations',
+          bytes: 679_747_584,
+          files: 6,
+          status: 'active',
+          reclaimable: 0,
+          reclaimableAssessed: true,
+          note: '2 generations resident',
+        },
+        {
+          family: 'sync-changelog',
+          bytes: 103_340_740,
+          files: 2,
+          status: 'unbounded',
+          reclaimable: 0,
+          reclaimableAssessed: false,
+          note: 'never rotated',
+        },
+        {
+          family: 'other',
+          bytes: 0,
+          files: 0,
+          status: 'empty',
+          reclaimable: 0,
+          reclaimableAssessed: true,
+          note: 'no files',
+        },
+      ],
+      generations: {
+        pointerGenId: 'gen-served',
+        entries: [
+          {
+            genId: 'gen-served',
+            bytes: 339_857_408,
+            disposition: 'pointer',
+            note: 'the served generation',
+          },
+          {
+            genId: 'gen-orphan',
+            bytes: 339_890_176,
+            disposition: 'orphan-collectable',
+            note: 'no in-flight marker and 300 min old',
+          },
+        ],
+        collectableCount: 1,
+        collectableBytes: 339_890_176,
+        sweepArmed: false,
+      },
+      eventLog: {
+        sampled: true,
+        shardsTotal: 170,
+        shardsSampled: 3,
+        totalBytes: 608_400_000,
+        types: [
+          { type: 'engagement.interval.observed', share: 0.584, estimatedBytes: 355_305_600 },
+          { type: 'capture.recorded', share: 0.268, estimatedBytes: 163_051_200 },
+        ],
+      },
+    },
+  });
+
+  it('renders the vault ledger families with plain-word statuses and no delete affordance', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(mkHealth(), { vaultLedger: mkLedger() });
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-vault')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-vault'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Where the space goes')).toBeInTheDocument();
+    });
+    // Concrete names, not internal family ids. "Graph generations" is the
+    // family row; the per-file drilldown below is titled "Generation files" so
+    // the two never read as a duplicated row.
+    expect(screen.getByText('Event store')).toBeInTheDocument();
+    expect(screen.getByText('Graph generations')).toBeInTheDocument();
+    expect(screen.getByText('Generation files')).toBeInTheDocument();
+    // Plain words for the typed statuses — "unused-under-config" means nothing
+    // to a reader.
+    expect(screen.getByText('unused with the event store off')).toBeInTheDocument();
+    expect(screen.getByText('grows without a retention policy')).toBeInTheDocument();
+    // An empty family is not rendered at all (files === 0).
+    expect(screen.queryByText('Everything else')).not.toBeInTheDocument();
+    // Reporting-only posture is stated, and there is no delete control anywhere.
+    expect(screen.getByText(/Reporting only/)).toBeInTheDocument();
+    for (const label of [/^Delete$/, /^Free up$/, /^Clean up$/, /^Sweep$/]) {
+      expect(screen.queryByRole('button', { name: label })).not.toBeInTheDocument();
+    }
+    // The old Revision inventory survives as a subsection, now labelled as the
+    // narrow subset it always was.
+    expect(screen.getByText('Revision inventory')).toBeInTheDocument();
+    expect(screen.getByText(/A small slice of the table above/)).toBeInTheDocument();
+  });
+
+  it('shows the orphaned-generation counter and says the sweep is reporting only', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(mkHealth(), { vaultLedger: mkLedger() });
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-vault')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-vault'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Orphaned graph generations')).toBeInTheDocument();
+    });
+    expect(screen.getByText(/1 abandoned · sweep off \(reporting only\)/)).toBeInTheDocument();
+    // Per-generation state in plain words.
+    expect(screen.getByText('serving now')).toBeInTheDocument();
+    expect(screen.getByText('orphaned — safe to collect')).toBeInTheDocument();
+    // Sampling is stated rather than presented as a measurement.
+    expect(screen.getByText(/Estimated from the 3 largest of 170 shards/)).toBeInTheDocument();
+  });
+
+  it('renders the ledger unavailable state instead of a fabricated zero', async () => {
+    vi.unstubAllGlobals();
+    stubFetch(mkHealth());
+
+    render(<HealthPanel onClose={vi.fn()} companionPort={17373} bridgeKey="key" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('hp-pipeline-stage-vault')).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('hp-pipeline-stage-vault'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Vault ledger unavailable/)).toBeInTheDocument();
+    });
+    // The ledger's own honesty line, distinct from the GC inventory's (which
+    // says "counts are not fabricated as zero" for its narrower surface).
+    expect(screen.getByText(/Sizes are not fabricated as zero/)).toBeInTheDocument();
   });
 
   it('flags the vault stage err when writable=false', async () => {

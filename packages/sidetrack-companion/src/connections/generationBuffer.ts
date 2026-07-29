@@ -616,6 +616,344 @@ export const residentGenerations = (connectionsDir: string): readonly string[] =
   }
 };
 
+// ---------------------------------------------------------------------------
+// PUBLISH-INDEPENDENT ORPHAN SURVEY + SWEEP (live P0 follow-up, 2026-07-29).
+//
+// MEASURED on the dogfood vault: `_BAC/connections/` held FOUR generation dbs
+// — the pointer target (292 MB) plus THREE orphans at ~323 MB each — i.e. ~970
+// MB of dead generations, while the UI's GC inventory reported "10.7 MB / 1
+// file". The orphans were minted AFTER the cross-process marker fix above
+// shipped, so the marker protocol was not the gap. Two distinct gaps were:
+//
+//   (1) MINTING. All three orphan filenames had the child-writer's genId shape
+//       (`<epochMs>-<pid><rev8>` from snapshot.ts's `#openHandleForRole`), and
+//       two shared one pid. The child-writer's SUPERSEDED branch in
+//       `#publishGeneration` cleared the in-flight marker but never unlinked
+//       the shadow FILE — unlike the three parent-side shadow paths, which all
+//       call discardShadowGeneration on a lost CAS. So every child drain whose
+//       CAS lost left a full ~323 MB clone behind, deliberately delegating
+//       collection to "some other process's GC".
+//
+//   (2) COLLECTING. gcOldGenerations is reachable ONLY from inside casPublish's
+//       *published* branch. Its predicate is already correct (a non-pointer,
+//       non-keep-set, not-live-marked generation IS unlinked) — but it only
+//       ever RUNS when some later publisher wins a CAS. On an idle vault, or a
+//       run of superseded CASes, or with double-buffer rolled back to legacy,
+//       nothing sweeps and nothing counts. Marker-less orphans were therefore
+//       unbounded in time, not unbounded in the predicate.
+//
+// This section adds the missing half: a survey that can run ANY time, off the
+// publish path (feeding the vault ledger + a health counter so orphans are
+// VISIBLE even when nothing is armed to delete them), and an armed sweep.
+//
+// THE ASYMMETRY IS UNCHANGED AND EXPLICIT: a false KEEP costs one stale file
+// that the next survey re-offers; a false COLLECT is the P0 "disk I/O error"
+// this whole mechanism exists to prevent (measurement (3) in the header —
+// unlinking a generation under an open readonly handle throws on its next
+// query). So the survey keeps, in addition to the pointer target:
+//   - the newest `keepRecentGenerations - 1` non-pointer generations by mtime,
+//     mirroring casPublish's pointer+seed keep-set. This is load-bearing, NOT
+//     decoration: casPublish deliberately retains the immediately-prior
+//     generation for the window in which a parent reader still holds a RETIRED
+//     handle on it, and a survey running outside the publish critical section
+//     cannot see that in-process handle set at all;
+//   - anything whose marker names ANY live pid — including OUR OWN, which is
+//     where this differs from foreignWriterHoldsGeneration. That function may
+//     ignore own-pid markers because it only ever runs inside casPublish, where
+//     the store's exact #inFlightShadowGenIds is unioned into the keep-set. The
+//     survey has no such keep-set, so an own-pid marker is the only evidence it
+//     gets that this process is mid-write on that generation;
+//   - anything younger than the grace window, marker or not.
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a marker-LESS generation must sit untouched before the survey will
+ * call it collectable.
+ *
+ * Sized off the longest legitimate writer lifetime, not tuned tight: a drain
+ * child is watchdogged at 10 min of no progress
+ * (DEFAULT_NO_PROGRESS_TIMEOUT_MS in connectionsReconcileChildClient.ts) and a
+ * parent overlay shadow lives milliseconds. 60 min is 6x the watchdog, which
+ * covers the only way a live writer can be marker-less: markShadowInFlight is
+ * best-effort (it must never fail the write that is about to happen), so a
+ * marker write that lost to ENOSPC/EPERM leaves a live shadow unclaimed. It
+ * also covers generations left by builds older than the marker protocol.
+ */
+export const GENERATION_ORPHAN_GRACE_MS = 60 * 60_000;
+
+/** Default number of newest generations the survey keeps regardless of markers:
+ *  the pointer target + one prior, matching casPublish's keep-set (pointer +
+ *  seed) and therefore the retired-handle window. */
+export const GENERATION_KEEP_RECENT_DEFAULT = 2;
+
+export type GenerationDisposition =
+  /** The generation the POINTER names. Never collectable, under any flag. */
+  | 'pointer'
+  /** Within the newest-N window — the retired-handle safety margin. */
+  | 'recent-prior'
+  /** A marker names a live pid (ours or another process's): a writer owns it. */
+  | 'live-marked'
+  /** Marker-less (or dead-pid-marked) but younger than the grace window. */
+  | 'orphan-young'
+  /** Marker-less or dead-pid-marked, aged past grace, outside the keep window. */
+  | 'orphan-collectable';
+
+export interface GenerationSurveyEntry {
+  readonly genId: string;
+  /** Bytes of the generation db PLUS its -wal/-shm siblings — what collecting
+   *  it actually reclaims. Siblings are never counted separately anywhere. */
+  readonly bytes: number;
+  /** Newest mtime across the db + siblings (ms epoch), or null if unstattable. */
+  readonly mtimeMs: number | null;
+  readonly disposition: GenerationDisposition;
+  /** The marker's pid, when a marker file exists and parses. Typed emptiness:
+   *  null = no marker (or unreadable), which is NOT the same as pid 0. */
+  readonly markerPid: number | null;
+  /** Whether that pid is currently alive. null when there is no marker pid. */
+  readonly markerPidAlive: boolean | null;
+  /** Human-readable WHY, for the ledger/health surface. */
+  readonly note: string;
+}
+
+export interface GenerationSurvey {
+  readonly producedAt: string;
+  /** POINTER contents at survey time, or null on a vault with no pointer. */
+  readonly pointerGenId: string | null;
+  readonly entries: readonly GenerationSurveyEntry[];
+  readonly totalBytes: number;
+  /** Sum of bytes over `orphan-collectable` entries only. */
+  readonly collectableBytes: number;
+  readonly collectableCount: number;
+  /** True when SIDETRACK_GENERATION_GC_SWEEP is armed (deletion permitted). */
+  readonly sweepArmed: boolean;
+}
+
+export interface SurveyGenerationsOptions {
+  readonly now?: Date;
+  readonly graceMs?: number;
+  readonly keepRecentGenerations?: number;
+  /** Extra gen ids to treat as live (the store's in-process handle set, when a
+   *  caller happens to have it). Purely additive caution. */
+  readonly keepAlive?: readonly string[];
+}
+
+/**
+ * Is deletion of surveyed orphans permitted?
+ *
+ * DEFAULTS OFF because this deletes data: the first landing reports the orphans
+ * in the vault ledger + a health counter so the operator can inspect the report
+ * (and cross-check against `residentGenerations`) BEFORE arming a sweep that
+ * unlinks ~323 MB files. Only '1'/'true' arms it — mirroring the repo rule that
+ * a destructive switch must be opted INTO, never merely not-opted-out-of.
+ */
+export const generationSweepArmed = (): boolean => {
+  const raw = process.env['SIDETRACK_GENERATION_GC_SWEEP'];
+  return raw === '1' || raw === 'true';
+};
+
+/** Bytes + newest mtime for a generation's db and its -wal/-shm siblings. */
+const generationFootprint = (
+  connectionsDir: string,
+  genId: string,
+): { readonly bytes: number; readonly mtimeMs: number | null } => {
+  const base = genFilePath(connectionsDir, genId);
+  let bytes = 0;
+  let mtimeMs: number | null = null;
+  for (const path of [base, `${base}-wal`, `${base}-shm`]) {
+    try {
+      const info = statSync(path);
+      bytes += info.size;
+      mtimeMs = mtimeMs === null ? info.mtimeMs : Math.max(mtimeMs, info.mtimeMs);
+    } catch {
+      /* sibling absent — the common case for a checkpoint-TRUNCATE'd gen */
+    }
+  }
+  return { bytes, mtimeMs };
+};
+
+/** Read a generation's marker without judging it. Returns typed emptiness:
+ *  null pid = no marker / unparseable, distinct from a dead pid. */
+const readMarker = (
+  connectionsDir: string,
+  genId: string,
+): { readonly pid: number | null; readonly atMs: number | null } => {
+  let raw: string;
+  try {
+    raw = readFileSync(inflightMarkerPath(connectionsDir, genId), 'utf8');
+  } catch {
+    return { pid: null, atMs: null };
+  }
+  const [pidText, atText] = raw.trim().split(/\s+/u);
+  const pid = Number.parseInt(pidText ?? '', 10);
+  const atMs = Number.parseInt(atText ?? '', 10);
+  return {
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+    atMs: Number.isFinite(atMs) ? atMs : null,
+  };
+};
+
+/**
+ * Classify every resident generation. READ-ONLY: stats files, reads markers and
+ * the pointer, deletes nothing. Cheap enough to run on a TTL — O(resident
+ * generations) stats, and a real vault holds 2-4 of them.
+ */
+export const surveyGenerations = (
+  connectionsDir: string,
+  options: SurveyGenerationsOptions = {},
+): GenerationSurvey => {
+  const now = options.now ?? new Date();
+  const graceMs = options.graceMs ?? GENERATION_ORPHAN_GRACE_MS;
+  const keepRecent = Math.max(1, options.keepRecentGenerations ?? GENERATION_KEEP_RECENT_DEFAULT);
+  const keepAlive = new Set(options.keepAlive ?? []);
+  const pointerGenId = readPointer(connectionsDir);
+
+  const measured = residentGenerations(connectionsDir).map((genId) => ({
+    genId,
+    ...generationFootprint(connectionsDir, genId),
+    marker: readMarker(connectionsDir, genId),
+  }));
+
+  // Newest-first by mtime. An unstattable generation (mtimeMs null) sorts LAST
+  // so it can never displace a real recent generation from the keep window —
+  // but it is also never AGED past grace below (unknown age ⇒ keep), so it
+  // simply survives as orphan-young. Absent ≠ zero ≠ unknown.
+  const byRecency = [...measured].sort((left, right) => (right.mtimeMs ?? -1) - (left.mtimeMs ?? -1));
+  const recentWindow = new Set<string>();
+  for (const row of byRecency) {
+    if (recentWindow.size >= keepRecent) break;
+    recentWindow.add(row.genId);
+  }
+  // The pointer target occupies one keep slot by definition, so it must be IN
+  // the window even if a fresher in-flight shadow out-ranks it by mtime.
+  if (pointerGenId !== null) recentWindow.add(pointerGenId);
+
+  const entries: GenerationSurveyEntry[] = measured
+    .map((row): GenerationSurveyEntry => {
+      const markerPid = row.marker.pid;
+      const markerPidAlive = markerPid === null ? null : processAlive(markerPid);
+      const ageMs = row.mtimeMs === null ? null : now.getTime() - row.mtimeMs;
+      const base = {
+        genId: row.genId,
+        bytes: row.bytes,
+        mtimeMs: row.mtimeMs,
+        markerPid,
+        markerPidAlive,
+      };
+      if (row.genId === pointerGenId) {
+        return { ...base, disposition: 'pointer', note: 'the served generation' };
+      }
+      if (keepAlive.has(row.genId)) {
+        return {
+          ...base,
+          disposition: 'live-marked',
+          note: 'held by a live handle in this process',
+        };
+      }
+      // A live marker wins over recency so the note explains the real reason.
+      // Unlike foreignWriterHoldsGeneration this honours OUR OWN pid too (see
+      // the section header): outside casPublish there is no in-process keep-set
+      // to fall back on. The 6h marker ceiling still applies as a pid-reuse
+      // backstop.
+      if (
+        markerPidAlive === true &&
+        (row.marker.atMs === null || now.getTime() - row.marker.atMs <= INFLIGHT_MARKER_MAX_AGE_MS)
+      ) {
+        return {
+          ...base,
+          disposition: 'live-marked',
+          note: `in-flight marker names live pid ${String(markerPid)}`,
+        };
+      }
+      if (recentWindow.has(row.genId)) {
+        return {
+          ...base,
+          disposition: 'recent-prior',
+          note: `within the newest ${String(keepRecent)} generations (retired-handle window)`,
+        };
+      }
+      if (ageMs === null || ageMs <= graceMs) {
+        return {
+          ...base,
+          disposition: 'orphan-young',
+          note:
+            ageMs === null
+              ? 'age unknown (unstattable) — kept'
+              : `unclaimed but only ${String(Math.round(ageMs / 60_000))} min old (grace ${String(
+                  Math.round(graceMs / 60_000),
+                )} min)`,
+        };
+      }
+      return {
+        ...base,
+        disposition: 'orphan-collectable',
+        note:
+          markerPid === null
+            ? `no in-flight marker and ${String(Math.round(ageMs / 60_000))} min old — abandoned`
+            : `marker names dead pid ${String(markerPid)}, ${String(
+                Math.round(ageMs / 60_000),
+              )} min old — abandoned`,
+      };
+    })
+    .sort((left, right) => left.genId.localeCompare(right.genId));
+
+  const collectable = entries.filter((entry) => entry.disposition === 'orphan-collectable');
+  return {
+    producedAt: now.toISOString(),
+    pointerGenId,
+    entries,
+    totalBytes: entries.reduce((sum, entry) => sum + entry.bytes, 0),
+    collectableBytes: collectable.reduce((sum, entry) => sum + entry.bytes, 0),
+    collectableCount: collectable.length,
+    sweepArmed: generationSweepArmed(),
+  };
+};
+
+/**
+ * Survey, then — only if SIDETRACK_GENERATION_GC_SWEEP is armed — unlink the
+ * `orphan-collectable` generations (db + -wal/-shm + any file-less marker).
+ *
+ * Runs the whole survey→unlink sequence under the cross-process publish lock so
+ * it cannot interleave with a publisher's clone/checkpoint/flip: without the
+ * lock a shadow created between our readdir and our unlink could be collected
+ * before its marker landed. Same lock every publisher contends on, so this is
+ * genuinely serialized against them, not merely against other sweeps.
+ *
+ * Returns the survey (always) plus what was collected (empty when disarmed), so
+ * a caller can report the orphans either way. `force` exists for tests only —
+ * production arms via the env flag.
+ */
+export const sweepOrphanGenerations = (
+  connectionsDir: string,
+  options: SurveyGenerationsOptions & { readonly force?: boolean } = {},
+): {
+  readonly survey: GenerationSurvey;
+  readonly collected: readonly string[];
+  readonly collectedBytes: number;
+} =>
+  withPublishLock(connectionsDir, () => {
+    const survey = surveyGenerations(connectionsDir, options);
+    const armed = options.force === true || survey.sweepArmed;
+    if (!armed) return { survey, collected: [] as readonly string[], collectedBytes: 0 };
+    const collected: string[] = [];
+    let collectedBytes = 0;
+    // Re-read the pointer inside the lock as the same defensive invariant
+    // gcOldGenerations keeps: never unlink what the pointer names, whatever the
+    // survey concluded a moment ago.
+    const livePointer = readPointer(connectionsDir);
+    for (const entry of survey.entries) {
+      if (entry.disposition !== 'orphan-collectable') continue;
+      if (entry.genId === livePointer) continue;
+      const base = genFilePath(connectionsDir, entry.genId);
+      safeUnlink(base);
+      safeUnlink(`${base}-wal`);
+      safeUnlink(`${base}-shm`);
+      clearShadowInFlight(connectionsDir, entry.genId);
+      collected.push(entry.genId);
+      collectedBytes += entry.bytes;
+    }
+    return { survey, collected, collectedBytes };
+  });
+
 export const generationDbPath = (connectionsDir: string, genId: string): string =>
   genFilePath(connectionsDir, genId);
 

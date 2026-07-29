@@ -94,6 +94,7 @@ import { loadOrCreateReplicaKeyPair } from '../sync/replicaKeyPair.js';
 import type { LogTransport } from '../sync/transport.js';
 import { enforceRetention } from '../vault/auditRetention.js';
 import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
+import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -122,6 +123,13 @@ export interface HygieneStatus {
   lastDerivedRevisionGcAt?: string;
   lastVacuumAt?: string;
   lastVacuumDurationMs?: number;
+  /** Last time the publish-independent generation survey ran. */
+  lastGenerationSurveyAt?: string;
+  /** Orphaned generations the last survey found. 0 is a real measurement. */
+  lastGenerationOrphanCount?: number;
+  lastGenerationOrphanBytes?: number;
+  /** How many the sweep actually collected — always 0 while disarmed. */
+  lastGenerationSweepCollected?: number;
 }
 
 export const scheduleSqliteVacuumGc = (
@@ -483,6 +491,24 @@ export const startCompanion = async (
         hygieneStatus.lastDerivedRevisionGcAt = new Date().toISOString();
       } catch {
         // Best-effort — a failed sweep must never crash the companion.
+      }
+      // GENERATION ORPHAN SURVEY (live P0, 2026-07-29). The connections
+      // generation GC previously ran ONLY inside a winning casPublish, so on an
+      // idle vault (or a run of superseded CASes) nothing ever collected an
+      // abandoned shadow and nothing counted it: three ~323 MB orphans sat
+      // resident while the storage surface reported 10.7 MB. Surveying here
+      // makes collection publish-INDEPENDENT and, more importantly, makes the
+      // orphans VISIBLE — the survey always runs and always records its count;
+      // the sweep only deletes when SIDETRACK_GENERATION_GC_SWEEP is armed.
+      // Hourly is the right cadence: an orphan costs disk, not correctness.
+      try {
+        const result = sweepOrphanGenerations(join(options.vaultPath, '_BAC', 'connections'));
+        hygieneStatus.lastGenerationSurveyAt = result.survey.producedAt;
+        hygieneStatus.lastGenerationOrphanCount = result.survey.collectableCount;
+        hygieneStatus.lastGenerationOrphanBytes = result.survey.collectableBytes;
+        hygieneStatus.lastGenerationSweepCollected = result.collected.length;
+      } catch {
+        // Best-effort — a survey must never crash the companion.
       }
     };
     const derivedRevisionGc = setInterval(

@@ -130,6 +130,7 @@ import {
   writePageContentTombstoned,
 } from '../page-content/store.js';
 import { gcInventoryCached } from '../gc/plan.js';
+import { summarizeVaultLedger, vaultLedgerCached } from '../gc/vaultLedger.js';
 import { readHealthHistory } from '../connections/healthHistory.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
@@ -6431,6 +6432,19 @@ const routes: readonly RouteDefinition[] = [
       // size+mtime, so a warm read is two stats. Best-effort — a measurement
       // must never be able to degrade the health probe it rides on.
       const laneCalibration = await lanePrequentialSummary(vaultRoot).catch(() => null);
+      // VAULT LEDGER SUMMARY. Which families own the disk, and the orphaned-
+      // generation counter (the P0: three ~323 MB abandoned generation dbs sat
+      // resident while the only storage surface reported 10.7 MB). Read from the
+      // SAME TTL cache the /v1/system/vault-ledger route uses — never a walk on
+      // this path — and omitted entirely rather than faked when the first walk
+      // has not landed or the flag is off.
+      const vaultLedgerCache = await vaultLedgerCached(vaultRoot).catch(() => null);
+      const vaultLedger =
+        vaultLedgerCache === null ||
+        vaultLedgerCache.value === null ||
+        (vaultLedgerCache.availability !== 'ok' && vaultLedgerCache.availability !== 'stale')
+          ? null
+          : summarizeVaultLedger(vaultLedgerCache.value, vaultLedgerCache.availability);
       // NOTE: the companion no longer hosts a node-runtime title-synthesis
       // generation lane (onnxruntime-node q4 unsupported / int8 unusable —
       // measured). Generation now runs in the extension panel via WebGPU
@@ -6447,6 +6461,7 @@ const routes: readonly RouteDefinition[] = [
             // fake zero) when the summary could not be computed — typed
             // emptiness, not a fabricated measurement.
             ...(laneCalibration === null ? {} : { laneCalibration }),
+            ...(vaultLedger === null ? {} : { vaultLedger }),
           },
         },
       ];
@@ -6511,6 +6526,37 @@ const routes: readonly RouteDefinition[] = [
                     count: overCollapsedRecords.value.length,
                     samples: overCollapsedRecords.value.slice(0, 5),
                   },
+          },
+        },
+      ];
+    },
+  },
+  {
+    // THE VAULT LEDGER. Every byte under `_BAC`, classified, reconciling to the
+    // on-disk total — the answer `/v1/system/hygiene-status` structurally
+    // cannot give (it reports the GC *plan*, which on the live vault was 10.7
+    // MB of 3.02 GB). Read-only: no delete affordance in this landing.
+    //
+    // Served from the same TTL'd background-refreshed cache idiom as the
+    // hygiene sibling: the walk is ~5.6k stats plus a sampled log read (190ms
+    // measured on the live vault) and must not sit on a request. O(1) here.
+    // `disabled` is a distinct availability from `unavailable` — an operator who
+    // set SIDETRACK_VAULT_LEDGER=0 must not read that as a broken walk.
+    method: 'GET',
+    pattern: /^\/v1\/system\/vault-ledger$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const ledger = await vaultLedgerCached(vaultRoot);
+      return [
+        200,
+        {
+          data: {
+            asOf: ledger.asOf,
+            availability: ledger.availability,
+            // Typed emptiness: `null` is "not computed yet / disabled", never
+            // an empty vault. The availability field says which.
+            ledger: ledger.value,
           },
         },
       ];
@@ -7305,6 +7351,14 @@ const routes: readonly RouteDefinition[] = [
           200,
           {
             cursor: String(result.cursor),
+            // GAP HONESTY (changelog rotation, 2026-07-29). The feed now rotates
+            // at a byte cap keeping one prior generation; a client whose `since`
+            // predates what is still retained lost changes it will never be
+            // handed. `resyncRequired` tells it to fall back to the full
+            // /v1/review-drafts listing instead of trusting `changed` to be
+            // complete. `retainedFromSeq` 0 means nothing was ever rotated away.
+            retainedFromSeq: String(result.retainedFromSeq),
+            resyncRequired: result.retainedFromSeq > 0 && safeSince < result.retainedFromSeq,
             changed: filtered.map((change) => ({
               threadId: change.aggregateId,
               vector: change.vector,
