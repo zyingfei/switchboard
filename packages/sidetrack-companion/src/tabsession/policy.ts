@@ -61,6 +61,42 @@ const SIMILARITY_LONE_AGREEMENT_MAX = 0.2;
 // facing line — 0.82 not 0.8231. Trailing-zero trim keeps "1.2" not "1.20".
 const num = (value: number): string => Number(value.toFixed(2)).toString();
 
+/**
+ * How many corroborating evidence channels this pick must show.
+ *
+ * EXPORTED so the lane-corroboration promotion (tabsession/laneCorroboration.ts)
+ * can report the bar it is clearing without re-deriving the lift rule. Two
+ * copies of this rule would drift the moment the guard is tuned, and the
+ * drifted copy would be the one printing the number a human reads.
+ *
+ * The rule itself (unchanged): a similarity-dominant pick with weak agreement
+ * and no corroborating signal (no graph path, no topic cluster) is frequently a
+ * lexical/site-skeleton false-friend — e.g. two unrelated items sharing an
+ * aggregator platform's URL skeleton. Demand a second corroborating source
+ * before surfacing such a pick, regardless of raw score.
+ *
+ * Keyed off whether similarity is the top RAW evidence channel, NOT off
+ * `dominantSource`. The diagnostic label is the argmax of the WEIGHTED
+ * contribution, where a small nonzero pprScore (×5.0 weight) can out-rank a
+ * genuinely-thin similarity family and flip the label to 'ppr' — which is
+ * exactly the aggregator false-friend shape this guard exists to catch (a
+ * shared-platform link graph yields a tiny PPR alongside the skeleton-match
+ * similarity). Re-keying off the raw simTopScore dominance keeps the guard
+ * firing on that flip case while never firing on a genuinely PPR- or
+ * cluster-dominant pick.
+ */
+export const requiredCorroborationFor = (
+  top: FusedCandidate,
+  mode: AttributionPolicyMode = 'balanced',
+): number => {
+  const policy = POLICY[mode];
+  const similarityIsTopRawChannel =
+    top.simTopScore >= top.pprScore && top.simTopScore >= top.clusterPosterior;
+  return similarityIsTopRawChannel && top.simAgreement <= SIMILARITY_LONE_AGREEMENT_MAX
+    ? Math.max(policy.corroboration, 2)
+    : policy.corroboration;
+};
+
 export const decideAttribution = (
   candidates: readonly FusedCandidate[],
   mode: AttributionPolicyMode = 'balanced',
@@ -100,12 +136,7 @@ export const decideAttribution = (
   // similarity). Re-keying off the raw simTopScore dominance keeps the guard
   // firing on that flip case while never firing on a genuinely PPR- or
   // cluster-dominant pick.
-  const similarityIsTopRawChannel =
-    top.simTopScore >= top.pprScore && top.simTopScore >= top.clusterPosterior;
-  const requiredCorroboration =
-    similarityIsTopRawChannel && top.simAgreement <= SIMILARITY_LONE_AGREEMENT_MAX
-      ? Math.max(policy.corroboration, 2)
-      : policy.corroboration;
+  const requiredCorroboration = requiredCorroborationFor(top, mode);
   if (
     top.rawFusionLogit >= policy.auto &&
     margin >= policy.margin &&

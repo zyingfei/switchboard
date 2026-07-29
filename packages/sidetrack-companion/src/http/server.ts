@@ -207,6 +207,17 @@ import {
   type ContentLaneStore,
 } from '../tabsession/contentLane.js';
 import { applyLaneFallbackGuess } from '../tabsession/laneFallback.js';
+import { declineMemoryFromMerged, type DeclineLookup } from '../tabsession/declineMemory.js';
+import {
+  applyLaneCorroboration,
+  laneCorroborationEnabled,
+} from '../tabsession/laneCorroboration.js';
+import {
+  lanePrequentialSummary,
+  recordLanePredictions,
+  type LanePredictionInput,
+  type LanePrequentialSummary,
+} from '../tabsession/lanePrequential.js';
 import {
   currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
@@ -2969,6 +2980,81 @@ const buildContentLaneDeps = async (
   };
 };
 
+// ---- the decision loop's serve-time context (review E1 + E6) -----------
+//
+// Two folded lookups the lane seam needs, loaded ONCE per batch:
+//   - declines: the user's "Not in any stream" answers. Consulted by BOTH the
+//     lane-fallback (never guess on a page the user refused) and the
+//     corroboration promotion (a refusal vetoes it).
+//   - calibration: each lane's MEASURED precision@1, the evidence the
+//     promotion self-gates on. Absent ⇒ no promotion, by design.
+//
+// NO EXTRA SCAN. The declines fold from the `merged` array this route has
+// ALREADY read (memoized on the same log signature the enrichment folds use),
+// not from a second readMerged — the batch path's one-scan promise is
+// load-bearing and asserted by visitsRoutes.test.ts. The caller must therefore
+// pass an array that includes USER_ORGANIZED_ITEM; both branches do (see the
+// typed reads above). The calibration is a file read and is only paid when the
+// promotion flag that consumes it is actually on.
+//
+// Both degrade to null on any failure: the fallback then behaves exactly as it
+// did before this feature, and the promotion refuses — the safe direction.
+interface LaneDecisionContext {
+  readonly declines: DeclineLookup | null;
+  readonly calibration: LanePrequentialSummary | null;
+}
+
+const laneDecisionContextFor = async (
+  vaultRoot: string,
+  mergedEvents: readonly AcceptedEvent[],
+  logSignature: string,
+): Promise<LaneDecisionContext> => {
+  let declines: DeclineLookup | null = null;
+  try {
+    declines = declineMemoryFromMerged(vaultRoot, logSignature, mergedEvents);
+  } catch {
+    declines = null;
+  }
+  const calibration = laneCorroborationEnabled()
+    ? await lanePrequentialSummary(vaultRoot).catch(() => null)
+    : null;
+  return { declines, calibration };
+};
+
+// The two decision-layer transforms, in the order they must run: DECIDE first
+// (corroboration may promote a held pick), then FALL BACK (only reachable when
+// fusion produced nothing at all). Their trigger conditions are disjoint on
+// `gate.reason`, so the order cannot change an outcome — it is written this way
+// because that is the order a reader should understand them in.
+//
+// Both run on the SERVED copy, after the resolver-cache write, exactly like the
+// lanes they read. Nothing either produces is persisted or replayed.
+const applyLaneDecisions = (
+  result: UrlResolutionResult,
+  canonicalUrl: string,
+  laneContext: LaneDecisionContext,
+): UrlResolutionResult =>
+  applyLaneFallbackGuess(
+    applyLaneCorroboration(result, {
+      canonicalUrl,
+      calibration: laneContext.calibration,
+      declines: laneContext.declines,
+    }),
+    { canonicalUrl, declines: laneContext.declines },
+  );
+
+// Fire-and-forget the prequential prediction append. Deliberately NOT awaited on
+// the response path: it is a measurement, and a slow or failing disk must cost
+// a data point rather than a resolve. One write per batch (see
+// recordLanePredictions), not one per URL.
+const recordLanePredictionsBestEffort = (
+  vaultRoot: string,
+  entries: readonly LanePredictionInput[],
+): void => {
+  if (entries.length === 0) return;
+  void recordLanePredictions(vaultRoot, entries).catch(() => undefined);
+};
+
 const candidateSourceWeight = (sources: readonly string[]): number => {
   if (sources.includes('same_canonical_url')) return 0.9;
   if (sources.includes('opener_chain')) return 0.85;
@@ -5419,8 +5505,21 @@ const routes: readonly RouteDefinition[] = [
                 (event) =>
                   event.type === ENTITY_TITLE_ENRICHED ||
                   event.type === ENTITY_CONTENT_ENRICHED ||
-                  event.type === ENTITY_ENRICHMENT_RETRACTED,
-                [ENTITY_TITLE_ENRICHED, ENTITY_CONTENT_ENRICHED, ENTITY_ENRICHMENT_RETRACTED],
+                  event.type === ENTITY_ENRICHMENT_RETRACTED ||
+                  // Decline memory (review E6) folds from THIS array. Omitting
+                  // the type here would fold an empty decline set and memoize
+                  // it under the real log signature — the same silent
+                  // half-applied fold the enrichment types above were added to
+                  // prevent — and the lane-fallback would resume guessing on
+                  // pages the user refused. Sparse family, typed index read,
+                  // still ONE scan.
+                  event.type === USER_ORGANIZED_ITEM,
+                [
+                  ENTITY_TITLE_ENRICHED,
+                  ENTITY_CONTENT_ENRICHED,
+                  ENTITY_ENRICHMENT_RETRACTED,
+                  USER_ORGANIZED_ITEM,
+                ],
               )
             : await readEventsFromStoreOrLog(
                 context,
@@ -5601,6 +5700,17 @@ const routes: readonly RouteDefinition[] = [
         const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
         if (contentDeps.guessLanesEnabled && contentLaneEnabled()) {
           const contentStartMs = Date.now();
+          // Decision-layer context (declines + lane calibration), folded once
+          // for the whole batch from the events already read — see
+          // laneDecisionContextFor.
+          const laneContext = await laneDecisionContextFor(
+            requireVaultRoot(context),
+            merged,
+            batchEnrichSig,
+          );
+          // Prequential predictions accumulate across the loop and are written
+          // in ONE append after it.
+          const predictions: LanePredictionInput[] = [];
           const joinSnapshot =
             missedSnapshot ??
             (Object.keys(results).length > 0
@@ -5637,16 +5747,24 @@ const routes: readonly RouteDefinition[] = [
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
-              // Lane-fallback guess. Only when fusion produced NOTHING and the
-              // gate says so ('no-candidates'): the displayed pick is filled
-              // from the content + ai lanes just appended, marked unconfirmed.
-              // Never overrides real fusion output, never touches the decision
-              // action/margin (so auto-apply is unreachable from here), and —
-              // like the lanes themselves — runs AFTER the resolver-cache write
-              // above, so nothing synthesized is ever persisted.
-              results[canonicalUrl] = applyLaneFallbackGuess(results[canonicalUrl]!);
+              // The decision layer over the lanes just appended: the
+              // corroboration promotion (flagged OFF by default) and the
+              // lane-fallback guess, both decline-vetoed. See
+              // applyLaneDecisions — and note that, exactly like the lanes
+              // themselves, this runs AFTER the resolver-cache write above, so
+              // nothing it produces is ever persisted.
+              results[canonicalUrl] = applyLaneDecisions(
+                results[canonicalUrl]!,
+                canonicalUrl,
+                laneContext,
+              );
+              // Record what every lane predicted BEFORE the user answers. The
+              // lanes are read post-decision so the recorded pick is the one
+              // that was actually served.
+              predictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
             }
           }
+          recordLanePredictionsBestEffort(requireVaultRoot(context), predictions);
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
           // pass duration + how many URLs it decorated — so the ≤~50ms indexed /
           // ≤~450ms embed-race budget is observable on the box, PII-free.
@@ -5687,6 +5805,15 @@ const routes: readonly RouteDefinition[] = [
       gistLookup = gistLookupFromMerged(requireVaultRoot(context), fallbackEnrichSig, merged);
       const fallbackTombstones = await domainTombstoneSetFor(context);
       const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
+      // Decision-layer context + prediction buffer — see the sqlite-store path
+      // above. Same call, same position, so the two batch-resolve paths decide
+      // and measure identically.
+      const fallbackLaneContext = await laneDecisionContextFor(
+        requireVaultRoot(context),
+        merged,
+        fallbackEnrichSig,
+      );
+      const fallbackPredictions: LanePredictionInput[] = [];
       for (const canonicalUrl of uniqueUrls) {
         const synthesizedForUrl = synthesizedTitleFor(canonicalUrl);
         const result = await resolveUrlAttributionArmed({
@@ -5713,11 +5840,17 @@ const routes: readonly RouteDefinition[] = [
           { canonicalUrl, snapshot, title, gist },
           contentDeps,
         );
-        // Lane-fallback guess — see the sqlite-store path above for the full
-        // boundary. Same call, same position (after both lanes are appended),
-        // so the two batch-resolve paths serve identically.
-        results[canonicalUrl] = applyLaneFallbackGuess(results[canonicalUrl]!);
+        // Decision layer (corroboration promotion + lane-fallback guess, both
+        // decline-vetoed) — see the sqlite-store path above for the full
+        // boundary. Same call, same position (after both lanes are appended).
+        results[canonicalUrl] = applyLaneDecisions(
+          results[canonicalUrl]!,
+          canonicalUrl,
+          fallbackLaneContext,
+        );
+        fallbackPredictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
       }
+      recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions);
       return [
         200,
         {
@@ -6225,6 +6358,16 @@ const routes: readonly RouteDefinition[] = [
           ? context.connectionsStore.doubleBufferDiagnostics()
           : undefined;
       const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
+      // LANE CALIBRATION (review E1). Per-lane measured precision@1 over the
+      // trailing prequential window — the number that decides whether lane
+      // agreement is allowed to count as corroboration, and the first honest
+      // answer this system has ever had to "how good is the content lane?".
+      //
+      // Read live (outside the health TTL) for the same reason `reliability` is:
+      // it decays on its own window and is memoized on the prediction files'
+      // size+mtime, so a warm read is two stats. Best-effort — a measurement
+      // must never be able to degrade the health probe it rides on.
+      const laneCalibration = await lanePrequentialSummary(vaultRoot).catch(() => null);
       // NOTE: the companion no longer hosts a node-runtime title-synthesis
       // generation lane (onnxruntime-node q4 unsupported / int8 unusable —
       // measured). Generation now runs in the extension panel via WebGPU
@@ -6235,7 +6378,13 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
-          data: withReliabilityHealthSection(baseReport, reliability),
+          data: {
+            ...withReliabilityHealthSection(baseReport, reliability),
+            // Additive, read-only. Omitted entirely (rather than sent as a
+            // fake zero) when the summary could not be computed — typed
+            // emptiness, not a fabricated measurement.
+            ...(laneCalibration === null ? {} : { laneCalibration }),
+          },
         },
       ];
     },

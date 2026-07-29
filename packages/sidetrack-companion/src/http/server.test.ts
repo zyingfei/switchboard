@@ -2242,6 +2242,28 @@ describe('companion HTTP server', () => {
     ).data?.reliability;
     expect(reliability?.resolveCanary).toBeDefined();
     expect(typeof reliability?.resolveCanary?.status).toBe('string');
+
+    // LANE CALIBRATION (review E1). Same closing-the-loop argument as the
+    // reliability section above: the per-lane measured precision@1 is what
+    // decides whether lane agreement may count as corroboration, so it has to
+    // survive the real envelope. On this empty vault nothing has been predicted
+    // or filed, so the honest answer is an OK section with zero scored pairs
+    // and an empty lanes array — never an invented precision.
+    const laneCalibration = (
+      health.body as {
+        readonly data?: {
+          readonly laneCalibration?: {
+            readonly status?: unknown;
+            readonly scored?: unknown;
+            readonly lanes?: readonly unknown[];
+          };
+        };
+      }
+    ).data?.laneCalibration;
+    expect(laneCalibration).toBeDefined();
+    expect(laneCalibration?.status).toBe('ok');
+    expect(laneCalibration?.scored).toBe(0);
+    expect(laneCalibration?.lanes).toEqual([]);
   });
 
   it('serves the drain-time workGraph health artifact instead of the live compute', async () => {
