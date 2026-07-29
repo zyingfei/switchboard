@@ -35,6 +35,20 @@
 // "companion went idle with a queued write" case, and it re-arms while any
 // request is in flight so it can never reintroduce the thing we just removed.
 //
+// WHAT IT MAY NOT CAPTURE (added 2026-07-29, after the "disk I/O error" P0).
+// Deferral moves the write across an arbitrary amount of wall clock, and the
+// connections store publishes a NEW sqlite generation (new file, pointer flip,
+// old file unlinked) whenever a drain or an overlay lands. So a queued entry may
+// well be drained on the far side of a publish. It therefore stores a
+// `ResolverCacheWriterSource` — a thunk resolved at flush time — and never a
+// writer bound to a particular store or, worse, a particular `Database`. Binding
+// early would mean writing through a handle whose file no longer exists, which
+// bun:sqlite reports as the literal message "disk I/O error": not a lock, not
+// corruption, so nothing in the stack retries it.
+// (The resolver cache itself lives in its own `resolver-cache.db`, which is NOT
+// generation-swapped — so today's writer is safe either way. The thunk is what
+// keeps it safe when someone later points this queue at a store that is.)
+//
 // KILL SWITCH: SIDETRACK_RESOLVER_CACHE_DEFER=0 restores the synchronous
 // in-request write (default ON, same '0'/'false' convention as every other
 // switch in this package).
@@ -57,8 +71,28 @@ export type ResolverCacheWriter = (
   result: unknown,
 ) => Promise<void>;
 
+/**
+ * Late-bound writer lookup. Called at FLUSH time, never at enqueue time, and
+ * this indirection is load-bearing rather than stylistic.
+ *
+ * THE RULE IT ENFORCES (2026-07-29 "disk I/O error" P0). Anything this queue
+ * holds outlives the request that queued it and can be drained on the other
+ * side of a connections-generation publish. If an enqueue captured a sqlite
+ * `Database` — or any object that had already resolved one — the flush would
+ * write through a handle whose file may have been unlinked/rename-swapped by
+ * the publish, and bun:sqlite answers that with the literal message "disk I/O
+ * error": not a lock, not corruption, so nothing retries it. A thunk makes it
+ * impossible to express that mistake at the call site: the store (and through
+ * it the live handle) is looked up when the write actually happens.
+ *
+ * Return null when there is no store to write to (shut down / non-sqlite
+ * backend); the queued entry is dropped, which the cache contract already
+ * permits — a lost cache write costs one recompute.
+ */
+export type ResolverCacheWriterSource = () => ResolverCacheWriter | null;
+
 interface PendingWrite {
-  readonly writer: ResolverCacheWriter;
+  readonly writerSource: ResolverCacheWriterSource;
   readonly visitId: string;
   readonly snapshotRevision: string;
   readonly result: unknown;
@@ -89,6 +123,7 @@ let flushInFlight: Promise<void> | null = null;
 let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
 let droppedOverflow = 0;
 let writeFailures = 0;
+let droppedNoWriter = 0;
 
 const pendingKey = (visitId: string, snapshotRevision: string): string =>
   `${visitId}\u0000${snapshotRevision}`;
@@ -98,7 +133,7 @@ const pendingKey = (visitId: string, snapshotRevision: string): string =>
  * awaits, never touches sqlite on the caller's tick.
  */
 export const queueResolverCacheWrite = (
-  writer: ResolverCacheWriter,
+  writerSource: ResolverCacheWriterSource,
   visitId: string,
   snapshotRevision: string,
   result: unknown,
@@ -108,7 +143,7 @@ export const queueResolverCacheWrite = (
     droppedOverflow += 1;
     return;
   }
-  pending.set(key, { writer, visitId, snapshotRevision, result });
+  pending.set(key, { writerSource, visitId, snapshotRevision, result });
   armFallbackFlush();
 };
 
@@ -148,16 +183,28 @@ const drainPendingWrites = async (): Promise<void> => {
     if (next.done === true) return;
     const [key, entry] = next.value;
     pending.delete(key);
-    try {
-      await entry.writer(entry.visitId, entry.snapshotRevision, entry.result);
-    } catch (error) {
-      // A failed cache write is a recompute next time, nothing more. It must
-      // NEVER propagate: this runs detached from any request, so a throw here
-      // would surface as an unhandled rejection and (under some Bun versions)
-      // take the process with it.
-      writeFailures += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[resolver-cache] deferred write failed: ${message}`);
+    // Resolve the writer HERE, on the flush tick, so it binds to whatever store
+    // (and therefore whatever sqlite handle) is current NOW — not to whatever
+    // was current when the request that queued this entry was still running.
+    // See ResolverCacheWriterSource for why that distinction is a P0 and not a
+    // stylistic preference.
+    const writer = entry.writerSource();
+    if (writer === null) {
+      // No store to write to any more (shutdown / non-sqlite backend). Dropping
+      // is the contract: a lost cache write costs one recompute.
+      droppedNoWriter += 1;
+    } else {
+      try {
+        await writer(entry.visitId, entry.snapshotRevision, entry.result);
+      } catch (error) {
+        // A failed cache write is a recompute next time, nothing more. It must
+        // NEVER propagate: this runs detached from any request, so a throw here
+        // would surface as an unhandled rejection and (under some Bun versions)
+        // take the process with it.
+        writeFailures += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[resolver-cache] deferred write failed: ${message}`);
+      }
     }
     // Between writes, not just between batches: N queued upserts must not
     // reassemble into the single long tick this module exists to break up.
@@ -188,12 +235,14 @@ export const flushResolverCacheWrites = async (): Promise<void> => {
 /** Queue depth — for tests and for a future /v1/status field. */
 export const pendingResolverCacheWriteCount = (): number => pending.size;
 
-/** Diagnostics: writes dropped on overflow, and writes that threw. */
+/** Diagnostics: writes dropped on overflow, writes that threw, and writes
+ *  dropped because the flush found no live store to bind to. */
 export const resolverCacheDeferStats = (): {
   readonly pending: number;
   readonly droppedOverflow: number;
   readonly writeFailures: number;
-} => ({ pending: pending.size, droppedOverflow, writeFailures });
+  readonly droppedNoWriter: number;
+} => ({ pending: pending.size, droppedOverflow, writeFailures, droppedNoWriter });
 
 /** Test seam: module-level state is process-global, so tests must reset it. */
 export const __resetResolverCacheDeferQueue = (): void => {
@@ -201,6 +250,7 @@ export const __resetResolverCacheDeferQueue = (): void => {
   flushInFlight = null;
   droppedOverflow = 0;
   writeFailures = 0;
+  droppedNoWriter = 0;
   if (fallbackTimer !== null) {
     clearTimeout(fallbackTimer);
     fallbackTimer = null;

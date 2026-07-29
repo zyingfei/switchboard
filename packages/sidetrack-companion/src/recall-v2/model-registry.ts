@@ -23,6 +23,8 @@
 //
 // See docs/recall-v2-hybrid-rerank-design.md §D7.
 
+import { RECALL_MODEL } from '../recall/modelManifest.js';
+
 export interface RetrievalModelProfile {
   readonly modelId: string;
   readonly embeddingDim: number;
@@ -66,14 +68,22 @@ export interface RetrievalModelProfile {
   readonly calibratedAt: string;
 }
 
+// E2 (single model identity). The production entry was keyed and typed with
+// its own copies of `'Xenova/multilingual-e5-small'` and `384`, so a manifest
+// swap would not have failed anything — `profileFor` would simply have missed,
+// warned once, and returned the "safe default" that DISABLES the semantic
+// gap-gate. That is a silent retrieval-quality change dressed as a fallback.
+// Deriving the key and the dim from the manifest makes the miss impossible for
+// the production model; a genuinely new model still lands on the default (and
+// still needs calibrating), which is the intended behaviour.
 const KNOWN_MODELS: Record<string, RetrievalModelProfile> = {
   // Production embedder. Calibrated 2026-05-26 from a measurement
   // pass over 8 queries × top-50 candidates on the dogfood vault
   // (~1300 timeline-visit / ~60 page-content / ~7800 chat-turn /
   // 1275 vectors).
-  'Xenova/multilingual-e5-small': {
-    modelId: 'Xenova/multilingual-e5-small',
-    embeddingDim: 384,
+  [RECALL_MODEL.modelId]: {
+    modelId: RECALL_MODEL.modelId,
+    embeddingDim: RECALL_MODEL.embeddingDim,
     semGapNoiseFloor: 0.03,
     semGapFullSignal: 0.07,
     semAbsoluteSignalFloor: 0.6,
@@ -112,7 +122,7 @@ export const profileFor = (modelId: string | undefined): RetrievalModelProfile =
   }
   return {
     modelId: baseId,
-    embeddingDim: 384,
+    embeddingDim: RECALL_MODEL.embeddingDim,
     semGapNoiseFloor: 0,
     semGapFullSignal: 0.0001,
     semAbsoluteSignalFloor: 0, // pass-through

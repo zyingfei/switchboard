@@ -52,8 +52,8 @@ describe('resolverCacheDeferEnabled (kill switch)', () => {
 describe('queueResolverCacheWrite', () => {
   it('writes NOTHING until a flush is asked for — this is the whole point', async () => {
     const writer = vi.fn(async () => undefined);
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { action: 'inbox' });
-    queueResolverCacheWrite(writer, 'https://a.test/2', 'rev-1', { action: 'inbox' });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { action: 'inbox' });
+    queueResolverCacheWrite(() => writer, 'https://a.test/2', 'rev-1', { action: 'inbox' });
     // Several macrotask turns pass — the batch loop's own between-URL yields
     // are setImmediate, so a self-scheduling queue would have fired by now and
     // put the sqlite write back inside the request it was moved out of.
@@ -66,8 +66,8 @@ describe('queueResolverCacheWrite', () => {
 
   it('drains everything queued once flushed, preserving the arguments', async () => {
     const writer = vi.fn(async () => undefined);
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { n: 1 });
-    queueResolverCacheWrite(writer, 'https://a.test/2', 'rev-1', { n: 2 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { n: 1 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/2', 'rev-1', { n: 2 });
     await flushResolverCacheWrites();
     expect(writer).toHaveBeenCalledTimes(2);
     expect(writer).toHaveBeenCalledWith('https://a.test/1', 'rev-1', { n: 1 });
@@ -77,8 +77,8 @@ describe('queueResolverCacheWrite', () => {
 
   it('is last-wins per (visit, revision) — one write, the newest value', async () => {
     const writer = vi.fn(async () => undefined);
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { generation: 'stale' });
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { generation: 'fresh' });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { generation: 'stale' });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { generation: 'fresh' });
     expect(pendingResolverCacheWriteCount()).toBe(1);
     await flushResolverCacheWrites();
     expect(writer).toHaveBeenCalledTimes(1);
@@ -87,8 +87,8 @@ describe('queueResolverCacheWrite', () => {
 
   it('treats a different snapshot revision as a different entry', async () => {
     const writer = vi.fn(async () => undefined);
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { n: 1 });
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-2', { n: 2 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { n: 1 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-2', { n: 2 });
     expect(pendingResolverCacheWriteCount()).toBe(2);
     await flushResolverCacheWrites();
     expect(writer).toHaveBeenCalledTimes(2);
@@ -97,7 +97,7 @@ describe('queueResolverCacheWrite', () => {
   it('yields between writes so N upserts are not one uninterruptible tick', async () => {
     const writer = vi.fn(async () => undefined);
     for (let index = 0; index < 5; index += 1) {
-      queueResolverCacheWrite(writer, `https://a.test/${String(index)}`, 'rev-1', { index });
+      queueResolverCacheWrite(() => writer, `https://a.test/${String(index)}`, 'rev-1', { index });
     }
     // A setImmediate chain running alongside the drain gets turns only if the
     // drain actually hands the loop back between writes.
@@ -123,9 +123,9 @@ describe('flush failure handling', () => {
     const writer = vi.fn(async (visitId: string) => {
       if (visitId === 'https://a.test/2') throw new Error('database is locked');
     });
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { n: 1 });
-    queueResolverCacheWrite(writer, 'https://a.test/2', 'rev-1', { n: 2 });
-    queueResolverCacheWrite(writer, 'https://a.test/3', 'rev-1', { n: 3 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { n: 1 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/2', 'rev-1', { n: 2 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/3', 'rev-1', { n: 3 });
     // Must not reject: this runs detached from any request, so a throw would
     // surface as an unhandled rejection.
     await expect(flushResolverCacheWrites()).resolves.toBeUndefined();
@@ -143,7 +143,7 @@ describe('flush failure handling', () => {
     const writer = ((): Promise<void> => {
       throw new Error('boom');
     }) as unknown as (visitId: string, snapshotRevision: string, result: unknown) => Promise<void>;
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { n: 1 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { n: 1 });
     await expect(flushResolverCacheWrites()).resolves.toBeUndefined();
     expect(resolverCacheDeferStats().writeFailures).toBe(1);
     warn.mockRestore();
@@ -153,7 +153,7 @@ describe('flush failure handling', () => {
 describe('scheduleResolverCacheFlush (the dispatch-finally trigger)', () => {
   it('drains on the next macrotask after being asked', async () => {
     const writer = vi.fn(async () => undefined);
-    queueResolverCacheWrite(writer, 'https://a.test/1', 'rev-1', { n: 1 });
+    queueResolverCacheWrite(() => writer, 'https://a.test/1', 'rev-1', { n: 1 });
     scheduleResolverCacheFlush();
     expect(writer).not.toHaveBeenCalled();
     await tick();
@@ -178,7 +178,7 @@ describe('scheduleResolverCacheFlush (the dispatch-finally trigger)', () => {
       concurrent -= 1;
     });
     for (let index = 0; index < 4; index += 1) {
-      queueResolverCacheWrite(writer, `https://a.test/${String(index)}`, 'rev-1', { index });
+      queueResolverCacheWrite(() => writer, `https://a.test/${String(index)}`, 'rev-1', { index });
     }
     await Promise.all([
       flushResolverCacheWrites(),
@@ -197,13 +197,13 @@ describe('overflow', () => {
   it('drops new writes past the cap instead of growing without bound', () => {
     const writer = vi.fn(async () => undefined);
     for (let index = 0; index < 1100; index += 1) {
-      queueResolverCacheWrite(writer, `https://a.test/${String(index)}`, 'rev-1', { index });
+      queueResolverCacheWrite(() => writer, `https://a.test/${String(index)}`, 'rev-1', { index });
     }
     expect(pendingResolverCacheWriteCount()).toBe(1024);
     expect(resolverCacheDeferStats().droppedOverflow).toBe(76);
     // An UPDATE to an already-queued key still lands at the cap — it costs no
     // new memory and it is the fresher value.
-    queueResolverCacheWrite(writer, 'https://a.test/0', 'rev-1', { updated: true });
+    queueResolverCacheWrite(() => writer, 'https://a.test/0', 'rev-1', { updated: true });
     expect(pendingResolverCacheWriteCount()).toBe(1024);
     expect(resolverCacheDeferStats().droppedOverflow).toBe(76);
   });

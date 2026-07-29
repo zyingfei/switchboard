@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promi
 import { join } from 'node:path';
 
 import type { VisitSimilarityRevision } from '../connections/types.js';
+import { RECALL_MODEL } from '../recall/modelManifest.js';
 
 const VISIT_SIMILARITY_REVISION_DIR = '_BAC/connections/visit-similarity';
 
@@ -31,7 +32,10 @@ const isVisitSimilarityRevision = (value: unknown): value is VisitSimilarityRevi
   if (typeof value['revisionId'] !== 'string' || value['revisionId'].length === 0) {
     return false;
   }
-  if (value['modelId'] !== 'Xenova/multilingual-e5-small') return false;
+  // E2 (single model identity): compare against the manifest, not a third copy
+  // of the literal. A model swap that forgot this line would have made every
+  // persisted revision fail this guard and read back as absent.
+  if (value['modelId'] !== RECALL_MODEL.modelId) return false;
   if (typeof value['modelRevision'] !== 'string' || value['modelRevision'].length === 0) {
     return false;
   }
