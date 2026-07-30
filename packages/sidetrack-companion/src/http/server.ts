@@ -7,7 +7,7 @@ import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import { titleForCanonicalUrl } from '../attribution-v1/emit.js';
 import { bridgeKeysMatch, isBridgeKeyAccepted } from '../auth/bridgeKey.js';
 import type { WorkstreamWriteTool } from '../auth/workstreamTrust.js';
-import { SqliteConnectionsStore } from '../connections/snapshot.js';
+import { SqliteConnectionsStore, type ConnectionsSnapshot } from '../connections/snapshot.js';
 import { createRequestId } from '../domain/ids.js';
 import { ENTITY_CONTENT_ENRICHED, gistLookupFromMerged, lookupGist, type GistLookup } from '../enrichment/contentEnrichment.js';
 import { ENTITY_ENRICHMENT_RETRACTED } from '../enrichment/events.js';
@@ -767,6 +767,82 @@ const primeBatchSwrEntry = (
   resolveSwrCache.prime(batchResolveSwrKey(canonicalUrl), graphSig, [200, result]);
 };
 
+// ---- the single decoration seam (stage S3) -----------------------------
+//
+// Every result this route serves — resolver-cache hit, SWR-stale, or
+// freshly computed, on EITHER store path below — gets the SAME query-time
+// treatment: the content lane (7), the ai lane (8), and the decision layer
+// over them (corroboration promotion + lane-fallback guess). Before this
+// seam existed the two terminals each carried their own copy of that
+// per-URL sequence, so a cross-cutting addition (a ninth lane, another
+// decision-layer transform) had two edit sites to keep in sync — and the
+// guess-lane extras append had a documented history of landing in one and
+// being missed in the other. Both terminals now call this ONE function,
+// immediately before they build the response tuple, so a future per-result
+// field is a single edit here.
+//
+// Callers keep their OWN decision about whether to invoke it at all — the
+// sqlite path's `guessLanesEnabled && contentLaneEnabled()` gate stays at
+// that call site, not inside this function — and their own `joinSnapshot` /
+// lane-decision context. Only the per-URL BODY is shared.
+// `appendContentLane` / `appendAiLane` / `applyLaneDecisions` are themselves
+// idempotent no-ops when their flags are off or `lanes` is absent, so this
+// function degrades exactly the way the two inline copies it replaces
+// already did.
+const finalizeBatchResolveResults = async (
+  results: Record<string, UrlResolutionResult>,
+  urls: readonly string[],
+  joinSnapshot: ConnectionsSnapshot,
+  contentDeps: AppendContentLaneDeps,
+  laneContext: LaneDecisionContext,
+  titleHints: ReadonlyMap<string, string>,
+  synthesizedTitleFor: (canonicalUrl: string) => string | undefined,
+  gistFor: (canonicalUrl: string) => string | undefined,
+): Promise<readonly LanePredictionInput[]> => {
+  const predictions: LanePredictionInput[] = [];
+  for (const canonicalUrl of urls) {
+    // Two lanes per URL now (content + ai), each a vector KNN plus an FTS
+    // query plus a workstream join — all synchronous sqlite. This loop runs
+    // for EVERY url in the batch including cache hits, so it is the longest
+    // uninterrupted stretch in the route.
+    await yieldToEventLoop();
+    const title =
+      titleHints.get(canonicalUrl) ??
+      titleForCanonicalUrl(joinSnapshot, canonicalUrl, synthesizedTitleFor(canonicalUrl)) ??
+      null;
+    const gist = gistFor(canonicalUrl) ?? null;
+    results[canonicalUrl] = await appendContentLane(
+      results[canonicalUrl]!,
+      { canonicalUrl, snapshot: joinSnapshot, title, gist },
+      contentDeps,
+    );
+    // PHASE BREAK: lane 7 -> lane 8. Each lane is an independent KNN + FTS +
+    // workstream join; running both without a break makes one URL cost two
+    // full lane computations in a single tick, and the measured
+    // `content-lane batch=1 dur=966ms` diag says that pair is ~1s of the
+    // route on its own. buildContentLane also yields BETWEEN its own phases
+    // now (contentLane.ts) — this break is the one it cannot make for itself.
+    await yieldToEventLoop();
+    // Lane 8, same inputs, gist-only query — see appendAiLane.
+    results[canonicalUrl] = await appendAiLane(
+      results[canonicalUrl]!,
+      { canonicalUrl, snapshot: joinSnapshot, title, gist },
+      contentDeps,
+    );
+    // The decision layer over the lanes just appended: the corroboration
+    // promotion (flagged OFF by default) and the lane-fallback guess, both
+    // decline-vetoed. See applyLaneDecisions — and note that, exactly like
+    // the lanes themselves, this runs AFTER the resolver-cache write, so
+    // nothing it produces is ever persisted.
+    results[canonicalUrl] = applyLaneDecisions(results[canonicalUrl]!, canonicalUrl, laneContext);
+    // Record what every lane predicted BEFORE the user answers. The lanes
+    // are read post-decision so the recorded pick is the one that was
+    // actually served.
+    predictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
+  }
+  return predictions;
+};
+
 export const routes: readonly RouteDefinition[] = [
   ...(process.env['DEBUG_HEAP_SNAPSHOT'] === '1'
     ? [
@@ -1177,62 +1253,28 @@ export const routes: readonly RouteDefinition[] = [
             merged,
             batchEnrichSig,
           );
-          // Prequential predictions accumulate across the loop and are written
-          // in ONE append after it.
-          const predictions: LanePredictionInput[] = [];
           const joinSnapshot =
             missedSnapshot ??
             (Object.keys(results).length > 0
               ? await sqliteStore.readResolverSubgraphForUrls(uniqueUrls)
               : null);
-          if (joinSnapshot !== null) {
-            for (const canonicalUrl of Object.keys(results)) {
-              // Two lanes per URL now (content + ai), each a vector KNN plus an
-              // FTS query plus a workstream join — all synchronous sqlite. This
-              // loop runs for EVERY url in the batch including cache hits, so
-              // it is the longest uninterrupted stretch in the route.
-              await yieldToEventLoop();
-              const title =
-                titleHints.get(canonicalUrl) ??
-                titleForCanonicalUrl(joinSnapshot, canonicalUrl, synthesizedTitleFor(canonicalUrl)) ??
-                null;
-              const gist = gistFor(canonicalUrl) ?? null;
-              results[canonicalUrl] = await appendContentLane(
-                results[canonicalUrl]!,
-                { canonicalUrl, snapshot: joinSnapshot, title, gist },
-                contentDeps,
-              );
-              // PHASE BREAK: lane 7 -> lane 8. Each lane is an independent
-              // KNN + FTS + workstream join; running both without a break makes
-              // one URL cost two full lane computations in a single tick, and
-              // the measured `content-lane batch=1 dur=966ms` diag says that
-              // pair is ~1s of the route on its own. buildContentLane also
-              // yields BETWEEN its own phases now (contentLane.ts) — this break
-              // is the one it cannot make for itself.
-              await yieldToEventLoop();
-              // Lane 8, same inputs, gist-only query — see appendAiLane.
-              results[canonicalUrl] = await appendAiLane(
-                results[canonicalUrl]!,
-                { canonicalUrl, snapshot: joinSnapshot, title, gist },
-                contentDeps,
-              );
-              // The decision layer over the lanes just appended: the
-              // corroboration promotion (flagged OFF by default) and the
-              // lane-fallback guess, both decline-vetoed. See
-              // applyLaneDecisions — and note that, exactly like the lanes
-              // themselves, this runs AFTER the resolver-cache write above, so
-              // nothing it produces is ever persisted.
-              results[canonicalUrl] = applyLaneDecisions(
-                results[canonicalUrl]!,
-                canonicalUrl,
-                laneContext,
-              );
-              // Record what every lane predicted BEFORE the user answers. The
-              // lanes are read post-decision so the recorded pick is the one
-              // that was actually served.
-              predictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
-            }
-          }
+          // Single finalize seam (stage S3): every served result — cache hit,
+          // SWR stale, fresh compute alike — flows through the SAME function
+          // the plain-store fallback path below calls. See
+          // finalizeBatchResolveResults.
+          const predictions: readonly LanePredictionInput[] =
+            joinSnapshot === null
+              ? []
+              : await finalizeBatchResolveResults(
+                  results,
+                  Object.keys(results),
+                  joinSnapshot,
+                  contentDeps,
+                  laneContext,
+                  titleHints,
+                  synthesizedTitleFor,
+                  gistFor,
+                );
           recordLanePredictionsBestEffort(requireVaultRoot(context), predictions);
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
           // pass duration + how many URLs it decorated — so the ≤~50ms indexed /
@@ -1274,18 +1316,17 @@ export const routes: readonly RouteDefinition[] = [
       gistLookup = gistLookupFromMerged(requireVaultRoot(context), fallbackEnrichSig, merged);
       const fallbackTombstones = await domainTombstoneSetFor(context);
       const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
-      // Decision-layer context + prediction buffer — see the sqlite-store path
-      // above. Same call, same position, so the two batch-resolve paths decide
-      // and measure identically.
+      // Decision-layer context — see the sqlite-store path above. Same call,
+      // same position, so the two batch-resolve paths decide and measure
+      // identically.
       const fallbackLaneContext = await laneDecisionContextFor(
         requireVaultRoot(context),
         merged,
         fallbackEnrichSig,
       );
-      const fallbackPredictions: LanePredictionInput[] = [];
       for (const canonicalUrl of uniqueUrls) {
         const synthesizedForUrl = synthesizedTitleFor(canonicalUrl);
-        const result = await resolveUrlAttributionArmed({
+        results[canonicalUrl] = await resolveUrlAttributionArmed({
           vaultRoot: requireVaultRoot(context),
           canonicalUrl,
           snapshot,
@@ -1294,31 +1335,20 @@ export const routes: readonly RouteDefinition[] = [
           ...(titleHints.has(canonicalUrl) ? { titleHint: titleHints.get(canonicalUrl)! } : {}),
           ...(synthesizedForUrl === undefined ? {} : { synthesizedTitle: synthesizedForUrl }),
         });
-        const title =
-          titleHints.get(canonicalUrl) ??
-          titleForCanonicalUrl(snapshot, canonicalUrl, synthesizedForUrl) ??
-          null;
-        const gist = gistFor(canonicalUrl) ?? null;
-        results[canonicalUrl] = await appendContentLane(
-          result,
-          { canonicalUrl, snapshot, title, gist },
-          contentDeps,
-        );
-        results[canonicalUrl] = await appendAiLane(
-          results[canonicalUrl]!,
-          { canonicalUrl, snapshot, title, gist },
-          contentDeps,
-        );
-        // Decision layer (corroboration promotion + lane-fallback guess, both
-        // decline-vetoed) — see the sqlite-store path above for the full
-        // boundary. Same call, same position (after both lanes are appended).
-        results[canonicalUrl] = applyLaneDecisions(
-          results[canonicalUrl]!,
-          canonicalUrl,
-          fallbackLaneContext,
-        );
-        fallbackPredictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
       }
+      // Single finalize seam (stage S3): every served result flows through
+      // the SAME function the sqlite-store path above calls. See
+      // finalizeBatchResolveResults.
+      const fallbackPredictions = await finalizeBatchResolveResults(
+        results,
+        uniqueUrls,
+        snapshot,
+        contentDeps,
+        fallbackLaneContext,
+        titleHints,
+        synthesizedTitleFor,
+        gistFor,
+      );
       recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions);
       return [
         200,
