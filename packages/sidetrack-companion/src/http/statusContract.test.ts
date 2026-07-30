@@ -38,8 +38,10 @@ const FORBIDDEN_PATHS = [
 
 describe('/v1/status availability contract', () => {
   // The route handler that fields /v1/status lives in
-  // `src/http/server.ts`. We can't introspect the bundled router
-  // dependency graph at import time without a bundler, but we can
+  // `src/http/routes/systemRoutes.ts` (moved out of `src/http/server.ts`
+  // in stage S2 of the cost-of-change refactor, along with the rest of
+  // the system/health route family). We can't introspect the bundled
+  // router dependency graph at import time without a bundler, but we can
   // use `node --experimental-vm-modules` to ask the runtime which
   // modules a *bare* import of the relevant module pulls in. The
   // approach: load src/http/statusHandler.ts (a future extraction)
@@ -47,16 +49,19 @@ describe('/v1/status availability contract', () => {
   //
   // For now, the surface assertion is simpler and intentionally
   // conservative: literal source-text search of the /v1/status
-  // handler in server.ts must not reference any forbidden module
+  // handler in systemRoutes.ts must not reference any forbidden module
   // by name. The handler is small enough to read; the assertion
   // catches the failure mode where a future edit adds e.g.
   // `await embed(...)` to /v1/status.
   it('source of /v1/status handler does not reference any forbidden recall/embedder/ONNX module', async () => {
     const fs = await import('node:fs/promises');
-    const serverSrc = await fs.readFile(resolve(packageRoot, 'src', 'http', 'server.ts'), 'utf8');
+    const serverSrc = await fs.readFile(
+      resolve(packageRoot, 'src', 'http', 'routes', 'systemRoutes.ts'),
+      'utf8',
+    );
     // Slice out the /v1/status handler block.
     const start = serverSrc.indexOf('pattern: /^\\/v1\\/status$/');
-    expect(start, '/v1/status handler not found in server.ts').toBeGreaterThan(0);
+    expect(start, '/v1/status handler not found in routes/systemRoutes.ts').toBeGreaterThan(0);
     // Find the closing of the route object — the next `},` at the
     // same indentation level. Approximate by reading 6000 chars; the
     // handler is < 3000 today.
