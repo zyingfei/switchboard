@@ -676,6 +676,321 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
   };
 };
 
+// ---- /v1/system/health contributor registry -----------------------------
+//
+// GET /v1/system/health assembles its `data` object from this ordered,
+// named list instead of inline in the route handler below. Each entry
+// contributes one (or one small group of) top-level `data` key(s); the
+// handler folds every entry's result into `data` via Object.assign, IN
+// ARRAY ORDER. Object.assign preserves the exact insertion-order semantics
+// the old object-spread chain had: a key an entry re-touches (`reliability`
+// below overwrites `observability`) keeps its ORIGINAL position, while a
+// brand-new key is appended at the end.
+//
+// Entries run SEQUENTIALLY — never Promise.all'd — because `reliability`
+// reads `scratch.baseReport`, state the `baseReport` entry ahead of it
+// writes. Any future entry that reads state an earlier entry computes must
+// stay ordered after that entry, for the same reason.
+//
+// To add a new health key `foo`: append ONE entry to this array that
+// computes and returns `{ foo: ... }` (or `{}` when it can't be computed —
+// typed emptiness, never a fabricated value). Nothing else in the route
+// handler changes.
+interface HealthContributorScratch {
+  // Written by the `baseReport` entry; read by `reliability` to fold its
+  // section into `observability` in place.
+  baseReport?: HealthReport;
+}
+
+interface HealthContributorArgs {
+  readonly context: CompanionHttpConfig;
+  readonly vaultRoot: string;
+  readonly scratch: HealthContributorScratch;
+}
+
+interface HealthContributor {
+  readonly name: string;
+  readonly contribute: (args: HealthContributorArgs) => Promise<Record<string, unknown>>;
+}
+
+const healthContributors: readonly HealthContributor[] = [
+  {
+    name: 'baseReport',
+    // Fold the resolve-canary reliability section into the health
+    // response. The base report is served from the TTL'd cache; the
+    // reliability section (the next entry) reads the (cheap) canary
+    // snapshot + WAL stat live so it decays on its own window rather
+    // than the health TTL.
+    contribute: async ({ context, vaultRoot, scratch }) => {
+      const indexPath = recallIndexPath(vaultRoot);
+      const baseReport = await cachedCollectHealth(vaultRoot, () =>
+        collectHealth({
+          startedAt: context.startedAt ?? new Date(),
+          vaultRoot,
+          vaultWritable: async () => {
+            try {
+              await access(vaultRoot);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
+          captureSummary: () => captureHealthSummary(vaultRoot),
+          recallSummary: async () => {
+            // Recall serves from recall-v2 (sqlite-vec). The legacy
+            // index.bin is deprecated; reading + parsing it here (24MB)
+            // was both wrong and SLOW — it timed out this probe under
+            // load, surfacing as a permanent false "degraded". Use a
+            // cheap v2 sqlite stat + (when the store is already open)
+            // its doc count, so the probe is fast and reflects the
+            // actually-served backend.
+            const { peekRecallV2Store } = await import('../../recall-v2/pipeline.js');
+            const v2SqlitePath = join(vaultRoot, '_BAC', 'recall', 'v2', 'index.sqlite');
+            const [info, modelStatus, v2Store, v2Stat] = await Promise.all([
+              stat(indexPath).catch(() => undefined),
+              getModelCacheStatus().catch(() => undefined),
+              peekRecallV2Store(vaultRoot).catch(() => undefined),
+              stat(v2SqlitePath).catch(() => undefined),
+            ]);
+            const v2DocCount = v2Store !== undefined ? v2Store.documentCount() : null;
+            const v2Present =
+              (v2DocCount !== null && v2DocCount > 0) ||
+              (v2Stat !== undefined && v2Stat.size > 0);
+            // The legacy recall-lifecycle report runs countTurnsInEventLog
+            // — a FULL scan of the entire event store that blew the 5s
+            // health budget on a real-size vault (the ~5.0s /v1/system/health
+            // wall). It's vestigial once v2 (sqlite-vec) is the served
+            // backend (status is already reported 'ready' from v2 below),
+            // so only pay the scan on a legacy non-v2 vault that still
+            // depends on those drift fields.
+            const lifecycleReport = v2Present
+              ? undefined
+              : await (context.recallLifecycle?.report() ?? Promise.resolve(undefined));
+            const indexExists = v2Present;
+            return {
+              indexExists,
+              entryCount: v2DocCount,
+              modelId: modelStatus?.modelId ?? null,
+              sizeBytes: v2Stat?.size ?? info?.size ?? null,
+              semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
+              // Lifecycle fields are optional so legacy callers
+              // (no recallLifecycle injected) keep the old shape.
+              ...(lifecycleReport === undefined
+                ? {}
+                : {
+                    status: lifecycleReport.status,
+                    eventTurnCount: lifecycleReport.eventTurnCount,
+                    currentModelId: lifecycleReport.currentModelId,
+                    companionVersion: lifecycleReport.companionVersion,
+                    lastRebuildAt: lifecycleReport.lastRebuildAt,
+                    lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
+                    lastError: lifecycleReport.lastError,
+                    rebuildEmbedded: lifecycleReport.rebuildEmbedded,
+                    rebuildTotal: lifecycleReport.rebuildTotal,
+                    rebuildPhase: lifecycleReport.rebuildPhase,
+                    embedderDevice: lifecycleReport.embedderDevice,
+                    embedderAccelerator: lifecycleReport.embedderAccelerator,
+                    drift: lifecycleReport.drift,
+                  }),
+              // recall-v2 is the served backend; when it's present,
+              // recall is ready regardless of the deprecated legacy
+              // lifecycle's status (which would otherwise force a false
+              // "degraded" on a v2-only vault).
+              ...(v2Present ? { status: 'ready' as const } : {}),
+              ...(context.recallActivity === undefined
+                ? {}
+                : { activity: context.recallActivity.report() }),
+              ...(modelStatus === undefined
+                ? {}
+                : {
+                    model: {
+                      id: modelStatus.modelId,
+                      revision: modelStatus.revision,
+                      cacheDir: modelStatus.cacheDir,
+                      present: modelStatus.present,
+                      verified: modelStatus.verified,
+                      offline: modelStatus.offline,
+                    },
+                  }),
+            };
+          },
+          serviceStatus: async () => {
+            // `installed` still comes from the installer (plist/unit
+            // existence), which is what "installed" honestly means.
+            // `running`, however, must reflect ACTUAL process
+            // liveness — the installer inferred it from plist
+            // existence, so a crashed-but-installed service read as
+            // "running" forever. Probe real liveness (launchctl /
+            // systemctl); only when the probe is `unknown` (tool
+            // absent / timed out) do we fall back to the installer's
+            // heuristic rather than claim a false negative.
+            const status = await (context.serviceInstaller ?? pickInstaller()).status();
+            const liveness = await (
+              context.serviceLiveness ?? (() => probeServiceLiveness(process.platform))
+            )();
+            return {
+              installed: status.installed,
+              running: resolveServiceRunning(status.running, liveness),
+            };
+          },
+          eventLaneHealth: getEventLaneHealth,
+          storeReconciliation: async () => {
+            // Cheap store-vs-JSONL reconciliation the store ALREADY
+            // knows: its physical row count vs the sum of its
+            // per-replica watermarks (the count it believes it
+            // accepted). A non-zero delta ⇒ committed events the
+            // store thinks it holds are missing, or seqs are sparse —
+            // either way a durability red flag. Never a full JSONL
+            // scan: getSharedEventStore returns the already-open store
+            // (or null when the event store is off) and count() /
+            // watermark() are single indexed queries.
+            const store = await getSharedEventStore(vaultRoot);
+            if (store === null) return null;
+            const storeRowCount = store.count();
+            const watermark = store.watermark();
+            const expectedFromWatermark = Object.values(watermark).reduce(
+              (sum, seq) => sum + seq,
+              0,
+            );
+            return {
+              storeRowCount,
+              expectedFromWatermark,
+              delta: expectedFromWatermark - storeRowCount,
+            };
+          },
+          // Engagement-lane freshness — two indexed MAX queries on
+          // the shared store; observability only (aggregate-vs-interval
+          // divergence, the fingerprint of the 06-27 regression that
+          // starved visit similarity). Best-effort inside collectHealth.
+          engagementLaneHealth: () => collectEngagementLaneHealth({ vaultRoot }),
+          ...(context.rankerHealth === undefined
+            ? {}
+            : { rankerHealth: context.rankerHealth }),
+          ...(context.mcpChildHealth === undefined
+            ? {}
+            : { mcpChildHealth: context.mcpChildHealth }),
+          workGraphSummary: async () => {
+            // Drain-time artifact first: the connections drain
+            // materializes workgraph-health.json after every
+            // successful pass (runtime/companion.ts onDrainSuccess),
+            // keeping the cold-boot path off the heavy live collect
+            // that used to blow the 5s budget and pin the section
+            // on 'unavailable'. The serve gate is symmetric with
+            // the writer's (eventStoreEnabled) AND age-bounded:
+            // the writer only refreshes while the event store is
+            // on, so a restart without SIDETRACK_EVENT_STORE=1
+            // would otherwise serve a frozen snapshot forever —
+            // drains succeed, the hook no-ops, sync.materializers
+            // stays green, and nothing surfaces the staleness.
+            // Missing/corrupt/schema-mismatched/stale ⇒ live
+            // compute below, unchanged.
+            if (eventStoreEnabled()) {
+              const artifact = await readWorkGraphHealthArtifact(vaultRoot);
+              if (artifact !== null && isWorkGraphHealthArtifactFresh(artifact)) {
+                // The drain-time artifact froze shipGateV2.servingGateEnforced
+                // + shadowDiff at drain time (before requests ran / under a
+                // stale env). Overlay the LIVE enforcement flag + the
+                // in-process shadow-diff window so the served surface
+                // reflects the current serving decision and measurement.
+                return withLiveShipGateV2Serving(artifact.report, vaultRoot);
+              }
+            }
+            // Phase 4 — peek the canonical SQLite recall store so
+            // health reports live document/chunk vector counts.
+            // Non-blocking: returns undefined when the store
+            // hasn't been opened yet (no /v2/recall fired since
+            // companion start), in which case counts default to 0.
+            const { peekRecallV2Store } = await import('../../recall-v2/pipeline.js');
+            const canonicalRecallStore = await peekRecallV2Store(vaultRoot);
+            return collectWorkGraphHealth({
+              vaultRoot,
+              ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
+              ...(context.connectionsDiagnostics === undefined
+                ? {}
+                : { connectionsDiagnostics: context.connectionsDiagnostics }),
+              ...(canonicalRecallStore === undefined
+                ? {}
+                : { canonicalRecallStore }),
+            });
+          },
+          ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
+        }),
+      );
+      scratch.baseReport = baseReport;
+      // HealthReport has no index signature, so it needs an explicit (safe:
+      // every field is data) cast to the registry's key-bag return type.
+      return baseReport as unknown as Record<string, unknown>;
+    },
+  },
+  {
+    name: 'reliability',
+    contribute: async ({ context, vaultRoot, scratch }) => {
+      const doubleBufferHealth =
+        context.connectionsStore instanceof SqliteConnectionsStore
+          ? context.connectionsStore.doubleBufferDiagnostics()
+          : undefined;
+      const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
+      if (scratch.baseReport === undefined) {
+        // Registry order guarantees the `baseReport` entry above already
+        // ran (and populated this) by the time this entry executes.
+        throw new Error('health contributor order violated: baseReport missing');
+      }
+      return withReliabilityHealthSection(scratch.baseReport, reliability) as unknown as Record<
+        string,
+        unknown
+      >;
+    },
+  },
+  {
+    name: 'laneCalibration',
+    // LANE CALIBRATION (review E1). Per-lane measured precision@1 over the
+    // trailing prequential window — the number that decides whether lane
+    // agreement is allowed to count as corroboration, and the first honest
+    // answer this system has ever had to "how good is the content lane?".
+    //
+    // Read live (outside the health TTL) for the same reason `reliability`
+    // is: it decays on its own window and is memoized on the prediction
+    // files' size+mtime, so a warm read is two stats. Best-effort — a
+    // measurement must never be able to degrade the health probe it rides
+    // on.
+    contribute: async ({ vaultRoot }) => {
+      const laneCalibration = await lanePrequentialSummary(vaultRoot).catch(() => null);
+      // Additive, read-only. Omitted entirely (rather than sent as a
+      // fake zero) when the summary could not be computed — typed
+      // emptiness, not a fabricated measurement.
+      return laneCalibration === null ? {} : { laneCalibration };
+    },
+  },
+  {
+    name: 'vaultLedger',
+    // VAULT LEDGER SUMMARY. Which families own the disk, and the orphaned-
+    // generation counter (the P0: three ~323 MB abandoned generation dbs
+    // sat resident while the only storage surface reported 10.7 MB). Read
+    // from the SAME TTL cache the /v1/system/vault-ledger route uses —
+    // never a walk on this path — and omitted entirely rather than faked
+    // when the first walk has not landed or the flag is off.
+    contribute: async ({ vaultRoot }) => {
+      const vaultLedgerCache = await vaultLedgerCached(vaultRoot).catch(() => null);
+      const vaultLedger =
+        vaultLedgerCache === null ||
+        vaultLedgerCache.value === null ||
+        (vaultLedgerCache.availability !== 'ok' && vaultLedgerCache.availability !== 'stale')
+          ? null
+          : summarizeVaultLedger(vaultLedgerCache.value, vaultLedgerCache.availability);
+      return vaultLedger === null ? {} : { vaultLedger };
+    },
+  },
+];
+// NOTE: the companion no longer hosts a node-runtime title-synthesis
+// generation lane (onnxruntime-node q4 unsupported / int8 unusable —
+// measured). Generation now runs in the extension panel via WebGPU
+// (transformers.js + the companion-cached gemma-3-1b q4), which POSTs
+// synthesized titles/gists to /v1/enrichment/{titles,content}. The
+// companion's role is MODEL HOST (/v1/models/...) + enrichment store, so
+// there is no sweep singleton to surface on health here — no corresponding
+// contributor above.
+
 export const systemRoutesA: readonly RouteDefinition[] = [
   {
     method: 'GET',
@@ -1122,253 +1437,15 @@ export const systemRoutesB: readonly RouteDefinition[] = [
     authRequired: true,
     handle: async (_request, _requestId, _match, context) => {
       const vaultRoot = requireVaultRoot(context);
-      const indexPath = recallIndexPath(vaultRoot);
-      // Fold the resolve-canary reliability section into the health
-      // response. The base report is served from the TTL'd cache; the
-      // reliability section reads the (cheap) canary snapshot + WAL stat
-      // live so it decays on its own window rather than the health TTL.
-      const baseReport = await cachedCollectHealth(vaultRoot, () =>
-            collectHealth({
-              startedAt: context.startedAt ?? new Date(),
-              vaultRoot,
-              vaultWritable: async () => {
-                try {
-                  await access(vaultRoot);
-                  return true;
-                } catch {
-                  return false;
-                }
-              },
-              vaultSizeBytes: () => directorySize(join(vaultRoot, '_BAC')).catch(() => null),
-              captureSummary: () => captureHealthSummary(vaultRoot),
-              recallSummary: async () => {
-                // Recall serves from recall-v2 (sqlite-vec). The legacy
-                // index.bin is deprecated; reading + parsing it here (24MB)
-                // was both wrong and SLOW — it timed out this probe under
-                // load, surfacing as a permanent false "degraded". Use a
-                // cheap v2 sqlite stat + (when the store is already open)
-                // its doc count, so the probe is fast and reflects the
-                // actually-served backend.
-                const { peekRecallV2Store } = await import('../../recall-v2/pipeline.js');
-                const v2SqlitePath = join(vaultRoot, '_BAC', 'recall', 'v2', 'index.sqlite');
-                const [info, modelStatus, v2Store, v2Stat] = await Promise.all([
-                  stat(indexPath).catch(() => undefined),
-                  getModelCacheStatus().catch(() => undefined),
-                  peekRecallV2Store(vaultRoot).catch(() => undefined),
-                  stat(v2SqlitePath).catch(() => undefined),
-                ]);
-                const v2DocCount = v2Store !== undefined ? v2Store.documentCount() : null;
-                const v2Present =
-                  (v2DocCount !== null && v2DocCount > 0) ||
-                  (v2Stat !== undefined && v2Stat.size > 0);
-                // The legacy recall-lifecycle report runs countTurnsInEventLog
-                // — a FULL scan of the entire event store that blew the 5s
-                // health budget on a real-size vault (the ~5.0s /v1/system/health
-                // wall). It's vestigial once v2 (sqlite-vec) is the served
-                // backend (status is already reported 'ready' from v2 below),
-                // so only pay the scan on a legacy non-v2 vault that still
-                // depends on those drift fields.
-                const lifecycleReport = v2Present
-                  ? undefined
-                  : await (context.recallLifecycle?.report() ?? Promise.resolve(undefined));
-                const indexExists = v2Present;
-                return {
-                  indexExists,
-                  entryCount: v2DocCount,
-                  modelId: modelStatus?.modelId ?? null,
-                  sizeBytes: v2Stat?.size ?? info?.size ?? null,
-                  semanticRecallPoolMigration: getSemanticRecallPoolMigrationStatus(),
-                  // Lifecycle fields are optional so legacy callers
-                  // (no recallLifecycle injected) keep the old shape.
-                  ...(lifecycleReport === undefined
-                    ? {}
-                    : {
-                        status: lifecycleReport.status,
-                        eventTurnCount: lifecycleReport.eventTurnCount,
-                        currentModelId: lifecycleReport.currentModelId,
-                        companionVersion: lifecycleReport.companionVersion,
-                        lastRebuildAt: lifecycleReport.lastRebuildAt,
-                        lastRebuildIndexed: lifecycleReport.lastRebuildIndexed,
-                        lastError: lifecycleReport.lastError,
-                        rebuildEmbedded: lifecycleReport.rebuildEmbedded,
-                        rebuildTotal: lifecycleReport.rebuildTotal,
-                        rebuildPhase: lifecycleReport.rebuildPhase,
-                        embedderDevice: lifecycleReport.embedderDevice,
-                        embedderAccelerator: lifecycleReport.embedderAccelerator,
-                        drift: lifecycleReport.drift,
-                      }),
-                  // recall-v2 is the served backend; when it's present,
-                  // recall is ready regardless of the deprecated legacy
-                  // lifecycle's status (which would otherwise force a false
-                  // "degraded" on a v2-only vault).
-                  ...(v2Present ? { status: 'ready' as const } : {}),
-                  ...(context.recallActivity === undefined
-                    ? {}
-                    : { activity: context.recallActivity.report() }),
-                  ...(modelStatus === undefined
-                    ? {}
-                    : {
-                        model: {
-                          id: modelStatus.modelId,
-                          revision: modelStatus.revision,
-                          cacheDir: modelStatus.cacheDir,
-                          present: modelStatus.present,
-                          verified: modelStatus.verified,
-                          offline: modelStatus.offline,
-                        },
-                      }),
-                };
-              },
-              serviceStatus: async () => {
-                // `installed` still comes from the installer (plist/unit
-                // existence), which is what "installed" honestly means.
-                // `running`, however, must reflect ACTUAL process
-                // liveness — the installer inferred it from plist
-                // existence, so a crashed-but-installed service read as
-                // "running" forever. Probe real liveness (launchctl /
-                // systemctl); only when the probe is `unknown` (tool
-                // absent / timed out) do we fall back to the installer's
-                // heuristic rather than claim a false negative.
-                const status = await (context.serviceInstaller ?? pickInstaller()).status();
-                const liveness = await (
-                  context.serviceLiveness ?? (() => probeServiceLiveness(process.platform))
-                )();
-                return {
-                  installed: status.installed,
-                  running: resolveServiceRunning(status.running, liveness),
-                };
-              },
-              eventLaneHealth: getEventLaneHealth,
-              storeReconciliation: async () => {
-                // Cheap store-vs-JSONL reconciliation the store ALREADY
-                // knows: its physical row count vs the sum of its
-                // per-replica watermarks (the count it believes it
-                // accepted). A non-zero delta ⇒ committed events the
-                // store thinks it holds are missing, or seqs are sparse —
-                // either way a durability red flag. Never a full JSONL
-                // scan: getSharedEventStore returns the already-open store
-                // (or null when the event store is off) and count() /
-                // watermark() are single indexed queries.
-                const store = await getSharedEventStore(vaultRoot);
-                if (store === null) return null;
-                const storeRowCount = store.count();
-                const watermark = store.watermark();
-                const expectedFromWatermark = Object.values(watermark).reduce(
-                  (sum, seq) => sum + seq,
-                  0,
-                );
-                return {
-                  storeRowCount,
-                  expectedFromWatermark,
-                  delta: expectedFromWatermark - storeRowCount,
-                };
-              },
-              // Engagement-lane freshness — two indexed MAX queries on
-              // the shared store; observability only (aggregate-vs-interval
-              // divergence, the fingerprint of the 06-27 regression that
-              // starved visit similarity). Best-effort inside collectHealth.
-              engagementLaneHealth: () => collectEngagementLaneHealth({ vaultRoot }),
-              ...(context.rankerHealth === undefined
-                ? {}
-                : { rankerHealth: context.rankerHealth }),
-              ...(context.mcpChildHealth === undefined
-                ? {}
-                : { mcpChildHealth: context.mcpChildHealth }),
-              workGraphSummary: async () => {
-                // Drain-time artifact first: the connections drain
-                // materializes workgraph-health.json after every
-                // successful pass (runtime/companion.ts onDrainSuccess),
-                // keeping the cold-boot path off the heavy live collect
-                // that used to blow the 5s budget and pin the section
-                // on 'unavailable'. The serve gate is symmetric with
-                // the writer's (eventStoreEnabled) AND age-bounded:
-                // the writer only refreshes while the event store is
-                // on, so a restart without SIDETRACK_EVENT_STORE=1
-                // would otherwise serve a frozen snapshot forever —
-                // drains succeed, the hook no-ops, sync.materializers
-                // stays green, and nothing surfaces the staleness.
-                // Missing/corrupt/schema-mismatched/stale ⇒ live
-                // compute below, unchanged.
-                if (eventStoreEnabled()) {
-                  const artifact = await readWorkGraphHealthArtifact(vaultRoot);
-                  if (artifact !== null && isWorkGraphHealthArtifactFresh(artifact)) {
-                    // The drain-time artifact froze shipGateV2.servingGateEnforced
-                    // + shadowDiff at drain time (before requests ran / under a
-                    // stale env). Overlay the LIVE enforcement flag + the
-                    // in-process shadow-diff window so the served surface
-                    // reflects the current serving decision and measurement.
-                    return withLiveShipGateV2Serving(artifact.report, vaultRoot);
-                  }
-                }
-                // Phase 4 — peek the canonical SQLite recall store so
-                // health reports live document/chunk vector counts.
-                // Non-blocking: returns undefined when the store
-                // hasn't been opened yet (no /v2/recall fired since
-                // companion start), in which case counts default to 0.
-                const { peekRecallV2Store } = await import('../../recall-v2/pipeline.js');
-                const canonicalRecallStore = await peekRecallV2Store(vaultRoot);
-                return collectWorkGraphHealth({
-                  vaultRoot,
-                  ...(context.eventLog === undefined ? {} : { eventLog: context.eventLog }),
-                  ...(context.connectionsDiagnostics === undefined
-                    ? {}
-                    : { connectionsDiagnostics: context.connectionsDiagnostics }),
-                  ...(canonicalRecallStore === undefined
-                    ? {}
-                    : { canonicalRecallStore }),
-                });
-              },
-              ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
-            }),
-          );
-      const doubleBufferHealth =
-        context.connectionsStore instanceof SqliteConnectionsStore
-          ? context.connectionsStore.doubleBufferDiagnostics()
-          : undefined;
-      const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
-      // LANE CALIBRATION (review E1). Per-lane measured precision@1 over the
-      // trailing prequential window — the number that decides whether lane
-      // agreement is allowed to count as corroboration, and the first honest
-      // answer this system has ever had to "how good is the content lane?".
-      //
-      // Read live (outside the health TTL) for the same reason `reliability` is:
-      // it decays on its own window and is memoized on the prediction files'
-      // size+mtime, so a warm read is two stats. Best-effort — a measurement
-      // must never be able to degrade the health probe it rides on.
-      const laneCalibration = await lanePrequentialSummary(vaultRoot).catch(() => null);
-      // VAULT LEDGER SUMMARY. Which families own the disk, and the orphaned-
-      // generation counter (the P0: three ~323 MB abandoned generation dbs sat
-      // resident while the only storage surface reported 10.7 MB). Read from the
-      // SAME TTL cache the /v1/system/vault-ledger route uses — never a walk on
-      // this path — and omitted entirely rather than faked when the first walk
-      // has not landed or the flag is off.
-      const vaultLedgerCache = await vaultLedgerCached(vaultRoot).catch(() => null);
-      const vaultLedger =
-        vaultLedgerCache === null ||
-        vaultLedgerCache.value === null ||
-        (vaultLedgerCache.availability !== 'ok' && vaultLedgerCache.availability !== 'stale')
-          ? null
-          : summarizeVaultLedger(vaultLedgerCache.value, vaultLedgerCache.availability);
-      // NOTE: the companion no longer hosts a node-runtime title-synthesis
-      // generation lane (onnxruntime-node q4 unsupported / int8 unusable —
-      // measured). Generation now runs in the extension panel via WebGPU
-      // (transformers.js + the companion-cached gemma-3-1b q4), which POSTs
-      // synthesized titles/gists to /v1/enrichment/{titles,content}. The
-      // companion's role is MODEL HOST (/v1/models/...) + enrichment store, so
-      // there is no sweep singleton to surface on health here.
-      return [
-        200,
-        {
-          data: {
-            ...withReliabilityHealthSection(baseReport, reliability),
-            // Additive, read-only. Omitted entirely (rather than sent as a
-            // fake zero) when the summary could not be computed — typed
-            // emptiness, not a fabricated measurement.
-            ...(laneCalibration === null ? {} : { laneCalibration }),
-            ...(vaultLedger === null ? {} : { vaultLedger }),
-          },
-        },
-      ];
+      // Fold the registered contributors (defined above, ahead of
+      // systemRoutesA) into `data` IN ORDER. See the registry comment for
+      // why order is fixed and how a new health key is added.
+      const scratch: HealthContributorScratch = {};
+      const data: Record<string, unknown> = {};
+      for (const { contribute } of healthContributors) {
+        Object.assign(data, await contribute({ context, vaultRoot, scratch }));
+      }
+      return [200, { data }];
     },
   },
   {
