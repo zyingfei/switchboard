@@ -4066,7 +4066,7 @@ const modelFetchResult = (outcome: ModelFetchOutcome): readonly [number, unknown
   );
 };
 
-const routes: readonly RouteDefinition[] = [
+export const routes: readonly RouteDefinition[] = [
   ...(process.env['DEBUG_HEAP_SNAPSHOT'] === '1'
     ? [
         {
