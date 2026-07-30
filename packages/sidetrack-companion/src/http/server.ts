@@ -843,6 +843,37 @@ const finalizeBatchResolveResults = async (
   return predictions;
 };
 
+// ---- the single unconditional response boundary (stage S5) ------------
+//
+// Both batch-resolve terminals below — the SqliteConnectionsStore path and
+// the plain-store fallback — build their 200 response ONLY through this
+// function. It is UNCONDITIONAL by design: no feature-flag gating anywhere
+// in it, unlike finalizeBatchResolveResults (the flag-gated per-URL lane
+// seam above, which callers still invoke themselves, on their own gate,
+// BEFORE reaching this boundary). A cross-cutting per-result wire field
+// that must apply regardless of guessLanesEnabled / contentLaneEnabled, or
+// a new top-level response field (today there is exactly one:
+// snapshotRevision), is therefore a single edit site here instead of two.
+//
+// Reproduces both terminals' prior top-level shape exactly — `results` is
+// passed straight through as `data.results` (same reference, no copy), and
+// `snapshotRevision` is included only when defined, matching the
+// `...(snapshotRevision === undefined ? {} : { snapshotRevision })` spread
+// each terminal built inline before this extraction.
+const buildBatchResolveResponse = (
+  results: Record<string, UrlResolutionResult>,
+  snapshotRevision: string | undefined,
+): readonly [
+  200,
+  { data: { results: Record<string, UrlResolutionResult> }; snapshotRevision?: string },
+] => [
+  200,
+  {
+    data: { results },
+    ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
+  },
+];
+
 export const routes: readonly RouteDefinition[] = [
   ...(process.env['DEBUG_HEAP_SNAPSHOT'] === '1'
     ? [
@@ -1286,13 +1317,7 @@ export const routes: readonly RouteDefinition[] = [
             ).catch(() => undefined);
           }
         }
-        return [
-          200,
-          {
-            data: { results },
-            ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
-          },
-        ];
+        return buildBatchResolveResponse(results, snapshotRevision);
       }
       const snapshot = await context.connectionsStore.readCurrent();
       if (snapshot === null) {
@@ -1350,13 +1375,7 @@ export const routes: readonly RouteDefinition[] = [
         gistFor,
       );
       recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions);
-      return [
-        200,
-        {
-          data: { results },
-          ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
-        },
-      ];
+      return buildBatchResolveResponse(results, snapshotRevision);
     },
   },
   ...visitsRoutesB,
