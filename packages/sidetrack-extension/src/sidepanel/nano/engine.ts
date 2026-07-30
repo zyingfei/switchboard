@@ -686,6 +686,8 @@ export const engineAvailabilitySnapshot = async (
   return {
     nanoReady,
     appleReady: apple.available,
+    // Carry WHY, not just whether — the row's copy depends on it.
+    ...(apple.available || apple.reason === 'ok' ? {} : { appleUnavailable: apple.reason }),
     webGpuLoaded: isWebGpuLoaded(),
     webGpuLoading: status.phase === 'loading',
     webGpuPercent: status.percent,

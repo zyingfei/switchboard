@@ -194,6 +194,11 @@ export const engineStateLine = (
         ? `AI: downloading ${String(Math.round(pct))}%`
         : 'AI: downloading the local model…';
     }
+    case 'engine-service-failing':
+      // Do NOT say 'load it in Health' — nothing there fixes a service whose
+      // model is refusing to generate (live 2026-07-30: the machine was out
+      // of memory). Name the real thing so the reader can act on it.
+      return 'AI: on-device model failing — system may be low on memory';
     case 'model-not-loaded':
       return 'AI: model not loaded — Load in Health';
     case 'language-needs-local-model':
@@ -208,6 +213,8 @@ export const blockedHint = (reason: EnrichmentBlockReason): string => {
   switch (reason) {
     case 'model-loading':
       return 'The local model is still downloading — enrichment works once it finishes.';
+    case 'engine-service-failing':
+      return 'The on-device AI service is running but its model refuses to generate — usually memory pressure on the machine. Loading a model in Health will not help; free memory (or restart the companion) and it recovers on its own.';
     case 'model-not-loaded':
       return 'No on-device model is loaded. Open Health → Experiments and load the local model.';
     case 'language-needs-local-model':
