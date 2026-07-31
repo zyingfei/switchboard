@@ -121,3 +121,28 @@ sonnet-class executor, effort inherited constant.
 4. The probe technique itself: a frozen representative change is a cheap,
    repeatable seam detector — it found the flag-gating mismatch no review
    caught.
+
+## Post-hoc verification (2026-07-31)
+
+Beyond the per-stage referees, the outcome was verified end-to-end:
+
+- **Pin integrity at branch level**: zero commits touch the three
+  characterization files after S1; `git diff 9e993031..tip` on them is empty.
+- **Dist builds**: `tsc -p tsconfig.build.json` clean at both the fork point
+  and the tip — the 26 extracted modules and adjusted dynamic imports survive
+  the build path, not just `bun test`.
+- **Dist-gated tests un-skipped**: against the freshly built tip dist,
+  `statusContract` runs 2/0 (its bundle check no longer skips) and the 13-test
+  `connectionsHnswReconcileIntegration` suite — the "pre-existing failure"
+  class in every worktree — passes 13/0, spawning real children from the
+  refactored dist.
+- **Live A/B**: two isolated companions (fork point 51bd5026 vs tip) booted
+  from their own dists on throwaway vaults/ports; identical probes against
+  `/v1/status`, `/v1/system/health`, `/v1/system/vault-ledger`,
+  `POST /v1/visits/batch-resolve`, and an unknown route. The full-response
+  diff contains only timestamps, request IDs, and ms-scale timing jitter —
+  every key, key order (12 health keys; 7 result keys), and semantic value
+  identical, including the conditional omission of the vault-ledger health
+  key on a fresh vault behaving the same on both sides.
+- **No experiment contamination**: live batch-resolve results carry no
+  `probe` field — the throwaway change exists only in destroyed worktrees.
