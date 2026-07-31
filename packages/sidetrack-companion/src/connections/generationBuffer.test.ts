@@ -585,10 +585,20 @@ describe('generationBuffer', () => {
     expect(disarmed.collected).toEqual([]);
     expect(generationExists(dir, orphan)).toBe(true);
 
-    // Armed: collects exactly the reported orphan, and NOTHING else.
+    // The destructive env flag alone is only a request; without the S1 proof
+    // it still fails closed.
     process.env['SIDETRACK_GENERATION_GC_SWEEP'] = '1';
     try {
-      const armed = sweepOrphanGenerations(dir);
+      const requestedOnly = sweepOrphanGenerations(dir);
+      expect(requestedOnly.survey.sweepRequested).toBe(true);
+      expect(requestedOnly.survey.sweepArmed).toBe(false);
+      expect(requestedOnly.collected).toEqual([]);
+      expect(generationExists(dir, orphan)).toBe(true);
+
+      // The S2 proof boundary supplies this only after validating the active
+      // generation's quick_check, S1 signature, pointer, and checkpoint.
+      const armed = sweepOrphanGenerations(dir, { s1SafetyVerified: true });
+      expect(armed.survey.sweepArmed).toBe(true);
       expect(armed.collected).toEqual([orphan]);
       expect(generationExists(dir, orphan)).toBe(false);
       // Siblings go with the main file.
@@ -621,7 +631,7 @@ describe('generationBuffer', () => {
 
     process.env['SIDETRACK_GENERATION_GC_SWEEP'] = '1';
     try {
-      const result = sweepOrphanGenerations(dir);
+      const result = sweepOrphanGenerations(dir, { s1SafetyVerified: true });
       expect(result.collected).toEqual([]);
       expect(generationExists(dir, mine)).toBe(true);
       expect(generationExists(dir, foreign)).toBe(true);

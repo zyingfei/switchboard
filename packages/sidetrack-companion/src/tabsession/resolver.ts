@@ -457,6 +457,11 @@ export interface ResolveUrlAttributionInput {
 export interface UrlResolutionResult {
   readonly canonicalUrl: string;
   readonly dryRun: true;
+  /**
+   * Opaque identity for the materially distinct lane prediction served here.
+   * Absent when guess lanes are disabled or every lane abstained.
+   */
+  readonly servedOpportunityId?: string;
   readonly policyMode: AttributionPolicyMode;
   readonly decision: {
     readonly action: AttributionAction;

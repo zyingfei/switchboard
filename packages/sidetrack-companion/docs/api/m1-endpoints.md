@@ -68,9 +68,28 @@ capture, recall, and service status, newer companions may include:
   `servingImpact`, `status`, `reason`, `revisionId`, `asOf`, and JSON-safe
   `metrics`. Disabled and unavailable candidates are reported explicitly; they
   are never represented as zero counts.
+- `watchdogs.rss`: an O(1), request-time process RSS sample. `status` becomes
+  `warning` at 2 GiB; `baselineBytes`, signed `growthBytes`, `peakBytes`, and
+  recovery/staleness transition fields make growth and failed samples visible.
+- `watchdogs.bootToServing`: the frozen time from companion composition start
+  until the loopback listener is serving. The budget is strictly under 10,000
+  ms; named phase timings and `slowestPhase` attribute a miss.
+- `dataLoss.state`: `ok`, `warning`, `stale`, or `recovered`. Event-lane counters
+  remain cumulative evidence, while a fresh zero-delta store reconciliation
+  moves an earlier warning to `recovered` without waiting for the expensive
+  health-report cache to expire.
 
 Recall activity intentionally records query length and result count, not raw
 query text.
+
+The watchdog contributor performs no vault walk or background polling: RSS is
+sampled synchronously only when this authenticated endpoint is read, and boot
+phases are immutable in-memory timings recorded by the runtime composition
+root. A failed RSS/reconciliation sample returns a typed `stale` state instead
+of failing the endpoint; future resource rows append through the ordered health
+contributor registry. These rows expose process measurements and phase names
+only—no page content, paths beyond the pre-existing vault health fields, or
+credentials.
 
 ## Error behavior
 

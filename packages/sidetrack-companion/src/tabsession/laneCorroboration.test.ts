@@ -79,6 +79,12 @@ const calibration = (
   scored: n * 2,
   window: 500,
   unscored: 0,
+  rawPredictionRows: n * 2,
+  legacyPredictionRows: 0,
+  eligibleOpportunities: n,
+  outcomesObserved: n,
+  outcomesJoined: n,
+  outcomeJoinCoverage: 1,
   status: 'ok',
   lanes: [
     { lane: 'content', n, hits: Math.round(precision * n), precision },
@@ -96,7 +102,13 @@ const declineEvent = (itemId: string): AcceptedEvent => {
     type: USER_ORGANIZED_ITEM,
     acceptedAtMs: 1_000,
     dot: { replicaId: 'r1', seq },
-    payload: { payloadVersion: 1, itemKind: 'canonical-url', itemId, action: 'move', toContainer: null },
+    payload: {
+      payloadVersion: 1,
+      itemKind: 'canonical-url',
+      itemId,
+      action: 'move',
+      toContainer: null,
+    },
   } as unknown as AcceptedEvent;
 };
 
@@ -195,19 +207,19 @@ describe('lane corroboration — (b) it cannot file anything', () => {
   });
 });
 
-describe('lane corroboration — (c) the flag is OFF by default', () => {
-  it('is a no-op with the flag unset', () => {
+describe('lane corroboration — (c) armed by default, with an instant kill switch', () => {
+  it('is armed with the flag unset once measured evidence earns promotion', () => {
     const input = held();
-    expect(applyLaneCorroboration(input, { canonicalUrl: 'u', calibration: GOOD })).toBe(input);
+    expect(applyLaneCorroboration(input, { canonicalUrl: 'u', calibration: GOOD })).not.toBe(input);
   });
 
-  it("only '1' and 'true' enable it", () => {
+  it("only explicit '0' and 'false' disable it", () => {
     const input = held();
-    for (const value of ['0', 'false', 'yes', 'on', '']) {
+    for (const value of ['0', 'false']) {
       process.env[LANE_CORROBORATION_ENV] = value;
       expect(applyLaneCorroboration(input, { canonicalUrl: 'u', calibration: GOOD })).toBe(input);
     }
-    for (const value of ['1', 'true']) {
+    for (const value of ['1', 'true', 'yes', 'on', '']) {
       process.env[LANE_CORROBORATION_ENV] = value;
       expect(applyLaneCorroboration(input, { canonicalUrl: 'u', calibration: GOOD })).not.toBe(
         input,
@@ -262,6 +274,12 @@ describe('lane corroboration — (d) it self-gates on MEASURED precision', () =>
       scored: 100,
       window: 500,
       unscored: 0,
+      rawPredictionRows: 100,
+      legacyPredictionRows: 0,
+      eligibleOpportunities: 50,
+      outcomesObserved: 50,
+      outcomesJoined: 50,
+      outcomeJoinCoverage: 1,
       status: 'ok',
       lanes: [
         { lane: 'content', n: 60, hits: 57, precision: 0.95 },

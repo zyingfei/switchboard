@@ -35,6 +35,8 @@ tags:
     description: Inbound reminder writes
   - name: visits
     description: Canonical URL triage and resolver reads
+  - name: page-evidence
+    description: Local page-body evidence capture and background materialization admission
 paths:
   /health:
     get:
@@ -105,6 +107,123 @@ paths:
                         type: object
                         additionalProperties:
                           type: object
+                          properties:
+                            servedOpportunityId:
+                              type: string
+                              pattern: '^laneopp_[0-9a-f]{32}$'
+                              description: >-
+                                Opaque identity for a materially distinct served lane
+                                prediction. Absent when every lane abstained; callers echo
+                                it only when the user explicitly acts on this suggestion.
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /visits/{canonicalUrl}/attribute:
+    post:
+      operationId: attributeVisit
+      description: >-
+        Store the user's explicit workstream decision for a canonical URL. When
+        the action responds to a served resolver suggestion, echo that result's
+        servedOpportunityId so the prequential evaluator can join prediction to
+        outcome without URL/time inference.
+      tags: [visits]
+      parameters:
+        - name: canonicalUrl
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workstreamId]
+              properties:
+                workstreamId:
+                  oneOf:
+                    - type: string
+                      minLength: 1
+                    - type: 'null'
+                servedOpportunityId:
+                  type: string
+                  pattern: '^laneopp_[0-9a-f]{32}$'
+      responses:
+        '201':
+          description: Explicit URL attribution stored.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/VaultUnavailable'
+  /page-evidence/extracted:
+    post:
+      operationId: capturePageEvidence
+      description: >-
+        Accept extracted page evidence. Features-only captures durably admit a
+        minimized, scrubbed body to the bounded background materialization queue;
+        chunking, manifest rebuilds, and embedding do not run on this request.
+      tags: [page-evidence]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PageEvidenceExtractedRequest'
+            examples:
+              attentionCapture:
+                value:
+                  payloadVersion: 1
+                  canonicalUrl: https://example.test/research
+                  url: https://example.test/research?utm_source=feed
+                  title: Research notes
+                  extractedAt: '2026-07-31T12:00:00.000Z'
+                  extractionSource: reader-mode
+                  extractionPolicy:
+                    trigger: attention-gate
+                  quality: high
+                  qualitySignals:
+                    extractedWordCount: 360
+                    contentToDomRatio: 0.72
+                    boilerplateFraction: 0.05
+                    extractionStrategy: reader-mode
+                  content:
+                    text: Local page body used as untrusted evidence.
+                    contentHash: capture-supplied-hash
+                    charCount: 43
+                  storageMode: features_only
+      responses:
+        '202':
+          description: Evidence accepted; features-only body admission is explicit in the response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PageEvidenceExtractedResponse'
+              examples:
+                queued:
+                  value:
+                    data:
+                      evidence:
+                        evidenceTier: content_features_only
+                      bodyEvidenceQueue:
+                        state: queued
+                        jobId: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+                        pendingCount: 1
+                        cap: 2048
         '400':
           $ref: '#/components/responses/ValidationError'
         '401':
@@ -508,6 +627,152 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
   schemas:
+    PageEvidenceExtractedRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - payloadVersion
+        - canonicalUrl
+        - url
+        - extractedAt
+        - extractionSource
+        - extractionPolicy
+        - quality
+        - qualitySignals
+        - content
+        - storageMode
+      properties:
+        payloadVersion:
+          type: integer
+          const: 1
+        canonicalUrl:
+          type: string
+          format: uri
+        url:
+          type: string
+          format: uri
+        title:
+          type: string
+        provider:
+          type: string
+        extractedAt:
+          $ref: '#/components/schemas/IsoDateTime'
+        extractionSource:
+          type: string
+          enum: [manual-selection, reader-mode, visible-dom]
+        extractionPolicy:
+          type: object
+          additionalProperties: false
+          required: [trigger]
+          properties:
+            trigger:
+              type: string
+              enum:
+                - manual
+                - workstream-policy
+                - save-suggestion
+                - allowlist
+                - auto-observed
+                - attention-gate
+                - bulk-open-tabs
+            workstreamId:
+              type: string
+            domainPolicyId:
+              type: string
+        quality:
+          type: string
+          enum: [high, medium, low]
+        qualitySignals:
+          type: object
+          additionalProperties: false
+          required:
+            - extractedWordCount
+            - contentToDomRatio
+            - boilerplateFraction
+            - extractionStrategy
+          properties:
+            extractedWordCount:
+              type: integer
+              minimum: 0
+            contentToDomRatio:
+              type: number
+              minimum: 0
+            boilerplateFraction:
+              type: number
+              minimum: 0
+            extractionStrategy:
+              type: string
+              enum: [manual-selection, reader-mode, visible-dom]
+            headingSignatureHash:
+              type: string
+        content:
+          type: object
+          additionalProperties: false
+          required: [text, contentHash, charCount]
+          properties:
+            text:
+              type: string
+              minLength: 1
+            markdown:
+              type: string
+            contentHash:
+              type: string
+              minLength: 1
+            charCount:
+              type: integer
+              minimum: 0
+        redaction:
+          type: object
+          additionalProperties: false
+          required: [applied, rules]
+          properties:
+            applied:
+              type: boolean
+            rules:
+              type: array
+              items:
+                type: string
+        dimensions:
+          type: object
+          additionalProperties: true
+        storageMode:
+          type: string
+          enum: [features_only, indexed_chunks]
+    BodyEvidenceQueueAdmission:
+      type: object
+      additionalProperties: false
+      required: [state, jobId, pendingCount, cap]
+      properties:
+        state:
+          type: string
+          enum: [queued, coalesced, backpressure]
+        jobId:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        pendingCount:
+          type: integer
+          minimum: 0
+        cap:
+          type: integer
+          minimum: 1
+    PageEvidenceExtractedResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [evidence]
+          properties:
+            evidence:
+              type: object
+              additionalProperties: true
+            coverage:
+              type: object
+              additionalProperties: true
+            bodyEvidenceQueue:
+              $ref: '#/components/schemas/BodyEvidenceQueueAdmission'
     BacId:
       type: string
       minLength: 8

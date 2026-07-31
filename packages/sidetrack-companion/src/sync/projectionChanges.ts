@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { writeFileAtomic, writeJsonAtomic } from '../vault/atomic.js';
 import type { VersionVector } from './causal.js';
 
 // Local monotonic change feed for projections.
@@ -77,6 +79,7 @@ const LOG_FILE = 'projection-changes.jsonl';
 const ROTATED_LOG_FILE = `${LOG_FILE}.1`;
 /** Lowest seq still retained after a clobbering rotation (see note 3 above). */
 const FLOOR_FILE = 'projection-changes-floor';
+const ROTATION_PROOF_FILE = 'projection-changes-rotation-proof.json';
 
 const syncDir = (vaultPath: string): string => join(vaultPath, ...SYNC_DIR_SEGMENTS);
 const seqPath = (vaultPath: string): string => join(syncDir(vaultPath), SEQ_FILE);
@@ -84,6 +87,8 @@ const logPath = (vaultPath: string): string => join(syncDir(vaultPath), LOG_FILE
 export const rotatedLogPath = (vaultPath: string): string =>
   join(syncDir(vaultPath), ROTATED_LOG_FILE);
 const floorPath = (vaultPath: string): string => join(syncDir(vaultPath), FLOOR_FILE);
+const rotationProofPath = (vaultPath: string): string =>
+  join(syncDir(vaultPath), ROTATION_PROOF_FILE);
 
 /**
  * Byte cap on the LIVE changelog. 32 MB default: the measured 98.6 MB file was
@@ -149,6 +154,13 @@ export interface ProjectionChangeFeed {
    * a test asserts a second poll parses only the newly appended lines.
    */
   readonly __parsedLineCount: () => number;
+  /** Test/health observability for proof-gated rotation. */
+  readonly __rotationDiagnostics: () => {
+    readonly attempts: number;
+    readonly completed: number;
+    readonly refused: number;
+    readonly lastProofHash: string | null;
+  };
 }
 
 const writeAtomic = async (path: string, body: string): Promise<void> => {
@@ -208,6 +220,44 @@ const readMaxLoggedSeq = async (path: string): Promise<number> => {
   return maxSeq;
 };
 
+interface ChangeLogReadback {
+  readonly bytes: number;
+  readonly maxSeq: number;
+  readonly hash: string;
+}
+
+/** Strict read-back used only at the destructive rotation boundary. The normal
+ * reader remains tolerant of malformed legacy lines, but rotation must not
+ * discard/replace a generation unless every non-empty source line is valid and
+ * the file ends at a complete newline boundary. */
+const readChangeLogProof = async (path: string): Promise<ChangeLogReadback | null> => {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (raw.length > 0 && !raw.endsWith('\n')) return null;
+  let maxSeq = 0;
+  for (const line of raw.split('\n')) {
+    if (line.trim().length === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      return null;
+    }
+    if (!isProjectionChange(parsed)) return null;
+    maxSeq = Math.max(maxSeq, parsed.seq);
+  }
+  return {
+    bytes: Buffer.byteLength(raw, 'utf8'),
+    maxSeq,
+    hash: createHash('sha256').update(raw).digest('hex'),
+  };
+};
+
 export const createProjectionChangeFeed = (
   vaultPath: string,
   options: { readonly now?: () => number } = {},
@@ -228,6 +278,10 @@ export const createProjectionChangeFeed = (
   let cachedFloor: number | null = null;
   // Test-only: total JSONL lines parsed across all readSince calls.
   let parsedLineCount = 0;
+  let rotationAttempts = 0;
+  let rotationCompleted = 0;
+  let rotationRefused = 0;
+  let lastRotationProofHash: string | null = null;
 
   const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
     const next = chain.then(task, task);
@@ -275,22 +329,91 @@ export const createProjectionChangeFeed = (
     const live = logPath(vaultPath);
     const info = await stat(live).catch(() => null);
     if (info === null || info.size < syncChangelogMaxBytes()) return;
+    rotationAttempts += 1;
+    const liveProof = await readChangeLogProof(live).catch(() => null);
+    // cachedSeq was loaded before rotateIfNeeded. A log ahead of it means the
+    // authoritative high-water is not durable/readable enough to retire bytes.
+    if (
+      liveProof === null ||
+      liveProof.bytes !== info.size ||
+      cachedSeq === null ||
+      liveProof.maxSeq > cachedSeq
+    ) {
+      rotationRefused += 1;
+      return;
+    }
     // The generation currently at `.1` is about to be CLOBBERED by this
     // rename, so its high-water becomes the retained floor. Read it before the
     // rename (bounded by the cap; happens once per cap's worth of appends).
-    const doomed = await readMaxLoggedSeq(rotatedLogPath(vaultPath));
+    const rotatedExists = await stat(rotatedLogPath(vaultPath)).catch(() => null);
+    const doomedProof = await readChangeLogProof(rotatedLogPath(vaultPath)).catch(() => null);
+    if (rotatedExists !== null && doomedProof === null) {
+      rotationRefused += 1;
+      return;
+    }
+    const doomed = doomedProof?.maxSeq ?? 0;
+    // Persist the strict source read-back BEFORE any rename. This is the
+    // durable authorization record: if it cannot be written, rotation is
+    // refused and the existing live/prior files remain untouched.
+    try {
+      await writeJsonAtomic(rotationProofPath(vaultPath), {
+        schemaVersion: 1,
+        status: 'prepared',
+        preparedAt: new Date(now()).toISOString(),
+        sourceHash: liveProof.hash,
+        bytes: liveProof.bytes,
+        maxSeq: liveProof.maxSeq,
+        retiredThroughSeq: doomed,
+      });
+    } catch {
+      rotationRefused += 1;
+      return;
+    }
+    // Persist the gap floor BEFORE the rename that replaces `.1`. A crash
+    // before rename may cause one conservative full-resync; a crash after it
+    // can never hide a real gap. Failure to persist refuses rotation and keeps
+    // all existing generations.
+    if (doomed > 0) {
+      try {
+        await writeFileAtomic(floorPath(vaultPath), `${String(doomed)}\n`);
+      } catch {
+        rotationRefused += 1;
+        return;
+      }
+    }
     try {
       await rename(live, rotatedLogPath(vaultPath));
     } catch {
+      rotationRefused += 1;
       return; // over-cap append is fine; try again next time
     }
     if (doomed > 0) {
       cachedFloor = doomed;
-      // Best-effort persist: an unwritten floor understates what was lost,
-      // which is why the in-memory value is set first (this process stays
-      // honest even if the write fails).
-      await writeAtomic(floorPath(vaultPath), `${String(doomed)}\n`).catch(() => undefined);
     }
+    const readBack = await readChangeLogProof(rotatedLogPath(vaultPath)).catch(() => null);
+    if (
+      readBack === null ||
+      readBack.hash !== liveProof.hash ||
+      readBack.bytes !== liveProof.bytes ||
+      readBack.maxSeq !== liveProof.maxSeq
+    ) {
+      throw new Error('projection changelog rotation failed durable read-back');
+    }
+    // Completion metadata is observability, not authorization: the durable
+    // `prepared` proof already authorized the rename. Do not strand the feed
+    // without a fresh live file merely because this second metadata write
+    // fails after the atomic rename succeeded.
+    await writeJsonAtomic(rotationProofPath(vaultPath), {
+      schemaVersion: 1,
+      status: 'complete',
+      rotatedAt: new Date(now()).toISOString(),
+      sourceHash: liveProof.hash,
+      bytes: liveProof.bytes,
+      maxSeq: liveProof.maxSeq,
+      retiredThroughSeq: doomed,
+    }).catch(() => undefined);
+    rotationCompleted += 1;
+    lastRotationProofHash = liveProof.hash;
     // See note 2 in the header: a shrink check alone cannot detect a rename,
     // so invalidate the byte checkpoint explicitly.
     scannedBytes = 0;
@@ -455,5 +578,15 @@ export const createProjectionChangeFeed = (
     };
   };
 
-  return { appendChange, readSince, __parsedLineCount: () => parsedLineCount };
+  return {
+    appendChange,
+    readSince,
+    __parsedLineCount: () => parsedLineCount,
+    __rotationDiagnostics: () => ({
+      attempts: rotationAttempts,
+      completed: rotationCompleted,
+      refused: rotationRefused,
+      lastProofHash: lastRotationProofHash,
+    }),
+  };
 };

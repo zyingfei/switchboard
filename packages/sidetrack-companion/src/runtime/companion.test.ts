@@ -463,7 +463,11 @@ describe('startCompanion resolve-canary → /v1/system/health', () => {
   };
 
   it('registers the canary at boot and folds a real sample into the health report', async () => {
-    companion = await startCompanion({ vaultPath: vaultRoot, port: port++, allowAutoUpdate: false });
+    companion = await startCompanion({
+      vaultPath: vaultRoot,
+      port: port++,
+      allowAutoUpdate: false,
+    });
 
     // Seed a timeline visit so the connections drain materializes a
     // timeline-visit node — the canary's pickUrl target. /v1/timeline/events
@@ -509,6 +513,16 @@ describe('startCompanion resolve-canary → /v1/system/health', () => {
           };
           availability: string;
         };
+        watchdogs?: {
+          rss: { status: string; currentBytes: number | null; growthBytes: number | null };
+          bootToServing: {
+            status: string;
+            budgetMs: number;
+            elapsedMs: number;
+            phases: readonly { name: string; durationMs: number }[];
+            slowestPhase: string | null;
+          };
+        };
         observability?: { sections?: Record<string, string> };
       };
     }
@@ -551,5 +565,26 @@ describe('startCompanion resolve-canary → /v1/system/health', () => {
     expect(reliability?.resolveCanary.status).toBe('ok');
     expect(reliability?.availability).toBe('ok');
     expect(health?.observability?.sections?.['reliability']).toBe('ok');
+
+    // Runtime wiring read-back: the process that actually reached the listener
+    // exposes its frozen boot measurement and current RSS through the same
+    // authenticated artifact consumers read.
+    expect(health?.watchdogs?.rss.currentBytes).toBeGreaterThan(0);
+    expect(health?.watchdogs?.rss.growthBytes).not.toBeNull();
+    expect(health?.watchdogs?.bootToServing).toMatchObject({
+      status: 'ok',
+      budgetMs: 10_000,
+      slowestPhase: expect.any(String),
+    });
+    expect(health?.watchdogs?.bootToServing.elapsedMs).toBeLessThan(10_000);
+    expect(health?.watchdogs?.bootToServing.phases.map((phase) => phase.name)).toEqual([
+      'identity-lock',
+      'core-projections',
+      'recall-runtime',
+      'collector-framework',
+      'background-lanes',
+      'health-artifacts',
+      'http-listen',
+    ]);
   }, 30_000);
 });

@@ -271,6 +271,8 @@ export interface UrlInboxData {
 export interface UrlResolutionResult {
   readonly canonicalUrl: string;
   readonly dryRun: true;
+  /** Opaque ID echoed on an explicit attribution reaction; absent on abstention/old companions. */
+  readonly servedOpportunityId?: string;
   readonly decision: {
     readonly action: 'auto-apply' | 'suggest' | 'inbox';
     readonly workstreamId?: string;

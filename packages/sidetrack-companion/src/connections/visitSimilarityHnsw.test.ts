@@ -1,4 +1,4 @@
-import { mkdtemp, rename, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,10 +33,7 @@ const createRng = (seed: number): (() => number) => {
   };
 };
 
-const randomUnitVectors = (
-  count: number,
-  dimension: number,
-): ReadonlyArray<readonly number[]> => {
+const randomUnitVectors = (count: number, dimension: number): ReadonlyArray<readonly number[]> => {
   const rng = createRng(0x5eed);
   return Array.from({ length: count }, () =>
     unit(Array.from({ length: dimension }, () => rng() * 2 - 1)),
@@ -52,6 +49,82 @@ describe('SimilarityHnswStore', () => {
 
   afterEach(async () => {
     await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('round-trips canonical model and corpus revision provenance', async () => {
+    const identity = {
+      dimension: 4,
+      modelId: 'model-a',
+      modelRevision: 'model-rev-a',
+      vectorCorpusRevision: 'corpus-rev-a',
+    } as const;
+    const first = await createSimilarityHnswStore().ensureLoaded(vaultRoot, identity);
+    await first.insertOrUpdate('visit-a', [1, 0, 0, 0]);
+    await first.persist();
+    await first.close();
+
+    const reopened = await createSimilarityHnswStore().ensureLoaded(vaultRoot, identity);
+    expect(reopened.vectorIdentity?.()).toEqual(identity);
+    expect(await reopened.embedding('visit-a')).toEqual([1, 0, 0, 0]);
+  });
+
+  it('accepts a schema-v1 compatibility index once and upgrades its sidecar', async () => {
+    const legacy = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await legacy.insertOrUpdate('visit-a', [1, 0, 0, 0]);
+    await legacy.persist();
+    await legacy.close();
+    const base = join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw');
+    const sidecarPath = `${base}.v1.json`;
+    const sidecar = JSON.parse(await readFile(sidecarPath, 'utf8')) as Record<string, unknown>;
+    sidecar['schemaVersion'] = 1;
+    delete sidecar['modelId'];
+    delete sidecar['modelRevision'];
+    delete sidecar['vectorCorpusRevision'];
+    await writeFile(sidecarPath, `${JSON.stringify(sidecar)}\n`, 'utf8');
+
+    const identity = {
+      dimension: 4,
+      modelId: 'model-a',
+      modelRevision: 'model-rev-a',
+      vectorCorpusRevision: 'corpus-rev-a',
+    } as const;
+    const migrated = await createSimilarityHnswStore().ensureLoaded(vaultRoot, identity);
+    expect(await migrated.embedding('visit-a')).toEqual([1, 0, 0, 0]);
+    await migrated.persist();
+    const upgraded = JSON.parse(await readFile(`${base}.v2.json`, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(upgraded).toMatchObject({
+      schemaVersion: 2,
+      modelId: identity.modelId,
+      modelRevision: identity.modelRevision,
+      vectorCorpusRevision: identity.vectorCorpusRevision,
+    });
+  });
+
+  it('never serves a mismatched corpus revision and leaves the prior pointer rollbackable', async () => {
+    const originalIdentity = {
+      dimension: 4,
+      modelId: 'model-a',
+      modelRevision: 'model-rev-a',
+      vectorCorpusRevision: 'corpus-rev-a',
+    } as const;
+    const original = await createSimilarityHnswStore().ensureLoaded(vaultRoot, originalIdentity);
+    await original.insertOrUpdate('visit-a', [1, 0, 0, 0]);
+    await original.persist();
+    await original.close();
+
+    const incompatible = await createSimilarityHnswStore().ensureLoaded(vaultRoot, {
+      ...originalIdentity,
+      vectorCorpusRevision: 'corpus-rev-b',
+    });
+    expect(incompatible.recoveredFromCorruption()).toBe(true);
+    expect(incompatible.elementCount()).toBe(0);
+    await incompatible.close();
+
+    const rolledBack = await createSimilarityHnswStore().ensureLoaded(vaultRoot, originalIdentity);
+    expect(await rolledBack.embedding('visit-a')).toEqual([1, 0, 0, 0]);
   });
 
   it('returns top-k neighbors matching brute-force cosine for a small corpus', async () => {

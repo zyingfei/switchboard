@@ -17,6 +17,7 @@ import { ENTITY_TITLE_ENRICHED, effectiveUrlTitle, enrichmentLookupFromMerged, l
 import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, isUserFlowRejectedPayload, isUserOrganizedItemPayload } from '../../feedback/events.js';
 import { generateCandidates } from '../../ranker/candidates.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
+import { isLaneOpportunityId, recordLaneOutcome } from '../../tabsession/lanePrequential.js';
 import type { UrlResolutionResult } from '../../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../../timeline/events.js';
 import { autoApplyUrlAttribution } from '../../urls/autoApply.js';
@@ -559,7 +560,7 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
     method: 'POST',
     pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/attribute$/u,
     authRequired: true,
-    handle: async (request, _requestId, match, context) => {
+    handle: async (request, requestId, match, context) => {
       if (context.eventLog === undefined) {
         throw new HttpRouteError(
           503,
@@ -578,6 +579,7 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
       return await runIdempotent(context, 'urlAttribute', idempotencyKey, async () => {
         const body = objectRecord(await readBody(request));
         const workstreamId = body?.['workstreamId'];
+        const servedOpportunityId = body?.['servedOpportunityId'];
         if (
           !(workstreamId === null || (typeof workstreamId === 'string' && workstreamId.length > 0))
         ) {
@@ -586,6 +588,14 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
             'VALIDATION_ERROR',
             'Validation failed.',
             'Body must contain workstreamId as a non-empty string or null.',
+          );
+        }
+        if (servedOpportunityId !== undefined && !isLaneOpportunityId(servedOpportunityId)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'servedOpportunityId must be a valid lane opportunity id when provided.',
           );
         }
         // Stage 5.2 R5 — see matching note on the tab-session POST route
@@ -604,6 +614,9 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
             ? {}
             : { fromContainer: fromWorkstreamId }),
           toContainer: workstreamId,
+          ...(servedOpportunityId === undefined
+            ? {}
+            : { details: { servedOpportunityId } }),
         } as const;
         const aggregateId = aggregateIdForFeedbackEvent(USER_ORGANIZED_ITEM, payload);
         const accepted = await eventLog.appendClient({
@@ -613,6 +626,26 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        if (servedOpportunityId !== undefined) {
+          // The causal event above is canonical. This compact mirror makes the
+          // ID-first prequential join cheap even when the experimental 700 MB
+          // SQLite event mirror is disabled. Failure never rolls back the user
+          // decision; it is visible and recoverable from event payload details.
+          await recordLaneOutcome(requireVaultRoot(context), {
+            opportunityId: servedOpportunityId,
+            canonicalUrl,
+            workstreamId,
+            atMs: accepted.acceptedAtMs,
+          }).catch((error: unknown) => {
+            // PII-free structured operation marker; never log URL/workstream.
+            console.warn('[lane-prequential]', {
+              requestId,
+              operation: 'lane-prequential.outcome-record',
+              outcome: 'error',
+              errorCategory: error instanceof Error ? error.name : 'unknown',
+            });
+          });
+        }
         invalidateResolveCaches();
         // Stage 5.2 R5 — see matching block in the tab-session POST
         // route. (PR #141's invalidateCachedUrlProjection was a TTL

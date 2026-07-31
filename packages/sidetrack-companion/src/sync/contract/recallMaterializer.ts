@@ -1,14 +1,16 @@
-import { createHash } from 'node:crypto';
-
 import type { RecallActivityTracker } from '../../recall/activity.js';
 import { chunkTurn } from '../../recall/chunker.js';
 import { embed } from '../../recall/embedder.js';
-import type { EmbeddingCache } from '../../recall/embeddingCache.js';
+import { embedTextHash, type EmbeddingCache } from '../../recall/embeddingCache.js';
 import { replaceEntriesForSourceUnit } from '../../recall/indexFile.js';
 import type { RecallLifecycle } from '../../recall/lifecycle.js';
 import type { ExtractionStore } from '../../recall/extraction/store.js';
 import { MODEL_ID } from '../../recall/embedder.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
+import {
+  LEGACY_VECTOR_CACHE_MODEL_KEY,
+  VECTOR_CORPUS_MODEL_KEY,
+} from '../../recall/vectorCorpus.js';
 import type { IndexEntry } from '../../recall/ranker.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
@@ -121,6 +123,21 @@ export const createRecallMaterializer = (deps: CreateRecallMaterializerDeps): Ma
     const store = deps.extractionStore;
     const indexPath = deps.indexPath;
     if (store === undefined || indexPath === undefined) return;
+    if (deps.embeddingCache !== undefined) {
+      try {
+        await deps.embeddingCache.migrateModel(
+          { modelId: MODEL_ID, modelRevision: RECALL_MODEL.revision },
+          VECTOR_CORPUS_MODEL_KEY,
+        );
+        await deps.embeddingCache.migrateModel(
+          LEGACY_VECTOR_CACHE_MODEL_KEY,
+          VECTOR_CORPUS_MODEL_KEY,
+        );
+      } catch {
+        // Best-effort cache migration; extraction reconciliation remains
+        // authoritative and will simply re-embed misses.
+      }
+    }
     const stale = await store.listStaleSources();
     for (const sourceState of stale) {
       const revision = await store.readRevision(sourceState.latestExtractionRevision);
@@ -151,19 +168,16 @@ export const createRecallMaterializer = (deps: CreateRecallMaterializerDeps): Ma
         // `chunk.textHash`. A heading rename or chunker breadcrumb
         // change would otherwise reuse a stale vector even though
         // the embedding input changed. (Reviewer-flagged bug.)
-        const embedTextHashOf = (s: string): string =>
-          createHash('sha256').update(s).digest('hex').slice(0, 32);
         const cacheHits: (Float32Array | null)[] = [];
         const toEmbed: { index: number; embedText: string; hash: string }[] = [];
         for (let i = 0; i < chunks.length; i += 1) {
           const chunk = chunks[i]!;
-          const hash = embedTextHashOf(chunk.embedText);
+          const hash = embedTextHash(chunk.embedText);
           const cached =
             deps.embeddingCache === undefined
               ? null
               : await deps.embeddingCache.get({
-                  modelId: MODEL_ID,
-                  modelRevision: RECALL_MODEL.revision,
+                  ...VECTOR_CORPUS_MODEL_KEY,
                   embedTextHash: hash,
                 });
           cacheHits.push(cached);
@@ -188,8 +202,7 @@ export const createRecallMaterializer = (deps: CreateRecallMaterializerDeps): Ma
               if (entry !== undefined) {
                 await deps.embeddingCache.put(
                   {
-                    modelId: MODEL_ID,
-                    modelRevision: RECALL_MODEL.revision,
+                    ...VECTOR_CORPUS_MODEL_KEY,
                     embedTextHash: entry.hash,
                   },
                   vec,

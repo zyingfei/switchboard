@@ -1,7 +1,10 @@
+import { createHash } from 'node:crypto';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-// REPORT-ONLY retention plan for the legacy capture ingress spool,
+import { isAcceptedEvent } from '../sync/eventLog.js';
+
+// Proof-gated retention plan for the legacy capture ingress spool,
 // `_BAC/events/<YYYY-MM-DD>.jsonl`.
 //
 // THE MEASUREMENT. 131.5 MB across 40 daily files reaching back to May on the
@@ -26,9 +29,9 @@ import { join } from 'node:path';
 //     a different claim entirely.
 //   - `.config/idempotency/<hash>.json` receipts are keyed on the client's
 //     Idempotency-Key, are per-response not per-file, and EXPIRE AFTER 1 HOUR.
-//   - `sync/lineage.ts` — the registry that enumerates every canonical and
-//     derived store — does not list `_BAC/events/` AT ALL. No node, no parent,
-//     no rebuild entrypoint.
+//   - `sync/lineage.ts` does not list `_BAC/events/` as canonical state. Its
+//     only safe recovery parent is a matching capture.recorded payload in the
+//     canonical JSONL log, verified below rather than assumed.
 //   - the only dedupe is at READ time and in memory: recall/rebuild.ts skips a
 //     spool line whose `bac_id` it already saw in the canonical log. `bac_id` is
 //     minted FRESH on every writeCaptureEvent call, so a capture retried past
@@ -40,14 +43,14 @@ import { join } from 'node:path';
 //     `<inbox>/.bookmark.json` = {filename, byte_offset, line_hash_of_last_
 //     promoted, updated_at} — it is simply not wired to this spool.
 //
-// SO THIS PLANNER REPORTS AND STOPS. It classifies days as past-retention and
-// measures what they cost, and it sets `reclaimableBytes` to 0 with the reason
-// named, because the honest answer to "can I delete May?" is "not provably".
-// Deleting a spool day on age alone risks discarding a capture whose only copy
-// is that file. `proof: 'absent'` is a typed emptiness: it is not "nothing is
-// reclaimable", it is "reclaimability is unknown and here is the missing
-// artifact". The day the bookmark record lands, this planner needs one branch,
-// not a rewrite — which is why the shape is already here.
+// SAFE TRANSITION (S2). A separate bookmark was never added. Instead, the
+// canonical log itself is the durable read-back proof: every non-empty spool
+// line must parse, carry a bac_id, and have a byte-equivalent capture payload
+// in a structurally-valid `capture.recorded` AcceptedEvent. A missing canonical
+// log is `absent`; a present log with a missing/mismatched record is `refuted`.
+// Only a fully covered, past-retention day is reclaimable. Apply lives in
+// storageRetirement.ts and repeats this proof against the exact file hash
+// immediately before unlinking it.
 
 const SPOOL_SEGMENTS = ['_BAC', 'events'] as const;
 const SPOOL_NAME_RE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/u;
@@ -79,6 +82,8 @@ export interface IngressDayPlan {
   readonly date: string;
   readonly bytes: number;
   readonly lines: number | null;
+  /** SHA-256 of the exact spool bytes. Apply uses it as the stale-plan guard. */
+  readonly contentHash: string;
   /** True when the day is older than the retention window. */
   readonly pastRetention: boolean;
   readonly proof: IngestionProof;
@@ -99,8 +104,9 @@ export interface IngressRetentionPlan {
   readonly pastRetentionBytes: number;
   /** Bytes this planner will actually vouch for. 0 while proof is absent. */
   readonly reclaimableBytes: number;
-  /** REPORT-ONLY marker: this module has no apply function, by design. */
-  readonly reportOnly: true;
+  /** Planning is read-only; verified entries are applied only by the explicit
+   * storage-retirement confirmation path. */
+  readonly reportOnly: false;
   /** Present when nothing is reclaimable because no proof artifact exists. */
   readonly blockedBy: {
     readonly reason: string;
@@ -112,48 +118,114 @@ export interface IngressRetentionPlan {
 const dateMinusDays = (now: Date, days: number): string =>
   new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
 
-/**
- * Locate the per-day ingestion proof, if any exists. Kept as its own function
- * (rather than inlined as `'absent'`) so the search is auditable and so the
- * fix is a one-place change: today it looks for the collector-style bookmark
- * that would make this decidable, finds nothing, and says so.
- */
-const findIngestionProof = async (spoolDir: string): Promise<IngestionProof> => {
-  // The collectors' bookmark shape ({filename, byte_offset, ...}) is the record
-  // that would prove this. If someone wires it to the spool, it lands here.
-  const bookmark = join(spoolDir, '.bookmark.json');
-  try {
-    const parsed = JSON.parse(await readFile(bookmark, 'utf8')) as {
-      readonly filename?: unknown;
-      readonly byte_offset?: unknown;
-    };
-    if (typeof parsed.filename === 'string' && typeof parsed.byte_offset === 'number') {
-      // A bookmark exists. Per-day verification against it is deliberately NOT
-      // implemented here: introducing it silently would make this planner start
-      // vouching for deletions on a code path no test covers. Report `refuted`
-      // (proof exists, this day is not yet shown ingested) so the operator sees
-      // the artifact was found and the comparison is the remaining work.
-      return 'refuted';
-    }
-  } catch {
-    /* no bookmark — the expected case */
-  }
-  return 'absent';
-};
+const hashText = (raw: string): string => createHash('sha256').update(raw).digest('hex');
 
-/** Cheap line count for a spool day. Null when the file could not be read —
- *  absent ≠ zero lines. */
-const countLines = async (path: string): Promise<number | null> => {
-  try {
-    const raw = await readFile(path, 'utf8');
-    let lines = 0;
-    for (const line of raw.split('\n')) {
-      if (line.trim().length > 0) lines += 1;
-    }
-    return lines;
-  } catch {
+const canonicalCapturePayload = (value: Record<string, unknown>): Record<string, unknown> => ({
+  bac_id: value['bac_id'],
+  ...(value['threadId'] === undefined ? {} : { threadId: value['threadId'] }),
+  threadUrl: value['threadUrl'],
+  provider: value['provider'],
+  ...(value['title'] === undefined ? {} : { title: value['title'] }),
+  capturedAt: value['capturedAt'],
+  turns: value['turns'],
+});
+
+const capturePayloadHash = (value: unknown): string | null => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (
+    typeof row['bac_id'] !== 'string' ||
+    typeof row['threadUrl'] !== 'string' ||
+    typeof row['provider'] !== 'string' ||
+    typeof row['capturedAt'] !== 'string' ||
+    !Array.isArray(row['turns'])
+  ) {
     return null;
   }
+  return hashText(JSON.stringify(canonicalCapturePayload(row)));
+};
+
+interface CanonicalCaptureIndex {
+  readonly available: boolean;
+  readonly valid: boolean;
+  readonly payloadHashes: ReadonlyMap<string, string>;
+}
+
+const listCanonicalShards = async (vaultRoot: string): Promise<readonly string[]> => {
+  const root = join(vaultRoot, '_BAC', 'log');
+  const replicas = await readdir(root).catch(() => []);
+  const paths: string[] = [];
+  for (const replica of replicas.sort()) {
+    const dir = join(root, replica);
+    const names = await readdir(dir).catch(() => []);
+    for (const name of names.sort()) {
+      if (name.endsWith('.jsonl')) paths.push(join(dir, name));
+    }
+  }
+  return paths;
+};
+
+/** Read the canonical bytes back from disk; no in-memory append result counts
+ * as proof. Any malformed non-empty canonical line fails the proof closed. */
+const buildCanonicalCaptureIndex = async (vaultRoot: string): Promise<CanonicalCaptureIndex> => {
+  const shards = await listCanonicalShards(vaultRoot);
+  if (shards.length === 0) return { available: false, valid: false, payloadHashes: new Map() };
+  const payloadHashes = new Map<string, string>();
+  for (const shard of shards) {
+    let raw: string;
+    try {
+      raw = await readFile(shard, 'utf8');
+    } catch {
+      return { available: true, valid: false, payloadHashes };
+    }
+    for (const line of raw.split('\n')) {
+      if (line.trim().length === 0) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch {
+        return { available: true, valid: false, payloadHashes };
+      }
+      if (!isAcceptedEvent(parsed)) {
+        return { available: true, valid: false, payloadHashes };
+      }
+      if (parsed.type !== 'capture.recorded') continue;
+      const payloadHash = capturePayloadHash(parsed.payload);
+      if (payloadHash === null) return { available: true, valid: false, payloadHashes };
+      const bacId = (parsed.payload as Record<string, unknown>)['bac_id'] as string;
+      const prior = payloadHashes.get(bacId);
+      if (prior !== undefined && prior !== payloadHash) {
+        return { available: true, valid: false, payloadHashes };
+      }
+      payloadHashes.set(bacId, payloadHash);
+    }
+  }
+  return { available: true, valid: true, payloadHashes };
+};
+
+const verifySpoolDay = (
+  raw: string,
+  canonical: CanonicalCaptureIndex,
+): { readonly proof: IngestionProof; readonly lines: number } => {
+  const nonEmptyLines = raw.split('\n').filter((line) => line.trim().length > 0);
+  const lines = nonEmptyLines.length;
+  if (!canonical.available) return { proof: 'absent', lines };
+  if (!canonical.valid) return { proof: 'refuted', lines };
+  for (const line of nonEmptyLines) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      return { proof: 'refuted', lines };
+    }
+    const payloadHash = capturePayloadHash(parsed);
+    if (payloadHash === null) return { proof: 'refuted', lines };
+    const bacId = (parsed as Record<string, unknown>)['bac_id'] as string;
+    if (canonical.payloadHashes.get(bacId) !== payloadHash) {
+      return { proof: 'refuted', lines };
+    }
+  }
+  return { proof: 'verified', lines };
 };
 
 /**
@@ -181,7 +253,7 @@ export const planIngressRetention = async (
   } catch {
     names = [];
   }
-  const proof = await findIngestionProof(spoolDir);
+  const canonical = await buildCanonicalCaptureIndex(vaultRoot);
 
   const days: IngressDayPlan[] = [];
   for (const name of names) {
@@ -191,6 +263,10 @@ export const planIngressRetention = async (
     const path = join(spoolDir, name);
     const info = await stat(path).catch(() => null);
     if (info === null || !info.isFile()) continue;
+    const raw = await readFile(path, 'utf8').catch(() => null);
+    if (raw === null) continue;
+    const verified = verifySpoolDay(raw, canonical);
+    const proof = verified.proof;
     // Lexicographic compare is correct for YYYY-MM-DD.
     const pastRetention = date < cutoffDate;
     const reclaimable = pastRetention && proof === 'verified' ? info.size : 0;
@@ -198,7 +274,8 @@ export const planIngressRetention = async (
       path,
       date,
       bytes: info.size,
-      lines: wantLines ? await countLines(path) : null,
+      lines: wantLines ? verified.lines : null,
+      contentHash: hashText(raw),
       pastRetention,
       proof,
       reclaimable,
@@ -223,17 +300,15 @@ export const planIngressRetention = async (
       .filter((day) => day.pastRetention)
       .reduce((sum, day) => sum + day.bytes, 0),
     reclaimableBytes: days.reduce((sum, day) => sum + day.reclaimable, 0),
-    reportOnly: true,
-    blockedBy:
-      proof === 'absent'
-        ? {
-            reason:
-              'no artifact on disk proves a spool day was fully mirrored into the canonical log; the canonical-log append on POST /v1/events is best-effort and its result is discarded, and the only dedupe is a read-time bac_id set that a re-minted bac_id defeats',
-            missingArtifact:
-              '_BAC/events/.bookmark.json — the collector bookmark shape ({filename, byte_offset, line_hash_of_last_promoted, updated_at}) applied to this spool',
-            clearedBy:
-              'have the /v1/events handler record the spool offset it successfully mirrored, then compare per-day here',
-          }
-        : null,
+    reportOnly: false,
+    blockedBy: days.some((day) => day.pastRetention && day.proof === 'absent')
+      ? {
+          reason: 'no canonical JSONL shard exists to prove the spool day was durably mirrored',
+          missingArtifact:
+            '_BAC/log/<replicaId>/<date>.jsonl containing a matching capture.recorded event for every spool line',
+          clearedBy:
+            'successfully append every capture.recorded event and read the canonical shard back',
+        }
+      : null,
   };
 };

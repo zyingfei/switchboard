@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import type { GuessLaneResult } from './guessLanes.js';
 import {
   LANE_PREQUENTIAL_ENV,
+  laneOpportunityIdFor,
   lanePrequentialPath,
   lanePrequentialSummary,
+  recordLaneOutcome,
   recordLanePredictions,
   resetLanePrequentialMemoForTest,
   scoreLanePredictions,
@@ -22,12 +24,32 @@ import {
 // against a filing that came after it; the panel's constant re-resolving must
 // not inflate the sample count; a decline is a miss.
 
-const rec = (u: string, l: string, w: string, t: number): LanePredictionRecord => ({ u, l, w, t });
+const rec = (
+  u: string,
+  l: string,
+  w: string,
+  t: number,
+  opportunityId?: string,
+): LanePredictionRecord => ({
+  u,
+  l,
+  w,
+  t,
+  ...(opportunityId === undefined ? {} : { o: opportunityId }),
+});
 const filing = (
   canonicalUrl: string,
   workstreamId: string | null,
   atMs: number,
-): LaneFiling => ({ canonicalUrl, workstreamId, atMs });
+  opportunityId?: string,
+): LaneFiling => ({
+  canonicalUrl,
+  workstreamId,
+  atMs,
+  ...(opportunityId === undefined ? {} : { opportunityId }),
+});
+
+const opportunityId = (index: number): string => `laneopp_${index.toString(16).padStart(32, '0')}`;
 
 afterEach(() => {
   delete process.env[LANE_PREQUENTIAL_ENV];
@@ -119,10 +141,7 @@ describe('lane prequential — (b) dedupe (the panel re-resolves constantly)', (
 
   it('scores a second filing against predictions made after the first', () => {
     const summary = scoreLanePredictions(
-      [
-        rec('u1', 'content', 'ws-a', 100),
-        rec('u1', 'content', 'ws-b', 300),
-      ],
+      [rec('u1', 'content', 'ws-a', 100), rec('u1', 'content', 'ws-b', 300)],
       [filing('u1', 'ws-a', 200), filing('u1', 'ws-b', 400)],
     );
     expect(summary.scored).toBe(2);
@@ -135,6 +154,91 @@ describe('lane prequential — (b) dedupe (the panel re-resolves constantly)', (
       [filing('u1', 'ws-a', 200), filing('u1', 'ws-b', 300)],
     );
     expect(summary.scored).toBe(1);
+  });
+});
+
+describe('lane prequential — R1 durable opportunity joins', () => {
+  it('deduplicates repeated delivery polls and scores by opportunity id first', () => {
+    const id = opportunityId(1);
+    const records = Array.from({ length: 100 }, (_unused, index) => [
+      rec('u1', 'content', 'ws-a', 100 + index, id),
+      rec('u1', 'ai', 'ws-b', 100 + index, id),
+    ]).flat();
+    const summary = scoreLanePredictions(records, [filing('u1', 'ws-a', 500, id)]);
+    expect(summary.rawPredictionRows).toBe(200);
+    expect(summary.eligibleOpportunities).toBe(1);
+    expect(summary.outcomesObserved).toBe(1);
+    expect(summary.outcomesJoined).toBe(1);
+    expect(summary.outcomeJoinCoverage).toBe(1);
+    expect(summary.scored).toBe(2);
+    expect(summary.unscored).toBe(0);
+  });
+
+  it('does not let a URL/time-only filing claim an ID-bearing prediction', () => {
+    const id = opportunityId(2);
+    const summary = scoreLanePredictions(
+      [rec('u1', 'content', 'ws-a', 100, id)],
+      [filing('u1', 'ws-a', 200)],
+    );
+    expect(summary.scored).toBe(0);
+    expect(summary.unscored).toBe(1);
+    expect(summary.legacyPredictionRows).toBe(0);
+  });
+
+  it('reports complete outcome attribution at materially representative scale', () => {
+    const records: LanePredictionRecord[] = [];
+    const filings: LaneFiling[] = [];
+    for (let opportunity = 1; opportunity <= 250; opportunity += 1) {
+      const id = opportunityId(opportunity);
+      const url = `https://coverage.test/${String(opportunity)}`;
+      // Eight physical rows per opportunity: 2,000 rows, all attributable.
+      for (let lane = 0; lane < 8; lane += 1) {
+        records.push(rec(url, `lane-${String(lane)}`, 'ws-right', opportunity, id));
+      }
+      filings.push(filing(url, 'ws-right', 10_000 + opportunity, id));
+    }
+    const summary = scoreLanePredictions(records, filings, 5_000);
+    expect(summary.rawPredictionRows).toBe(2_000);
+    expect(summary.eligibleOpportunities).toBe(250);
+    expect(summary.outcomesObserved).toBe(250);
+    expect(summary.outcomesJoined).toBe(250);
+    expect(summary.outcomeJoinCoverage).toBe(1);
+    expect(summary.scored).toBe(2_000);
+    expect(summary.unscored).toBe(0);
+  });
+
+  it('derives one stable id for unchanged picks and none for typed emptiness', () => {
+    const lanes: readonly GuessLaneResult[] = [
+      { lane: 'graph', candidates: [], emptyReason: 'no graph path' },
+      { lane: 'content', candidates: [{ workstreamId: 'ws-a', score: 0.7, why: 'match' }] },
+    ];
+    const first = laneOpportunityIdFor({
+      canonicalUrl: 'https://stable.test/page',
+      dependencyKey: 'dep-1',
+      lanes,
+    });
+    expect(first).toMatch(/^laneopp_[0-9a-f]{32}$/u);
+    expect(
+      laneOpportunityIdFor({
+        canonicalUrl: 'https://stable.test/page',
+        dependencyKey: 'dep-1',
+        lanes,
+      }),
+    ).toBe(first);
+    expect(
+      laneOpportunityIdFor({
+        canonicalUrl: 'https://stable.test/page',
+        dependencyKey: 'dep-2',
+        lanes,
+      }),
+    ).not.toBe(first);
+    expect(
+      laneOpportunityIdFor({
+        canonicalUrl: 'https://stable.test/page',
+        dependencyKey: 'dep-1',
+        lanes: [{ lane: 'graph', candidates: [], emptyReason: 'empty' }],
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -235,6 +339,76 @@ describe('lane prequential — (d) the writer', () => {
       const off = await lanePrequentialSummary(vaultRoot);
       expect(off.status).toBe('off');
       expect(off.lanes).toEqual([]);
+    });
+  });
+
+  it('reads back a mirrored ID-bearing outcome without the optional event-store mirror', async () => {
+    await withVault(async (vaultRoot) => {
+      const id = opportunityId(9);
+      await recordLanePredictions(
+        vaultRoot,
+        [{ canonicalUrl: 'u1', lanes, opportunityId: id }],
+        100,
+      );
+      await recordLaneOutcome(vaultRoot, {
+        opportunityId: id,
+        canonicalUrl: 'u1',
+        workstreamId: 'ws-a',
+        atMs: 200,
+      });
+      resetLanePrequentialMemoForTest();
+      const summary = await lanePrequentialSummary(vaultRoot);
+      expect(summary.outcomesObserved).toBe(1);
+      expect(summary.outcomesJoined).toBe(1);
+      expect(summary.outcomeJoinCoverage).toBe(1);
+      expect(summary.scored).toBe(2);
+      expect(summary.unscored).toBe(0);
+    });
+  });
+
+  it('reads back complete attributable coverage beyond the 1,823-row failure scale', async () => {
+    await withVault(async (vaultRoot) => {
+      const fullLanes: readonly GuessLaneResult[] = [
+        'graph',
+        'similarity',
+        'topic',
+        'title',
+        'domain',
+        'recency',
+        'content',
+        'ai',
+      ].map((lane) => ({
+        lane: lane as GuessLaneResult['lane'],
+        candidates: [{ workstreamId: 'ws-right', score: 0.8, why: 'test evidence' }],
+      }));
+      const opportunities = Array.from({ length: 250 }, (_unused, index) => ({
+        canonicalUrl: `https://coverage.test/read-back/${String(index)}`,
+        lanes: fullLanes,
+        opportunityId: opportunityId(index + 1),
+      }));
+      expect(await recordLanePredictions(vaultRoot, opportunities, 100)).toBe(2_000);
+
+      // Use the production one-outcome append path, not an in-memory scorer
+      // shortcut. The acceptance read below therefore crosses the durable
+      // JSONL seam that was absent in the 14/1,823 failure.
+      for (const [index, opportunity] of opportunities.entries()) {
+        await recordLaneOutcome(vaultRoot, {
+          opportunityId: opportunity.opportunityId,
+          canonicalUrl: opportunity.canonicalUrl,
+          workstreamId: 'ws-right',
+          atMs: 1_000 + index,
+        });
+      }
+
+      resetLanePrequentialMemoForTest();
+      const summary = await lanePrequentialSummary(vaultRoot, 5_000);
+      expect(summary.rawPredictionRows).toBe(2_000);
+      expect(summary.eligibleOpportunities).toBe(250);
+      expect(summary.outcomesObserved).toBe(250);
+      expect(summary.outcomesJoined).toBe(250);
+      expect(summary.outcomeJoinCoverage).toBe(1);
+      expect(summary.scored).toBe(2_000);
+      expect(summary.unscored).toBe(0);
     });
   });
 

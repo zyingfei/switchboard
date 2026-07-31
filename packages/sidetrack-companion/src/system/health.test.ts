@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { collectHealth, resolveServiceRunning } from './health.js';
+import {
+  collectHealth,
+  deriveDataLossHealth,
+  resolveServiceRunning,
+  withCurrentDataLossHealth,
+} from './health.js';
 
 describe('collectHealth', () => {
   it('aggregates sub-collectors and computes uptime', async () => {
@@ -47,6 +52,7 @@ describe('collectHealth', () => {
           unreadableShards: 0,
         },
         reconciliation: null,
+        state: 'ok',
         clean: true,
       },
       observability: {
@@ -144,6 +150,7 @@ describe('collectHealth', () => {
 
       expect(report.dataLoss?.counters.skippedMalformedLines).toBe(2);
       expect(report.dataLoss?.clean).toBe(false);
+      expect(report.dataLoss?.state).toBe('warning');
       expect(report.observability?.sections['dataLoss']).toBe('stale');
       // Any tripped tripwire escalates overall status to failed — the
       // loudest signal PRD §15 falsifiability can produce.
@@ -170,6 +177,7 @@ describe('collectHealth', () => {
         delta: 0,
       });
       expect(report.dataLoss?.clean).toBe(true);
+      expect(report.dataLoss?.state).toBe('ok');
       expect(report.observability?.sections['dataLoss']).toBe('ok');
     });
 
@@ -182,7 +190,73 @@ describe('collectHealth', () => {
 
       expect(report.dataLoss?.reconciliation?.delta).toBe(2);
       expect(report.dataLoss?.clean).toBe(false);
+      expect(report.dataLoss?.state).toBe('warning');
       expect(report.observability?.status).toBe('failed');
+    });
+
+    it('transitions deterministically through warning, stale, recovery, and ok', () => {
+      const historicalCounters = {
+        skippedMalformedLines: 1,
+        storeSkippedOutOfOrder: 0,
+        dotCollisions: 0,
+        duplicateCaptures: 0,
+        unreadableShards: 0,
+      } as const;
+      const warning = deriveDataLossHealth({
+        counters: historicalCounters,
+        reconciliation: null,
+      });
+      expect(warning).toMatchObject({ state: 'warning', clean: false });
+
+      const stale = deriveDataLossHealth({
+        counters: historicalCounters,
+        reconciliation: null,
+        reconciliationUnavailable: true,
+      });
+      expect(stale).toMatchObject({ state: 'stale', clean: false });
+
+      // Counters stay cumulative for incident visibility, but a fresh current
+      // reconciliation proves the mirror has converged and decays the alarm.
+      const recovered = deriveDataLossHealth({
+        counters: historicalCounters,
+        reconciliation: { storeRowCount: 100, expectedFromWatermark: 100, delta: 0 },
+      });
+      expect(recovered).toMatchObject({ state: 'recovered', clean: true });
+
+      const ok = deriveDataLossHealth({
+        counters: {
+          skippedMalformedLines: 0,
+          storeSkippedOutOfOrder: 0,
+          dotCollisions: 0,
+          duplicateCaptures: 0,
+          unreadableShards: 0,
+        },
+        reconciliation: { storeRowCount: 100, expectedFromWatermark: 100, delta: 0 },
+      });
+      expect(ok).toMatchObject({ state: 'ok', clean: true });
+    });
+
+    it('live recovery read-back clears a cached dataLoss failure without hiding other rows', async () => {
+      const cachedWarning = await collectHealth({
+        ...baseDeps(),
+        eventLaneHealth: () => ({
+          skippedMalformedLines: 1,
+          storeSkippedOutOfOrder: 0,
+          dotCollisions: 0,
+          duplicateCaptures: 0,
+          unreadableShards: 0,
+        }),
+      });
+      expect(cachedWarning.observability?.status).toBe('failed');
+
+      const recovered = deriveDataLossHealth({
+        counters: cachedWarning.dataLoss!.counters,
+        reconciliation: { storeRowCount: 10, expectedFromWatermark: 10, delta: 0 },
+      });
+      const readBack = withCurrentDataLossHealth(cachedWarning, recovered);
+      expect(readBack.dataLoss).toMatchObject({ state: 'recovered', clean: true });
+      expect(readBack.observability?.sections['dataLoss']).toBe('ok');
+      expect(readBack.observability?.status).toBe('ok');
     });
   });
 

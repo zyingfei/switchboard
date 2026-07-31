@@ -68,6 +68,13 @@ jobs:
         working-directory: packages/sidetrack-companion
         run: ../../node_modules/.bin/tsc -p tsconfig.build.json
 
+      # Recommendation serving changes have a named referee. Keep this
+      # separate from the broad suite so a future test-filtering or teardown
+      # workaround cannot accidentally omit the frozen quality cases.
+      - name: Golden resolve referee (blocking)
+        working-directory: packages/sidetrack-companion
+        run: bun run test:golden
+
       # bun 1.3.14 reproducibly panics during post-suite teardown on this
       # suite (exit 133) AFTER printing the complete summary — the exit code
       # is unreliable as a pass signal. Parse the summary strictly instead:

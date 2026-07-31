@@ -60,6 +60,12 @@ export interface LineageNode {
    * here so the single lineage view also answers "how do I flip it?".
    */
   readonly toggleEnv?: string;
+  /** Explicit single-source retirement contract for an optional mirror. */
+  readonly retirement?: {
+    readonly authoritativeSourceId: string;
+    readonly criterion: 'disabled-and-canonical-readback-verified';
+    readonly applyEntrypoint: string;
+  };
 }
 
 // Canonical append-only roots. Everything else derives from these.
@@ -94,6 +100,11 @@ export const LINEAGE_REGISTRY: readonly LineageNode[] = [
     rebuildEntrypoint: 'sync/eventStore.ts:rebuildFromJsonl',
     defaultState: 'default-off',
     toggleEnv: 'SIDETRACK_EVENT_STORE',
+    retirement: {
+      authoritativeSourceId: CANONICAL_EVENT_LOG,
+      criterion: 'disabled-and-canonical-readback-verified',
+      applyEntrypoint: 'gc/storageRetirement.ts:applyStorageRetirementPlan',
+    },
   },
   {
     id: 'engagement-facts',

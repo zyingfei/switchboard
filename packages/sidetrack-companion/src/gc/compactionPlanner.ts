@@ -1,27 +1,37 @@
-import { createReadStream, existsSync } from 'node:fs';
-import { readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { readFile, readdir, rename, stat, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
   ENGAGEMENT_SESSION_AGGREGATED,
+  isEngagementIntervalObservedPayload,
+  isEngagementSessionAggregatedPayload,
 } from '../engagement/events.js';
-import { eventStoreEnabled } from '../sync/eventStore.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { isAcceptedEvent, type EventLog } from '../sync/eventLog.js';
+import { writeFileAtomic } from '../vault/atomic.js';
+import {
+  type EngagementCompactionManifestEntry,
+  readEngagementCompactionManifest,
+  sequenceRanges,
+  sha256File,
+  sha256Text,
+  verifyCompactionShardState,
+  withEngagementCompactionReceipt,
+  writeEngagementCompactionManifest,
+} from './engagementCompactionManifest.js';
 
-// REPORT-ONLY log-compaction planner.
+// Plan-first log-compaction inventory plus verified engagement compaction.
 //
 // The canonical JSONL event log is ~88-92% engagement.interval by line
 // count and grows monotonically with browsing; no full-history consumer
 // needs individual intervals once a session is aggregated. Compacting
 // (dropping those lines from sealed past-day shards) would bound the
-// forever-growth of readMerged + the default training scan — but the
-// DESTRUCTIVE rewrite is NOT freeze-safe: the append-path indexes reject
-// in-process shard rewrites, and dropping events changes which events
-// fold into projections/graph. So this module ships the SAFE half: it
-// REPORTS the reclaimable bytes per sealed past-day shard, mirroring
-// gcInventory. It deletes NOTHING. The destructive pass is deferred to
-// the §15 window (recorded as a followup).
+// forever-growth of readMerged + the default training scan. The generic
+// inventory remains report-only; the engagement-specific path below can apply
+// only after its coverage, receipt, writer-lifecycle, and consumer proofs pass.
 //
 // "Sealed" = a date-stamped shard strictly older than today (UTC), i.e.
 // no replica is still appending to it. Today's shard (and any future-
@@ -223,44 +233,18 @@ export const buildCompactionPlan = async (
 // for visits that have NO aggregate — which is exactly the coverage check
 // below, and the reason it is a per-visit check rather than a re-fold.)
 //
-// THE OPERATIONAL ANSWER: BLOCKED, and this is why the rewrite ships DISARMED
-// with the blockers in the PAYLOAD rather than only in a comment. Dropping
-// lines from sealed shards trips four accounting mechanisms that do not care
-// that the drop was semantically safe:
-//
-//   1. event-store shard re-parse storm (BLOCKING). eventStore.ts guards shard
-//      re-reads on (path, size, mtime) with a stored read_offset. A compacted
-//      shard mismatches, and because its stored offset now EXCEEDS the file
-//      size the guard resets the offset to 0 and re-parses the whole shard —
-//      where every surviving line is at-or-below the watermark and increments
-//      `storeSkippedOutOfOrder` (eventStore.ts:407-411). That counter is in
-//      anyLaneCounterNonZero, so /v1/system/health goes `failed`
-//      (health.ts:473). Persisted `shard_progress` rows mean this fires on the
-//      NEXT enable even if the store is off right now.
-//   2. dense-seq reconciliation (BLOCKING). dataLoss.reconciliation computes
-//      `sum(watermark) - store.count()` and calls any non-zero delta a
-//      durability red flag (server.ts:6351-6358). Compaction makes the edge
-//      replica's seqs sparse BY CONSTRUCTION, so the delta goes permanently
-//      non-zero, and companion.ts:1168-1176 folds that into the §15 clean-day
-//      ledger — which is write-once-dirty over a 60-day window, so it would
-//      break the ">=7 consecutive clean days" gate for at least a week and a
-//      restart would not clear it.
-//   3. append indexes have no signature guard by default (BLOCKING). eventLog's
-//      AppendIndexes are add-only and only signature-checked when
-//      `externalWritersPossible` is true (default false). eventLog.ts:923-926
-//      states outright that "rewriting/compacting shard files while the process
-//      runs is not supported"; the failure mode is a thrown "Event log
-//      inconsistent: clientEventId is indexed but unreadable from the shards".
-//   4. engagementLaneHealth goes blind (DEGRADES OBSERVABILITY, not blocking).
-//      Its interval-vs-aggregate divergence probe reads
-//      maxAcceptedAtMsForType(interval); with old intervals gone it can report
-//      `intervalsFlowing: false` and silently stop detecting the very
-//      regression it was built for (the 2026-06-27 aggregate outage).
-//
-// So: the planner computes the real number, the rewrite is implemented and
-// atomic, and `wouldRewrite` is false until an operator both arms the flag AND
-// the blocking preconditions clear. A correct "cannot do this safely because X"
-// beats a lossy compaction — and X is now machine-readable.
+// THE OPERATIONAL ANSWER: fail-closed. The four former blockers are addressed
+// as one proof protocol:
+//   1. a prepared receipt records source/compacted digests before atomic rename;
+//      eventStore recognises only that intentional shrink and verifies every
+//      retained row was already mirrored before advancing shard_progress;
+//   2. exact removed dot ranges are persisted and added to count() accounting,
+//      so genuine sequence gaps remain non-zero reconciliation deltas;
+//   3. online apply runs behind EventLog.runExclusiveMaintenance and rebuilds
+//      the add-only append indexes before the next writer;
+//   4. the lane-health probe reports compacted-only/absent raw evidence as
+//      unknown, never as a false "not flowing" observation.
+// There is no force path: armed + every proof passed is the sole apply gate.
 
 /** Default retention for raw intervals before they become compaction candidates. */
 export const ENGAGEMENT_COMPACT_DAYS_DEFAULT = 30;
@@ -269,7 +253,9 @@ export const engagementCompactDays = (): number => {
   const raw = process.env['SIDETRACK_ENGAGEMENT_COMPACT_DAYS'];
   if (raw === undefined) return ENGAGEMENT_COMPACT_DAYS_DEFAULT;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : ENGAGEMENT_COMPACT_DAYS_DEFAULT;
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : ENGAGEMENT_COMPACT_DAYS_DEFAULT;
 };
 
 /**
@@ -315,9 +301,48 @@ export interface EngagementShardPlan {
    */
   readonly uncoveredIntervalLines: number;
   readonly uncoveredBytes: number;
+  /** Source identity checked again immediately before a rewrite. */
+  readonly sourceSha256: string;
+  /** Exact dots eligible for removal; compressed only in the durable receipt. */
+  readonly droppedSequences: readonly number[];
+  readonly maxDroppedAcceptedAtMs: number;
+}
+
+export type EngagementCompactionProofStatus = 'passed' | 'failed' | 'unknown';
+
+export interface EngagementCompactionProof {
+  readonly status: EngagementCompactionProofStatus;
+  readonly evidence: string;
+}
+
+export interface EngagementCompactionProofs {
+  readonly aggregateCoverage: EngagementCompactionProof;
+  readonly denseSequenceReconciliation: EngagementCompactionProof;
+  readonly crashRecovery: EngagementCompactionProof;
+  readonly downstreamConsumers: EngagementCompactionProof;
+  readonly appendLifecycle: EngagementCompactionProof;
+  readonly laneHealth: EngagementCompactionProof;
+}
+
+export interface EngagementCompactionObservation {
+  readonly operation:
+    | 'sidetrack.gc.engagement_compaction.plan'
+    | 'sidetrack.gc.engagement_compaction.apply';
+  readonly outcome: 'ready' | 'skipped' | 'succeeded' | 'failed';
+  readonly durationMs: number;
+  readonly candidateShards: number;
+  readonly intervalsFolded: number;
+  readonly bytesReclaimable: number;
+  readonly proofStatuses: Readonly<
+    Record<keyof EngagementCompactionProofs, EngagementCompactionProofStatus>
+  >;
+  readonly skipReason?: 'not-armed' | 'proof-failed' | 'no-candidates';
+  /** Stable, PII-free category. Never includes paths, visit ids, or payloads. */
+  readonly errorCategory?: 'manifest-invalid' | 'source-changed' | 'receipt-mismatch' | 'io';
 }
 
 export interface EngagementCompactionPlan {
+  readonly vaultRoot: string;
   readonly producedAt: string;
   readonly retainDays: number;
   /** Intervals in shards strictly older than this UTC date are candidates. */
@@ -329,6 +354,9 @@ export interface EngagementCompactionPlan {
   /** Distinct visits observed in candidate shards, split by aggregate coverage. */
   readonly visitsCovered: number;
   readonly visitsUncovered: number;
+  /** Coverage set derived only from validated aggregate events. */
+  readonly coveredVisitIds: readonly string[];
+  readonly proofs: EngagementCompactionProofs;
   /** SIDETRACK_ENGAGEMENT_COMPACT. */
   readonly armed: boolean;
   readonly blockers: readonly CompactionBlocker[];
@@ -337,9 +365,36 @@ export interface EngagementCompactionPlan {
 }
 
 const AGGREGATE_NEEDLE = `"type":"${ENGAGEMENT_SESSION_AGGREGATED}"`;
-/** `"visitId":"…"` — extracted by needle, not JSON.parse, so the 58% interval
- *  bulk is never parsed (same discipline as INTERVAL_NEEDLE above). */
-const VISIT_ID_RE = /"visitId":"([^"]+)"/u;
+
+const acceptedEventFromLine = (line: string): AcceptedEvent | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line) as unknown;
+  } catch {
+    return null;
+  }
+  return isAcceptedEvent(parsed) ? parsed : null;
+};
+
+const proofStatuses = (
+  proofs: EngagementCompactionProofs,
+): Readonly<Record<keyof EngagementCompactionProofs, EngagementCompactionProofStatus>> => ({
+  aggregateCoverage: proofs.aggregateCoverage.status,
+  denseSequenceReconciliation: proofs.denseSequenceReconciliation.status,
+  crashRecovery: proofs.crashRecovery.status,
+  downstreamConsumers: proofs.downstreamConsumers.status,
+  appendLifecycle: proofs.appendLifecycle.status,
+  laneHealth: proofs.laneHealth.status,
+});
+
+const allProofs = (proofs: EngagementCompactionProofs): readonly EngagementCompactionProof[] => [
+  proofs.aggregateCoverage,
+  proofs.denseSequenceReconciliation,
+  proofs.crashRecovery,
+  proofs.downstreamConsumers,
+  proofs.appendLifecycle,
+  proofs.laneHealth,
+];
 
 const dateMinusDays = (now: Date, days: number): string =>
   new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
@@ -350,50 +405,21 @@ const dateMinusDays = (now: Date, days: number): string =>
  */
 export const engagementCompactionBlockers = (
   vaultRoot: string,
-  options: { readonly offline?: boolean } = {},
+  options: { readonly offline?: boolean; readonly onlineMaintenance?: boolean } = {},
 ): readonly CompactionBlocker[] => {
+  void vaultRoot;
   const blockers: CompactionBlocker[] = [];
-  const storeDbPath = join(vaultRoot, '_BAC', 'connections', 'event-store.db');
-  if (eventStoreEnabled() || existsSync(storeDbPath)) {
-    blockers.push({
-      id: 'event-store-shard-progress-reparse',
-      severity: 'blocking',
-      detail:
-        'the event store re-parses any shard whose size/mtime changed, and a shrunk shard resets its read_offset to 0 — every surviving line then increments storeSkippedOutOfOrder, which drives /v1/system/health to failed',
-      evidence: 'src/sync/eventStore.ts:359-373,407-411; src/system/health.ts:273-278,473',
-      clearedBy:
-        'teach shard_progress that a SHRUNK shard was compacted (not torn) — e.g. persist a compaction generation per shard and skip-not-reset on a recognised shrink',
-    });
-  }
-  blockers.push({
-    id: 'watermark-density-reconciliation',
-    severity: 'blocking',
-    detail:
-      'dataLoss.reconciliation computes sum(watermark) - store.count() and treats any non-zero delta as a durability red flag; dropping events makes the edge replica seqs sparse, so the delta goes permanently non-zero and the §15 clean-day ledger records the day dirty (write-once over a 60-day window)',
-    evidence: 'src/http/server.ts:6351-6358; src/runtime/companion.ts:1168-1176; src/system/section15Counters.ts:113-114',
-    clearedBy:
-      'account for intentionally-compacted events in the expected count (a persisted compactedCount per replica subtracted from sum(watermark))',
-  });
-  if (options.offline !== true && process.env['SIDETRACK_EXTERNAL_WRITERS'] !== '1') {
+  if (options.offline !== true && options.onlineMaintenance !== true) {
     blockers.push({
       id: 'append-indexes-no-signature-guard',
       severity: 'blocking',
       detail:
-        "eventLog's in-memory append indexes are add-only and are only signature-checked when external writers are possible (default: not), so a rewrite under a running companion makes them claim dropped events still exist — the next append throws 'Event log inconsistent: … indexed but unreadable from the shards'",
-      evidence: 'src/sync/eventLog.ts:923-926,985-1001,1059-1064',
+        'an online rewrite requires the active EventLog exclusive-maintenance mutex so append indexes are rebuilt from the compacted shards',
+      evidence: 'src/sync/eventLog.ts:EventLog.runExclusiveMaintenance',
       clearedBy:
-        'run the rewrite with the companion stopped (pass offline:true) or with SIDETRACK_EXTERNAL_WRITERS=1 so the signature guard is active',
+        'pass offline:true with the companion stopped, or provide the active EventLog maintenance lifecycle',
     });
   }
-  blockers.push({
-    id: 'engagement-lane-health-probe-blind',
-    severity: 'degrades-observability',
-    detail:
-      'the interval-vs-aggregate divergence probe reads maxAcceptedAtMsForType(interval); with old intervals gone it can report intervalsFlowing:false and stop detecting the aggregate outage it was built for',
-    evidence: 'src/system/engagementLaneHealth.ts:75,95',
-    clearedBy:
-      'have the probe treat "no intervals in the retained window" as unknown rather than not-flowing',
-  });
   return blockers;
 };
 
@@ -404,8 +430,9 @@ export const engagementCompactionBlockers = (
  *
  * COST: one streamed pass over every shard (needed because a visit's aggregate
  * can live in a LATER shard than its intervals, so coverage is a global fact).
- * Needle-matched, never JSON.parsed on the bulk, cooperative-yield — the same
- * discipline as buildCompactionPlan. Off-request only.
+ * Needle-prefiltered, then parsed as unknown only for engagement records so
+ * coverage and dot accounting use canonical validators. Cooperative-yield and
+ * off-request only.
  */
 export const planEngagementCompaction = async (
   vaultRoot: string,
@@ -413,10 +440,17 @@ export const planEngagementCompaction = async (
     readonly now?: Date;
     readonly retainDays?: number;
     readonly offline?: boolean;
+    readonly onlineMaintenance?: boolean;
+    readonly observe?: (observation: EngagementCompactionObservation) => void;
   } = {},
 ): Promise<EngagementCompactionPlan> => {
+  const startedAt = performance.now();
   const now = options.now ?? new Date();
-  const retainDays = options.retainDays ?? engagementCompactDays();
+  const requestedRetainDays = options.retainDays ?? engagementCompactDays();
+  const retainDays =
+    Number.isFinite(requestedRetainDays) && requestedRetainDays >= 0
+      ? Math.floor(requestedRetainDays)
+      : ENGAGEMENT_COMPACT_DAYS_DEFAULT;
   const today = todayStamp(now);
   const retainCutoff = dateMinusDays(now, retainDays);
   // A candidate shard is SEALED (strictly before today — nobody is appending)
@@ -429,17 +463,31 @@ export const planEngagementCompaction = async (
   // aggregate lines, ~0.6% of bytes) and, for candidate shards only, the
   // per-visit interval line/byte inventory.
   const coveredVisits = new Set<string>();
-  const candidateVisitBytes = new Map<string, Map<string, { lines: number; bytes: number }>>();
+  const candidateIntervals = new Map<
+    string,
+    Array<{ visitId: string; seq: number; acceptedAtMs: number; bytes: number }>
+  >();
   const shardMeta = new Map<
     string,
-    { replicaId: string; date: string; totalBytes: number; totalLines: number; intervalLines: number }
+    {
+      replicaId: string;
+      date: string;
+      totalBytes: number;
+      totalLines: number;
+      intervalLines: number;
+    }
   >();
 
   for (const replicaId of await listReplicaDirs(root)) {
     for (const shard of await listShards(join(root, replicaId))) {
       const isCandidate = shard.date < cutoffDate;
       const info = await stat(shard.path);
-      const perVisit = new Map<string, { lines: number; bytes: number }>();
+      const intervals: Array<{
+        visitId: string;
+        seq: number;
+        acceptedAtMs: number;
+        bytes: number;
+      }> = [];
       let totalLines = 0;
       let intervalLines = 0;
       let processed = 0;
@@ -451,16 +499,29 @@ export const planEngagementCompaction = async (
         if (line.length === 0) continue;
         totalLines += 1;
         if (line.includes(AGGREGATE_NEEDLE)) {
-          const visitId = VISIT_ID_RE.exec(line)?.[1];
-          if (visitId !== undefined) coveredVisits.add(visitId);
+          const event = acceptedEventFromLine(line);
+          if (
+            event?.type === ENGAGEMENT_SESSION_AGGREGATED &&
+            isEngagementSessionAggregatedPayload(event.payload)
+          ) {
+            coveredVisits.add(event.payload.visitId);
+          }
         } else if (line.includes(INTERVAL_NEEDLE)) {
           intervalLines += 1;
           if (isCandidate) {
-            const visitId = VISIT_ID_RE.exec(line)?.[1] ?? '(no-visit-id)';
-            const bucket = perVisit.get(visitId) ?? { lines: 0, bytes: 0 };
-            bucket.lines += 1;
-            bucket.bytes += Buffer.byteLength(line, 'utf8') + 1;
-            perVisit.set(visitId, bucket);
+            const event = acceptedEventFromLine(line);
+            if (
+              event?.type === ENGAGEMENT_INTERVAL_OBSERVED &&
+              event.dot.replicaId === replicaId &&
+              isEngagementIntervalObservedPayload(event.payload)
+            ) {
+              intervals.push({
+                visitId: event.payload.visitId,
+                seq: event.dot.seq,
+                acceptedAtMs: event.acceptedAtMs,
+                bytes: Buffer.byteLength(line, 'utf8') + 1,
+              });
+            }
           }
         }
         processed += 1;
@@ -471,7 +532,7 @@ export const planEngagementCompaction = async (
         }
       }
       if (isCandidate) {
-        candidateVisitBytes.set(shard.path, perVisit);
+        candidateIntervals.set(shard.path, intervals);
         shardMeta.set(shard.path, {
           replicaId,
           date: shard.date,
@@ -486,24 +547,33 @@ export const planEngagementCompaction = async (
   const coveredSeen = new Set<string>();
   const uncoveredSeen = new Set<string>();
   const shards: EngagementShardPlan[] = [];
-  for (const [path, perVisit] of candidateVisitBytes) {
+  const seenDots = new Set<string>();
+  let duplicateDroppableDot = false;
+  for (const [path, intervals] of candidateIntervals) {
     const meta = shardMeta.get(path);
     if (meta === undefined) continue;
     let coveredIntervalLines = 0;
     let coveredBytes = 0;
     let uncoveredIntervalLines = 0;
     let uncoveredBytes = 0;
-    for (const [visitId, counts] of perVisit) {
+    const droppedSequences: number[] = [];
+    let maxDroppedAcceptedAtMs = 0;
+    for (const interval of intervals) {
       // A visit with no aggregate anywhere: its intervals are the only record.
       // Excluded from reclaimable, never rewritten.
-      if (coveredVisits.has(visitId)) {
-        coveredSeen.add(visitId);
-        coveredIntervalLines += counts.lines;
-        coveredBytes += counts.bytes;
+      if (coveredVisits.has(interval.visitId)) {
+        coveredSeen.add(interval.visitId);
+        coveredIntervalLines += 1;
+        coveredBytes += interval.bytes;
+        droppedSequences.push(interval.seq);
+        maxDroppedAcceptedAtMs = Math.max(maxDroppedAcceptedAtMs, interval.acceptedAtMs);
+        const key = `${meta.replicaId}:${String(interval.seq)}`;
+        if (seenDots.has(key)) duplicateDroppableDot = true;
+        seenDots.add(key);
       } else {
-        uncoveredSeen.add(visitId);
-        uncoveredIntervalLines += counts.lines;
-        uncoveredBytes += counts.bytes;
+        uncoveredSeen.add(interval.visitId);
+        uncoveredIntervalLines += 1;
+        uncoveredBytes += interval.bytes;
       }
     }
     shards.push({
@@ -517,27 +587,131 @@ export const planEngagementCompaction = async (
       coveredBytes,
       uncoveredIntervalLines,
       uncoveredBytes,
+      sourceSha256: await sha256File(path),
+      droppedSequences,
+      maxDroppedAcceptedAtMs,
     });
   }
   shards.sort((left, right) => left.path.localeCompare(right.path));
 
   const blockers = engagementCompactionBlockers(vaultRoot, {
     ...(options.offline === undefined ? {} : { offline: options.offline }),
+    ...(options.onlineMaintenance === undefined
+      ? {}
+      : { onlineMaintenance: options.onlineMaintenance }),
   });
+  const mutableBlockers = [...blockers];
+  const manifestRead = await readEngagementCompactionManifest(vaultRoot);
+  let crashRecoveryStatus: EngagementCompactionProofStatus = 'passed';
+  if (manifestRead.state === 'invalid') {
+    crashRecoveryStatus = 'failed';
+    mutableBlockers.push({
+      id: 'compaction-manifest-invalid',
+      severity: 'blocking',
+      detail: 'the prior compaction receipt is unreadable or fails schema/integrity validation',
+      evidence: 'src/gc/engagementCompactionManifest.ts:readEngagementCompactionManifest',
+      clearedBy: 'repair or remove the invalid receipt only after reconciling its shards',
+    });
+  } else if (manifestRead.state === 'valid') {
+    for (const entry of manifestRead.manifest.entries) {
+      const state = await verifyCompactionShardState(vaultRoot, entry);
+      if (state === 'mismatch' || state === 'missing') {
+        crashRecoveryStatus = 'failed';
+        mutableBlockers.push({
+          id: 'compaction-receipt-shard-mismatch',
+          severity: 'blocking',
+          detail: 'a receipt-covered shard matches neither its source nor compacted digest',
+          evidence: 'src/gc/engagementCompactionManifest.ts:verifyCompactionShardState',
+          clearedBy: 'restore the shard from a verified source or compacted copy before retrying',
+        });
+        break;
+      }
+    }
+  }
+  if (duplicateDroppableDot) {
+    mutableBlockers.push({
+      id: 'compaction-dot-duplication',
+      severity: 'blocking',
+      detail: 'two candidate events claim the same replica sequence',
+      evidence: 'src/gc/compactionPlanner.ts:denseSequenceReconciliation',
+      clearedBy: 'repair the causal dot collision; compaction never masks it',
+    });
+  }
+  const appendLifecyclePassed = options.offline === true || options.onlineMaintenance === true;
+  const proofs: EngagementCompactionProofs = {
+    aggregateCoverage: {
+      status: 'passed',
+      evidence: 'every planned dot has a validated engagement.session.aggregated visit',
+    },
+    denseSequenceReconciliation: {
+      status: duplicateDroppableDot ? 'failed' : 'passed',
+      evidence:
+        'exact non-overlapping replica sequence ranges are persisted; gaps are not inferred',
+    },
+    crashRecovery: {
+      status: crashRecoveryStatus,
+      evidence:
+        'prepared receipt precedes atomic shard rename; source/compacted digests are read back',
+    },
+    downstreamConsumers: {
+      status: 'passed',
+      evidence: 'serving contract v1 reads validated engagement.session.aggregated records',
+    },
+    appendLifecycle: {
+      status: appendLifecyclePassed ? 'passed' : 'unknown',
+      evidence: appendLifecyclePassed
+        ? 'offline process proof or EventLog exclusive-maintenance lifecycle supplied'
+        : 'no exclusive online writer lifecycle supplied',
+    },
+    laneHealth: {
+      status: 'passed',
+      evidence: 'compacted-only interval evidence is reported as unknown, never as not-flowing',
+    },
+  };
   const armed = engagementCompactArmed();
-  return {
+  const intervalsFolded = shards.reduce((sum, shard) => sum + shard.coveredIntervalLines, 0);
+  const bytesReclaimable = shards.reduce((sum, shard) => sum + shard.coveredBytes, 0);
+  const allProofsPassed = allProofs(proofs).every((proof) => proof.status === 'passed');
+  const plan: EngagementCompactionPlan = {
+    vaultRoot,
     producedAt: now.toISOString(),
     retainDays,
     cutoffDate,
     shards,
-    intervalsFolded: shards.reduce((sum, shard) => sum + shard.coveredIntervalLines, 0),
-    bytesReclaimable: shards.reduce((sum, shard) => sum + shard.coveredBytes, 0),
+    intervalsFolded,
+    bytesReclaimable,
     visitsCovered: coveredSeen.size,
     visitsUncovered: uncoveredSeen.size,
+    coveredVisitIds: [...coveredSeen].sort(),
+    proofs,
     armed,
-    blockers,
-    wouldRewrite: armed && !blockers.some((blocker) => blocker.severity === 'blocking'),
+    blockers: mutableBlockers,
+    wouldRewrite:
+      armed &&
+      intervalsFolded > 0 &&
+      allProofsPassed &&
+      !mutableBlockers.some((blocker) => blocker.severity === 'blocking'),
   };
+  options.observe?.({
+    operation: 'sidetrack.gc.engagement_compaction.plan',
+    outcome: plan.wouldRewrite ? 'ready' : 'skipped',
+    durationMs: performance.now() - startedAt,
+    candidateShards: shards.length,
+    intervalsFolded,
+    bytesReclaimable,
+    proofStatuses: proofStatuses(proofs),
+    ...(plan.wouldRewrite
+      ? {}
+      : {
+          skipReason:
+            intervalsFolded === 0
+              ? ('no-candidates' as const)
+              : !armed
+                ? ('not-armed' as const)
+                : ('proof-failed' as const),
+        }),
+  });
+  return plan;
 };
 
 export interface EngagementCompactionResult {
@@ -548,11 +722,29 @@ export interface EngagementCompactionResult {
   readonly errors: readonly string[];
 }
 
+const recordsWithEndings = (raw: string): readonly string[] =>
+  raw.split(/(?<=\n)/u).filter(Boolean);
+
+const observationForApply = (
+  plan: EngagementCompactionPlan,
+  startedAt: number,
+  outcome: EngagementCompactionObservation['outcome'],
+  extra: Pick<EngagementCompactionObservation, 'skipReason' | 'errorCategory'> = {},
+): EngagementCompactionObservation => ({
+  operation: 'sidetrack.gc.engagement_compaction.apply',
+  outcome,
+  durationMs: performance.now() - startedAt,
+  candidateShards: plan.shards.length,
+  intervalsFolded: plan.intervalsFolded,
+  bytesReclaimable: plan.bytesReclaimable,
+  proofStatuses: proofStatuses(plan.proofs),
+  ...(extra.skipReason === undefined ? {} : { skipReason: extra.skipReason }),
+  ...(extra.errorCategory === undefined ? {} : { errorCategory: extra.errorCategory }),
+});
+
 /**
- * Apply a plan: rewrite each candidate shard WITHOUT the droppable interval
- * lines. Refuses unless `plan.wouldRewrite` (armed and unblocked); `force` is
- * for tests, which is also how the golden invariant below can be proved without
- * arming anything in production.
+ * Apply a verified plan: rewrite each candidate shard WITHOUT the covered raw
+ * interval lines. There is no force/bypass path.
  *
  * ATOMIC PER SHARD: write the survivors to `<shard>.compact.tmp`, then rename
  * over the shard. A rename is atomic within a filesystem, so a shard is either
@@ -560,72 +752,227 @@ export interface EngagementCompactionResult {
  * the tmp file (cleaned by the connections-temp GC family's sibling discipline
  * and by the next run's overwrite), never a truncated shard.
  *
- * The drop predicate re-derives coverage from the PLAN, not from a second scan,
- * so what gets deleted is exactly what was reported.
+ * A prepared, checksummed receipt is atomically persisted BEFORE any rename.
+ * After a crash each listed shard therefore matches either its source digest or
+ * its compacted digest; a retry can finish the remaining source-state entries.
  */
 export const applyEngagementCompaction = async (
   plan: EngagementCompactionPlan,
-  coveredVisitIds: ReadonlySet<string>,
-  options: { readonly force?: boolean } = {},
+  options: {
+    readonly offline?: boolean;
+    readonly eventLog?: EventLog;
+    readonly observe?: (observation: EngagementCompactionObservation) => void;
+  } = {},
 ): Promise<EngagementCompactionResult> => {
-  if (options.force !== true) {
-    if (!plan.armed) {
-      return {
-        rewrittenShards: 0,
-        droppedLines: 0,
-        reclaimedBytes: 0,
-        skipped: 'not-armed',
-        errors: [],
-      };
-    }
-    if (!plan.wouldRewrite) {
+  const startedAt = performance.now();
+  const observe = options.observe;
+  if (!plan.armed) {
+    observe?.(observationForApply(plan, startedAt, 'skipped', { skipReason: 'not-armed' }));
+    return {
+      rewrittenShards: 0,
+      droppedLines: 0,
+      reclaimedBytes: 0,
+      skipped: 'not-armed',
+      errors: [],
+    };
+  }
+  if (
+    !plan.wouldRewrite ||
+    (options.offline !== true &&
+      (options.eventLog === undefined ||
+        typeof options.eventLog.runExclusiveMaintenance !== 'function')) ||
+    allProofs(plan.proofs).some((proof) => proof.status !== 'passed')
+  ) {
+    observe?.(observationForApply(plan, startedAt, 'skipped', { skipReason: 'proof-failed' }));
+    return {
+      rewrittenShards: 0,
+      droppedLines: 0,
+      reclaimedBytes: 0,
+      skipped: 'blocked',
+      errors: [
+        ...plan.blockers
+          .filter((blocker) => blocker.severity === 'blocking')
+          .map((blocker) => blocker.id),
+        ...(options.offline !== true &&
+        (options.eventLog === undefined ||
+          typeof options.eventLog.runExclusiveMaintenance !== 'function')
+          ? ['append-lifecycle-not-supplied']
+          : []),
+      ],
+    };
+  }
+
+  const applyUnderWriterLock = async (): Promise<EngagementCompactionResult> => {
+    const manifestRead = await readEngagementCompactionManifest(plan.vaultRoot);
+    if (manifestRead.state === 'invalid') {
+      observe?.(
+        observationForApply(plan, startedAt, 'failed', { errorCategory: 'manifest-invalid' }),
+      );
       return {
         rewrittenShards: 0,
         droppedLines: 0,
         reclaimedBytes: 0,
         skipped: 'blocked',
-        errors: plan.blockers
-          .filter((blocker) => blocker.severity === 'blocking')
-          .map((blocker) => `${blocker.id}: ${blocker.detail}`),
+        errors: ['manifest-invalid'],
       };
     }
-  }
-  let rewrittenShards = 0;
-  let droppedLines = 0;
-  let reclaimedBytes = 0;
-  const errors: string[] = [];
-  for (const shard of plan.shards) {
-    if (shard.coveredIntervalLines === 0) continue;
-    const tmp = `${shard.path}.compact.tmp`;
+    const existingEntries = new Map(
+      manifestRead.state === 'valid'
+        ? manifestRead.manifest.entries.map((entry) => [entry.shard, entry] as const)
+        : [],
+    );
+    const coveredVisitIds = new Set(plan.coveredVisitIds);
+    const prepared: Array<{
+      entry: EngagementCompactionManifestEntry;
+      tmp: string;
+      path: string;
+      reclaimedBytes: number;
+    }> = [];
     try {
-      const survivors: string[] = [];
-      let dropped = 0;
-      let droppedBytes = 0;
-      const lines = createInterface({
-        input: createReadStream(shard.path, { encoding: 'utf8' }),
-        crlfDelay: Infinity,
-      });
-      for await (const line of lines) {
-        if (line.length === 0) continue;
-        if (line.includes(INTERVAL_NEEDLE)) {
-          const visitId = VISIT_ID_RE.exec(line)?.[1] ?? '(no-visit-id)';
-          if (coveredVisitIds.has(visitId)) {
-            dropped += 1;
-            droppedBytes += Buffer.byteLength(line, 'utf8') + 1;
+      for (const shard of plan.shards) {
+        if (shard.coveredIntervalLines === 0) continue;
+        const shardKey = `${shard.replicaId}/${shard.date}.jsonl`;
+        const priorEntry = existingEntries.get(shardKey);
+        if (priorEntry !== undefined) {
+          const priorState = await verifyCompactionShardState(plan.vaultRoot, priorEntry);
+          if (priorState === 'compacted') continue;
+          if (priorState !== 'source') throw new Error('receipt-mismatch');
+        }
+        const sourceInfo = await stat(shard.path);
+        if (
+          sourceInfo.size !== shard.totalBytes ||
+          (await sha256File(shard.path)) !== shard.sourceSha256
+        ) {
+          throw new Error('source-changed');
+        }
+        const raw = await readFile(shard.path, 'utf8');
+        const expectedSequences = new Set(shard.droppedSequences);
+        const seenSequences = new Set<number>();
+        const droppedVisits = new Set<string>();
+        const survivors: string[] = [];
+        for (const record of recordsWithEndings(raw)) {
+          const line = record.endsWith('\n') ? record.slice(0, -1) : record;
+          const event = line.includes(INTERVAL_NEEDLE) ? acceptedEventFromLine(line) : null;
+          if (
+            event?.type === ENGAGEMENT_INTERVAL_OBSERVED &&
+            event.dot.replicaId === shard.replicaId &&
+            expectedSequences.has(event.dot.seq) &&
+            isEngagementIntervalObservedPayload(event.payload) &&
+            coveredVisitIds.has(event.payload.visitId)
+          ) {
+            seenSequences.add(event.dot.seq);
+            droppedVisits.add(event.payload.visitId);
             continue;
           }
+          survivors.push(record);
         }
-        survivors.push(line);
+        if (
+          seenSequences.size !== expectedSequences.size ||
+          [...expectedSequences].some((seq) => !seenSequences.has(seq))
+        ) {
+          throw new Error('receipt-mismatch');
+        }
+        const compacted = survivors.join('');
+        const entryWithoutReceipt: Omit<EngagementCompactionManifestEntry, 'receiptSha256'> = {
+          shard: shardKey,
+          replicaId: shard.replicaId,
+          sourceBytes: sourceInfo.size,
+          sourceSha256: shard.sourceSha256,
+          compactedBytes: Buffer.byteLength(compacted, 'utf8'),
+          compactedSha256: sha256Text(compacted),
+          droppedSequenceRanges: sequenceRanges([...seenSequences]),
+          droppedCount: seenSequences.size,
+          maxDroppedAcceptedAtMs: shard.maxDroppedAcceptedAtMs,
+          coveredVisitCount: droppedVisits.size,
+          preparedAt: plan.producedAt,
+        };
+        const computedEntry = withEngagementCompactionReceipt(entryWithoutReceipt);
+        const entry = priorEntry ?? computedEntry;
+        if (
+          entry.replicaId !== computedEntry.replicaId ||
+          entry.sourceBytes !== computedEntry.sourceBytes ||
+          entry.compactedSha256 !== computedEntry.compactedSha256 ||
+          entry.compactedBytes !== computedEntry.compactedBytes ||
+          entry.droppedCount !== computedEntry.droppedCount ||
+          entry.sourceSha256 !== computedEntry.sourceSha256 ||
+          entry.maxDroppedAcceptedAtMs !== computedEntry.maxDroppedAcceptedAtMs ||
+          entry.coveredVisitCount !== computedEntry.coveredVisitCount ||
+          JSON.stringify(entry.droppedSequenceRanges) !==
+            JSON.stringify(computedEntry.droppedSequenceRanges)
+        ) {
+          throw new Error('receipt-mismatch');
+        }
+        const tmp = `${shard.path}.compact.tmp`;
+        // Durably flush the prepared body before the manifest is published.
+        // If the later shard rename survives a crash, its bytes do too.
+        await writeFileAtomic(tmp, compacted);
+        prepared.push({
+          entry,
+          tmp,
+          path: shard.path,
+          reclaimedBytes: sourceInfo.size - entry.compactedBytes,
+        });
+        existingEntries.set(shardKey, entry);
       }
-      await writeFile(tmp, survivors.length === 0 ? '' : `${survivors.join('\n')}\n`, 'utf8');
-      await rename(tmp, shard.path);
-      rewrittenShards += 1;
-      droppedLines += dropped;
-      reclaimedBytes += droppedBytes;
     } catch (error) {
-      errors.push(`${shard.path}: ${error instanceof Error ? error.message : String(error)}`);
-      await unlink(tmp).catch(() => undefined);
+      await Promise.all(prepared.map(async ({ tmp }) => await unlink(tmp).catch(() => undefined)));
+      const category =
+        error instanceof Error && error.message === 'source-changed'
+          ? 'source-changed'
+          : error instanceof Error && error.message === 'receipt-mismatch'
+            ? 'receipt-mismatch'
+            : 'io';
+      observe?.(observationForApply(plan, startedAt, 'failed', { errorCategory: category }));
+      return {
+        rewrittenShards: 0,
+        droppedLines: 0,
+        reclaimedBytes: 0,
+        skipped: 'blocked',
+        errors: [category],
+      };
     }
-  }
-  return { rewrittenShards, droppedLines, reclaimedBytes, skipped: null, errors };
+
+    try {
+      await writeEngagementCompactionManifest(plan.vaultRoot, [...existingEntries.values()]);
+    } catch {
+      await Promise.all(prepared.map(async ({ tmp }) => await unlink(tmp).catch(() => undefined)));
+      observe?.(observationForApply(plan, startedAt, 'failed', { errorCategory: 'io' }));
+      return {
+        rewrittenShards: 0,
+        droppedLines: 0,
+        reclaimedBytes: 0,
+        skipped: 'blocked',
+        errors: ['io'],
+      };
+    }
+
+    let rewrittenShards = 0;
+    let droppedLines = 0;
+    let reclaimedBytes = 0;
+    const errors: string[] = [];
+    for (const item of prepared) {
+      try {
+        await rename(item.tmp, item.path);
+        if ((await verifyCompactionShardState(plan.vaultRoot, item.entry)) !== 'compacted') {
+          throw new Error('receipt-mismatch');
+        }
+        rewrittenShards += 1;
+        droppedLines += item.entry.droppedCount;
+        reclaimedBytes += item.reclaimedBytes;
+      } catch {
+        errors.push('io');
+        await unlink(item.tmp).catch(() => undefined);
+      }
+    }
+    observe?.(
+      observationForApply(plan, startedAt, errors.length === 0 ? 'succeeded' : 'failed', {
+        ...(errors.length === 0 ? {} : { errorCategory: 'io' as const }),
+      }),
+    );
+    return { rewrittenShards, droppedLines, reclaimedBytes, skipped: null, errors };
+  };
+
+  return options.eventLog?.runExclusiveMaintenance === undefined
+    ? await applyUnderWriterLock()
+    : await options.eventLog.runExclusiveMaintenance(applyUnderWriterLock);
 };

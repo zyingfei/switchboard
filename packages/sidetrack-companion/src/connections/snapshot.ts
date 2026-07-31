@@ -121,6 +121,12 @@ import {
   recordGenerationRecovered,
   recordGenerationUnrecovered,
 } from './generationRecovery.js';
+import {
+  mergeMaterializerProgress,
+  progressFromCheckpoint,
+  readGenerationProgressCheckpoint,
+  writeGenerationProgressCheckpoint,
+} from './progressCheckpoint.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import { anisotropyZScore } from './visitSimilarity.js';
 import { SIMILARITY_FAMILY_RENDER_EDGE_KINDS } from './renderedSimilarityFloor.js';
@@ -3945,6 +3951,13 @@ export interface StoredConnectionsMetadata {
   // similarity-family rows). The stable non-similarity structural discriminator
   // for the resolve SWR graph signature (see ConnectionsSnapshot).
   readonly nonSimilarityEdgeCount?: number;
+  // S1 — strong byte-content discriminator for generation publish gating.
+  // snapshotRevision intentionally hashes only counts + freshness and can
+  // collide for same-sized row mutations; this signature covers every served
+  // node/edge/projection byte. It is store-only and omitted from readCurrent.
+  // Scoped/overlay writes clear it because they do not have the whole graph in
+  // hand; the next full write conservatively publishes once to restore it.
+  readonly contentSignature?: string;
 }
 
 export interface ConnectionsProjectionAccumulatorState {
@@ -4009,6 +4022,43 @@ const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMe
     0,
   ),
 });
+
+const contentSignatureForSnapshot = (
+  snapshot: ConnectionsSnapshot,
+  metadata: StoredConnectionsMetadata,
+): string => {
+  const hasher = createHash('sha256');
+  const add = (label: string, value: unknown): void => {
+    hasher.update(label);
+    hasher.update('\u0000');
+    hasher.update(JSON.stringify(value));
+    hasher.update('\u0000');
+  };
+  add('scope', metadata.scope);
+  add('updatedAt', metadata.updatedAt);
+  add('nodeCount', metadata.nodeCount);
+  add('edgeCount', metadata.edgeCount);
+  // Hash rows incrementally. Stringifying the whole graph array at once would
+  // create another graph-sized transient string on the unchanged fast path,
+  // defeating the memory half of the publish gate even though no SQLite
+  // generation was cloned.
+  for (const node of snapshot.nodes) add('node', node);
+  for (const edge of snapshot.edges) add('edge', edge);
+  add('urlProjection', metadata.urlProjection ?? null);
+  add('tabSessionProjection', metadata.tabSessionProjection ?? null);
+  add('visitSimilarityRevisionId', metadata.visitSimilarityRevisionId ?? null);
+  add('similarityCorpusSignature', metadata.similarityCorpusSignature ?? null);
+  add('nonSimilarityEdgeCount', metadata.nonSimilarityEdgeCount ?? null);
+  return hasher.digest('hex');
+};
+
+const withoutContentSignature = (
+  metadata: StoredConnectionsMetadata,
+): StoredConnectionsMetadata => {
+  const copy: { contentSignature?: string } & StoredConnectionsMetadata = { ...metadata };
+  delete copy.contentSignature;
+  return copy;
+};
 
 const snapshotFromParts = (
   metadata: StoredConnectionsMetadata,
@@ -4242,7 +4292,12 @@ const metadataForSnapshotWrite = (
   existing: StoredConnectionsMetadata | null,
 ): StoredConnectionsMetadata => {
   const incoming = metadataForSnapshot(snapshot);
-  if (existing === null) return incoming;
+  if (existing === null) {
+    return {
+      ...incoming,
+      contentSignature: contentSignatureForSnapshot(snapshot, incoming),
+    };
+  }
   const urlProjection = mergeUrlProjectionForWrite(incoming.urlProjection, existing.urlProjection);
   const tabSessionProjection = mergeTabSessionProjectionForWrite(
     incoming.tabSessionProjection,
@@ -4282,7 +4337,7 @@ const metadataForSnapshotWrite = (
     incoming.visitSimilarityRevisionId ?? existing.visitSimilarityRevisionId;
   const similarityCorpusSignature =
     incoming.similarityCorpusSignature ?? existing.similarityCorpusSignature;
-  return {
+  const metadata: StoredConnectionsMetadata = {
     ...incoming,
     updatedAt,
     ...(urlProjection === undefined ? {} : { urlProjection }),
@@ -4290,6 +4345,10 @@ const metadataForSnapshotWrite = (
     ...(snapshotRevision === undefined ? {} : { snapshotRevision }),
     ...(visitSimilarityRevisionId === undefined ? {} : { visitSimilarityRevisionId }),
     ...(similarityCorpusSignature === undefined ? {} : { similarityCorpusSignature }),
+  };
+  return {
+    ...metadata,
+    contentSignature: contentSignatureForSnapshot(snapshot, metadata),
   };
 };
 
@@ -4367,6 +4426,13 @@ export interface ConnectionsDoubleBufferDiagnostics {
   readonly lastCheckpointTruncatedPages: number | null;
   readonly lastCheckpointOk: boolean | null;
   readonly lastGcUnlinked: number;
+  /** Full generation publishes skipped because the write was progress-only or
+   *  the strong served-content signature was unchanged. Process-lifetime. */
+  readonly unchangedPublishSkipCount: number;
+  /** Progress-only acknowledgements written to the generation-bound atomic
+   *  sidecar instead of cloning/publishing the graph database. */
+  readonly progressCheckpointCount: number;
+  readonly lastPublishSkipAtMs: number | null;
 }
 
 export class SqliteConnectionsStore implements ConnectionsStore {
@@ -4440,6 +4506,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   #lastCheckpointTruncatedPages: number | null = null;
   #lastCheckpointOk: boolean | null = null;
   #lastGcUnlinked = 0;
+  #unchangedPublishSkipCount = 0;
+  #progressCheckpointCount = 0;
+  #lastPublishSkipAtMs: number | null = null;
   #resolverCachePruneScheduledFor: string | null = null;
   #resolverCacheCurrentRevision: string | null = null;
   readonly #resolverCacheStaleRevisions = new Set<string>();
@@ -4544,6 +4613,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     lastCheckpointTruncatedPages: this.#lastCheckpointTruncatedPages,
     lastCheckpointOk: this.#lastCheckpointOk,
     lastGcUnlinked: this.#lastGcUnlinked,
+    unchangedPublishSkipCount: this.#unchangedPublishSkipCount,
+    progressCheckpointCount: this.#progressCheckpointCount,
+    lastPublishSkipAtMs: this.#lastPublishSkipAtMs,
   });
 
   /** True when the currently-open handle can execute the schema DDL / writes.
@@ -5411,7 +5483,90 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }, 0).unref?.();
   }
 
+  /**
+   * Return the strong content signature when `snapshot` is byte-identical to
+   * the currently published served graph. The cheap count/freshness revision
+   * is checked first; the strong signature is decisive because two same-sized
+   * row mutations can share snapshotRevision.
+   *
+   * Scoped/overlay generations deliberately carry no contentSignature, so
+   * they conservatively miss this gate and the next full write publishes once
+   * to establish a new trustworthy signature.
+   */
+  async #matchingPublishedContentSignature(snapshot: ConnectionsSnapshot): Promise<string | null> {
+    if (!this.#doubleBuffer) return null;
+    return await this.#withRead(async () => {
+      const db = await this.#database();
+      const current = await this.#readMetadata(db);
+      if (current?.contentSignature === undefined) return null;
+      const candidate = metadataForSnapshotWrite(snapshot, current);
+      if (candidate.snapshotRevision !== current.snapshotRevision) return null;
+      return candidate.contentSignature === current.contentSignature
+        ? current.contentSignature
+        : null;
+    });
+  }
+
+  /** Persist a progress-only acknowledgement without creating a graph shadow.
+   *  The sidecar is tied to the exact pointer generation and accepted by reads
+   *  only while that generation remains current. */
+  async #writeGenerationBoundProgressCheckpoint(
+    progress: MaterializerProgress,
+    expectedContentSignature?: string,
+  ): Promise<boolean> {
+    const db = await this.#database();
+    const generationId = this.#openGenId;
+    const embedded = this.#readPersistedProgressOn(db, progress.materializerName);
+    const metadata = await this.#readMetadata(db);
+    if (generationId === null || embedded === null || metadata === null) {
+      throw new Error('connections progress checkpoint requires a published generation baseline');
+    }
+    if (
+      expectedContentSignature !== undefined &&
+      metadata.contentSignature !== expectedContentSignature
+    ) {
+      throw new Error('connections progress checkpoint generation changed during publish gate');
+    }
+    const snapshotRevisionId = metadata.snapshotRevision ?? null;
+    if (progress.snapshotRevisionId !== snapshotRevisionId) {
+      throw new Error('connections progress checkpoint snapshot revision mismatch');
+    }
+    const checkpoint = await readGenerationProgressCheckpoint(this.#root);
+    const effective =
+      progressFromCheckpoint({
+        checkpoint,
+        generationId,
+        snapshotRevisionId,
+        embedded,
+      }) ?? embedded;
+    const merged = mergeMaterializerProgress(effective, progress, snapshotRevisionId);
+    if (merged === null) {
+      // A materializer-version change intentionally invalidates persisted
+      // progress. It needs the original generation publish path so the new
+      // version becomes the embedded crash-recovery baseline.
+      return false;
+    }
+    await writeGenerationProgressCheckpoint(this.#root, generationId, merged);
+    // A graph publisher may have won immediately after our read. The sidecar
+    // is harmless (its generation id no longer matches), but report failure so
+    // the caller does not claim an acknowledgement that readers will ignore.
+    if (readPointer(this.#root) !== generationId) {
+      throw new Error('connections progress checkpoint superseded by graph publish');
+    }
+    this.#progressCheckpointCount += 1;
+    return true;
+  }
+
+  #recordUnchangedPublishSkip(): void {
+    this.#unchangedPublishSkipCount += 1;
+    this.#lastPublishSkipAtMs = Date.now();
+  }
+
   readonly putCurrent = async (snapshot: ConnectionsSnapshot): Promise<void> => {
+    if ((await this.#matchingPublishedContentSignature(snapshot)) !== null) {
+      this.#recordUnchangedPublishSkip();
+      return;
+    }
     const { db, finalize } = await this.#acquireGraphWriteHandle();
     try {
       this.#writeCurrentRows(db, snapshot, null);
@@ -5428,6 +5583,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     dirtyScopes?: ReadonlySet<Scope>,
     projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
   ): Promise<void> => {
+    const matchingSignature = await this.#matchingPublishedContentSignature(snapshot);
+    if (matchingSignature !== null) {
+      const checkpointed = await this.#writeGenerationBoundProgressCheckpoint(
+        progress,
+        matchingSignature,
+      );
+      if (checkpointed) {
+        this.#recordUnchangedPublishSkip();
+        return;
+      }
+    }
     const { db, finalize } = await this.#acquireGraphWriteHandle();
     try {
       const shouldBootstrapScopeMembership = this.#writeCurrentRows(
@@ -5534,7 +5700,11 @@ export class SqliteConnectionsStore implements ConnectionsStore {
             : Object.keys(tabSessionProjection.bySessionId).length,
       });
       const nextMetadata: StoredConnectionsMetadata = {
-        ...metadata,
+        // This metadata-only overlay does not have every node/edge byte in
+        // hand, so it cannot honestly recompute the strong full-graph content
+        // signature. Clear it; the next full write publishes conservatively
+        // and restores a signature instead of risking a false no-op skip.
+        ...withoutContentSignature(metadata),
         updatedAt,
         ...(urlProjection === undefined ? {} : { urlProjection }),
         ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
@@ -5811,9 +5981,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   }
 
   readonly writeMaterializerProgress = async (progress: MaterializerProgress): Promise<void> => {
-    // Progress rows live with the graph generation (instant-boot invariant),
-    // so a progress-only write publishes its generation too. On the parent
-    // this routes through a write shadow (parent's graph handle is readonly).
+    // S1 — once a graph generation exists, a progress-only acknowledgement is
+    // bound to it in the atomic sidecar instead of cloning/publishing the full
+    // graph DB. The embedded generation progress remains the crash-safe base;
+    // instant boot only reuses its accumulator when frontiers still match, so
+    // a newer sidecar correctly forces a safe accumulator re-seed after boot.
+    if (this.#doubleBuffer && readPointer(this.#root) !== null) {
+      if (await this.#writeGenerationBoundProgressCheckpoint(progress)) {
+        this.#recordUnchangedPublishSkip();
+        return;
+      }
+    }
+    // Fresh vault / legacy fallback: no published generation exists to bind a
+    // checkpoint to, so retain the original transactional generation write.
     const { db, finalize } = await this.#acquireGraphWriteHandle();
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -6156,7 +6336,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
             : Object.keys(tabSessionProjection.bySessionId).length,
       });
       const metadata: StoredConnectionsMetadata = {
-        ...previousMetadata,
+        // A scoped rewrite cannot recompute the full-graph content signature
+        // without reading every row. Clear it so the next full snapshot write
+        // publishes once rather than trusting a stale signature.
+        ...withoutContentSignature(previousMetadata),
         updatedAt,
         nodeCount: nodeOrder.length,
         edgeCount: edgeOrder.length,
@@ -6207,7 +6390,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
             //
             // Falls back to input.progress if nothing is persisted yet (the
             // overlay is the very first writer for this materializer).
-            (this.#readPersistedProgressInTx(db, input.progress.materializerName) ?? input.progress)
+            (this.#readPersistedProgressOn(db, input.progress.materializerName) ?? input.progress)
           : input.progress;
       this.#writeProgressRows(db, {
         ...baseProgress,
@@ -6483,11 +6666,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   }
 
-  // Synchronous read of persisted MaterializerProgress for use inside a
-  // BEGIN IMMEDIATE transaction (so the result can't race a concurrent
-  // writer). Mirrors readMaterializerProgress but without async hops.
+  // Synchronous read of MaterializerProgress embedded in one SQLite
+  // generation. When called inside BEGIN IMMEDIATE it cannot race that
+  // generation's writer; readMaterializerProgress layers the generation-bound
+  // progress checkpoint over this same baseline without mutating the graph.
   // Returns null when no row has been written for the named materializer.
-  #readPersistedProgressInTx(db: SqliteDatabase, name: string): MaterializerProgress | null {
+  #readPersistedProgressOn(db: SqliteDatabase, name: string): MaterializerProgress | null {
     const metaRow = db
       .query(
         `SELECT materializer_name, version, snapshot_revision_id, applied_frontier
@@ -6574,6 +6758,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     name: string,
   ): Promise<MaterializerProgress | null> => {
     const db = await this.#database();
+    const generationId = this.#openGenId;
     const metaRow = db
       .query(
         `SELECT materializer_name, version, snapshot_revision_id, applied_frontier
@@ -6610,7 +6795,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     if (!isRecord(metaRow)) throw new Error('SQLite progress metadata row is not a record');
     const snapshotRevisionId = metaRow['snapshot_revision_id'];
     const appliedFrontier = metaRow['applied_frontier'];
-    return {
+    const embedded: MaterializerProgress = {
       materializerName: textField(metaRow, 'materializer_name'),
       materializerVersion: textField(metaRow, 'version'),
       appliedDotIntervals,
@@ -6620,6 +6805,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           : {},
       snapshotRevisionId: typeof snapshotRevisionId === 'string' ? snapshotRevisionId : null,
     };
+    if (!this.#doubleBuffer || generationId === null) return embedded;
+    const metadata = await this.#readMetadata(db);
+    if (metadata === null) return embedded;
+    const checkpoint = await readGenerationProgressCheckpoint(this.#root);
+    return (
+      progressFromCheckpoint({
+        checkpoint,
+        generationId,
+        snapshotRevisionId: metadata.snapshotRevision ?? null,
+        embedded,
+      }) ?? embedded
+    );
   };
 
   readonly readCurrent = async (): Promise<ConnectionsSnapshot | null> =>

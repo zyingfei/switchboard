@@ -259,6 +259,12 @@ export interface EventLog {
    * short-lived CLI invocations skip it and pay only if they append.
    */
   readonly prewarmAppendIndexes: () => Promise<void>;
+  /**
+   * Run a sealed-shard maintenance operation behind the same mutex as every
+   * append/import, then invalidate all append-path membership indexes. This is
+   * the only supported in-process lifecycle for a compaction rewrite.
+   */
+  readonly runExclusiveMaintenance?: <T>(operation: () => Promise<T>) => Promise<T>;
 }
 
 export interface EventLogOptions {
@@ -593,10 +599,7 @@ export const maxShardTailSeqForReplica = async (
   vaultPath: string,
   replicaId: string,
 ): Promise<number> => {
-  const { maxSeq, unreadableShards } = await reconcileShardTailSeqForReplica(
-    vaultPath,
-    replicaId,
-  );
+  const { maxSeq, unreadableShards } = await reconcileShardTailSeqForReplica(vaultPath, replicaId);
   if (unreadableShards.length > 0) {
     throw new ShardUnreadableError(unreadableShards[0] as string, undefined);
   }
@@ -920,10 +923,9 @@ export const createEventLog = (
   // one file append, and the ~700MB full-log memo can idle out instead
   // of being re-warmed per write.
   //
-  // Indexes are add-only: rewriting/compacting shard files while the
-  // process runs is not supported (the readMerged memo tolerates it
-  // via its signature; these indexes would go stale — there is no such
-  // writer in-tree today).
+  // Indexes are add-only during normal writes. A sealed-shard rewrite is
+  // supported only through runExclusiveMaintenance, which shares the append
+  // mutex and discards these maps before the next writer can observe them.
   interface AppendIndexes {
     readonly clientIdToDot: Map<string, Dot>;
     readonly dotKeys: Set<string>;
@@ -1289,6 +1291,21 @@ export const createEventLog = (
       ...(input.hlc === undefined ? {} : { hlc: input.hlc }),
     });
 
+  const runExclusiveMaintenance = <T>(operation: () => Promise<T>): Promise<T> =>
+    enqueueAppend(async () => {
+      try {
+        return await operation();
+      } finally {
+        // A rewrite can remove ids/dots and aggregate frontier members. The
+        // maps are add-only during normal operation, so they must be rebuilt
+        // from the post-maintenance log before the next append decision.
+        appendIndexes = null;
+        appendIndexesSignature = null;
+        mergedMemo = null;
+        cancelMergedSweep();
+      }
+    });
+
   return {
     appendClient,
     appendClientObserved,
@@ -1306,8 +1323,9 @@ export const createEventLog = (
     listReplicaIds,
     importPeerEvent,
     prewarmAppendIndexes: async (): Promise<void> => {
-      await warmAppendIndexes();
+      await enqueueAppend(warmAppendIndexes);
     },
+    runExclusiveMaintenance,
   };
 };
 

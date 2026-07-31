@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
@@ -96,6 +96,38 @@ export interface EmbeddingCache {
     entries: readonly (readonly [string, Float32Array])[],
   ) => Promise<void>;
   readonly stats: () => Promise<{ readonly entries: number; readonly modelId: string | null }>;
+  /** Typed read-back: an absent file is not the same signal as an initialized
+   *  corpus with zero vectors. */
+  readonly inspect: (
+    model: EmbeddingCacheModelKey,
+  ) => Promise<
+    | { readonly kind: 'absent' }
+    | { readonly kind: 'ready'; readonly entries: number; readonly model: EmbeddingCacheModelKey }
+  >;
+  /** Atomically promote an exact-model cache to a new lifecycle revision.
+   *  Vectors are copied byte-for-byte; a rollback copy remains available. */
+  readonly migrateModel: (
+    from: EmbeddingCacheModelKey,
+    to: EmbeddingCacheModelKey,
+  ) => Promise<'absent' | 'not-applicable' | 'already-current' | 'migrated'>;
+  /** Restore the byte-for-byte pre-migration cache, if one exists. */
+  readonly rollbackMigration: () => Promise<boolean>;
+  /** Publish an initialized-empty corpus without inventing a sentinel vector. */
+  readonly initialize: (model: EmbeddingCacheModelKey) => Promise<void>;
+}
+
+export interface EmbeddingCacheOptions {
+  readonly lockAttempts?: number;
+  readonly lockRetryMs?: number;
+  readonly lockStaleMs?: number;
+}
+
+export class EmbeddingCacheBackpressureError extends Error {
+  readonly code = 'EMBEDDING_CACHE_BACKPRESSURE' as const;
+  constructor(readonly attempts: number) {
+    super(`embedding cache writer remained busy after ${String(attempts)} attempts`);
+    this.name = 'EmbeddingCacheBackpressureError';
+  }
 }
 
 /**
@@ -140,7 +172,7 @@ interface LoadedCache {
 // writer) is what makes it correct when the fork-per-drain child writes the
 // file underneath the parent — the parent picks the new bytes up on its next
 // call, with no cross-process signalling to get wrong.
-const memo = new Map<string, { mtimeMs: number; size: number; loaded: LoadedCache }>();
+const memo = new Map<string, { mtimeMs: number; size: number; ino: number; loaded: LoadedCache }>();
 
 /** Test seam — the memo is process-global, so tests that write the file
  *  directly (rather than through this module) must be able to drop it. */
@@ -148,9 +180,7 @@ export const __resetEmbeddingCacheMemo = (): void => {
   memo.clear();
 };
 
-const readCacheFileUncached = async (
-  state: CacheState,
-): Promise<LoadedCache | null> => {
+const readCacheFileUncached = async (state: CacheState): Promise<LoadedCache | null> => {
   let buffer: Buffer;
   try {
     buffer = await readFile(state.path);
@@ -187,23 +217,27 @@ const readCacheFileUncached = async (
 const readCacheFile = async (state: CacheState): Promise<LoadedCache | null> => {
   let mtimeMs: number;
   let size: number;
+  let ino: number;
   try {
     const info = await stat(state.path);
     mtimeMs = info.mtimeMs;
     size = info.size;
+    ino = info.ino;
   } catch {
     // No file yet (or unreadable) — drop any memo so a later create is seen.
     memo.delete(state.path);
     return null;
   }
   const hit = memo.get(state.path);
-  if (hit !== undefined && hit.mtimeMs === mtimeMs && hit.size === size) return hit.loaded;
+  if (hit !== undefined && hit.mtimeMs === mtimeMs && hit.size === size && hit.ino === ino) {
+    return hit.loaded;
+  }
   const loaded = await readCacheFileUncached(state);
   if (loaded === null) {
     memo.delete(state.path);
     return null;
   }
-  memo.set(state.path, { mtimeMs, size, loaded });
+  memo.set(state.path, { mtimeMs, size, ino, loaded });
   return loaded;
 };
 
@@ -231,16 +265,64 @@ const writeCacheFile = async (
   // of re-parsing bytes this process already has in hand.
   try {
     const info = await stat(state.path);
-    memo.set(state.path, { mtimeMs: info.mtimeMs, size: info.size, loaded: { header, entries } });
+    memo.set(state.path, {
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      ino: info.ino,
+      loaded: { header, entries },
+    });
   } catch {
     memo.delete(state.path);
   }
 };
 
-export const createEmbeddingCache = (vaultRoot: string, dim = 384): EmbeddingCache => {
+export const createEmbeddingCache = (
+  vaultRoot: string,
+  dim = 384,
+  options: EmbeddingCacheOptions = {},
+): EmbeddingCache => {
   const state: CacheState = {
     path: join(vaultRoot, '_BAC', 'recall', 'embed-cache.bin'),
     dim,
+  };
+  const lockPath = `${state.path}.lock`;
+  const rollbackPath = `${state.path}.rollback`;
+  const lockAttempts = Math.max(1, options.lockAttempts ?? 6);
+  const lockRetryMs = Math.max(0, options.lockRetryMs ?? 5);
+  const lockStaleMs = Math.max(1, options.lockStaleMs ?? 120_000);
+
+  const withWriteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
+    await mkdir(dirname(lockPath), { recursive: true });
+    for (let attempt = 0; attempt < lockAttempts; attempt += 1) {
+      try {
+        await mkdir(lockPath);
+        try {
+          return await fn();
+        } finally {
+          await rm(lockPath, { recursive: true, force: true });
+        }
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+        try {
+          const lockStat = await stat(lockPath);
+          if (Date.now() - lockStat.mtimeMs > lockStaleMs) {
+            await rm(lockPath, { recursive: true, force: true });
+            continue;
+          }
+        } catch (lockError) {
+          if (!(lockError instanceof Error && 'code' in lockError && lockError.code === 'ENOENT')) {
+            throw lockError;
+          }
+        }
+        if (attempt === lockAttempts - 1) {
+          throw new EmbeddingCacheBackpressureError(lockAttempts);
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, lockRetryMs * 2 ** attempt);
+        });
+      }
+    }
+    throw new EmbeddingCacheBackpressureError(lockAttempts);
   };
 
   const get = async (key: EmbeddingCacheKey): Promise<Float32Array | null> => {
@@ -265,25 +347,30 @@ export const createEmbeddingCache = (vaultRoot: string, dim = 384): EmbeddingCac
   ): Promise<void> => {
     const writable = incoming.filter(([, vector]) => vector.length === state.dim);
     if (writable.length === 0) return;
-    const existing = await readCacheFile(state);
-    const modelMatches =
-      existing !== null &&
-      existing.header.modelId === model.modelId &&
-      existing.header.modelRevision === model.modelRevision;
-    // Model changed (or no file yet) — start clean. Serving vectors from a
-    // different model would be worse than a cold cache.
-    //
-    // COPY, never mutate `existing.entries` in place: that Map may be the
-    // MEMO's, and a write that fails after an in-place mutation would leave the
-    // memo claiming entries that are not on disk (the file's stat is unchanged,
-    // so nothing would ever invalidate it). writeCacheFile installs this fresh
-    // map as the new memo on success.
-    const entries = modelMatches
-      ? new Map<string, Float32Array>(existing.entries)
-      : new Map<string, Float32Array>();
-    const header = modelMatches ? existing.header : freshHeader(model);
-    for (const [hash, vector] of writable) entries.set(hash, vector);
-    await writeCacheFile(state, header, entries);
+    await withWriteLock(async () => {
+      // Re-read only after taking the cross-process writer lock. The previous
+      // implementation read before write with no exclusion, so the parent and
+      // drain child could each publish a map that omitted the other's batch.
+      const existing = await readCacheFileUncached(state);
+      const modelMatches =
+        existing !== null &&
+        existing.header.modelId === model.modelId &&
+        existing.header.modelRevision === model.modelRevision;
+      // Model changed (or no file yet) — start clean. Serving vectors from a
+      // different model would be worse than a cold cache.
+      //
+      // COPY, never mutate `existing.entries` in place: that Map may be the
+      // MEMO's, and a write that fails after an in-place mutation would leave the
+      // memo claiming entries that are not on disk (the file's stat is unchanged,
+      // so nothing would ever invalidate it). writeCacheFile installs this fresh
+      // map as the new memo on success.
+      const entries = modelMatches
+        ? new Map<string, Float32Array>(existing.entries)
+        : new Map<string, Float32Array>();
+      const header = modelMatches ? existing.header : freshHeader(model);
+      for (const [hash, vector] of writable) entries.set(hash, vector);
+      await writeCacheFile(state, header, entries);
+    });
   };
 
   const put = async (key: EmbeddingCacheKey, vector: Float32Array): Promise<void> => {
@@ -321,5 +408,87 @@ export const createEmbeddingCache = (vaultRoot: string, dim = 384): EmbeddingCac
     };
   };
 
-  return { get, put, getMany, putMany, stats };
+  const inspect = async (
+    model: EmbeddingCacheModelKey,
+  ): Promise<
+    | { readonly kind: 'absent' }
+    | { readonly kind: 'ready'; readonly entries: number; readonly model: EmbeddingCacheModelKey }
+  > => {
+    const cached = await readCacheFile(state);
+    if (
+      cached === null ||
+      cached.header.modelId !== model.modelId ||
+      cached.header.modelRevision !== model.modelRevision
+    ) {
+      return { kind: 'absent' };
+    }
+    return { kind: 'ready', entries: cached.entries.size, model };
+  };
+
+  const migrateModel = async (
+    from: EmbeddingCacheModelKey,
+    to: EmbeddingCacheModelKey,
+  ): Promise<'absent' | 'not-applicable' | 'already-current' | 'migrated'> =>
+    await withWriteLock(async () => {
+      const cached = await readCacheFileUncached(state);
+      if (cached === null) return 'absent';
+      if (
+        cached.header.modelId === to.modelId &&
+        cached.header.modelRevision === to.modelRevision
+      ) {
+        return 'already-current';
+      }
+      if (
+        cached.header.modelId !== from.modelId ||
+        cached.header.modelRevision !== from.modelRevision
+      ) {
+        return 'not-applicable';
+      }
+      // Copy first. If the new publication fails, the active file remains the
+      // old revision and rollback is still byte-for-byte available.
+      await mkdir(dirname(rollbackPath), { recursive: true });
+      await copyFile(state.path, rollbackPath);
+      await writeCacheFile(state, freshHeader(to), new Map(cached.entries));
+      return 'migrated';
+    });
+
+  const rollbackMigration = async (): Promise<boolean> =>
+    await withWriteLock(async () => {
+      try {
+        const temporary = `${state.path}.rollback-${createRevision()}.tmp`;
+        await copyFile(rollbackPath, temporary);
+        await rename(temporary, state.path);
+        memo.delete(state.path);
+        return true;
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
+        throw error;
+      }
+    });
+
+  const initialize = async (model: EmbeddingCacheModelKey): Promise<void> => {
+    await withWriteLock(async () => {
+      const cached = await readCacheFileUncached(state);
+      if (
+        cached !== null &&
+        cached.header.modelId === model.modelId &&
+        cached.header.modelRevision === model.modelRevision
+      ) {
+        return;
+      }
+      await writeCacheFile(state, freshHeader(model), new Map());
+    });
+  };
+
+  return {
+    get,
+    put,
+    getMany,
+    putMany,
+    stats,
+    inspect,
+    migrateModel,
+    rollbackMigration,
+    initialize,
+  };
 };

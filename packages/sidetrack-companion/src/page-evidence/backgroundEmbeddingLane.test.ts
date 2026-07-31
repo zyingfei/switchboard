@@ -42,13 +42,9 @@ const deps = (
 
 describe('isBackgroundEmbeddingBacklog', () => {
   it('is backlog when content is present with a missing embedding', () => {
+    expect(isBackgroundEmbeddingBacklog(candidate({ canonicalUrl: 'https://a.test' }))).toBe(true);
     expect(
-      isBackgroundEmbeddingBacklog(candidate({ canonicalUrl: 'https://a.test' })),
-    ).toBe(true);
-    expect(
-      isBackgroundEmbeddingBacklog(
-        candidate({ canonicalUrl: 'https://a.test', content: {} }),
-      ),
+      isBackgroundEmbeddingBacklog(candidate({ canonicalUrl: 'https://a.test', content: {} })),
     ).toBe(true);
   });
 
@@ -85,7 +81,9 @@ describe('createBackgroundEmbeddingLane.runOnce', () => {
     const lane = createBackgroundEmbeddingLane(
       deps({
         listCandidates: async () =>
-          Array.from({ length: 20 }, (_, i) => candidate({ canonicalUrl: `https://a.test/${String(i)}` })),
+          Array.from({ length: 20 }, (_, i) =>
+            candidate({ canonicalUrl: `https://a.test/${String(i)}` }),
+          ),
         embedCanonicalUrl: async (url) => {
           embedded.push(url);
           return 'embedded';
@@ -124,7 +122,9 @@ describe('createBackgroundEmbeddingLane.runOnce', () => {
       deps({
         isDrainActive: () => drainActive,
         listCandidates: async () =>
-          Array.from({ length: 5 }, (_, i) => candidate({ canonicalUrl: `https://a.test/${String(i)}` })),
+          Array.from({ length: 5 }, (_, i) =>
+            candidate({ canonicalUrl: `https://a.test/${String(i)}` }),
+          ),
         embedCanonicalUrl: async (url) => {
           embedded.push(url);
           // A drain lands after the first record.
@@ -254,7 +254,11 @@ describe('createBackgroundEmbeddingLane.runOnce', () => {
       );
     // First lane instance: one failure recorded + persisted.
     await makeLane().runOnce();
-    expect((stored as { attemptsByCanonicalUrl: Record<string, number> }).attemptsByCanonicalUrl['https://x.test']).toBe(1);
+    expect(
+      (stored as { attemptsByCanonicalUrl: Record<string, number> }).attemptsByCanonicalUrl[
+        'https://x.test'
+      ],
+    ).toBe(1);
     // Fresh lane instance reloads the persisted attempt; a second failure
     // reaches the quarantine threshold.
     const second = makeLane();
@@ -414,7 +418,7 @@ describe('createBackgroundEmbeddingLane attempt-counted batch cap', () => {
     expect(r.embedded + r.failed).toBe(6);
   });
 
-  it('skips do NOT consume the cap (they are not real work)', async () => {
+  it('bounds reconstruction skips without burning failure attempts', async () => {
     let calls = 0;
     const lane = createBackgroundEmbeddingLane(
       deps({
@@ -430,9 +434,11 @@ describe('createBackgroundEmbeddingLane attempt-counted batch cap', () => {
       { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 3 },
     );
     const r = await lane.runOnce();
-    // All 10 are visited (skips are cheap no-ops) but none burn the cap.
-    expect(calls).toBe(10);
-    expect(r.skipped).toBe(10);
+    // A skip still performs a page-content lookup, so visits are capped even
+    // though no failure/quarantine attempt is recorded for the candidate.
+    expect(calls).toBe(3);
+    expect(r.skipped).toBe(3);
+    expect(Object.keys(lane.progress().attemptsByCanonicalUrl)).toHaveLength(0);
   });
 });
 

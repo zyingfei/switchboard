@@ -206,6 +206,7 @@ describe('vaultLedger', () => {
     // 0 orphans is a REAL measurement here (the survey ran and found none), not
     // an absent field — that distinction is the whole P0 counter.
     expect(summary.orphanGenerations).toBe(0);
+    expect(summary.generationSweepRequested).toBe(false);
     expect(summary.generationSweepArmed).toBe(false);
     // Families with zero files are not counted as present.
     expect(summary.familyCount).toBe(4);

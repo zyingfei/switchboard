@@ -39,6 +39,7 @@
 // consumer this feeds: the promotion decides whether to SURFACE a lane pick,
 // and a page the user refused to file is a page where surfacing was wrong.
 
+import { createHash } from 'node:crypto';
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -53,9 +54,10 @@ import type { GuessLane, GuessLaneResult } from './guessLanes.js';
 export const LANE_PREQUENTIAL_ENV = 'SIDETRACK_LANE_PREQUENTIAL';
 
 // Default ON. This is an OBSERVATION lane: it appends a few hundred bytes per
-// resolve and changes no served value. The promotion that consumes it
-// (laneCorroboration.ts) is the part that is default OFF. Only an explicit
-// '0' / 'false' disables — same parse as SIDETRACK_GUESS_LANES.
+// resolve and changes no served value. The promotion that consumes it remains
+// separately kill-switchable and fails closed on its measured n/precision
+// gate. Only an explicit '0' / 'false' disables this observation lane — same
+// parse as SIDETRACK_GUESS_LANES.
 export const lanePrequentialEnabled = (): boolean => {
   const raw = process.env[LANE_PREQUENTIAL_ENV];
   return raw !== '0' && raw !== 'false';
@@ -70,6 +72,16 @@ export const lanePrequentialPath = (vaultRoot: string): string =>
 /** The single rotated generation. See ROTATE_AT_BYTES. */
 export const lanePrequentialRotatedPath = (vaultRoot: string): string =>
   `${lanePrequentialPath(vaultRoot)}.1`;
+
+// Stable identity carried from the served resolve result into the later
+// user.organized.item outcome. The hash is intentionally opaque: URLs and
+// workstream ids never cross the HTTP boundary in this identifier or appear in
+// observability fields that report join health.
+export const LANE_OPPORTUNITY_ID_PREFIX = 'laneopp_';
+const LANE_OPPORTUNITY_ID_PATTERN = /^laneopp_[0-9a-f]{32}$/u;
+
+export const isLaneOpportunityId = (value: unknown): value is string =>
+  typeof value === 'string' && LANE_OPPORTUNITY_ID_PATTERN.test(value);
 
 // Rotate at 4 MB. At ~70 bytes/line and up to 8 lines per resolved URL, that is
 // on the order of 7,500 resolved URLs' worth of predictions — comfortably more
@@ -91,6 +103,18 @@ export interface LanePredictionRecord {
   readonly l: string;
   readonly w: string;
   readonly t: number;
+  /** Durable served-opportunity identity. Absent on pre-R1 legacy rows. */
+  readonly o?: string;
+}
+
+/** A durable user answer mirrored beside predictions for cheap ID-first joins. */
+export interface LaneOutcomeRecord {
+  readonly k: 'outcome';
+  readonly o: string;
+  readonly u: string;
+  /** Selected workstream, or null for the explicit "Not in any stream" answer. */
+  readonly w: string | null;
+  readonly t: number;
 }
 
 const isLaneRecord = (value: unknown): value is LanePredictionRecord => {
@@ -104,8 +128,59 @@ const isLaneRecord = (value: unknown): value is LanePredictionRecord => {
     typeof record['w'] === 'string' &&
     record['w'].length > 0 &&
     typeof record['t'] === 'number' &&
+    Number.isFinite(record['t']) &&
+    (record['o'] === undefined || isLaneOpportunityId(record['o']))
+  );
+};
+
+const isLaneOutcomeRecord = (value: unknown): value is LaneOutcomeRecord => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record['k'] === 'outcome' &&
+    isLaneOpportunityId(record['o']) &&
+    typeof record['u'] === 'string' &&
+    record['u'].length > 0 &&
+    (record['w'] === null || (typeof record['w'] === 'string' && record['w'].length > 0)) &&
+    typeof record['t'] === 'number' &&
     Number.isFinite(record['t'])
   );
+};
+
+/**
+ * Deterministic identity for one materially distinct served lane opportunity.
+ *
+ * Repeated panel polls over the same resolver dependency and the same top lane
+ * picks deliberately produce the same id, so they remain raw delivery rows but
+ * count as one opportunity. A dependency change or a changed lane top pick
+ * produces a new id. Typed-empty lanes do not contribute; when every lane is
+ * empty there is no prediction to judge and therefore no opportunity id.
+ */
+export const laneOpportunityIdFor = (input: {
+  readonly canonicalUrl: string;
+  readonly dependencyKey: string;
+  readonly lanes: readonly GuessLaneResult[] | undefined;
+}): string | undefined => {
+  if (input.canonicalUrl.length === 0 || input.lanes === undefined) return undefined;
+  const tops = input.lanes.flatMap((lane) => {
+    const top = lane.candidates[0];
+    return top === undefined || top.workstreamId.length === 0
+      ? []
+      : [{ lane: lane.lane, workstreamId: top.workstreamId }];
+  });
+  if (tops.length === 0) return undefined;
+  const hasher = createHash('sha256');
+  hasher.update('sidetrack-lane-opportunity-v1\0');
+  hasher.update(input.canonicalUrl);
+  hasher.update('\0');
+  hasher.update(input.dependencyKey);
+  for (const top of tops) {
+    hasher.update('\0');
+    hasher.update(top.lane);
+    hasher.update('\0');
+    hasher.update(top.workstreamId);
+  }
+  return `${LANE_OPPORTUNITY_ID_PREFIX}${hasher.digest('hex').slice(0, 32)}`;
 };
 
 // ---- the writer --------------------------------------------------------
@@ -113,7 +188,23 @@ const isLaneRecord = (value: unknown): value is LanePredictionRecord => {
 export interface LanePredictionInput {
   readonly canonicalUrl: string;
   readonly lanes: readonly GuessLaneResult[] | undefined;
+  /** Present on R1 served results; absent only for legacy callers/tests. */
+  readonly opportunityId?: string;
 }
+
+const appendLaneLogLines = async (vaultRoot: string, lines: readonly string[]): Promise<number> => {
+  if (lines.length === 0) return 0;
+  const path = lanePrequentialPath(vaultRoot);
+  await mkdir(join(vaultRoot, '_BAC', 'eval'), { recursive: true });
+  // Rotate BEFORE appending so the cap is a real ceiling on the live file
+  // rather than "the cap plus whatever the last batch happened to be".
+  const info = await stat(path).catch(() => null);
+  if (info !== null && info.size >= ROTATE_AT_BYTES) {
+    await rename(path, lanePrequentialRotatedPath(vaultRoot)).catch(() => undefined);
+  }
+  await appendFile(path, `${lines.join('\n')}\n`, 'utf8');
+  return lines.length;
+};
 
 /**
  * Append every lane's TOP pick for each resolved URL, as one write.
@@ -139,6 +230,9 @@ export const recordLanePredictions = async (
   const lines: string[] = [];
   for (const entry of entries) {
     if (entry.lanes === undefined) continue;
+    if (entry.opportunityId !== undefined && !isLaneOpportunityId(entry.opportunityId)) {
+      throw new Error('lane prequential prediction carried an invalid opportunity id');
+    }
     for (const lane of entry.lanes) {
       const top = lane.candidates[0];
       if (top === undefined || top.workstreamId.length === 0) continue;
@@ -147,31 +241,63 @@ export const recordLanePredictions = async (
         l: lane.lane,
         w: top.workstreamId,
         t: nowMs,
+        ...(entry.opportunityId === undefined ? {} : { o: entry.opportunityId }),
       };
       lines.push(JSON.stringify(record));
     }
   }
-  if (lines.length === 0) return 0;
-  const path = lanePrequentialPath(vaultRoot);
-  await mkdir(join(vaultRoot, '_BAC', 'eval'), { recursive: true });
-  // Rotate BEFORE appending so the cap is a real ceiling on the live file
-  // rather than "the cap plus whatever the last batch happened to be".
-  const info = await stat(path).catch(() => null);
-  if (info !== null && info.size >= ROTATE_AT_BYTES) {
-    await rename(path, lanePrequentialRotatedPath(vaultRoot)).catch(() => undefined);
+  return await appendLaneLogLines(vaultRoot, lines);
+};
+
+/**
+ * Mirror one explicit URL-attribution answer into the small prequential log.
+ * The canonical user.organized.item event remains the source of truth; this is
+ * a read-optimised, rebuildable join row carrying the served opportunity id.
+ */
+export const recordLaneOutcome = async (
+  vaultRoot: string,
+  input: {
+    readonly opportunityId: string;
+    readonly canonicalUrl: string;
+    readonly workstreamId: string | null;
+    readonly atMs: number;
+  },
+): Promise<number> => {
+  if (!lanePrequentialEnabled()) return 0;
+  if (!isLaneOpportunityId(input.opportunityId)) {
+    throw new Error('lane prequential outcome carried an invalid opportunity id');
   }
-  await appendFile(path, `${lines.join('\n')}\n`, 'utf8');
-  return lines.length;
+  if (
+    input.canonicalUrl.length === 0 ||
+    (input.workstreamId !== null && input.workstreamId.length === 0) ||
+    !Number.isFinite(input.atMs)
+  ) {
+    throw new Error('lane prequential outcome carried invalid fields');
+  }
+  const record: LaneOutcomeRecord = {
+    k: 'outcome',
+    o: input.opportunityId,
+    u: input.canonicalUrl,
+    w: input.workstreamId,
+    t: input.atMs,
+  };
+  return await appendLaneLogLines(vaultRoot, [JSON.stringify(record)]);
 };
 
 // ---- the reader --------------------------------------------------------
 
-const readRecords = async (path: string): Promise<readonly LanePredictionRecord[]> => {
+interface LaneLogRecords {
+  readonly predictions: readonly LanePredictionRecord[];
+  readonly outcomes: readonly LaneOutcomeRecord[];
+}
+
+const readRecords = async (path: string): Promise<LaneLogRecords> => {
   const handle = await open(path, 'r').catch(() => null);
-  if (handle === null) return [];
+  if (handle === null) return { predictions: [], outcomes: [] };
   try {
     const text = await handle.readFile('utf8');
-    const out: LanePredictionRecord[] = [];
+    const predictions: LanePredictionRecord[] = [];
+    const outcomes: LaneOutcomeRecord[] = [];
     for (const line of text.split('\n')) {
       if (line.length === 0) continue;
       let parsed: unknown;
@@ -183,9 +309,10 @@ const readRecords = async (path: string): Promise<readonly LanePredictionRecord[
         // be able to throw into a health probe or a resolve.
         continue;
       }
-      if (isLaneRecord(parsed)) out.push(parsed);
+      if (isLaneOutcomeRecord(parsed)) outcomes.push(parsed);
+      else if (isLaneRecord(parsed)) predictions.push(parsed);
     }
-    return out;
+    return { predictions, outcomes };
   } finally {
     await handle.close().catch(() => undefined);
   }
@@ -199,6 +326,8 @@ export interface LaneFiling {
   readonly canonicalUrl: string;
   readonly workstreamId: string | null;
   readonly atMs: number;
+  /** Present when the user acted on a served R1 suggestion. */
+  readonly opportunityId?: string;
 }
 
 // Time-ordered filings for the join. Deliberately a DIFFERENT projection from
@@ -216,6 +345,9 @@ const foldFilings = (events: readonly AcceptedEvent[]): readonly LaneFiling[] =>
       canonicalUrl: payload.itemId,
       workstreamId: payload.toContainer ?? null,
       atMs: event.acceptedAtMs,
+      ...(payload.details?.servedOpportunityId === undefined
+        ? {}
+        : { opportunityId: payload.details.servedOpportunityId }),
     });
   }
   return filings.sort((left, right) => left.atMs - right.atMs);
@@ -256,6 +388,18 @@ export interface LanePrequentialSummary {
   readonly window: number;
   /** Predictions on disk that no filing has answered yet — honest, not a miss. */
   readonly unscored: number;
+  /** Physical prediction rows, including repeated delivery polls. */
+  readonly rawPredictionRows: number;
+  /** Pre-R1 prediction rows that can only use the URL/time fallback join. */
+  readonly legacyPredictionRows: number;
+  /** Distinct ID-bearing served opportunities after polling dedupe. */
+  readonly eligibleOpportunities: number;
+  /** Distinct ID-bearing user outcomes observed in either durable store. */
+  readonly outcomesObserved: number;
+  /** Observed outcomes whose id + URL matched a prior served opportunity. */
+  readonly outcomesJoined: number;
+  /** outcomesJoined / outcomesObserved; null means no attributable outcomes yet. */
+  readonly outcomeJoinCoverage: number | null;
   readonly lanes: readonly LanePrecision[];
   /** 'off' when the flag is disabled, else 'ok'. Typed emptiness for a reader. */
   readonly status: 'ok' | 'off';
@@ -271,6 +415,12 @@ export const EMPTY_LANE_PREQUENTIAL_SUMMARY: LanePrequentialSummary = {
   scored: 0,
   window: LANE_PREQUENTIAL_WINDOW,
   unscored: 0,
+  rawPredictionRows: 0,
+  legacyPredictionRows: 0,
+  eligibleOpportunities: 0,
+  outcomesObserved: 0,
+  outcomesJoined: 0,
+  outcomeJoinCoverage: null,
   lanes: [],
   status: 'ok',
 };
@@ -279,7 +429,10 @@ export const EMPTY_LANE_PREQUENTIAL_SUMMARY: LanePrequentialSummary = {
  * Join predictions to filings and score them. Pure — the I/O is the caller's.
  *
  * The join, stated precisely:
- *   - group predictions by (url, lane), ascending by t;
+ *   - R1 records join by durable opportunity id + URL first;
+ *   - repeated polling rows with the same opportunity id count once per lane;
+ *   - ONLY legacy predictions (no opportunity id) use the URL/time fallback;
+ *   - group legacy predictions by (url, lane), ascending by t;
  *   - walk the url's filings ascending; each filing consumes the LATEST
  *     prediction strictly before it that has not already been scored;
  *   - hit iff the filing's workstreamId equals the prediction's;
@@ -291,8 +444,87 @@ export const scoreLanePredictions = (
   filings: readonly LaneFiling[],
   window: number = LANE_PREQUENTIAL_WINDOW,
 ): LanePrequentialSummary => {
-  const filingsByUrl = new Map<string, LaneFiling[]>();
+  interface Scored {
+    readonly lane: string;
+    readonly hit: boolean;
+    readonly atMs: number;
+  }
+  const scored: Scored[] = [];
+  let unscored = 0;
+
+  // ---- R1 ID-first join -------------------------------------------------
+  interface Opportunity {
+    readonly canonicalUrl: string;
+    firstAtMs: number;
+    readonly byLane: Map<string, LanePredictionRecord>;
+  }
+  const opportunities = new Map<string, Opportunity>();
+  const legacyRecords: LanePredictionRecord[] = [];
+  for (const record of records) {
+    if (record.o === undefined) {
+      legacyRecords.push(record);
+      continue;
+    }
+    const existing = opportunities.get(record.o);
+    if (existing === undefined) {
+      opportunities.set(record.o, {
+        canonicalUrl: record.u,
+        firstAtMs: record.t,
+        byLane: new Map([[record.l, record]]),
+      });
+      continue;
+    }
+    // A valid deterministic id cannot span URLs. Keep the first well-formed
+    // opportunity and leave a mismatched row as raw-only diagnostic evidence.
+    if (existing.canonicalUrl !== record.u) continue;
+    existing.firstAtMs = Math.min(existing.firstAtMs, record.t);
+    const prior = existing.byLane.get(record.l);
+    if (prior === undefined || record.t < prior.t) existing.byLane.set(record.l, record);
+  }
+
+  // One outcome row is mirrored into lane-prequential.jsonl and also remains
+  // in the canonical event log. Deduplicate those two durable views by id,
+  // choosing the earliest answer; later answers require a newly served id.
+  const outcomesById = new Map<string, LaneFiling>();
+  const legacyFilings: LaneFiling[] = [];
   for (const filing of filings) {
+    if (filing.opportunityId === undefined) {
+      legacyFilings.push(filing);
+      continue;
+    }
+    const prior = outcomesById.get(filing.opportunityId);
+    if (prior === undefined || filing.atMs < prior.atMs) {
+      outcomesById.set(filing.opportunityId, filing);
+    }
+  }
+
+  let outcomesJoined = 0;
+  for (const [opportunityId, opportunity] of opportunities) {
+    const outcome = outcomesById.get(opportunityId);
+    if (
+      outcome === undefined ||
+      outcome.canonicalUrl !== opportunity.canonicalUrl ||
+      outcome.atMs <= opportunity.firstAtMs
+    ) {
+      unscored += opportunity.byLane.size;
+      continue;
+    }
+    outcomesJoined += 1;
+    for (const prediction of opportunity.byLane.values()) {
+      scored.push({
+        lane: prediction.l,
+        hit: outcome.workstreamId !== null && outcome.workstreamId === prediction.w,
+        atMs: outcome.atMs,
+      });
+    }
+  }
+
+  // ---- legacy URL/time fallback ----------------------------------------
+  // Narrow by construction: ID-bearing predictions never enter this branch,
+  // so an unrelated later filing for the same URL cannot be retroactively
+  // attributed to an R1 served opportunity.
+  const filingsByUrl = new Map<string, LaneFiling[]>();
+  for (const filing of legacyFilings) {
     const list = filingsByUrl.get(filing.canonicalUrl);
     if (list === undefined) filingsByUrl.set(filing.canonicalUrl, [filing]);
     else list.push(filing);
@@ -302,7 +534,7 @@ export const scoreLanePredictions = (
   // separator character you might pick, and a key collision here would silently
   // merge two lanes' records into one precision number.
   const byUrl = new Map<string, Map<string, LanePredictionRecord[]>>();
-  for (const record of records) {
+  for (const record of legacyRecords) {
     let byLane = byUrl.get(record.u);
     if (byLane === undefined) {
       byLane = new Map<string, LanePredictionRecord[]>();
@@ -312,14 +544,6 @@ export const scoreLanePredictions = (
     if (list === undefined) byLane.set(record.l, [record]);
     else list.push(record);
   }
-
-  interface Scored {
-    readonly lane: string;
-    readonly hit: boolean;
-    readonly atMs: number;
-  }
-  const scored: Scored[] = [];
-  let unscored = 0;
 
   for (const [url, byLane] of byUrl) {
     const urlFilings = filingsByUrl.get(url) ?? [];
@@ -376,6 +600,12 @@ export const scoreLanePredictions = (
     scored: windowed.length,
     window,
     unscored,
+    rawPredictionRows: records.length,
+    legacyPredictionRows: legacyRecords.length,
+    eligibleOpportunities: opportunities.size,
+    outcomesObserved: outcomesById.size,
+    outcomesJoined,
+    outcomeJoinCoverage: outcomesById.size === 0 ? null : outcomesJoined / outcomesById.size,
     lanes,
     status: 'ok',
   };
@@ -391,12 +621,10 @@ interface MemoizedSummary {
 
 let memoized: MemoizedSummary | null = null;
 
-// Cache key: size + mtime of both prediction generations. Cheap (two stats) and
-// it moves whenever a prediction is appended — which, on an active companion,
-// is every batch-resolve. KNOWN LIMIT, stated rather than hidden: a filing that
-// lands with NO subsequent prediction append does not bust this key, so the
-// summary can lag one filing behind. The consumer is a promotion gate keyed on
-// n>=20 — a one-label lag cannot flip it, and the next resolve refreshes it.
+// Cache key: size + mtime of both log generations. Cheap (two stats) and it
+// moves on every prediction OR mirrored outcome append. Legacy filings that do
+// not carry an opportunity id still depend on the event-store read and can lag
+// until the next prediction append; R1 outcomes are represented in this key.
 const summarySignature = async (vaultRoot: string): Promise<string> => {
   const [live, rotated] = await Promise.all([
     stat(lanePrequentialPath(vaultRoot)).catch(() => null),
@@ -435,7 +663,19 @@ export const lanePrequentialSummary = async (
       readRecords(lanePrequentialPath(vaultRoot)),
       readFilingEvents(vaultRoot).catch(() => [] as readonly AcceptedEvent[]),
     ]);
-    return scoreLanePredictions([...rotated, ...live], foldFilings(events), window);
+    const mirroredOutcomes: LaneFiling[] = [...rotated.outcomes, ...live.outcomes].map(
+      (outcome) => ({
+        canonicalUrl: outcome.u,
+        workstreamId: outcome.w,
+        atMs: outcome.t,
+        opportunityId: outcome.o,
+      }),
+    );
+    return scoreLanePredictions(
+      [...rotated.predictions, ...live.predictions],
+      [...foldFilings(events), ...mirroredOutcomes],
+      window,
+    );
   })().catch(() => ({ ...EMPTY_LANE_PREQUENTIAL_SUMMARY, window }));
   memoized = { vaultRoot, signature, summary };
   return summary;

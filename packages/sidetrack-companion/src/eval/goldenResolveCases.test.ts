@@ -6,10 +6,7 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { appendAiLane, appendContentLane } from '../tabsession/contentLane.js';
 import { foldDeclineMemory } from '../tabsession/declineMemory.js';
 import type { GuessLaneResult } from '../tabsession/guessLanes.js';
-import {
-  applyLaneCorroboration,
-  LANE_CORROBORATION_ENV,
-} from '../tabsession/laneCorroboration.js';
+import { applyLaneCorroboration, LANE_CORROBORATION_ENV } from '../tabsession/laneCorroboration.js';
 import { applyLaneFallbackGuess, type ResultWithFusion } from '../tabsession/laneFallback.js';
 import type { LanePrequentialSummary } from '../tabsession/lanePrequential.js';
 import { decideAttribution } from '../tabsession/policy.js';
@@ -115,6 +112,12 @@ const calibrated = (precision: number, n: number): LanePrequentialSummary => ({
   scored: n * 2,
   window: 500,
   unscored: 0,
+  rawPredictionRows: n * 2,
+  legacyPredictionRows: 0,
+  eligibleOpportunities: n,
+  outcomesObserved: n,
+  outcomesJoined: n,
+  outcomeJoinCoverage: 1,
   status: 'ok',
   lanes: [
     { lane: 'content', n, hits: Math.round(precision * n), precision },
@@ -206,7 +209,12 @@ describe('golden case 1 — hub-magnet (aggregator votes must never win)', () =>
     process.env['SIDETRACK_LANE_HUB_GUARD'] = '0';
     const out = await appendContentLane(
       BARE_RESULT,
-      { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'T', gist: 'g' },
+      {
+        canonicalUrl: 'https://binance.example/options',
+        snapshot: SNAPSHOT,
+        title: 'T',
+        gist: 'g',
+      },
       depsFor(HUB_HITS, BY_URL),
     );
     expect(out.lanes.find((entry) => entry.lane === 'content')?.candidates[0]?.workstreamId).toBe(
@@ -217,7 +225,12 @@ describe('golden case 1 — hub-magnet (aggregator votes must never win)', () =>
   it('says the guard ate everything rather than claiming nothing matched', async () => {
     const out = await appendContentLane(
       BARE_RESULT,
-      { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'T', gist: 'g' },
+      {
+        canonicalUrl: 'https://binance.example/options',
+        snapshot: SNAPSHOT,
+        title: 'T',
+        gist: 'g',
+      },
       depsFor(HUB_HITS.slice(0, 3), BY_URL),
     );
     const lane = out.lanes.find((entry) => entry.lane === 'content');
@@ -269,7 +282,8 @@ describe('golden case 2 — corroboration-hold (the right answer, held at 1 < 2)
     expect(KIMI.decision.gate.detail).toContain('corroboration 1 < 2');
   });
 
-  it('stays held with the promotion OFF (today’s shipped behavior)', () => {
+  it('stays held with the promotion kill switch OFF', () => {
+    process.env[LANE_CORROBORATION_ENV] = '0';
     const out = applyLaneCorroboration(KIMI, {
       canonicalUrl: 'https://arxiv.org/abs/2510.26692',
       calibration: calibrated(0.72, 41),
@@ -345,7 +359,9 @@ describe('golden case 3 — lane-fallback shape (structural lanes empty, content
   };
 
   it('ranks the TWO-LANE agreement first, not the loudest single lane', () => {
-    const out = applyLaneFallbackGuess(JFROG, { canonicalUrl: 'https://jfrog.example/ai-zero-day' });
+    const out = applyLaneFallbackGuess(JFROG, {
+      canonicalUrl: 'https://jfrog.example/ai-zero-day',
+    });
     // ws-linux-security: both lanes, best score 0.71. ws-ai: both lanes, 0.62.
     // ws-interview: content only at 0.31 — agreement beats score.
     expect(out.fusedCandidates.map((c) => c.workstreamId)).toEqual([
@@ -356,7 +372,9 @@ describe('golden case 3 — lane-fallback shape (structural lanes empty, content
   });
 
   it('cannot file: action, workstreamId and margin pass through verbatim', () => {
-    const out = applyLaneFallbackGuess(JFROG, { canonicalUrl: 'https://jfrog.example/ai-zero-day' });
+    const out = applyLaneFallbackGuess(JFROG, {
+      canonicalUrl: 'https://jfrog.example/ai-zero-day',
+    });
     expect(out.decision.action).toBe('inbox');
     expect(out.decision.workstreamId).toBeUndefined();
     expect(out.decision.margin).toBe(0);

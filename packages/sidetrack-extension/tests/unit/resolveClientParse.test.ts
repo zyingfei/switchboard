@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   isTabSessionResolutionResult,
+  isUrlResolutionResult,
   tabSessionResolutionFromUrl,
 } from '../../entrypoints/sidepanel/App';
 import type {
@@ -112,5 +113,31 @@ describe('resolve client parse — guess-lanes normalization', () => {
     const adapted = tabSessionResolutionFromUrl(url);
     expect(adapted.lanes).toBe(url.lanes);
     expect(adapted.lanes).toHaveLength(1);
+  });
+});
+
+describe('resolve client parse — served opportunity identity', () => {
+  const urlWire = (servedOpportunityId: unknown) => ({
+    canonicalUrl: 'https://example.com/served',
+    dryRun: true,
+    decision: { action: 'suggest', workstreamId: 'ws-1', margin: 0.4 },
+    fusedCandidates: [candidate('ws-1')],
+    servedOpportunityId,
+  });
+
+  it('preserves a valid opaque opportunity id for the later attribution reaction', () => {
+    const wire = urlWire('laneopp_0123456789abcdef0123456789abcdef');
+    expect(isUrlResolutionResult(wire)).toBe(true);
+    if (isUrlResolutionResult(wire)) {
+      expect(wire.servedOpportunityId).toBe('laneopp_0123456789abcdef0123456789abcdef');
+    }
+  });
+
+  it('degrades a malformed opportunity id to absent, never empty', () => {
+    const wire = urlWire('');
+    expect(isUrlResolutionResult(wire)).toBe(true);
+    if (isUrlResolutionResult(wire)) {
+      expect(wire.servedOpportunityId).toBeUndefined();
+    }
   });
 });

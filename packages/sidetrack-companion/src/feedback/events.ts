@@ -69,6 +69,8 @@ export interface UserOrganizedItemDetails {
   // additions instead of silently changing the promoted workstream.
   readonly memberIds?: readonly string[];
   readonly attributionSource?: 'manual' | 'tab-group-pull-in' | 'tab-group-pull-out';
+  /** Served lane-opportunity identity echoed by the URL suggestion UI. */
+  readonly servedOpportunityId?: string;
 }
 
 export interface UserOrganizedItemPayload {
@@ -235,6 +237,12 @@ const isOptionalAttributionSource = (
   value === 'tab-group-pull-in' ||
   value === 'tab-group-pull-out';
 
+const LANE_OPPORTUNITY_ID_PATTERN = /^laneopp_[0-9a-f]{32}$/u;
+
+const isOptionalServedOpportunityId = (value: unknown): value is string | undefined =>
+  value === undefined ||
+  (typeof value === 'string' && LANE_OPPORTUNITY_ID_PATTERN.test(value));
+
 const isOptionalOrganizedItemReason = (
   value: unknown,
 ): value is UserOrganizedItemDetails['reason'] =>
@@ -277,7 +285,8 @@ const isUserOrganizedItemDetails = (value: unknown): value is UserOrganizedItemD
     isOptionalOrganizedItemReason(value['reason']) &&
     isOptionalString(value['targetTopicId']) &&
     isOptionalStringArray(value['memberIds']) &&
-    isOptionalAttributionSource(value['attributionSource'])
+    isOptionalAttributionSource(value['attributionSource']) &&
+    isOptionalServedOpportunityId(value['servedOpportunityId'])
   );
 };
 

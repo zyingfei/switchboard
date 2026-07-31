@@ -12,9 +12,9 @@
 // FREEZE-SAFE (ADR-0011): observability only. No serving-math consumer
 // reads any of this — it never gates similarity, attribution, or ranking.
 //
-// Cost: two single indexed MAX(accepted_at_ms) queries (one per type via
-// events_type_idx). Cheap enough for the request-time health path; also
-// materialized at drain via the health report.
+// Cost: three indexed MAX(accepted_at_ms) queries (retained interval,
+// compacted interval receipt, aggregate). Cheap enough for the request-time
+// health path; also materialized at drain via the health report.
 
 import {
   ENGAGEMENT_INTERVAL_OBSERVED,
@@ -38,18 +38,21 @@ export interface EngagementLaneHealth {
   // Gap between the two lanes (interval - aggregate), ms; 0 when aggregate
   // is at least as fresh as interval.
   readonly aggregateLagMs: number;
+  /** Retained raw evidence can prove flowing/idle; compacted/absent is unknown. */
+  readonly intervalFlowState: 'flowing' | 'idle' | 'unknown';
   // TRUE when intervals are flowing (fresh within
   // ENGAGEMENT_INTERVAL_FRESH_MS) but the aggregate lane has stalled
   // (aggregateLagMs >= ENGAGEMENT_AGGREGATE_STALL_MS, OR aggregate never
   // seen while intervals exist). This is the divergence alarm.
-  readonly aggregateStalled: boolean;
+  readonly aggregateStalled: boolean | null;
 }
 
 export const emptyEngagementLaneHealth = (): EngagementLaneHealth => ({
   intervalObservedLastSeenMs: 0,
   sessionAggregateLastSeenMs: 0,
   aggregateLagMs: 0,
-  aggregateStalled: false,
+  intervalFlowState: 'unknown',
+  aggregateStalled: null,
 });
 
 export interface ComputeEngagementLaneHealthInputs {
@@ -58,6 +61,7 @@ export interface ComputeEngagementLaneHealthInputs {
   readonly nowMs: number;
   readonly aggregateStallMs?: number;
   readonly intervalFreshMs?: number;
+  readonly intervalEvidence?: 'retained' | 'compacted-only' | 'absent';
 }
 
 // Pure — decoupled from the store so it's exhaustively testable.
@@ -72,18 +76,28 @@ export const computeEngagementLaneHealth = (
   // are relative to each other. When aggregate is fresher than interval
   // (possible right after a final), the lag floors at 0.
   const aggregateLagMs = intervalLast > aggregateLast ? intervalLast - aggregateLast : 0;
-  const intervalsFlowing = intervalLast > 0 && inputs.nowMs - intervalLast <= freshMs;
-  const aggregateStalled = intervalsFlowing && aggregateLagMs >= stallMs;
+  const evidence = inputs.intervalEvidence ?? (intervalLast > 0 ? 'retained' : 'absent');
+  const intervalFlowState =
+    evidence !== 'retained'
+      ? 'unknown'
+      : inputs.nowMs - intervalLast <= freshMs
+        ? 'flowing'
+        : 'idle';
+  const aggregateStalled =
+    intervalFlowState === 'unknown'
+      ? null
+      : intervalFlowState === 'flowing' && aggregateLagMs >= stallMs;
   return {
     intervalObservedLastSeenMs: intervalLast,
     sessionAggregateLastSeenMs: aggregateLast,
     aggregateLagMs,
+    intervalFlowState,
     aggregateStalled,
   };
 };
 
 // Read the two lane last-seen timestamps from the shared event store and
-// compute the health. Returns the empty (all-zero, not-stalled) health when
+// compute the health. Returns the empty (all-zero, unknown) health when
 // the store is unavailable — never throws, never blocks a drain.
 export const collectEngagementLaneHealth = async (input: {
   readonly vaultRoot: string;
@@ -92,12 +106,25 @@ export const collectEngagementLaneHealth = async (input: {
   try {
     const store = await getCaughtUpSharedEventStore(input.vaultRoot);
     if (store === null) return emptyEngagementLaneHealth();
-    const intervalObservedLastSeenMs = store.maxAcceptedAtMsForType(ENGAGEMENT_INTERVAL_OBSERVED);
+    const retainedIntervalLastSeenMs = store.maxAcceptedAtMsForType(ENGAGEMENT_INTERVAL_OBSERVED);
+    const compactedIntervalLastSeenMs = store.maxCompactedAcceptedAtMsForType(
+      ENGAGEMENT_INTERVAL_OBSERVED,
+    );
+    const intervalObservedLastSeenMs = Math.max(
+      retainedIntervalLastSeenMs,
+      compactedIntervalLastSeenMs,
+    );
     const sessionAggregateLastSeenMs = store.maxAcceptedAtMsForType(ENGAGEMENT_SESSION_AGGREGATED);
     return computeEngagementLaneHealth({
       intervalObservedLastSeenMs,
       sessionAggregateLastSeenMs,
       nowMs: input.nowMs ?? Date.now(),
+      intervalEvidence:
+        retainedIntervalLastSeenMs > 0
+          ? 'retained'
+          : compactedIntervalLastSeenMs > 0
+            ? 'compacted-only'
+            : 'absent',
     });
   } catch {
     return emptyEngagementLaneHealth();

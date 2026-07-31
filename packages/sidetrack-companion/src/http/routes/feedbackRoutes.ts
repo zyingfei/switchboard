@@ -6,8 +6,9 @@
 
 import { USER_ENGAGEMENT_RELABELED, USER_FLOW_CONFIRMED, USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, USER_REJECTED_RELATION, USER_SNIPPET_PROMOTED, USER_TOPIC_RENAMED, isUserEngagementRelabeledPayload, isUserFlowConfirmedPayload, isUserFlowRejectedPayload, isUserOrganizedItemPayload, isUserRejectedRelationPayload, isUserSnippetPromotedPayload, isUserTopicRenamedPayload } from '../../feedback/events.js';
 import { projectFeedback } from '../../feedback/projection.js';
+import { recordLaneOutcome } from '../../tabsession/lanePrequential.js';
 
-import { FEEDBACK_EVENT_TYPE_LIST, HttpRouteError, aggregateIdForFeedbackEvent, baseVectorForAggregate, isFeedbackEventType, objectRecord, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, runIdempotent } from '../routeSupport.js';
+import { FEEDBACK_EVENT_TYPE_LIST, HttpRouteError, aggregateIdForFeedbackEvent, baseVectorForAggregate, isFeedbackEventType, objectRecord, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 const isFeedbackPayloadForType = (
@@ -29,7 +30,7 @@ export const feedbackRoutes: readonly RouteDefinition[] = [
     method: 'POST',
     pattern: /^\/v1\/feedback\/events$/,
     authRequired: true,
-    handle: async (request, _requestId, _match, context) => {
+    handle: async (request, requestId, _match, context) => {
       if (context.eventLog === undefined) {
         throw new HttpRouteError(
           503,
@@ -59,6 +60,27 @@ export const feedbackRoutes: readonly RouteDefinition[] = [
           payload,
           baseVector: await baseVectorForAggregate(eventLog, aggregateId),
         });
+        if (
+          type === USER_ORGANIZED_ITEM &&
+          isUserOrganizedItemPayload(payload) &&
+          payload.itemKind === 'canonical-url' &&
+          payload.action === 'move' &&
+          payload.details?.servedOpportunityId !== undefined
+        ) {
+          await recordLaneOutcome(requireVaultRoot(context), {
+            opportunityId: payload.details.servedOpportunityId,
+            canonicalUrl: payload.itemId,
+            workstreamId: payload.toContainer ?? null,
+            atMs: accepted.acceptedAtMs,
+          }).catch((error: unknown) => {
+            console.warn('[lane-prequential]', {
+              requestId,
+              operation: 'lane-prequential.outcome-record',
+              outcome: 'error',
+              errorCategory: error instanceof Error ? error.name : 'unknown',
+            });
+          });
+        }
         return [201, { data: { accepted } }];
       });
     },

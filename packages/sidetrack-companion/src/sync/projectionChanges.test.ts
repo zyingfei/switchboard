@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -250,6 +250,17 @@ describe('projection change feed', () => {
       // so a second generation file can never accumulate.
       expect(existsSync(rotatedLogPath(vaultRoot))).toBe(true);
       expect(existsSync(`${rotatedLogPath(vaultRoot)}.1`)).toBe(false);
+      const diagnostics = feed.__rotationDiagnostics();
+      expect(diagnostics).toMatchObject({ attempts: 1, completed: 1, refused: 0 });
+      expect(diagnostics.lastProofHash).toMatch(/^[a-f0-9]{64}$/u);
+      const persistedProof = JSON.parse(
+        await readFile(
+          join(vaultRoot, '_BAC', '.sync', 'projection-changes-rotation-proof.json'),
+          'utf8',
+        ),
+      ) as { readonly status?: unknown; readonly sourceHash?: unknown };
+      expect(persistedProof.status).toBe('complete');
+      expect(persistedProof.sourceHash).toBe(diagnostics.lastProofHash);
 
       // A COLD reader (no in-memory checkpoint) from 0 sees EVERY change across
       // both generations, in seq order, with no hole at the rotation boundary.
@@ -344,5 +355,28 @@ describe('projection change feed', () => {
     process.env['SIDETRACK_SYNC_CHANGELOG_MAX_BYTES'] = '-1';
     expect(syncChangelogMaxBytes()).toBe(SYNC_CHANGELOG_MAX_BYTES_DEFAULT);
     delete process.env['SIDETRACK_SYNC_CHANGELOG_MAX_BYTES'];
+  });
+
+  it('fails closed and keeps an over-cap live log when durable read-back is malformed', async () => {
+    process.env['SIDETRACK_SYNC_CHANGELOG_MAX_BYTES'] = '100';
+    try {
+      const dir = join(vaultRoot, '_BAC', '.sync');
+      const live = join(dir, 'projection-changes.jsonl');
+      await mkdir(dir, { recursive: true });
+      await writeFile(live, `${'not-json\n'.repeat(20)}`, 'utf8');
+      const feed = createProjectionChangeFeed(vaultRoot);
+      await append(feed, 'safe-tail');
+
+      expect(existsSync(live)).toBe(true);
+      expect(existsSync(rotatedLogPath(vaultRoot))).toBe(false);
+      expect(feed.__rotationDiagnostics()).toMatchObject({
+        attempts: 1,
+        completed: 0,
+        refused: 1,
+        lastProofHash: null,
+      });
+    } finally {
+      delete process.env['SIDETRACK_SYNC_CHANGELOG_MAX_BYTES'];
+    }
   });
 });
