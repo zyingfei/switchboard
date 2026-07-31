@@ -91,3 +91,58 @@ describe('the blocked state the re-probe timer watches for', () => {
     expect(route).toEqual({ engine: null, reason: 'model-loading' });
   });
 });
+
+describe('a FAILING service is not a MISSING model', () => {
+  // REPORTED LIVE 2026-07-30: "intermittent: no model loaded — load it in
+  // Health". apfel had 2 days of uptime and answered /v1/models in 3ms; every
+  // generation returned
+  //   FoundationModels.LanguageModelSession.GenerationError error -1
+  // because the machine was swapping — 1.44M pageouts, ~14MB free, with the
+  // companion itself at 6.5GB RSS — so the OS could not run the model's
+  // assets. Restarting the service did not help. Nothing in Health loads that
+  // model, so the advice the row gave was not merely unhelpful, it pointed
+  // away from the only thing that works.
+  //
+  // The probe already KNEW ('probe-failed' — it tests generation, not just
+  // liveness); routing flattened it into 'model-not-loaded'.
+
+  const nothingElse = {
+    nanoReady: false,
+    webGpuLoaded: false,
+    webGpuSupported: true,
+  };
+
+  it('reports engine-service-failing when the service answers but cannot generate', () => {
+    expect(
+      routeEnrichmentEngine('en', { ...nothingElse, appleUnavailable: 'probe-failed' }),
+    ).toEqual({ engine: null, reason: 'engine-service-failing' });
+  });
+
+  it('reports it for an origin-blocked service too — also present, also refusing', () => {
+    expect(
+      routeEnrichmentEngine('en', { ...nothingElse, appleUnavailable: 'origin-blocked' }),
+    ).toEqual({ engine: null, reason: 'engine-service-failing' });
+  });
+
+  it('still says model-not-loaded when the service is genuinely ABSENT', () => {
+    // The distinction only pays if the ordinary case keeps its ordinary,
+    // correct advice.
+    expect(
+      routeEnrichmentEngine('en', { ...nothingElse, appleUnavailable: 'not-running' }),
+    ).toEqual({ engine: null, reason: 'model-not-loaded' });
+    expect(routeEnrichmentEngine('en', nothingElse)).toEqual({
+      engine: null,
+      reason: 'model-not-loaded',
+    });
+  });
+
+  it('a working engine still wins — a stale failure reason cannot block it', () => {
+    expect(
+      routeEnrichmentEngine('en', {
+        ...nothingElse,
+        webGpuLoaded: true,
+        appleUnavailable: 'probe-failed',
+      }).engine,
+    ).toBe('webgpu');
+  });
+});

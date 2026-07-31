@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, utimesSync, writeFileSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,16 +8,20 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   casPublish,
   checkpointTruncate,
+  clearShadowInFlight,
   composeGenId,
   createShadowGeneration,
   discardShadowGeneration,
   gcOldGenerations,
+  markShadowInFlight,
   generationDbPath,
   generationExists,
   migrateLegacyToGeneration,
   readPointer,
   reconcileLegacyToPublished,
   residentGenerations,
+  surveyGenerations,
+  sweepOrphanGenerations,
   withPublishLock,
   writePointer,
 } from './generationBuffer.js';
@@ -323,5 +327,306 @@ describe('generationBuffer', () => {
     expect(readMarker(join(dir, 'current.db'), false)).toBe('served-new');
     // Idempotent: a second call on the unchanged pointer is a no-op.
     expect(reconcileLegacyToPublished(dir)).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-process in-flight shadow markers (the 2026-07-29 "disk I/O error" P0).
+  //
+  // The GC keep-set is assembled from the publisher's OWN process state, but a
+  // write SHADOW is an ordinary `current.<gen>.db` on disk. So a publish in one
+  // process readdir'd, found another process's live shadow in neither its
+  // keep-set nor the pointer, and unlinked it — after which the victim's next
+  // query threw "disk I/O error" (bun:sqlite's vnode-detached signature). Both
+  // directions happened live: the fork-per-drain child's shadow is open for the
+  // whole reconcile (minutes) and the parent's overlay publishes land inside it.
+  // -------------------------------------------------------------------------
+
+  /** Write an in-flight marker as if some OTHER process owned the shadow. */
+  const writeForeignMarker = (
+    dirPath: string,
+    genId: string,
+    pid: number,
+    atMs = Date.now(),
+  ): void => {
+    writeFileSync(`${generationDbPath(dirPath, genId)}.inflight`, `${String(pid)} ${String(atMs)}`);
+  };
+  // Our parent process: a real, live pid that is definitively not us.
+  const LIVE_FOREIGN_PID = process.ppid;
+  // Above macOS' default pid_max (99998) ⇒ guaranteed ESRCH, i.e. dead.
+  const DEAD_PID = 999_999;
+
+  sqliteIt('gcOldGenerations does NOT unlink a shadow a LIVE foreign process holds', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-live-'));
+    const live = composeGenId(1, 'live');
+    const childShadow = composeGenId(2, 'childshadow');
+    for (const id of [live, childShadow]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // The child claimed its shadow before writing a byte into it.
+    writeForeignMarker(dir, childShadow, LIVE_FOREIGN_PID);
+
+    // A parent overlay publishes mid-drain. Its keep-set cannot mention the
+    // child's shadow — it has never heard of it. Pre-fix, this unlinked it.
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).not.toContain(childShadow);
+    expect(generationExists(dir, childShadow)).toBe(true);
+    expect(existsSync(`${generationDbPath(dir, childShadow)}.inflight`)).toBe(true);
+  });
+
+  sqliteIt('gcOldGenerations collects a shadow whose owning process DIED (no leak)', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-dead-'));
+    const live = composeGenId(1, 'live');
+    const abandoned = composeGenId(2, 'abandoned');
+    for (const id of [live, abandoned]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // A child that was SIGKILLed mid-drain leaves its marker behind. Honouring
+    // it forever would trade the P0 for an unbounded disk leak (each generation
+    // is ~330MB on the real vault).
+    writeForeignMarker(dir, abandoned, DEAD_PID);
+
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).toContain(abandoned);
+    expect(generationExists(dir, abandoned)).toBe(false);
+    // The orphaned marker goes with the file it named.
+    expect(existsSync(`${generationDbPath(dir, abandoned)}.inflight`)).toBe(false);
+  });
+
+  sqliteIt('an OWN-process marker does not block this process own GC', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-self-'));
+    const live = composeGenId(1, 'live');
+    const mine = composeGenId(2, 'mine');
+    for (const id of [live, mine]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, live);
+    // markShadowInFlight always stamps OUR pid.
+    markShadowInFlight(dir, mine);
+
+    // Within one process the store already tracks its live shadows exactly
+    // (#inFlightShadowGenIds feeds keepAlive), so a self-marker must not add a
+    // second, weaker authority that outlives finalize().
+    const unlinked = gcOldGenerations(dir, [live]);
+    expect(unlinked).toContain(mine);
+    expect(generationExists(dir, mine)).toBe(false);
+  });
+
+  sqliteIt('createShadowGeneration claims the shadow and casPublish releases it', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-lifecycle-'));
+    const gen0 = composeGenId(0, 'seed');
+    seedDb(generationDbPath(dir, gen0), 'served-v1');
+    writePointer(dir, gen0);
+
+    const shadowGen = composeGenId(1, 'shadow');
+    createShadowGeneration(dir, shadowGen);
+    // Claimed at creation — there is no window in which the file exists on disk
+    // unclaimed, which is what a foreign readdir would have collected.
+    expect(existsSync(`${generationDbPath(dir, shadowGen)}.inflight`)).toBe(true);
+
+    const res = casPublish(dir, { seedGenId: gen0, newGenId: shadowGen });
+    expect(res.outcome).toBe('published');
+    // Published ⇒ no longer a write target ⇒ claim released, so it cannot pin
+    // itself once the pointer moves on.
+    expect(existsSync(`${generationDbPath(dir, shadowGen)}.inflight`)).toBe(false);
+  });
+
+  sqliteIt('discardShadowGeneration and an aged-out marker both release the claim', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-release-'));
+    const live = composeGenId(1, 'live');
+    seedDb(generationDbPath(dir, live), live);
+    writePointer(dir, live);
+
+    const lost = composeGenId(2, 'lostcas');
+    createShadowGeneration(dir, lost);
+    discardShadowGeneration(dir, lost);
+    expect(existsSync(`${generationDbPath(dir, lost)}.inflight`)).toBe(false);
+
+    // Pid-reuse backstop: a marker older than the ceiling is ignored even
+    // though its pid is alive, so a recycled pid cannot pin a gen forever.
+    const ancient = composeGenId(3, 'ancient');
+    seedDb(generationDbPath(dir, ancient), ancient);
+    writeForeignMarker(dir, ancient, LIVE_FOREIGN_PID, Date.now() - 7 * 60 * 60_000);
+    expect(gcOldGenerations(dir, [live])).toContain(ancient);
+    expect(generationExists(dir, ancient)).toBe(false);
+  });
+
+  sqliteIt('clearShadowInFlight is idempotent and sweeps file-less orphan markers', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-inflight-sweep-'));
+    const live = composeGenId(1, 'live');
+    seedDb(generationDbPath(dir, live), live);
+    writePointer(dir, live);
+    // Double-clear must not throw (publish clears, then the finally clears).
+    clearShadowInFlight(dir, composeGenId(9, 'never'));
+    clearShadowInFlight(dir, composeGenId(9, 'never'));
+
+    // A writer killed between the claim and the clone leaves a marker with no
+    // db beside it. GC sweeps it in the same readdir it already does.
+    const ghost = composeGenId(4, 'ghost');
+    writeForeignMarker(dir, ghost, LIVE_FOREIGN_PID);
+    expect(generationExists(dir, ghost)).toBe(false);
+    gcOldGenerations(dir, [live]);
+    expect(existsSync(`${generationDbPath(dir, ghost)}.inflight`)).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // PUBLISH-INDEPENDENT ORPHAN SURVEY (the 2026-07-29 leak follow-up).
+  //
+  // MEASURED: `_BAC/connections/` held the pointer target plus THREE ~323 MB
+  // orphans (~970 MB dead) while the UI's GC inventory said "10.7 MB / 1 file".
+  // Two gaps: the child-writer's superseded branch never unlinked its own lost
+  // shadow, and gcOldGenerations only ever ran inside a WINNING casPublish — so
+  // an idle vault swept nothing and counted nothing.
+  //
+  // These tests pin exactly which dispositions the survey assigns and, in
+  // particular, which generations it REFUSES to collect: a false keep costs one
+  // file, a false collect is the "disk I/O error" P0.
+  // -------------------------------------------------------------------------
+
+  /** Backdate a generation's db + siblings so the grace window can be tested
+   *  without sleeping. Mirrors what an abandoned gen looks like on disk. */
+  const backdateGeneration = (dirPath: string, genId: string, ageMs: number): void => {
+    const when = new Date(Date.now() - ageMs);
+    for (const suffix of ['', '-wal', '-shm']) {
+      const path = `${generationDbPath(dirPath, genId)}${suffix}`;
+      if (existsSync(path)) utimesSync(path, when, when);
+    }
+  };
+
+  sqliteIt('surveyGenerations classifies pointer / live-marked / dead-marked / marker-less', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-survey-'));
+    const HOUR = 60 * 60_000;
+    // The four cases the brief names, built as they occur on disk.
+    const pointer = composeGenId(10, 'pointer');
+    const foreignLive = composeGenId(11, 'foreignlive');
+    const deadMarked = composeGenId(12, 'deadmarked');
+    const markerless = composeGenId(13, 'markerless');
+    for (const id of [pointer, foreignLive, deadMarked, markerless]) {
+      seedDb(generationDbPath(dir, id), id);
+    }
+    writePointer(dir, pointer);
+    writeForeignMarker(dir, foreignLive, LIVE_FOREIGN_PID);
+    writeForeignMarker(dir, deadMarked, DEAD_PID);
+    // Age every non-pointer generation well past the grace window, and make the
+    // pointer the NEWEST so the recent-prior slot is unambiguous. Ordering
+    // matters: the survey's newest-N window is mtime-ranked, so the two aged
+    // orphans must both be older than the live-marked one.
+    backdateGeneration(dir, markerless, 5 * HOUR);
+    backdateGeneration(dir, deadMarked, 4 * HOUR);
+    backdateGeneration(dir, foreignLive, 3 * HOUR);
+
+    const survey = surveyGenerations(dir);
+    const disposition = (genId: string): string =>
+      survey.entries.find((entry) => entry.genId === genId)?.disposition ?? 'MISSING';
+
+    expect(survey.pointerGenId).toBe(pointer);
+    expect(disposition(pointer)).toBe('pointer');
+    // A live foreign writer owns it — the whole reason the marker protocol
+    // exists. Must survive even though it is aged and not the pointer.
+    expect(disposition(foreignLive)).toBe('live-marked');
+    // Dead owner + aged ⇒ abandoned. Marker-less + aged ⇒ abandoned. These are
+    // the two shapes the live vault actually had.
+    expect(disposition(deadMarked)).toBe('orphan-collectable');
+    expect(disposition(markerless)).toBe('orphan-collectable');
+    expect(survey.collectableCount).toBe(2);
+    expect(survey.collectableBytes).toBeGreaterThan(0);
+    // The dead-pid marker is reported as such — typed, not just "no marker".
+    const dead = survey.entries.find((entry) => entry.genId === deadMarked);
+    expect(dead?.markerPid).toBe(DEAD_PID);
+    expect(dead?.markerPidAlive).toBe(false);
+    const orphan = survey.entries.find((entry) => entry.genId === markerless);
+    expect(orphan?.markerPid).toBeNull();
+    expect(orphan?.markerPidAlive).toBeNull();
+  });
+
+  sqliteIt('the survey keeps the newest prior generation and anything inside the grace window', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-survey-keep-'));
+    const pointer = composeGenId(20, 'pointer');
+    const prior = composeGenId(21, 'prior');
+    const young = composeGenId(22, 'young');
+    const aged = composeGenId(23, 'aged');
+    for (const id of [pointer, prior, young, aged]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, pointer);
+    // `prior` is the immediately-preceding publish: casPublish keeps it for the
+    // parent's retired-handle window, and a survey running OUTSIDE the publish
+    // critical section cannot see that in-process handle set — so it must keep
+    // the newest non-pointer gen on recency alone. `aged` is older still.
+    backdateGeneration(dir, prior, 3 * 60 * 60_000);
+    backdateGeneration(dir, aged, 4 * 60 * 60_000);
+    // `young` is marker-less but recent: within grace, so never collected.
+
+    const survey = surveyGenerations(dir, { keepRecentGenerations: 2, graceMs: 60 * 60_000 });
+    const disposition = (genId: string): string =>
+      survey.entries.find((entry) => entry.genId === genId)?.disposition ?? 'MISSING';
+    expect(disposition(pointer)).toBe('pointer');
+    // `young` has the newest mtime of the non-pointer gens ⇒ it takes the single
+    // recent-prior slot; `prior` then falls through to the grace/age test.
+    expect(disposition(young)).toBe('recent-prior');
+    expect(disposition(prior)).toBe('orphan-collectable');
+    expect(disposition(aged)).toBe('orphan-collectable');
+    // With keepRecent 3 the next-newest is also protected — the knob is real.
+    const wider = surveyGenerations(dir, { keepRecentGenerations: 3, graceMs: 60 * 60_000 });
+    expect(
+      wider.entries.find((entry) => entry.genId === prior)?.disposition,
+    ).toBe('recent-prior');
+  });
+
+  sqliteIt('sweepOrphanGenerations REPORTS but deletes nothing while disarmed', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-sweep-disarmed-'));
+    const pointer = composeGenId(30, 'pointer');
+    const prior = composeGenId(31, 'prior');
+    const orphan = composeGenId(32, 'orphan');
+    for (const id of [pointer, prior, orphan]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, pointer);
+    backdateGeneration(dir, orphan, 5 * 60 * 60_000);
+
+    // Default posture: SIDETRACK_GENERATION_GC_SWEEP unset. The whole point of
+    // the first landing — the operator inspects the report before arming a
+    // sweep that unlinks ~323 MB files.
+    delete process.env['SIDETRACK_GENERATION_GC_SWEEP'];
+    const disarmed = sweepOrphanGenerations(dir);
+    expect(disarmed.survey.sweepArmed).toBe(false);
+    expect(disarmed.survey.collectableCount).toBe(1);
+    expect(disarmed.collected).toEqual([]);
+    expect(generationExists(dir, orphan)).toBe(true);
+
+    // Armed: collects exactly the reported orphan, and NOTHING else.
+    process.env['SIDETRACK_GENERATION_GC_SWEEP'] = '1';
+    try {
+      const armed = sweepOrphanGenerations(dir);
+      expect(armed.collected).toEqual([orphan]);
+      expect(generationExists(dir, orphan)).toBe(false);
+      // Siblings go with the main file.
+      expect(existsSync(`${generationDbPath(dir, orphan)}-wal`)).toBe(false);
+      expect(existsSync(`${generationDbPath(dir, orphan)}-shm`)).toBe(false);
+      // The served generation and the retired-handle margin both survive.
+      expect(generationExists(dir, pointer)).toBe(true);
+      expect(generationExists(dir, prior)).toBe(true);
+      expect(readPointer(dir)).toBe(pointer);
+    } finally {
+      delete process.env['SIDETRACK_GENERATION_GC_SWEEP'];
+    }
+  });
+
+  sqliteIt('an armed sweep still refuses a generation a live writer claims — even our own', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'genbuf-sweep-live-'));
+    const pointer = composeGenId(40, 'pointer');
+    const mine = composeGenId(41, 'mine');
+    const foreign = composeGenId(42, 'foreign');
+    for (const id of [pointer, mine, foreign]) seedDb(generationDbPath(dir, id), id);
+    writePointer(dir, pointer);
+    // Own-pid marker: gcOldGenerations ignores these (inside casPublish the
+    // store's exact #inFlightShadowGenIds is in the keep-set), but the SURVEY
+    // has no such keep-set — an own-pid marker is its only evidence that this
+    // process is mid-write. Collecting it would be the P0, from our own hand.
+    markShadowInFlight(dir, mine);
+    writeForeignMarker(dir, foreign, LIVE_FOREIGN_PID);
+    backdateGeneration(dir, mine, 5 * 60 * 60_000);
+    backdateGeneration(dir, foreign, 5 * 60 * 60_000);
+
+    process.env['SIDETRACK_GENERATION_GC_SWEEP'] = '1';
+    try {
+      const result = sweepOrphanGenerations(dir);
+      expect(result.collected).toEqual([]);
+      expect(generationExists(dir, mine)).toBe(true);
+      expect(generationExists(dir, foreign)).toBe(true);
+    } finally {
+      delete process.env['SIDETRACK_GENERATION_GC_SWEEP'];
+    }
   });
 });

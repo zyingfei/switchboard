@@ -204,6 +204,12 @@ export interface EngineAvailability {
    * case, and never an error.
    */
   readonly appleReady?: boolean;
+  /**
+   * WHY the Apple engine is unavailable, when it is. 'probe-failed' means the
+   * service answered but generation did not — a different fact from "not
+   * installed", and the row must not flatten the two into one wrong sentence.
+   */
+  readonly appleUnavailable?: 'not-running' | 'wrong-service' | 'origin-blocked' | 'probe-failed';
   /** The WebGPU engine was EXPLICITLY loaded this session (Health button). */
   readonly webGpuLoaded: boolean;
   /** An explicit WebGPU load is in flight right now. */
@@ -228,6 +234,21 @@ export interface EngineAvailability {
 export type EnrichmentBlockReason =
   | 'model-loading'
   | 'model-not-loaded'
+  /**
+   * An on-device engine SERVICE is present and answering, but its model refuses
+   * to generate. Distinct from 'model-not-loaded' because the remedy is
+   * completely different, and because sending someone to Health — where nothing
+   * can help — is worse than saying nothing.
+   *
+   * Live case 2026-07-30: Apple's local service answered /v1/models in 3ms
+   * while EVERY generation returned
+   * "FoundationModels.LanguageModelSession.GenerationError error -1". The
+   * machine was swapping (1.44M pageouts, ~14MB free) with the companion itself
+   * at 6.5GB RSS, so the OS could not run the model's assets. Restarting the
+   * service did not help; nothing in Health loads that model. Only relieving
+   * the memory pressure does.
+   */
+  | 'engine-service-failing'
   | 'language-needs-local-model'
   | 'no-engine';
 
@@ -301,6 +322,15 @@ export const routeEnrichmentEngine = (
     (availability.appleReady === true && !appleCanServe(language));
   if (onDeviceRefusedLanguage) {
     return { engine: null, reason: 'language-needs-local-model' };
+  }
+  // A service that is THERE but FAILING is not a missing model. Checked before
+  // the generic fallthrough so the specific, actionable truth wins — the whole
+  // point of the distinction is that "load it in Health" is the wrong advice.
+  if (
+    availability.appleUnavailable === 'probe-failed' ||
+    availability.appleUnavailable === 'origin-blocked'
+  ) {
+    return { engine: null, reason: 'engine-service-failing' };
   }
   return { engine: null, reason: 'model-not-loaded' };
 };

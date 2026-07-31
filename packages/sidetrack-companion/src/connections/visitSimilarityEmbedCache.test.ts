@@ -117,3 +117,75 @@ describe('visit similarity — corpus embedding cache', () => {
     expect(revision).toBeDefined();
   });
 });
+
+describe('visit similarity — embed-cache resumability (the 2026-07-29 outage shape)', () => {
+  // The full-rebuild fallback handed the cache the WHOLE corpus cold; one
+  // giant embed ran past the reconcile child's 10-minute watchdog; SIGKILL
+  // landed before any cache write; every retry restarted from zero. The vault
+  // showed `connections: never / pending` for 18 hours. These pin the two
+  // properties that make that impossible: writes land per chunk, so a killed
+  // run leaves durable progress, and the next run only embeds the remainder.
+
+  let vaultRoot: string;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-embed-resume-'));
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('a run killed mid-way leaves its finished chunks in the cache', async () => {
+    // >64 entries so there are at least two chunks; the embedder dies on the
+    // second call, simulating the watchdog SIGKILL between chunks.
+    const corpora = Array.from({ length: 70 }, (_, i) => `document text number ${String(i)}`);
+    let calls = 0;
+    const dyingEmbed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      calls += 1;
+      if (calls > 1) throw new Error('killed (simulated SIGKILL)');
+      return texts.map((_, i) => vectorFor(i));
+    };
+    await buildVisitSimilarity(entriesOf(corpora), dyingEmbed, { vaultRoot }).catch(() => undefined);
+
+    // Second run with a healthy embedder: everything the first run finished
+    // must come from the cache — only the REMAINDER is embedded.
+    const embeddedNow: string[] = [];
+    const healthyEmbed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+      embeddedNow.push(...texts);
+      return texts.map((_, i) => vectorFor(i));
+    };
+    await buildVisitSimilarity(entriesOf(corpora), healthyEmbed, { vaultRoot });
+    expect(embeddedNow.length).toBeGreaterThan(0);
+    // 70 docs × (passage+query) = 140 texts; the first run's surviving chunk
+    // (64) must be gone from the workload. Exact split depends on internal
+    // ordering, so pin the property, not the arithmetic: strictly less than
+    // the full corpus by at least one chunk.
+    expect(embeddedNow.length).toBeLessThanOrEqual(140 - 64);
+  });
+
+  it('retries CONVERGE: each killed run strictly shrinks the remaining work', async () => {
+    const corpora = Array.from({ length: 96 }, (_, i) => `converging corpus item ${String(i)}`);
+    const perRun: number[] = [];
+    for (let run = 0; run < 4; run += 1) {
+      let sentThisRun = 0;
+      let calls = 0;
+      const embedOnceThenDie = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+        calls += 1;
+        if (calls > 1) throw new Error('killed');
+        sentThisRun += texts.length;
+        return texts.map((_, i) => vectorFor(i));
+      };
+      await buildVisitSimilarity(entriesOf(corpora), embedOnceThenDie, { vaultRoot }).catch(() => undefined);
+      perRun.push(sentThisRun);
+      if (sentThisRun === 0) break;
+    }
+    // Every run does at most one chunk, and the workload shrinks monotonically
+    // until nothing is left — the exact opposite of the outage, where every
+    // run re-embedded the full corpus and none finished.
+    for (let i = 1; i < perRun.length; i += 1) {
+      expect(perRun[i]!).toBeLessThanOrEqual(perRun[i - 1]!);
+    }
+    expect(perRun[perRun.length - 1]).toBe(0);
+  });
+});

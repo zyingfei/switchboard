@@ -155,3 +155,93 @@ describe('lane 8 — the AI lane', () => {
     expect(out.lanes).toHaveLength(0);
   });
 });
+
+describe('hub guard — aggregator pages must not vote', () => {
+  // THE BINANCE CASE (live, 2026-07-28). A nine-word features-only gist
+  // embedded into generic-tech space; the lane's winning votes came from
+  // "Deno 2.8 | Hacker News"-class pages that happened to be FILED under the
+  // 'ai' workstream — so 'ai' beat the genuinely relevant 'interview / crypto'
+  // carried by one topical PoW page. Hub pages are similarity magnets for any
+  // thin query; their workstream label is an accident of one filing.
+
+  const hubHit: Hit = {
+    entityId: 'hn1',
+    canonicalUrl: 'https://news.ycombinator.com/item?id=1',
+    title: 'Deno 2.8 | Hacker News',
+    bodyIndexed: 0,
+  };
+  const topicalHit: Hit = {
+    entityId: 'pow1',
+    canonicalUrl: 'https://example.test/pow-verification',
+    title: 'PoW verification and computation',
+    bodyIndexed: 1,
+  };
+
+  const depsWith = (r: ReturnType<typeof recordingStore>, byUrl: Record<string, string>) => ({
+    store: r.store,
+    embed: r.embed,
+    embedderUsable: true,
+    guessLanesEnabled: true,
+    lookupWorkstreamByUrl: (u: string) => byUrl[u],
+  });
+
+  it('drops hub-domain hits so the topical page decides the lane', async () => {
+    const r = recordingStore([hubHit, topicalHit]);
+    const out = await appendContentLane(
+      RESULT,
+      { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'Binance options', gist: GIST },
+      depsWith(r, {
+        'https://news.ycombinator.com/item?id=1': 'WS_AI',
+        'https://example.test/pow-verification': 'WS_CRYPTO',
+      }),
+    );
+    const lane = out.lanes.find((l) => l.lane === 'content');
+    const ids = (lane?.candidates ?? []).map((c) => c.workstreamId);
+    expect(ids).toContain('WS_CRYPTO');
+    // The HN-carried workstream must NOT appear — its only evidence was a hub page.
+    expect(ids).not.toContain('WS_AI');
+  });
+
+  it('says so when the guard ate EVERY match, rather than claiming nothing matched', async () => {
+    const r = recordingStore([hubHit]);
+    const out = await appendContentLane(
+      RESULT,
+      { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'Binance options', gist: GIST },
+      depsWith(r, { 'https://news.ycombinator.com/item?id=1': 'WS_AI' }),
+    );
+    const lane = out.lanes.find((l) => l.lane === 'content');
+    expect(lane?.candidates ?? []).toHaveLength(0);
+    expect(lane?.emptyReason).toContain('aggregator');
+  });
+
+  it('the kill switch restores hub votes', async () => {
+    process.env['SIDETRACK_LANE_HUB_GUARD'] = '0';
+    try {
+      const r = recordingStore([hubHit]);
+      const out = await appendContentLane(
+        RESULT,
+        { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'Binance options', gist: GIST },
+        depsWith(r, { 'https://news.ycombinator.com/item?id=1': 'WS_AI' }),
+      );
+      const lane = out.lanes.find((l) => l.lane === 'content');
+      expect((lane?.candidates ?? []).map((c) => c.workstreamId)).toContain('WS_AI');
+    } finally {
+      delete process.env['SIDETRACK_LANE_HUB_GUARD'];
+    }
+  });
+
+  it('an empty AI lane is labeled ai, not content (typed-empty lane id)', async () => {
+    // The pre-existing miss found while adding the guard: the "none filed"
+    // typed-empty defaulted its lane to 'content', so an empty AI lane would
+    // masquerade as a second content lane in the disclosure.
+    const r = recordingStore([{ ...topicalHit, canonicalUrl: 'https://unfiled.test/x' }]);
+    const out = await appendAiLane(
+      RESULT,
+      { canonicalUrl: 'https://binance.example/options', snapshot: SNAPSHOT, title: 'T', gist: GIST },
+      depsWith(r, {}),
+    );
+    const lane = out.lanes.find((l) => l.lane === 'ai');
+    expect(lane).toBeDefined();
+    expect(lane?.emptyReason).toContain('none filed');
+  });
+});

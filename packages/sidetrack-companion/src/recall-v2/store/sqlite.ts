@@ -16,6 +16,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { getSqliteDriver, type SqliteHandle, type SqliteStatement } from './driver.js';
+// Dependency-free leaf (no ONNX, no runtime weight) — safe to import from the
+// store, which is on the server's static import graph.
+import { RECALL_MODEL } from '../../recall/modelManifest.js';
 
 import type {
   RecallStore,
@@ -183,14 +186,22 @@ class SqliteRecallStore implements RecallStore {
     if (vecPath !== null) {
       try {
         this.db.loadExtension(vecPath);
+        // E2 (single model identity): the column WIDTH is the embedding
+        // dimension, so it is a property of the manifest — not a constant that
+        // happens to agree with it. It was `FLOAT[384]` written out twice, and
+        // nothing in application code checks vector length on the way in
+        // (upsertVector/upsertChunkVector only catch what the native extension
+        // throws), so a manifest dim change would have surfaced as silently
+        // rejected vectors rather than a loud failure. Same SQL today.
+        const vecDim = String(RECALL_MODEL.embeddingDim);
         this.db.exec(`
           CREATE VIRTUAL TABLE IF NOT EXISTS docs_vec USING vec0(
             entity_id TEXT PRIMARY KEY,
-            embedding FLOAT[384]
+            embedding FLOAT[${vecDim}]
           );
           CREATE VIRTUAL TABLE IF NOT EXISTS documents_chunks_vec USING vec0(
             chunk_id TEXT PRIMARY KEY,
-            embedding float[384]
+            embedding float[${vecDim}]
           );
         `);
         this.vecAvailable = true;

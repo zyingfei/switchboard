@@ -4,6 +4,7 @@ import {
   probabilityFromLogit,
 } from '../suggestion/confidence';
 import { CompanionRequestError } from '../../companion/client';
+import { isLaneFallbackCandidate } from './laneFallbackPick';
 import { endorsementFor } from './suggestionEndorsement';
 import type {
   ResolveOutcomeError,
@@ -193,6 +194,12 @@ export interface PossibilityRow {
   // so the row can carry a stable key and the caller can tell the primary
   // (rank 0) from the rest.
   readonly rank: number;
+  // True when this row is a lane-fallback pick (companion synthesized it from
+  // the content/ai lanes because fusion produced nothing). `level` is then
+  // computed from a lane score sitting in the rawFusionLogit field, so it is
+  // NOT a confidence read and the row must not print one — see
+  // laneFallbackPick.ts.
+  readonly unconfirmed: boolean;
 }
 
 export interface Possibilities {
@@ -239,6 +246,7 @@ export const possibilitiesFrom = (
         ...(index === 0 ? { margin } : {}),
       }),
       rank: index,
+      unconfirmed: isLaneFallbackCandidate(candidate),
     }));
   // "Primary" means a CONFIDENT pick the card shows prominently — an endorsed
   // (policy suggest/auto-apply) suggestion. A weak guess (action='inbox') is

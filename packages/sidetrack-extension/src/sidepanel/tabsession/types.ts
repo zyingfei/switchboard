@@ -309,6 +309,14 @@ const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>([
   'domain',
   'recency',
   'content',
+  // Lane 8 — 'ai'. This set is the parse WHITELIST: parseGuessLaneResult drops
+  // any lane whose name is not in it, before any renderer ever sees the entry.
+  // Omitting 'ai' here is what made a live 8-lane payload render as seven dots
+  // — the companion sent the lane, the client silently deleted it, and both the
+  // strip and the array-order disclosure were handed a 7-lane array with no
+  // trace of the loss. Every lane added to the GuessLane union MUST be added
+  // here in the same change.
+  'ai',
 ]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>

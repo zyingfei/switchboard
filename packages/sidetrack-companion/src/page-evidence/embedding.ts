@@ -1,4 +1,4 @@
-import { createEmbeddingCache } from '../recall/embeddingCache.js';
+import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { splitPageContentIntoChunks } from '../page-content/store.js';
 import { vectorIdFor } from './vectorRef.js';
@@ -104,6 +104,67 @@ const weightedMean = (
   return l2Normalize(out);
 };
 
+/**
+ * Embed chunk texts, consulting the shared (model, sha256(text)) cache first
+ * and writing the misses back. One read + one write for the whole page — the
+ * chunk count per page is small and bounded, so no extra batching is needed.
+ *
+ * Best-effort throughout: any cache failure falls through to a plain embed.
+ */
+const embedChunksThroughSharedCache = async (
+  vaultRoot: string,
+  ref: VectorRef,
+  chunks: readonly DocEmbeddingChunk[],
+  embedder: PageEvidenceEmbedder,
+): Promise<readonly Float32Array[]> => {
+  const model = { modelId: ref.modelId, modelRevision: ref.modelVersion } as const;
+  let cache: ReturnType<typeof createEmbeddingCache> | null = null;
+  try {
+    cache = createEmbeddingCache(vaultRoot, ref.dimensions);
+  } catch {
+    cache = null;
+  }
+  const hashes = chunks.map((chunk) => embedTextHash(chunk.text));
+  let cached: ReadonlyMap<string, Float32Array> = new Map();
+  if (cache !== null) {
+    try {
+      cached = await cache.getMany(model, hashes);
+    } catch {
+      cached = new Map();
+    }
+  }
+  const missIndexes: number[] = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    if (!cached.has(hashes[index] ?? '')) missIndexes.push(index);
+  }
+  const fresh =
+    missIndexes.length === 0
+      ? []
+      : await embedder(missIndexes.map((index) => chunks[index]?.text ?? ''));
+  const out: Float32Array[] = [];
+  const toPersist: [string, Float32Array][] = [];
+  const freshByIndex = new Map<number, Float32Array>();
+  for (let m = 0; m < missIndexes.length; m += 1) {
+    const index = missIndexes[m];
+    const vector = fresh[m];
+    if (index === undefined || vector === undefined) continue;
+    freshByIndex.set(index, vector);
+    const hash = hashes[index];
+    if (hash !== undefined && vector.length > 0) toPersist.push([hash, vector]);
+  }
+  for (let index = 0; index < chunks.length; index += 1) {
+    out.push(freshByIndex.get(index) ?? cached.get(hashes[index] ?? '') ?? new Float32Array(0));
+  }
+  if (cache !== null && toPersist.length > 0) {
+    try {
+      await cache.putMany(model, toPersist);
+    } catch {
+      /* best-effort */
+    }
+  }
+  return out;
+};
+
 export const pageEvidenceDocEmbeddingRefFor = (input: {
   readonly canonicalUrl: string;
   readonly contentHash: string;
@@ -144,7 +205,20 @@ export const writePageEvidenceDocEmbedding = async (
   if (existing !== null) return ref;
   const chunks = splitDocEmbeddingChunks(payload);
   if (chunks.length === 0) return undefined;
-  const vectors = await embedder(chunks.map((chunk) => chunk.text));
+  // E2 — the per-CHUNK embeds now go through the shared text-keyed cache.
+  //
+  // This function already used the cache, but keyed on `ref.vectorId`
+  // (canonicalUrl + contentHash + model) and only for the FINAL doc vector, so
+  // the chunk embeds underneath it were uncached. Those chunk texts are
+  // byte-identical to what recall-v2's `chunkEmbedText` produces (both are
+  // `passage: ${title}\n\n${chunk.text}` off the same splitter), which made
+  // every indexed page pay for the same ONNX pass twice — once here, once in
+  // the recall-v2 chunk backfill. Text-keying the chunk embeds is what turns
+  // the second pass into a cache hit. The doc-vector entry keeps its vectorId
+  // key: it is a WEIGHTED MEAN, not the embedding of any text, so it has no
+  // text hash to be keyed by (documented in the substrate map as a deliberate
+  // second keyspace in the same file).
+  const vectors = await embedChunksThroughSharedCache(vaultRoot, ref, chunks, embedder);
   const docVector = weightedMean(chunks, vectors, payload.quality);
   if (docVector === null || docVector.length !== ref.dimensions) return undefined;
   await cache.put(

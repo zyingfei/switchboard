@@ -28,8 +28,21 @@
 // Promise.race). An in-memory LRU caps repeated on-the-fly embeds. Any failure
 // (no store, embed timeout, empty corpus) degrades to a typed-empty lane — it
 // never throws into the resolve.
+//
+// BLOCKING. Bounded ≠ non-blocking. Everything above is SYNCHRONOUS on the
+// thread that serves HTTP (bun:sqlite has no async API), and a batch-resolve
+// runs this twice — lane 7 and lane 8 — for EVERY url it returns; the measured
+// diag `content-lane batch=1 dur=966ms` is one URL's pair. So the three
+// internal phases (query-vector acquisition / KNN / FTS / workstream join) are
+// separated by `await yieldToEventLoop()`. That does not make the lane cheaper;
+// it stops the lane from being one uninterruptible tick, which is what a
+// client's "Companion did not respond within 15s" actually measures. Adding a
+// yield inside a lane whose whole job is to be cheap looks redundant until you
+// see the 250ms watchdog threshold and the batch multiplier.
 
+import { isCoarseMultiTopicPriorDomain } from '../attribution-v1/state.js';
 import type { ConnectionsSnapshot } from '../connections/types.js';
+import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
 import type { GuessLane, GuessLaneCandidate, GuessLaneResult } from './guessLanes.js';
 
 // ---- env flag ---------------------------------------------------------
@@ -42,6 +55,26 @@ export const CONTENT_LANE_ENV = 'SIDETRACK_CONTENT_LANE';
 export const contentLaneEnabled = (): boolean => {
   const raw = process.env[CONTENT_LANE_ENV];
   return raw !== '0' && raw !== 'false';
+};
+
+// Hub guard — see the comment at the vote loop. Default ON; '0'/'false' turns
+// hub-domain hits back into voters (the pre-2026-07-28 behavior).
+export const LANE_HUB_GUARD_ENV = 'SIDETRACK_LANE_HUB_GUARD';
+
+export const laneHubGuardEnabled = (): boolean => {
+  const raw = process.env[LANE_HUB_GUARD_ENV];
+  return raw !== '0' && raw !== 'false';
+};
+
+/** True when a hit's URL lives on a coarse multi-topic (aggregator) domain. */
+const isHubUrl = (canonicalUrl: string): boolean => {
+  try {
+    return isCoarseMultiTopicPriorDomain(new URL(canonicalUrl).hostname);
+  } catch {
+    // Unparseable URL: not evidence of anything — let it through to the join,
+    // which will drop it as unattributed if it matches nothing.
+    return false;
+  }
 };
 
 // ---- injectable store / embedder deps ---------------------------------
@@ -460,6 +493,12 @@ export const buildContentLane = async (
       })
     : { vector: undefined, embedded: false, ownEntityIds };
 
+  // PHASE BREAK — see the block comment above `buildContentLane`. Phases (2)
+  // and (4) below are synchronous sqlite / synchronous O(snapshot) JS, run
+  // back-to-back, twice per URL (lanes 7 and 8), for every URL in a batch.
+  // Without these breaks the whole lane is one uninterruptible tick.
+  await yieldToEventLoop();
+
   // (2) retrieval — vector KNN + FTS, each top-12.
   const vectorRanking: RankedDoc[] = [];
   if (qv.vector !== undefined) {
@@ -490,6 +529,12 @@ export const buildContentLane = async (
       });
     }
   }
+
+  // PHASE BREAK — KNN done, FTS next. These are two independent sqlite round
+  // trips (an HNSW/vec scan then an FTS5 BM25 match); the native `sample` of a
+  // live batch-resolve found main-thread frames in BOTH (BtreeTableMoveto and
+  // the FTS functions), so they are two separately-chargeable blocks, not one.
+  await yieldToEventLoop();
 
   // AI lane: the gist is the whole query. No title, no URL tokens — those
   // are what the OTHER lanes already contribute, and mixing them back in would
@@ -527,7 +572,33 @@ export const buildContentLane = async (
     return typedEmpty('nothing indexed matches this page yet', laneId);
   }
 
+  // PHASE BREAK — retrieval done, join next. buildWorkstreamJoin walks EVERY
+  // node and EVERY edge of the resolver subgraph to build its two indexes; it
+  // is pure JS rather than sqlite, but it is O(snapshot) and it is rebuilt per
+  // lane per URL, so on a batch it is the phase most likely to be the tick that
+  // outlives the 250ms watchdog threshold. Placed after the early typed-empty
+  // returns above so a lane with nothing to join costs no extra scheduling.
+  await yieldToEventLoop();
+
   // (4) workstream join + per-workstream aggregation.
+  //
+  // HUB GUARD. A hit on an aggregator domain must not vote for its workstream.
+  // Live case (2026-07-28, "Binance makes Bitcoin options writing available"):
+  // a nine-word features-only gist embedded into generic-tech space, and the
+  // lane's top votes came from "Deno 2.8 | Hacker News" and similar pages that
+  // happen to be FILED under the 'ai' workstream — so 'ai' beat the actually
+  // relevant 'interview / crypto', which was carried only by a genuinely
+  // topical PoW page. This is the same failure family as the 2026-07-10
+  // aggregator false-friend (an HN AI-video page mis-filed to linux-security):
+  // multi-topic hub pages act as similarity magnets for ANY thin query, and
+  // their workstream label is an accident of where the user filed one visit.
+  //
+  // Same list, same registrable-domain matching as the attribution prior
+  // (COARSE_MULTI_TOPIC_DOMAIN_PRIOR) — imported, not copied, so the two can
+  // never drift. Suppressing the VOTE is the precedented remedy (ranker B1);
+  // the page itself can still be resolved, and non-hub matches still vote.
+  const hubGuardOn = laneHubGuardEnabled();
+  let droppedHubHits = 0;
   const join = buildWorkstreamJoin(snapshot);
   interface Agg {
     sum: number;
@@ -538,6 +609,10 @@ export const buildContentLane = async (
   const perWorkstream = new Map<string, Agg>();
   let droppedUnattributed = 0;
   for (const hit of fused) {
+    if (hubGuardOn && hit.canonicalUrl !== undefined && isHubUrl(hit.canonicalUrl)) {
+      droppedHubHits += 1;
+      continue;
+    }
     let workstreamId: string | undefined;
     if (hit.canonicalUrl !== undefined) {
       // Projection lookup FIRST (authoritative filings, full-vault scope);
@@ -571,13 +646,26 @@ export const buildContentLane = async (
   }
 
   if (perWorkstream.size === 0) {
+    // The hub guard ate every vote: matches existed, but all of them were
+    // aggregator pages. Named explicitly — an empty lane whose reason is
+    // "guard" invites a different response (nothing; this is correct) than
+    // one whose reason is "nothing filed yet" (file something).
+    if (droppedHubHits > 0 && droppedUnattributed === 0) {
+      return typedEmpty(
+        `only aggregator-page matches (${String(droppedHubHits)}) — ignored, they vote for their workstream by accident`,
+        laneId,
+      );
+    }
     // Everything matched but nothing was attributed to a workstream. This is
     // NOT "nothing matches" — the lane found neighbors, but the join has no
     // labels to vote with. Say so: the lane's ceiling here is attribution
     // sparsity (label economics), not retrieval, and the fix the reason
     // points at is "file some of these matches", not "index more pages".
+    // (laneId threaded through — this empty previously defaulted to 'content'
+    // and would have mislabeled an empty AI lane.)
     return typedEmpty(
       `${String(droppedUnattributed)} similar ${droppedUnattributed === 1 ? 'page' : 'pages'} found, none filed to a workstream yet`,
+      laneId,
     );
   }
 

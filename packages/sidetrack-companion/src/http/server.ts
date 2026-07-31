@@ -15,6 +15,15 @@ import { tmpdir } from 'node:os';
 
 import { buildAnchorFromTerm } from '../annotation/anchorBuilder.js';
 import { getDrainDegradation, type DrainDegradationSnapshot } from '../connections/drainDegradation.js';
+import {
+  getGenerationRecovery,
+  type GenerationRecoverySnapshot,
+} from '../connections/generationRecovery.js';
+// E2 — shared embed substrate. Both are dependency-free leaves (fs + crypto,
+// pure data): importing them here does NOT pull recall/embedder.js (ONNX) onto
+// the server's static graph, which the /v1/status availability contract forbids.
+import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
+import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { bridgeKeysMatch, isBridgeKeyAccepted, rotateBridgeKey } from '../auth/bridgeKey.js';
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import {
@@ -121,6 +130,7 @@ import {
   writePageContentTombstoned,
 } from '../page-content/store.js';
 import { gcInventoryCached } from '../gc/plan.js';
+import { summarizeVaultLedger, vaultLedgerCached } from '../gc/vaultLedger.js';
 import { readHealthHistory } from '../connections/healthHistory.js';
 import { THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../threads/events.js';
 import { projectThread } from '../threads/projection.js';
@@ -197,6 +207,18 @@ import {
   type AppendContentLaneDeps,
   type ContentLaneStore,
 } from '../tabsession/contentLane.js';
+import { applyLaneFallbackGuess } from '../tabsession/laneFallback.js';
+import { declineMemoryFromMerged, type DeclineLookup } from '../tabsession/declineMemory.js';
+import {
+  applyLaneCorroboration,
+  laneCorroborationEnabled,
+} from '../tabsession/laneCorroboration.js';
+import {
+  lanePrequentialSummary,
+  recordLanePredictions,
+  type LanePredictionInput,
+  type LanePrequentialSummary,
+} from '../tabsession/lanePrequential.js';
 import {
   currentAttributionV1StateRevision,
   emitAttributionV1Shadow,
@@ -230,6 +252,14 @@ import {
   type EntityContentEnrichedPayload,
   type GistLookup,
 } from '../enrichment/contentEnrichment.js';
+import {
+  ENTITY_LIST_MAX,
+  entityIndexEnabled,
+  listEntities,
+  loadEntityIndex,
+  lookupEntity,
+  type EntityIndex,
+} from '../enrichment/entityIndex.js';
 import { appendEnrichmentRetractionEvent } from '../enrichment/enrichmentRetraction.js';
 import {
   ENTITY_ENRICHMENT_RETRACTED,
@@ -237,19 +267,22 @@ import {
   type EntityEnrichmentRetractedPayload,
 } from '../enrichment/events.js';
 
-// Hand the event loop back for one macrotask.
-//
-// bun:sqlite is fully SYNCHRONOUS, so a route that touches sqlite N times in a
-// loop holds the thread that serves every other request for the whole run.
-// Awaiting this between iterations does not make the work cheaper — it caps
-// how long a single tick can hold the loop, which is what a client timeout
-// actually measures. setImmediate (not a microtask) so pending I/O callbacks
-// genuinely get a turn. Mirrors the reconcile phase yields in
-// connectionsMaterializer.ts.
-const yieldToEventLoop = (): Promise<void> =>
-  new Promise<void>((resolve) => {
-    setImmediate(resolve);
-  });
+// Hand the event loop back for one macrotask. MOVED to runtime/eventLoopYield.ts
+// (same helper, same reasoning, full comment there) because the content/ai lane
+// phases and the deferred resolver-cache drain need the identical primitive on
+// the identical hot path, and three copies of a scheduling primitive is how
+// they drift apart.
+import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
+import {
+  queueResolverCacheWrite,
+  resolverCacheDeferEnabled,
+  scheduleResolverCacheFlush,
+} from './resolverCacheDefer.js';
+import {
+  completeInflight,
+  registerInflight,
+  routeLabelFromPattern,
+} from '../runtime/inflightRegistry.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -842,6 +875,9 @@ interface RouteMatch {
   readonly canonicalUrl?: string;
   readonly modelOrg?: string;
   readonly modelRepo?: string;
+  // URL-encoded entity name (GET /v1/entities/{name}). Encoded because entity
+  // names carry spaces, slashes and punctuation straight from a model's prose.
+  readonly entityName?: string;
 }
 
 interface RouteDefinition {
@@ -2076,6 +2112,17 @@ export interface ReliabilityHealthSection {
   // the fallback only emitted a phase mark, and phase marks are off by
   // default. Non-zero here means at least one drain ran the slow path.
   readonly drainDegradation: DrainDegradationSnapshot;
+  // Generation-swap recovery: reads that hit bun:sqlite's "disk I/O error" —
+  // the signature of a handle whose double-buffer generation file was
+  // unlinked/swapped underneath it — and were recovered by a reopen-and-retry
+  // (or were not). This was the 2026-07-29 P0: a publish in ONE process GC'd a
+  // write shadow open in ANOTHER, and the victim's next query threw an error
+  // that was neither a lock nor corruption, so nothing retried it and it
+  // surfaced as sync.materializers.connections 'failed'. The structural fix is
+  // cross-process in-flight markers (generationBuffer.ts); these counters are
+  // how a regression announces itself instead of being absorbed silently.
+  // Absent == zero (process-lifetime counters, never persisted).
+  readonly generationRecovery: GenerationRecoverySnapshot;
   // Section availability derived from the canary status: 'ok' when
   // ok/idle, 'stale' when degraded. This is what the observability board
   // renders for the reliability lane.
@@ -2179,6 +2226,7 @@ export const buildReliabilityHealthSection = async (
     return {
       resolveCanary: { ...idleSnapshot, status: 'idle' },
       drainDegradation: getDrainDegradation(),
+      generationRecovery: getGenerationRecovery(),
       availability: 'ok',
       walBytes,
       ...doubleBufferSection,
@@ -2193,6 +2241,7 @@ export const buildReliabilityHealthSection = async (
   return {
     resolveCanary: { ...snapshot, status },
     drainDegradation: getDrainDegradation(),
+    generationRecovery: getGenerationRecovery(),
     availability,
     walBytes,
     ...doubleBufferSection,
@@ -2837,6 +2886,77 @@ const parseTitleHints = (raw: unknown): ReadonlyMap<string, string> => {
   return out;
 };
 
+// Authoritative canonicalUrl → workstream lookup for any read surface that
+// needs to know where a URL is FILED.
+//
+// The resolver's snapshot is SCOPED to a request's own URLs, so a neighbor's
+// membership edges are usually absent from it — joining on the snapshot alone
+// reported "none filed to a workstream" while live neighbors were user-filed
+// (caught by the user, 2026-07-27). The URL attribution projection is the
+// filing record of truth.
+//
+// STRICTLY the metadata-only read (SqliteConnectionsStore.readSnapshotMetadata):
+// no read surface may pay a full readCurrent / event-log fold for a join (the
+// resolve route's perf contract, asserted in visitsRoutes.test.ts). On any
+// other store shape this returns undefined and the caller keeps whatever
+// fallback it has.
+//
+// EXTRACTED (not copied) so the content/AI lanes and the entity index share
+// one definition of "where is this URL filed" — two copies of a join is how
+// two answers to the same question start disagreeing.
+const urlWorkstreamLookupFromProjection = async (
+  context: CompanionHttpConfig,
+): Promise<((canonicalUrl: string) => string | undefined) | undefined> => {
+  if (!(context.connectionsStore instanceof SqliteConnectionsStore)) return undefined;
+  try {
+    const metadata = await context.connectionsStore.readSnapshotMetadata();
+    if (metadata?.urlProjection === undefined) return undefined;
+    const projection = deserializeUrlProjection(metadata.urlProjection);
+    return (canonicalUrl: string): string | undefined =>
+      projection.byCanonicalUrl.get(canonicalUrl)?.currentAttribution?.workstreamId ?? undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+// Entity index for a read request (GET /v1/entities…). Threads the SAME
+// projection join the content lane uses, so "which workstream is this page
+// filed under" has one answer across the whole companion. Returns null when
+// there is nothing to derive from (no vault / no event log / gist fold off) —
+// typed absence, which the routes render as typed empty with the reason
+// named, never as "no entities exist".
+const loadEntityIndexForRequest = async (
+  context: CompanionHttpConfig,
+): Promise<EntityIndex | null> => {
+  if (context.vaultRoot === undefined || context.eventLog === undefined) return null;
+  const lookupWorkstreamByUrl = await urlWorkstreamLookupFromProjection(context);
+  const { index } = await loadEntityIndex(
+    context.vaultRoot,
+    context.eventLog,
+    lookupWorkstreamByUrl === undefined ? {} : { lookupWorkstreamByUrl },
+  );
+  return index;
+};
+
+// The typed-empty body for GET /v1/entities. Same field set as a populated
+// response (zeroed) plus the REASON — a client rendering "no entities yet"
+// must be able to tell "the switch is off" from "nothing has a gist yet",
+// because those invite completely different responses from the user.
+const entityIndexUnavailable = (
+  emptyReason: string,
+  disabled = false,
+): { readonly data: Record<string, unknown> } => ({
+  data: {
+    entities: [],
+    hubs: 0,
+    gists: 0,
+    scanned: 0,
+    dropped: 0,
+    ...(disabled ? { disabled: true } : {}),
+    emptyReason,
+  },
+});
+
 // Content-lane (guess lane 7) deps, assembled ONCE per batch-resolve request so
 // the store handle + embedder state are read a single time and shared across
 // every URL in the batch. Reuses the ALREADY-OPEN /v2 recall store via
@@ -2876,8 +2996,32 @@ const buildContentLaneDeps = async (
   }
   const embedderState = context.getEmbedderStatus?.()?.state;
   const embedderUsable = embedderState === 'ready' || embedderState === 'disabled';
+  // E2 — the lane's query embed consults the SHARED (model, sha256(text))
+  // cache before paying for an ONNX pass. This is the same file the
+  // visit-similarity materializer and the recall-v2 chunk backfill write, so a
+  // query whose exact text has been embedded anywhere on this machine is free,
+  // and it survives restarts (contentLane's own LRU does not — its emptiness
+  // after a restart is part of the §G2 seam).
+  //
+  // READ-THROUGH ONLY, deliberately. A `put` rewrites the whole cache file;
+  // at full corpus that is ~97MB, and doing it once per resolved URL would put
+  // exactly the kind of unbounded I/O back on the request path that the resolve
+  // work keeps taking off it. The lane's bounded in-process LRU stays the write
+  // side for query vectors. Documented in the substrate map as the boundary.
   const embed = embedderUsable
     ? async (text: string): Promise<Float32Array | undefined> => {
+        try {
+          const cached = await createEmbeddingCache(
+            vaultRoot,
+            RECALL_MODEL.embeddingDim,
+          ).getMany({ modelId: RECALL_MODEL.modelId, modelRevision: RECALL_MODEL.revision }, [
+            embedTextHash(text),
+          ]);
+          const hit = cached.get(embedTextHash(text));
+          if (hit !== undefined) return hit;
+        } catch {
+          /* cache is an optimisation — fall through to a real embed */
+        }
         try {
           const { embed: embedFn } = await import('../recall/embedder.js');
           const [vec] = await embedFn([text]);
@@ -2887,29 +3031,10 @@ const buildContentLaneDeps = async (
         }
       }
     : undefined;
-  // Authoritative neighbor-URL → workstream lookup for the lane's join. The
-  // resolver's snapshot is SCOPED to the batch's query URLs, so a neighbor's
-  // membership edges are usually absent from it — joining on the snapshot
-  // alone reported "none filed to a workstream" while live neighbors were
-  // user-filed. The URL projection is the filing record of truth. STRICTLY
-  // the metadata-only read (SqliteConnectionsStore.readSnapshotMetadata):
-  // batch-resolve must never pay a full readCurrent / event-log fold for a
-  // lane (the route's perf contract, asserted in visitsRoutes.test.ts) — on
-  // any other store shape the lane keeps its snapshot-join fallback.
-  let lookupWorkstreamByUrl: ((canonicalUrl: string) => string | undefined) | undefined;
-  if (context.connectionsStore instanceof SqliteConnectionsStore) {
-    try {
-      const metadata = await context.connectionsStore.readSnapshotMetadata();
-      if (metadata?.urlProjection !== undefined) {
-        const projection = deserializeUrlProjection(metadata.urlProjection);
-        lookupWorkstreamByUrl = (canonicalUrl: string): string | undefined =>
-          projection.byCanonicalUrl.get(canonicalUrl)?.currentAttribution?.workstreamId ??
-          undefined;
-      }
-    } catch {
-      lookupWorkstreamByUrl = undefined;
-    }
-  }
+  // Authoritative neighbor-URL → workstream lookup for the lane's join (see
+  // urlWorkstreamLookupFromProjection for the full WHY). Undefined on a
+  // non-sqlite store — the lane then keeps its snapshot-join fallback.
+  const lookupWorkstreamByUrl = await urlWorkstreamLookupFromProjection(context);
   return {
     store,
     ...(embed === undefined ? {} : { embed }),
@@ -2917,6 +3042,81 @@ const buildContentLaneDeps = async (
     guessLanesEnabled: guessOn,
     ...(lookupWorkstreamByUrl === undefined ? {} : { lookupWorkstreamByUrl }),
   };
+};
+
+// ---- the decision loop's serve-time context (review E1 + E6) -----------
+//
+// Two folded lookups the lane seam needs, loaded ONCE per batch:
+//   - declines: the user's "Not in any stream" answers. Consulted by BOTH the
+//     lane-fallback (never guess on a page the user refused) and the
+//     corroboration promotion (a refusal vetoes it).
+//   - calibration: each lane's MEASURED precision@1, the evidence the
+//     promotion self-gates on. Absent ⇒ no promotion, by design.
+//
+// NO EXTRA SCAN. The declines fold from the `merged` array this route has
+// ALREADY read (memoized on the same log signature the enrichment folds use),
+// not from a second readMerged — the batch path's one-scan promise is
+// load-bearing and asserted by visitsRoutes.test.ts. The caller must therefore
+// pass an array that includes USER_ORGANIZED_ITEM; both branches do (see the
+// typed reads above). The calibration is a file read and is only paid when the
+// promotion flag that consumes it is actually on.
+//
+// Both degrade to null on any failure: the fallback then behaves exactly as it
+// did before this feature, and the promotion refuses — the safe direction.
+interface LaneDecisionContext {
+  readonly declines: DeclineLookup | null;
+  readonly calibration: LanePrequentialSummary | null;
+}
+
+const laneDecisionContextFor = async (
+  vaultRoot: string,
+  mergedEvents: readonly AcceptedEvent[],
+  logSignature: string,
+): Promise<LaneDecisionContext> => {
+  let declines: DeclineLookup | null = null;
+  try {
+    declines = declineMemoryFromMerged(vaultRoot, logSignature, mergedEvents);
+  } catch {
+    declines = null;
+  }
+  const calibration = laneCorroborationEnabled()
+    ? await lanePrequentialSummary(vaultRoot).catch(() => null)
+    : null;
+  return { declines, calibration };
+};
+
+// The two decision-layer transforms, in the order they must run: DECIDE first
+// (corroboration may promote a held pick), then FALL BACK (only reachable when
+// fusion produced nothing at all). Their trigger conditions are disjoint on
+// `gate.reason`, so the order cannot change an outcome — it is written this way
+// because that is the order a reader should understand them in.
+//
+// Both run on the SERVED copy, after the resolver-cache write, exactly like the
+// lanes they read. Nothing either produces is persisted or replayed.
+const applyLaneDecisions = (
+  result: UrlResolutionResult,
+  canonicalUrl: string,
+  laneContext: LaneDecisionContext,
+): UrlResolutionResult =>
+  applyLaneFallbackGuess(
+    applyLaneCorroboration(result, {
+      canonicalUrl,
+      calibration: laneContext.calibration,
+      declines: laneContext.declines,
+    }),
+    { canonicalUrl, declines: laneContext.declines },
+  );
+
+// Fire-and-forget the prequential prediction append. Deliberately NOT awaited on
+// the response path: it is a measurement, and a slow or failing disk must cost
+// a data point rather than a resolve. One write per batch (see
+// recordLanePredictions), not one per URL.
+const recordLanePredictionsBestEffort = (
+  vaultRoot: string,
+  entries: readonly LanePredictionInput[],
+): void => {
+  if (entries.length === 0) return;
+  void recordLanePredictions(vaultRoot, entries).catch(() => undefined);
 };
 
 const candidateSourceWeight = (sources: readonly string[]): number => {
@@ -5369,8 +5569,21 @@ const routes: readonly RouteDefinition[] = [
                 (event) =>
                   event.type === ENTITY_TITLE_ENRICHED ||
                   event.type === ENTITY_CONTENT_ENRICHED ||
-                  event.type === ENTITY_ENRICHMENT_RETRACTED,
-                [ENTITY_TITLE_ENRICHED, ENTITY_CONTENT_ENRICHED, ENTITY_ENRICHMENT_RETRACTED],
+                  event.type === ENTITY_ENRICHMENT_RETRACTED ||
+                  // Decline memory (review E6) folds from THIS array. Omitting
+                  // the type here would fold an empty decline set and memoize
+                  // it under the real log signature — the same silent
+                  // half-applied fold the enrichment types above were added to
+                  // prevent — and the lane-fallback would resume guessing on
+                  // pages the user refused. Sparse family, typed index read,
+                  // still ONE scan.
+                  event.type === USER_ORGANIZED_ITEM,
+                [
+                  ENTITY_TITLE_ENRICHED,
+                  ENTITY_CONTENT_ENRICHED,
+                  ENTITY_ENRICHMENT_RETRACTED,
+                  USER_ORGANIZED_ITEM,
+                ],
               )
             : await readEventsFromStoreOrLog(
                 context,
@@ -5474,6 +5687,14 @@ const routes: readonly RouteDefinition[] = [
               ]
             : missedEvents;
           const synthesizedForMiss = synthesizedTitleFor(canonicalUrl);
+          // PHASE BREAK: events-prep -> resolve. In the event-candidate case the
+          // lines above are two O(merged) filters over the whole read window
+          // (signal + timeline events for the target and every expanded
+          // candidate) — pure JS, but on a real vault `merged` is hundreds of
+          // thousands of events, so the prep alone is a tick worth of work
+          // BEFORE the resolver's sqlite reads start. Splitting them keeps
+          // "slowest single URL" from meaning "prep AND resolve back to back".
+          await yieldToEventLoop();
           const result = await resolveUrlAttributionArmed({
             vaultRoot: requireVaultRoot(context),
             canonicalUrl,
@@ -5490,7 +5711,41 @@ const routes: readonly RouteDefinition[] = [
             // query-time + titleHint-dependent, so it is appended to the served
             // copy AFTER the cache read/write (see the final pass below) and is
             // never persisted — a titleHint change never stales the cache.
-            await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
+            //
+            // DEFERRED OFF THE REQUEST PATH (SIDETRACK_RESOLVER_CACHE_DEFER,
+            // default ON). This INSERT is the sqlite3BtreeInsert frame that
+            // showed up in the native `sample` of a live batch-resolve — a
+            // WRITE inside a read request, once per resolved URL, synchronous
+            // because bun:sqlite has no async API. Queuing it costs a Map set;
+            // the HTTP dispatch drains the queue AFTER the response is written
+            // (see resolverCacheDefer.ts for the full safety argument: this
+            // request serves from its own in-memory `results`, never reads the
+            // entry back, and the key already folds arm + state revision so a
+            // late landing under a superseded key is inert).
+            if (resolverCacheDeferEnabled()) {
+              // LATE-BOUND, not captured. The thunk re-reads
+              // `context.connectionsStore` on the FLUSH tick, so the write goes
+              // through whatever store — and therefore whatever sqlite handle —
+              // is live when it actually happens. A queued write can drain on
+              // the far side of a connections-generation publish, and a handle
+              // captured here would by then name a file the publish may have
+              // unlinked, which bun:sqlite reports as "disk I/O error" (neither
+              // a lock nor corruption, so nothing retries it).
+              queueResolverCacheWrite(
+                () => {
+                  const live = context.connectionsStore;
+                  return live instanceof SqliteConnectionsStore
+                    ? async (visitId, revision, value): Promise<void> =>
+                        await live.cacheResolverResult(visitId, revision, value)
+                    : null;
+                },
+                canonicalUrl,
+                batchCacheRevision,
+                result,
+              );
+            } else {
+              await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
+            }
             // Seed the SWR cache so a later drain can serve this item stale +
             // refresh in the background rather than recomputing it inline in
             // the next convoy. eventCandidate items are intentionally excluded
@@ -5509,6 +5764,17 @@ const routes: readonly RouteDefinition[] = [
         const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
         if (contentDeps.guessLanesEnabled && contentLaneEnabled()) {
           const contentStartMs = Date.now();
+          // Decision-layer context (declines + lane calibration), folded once
+          // for the whole batch from the events already read — see
+          // laneDecisionContextFor.
+          const laneContext = await laneDecisionContextFor(
+            requireVaultRoot(context),
+            merged,
+            batchEnrichSig,
+          );
+          // Prequential predictions accumulate across the loop and are written
+          // in ONE append after it.
+          const predictions: LanePredictionInput[] = [];
           const joinSnapshot =
             missedSnapshot ??
             (Object.keys(results).length > 0
@@ -5531,14 +5797,38 @@ const routes: readonly RouteDefinition[] = [
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
+              // PHASE BREAK: lane 7 -> lane 8. Each lane is an independent
+              // KNN + FTS + workstream join; running both without a break makes
+              // one URL cost two full lane computations in a single tick, and
+              // the measured `content-lane batch=1 dur=966ms` diag says that
+              // pair is ~1s of the route on its own. buildContentLane also
+              // yields BETWEEN its own phases now (contentLane.ts) — this break
+              // is the one it cannot make for itself.
+              await yieldToEventLoop();
               // Lane 8, same inputs, gist-only query — see appendAiLane.
               results[canonicalUrl] = await appendAiLane(
                 results[canonicalUrl]!,
                 { canonicalUrl, snapshot: joinSnapshot, title, gist },
                 contentDeps,
               );
+              // The decision layer over the lanes just appended: the
+              // corroboration promotion (flagged OFF by default) and the
+              // lane-fallback guess, both decline-vetoed. See
+              // applyLaneDecisions — and note that, exactly like the lanes
+              // themselves, this runs AFTER the resolver-cache write above, so
+              // nothing it produces is ever persisted.
+              results[canonicalUrl] = applyLaneDecisions(
+                results[canonicalUrl]!,
+                canonicalUrl,
+                laneContext,
+              );
+              // Record what every lane predicted BEFORE the user answers. The
+              // lanes are read post-decision so the recorded pick is the one
+              // that was actually served.
+              predictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
             }
           }
+          recordLanePredictionsBestEffort(requireVaultRoot(context), predictions);
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
           // pass duration + how many URLs it decorated — so the ≤~50ms indexed /
           // ≤~450ms embed-race budget is observable on the box, PII-free.
@@ -5579,6 +5869,15 @@ const routes: readonly RouteDefinition[] = [
       gistLookup = gistLookupFromMerged(requireVaultRoot(context), fallbackEnrichSig, merged);
       const fallbackTombstones = await domainTombstoneSetFor(context);
       const contentDeps = await buildContentLaneDeps(context, requireVaultRoot(context));
+      // Decision-layer context + prediction buffer — see the sqlite-store path
+      // above. Same call, same position, so the two batch-resolve paths decide
+      // and measure identically.
+      const fallbackLaneContext = await laneDecisionContextFor(
+        requireVaultRoot(context),
+        merged,
+        fallbackEnrichSig,
+      );
+      const fallbackPredictions: LanePredictionInput[] = [];
       for (const canonicalUrl of uniqueUrls) {
         const synthesizedForUrl = synthesizedTitleFor(canonicalUrl);
         const result = await resolveUrlAttributionArmed({
@@ -5605,7 +5904,17 @@ const routes: readonly RouteDefinition[] = [
           { canonicalUrl, snapshot, title, gist },
           contentDeps,
         );
+        // Decision layer (corroboration promotion + lane-fallback guess, both
+        // decline-vetoed) — see the sqlite-store path above for the full
+        // boundary. Same call, same position (after both lanes are appended).
+        results[canonicalUrl] = applyLaneDecisions(
+          results[canonicalUrl]!,
+          canonicalUrl,
+          fallbackLaneContext,
+        );
+        fallbackPredictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
       }
+      recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions);
       return [
         200,
         {
@@ -6113,6 +6422,29 @@ const routes: readonly RouteDefinition[] = [
           ? context.connectionsStore.doubleBufferDiagnostics()
           : undefined;
       const reliability = await buildReliabilityHealthSection(vaultRoot, doubleBufferHealth);
+      // LANE CALIBRATION (review E1). Per-lane measured precision@1 over the
+      // trailing prequential window — the number that decides whether lane
+      // agreement is allowed to count as corroboration, and the first honest
+      // answer this system has ever had to "how good is the content lane?".
+      //
+      // Read live (outside the health TTL) for the same reason `reliability` is:
+      // it decays on its own window and is memoized on the prediction files'
+      // size+mtime, so a warm read is two stats. Best-effort — a measurement
+      // must never be able to degrade the health probe it rides on.
+      const laneCalibration = await lanePrequentialSummary(vaultRoot).catch(() => null);
+      // VAULT LEDGER SUMMARY. Which families own the disk, and the orphaned-
+      // generation counter (the P0: three ~323 MB abandoned generation dbs sat
+      // resident while the only storage surface reported 10.7 MB). Read from the
+      // SAME TTL cache the /v1/system/vault-ledger route uses — never a walk on
+      // this path — and omitted entirely rather than faked when the first walk
+      // has not landed or the flag is off.
+      const vaultLedgerCache = await vaultLedgerCached(vaultRoot).catch(() => null);
+      const vaultLedger =
+        vaultLedgerCache === null ||
+        vaultLedgerCache.value === null ||
+        (vaultLedgerCache.availability !== 'ok' && vaultLedgerCache.availability !== 'stale')
+          ? null
+          : summarizeVaultLedger(vaultLedgerCache.value, vaultLedgerCache.availability);
       // NOTE: the companion no longer hosts a node-runtime title-synthesis
       // generation lane (onnxruntime-node q4 unsupported / int8 unusable —
       // measured). Generation now runs in the extension panel via WebGPU
@@ -6123,7 +6455,14 @@ const routes: readonly RouteDefinition[] = [
       return [
         200,
         {
-          data: withReliabilityHealthSection(baseReport, reliability),
+          data: {
+            ...withReliabilityHealthSection(baseReport, reliability),
+            // Additive, read-only. Omitted entirely (rather than sent as a
+            // fake zero) when the summary could not be computed — typed
+            // emptiness, not a fabricated measurement.
+            ...(laneCalibration === null ? {} : { laneCalibration }),
+            ...(vaultLedger === null ? {} : { vaultLedger }),
+          },
         },
       ];
     },
@@ -6187,6 +6526,37 @@ const routes: readonly RouteDefinition[] = [
                     count: overCollapsedRecords.value.length,
                     samples: overCollapsedRecords.value.slice(0, 5),
                   },
+          },
+        },
+      ];
+    },
+  },
+  {
+    // THE VAULT LEDGER. Every byte under `_BAC`, classified, reconciling to the
+    // on-disk total — the answer `/v1/system/hygiene-status` structurally
+    // cannot give (it reports the GC *plan*, which on the live vault was 10.7
+    // MB of 3.02 GB). Read-only: no delete affordance in this landing.
+    //
+    // Served from the same TTL'd background-refreshed cache idiom as the
+    // hygiene sibling: the walk is ~5.6k stats plus a sampled log read (190ms
+    // measured on the live vault) and must not sit on a request. O(1) here.
+    // `disabled` is a distinct availability from `unavailable` — an operator who
+    // set SIDETRACK_VAULT_LEDGER=0 must not read that as a broken walk.
+    method: 'GET',
+    pattern: /^\/v1\/system\/vault-ledger$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      const vaultRoot = requireVaultRoot(context);
+      const ledger = await vaultLedgerCached(vaultRoot);
+      return [
+        200,
+        {
+          data: {
+            asOf: ledger.asOf,
+            availability: ledger.availability,
+            // Typed emptiness: `null` is "not computed yet / disabled", never
+            // an empty vault. The availability field says which.
+            ledger: ledger.value,
           },
         },
       ];
@@ -6981,6 +7351,14 @@ const routes: readonly RouteDefinition[] = [
           200,
           {
             cursor: String(result.cursor),
+            // GAP HONESTY (changelog rotation, 2026-07-29). The feed now rotates
+            // at a byte cap keeping one prior generation; a client whose `since`
+            // predates what is still retained lost changes it will never be
+            // handed. `resyncRequired` tells it to fall back to the full
+            // /v1/review-drafts listing instead of trusting `changed` to be
+            // complete. `retainedFromSeq` 0 means nothing was ever rotated away.
+            retainedFromSeq: String(result.retainedFromSeq),
+            resyncRequired: result.retainedFromSeq > 0 && safeSince < result.retainedFromSeq,
             changed: filtered.map((change) => ({
               threadId: change.aggregateId,
               vector: change.vector,
@@ -8537,6 +8915,144 @@ const routes: readonly RouteDefinition[] = [
         else skipped += 1;
       }
       return [200, { data: { accepted, skipped } }];
+    },
+  },
+  {
+    // Entity layer v1 — GET /v1/entities. The conceptual index the gists have
+    // been producing all along (review §G4/§E3): every `Key Entities:` line
+    // the on-device model wrote, parsed, deduped, and joined to the
+    // workstreams its pages are filed under.
+    //
+    // DERIVED, NOT STORED. No new event type: the index is a pure fold over
+    // the SAME ENTITY_CONTENT_ENRICHED events the gist lookup already folds
+    // (entityIndex.ts). So it covers every gist already in the vault, and a
+    // retracted gist's entities disappear with it for free.
+    //
+    // FROZEN CONTRACT: 200 { data: { entities: [{ name, kinds, refCount,
+    // workstreams, hub }], … } }, sorted by refCount desc (ties by name), cap
+    // ENTITY_LIST_MAX. HUBS ARE EXCLUDED — an entity in >25% of gists or with
+    // >30 refs is the vault's subject matter, not a link between two pages,
+    // and listing it buries everything that discriminates. It stays reachable
+    // by exact name (the route below), which is why `hub` is in the item
+    // shape at all. The sibling counters (hubs/gists/scanned/dropped) are
+    // REPORT-NOT-SILENT: how many entities were damped, how much of the
+    // corpus carried entities, and how many candidates the parser rejected.
+    //
+    // KILL SWITCH SIDETRACK_ENTITY_INDEX (default ON — read-only derivation
+    // over data that already exists). '0'/'false' ⇒ typed empty with the
+    // reason named, and the fold is never built.
+    method: 'GET',
+    pattern: /^\/v1\/entities$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (!entityIndexEnabled()) {
+        return [
+          200,
+          entityIndexUnavailable('entity index disabled (SIDETRACK_ENTITY_INDEX=0)', true),
+        ];
+      }
+      const index = await loadEntityIndexForRequest(context);
+      if (index === null) {
+        return [200, entityIndexUnavailable('no enrichment event log on this companion')];
+      }
+      return [
+        200,
+        {
+          data: {
+            entities: listEntities(index, ENTITY_LIST_MAX),
+            hubs: index.hubCount,
+            gists: index.gistCount,
+            scanned: index.scannedCount,
+            dropped: index.droppedCandidates,
+          },
+        },
+      ];
+    },
+  },
+  {
+    // Entity dossier — GET /v1/entities/{name}. The full entry INCLUDING its
+    // refs: which pages/threads named this entity and where each is filed.
+    // This is the "show me everything touching Kimi Delta Attention" surface
+    // the review calls out; the listing route is the index into it.
+    //
+    // The name is URL-ENCODED and matched CASE-INSENSITIVELY — model prose
+    // capitalizes inconsistently ("OpenAI" / "openai"), and a lookup that
+    // demanded the exact spelling would 404 on the user's own reading of the
+    // page. Case folding happens in entityKeyFor, the single place the fold
+    // and this route share, so the two can never disagree on identity.
+    //
+    // HUBS ARE RETURNED HERE. A caller who names an entity explicitly gets
+    // the honest answer including `hub: true`; damping suppresses the
+    // LISTING, it never hides a fact from someone who asked for it.
+    //
+    // 404 is a TYPED problem (ENTITY_NOT_FOUND) and means exactly "no gist in
+    // this vault names that" — the disabled flag returns typed empty instead,
+    // because "the feature is off" and "nothing named it" are different facts
+    // and answering the first with the second is a lie.
+    method: 'GET',
+    pattern: /^\/v1\/entities\/(?<entityName>[^/]+)$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (!entityIndexEnabled()) {
+        return [
+          200,
+          {
+            data: {
+              entity: null,
+              disabled: true,
+              emptyReason: 'entity index disabled (SIDETRACK_ENTITY_INDEX=0)',
+            },
+          },
+        ];
+      }
+      let name: string;
+      try {
+        name = decodeURIComponent(match.entityName ?? '');
+      } catch {
+        // A malformed percent-escape is a caller bug, not a missing entity.
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Entity name must be URL-encoded.',
+        );
+      }
+      const index = await loadEntityIndexForRequest(context);
+      if (index === null) {
+        return [
+          200,
+          {
+            data: {
+              entity: null,
+              emptyReason: 'no enrichment event log on this companion',
+            },
+          },
+        ];
+      }
+      const entry = lookupEntity(index, name);
+      if (entry === undefined) {
+        throw new HttpRouteError(
+          404,
+          'ENTITY_NOT_FOUND',
+          'Entity not found.',
+          'No gist in this vault names that entity.',
+        );
+      }
+      return [
+        200,
+        {
+          data: {
+            entity: {
+              name: entry.display,
+              kinds: entry.kinds,
+              refCount: entry.refs.length,
+              workstreams: entry.workstreams,
+              hub: entry.hub,
+              refs: entry.refs,
+            },
+          },
+        },
+      ];
     },
   },
   {
@@ -10652,6 +11168,28 @@ export const handleRequest = async (
     ).catch(() => undefined);
   };
 
+  // STALL ATTRIBUTION (always on, not debug-gated — an operator does not get to
+  // reproduce a stall on demand, so the field has to already be in the log).
+  // The event-loop watchdog could only ever say `[api.stall]
+  // eventLoopBlockedMs=3008` — never WHICH route held the thread — so every
+  // stall investigation in this repo began by guessing the endpoint.
+  // Registering here and completing in the `finally` below lets the monitor
+  // name the routes that were still running when it noticed the block.
+  //
+  // PLACEMENT is deliberate: this is after the 404, the model-host stream and
+  // the /v1/vault/changes SSE early-returns, so only DISPATCHED JSON routes are
+  // tracked. The SSE connection in particular is open for the entire session —
+  // tracking it would make it permanently the longest-running request and it
+  // would head every suspect list forever, drowning the actual culprit.
+  //
+  // The recorded string is the route PATTERN from the matched route table entry
+  // — `POST:/v1/visits/batch-resolve`, `GET:/v1/visits/{canonicalUrl}/resolve` —
+  // NOT url.pathname. The http-log line above strips url.search for PII; for
+  // the resolve routes the PATHNAME ITSELF carries the encoded canonical URL,
+  // so a stall line built from it would leak browsing history into a log the
+  // user is asked to paste. The pattern cannot.
+  const inflightId = registerInflight(routeLabelFromPattern(route.method, route.pattern));
+
   try {
     const match = route.pattern.exec(url.pathname);
     // F02 systemic default-deny. An mcp-key caller may only reach a
@@ -10784,6 +11322,16 @@ export const handleRequest = async (
         ...(issues === undefined ? {} : { issues }),
       }),
     );
+  } finally {
+    completeInflight(inflightId);
+    // AFTER the response — both branches above have already called sendJson /
+    // send304 by the time this runs, so the queued resolver-cache upserts drain
+    // on a tick the client is no longer waiting on. This is the PRIMARY drain
+    // trigger (resolverCacheDefer's own fallback timer exists only for a
+    // companion that goes completely idle with a queued write). No-op, and no
+    // scheduling at all, when the queue is empty — which is every request that
+    // is not a batch-resolve with fresh misses.
+    scheduleResolverCacheFlush();
   }
 };
 

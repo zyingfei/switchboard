@@ -104,6 +104,7 @@ import type { EngagementClassRevision } from './engagementClassifier.js';
 import {
   casPublish,
   checkpointTruncate,
+  clearShadowInFlight,
   composeGenId,
   createShadowGeneration,
   discardShadowGeneration,
@@ -115,6 +116,11 @@ import {
   residentGenerations,
   type SqliteLikeDb,
 } from './generationBuffer.js';
+import {
+  isGenerationVanishedError,
+  recordGenerationRecovered,
+  recordGenerationUnrecovered,
+} from './generationRecovery.js';
 import { findThreadQuotes, type ThreadText } from './quoteIndex.js';
 import { anisotropyZScore } from './visitSimilarity.js';
 import { SIMILARITY_FAMILY_RENDER_EDGE_KINDS } from './renderedSimilarityFloor.js';
@@ -4754,10 +4760,63 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   async #withRead<T>(fn: () => Promise<T>): Promise<T> {
     this.#inFlightReads += 1;
     try {
-      return await fn();
+      return await this.#readWithGenerationRetry(fn);
     } finally {
       this.#inFlightReads -= 1;
       this.#closeRetiredHandlesIfQuiescent();
+    }
+  }
+
+  /**
+   * Run a read; if it dies with "disk I/O error" — bun:sqlite's signature for a
+   * handle whose generation file was unlinked/swapped out from under it — drop
+   * the dead handle, reopen on the CURRENT pointer, and retry ONCE.
+   *
+   * WHY THIS IS SAFE AND WHY IT IS A RETRY (not a failure): the pointer only
+   * ever names a fully-published, checkpoint-TRUNCATE'd generation, and GC only
+   * ever removes generations the pointer has moved past. So "my file vanished"
+   * always means "a newer complete generation is published" — re-running the
+   * read on it returns fresher-but-valid data, which is exactly what the reader
+   * would have gotten had it arrived a moment later. This is the same reasoning
+   * that makes #reopenIfPointerChanged safe, applied to the case where we learn
+   * about the swap from the error instead of from the pointer.
+   *
+   * ONCE, not a loop: one reopen closes the race by construction (the retry
+   * runs against a generation the pointer names *now*). A second failure means
+   * something other than a swap is wrong, and a spin against failing storage is
+   * strictly worse than surfacing it. Both outcomes are counted so the window
+   * shows up in health instead of being silently absorbed — the structural fix
+   * lives in generationBuffer.ts's cross-process in-flight markers, and these
+   * counters are how we find out if it ever stops holding.
+   */
+  async #readWithGenerationRetry<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (error) {
+      // Only the reopen-capable roles can recover: a child-writer owns a
+      // private shadow (nothing to reopen onto) and legacy has no generations.
+      if (
+        !isGenerationVanishedError(error) ||
+        !this.#doubleBuffer ||
+        (this.#role !== 'parent-reader' && this.#role !== 'single-buffer')
+      ) {
+        throw error;
+      }
+      // The file is gone, so this handle can never serve again — close it
+      // outright rather than retiring it (a retired handle is one we might
+      // still read; this one is dead). Retired handles are left alone: they
+      // name other generations and their own reads own their lifecycle.
+      this.#closeDbHandle();
+      this.#openGenId = null;
+      this.#dropCachedSnapshot();
+      try {
+        const recovered = await fn();
+        recordGenerationRecovered(error);
+        return recovered;
+      } catch (retryError) {
+        recordGenerationUnrecovered(retryError);
+        throw retryError;
+      }
     }
   }
 
@@ -4865,10 +4924,28 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     if (result.outcome === 'published') {
       // The pointer now names genId; a single-buffer writer stays on this gen
       // and re-flips to it on its NEXT write, so advance the CAS seed to match.
+      // (casPublish already cleared this gen's cross-process in-flight marker.)
       this.#seedGenId = genId;
       this.#swapCount += 1;
       this.#lastSwapAtMs = Date.now();
       this.#lastGcUnlinked = result.unlinked.length;
+    } else {
+      // Superseded: this shadow is an orphan we no longer write.
+      //
+      // MEASURED LEAK (live vault, 2026-07-29): this branch used to ONLY clear
+      // the marker, delegating the FILE to "another process's GC". On the
+      // dogfood vault that left THREE ~323 MB child-writer clones resident
+      // (their genIds carry this path's `<epochMs>-<pid><rev8>` shape) because
+      // gcOldGenerations only ever runs inside a *winning* casPublish — so the
+      // handoff had no guaranteed taker. The three parent-side shadow paths all
+      // discard their own lost-CAS shadow; the child must too.
+      //
+      // Safe by construction: a shadow that LOST the CAS is provably not the
+      // pointer target (the pointer names the winner), and
+      // discardShadowGeneration re-checks the live pointer anyway before
+      // unlinking. It also clears the marker, so this subsumes the old
+      // clear-only behaviour rather than replacing it.
+      discardShadowGeneration(this.#root, genId);
     }
   }
 
@@ -5723,6 +5800,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     } finally {
       closeShadow();
       this.#inFlightShadowGenIds.delete(shadowGenId);
+      // Release the cross-process claim on EVERY exit, including the throw path
+      // (which leaves the shadow file behind). Idempotent: a published shadow's
+      // marker was already cleared inside casPublish, a discarded one by
+      // discardShadowGeneration. Without this, a shadow abandoned by an
+      // exception would stay pinned against the child's GC for this pid's whole
+      // lifetime.
+      clearShadowInFlight(this.#root, shadowGenId);
     }
   }
 
@@ -6772,14 +6856,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly threadId: string;
     readonly providerThreadId?: string;
     readonly threadUrl?: string;
-  }): Promise<ConnectionsSnapshot | null> => {
-    const db = await this.#database();
-    return await this.#readTraversedSubgraph(this.#threadResolverSeedNodeIds(db, _input), {
-      hops: RESOLVER_SUBGRAPH_HOPS,
+  }): Promise<ConnectionsSnapshot | null> =>
+    // The SEED lookup ran outside #withRead (only the traversal below was
+    // protected), so a generation swap during the seed query failed the request
+    // outright. Wrapping the whole thing makes the retry cover both halves;
+    // #withRead nests safely (it only counts in-flight reads).
+    await this.#withRead(async () => {
+      const db = await this.#database();
+      return await this.#readTraversedSubgraph(this.#threadResolverSeedNodeIds(db, _input), {
+        hops: RESOLVER_SUBGRAPH_HOPS,
+      });
     });
-  };
 
-  readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> => {
+  // Wrapped in #withRead like every other served read: it is production-
+  // reachable (GET /v1/connections/edges/:id) and was one of two read paths
+  // that called #database() directly, so a generation swap under it produced a
+  // hard request failure instead of the transparent reopen-and-retry the rest
+  // of the read surface gets.
+  readonly readEdge = async (edgeId: string): Promise<ConnectionEdge | null> =>
+    await this.#withRead(async () => await this.#readEdgeInner(edgeId));
+
+  async #readEdgeInner(edgeId: string): Promise<ConnectionEdge | null> {
     const db = await this.#database();
     // O(1) path: edges_index maps edge_id -> (src, dst), so we read only that
     // one bucket via the (src, dst) primary key instead of scanning every
@@ -6805,7 +6902,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       if (match !== undefined) return match;
     }
     return null;
-  };
+  }
 
   readonly putDay = async (date: string, snapshot: ConnectionsSnapshot): Promise<void> => {
     await writeConnectionsSnapshotJson(join(this.#snapshotsDir, `${date}.json`), snapshot);

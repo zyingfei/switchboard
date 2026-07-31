@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { buildAnnIndex } from '../recall/ann-index.js';
-import { createEmbeddingCache } from '../recall/embeddingCache.js';
+import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { evidenceCorpusForRecord } from '../page-evidence/extract.js';
 import {
   DEFAULT_UNKNOWN_IDF,
@@ -74,7 +74,14 @@ export interface BuildVisitSimilarityOptions {
   >;
 }
 
-export const VISIT_SIMILARITY_MODEL_ID = 'Xenova/multilingual-e5-small' as const;
+// E2 (single model identity). This used to be its own literal
+// `'Xenova/multilingual-e5-small'`, sitting a few lines from the RECALL_MODEL
+// import that the actual embed call uses — two independently-editable sources
+// of truth for one fact, so the id STAMPED on every persisted revision could
+// drift from the model that produced the vectors without anything failing.
+// Derived now: the value is unchanged, and a model swap can no longer be
+// half-applied.
+export const VISIT_SIMILARITY_MODEL_ID = RECALL_MODEL.modelId;
 export const VISIT_SIMILARITY_FEATURE_SCHEMA_VERSION = 1;
 export const VISIT_SIMILARITY_DEFAULT_THRESHOLD = 0.85;
 export const VISIT_SIMILARITY_DEFAULT_TOP_K = 50;
@@ -1282,36 +1289,87 @@ const embedWithCache = async (
   const out = new Array<Float32Array | undefined>(texts.length);
   const missIndexes: number[] = [];
   const missTexts: string[] = [];
-  const hashes = texts.map((t) => createHash('sha256').update(t).digest('hex'));
+  // `embedTextHash` is the SHARED key derivation (recall/embeddingCache.ts) —
+  // the same function the recall-v2 chunk backfill, the page-evidence chunk
+  // embed and the lane query path now use, so one (model, text) pair is
+  // embedded once machine-wide instead of once per substrate.
+  const hashes = texts.map((t) => embedTextHash(t));
+  // ONE read for the whole lookup phase. Per-key `cache.get` re-read and
+  // re-parsed the entire cache file per text: with N texts against a file that
+  // grows to N × dim × 4 bytes, the lookup phase alone was quadratic in bytes.
+  let hits: ReadonlyMap<string, Float32Array>;
+  try {
+    hits = await cache.getMany({ modelId, modelRevision }, hashes);
+  } catch {
+    hits = new Map();
+  }
   for (let i = 0; i < texts.length; i += 1) {
     const hash = hashes[i];
-    let hit: Float32Array | null = null;
-    try {
-      hit = hash === undefined ? null : await cache.get({ modelId, modelRevision, embedTextHash: hash });
-    } catch {
-      hit = null;
-    }
-    if (hit === null) {
+    const hit = hash === undefined ? undefined : hits.get(hash);
+    if (hit === undefined) {
       missIndexes.push(i);
       missTexts.push(texts[i] ?? '');
     } else {
       out[i] = hit;
     }
   }
+  // CHUNKED, FLUSH-AS-YOU-GO — the shape that survived a live outage.
+  //
+  // This used to embed ALL misses in one `embed(missTexts)` call and only
+  // write the cache afterwards. On 2026-07-29 that combination froze the
+  // vault: the full-rebuild fallback handed this function the whole corpus
+  // with a cold cache, the single embed ran past the reconcile child's
+  // 10-minute no-progress watchdog, the child was SIGKILLed before ONE cache
+  // write happened — so the next drain started cold again, and again, forever
+  // (`connections: never / pending`, SIGKILL seq=1..11, zero successful drains
+  // in 18 hours; the child sampled at ~100% CPU inside onnxruntime with a
+  // fresh 600s kill history).
+  //
+  // Chunking changes both halves of that failure:
+  //   * PROGRESS IS DURABLE. The cache is written after EVERY chunk, so a
+  //     kill costs at most one chunk and consecutive retries converge to done
+  //     instead of restarting from zero. Monotonic under any timeout.
+  //   * PROGRESS IS VISIBLE. One stdout line per chunk — deliberately plain
+  //     console.log, NOT a phase mark: marks are gated behind the phase-log
+  //     flag (off by default), which is exactly how this phase got to burn 10
+  //     silent minutes. The parent pipes child stdout AND resets its
+  //     no-progress watchdog on every line, so a legitimately long embed now
+  //     ticks the watchdog by construction, whatever the state of the IPC
+  //     heartbeat.
+  //
+  // 64 texts/chunk: big enough that per-call overhead is noise, small enough
+  // that a chunk is seconds — so the kill-loss bound and the log cadence are
+  // both measured in seconds.
+  const EMBED_CACHE_CHUNK = 64;
   if (missTexts.length > 0) {
-    const fresh = await embed(missTexts);
-    for (let m = 0; m < missIndexes.length; m += 1) {
-      const target = missIndexes[m];
-      const vec = fresh[m];
-      if (target === undefined || vec === undefined) continue;
-      out[target] = vec;
-      const hash = hashes[target];
-      if (hash !== undefined) {
-        try {
-          await cache.put({ modelId, modelRevision, embedTextHash: hash }, vec);
-        } catch {
-          // best-effort: a cache write failure must not fail the drain
-        }
+    for (let start = 0; start < missTexts.length; start += EMBED_CACHE_CHUNK) {
+      const chunkTexts = missTexts.slice(start, start + EMBED_CACHE_CHUNK);
+      const fresh = await embed(chunkTexts);
+      const toPersist: [string, Float32Array][] = [];
+      for (let m = 0; m < chunkTexts.length; m += 1) {
+        const target = missIndexes[start + m];
+        const vec = fresh[m];
+        if (target === undefined || vec === undefined) continue;
+        out[target] = vec;
+        const hash = hashes[target];
+        if (hash !== undefined) toPersist.push([hash, vec]);
+      }
+      // ONE write per chunk, not one per vector. The flush-as-you-go
+      // durability the outage fix bought is unchanged (a kill still costs at
+      // most one chunk); what changes is that a chunk no longer rewrites the
+      // whole cache file 64 times over.
+      try {
+        await cache.putMany({ modelId, modelRevision }, toPersist);
+      } catch {
+        // best-effort: a cache write failure must not fail the drain
+      }
+      const done = Math.min(start + EMBED_CACHE_CHUNK, missTexts.length);
+      // Only worth a line when this is real work — a handful of misses on a
+      // warm cache should not chat.
+      if (missTexts.length > EMBED_CACHE_CHUNK) {
+        console.log(
+          `[similarity-embed] ${String(done)}/${String(missTexts.length)} embedded (cache-backed, resumable)`,
+        );
       }
     }
   }

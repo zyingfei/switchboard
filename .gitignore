@@ -43,6 +43,16 @@ sidetrack-vault*/
 # Screen session logs
 screenlog.*
 
+# Local eval output that contains REAL browsing data.
+# The golden-resolve-set harness (packages/sidetrack-companion/src/eval/
+# goldenResolveSet.ts) replays the user's own filings, so its report carries
+# real canonical URLs and workstream ids. It normally writes under the vault
+# (_BAC/eval/, already outside the repo); these patterns catch a --vault or
+# redirect that lands inside the checkout. Same for the live lane-prequential
+# prediction log.
+golden-resolve-set*.json
+lane-prequential.jsonl*
+
 # Build artifacts + diagnostics (auto-generated, never commit)
 packages/*/.wxt/
 .diag-heap/

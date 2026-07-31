@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
+import { LANE_FALLBACK_WHY_PREFIX } from './laneFallbackPick';
 import { SuggestionStats } from './SuggestionStats';
 import type {
   TabSessionResolutionResult,
@@ -157,5 +158,102 @@ describe('SuggestionStats — ranked "Possibilities" list', () => {
     );
     expect(screen.getByText('Companion is busy — retrying')).toBeDefined();
     expect(container.querySelector('.suggestion-possibilities')).toBeNull();
+  });
+});
+
+// The lane-fallback pick — the companion now fills an EMPTY fusion's displayed
+// pick from the content + ai guess lanes (tabsession/laneFallback.ts) so the
+// card shows a best guess on partial data instead of "In workstream: — / No
+// confident pick". Those candidates ride in the same fusedCandidates array a
+// real fused candidate would, so the card must be able to tell them apart and
+// label the pick as UNCONFIRMED rather than presenting it like a suggestion.
+describe('SuggestionStats — lane-fallback pick (unconfirmed, page-content only)', () => {
+  // Exactly what the companion emits: reasons[0].summary carries the frozen
+  // provenance prefix, all evidence channels are 0, dominantSource is 'none',
+  // and rawFusionLogit holds the lane-native score (NOT a fusion logit).
+  const fallbackCandidate = (
+    workstreamId: string,
+    score: number,
+    lanes: string,
+  ): TabSessionResolverCandidate => ({
+    workstreamId,
+    rawFusionLogit: score,
+    dominantSource: 'none',
+    reasons: [
+      {
+        source: 'similarity',
+        summary: `${LANE_FALLBACK_WHY_PREFIX} · ${lanes} ${String(Math.round(score * 100))}%`,
+        anchors: [],
+      },
+    ],
+  });
+
+  const jfrogResolution = (): TabSessionResolutionResult =>
+    resolution(
+      {
+        action: 'inbox',
+        margin: 0,
+        gate: {
+          reason: 'no-candidates',
+          detail: 'no candidates reached fusion · lane-fallback shown',
+        },
+      },
+      [
+        fallbackCandidate('ws-2', 0.71, 'content + ai lanes'),
+        fallbackCandidate('ws-1', 0.62, 'content + ai lanes'),
+        fallbackCandidate('ws-3', 0.31, 'content lane'),
+      ],
+    );
+
+  it('labels the pick UNCONFIRMED with its page-content provenance, not as a suggestion', () => {
+    render(
+      <SuggestionStats suggestion={jfrogResolution()} workstreams={workstreams} showEmptyPlaceholder />,
+    );
+    const chip = screen.getByTestId('lane-fallback-pick');
+    expect(chip.textContent).toBe('Unconfirmed — from page content (AI-assisted)');
+    // The workstream IS shown (the whole point — a best guess beats a dash) …
+    expect(screen.getAllByText('Infra / Deploy').length).toBeGreaterThanOrEqual(1);
+    // … and the generic weak-guess wording is NOT used: there was no fusion
+    // here at all, so "below the resolver's confidence bar" would misdescribe it.
+    expect(screen.queryByText('weak guess — filed to inbox')).toBeNull();
+  });
+
+  it('never prints a confidence word for a synthesized score', () => {
+    const { container } = render(
+      <SuggestionStats suggestion={jfrogResolution()} workstreams={workstreams} showEmptyPlaceholder />,
+    );
+    // The headline shows NO confidence word at all when the uncertainty chip
+    // is up. It used to print the level label ("No clear pick") beside the
+    // chip; on a real weak-guess page that same slot rendered "WEAK GUESS —
+    // FILED TO INBOX  ai  Highly likely" — a contradiction on one line (live
+    // screenshot, 2026-07-28). The chip is the whole statement now; the level
+    // survives only in the ⓘ tooltip.
+    expect(screen.queryByText('No clear pick')).toBeNull();
+    expect(container.querySelector('.suggestion-stats-confidence')).toBeNull();
+    // … and every possibility row says "unconfirmed" rather than a calibrated
+    // word ("Medium") derived from a lane score sitting in the logit field.
+    const words = Array.from(
+      container.querySelectorAll('.suggestion-possibility-confidence'),
+    ).map((el) => el.textContent);
+    expect(words.length).toBeGreaterThan(0);
+    for (const word of words) expect(word).toBe('· unconfirmed');
+    // The card is tagged for the fallback so styling/telemetry can tell.
+    expect(container.querySelector('[data-endorsement="lane-fallback"]')).not.toBeNull();
+  });
+
+  it('leaves a REAL weak guess reading exactly as before', () => {
+    // Regression guard: an ordinary un-endorsed fused candidate (no fallback
+    // provenance) must keep the existing weak-guess headline.
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: -0.4 }, [
+          candidate({ workstreamId: 'ws-1', rawFusionLogit: 0.6 }),
+        ])}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+      />,
+    );
+    expect(screen.getByText('weak guess — filed to inbox')).toBeDefined();
+    expect(screen.queryByTestId('lane-fallback-pick')).toBeNull();
   });
 });

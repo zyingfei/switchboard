@@ -828,6 +828,20 @@ button:disabled {
   color: var(--ink-3);
   font-weight: 500;
 }
+/* Lane-fallback pick (companion tabsession/laneFallback.ts): fusion produced
+   NOTHING and the shown pick was synthesized from the content + AI guess lanes.
+   Same muted pill — it must never read as a suggestion — but its label is a
+   short sentence rather than two words, so the row wraps (the pill takes the
+   first line, the workstream name the next) instead of squeezing the name, and
+   the sentence is not shouted in uppercase. */
+.suggestion-stats.is-lane-fallback .suggestion-stats-row {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.suggestion-stats-unconfirmed {
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
 
 /* Ranked "Possibilities" — the resolver's FULL candidate list, one-click
    filable. Collapsed under a confident primary ("Other possibilities (N)")
@@ -889,7 +903,11 @@ button:disabled {
   font-size: 10px;
 }
 .suggestion-possibility-file {
-  margin-left: auto;
+  /* NOT margin-left:auto. The panel also runs as a full-width TAB, where
+     auto-margin strands "File here" ~900px from the row it belongs to
+     (live screenshot, 2026-07-28). Adjacent with a small gap reads correctly
+     at both 380px docked and full-tab width. */
+  margin-left: 6px;
   font-size: 10px;
 }
 
@@ -1029,7 +1047,7 @@ button:disabled {
 .pipeline-chip {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   font-family: var(--mono);
   font-size: 10px;
   white-space: nowrap;
@@ -1072,7 +1090,10 @@ button:disabled {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 8px;
+  /* 14px column gap: the state ("…model ready") and the limits line are two
+     separate facts in the same mono size — at 8px they read as one glued
+     sentence ("ready limits: 9.8k…"). */
+  gap: 4px 14px;
   min-width: 0;
 }
 .enrich-row-state {
@@ -10077,6 +10098,7 @@ pre.diff {
   background: var(--paper-tinted);
 }
 .cx-page-content-card {
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -10129,6 +10151,13 @@ pre.diff {
 .cx-mini-btn:disabled {
   opacity: 0.55;
   cursor: default;
+}
+/* page-text tidy 2026-07-28 */
+/* The destructive action sits apart from the constructive ones — pushed to
+   the row's far edge so "Delete text" can never be mistaken for the next
+   step after "Index page". */
+.cx-page-content-actions .cx-mini-btn.danger {
+  margin-left: auto;
 }
 .cx-mini-btn.danger {
   color: var(--signal);

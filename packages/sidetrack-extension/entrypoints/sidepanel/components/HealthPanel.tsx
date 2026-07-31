@@ -420,6 +420,103 @@ interface HygieneStatusResponse {
   } | null;
 }
 
+// THE VAULT LEDGER (/v1/system/vault-ledger). The Revision inventory above
+// reports the GC *plan* — on the live vault that was 10.7 MB of a 3.02 GB
+// vault, i.e. 99.6% of the disk had no surface at all. The ledger classifies
+// EVERY byte and its family totals reconcile to the on-disk total, so this
+// table is the one that answers "why is my vault 3 GB".
+//
+// Statuses are rendered in plain words (statusWords below) because
+// `unused-under-config` is meaningless to a reader and "unused with the event
+// store off" is not. `availability: 'disabled'` is distinct from
+// 'unavailable' — the operator turned it off, the walk is not broken.
+//
+// v1 IS READ-ONLY BY DESIGN: reclaimable bytes are reported and NEVER given a
+// delete affordance. The sweeps that can act are armed by env flag on the
+// companion, deliberately not by a button here.
+interface VaultLedgerFamily {
+  readonly family: string;
+  readonly bytes: number;
+  readonly files: number;
+  readonly status: string;
+  readonly reclaimable: number;
+  readonly reclaimableAssessed: boolean;
+  readonly note: string;
+}
+interface VaultLedgerGenerationEntry {
+  readonly genId: string;
+  readonly bytes: number;
+  readonly disposition: string;
+  readonly note: string;
+}
+interface VaultLedgerResponse {
+  readonly asOf: string | null;
+  readonly availability: 'ok' | 'stale' | 'unavailable' | 'disabled';
+  readonly ledger: {
+    readonly totalBytes: number;
+    readonly totalFiles: number;
+    readonly families: readonly VaultLedgerFamily[];
+    readonly reclaimableBytes: number;
+    readonly generations: {
+      readonly pointerGenId: string | null;
+      readonly entries: readonly VaultLedgerGenerationEntry[];
+      readonly collectableCount: number;
+      readonly collectableBytes: number;
+      readonly sweepArmed: boolean;
+    };
+    readonly eventLog: {
+      readonly sampled: boolean;
+      readonly shardsTotal: number;
+      readonly shardsSampled: number;
+      readonly totalBytes: number;
+      readonly types: readonly {
+        readonly type: string;
+        readonly share: number;
+        readonly estimatedBytes: number;
+      }[];
+    } | null;
+  } | null;
+}
+
+/** Plain words for the ledger's typed statuses. No jargon, no fake precision. */
+const LEDGER_STATUS_WORDS: Readonly<Record<string, string>> = {
+  active: 'in use',
+  'unused-under-config': 'unused with the event store off',
+  'retained-anchor': 'kept as a rollback anchor',
+  unbounded: 'grows without a retention policy',
+  orphaned: 'orphaned — safe to collect',
+  empty: 'empty',
+  unclassified: 'not yet named',
+};
+
+/** Plain words for a generation's disposition. */
+const LEDGER_DISPOSITION_WORDS: Readonly<Record<string, string>> = {
+  pointer: 'serving now',
+  'recent-prior': 'kept — previous generation',
+  'live-marked': 'kept — a writer still holds it',
+  'orphan-young': 'kept — too recent to be sure',
+  'orphan-collectable': 'orphaned — safe to collect',
+};
+
+/** Family names as a reader would say them. */
+const LEDGER_FAMILY_WORDS: Readonly<Record<string, string>> = {
+  'connections-generations': 'Graph generations',
+  'connections-legacy-anchor': 'Graph rollback anchor',
+  'connections-sidecar-dbs': 'Graph side databases',
+  'connections-derived': 'Graph derived revisions',
+  'event-store': 'Event store',
+  'event-log': 'Event log',
+  'ingress-spool': 'Capture spool',
+  'sync-changelog': 'Projection changelog',
+  'recall-index': 'Recall index',
+  'page-evidence': 'Page evidence',
+  'page-content': 'Page text',
+  ranker: 'Ranker',
+  diagnostics: 'Diagnostics',
+  'debug-dumps': 'Debug dumps',
+  other: 'Everything else',
+};
+
 interface HealthPanelProps {
   readonly onClose: () => void;
   readonly companionPort?: number | null;
@@ -730,6 +827,7 @@ export function HealthPanel({
   const [report, setReport] = useState<HealthReport | null>(null);
   const [focusHealth, setFocusHealth] = useState<FocusHealthResponse | null>(null);
   const [hygiene, setHygiene] = useState<HygieneStatusResponse | null>(null);
+  const [vaultLedger, setVaultLedger] = useState<VaultLedgerResponse | null>(null);
   const [section15, setSection15] = useState<Section15Response | null>(null);
   const [loadState, setLoadState] = useState<'loading' | 'live' | 'unavailable' | 'not-configured'>(
     companionPort === undefined || companionPort === null || !bridgeKey
@@ -807,6 +905,24 @@ export function HealthPanel({
       setHygiene(body.data ?? null);
     } catch {
       setHygiene(null);
+    }
+  };
+
+  // Best-effort like focus/hygiene/§15: an older companion without the route
+  // leaves state null and the section simply is not rendered — never a
+  // fabricated zero for a 3 GB vault.
+  const fetchVaultLedger = async (): Promise<void> => {
+    if (base === null || authHeaders === undefined) return;
+    try {
+      const response = await fetch(`${base}/v1/system/vault-ledger`, { headers: authHeaders });
+      if (!response.ok) {
+        setVaultLedger(null);
+        return;
+      }
+      const body = (await response.json()) as { readonly data?: VaultLedgerResponse };
+      setVaultLedger(body.data ?? null);
+    } catch {
+      setVaultLedger(null);
     }
   };
 
@@ -902,7 +1018,13 @@ export function HealthPanel({
     let cancelled = false;
     const run = async (): Promise<void> => {
       if (report === null) setLoadState('loading');
-      await Promise.all([fetchReport(), fetchFocusHealth(), fetchHygiene(), fetchSection15()]);
+      await Promise.all([
+        fetchReport(),
+        fetchFocusHealth(),
+        fetchHygiene(),
+        fetchSection15(),
+        fetchVaultLedger(),
+      ]);
       if (cancelled) return;
     };
     void run();
@@ -2155,30 +2277,158 @@ export function HealthPanel({
     const groups = hygiene?.gc?.groups ?? {};
     const groupEntries = Object.entries(groups);
     const sizeBytes = report?.vault.sizeBytes ?? null;
+    const ledger = vaultLedger?.ledger ?? null;
+    const ledgerAvailability = vaultLedger?.availability ?? null;
+    const generations = ledger?.generations ?? null;
+    const orphanCount = generations?.collectableCount ?? 0;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <h2 className="sx-drill-title">Vault · {formatBytes(sizeBytes)}</h2>
+        <h2 className="sx-drill-title">Vault · {formatBytes(ledger?.totalBytes ?? sizeBytes)}</h2>
 
         <div className="sx-tilegrid" style={{ gridTemplateColumns: '1fr 1fr' }}>
           <div className="sx-tile">
             <div className="lbl">On disk</div>
-            <div className="num">{formatBytes(sizeBytes)}</div>
-            <div className="foot">{report?.vault.root ?? '—'}</div>
+            <div className="num">{formatBytes(ledger?.totalBytes ?? sizeBytes)}</div>
+            <div className="foot">
+              {ledger === null
+                ? (report?.vault.root ?? '—')
+                : `${String(ledger.totalFiles)} files · ${report?.vault.root ?? ''}`}
+            </div>
           </div>
-          <div className={`sx-tile${gcUnavailable ? ' unavail' : ''}`}>
-            <div className="lbl">GC-tracked</div>
+          <div className={`sx-tile${orphanCount > 0 ? ' unavail' : ''}`}>
+            <div className="lbl">Orphaned graph generations</div>
             <div className="num">
-              {gcUnavailable ? 'unavailable' : formatBytes(hygiene?.gc?.totalBytes ?? null)}
+              {generations === null ? '—' : formatBytes(generations.collectableBytes)}
             </div>
             <div className="foot">
-              {gcUnavailable
-                ? 'inventory didn’t load (not zero)'
-                : `${String(hygiene?.gc?.totalCount ?? 0)} files`}
+              {generations === null
+                ? 'ledger didn’t load (not zero)'
+                : orphanCount === 0
+                  ? 'none — every generation is accounted for'
+                  : `${String(orphanCount)} abandoned · sweep ${generations.sweepArmed ? 'armed' : 'off (reporting only)'}`}
             </div>
           </div>
         </div>
 
+        {/* WHERE THE BYTES ARE. The Revision inventory below reports only what
+            the GC plans to delete; this reports everything, and reconciles. */}
+        <h3 className="sx-h">Where the space goes</h3>
+        {ledgerAvailability === 'disabled' ? (
+          <div className="sx-callout">
+            Vault ledger is switched off (<code>SIDETRACK_VAULT_LEDGER=0</code>).
+          </div>
+        ) : ledger === null ? (
+          <div className="sx-callout warn">
+            Vault ledger unavailable — the cached walk hasn’t landed yet, or this companion
+            predates the route. Sizes are not fabricated as zero.
+          </div>
+        ) : (
+          <>
+            <table className="sx-inv">
+              <thead>
+                <tr>
+                  <th>What</th>
+                  <th>Size</th>
+                  <th>Files</th>
+                  <th>Status</th>
+                  <th>Reclaimable</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ledger.families
+                  .filter((family) => family.files > 0)
+                  .map((family) => (
+                    <tr key={family.family}>
+                      <td title={family.note}>
+                        {LEDGER_FAMILY_WORDS[family.family] ?? family.family}
+                      </td>
+                      <td className="mono">{formatBytes(family.bytes)}</td>
+                      <td className="mono">{String(family.files)}</td>
+                      <td>{LEDGER_STATUS_WORDS[family.status] ?? family.status}</td>
+                      <td className="mono">
+                        {/* "not assessed" is not the same as 0 — a family nothing
+                            knows how to assess must not read as "nothing to free". */}
+                        {family.reclaimableAssessed ? formatBytes(family.reclaimable) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+            <div className="sx-callout">
+              Reporting only — nothing here is deleted from this panel. Reclaimable totals say
+              what a sweep could free; the sweeps are armed on the companion.
+            </div>
+            {generations !== null && generations.entries.length > 0 ? (
+              <>
+                {/* Named "Generation files" rather than repeating the family
+                    label above — the same words for a total and its breakdown
+                    reads as a duplicate row, not a drilldown. */}
+                <h3 className="sx-h">Generation files</h3>
+                <table className="sx-inv">
+                  <thead>
+                    <tr>
+                      <th>Generation</th>
+                      <th>Size</th>
+                      <th>State</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {generations.entries.map((entry) => (
+                      <tr key={entry.genId}>
+                        <td className="mono" title={entry.note}>
+                          {entry.genId}
+                        </td>
+                        <td className="mono">{formatBytes(entry.bytes)}</td>
+                        <td>
+                          {LEDGER_DISPOSITION_WORDS[entry.disposition] ?? entry.disposition}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            ) : null}
+            {ledger.eventLog !== null ? (
+              <>
+                <h3 className="sx-h">Event log by kind</h3>
+                <div className="sx-callout">
+                  {/* Sampling is stated, not hidden: these are estimates from the
+                      largest shards, and presenting them as measurements would be
+                      the exact fake precision this surface exists to remove. */}
+                  {ledger.eventLog.sampled
+                    ? `Estimated from the ${String(ledger.eventLog.shardsSampled)} largest of ${String(ledger.eventLog.shardsTotal)} shards.`
+                    : `Measured across all ${String(ledger.eventLog.shardsTotal)} shards.`}
+                </div>
+                <table className="sx-inv">
+                  <thead>
+                    <tr>
+                      <th>Event</th>
+                      <th>Share</th>
+                      <th>Size</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ledger.eventLog.types.slice(0, 8).map((entry) => (
+                      <tr key={entry.type}>
+                        <td className="mono">{entry.type}</td>
+                        <td className="mono">{`${(entry.share * 100).toFixed(1)}%`}</td>
+                        <td className="mono">{formatBytes(entry.estimatedBytes)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            ) : null}
+          </>
+        )}
+
         <h3 className="sx-h">Revision inventory</h3>
+        <div className="sx-callout">
+          The subset the derived-revision GC already tracks —{' '}
+          {gcUnavailable ? 'unavailable' : formatBytes(hygiene?.gc?.totalBytes ?? null)} across{' '}
+          {gcUnavailable ? '—' : String(hygiene?.gc?.totalCount ?? 0)} files. A small slice of the
+          table above, not the whole vault.
+        </div>
         {gcUnavailable ? (
           <div className="sx-callout warn">
             GC inventory unavailable — the cached walk hasn’t landed yet (

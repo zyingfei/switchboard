@@ -18,7 +18,15 @@ export interface RecallModelManifest {
   readonly transformersVersionRange: string;
 }
 
-export const RECALL_MODEL: RecallModelManifest = {
+// `as const satisfies` rather than a type ANNOTATION: the annotation widened
+// `modelId` to `string`, which is why three other modules carried their own
+// copy of the literal `'Xenova/multilingual-e5-small'` (the persisted
+// VisitSimilarityRevision type, its runtime type guard, and the visit-similarity
+// producer id) instead of deriving from here. Keeping the literal type lets all
+// of them import this one constant and stay type-compatible, so a model swap is
+// a one-line edit that the compiler propagates. `satisfies` still enforces the
+// interface.
+export const RECALL_MODEL = {
   modelId: 'Xenova/multilingual-e5-small',
   // Pinned HF commit sha (https://huggingface.co/api/models/
   // Xenova/multilingual-e5-small as of 2025-07-22). Bumping this
@@ -31,7 +39,7 @@ export const RECALL_MODEL: RecallModelManifest = {
   dtypePreference: ['q8', 'fp16', 'fp32'],
   inputPrefix: 'query: ',
   transformersVersionRange: '^3.8.1',
-};
+} as const satisfies RecallModelManifest;
 
 // Identity string the lifecycle compares against the on-disk index
 // header. Bumping the revision here marks every existing entry
