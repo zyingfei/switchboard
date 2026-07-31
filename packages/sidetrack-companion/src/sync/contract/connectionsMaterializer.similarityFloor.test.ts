@@ -33,6 +33,7 @@ import { readLatestNonEmptyVisitSimilarityRevision } from '../../producers/visit
 import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
 import { collectHealth } from '../../system/health.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
+import { VECTOR_CORPUS_REVISION } from '../../recall/vectorCorpus.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -90,6 +91,17 @@ const embedForbiddenOnDrain2 = (
 // exercise the HNSW stale-deletion path this fix guards). A shared unit
 // vector makes every pair resemble every other pair → a dense edge set.
 const fullDim = RECALL_MODEL.embeddingDim;
+
+// The materializer persists the HNSW projection under the served vector
+// identity (schema-v2 sidecar). A bare dimension maps to the synthetic test
+// identity, mismatches that sidecar, and reads back an empty reset store —
+// so every read here must present the same identity the writer stamped.
+const servedVectorIdentity = {
+  dimension: fullDim,
+  modelId: RECALL_MODEL.modelId,
+  modelRevision: RECALL_MODEL.revision,
+  vectorCorpusRevision: VECTOR_CORPUS_REVISION,
+} as const;
 const unitFullDim = (): Float32Array => {
   const v = new Float32Array(fullDim);
   v[0] = 1;
@@ -431,7 +443,7 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     await m.awaitIdle();
 
     const storeCountBefore = await (async () => {
-      const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, fullDim);
+      const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, servedVectorIdentity);
       const count = loaded.elementCount();
       await loaded.close();
       return count;
@@ -460,7 +472,7 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
     await m.awaitIdle();
 
     const storeCountAfter = await (async () => {
-      const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, fullDim);
+      const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, servedVectorIdentity);
       const count = loaded.elementCount();
       await loaded.close();
       return count;
@@ -1072,7 +1084,7 @@ describe('connections materializer — served-signal floor guard (flapping fix)'
   // store element count + the durable floor state.
 
   const readHnswStoreCount = async (): Promise<number> => {
-    const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, fullDim);
+    const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, servedVectorIdentity);
     const count = loaded.elementCount();
     await loaded.close();
     return count;
