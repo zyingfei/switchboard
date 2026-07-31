@@ -297,7 +297,7 @@ import {
   type Dot,
   type VersionVector,
 } from '../causal.js';
-import { eventStoreEnabled, getSharedEventStore, type EventStore } from '../eventStore.js';
+import { eventStoreEnabled, getSharedEventStore, startCoalescedEventStoreCatchUp, type EventStore } from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
@@ -3088,8 +3088,14 @@ export const createConnectionsMaterializer = (
       // load — not silently folded into the eventStore.catchUp phase below —
       // keeping boot attribution honest per the B1 phase-log doctrine.
       mark(`projectionAccumulators.load reused=${String(loadedProjectionAccumulatorState)}`);
-      const ingested = await storeBackedEvents.catchUpFromJsonl(
-        join(deps.vaultRoot, '_BAC', 'log'),
+      // Coalesced: joins any pass an HTTP serve-stale kick already started
+      // (and vice versa) so the drain and a reader can never run two
+      // overlapping JSONL passes on this store. A joined pass's count is
+      // the count of the pass we waited on — exactly what the diagnostic
+      // mark below wants.
+      const ingested = await startCoalescedEventStoreCatchUp(
+        deps.vaultRoot,
+        storeBackedEvents,
       );
       if (
         existingProgress !== null &&
@@ -7283,7 +7289,8 @@ export const createConnectionsMaterializer = (
     if (eventStoreEnabled()) {
       const storeForCatchUp = await ensureEventStore();
       if (storeForCatchUp !== null) {
-        await storeForCatchUp.catchUpFromJsonl(join(deps.vaultRoot, '_BAC', 'log'));
+        // Coalesced with any reader-kicked pass (see the per-drain site).
+        await startCoalescedEventStoreCatchUp(deps.vaultRoot, storeForCatchUp);
       }
     }
     for (let offset = 0; offset < ordered.length; offset += BACKLOG_FALLBACK_THRESHOLD) {

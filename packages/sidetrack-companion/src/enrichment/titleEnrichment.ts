@@ -32,7 +32,7 @@ import { createHash } from 'node:crypto';
 
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../sync/eventStore.js';
 
 import {
   ENTITY_ENRICHMENT_RETRACTED,
@@ -259,7 +259,10 @@ const readEnrichmentEvents = async (
   vaultRoot: string,
   eventLog: EventLog,
 ): Promise<readonly AcceptedEvent[]> => {
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  // Serve-stale: no serving fold may await a JSONL catch-up pass (measured
+  // 30-70s post-boot). The store is read as-is; the kicked background pass
+  // freshens it for later reads.
+  const store = await getSharedEventStoreServeStale(vaultRoot);
   if (store === null) {
     return (await eventLog.readMerged()).filter((event) => isTitleFoldType(event.type));
   }

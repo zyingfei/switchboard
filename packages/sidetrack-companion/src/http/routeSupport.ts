@@ -39,7 +39,7 @@ import type { RecallLifecycle } from '../recall/lifecycle.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { type AcceptedEvent, type VersionVector, vectorFromEvents } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../sync/eventStore.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 import type { UpdateAdvisory } from '../system/versionCheck.js';
@@ -965,7 +965,11 @@ export const readEventsFromStoreOrLog = async (
   if (context.vaultRoot === undefined) {
     return (await eventLog.readMerged()).filter(predicate);
   }
-  const store = await getCaughtUpSharedEventStore(context.vaultRoot);
+  // SERVE-STALE: every caller of this helper is a route handler, and no
+  // route may await a JSONL catch-up pass (measured 30-70s post-boot while
+  // the event loop sat idle — the recurring busy-banner). The store is read
+  // as-is; the kicked background pass freshens it for later requests.
+  const store = await getSharedEventStoreServeStale(context.vaultRoot);
   if (store === null) return (await eventLog.readMerged()).filter(predicate);
   const events: AcceptedEvent[] = [];
   const collect = (chunk: readonly AcceptedEvent[]): void => {
@@ -979,6 +983,22 @@ export const readEventsFromStoreOrLog = async (
     await store.forEachChunk(collect, 2000);
   }
   return events;
+};
+
+// Coverage token matching readEventsFromStoreOrLog's read path. Callers that
+// MEMOIZE a fold over events returned by that helper MUST key the memo on
+// this — the store's own watermark token when the store served the read, the
+// log signature only on the log fallback. Keying a store-read fold on
+// logSignature() caches it under shard appends the (possibly stale) store
+// never ingested, and the memo then keeps serving the stale fold after
+// catch-up lands — the memo-poisoning shape this repo has already hit once.
+export const eventReadCoverageSig = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<string> => {
+  if (context.vaultRoot === undefined) return eventLog.logSignature();
+  const store = await getSharedEventStoreServeStale(context.vaultRoot);
+  return store === null ? eventLog.logSignature() : eventStoreCoverageToken(store);
 };
 
 // Type hints for the readEventsFromStoreOrLog callers (must list every
@@ -1028,23 +1048,27 @@ export const projectUrlsFromStoreOrLog = async (
   eventLog: EventLog,
 ): Promise<UrlProjection> => {
   const key = context.vaultRoot ?? '<none>';
-  const sig = await eventLog.logSignature();
+  // Resolve the store FIRST (serve-stale — no route awaits a catch-up pass)
+  // so the memo can be keyed by what the fold will ACTUALLY see: the store's
+  // own watermark token. Keying a stale fold on logSignature() would cache
+  // it under appends the fold never saw and keep serving it after catch-up
+  // lands. Log-fallback path keeps the log signature, as before.
+  const store =
+    context.vaultRoot === undefined
+      ? null
+      : await getSharedEventStoreServeStale(context.vaultRoot);
+  const sig = store === null ? await eventLog.logSignature() : eventStoreCoverageToken(store);
   const cached = urlProjectionCache.get(key);
   if (cached !== undefined && cached.sig === sig) return cached.proj;
   let proj: UrlProjection;
-  if (context.vaultRoot === undefined) {
+  if (store === null) {
     proj = projectUrls(await eventLog.readMerged());
   } else {
-    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
-    if (store === null) {
-      proj = projectUrls(await eventLog.readMerged());
-    } else {
-      const accumulator = createEmptyUrlProjectionAccumulator();
-      await store.forEachChunk((chunk) => {
-        for (const event of chunk) foldEventIntoUrlProjectionAccumulator(accumulator, event);
-      }, 2000);
-      proj = urlProjectionFromAccumulator(accumulator);
-    }
+    const accumulator = createEmptyUrlProjectionAccumulator();
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) foldEventIntoUrlProjectionAccumulator(accumulator, event);
+    }, 2000);
+    proj = urlProjectionFromAccumulator(accumulator);
   }
   urlProjectionCache.set(key, { sig, proj });
   return proj;

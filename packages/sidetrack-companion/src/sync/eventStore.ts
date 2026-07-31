@@ -99,7 +99,7 @@ const sharedEventStores = new Map<string, Promise<EventStore | null>>();
 // catchUpFromJsonl pass. Without this, the first read after idle on a large
 // vault runs a 40s+ catch-up per caller — duplicated CPU and racing shard-
 // progress/watermark writes on the same SQLite handle.
-const catchUpInFlight = new Map<string, Promise<void>>();
+const catchUpInFlight = new Map<string, Promise<number>>();
 
 interface SqliteStatement {
   readonly run: (...params: readonly unknown[]) => unknown;
@@ -794,28 +794,78 @@ export const getSharedEventStore = (vaultRoot: string): Promise<EventStore | nul
   return created;
 };
 
-export const getCaughtUpSharedEventStore = async (
+// Test-only: injected at the head of every coalesced pass so tests can hold
+// a catch-up open deterministically and prove serve-stale reads do not wait.
+let catchUpGateForTest: (() => Promise<void>) | null = null;
+export const setEventStoreCatchUpGateForTest = (gate: (() => Promise<void>) | null): void => {
+  catchUpGateForTest = gate;
+};
+
+// ONE coalesced catch-up pass per vault PER PROCESS. Every caller — the
+// awaited route variant below, the serve-stale kick, and the connections
+// materializer's own pre-drain passes — shares the same in-flight promise,
+// so no caller can ever start a second overlapping JSONL pass on a store
+// another caller is already filling. (Measured before this existed: an HTTP
+// read arriving mid-drain-pass started its OWN pass and parked 30-70s.)
+// Process-local by design: the reconcile child has its own module instance
+// and store handle; cross-process exclusion remains SQLite busy_timeout.
+// Returns the pass's ingested-event count; a joiner receives the count of
+// the pass it waited on, which is what the drain's diagnostics want anyway.
+export const startCoalescedEventStoreCatchUp = (
   vaultRoot: string,
-): Promise<EventStore | null> => {
-  const store = await getSharedEventStore(vaultRoot);
-  if (store === null) return null;
-  // Single-flight the catch-up so overlapping callers coalesce into one
-  // JSONL pass. A caller that arrives mid-catch-up awaits the SAME promise;
-  // callers arriving after it completes start a fresh (now-cheap, only-new-
-  // bytes) pass. The guard is cleared in finally so a failed pass can retry.
+  store: EventStore,
+): Promise<number> => {
   const existing = catchUpInFlight.get(vaultRoot);
-  if (existing !== undefined) {
-    await existing;
-    return store;
-  }
-  const pass = (async (): Promise<void> => {
+  if (existing !== undefined) return existing;
+  const pass = (async (): Promise<number> => {
     try {
-      await store.catchUpFromJsonl(join(vaultRoot, '_BAC', 'log'));
+      if (catchUpGateForTest !== null) await catchUpGateForTest();
+      return await store.catchUpFromJsonl(join(vaultRoot, '_BAC', 'log'));
     } finally {
       catchUpInFlight.delete(vaultRoot);
     }
   })();
   catchUpInFlight.set(vaultRoot, pass);
-  await pass;
+  return pass;
+};
+
+export const getCaughtUpSharedEventStore = async (
+  vaultRoot: string,
+): Promise<EventStore | null> => {
+  const store = await getSharedEventStore(vaultRoot);
+  if (store === null) return null;
+  await startCoalescedEventStoreCatchUp(vaultRoot, store);
   return store;
+};
+
+// Serve-stale variant for interactive reads: returns the store AS-IS —
+// watermark-bounded and internally consistent, just possibly behind the
+// JSONL tail — and kicks (or joins) the coalesced catch-up WITHOUT awaiting
+// it. This is the read side of the inversion /v1/status shipped long ago
+// (kickBackgroundEventStoreCatchUp): freshness is the background pass's
+// problem, never a request's. A serve-stale reader must not fail because
+// ingest failed, so the kicked pass's rejection is swallowed here; the
+// awaited variant above still surfaces it to callers that require freshness.
+export const getSharedEventStoreServeStale = async (
+  vaultRoot: string,
+): Promise<EventStore | null> => {
+  const store = await getSharedEventStore(vaultRoot);
+  if (store === null) return null;
+  startCoalescedEventStoreCatchUp(vaultRoot, store).catch(() => {});
+  return store;
+};
+
+// Deterministic token for WHAT A STALE READ ACTUALLY SAW. Anything that
+// memoizes a fold computed from a serve-stale store MUST key the memo on
+// this — never on eventLog.logSignature(), which advances on shard appends
+// the stale read has not ingested. A fold cached under the log signature
+// would claim coverage it does not have and keep serving the stale result
+// even after catch-up lands (the memo-poisoning shape this repo has hit
+// before, on the gist lookup).
+export const eventStoreCoverageToken = (store: EventStore): string => {
+  const wm = store.watermark();
+  return `store:${Object.keys(wm)
+    .sort()
+    .map((replica) => `${replica}=${String(wm[replica] ?? 0)}`)
+    .join(',')}`;
 };
