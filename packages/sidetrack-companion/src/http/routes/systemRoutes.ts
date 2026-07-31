@@ -14,15 +14,25 @@ import { join } from 'node:path';
 import { rotateBridgeKey } from '../../auth/bridgeKey.js';
 import { readBuildInfo } from '../../build-info.js';
 import { collectReliabilityReport } from '../../calibration/reliabilityCollector.js';
-import { getDrainDegradation, type DrainDegradationSnapshot } from '../../connections/drainDegradation.js';
-import { getGenerationRecovery, type GenerationRecoverySnapshot } from '../../connections/generationRecovery.js';
+import {
+  getDrainDegradation,
+  type DrainDegradationSnapshot,
+} from '../../connections/drainDegradation.js';
+import {
+  getGenerationRecovery,
+  type GenerationRecoverySnapshot,
+} from '../../connections/generationRecovery.js';
 import { readHealthHistory } from '../../connections/healthHistory.js';
 import { SqliteConnectionsStore } from '../../connections/snapshot.js';
 import { gcInventoryCached } from '../../gc/plan.js';
 import { summarizeVaultLedger, vaultLedgerCached } from '../../gc/vaultLedger.js';
 import { pickInstaller, type InstallOptions } from '../../install/index.js';
 import { probeServiceLiveness } from '../../install/launchd.js';
-import { pageContentCoverageCounts, scanForOverCollapsedPageContent, type OverCollapsedRecord } from '../../page-content/store.js';
+import {
+  pageContentCoverageCounts,
+  scanForOverCollapsedPageContent,
+  type OverCollapsedRecord,
+} from '../../page-content/store.js';
 import { getModelCacheStatus } from '../../recall/modelCache.js';
 import { rank } from '../../recall/ranker.js';
 import { getSemanticRecallPoolMigrationStatus } from '../../recall/semanticRecallPool.js';
@@ -31,20 +41,58 @@ import { eventStoreEnabled, getSharedEventStore } from '../../sync/eventStore.js
 import type { ReplicaContext } from '../../sync/replicaId.js';
 import { runAutoUpdate } from '../../system/autoUpdate.js';
 import { collectEngagementLaneHealth } from '../../system/engagementLaneHealth.js';
-import { collectHealth, resolveServiceRunning, type CaptureWarningHealth, type HealthReport, type HealthStatus, type SectionAvailability } from '../../system/health.js';
-import { isReliabilityArtifactFresh, readReliabilityArtifact } from '../../system/reliabilityArtifact.js';
-import { getResolveCanary, resolveCanaryStatus, resolveCanaryThresholdMs, type ResolveCanarySnapshot } from '../../system/resolveCanary.js';
+import {
+  collectHealth,
+  deriveDataLossHealth,
+  healthStatusFromReport,
+  resolveServiceRunning,
+  withCurrentDataLossHealth,
+  type CaptureWarningHealth,
+  type DataLossHealth,
+  type HealthReport,
+  type SectionAvailability,
+} from '../../system/health.js';
+import {
+  isReliabilityArtifactFresh,
+  readReliabilityArtifact,
+} from '../../system/reliabilityArtifact.js';
+import type {
+  ResourceReadinessWatchdogs,
+  WatchdogStatus,
+} from '../../system/resourceReadinessWatchdog.js';
+import {
+  getResolveCanary,
+  resolveCanaryStatus,
+  resolveCanaryThresholdMs,
+  type ResolveCanarySnapshot,
+} from '../../system/resolveCanary.js';
 import { isSection15ArtifactFresh, readSection15Artifact } from '../../system/section15Artifact.js';
 import { collectSection15Report } from '../../system/section15Collector.js';
-import { CHROME_SESSIONS_RESTORE, TAB_RECOVERY_AGGREGATE_ID, isChromeSessionsRestorePayload } from '../../system/section15Events.js';
+import {
+  CHROME_SESSIONS_RESTORE,
+  TAB_RECOVERY_AGGREGATE_ID,
+  isChromeSessionsRestorePayload,
+} from '../../system/section15Events.js';
 import { checkLatestVersion } from '../../system/versionCheck.js';
 import { collectWorkGraphHealth, withLiveShipGateV2Serving } from '../../system/workGraphHealth.js';
-import { isWorkGraphHealthArtifactFresh, readWorkGraphHealthArtifact } from '../../system/workGraphHealthArtifact.js';
+import {
+  isWorkGraphHealthArtifactFresh,
+  readWorkGraphHealthArtifact,
+} from '../../system/workGraphHealthArtifact.js';
 import { lanePrequentialSummary } from '../../tabsession/lanePrequential.js';
 import { COMPANION_VERSION } from '../../version.js';
 import { autoUpdateSchema } from '../schemas.js';
 
-import { HttpRouteError, baseVectorForAggregate, objectRecord, readBody, recallIndexPath, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
+import {
+  HttpRouteError,
+  baseVectorForAggregate,
+  objectRecord,
+  readBody,
+  recallIndexPath,
+  requireIdempotencyKey,
+  requireVaultRoot,
+  runIdempotent,
+} from '../routeSupport.js';
 import type { CompanionHttpConfig, RouteDefinition } from '../routeSupport.js';
 
 // Spread-helper for the optional sync summary in /v1/system/health.
@@ -291,6 +339,9 @@ export interface ReliabilityHealthSection {
     readonly lastCheckpointTruncatedPages: number | null;
     readonly lastCheckpointOk: boolean | null;
     readonly lastGcUnlinked: number;
+    readonly unchangedPublishSkipCount: number;
+    readonly progressCheckpointCount: number;
+    readonly lastPublishSkipAtMs: number | null;
   };
 }
 
@@ -328,6 +379,9 @@ export interface ConnectionsDoubleBufferHealth {
   readonly lastCheckpointTruncatedPages: number | null;
   readonly lastCheckpointOk: boolean | null;
   readonly lastGcUnlinked: number;
+  readonly unchangedPublishSkipCount: number;
+  readonly progressCheckpointCount: number;
+  readonly lastPublishSkipAtMs: number | null;
 }
 
 export const buildReliabilityHealthSection = async (
@@ -351,6 +405,9 @@ export const buildReliabilityHealthSection = async (
             lastCheckpointTruncatedPages: doubleBuffer.lastCheckpointTruncatedPages,
             lastCheckpointOk: doubleBuffer.lastCheckpointOk,
             lastGcUnlinked: doubleBuffer.lastGcUnlinked,
+            unchangedPublishSkipCount: doubleBuffer.unchangedPublishSkipCount,
+            progressCheckpointCount: doubleBuffer.progressCheckpointCount,
+            lastPublishSkipAtMs: doubleBuffer.lastPublishSkipAtMs,
           },
         }
       : {};
@@ -390,19 +447,6 @@ export const buildReliabilityHealthSection = async (
   };
 };
 
-// Worst-of over HealthStatus (ok < degraded < failed). A stale/unavailable
-// section maps to a degraded top-level status; an unavailable one to failed.
-const sectionAvailabilityToStatus = (availability: SectionAvailability): HealthStatus => {
-  if (availability === 'unavailable') return 'failed';
-  if (availability === 'stale') return 'degraded';
-  return 'ok';
-};
-
-const worseHealthStatus = (a: HealthStatus, b: HealthStatus): HealthStatus => {
-  const rank: Record<HealthStatus, number> = { ok: 0, degraded: 1, failed: 2 };
-  return rank[a] >= rank[b] ? a : b;
-};
-
 export const withReliabilityHealthSection = (
   report: HealthReport,
   section: ReliabilityHealthSection,
@@ -413,20 +457,22 @@ export const withReliabilityHealthSection = (
     ...priorSections,
     reliability: section.availability,
   };
-  // Recompute the board's worst-of over ALL sections including reliability
-  // (never just the reliability contribution — a pre-existing degraded
-  // section must survive folding in a healthy reliability lane).
-  let status: HealthStatus = 'ok';
-  for (const availability of Object.values(sections)) {
-    status = worseHealthStatus(status, sectionAvailabilityToStatus(availability));
-  }
-  return {
+  const next: HealthReport & { readonly reliability: ReliabilityHealthSection } = {
     ...report,
     reliability: section,
     observability: {
       asOf: priorObservability?.asOf ?? new Date().toISOString(),
-      status,
+      status: 'ok',
       sections,
+    },
+  };
+  return {
+    ...next,
+    observability: {
+      ...next.observability!,
+      // Recompute from the complete report so replacing a live row can clear
+      // its cached failure without hiding an unrelated hard failure.
+      status: healthStatusFromReport(next),
     },
   };
 };
@@ -676,6 +722,84 @@ const captureHealthSummary = async (vaultRoot: string): Promise<HealthReport['ca
   };
 };
 
+// The data-loss row is deliberately collected outside the 60s base-report
+// cache. These are indexed O(1) reads against the shared store, so every health
+// poll can observe a clean current reconciliation and decay an old warning
+// without re-running the expensive vault/work-graph collectors.
+const storeReconciliationForVault = async (
+  vaultRoot: string,
+): Promise<DataLossHealth['reconciliation']> => {
+  const store = await getSharedEventStore(vaultRoot);
+  if (store === null) return null;
+  const storeRowCount = store.count();
+  const expectedFromWatermark = store.expectedRetainedCount();
+  return {
+    storeRowCount,
+    expectedFromWatermark,
+    delta: expectedFromWatermark - storeRowCount,
+  };
+};
+
+const LIVE_DATA_LOSS_BUDGET_MS = 1_000;
+
+const collectLiveDataLoss = async (vaultRoot: string): Promise<DataLossHealth> => {
+  const counters = getEventLaneHealth();
+  const unavailable = Symbol('data-loss-reconciliation-unavailable');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<typeof unavailable>((resolve) => {
+      timer = setTimeout(() => resolve(unavailable), LIVE_DATA_LOSS_BUDGET_MS);
+      timer.unref?.();
+    });
+    const reconciliation = await Promise.race([storeReconciliationForVault(vaultRoot), timeout]);
+    return reconciliation === unavailable
+      ? deriveDataLossHealth({
+          counters,
+          reconciliation: null,
+          reconciliationUnavailable: true,
+        })
+      : deriveDataLossHealth({ counters, reconciliation });
+  } catch {
+    return deriveDataLossHealth({
+      counters,
+      reconciliation: null,
+      reconciliationUnavailable: true,
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
+const watchdogAvailability = (status: WatchdogStatus): SectionAvailability =>
+  status === 'ok' ? 'ok' : status === 'warning' ? 'stale' : 'unavailable';
+
+const withResourceReadinessWatchdogs = (
+  report: HealthReport,
+  watchdogs: ResourceReadinessWatchdogs,
+): HealthReport & { readonly watchdogs: ResourceReadinessWatchdogs } => {
+  const priorObservability = report.observability;
+  const next: HealthReport & { readonly watchdogs: ResourceReadinessWatchdogs } = {
+    ...report,
+    watchdogs,
+    observability: {
+      asOf: priorObservability?.asOf ?? new Date().toISOString(),
+      status: 'ok',
+      sections: {
+        ...(priorObservability?.sections ?? {}),
+        rss: watchdogAvailability(watchdogs.rss.status),
+        bootToServing: watchdogAvailability(watchdogs.bootToServing.status),
+      },
+    },
+  };
+  return {
+    ...next,
+    observability: {
+      ...next.observability!,
+      status: healthStatusFromReport(next),
+    },
+  };
+};
+
 // ---- /v1/system/health contributor registry -----------------------------
 //
 // GET /v1/system/health assembles its `data` object from this ordered,
@@ -755,8 +879,7 @@ const healthContributors: readonly HealthContributor[] = [
             ]);
             const v2DocCount = v2Store !== undefined ? v2Store.documentCount() : null;
             const v2Present =
-              (v2DocCount !== null && v2DocCount > 0) ||
-              (v2Stat !== undefined && v2Stat.size > 0);
+              (v2DocCount !== null && v2DocCount > 0) || (v2Stat !== undefined && v2Stat.size > 0);
             // The legacy recall-lifecycle report runs countTurnsInEventLog
             // — a FULL scan of the entire event store that blew the 5s
             // health budget on a real-size vault (the ~5.0s /v1/system/health
@@ -834,39 +957,15 @@ const healthContributors: readonly HealthContributor[] = [
               running: resolveServiceRunning(status.running, liveness),
             };
           },
-          eventLaneHealth: getEventLaneHealth,
-          storeReconciliation: async () => {
-            // Cheap store-vs-JSONL reconciliation the store ALREADY
-            // knows: its physical row count vs the sum of its
-            // per-replica watermarks (the count it believes it
-            // accepted). A non-zero delta ⇒ committed events the
-            // store thinks it holds are missing, or seqs are sparse —
-            // either way a durability red flag. Never a full JSONL
-            // scan: getSharedEventStore returns the already-open store
-            // (or null when the event store is off) and count() /
-            // watermark() are single indexed queries.
-            const store = await getSharedEventStore(vaultRoot);
-            if (store === null) return null;
-            const storeRowCount = store.count();
-            const watermark = store.watermark();
-            const expectedFromWatermark = Object.values(watermark).reduce(
-              (sum, seq) => sum + seq,
-              0,
-            );
-            return {
-              storeRowCount,
-              expectedFromWatermark,
-              delta: expectedFromWatermark - storeRowCount,
-            };
-          },
+          // dataLoss is replaced by the live `dataLossCurrent` contributor
+          // below. Do not duplicate its indexed reconciliation reads inside
+          // this TTL'd base collect.
           // Engagement-lane freshness — two indexed MAX queries on
           // the shared store; observability only (aggregate-vs-interval
           // divergence, the fingerprint of the 06-27 regression that
           // starved visit similarity). Best-effort inside collectHealth.
           engagementLaneHealth: () => collectEngagementLaneHealth({ vaultRoot }),
-          ...(context.rankerHealth === undefined
-            ? {}
-            : { rankerHealth: context.rankerHealth }),
+          ...(context.rankerHealth === undefined ? {} : { rankerHealth: context.rankerHealth }),
           ...(context.mcpChildHealth === undefined
             ? {}
             : { mcpChildHealth: context.mcpChildHealth }),
@@ -909,9 +1008,7 @@ const healthContributors: readonly HealthContributor[] = [
               ...(context.connectionsDiagnostics === undefined
                 ? {}
                 : { connectionsDiagnostics: context.connectionsDiagnostics }),
-              ...(canonicalRecallStore === undefined
-                ? {}
-                : { canonicalRecallStore }),
+              ...(canonicalRecallStore === undefined ? {} : { canonicalRecallStore }),
             });
           },
           ...syncSummaryDeps(context.replica, context.sync, context.syncMaterializerHealth),
@@ -936,10 +1033,50 @@ const healthContributors: readonly HealthContributor[] = [
         // ran (and populated this) by the time this entry executes.
         throw new Error('health contributor order violated: baseReport missing');
       }
-      return withReliabilityHealthSection(scratch.baseReport, reliability) as unknown as Record<
-        string,
-        unknown
-      >;
+      const report = withReliabilityHealthSection(scratch.baseReport, reliability);
+      scratch.baseReport = report;
+      return report as unknown as Record<string, unknown>;
+    },
+  },
+  {
+    name: 'dataLossCurrent',
+    // The base report is TTL'd because most of its collectors are expensive.
+    // dataLoss is not: cumulative counters + indexed reconciliation queries
+    // are cheap, and recovery must not sit behind a cached warning. Re-touch
+    // the existing key and observability row live on every health read.
+    contribute: async ({ vaultRoot, scratch }) => {
+      if (scratch.baseReport === undefined) {
+        throw new Error('health contributor order violated: baseReport missing');
+      }
+      const report = withCurrentDataLossHealth(
+        scratch.baseReport,
+        await collectLiveDataLoss(vaultRoot),
+      );
+      scratch.baseReport = report;
+      return report as unknown as Record<string, unknown>;
+    },
+  },
+  {
+    name: 'resourceReadinessWatchdogs',
+    // One synchronous RSS read plus already-recorded boot timings. No timer,
+    // vault scan, child query, or awaited I/O is allowed in this contributor.
+    contribute: async ({ context, scratch }) => {
+      if (context.getResourceReadinessWatchdogs === undefined) return {};
+      if (scratch.baseReport === undefined) {
+        throw new Error('health contributor order violated: baseReport missing');
+      }
+      let watchdogs: ResourceReadinessWatchdogs;
+      try {
+        watchdogs = context.getResourceReadinessWatchdogs();
+      } catch {
+        // A diagnostic getter must never take down the health endpoint. The
+        // watchdog itself reports recoverable RSS read failures as `stale`;
+        // this catch is only for an unexpected integration bug.
+        return {};
+      }
+      const report = withResourceReadinessWatchdogs(scratch.baseReport, watchdogs);
+      scratch.baseReport = report;
+      return report as unknown as Record<string, unknown>;
     },
   },
   {
@@ -1298,6 +1435,7 @@ export const systemRoutesA: readonly RouteDefinition[] = [
             };
       const eventLoopState = context.getEventLoopSnapshot?.();
       const pageEvidenceEmbedLane = context.getBackgroundEmbeddingLaneHealth?.();
+      const bodyEvidenceLane = context.getBodyEvidenceLaneHealth?.();
       // Non-blocking event-store catch-up (CLASS A). Kick it in the BACKGROUND
       // (single-flight) and report `catchingUp` — never await the potentially
       // 40s+ JSONL catch-up inline, which would freeze the loop for every
@@ -1330,6 +1468,7 @@ export const systemRoutesA: readonly RouteDefinition[] = [
             ...(materializerState === undefined ? {} : { materializer: materializerState }),
             ...(eventLoopState === undefined ? {} : { eventLoop: eventLoopState }),
             ...(pageEvidenceEmbedLane === undefined ? {} : { pageEvidenceEmbedLane }),
+            ...(bodyEvidenceLane === undefined ? {} : { bodyEvidenceLane }),
             ...(context.vaultChanges === undefined
               ? {}
               : { vaultChangeSubscribers: context.vaultChanges.subscriberCount() }),
@@ -1610,7 +1749,13 @@ export const systemRoutesB: readonly RouteDefinition[] = [
         if (artifact !== null && isSection15ArtifactFresh(artifact)) {
           return [
             200,
-            { data: { availability: 'ok', generatedAt: artifact.generatedAt, report: artifact.report } },
+            {
+              data: {
+                availability: 'ok',
+                generatedAt: artifact.generatedAt,
+                report: artifact.report,
+              },
+            },
           ];
         }
       }
@@ -1642,7 +1787,13 @@ export const systemRoutesB: readonly RouteDefinition[] = [
         if (artifact !== null && isReliabilityArtifactFresh(artifact)) {
           return [
             200,
-            { data: { availability: 'ok', generatedAt: artifact.generatedAt, report: artifact.report } },
+            {
+              data: {
+                availability: 'ok',
+                generatedAt: artifact.generatedAt,
+                report: artifact.report,
+              },
+            },
           ];
         }
       }

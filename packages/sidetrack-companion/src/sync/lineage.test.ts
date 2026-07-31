@@ -37,6 +37,11 @@ describe('lineage registry (derivation DAG)', () => {
   it('accessors: lineageNode + inputs in dependency order', () => {
     expect(lineageNode('does-not-exist')).toBeUndefined();
     expect(lineageNode('event-store')?.toggleEnv).toBe('SIDETRACK_EVENT_STORE');
+    expect(lineageNode('event-store')?.retirement).toEqual({
+      authoritativeSourceId: 'event-log',
+      criterion: 'disabled-and-canonical-readback-verified',
+      applyEntrypoint: 'gc/storageRetirement.ts:applyStorageRetirementPlan',
+    });
 
     // connections-current derives (transitively) from the event log.
     const inputs = lineageInputsOf('connections-current');

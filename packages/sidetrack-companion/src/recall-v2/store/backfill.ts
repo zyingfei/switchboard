@@ -20,10 +20,14 @@ import type { PageEvidenceRecord } from '../../page-evidence/types.js';
 import { mapInChunks } from '../../domain/asyncChunks.js';
 import { readIndex } from '../../recall/indexFile.js';
 import { readSemanticRecallVectorStore } from '../../recall/semanticRecallPool.js';
-import { RECALL_MODEL, RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
+import { RECALL_MODEL_ID as MODEL_ID } from '../../recall/modelManifest.js';
 // Dependency-free leaf (fs + crypto only) — safe on the server's static graph,
 // unlike recall/embedder.js which is imported lazily below.
-import { createEmbeddingCache, embedTextHash } from '../../recall/embeddingCache.js';
+import {
+  pruneVectorCorpusBindings,
+  resolveCanonicalVectors,
+  VECTOR_CORPUS_REVISION,
+} from '../../recall/vectorCorpus.js';
 import type { PageEvidenceEmbedder } from '../../page-evidence/embedding.js';
 
 // Lazy embedder: this module sits in http/server.ts's static import
@@ -58,7 +62,6 @@ const pageContentChunksPath = (vaultRoot: string, contentHash: string): string =
 
 const entityIdForUrl = (url: string): string =>
   `url:${createHash('sha256').update(url).digest('hex').slice(0, 24)}`;
-const entityIdForThread = (threadId: string): string => `thread:${threadId}`;
 
 const slugTokensOf = (url: string): string => {
   try {
@@ -425,48 +428,38 @@ const chunkEmbedText = (chunk: PageContentChunk): string => {
 // entries carry — that is what makes a hit possible across the two substrates.
 // ---------------------------------------------------------------------------
 
-const EMBED_CACHE_MODEL = {
-  modelId: RECALL_MODEL.modelId,
-  modelRevision: RECALL_MODEL.revision,
-} as const;
-
-type SharedEmbedCache = ReturnType<typeof createEmbeddingCache> | null;
-
-const embedCacheFor = (vaultRoot: string): SharedEmbedCache => {
-  try {
-    return createEmbeddingCache(vaultRoot, RECALL_MODEL.embeddingDim);
-  } catch {
-    return null;
-  }
-};
-
-const cacheGetMany = async (
-  cache: SharedEmbedCache,
-  hashes: readonly string[],
-): Promise<ReadonlyMap<string, Float32Array>> => {
-  if (cache === null) return new Map();
-  try {
-    return await cache.getMany(EMBED_CACHE_MODEL, hashes);
-  } catch {
-    return new Map();
-  }
-};
-
-const cachePutMany = async (
-  cache: SharedEmbedCache,
-  entries: readonly (readonly [string, Float32Array])[],
-): Promise<void> => {
-  if (cache === null || entries.length === 0) return;
-  try {
-    await cache.putMany(EMBED_CACHE_MODEL, entries);
-  } catch {
-    /* best-effort */
-  }
-};
-
 /** Batch size for chunk embedding. Unchanged by E2 — the shared cache is
  *  consulted ONCE per batch (one read, one write), never per chunk. */
 const EMBED_BATCH_SIZE = 32;
+
+export const RECALL_VECTOR_CORPUS_REVISION_KEY = 'vector_corpus_revision_v1';
+export const RECALL_VECTOR_CORPUS_STATE_KEY = 'vector_corpus_state_v1';
+
+export type RecallVectorProjectionState =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'empty'; readonly revision: string }
+  | { readonly kind: 'measured'; readonly revision: string; readonly vectors: number };
+
+export const readRecallVectorProjectionState = (
+  store: Pick<RecallStore, 'getRecallMetadata'>,
+): RecallVectorProjectionState => {
+  const revision = store.getRecallMetadata(RECALL_VECTOR_CORPUS_REVISION_KEY);
+  const rawState = store.getRecallMetadata(RECALL_VECTOR_CORPUS_STATE_KEY);
+  if (revision === undefined || rawState === undefined) return { kind: 'absent' };
+  if (rawState === 'empty') return { kind: 'empty', revision };
+  const match = /^measured:(\d+)$/u.exec(rawState);
+  if (match === null) return { kind: 'absent' };
+  return { kind: 'measured', revision, vectors: Number(match[1]) };
+};
+
+const publishRecallVectorProjectionState = (store: RecallStore): void => {
+  store.setRecallMetadata(RECALL_VECTOR_CORPUS_REVISION_KEY, VECTOR_CORPUS_REVISION);
+  const projectedVectorCount = store.allChunkVectorIds().size;
+  store.setRecallMetadata(
+    RECALL_VECTOR_CORPUS_STATE_KEY,
+    projectedVectorCount === 0 ? 'empty' : `measured:${String(projectedVectorCount)}`,
+  );
+};
 
 /**
  * Embed the chunks that have no vector yet and upsert them, consulting the
@@ -486,43 +479,38 @@ const embedAndUpsertChunkVectors = async (input: {
   }[];
 }): Promise<number> => {
   let vectors = 0;
-  const cache = embedCacheFor(input.vaultRoot);
   for (let start = 0; start < input.items.length; start += EMBED_BATCH_SIZE) {
     const batch = input.items.slice(start, start + EMBED_BATCH_SIZE);
-    const hashes = batch.map((item) => embedTextHash(item.embedText));
-    // eslint-disable-next-line no-await-in-loop -- one cache read per batch
-    const cached = await cacheGetMany(cache, hashes);
-    const missIndexes: number[] = [];
-    for (let index = 0; index < batch.length; index += 1) {
-      if (!cached.has(hashes[index] ?? '')) missIndexes.push(index);
-    }
-    const freshTexts = missIndexes.map((index) => batch[index]?.embedText ?? '');
-    // eslint-disable-next-line no-await-in-loop -- embedder is batched
-    const fresh = freshTexts.length === 0 ? [] : await input.embedder(freshTexts);
-    const toPersist: [string, Float32Array][] = [];
-    const vectorByIndex = new Map<number, Float32Array>();
-    for (let m = 0; m < missIndexes.length; m += 1) {
-      const index = missIndexes[m];
-      const vector = fresh[m];
-      if (index === undefined || vector === undefined || vector.length === 0) continue;
-      vectorByIndex.set(index, vector);
-      const hash = hashes[index];
-      if (hash !== undefined) toPersist.push([hash, vector]);
-    }
+    const resolved = await resolveCanonicalVectors({
+      vaultRoot: input.vaultRoot,
+      texts: batch.map((item) => item.embedText),
+      embed: input.embedder,
+      bindings: batch.map((item) => ({
+        consumer: 'recall_chunk',
+        projectionId: item.chunk.id,
+        sourceRevision: item.chunk.id,
+        effectiveAtMs: Date.now(),
+      })),
+    });
     input.store.runTransaction(() => {
       for (let index = 0; index < batch.length; index += 1) {
         const item = batch[index];
-        const vector = vectorByIndex.get(index) ?? cached.get(hashes[index] ?? '');
+        const vector = resolved.vectors[index];
         if (item === undefined || vector === undefined || vector.length === 0) continue;
         input.store.upsertChunkVector(item.chunk.id, vector);
         vectors += 1;
       }
     });
-    // eslint-disable-next-line no-await-in-loop -- one cache write per batch
-    await cachePutMany(cache, toPersist);
-    // eslint-disable-next-line no-await-in-loop -- yield between embed batches
+    // eslint-disable-next-line no-console -- structured lifecycle evidence
+    console.info(
+      `[vector-corpus] consumer=recall_chunk revision=${resolved.revision} hits=${String(resolved.cacheHits)} embedded=${String(resolved.embedded)} migrated=${String(resolved.migratedLegacyCache)}`,
+    );
     if (start + EMBED_BATCH_SIZE < input.items.length) await yieldToEventLoop();
   }
+  // Publish lifecycle metadata last. A crash before this point leaves the
+  // projection typed absent/stale and the next backfill retries; it can never
+  // claim the canonical revision before every transaction commits.
+  publishRecallVectorProjectionState(input.store);
   return vectors;
 };
 
@@ -617,6 +605,10 @@ export const backfillChunkVectors = async (
       store.deleteChunkVector(chunkId);
     }
   });
+  if (store.vectorBackendAvailable) {
+    publishRecallVectorProjectionState(store);
+    await pruneVectorCorpusBindings(vaultRoot, 'recall_chunk', store.allChunkVectorIds());
+  }
   const tSweep = Date.now() - tSweepStart;
   return {
     chunks: items.length,
@@ -687,13 +679,14 @@ const ingestChunksForRecords = async (
     const contentHash = record.content?.contentHash;
     if (contentHash === undefined) continue;
     const documentEntityId = entityIdForUrl(record.canonicalUrl);
-    // eslint-disable-next-line no-await-in-loop -- bounded by |changed records|
     const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
       pageContentChunksPath(vaultRoot, contentHash),
     );
     const chunks = raw?.chunks ?? [];
     const rows = chunks
-      .map((chunk) => chunkRowForStore({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) }))
+      .map((chunk) =>
+        chunkRowForStore({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) }),
+      )
       .sort((left, right) => left.chunkIndex - right.chunkIndex);
     store.runTransaction(() => {
       // upsertDocumentChunks replaces this doc's rows (vectors are
@@ -720,6 +713,10 @@ const ingestChunksForRecords = async (
     // Same shared-cache path as the full backfill (see E2 note above) — one
     // implementation so the two can never disagree on the hash or model key.
     vectors = await embedAndUpsertChunkVectors({ vaultRoot, store, embedder, items: toEmbed });
+  }
+  if (store.vectorBackendAvailable) {
+    publishRecallVectorProjectionState(store);
+    await pruneVectorCorpusBindings(vaultRoot, 'recall_chunk', store.allChunkVectorIds());
   }
   return { chunks: chunksN, vectors };
 };

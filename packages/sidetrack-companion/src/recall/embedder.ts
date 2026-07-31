@@ -34,6 +34,7 @@ import { INDEX_DIM } from './indexFile.js';
 // though the underlying HF model didn't change.
 import { isOfflineMode, resolveModelsDir } from './modelCache.js';
 import { RECALL_MODEL, RECALL_MODEL_ID } from './modelManifest.js';
+import { prepareVectorModelInput } from './vectorCorpus.js';
 
 const HF_MODEL = RECALL_MODEL.modelId;
 // Identity string the lifecycle compares against the on-disk index.
@@ -229,8 +230,6 @@ const padOrTruncate = (values: Float32Array): Float32Array => {
 // will simply prepend "query: " as part of the input — harmless
 // at the cost of ~3 tokens of extra input. Switch the prefix to ""
 // here if a future model swap doesn't want it.
-const E5_PREFIX = 'query: ';
-
 // We embed one text per pipeline call rather than passing the whole
 // batch as a single tensor. The all-at-once path used to run with
 // @xenova/transformers allocated a [batch, seq, hidden] tensor that
@@ -250,7 +249,7 @@ const isTestEmbedderEnabled = (): boolean =>
   typeof process !== 'undefined' && process.env['SIDETRACK_TEST_EMBEDDER'] === '1';
 
 const normalizeTestText = (text: string): string =>
-  text.replace(/^(query|passage):\s*/iu, '').toLowerCase();
+  text.replace(/^(?:(?:query|passage):\s*)+/iu, '').toLowerCase();
 
 const testTokens = (text: string): readonly string[] =>
   normalizeTestText(text)
@@ -315,21 +314,24 @@ export const setEmbedderOverride = (fn: EmbedFn | undefined): void => {
   embedderOverride = fn;
 };
 
-export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+/** Embed strings that have already been transformed into exact model inputs.
+ * The sidecar child uses this entry point because the parent applies the
+ * active input policy before crossing IPC. It is intentionally not routed
+ * through embedderOverride, which would recurse back into the child. */
+export const embedPreparedModelInputs = async (
+  texts: readonly string[],
+): Promise<readonly Float32Array[]> => {
   if (texts.length === 0) {
     return [];
   }
   if (isTestEmbedderEnabled()) {
     return texts.map(testEmbed);
   }
-  if (embedderOverride !== undefined) {
-    return embedderOverride(texts);
-  }
   const extractor = await getEmbedder();
   const vectors: Float32Array[] = [];
   for (let i = 0; i < texts.length; i += 1) {
     const text = texts[i]!;
-    const output = await extractor(`${E5_PREFIX}${text}`, {
+    const output = await extractor(text, {
       pooling: 'mean',
       normalize: true,
     });
@@ -354,4 +356,18 @@ export const embed = async (texts: readonly string[]): Promise<readonly Float32A
     }
   }
   return vectors;
+};
+
+export const embed = async (texts: readonly string[]): Promise<readonly Float32Array[]> => {
+  if (texts.length === 0) return [];
+  // Apply the prefix policy BEFORE every execution branch. Previously an
+  // override bypassed the wrapper while the production sidecar happened to
+  // re-apply it in the child. That made an override capable of producing a
+  // different vector under the same persistent cache key. Exact model inputs
+  // are now identical in-process, across IPC, and under test injection.
+  const prepared = texts.map((text) => prepareVectorModelInput(text));
+  if (embedderOverride !== undefined && !isTestEmbedderEnabled()) {
+    return embedderOverride(prepared);
+  }
+  return embedPreparedModelInputs(prepared);
 };

@@ -19,7 +19,7 @@
 // implementation) so the same embed code is used everywhere; we
 // just isolate the process boundary.
 
-import { embed as inProcessEmbed } from './embedder.js';
+import { embed as inProcessEmbed, embedPreparedModelInputs } from './embedder.js';
 
 type ParentMessage =
   | { readonly kind: 'ping' }
@@ -69,7 +69,11 @@ process.on('message', (raw: unknown) => {
     void (async () => {
       try {
         await ensureWarm();
-        const vectors = await inProcessEmbed(msg.texts);
+        // The parent applies the canonical input policy before invoking its
+        // override/client. Re-applying it here was the R1 cache-identity
+        // hazard: production happened to double-hop while other overrides did
+        // not. Consume the exact model inputs once.
+        const vectors = await embedPreparedModelInputs(msg.texts);
         // structuredClone preserves Float32Array, but `process.send`
         // serialises to JSON — so we copy into plain arrays.
         post({

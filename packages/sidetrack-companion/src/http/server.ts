@@ -16,6 +16,7 @@ import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import { listPageEvidenceRecords } from '../page-evidence/store.js';
 import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
+import { VECTOR_CORPUS_MODEL_KEY } from '../recall/vectorCorpus.js';
 import { getOrBuildSemanticRecallPool } from '../recall/semanticRecallPool.js';
 import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
 import { completeInflight, registerInflight, routeLabelFromPattern } from '../runtime/inflightRegistry.js';
@@ -25,7 +26,7 @@ import { declineMemoryFromMerged, type DeclineLookup } from '../tabsession/decli
 import { guessLanesEnabled } from '../tabsession/guessLanes.js';
 import { applyLaneCorroboration, laneCorroborationEnabled } from '../tabsession/laneCorroboration.js';
 import { applyLaneFallbackGuess } from '../tabsession/laneFallback.js';
-import { lanePrequentialSummary, recordLanePredictions, type LanePredictionInput, type LanePrequentialSummary } from '../tabsession/lanePrequential.js';
+import { laneOpportunityIdFor, lanePrequentialSummary, recordLanePredictions, type LanePredictionInput, type LanePrequentialSummary } from '../tabsession/lanePrequential.js';
 import type { UrlResolutionResult } from '../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { boundArgsSummary, runWithAuditContext, type AuditContext } from '../vault/auditContext.js';
@@ -566,9 +567,7 @@ const buildContentLaneDeps = async (
           const cached = await createEmbeddingCache(
             vaultRoot,
             RECALL_MODEL.embeddingDim,
-          ).getMany({ modelId: RECALL_MODEL.modelId, modelRevision: RECALL_MODEL.revision }, [
-            embedTextHash(text),
-          ]);
+          ).getMany(VECTOR_CORPUS_MODEL_KEY, [embedTextHash(text)]);
           const hit = cached.get(embedTextHash(text));
           if (hit !== undefined) return hit;
         } catch {
@@ -666,9 +665,19 @@ const applyLaneDecisions = (
 const recordLanePredictionsBestEffort = (
   vaultRoot: string,
   entries: readonly LanePredictionInput[],
+  requestId: string,
 ): void => {
   if (entries.length === 0) return;
-  void recordLanePredictions(vaultRoot, entries).catch(() => undefined);
+  void recordLanePredictions(vaultRoot, entries).catch((error: unknown) => {
+    // PII-free: counts and error class only, never URLs or workstream ids.
+    console.warn('[lane-prequential]', {
+      requestId,
+      operation: 'lane-prequential.prediction-record',
+      outcome: 'error',
+      opportunityCount: entries.length,
+      errorCategory: error instanceof Error ? error.name : 'unknown',
+    });
+  });
 };
 
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
@@ -798,8 +807,7 @@ const finalizeBatchResolveResults = async (
   titleHints: ReadonlyMap<string, string>,
   synthesizedTitleFor: (canonicalUrl: string) => string | undefined,
   gistFor: (canonicalUrl: string) => string | undefined,
-): Promise<readonly LanePredictionInput[]> => {
-  const predictions: LanePredictionInput[] = [];
+): Promise<void> => {
   for (const canonicalUrl of urls) {
     // Two lanes per URL now (content + ai), each a vector KNN plus an FTS
     // query plus a workstream join — all synchronous sqlite. This loop runs
@@ -835,10 +843,34 @@ const finalizeBatchResolveResults = async (
     // the lanes themselves, this runs AFTER the resolver-cache write, so
     // nothing it produces is ever persisted.
     results[canonicalUrl] = applyLaneDecisions(results[canonicalUrl]!, canonicalUrl, laneContext);
-    // Record what every lane predicted BEFORE the user answers. The lanes
-    // are read post-decision so the recorded pick is the one that was
-    // actually served.
-    predictions.push({ canonicalUrl, lanes: results[canonicalUrl]!.lanes });
+  }
+};
+
+// Stamp one durable, opaque opportunity id onto every result that contains at
+// least one real lane prediction, and build the matching append inputs. This
+// runs after the query-time lane decoration but outside its feature gate, so
+// the six structural lanes still get an attributable opportunity when the
+// content lane is disabled. Repeated polls over an unchanged dependency + top
+// picks derive the same id; lanePrequential's reader deduplicates them.
+const stampLanePredictionOpportunities = (
+  results: Record<string, UrlResolutionResult>,
+  urls: readonly string[],
+): readonly LanePredictionInput[] => {
+  const predictions: LanePredictionInput[] = [];
+  for (const canonicalUrl of urls) {
+    const result = results[canonicalUrl];
+    if (result === undefined) continue;
+    const opportunityId = laneOpportunityIdFor({
+      canonicalUrl,
+      dependencyKey: result.reasons.dependencyKey,
+      lanes: result.lanes,
+    });
+    if (opportunityId === undefined) {
+      predictions.push({ canonicalUrl, lanes: result.lanes });
+      continue;
+    }
+    results[canonicalUrl] = { ...result, servedOpportunityId: opportunityId };
+    predictions.push({ canonicalUrl, lanes: result.lanes, opportunityId });
   }
   return predictions;
 };
@@ -922,7 +954,7 @@ export const routes: readonly RouteDefinition[] = [
     method: 'POST',
     pattern: /^\/v1\/visits\/batch-resolve$/u,
     authRequired: true,
-    handle: async (request, _requestId, _match, context) => {
+    handle: async (request, requestId, _match, context) => {
       if (context.eventLog === undefined) {
         throw new HttpRouteError(
           503,
@@ -1293,20 +1325,18 @@ export const routes: readonly RouteDefinition[] = [
           // SWR stale, fresh compute alike — flows through the SAME function
           // the plain-store fallback path below calls. See
           // finalizeBatchResolveResults.
-          const predictions: readonly LanePredictionInput[] =
-            joinSnapshot === null
-              ? []
-              : await finalizeBatchResolveResults(
-                  results,
-                  Object.keys(results),
-                  joinSnapshot,
-                  contentDeps,
-                  laneContext,
-                  titleHints,
-                  synthesizedTitleFor,
-                  gistFor,
-                );
-          recordLanePredictionsBestEffort(requireVaultRoot(context), predictions);
+          if (joinSnapshot !== null) {
+            await finalizeBatchResolveResults(
+              results,
+              Object.keys(results),
+              joinSnapshot,
+              contentDeps,
+              laneContext,
+              titleHints,
+              synthesizedTitleFor,
+              gistFor,
+            );
+          }
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
           // pass duration + how many URLs it decorated — so the ≤~50ms indexed /
           // ≤~450ms embed-race budget is observable on the box, PII-free.
@@ -1317,6 +1347,11 @@ export const routes: readonly RouteDefinition[] = [
             ).catch(() => undefined);
           }
         }
+        // Unconditional serve-opportunity seam. Even when content/AI lanes are
+        // disabled, the six structural lanes can carry real predictions and
+        // need the same durable identity on the wire + in the append log.
+        const predictions = stampLanePredictionOpportunities(results, Object.keys(results));
+        recordLanePredictionsBestEffort(requireVaultRoot(context), predictions, requestId);
         return buildBatchResolveResponse(results, snapshotRevision);
       }
       const snapshot = await context.connectionsStore.readCurrent();
@@ -1364,7 +1399,7 @@ export const routes: readonly RouteDefinition[] = [
       // Single finalize seam (stage S3): every served result flows through
       // the SAME function the sqlite-store path above calls. See
       // finalizeBatchResolveResults.
-      const fallbackPredictions = await finalizeBatchResolveResults(
+      await finalizeBatchResolveResults(
         results,
         uniqueUrls,
         snapshot,
@@ -1374,7 +1409,8 @@ export const routes: readonly RouteDefinition[] = [
         synthesizedTitleFor,
         gistFor,
       );
-      recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions);
+      const fallbackPredictions = stampLanePredictionOpportunities(results, uniqueUrls);
+      recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions, requestId);
       return buildBatchResolveResponse(results, snapshotRevision);
     },
   },
@@ -1805,4 +1841,3 @@ export const startHttpServer = async (server: Server, port: number): Promise<Sta
     };
     listen();
   });
-

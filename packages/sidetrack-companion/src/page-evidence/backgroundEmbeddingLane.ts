@@ -28,9 +28,9 @@
 //   - Persists progress (a cursor + attempt bookkeeping) so a restart
 //     resumes instead of re-scanning from zero, and a record that fails
 //     to embed is not retried in a tight loop.
-//   - Kill-switch: SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING absent /
-//     '0' disables the lane entirely (default OFF until the eval-spine
-//     verdict lifts it — see ADR-0011 amendment 2026-07-12b).
+//   - Kill-switch: SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING=0/false/off
+//     disables the lane. R3 defaults it ON only when the child-process
+//     embedder is active; inference never falls back onto the API loop.
 //   - On each successful embedding, notifies a completion sink so the
 //     connections materializer can requalify that visit for similarity
 //     re-embedding on the next drain (closes the
@@ -109,12 +109,13 @@ export interface BackgroundEmbeddingLaneDeps {
 }
 
 export interface BackgroundEmbeddingLaneConfig {
-  /** Max ATTEMPTS per cycle (embeds + failures). Hard cap; the CPU regime
+  /** Max candidate visits per cycle (embeds + failures + reconstruction
+   *  skips). Hard cap; the CPU regime
    *  forbids unbounded batches. WHY ATTEMPTS not successes: the original
    *  cap counted only successful embeds, so a cycle of pure failures/skips
    *  never consumed the cap and the loop spun the whole backlog each tick
    *  without making forward progress (stall-not-progress). Counting
-   *  attempts bounds the work per cycle regardless of outcome. */
+   *  candidate visits bounds the work per cycle regardless of outcome. */
   readonly batchCap: number;
   /** Idle delay between cycles when the backlog is non-empty. */
   readonly cycleIntervalMs: number;
@@ -178,9 +179,7 @@ const emptyProgress = (): BackgroundEmbeddingProgress => ({
  *  block; `metadata_only` never does. A 'disabled' record opted out
  *  (SIDETRACK_PAGE_EVIDENCE_DOC_EMBEDDINGS=0 at write time) — leave it.
  *  A 'ready' record already has its vector. */
-export const isBackgroundEmbeddingBacklog = (
-  candidate: BackgroundEmbeddingCandidate,
-): boolean => {
+export const isBackgroundEmbeddingBacklog = (candidate: BackgroundEmbeddingCandidate): boolean => {
   if (candidate.evidenceTier === 'metadata_only') return false;
   const content = candidate.content;
   if (content === undefined) return false;
@@ -354,7 +353,12 @@ export const createBackgroundEmbeddingLane = (
     let quarantined = 0;
     const backlog = candidates.filter((candidate) => {
       if (!isBackgroundEmbeddingBacklog(candidate)) return false;
-      if (isTombstoned({ url: candidate.url, ...(candidate.title === undefined ? {} : { title: candidate.title }) })) {
+      if (
+        isTombstoned({
+          url: candidate.url,
+          ...(candidate.title === undefined ? {} : { title: candidate.title }),
+        })
+      ) {
         return false;
       }
       const url = candidate.canonicalUrl;
@@ -382,11 +386,13 @@ export const createBackgroundEmbeddingLane = (
     let skipped = 0;
     let failed = 0;
     for (const candidate of backlog) {
-      // ATTEMPT-counted cap: successes + failures both consume the cap so
-      // a cycle of pure failures can't spin the whole backlog (the
-      // stall-not-progress bug). Skips do NOT consume the cap — they're
-      // not real work and not a failure of the record.
-      if (embedded + failed >= batchCap) break;
+      // VISIT-counted cap: successes + failures + reconstruction skips all
+      // consume the cap. A features-only record requires a real page-content
+      // store read before `embedCanonicalUrl` can return skipped; after R3
+      // made those records a durable feeder backlog, treating skips as free
+      // would scan thousands of bodies every 4 s. Skips still do NOT burn a
+      // failure/quarantine attempt — they only bound per-cycle work.
+      if (embedded + failed + skipped >= batchCap) break;
       // Re-check the drain gate between records: a drain that starts
       // mid-cycle must stop us on the very next record, not at cycle end.
       if (deps.isDrainActive()) {

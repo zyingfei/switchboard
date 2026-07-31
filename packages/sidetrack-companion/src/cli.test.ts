@@ -59,6 +59,36 @@ describe('runCli', () => {
     expect(streams.stderr.text()).toContain('Missing required --vault <path>.');
   });
 
+  it('storage-retirement reports a plan id and requires it for apply', async () => {
+    const vault = await mkdtemp(join(tmpdir(), 'sidetrack-cli-retirement-'));
+    try {
+      const reportStreams = createStreams();
+      const reportCode = await runCli(
+        ['gc', '--vault', vault, '--storage-retirement', '--dry-run', '--json'],
+        reportStreams,
+      );
+      expect(reportCode).toBe(0);
+      const report = JSON.parse(reportStreams.stdout.text()) as {
+        readonly plan?: {
+          readonly planId?: unknown;
+          readonly canonicalLogDeletionPermitted?: unknown;
+        };
+      };
+      expect(report.plan?.planId).toMatch(/^[a-f0-9]{64}$/u);
+      expect(report.plan?.canonicalLogDeletionPermitted).toBe(false);
+
+      const applyStreams = createStreams();
+      const applyCode = await runCli(
+        ['gc', '--vault', vault, '--storage-retirement', '--apply'],
+        applyStreams,
+      );
+      expect(applyCode).toBe(2);
+      expect(applyStreams.stderr.text()).toContain('requires --plan-id');
+    } finally {
+      await rm(vault, { recursive: true, force: true });
+    }
+  });
+
   it('models status reports the manifest revision + cache dir without touching the network', async () => {
     const streams = createStreams();
     const exitCode = await runCli(

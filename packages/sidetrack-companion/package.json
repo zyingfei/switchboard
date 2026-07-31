@@ -40,6 +40,7 @@
     "test": "bun test",
     "test:vitest": "bunx --no-install vitest run",
     "test:watch": "bunx --no-install vitest",
+    "test:golden": "bun test src/eval/goldenResolveCases.test.ts src/eval/goldenResolveSet.test.ts",
     "eval:recall": "bunx --no-install vitest run src/recall-v2/eval/index.test.ts",
     "eval:golden": "bun src/eval/goldenResolveSet.ts"
   },

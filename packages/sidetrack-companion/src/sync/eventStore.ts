@@ -1,12 +1,23 @@
 // Derived, persistent SQLite mirror of the causal JSONL event log.
 //
-// JSONL remains the source of truth. This store is rebuildable and
-// exists so hot materializers can read small ordered tails without
-// materializing the full AcceptedEvent[] in the JS heap.
+// JSONL is the ONLY source of truth. This store is a disposable, rebuildable
+// mirror and exists so hot materializers can read small ordered tails without
+// materializing the full AcceptedEvent[] in the JS heap. When the feature is
+// disabled, gc/storageRetirement.ts may retire it only after reading every
+// mirror row back identically from canonical JSONL; no reverse recovery path
+// from SQLite to JSONL exists or is permitted.
 
-import { open, readdir, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { mkdir, open, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 
+import {
+  type EngagementCompactionManifestEntry,
+  readEngagementCompactionManifest,
+  verifyCompactionShardState,
+} from '../gc/engagementCompactionManifest.js';
+import { ENGAGEMENT_INTERVAL_OBSERVED } from '../engagement/events.js';
 import { isAcceptedEvent } from './eventLog.js';
 import type { AcceptedEvent, Hlc, TargetRef, VersionVector } from './causal.js';
 import {
@@ -33,7 +44,15 @@ export interface EventStore {
    *  by the engagement-lane freshness probe to spot aggregate-vs-interval
    *  divergence without materializing rows. */
   readonly maxAcceptedAtMsForType: (type: string) => number;
+  /** Most recent accepted time represented only by a verified compaction receipt. */
+  readonly maxCompactedAcceptedAtMsForType: (type: string) => number;
+  /** Physical retained event rows. */
   readonly count: () => number;
+  /**
+   * Sum(watermark) minus exact dots covered by trusted compaction receipts.
+   * Genuine sequence holes remain expected and therefore visible in the delta.
+   */
+  readonly expectedRetainedCount: () => number;
   readonly forEachChunk: (
     cb: (chunk: readonly AcceptedEvent[]) => void | Promise<void>,
     chunkSize: number,
@@ -51,6 +70,10 @@ export interface EventStore {
   readonly watermark: () => VersionVector;
   readonly close: () => void;
 }
+
+/** Machine-readable single-source declaration consumed by docs/tests. */
+export const EVENT_STORE_AUTHORITY = 'canonical-jsonl' as const;
+export const EVENT_STORE_STORAGE_ROLE = 'rebuildable-mirror' as const;
 
 // Default OFF: measured net-negative. The off-heap event store does NOT
 // reduce memory — idle resident is already tiny (mergedMemo TTL-evicts;
@@ -133,6 +156,22 @@ const SCHEMA = `
     mtime_ms INTEGER NOT NULL,
     read_offset INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS compacted_events (
+    replica_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    accepted_at_ms INTEGER NOT NULL,
+    shard_path TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    PRIMARY KEY (replica_id, seq)
+  );
+  CREATE INDEX IF NOT EXISTS compacted_events_type_idx
+    ON compacted_events(type, accepted_at_ms);
+  CREATE TABLE IF NOT EXISTS compaction_receipt_trust (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    trusted INTEGER NOT NULL CHECK (trusted IN (0, 1))
+  );
+  INSERT OR IGNORE INTO compaction_receipt_trust (singleton, trusted) VALUES (1, 1);
 `;
 
 const numberField = (row: unknown, field: string): number => {
@@ -206,6 +245,7 @@ interface ShardProgress {
 export const createEventStore = async (vaultRoot: string): Promise<EventStore> => {
   const { Database } = await loadSqlite();
   const dbPath = join(vaultRoot, '_BAC', 'connections', 'event-store.db');
+  await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
   const db = new Database(dbPath, { create: true, readwrite: true });
   db.exec(SCHEMA);
 
@@ -232,6 +272,92 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
        mtime_ms = excluded.mtime_ms,
        read_offset = excluded.read_offset`,
   );
+  const selectCompactedReceiptByDot = db.query(
+    'SELECT receipt_sha256 FROM compacted_events WHERE replica_id = ? AND seq = ?',
+  );
+  const selectStoredTypeByDot = db.query(
+    'SELECT type FROM events WHERE replica_id = ? AND seq = ?',
+  );
+  const insertCompactedEvent = db.query(
+    `INSERT OR IGNORE INTO compacted_events
+       (replica_id, seq, type, accepted_at_ms, shard_path, receipt_sha256)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const deleteCompactedEvent = db.query(
+    'DELETE FROM events WHERE replica_id = ? AND seq = ? AND type = ?',
+  );
+  const setCompactionReceiptTrust = db.query(
+    'UPDATE compaction_receipt_trust SET trusted = ? WHERE singleton = 1',
+  );
+
+  const applyCompactionReceipt = (entry: EngagementCompactionManifestEntry): void => {
+    db.exec('BEGIN');
+    try {
+      for (const range of entry.droppedSequenceRanges) {
+        for (let seq = range.from; seq <= range.to; seq += 1) {
+          const existingReceipt = selectCompactedReceiptByDot.get(entry.replicaId, seq);
+          if (existingReceipt !== null && existingReceipt !== undefined) {
+            if (stringField(existingReceipt, 'receipt_sha256') !== entry.receiptSha256) {
+              throw new Error('compaction-receipt-dot-conflict');
+            }
+            continue;
+          }
+          const stored = selectStoredTypeByDot.get(entry.replicaId, seq);
+          if (
+            stored !== null &&
+            stored !== undefined &&
+            stringField(stored, 'type') !== ENGAGEMENT_INTERVAL_OBSERVED
+          ) {
+            throw new Error('compaction-receipt-type-mismatch');
+          }
+          insertCompactedEvent.run(
+            entry.replicaId,
+            seq,
+            ENGAGEMENT_INTERVAL_OBSERVED,
+            entry.maxDroppedAcceptedAtMs,
+            entry.shard,
+            entry.receiptSha256,
+          );
+          deleteCompactedEvent.run(entry.replicaId, seq, ENGAGEMENT_INTERVAL_OBSERVED);
+          bumpWatermark.run(entry.replicaId, seq);
+        }
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
+  const mirrorContainsEveryShardEvent = async (shardPath: string): Promise<boolean> => {
+    const lines = createInterface({
+      input: createReadStream(shardPath, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    try {
+      for await (const line of lines) {
+        if (line.trim().length === 0) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          return false;
+        }
+        if (!isAcceptedEvent(parsed)) return false;
+        const stored = selectClientEventIdByDot.get(parsed.dot.replicaId, parsed.dot.seq);
+        if (
+          stored === null ||
+          stored === undefined ||
+          stringField(stored, 'client_event_id') !== parsed.clientEventId
+        ) {
+          return false;
+        }
+      }
+      return true;
+    } finally {
+      lines.close();
+    }
+  };
 
   const ingest = (event: AcceptedEvent): boolean => {
     if (!isStructurallyValidAcceptedEvent(event)) return false;
@@ -320,6 +446,29 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
   };
 
   const catchUpFromJsonl = async (logRoot: string): Promise<number> => {
+    const vaultRoot = join(logRoot, '..', '..');
+    const manifestRead = await readEngagementCompactionManifest(vaultRoot);
+    const manifestEntries =
+      manifestRead.state === 'valid'
+        ? new Map(
+            manifestRead.manifest.entries.map(
+              (entry) => [join(logRoot, entry.shard), entry] as const,
+            ),
+          )
+        : new Map<string, EngagementCompactionManifestEntry>();
+    const storedReceipts = db.query('SELECT DISTINCT receipt_sha256 FROM compacted_events').all();
+    const manifestReceiptIds = new Set(
+      manifestRead.state === 'valid'
+        ? manifestRead.manifest.entries.map((entry) => entry.receiptSha256)
+        : [],
+    );
+    // Absent and invalid are distinct at the boundary, but either makes prior
+    // compacted-dot accounting untrusted. The rows stay recoverable; count()
+    // simply stops crediting them until the matching valid manifest returns.
+    const receiptsTrusted = storedReceipts.every((row) =>
+      manifestReceiptIds.has(stringField(row, 'receipt_sha256')),
+    );
+    setCompactionReceiptTrust.run(receiptsTrusted ? 1 : 0);
     let replicaDirs: string[];
     try {
       replicaDirs = (await readdir(logRoot)).sort();
@@ -366,6 +515,29 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
                 readOffset: numberField(progressRow, 'read_offset'),
               };
         if (progress !== null && progress.size === size && progress.mtimeMs === mtimeMs) {
+          continue;
+        }
+
+        const receipt = manifestEntries.get(shardPath);
+        const receiptState =
+          receipt === undefined ? null : await verifyCompactionShardState(vaultRoot, receipt);
+        if (receiptState === 'mismatch' || receiptState === 'missing') {
+          setCompactionReceiptTrust.run(0);
+        }
+        if (
+          progress !== null &&
+          receipt !== undefined &&
+          receiptState === 'compacted' &&
+          progress.size === receipt.sourceBytes &&
+          progress.readOffset <= receipt.sourceBytes &&
+          (await mirrorContainsEveryShardEvent(shardPath))
+        ) {
+          // Recognised intentional shrink: account for the exact removed dots,
+          // prune their stale mirror rows, and advance straight to the new EOF.
+          // Unknown/tampered shrinks do not enter this branch and retain the
+          // legacy reparse + anomaly-counter behavior.
+          applyCompactionReceipt(receipt);
+          upsertShardProgress.run(shardPath, size, mtimeMs, size);
           continue;
         }
 
@@ -417,6 +589,14 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
           }
         }
         upsertShardProgress.run(shardPath, size, mtimeMs, nextReadOffset);
+        if (progress === null && receipt !== undefined && receiptState === 'compacted') {
+          // Fresh/rebuilt store: ingest the retained file first, then advance
+          // the watermark across exactly the receipt-covered dots. This avoids
+          // classifying retained lower-sequence rows as out-of-order.
+          await flush();
+          applyCompactionReceipt(receipt);
+          wm = watermark();
+        }
       }
     }
     await flush();
@@ -428,6 +608,8 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       DELETE FROM events;
       DELETE FROM ingest_watermark;
       DELETE FROM shard_progress;
+      DELETE FROM compacted_events;
+      UPDATE compaction_receipt_trust SET trusted = 1 WHERE singleton = 1;
     `);
     await catchUpFromJsonl(logRoot);
   };
@@ -459,7 +641,19 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
   };
 
   const maxAcceptedAtMs = (): number => {
-    const row = db.query('SELECT COALESCE(MAX(accepted_at_ms), 0) AS max FROM events').get();
+    const row = db
+      .query(
+        `SELECT MAX(value) AS max FROM (
+           SELECT COALESCE(MAX(accepted_at_ms), 0) AS value FROM events
+           UNION ALL
+           SELECT CASE
+             WHEN (SELECT trusted FROM compaction_receipt_trust WHERE singleton = 1) = 1
+             THEN COALESCE(MAX(accepted_at_ms), 0)
+             ELSE 0
+           END AS value FROM compacted_events
+         )`,
+      )
+      .get();
     return row === null || row === undefined ? 0 : numberField(row, 'max');
   };
 
@@ -470,9 +664,40 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     return row === null || row === undefined ? 0 : numberField(row, 'max');
   };
 
+  const maxCompactedAcceptedAtMsForType = (type: string): number => {
+    const row = db
+      .query(
+        `SELECT CASE WHEN trust.trusted = 1
+           THEN COALESCE(MAX(compacted.accepted_at_ms), 0)
+           ELSE 0
+         END AS max
+         FROM compaction_receipt_trust AS trust
+         LEFT JOIN compacted_events AS compacted ON compacted.type = ?
+         WHERE trust.singleton = 1`,
+      )
+      .get(type);
+    return row === null || row === undefined ? 0 : numberField(row, 'max');
+  };
+
   const count = (): number => {
     const row = db.query('SELECT COUNT(*) AS count FROM events').get();
     return row === null || row === undefined ? 0 : numberField(row, 'count');
+  };
+
+  const expectedRetainedCount = (): number => {
+    const expectedFromWatermark = Object.values(watermark()).reduce((sum, seq) => sum + seq, 0);
+    const row = db
+      .query(
+        `SELECT CASE
+           WHEN (SELECT trusted FROM compaction_receipt_trust WHERE singleton = 1) = 1
+           THEN COUNT(*)
+           ELSE 0
+         END AS count
+         FROM compacted_events`,
+      )
+      .get();
+    const trustedCompactedCount = row === null || row === undefined ? 0 : numberField(row, 'count');
+    return expectedFromWatermark - trustedCompactedCount;
   };
 
   const forEachChunk = async (
@@ -548,7 +773,9 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     readSince,
     maxAcceptedAtMs,
     maxAcceptedAtMsForType,
+    maxCompactedAcceptedAtMsForType,
     count,
+    expectedRetainedCount,
     forEachChunk,
     forEachChunkOfTypes,
     watermark,

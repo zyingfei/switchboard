@@ -249,6 +249,11 @@ import { DOMAIN_TOMBSTONE } from '../../privacy/domainTombstone.js';
 import { embed as defaultEmbed } from '../../recall/embedder.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import {
+  pruneVectorCorpusBindings,
+  resolveCanonicalVectors,
+  VECTOR_CORPUS_REVISION,
+} from '../../recall/vectorCorpus.js';
+import {
   canonicalizeEvidenceUrl,
   ensurePageEvidenceForTimelineEntries,
   readPageEvidenceMap,
@@ -1463,6 +1468,12 @@ export const createConnectionsMaterializer = (
     incrementalSimilarityIndexOptions,
   );
   const hnswSimilarityStore = createSimilarityHnswStore();
+  const hnswVectorIdentity = {
+    dimension: RECALL_MODEL.embeddingDim,
+    modelId: RECALL_MODEL.modelId,
+    modelRevision: RECALL_MODEL.revision,
+    vectorCorpusRevision: VECTOR_CORPUS_REVISION,
+  } as const;
   let loadedHnswSimilarityStore: LoadedSimilarityHnswStore | null = null;
   // Drain-path observability (M3 rebuild-storm fix): the number of embeddings
   // buildHnswVisitSimilarity inserted/updated on the LAST call. On an
@@ -1788,7 +1799,7 @@ export const createConnectionsMaterializer = (
     if (input.fullRebuild) await resetHnswSimilarityFiles();
     const loadedHnswStore = await hnswSimilarityStore.ensureLoaded(
       deps.vaultRoot,
-      RECALL_MODEL.embeddingDim,
+      hnswVectorIdentity,
     );
     loadedHnswSimilarityStore = loadedHnswStore;
     const knownVisitIdsBeforeMutation = input.fullRebuild
@@ -1833,12 +1844,27 @@ export const createConnectionsMaterializer = (
       const texts = entriesToEmbed.map(
         (entry) => `passage: ${corpusForVisitEntry(entry, input.evidenceByCanonicalUrl)}`,
       );
-      const embedded = await input.embed(texts);
+      const resolved = await resolveCanonicalVectors({
+        vaultRoot: deps.vaultRoot,
+        texts,
+        embed: input.embed,
+        bindings: entriesToEmbed.map((entry) => ({
+          consumer: 'visit_similarity',
+          projectionId: visitKeyForVisitEntry(entry),
+          sourceRevision: input.revisionId,
+          effectiveAtMs: Date.parse(entry.lastSeenAt),
+        })),
+      });
+      const embedded = resolved.vectors;
       if (embedded.length !== entriesToEmbed.length) {
         throw new Error(
           `expected ${String(entriesToEmbed.length)} HNSW embeddings, received ${String(embedded.length)}`,
         );
       }
+      // eslint-disable-next-line no-console -- structured lifecycle evidence
+      console.info(
+        `[vector-corpus] consumer=visit_similarity revision=${resolved.revision} hits=${String(resolved.cacheHits)} embedded=${String(resolved.embedded)} migrated=${String(resolved.migratedLegacyCache)}`,
+      );
       for (let i = 0; i < entriesToEmbed.length; i += 1) {
         const entry = entriesToEmbed[i];
         const embedding = embedded[i];
@@ -1884,6 +1910,7 @@ export const createConnectionsMaterializer = (
             activeVisitIds,
           );
     await loadedHnswStore.persist();
+    await pruneVectorCorpusBindings(deps.vaultRoot, 'visit_similarity', activeVisitIds);
     return {
       revisionId: input.revisionId,
       modelId: VISIT_SIMILARITY_MODEL_ID,
@@ -3607,7 +3634,7 @@ export const createConnectionsMaterializer = (
       try {
         loadedHnswStoreForGate = await hnswSimilarityStore.ensureLoaded(
           deps.vaultRoot,
-          RECALL_MODEL.embeddingDim,
+          hnswVectorIdentity,
         );
       } catch (err) {
         if (!isHnswDimensionMismatchError(err)) throw err;
@@ -3615,7 +3642,7 @@ export const createConnectionsMaterializer = (
         await resetHnswSimilarityFiles();
         loadedHnswStoreForGate = await hnswSimilarityStore.ensureLoaded(
           deps.vaultRoot,
-          RECALL_MODEL.embeddingDim,
+          hnswVectorIdentity,
         );
       }
     }
@@ -4404,7 +4431,18 @@ export const createConnectionsMaterializer = (
           (e) => `passage: ${corpusForVisitEntry(e, pageEvidenceByCanonicalUrl)}`,
         );
         try {
-          const embedded = await (deps.embed ?? defaultEmbed)(texts);
+          const resolved = await resolveCanonicalVectors({
+            vaultRoot: deps.vaultRoot,
+            texts,
+            embed: deps.embed ?? defaultEmbed,
+            bindings: newEntries.map((entry) => ({
+              consumer: 'visit_similarity',
+              projectionId: visitKeyForVisitEntry(entry),
+              sourceRevision: expectedSimilarityRevisionId,
+              effectiveAtMs: Date.parse(entry.lastSeenAt),
+            })),
+          });
+          const embedded = resolved.vectors;
           for (let i = 0; i < newEntries.length; i += 1) {
             const entry = newEntries[i];
             const embedding = embedded[i];

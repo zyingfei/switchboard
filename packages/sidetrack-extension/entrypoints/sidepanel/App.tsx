@@ -476,7 +476,9 @@ const isUrlInboxData = (value: unknown): value is UrlInboxData =>
   typeof value['limit'] === 'number' &&
   typeof value['offset'] === 'number';
 
-const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult => {
+const LANE_OPPORTUNITY_ID_PATTERN = /^laneopp_[0-9a-f]{32}$/u;
+
+export const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult => {
   if (
     !(
       isPlainRecord(value) &&
@@ -495,6 +497,17 @@ const isUrlResolutionResult = (value: unknown): value is UrlResolutionResult => 
   // Normalize the additive guess-lanes field (see normalizeResolutionLanes) so
   // malformed lanes degrade to absent rather than failing the resolution.
   normalizeResolutionLanes(value);
+  // Additive served-opportunity identity follows the same tolerant contract:
+  // a malformed value is ABSENT, never an empty string and never a reason to
+  // throw away the otherwise valid resolver result.
+  const servedOpportunityId = value['servedOpportunityId'];
+  if (
+    servedOpportunityId !== undefined &&
+    !(typeof servedOpportunityId === 'string' &&
+      LANE_OPPORTUNITY_ID_PATTERN.test(servedOpportunityId))
+  ) {
+    delete value['servedOpportunityId'];
+  }
   return true;
 };
 
@@ -3508,6 +3521,11 @@ const App = () => {
     const attributeIdempotencyKey =
       idempotencyKeyOverride ??
       idempotencyKey('url', `${canonicalUrl}-${workstreamId ?? 'inbox'}-${String(Date.now())}`);
+    // This is the exact opportunity currently rendered for the URL. Echoing it
+    // turns this explicit accept/reject/organize gesture into an attributable
+    // outcome. No current opportunity means the field stays ABSENT: drag/drop
+    // and other independent organization actions must not fabricate a join.
+    const servedOpportunityId = urlSuggestionsRef.current[canonicalUrl]?.servedOpportunityId;
     const response = await fetch(
       `http://127.0.0.1:${port}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
       {
@@ -3517,7 +3535,10 @@ const App = () => {
           'idempotency-key': attributeIdempotencyKey,
           'x-bac-bridge-key': bridgeKey,
         },
-        body: JSON.stringify({ workstreamId }),
+        body: JSON.stringify({
+          workstreamId,
+          ...(servedOpportunityId === undefined ? {} : { servedOpportunityId }),
+        }),
       },
     );
     if (!response.ok) {

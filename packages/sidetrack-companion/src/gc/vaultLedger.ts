@@ -395,8 +395,8 @@ const describeFamily = (
       return {
         status: 'retained-anchor',
         reclaimable: 0,
-        reclaimableAssessed: true,
-        note: 'kept for the double-buffer kill switch — becomes the served graph on rollback, not the live one now',
+        reclaimableAssessed: false,
+        note: 'retained until storage retirement proves the S1 generation is complete; rollback can recreate it from current.gen',
       };
     case 'event-store':
       return ctx.eventStoreOn
@@ -410,7 +410,7 @@ const describeFamily = (
             status: 'unused-under-config',
             reclaimable: 0,
             reclaimableAssessed: false,
-            note: 'nothing reads it with the event store off — but it is load-bearing again the moment SIDETRACK_EVENT_STORE=1',
+            note: 'nothing reads it with the event store off; storage retirement verifies every row against canonical JSONL before removal',
           };
     case 'event-log':
       return {
@@ -424,14 +424,14 @@ const describeFamily = (
         status: 'unbounded',
         reclaimable: 0,
         reclaimableAssessed: false,
-        note: 'daily ingress spool with no retention — assessed by the retention planner',
+        note: 'legacy daily ingress spool — past-retention days are eligible only after canonical capture read-back proof',
       };
     case 'sync-changelog':
       return {
         status: 'unbounded',
         reclaimable: 0,
         reclaimableAssessed: false,
-        note: 'projection changelog, never rotated — assessed by the retention planner',
+        note: 'bounded projection changelog — rotation requires a durable source read-back proof and publishes a retained floor',
       };
     case 'connections-derived':
     case 'diagnostics':
@@ -539,6 +539,7 @@ export interface VaultLedgerSummary {
   /** Orphaned generations — the P0 counter. 0 here is a real measurement. */
   readonly orphanGenerations: number;
   readonly orphanGenerationBytes: number;
+  readonly generationSweepRequested: boolean;
   readonly generationSweepArmed: boolean;
 }
 
@@ -556,6 +557,7 @@ export const summarizeVaultLedger = (
     .map((family) => ({ family: family.family, bytes: family.bytes, status: family.status })),
   orphanGenerations: ledger.generations.collectableCount,
   orphanGenerationBytes: ledger.generations.collectableBytes,
+  generationSweepRequested: ledger.generations.sweepRequested,
   generationSweepArmed: ledger.generations.sweepArmed,
 });
 

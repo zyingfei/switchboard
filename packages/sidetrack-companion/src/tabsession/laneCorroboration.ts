@@ -66,22 +66,23 @@ import type { LanePrequentialSummary } from './lanePrequential.js';
 import { lanePrecisionFrom } from './lanePrequential.js';
 import type { ResolverCandidate } from './resolver.js';
 
-// ---- env flag ---------------------------------------------------------
+// ---- kill switch ------------------------------------------------------
 
 export const LANE_CORROBORATION_ENV = 'SIDETRACK_LANE_CORROBORATION';
 
 /**
- * Default OFF — only '1' / 'true' enables.
+ * Default ON, with an explicit '0' / 'false' kill switch.
  *
- * This is the repo's observe-first rule applied strictly: unlike the lanes,
- * the fallback and the decline memory (all of which only ever change what is
- * SHOWN or withhold a guess), this changes what the system DECIDES. It can move
- * a pick from inbox to suggest. Off by default until the prequential numbers
- * it depends on have accumulated on a real vault and been looked at.
+ * The serving change remains fail-closed on evidence: laneEvidence refuses to
+ * promote until BOTH lanes clear p>=0.60 at n>=20, so arming the mechanism on a
+ * fresh or under-observed vault changes no decision. Keeping a separate hidden
+ * opt-in made that calibrated promotion mathematically reachable but
+ * operationally inert; the measurement gate is the rollout gate. The env knob
+ * remains as an instant rollback path.
  */
 export const laneCorroborationEnabled = (): boolean => {
   const raw = process.env[LANE_CORROBORATION_ENV];
-  return raw === '1' || raw === 'true';
+  return raw !== '0' && raw !== 'false';
 };
 
 // ---- the self-gating thresholds ---------------------------------------
@@ -178,7 +179,7 @@ const num = (value: number): string => Number(value.toFixed(2)).toString();
  *
  * Returns `result` unchanged — by identity, so callers and tests can assert on
  * it — whenever any of these hold:
- *   - the flag is off (SIDETRACK_LANE_CORROBORATION unset / not '1'|'true');
+ *   - the kill switch is off (SIDETRACK_LANE_CORROBORATION='0'|'false');
  *   - the user declined this URL ("Not in any stream");
  *   - the gate reason is not 'corroboration' (nothing to lift, or a different
  *     gate is the binding one and lifting corroboration would change nothing);
@@ -226,7 +227,9 @@ export const applyLaneCorroboration = <T extends ResultForCorroboration>(
   // the logit floor, the margin bar and the tier ordering must still apply, and
   // re-implementing them here is how they would drift.
   const bumped: FusedCandidate[] = result.fusedCandidates.map((candidate, index) =>
-    index === 0 ? { ...candidate, corroborationCount: candidate.corroborationCount + 1 } : candidate,
+    index === 0
+      ? { ...candidate, corroborationCount: candidate.corroborationCount + 1 }
+      : candidate,
   );
   const promoted = decideAttribution(bumped, result.policyMode);
   // Still held ⇒ hands off entirely. The pick was failing more than the

@@ -429,11 +429,16 @@ describe('resolve canary acceptance — real core + health read-back', () => {
       lastCheckpointTruncatedPages: 0,
       lastCheckpointOk: true,
       lastGcUnlinked: 1,
+      unchangedPublishSkipCount: 9,
+      progressCheckpointCount: 8,
+      lastPublishSkipAtMs: 1_700_000_001_000,
     });
     expect(enabled.connectionsDoubleBuffer?.enabled).toBe(true);
     expect(enabled.connectionsDoubleBuffer?.generation).toBe('gen-123-abc');
     expect(enabled.connectionsDoubleBuffer?.swapCount).toBe(4);
     expect(enabled.connectionsDoubleBuffer?.lastCheckpointOk).toBe(true);
+    expect(enabled.connectionsDoubleBuffer?.unchangedPublishSkipCount).toBe(9);
+    expect(enabled.connectionsDoubleBuffer?.progressCheckpointCount).toBe(8);
     expect(enabled.connectionsDoubleBuffer?.residentGenerations).toEqual([
       'gen-123-abc',
       'gen-122-def',
@@ -449,6 +454,9 @@ describe('resolve canary acceptance — real core + health read-back', () => {
       lastCheckpointTruncatedPages: null,
       lastCheckpointOk: null,
       lastGcUnlinked: 0,
+      unchangedPublishSkipCount: 0,
+      progressCheckpointCount: 0,
+      lastPublishSkipAtMs: null,
     });
     expect(legacy.connectionsDoubleBuffer).toBeUndefined();
   });

@@ -201,6 +201,28 @@ describe('feedback event payload guards', () => {
     ).toBe(false);
   });
 
+  it('validates the optional served lane-opportunity id on URL outcomes', () => {
+    const base = {
+      payloadVersion: 1,
+      itemKind: 'canonical-url',
+      itemId: 'https://example.test/served',
+      action: 'move',
+      toContainer: 'ws-a',
+    } as const;
+    expect(
+      isUserOrganizedItemPayload({
+        ...base,
+        details: { servedOpportunityId: 'laneopp_0123456789abcdef0123456789abcdef' },
+      }),
+    ).toBe(true);
+    expect(
+      isUserOrganizedItemPayload({ ...base, details: { servedOpportunityId: '' } }),
+    ).toBe(false);
+    expect(
+      isUserOrganizedItemPayload({ ...base, details: { servedOpportunityId: 'not-an-id' } }),
+    ).toBe(false);
+  });
+
   it('accepts a rejected-relation payload without an optional reason', () => {
     expect(
       isUserRejectedRelationPayload({

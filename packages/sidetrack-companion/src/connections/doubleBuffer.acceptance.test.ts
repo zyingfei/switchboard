@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { SqliteConnectionsStore } from './snapshot.js';
-import { readPointer, generationDbPath } from './generationBuffer.js';
+import { readPointer, generationDbPath, residentGenerations } from './generationBuffer.js';
 import {
   __resetResolverCacheDeferQueue,
   flushResolverCacheWrites,
@@ -109,6 +109,83 @@ describe('M4 double-buffer acceptance', () => {
     child.close();
     parent.close();
   });
+
+  // S1 — acceptance at the SERVED artifact. Graph-inert ticks may advance the
+  // materializer frontier, but they must not clone/checkpoint/pointer-publish a
+  // ~300 MB graph generation. A real same-sized row mutation must still publish
+  // exactly once; snapshotRevision alone is deliberately held constant here to
+  // prove the strong content signature, not the weak count hash, makes the call.
+  sqliteIt(
+    'unchanged ticks skip full publish; one real content delta publishes once and stays atomic',
+    async () => {
+      const writer = new SqliteConnectionsStore(vaultRoot!, { role: 'child-writer' });
+      const parent = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
+      const progressThrough = (end: number) => ({
+        ...EMPTY_PROGRESS('connections', 'connections@test'),
+        appliedDotIntervals: { replica: [[1, end] as const] },
+        appliedFrontier: { replica: end },
+        snapshotRevisionId: 'rev-stable',
+      });
+
+      await writer.writeSnapshotAndProgress(buildGraph(24, 'rev-stable'), progressThrough(1));
+      const firstGeneration = readPointer(connectionsDir());
+      expect(firstGeneration).not.toBeNull();
+      expect(residentGenerations(connectionsDir())).toEqual([firstGeneration]);
+      expect((await parent.readCurrent())?.nodes).toHaveLength(24);
+      const swapsAfterInitialPublish = writer.doubleBufferDiagnostics().swapCount;
+
+      // Four active-minute acknowledgements: same served graph, advancing
+      // canonical event frontier. They persist via the generation-bound
+      // checkpoint and leave POINTER + resident generation count untouched.
+      // The production engagement/content lane calls writeMaterializerProgress
+      // directly; exercise that exact hot path first.
+      await writer.writeMaterializerProgress(progressThrough(2));
+      // Repeated full-snapshot callers are gated too (defence in depth for a
+      // graph-inert event that reaches the general materializer seam).
+      for (let end = 3; end <= 5; end += 1) {
+        await writer.writeSnapshotAndProgress(buildGraph(24, 'rev-stable'), progressThrough(end));
+      }
+      expect(readPointer(connectionsDir())).toBe(firstGeneration);
+      expect(residentGenerations(connectionsDir())).toEqual([firstGeneration]);
+      expect(writer.doubleBufferDiagnostics()).toMatchObject({
+        swapCount: swapsAfterInitialPublish,
+        unchangedPublishSkipCount: 4,
+        progressCheckpointCount: 4,
+      });
+      expect(await writer.readMaterializerProgress('connections')).toMatchObject({
+        appliedFrontier: { replica: 5 },
+        snapshotRevisionId: 'rev-stable',
+      });
+      expect((await parent.readCurrent())?.nodes).toHaveLength(24);
+
+      // Same weak revision/counts/freshness, one changed served row. The strong
+      // signature must detect it and publish one new, fully-built generation.
+      const changedBase = buildGraph(24, 'rev-stable');
+      const changed: ConnectionsSnapshot = {
+        ...changedBase,
+        nodes: changedBase.nodes.map((entry) =>
+          entry.id === 'v0' ? { ...entry, label: 'v0 changed' } : entry,
+        ),
+      };
+      await writer.writeSnapshotAndProgress(changed, progressThrough(6));
+      const changedGeneration = readPointer(connectionsDir());
+      expect(changedGeneration).not.toBe(firstGeneration);
+      expect(writer.doubleBufferDiagnostics().swapCount).toBe(swapsAfterInitialPublish + 1);
+
+      // The parent's next request observes one complete generation: all rows
+      // plus the mutation, never a partial/torn SQLite copy.
+      const served = await parent.readCurrent();
+      expect(served?.nodes).toHaveLength(24);
+      expect(served?.edges).toHaveLength(23);
+      expect(served?.nodes.find((entry) => entry.id === 'v0')?.label).toBe('v0 changed');
+      expect(await parent.readMaterializerProgress('connections')).toMatchObject({
+        appliedFrontier: { replica: 6 },
+      });
+
+      writer.close();
+      parent.close();
+    },
+  );
 
   // Acceptance (a) — class elimination: a reader reads the published gen with
   // ms-scale latency WHILE a writer holds a long BEGIN IMMEDIATE on a SEPARATE

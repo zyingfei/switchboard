@@ -46,7 +46,8 @@ import { writeReliabilityArtifact } from '../system/reliabilityArtifact.js';
 import { writeAttributionV1Artifact } from '../attribution-v1/artifact.js';
 import { flushShadowBuffer } from '../attribution-v1/shadow.js';
 import { flushArmShadow } from '../attribution-v1/armShadow.js';
-import { anyLaneCounterNonZero } from '../system/health.js';
+import { deriveDataLossHealth } from '../system/health.js';
+import { createResourceReadinessWatchdog } from '../system/resourceReadinessWatchdog.js';
 import { getEventLaneHealth } from '../sync/eventLaneHealth.js';
 import { createKnownReplicasStore } from '../sync/knownReplicas.js';
 import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
@@ -67,6 +68,11 @@ import {
   createBackgroundEmbeddingLane,
   type BackgroundEmbeddingLaneHealth,
 } from '../page-evidence/backgroundEmbeddingLane.js';
+import {
+  createBodyEvidenceLane,
+  type BodyEvidenceLaneHealth,
+} from '../page-evidence/bodyEvidenceLane.js';
+import { PAGE_CONTENT_EXTRACTED } from '../page-content/types.js';
 import { buildDomainTombstoneSet } from '../privacy/domainTombstone.js';
 import { readDomainTombstones } from '../privacy/domainTombstoneStore.js';
 import {
@@ -361,6 +367,8 @@ export interface CompanionRuntime {
 export const startCompanion = async (
   options: CompanionRuntimeOptions,
 ): Promise<CompanionRuntime> => {
+  const bootStartedAtMs = Date.now();
+  const resourceReadinessWatchdog = createResourceReadinessWatchdog({ bootStartedAtMs });
   // Teardown stack: every side-effecting setup step (lock, intervals,
   // watcher, relay transport) registers a rollback here. If startup
   // throws partway through (most often `await startHttpServer`
@@ -404,6 +412,7 @@ export const startCompanion = async (
     // Sweep stale `.index.bin.<rev>.tmp` files from a prior crash.
     // Idempotent; runs every startup.
     await cleanupOrphanIndexTmpFiles(options.vaultPath);
+    resourceReadinessWatchdog.recordBootPhase('identity-lock');
     const vaultWriter = createVaultWriter(options.vaultPath);
     const pageEvidenceWriteQueue = createPageEvidenceWriteQueue(options.vaultPath);
     const idempotencyStore = createIdempotencyStore(options.vaultPath);
@@ -498,8 +507,10 @@ export const startCompanion = async (
       // abandoned shadow and nothing counted it: three ~323 MB orphans sat
       // resident while the storage surface reported 10.7 MB. Surveying here
       // makes collection publish-INDEPENDENT and, more importantly, makes the
-      // orphans VISIBLE — the survey always runs and always records its count;
-      // the sweep only deletes when SIDETRACK_GENERATION_GC_SWEEP is armed.
+      // orphans VISIBLE — the survey always runs and records its count. S2
+      // deliberately keeps this background call report-only: collection now
+      // requires a reviewed storage-retirement plan id plus durable S1 proof;
+      // the environment flag alone cannot delete a generation.
       // Hourly is the right cadence: an orphan costs disk, not correctness.
       try {
         const result = sweepOrphanGenerations(join(options.vaultPath, '_BAC', 'connections'));
@@ -636,6 +647,7 @@ export const startCompanion = async (
       eventLog: baseEventLog,
       projectionChanges,
     }).catch(() => undefined);
+    resourceReadinessWatchdog.recordBootPhase('core-projections');
 
     // Periodic anti-entropy. Walks the merged log every 30 min and
     // re-runs the projector for every aggregate's latest event. Repairs
@@ -807,6 +819,7 @@ export const startCompanion = async (
         embeddingCache: createEmbeddingCache(options.vaultPath),
       }),
     );
+    resourceReadinessWatchdog.recordBootPhase('recall-runtime');
     // ─── Collector framework (Stage 4) ──────────────────────────────
     // Wired BEFORE the HTTP server starts so the GET /v1/collectors and
     // POST /v1/collectors/{id}/replay routes have a live framework
@@ -960,6 +973,7 @@ export const startCompanion = async (
     } catch {
       collectorFramework = null;
     }
+    resourceReadinessWatchdog.recordBootPhase('collector-framework');
     // ────────────────────────────────────────────────────────────────
 
     // Embedder sidecar — owns ONNX + transformers.js in a child process
@@ -1020,22 +1034,76 @@ export const startCompanion = async (
         // verb + lifecycle stale-check rebuilds remain available.
       }
     })();
+    // R3 body-evidence materialization lane. Auto/attention capture writes a
+    // durable latest-wins body queue on the request path, then this bounded
+    // worker_thread lane builds raw/chunk artifacts and upgrades the
+    // page-evidence tier. The worker also performs served-store read-back and
+    // coverage accounting, so /status never scans/parses the corpus inline.
+    // Default ON in production, explicit kill-switch for diagnostics/tests.
+    const bodyEvidenceWorkerFlag = process.env['SIDETRACK_BODY_EVIDENCE_WORKER']
+      ?.trim()
+      .toLowerCase();
+    const bodyEvidenceLaneEnabled =
+      useChildProcesses &&
+      bodyEvidenceWorkerFlag !== '0' &&
+      bodyEvidenceWorkerFlag !== 'false' &&
+      bodyEvidenceWorkerFlag !== 'off';
+    let bodyEvidenceLaneHealth: (() => BodyEvidenceLaneHealth) | undefined;
+
+    // The tombstone snapshot protects both background lanes. The explicit
+    // tombstone route also removes queued bodies immediately; this startup
+    // snapshot is the recovery/backstop for work left by a prior process.
+    const pageEvidenceTombstoneSet =
+      bodyEvidenceLaneEnabled || process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'] !== '0'
+        ? buildDomainTombstoneSet(await readDomainTombstones(options.vaultPath).catch(() => []))
+        : buildDomainTombstoneSet([]);
+    if (bodyEvidenceLaneEnabled) {
+      const bodyEvidenceLane = createBodyEvidenceLane({
+        vaultRoot: options.vaultPath,
+        isBlocked: async (item) =>
+          buildDomainTombstoneSet(await readDomainTombstones(options.vaultPath)).matchesPage({
+            url: item.payload.url,
+            ...(item.payload.title === undefined ? {} : { title: item.payload.title }),
+          }),
+        onMaterialized: async (item) => {
+          // Notification is part of queue acknowledgment: if append/dispatch
+          // fails the durable item retries, while the materialization itself is
+          // idempotent. This keeps recall/materializers in sync with the body
+          // artifact instead of silently creating an unannounced side store.
+          await eventLog.appendServerObserved({
+            clientEventId: `body-evidence-materialized:${item.jobId}`,
+            aggregateId: `page-content:${item.canonicalUrl}`,
+            type: PAGE_CONTENT_EXTRACTED,
+            payload: { ...item.payload },
+          });
+        },
+        log: (event, fields) => process.stdout.write(`[${event}] ${JSON.stringify(fields)}\n`),
+      });
+      bodyEvidenceLaneHealth = bodyEvidenceLane.health;
+      bodyEvidenceLane.start();
+      teardown.push(() => bodyEvidenceLane.stop());
+    }
+
     // Off-main-loop page-evidence content embedding lane. Drains the
     // backlog of content-tier page-evidence records that have no doc
     // vector yet (the ~13.6%-coverage ceiling the audit flagged),
     // embedding them in bounded idle batches through the embedder CHILD
     // (the same setEmbedderOverride installed above) so the heavy
     // ONNX/CoreML work never lands on the API process. Gated by
-    // SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING (default OFF — the flag
-    // now drives THIS lane, not the retired setTimeout(0) request-path
-    // embed) AND by useChildProcesses (an in-process embedder would put
+    // SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING (default ON now that R3
+    // durably supplies bodies and all inference is child-owned; 0/false/off
+    // remains the kill-switch) AND by useChildProcesses (an in-process embedder would put
     // the exact main-loop CPU this lane exists to avoid right back on the
     // event loop). On each completed embed the lane requalifies the visit
     // so the next connections drain re-derives its similarity edges.
+    const backgroundEmbeddingFlag = process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING']
+      ?.trim()
+      .toLowerCase();
     const backgroundEmbeddingLaneEnabled =
-      (process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING'] === '1' ||
-        process.env['SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING']?.toLowerCase() === 'true') &&
-      useChildProcesses;
+      useChildProcesses &&
+      backgroundEmbeddingFlag !== '0' &&
+      backgroundEmbeddingFlag !== 'false' &&
+      backgroundEmbeddingFlag !== 'off';
     // Populated when the lane is enabled; surfaced on /v1/status so an
     // inert lane (the 90-min soak failure) is observable. Absent → the
     // lane is off and /status omits the field.
@@ -1046,9 +1114,6 @@ export const startCompanion = async (
       // a snapshot; a tombstone added mid-session takes effect on the next
       // restart — acceptable because the backlog is durable and the
       // record's content is already on disk regardless.
-      const tombstoneSet = buildDomainTombstoneSet(
-        await readDomainTombstones(options.vaultPath).catch(() => []),
-      );
       const embedOne = await embedBacklogCanonicalUrl(options.vaultPath);
       // Incremental, cursor-backed candidate discovery — reads+parses ONLY
       // the changed/new record files each cycle (mtime-bucketed delta),
@@ -1068,7 +1133,7 @@ export const startCompanion = async (
         // embedderClient is non-null here (the lane is gated on
         // useChildProcesses), but stay defensive.
         isEmbedderReady: () => embedderClient?.isReady() ?? false,
-        isTombstoned: (page) => tombstoneSet.matchesPage(page),
+        isTombstoned: (page) => pageEvidenceTombstoneSet.matchesPage(page),
         onEmbedded: (canonicalUrl) =>
           connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
         readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
@@ -1098,6 +1163,7 @@ export const startCompanion = async (
     teardown.push(() => {
       eventLoopMonitor.stop();
     });
+    resourceReadinessWatchdog.recordBootPhase('background-lanes');
 
     const getEmbedderStatus = (): {
       readonly state: 'disabled' | 'cold' | 'warming' | 'ready' | 'failed';
@@ -1188,13 +1254,20 @@ export const startCompanion = async (
         const store = await getCaughtUpSharedEventStore(options.vaultPath);
         if (store === null) return false;
         // dataLoss.clean, computed exactly as /v1/system/health does:
-        // every process-lifetime lane counter zero AND the store
-        // reconciliation delta zero. count()/watermark() are single
-        // indexed queries — never a JSONL scan.
-        const watermark = store.watermark();
-        const expectedFromWatermark = Object.values(watermark).reduce((sum, seq) => sum + seq, 0);
-        const reconciliationClean = expectedFromWatermark - store.count() === 0;
-        const dataLossClean = !anyLaneCounterNonZero(getEventLaneHealth()) && reconciliationClean;
+        // cumulative lane-counter evidence plus the current store
+        // reconciliation. A zero delta authoritatively recovers an earlier
+        // counter incident without erasing its evidence. count() /
+        // expectedRetainedCount() are indexed queries — never a JSONL scan.
+        const expectedFromWatermark = store.expectedRetainedCount();
+        const storeRowCount = store.count();
+        const dataLossClean = deriveDataLossHealth({
+          counters: getEventLaneHealth(),
+          reconciliation: {
+            storeRowCount,
+            expectedFromWatermark,
+            delta: expectedFromWatermark - storeRowCount,
+          },
+        }).clean;
         await writeSection15Artifact({
           vaultRoot: options.vaultPath,
           eventLog,
@@ -1275,6 +1348,7 @@ export const startCompanion = async (
     });
     const scheduleAttributionV1Artifact = attributionV1ArtifactScheduler.schedule;
     teardown.push(attributionV1ArtifactScheduler.teardown);
+    resourceReadinessWatchdog.recordBootPhase('health-artifacts');
     const server = createCompanionHttpServer({
       bridgeKey: ensured.key,
       // F02: classify MCP callers by this key so the auth gate can apply
@@ -1285,10 +1359,11 @@ export const startCompanion = async (
       serviceInstaller: pickInstaller(),
       idempotencyStore,
       allowAutoUpdate: options.allowAutoUpdate ?? false,
-      startedAt: new Date(),
+      startedAt: new Date(bootStartedAtMs),
       bucketRegistry: createBucketRegistry(options.vaultPath),
       getEventLoopSnapshot: eventLoopMonitor.snapshot,
       getEmbedderStatus,
+      getResourceReadinessWatchdogs: resourceReadinessWatchdog.snapshot,
       // Non-blocking event-store catch-up trigger for /v1/status (CLASS A).
       // /status kicks this in the background so the first poll after idle
       // never awaits the (up to ~47s on a large vault) JSONL catch-up inline,
@@ -1301,6 +1376,9 @@ export const startCompanion = async (
       ...(backgroundEmbeddingLaneHealth === undefined
         ? {}
         : { getBackgroundEmbeddingLaneHealth: backgroundEmbeddingLaneHealth }),
+      ...(bodyEvidenceLaneHealth === undefined
+        ? {}
+        : { getBodyEvidenceLaneHealth: bodyEvidenceLaneHealth }),
       ...(collectorFramework === null
         ? {}
         : {
@@ -1479,6 +1557,7 @@ export const startCompanion = async (
       },
     });
     const started: StartedHttpServer = await startHttpServer(server, options.port);
+    resourceReadinessWatchdog.markServing();
 
     // --- Resolve canary (system/resolveCanary.ts) ----------------------
     //

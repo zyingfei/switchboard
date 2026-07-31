@@ -692,3 +692,38 @@ only how many rows the drain thread reads to compute the same result.
 **Freeze-lift interaction.** None. Served output is byte-identical; this
 is a CPU/stability fix to the retrain-adjacent drain path, permitted by
 the maintenance-only clause and the write-path-vs-read-path boundary.
+
+## Amendment 2026-07-31 — R3 body-evidence feeder and child-owned vector production
+
+**Context.** Amendment 2026-07-12b correctly kept background embedding
+default-OFF while its only usable page-body producer could put unbounded
+ONNX/CoreML work on the API process. Moving embedding scheduling to the
+child-owned bounded lane removed that inference hazard, but did not close the
+supply gap: auto/attention capture still posted `features_only`, derived a
+feature record, and discarded the body. The embedding lane therefore had
+nothing to reconstruct for most of the 13.6%-coverage corpus.
+
+**Decision.** R3 adds a separate durable body-evidence feeder. HTTP admission
+performs one bounded atomic write of a minimized, redacted, injection-scrubbed
+body; a `worker_thread` builds page-content chunks and upgrades page evidence
+off the serving thread; the existing embedder child remains the only vector
+producer. Both infrastructure lanes now default ON only when child-process
+mode is active. Either can be disabled independently with
+`SIDETRACK_BODY_EVIDENCE_WORKER=0|false|off` or
+`SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING=0|false|off`; neither falls back
+to inference on the API loop.
+
+The change produces evidence but does not alter serving math, candidate
+preference, edge weights, thresholds, or the still-OFF
+`SIDETRACK_SIMILARITY_CONTENT_CORPUS` flag. It is therefore within the
+write-path/data-production side of this ADR's freeze boundary. The feeder is
+bounded to four items per cycle, the vector scheduler to eight candidate
+visits, both have failure cooldown/retry recovery, and status reads cached
+health rather than scanning the corpus. Deterministic read-back acceptance
+tests demonstrate four of five eligible records reaching both body and vector
+coverage `0.8`; the production CPU/quality soak remains an operational
+acceptance gate, not a serving-math authorization.
+
+**Supersession.** This amendment supersedes only the earlier operational
+default for `SIDETRACK_PAGE_EVIDENCE_BACKGROUND_EMBEDDING`. It does not
+supersede the prior evidence verdicts for recall or similarity serving flags.

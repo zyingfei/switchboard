@@ -21,8 +21,17 @@ import { join } from 'node:path';
 
 import { isAllowed, readTrust, type WorkstreamWriteTool } from '../auth/workstreamTrust.js';
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
-import { USER_ENGAGEMENT_RELABELED, USER_FLOW_CONFIRMED, USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, USER_REJECTED_RELATION, USER_SNIPPET_PROMOTED, USER_TOPIC_RENAMED } from '../feedback/events.js';
+import {
+  USER_ENGAGEMENT_RELABELED,
+  USER_FLOW_CONFIRMED,
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  USER_REJECTED_RELATION,
+  USER_SNIPPET_PROMOTED,
+  USER_TOPIC_RENAMED,
+} from '../feedback/events.js';
 import type { InstallOptions, Installer } from '../install/index.js';
+import type { BodyEvidenceLaneHealth } from '../page-evidence/bodyEvidenceLane.js';
 import { buildDomainTombstoneSet, type DomainTombstoneSet } from '../privacy/domainTombstone.js';
 import { readDomainTombstones } from '../privacy/domainTombstoneStore.js';
 import type { RecallActivityTracker } from '../recall/activity.js';
@@ -34,9 +43,17 @@ import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 import type { UpdateAdvisory } from '../system/versionCheck.js';
+import type { ResourceReadinessWatchdogs } from '../system/resourceReadinessWatchdog.js';
 import type { ConnectionsDiagnosticSnapshot } from '../system/workGraphHealth.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from '../tabsession/policy.js';
-import { createEmptyUrlProjectionAccumulator, deserializeUrlProjection, foldEventIntoUrlProjectionAccumulator, projectUrls, type UrlProjection, urlProjectionFromAccumulator } from '../urls/projection.js';
+import {
+  createEmptyUrlProjectionAccumulator,
+  deserializeUrlProjection,
+  foldEventIntoUrlProjectionAccumulator,
+  projectUrls,
+  type UrlProjection,
+  urlProjectionFromAccumulator,
+} from '../urls/projection.js';
 import { currentAuditContext as currentAuditContextMut } from '../vault/auditContext.js';
 import type { VaultChangeEvent } from '../vault/watcher.js';
 import { createVaultWriter, type VaultWriter } from '../vault/writer.js';
@@ -86,6 +103,10 @@ export interface CompanionHttpConfig {
   // surface surfaces a silently-dead ranker refresh / MCP child.
   readonly rankerHealth?: () => import('../system/health.js').RankerRefreshHealth;
   readonly mcpChildHealth?: () => import('../system/health.js').McpChildHealth;
+  // P1 resource/readiness budgets. Runtime-owned, synchronous O(1) getter:
+  // samples process RSS and reads the already-recorded boot phase timings.
+  // It must never start work, scan the vault, or await I/O on the health path.
+  readonly getResourceReadinessWatchdogs?: () => ResourceReadinessWatchdogs;
   readonly sync?: {
     readonly relay?: {
       readonly mode: 'local' | 'remote';
@@ -262,9 +283,10 @@ export interface CompanionHttpConfig {
   // full) is visible in minutes, not hours. Synchronous + side-effect-
   // free (reads in-memory counters). Absent when the lane is disabled →
   // /status omits the field.
-  readonly getBackgroundEmbeddingLaneHealth?: () => import(
-    '../page-evidence/backgroundEmbeddingLane.js'
-  ).BackgroundEmbeddingLaneHealth;
+  readonly getBackgroundEmbeddingLaneHealth?: () => import('../page-evidence/backgroundEmbeddingLane.js').BackgroundEmbeddingLaneHealth;
+  // R3 durable body-evidence queue + off-serving worker health. Synchronous
+  // cached counters only: /status must never scan the queue/corpus itself.
+  readonly getBodyEvidenceLaneHealth?: () => BodyEvidenceLaneHealth;
   // Bounded event-store catch-up trigger. Wired by the runtime to
   // getCaughtUpSharedEventStore(vaultRoot). /v1/status kicks this in the
   // BACKGROUND (single-flight) and returns immediately with `catchingUp: true`
@@ -468,7 +490,10 @@ export const domainTombstoneSetFor = async (
   domainTombstoneInFlight = (async (): Promise<DomainTombstoneSet> => {
     try {
       const set = buildDomainTombstoneSet(await readDomainTombstones(vaultRoot));
-      cachedDomainTombstoneSet = { value: set, expiresAtMs: Date.now() + DOMAIN_TOMBSTONE_CACHE_TTL_MS };
+      cachedDomainTombstoneSet = {
+        value: set,
+        expiresAtMs: Date.now() + DOMAIN_TOMBSTONE_CACHE_TTL_MS,
+      };
       return set;
     } catch {
       // Fail toward "nothing hidden" on a read error — the tombstone is
@@ -1043,7 +1068,10 @@ export const isFeedbackEventType = (
   value === USER_SNIPPET_PROMOTED ||
   value === USER_REJECTED_RELATION;
 
-export const aggregateIdForFeedbackEvent = (type: string, payload: Record<string, unknown>): string => {
+export const aggregateIdForFeedbackEvent = (
+  type: string,
+  payload: Record<string, unknown>,
+): string => {
   if (type === USER_ORGANIZED_ITEM) {
     return `feedback:${String(payload['itemKind'])}:${String(payload['itemId'])}`;
   }

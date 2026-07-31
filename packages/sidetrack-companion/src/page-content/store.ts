@@ -307,7 +307,9 @@ export const readPageContentCoverageMap = async (
 export const writePageContentExtracted = async (
   vaultRoot: string,
   payload: PageContentExtractedPayload,
+  options: { readonly rebuildManifestsAfterWrite?: boolean } = {},
 ): Promise<PageContentCoverage> => {
+  const rebuildAfterWrite = options.rebuildManifestsAfterWrite ?? true;
   const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
   recordCanonicalCollision(payload.url, canonicalUrl);
   const contentHash = payload.content.contentHash || sha256Hex(payload.content.text);
@@ -329,7 +331,7 @@ export const writePageContentExtracted = async (
       updatedAt: payload.extractedAt,
       sourceEventType: PAGE_CONTENT_EXTRACTED,
     } satisfies PageContentRecord);
-    await rebuildManifests(vaultRoot);
+    if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
     invalidatePageContentLexicalIndex(vaultRoot);
     return coverage;
   }
@@ -377,9 +379,19 @@ export const writePageContentExtracted = async (
     sourceEventType: PAGE_CONTENT_EXTRACTED,
   } satisfies PageContentRecord);
   await atomicWriteJson(join(chunksDir(vaultRoot), `${contentHash}.json`), { version: 1, chunks });
-  await rebuildManifests(vaultRoot);
+  if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
   invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
+};
+
+/**
+ * Batch seam for off-serving body materialization. The worker writes a bounded
+ * group with `rebuildManifestsAfterWrite:false`, then rebuilds once after the
+ * group rather than performing an O(records) scan for every page.
+ */
+export const rebuildPageContentManifests = async (vaultRoot: string): Promise<void> => {
+  await rebuildManifests(vaultRoot);
+  invalidatePageContentLexicalIndex(vaultRoot);
 };
 
 export const writePageContentTombstoned = async (
@@ -474,7 +486,9 @@ export const readPageContentChunksForCanonicalUrls = async (
   rawCanonicalUrls: readonly string[],
 ): Promise<ReadonlyMap<string, readonly PageContentChunk[]>> => {
   const out = new Map<string, readonly PageContentChunk[]>();
-  const uniqueCanonicalUrls = [...new Set(rawCanonicalUrls.map(canonicalizePageUrlAndRecord))].sort();
+  const uniqueCanonicalUrls = [
+    ...new Set(rawCanonicalUrls.map(canonicalizePageUrlAndRecord)),
+  ].sort();
   for (const canonicalUrl of uniqueCanonicalUrls) {
     const record = safeRecordFromUnknown(
       await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),

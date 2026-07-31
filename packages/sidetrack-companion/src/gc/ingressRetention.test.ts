@@ -3,18 +3,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { INGRESS_RETAIN_DAYS_DEFAULT, ingressRetainDays, planIngressRetention } from './ingressRetention.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import {
+  INGRESS_RETAIN_DAYS_DEFAULT,
+  ingressRetainDays,
+  planIngressRetention,
+} from './ingressRetention.js';
 
-// The interesting assertion here is a REFUSAL. The brief asked for age-based
-// retention on `_BAC/events/` gated on a proof that a day was fully ingested.
-// That proof does not exist anywhere on disk (no bookmark, no per-file offset;
-// `recall/ingest-state.json` is a version vector over the CANONICAL log and
-// says nothing about this spool; idempotency receipts expire in an hour). So
-// the planner reports the opportunity and vouches for NOTHING — and these tests
-// pin that, so a future change that starts deleting has to change a test that
-// explains why deleting was unsafe.
+// S2 uses canonical JSONL read-back as the proof. No append result or expiring
+// idempotency receipt is trusted: every spool record must have an identical,
+// structurally-valid capture.recorded payload on disk.
 
-describe('planIngressRetention (report-only)', () => {
+describe('planIngressRetention (canonical read-back proof)', () => {
   let vaultRoot: string;
   let spool: string;
 
@@ -30,23 +30,68 @@ describe('planIngressRetention (report-only)', () => {
     delete process.env['SIDETRACK_INGRESS_RETAIN_DAYS'];
   });
 
-  const day = async (date: string, bytes: number): Promise<void> => {
-    // One JSON line padded to the requested size, so line counts are meaningful.
-    const line = JSON.stringify({ bac_id: `b-${date}`, pad: 'x'.repeat(Math.max(0, bytes - 40)) });
-    await writeFile(join(spool, `${date}.jsonl`), `${line}\n`, 'utf8');
+  const capture = (date: string) => ({
+    bac_id: `b-${date}`,
+    revision: `r-${date}`,
+    requestId: `req-${date}`,
+    receivedAt: `${date}T12:00:01.000Z`,
+    threadUrl: `https://example.test/${date}`,
+    provider: 'test',
+    title: `Thread ${date}`,
+    capturedAt: `${date}T12:00:00.000Z`,
+    turns: [
+      {
+        ordinal: 1,
+        role: 'user',
+        text: `hello ${date}`,
+        capturedAt: `${date}T12:00:00.000Z`,
+      },
+    ],
+  });
+
+  const day = async (date: string): Promise<ReturnType<typeof capture>> => {
+    const row = capture(date);
+    await writeFile(join(spool, `${date}.jsonl`), `${JSON.stringify(row)}\n`, 'utf8');
+    return row;
+  };
+
+  const mirror = async (rows: readonly ReturnType<typeof capture>[]): Promise<void> => {
+    const logDir = join(vaultRoot, '_BAC', 'log', 'replica-a');
+    await mkdir(logDir, { recursive: true });
+    const events: AcceptedEvent[] = rows.map((row, index) => ({
+      clientEventId: `client-${String(index + 1)}`,
+      dot: { replicaId: 'replica-a', seq: index + 1 },
+      deps: index === 0 ? {} : { 'replica-a': index },
+      aggregateId: row.bac_id,
+      type: 'capture.recorded',
+      payload: {
+        bac_id: row.bac_id,
+        threadUrl: row.threadUrl,
+        provider: row.provider,
+        title: row.title,
+        capturedAt: row.capturedAt,
+        turns: row.turns,
+      },
+      acceptedAtMs: Date.parse(row.capturedAt),
+    }));
+    await writeFile(
+      join(logDir, '2026-01-01.jsonl'),
+      `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
+      'utf8',
+    );
   };
 
   it('classifies days past the retention window but reclaims nothing without proof', async () => {
-    await day('2026-05-01', 200);
-    await day('2026-07-20', 300);
-    await day('2026-07-28', 400);
+    await day('2026-05-01');
+    await day('2026-07-20');
+    await day('2026-07-28');
 
     const plan = await planIngressRetention(vaultRoot, {
       now: new Date('2026-07-29T12:00:00Z'),
       retainDays: 14,
     });
 
-    expect(plan.reportOnly).toBe(true);
+    expect(plan.reportOnly).toBe(false);
     expect(plan.cutoffDate).toBe('2026-07-15');
     expect(plan.days.map((entry) => entry.date)).toEqual([
       '2026-05-01',
@@ -64,31 +109,27 @@ describe('planIngressRetention (report-only)', () => {
     // can see exactly what a bookmark record would unlock.
     expect(plan.pastRetentionBytes).toBeGreaterThan(0);
     expect(plan.reclaimableBytes).toBe(0);
-    expect(plan.blockedBy?.missingArtifact).toContain('.bookmark.json');
+    expect(plan.blockedBy?.missingArtifact).toContain('_BAC/log');
   });
 
-  it('reports refuted (not absent) once a bookmark artifact exists', async () => {
-    await day('2026-05-01', 200);
-    // A collector-shaped bookmark exists but per-day verification against it is
-    // deliberately not implemented, so the planner says "proof found, comparison
-    // outstanding" rather than silently vouching for a deletion.
-    await writeFile(
-      join(spool, '.bookmark.json'),
-      JSON.stringify({ filename: '2026-05-01.jsonl', byte_offset: 10 }),
-      'utf8',
-    );
+  it('verifies only a fully mirrored day and refutes a missing canonical record', async () => {
+    const mirrored = await day('2026-05-01');
+    await day('2026-05-02');
+    await mirror([mirrored]);
 
     const plan = await planIngressRetention(vaultRoot, {
       now: new Date('2026-07-29T12:00:00Z'),
       retainDays: 14,
     });
-    expect(plan.days[0]?.proof).toBe('refuted');
-    expect(plan.days[0]?.reclaimable).toBe(0);
+    expect(plan.days[0]?.proof).toBe('verified');
+    expect(plan.days[0]?.reclaimable).toBeGreaterThan(0);
+    expect(plan.days[1]?.proof).toBe('refuted');
+    expect(plan.days[1]?.reclaimable).toBe(0);
     expect(plan.blockedBy).toBeNull();
   });
 
   it('counts lines, ignores non-spool filenames, and honours the env knob', async () => {
-    await day('2026-05-01', 200);
+    await day('2026-05-01');
     await writeFile(join(spool, 'notes.txt'), 'ignore me', 'utf8');
     // The name filter matches the SHAPE `YYYY-MM-DD.jsonl`, not a calendar
     // date — same as plan.ts's SNAPSHOT_DATE_NAME_RE. A shape-valid but

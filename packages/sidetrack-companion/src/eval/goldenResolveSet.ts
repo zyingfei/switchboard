@@ -274,11 +274,17 @@ export const formatGoldenReport = (result: GoldenRunResult): string => {
   const live = result.livePrequential;
   if (live === null || live.status !== 'ok') {
     lines.push('    unavailable (measurement off, or no predictions recorded yet)');
-  } else if (live.lanes.length === 0) {
+  } else {
+    lines.push(
+      `    delivery rows=${String(live.rawPredictionRows)} · opportunities=${String(live.eligibleOpportunities)}` +
+        ` · outcome join=${String(live.outcomesJoined)}/${String(live.outcomesObserved)}`,
+    );
+  }
+  if (live !== null && live.status === 'ok' && live.lanes.length === 0) {
     lines.push(
       `    no scored predictions yet · ${String(live.unscored)} awaiting a filing to score against`,
     );
-  } else {
+  } else if (live !== null && live.status === 'ok') {
     for (const lane of live.lanes) {
       lines.push(
         `    ${lane.lane.padEnd(14)} n=${String(lane.n).padStart(4)}  p=${pct(lane.precision)}`,

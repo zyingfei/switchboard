@@ -19,6 +19,7 @@ describe('computeEngagementLaneHealth', () => {
       nowMs: now,
     });
     expect(health.aggregateStalled).toBe(false);
+    expect(health.intervalFlowState).toBe('flowing');
     expect(health.aggregateLagMs).toBe(5 * 60_000 - 30_000);
   });
 
@@ -56,6 +57,7 @@ describe('computeEngagementLaneHealth', () => {
       nowMs: now,
     });
     expect(health.aggregateStalled).toBe(false);
+    expect(health.intervalFlowState).toBe('idle');
   });
 
   it('does NOT flag when there is no engagement data at all', () => {
@@ -65,7 +67,8 @@ describe('computeEngagementLaneHealth', () => {
       sessionAggregateLastSeenMs: 0,
       nowMs: now,
     });
-    expect(health.aggregateStalled).toBe(false);
+    expect(health.aggregateStalled).toBeNull();
+    expect(health.intervalFlowState).toBe('unknown');
     expect(health.aggregateLagMs).toBe(0);
   });
 
@@ -102,12 +105,25 @@ describe('computeEngagementLaneHealth', () => {
     expect(stale.aggregateStalled).toBe(false);
   });
 
-  it('emptyEngagementLaneHealth is an all-zero, not-stalled sentinel', () => {
+  it('reports compacted-only interval evidence as unknown, not falsely idle', () => {
+    const now = 100 * DAY;
+    const health = computeEngagementLaneHealth({
+      intervalObservedLastSeenMs: now - 7 * DAY,
+      sessionAggregateLastSeenMs: now - 8 * DAY,
+      intervalEvidence: 'compacted-only',
+      nowMs: now,
+    });
+    expect(health.intervalFlowState).toBe('unknown');
+    expect(health.aggregateStalled).toBeNull();
+  });
+
+  it('emptyEngagementLaneHealth is an all-zero, unknown sentinel', () => {
     expect(emptyEngagementLaneHealth()).toEqual({
       intervalObservedLastSeenMs: 0,
       sessionAggregateLastSeenMs: 0,
       aggregateLagMs: 0,
-      aggregateStalled: false,
+      intervalFlowState: 'unknown',
+      aggregateStalled: null,
     });
   });
 });

@@ -727,6 +727,7 @@ describe('live side-panel App wiring', () => {
     const urlSuggestion = {
       canonicalUrl: 'https://example.test/research',
       dryRun: true,
+      servedOpportunityId: 'laneopp_0123456789abcdef0123456789abcdef',
       decision: {
         action: 'suggest',
         workstreamId: 'bac_workstream_sibling',
@@ -837,7 +838,10 @@ describe('live side-panel App wiring', () => {
         `http://127.0.0.1:17373/v1/visits/${encodeURIComponent('https://example.test/research')}/attribute`,
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ workstreamId: 'bac_workstream_sibling' }),
+          body: JSON.stringify({
+            workstreamId: 'bac_workstream_sibling',
+            servedOpportunityId: 'laneopp_0123456789abcdef0123456789abcdef',
+          }),
         }),
       );
     });

@@ -86,4 +86,20 @@ describe('embedding cache', () => {
     expect(got).not.toBeNull();
     expect(got![0]).toBe(42);
   });
+
+  it('serializes concurrent writers without losing either batch', async () => {
+    const first = createEmbeddingCache(vault, 384, { lockRetryMs: 1 });
+    const second = createEmbeddingCache(vault, 384, { lockRetryMs: 1 });
+    await first.put({ modelId: 'A', modelRevision: 'r1', embedTextHash: 'seed' }, makeVector(0));
+    await Promise.all([
+      first.put({ modelId: 'A', modelRevision: 'r1', embedTextHash: 'left' }, makeVector(1)),
+      second.put({ modelId: 'A', modelRevision: 'r1', embedTextHash: 'right' }, makeVector(2)),
+    ]);
+    const hits = await first.getMany({ modelId: 'A', modelRevision: 'r1' }, [
+      'seed',
+      'left',
+      'right',
+    ]);
+    expect([...hits.keys()].sort()).toEqual(['left', 'right', 'seed']);
+  });
 });

@@ -5,14 +5,50 @@
 // refactor; order within this array is dispatch order and is pinned by
 // routeTable.characterization.test.ts.
 
-import { readPageContentCoverage, readPageContentExtractedPayloadForEvidence, writePageContentExtracted, writePageContentTombstoned } from '../../page-content/store.js';
-import { PAGE_CONTENT_EXTRACTED, PAGE_CONTENT_TOMBSTONED, type PageContentExtractedPayload, type PageContentTombstonedPayload } from '../../page-content/types.js';
+import {
+  readPageContentCoverage,
+  readPageContentExtractedPayloadForEvidence,
+  writePageContentExtracted,
+  writePageContentTombstoned,
+} from '../../page-content/store.js';
+import {
+  PAGE_CONTENT_EXTRACTED,
+  PAGE_CONTENT_TOMBSTONED,
+  type PageContentExtractedPayload,
+  type PageContentTombstonedPayload,
+} from '../../page-content/types.js';
 import { PAGE_EVIDENCE_EXTRACTED } from '../../page-evidence/events.js';
-import { readPageEvidence, writeExtractedPageEvidence, writeExtractedPageEvidenceFast } from '../../page-evidence/store.js';
-import type { PageEvidenceExtractedEventPayload, PageEvidenceExtractedRequest, PageEvidenceRecord } from '../../page-evidence/types.js';
-import { pageContentCoverageQuerySchema, pageContentExtractedSchema, pageContentTombstonedSchema, pageEvidenceExtractedSchema } from '../schemas.js';
+import {
+  discardQueuedBodyEvidenceUnderLock,
+  enqueueBodyEvidence,
+  scrubBodyEvidencePayload,
+  withBodyEvidenceUrlLock,
+} from '../../page-evidence/bodyEvidenceQueue.js';
+import {
+  readPageEvidence,
+  writeExtractedPageEvidence,
+  writeExtractedPageEvidenceFast,
+} from '../../page-evidence/store.js';
+import type {
+  PageEvidenceExtractedEventPayload,
+  PageEvidenceExtractedRequest,
+  PageEvidenceRecord,
+} from '../../page-evidence/types.js';
+import {
+  pageContentCoverageQuerySchema,
+  pageContentExtractedSchema,
+  pageContentTombstonedSchema,
+  pageEvidenceExtractedSchema,
+} from '../schemas.js';
 
-import { HttpRouteError, objectRecord, readBody, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
+import {
+  HttpRouteError,
+  objectRecord,
+  readBody,
+  requireIdempotencyKey,
+  requireVaultRoot,
+  runIdempotent,
+} from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 const compactPageContentExtractedPayload = (
@@ -271,20 +307,56 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         pageEvidenceExtractedSchema.parse(await readBody(request)),
       );
       return await runIdempotent(context, 'pageEvidenceExtracted', idempotencyKey, async () => {
-        const pageContentPayload = compactPageContentExtractedPayload(payload);
-        const coverage =
-          payload.storageMode === 'indexed_chunks'
-            ? await writePageContentExtracted(vaultRoot, pageContentPayload)
-            : null;
+        const capturedPageContentPayload = compactPageContentExtractedPayload(payload);
+        // Features-only auto capture becomes durable background work, so scrub
+        // and minimize before either the queue OR feature record persists it.
+        // Indexed/manual capture preserves its existing local-vault behavior.
+        const pageContentPayload =
+          payload.storageMode === 'features_only'
+            ? scrubBodyEvidencePayload(capturedPageContentPayload).payload
+            : capturedPageContentPayload;
+        const evidencePayload: PageEvidenceExtractedRequest = {
+          ...pageContentPayload,
+          storageMode: payload.storageMode,
+        };
         // Skip both the O(records) manifest rebuild and doc embedding
         // on the request path. The per-URL features record is written
         // immediately so /v1/page-evidence/summary can resolve on the
         // next badge poll. Doc embedding is intentionally not run on
-        // the default API process; it is still main-loop CPU until the
-        // dedicated worker lane lands.
-        const evidence = await writeExtractedPageEvidenceFast(vaultRoot, payload, {
-          rebuildManifestAfterWrite: false,
-        });
+        // the default API process; the embedder child owns that CPU.
+        const { coverage, evidence, bodyEvidenceQueue } = await (async () => {
+          if (payload.storageMode === 'features_only') {
+            // Persist the fast feature record BEFORE making the body job visible.
+            // Once the queue entry exists, a worker may immediately upgrade this
+            // same record; writing features afterward could downgrade a completed
+            // worker result back to features-only and strand the vector lane.
+            const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
+              rebuildManifestAfterWrite: false,
+            });
+            // Auto/attention capture intentionally posts `features_only` so the
+            // request path stays fast. Preserve its body in a bounded, durable,
+            // latest-wins queue before returning. Admission is one atomic file
+            // write; no chunking, corpus scan, or embedding runs here.
+            const bodyEvidenceQueue = await enqueueBodyEvidence(vaultRoot, pageContentPayload);
+            return { coverage: null, evidence, bodyEvidenceQueue };
+          }
+          // A manual indexed capture supersedes any older automatic body job.
+          // Queue removal + both served-store writes share the worker's
+          // per-URL lock, so an in-flight stale worker is ordered wholly before
+          // or after this newer capture and can never overwrite it afterward.
+          return await withBodyEvidenceUrlLock(
+            vaultRoot,
+            pageContentPayload.canonicalUrl,
+            async () => {
+              await discardQueuedBodyEvidenceUnderLock(vaultRoot, pageContentPayload.canonicalUrl);
+              const coverage = await writePageContentExtracted(vaultRoot, pageContentPayload);
+              const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
+                rebuildManifestAfterWrite: false,
+              });
+              return { coverage, evidence, bodyEvidenceQueue: null };
+            },
+          );
+        })();
         // Doc embedding is NOT run on the request path. The record is
         // written content-tier with embeddingState:'missing'; the
         // off-main-loop background-embedding lane (page-evidence/
@@ -307,10 +379,19 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
             clientEventId: `${idempotencyKey}:page-evidence`,
             aggregateId: `page-evidence:${evidence.canonicalUrl}`,
             type: PAGE_EVIDENCE_EXTRACTED,
-            payload: { ...pageEvidenceExtractedEventPayload(evidence, payload) },
+            payload: { ...pageEvidenceExtractedEventPayload(evidence, evidencePayload) },
           });
         }
-        return [202, { data: { evidence, ...(coverage === null ? {} : { coverage }) } }];
+        return [
+          202,
+          {
+            data: {
+              evidence,
+              ...(coverage === null ? {} : { coverage }),
+              ...(bodyEvidenceQueue === null ? {} : { bodyEvidenceQueue }),
+            },
+          },
+        ];
       });
     },
   },
@@ -325,7 +406,16 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         pageContentTombstonedSchema.parse(await readBody(request)),
       );
       return await runIdempotent(context, 'pageContentTombstone', idempotencyKey, async () => {
-        const coverage = await writePageContentTombstoned(vaultRoot, payload);
+        const coverage = await withBodyEvidenceUrlLock(
+          vaultRoot,
+          payload.canonicalUrl,
+          async () => {
+            // Remove pending/dead-letter work before publishing the tombstone
+            // while holding the same lock the worker checks before writing.
+            await discardQueuedBodyEvidenceUnderLock(vaultRoot, payload.canonicalUrl);
+            return await writePageContentTombstoned(vaultRoot, payload);
+          },
+        );
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({
             clientEventId: idempotencyKey,
@@ -360,12 +450,18 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
           'POST /v1/page-content/recanonicalize requires a canonicalUrl string body.',
         );
       }
-      const coverage = await writePageContentTombstoned(vaultRoot, {
-        payloadVersion: 1,
-        canonicalUrl,
-        tombstonedAt: new Date().toISOString(),
-        reason: 'user-delete',
-        dimensions: { source: 'recanonicalize' },
+      const coverage = await withBodyEvidenceUrlLock(vaultRoot, canonicalUrl, async () => {
+        // Privacy/delete wins over queued background work. Queue removal and
+        // the tombstone write are one per-URL critical section shared with the
+        // worker's pre-write identity check.
+        await discardQueuedBodyEvidenceUnderLock(vaultRoot, canonicalUrl);
+        return await writePageContentTombstoned(vaultRoot, {
+          payloadVersion: 1,
+          canonicalUrl,
+          tombstonedAt: new Date().toISOString(),
+          reason: 'user-delete',
+          dimensions: { source: 'recanonicalize' },
+        });
       });
       return [200, { data: { tombstoned: true, canonicalUrl: coverage.canonicalUrl } }];
     },

@@ -3,7 +3,7 @@ import { dirname, join } from 'node:path';
 
 import HnswLib from 'hnswlib-node';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const INITIAL_MAX_ELEMENTS = 4096;
 const HNSW_M = 16;
 const HNSW_EF_CONSTRUCTION = 200;
@@ -11,13 +11,24 @@ const HNSW_EF_SEARCH = 64;
 const HNSW_RANDOM_SEED = 100;
 
 export interface UnloadedSimilarityHnswStore {
-  ensureLoaded(vaultRoot: string, dimension: number): Promise<LoadedSimilarityHnswStore>;
+  ensureLoaded(
+    vaultRoot: string,
+    identity: number | SimilarityVectorIdentity,
+  ): Promise<LoadedSimilarityHnswStore>;
+}
+
+export interface SimilarityVectorIdentity {
+  readonly dimension: number;
+  readonly modelId: string;
+  readonly modelRevision: string;
+  readonly vectorCorpusRevision: string;
 }
 
 export interface LoadedSimilarityHnswStore {
   elementCount(): number;
   knownLabels(): Promise<ReadonlySet<string>>;
   recoveredFromCorruption(): boolean;
+  vectorIdentity?(): SimilarityVectorIdentity;
   insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void>;
   delete(visitId: string): Promise<void>;
   embedding(visitId: string): Promise<readonly number[] | null>;
@@ -32,6 +43,9 @@ export interface LoadedSimilarityHnswStore {
 interface SimilarityHnswSidecar {
   readonly schemaVersion: number;
   readonly dimension: number;
+  readonly modelId?: string;
+  readonly modelRevision?: string;
+  readonly vectorCorpusRevision?: string;
   readonly elementCount: number;
   readonly visitIdToLabel: Record<string, number>;
   readonly labelToVisitId: Record<string, string>;
@@ -43,6 +57,7 @@ interface LoadedState {
   readonly pointerPath: string;
   readonly index: HnswLib.HierarchicalNSW;
   dimension: number;
+  readonly vectorIdentity: SimilarityVectorIdentity;
   maxElements: number;
   elementCount: number;
   version: number;
@@ -98,7 +113,10 @@ const parseSidecar = (raw: string): SimilarityHnswSidecar => {
   const elementCount = value['elementCount'];
   const visitIdToLabel = value['visitIdToLabel'];
   const labelToVisitId = value['labelToVisitId'];
-  if (schemaVersion !== SCHEMA_VERSION) {
+  const modelId = value['modelId'];
+  const modelRevision = value['modelRevision'];
+  const vectorCorpusRevision = value['vectorCorpusRevision'];
+  if (schemaVersion !== 1 && schemaVersion !== SCHEMA_VERSION) {
     throw new Error(`unsupported HNSW sidecar schemaVersion: ${String(schemaVersion)}`);
   }
   if (
@@ -117,10 +135,26 @@ const parseSidecar = (raw: string): SimilarityHnswSidecar => {
   ) {
     throw new Error('invalid HNSW sidecar shape');
   }
+  if (
+    schemaVersion === SCHEMA_VERSION &&
+    (typeof modelId !== 'string' ||
+      modelId.length === 0 ||
+      typeof modelRevision !== 'string' ||
+      modelRevision.length === 0 ||
+      typeof vectorCorpusRevision !== 'string' ||
+      vectorCorpusRevision.length === 0)
+  ) {
+    throw new Error('invalid HNSW sidecar vector identity');
+  }
   const visitLabels = visitIdToLabel as Record<string, unknown>;
   const labelVisits = labelToVisitId as Record<string, unknown>;
   for (const [visitId, label] of Object.entries(visitLabels)) {
-    if (visitId.length === 0 || typeof label !== 'number' || !Number.isInteger(label) || label < 0) {
+    if (
+      visitId.length === 0 ||
+      typeof label !== 'number' ||
+      !Number.isInteger(label) ||
+      label < 0
+    ) {
       throw new Error('invalid HNSW sidecar visitIdToLabel entry');
     }
   }
@@ -137,6 +171,9 @@ const parseSidecar = (raw: string): SimilarityHnswSidecar => {
   return {
     schemaVersion,
     dimension,
+    ...(typeof modelId === 'string' ? { modelId } : {}),
+    ...(typeof modelRevision === 'string' ? { modelRevision } : {}),
+    ...(typeof vectorCorpusRevision === 'string' ? { vectorCorpusRevision } : {}),
     elementCount,
     visitIdToLabel: visitLabels as Record<string, number>,
     labelToVisitId: labelVisits as Record<string, string>,
@@ -146,8 +183,13 @@ const parseSidecar = (raw: string): SimilarityHnswSidecar => {
 const sidecarFor = (state: LoadedState): SimilarityHnswSidecar => ({
   schemaVersion: SCHEMA_VERSION,
   dimension: state.dimension,
+  modelId: state.vectorIdentity.modelId,
+  modelRevision: state.vectorIdentity.modelRevision,
+  vectorCorpusRevision: state.vectorIdentity.vectorCorpusRevision,
   elementCount: state.elementCount,
-  visitIdToLabel: Object.fromEntries([...state.visitIdToLabel.entries()].sort(([a], [b]) => a.localeCompare(b))),
+  visitIdToLabel: Object.fromEntries(
+    [...state.visitIdToLabel.entries()].sort(([a], [b]) => a.localeCompare(b)),
+  ),
   labelToVisitId: Object.fromEntries(
     [...state.labelToVisitId.entries()]
       .sort(([a], [b]) => a - b)
@@ -191,6 +233,36 @@ const assertEmbedding = (embedding: readonly number[], dimension: number): void 
   }
 };
 
+const testVectorIdentity = (dimension: number): SimilarityVectorIdentity => ({
+  dimension,
+  modelId: 'test-model',
+  modelRevision: 'test-revision',
+  vectorCorpusRevision: 'test-corpus-revision',
+});
+
+const assertSameVectorIdentity = (
+  sidecar: SimilarityHnswSidecar,
+  requested: SimilarityVectorIdentity,
+): void => {
+  if (sidecar.dimension !== requested.dimension) {
+    throw new Error(
+      `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(requested.dimension)}`,
+    );
+  }
+  // Schema v1 is the migration source. It had no identity and is accepted
+  // once under the frozen legacy policy; the next persist publishes v2.
+  if (sidecar.schemaVersion === 1) return;
+  if (
+    sidecar.modelId !== requested.modelId ||
+    sidecar.modelRevision !== requested.modelRevision ||
+    sidecar.vectorCorpusRevision !== requested.vectorCorpusRevision
+  ) {
+    throw new Error(
+      `HNSW vector identity mismatch: sidecar=${String(sidecar.vectorCorpusRevision)} requested=${requested.vectorCorpusRevision}`,
+    );
+  }
+};
+
 export const createSimilarityHnswStore = (
   options: SimilarityHnswStoreOptions = {},
 ): UnloadedSimilarityHnswStore => {
@@ -213,6 +285,10 @@ export const createSimilarityHnswStore = (
 
     recoveredFromCorruption(): boolean {
       return requireLoaded().recoveredFromCorruption;
+    },
+
+    vectorIdentity(): SimilarityVectorIdentity {
+      return { ...requireLoaded().vectorIdentity };
     },
 
     async insertOrUpdate(visitId: string, embedding: readonly number[]): Promise<void> {
@@ -307,14 +383,23 @@ export const createSimilarityHnswStore = (
   return {
     async ensureLoaded(
       vaultRoot: string,
-      dimension: number,
+      identity: number | SimilarityVectorIdentity,
     ): Promise<LoadedSimilarityHnswStore> {
+      const vectorIdentity =
+        typeof identity === 'number' ? testVectorIdentity(identity) : { ...identity };
+      const dimension = vectorIdentity.dimension;
       if (!Number.isInteger(dimension) || dimension <= 0) {
         throw new Error(`invalid HNSW dimension: ${String(dimension)}`);
       }
       if (state !== null) {
-        if (state.vaultRoot !== vaultRoot || state.dimension !== dimension) {
-          throw new Error('HNSW similarity store already loaded for a different vault or dimension');
+        if (
+          state.vaultRoot !== vaultRoot ||
+          state.dimension !== dimension ||
+          state.vectorIdentity.vectorCorpusRevision !== vectorIdentity.vectorCorpusRevision
+        ) {
+          throw new Error(
+            'HNSW similarity store already loaded for a different vault or dimension',
+          );
         }
         return loadedStore;
       }
@@ -331,11 +416,7 @@ export const createSimilarityHnswStore = (
           const sidecar = parseSidecar(
             await readFile(versionedSidecarPath(basePath, version), 'utf8'),
           );
-          if (sidecar.dimension !== dimension) {
-            throw new Error(
-              `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
-            );
-          }
+          assertSameVectorIdentity(sidecar, vectorIdentity);
           await index.readIndex(versionedIndexPath(basePath, version));
           index.setEf(HNSW_EF_SEARCH);
           state = {
@@ -344,6 +425,7 @@ export const createSimilarityHnswStore = (
             pointerPath,
             index,
             dimension,
+            vectorIdentity,
             maxElements: index.getMaxElements(),
             elementCount: sidecar.elementCount,
             version,
@@ -370,11 +452,7 @@ export const createSimilarityHnswStore = (
       const hasSidecar = await pathExists(legacySidecarPath);
       if (hasIndex && hasSidecar) {
         const sidecar = parseSidecar(await readFile(legacySidecarPath, 'utf8'));
-        if (sidecar.dimension !== dimension) {
-          throw new Error(
-            `HNSW dimension mismatch: sidecar=${String(sidecar.dimension)} requested=${String(dimension)}`,
-          );
-        }
+        assertSameVectorIdentity(sidecar, vectorIdentity);
         await index.readIndex(legacyIndexPath);
         index.setEf(HNSW_EF_SEARCH);
         state = {
@@ -383,12 +461,16 @@ export const createSimilarityHnswStore = (
           pointerPath,
           index,
           dimension,
+          vectorIdentity,
           maxElements: index.getMaxElements(),
           elementCount: sidecar.elementCount,
           version: 0,
           visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
           labelToVisitId: new Map(
-            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [Number(label), visitId]),
+            Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [
+              Number(label),
+              visitId,
+            ]),
           ),
           recoveredFromCorruption: false,
         };
@@ -403,6 +485,7 @@ export const createSimilarityHnswStore = (
         pointerPath,
         index,
         dimension,
+        vectorIdentity,
         maxElements: INITIAL_MAX_ELEMENTS,
         elementCount: 0,
         version: 0,

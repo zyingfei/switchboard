@@ -165,10 +165,14 @@ export const renderHelp = (): string =>
     'GC subcommand (derived data only):',
     '  sidetrack-companion gc --vault <path> --dry-run [--json]',
     '  sidetrack-companion gc --vault <path> --apply [--json]',
+    '  sidetrack-companion gc --vault <path> --storage-retirement --dry-run [--json]',
+    '  sidetrack-companion gc --vault <path> --storage-retirement --apply --plan-id <id> [--json]',
     '    Plans or removes rebuildable Sidetrack-owned derived data only:',
     '    connection revisions, diagnostics, debug dumps, temp files, expired',
-    '    idempotency records, and ranker caches. It never touches _BAC/log,',
-    '    _BAC/events, threads, workstreams, or other canonical user state.',
+    '    idempotency records, and ranker caches. Storage retirement is a separate',
+    '    proof-gated, plan-id-confirmed path for verified duplicates (including',
+    '    fully mirrored legacy spool days). Neither mode ever touches _BAC/log,',
+    '    threads, workstreams, or other canonical user state.',
     '',
     'Eval subcommand (report-only; runs WITHOUT the companion):',
     '  sidetrack-companion eval replay --vault <path> [--json] [--no-persist]',
@@ -698,7 +702,7 @@ const runGcSubcommand = async (argv: readonly string[], streams: CliStreams): Pr
   if (argv.includes('--help') || argv.includes('help')) {
     writeLine(
       streams.stdout,
-      'Usage: sidetrack-companion gc --vault <path> (--dry-run | --apply) [--json]',
+      'Usage: sidetrack-companion gc --vault <path> (--dry-run | --apply) [--json] [--storage-retirement [--plan-id <id>]]',
     );
     return 0;
   }
@@ -714,6 +718,55 @@ const runGcSubcommand = async (argv: readonly string[], streams: CliStreams): Pr
     return 2;
   }
   const json = argv.includes('--json');
+  if (argv.includes('--storage-retirement')) {
+    const { applyStorageRetirementPlan, buildStorageRetirementPlan } = await import(
+      './gc/storageRetirement.js'
+    );
+    const plan = await buildStorageRetirementPlan(vaultPath);
+    if (dryRun) {
+      if (json) {
+        writeLine(streams.stdout, JSON.stringify({ mode: 'dry-run', plan }, null, 2));
+        return 0;
+      }
+      writeLine(
+        streams.stdout,
+        `storage-retirement dry-run: plan ${plan.planId}, ${String(plan.verifiedCount)} verified candidates, ${String(plan.reclaimableBytes)} bytes`,
+      );
+      for (const candidate of plan.candidates) {
+        writeLine(
+          streams.stdout,
+          `${candidate.proof.status}\t${candidate.artifact}\t${String(candidate.bytes)}\t${candidate.id}\t${candidate.proof.evidence}`,
+        );
+      }
+      return 0;
+    }
+    const planId = findArgValue(argv, '--plan-id');
+    if (planId === undefined || planId.length === 0) {
+      writeLine(
+        streams.stderr,
+        '--storage-retirement --apply requires --plan-id from a reviewed dry-run.',
+      );
+      return 2;
+    }
+    if (planId !== plan.planId) {
+      writeLine(
+        streams.stderr,
+        `storage-retirement plan is stale or mismatched: supplied=${planId} current=${plan.planId}`,
+      );
+      return 2;
+    }
+    const result = await applyStorageRetirementPlan(plan, { confirmPlanId: planId });
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'apply', plan, result }, null, 2));
+      return result.errors.length === 0 ? 0 : 1;
+    }
+    writeLine(
+      streams.stdout,
+      `storage-retirement apply: removed ${String(result.removedCandidates.length)} candidates, ${String(result.bytes)} bytes`,
+    );
+    for (const error of result.errors) writeLine(streams.stderr, error);
+    return result.errors.length === 0 ? 0 : 1;
+  }
   const { applyGcPlan, buildGcPlan } = await import('./gc/plan.js');
   const plan = await buildGcPlan(vaultPath);
   if (dryRun) {

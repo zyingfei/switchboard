@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { buildAnnIndex } from '../recall/ann-index.js';
 import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
+import { LEGACY_VECTOR_CACHE_MODEL_KEY, VECTOR_CORPUS_MODEL_KEY } from '../recall/vectorCorpus.js';
 import { evidenceCorpusForRecord } from '../page-evidence/extract.js';
 import {
   DEFAULT_UNKNOWN_IDF,
@@ -162,8 +163,7 @@ export const anisotropyZScore = (
 };
 
 // Optional z-gate minimum (default undefined = OFF). See SIMILARITY_Z_MIN_ENV.
-export const resolveSimilarityZMin = (): number | undefined =>
-  readEnvNumber(SIMILARITY_Z_MIN_ENV);
+export const resolveSimilarityZMin = (): number | undefined => readEnvNumber(SIMILARITY_Z_MIN_ENV);
 
 const lexicalFallbackEnabled = (): boolean => {
   const raw = process.env[VISIT_SIMILARITY_LEXICAL_FALLBACK_ENV];
@@ -1261,7 +1261,6 @@ export const buildVisitSimilarityIncremental = (
   };
 };
 
-
 // ---- cached corpus embedding -------------------------------------------
 //
 // Embed only what we have not embedded before. Keyed by a hash of the exact
@@ -1276,13 +1275,12 @@ const embedWithCache = async (
   texts: readonly string[],
   embed: VisitSimilarityEmbedder,
   vaultRoot: string | undefined,
-  modelId: string,
-  modelRevision: string,
 ): Promise<readonly Float32Array[]> => {
   if (vaultRoot === undefined) return embed(texts);
   let cache: ReturnType<typeof createEmbeddingCache> | undefined;
   try {
     cache = createEmbeddingCache(vaultRoot);
+    await cache.migrateModel(LEGACY_VECTOR_CACHE_MODEL_KEY, VECTOR_CORPUS_MODEL_KEY);
   } catch {
     return embed(texts);
   }
@@ -1299,7 +1297,7 @@ const embedWithCache = async (
   // grows to N × dim × 4 bytes, the lookup phase alone was quadratic in bytes.
   let hits: ReadonlyMap<string, Float32Array>;
   try {
-    hits = await cache.getMany({ modelId, modelRevision }, hashes);
+    hits = await cache.getMany(VECTOR_CORPUS_MODEL_KEY, hashes);
   } catch {
     hits = new Map();
   }
@@ -1359,7 +1357,7 @@ const embedWithCache = async (
       // most one chunk); what changes is that a chunk no longer rewrites the
       // whole cache file 64 times over.
       try {
-        await cache.putMany({ modelId, modelRevision }, toPersist);
+        await cache.putMany(VECTOR_CORPUS_MODEL_KEY, toPersist);
       } catch {
         // best-effort: a cache write failure must not fail the drain
       }
@@ -1367,6 +1365,7 @@ const embedWithCache = async (
       // Only worth a line when this is real work — a handful of misses on a
       // warm cache should not chat.
       if (missTexts.length > EMBED_CACHE_CHUNK) {
+        // eslint-disable-next-line no-console -- child watchdog progress signal
         console.log(
           `[similarity-embed] ${String(done)}/${String(missTexts.length)} embedded (cache-backed, resumable)`,
         );
@@ -1470,13 +1469,7 @@ export const buildVisitSimilarity = async (
   const queryTexts = eligible.map((visit) => `${QUERY_PREFIX}${visit.corpus}`);
   let embedded: readonly Float32Array[];
   try {
-    embedded = await embedWithCache(
-      [...passageTexts, ...queryTexts],
-      embed,
-      options.vaultRoot,
-      RECALL_MODEL.modelId,
-      RECALL_MODEL.revision,
-    );
+    embedded = await embedWithCache([...passageTexts, ...queryTexts], embed, options.vaultRoot);
   } catch (error) {
     logMaterializerError(error);
     if (fallbackAllowed) return lexicalRevision();

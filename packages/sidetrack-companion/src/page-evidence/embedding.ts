@@ -1,5 +1,9 @@
 import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
+import {
+  LEGACY_VECTOR_CACHE_MODEL_KEY,
+  VECTOR_CORPUS_MODEL_KEY,
+} from '../recall/vectorCorpus.js';
 import { splitPageContentIntoChunks } from '../page-content/store.js';
 import { vectorIdFor } from './vectorRef.js';
 import type { PageEvidenceExtractedRequest, VectorRef } from './types.js';
@@ -117,10 +121,11 @@ const embedChunksThroughSharedCache = async (
   chunks: readonly DocEmbeddingChunk[],
   embedder: PageEvidenceEmbedder,
 ): Promise<readonly Float32Array[]> => {
-  const model = { modelId: ref.modelId, modelRevision: ref.modelVersion } as const;
+  const model = VECTOR_CORPUS_MODEL_KEY;
   let cache: ReturnType<typeof createEmbeddingCache> | null = null;
   try {
     cache = createEmbeddingCache(vaultRoot, ref.dimensions);
+    await cache.migrateModel(LEGACY_VECTOR_CACHE_MODEL_KEY, VECTOR_CORPUS_MODEL_KEY);
   } catch {
     cache = null;
   }
@@ -198,11 +203,14 @@ export const writePageEvidenceDocEmbedding = async (
   });
   const cache = createEmbeddingCache(vaultRoot, ref.dimensions);
   const existing = await cache.get({
-    modelId: ref.modelId,
-    modelRevision: ref.modelVersion,
+    ...VECTOR_CORPUS_MODEL_KEY,
     embedTextHash: ref.vectorId,
   });
-  if (existing !== null) return ref;
+  const legacyExisting =
+    existing === null
+      ? await cache.get({ ...LEGACY_VECTOR_CACHE_MODEL_KEY, embedTextHash: ref.vectorId })
+      : existing;
+  if (legacyExisting !== null) return ref;
   const chunks = splitDocEmbeddingChunks(payload);
   if (chunks.length === 0) return undefined;
   // E2 — the per-CHUNK embeds now go through the shared text-keyed cache.
@@ -224,7 +232,7 @@ export const writePageEvidenceDocEmbedding = async (
   await cache.put(
     {
       modelId: ref.modelId,
-      modelRevision: ref.modelVersion,
+      modelRevision: VECTOR_CORPUS_MODEL_KEY.modelRevision,
       embedTextHash: ref.vectorId,
     },
     docVector,
@@ -238,9 +246,12 @@ export const readPageEvidenceDocVector = async (
 ): Promise<Float32Array | null> => {
   if (!isCurrentPageEvidenceVectorRef(ref)) return null;
   const cache = createEmbeddingCache(vaultRoot, ref.dimensions);
-  return await cache.get({
-    modelId: ref.modelId,
-    modelRevision: ref.modelVersion,
+  const current = await cache.get({
+    ...VECTOR_CORPUS_MODEL_KEY,
     embedTextHash: ref.vectorId,
   });
+  return (
+    current ??
+    (await cache.get({ ...LEGACY_VECTOR_CACHE_MODEL_KEY, embedTextHash: ref.vectorId }))
+  );
 };

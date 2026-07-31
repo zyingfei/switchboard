@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,11 @@ import { SqliteConnectionsStore } from '../connections/snapshot.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
+import {
+  lanePrequentialPath,
+  lanePrequentialSummary,
+  resetLanePrequentialMemoForTest,
+} from '../tabsession/lanePrequential.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
@@ -196,6 +201,89 @@ describe('per-URL HTTP routes', () => {
     expect(projBody.data.byCanonicalUrl[canonicalUrl]?.currentAttribution?.workstreamId).toBe(
       'ws_switchboard',
     );
+  });
+
+  it('serves a durable opportunity id, stores the explicit outcome, and reads back a joined score', async () => {
+    const canonicalUrl = 'https://coverage.test/served-page';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_coverage' });
+    installStrongUrlSnapshot(canonicalUrl);
+
+    const served = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ canonicalUrls: [canonicalUrl] }),
+    });
+    expect(served.status).toBe(200);
+    const servedBody = (await served.json()) as {
+      data: {
+        results: Record<string, { readonly servedOpportunityId?: unknown }>;
+      };
+    };
+    const opportunityId = servedBody.data.results[canonicalUrl]?.servedOpportunityId;
+    expect(opportunityId).toMatch(/^laneopp_[0-9a-f]{32}$/u);
+    if (typeof opportunityId !== 'string') throw new Error('missing served opportunity id');
+
+    // The prediction append is deliberately off the response path. Read the
+    // served artifact back before answering so this acceptance test enforces
+    // the same predict-then-observe ordering required in production.
+    const predictionDeadline = Date.now() + 2_000;
+    let predictionText = '';
+    while (!predictionText.includes(opportunityId) && Date.now() < predictionDeadline) {
+      predictionText = await readFile(lanePrequentialPath(vaultRoot), 'utf8').catch(() => '');
+      if (!predictionText.includes(opportunityId)) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    expect(predictionText).toContain(opportunityId);
+
+    const outcome = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
+      {
+        method: 'POST',
+        headers: headers('idem-coverage-outcome'),
+        body: JSON.stringify({ workstreamId: 'ws_security', servedOpportunityId: opportunityId }),
+      },
+    );
+    expect(outcome.status).toBe(201);
+
+    const accepted = (await eventLog.readMerged()).find(
+      (event) => event.clientEventId === 'idem-coverage-outcome',
+    );
+    expect(accepted?.payload).toMatchObject({
+      itemKind: 'canonical-url',
+      itemId: canonicalUrl,
+      toContainer: 'ws_security',
+      details: { servedOpportunityId: opportunityId },
+    });
+
+    resetLanePrequentialMemoForTest();
+    const summary = await lanePrequentialSummary(vaultRoot, 5_000);
+    expect(summary.rawPredictionRows).toBeGreaterThan(0);
+    expect(summary.eligibleOpportunities).toBe(1);
+    expect(summary.outcomesObserved).toBe(1);
+    expect(summary.outcomesJoined).toBe(1);
+    expect(summary.outcomeJoinCoverage).toBe(1);
+    expect(summary.scored).toBeGreaterThan(0);
+    expect(summary.unscored).toBe(0);
+  });
+
+  it('rejects a malformed servedOpportunityId instead of storing an unjoinable value', async () => {
+    const canonicalUrl = 'https://coverage.test/invalid-id';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_invalid' });
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/attribute`,
+      {
+        method: 'POST',
+        headers: headers('idem-invalid-opportunity'),
+        body: JSON.stringify({ workstreamId: 'ws_security', servedOpportunityId: '' }),
+      },
+    );
+    expect(response.status).toBe(400);
+    expect(
+      (await eventLog.readMerged()).some(
+        (event) => event.clientEventId === 'idem-invalid-opportunity',
+      ),
+    ).toBe(false);
   });
 
   it('POST attribute with workstreamId:null dismisses the URL back to Inbox', async () => {

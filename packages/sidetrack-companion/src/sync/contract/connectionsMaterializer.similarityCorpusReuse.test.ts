@@ -37,6 +37,7 @@ import {
   writeVisitSimilarityRevision,
 } from '../../producers/visit-resembles-revision.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
+import { VECTOR_CORPUS_REVISION } from '../../recall/vectorCorpus.js';
 import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
@@ -61,6 +62,17 @@ const buildEvent = (input: { seq: number; type: string; payload: unknown }): Acc
 // store this fix guards). A shared unit vector makes every pair resemble
 // every other pair → a dense edge set.
 const fullDim = RECALL_MODEL.embeddingDim;
+
+// The materializer persists the HNSW projection under the served vector
+// identity (schema-v2 sidecar). A bare dimension maps to the synthetic test
+// identity, mismatches that sidecar, and reads back an empty reset store —
+// so every read here must present the same identity the writer stamped.
+const servedVectorIdentity = {
+  dimension: fullDim,
+  modelId: RECALL_MODEL.modelId,
+  modelRevision: RECALL_MODEL.revision,
+  vectorCorpusRevision: VECTOR_CORPUS_REVISION,
+} as const;
 const unitFullDim = (): Float32Array => {
   const v = new Float32Array(fullDim);
   v[0] = 1;
@@ -120,7 +132,7 @@ const resemblesEdgeCount = (
 ): number => (edges ?? []).filter((edge) => edge.kind === 'visit_resembles_visit').length;
 
 const hnswElementCount = async (vaultRoot: string): Promise<number> => {
-  const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, fullDim);
+  const loaded = await createSimilarityHnswStore().ensureLoaded(vaultRoot, servedVectorIdentity);
   const count = loaded.elementCount();
   await loaded.close();
   return count;

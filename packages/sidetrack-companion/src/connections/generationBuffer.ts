@@ -272,7 +272,11 @@ const sleepBusy = (ms: number): void => {
  * critical section must complete without yielding the lock to another awaited
  * publisher (the flip + GC are pure fs ops).
  */
-export const withPublishLock = <T>(connectionsDir: string, fn: () => T): T => {
+export const withPublishLock = <T>(
+  connectionsDir: string,
+  fn: () => T,
+  options: { readonly failClosed?: boolean } = {},
+): T => {
   mkdirSync(connectionsDir, { recursive: true });
   const lockPath = publishLockPath(connectionsDir);
   const deadline = Date.now() + PUBLISH_LOCK_MAX_WAIT_MS;
@@ -302,7 +306,15 @@ export const withPublishLock = <T>(connectionsDir: string, fn: () => T): T => {
         safeUnlink(lockPath);
         continue;
       }
-      if (Date.now() > deadline) break; // deadlock-avoidance: proceed unlocked
+      if (Date.now() > deadline) {
+        // Publishers preserve the historical deadlock-avoidance fallback.
+        // Destructive maintenance passes fail closed instead: no reclamation is
+        // worth racing an owner whose liveness we could not resolve.
+        if (options.failClosed === true) {
+          throw new Error('connections publish lock could not be acquired safely');
+        }
+        break;
+      }
       sleepBusy(PUBLISH_LOCK_POLL_MS);
     }
   }
@@ -724,7 +736,9 @@ export interface GenerationSurvey {
   /** Sum of bytes over `orphan-collectable` entries only. */
   readonly collectableBytes: number;
   readonly collectableCount: number;
-  /** True when SIDETRACK_GENERATION_GC_SWEEP is armed (deletion permitted). */
+  /** True when the destructive switch was requested. */
+  readonly sweepRequested: boolean;
+  /** True only when requested AND an S1 active-generation proof was supplied. */
   readonly sweepArmed: boolean;
 }
 
@@ -735,16 +749,19 @@ export interface SurveyGenerationsOptions {
   /** Extra gen ids to treat as live (the store's in-process handle set, when a
    *  caller happens to have it). Purely additive caution. */
   readonly keepAlive?: readonly string[];
+  /** Supplied only by the proof-gated S2 retirement boundary after validating
+   * quick_check, strong content signature, pointer stability, and checkpoint
+   * generation binding. An env flag alone must never authorize collection. */
+  readonly s1SafetyVerified?: boolean;
 }
 
 /**
  * Is deletion of surveyed orphans permitted?
  *
- * DEFAULTS OFF because this deletes data: the first landing reports the orphans
- * in the vault ledger + a health counter so the operator can inspect the report
- * (and cross-check against `residentGenerations`) BEFORE arming a sweep that
- * unlinks ~323 MB files. Only '1'/'true' arms it — mirroring the repo rule that
- * a destructive switch must be opted INTO, never merely not-opted-out-of.
+ * DEFAULTS OFF because this deletes data. In S2 this flag is only the operator's
+ * REQUEST: surveyGenerations also requires `s1SafetyVerified`, supplied by the
+ * storage-retirement boundary after durable active-generation read-back. The
+ * environment can no longer authorize deletion by itself.
  */
 export const generationSweepArmed = (): boolean => {
   const raw = process.env['SIDETRACK_GENERATION_GC_SWEEP'];
@@ -904,13 +921,14 @@ export const surveyGenerations = (
     totalBytes: entries.reduce((sum, entry) => sum + entry.bytes, 0),
     collectableBytes: collectable.reduce((sum, entry) => sum + entry.bytes, 0),
     collectableCount: collectable.length,
-    sweepArmed: generationSweepArmed(),
+    sweepRequested: generationSweepArmed(),
+    sweepArmed: generationSweepArmed() && options.s1SafetyVerified === true,
   };
 };
 
 /**
- * Survey, then — only if SIDETRACK_GENERATION_GC_SWEEP is armed — unlink the
- * `orphan-collectable` generations (db + -wal/-shm + any file-less marker).
+ * Survey, then — only if SIDETRACK_GENERATION_GC_SWEEP is requested AND an S1
+ * safety proof is supplied — unlink the `orphan-collectable` generations.
  *
  * Runs the whole survey→unlink sequence under the cross-process publish lock so
  * it cannot interleave with a publisher's clone/checkpoint/flip: without the
@@ -919,8 +937,7 @@ export const surveyGenerations = (
  * genuinely serialized against them, not merely against other sweeps.
  *
  * Returns the survey (always) plus what was collected (empty when disarmed), so
- * a caller can report the orphans either way. `force` exists for tests only —
- * production arms via the env flag.
+ * a caller can report the orphans either way. `force` exists for tests only.
  */
 export const sweepOrphanGenerations = (
   connectionsDir: string,
