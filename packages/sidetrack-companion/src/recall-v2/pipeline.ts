@@ -239,6 +239,32 @@ const getOrOpenStore = async (vaultRoot: string): Promise<RecallStore> => {
   return store;
 };
 
+/**
+ * OPEN the store into the shared cache WITHOUT running a backfill.
+ *
+ * WHY THIS IS SEPARATE FROM getOrOpenStore. That function opens AND calls
+ * ensureFreshBackfill, whose own comment records that its ~7000-row chat-turn
+ * upsert loop "starves /v1/status for tens of seconds". Callers that merely
+ * need the handle to EXIST — the guess lanes, which peek and then give up —
+ * must never pay that. Opening the SQLite file is milliseconds; the backfill
+ * is the expensive part and stays owned by the /v2 path.
+ *
+ * Fire-and-forget by design: the caller does not await, so the resolve that
+ * discovers the miss still returns a typed-empty lane, and the NEXT one finds
+ * the handle. Never throws — a failed open leaves the cache empty and the
+ * lanes keep reporting "recall store unavailable", which is the honest state.
+ */
+export const warmRecallV2Store = (vaultRoot: string): void => {
+  if (storeCache.has(vaultRoot)) return;
+  const openPromise = (async () => openSqliteRecallStore(vaultRoot))();
+  storeCache.set(vaultRoot, openPromise);
+  void openPromise.catch(() => {
+    // Drop the rejected promise so a later attempt can retry rather than
+    // caching the failure forever.
+    storeCache.delete(vaultRoot);
+  });
+};
+
 /** Phase 4 — non-blocking peek for the canonical SQLite store.
  *  Returns undefined if the store hasn't been opened yet (e.g.
  *  health is polled before the first /v2/recall). Health pollers
