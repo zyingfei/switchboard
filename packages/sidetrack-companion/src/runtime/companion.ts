@@ -851,17 +851,21 @@ export const startCompanion = async (
             )),
           );
         } else {
-          await store.forEachChunk((chunk) => {
-            for (const event of chunk) {
-              if (
-                event.type === PRIVACY_GATE_FLIPPED ||
-                event.type === PRIVACY_PERMISSION_GRANTED ||
-                event.type === PRIVACY_PERMISSION_REVOKED
-              ) {
-                events.push(event);
-              }
-            }
-          }, 2000);
+          // Typed read: the SAME 3 needles the no-store branch above
+          // streams, pushed down to the events_type_idx index. The old
+          // untyped forEachChunk materialised (JSON.parse'd) every row in
+          // the store just to discard ~all of them — on a ~450k-event
+          // vault that alone dominated the boot 'collector-framework'
+          // watchdog phase. Ordering is unchanged: both store reads page
+          // by ORDER BY replica_id, seq, so projectPrivacy's last-write-
+          // wins gate folding sees the identical sequence.
+          await store.forEachChunkOfTypes(
+            [PRIVACY_GATE_FLIPPED, PRIVACY_PERMISSION_GRANTED, PRIVACY_PERMISSION_REVOKED],
+            (chunk) => {
+              for (const event of chunk) events.push(event);
+            },
+            2000,
+          );
         }
         cachedPrivacyProjection = projectPrivacy(events);
       } catch {

@@ -83,11 +83,19 @@ export const createTimelineMaterializer = (deps: CreateTimelineMaterializerDeps)
       );
     }
     const events: AcceptedEvent[] = [];
-    await store.forEachChunk((chunk) => {
-      for (const event of chunk) {
-        if (event.type === BROWSER_TIMELINE_OBSERVED) events.push(event);
-      }
-    }, 2000);
+    // Typed read: the SAME single needle the streamFiltered branches above
+    // use, pushed down to the events_type_idx index. The old untyped
+    // forEachChunk materialised (JSON.parse'd) every row in the store just
+    // to discard the ~92% that are engagement intervals — and catchUp runs
+    // this once per boot, plus once per dirty day on every drain. Ordering
+    // is unchanged: both store reads page by ORDER BY replica_id, seq.
+    await store.forEachChunkOfTypes(
+      [BROWSER_TIMELINE_OBSERVED],
+      (chunk) => {
+        for (const event of chunk) events.push(event);
+      },
+      2000,
+    );
     return events;
   };
 
