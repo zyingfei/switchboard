@@ -253,10 +253,18 @@ export interface EventLog {
   readonly importPeerEvent: (event: AcceptedEvent) => Promise<{ readonly imported: boolean }>;
   /**
    * Warm the append-path indexes off the request path (idempotent,
-   * single-flighted; appends issued meanwhile join the in-flight
-   * warm). Long-lived processes call this at boot so the FIRST user
-   * write doesn't pay the one-time streaming pass over the log;
-   * short-lived CLI invocations skip it and pay only if they append.
+   * single-flighted). Long-lived processes call this at boot so the
+   * FIRST user write doesn't pay the one-time streaming pass over the
+   * log; short-lived CLI invocations skip it and pay only if they
+   * append.
+   *
+   * The pass runs as a chain of BOUNDED segments, each its own unit on
+   * the append mutex, so appends issued meanwhile interleave between
+   * segments instead of queueing behind the whole warm (which was tens
+   * of seconds on a 333k-event vault). An append that lands while the
+   * warm is incomplete never reads the partially-built index — it
+   * answers its dedupe / deps / dot questions straight off disk. The
+   * returned promise still resolves only when the index is COMPLETE.
    */
   readonly prewarmAppendIndexes: () => Promise<void>;
   /**
@@ -803,6 +811,40 @@ export const createEventLog = (
     return sortAcceptedEvents(out);
   };
 
+  // Raw-line walk over every shard, in the canonical order (replica ids
+  // sorted, then that replica's shard files sorted). A GENERATOR rather
+  // than a callback loop because the append-index warm has to consume it
+  // a BOUNDED number of lines at a time and suspend in between (see
+  // `runWarmSegment`): the walk keeps a single open fd across
+  // suspensions and resumes exactly where it stopped, so a segmented
+  // pass is still one O(bytes) sweep, not a re-scan per segment.
+  // Abandoning the generator (`.return()`) closes the open shard.
+  async function* iterateLogLines(): AsyncGenerator<string, void, void> {
+    const ids = await listReplicaIds();
+    for (const id of ids) {
+      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort();
+      for (const file of files) {
+        let stream: ReturnType<typeof createReadStream>;
+        try {
+          stream = createReadStream(file, { encoding: 'utf8' });
+        } catch (error) {
+          if (isEnoent(error)) continue;
+          throw error;
+        }
+        const lines = createInterface({ input: stream, crlfDelay: Infinity });
+        try {
+          for await (const line of lines) yield line;
+        } catch (error) {
+          if (isEnoent(error)) continue;
+          throw error;
+        } finally {
+          lines.close();
+          stream.destroy();
+        }
+      }
+    }
+  }
+
   // Stream every event through `onEvent` one at a time, O(1) memory —
   // never materialises the full merged array. The boot consumers that
   // only need a small subset (privacy: 3 types; recall freshness: a
@@ -824,36 +866,17 @@ export const createEventLog = (
     // longer type); a stray match inside a payload only costs one wasted
     // parse, which the caller's predicate still filters out.
     const needles = typeHints === undefined ? null : [...typeHints].map((t) => `"type":"${t}"`);
-    const ids = await listReplicaIds();
     let processed = 0;
-    for (const id of ids) {
-      const files = (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort();
-      for (const file of files) {
-        let stream: ReturnType<typeof createReadStream>;
-        try {
-          stream = createReadStream(file, { encoding: 'utf8' });
-        } catch (error) {
-          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
-          throw error;
-        }
-        const lines = createInterface({ input: stream, crlfDelay: Infinity });
-        try {
-          for await (const line of lines) {
-            if (needles === null || needles.some((n) => line.includes(n))) {
-              const event = parseLine(line);
-              if (event !== null) onEvent(event);
-            }
-            processed += 1;
-            if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
-              await new Promise<void>((resolve) => {
-                setImmediate(resolve);
-              });
-            }
-          }
-        } catch (error) {
-          if (error instanceof Error && 'code' in error && error.code === 'ENOENT') continue;
-          throw error;
-        }
+    for await (const line of iterateLogLines()) {
+      if (needles === null || needles.some((n) => line.includes(n))) {
+        const event = parseLine(line);
+        if (event !== null) onEvent(event);
+      }
+      processed += 1;
+      if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
       }
     }
   };
@@ -883,8 +906,10 @@ export const createEventLog = (
     // Negative fast-path: when the append indexes are warm they are
     // authoritative for membership — absent there means absent in the
     // log, no need to read anything. (A stale-index false negative
-    // self-corrects at the guarded append: freshAppendIndexes rebuilds
+    // self-corrects at the guarded append: acquireAppendFacts rebuilds
     // on a foreign signature change before any dedupe decision.)
+    // `appendIndexes` is non-null only when the warm COMPLETED, so a
+    // mid-warm partial index can never license this negative.
     if (appendIndexes !== null && !appendIndexes.clientIdToDot.has(clientEventId)) {
       return null;
     }
@@ -908,10 +933,12 @@ export const createEventLog = (
 
   // ── Append-path indexes ─────────────────────────────────────────
   // clientEventId → dot, dot-key set, aggregateId → deps vector.
-  // Warmed ONCE via streamEvents (O(1) memory during the pass; the
-  // retained maps hold ids/dots only, never payloads), then maintained
-  // by every append/import — which all run under the enqueueAppend
-  // mutex, so warm + reads + writes never race.
+  // Warmed ONCE by a segmented walk over the log (O(1) memory during
+  // the pass; the retained maps hold ids/dots only, never payloads),
+  // then maintained by every append/import. Every warm segment and
+  // every append/import runs under the enqueueAppend mutex, so index
+  // reads and writes never race; the segments just release the mutex
+  // between slices so writes are not stuck behind the whole warm.
   //
   // Why: every append used to call readMerged() for dedupe + deps, and
   // the append itself invalidates the memo's file signature — so each
@@ -931,8 +958,13 @@ export const createEventLog = (
     readonly dotKeys: Set<string>;
     readonly aggregateVectors: Map<string, VersionVector>;
   }
+  // ONLY ever assigned a COMPLETE index. This doubles as the
+  // warm-completeness flag: `appendIndexes !== null` is the single
+  // predicate that licenses trusting an ABSENCE (dedupe negative, dot
+  // free, aggregate has no prior events). A partially-built index lives
+  // in `warmState.idx` and is never visible here, so no append and no
+  // reader can mistake mid-warm coverage for the whole log.
   let appendIndexes: AppendIndexes | null = null;
-  let appendIndexesWarming: Promise<AppendIndexes> | null = null;
 
   const dotKeyOf = (dot: Dot): string => `${dot.replicaId}:${String(dot.seq)}`;
 
@@ -944,31 +976,6 @@ export const createEventLog = (
       event.aggregateId,
       maxVector(prior, { [event.dot.replicaId]: event.dot.seq }),
     );
-  };
-
-  const warmAppendIndexes = (): Promise<AppendIndexes> => {
-    if (appendIndexes !== null) return Promise.resolve(appendIndexes);
-    appendIndexesWarming ??= (async () => {
-      const idx: AppendIndexes = {
-        clientIdToDot: new Map(),
-        dotKeys: new Set(),
-        aggregateVectors: new Map(),
-      };
-      await streamEvents((event) => {
-        registerInAppendIndexes(idx, event);
-      });
-      appendIndexes = idx;
-      appendIndexesWarming = null;
-      return idx;
-    })().catch((error: unknown) => {
-      // A failed warm (transient read error mid-stream) must not pin a
-      // rejected promise here forever — that would fail EVERY later
-      // append until restart. Clear the slot so the next append
-      // retries the warm from scratch.
-      appendIndexesWarming = null;
-      throw error;
-    });
-    return appendIndexesWarming;
   };
 
   // Log signature the indexes were last reconciled against. The
@@ -984,28 +991,373 @@ export const createEventLog = (
   // signature so the next check doesn't self-trigger.
   let appendIndexesSignature: string | null = null;
 
-  const freshAppendIndexes = async (): Promise<AppendIndexes> => {
-    // Single-writer (default): the in-memory indexes are authoritative —
-    // no other process mutates the log, so skip the on-disk signature
-    // scan entirely (the indexes are warmed once and maintained by our
-    // own appends).
-    if (!externalWritersPossible) return warmAppendIndexes();
-    let idx = await warmAppendIndexes();
-    const sig = await computeLogSignature();
-    if (appendIndexesSignature !== null && appendIndexesSignature !== sig) {
-      appendIndexes = null;
-      idx = await warmAppendIndexes();
-      appendIndexesSignature = await computeLogSignature();
-      return idx;
+  // ── Segmented warm ──────────────────────────────────────────────
+  // The warm used to run as ONE enqueueAppend unit, so the append
+  // mutex was held for the whole streaming pass — tens of seconds on a
+  // 333k-event vault, with every write-shaped endpoint queued behind
+  // it for the first minute after boot. It now runs as a chain of
+  // bounded segments: each segment holds the mutex for at most
+  // WARM_SEGMENT_LINES lines, and between segments the driver hands
+  // the event loop a macrotask so writes that arrived meanwhile
+  // enqueue AHEAD of the next segment and run to completion.
+  //
+  // 2_000 lines is ~10-40 ms of parse+index work, which is the worst
+  // case an interleaved append waits for the mutex; the intra-segment
+  // yield every EVENT_LOG_PARSE_YIELD_EVERY lines keeps the event-loop
+  // cadence identical to the old single-shot warm.
+  const WARM_SEGMENT_LINES = 2_000;
+  // Strict drift handling restarts the walk when a FOREIGN writer
+  // moves the log mid-warm. A writer that keeps moving it could in
+  // principle restart us forever, so after this many restarts the next
+  // attempt runs unsegmented (exactly the old single-shot shape) and
+  // publishes against the pre-scan baseline, leaving the per-append
+  // signature guard to catch any drift. Progress is then guaranteed.
+  const WARM_MAX_STRICT_RESTARTS = 3;
+  // Anti-starvation valve. An append that lands before the index is
+  // complete answers from disk (one raw pass) instead of waiting, which
+  // is the whole point — but a write stream that never stops would then
+  // pay that pass forever while the warm crawls 2_000 lines per write
+  // and may never finish. After this many disk-answered appends the
+  // warm stops segmenting and completes in one unit: the worst case
+  // degrades to exactly the old behaviour (plus a bounded number of
+  // cheap scans), never to an unbounded one.
+  const WARM_MAX_SCOPED_APPENDS = 16;
+
+  interface WarmState {
+    readonly idx: AppendIndexes;
+    readonly lines: AsyncGenerator<string, void, void>;
+    // Log signature this walk is known to be consistent with: the log
+    // as it stood when the walk started, advanced ONLY by our own
+    // appends (which register their event into `idx` directly).
+    baselineSignature: string | null;
+    // Set when an append observed a signature the baseline does not
+    // explain — i.e. somebody else wrote a shard. Sticky: the walk's
+    // file-list snapshot predates that write, so the partial index can
+    // never become complete and must be thrown away.
+    drifted: boolean;
+    // false ⇒ run to completion in one segment and skip the
+    // restart-on-drift rule (the anti-livelock valve above).
+    readonly strict: boolean;
+  }
+  let warmState: WarmState | null = null;
+  let warmStrictRestarts = 0;
+  let warmScopedAppends = 0;
+  let warmDriver: Promise<void> | null = null;
+
+  const discardWarmState = async (): Promise<void> => {
+    const abandoned = warmState;
+    warmState = null;
+    if (abandoned === null) return;
+    try {
+      await abandoned.lines.return(undefined);
+    } catch {
+      // Closing the abandoned shard reader is best-effort cleanup; a
+      // failure here must not mask the reason we are discarding.
     }
-    appendIndexesSignature = sig;
+  };
+
+  type WarmOutcome = 'more' | 'done';
+
+  // One bounded slice of the warm. Runs UNDER the append mutex, so it
+  // never races an append's index mutation — same invariant the
+  // single-shot warm had, just re-established per segment.
+  const runWarmSegment = async (): Promise<WarmOutcome> => {
+    if (appendIndexes !== null) return 'done';
+    try {
+      if (warmState !== null && warmState.drifted) {
+        warmStrictRestarts += 1;
+        await discardWarmState();
+      }
+      if (warmState === null) {
+        warmState = {
+          idx: { clientIdToDot: new Map(), dotKeys: new Set(), aggregateVectors: new Map() },
+          lines: iterateLogLines(),
+          baselineSignature: externalWritersPossible ? await computeLogSignature() : null,
+          drifted: false,
+          strict: warmStrictRestarts <= WARM_MAX_STRICT_RESTARTS,
+        };
+      }
+      const state = warmState;
+      if (state.strict && externalWritersPossible) {
+        const live = await computeLogSignature();
+        if (live !== state.baselineSignature) {
+          warmStrictRestarts += 1;
+          await discardWarmState();
+          return 'more';
+        }
+      }
+      const segmented = state.strict && warmScopedAppends <= WARM_MAX_SCOPED_APPENDS;
+      const limit = segmented ? WARM_SEGMENT_LINES : Number.POSITIVE_INFINITY;
+      for (let processed = 0; processed < limit; processed += 1) {
+        const next = await state.lines.next();
+        if (next.done === true) {
+          // Publish only against a log that has not moved under us
+          // since the baseline. A foreign write during the FINAL
+          // segment would otherwise be baked in as "already known".
+          if (externalWritersPossible) {
+            const live = await computeLogSignature();
+            if (state.strict && (state.drifted || live !== state.baselineSignature)) {
+              warmStrictRestarts += 1;
+              await discardWarmState();
+              return 'more';
+            }
+            // Unsegmented fallback: record the PRE-scan baseline so the
+            // next append's guard sees the drift and rebuilds.
+            appendIndexesSignature = state.baselineSignature ?? live;
+          }
+          appendIndexes = state.idx;
+          warmState = null;
+          warmScopedAppends = 0;
+          return 'done';
+        }
+        const event = parseLine(next.value);
+        if (event !== null) registerInAppendIndexes(state.idx, event);
+        if (processed > 0 && processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
+        }
+      }
+      return 'more';
+    } catch (error) {
+      // A failed segment (transient read error mid-stream) must not
+      // pin a half-built index or a rejected driver promise — that
+      // would fail EVERY later append until restart. Drop the partial
+      // state (and its open fd); the next attempt re-walks from
+      // scratch. Same unpin guarantee the single-shot warm had, and a
+      // kill mid-warm is unchanged: the warm writes nothing to disk,
+      // so a dead process leaves exactly the durable state it had.
+      await discardWarmState();
+      throw error;
+    }
+  };
+
+  const ensureAppendIndexesWarm = (): Promise<void> => {
+    if (appendIndexes !== null) return Promise.resolve();
+    warmDriver ??= (async () => {
+      try {
+        for (;;) {
+          const outcome = await enqueueAppend(runWarmSegment);
+          if (outcome === 'done') return;
+          // Hand the loop a MACROTASK before queueing the next segment.
+          // This is what makes the chunking real: an append whose HTTP
+          // request landed during the segment gets to call
+          // enqueueAppend here, so it sits AHEAD of the next segment in
+          // the write chain instead of behind the rest of the warm. A
+          // bare promise-chain continuation would stay in the microtask
+          // queue and never let that happen.
+          await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+          });
+        }
+      } finally {
+        warmDriver = null;
+      }
+    })();
+    return warmDriver;
+  };
+
+  // ── Disk-authoritative append oracle (used while the warm is incomplete)
+  // A partial index may not answer an append: it is add-only and covers
+  // an arbitrary prefix of the walk, so every ABSENCE it reports could
+  // be a false negative — which on the dedupe question means minting a
+  // second dot for a clientEventId the log already carries and poisoning
+  // sync with a ClientEventIdReuse on every peer. So while the index is
+  // incomplete, appends read the questions they actually ask straight
+  // off disk and get an `AppendIndexes` populated with exactly those
+  // entries: the downstream dedupe / deps / dot logic is then
+  // byte-identical to the warm path, it just consults a scoped map.
+  //
+  // Cost is one raw-line pass with NO JSON.parse except on candidate
+  // lines (vs the warm's parse-and-index of every line), so a write
+  // arriving during boot completes in a bounded scan instead of
+  // queueing behind the whole warm.
+  interface AppendFactRequest {
+    readonly clientEventIds: ReadonlySet<string>;
+    readonly aggregateIds: ReadonlySet<string>;
+    readonly dots: readonly Dot[];
+  }
+
+  const CLIENT_EVENT_ID_MARK = '"clientEventId":"';
+
+  // True when JSON.stringify writes `value` with no escaping — i.e. the
+  // literal substring `"<key>":"<value>"` is EXACTLY what the serialiser
+  // put on disk for that field. Only then may a raw substring prefilter
+  // stand in for a parse: a value containing a quote, backslash or
+  // control character appears escaped on disk, the prefilter would miss
+  // it, and a missed match here is a FALSE NEGATIVE on an identity
+  // question. When any wanted value fails this test the scan parses
+  // every line instead.
+  const isLiteralJsonStringValue = (value: string): boolean =>
+    JSON.stringify(value) === `"${value}"`;
+
+  const scanAppendFactsFromDisk = async (
+    request: AppendFactRequest,
+  ): Promise<AppendIndexes> => {
+    const idx: AppendIndexes = {
+      clientIdToDot: new Map(),
+      dotKeys: new Set(),
+      aggregateVectors: new Map(),
+    };
+    const wantedDotKeys = new Set(request.dots.map(dotKeyOf));
+    const prefilterSafe =
+      [...request.clientEventIds].every(isLiteralJsonStringValue) &&
+      [...request.aggregateIds].every(isLiteralJsonStringValue);
+    const aggregateNeedles = [...request.aggregateIds].map((id) => `"aggregateId":"${id}"`);
+    // `"seq":<n>` is exactly what JSON.stringify emits for the numeric
+    // seq of the dot in hand — same value, same formatter — so a line
+    // carrying that dot ALWAYS contains this substring. Rests on the
+    // same invariant streamEvents' `"type":"<t>"` prefilter already
+    // relies on: every shard line is compact JSON.stringify output
+    // (this codebase is the only writer; sync tools copy bytes). False
+    // positives (a payload number, another replica's same seq) cost one
+    // parse and are rejected by the exact dot-key check below.
+    const dotNeedles = request.dots.map((dot) => `"seq":${String(dot.seq)}`);
+    let processed = 0;
+    for await (const line of iterateLogLines()) {
+      let candidate = !prefilterSafe;
+      if (!candidate && request.clientEventIds.size > 0) {
+        // Test EVERY occurrence of the field marker, not just the
+        // first: key order on disk is whatever the writing replica
+        // emitted, and a payload string could carry the marker too.
+        // One occurrence in practice; no ordering assumption.
+        let at = line.indexOf(CLIENT_EVENT_ID_MARK);
+        while (at >= 0 && !candidate) {
+          const start = at + CLIENT_EVENT_ID_MARK.length;
+          const end = line.indexOf('"', start);
+          if (end > start && request.clientEventIds.has(line.slice(start, end))) candidate = true;
+          at = line.indexOf(CLIENT_EVENT_ID_MARK, start);
+        }
+      }
+      if (!candidate) candidate = aggregateNeedles.some((needle) => line.includes(needle));
+      if (!candidate) candidate = dotNeedles.some((needle) => line.includes(needle));
+      if (candidate) {
+        const event = parseLine(line);
+        if (event !== null) {
+          if (request.clientEventIds.has(event.clientEventId)) {
+            idx.clientIdToDot.set(event.clientEventId, event.dot);
+          }
+          const dotKey = dotKeyOf(event.dot);
+          if (wantedDotKeys.has(dotKey)) idx.dotKeys.add(dotKey);
+          if (request.aggregateIds.has(event.aggregateId)) {
+            const prior = idx.aggregateVectors.get(event.aggregateId) ?? {};
+            idx.aggregateVectors.set(
+              event.aggregateId,
+              maxVector(prior, { [event.dot.replicaId]: event.dot.seq }),
+            );
+          }
+        }
+      }
+      processed += 1;
+      if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
+    }
     return idx;
   };
 
+  interface AppendFacts {
+    // Scoped (warm incomplete) or complete (warm published). Either way
+    // every entry it DOES carry is disk truth, so the dedupe / deps /
+    // dot-collision logic reads it identically.
+    readonly idx: AppendIndexes;
+    // Local dot-reuse guard. Complete index ⇒ exact membership. Scoped ⇒
+    // the committed shard-tail high-water mark for our OWN replica:
+    // appendClient only ever appends to our own shard in strictly
+    // increasing seq order, so `seq <= tail` is exactly "this dot is
+    // already committed" — which is the regressed-counter fault the
+    // guard exists to refuse.
+    readonly localDotTaken: (seq: number) => boolean;
+  }
+
+  const completeAppendFacts = (idx: AppendIndexes): AppendFacts => ({
+    idx,
+    localDotTaken: (seq) => idx.dotKeys.has(dotKeyOf({ replicaId: replica.replicaId, seq })),
+  });
+
+  const factRequestFor = (
+    inputs: readonly AppendInput[],
+  ): { clientEventIds: Set<string>; aggregateIds: Set<string> } => {
+    const clientEventIds = new Set<string>();
+    const aggregateIds = new Set<string>();
+    for (const input of inputs) {
+      clientEventIds.add(input.clientEventId);
+      for (const dep of input.clientDeps ?? []) clientEventIds.add(dep);
+      // Only a server-observed append (baseVector omitted) reads the
+      // aggregate frontier — see computeDepsIndexed.
+      if (input.baseVector === undefined) aggregateIds.add(input.aggregateId);
+    }
+    return { clientEventIds, aggregateIds };
+  };
+
+  const acquireAppendFacts = async (request: AppendFactRequest): Promise<AppendFacts> => {
+    if (externalWritersPossible) {
+      const live = await computeLogSignature();
+      // A foreign shard write invalidates BOTH the published index and
+      // any in-progress walk (whose file-list snapshot predates it).
+      if (warmState !== null && warmState.baselineSignature !== live) warmState.drifted = true;
+      if (
+        appendIndexes !== null &&
+        appendIndexesSignature !== null &&
+        appendIndexesSignature !== live
+      ) {
+        // Somebody else moved the log. Drop the index and answer THIS
+        // append from disk; the background warm rebuilds for the next
+        // one. (The old shape re-warmed inline — a segmented warm
+        // cannot, because the rebuild would deadlock behind the mutex
+        // this append is holding.)
+        appendIndexes = null;
+        appendIndexesSignature = null;
+      }
+      if (appendIndexes !== null) {
+        appendIndexesSignature = live;
+        return completeAppendFacts(appendIndexes);
+      }
+    } else if (appendIndexes !== null) {
+      // Single-writer (default): the in-memory index is authoritative —
+      // no other process mutates the log, so skip the on-disk signature
+      // scan entirely.
+      return completeAppendFacts(appendIndexes);
+    }
+    // Not warm (or just invalidated): keep the warm moving in the
+    // background and serve this append from disk. Not awaited — the
+    // driver enqueues its segments behind this task, so awaiting it
+    // here would deadlock.
+    warmScopedAppends += 1;
+    void ensureAppendIndexesWarm().catch(() => undefined);
+    const idx = await scanAppendFactsFromDisk(request);
+    // Bounded (one tail read per shard of our own replica dir), never a
+    // full-log scan. `unreadableShards` is not fatal here: this is the
+    // defense-in-depth dot guard, and the boot reconciliation in
+    // loadOrCreateReplica already decided policy on unreadable shards.
+    const { maxSeq } = await reconcileShardTailSeqForReplica(vaultPath, replica.replicaId);
+    return { idx, localDotTaken: (seq) => seq <= maxSeq };
+  };
+
+  const registerAppendedEvent = (facts: AppendFacts, event: AcceptedEvent): void => {
+    registerInAppendIndexes(facts.idx, event);
+    // An event appended BETWEEN warm segments can land in a region the
+    // walk already passed, or in a shard / replica dir created after
+    // the walk snapshotted the file list — so the in-progress index has
+    // to learn about it explicitly or the published index would be
+    // missing it. Registration is idempotent (set / add / maxVector),
+    // so the walk re-reading the same line later is a no-op.
+    if (warmState !== null) registerInAppendIndexes(warmState.idx, event);
+  };
+
   const recordAppendIndexesSignature = async (): Promise<void> => {
-    // Only meaningful when freshAppendIndexes is signature-checking.
+    // Only meaningful when acquireAppendFacts is signature-checking.
     if (!externalWritersPossible) return;
-    appendIndexesSignature = await computeLogSignature();
+    const signature = await computeLogSignature();
+    appendIndexesSignature = signature;
+    // Our OWN write is not "somebody else moved the log": advance the
+    // baseline the in-progress walk validates against, so the next
+    // segment does not mistake it for a foreign shard write. A genuine
+    // foreign write was already latched into `drifted` by
+    // acquireAppendFacts before this write happened.
+    if (warmState !== null) warmState.baselineSignature = signature;
   };
 
   // Critical correctness rule: deps must reflect the editor's observed
@@ -1050,7 +1402,8 @@ export const createEventLog = (
     input: AppendInput<TPayload>,
   ): Promise<AcceptedEvent<TPayload>> =>
     enqueueAppend(async () => {
-      const idx = await freshAppendIndexes();
+      const facts = await acquireAppendFacts({ ...factRequestFor([input]), dots: [] });
+      const idx = facts.idx;
       if (idx.clientIdToDot.has(input.clientEventId)) {
         // Duplicate replay (rare) — the index proves presence; fetch
         // the full event from the merged log for the return contract.
@@ -1076,10 +1429,10 @@ export const createEventLog = (
       // the seq counter past every committed shard tail, so a fresh seq
       // must not collide. But if the seq counter were ever corrupted at
       // runtime, appending on a dot the index already carries would mint
-      // a duplicate causal primary key. The index is already in hand
-      // here (freshAppendIndexes above) — no extra scan — so reject
+      // a duplicate causal primary key. The answer is already in hand
+      // here (acquireAppendFacts above) — no extra scan — so reject
       // loudly instead of poisoning the log.
-      if (idx.dotKeys.has(dotKeyOf(dot))) {
+      if (facts.localDotTaken(seq)) {
         throw new Error(
           `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
         );
@@ -1109,7 +1462,7 @@ export const createEventLog = (
       // Register only after the durable write — a failed write must
       // not leave the index claiming presence (it would silently drop
       // the retry as a duplicate).
-      registerInAppendIndexes(idx, event);
+      registerAppendedEvent(facts, event);
       await recordAppendIndexesSignature();
       return event;
     });
@@ -1123,7 +1476,8 @@ export const createEventLog = (
       // Index-backed dedupe + deps (was: ONE readMerged per batch —
       // which still re-read the whole log every time, because the
       // previous batch's append invalidates the memo).
-      const idx = await freshAppendIndexes();
+      const facts = await acquireAppendFacts({ ...factRequestFor(inputs), dots: [] });
+      const idx = facts.idx;
       const presentInBatch = new Set<string>();
       // Dots minted earlier in THIS batch. Kept separate from the shared
       // idx.dotKeys (which only registers after the durable write) so a
@@ -1159,7 +1513,7 @@ export const createEventLog = (
         // index before the durable write (which would strand phantom dots
         // on a mid-batch write failure).
         const dotKey = dotKeyOf(dot);
-        if (idx.dotKeys.has(dotKey) || dotsInBatch.has(dotKey)) {
+        if (facts.localDotTaken(seq) || dotsInBatch.has(dotKey)) {
           throw new Error(
             `Refusing to reuse local dot (${dot.replicaId}, ${String(dot.seq)}) for clientEventId ${input.clientEventId}: the seq counter regressed behind the committed shard tail.`,
           );
@@ -1197,7 +1551,7 @@ export const createEventLog = (
         // appendClient) — and after, not during, the input loop, so a
         // mid-batch write failure can't strand half a batch as
         // phantom duplicates.
-        for (const event of events) registerInAppendIndexes(idx, event);
+        for (const event of events) registerAppendedEvent(facts, event);
         await recordAppendIndexesSignature();
       }
       // Dispatch AFTER the durable write so a hook only ever sees
@@ -1216,7 +1570,15 @@ export const createEventLog = (
       if (event.dot.replicaId === replica.replicaId) {
         return { imported: false } as const;
       }
-      const idx = await freshAppendIndexes();
+      // The peer dot is an EXACT question in both modes: the complete
+      // index answers from memory, the scoped scan asks disk for that
+      // one dot (and that one clientEventId).
+      const facts = await acquireAppendFacts({
+        clientEventIds: new Set([event.clientEventId]),
+        aggregateIds: new Set<string>(),
+        dots: [event.dot],
+      });
+      const idx = facts.idx;
       if (idx.dotKeys.has(dotKeyOf(event.dot))) {
         // Dot already present — the collision/equality verdict needs
         // the full stored event; this (rare) path may warm the memo.
@@ -1253,7 +1615,7 @@ export const createEventLog = (
         `${JSON.stringify(event)}\n`,
         { encoding: 'utf8', flag: 'a' },
       );
-      registerInAppendIndexes(idx, event);
+      registerAppendedEvent(facts, event);
       await recordAppendIndexesSignature();
       // Each replica's seq counter is independent; we don't bump our
       // own seq when ingesting a peer event (that would corrupt our
@@ -1301,6 +1663,11 @@ export const createEventLog = (
         // from the post-maintenance log before the next append decision.
         appendIndexes = null;
         appendIndexesSignature = null;
+        // Same for a warm that was mid-walk: its partial index and its
+        // open fd both point at the pre-rewrite log. Maintenance shares
+        // the append mutex with the warm segments, so this cannot land
+        // inside one — the next segment simply starts a fresh walk.
+        await discardWarmState();
         mergedMemo = null;
         cancelMergedSweep();
       }
@@ -1323,7 +1690,7 @@ export const createEventLog = (
     listReplicaIds,
     importPeerEvent,
     prewarmAppendIndexes: async (): Promise<void> => {
-      await enqueueAppend(warmAppendIndexes);
+      await ensureAppendIndexesWarm();
     },
     runExclusiveMaintenance,
   };
