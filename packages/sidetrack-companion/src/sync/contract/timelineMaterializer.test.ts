@@ -10,6 +10,7 @@ import {
 import { createTimelineStore } from '../../timeline/projection.js';
 import type { AcceptedEvent } from '../causal.js';
 import { createEventLog } from '../eventLog.js';
+import { getCaughtUpSharedEventStore } from '../eventStore.js';
 import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineMaterializer } from './timelineMaterializer.js';
 
@@ -315,5 +316,175 @@ describe('timelineMaterializer (Class B)', () => {
     await m.awaitIdle();
     const days = await store.listDays();
     expect(days).toHaveLength(0);
+  });
+});
+
+// The store-backed read inside readTimelineEvents used to be an UNTYPED
+// store.forEachChunk full scan: it materialised (JSON.parse'd) EVERY row in
+// the event store and threw away the ~92% that are engagement intervals,
+// once per boot catchUp and once per dirty day per drain. It is now
+// forEachChunkOfTypes over the single type the fold consumes, pushed down
+// to the events_type_idx index.
+//
+// This block drives the REAL production path (createTimelineMaterializer
+// with vaultRoot + SIDETRACK_EVENT_STORE=1 → getCaughtUpSharedEventStore),
+// against a store seeded with MIXED event types.
+const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
+
+describe('timelineMaterializer store-backed read (typed)', () => {
+  let vaultRoot: string;
+  let priorFlag: string | undefined;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-timeline-store-'));
+    priorFlag = process.env['SIDETRACK_EVENT_STORE'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+  });
+  afterEach(async () => {
+    if (priorFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+    else process.env['SIDETRACK_EVENT_STORE'] = priorFlag;
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const noiseEvent = (seq: number, type: string, acceptedAtMs: number): AcceptedEvent => ({
+    clientEventId: `noise-${String(seq)}`,
+    dot: { replicaId: 'edge_test', seq },
+    deps: {},
+    aggregateId: 'noise',
+    type,
+    payload: { payloadVersion: 1, value: seq },
+    acceptedAtMs,
+  });
+
+  // Interleaved so the timeline events are NOT contiguous in the store:
+  // seq 1 timeline, 2 noise, 3 timeline, 4 noise, 5 timeline (next day),
+  // 6 noise. A read that lost the type filter, or that kept only a
+  // contiguous run, would produce a different projection.
+  const seedMixedLog = async (): Promise<ReturnType<typeof createEventLog>> => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 1,
+        payload: payload({
+          observedAt: '2026-05-07T10:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+        }),
+      }),
+    );
+    await eventLog.importPeerEvent(noiseEvent(2, 'engagement.interval.observed', 1));
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 3,
+        payload: payload({
+          observedAt: '2026-05-07T12:00:00.000Z',
+          url: 'https://x/a',
+          canonicalUrl: 'https://x/a',
+          transition: 'updated',
+        }),
+      }),
+    );
+    await eventLog.importPeerEvent(noiseEvent(4, 'engagement.session.aggregated', 2));
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 5,
+        payload: payload({
+          observedAt: '2026-05-08T09:00:00.000Z',
+          url: 'https://x/b',
+          canonicalUrl: 'https://x/b',
+        }),
+      }),
+    );
+    await eventLog.importPeerEvent(noiseEvent(6, 'navigation.committed', 3));
+    return eventLog;
+  };
+
+  sqliteIt('catchUp folds only timeline events out of a mixed-type store', async () => {
+    const eventLog = await seedMixedLog();
+    const store = createTimelineStore(vaultRoot);
+    const m = createTimelineMaterializer({ store, eventLog, vaultRoot });
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+
+    // The store-backed branch really ran (not the streamFiltered fallback).
+    const eventStore = await getCaughtUpSharedEventStore(vaultRoot);
+    expect(eventStore, 'event store must be live for this test to mean anything').not.toBeNull();
+    expect(eventStore?.count()).toBe(6);
+
+    // Hand-computed: 2026-05-07 has two events for the SAME canonical url
+    // (activated + updated) → one entry, visitCount 2; 2026-05-08 has one.
+    // Drop BROWSER_TIMELINE_OBSERVED from the needle set and both days
+    // vanish; leak the noise types in and collectTimelinePayloads still
+    // rejects them, so the counts below are exact either way.
+    const day7 = await store.readDay('2026-05-07');
+    expect(day7?.entryCount).toBe(1);
+    expect(day7?.entries[0]?.id).toBe('https://x/a');
+    expect(day7?.entries[0]?.visitCount).toBe(2);
+    expect(day7?.updatedAt).toBe('2026-05-07T12:00:00.000Z');
+
+    const day8 = await store.readDay('2026-05-08');
+    expect(day8?.entryCount).toBe(1);
+    expect(day8?.entries[0]?.id).toBe('https://x/b');
+    expect(day8?.entries[0]?.visitCount).toBe(1);
+
+    expect(await store.listDays()).toEqual(['2026-05-07', '2026-05-08']);
+    expect(m.health().status).toBe('healthy');
+  });
+
+  sqliteIt('typed read is substitutable for the untyped full scan', async () => {
+    await seedMixedLog();
+    const eventStore = await getCaughtUpSharedEventStore(vaultRoot);
+    expect(eventStore).not.toBeNull();
+
+    // Inline reimplementation of the pre-fix read (the oracle).
+    const oracle: AcceptedEvent[] = [];
+    let untypedRows = 0;
+    await eventStore!.forEachChunk((chunk) => {
+      untypedRows += chunk.length;
+      for (const event of chunk) {
+        if (event.type === BROWSER_TIMELINE_OBSERVED) oracle.push(event);
+      }
+    }, 2000);
+
+    // The shipped read.
+    const typed: AcceptedEvent[] = [];
+    let typedRows = 0;
+    await eventStore!.forEachChunkOfTypes(
+      [BROWSER_TIMELINE_OBSERVED],
+      (chunk) => {
+        typedRows += chunk.length;
+        for (const event of chunk) typed.push(event);
+      },
+      2000,
+    );
+
+    // Same events in the same order — both store paths page by
+    // ORDER BY replica_id, seq — so the same day projections.
+    expect(typed).toEqual(oracle);
+    expect(typed.map((e) => e.dot.seq)).toEqual([1, 3, 5]);
+    // The whole point: 6 rows parsed before, 3 after. On a real vault the
+    // ratio is ~450k-to-a-few-thousand, which is what blew the boot budget.
+    expect(untypedRows).toBe(6);
+    expect(typedRows).toBe(3);
+  });
+
+  sqliteIt('typed read preserves the chunk-yield cadence', async () => {
+    await seedMixedLog();
+    const eventStore = await getCaughtUpSharedEventStore(vaultRoot);
+    expect(eventStore).not.toBeNull();
+
+    const chunkSizes: number[] = [];
+    await eventStore!.forEachChunkOfTypes(
+      [BROWSER_TIMELINE_OBSERVED],
+      (chunk) => {
+        chunkSizes.push(chunk.length);
+      },
+      2,
+    );
+    // Still pages at the requested size and yields between pages, so a
+    // large fold stays interruptible rather than blocking the loop once.
+    expect(chunkSizes).toEqual([2, 1]);
   });
 });
