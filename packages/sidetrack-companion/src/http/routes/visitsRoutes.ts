@@ -24,7 +24,7 @@ import { autoApplyUrlAttribution } from '../../urls/autoApply.js';
 import { URL_IGNORED } from '../../urls/events.js';
 import { serializeUrlProjection, urlInbox } from '../../urls/projection.js';
 
-import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, aggregateIdForFeedbackEvent, baseVectorForAggregate, connectionsGraphSig, domainTombstoneSetFor, invalidateResolveCaches, loadUrlProjection, objectRecord, optionalAttributionPolicyMode, optionalAttributionPolicyTelemetry, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, requireVaultRoot, runIdempotent, serveResolveSwr } from '../routeSupport.js';
+import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, aggregateIdForFeedbackEvent, baseVectorForAggregate, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, invalidateResolveCaches, loadUrlProjection, objectRecord, optionalAttributionPolicyMode, optionalAttributionPolicyTelemetry, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, requireVaultRoot, runIdempotent, serveResolveSwr } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
@@ -401,7 +401,10 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
           const singleEnrichmentSynthesized = lookupSynthesizedTitle(
             enrichmentLookupFromMerged(
               requireVaultRoot(context),
-              await context.eventLog!.logSignature(),
+              // Coverage token of the read that produced `merged` (serve-stale
+              // store) — NOT logSignature(), which would poison the memo with
+              // a stale fold keyed under appends the read never saw.
+              await eventReadCoverageSig(context, context.eventLog!),
               merged,
             ),
             'url',

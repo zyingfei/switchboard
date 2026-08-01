@@ -12,7 +12,7 @@ import { SqliteConnectionsStore } from '../../connections/snapshot.js';
 import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, isUserFlowRejectedPayload, isUserOrganizedItemPayload } from '../../feedback/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
 import type { EventLog } from '../../sync/eventLog.js';
-import { getCaughtUpSharedEventStore } from '../../sync/eventStore.js';
+import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../../sync/eventStore.js';
 import { autoApplyTabSessionAttribution } from '../../tabsession/autoApply.js';
 import { guessLanesEnabled, type GuessLaneVoteSignals, voteSignalsFor } from '../../tabsession/guessLanes.js';
 import { createEmptyTabSessionProjectionAccumulator, deserializeTabSessionProjection, foldEventIntoTabSessionProjectionAccumulator, projectTabSessions, serializeTabSessionProjection, tabSessionInbox, tabSessionProjectionFromAccumulator, type TabSessionProjection } from '../../tabsession/projection.js';
@@ -44,23 +44,26 @@ const projectTabSessionsFromStoreOrLog = async (
   eventLog: EventLog,
 ): Promise<TabSessionProjection> => {
   const key = context.vaultRoot ?? '<none>';
-  const sig = await eventLog.logSignature();
+  // Serve-stale + watermark-keyed memo: no route awaits a catch-up pass, and
+  // a stale fold must be cached under the store's OWN coverage token — never
+  // under logSignature(), which advances on appends the fold never saw (the
+  // memo-poisoning shape). Log-fallback path keeps the log signature.
+  const store =
+    context.vaultRoot === undefined
+      ? null
+      : await getSharedEventStoreServeStale(context.vaultRoot);
+  const sig = store === null ? await eventLog.logSignature() : eventStoreCoverageToken(store);
   const cached = tabSessionProjectionCache.get(key);
   if (cached !== undefined && cached.sig === sig) return cached.proj;
   let proj: TabSessionProjection;
-  if (context.vaultRoot === undefined) {
+  if (store === null) {
     proj = projectTabSessions(await eventLog.readMerged());
   } else {
-    const store = await getCaughtUpSharedEventStore(context.vaultRoot);
-    if (store === null) {
-      proj = projectTabSessions(await eventLog.readMerged());
-    } else {
-      const accumulator = createEmptyTabSessionProjectionAccumulator();
-      await store.forEachChunk((chunk) => {
-        for (const event of chunk) foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
-      }, 2000);
-      proj = tabSessionProjectionFromAccumulator(accumulator);
-    }
+    const accumulator = createEmptyTabSessionProjectionAccumulator();
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+    }, 2000);
+    proj = tabSessionProjectionFromAccumulator(accumulator);
   }
   tabSessionProjectionCache.set(key, { sig, proj });
   return proj;

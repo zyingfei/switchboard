@@ -36,7 +36,7 @@ import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import { createProblem, type ValidationIssue } from './problem.js';
 import { queueResolverCacheWrite, resolverCacheDeferEnabled, scheduleResolverCacheFlush } from './resolverCacheDefer.js';
 
-import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
+import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
 import type { CallerIdentity, CompanionHttpConfig, HttpMethod, RouteDefinition } from './routeSupport.js';
 import { urlWorkstreamLookupFromProjection } from './routes/entitiesRoutes.js';
 import { isPrivacyEventType } from './routes/privacyRoutes.js';
@@ -1150,13 +1150,15 @@ export const routes: readonly RouteDefinition[] = [
                   ENTITY_ENRICHMENT_RETRACTED,
                 ],
               );
-        // Fold enrichment from the merged log just read (no extra scan),
-        // memoized on the event-log signature. When misses === 0 the convoy
-        // was all cache/stale hits and no fresh title lane is computed, so an
-        // empty fold is correct — those served results already carry their
-        // cached title lane. Both families (title + content/gist) fold from the
-        // same merged log.
-        const batchEnrichSig = await context.eventLog.logSignature();
+        // Fold enrichment from the merged events just read (no extra scan),
+        // memoized on the READ's coverage token — the events came from the
+        // serve-stale store, so keying this fold on logSignature() would
+        // cache a stale fold under appends it never saw. When misses === 0
+        // the convoy was all cache/stale hits and no fresh title lane is
+        // computed, so an empty fold is correct — those served results
+        // already carry their cached title lane. Both families (title +
+        // content/gist) fold from the same merged events.
+        const batchEnrichSig = await eventReadCoverageSig(context, context.eventLog);
         enrichmentLookup = enrichmentLookupFromMerged(
           requireVaultRoot(context),
           batchEnrichSig,

@@ -46,7 +46,7 @@ import { join } from 'node:path';
 
 import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../sync/eventStore.js';
 import type { GuessLane, GuessLaneResult } from './guessLanes.js';
 
 // ---- env flag ---------------------------------------------------------
@@ -356,7 +356,10 @@ const foldFilings = (events: readonly AcceptedEvent[]): readonly LaneFiling[] =>
 // Typed read via events_type_idx — never the untyped full scan (the 45s-timeout
 // shape this repo has fixed repeatedly).
 const readFilingEvents = async (vaultRoot: string): Promise<readonly AcceptedEvent[]> => {
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  // Serve-stale: no serving fold may await a JSONL catch-up pass (measured
+  // 30-70s post-boot). The store is read as-is; the kicked background pass
+  // freshens it for later reads.
+  const store = await getSharedEventStoreServeStale(vaultRoot);
   if (store === null) return [];
   const events: AcceptedEvent[] = [];
   await store.forEachChunkOfTypes(
