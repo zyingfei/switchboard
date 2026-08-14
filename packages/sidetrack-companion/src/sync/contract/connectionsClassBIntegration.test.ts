@@ -758,8 +758,13 @@ describe('connections Class B integration invariants', () => {
     const eventLog = createEventLog(vaultRoot, replica);
     const store = createConnectionsStore(vaultRoot);
     let replaceCount = 0;
+    let fullWriteCount = 0;
     const recordingStore: ConnectionsStore = {
       ...store,
+      writeSnapshotAndProgress: async (...args) => {
+        fullWriteCount += 1;
+        await store.writeSnapshotAndProgress(...args);
+      },
       replaceScopeRows:
         store.replaceScopeRows === undefined
           ? undefined
@@ -783,6 +788,7 @@ describe('connections Class B integration invariants', () => {
     );
     await importEvents(eventLog, events.slice(0, 1));
     await materializer.catchUp(eventLog);
+    fullWriteCount = 0;
     await importEvents(eventLog, events.slice(1));
 
     const output: string[] = [];
@@ -802,7 +808,15 @@ describe('connections Class B integration invariants', () => {
     expect(phaseOutput).toContain('catchUp.chunk scopedWindow events=5000');
     expect(phaseOutput).toContain('catchUp.chunk scopedWindow events=1000');
     expect(phaseOutput).toContain('replaceScopeRows scopedTimelineDelta');
-    expect(phaseOutput).not.toContain('buildConnectionsSnapshot base');
+    // "No base rebuild" must be proven on THIS store, not on the global
+    // phase log: the phase log is process-wide console.warn, and another
+    // live materializer (this file's or another file's) draining inside
+    // the spied window emits its own `buildConnectionsSnapshot base`
+    // line. A base rebuild always lands via writeSnapshotAndProgress
+    // while the scoped path lands via replaceScopeRows, so the
+    // store-scoped counter is the instance-proof form of the assertion
+    // (same seam the scoped-recall sibling test uses).
+    expect(fullWriteCount).toBe(0);
 
     const incremental = await store.readCurrent();
     if (incremental === null) throw new Error('expected chunked scoped snapshot');
