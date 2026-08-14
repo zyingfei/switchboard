@@ -600,6 +600,12 @@ const buildPageContentLexicalIndex = async (
       join(chunksDir(vaultRoot), `${coverage.contentHash}.json`),
     );
     for (const chunk of raw?.chunks ?? []) {
+      // Chunk ids are `<contentHash>:<ix>`, so two records with IDENTICAL
+      // content (canonical-URL twins) collide. mini.add throws on a
+      // duplicate id, and one throw used to kill the ENTIRE warm build —
+      // no lexical index at all for the whole session. Identical content
+      // is one searchable document: first record wins, siblings skip.
+      if (idToEntry.has(chunk.id)) continue;
       idToEntry.set(chunk.id, {
         chunk,
         coverage,
