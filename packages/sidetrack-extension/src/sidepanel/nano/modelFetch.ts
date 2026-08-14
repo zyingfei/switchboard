@@ -25,6 +25,7 @@
 // other is "3.3GB crosses loopback into my GPU".
 
 import type { LocalModelSpec } from './modelRegistry';
+import { formatBytes } from '../../util/bytes';
 
 /** The host the companion contacts for a fetch. Stated in the UI, not implied. */
 export const MODEL_FETCH_HOST = 'huggingface.co';
@@ -175,19 +176,13 @@ export const readModelFetchStatus = async (options: {
 
 // ---- copy ---------------------------------------------------------------
 
-/** "3.3GB" / "820MB" — same rounding as the registry's size line. */
-const sizeLabel = (bytes: number): string =>
-  bytes >= 1_000_000_000
-    ? `${(bytes / 1_000_000_000).toFixed(1)}GB`
-    : `${String(Math.round(bytes / 1_000_000))}MB`;
-
 /**
  * The download button's label. It states BOTH costs the user is consenting to:
  * how much data, and which non-loopback host it comes from. "Download" alone
  * would hide the outbound; a size alone would hide the wait.
  */
 export const downloadButtonLabel = (spec: LocalModelSpec): string =>
-  `Download to companion · ${sizeLabel(spec.approxBytesOnDisk)} from ${MODEL_FETCH_HOST}`;
+  `Download to companion · ${formatBytes(spec.approxBytesOnDisk)} from ${MODEL_FETCH_HOST}`;
 
 /**
  * The progress line: files, percent, and WHICH file is moving. Percent is
@@ -201,7 +196,7 @@ export const fetchProgressLabel = (status: ModelFetchStatus): string => {
       : '';
   const size =
     status.bytesTotal > 0
-      ? ` (${sizeLabel(status.bytesDone)} of ${sizeLabel(status.bytesTotal)})`
+      ? ` (${formatBytes(status.bytesDone)} of ${formatBytes(status.bytesTotal)})`
       : '';
   const current = status.currentFile === null ? '' : ` · ${status.currentFile}`;
   return `Downloading from ${status.host} · ${files}${percent}${size}${current}`;
@@ -217,7 +212,7 @@ export const fetchProgressLabel = (status: ModelFetchStatus): string => {
  */
 export const notCachedMessage = (spec: LocalModelSpec): string =>
   `${spec.label} is not on the companion yet — download it first ` +
-  `(${sizeLabel(spec.approxBytesOnDisk)} from ${MODEL_FETCH_HOST}), then load it.`;
+  `(${formatBytes(spec.approxBytesOnDisk)} from ${MODEL_FETCH_HOST}), then load it.`;
 
 /**
  * Recognize the raw transformers.js "file missing" failure so a load that

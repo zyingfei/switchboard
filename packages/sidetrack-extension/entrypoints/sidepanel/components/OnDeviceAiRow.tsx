@@ -32,11 +32,11 @@ import {
 import {
   DEFAULT_LOCAL_MODEL_ID,
   LOCAL_MODELS,
-  formatModelSize,
   localModelSpec,
   readSelectedLocalModelId,
   writeSelectedLocalModelId,
 } from '../../../src/sidepanel/nano/modelRegistry';
+import { formatBytes } from '../../../src/util/bytes';
 import {
   downloadButtonLabel,
   fetchProgressLabel,
@@ -707,7 +707,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
             >
               {LOCAL_MODELS.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.label} · ~{formatModelSize(m.approxBytesOnDisk)}
+                  {m.label} · ~{formatBytes(m.approxBytesOnDisk)}
                 </option>
               ))}
             </select>
@@ -758,7 +758,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
             >
               {webGpuState === 'loading'
                 ? 'Loading local model…'
-                : `Load local model (WebGPU · ~${formatModelSize(selectedSpec.approxBytesOnDisk)}, from companion)`}
+                : `Load local model (WebGPU · ~${formatBytes(selectedSpec.approxBytesOnDisk)}, from companion)`}
             </button>
           )
         ) : (

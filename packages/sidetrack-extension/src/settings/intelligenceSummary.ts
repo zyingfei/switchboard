@@ -22,6 +22,8 @@
 // mirrors HealthPanel's own guard discipline (it consumes the same
 // /v1/system/health shape).
 
+import { formatRelative } from '../util/time';
+
 export interface IntelligenceMetric {
   // 'calibration' is appended by reliabilitySummary.ts (S1 reliability
   // readout) — a separate best-effort endpoint folded into the same strip.
@@ -53,21 +55,6 @@ const asRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined;
 
 const formatCount = (n: number): string => n.toLocaleString('en-US');
-
-/** Relative "Xh ago" / "Xm ago" for a drain timestamp. `nowMs` is
- * injectable so the formatting is deterministic in tests. */
-export const formatRelativeMs = (iso: string, nowMs: number): string => {
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return iso;
-  const deltaMs = Math.max(0, nowMs - then);
-  const min = Math.floor(deltaMs / 60_000);
-  if (min < 1) return 'just now';
-  if (min < 60) return `${String(min)}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${String(hr)}h ago`;
-  const days = Math.floor(hr / 24);
-  return `${String(days)}d ago`;
-};
 
 /** Parse the raw /v1/system/health payload (data envelope or bare) into
  * the four Intelligence metrics. Pure + defensive: unknown shape yields
@@ -162,7 +149,7 @@ export const intelligenceSummaryFromHealth = (
       : {
           key: 'lastDrain',
           label: 'Last drain',
-          value: formatRelativeMs(lastDrainIso, nowMs),
+          value: formatRelative(lastDrainIso, { short: true, nowMs }),
           ...(drainStatus === undefined ? {} : { detail: drainStatus }),
           state: drainStatus === 'healthy' || drainStatus === undefined ? 'live' : 'idle',
           title:

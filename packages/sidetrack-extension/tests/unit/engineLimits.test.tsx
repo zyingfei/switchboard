@@ -18,9 +18,9 @@ import {
   NANO_CLASS_LOCAL_MODEL_ID,
   WEBGPU_1B_MAX_INPUT_CHARS,
   WEBGPU_3B_MAX_INPUT_CHARS,
-  formatModelSize,
   localModelSpec,
 } from '../../src/sidepanel/nano/modelRegistry';
+import { formatBytes } from '../../src/util/bytes';
 import { synthesizeGist } from '../../src/sidepanel/nano/gistSynthesis';
 import { GIST_PROMPT_PREFIX } from '../../src/sidepanel/nano/titleSynthesis';
 import {
@@ -105,9 +105,8 @@ describe('the limit table — one place, per MODEL for the local engine', () => 
     expect(formatEngineLimits(limitsFor('remote'))).toBe('limits: 24k in / 140 tok out');
     expect(compactCount(1800)).toBe('1.8k');
     expect(compactCount(140)).toBe('140');
-    expect(formatModelSize(819_000_000)).toBe('800MB');
-    expect(formatModelSize(3_300_000_000)).toBe('3.3GB');
-    expect(formatModelSize(null)).toBe('unknown size');
+    expect(formatBytes(819_000_000)).toBe('819 MB');
+    expect(formatBytes(3_300_000_000)).toBe('3.3 GB');
   });
 });
 
@@ -283,12 +282,12 @@ describe('DISPLAY — the limits appear in BOTH rows', () => {
     const select: HTMLSelectElement = await screen.findByTestId('hp-ondevice-ai-model-select');
     expect(select.options).toHaveLength(LOCAL_MODELS.length);
     expect(select.options[0]?.textContent).toContain('1B q4 (fast)');
-    expect(select.options[0]?.textContent).toContain('~800MB');
+    expect(select.options[0]?.textContent).toContain('~819 MB');
     // q4f16, not q4: the q4 build (3.17GB) traps with "memory access out of
     // bounds" in the browser's 32-bit WASM space. Size is the measured 2.42GB
     // download, not a model-card round number.
     expect(select.options[1]?.textContent).toContain('3B q4f16 (matched to Nano)');
-    expect(select.options[1]?.textContent).toContain('~2.4GB');
+    expect(select.options[1]?.textContent).toContain('~2.4 GB');
     expect(screen.getByTestId('hp-ondevice-ai-model-note')).not.toHaveTextContent('unverified');
     // Now genuinely loaded here (3.8 min to ready, ~61s per gist on an M2), so
     // it claims 'verified' — earned by a real load, not by assumption.
