@@ -192,10 +192,20 @@ export const buildDomainTombstoneSet = (
         hostRulesByDomain.set(payload.domain, existing);
       }
     } else {
-      // 'similar' rules are inherently cross-domain / family-wide — a host
-      // scope on a 'similar' rule still hides its own family (the tokens
-      // reach across domains anyway), so treat its domain as family-blocked.
-      familyDomains.add(payload.domain);
+      // 'similar' rules: the SITE arm is host-scoped when the rule carries a
+      // host — the extension's capture gate (ruleCoversSite) blocks only that
+      // host + its own subdomains, and the destructive serve-time hide must
+      // never be broader than the capture gate (a host-scoped purge of
+      // mail.google.com must not hide all of google.com). Family-wide stays
+      // the semantics for legacy host-less rules only. The token arm below
+      // reaches across domains either way.
+      if (scopedHost === undefined) {
+        familyDomains.add(payload.domain);
+      } else {
+        const existing = hostRulesByDomain.get(payload.domain) ?? new Set<string>();
+        existing.add(scopedHost);
+        hostRulesByDomain.set(payload.domain, existing);
+      }
       similarRules.push({ domain: payload.domain, tokens: payload.categoryTokens ?? [] });
     }
   }
