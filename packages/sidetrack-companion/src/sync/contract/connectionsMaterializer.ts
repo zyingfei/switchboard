@@ -1023,6 +1023,17 @@ export interface ConnectionsMaterializer extends Materializer {
    * must never contend with embedding CPU (CPU regime).
    */
   readonly isDrainActive: () => boolean;
+  /**
+   * Lifecycle — release this instance. Cancels all scheduled work the
+   * factory owns (the drain debounce timer and the content-only
+   * progress retry timer) and turns `onAccepted` / drain scheduling
+   * into no-ops. An IN-FLIGHT drain is allowed to run to completion
+   * (it is never aborted), but no follow-up pass is scheduled after
+   * it. Idempotent — safe to call more than once. The instance is
+   * unusable after dispose; owners (runtime shutdown, tests) must not
+   * feed it further events.
+   */
+  readonly dispose: () => void;
 }
 
 export interface ContentLaneSourceUnitReconciler {
@@ -1534,6 +1545,16 @@ export const createConnectionsMaterializer = (
   // the window. unref() so a pending timer doesn't keep the process
   // alive at shutdown.
   let drainDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  // Retry timer for the content-only progress flush (requeueBatch).
+  // Factory-scoped (not local to the closure that arms it) so dispose
+  // can cancel it — an orphaned retry firing after the owner tore the
+  // store down would drain against deleted state.
+  let contentOnlyProgressRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set once by dispose(). Guards every scheduling entry point
+  // (requestDrain / onAccepted / startDrain / content-only flush) so a
+  // disposed instance never arms a timer or starts a new drain pass.
+  // An in-flight drain is deliberately allowed to finish.
+  let disposed = false;
 
   const isRecord = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -6896,6 +6917,7 @@ export const createConnectionsMaterializer = (
   };
 
   const startDrain = (): void => {
+    if (disposed) return;
     if (running) return;
     running = true;
     void (async () => {
@@ -6918,6 +6940,7 @@ export const createConnectionsMaterializer = (
   // starvation). Re-arms itself via the same unref'd debounce slot.
   // The first drain (lastDrainStartedAtMs===0) is never deferred.
   const startDrainWhenIntervalElapsed = (): void => {
+    if (disposed) return;
     if (!dirty || running) return;
     if (urgentDrainRequested) {
       startDrain();
@@ -6938,19 +6961,22 @@ export const createConnectionsMaterializer = (
   };
 
   const flushContentOnlyProgressEvents = async (): Promise<void> => {
+    if (disposed) return;
     const writeProgress = deps.store.writeMaterializerProgress;
     const batch = pendingContentOnlyProgressEvents;
     pendingContentOnlyProgressEvents = [];
     if (writeProgress === undefined || batch.length === 0) return;
     const requeueBatch = (): void => {
+      if (disposed) return;
       pendingContentOnlyProgressEvents = [...batch, ...pendingContentOnlyProgressEvents];
       if (contentOnlyProgressFlushScheduled) return;
       contentOnlyProgressFlushScheduled = true;
-      const timer = setTimeout(() => {
+      contentOnlyProgressRetryTimer = setTimeout(() => {
+        contentOnlyProgressRetryTimer = null;
         contentOnlyProgressFlushScheduled = false;
         void flushContentOnlyProgressEvents();
       }, 25);
-      timer.unref?.();
+      contentOnlyProgressRetryTimer.unref?.();
     };
     contentOnlyProgressFlushRunning = true;
     const startedAtMs = Date.now();
@@ -7008,6 +7034,7 @@ export const createConnectionsMaterializer = (
   };
 
   function scheduleContentOnlyProgressAdvance(event?: AcceptedEvent): void {
+    if (disposed) return;
     if (event !== undefined) pendingContentOnlyProgressEvents.push(event);
     if (contentOnlyProgressFlushScheduled || contentOnlyProgressFlushRunning) return;
     contentOnlyProgressFlushScheduled = true;
@@ -7116,6 +7143,7 @@ export const createConnectionsMaterializer = (
   };
 
   const requestDrain = (options: { readonly urgent?: boolean } = {}): void => {
+    if (disposed) return;
     dirty = true;
     pending = true;
     if (options.urgent === true) urgentDrainRequested = true;
@@ -7237,6 +7265,7 @@ export const createConnectionsMaterializer = (
   };
 
   const onAccepted: Materializer['onAccepted'] = (event) => {
+    if (disposed) return;
     const handlesGraph = HANDLES.has(event.type);
     const handlesContentLaneOnly = CONTENT_LANE_ONLY_HANDLES.has(event.type);
     const handlesProjectionOnly = PROJECTION_ONLY_HANDLES.has(event.type);
@@ -7593,6 +7622,30 @@ export const createConnectionsMaterializer = (
   // isDrainActive() reads the authoritative signal.
   const isDrainActive = (): boolean => running;
 
+  // Lifecycle — see the interface doc. Cancels the two factory-owned
+  // timers (drain debounce, content-only progress retry) and drops any
+  // queued content-only batch; the disposed flag turns every scheduling
+  // entry point into a no-op. dirty/pending are cleared so an in-flight
+  // drain's `while (dirty)` loop exits after its current pass and
+  // awaitIdle callers don't spin on work that will never be scheduled.
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    if (drainDebounceTimer !== null) {
+      clearTimeout(drainDebounceTimer);
+      drainDebounceTimer = null;
+    }
+    if (contentOnlyProgressRetryTimer !== null) {
+      clearTimeout(contentOnlyProgressRetryTimer);
+      contentOnlyProgressRetryTimer = null;
+    }
+    pendingContentOnlyProgressEvents = [];
+    contentOnlyProgressFlushScheduled = false;
+    urgentDrainRequested = false;
+    dirty = false;
+    pending = false;
+  };
+
   const drainContentLaneQueue = async (
     reconciler: ContentLaneSourceUnitReconciler,
   ): Promise<number> => {
@@ -7645,5 +7698,6 @@ export const createConnectionsMaterializer = (
     drainContentLaneQueue,
     requalifyVisitForSimilarity,
     isDrainActive,
+    dispose,
   };
 };

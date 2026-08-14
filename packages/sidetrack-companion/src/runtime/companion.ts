@@ -693,6 +693,14 @@ export const startCompanion = async (
         scheduleAttributionV1Artifact();
       },
     });
+    // Lifecycle: cancel the materializer's scheduled work (drain
+    // debounce + content-only progress retry timers) at shutdown. An
+    // in-flight drain finishes, but no new pass fires afterwards — a
+    // live debounce timer surviving teardown would otherwise drain
+    // against already-torn-down stores.
+    teardown.push(() => {
+      connectionsMaterializer.dispose();
+    });
     syncContractRunner.register(connectionsMaterializer);
 
     // Reproject on startup if the projector logic has changed since
@@ -1753,6 +1761,11 @@ export const startCompanion = async (
         // starting up would race the still-running background write.
         // Reviewer-flagged ordering.
         await syncContractRunner.awaitIdle();
+        // Pending work has drained; now cancel any drain-debounce
+        // timer that got re-armed during the drain-out so no ghost
+        // drain fires after the lock is released. (The teardown[]
+        // array holds the same dispose for the startup-failure path.)
+        connectionsMaterializer.dispose();
         // Then wait for any rebuild that those materializers (or a
         // direct path) kicked off.
         await recallLifecycle.waitForRebuild();

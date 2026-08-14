@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatRelativeMs, intelligenceSummaryFromHealth } from './intelligenceSummary';
+import { intelligenceSummaryFromHealth } from './intelligenceSummary';
 
 // Mirrors the live-rig GET /v1/system/health shape (data envelope).
 const LIVE_HEALTH = {
@@ -88,18 +88,5 @@ describe('intelligenceSummaryFromHealth', () => {
     const s = intelligenceSummaryFromHealth(LIVE_HEALTH.data, NOW);
     expect(s.available).toBe(true);
     expect(s.metrics.find((m) => m.key === 'impressions')?.value).toBe('1,442');
-  });
-});
-
-describe('formatRelativeMs', () => {
-  const base = Date.parse('2026-07-13T10:00:00.000Z');
-  it('formats minutes, hours, days, and just-now', () => {
-    expect(formatRelativeMs('2026-07-13T09:59:40.000Z', base)).toBe('just now');
-    expect(formatRelativeMs('2026-07-13T09:40:00.000Z', base)).toBe('20m ago');
-    expect(formatRelativeMs('2026-07-13T07:00:00.000Z', base)).toBe('3h ago');
-    expect(formatRelativeMs('2026-07-11T10:00:00.000Z', base)).toBe('2d ago');
-  });
-  it('passes through an unparseable timestamp', () => {
-    expect(formatRelativeMs('not-a-date', base)).toBe('not-a-date');
   });
 });

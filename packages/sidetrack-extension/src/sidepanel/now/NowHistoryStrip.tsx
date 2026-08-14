@@ -2,6 +2,7 @@ import type { ReactElement } from 'react';
 
 import type { NowContext } from './nowHistory';
 import { pageKindLabel } from './pageKind';
+import { formatRelative } from '../../util/time';
 
 // Lightweight breadcrumb above the Now card.
 //
@@ -17,17 +18,6 @@ export interface NowHistoryStripProps {
   readonly pinnedUrl: string | null;
   readonly onPin: (url: string | null) => void;
 }
-
-const compactRel = (iso: string, nowMs: number): string => {
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return '';
-  const deltaMin = Math.max(0, Math.round((nowMs - ms) / 60_000));
-  if (deltaMin === 0) return 'just now';
-  if (deltaMin < 60) return `${String(deltaMin)}m ago`;
-  const hrs = Math.round(deltaMin / 60);
-  if (hrs < 24) return `${String(hrs)}h ago`;
-  return `${String(Math.round(hrs / 24))}d ago`;
-};
 
 export const NowHistoryStrip = ({
   contexts,
@@ -79,7 +69,9 @@ export const NowHistoryStrip = ({
           >
             <span className="cx-now-history-kind">{pageKindLabel[ctx.kind]}</span>
             <span className="cx-now-history-title">{ctx.title}</span>
-            <span className="cx-now-history-when">{compactRel(ctx.enteredAt, nowMs)}</span>
+            <span className="cx-now-history-when">
+              {formatRelative(ctx.enteredAt, { short: true, nowMs })}
+            </span>
           </button>
         );
       })}

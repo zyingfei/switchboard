@@ -234,7 +234,7 @@ describe('download copy states the real cost and names the outbound host', () =>
   it('the button label carries BOTH the size and huggingface.co', () => {
     const label = downloadButtonLabel(NANO_CLASS_SPEC);
     expect(label).toContain('Download to companion');
-    expect(label).toContain('2.4GB');
+    expect(label).toContain('2.4 GB');
     expect(label).toContain('huggingface.co');
   });
 
@@ -273,7 +273,7 @@ describe('download copy states the real cost and names the outbound host', () =>
   it('the not-cached message points at the STEP, never at the URL', () => {
     const message = notCachedMessage(NANO_CLASS_SPEC);
     expect(message).toContain('not on the companion yet');
-    expect(message).toContain('2.4GB');
+    expect(message).toContain('2.4 GB');
     expect(message).toContain('huggingface.co');
     expect(message).not.toContain('Could not locate file');
     expect(message).not.toContain('127.0.0.1');
@@ -302,7 +302,7 @@ describe('OnDeviceAiRow — a model the companion does not have', () => {
     const download = await screen.findByTestId('hp-ondevice-ai-model-download');
     // The cost and the outbound are on the button itself — not in a tooltip,
     // not in a confirm dialog the user could skip.
-    expect(download).toHaveTextContent('2.4GB');
+    expect(download).toHaveTextContent('2.4 GB');
     expect(download).toHaveTextContent('huggingface.co');
     // A load that would fail is not offered at all.
     expect(screen.queryByTestId('hp-ondevice-ai-webgpu-load')).not.toBeInTheDocument();

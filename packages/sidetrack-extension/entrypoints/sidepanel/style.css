@@ -14278,6 +14278,30 @@ pre.diff {
   flex-wrap: wrap;
   gap: var(--space-2);
 }
+/* Off-device AI (RemoteEngineRow) — the one control that can arrange for
+   page text to leave the device, so it lives here with the other privacy
+   controls. Same card shell as .privacy-add-current; the controls inside
+   reuse the standard idioms (.switch, .settings-text-row, .btn). */
+.privacy-offdevice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--rule-soft);
+  border-radius: var(--r1);
+  background: var(--paper-light);
+  font-size: 12px;
+}
+.privacy-offdevice .settings-text-row {
+  /* The card's column gap does the spacing. */
+  margin-bottom: 0;
+}
+.privacy-offdevice-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
 /* NoCaptureRulesSection ships with Settings-context type sizes. Inside
    the Privacy view, tighten the nested subsection heading + lede so the
    panel reads as one composed surface (not a transplanted Settings

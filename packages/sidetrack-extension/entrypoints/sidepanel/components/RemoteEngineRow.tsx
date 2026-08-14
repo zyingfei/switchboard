@@ -13,7 +13,11 @@ import {
 } from '../../../src/sidepanel/nano/remoteConfig';
 import { formatEngineLimits, remoteLimits } from '../../../src/sidepanel/nano/engineLimits';
 
-// The OPTIONAL remote engine's configuration block, inside Health → Experiments.
+// The OPTIONAL remote engine's configuration block, inside the Privacy view
+// (Privacy → Off-device AI), next to the no-capture rules. It lived in
+// Health → Experiments until the 2026-08-14 UI review (finding 3): an
+// off-device data control belongs on the privacy surface, styled like every
+// other setting, not buried in an experiments drill.
 //
 // This is the one place in the product where a user can arrange for page text to
 // leave the device, so the UI is built to make that impossible to do by accident
@@ -102,13 +106,13 @@ export function RemoteEngineRow({ onChanged }: RemoteEngineRowProps = {}) {
   const mask = maskApiKey(config.apiKey);
 
   return (
-    <div className="sx-callout" data-testid="hp-remote-engine" style={{ marginTop: 8 }}>
+    <div className="privacy-offdevice" data-testid="hp-remote-engine">
       <strong>Remote engine (optional, off by default)</strong>
-      <div className="mono" style={{ marginTop: 4 }}>
+      <p className="privacy-lede">
         Everything else in Sidetrack runs on this device. Turning this on sends the page or thread
         text you enrich to a provider you choose, with a key you supply.
-      </div>
-      <label style={{ display: 'block', marginTop: 6 }}>
+      </p>
+      <label className={'switch ' + (config.enabled ? 'on' : '')}>
         <input
           type="checkbox"
           checked={config.enabled}
@@ -116,71 +120,78 @@ export function RemoteEngineRow({ onChanged }: RemoteEngineRowProps = {}) {
             void persist({ enabled: e.target.checked });
           }}
           data-testid="hp-remote-enable"
-        />{' '}
-        Enable the remote engine
-        {config.enabled && mask.length === 0 ? ' — add a key below to use it' : ''}
+        />
+        <span className="knob" />
+        <span className="lbl">
+          Enable the remote engine
+          {config.enabled && mask.length === 0 ? (
+            <span className="desc mono">add a key below to use it</span>
+          ) : null}
+        </span>
       </label>
-      <div style={{ marginTop: 6 }}>
-        <label>
-          Base URL{' '}
-          <input
-            type="text"
-            value={baseUrlDraft}
-            onChange={(e) => {
-              setBaseUrlDraft(e.target.value);
-            }}
-            data-testid="hp-remote-base-url"
-          />
-        </label>
-      </div>
-      <div style={{ marginTop: 4 }}>
-        <label>
-          Model{' '}
-          <input
-            type="text"
-            value={modelDraft}
-            onChange={(e) => {
-              setModelDraft(e.target.value);
-            }}
-            data-testid="hp-remote-model"
-          />
-        </label>
-      </div>
-      <div style={{ marginTop: 4 }}>
-        <label>
-          API key{' '}
-          <input
-            type="password"
-            value={keyDraft}
-            placeholder={mask.length === 0 ? 'sk-…' : 'replace the stored key'}
-            onChange={(e) => {
-              setKeyDraft(e.target.value);
-            }}
-            data-testid="hp-remote-key"
-          />
-        </label>
-        {mask.length > 0 ? (
-          <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-remote-key-mask">
-            stored: {mask}
-          </span>
-        ) : null}
-      </div>
-      <div style={{ marginTop: 6 }}>
-        <button type="button" className="sx-btn" onClick={saveFields} data-testid="hp-remote-save">
+      <label className="settings-text-row">
+        <span>Base URL</span>
+        <input
+          type="text"
+          className="mono"
+          value={baseUrlDraft}
+          onChange={(e) => {
+            setBaseUrlDraft(e.target.value);
+          }}
+          data-testid="hp-remote-base-url"
+        />
+      </label>
+      <label className="settings-text-row">
+        <span>Model</span>
+        <input
+          type="text"
+          className="mono"
+          value={modelDraft}
+          onChange={(e) => {
+            setModelDraft(e.target.value);
+          }}
+          data-testid="hp-remote-model"
+        />
+      </label>
+      <label className="settings-text-row">
+        <span>API key</span>
+        <input
+          type="password"
+          autoComplete="off"
+          className="mono"
+          value={keyDraft}
+          placeholder={mask.length === 0 ? 'sk-…' : 'replace the stored key'}
+          onChange={(e) => {
+            setKeyDraft(e.target.value);
+          }}
+          data-testid="hp-remote-key"
+        />
+      </label>
+      {mask.length > 0 ? (
+        <span className="mono" data-testid="hp-remote-key-mask">
+          stored: {mask}
+        </span>
+      ) : null}
+      <div className="privacy-offdevice-actions">
+        <button
+          type="button"
+          className="btn btn-primary"
+          onClick={saveFields}
+          data-testid="hp-remote-save"
+        >
           Save
         </button>
         {mask.length > 0 ? (
           <button
             type="button"
-            className="sx-btn"
-            style={{ marginLeft: 8 }}
+            className="btn btn-ghost"
             onClick={clearKey}
             data-testid="hp-remote-clear-key"
           >
             Clear key
           </button>
         ) : null}
-        <span className="mono" style={{ marginLeft: 8 }} data-testid="hp-remote-limits">
+        <span className="mono" data-testid="hp-remote-limits">
           {formatEngineLimits(remoteLimits)}
         </span>
       </div>
@@ -196,7 +207,6 @@ export function RemoteEngineRow({ onChanged }: RemoteEngineRowProps = {}) {
           role="note"
           title={remotePrivacyDetail(host)}
           data-testid="hp-remote-warning"
-          style={{ marginTop: 6 }}
         >
           {remotePrivacyMarker(host)}
         </div>
