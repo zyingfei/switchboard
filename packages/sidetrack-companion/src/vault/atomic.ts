@@ -22,7 +22,7 @@ const isUnsupportedSyncError = (error: unknown): boolean =>
 // rename that is buffered in the dir's dirent cache can be lost on a
 // power cut even after the file data is flushed). Best-effort: a FS that
 // refuses dir open/sync must not fail the write.
-const syncDirectory = async (directory: string): Promise<void> => {
+export const syncDirectory = async (directory: string): Promise<void> => {
   let dirHandle;
   try {
     dirHandle = await open(directory, 'r');

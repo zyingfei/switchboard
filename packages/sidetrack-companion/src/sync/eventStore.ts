@@ -68,7 +68,36 @@ export interface EventStore {
     chunkSize: number,
   ) => Promise<void>;
   readonly watermark: () => VersionVector;
+  /** Per-UTC-day aggregate of RETAINED rows for one replica (day = the UTC
+   *  date of accepted_at_ms). The columnar sealer's planning + verification
+   *  read: compacted dots are already absent here, so a seal derived from
+   *  these stats mirrors the retained set, not raw JSONL. */
+  readonly sealDayStats: (replicaId: string) => readonly SealDayStat[];
+  /** Retained rows for one replica-day ordered by seq, as raw column values
+   *  (payload stays the stored JSON TEXT) — exactly what a sealed segment
+   *  writes. Day bounds are UTC-midnight accepted_at_ms bounds, matching
+   *  sealDayStats bucketing. */
+  readonly readSealRows: (replicaId: string, day: string) => readonly SealRow[];
   readonly close: () => void;
+}
+
+export interface SealDayStat {
+  /** UTC YYYY-MM-DD of accepted_at_ms. */
+  readonly day: string;
+  readonly rows: number;
+  readonly seqLo: number;
+  readonly seqHi: number;
+}
+
+export interface SealRow {
+  readonly replicaId: string;
+  readonly seq: number;
+  readonly type: string;
+  readonly acceptedAtMs: number;
+  readonly aggregateId: string;
+  readonly clientEventId: string;
+  /** Stored JSON TEXT, passed through untouched. */
+  readonly payload: string;
 }
 
 /** Machine-readable single-source declaration consumed by docs/tests. */
@@ -762,6 +791,53 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     }
   };
 
+  // UTC-midnight bounds for a YYYY-MM-DD day — integer ms, index-friendly
+  // (events_accepted_at_ms_idx) where a strftime() predicate would scan.
+  const dayBoundsMs = (day: string): { readonly lo: number; readonly hi: number } => {
+    const lo = Date.parse(`${day}T00:00:00.000Z`);
+    if (!Number.isFinite(lo)) throw new Error(`invalid day stamp: ${day}`);
+    return { lo, hi: lo + 24 * 60 * 60 * 1000 };
+  };
+
+  const sealDayStats = (replicaId: string): readonly SealDayStat[] => {
+    const rows = db
+      .query(
+        `SELECT strftime('%Y-%m-%d', accepted_at_ms / 1000, 'unixepoch') AS day,
+                COUNT(*) AS n, MIN(seq) AS seq_lo, MAX(seq) AS seq_hi
+           FROM events WHERE replica_id = ?
+          GROUP BY day ORDER BY day`,
+      )
+      .all(replicaId);
+    return rows.map((row) => ({
+      day: stringField(row, 'day'),
+      rows: numberField(row, 'n'),
+      seqLo: numberField(row, 'seq_lo'),
+      seqHi: numberField(row, 'seq_hi'),
+    }));
+  };
+
+  const readSealRows = (replicaId: string, day: string): readonly SealRow[] => {
+    const { lo, hi } = dayBoundsMs(day);
+    const rows = db
+      .query(
+        `SELECT replica_id, seq, type, accepted_at_ms, aggregate_id,
+                client_event_id, payload
+           FROM events
+          WHERE replica_id = ? AND accepted_at_ms >= ? AND accepted_at_ms < ?
+          ORDER BY seq`,
+      )
+      .all(replicaId, lo, hi);
+    return rows.map((row) => ({
+      replicaId: stringField(row, 'replica_id'),
+      seq: numberField(row, 'seq'),
+      type: stringField(row, 'type'),
+      acceptedAtMs: numberField(row, 'accepted_at_ms'),
+      aggregateId: stringField(row, 'aggregate_id'),
+      clientEventId: stringField(row, 'client_event_id'),
+      payload: stringField(row, 'payload'),
+    }));
+  };
+
   return {
     ingest: (event) => {
       ingest(event);
@@ -779,6 +855,8 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     forEachChunk,
     forEachChunkOfTypes,
     watermark,
+    sealDayStats,
+    readSealRows,
     close: () => {
       db.close?.();
     },

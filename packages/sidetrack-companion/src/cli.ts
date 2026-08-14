@@ -174,6 +174,14 @@ export const renderHelp = (): string =>
     '    fully mirrored legacy spool days). Neither mode ever touches _BAC/log,',
     '    threads, workstreams, or other canonical user state.',
     '',
+    'Seal subcommand (columnar event tier, stage 1):',
+    '  sidetrack-companion seal --vault <path> --dry-run [--json]',
+    '  sidetrack-companion seal --vault <path> --run [--json]',
+    '    Seals closed UTC days of the typed event store into zstd Parquet',
+    '    segments under _BAC/seal/, verified against the store before publish',
+    '    and recorded in the append-only seal manifest. Requires',
+    '    SIDETRACK_EVENT_STORE=1; never reads, writes, or deletes _BAC/log.',
+    '',
     'Eval subcommand (report-only; runs WITHOUT the companion):',
     '  sidetrack-companion eval replay --vault <path> [--json] [--no-persist]',
     '  sidetrack-companion eval connections-precision --vault <path> [--json]',
@@ -698,6 +706,50 @@ const runRecallSubcommand = async (
   return 2;
 };
 
+const runSealSubcommand = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion seal --vault <path> (--dry-run | --run) [--json]',
+    );
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for seal.');
+    return 2;
+  }
+  const dryRun = argv.includes('--dry-run');
+  const run = argv.includes('--run');
+  if (dryRun === run) {
+    writeLine(streams.stderr, 'seal requires exactly one of --dry-run or --run.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const { runEventSealPass } = await import('./analytics/eventSeal.js');
+  const result = await runEventSealPass(vaultPath, { dryRun });
+  if (json) {
+    writeLine(streams.stdout, JSON.stringify({ mode: dryRun ? 'dry-run' : 'run', result }, null, 2));
+    return result.errors.length === 0 ? 0 : 1;
+  }
+  writeLine(
+    streams.stdout,
+    `seal ${dryRun ? 'dry-run' : 'run'}: planned=${String(result.planned.length)} sealed=${String(
+      result.sealed.length,
+    )} open-skipped=${String(result.skippedOpenDays)} already-sealed=${String(
+      result.skippedAlreadySealed,
+    )} errors=${String(result.errors.length)}`,
+  );
+  for (const entry of dryRun ? result.planned : result.sealed) {
+    writeLine(
+      streams.stdout,
+      `${entry.replica}\t${entry.day}\trows=${String(entry.rows)}\tseq=[${String(entry.seqLo)},${String(entry.seqHi)}]`,
+    );
+  }
+  for (const error of result.errors) writeLine(streams.stderr, error);
+  return result.errors.length === 0 ? 0 : 1;
+};
+
 const runGcSubcommand = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   if (argv.includes('--help') || argv.includes('help')) {
     writeLine(
@@ -1208,6 +1260,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'gc') {
     return await runGcSubcommand(argv, streams);
+  }
+  if (argv[0] === 'seal') {
+    return await runSealSubcommand(argv, streams);
   }
   if (argv[0] === 'ingest') {
     return await runIngestSubcommand(argv, streams);

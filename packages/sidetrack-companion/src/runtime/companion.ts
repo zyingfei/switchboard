@@ -36,6 +36,7 @@ import { startEventLoopMonitor } from './eventLoopMonitor.js';
 import { createEmbedderClient } from '../recall/embedderClient.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { eventStoreEnabled, getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { eventSealEnabled } from '../analytics/eventSeal.js';
 import {
   collectWorkGraphHealth,
   type ConnectionsDiagnosticSnapshot,
@@ -136,6 +137,10 @@ export interface HygieneStatus {
   lastGenerationOrphanBytes?: number;
   /** How many the sweep actually collected — always 0 while disarmed. */
   lastGenerationSweepCollected?: number;
+  /** Last columnar sealer pass (SIDETRACK_EVENT_SEAL). */
+  lastEventSealAt?: string;
+  lastEventSealSealedCount?: number;
+  lastEventSealErrorCount?: number;
 }
 
 export const scheduleSqliteVacuumGc = (
@@ -538,6 +543,41 @@ export const startCompanion = async (
     }, 60_000);
     teardown.push(() => {
       clearTimeout(derivedRevisionGcKickoff);
+    });
+    // Columnar sealer (design 2026-08-01, stage 1). Flag checked per tick so
+    // the loop costs nothing while SIDETRACK_EVENT_SEAL is off. Hourly, like
+    // the derived-revision GC: a day seals at most once plus late-arrival
+    // re-seals, so cadence only bounds how stale the newest seal can be.
+    const runEventSealTick = async (): Promise<void> => {
+      if (!eventSealEnabled()) return;
+      try {
+        const { runEventSealPass } = await import('../analytics/eventSeal.js');
+        const result = await runEventSealPass(options.vaultPath);
+        hygieneStatus.lastEventSealAt = new Date().toISOString();
+        hygieneStatus.lastEventSealSealedCount = result.sealed.length;
+        hygieneStatus.lastEventSealErrorCount = result.errors.length;
+      } catch {
+        // Best-effort — a failed seal pass must never crash the companion.
+      }
+    };
+    const eventSealLoop = setInterval(
+      () => {
+        void runEventSealTick();
+      },
+      60 * 60 * 1000,
+    );
+    teardown.push(() => {
+      clearInterval(eventSealLoop);
+    });
+    // First pass well after boot so it never competes with catch-up drains.
+    const eventSealKickoff = setTimeout(
+      () => {
+        void runEventSealTick();
+      },
+      5 * 60_000,
+    );
+    teardown.push(() => {
+      clearTimeout(eventSealKickoff);
     });
     const sqliteVacuumEveryMs = (() => {
       const raw = process.env['SIDETRACK_SQLITE_VACUUM_EVERY_MS'];

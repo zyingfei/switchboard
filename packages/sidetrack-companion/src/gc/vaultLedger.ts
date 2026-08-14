@@ -74,6 +74,8 @@ export type LedgerFamily =
   | 'ranker'
   | 'diagnostics'
   | 'debug-dumps'
+  /** Sealed Parquet segments + manifest (`seal/`, SIDETRACK_EVENT_SEAL). */
+  | 'event-seal'
   /** Catch-all — the reconciliation invariant's escape valve. */
   | 'other';
 
@@ -227,6 +229,7 @@ export const classifyVaultPath = (segments: readonly string[]): LedgerFamily => 
   if (top === 'ranker') return 'ranker';
   if (top === 'diagnostics') return 'diagnostics';
   if (top === 'debug-dumps') return 'debug-dumps';
+  if (top === 'seal') return 'event-seal';
   return 'other';
 };
 
@@ -245,6 +248,7 @@ const ALL_FAMILIES: readonly LedgerFamily[] = [
   'ranker',
   'diagnostics',
   'debug-dumps',
+  'event-seal',
   'other',
 ];
 
@@ -411,6 +415,20 @@ const describeFamily = (
             reclaimable: 0,
             reclaimableAssessed: false,
             note: 'nothing reads it with the event store off; storage retirement verifies every row against canonical JSONL before removal',
+          };
+    case 'event-seal':
+      return process.env['SIDETRACK_EVENT_SEAL'] === '1'
+        ? {
+            status: 'active',
+            reclaimable: 0,
+            reclaimableAssessed: true,
+            note: 'sealed Parquet segments + manifest (SIDETRACK_EVENT_SEAL is on); rollback = delete seal/ — the canonical log is untouched',
+          }
+        : {
+            status: 'unused-under-config',
+            reclaimable: 0,
+            reclaimableAssessed: false,
+            note: 'sealed segments left by a previous SIDETRACK_EVENT_SEAL run; safe to delete wholesale, everything rebuilds from canonical JSONL',
           };
     case 'event-log':
       return {
