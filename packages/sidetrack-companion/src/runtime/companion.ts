@@ -141,6 +141,13 @@ export interface HygieneStatus {
   lastEventSealAt?: string;
   lastEventSealSealedCount?: number;
   lastEventSealErrorCount?: number;
+  /** Last sealed-vs-store integrity A/B (stage 2 verify-green soak). */
+  lastSealIntegrityAt?: string;
+  lastSealIntegrityMatches?: number;
+  /** Benign: store moved past the seal; re-sealed next pass. */
+  lastSealIntegrityStoreDrift?: number;
+  /** NEVER benign: segment corrupt or missing vs its own manifest entry. */
+  lastSealIntegrityAlarmCount?: number;
 }
 
 export const scheduleSqliteVacuumGc = (
@@ -558,6 +565,22 @@ export const startCompanion = async (
         hygieneStatus.lastEventSealErrorCount = result.errors.length;
       } catch {
         // Best-effort — a failed seal pass must never crash the companion.
+      }
+      try {
+        // Stage 2: continuous sealed-vs-store integrity A/B — the verify-green
+        // soak the design requires before any store shrink. One aggregate over
+        // all segments (~30ms at real vault scale); store-drift is benign
+        // (re-sealed next pass), segment alarms never are.
+        const { runSealIntegrityCheck } = await import('../analytics/eventScan.js');
+        const report = await runSealIntegrityCheck(options.vaultPath);
+        if (report !== null) {
+          hygieneStatus.lastSealIntegrityAt = report.producedAt;
+          hygieneStatus.lastSealIntegrityMatches = report.matches;
+          hygieneStatus.lastSealIntegrityStoreDrift = report.storeDrift;
+          hygieneStatus.lastSealIntegrityAlarmCount = report.segmentAlarms.length;
+        }
+      } catch {
+        // Best-effort — a failed integrity check must never crash the companion.
       }
     };
     const eventSealLoop = setInterval(
