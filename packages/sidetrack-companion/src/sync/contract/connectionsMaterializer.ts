@@ -5814,12 +5814,79 @@ export const createConnectionsMaterializer = (
           )} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
         );
         missingRequiredVisitKeys = missingRequiredTimelineVisitKeys();
+        // The fact store can be PARTIAL (it materializes what its own ingest
+        // has covered, not necessarily every BROWSER_TIMELINE_OBSERVED in
+        // history). Before declaring a key unsatisfiable, re-derive from the
+        // complete event set — the same derivation the widened fallback uses.
+        if (missingRequiredVisitKeys.size > 0 && timelineSource === 'factstore') {
+          let completeRawDays: readonly TimelineDayProjectionWithDimensions[];
+          let completeSource: string;
+          if (storeBackedEvents !== null) {
+            const timelineEvents: AcceptedEvent[] = [];
+            await storeBackedEvents.forEachChunkOfTypes(
+              [BROWSER_TIMELINE_OBSERVED],
+              (chunk) => {
+                for (const event of chunk) timelineEvents.push(event);
+              },
+              2000,
+            );
+            completeRawDays = buildTimelineDays(timelineEvents);
+            completeSource = 'typed-store-after-factstore';
+          } else {
+            completeRawDays = buildTimelineDays(await deps.eventLog.readMerged());
+            completeSource = 'merged-after-factstore';
+          }
+          scopedTimelineDays = filterTimelineDaysForScopedDelta(
+            enrichTimelineDaysWithEngagement(completeRawDays, engagementInputs),
+            scopedTimelineDayFilter,
+          );
+          mark(
+            `scopedTimelineDelta.timelineSourced src=${completeSource} missing=${String(
+              missingRequiredVisitKeys.size,
+            )} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))}`,
+          );
+          missingRequiredVisitKeys = missingRequiredTimelineVisitKeys();
+        }
+        // Keys a COMPLETE timeline derivation cannot supply are unsatisfiable
+        // in the widened fallback too — it derives its timeline days from the
+        // same BROWSER_TIMELINE_OBSERVED set (the sourcing comment above
+        // documents the identity) — so bailing here buys a ~35s-per-chunk
+        // full rebuild (measured on a 103k-event catch-up) that produces the
+        // exact same absence. Live-observed unsatisfiable classes: search-
+        // visit URLs (excluded from timeline entries by design) and HNSW
+        // visit-instance ids (`visit_<ms>_<hash>` — a different key namespace
+        // than timeline entries; they enter the required set via the
+        // similarity-affected expansion). Proceed scoped with the requirement
+        // relaxed to the satisfiable subset; the similarity-family
+        // carry-forward below preserves prior rows for untouched pairs
+        // exactly as it does on every other scoped drain.
+        if (missingRequiredVisitKeys.size > 0) {
+          mark(
+            `scopedTimelineDelta.relaxedUnsatisfiable n=${String(
+              missingRequiredVisitKeys.size,
+            )} sample=${[...missingRequiredVisitKeys].slice(0, 3).join(' | ')}`,
+          );
+          for (const key of missingRequiredVisitKeys) requiredTimelineVisitKeys.delete(key);
+          missingRequiredVisitKeys = new Set();
+        }
       }
       const hasRequiredTimelineRows = missingRequiredVisitKeys.size === 0;
       if (!hasRequiredTimelineRows) {
         scopedTimelineDeltaSkipDetail = `missing-required-timeline-entries:${String(
           missingRequiredVisitKeys.size,
         )}`;
+        // The bail below costs a full widened rebuild per drain (measured
+        // ~35s/chunk on a 103k-event catch-up), so the miss must be
+        // attributable from the log alone: name a sample of the keys the
+        // timeline could not supply. PII posture matches the timelineSourced
+        // mark (visit keys are already logged by other phase marks).
+        mark(
+          `scopedTimelineDelta.missingRequired n=${String(missingRequiredVisitKeys.size)} sample=${[
+            ...missingRequiredVisitKeys,
+          ]
+            .slice(0, 3)
+            .join(' | ')}`,
+        );
       }
       if (
         (scopedTimelineDays.length > 0 ||
@@ -6046,12 +6113,18 @@ export const createConnectionsMaterializer = (
           `replaceScopeRows scopedTimelineDeltaContentLaneOnly entries=0 pending=${String(pendingEventsForDrain.length)}`,
         );
       } else {
-        scopedTimelineDeltaSkipDetail =
-          scopedTimelineDays.length === 0
-            ? 'no-timeline-entries-with-owned-rows'
-            : pendingHasSearchVisit
-              ? 'pending-search-visit'
-              : 'unknown-inner';
+        // Never clobber a specific detail set upstream (the
+        // `missing-required-timeline-entries:N` class spent weeks in
+        // production logs mislabeled as `unknown-inner` because this
+        // fallback assignment overwrote it).
+        if (scopedTimelineDeltaSkipDetail === 'gate') {
+          scopedTimelineDeltaSkipDetail =
+            scopedTimelineDays.length === 0
+              ? 'no-timeline-entries-with-owned-rows'
+              : pendingHasSearchVisit
+                ? 'pending-search-visit'
+                : 'unknown-inner';
+        }
       }
     }
     if (!scopedTimelineDeltaApplied) {
