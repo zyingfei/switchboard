@@ -35,6 +35,14 @@ jobs:
     # lane with dimension-matched (384) fixtures.
     env:
       SIDETRACK_SQLITE_LIB: "off"
+      # Test vaults live in mkdtemp(tmpdir()). The double-buffer store seeds
+      # every publish by copyFileSync-cloning the generation db — ~0ms COW on
+      # local APFS, but a FULL byte copy on the runner's ext4, which turns each
+      # materializer publish into O(db-size) disk I/O (~10s per 5000-row chunk
+      # measured) and stretches timing windows until order-sensitive tests
+      # flake. tmpfs restores the "clone is cheap" assumption the store was
+      # built on.
+      TMPDIR: /dev/shm
     steps:
       - uses: actions/checkout@v4
 

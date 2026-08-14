@@ -418,6 +418,16 @@ export const rankHybrid = (
       }
       return true;
     })
+    // Total comparator: score desc, then id asc — the lexical twin of the
+    // vector arm's tiebreak above, for the same reason: the FUSION_WINDOW
+    // cut over a score-tied block must not depend on MiniSearch's internal
+    // ordering of equal scores. Cannot change any served ordering where
+    // scores are untied.
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        (String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0),
+    )
     .slice(0, FUSION_WINDOW);
 
   // 3. RRF fusion: each list contributes 1/(k+rank); freshness is a
