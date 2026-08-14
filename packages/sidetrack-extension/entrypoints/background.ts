@@ -1242,7 +1242,17 @@ const extractPageEvidenceFromTab = async (
 };
 
 const PAGE_EVIDENCE_ATTENTION_GATE_MS = 5_000;
-const PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS = 6 * 60 * 60 * 1_000;
+// Re-send gating for auto page-evidence extraction, per canonicalThreadUrl.
+// A re-send is allowed when EITHER the max interval elapsed (upper bound for
+// any page), OR the user revisited the page and the revisit floor elapsed.
+// Every call into maybeExtractAutoPageEvidence is user-driven (tab
+// navigation/activation/attention), i.e. a revisit — so revisited pages
+// re-extract at most every 15 minutes while idle pages simply never re-send.
+// Constraint that makes the 15-minute floor cheap: the companion's
+// page-evidence pipeline (page-evidence/extract.ts) simhash-dedupes unchanged
+// content downstream, so a no-change re-send is absorbed there.
+const PAGE_EVIDENCE_REVISIT_RESEND_FLOOR_MS = 15 * 60 * 1_000;
+const PAGE_EVIDENCE_MAX_RESEND_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const pageEvidenceAutoExtractedAtByCanonical = new Map<string, number>();
 
 const maybeExtractAutoPageEvidence = async (
@@ -1262,7 +1272,14 @@ const maybeExtractAutoPageEvidence = async (
   const canonicalUrl = canonicalThreadUrl(tabUrl);
   const now = Date.now();
   const previous = pageEvidenceAutoExtractedAtByCanonical.get(canonicalUrl);
-  if (previous !== undefined && now - previous < PAGE_EVIDENCE_EXTRACTION_COOLDOWN_MS) return;
+  if (previous !== undefined) {
+    const elapsedMs = now - previous;
+    const maxIntervalElapsed = elapsedMs >= PAGE_EVIDENCE_MAX_RESEND_INTERVAL_MS;
+    // This call site only fires on user revisits (navigation/activation/attention),
+    // so the revisit floor applies to every request reaching this gate.
+    const revisitFloorElapsed = elapsedMs >= PAGE_EVIDENCE_REVISIT_RESEND_FLOOR_MS;
+    if (!maxIntervalElapsed && !revisitFloorElapsed) return;
+  }
   pageEvidenceAutoExtractedAtByCanonical.set(canonicalUrl, now);
   try {
     await extractPageEvidenceFromTab(tab, trigger);
