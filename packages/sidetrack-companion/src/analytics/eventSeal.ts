@@ -63,8 +63,20 @@ export interface SealPassResult {
   readonly sealed: readonly SealManifestEntry[];
   readonly skippedOpenDays: number;
   readonly skippedAlreadySealed: number;
+  /** Planned days beyond `maxDaysPerPass` left for the next pass; 0 when nothing deferred. */
+  readonly deferredDays: number;
   readonly errors: readonly string[];
 }
+
+/**
+ * Per-pass day cap. The per-day JS work (readSealRows materializing the day,
+ * the row-by-row appender feed, sha256File) runs on the single serving
+ * thread, so an unbounded pass over a large backlog (first live pass: 113
+ * days) stalls HTTP serving. Backfill math: worst-case backlog of 182 days is
+ * fully sealed within ceil(182 / 25) = 8 hourly ticks; steady state is 1 new
+ * day per day, far under the cap.
+ */
+const DEFAULT_MAX_DAYS_PER_PASS = 25;
 
 export const sealRoot = (vaultRoot: string): string => join(vaultRoot, ...SEAL_ROOT_SEGMENTS);
 export const sealManifestPath = (vaultRoot: string): string =>
@@ -274,14 +286,20 @@ const sealOneDay = async (
 
 /**
  * One sealer pass: plan every closed, unsealed (or changed) replica-day, then
- * — unless dryRun — seal each one. Individual day failures are collected, not
- * thrown: a bad day must not block the rest of the pass.
+ * — unless dryRun — seal each one, at most `maxDaysPerPass` per pass (the
+ * hourly tick drains any remainder). Individual day failures are collected,
+ * not thrown: a bad day must not block the rest of the pass.
  */
 export const runEventSealPass = async (
   vaultRoot: string,
-  options: { readonly dryRun?: boolean; readonly now?: () => Date } = {},
+  options: {
+    readonly dryRun?: boolean;
+    readonly now?: () => Date;
+    readonly maxDaysPerPass?: number;
+  } = {},
 ): Promise<SealPassResult> => {
   const now = options.now ?? ((): Date => new Date());
+  const maxDaysPerPass = options.maxDaysPerPass ?? DEFAULT_MAX_DAYS_PER_PASS;
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) {
     return {
@@ -289,6 +307,7 @@ export const runEventSealPass = async (
       sealed: [],
       skippedOpenDays: 0,
       skippedAlreadySealed: 0,
+      deferredDays: 0,
       errors: ['event store unavailable (SIDETRACK_EVENT_STORE off or failed to open)'],
     };
   }
@@ -330,29 +349,44 @@ export const runEventSealPass = async (
     sha256: '',
     sealedAt: '',
   }));
+  // Dry-run reports the FULL plan — the day cap bounds work, not visibility.
   if (options.dryRun === true || planned.length === 0) {
     return {
       planned: plannedEntries,
       sealed: [],
       skippedOpenDays,
       skippedAlreadySealed,
+      deferredDays: 0,
       errors: [],
     };
   }
 
+  const toSeal = planned.slice(0, maxDaysPerPass);
+  const deferredDays = planned.length - toSeal.length;
   const sealed: SealManifestEntry[] = [];
   const errors: string[] = [];
   const duck = await openDuck();
   try {
-    for (const { replica, stat } of planned) {
+    for (const { replica, stat } of toSeal) {
       try {
         sealed.push(await sealOneDay(vaultRoot, duck, store, replica, stat, now));
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
       }
+      // Yield to the event loop between days: the per-day JS work above runs
+      // on the serving thread, so this gap is where pending HTTP requests
+      // (and any other queued work) get to interleave.
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } finally {
     duck.close();
   }
-  return { planned: plannedEntries, sealed, skippedOpenDays, skippedAlreadySealed, errors };
+  return {
+    planned: plannedEntries,
+    sealed,
+    skippedOpenDays,
+    skippedAlreadySealed,
+    deferredDays,
+    errors,
+  };
 };
