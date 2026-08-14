@@ -234,6 +234,12 @@ export interface BackgroundEmbeddingLaneHealth {
    *  the backlog is non-empty — the exact inertness the soak exposed.
    *  A health surface should flag this loudly. */
   readonly inert: boolean;
+  /** Consecutive cycles that reported embeds while the backlog did NOT
+   *  shrink. The phantom-success signature (676k "embeds" against a
+   *  frozen backlog of 453 on the live vault) was invisible to every
+   *  other counter — embeddedTotal and lastSuccessAtMs both looked
+   *  healthy the whole time. Success without progress is the alarm. */
+  readonly noProgressCycles: number;
 }
 
 export interface BackgroundEmbeddingLane {
@@ -276,6 +282,19 @@ export const createBackgroundEmbeddingLane = (
   let lastQuarantinedCount = 0;
   let hasRun = false;
   let lastCycle: BackgroundEmbeddingLaneHealth['lastCycle'] = 'never-run';
+  // Success-without-progress detector: compares consecutive cycle START
+  // backlog sizes. Embeds that never shrink the next cycle's backlog are
+  // phantoms (completion landing under the wrong key, silent no-writes).
+  let noProgressCycles = 0;
+  let previousCycleBacklog: number | null = null;
+  // In-memory skip strikes. 'skipped' burns no quarantine attempt by
+  // design (timing, not record failure) — but a record whose page-content
+  // payload can NEVER exist (search-URL-class canonicalization) skips
+  // forever and occupies a batch slot every cycle. After enough strikes
+  // it is handed to the ordinary attempt/quarantine machinery, whose
+  // cooldown still gives it periodic fresh shots.
+  const skipStrikes = new Map<string, number>();
+  const SKIP_STRIKE_LIMIT = 8;
 
   const loadProgressOnce = async (): Promise<void> => {
     if (progressLoaded) return;
@@ -433,6 +452,7 @@ export const createBackgroundEmbeddingLane = (
         embedded += 1;
         delete attempts[candidate.canonicalUrl];
         delete quarantinedAt[candidate.canonicalUrl];
+        skipStrikes.delete(candidate.canonicalUrl);
         try {
           deps.onEmbedded?.(candidate.canonicalUrl);
         } catch {
@@ -448,8 +468,22 @@ export const createBackgroundEmbeddingLane = (
         }
       } else {
         // 'skipped' — no content payload available yet. Do not burn an
-        // attempt (this is not a failure of the record, just of timing).
+        // attempt for a timing miss — but a record that skips every cycle
+        // it is offered (SKIP_STRIKE_LIMIT strikes) has no payload coming
+        // and is handed to the attempt/quarantine machinery so it stops
+        // occupying a batch slot forever. The cooldown still re-offers it.
         skipped += 1;
+        const strikes = (skipStrikes.get(candidate.canonicalUrl) ?? 0) + 1;
+        if (strikes >= SKIP_STRIKE_LIMIT) {
+          skipStrikes.delete(candidate.canonicalUrl);
+          const nextAttempts = (attempts[candidate.canonicalUrl] ?? 0) + 1;
+          attempts[candidate.canonicalUrl] = nextAttempts;
+          if (nextAttempts >= maxAttempts && quarantinedAt[candidate.canonicalUrl] === undefined) {
+            quarantinedAt[candidate.canonicalUrl] = nowMs;
+          }
+        } else {
+          skipStrikes.set(candidate.canonicalUrl, strikes);
+        }
       }
     }
 
@@ -463,13 +497,27 @@ export const createBackgroundEmbeddingLane = (
       lastSuccessAtMs: embedded > 0 ? nowMs : (progress.lastSuccessAtMs ?? null),
     };
     await persistProgress();
+    // Success-without-progress: embeds this cycle but the backlog did not
+    // start any smaller than last cycle's ⇒ the completions are not landing.
+    if (embedded > 0 && previousCycleBacklog !== null && backlog.length >= previousCycleBacklog) {
+      noProgressCycles += 1;
+    } else if (embedded > 0 || backlog.length < (previousCycleBacklog ?? Number.POSITIVE_INFINITY)) {
+      noProgressCycles = 0;
+    }
+    previousCycleBacklog = backlog.length;
     if (embedded > 0 || failed > 0) {
+      // Name the head URLs: 182 byte-identical cycle lines hid a wedge that
+      // one glance at the URLs would have exposed.
+      const sample = backlog
+        .slice(0, 3)
+        .map((candidate) => candidate.canonicalUrl)
+        .join(' | ');
       log(
         `[page-evidence.embed-lane] cycle embedded=${String(embedded)} failed=${String(
           failed,
         )} skipped=${String(skipped)} backlog=${String(backlog.length)} quarantined=${String(
           quarantined,
-        )}`,
+        )}${noProgressCycles > 0 ? ` noProgress=${String(noProgressCycles)}` : ''} head=${sample}`,
       );
     }
     const cycleTag: BackgroundEmbeddingLaneHealth['lastCycle'] =
@@ -555,7 +603,12 @@ export const createBackgroundEmbeddingLane = (
       // Inert = ran cycles, never embedded anything, and backlog is
       // non-empty. This is precisely the 90-min soak failure; a health
       // surface flags it so the operator sees it in minutes not hours.
-      inert: hasRun && progress.embeddedTotal === 0 && lastBacklog > 0,
+      // Inert = never embedded anything against a live backlog, OR embedding
+      // "successfully" for 10+ cycles without the backlog moving (the
+      // phantom-success wedge — counters healthy, zero real progress).
+      inert:
+        (hasRun && progress.embeddedTotal === 0 && lastBacklog > 0) || noProgressCycles >= 10,
+      noProgressCycles,
     };
   };
 
