@@ -10727,7 +10727,7 @@ const App = () => {
         />
       ) : null}
 
-      {designPreviewOpen ? (
+      {__DEV__ && designPreviewOpen ? (
         <DesignPreview
           onClose={() => {
             setDesignPreviewOpen(false);

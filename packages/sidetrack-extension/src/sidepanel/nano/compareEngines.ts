@@ -89,7 +89,7 @@ export interface CompareOutcome {
 }
 
 /** Deterministic tie-break order, local-first — the same order routing uses. */
-export const COMPARE_ENGINE_ORDER: readonly EngineKind[] = ['nano', 'webgpu', 'remote'];
+export const COMPARE_ENGINE_ORDER: readonly EngineKind[] = ['nano', 'apple', 'webgpu', 'remote'];
 
 /** The exact headline when nothing validated. Asserted verbatim in the tests. */
 export const NO_USABLE_SUMMARY = 'no engine produced a usable summary';

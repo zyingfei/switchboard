@@ -11,6 +11,7 @@ import {
 } from '../../../src/sidepanel/nano/enrichmentWorker';
 import {
   isWebGpuLoaded,
+  appleServiceStatus,
   loadWebGpuEngine,
   readyEngines,
   resolveReadyEngine,
@@ -197,7 +198,23 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   const [compareRunning, setCompareRunning] = useState(false);
   const [compareOutcome, setCompareOutcome] = useState<CompareOutcome | null>(null);
   const [compareNote, setCompareNote] = useState<string | null>(null);
+  // Apple on-device service availability. Probed once per mount (the probe
+  // has its own TTL cache); without this the Experiments drill contradicted
+  // the Now card — "Apple ready" there, "cannot run the model" here.
+  const [appleReady, setAppleReady] = useState(false);
   const mountedRef = useRef(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    void appleServiceStatus()
+      .then((info) => {
+        if (!cancelled) setAppleReady(info.available);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const probe = useCallback(async (): Promise<void> => {
     const lm = builtinLanguageModel();
@@ -607,27 +624,32 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // which is active so the user knows what produced the text.
   const nanoReady = state === 'available';
   const webGpuReady = webGpuState === 'ready';
-  // Engine precedence, LOCAL-FIRST and identical to routing (language.ts):
-  // Nano → the loaded local model → the opt-in remote engine. Remote is last
-  // because it is the only one that sends text off the device.
-  const activeEngineLabel: 'Nano' | 'WebGPU' | 'Remote' | null = nanoReady
+  // Engine precedence, LOCAL-FIRST and identical to routing (engine.ts):
+  // Nano → Apple on-device service → the loaded local model → the opt-in
+  // remote engine. Remote is last because it is the only one that sends text
+  // off the device.
+  const activeEngineLabel: 'Nano' | 'Apple' | 'WebGPU' | 'Remote' | null = nanoReady
     ? 'Nano'
-    : webGpuReady
-      ? 'WebGPU'
-      : remoteArmed
-        ? 'Remote'
-        : null;
+    : appleReady
+      ? 'Apple'
+      : webGpuReady
+        ? 'WebGPU'
+        : remoteArmed
+          ? 'Remote'
+          : null;
   const engineReady = activeEngineLabel !== null;
   const selectedSpec = localModelSpec(localModelId);
   // The limits of whatever would run right now — stated before anything runs.
   const activeLimits =
     activeEngineLabel === 'Nano'
       ? limitsFor('nano')
-      : activeEngineLabel === 'WebGPU'
-        ? limitsFor('webgpu', localModelId)
-        : activeEngineLabel === 'Remote'
-          ? limitsFor('remote')
-          : null;
+      : activeEngineLabel === 'Apple'
+        ? limitsFor('apple')
+        : activeEngineLabel === 'WebGPU'
+          ? limitsFor('webgpu', localModelId)
+          : activeEngineLabel === 'Remote'
+            ? limitsFor('remote')
+            : null;
   // The marker is tied to the ACTIVE engine, not merely to the setting: if a
   // local model is ready, remote is not what runs, and claiming text leaves the
   // device would be as dishonest as hiding it when it does.
