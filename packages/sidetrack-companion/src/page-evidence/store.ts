@@ -966,12 +966,33 @@ export const embedBacklogCanonicalUrl = async (
   return async (rawCanonicalUrl) => {
     const payload = await readPageContentExtractedPayloadForEvidence(vaultRoot, rawCanonicalUrl);
     if (payload === null) return 'skipped';
+    // ONE KEY, END TO END. The page-content read canonicalizes with the
+    // page-content rules (sorted query params, tracking params stripped),
+    // which for multi-param URLs is a DIFFERENT string than the evidence
+    // key the lane's backlog is filed under. Writing under the payload's
+    // key as-is created a ready TWIN record and left the backlog record
+    // untouched — the lane then re-"embedded" the same head slots forever
+    // (676,537 phantom successes against a frozen backlog of ~453 on the
+    // live vault). Pin the write to the evidence key that was requested.
+    const requestedKey = canonicalizeEvidenceUrl(rawCanonicalUrl);
     const record = await completeExtractedPageEvidenceEmbedding(
       vaultRoot,
-      { ...payload, storageMode: 'indexed_chunks' },
+      { ...payload, canonicalUrl: requestedKey, storageMode: 'indexed_chunks' },
       { rebuildManifestAfterWrite: false },
     );
-    if (record.content?.embeddingState === 'ready' && record.content.docEmbeddingRef !== undefined) {
+    if (record.content?.embeddingState !== 'ready' || record.content.docEmbeddingRef === undefined) {
+      return 'failed';
+    }
+    // Completion is what is ON DISK at the requested key, not what the
+    // in-memory return claims (same read-back discipline as the body
+    // evidence worker): a silent no-write or a write under another key
+    // must count as failure so the lane burns an attempt instead of
+    // celebrating forever.
+    const persisted = await readRawPageEvidence(vaultRoot, requestedKey);
+    if (
+      persisted?.content?.embeddingState === 'ready' &&
+      persisted.content.docEmbeddingRef !== undefined
+    ) {
       return 'embedded';
     }
     return 'failed';
