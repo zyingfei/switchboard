@@ -593,6 +593,7 @@ only this recorded verdict + the enable commands for when data accrues.
 | `SIDETRACK_PAGE_EVIDENCE_DOC_EMBEDDINGS` | infra (embed-on-extract) | keep default — pre-existing lane, not a serving-math change | **ON** (disable with `=0`) | n/a |
 | `SIDETRACK_SIMILARITY_REQUALIFY` | regression-repair | keep default — restores the June baseline lane, not a new serving change; eval cannot argue against a repair it can't yet observe (lane serves 0) | **ON** (kill with `=0`) | n/a |
 | `SIDETRACK_SIMILARITY_CONTENT_REQUALIFY` | regression-repair | keep default — pure re-derive of already-eligible visits; no-op against the title skeleton while CONTENT_CORPUS is OFF | **ON** (kill with `=0`) | n/a |
+| `SIDETRACK_EVENT_SEAL` | infra (columnar tier, stage 1) | additive-only sealer; design 2026-08-01, rollout step 1 = soak on the TEST clone | **OFF** | `SIDETRACK_EVENT_SEAL=1` (requires `SIDETRACK_EVENT_STORE=1`) + restart |
 
 **Why "inconclusive → OFF" and not "OFF because it lost."** The owner
 directive is explicit that defaults are set by the verdict, not
