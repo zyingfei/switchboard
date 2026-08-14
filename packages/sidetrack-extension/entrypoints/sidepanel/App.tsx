@@ -77,6 +77,7 @@ import {
   InboundView,
   QueuedView,
   NoCaptureRulesSection,
+  RemoteEngineRow,
   Wizard,
   type RestoreStrategy,
   type ReviewVerdict,
@@ -9599,7 +9600,7 @@ const App = () => {
         // chip deep-links here. NoCaptureRulesSection is the SAME
         // standalone component Settings mounts; we reuse it verbatim
         // and wrap it with the section header + add-current-site row.
-        <div className="privacy-view" aria-label="Privacy — capture rules">
+        <div className="privacy-view" aria-label="Privacy — capture rules and off-device AI">
           <div className="sec-head">
             <span>Capture &amp; rules</span>
             <span className="count mono">
@@ -9661,6 +9662,21 @@ const App = () => {
             </div>
           )}
           <NoCaptureRulesSection busy={busy} />
+          {/* Off-device AI — the remote engine is the ONLY control in the
+              product that can send page or thread text off this device, so
+              it lives on the privacy surface with the no-capture rules
+              (UI review 2026-08-14, finding 3; formerly buried in Health →
+              Experiments, which now carries a one-line pointer here).
+              onChanged bumps the enrich probe so the Now card's engine
+              label reflects the change without a reopen. */}
+          <div className="sec-head">
+            <span>Off-device AI</span>
+          </div>
+          <RemoteEngineRow
+            onChanged={() => {
+              setEnrichProbeNonce((n) => n + 1);
+            }}
+          />
         </div>
       ) : null}
 

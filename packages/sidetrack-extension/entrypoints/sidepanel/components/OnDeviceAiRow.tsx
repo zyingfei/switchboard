@@ -54,7 +54,6 @@ import {
   remotePrivacyDetail,
   remotePrivacyMarker,
 } from '../../../src/sidepanel/nano/remoteConfig';
-import { RemoteEngineRow } from './RemoteEngineRow';
 import { TITLE_GENERATION } from '../../../src/sidepanel/nano/generationOptions';
 import { detectContentLanguage } from '../../../src/sidepanel/nano/language';
 import {
@@ -193,7 +192,6 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
   // marker and the engine-precedence label. A storage read, never a network one.
   const [remoteArmed, setRemoteArmed] = useState(false);
   const [remoteHost, setRemoteHost] = useState<string | null>(null);
-  const [remoteNonce, setRemoteNonce] = useState(0);
   // Comparative generation — observe-only, like the eval above it.
   const [compareRunning, setCompareRunning] = useState(false);
   const [compareOutcome, setCompareOutcome] = useState<CompareOutcome | null>(null);
@@ -254,8 +252,9 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
     })();
   }, []);
 
-  // Remote-engine armed state. Re-read whenever the config block reports a
-  // change, so the marker and the precedence label never lag the setting.
+  // Remote-engine armed state, read once per mount. The config block itself
+  // lives in Privacy → Off-device AI now; reopening this drill re-reads it,
+  // so the marker and the precedence label track the setting.
   useEffect(() => {
     void (async () => {
       const config = await readRemoteConfig();
@@ -264,7 +263,7 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
       setRemoteArmed(armed);
       setRemoteHost(armed ? remoteHostOf(config.baseUrl) : null);
     })();
-  }, [remoteNonce]);
+  }, []);
 
   // While a download is in flight, refresh the availability read on a slow
   // cadence so the row converges to 'available' without a manual reopen.
@@ -933,11 +932,12 @@ export function OnDeviceAiRow({ companionPort, bridgeKey }: OnDeviceAiRowProps =
           ))}
         </div>
       ) : null}
-      <RemoteEngineRow
-        onChanged={() => {
-          setRemoteNonce((n) => n + 1);
-        }}
-      />
+      {/* The remote engine's configuration moved to Privacy → Off-device AI
+          (UI review 2026-08-14, finding 3) — an off-device data control
+          belongs on the privacy surface, not in an experiments drill. */}
+      <div className="mono" style={{ marginTop: 8 }} data-testid="hp-remote-engine-pointer">
+        Remote engine: configured in Privacy → Off-device AI.
+      </div>
     </div>
   );
 }
