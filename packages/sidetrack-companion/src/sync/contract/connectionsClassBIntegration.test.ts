@@ -200,13 +200,23 @@ const normalizeProgress = (progress: MaterializerProgress | null): unknown => {
   };
 };
 
+// Every materializer created in this file. A materializer's debounced
+// drain timer survives its `it` block, and the phase log is a GLOBAL
+// console.warn — so a stray drain from a finished test (against its
+// already-deleted vault) lands inside a later test's spied window and
+// trips that test's phase-output assertions. Reproduced on the CI
+// runner, where a slow replaceScopeRows stretches the spied window past
+// the leftover timer. afterEach awaits idle on all of these BEFORE
+// deleting the vault, so no drain outlives its test.
+const liveMaterializers: ConnectionsMaterializer[] = [];
+
 const createNoisyFreeMaterializer = (input: {
   readonly vaultRoot: string;
   readonly eventLog: EventLog;
   readonly store: ConnectionsStore;
   readonly embed?: (texts: readonly string[]) => Promise<readonly Float32Array[]>;
-}): ConnectionsMaterializer =>
-  createConnectionsMaterializer({
+}): ConnectionsMaterializer => {
+  const materializer = createConnectionsMaterializer({
     vaultRoot: input.vaultRoot,
     eventLog: input.eventLog,
     timelineStore: createTimelineStore(input.vaultRoot),
@@ -227,6 +237,9 @@ const createNoisyFreeMaterializer = (input: {
     diagnosticsStore: { write: async () => undefined },
     diagnosticsLogger: () => {},
   });
+  liveMaterializers.push(materializer);
+  return materializer;
+};
 
 const importEvents = async (
   eventLog: EventLog,
@@ -457,6 +470,11 @@ describe('connections Class B integration invariants', () => {
       const value = previousEnv[key];
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
+    }
+    // Drain-timer hygiene: settle every materializer this test created
+    // while its vault still exists (see liveMaterializers).
+    for (const materializer of liveMaterializers.splice(0)) {
+      await materializer.awaitIdle();
     }
     await rm(vaultRoot, { recursive: true, force: true });
   });
