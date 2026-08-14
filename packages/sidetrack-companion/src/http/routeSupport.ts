@@ -188,6 +188,10 @@ export interface CompanionHttpConfig {
     lastEventSealAt?: string;
     lastEventSealSealedCount?: number;
     lastEventSealErrorCount?: number;
+    lastSealIntegrityAt?: string;
+    lastSealIntegrityMatches?: number;
+    lastSealIntegrityStoreDrift?: number;
+    lastSealIntegrityAlarmCount?: number;
   };
   // Owns the recall index lifecycle (auto-rebuild on stale, status
   // surface for /v1/system/health). Optional so tests + legacy
