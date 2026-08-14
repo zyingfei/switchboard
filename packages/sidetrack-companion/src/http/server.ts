@@ -1,4 +1,4 @@
-import { appendFile, chmod, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -130,9 +130,26 @@ const writeDebugHeapSnapshot = async (): Promise<string> => {
 // world-readable.
 const HTTP_DEBUG_LOG_PATH = '/tmp/sidetrack-http-debug.log';
 
+// Rollover cap. The log is append-only and lived unbounded before this —
+// 96 MB observed after 12 days of two companions sharing the path. One
+// `.1` rollover bounds total disk at ~2x the cap while keeping the recent
+// window an operator actually greps.
+const HTTP_DEBUG_LOG_MAX_BYTES = 32 * 1024 * 1024;
+
 let httpDebugLogModeEnsured = false;
 
 const appendHttpDebugLine = async (line: string): Promise<void> => {
+  try {
+    const info = await stat(HTTP_DEBUG_LOG_PATH);
+    if (info.size >= HTTP_DEBUG_LOG_MAX_BYTES) {
+      // rename-then-append: another companion appending concurrently just
+      // recreates the fresh file, so rotation never loses more than a line.
+      await rename(HTTP_DEBUG_LOG_PATH, `${HTTP_DEBUG_LOG_PATH}.1`);
+      httpDebugLogModeEnsured = false;
+    }
+  } catch {
+    /* absent or unstattable — the append below creates it */
+  }
   await appendFile(HTTP_DEBUG_LOG_PATH, line, { mode: 0o600 });
   if (!httpDebugLogModeEnsured) {
     httpDebugLogModeEnsured = true;
