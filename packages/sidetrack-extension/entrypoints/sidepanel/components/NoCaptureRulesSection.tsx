@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { messageTypes } from '../../../src/messages';
-import type { NoCaptureRule } from '../../../src/capture/noCaptureRules';
+import { noCaptureRuleScopeKey, type NoCaptureRule } from '../../../src/capture/noCaptureRules';
 
 // The no-capture rules management surface. Mounted BOTH in the Privacy
 // section (inline, the primary home) and in Settings → Capture. Lists
@@ -31,11 +31,16 @@ const isRuleListResponse = (
   Array.isArray((value as { noCaptureRules?: unknown }).noCaptureRules);
 
 const describeRule = (rule: NoCaptureRule): string => {
+  // Host-scoped rules name the exact host the user acted on — a rule made
+  // on mail.google.com must not render as "google.com + subdomains" (it
+  // does NOT cover calendar.google.com). Legacy host-less rules keep the
+  // eTLD+1 family wording.
+  const scope = noCaptureRuleScopeKey(rule);
   if (rule.kind === 'similar') {
     const tokens = rule.categoryTokens.length > 0 ? ` · ${rule.categoryTokens.join(', ')}` : '';
-    return `similar to ${rule.domain}${tokens}`;
+    return `similar to ${scope}${tokens}`;
   }
-  return `${rule.domain} + subdomains`;
+  return `${scope} + subdomains`;
 };
 
 export function NoCaptureRulesSection({ busy = false }: { readonly busy?: boolean }) {

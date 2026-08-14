@@ -3872,7 +3872,13 @@ const handleRequest = async (
       await companionJson('/v1/privacy/domain-tombstone', {
         method: 'POST',
         headers: {
-          'idempotency-key': idempotencyKey('domain-tombstone', `${rule.kind}:${rule.domain}`),
+          // Key on the rule's SCOPE (host when host-scoped), not the eTLD+1:
+          // purging mail.google.com then meet.google.com must be two purges,
+          // not one replayed cached response.
+          'idempotency-key': idempotencyKey(
+            'domain-tombstone',
+            `${rule.kind}:${noCaptureRuleScopeKey(rule)}`,
+          ),
         },
         body: JSON.stringify(body),
       });
