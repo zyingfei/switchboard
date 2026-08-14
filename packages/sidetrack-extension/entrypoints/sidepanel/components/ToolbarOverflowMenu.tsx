@@ -112,6 +112,10 @@ export function ToolbarOverflowMenu({
               {dumpStatus === 'dumped' ? ' ✓' : dumpStatus === 'dumping' ? '…' : ''}
             </span>
           </button>
+          {/* Dev-only: production omits the design-preview surface entirely
+              (the App.tsx DEV-badge comment always claimed this; the menu
+              item was the ungated half). */}
+          {__DEV__ ? (
           <button
             type="button"
             role="menuitem"
@@ -139,6 +143,7 @@ export function ToolbarOverflowMenu({
             </span>
             <span className="toolbar-overflow-item-label">Design preview</span>
           </button>
+          ) : null}
         </div>
       ) : null}
     </div>

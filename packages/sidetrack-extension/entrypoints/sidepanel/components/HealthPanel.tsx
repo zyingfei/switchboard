@@ -2449,7 +2449,7 @@ export function HealthPanel({
             <tbody>
               {groupEntries.map(([family, g]) => (
                 <tr key={family}>
-                  <td>{family}</td>
+                  <td>{LEDGER_FAMILY_WORDS[family] ?? family}</td>
                   <td className="mono">{String(g.count)}</td>
                   <td className="mono">{formatBytes(g.bytes)}</td>
                 </tr>

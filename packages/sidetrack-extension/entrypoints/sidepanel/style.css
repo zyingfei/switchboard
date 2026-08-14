@@ -816,7 +816,7 @@ button:disabled {
    never reads as a confident suggestion. */
 .suggestion-stats-weak {
   padding: 1px 6px;
-  border: 1px dotted var(--hair-soft);
+  border: 1px dotted var(--rule-soft);
   border-radius: 999px;
   font-size: 9px;
   text-transform: uppercase;
@@ -851,7 +851,7 @@ button:disabled {
 .suggestion-possibilities {
   margin-top: 4px;
   padding-top: 4px;
-  border-top: 1px solid var(--hair-soft);
+  border-top: 1px solid var(--rule-soft);
 }
 .suggestion-possibilities-summary {
   cursor: pointer;
@@ -919,7 +919,7 @@ button:disabled {
 .guess-lanes {
   margin-top: 4px;
   padding-top: 4px;
-  border-top: 1px solid var(--hair-soft);
+  border-top: 1px solid var(--rule-soft);
 }
 .guess-lanes-summary {
   cursor: pointer;
@@ -978,7 +978,9 @@ button:disabled {
   font-size: 10px;
 }
 .guess-lane-file {
-  margin-left: auto;
+  /* 6px, not auto: same wide-panel fix as .suggestion-possibility-file —
+     auto-margin strands the button ~900px from its label in full-tab mode. */
+  margin-left: 6px;
   font-size: 10px;
 }
 .guess-lane-why {
@@ -1521,7 +1523,7 @@ button:disabled {
 }
 .tab-session-reason-chip.is-topic {
   color: var(--ink-2);
-  border-color: var(--hair-soft);
+  border-color: var(--rule-soft);
 }
 
 .tab-session-badge {
@@ -1556,7 +1558,7 @@ button:disabled {
 .tab-session-badge.is-thread {
   background: var(--paper);
   color: var(--ink-2);
-  border-color: var(--hair-soft);
+  border-color: var(--rule-soft);
   border-style: dotted;
 }
 
@@ -1575,7 +1577,7 @@ button:disabled {
 .tab-session-badge.is-weak-guess {
   background: var(--ink-0);
   color: var(--ink-3);
-  border-color: var(--hair-soft);
+  border-color: var(--rule-soft);
   border-style: dotted;
   opacity: 0.85;
 }
@@ -1584,7 +1586,7 @@ button:disabled {
 .tab-session-badge.is-ignored {
   background: var(--ink-0);
   color: var(--ink-3);
-  border-color: var(--hair-soft);
+  border-color: var(--rule-soft);
   text-decoration: line-through;
 }
 
@@ -1631,7 +1633,7 @@ button:disabled {
 .tab-session-capture-badge.is-metadata-only {
   background: var(--ink-0);
   color: var(--ink-3);
-  border-color: var(--hair-soft);
+  border-color: var(--rule-soft);
 }
 
 .tab-session-capture-badge.is-features-only {
@@ -9135,7 +9137,8 @@ pre.diff {
   border-bottom: 1px solid var(--rule-soft);
   padding: 14px 16px;
 }
-.settings-sec-v2 .sec-h {
+.settings-sec-v2 .sec-h,
+.settings-section-title {
   font-family: var(--mono);
   font-size: 9.5px;
   letter-spacing: 0.14em;
