@@ -380,13 +380,6 @@ export const remoteIdentity = (modelName: string): EngineIdentity => ({
 // Rendering helpers.
 // ---------------------------------------------------------------------------
 
-/** "~800MB" / "3.3GB" — the number the load button states before committing. */
-export const formatModelSize = (bytes: number | null): string => {
-  if (bytes === null || bytes <= 0) return 'unknown size';
-  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(1)}GB`;
-  return `${String(Math.round(bytes / 100_000_000) * 100)}MB`;
-};
-
 /** "Chrome built-in · ~3.25B · 4-bit" — the matchup line on a comparison row. */
 export const describeIdentity = (identity: EngineIdentity): string =>
   [identity.label, identity.params, identity.quantization].join(' · ');

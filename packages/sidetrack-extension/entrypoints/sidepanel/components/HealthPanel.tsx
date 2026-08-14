@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import { formatRelative } from '../../../src/util/time';
+import { formatBytes } from '../../../src/util/bytes';
 import { Icons } from './icons';
 import { OnDeviceAiRow } from './OnDeviceAiRow';
 
@@ -552,13 +553,9 @@ const providerLabel = (provider: string): string => {
   return provider;
 };
 
-const formatBytes = (n: number | null | undefined): string => {
-  if (n === null || n === undefined) return '?';
-  if (n < 1024) return `${String(n)} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-};
+/** '?' when the report omits the number — otherwise the shared formatter. */
+const bytesOrUnknown = (n: number | null | undefined): string =>
+  n === null || n === undefined ? '?' : formatBytes(n);
 
 const formatCount = (value: number | null): string => {
   if (value === null) return '?';
@@ -1106,9 +1103,9 @@ export function HealthPanel({
 
     const vaultStatus: PipelineStatus = report.vault.writable ? 'ok' : 'err';
     const vaultDetail = report.vault.writable
-      ? `writable · ${formatBytes(report.vault.sizeBytes)}`
+      ? `writable · ${bytesOrUnknown(report.vault.sizeBytes)}`
       : 'not writable';
-    const vaultHead = report.vault.writable ? formatBytes(report.vault.sizeBytes) : 'Not writable';
+    const vaultHead = report.vault.writable ? bytesOrUnknown(report.vault.sizeBytes) : 'Not writable';
 
     const materializers = report.sync?.materializers ?? {};
     const matEntries = Object.entries(materializers);
@@ -2283,12 +2280,12 @@ export function HealthPanel({
     const orphanCount = generations?.collectableCount ?? 0;
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <h2 className="sx-drill-title">Vault · {formatBytes(ledger?.totalBytes ?? sizeBytes)}</h2>
+        <h2 className="sx-drill-title">Vault · {bytesOrUnknown(ledger?.totalBytes ?? sizeBytes)}</h2>
 
         <div className="sx-tilegrid" style={{ gridTemplateColumns: '1fr 1fr' }}>
           <div className="sx-tile">
             <div className="lbl">On disk</div>
-            <div className="num">{formatBytes(ledger?.totalBytes ?? sizeBytes)}</div>
+            <div className="num">{bytesOrUnknown(ledger?.totalBytes ?? sizeBytes)}</div>
             <div className="foot">
               {ledger === null
                 ? (report?.vault.root ?? '—')
@@ -2298,7 +2295,7 @@ export function HealthPanel({
           <div className={`sx-tile${orphanCount > 0 ? ' unavail' : ''}`}>
             <div className="lbl">Orphaned graph generations</div>
             <div className="num">
-              {generations === null ? '—' : formatBytes(generations.collectableBytes)}
+              {generations === null ? '—' : bytesOrUnknown(generations.collectableBytes)}
             </div>
             <div className="foot">
               {generations === null
@@ -2342,13 +2339,13 @@ export function HealthPanel({
                       <td title={family.note}>
                         {LEDGER_FAMILY_WORDS[family.family] ?? family.family}
                       </td>
-                      <td className="mono">{formatBytes(family.bytes)}</td>
+                      <td className="mono">{bytesOrUnknown(family.bytes)}</td>
                       <td className="mono">{String(family.files)}</td>
                       <td>{LEDGER_STATUS_WORDS[family.status] ?? family.status}</td>
                       <td className="mono">
                         {/* "not assessed" is not the same as 0 — a family nothing
                             knows how to assess must not read as "nothing to free". */}
-                        {family.reclaimableAssessed ? formatBytes(family.reclaimable) : '—'}
+                        {family.reclaimableAssessed ? bytesOrUnknown(family.reclaimable) : '—'}
                       </td>
                     </tr>
                   ))}
@@ -2378,7 +2375,7 @@ export function HealthPanel({
                         <td className="mono" title={entry.note}>
                           {entry.genId}
                         </td>
-                        <td className="mono">{formatBytes(entry.bytes)}</td>
+                        <td className="mono">{bytesOrUnknown(entry.bytes)}</td>
                         <td>
                           {LEDGER_DISPOSITION_WORDS[entry.disposition] ?? entry.disposition}
                         </td>
@@ -2412,7 +2409,7 @@ export function HealthPanel({
                       <tr key={entry.type}>
                         <td className="mono">{entry.type}</td>
                         <td className="mono">{`${(entry.share * 100).toFixed(1)}%`}</td>
-                        <td className="mono">{formatBytes(entry.estimatedBytes)}</td>
+                        <td className="mono">{bytesOrUnknown(entry.estimatedBytes)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -2425,7 +2422,7 @@ export function HealthPanel({
         <h3 className="sx-h">Revision inventory</h3>
         <div className="sx-callout">
           The subset the derived-revision GC already tracks —{' '}
-          {gcUnavailable ? 'unavailable' : formatBytes(hygiene?.gc?.totalBytes ?? null)} across{' '}
+          {gcUnavailable ? 'unavailable' : bytesOrUnknown(hygiene?.gc?.totalBytes ?? null)} across{' '}
           {gcUnavailable ? '—' : String(hygiene?.gc?.totalCount ?? 0)} files. A small slice of the
           table above, not the whole vault.
         </div>
@@ -2451,7 +2448,7 @@ export function HealthPanel({
                 <tr key={family}>
                   <td>{LEDGER_FAMILY_WORDS[family] ?? family}</td>
                   <td className="mono">{String(g.count)}</td>
-                  <td className="mono">{formatBytes(g.bytes)}</td>
+                  <td className="mono">{bytesOrUnknown(g.bytes)}</td>
                 </tr>
               ))}
             </tbody>
@@ -2546,7 +2543,7 @@ export function HealthPanel({
           <div className="sx-tile">
             <div className="lbl">Vectors</div>
             <div className="num">{formatCount(rec?.entryCount ?? null)}</div>
-            <div className="foot">{formatBytes(rec?.sizeBytes ?? null)}</div>
+            <div className="foot">{bytesOrUnknown(rec?.sizeBytes ?? null)}</div>
           </div>
           <div
             className={`sx-tile${rec?.status === 'rebuilding' ? ' warn' : rec?.status === undefined ? ' unavail' : ''}`}

@@ -70,7 +70,7 @@ describe('OnDeviceAiRow — WebGPU fallback', () => {
     // No LanguageModel exposed → nano state 'no-api'; companion connected.
     render(<OnDeviceAiRow companionPort={17_373} bridgeKey="k" />);
     const btn = await screen.findByTestId('hp-ondevice-ai-webgpu-load');
-    expect(btn).toHaveTextContent('Load local model (WebGPU · ~800MB, from companion)');
+    expect(btn).toHaveTextContent('Load local model (WebGPU · ~819 MB, from companion)');
   });
 
   it('does NOT show the load button when nano IS available', async () => {
