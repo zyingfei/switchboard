@@ -307,11 +307,21 @@ export const readPageContentCoverageMap = async (
 export const writePageContentExtracted = async (
   vaultRoot: string,
   payload: PageContentExtractedPayload,
-  options: { readonly rebuildManifestsAfterWrite?: boolean } = {},
+  options: {
+    readonly rebuildManifestsAfterWrite?: boolean;
+    // 'incremental': O(1) manifest upsert instead of the O(records) rebuild.
+    // For the interactive capture POST — see applyPageContentManifestUpsert.
+    readonly manifestUpdate?: 'rebuild' | 'incremental';
+  } = {},
 ): Promise<PageContentCoverage> => {
-  const rebuildAfterWrite = options.rebuildManifestsAfterWrite ?? true;
+  const incremental = options.manifestUpdate === 'incremental';
+  const rebuildAfterWrite = !incremental && (options.rebuildManifestsAfterWrite ?? true);
   const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
   recordCanonicalCollision(payload.url, canonicalUrl);
+  const previousCoverage = incremental
+    ? (safeRecordFromUnknown(await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)))
+        ?.coverage ?? null)
+    : null;
   const contentHash = payload.content.contentHash || sha256Hex(payload.content.text);
   const quality = classifyPageContentQuality(payload.qualitySignals);
   if (quality.state === 'metadata_only_error') {
@@ -331,7 +341,8 @@ export const writePageContentExtracted = async (
       updatedAt: payload.extractedAt,
       sourceEventType: PAGE_CONTENT_EXTRACTED,
     } satisfies PageContentRecord);
-    if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
+    if (incremental) await applyPageContentManifestUpsert(vaultRoot, previousCoverage, coverage);
+    else if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
     invalidatePageContentLexicalIndex(vaultRoot);
     return coverage;
   }
@@ -379,7 +390,8 @@ export const writePageContentExtracted = async (
     sourceEventType: PAGE_CONTENT_EXTRACTED,
   } satisfies PageContentRecord);
   await atomicWriteJson(join(chunksDir(vaultRoot), `${contentHash}.json`), { version: 1, chunks });
-  if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
+  if (incremental) await applyPageContentManifestUpsert(vaultRoot, previousCoverage, coverage);
+  else if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
   invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
 };
@@ -392,6 +404,100 @@ export const writePageContentExtracted = async (
 export const rebuildPageContentManifests = async (vaultRoot: string): Promise<void> => {
   await rebuildManifests(vaultRoot);
   invalidatePageContentLexicalIndex(vaultRoot);
+};
+
+// O(1) incremental manifest maintenance for the interactive capture path.
+// The capture POST (/v1/page-content/extracted — the panel's "index this
+// page" and the auto-capture path, with a 15s client timeout behind the
+// "Companion did not respond" banner) must not re-derive the manifests from
+// ALL records per write: the O(records) rebuild measured 16-119s under
+// catch-up disk load, and deferring the same scan onto the event loop was
+// worse (a 43s starved tick — 703 microtask-chained readJson awaits never
+// let timers run). Instead a single write adjusts exactly its own record's
+// contribution: read the two manifests, swap this canonicalUrl's bucket
+// counts (previous coverage → next coverage) and chunks-manifest entry,
+// write back. Serialized per vault (promise-chain lock) so interleaved
+// captures can't lose updates; the lane/batch full rebuilds
+// (rebuildPageContentManifests) remain the drift-healing source of truth.
+const manifestUpsertLocks = new Map<string, Promise<void>>();
+
+const objectFromUnknown = (value: unknown): Record<string, unknown> | null =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const numberField = (record: Record<string, unknown> | null, key: string): number => {
+  const value = record?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+};
+
+const manifestStateBucket = (state: string): 'indexed' | 'low' | 'tombstoned' | null =>
+  state === 'indexed'
+    ? 'indexed'
+    : state === 'indexed_low_quality'
+      ? 'low'
+      : state === 'tombstoned'
+        ? 'tombstoned'
+        : null;
+
+export const applyPageContentManifestUpsert = async (
+  vaultRoot: string,
+  previous: PageContentCoverage | null,
+  next: PageContentCoverage,
+): Promise<void> => {
+  const prior = manifestUpsertLocks.get(vaultRoot) ?? Promise.resolve();
+  const run = prior.then(async () => {
+    const manifest = objectFromUnknown(await readJson(manifestPath(vaultRoot)));
+    const chunksManifest = objectFromUnknown(await readJson(chunksManifestPath(vaultRoot)));
+    const counts = {
+      recordCount: numberField(manifest, 'recordCount'),
+      indexedCount: numberField(manifest, 'indexedCount'),
+      lowQualityCount: numberField(manifest, 'lowQualityCount'),
+      tombstonedCount: numberField(manifest, 'tombstonedCount'),
+    };
+    if (previous === null) counts.recordCount += 1;
+    const bucketDelta = (bucket: 'indexed' | 'low' | 'tombstoned' | null, by: number): void => {
+      if (bucket === 'indexed') counts.indexedCount += by;
+      else if (bucket === 'low') counts.lowQualityCount += by;
+      else if (bucket === 'tombstoned') counts.tombstonedCount += by;
+    };
+    if (previous !== null) bucketDelta(manifestStateBucket(previous.state), -1);
+    bucketDelta(manifestStateBucket(next.state), 1);
+    const updatedAt = new Date().toISOString();
+    await atomicWriteJson(manifestPath(vaultRoot), {
+      version: 1,
+      updatedAt,
+      recordCount: Math.max(0, counts.recordCount),
+      indexedCount: Math.max(0, counts.indexedCount),
+      lowQualityCount: Math.max(0, counts.lowQualityCount),
+      tombstonedCount: Math.max(0, counts.tombstonedCount),
+    });
+    const pagesRaw = chunksManifest?.['pages'];
+    const pages = (Array.isArray(pagesRaw) ? pagesRaw : []).filter(
+      (page) =>
+        typeof page === 'object' &&
+        page !== null &&
+        (page as Record<string, unknown>)['canonicalUrl'] !== next.canonicalUrl,
+    );
+    if (
+      (next.state === 'indexed' || next.state === 'indexed_low_quality') &&
+      typeof next.contentHash === 'string'
+    ) {
+      pages.push({
+        canonicalUrl: next.canonicalUrl,
+        contentHash: next.contentHash,
+        chunkCount: next.chunkCount ?? 0,
+      });
+    }
+    await atomicWriteJson(chunksManifestPath(vaultRoot), { version: 1, updatedAt, pages });
+    await atomicWriteJson(ingestStatePath(vaultRoot), { version: 1, updatedAt });
+    invalidatePageContentLexicalIndex(vaultRoot);
+  });
+  manifestUpsertLocks.set(
+    vaultRoot,
+    run.catch(() => undefined),
+  );
+  return run;
 };
 
 export const writePageContentTombstoned = async (
