@@ -6044,9 +6044,22 @@ export const createConnectionsMaterializer = (
             }),
             ...dirtyThreadScopes,
           ]);
-          const rawScoped = unionScopeOutputs(
-            rowLocalScopes.map((scope) => recomputeScope(scope, scopedSnapshot)),
+          mark(`scopedDelta.rowLocalScopes n=${String(rowLocalScopes.length)}`);
+          // Yield periodically: a catch-up chunk can carry thousands of
+          // accumulated dirty scopes, and a fully synchronous recompute
+          // starves the reconcile child's 30s liveness heartbeat until the
+          // parent's no-progress watchdog SIGKILLs it (observed live
+          // 2026-08-15: killed at 600s on the first post-deferral chunk).
+          const scopeOutputs: ScopeRecomputeOutput[] = [];
+          for (const [index, scope] of rowLocalScopes.entries()) {
+            scopeOutputs.push(recomputeScope(scope, scopedSnapshot));
+            if (index % 100 === 99) await yieldToEventLoop();
+          }
+          const rawScoped = unionScopeOutputs(scopeOutputs);
+          mark(
+            `scopedDelta.recomputeScopes n=${String(rowLocalScopes.length)} nodes=${String(rawScoped.nodes.length)} edges=${String(rawScoped.edges.length)}`,
           );
+          await yieldToEventLoop();
           const scopedWithThreads = preserveThreadRowsForScopedDelta({
             output: rawScoped,
             previousSnapshot: previousSnapshotForScopedDelta,
@@ -6054,6 +6067,8 @@ export const createConnectionsMaterializer = (
             threadScopes: dirtyThreadScopes,
             deletedThreadIds: deletedThreadIdsForScopedDelta,
           });
+          mark(`scopedDelta.preserveThreadRows threads=${String(dirtyThreadScopes.length)}`);
+          await yieldToEventLoop();
           // Losslessness (unconditional): the scoped snapshot carries no
           // ranker/frontier-scoped similarity edges, so re-asserting each
           // rewritten url scope from it would erase the prior snapshot's
@@ -6076,6 +6091,10 @@ export const createConnectionsMaterializer = (
             rewrittenScopes: rowLocalScopes,
             similarityRecomputedOwnerVisitKeys,
           });
+          mark(
+            `scopedDelta.carryForwardSimilarity nodes=${String(scoped.nodes.length)} edges=${String(scoped.edges.length)}`,
+          );
+          await yieldToEventLoop();
           const progress = progressForDrainSnapshot(scopedSnapshot);
           await replaceScopeRowsForScopedDelta({
             scopes: rowLocalScopes,
