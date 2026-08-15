@@ -24,7 +24,6 @@ import { fileURLToPath } from 'node:url';
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { bridgeKeyPath, pairTokenPath, pairingToken, writePairToken } from './auth/bridgeKey.js';
 import { pickInstaller } from './install/index.js';
-import { ensurePageContentLexicalIndex } from './page-content/store.js';
 import { withBunSmolCommand } from './process/bunMemory.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
 import { RECALL_MODEL } from './recall/modelManifest.js';
@@ -1457,21 +1456,22 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   });
 
   writeLine(streams.stdout, `sidetrack-companion listening on ${runtime.url}`);
-  // Background pre-warm: build the page-content MiniSearch index
-  // against the live `ANALYZER_VERSION`. This is the "forced rebuild
-  // on companion start" migration policy for tokenizer changes —
-  // bumping `ANALYZER_VERSION` reseeds the index here without any
-  // operator action. Fire-and-forget so startup stays snappy; the
-  // first query awaits the same promise if the warm hasn't finished.
-  void ensurePageContentLexicalIndex(runtime.vaultPath).catch((err: unknown) => {
-    writeLine(
-      streams.stderr,
-      `[page-content] background index warm failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  });
+  // NOTE: the page-content MiniSearch lexical index used to be
+  // pre-warmed here on every boot. Verified (2026-08-15) that its
+  // only query entrypoint, `queryPageContent`, has zero production
+  // callers — the one consumer, the `/v1/content/query` HTTP route,
+  // was removed in the Scope A /v2/recall migration (PR #217 F1).
+  // `recall/ranker.ts` and `page-evidence/timelineRecall.ts` each
+  // build their own separate MiniSearch indices; they only reference
+  // page-content's index in comments for analyzer-consistency, never
+  // by calling it. Removed the boot prewarm (6.4s CPU / ~1.1s
+  // event-loop stall / +1.4GB RSS on the live dogfood vault: 1018
+  // chunk files, 44MB) and kept the lazy build-on-first-query path in
+  // `ensurePageContentLexicalIndex` (see page-content/store.ts) as
+  // the fallback for the day a real caller shows up again.
   // P1 — pre-warm the embedder model in the background so the first
-  // /v2/recall isn't 4-8s while the e5 model loads. Same fire-and-
-  // forget pattern as the page-content lexical warm above.
+  // /v2/recall isn't 4-8s while the e5 model loads. Fire-and-forget,
+  // same pattern the (now-removed) page-content lexical prewarm used.
   void (async () => {
     try {
       const { embed: embedFn } = await import('./recall/embedder.js');

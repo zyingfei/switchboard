@@ -534,9 +534,13 @@ const snippetFor = (text: string, query: string, maxChars = 220): string => {
 // In-memory MiniSearch over every indexed chunk. Built lazily per
 // vaultRoot, cached by promise so concurrent callers share the same
 // in-flight build, invalidated on every write/tombstone so the next
-// query rebuilds against fresh content. Companion startup may
-// pre-warm via `ensurePageContentLexicalIndex` (fire-and-forget) to
-// move the build off the first-query critical path.
+// query rebuilds against fresh content. `queryPageContent` triggers
+// the (lazy) build on first call via `ensurePageContentLexicalIndex`.
+// Companion startup no longer pre-warms this at boot (removed
+// 2026-08-15: `queryPageContent` had zero production callers — see
+// cli.ts for the verification note) but a caller may still call
+// `ensurePageContentLexicalIndex` directly to warm ahead of the
+// first query.
 
 interface PageContentIndexEntry {
   readonly chunk: PageContentChunk;
