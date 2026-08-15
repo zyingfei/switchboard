@@ -59,11 +59,24 @@ interface LoadedState {
   dimension: number;
   readonly vectorIdentity: SimilarityVectorIdentity;
   maxElements: number;
-  elementCount: number;
+  /**
+   * High-water mark of the label allocator, persisted as the sidecar's
+   * `elementCount`. This is NOT the live element count — `visitIdToLabel.size`
+   * is. Conflating the two is what let the slot leak below go unnoticed.
+   */
+  labelWatermark: number;
+  /**
+   * Labels whose hnswlib slot exists in the index but that no live visit maps
+   * to. Re-adding one of these labels reuses its slot in place, so the
+   * allocator hands them back out before it grows the watermark.
+   */
+  readonly freeLabels: number[];
   version: number;
   readonly visitIdToLabel: Map<string, number>;
   readonly labelToVisitId: Map<number, string>;
   readonly recoveredFromCorruption: boolean;
+  /** Set by every mutation; cleared by persist(). See persist() for why. */
+  dirty: boolean;
 }
 
 interface SimilarityHnswStoreOptions {
@@ -186,7 +199,7 @@ const sidecarFor = (state: LoadedState): SimilarityHnswSidecar => ({
   modelId: state.vectorIdentity.modelId,
   modelRevision: state.vectorIdentity.modelRevision,
   vectorCorpusRevision: state.vectorIdentity.vectorCorpusRevision,
-  elementCount: state.elementCount,
+  elementCount: state.labelWatermark,
   visitIdToLabel: Object.fromEntries(
     [...state.visitIdToLabel.entries()].sort(([a], [b]) => a.localeCompare(b)),
   ),
@@ -220,6 +233,30 @@ const gcOldVersions = async (basePath: string, keepVersion: number): Promise<voi
         }
       }),
   );
+};
+
+/**
+ * Slots that physically exist in the loaded index but that no live visit maps
+ * to. hnswlib keeps a markDeleted element's slot allocated forever and sizes
+ * its file by `cur_element_count`, so these are the leaked bytes: on the
+ * dogfood vault the index had allocated 29,814 slots to hold 737 live visits
+ * (40.4x), and the .bin was 50,138,820 bytes where the live vectors need
+ * ~1.24 MB (99.7% of the file is `cur_element_count * 1676`).
+ *
+ * Recovering them costs nothing and changes nothing that is served: re-adding
+ * a label hnswlib already knows updates that element in place, leaving every
+ * other stored vector bit-identical (measured: 0 perturbed float components
+ * across 400x384 untouched vectors).
+ */
+const reusableLabelsFor = (slotCount: number, liveLabels: Iterable<number>): number[] => {
+  const live = new Set(liveLabels);
+  const free: number[] = [];
+  // Descending push so that pop() hands out the LOWEST free label first,
+  // which keeps allocation deterministic across runs.
+  for (let label = slotCount - 1; label >= 0; label -= 1) {
+    if (!live.has(label)) free.push(label);
+  }
+  return free;
 };
 
 const assertEmbedding = (embedding: readonly number[], dimension: number): void => {
@@ -297,20 +334,33 @@ export const createSimilarityHnswStore = (
       assertEmbedding(embedding, loaded.dimension);
       const existingLabel = loaded.visitIdToLabel.get(visitId);
       if (existingLabel !== undefined) {
-        loaded.index.markDelete(existingLabel);
-        loaded.visitIdToLabel.delete(visitId);
-        loaded.labelToVisitId.delete(existingLabel);
+        // Update in place. The previous shape markDeleted this label and then
+        // burned a fresh one, so every re-embed of an already-known visit
+        // permanently leaked a slot; hnswlib updates a known label without
+        // growing `cur_element_count`, and the mapping is already correct.
+        loaded.index.addPoint(Array.from(embedding), existingLabel);
+        loaded.dirty = true;
+        return;
       }
-      if (loaded.elementCount >= loaded.maxElements) {
-        const nextMaxElements = Math.max(1, loaded.maxElements * 2);
-        loaded.index.resizeIndex(nextMaxElements);
-        loaded.maxElements = nextMaxElements;
+      const reusedLabel = loaded.freeLabels.pop();
+      let label: number;
+      if (reusedLabel === undefined) {
+        if (loaded.labelWatermark >= loaded.maxElements) {
+          const nextMaxElements = Math.max(1, loaded.maxElements * 2);
+          loaded.index.resizeIndex(nextMaxElements);
+          loaded.maxElements = nextMaxElements;
+        }
+        label = loaded.labelWatermark;
+        loaded.labelWatermark += 1;
+      } else {
+        // The slot already exists in the index, so no capacity check is
+        // needed — re-adding a known label reuses it rather than appending.
+        label = reusedLabel;
       }
-      const label = loaded.elementCount;
-      loaded.elementCount += 1;
       loaded.index.addPoint(Array.from(embedding), label);
       loaded.visitIdToLabel.set(visitId, label);
       loaded.labelToVisitId.set(label, visitId);
+      loaded.dirty = true;
     },
 
     async delete(visitId: string): Promise<void> {
@@ -320,6 +370,9 @@ export const createSimilarityHnswStore = (
       loaded.index.markDelete(label);
       loaded.visitIdToLabel.delete(visitId);
       loaded.labelToVisitId.delete(label);
+      // Hand the slot back to the allocator instead of stranding it.
+      loaded.freeLabels.push(label);
+      loaded.dirty = true;
     },
 
     async embedding(visitId: string): Promise<readonly number[] | null> {
@@ -358,6 +411,12 @@ export const createSimilarityHnswStore = (
 
     async persist(): Promise<void> {
       const loaded = requireLoaded();
+      // The materializer persists once per drain, unconditionally — including
+      // on drains that carry the previous revision's edges forward without
+      // touching a single vector. Republishing then rewrites the whole index
+      // (50 MB on the dogfood vault) to produce a byte-identical successor.
+      // Nothing observable depends on the version advancing, so skip it.
+      if (!loaded.dirty) return;
       await mkdir(dirname(loaded.basePath), { recursive: true });
       const nextVersion = loaded.version + 1;
       const nextIndexPath = versionedIndexPath(loaded.basePath, nextVersion);
@@ -372,6 +431,7 @@ export const createSimilarityHnswStore = (
       await writeFile(pointerTmpPath, `v${String(nextVersion)}\n`, 'utf8');
       await renameFile(pointerTmpPath, loaded.pointerPath);
       loaded.version = nextVersion;
+      loaded.dirty = false;
       await gcOldVersions(loaded.basePath, nextVersion);
     },
 
@@ -419,6 +479,7 @@ export const createSimilarityHnswStore = (
           assertSameVectorIdentity(sidecar, vectorIdentity);
           await index.readIndex(versionedIndexPath(basePath, version));
           index.setEf(HNSW_EF_SEARCH);
+          const visitIdToLabel = new Map(Object.entries(sidecar.visitIdToLabel));
           state = {
             vaultRoot,
             basePath,
@@ -427,9 +488,10 @@ export const createSimilarityHnswStore = (
             dimension,
             vectorIdentity,
             maxElements: index.getMaxElements(),
-            elementCount: sidecar.elementCount,
+            labelWatermark: sidecar.elementCount,
+            freeLabels: reusableLabelsFor(index.getCurrentCount(), visitIdToLabel.values()),
             version,
-            visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+            visitIdToLabel,
             labelToVisitId: new Map(
               Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [
                 Number(label),
@@ -437,6 +499,10 @@ export const createSimilarityHnswStore = (
               ]),
             ),
             recoveredFromCorruption: false,
+            // Clean read of the published pair — nothing to republish unless a
+            // mutation lands, except when the sidecar is still on the legacy
+            // schema and the next persist owes it an upgrade.
+            dirty: sidecar.schemaVersion !== SCHEMA_VERSION,
           };
           return loadedStore;
         } catch {
@@ -455,6 +521,7 @@ export const createSimilarityHnswStore = (
         assertSameVectorIdentity(sidecar, vectorIdentity);
         await index.readIndex(legacyIndexPath);
         index.setEf(HNSW_EF_SEARCH);
+        const visitIdToLabel = new Map(Object.entries(sidecar.visitIdToLabel));
         state = {
           vaultRoot,
           basePath,
@@ -463,9 +530,10 @@ export const createSimilarityHnswStore = (
           dimension,
           vectorIdentity,
           maxElements: index.getMaxElements(),
-          elementCount: sidecar.elementCount,
+          labelWatermark: sidecar.elementCount,
+          freeLabels: reusableLabelsFor(index.getCurrentCount(), visitIdToLabel.values()),
           version: 0,
-          visitIdToLabel: new Map(Object.entries(sidecar.visitIdToLabel)),
+          visitIdToLabel,
           labelToVisitId: new Map(
             Object.entries(sidecar.labelToVisitId).map(([label, visitId]) => [
               Number(label),
@@ -473,6 +541,8 @@ export const createSimilarityHnswStore = (
             ]),
           ),
           recoveredFromCorruption: false,
+          // Unversioned legacy pair: the next persist owes it a versioned one.
+          dirty: true,
         };
         return loadedStore;
       }
@@ -487,11 +557,14 @@ export const createSimilarityHnswStore = (
         dimension,
         vectorIdentity,
         maxElements: INITIAL_MAX_ELEMENTS,
-        elementCount: 0,
+        labelWatermark: 0,
+        freeLabels: [],
         version: 0,
         visitIdToLabel: new Map(),
         labelToVisitId: new Map(),
         recoveredFromCorruption,
+        // Fresh (or recovered) index: publish an initial pair on first persist.
+        dirty: true,
       };
       return loadedStore;
     },
