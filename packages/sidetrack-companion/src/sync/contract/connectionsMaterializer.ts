@@ -1357,14 +1357,45 @@ export const createConnectionsMaterializer = (
   const tryLoadProjectionAccumulatorState = async (
     progress: MaterializerProgress | null,
   ): Promise<boolean> => {
-    if (progress === null || progress.materializerVersion !== MATERIALIZER_VERSION) return false;
+    // Reason-coded rejects: the reconcile child forks FRESH PER DRAIN by
+    // design (connectionsReconcileChildClient.ts header), so a silent load
+    // failure here costs a full ~20s event-store re-fold on EVERY drain —
+    // measured live while the panel showed "Companion is busy". The reject
+    // reason must be attributable from one log line.
+    const reject = (reason: string): false => {
+      if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+        console.warn(`[connections-phase] projectionAccumulators.loadReject reason=${reason}`);
+      }
+      return false;
+    };
+    if (progress === null) return reject('no-progress');
+    if (progress.materializerVersion !== MATERIALIZER_VERSION) return reject('progress-version');
     const readState = deps.store.readProjectionAccumulatorState;
-    if (readState === undefined) return false;
+    if (readState === undefined) return reject('store-unsupported');
     const state = await readState(MATERIALIZER_NAME);
-    if (state === null) return false;
-    if (state.materializerVersion !== MATERIALIZER_VERSION) return false;
-    if (!versionVectorsEqual(state.appliedFrontier, progress.appliedFrontier)) return false;
-    if (!dotIntervalsEqual(state.appliedDotIntervals, progress.appliedDotIntervals)) return false;
+    if (state === null) return reject('no-persisted-state');
+    if (state.materializerVersion !== MATERIALIZER_VERSION) return reject('state-version');
+    if (!versionVectorsEqual(state.appliedFrontier, progress.appliedFrontier)) {
+      // Name the first divergent replica so the writer that advanced
+      // progress without re-tagging the blob is identifiable from one line.
+      const replicas = new Set([
+        ...Object.keys(state.appliedFrontier),
+        ...Object.keys(progress.appliedFrontier),
+      ]);
+      let sample = '';
+      for (const replica of replicas) {
+        const inState = state.appliedFrontier[replica] ?? 0;
+        const inProgress = progress.appliedFrontier[replica] ?? 0;
+        if (inState !== inProgress) {
+          sample = `${replica.slice(0, 8)} blob=${String(inState)} progress=${String(inProgress)}`;
+          break;
+        }
+      }
+      return reject(`frontier-mismatch ${sample}`);
+    }
+    if (!dotIntervalsEqual(state.appliedDotIntervals, progress.appliedDotIntervals)) {
+      return reject('intervals-mismatch');
+    }
     urlAccumulator = deserializeUrlProjectionAccumulator(state.urlAccumulator);
     tabSessionAccumulator = deserializeTabSessionProjectionAccumulator(state.tabSessionAccumulator);
     projectionAccumulatorsInitialized = true;
@@ -3081,6 +3112,22 @@ export const createConnectionsMaterializer = (
       if (!existingProgressMatches) {
         throw new Error('connections catchUp chunk requires current materializer progress');
       }
+      // Attempt the persisted-blob load here too. This branch REQUIRES
+      // current progress, and every chunk's replaceScopeRows persists the
+      // accumulator blob tagged with exactly that progress — so a catch-up
+      // round starting in a fresh drain child can resume round N-1's
+      // accumulators instead of re-folding the whole store. Without this,
+      // every round's first chunk paid a full seed (measured live: 20-29s
+      // per round, rounds every few minutes during catch-up — the dominant
+      // "Companion is busy" cost on a backlogged vault). tryLoad's
+      // frontier+intervals equality check is the safety: any mismatch
+      // falls through to the full seed exactly as before.
+      loadedProjectionAccumulatorState =
+        !projectionAccumulatorsInitialized &&
+        (await tryLoadProjectionAccumulatorState(existingProgress));
+      mark(
+        `projectionAccumulators.load reused=${String(loadedProjectionAccumulatorState)} src=chunk`,
+      );
       pendingEventsForDrain = forcedPendingEventWindow;
       merged = forcedPendingEventWindow;
       maxAcceptedAtMsForDrain = maxAcceptedAtMs(forcedPendingEventWindow);

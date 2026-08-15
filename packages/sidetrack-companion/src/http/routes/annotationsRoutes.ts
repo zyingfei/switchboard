@@ -14,7 +14,7 @@ import { listAnnotations, softDeleteAnnotation, updateAnnotation, writeAnnotatio
 import { currentAuditContext as currentAuditContextMut } from '../../vault/auditContext.js';
 import { annotationCreateSchema, annotationListQuerySchema, annotationUpdateSchema, auditEventSchema } from '../schemas.js';
 
-import { HttpRouteError, readBody, readEventsFromStoreOrLog, readThreadMetadata, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, readBody, readEventsFromStoreOrLog, readThreadMetadata, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 // Write an audit row for an HTTP write that does NOT flow through the
@@ -404,7 +404,7 @@ export const annotationsRoutes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const merged = await readAggregateEventsServeStale(context, match.bacId);
       const projection = projectAnnotations(merged);
       const entry = projection.entries.find((row) => row.bac_id === match.bacId);
       return [

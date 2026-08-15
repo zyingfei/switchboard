@@ -13,7 +13,7 @@ import { redact } from '../../safety/redaction.js';
 import { estimateTokens, tokenThresholdForProvider } from '../../safety/tokenBudget.js';
 import { dispatchEventSchema, dispatchLinkRequestSchema, dispatchListQuerySchema } from '../schemas.js';
 
-import { HttpRouteError, readBody, readEventsFromStoreOrLog, readThreadMetadata, requireIdempotencyKey, runIdempotent, writerForBucket } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, readBody, readEventsFromStoreOrLog, readThreadMetadata, requireIdempotencyKey, runIdempotent, writerForBucket } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 const DISPATCH_PROJECTION_EVENT_TYPES = [DISPATCH_RECORDED, DISPATCH_LINKED] as const;
@@ -379,7 +379,7 @@ export const dispatchesRoutesB: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const merged = await context.eventLog.readByAggregate(match.bacId);
+      const merged = await readAggregateEventsServeStale(context, match.bacId);
       const projection = projectDispatches(merged);
       const entry = projection.entries.find((row) => row.bac_id === match.bacId);
       const link = projection.links.find((row) => row.dispatchId === match.bacId);

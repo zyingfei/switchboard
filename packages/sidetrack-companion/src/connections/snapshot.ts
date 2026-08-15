@@ -6365,6 +6365,20 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           projectionAccumulatorMetadataKey(input.projectionAccumulatorState.materializerName),
           JSON.stringify(input.projectionAccumulatorState),
         );
+        // Write-side probe for the stale-blob investigation: the persisted
+        // blob sat at frontier 187,920 while progress reached 763,851 —
+        // something on the write path stopped refreshing it. This names
+        // every blob write with its tagged frontier so the missing writes
+        // are attributable from the log alone.
+        if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+          const fr = input.projectionAccumulatorState.appliedFrontier;
+          const maxSeq = Math.max(0, ...Object.values(fr));
+          console.warn(
+            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)}`,
+          );
+        }
+      } else if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+        console.warn('[connections-phase] projectionAccumulators.persist skipped=no-state');
       }
       const baseProgress =
         input.progressMode === 'snapshot-revision-only'
@@ -6649,6 +6663,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         upsertMetadata.run(
           projectionAccumulatorMetadataKey(projectionAccumulatorState.materializerName),
           JSON.stringify(projectionAccumulatorState),
+        );
+        // Same write-side probe as the replaceScopeRows site — see the
+        // stale-blob note there (blob froze at 187,920 vs progress 763,851).
+        if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+          const fr = projectionAccumulatorState.appliedFrontier;
+          const maxSeq = Math.max(0, ...Object.values(fr));
+          console.warn(
+            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)} src=writeCurrentRows`,
+          );
+        }
+      } else if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
+        console.warn(
+          '[connections-phase] projectionAccumulators.persist skipped=no-state src=writeCurrentRows',
         );
       }
       // H6: writeCurrentRows mutates nodes/edges/current/node_order/

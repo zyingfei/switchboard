@@ -15,7 +15,7 @@ import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/event
 import { projectWorkstream } from '../../workstreams/projection.js';
 import { workstreamCreateSchema, workstreamExportSchema, workstreamTrustPutSchema, workstreamUpdateSchema } from '../schemas.js';
 
-import { HttpRouteError, ROUTE_CACHE_TTL_MS, mutationResponse, readBody, readEventsFromStoreOrLog, readVaultMarkdown, requireVaultRoot, requireWorkstreamTrust, routeCache, routeInFlight } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, ROUTE_CACHE_TTL_MS, mutationResponse, readBody, readEventsFromStoreOrLog, readVaultMarkdown, requireVaultRoot, requireWorkstreamTrust, routeCache, routeInFlight } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 const cachedRoute = async (
@@ -158,7 +158,7 @@ export const workstreamsRoutes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const events = await context.eventLog.readByAggregate(match.bacId);
+      const events = await readAggregateEventsServeStale(context, match.bacId);
       const projection = projectWorkstream(match.bacId, events);
       return [200, { data: projection }];
     },

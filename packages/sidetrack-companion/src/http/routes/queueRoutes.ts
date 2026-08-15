@@ -8,7 +8,7 @@ import { QUEUE_CREATED } from '../../queue/events.js';
 import { projectQueueItem } from '../../queue/projection.js';
 import { queueCreateSchema } from '../schemas.js';
 
-import { HttpRouteError, mutationResponse, readBody, requireIdempotencyKey, requireWorkstreamTrust, runIdempotent } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, mutationResponse, readBody, requireIdempotencyKey, requireWorkstreamTrust, runIdempotent } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 export const queueRoutes: readonly RouteDefinition[] = [
@@ -62,7 +62,7 @@ export const queueRoutes: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const events = await context.eventLog.readByAggregate(match.bacId);
+      const events = await readAggregateEventsServeStale(context, match.bacId);
       return [200, { data: projectQueueItem(match.bacId, events) }];
     },
   },

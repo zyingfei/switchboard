@@ -77,6 +77,36 @@ export const baseVectorForAggregate = async (
   aggregateId: string,
 ): Promise<VersionVector> => vectorFromEvents(await eventLog.readByAggregate(aggregateId));
 
+/** Serve-stale per-aggregate event read for request paths. The eventLog
+ *  fallback is readMerged()+filter — a FULL-LOG materialization that
+ *  measured 9.1s cold on an 866k-event vault, fired in bursts by every
+ *  extension service-worker reconnect (one GET per thread/workstream
+ *  projection). The typed store answers the same query in O(aggregate
+ *  rows) via events_aggregate_idx. Zero-row store results fall back to
+ *  the log: a just-created aggregate may not be ingested yet, and the
+ *  serve-stale store must never turn "brand new" into "missing". */
+export const readAggregateEventsServeStale = async (
+  context: {
+    readonly eventLog?: EventLog | undefined;
+    readonly vaultRoot?: string | undefined;
+  },
+  aggregateId: string,
+): Promise<readonly AcceptedEvent[]> => {
+  if (context.vaultRoot !== undefined) {
+    const store = await getSharedEventStoreServeStale(context.vaultRoot);
+    if (store !== null) {
+      const events = store.readByAggregate(aggregateId);
+      if (events.length > 0) return events;
+    }
+  }
+  if (context.eventLog === undefined) {
+    // Same failure the pre-helper direct access produced — routes that
+    // reach here are only ever wired with a live event log.
+    throw new Error('readAggregateEventsServeStale: context has no eventLog');
+  }
+  return context.eventLog.readByAggregate(aggregateId);
+};
+
 export interface CompanionHttpConfig {
   readonly bridgeKey: string;
   // F02 — the MCP-scoped bridge key (mcp.key). When set, the sidetrack-mcp

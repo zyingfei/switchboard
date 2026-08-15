@@ -11,7 +11,7 @@ import type { TargetRef } from '../../sync/causal.js';
 import { deleteReviewDraft, listReviewDrafts, readReviewDraft, writeReviewDraft } from '../../vault/reviewDrafts.js';
 import { reviewDraftEventBatchSchema, reviewDraftListQuerySchema } from '../schemas.js';
 
-import { HttpRouteError, readBody, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, readBody, requireIdempotencyKey, requireVaultRoot, runIdempotent } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 // Strip undefined keys produced by zod's `optional()` so the caller's
@@ -165,7 +165,7 @@ export const reviewDraftsRoutes: readonly RouteDefinition[] = [
         // peer events are reflected too. Phase D may hoist this onto
         // a background projector; for M2 the recompute cost is tiny
         // (one thread's events).
-        const reviewEvents = await eventLog.readByAggregate(threadId);
+        const reviewEvents = await readAggregateEventsServeStale(context, threadId);
         const threadUrl =
           input.threadUrl ?? (await readReviewDraft(vaultRoot, threadId))?.threadUrl ?? '';
         const projection = projectReviewDraft(threadId, threadUrl, reviewEvents);
@@ -227,7 +227,7 @@ export const reviewDraftsRoutes: readonly RouteDefinition[] = [
       // discarded). If the projection function returns null we
       // delete the file; otherwise we write the tombstoned
       // projection so peers still see the vector advance.
-      const merged = await eventLog.readByAggregate(threadId);
+      const merged = await readAggregateEventsServeStale(context, threadId);
       const reviewEvents = merged.filter((event) => isReviewDraftEvent(event));
       const projection = projectReviewDraft(threadId, '', reviewEvents);
       if (projection.discarded) {
