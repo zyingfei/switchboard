@@ -6245,21 +6245,52 @@ export const createConnectionsMaterializer = (
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
       );
-      if (requireScopedTimelineDeltaForDrain && !similarityRecoveryNeedsBaseRebuild) {
-        // Round-2 BLOCKER fix — a Layer-0 corpus recovery (reuse/bootstrap)
-        // DELIBERATELY takes the full base rebuild (it set
-        // `similarityRecoveryNeedsBaseRebuild`, which disarms the scoped-delta
-        // gate via `similarityRecoveryFresh=false`), so `scopedTimelineDelta`
-        // legitimately did not apply. In the chunked boot-catch-up path
-        // (`catchUpInScopedChunks` sets `requireScopedTimelineDeltaForDrain`
-        // per chunk), throwing here would abort the chunk, leave the frontier
-        // stalled, and re-enter the same >5000-scoped-event backlog forever —
-        // a hard wedge, not a one-drain miss. The recovery already produced a
-        // COMPLETE base snapshot (`baseSnapshotPrebuilt=true`, the full-log
-        // rebuild with the recovered edges), so fall through to write it
-        // (writeSnapshotWithDrainProgress advances the chunk's frontier). The
-        // throw still fires for a genuine scoped-delta failure (no recovery),
-        // preserving the original catch-up safety net.
+      if (
+        requireScopedTimelineDeltaForDrain &&
+        !similarityRecoveryNeedsBaseRebuild &&
+        previousSnapshotForScopedDelta !== null &&
+        replaceScopeRowsForScopedDelta !== undefined
+      ) {
+        // Catch-up chunk whose scoped delta cannot apply. This used to throw
+        // ("connections catchUp chunk could not apply scoped delta") as a
+        // safety net — but any deterministic skip reason (a window with a
+        // search visit, a thread-membership change, …) then re-fires on the
+        // SAME chunk every retry: the frontier never advances and the
+        // catch-up livelocks forever (observed live 2026-08-15, first as
+        // thread-workstream-membership-changed, then — one fix later — as
+        // pending-search-visit on the very next chunk). Skip reasons are a
+        // CLASS, not an instance, so handle the class: advance the frontier
+        // with a progress-only write (the served graph is byte-unchanged —
+        // same mechanics as the content-lane-only branch above) and defer the
+        // skipped rows to the single full rebuild that runs after the chunk
+        // loop (catchUpDeferredThreadReconcile). Lossless: the reconcile
+        // rebuilds from the complete event log; the graph is merely stale for
+        // the remainder of the catch-up.
+        const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        await replaceScopeRowsForScopedDelta({
+          scopes: [],
+          nodes: [],
+          edges: [],
+          progress,
+          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          metadata: {
+            urlProjection: serializeUrlProjection(urlProjection),
+            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        catchUpDeferredThreadReconcile = true;
+        mark(
+          `scopedTimelineDelta.deferredToPostCatchUp reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)}`,
+        );
+      } else if (requireScopedTimelineDeltaForDrain && !similarityRecoveryNeedsBaseRebuild) {
+        // No previous snapshot to serve — the progress-only deferral has
+        // nothing to carry. The chunked path is not entered without a current
+        // snapshot (catchUp returns 'no-current-snapshot'), so this is a
+        // genuine invariant breach; keep the original safety-net throw.
         throw new Error(
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
