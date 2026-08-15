@@ -1354,6 +1354,19 @@ export const createConnectionsMaterializer = (
     urlAccumulator: serializeUrlProjectionAccumulator(urlAccumulator),
     tabSessionAccumulator: serializeTabSessionProjectionAccumulator(tabSessionAccumulator),
   });
+  // Catch-up blob pacing: serializing + upserting the accumulator blob on
+  // EVERY chunk write is part of the drain's disk duty cycle (the blob is
+  // tens of MB; real captures measured 14-33s queued behind an unpaced
+  // drain). During chunk rounds only every 5th chunk persists it — a
+  // resume then re-folds at most 4 chunks' windows (~14ms per 5000
+  // events), which the blob-reuse fast path absorbs. Non-chunk drains are
+  // unchanged (always persist).
+  const chunkProjectionAccumulatorStateFor = (
+    progress: MaterializerProgress,
+  ): { projectionAccumulatorState?: ConnectionsProjectionAccumulatorState } =>
+    !requireScopedTimelineDeltaForDrain || catchUpChunkCounter % 5 === 0
+      ? { projectionAccumulatorState: serializeProjectionAccumulatorState(progress) }
+      : {};
   const tryLoadProjectionAccumulatorState = async (
     progress: MaterializerProgress | null,
   ): Promise<boolean> => {
@@ -1422,6 +1435,9 @@ export const createConnectionsMaterializer = (
   // reconciles memberships honestly.
   let catchUpDeferredThreadReconcile = false;
   let forceFullRebuildForThreadReconcile = false;
+  // Chunk counter for catch-up blob pacing (see
+  // chunkProjectionAccumulatorStateFor). Reset per chunked catch-up.
+  let catchUpChunkCounter = 0;
   // Persistent engagement fact store (lazy-opened; survives restart).
   // Sourced via deps for tests; defaults to the SQLite-backed store.
   let engagementFactStore: EngagementFactsStore | null = null;
@@ -6101,7 +6117,7 @@ export const createConnectionsMaterializer = (
             nodes: scoped.nodes,
             edges: scoped.edges,
             progress,
-            projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+            ...chunkProjectionAccumulatorStateFor(progress),
             metadata: {
               ...(scopedSnapshot.urlProjection === undefined
                 ? {}
@@ -6135,7 +6151,7 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
-          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          ...chunkProjectionAccumulatorStateFor(progress),
           metadata: {
             urlProjection: serializeUrlProjection(urlProjection),
             tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
@@ -6179,7 +6195,7 @@ export const createConnectionsMaterializer = (
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
-          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          ...chunkProjectionAccumulatorStateFor(progress),
           metadata: {
             urlProjection: serializeUrlProjection(urlProjection),
             tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
@@ -6213,7 +6229,7 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
-          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          ...chunkProjectionAccumulatorStateFor(progress),
           metadata: {
             urlProjection: serializeUrlProjection(urlProjection),
             tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
@@ -6272,7 +6288,7 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
-          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          ...chunkProjectionAccumulatorStateFor(progress),
           metadata: {
             urlProjection: serializeUrlProjection(urlProjection),
             tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
@@ -6415,7 +6431,7 @@ export const createConnectionsMaterializer = (
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
-          projectionAccumulatorState: serializeProjectionAccumulatorState(progress),
+          ...chunkProjectionAccumulatorStateFor(progress),
           metadata: {
             ...(baseSnapshot.urlProjection === undefined
               ? {}
@@ -7548,15 +7564,28 @@ export const createConnectionsMaterializer = (
       }
       catchUpPendingEventWindow = chunk;
       requireScopedTimelineDeltaForDrain = true;
+      const chunkStartedAtMs = Date.now();
       try {
         await buildAndWrite();
       } finally {
         catchUpPendingEventWindow = null;
         requireScopedTimelineDeltaForDrain = false;
+        catchUpChunkCounter += 1;
         requestBunMemoryRelease();
       }
       lastSuccessAt = new Date().toISOString();
       lastError = null;
+      // I/O pacing: back-to-back chunk writes saturate the disk for the
+      // whole backlog and interactive appends/fsyncs queue behind them —
+      // real captures measured 14-33s during an unpaced drain. A breather
+      // proportional to the chunk's own cost caps the drain's I/O duty
+      // cycle at ~75% without meaningfully stretching short drains.
+      const chunkPauseMs = Math.min(5_000, Math.round((Date.now() - chunkStartedAtMs) / 3));
+      if (chunkPauseMs > 50) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, chunkPauseMs);
+        });
+      }
     }
     if (catchUpDeferredThreadReconcile) {
       // One full rebuild reconciles the thread_in_workstream edges the
