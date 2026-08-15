@@ -204,7 +204,12 @@ const openDuck = async (): Promise<DuckSession> => {
     },
     appendRows: async (table, rows) => {
       const appender = await connection.createAppender(table);
-      for (const row of rows) {
+      // The feed loop runs on the single serving thread. Yield every 5k
+      // rows so a flood-era day (30-100k rows, measured 66-186ms of
+      // uninterrupted appender work) cannot block HTTP serving for its
+      // whole duration — each block stays ~10ms.
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i]!;
         appender.appendVarchar(row.replicaId);
         appender.appendBigInt(BigInt(row.seq));
         appender.appendVarchar(row.type);
@@ -213,6 +218,9 @@ const openDuck = async (): Promise<DuckSession> => {
         appender.appendVarchar(row.clientEventId);
         appender.appendVarchar(row.payload);
         appender.endRow();
+        if ((i + 1) % 5_000 === 0) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
       }
       appender.flushSync();
       appender.closeSync();
