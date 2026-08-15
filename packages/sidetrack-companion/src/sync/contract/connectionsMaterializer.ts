@@ -6549,8 +6549,14 @@ export const createConnectionsMaterializer = (
       // pass is never reintroduced. Kill-switch: set
       // SIDETRACK_RANKER_ON_SCOPED_DELTA=0 to restore the pure deferral.
       const rankerOnScopedDeltaEnabled = rankerOnScopedDeltaAugmentationEnabled();
+      // Catch-up chunks ALWAYS defer: the frontier augmentation ends in a
+      // full ranker-augmented snapshot write (measured 40-84s of disk per
+      // 5000-event chunk — write amplification that starves interactive
+      // captures), while the catch-up serves the PRIOR snapshot by doctrine
+      // and the post-catch-up reconcile publishes the final augmented form.
       const deferRankerForScopedTimelineDelta =
-        scopedTimelineDeltaApplied && !rankerOnScopedDeltaEnabled;
+        scopedTimelineDeltaApplied &&
+        (!rankerOnScopedDeltaEnabled || requireScopedTimelineDeltaForDrain);
       if (deferRankerForScopedTimelineDelta) {
         mark('ranker-augmented skipped (scopedTimelineDelta)');
         rankerAugmentation = rankerAugmentationCounters({
