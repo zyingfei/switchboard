@@ -25,7 +25,7 @@ import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../
 import { dayBucketFor } from '../../timeline/projection.js';
 import { suggestionQuerySchema, threadUpsertSchema } from '../schemas.js';
 
-import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, connectionsGraphSig, loadUrlProjection, mutationResponse, objectRecord, readBody, readEventsFromStoreOrLog, readVaultMarkdown, recallIndexPath, requireVaultRoot, requireWorkstreamTrust } from '../routeSupport.js';
+import { HttpRouteError, readAggregateEventsServeStale, RESOLVER_SIGNAL_EVENT_TYPES, connectionsGraphSig, loadUrlProjection, mutationResponse, objectRecord, readBody, readEventsFromStoreOrLog, readVaultMarkdown, recallIndexPath, requireVaultRoot, requireWorkstreamTrust } from '../routeSupport.js';
 import type { CompanionHttpConfig, RouteDefinition } from '../routeSupport.js';
 
 interface ThreadSuggestionTarget {
@@ -603,7 +603,7 @@ export const threadsRoutesA: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const events = await context.eventLog.readByAggregate(match.bacId);
+      const events = await readAggregateEventsServeStale(context, match.bacId);
       const projection = projectThread(match.bacId, events);
       return [200, { data: projection }];
     },

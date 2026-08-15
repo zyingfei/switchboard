@@ -38,6 +38,12 @@ export interface EventStore {
   readonly rebuildFromJsonl: (logRoot: string) => Promise<void>;
   /** Ordered like readMerged().filter(event => event.dot.seq > frontier[replica] ?? 0). */
   readonly readSince: (frontier: VersionVector) => readonly AcceptedEvent[];
+  /** All retained events for one aggregate, ordered like readSince —
+   *  O(aggregate rows) via events_aggregate_idx, replacing the request-
+   *  path readMerged()+filter that cost a full-log materialization per
+   *  per-aggregate projection GET (measured: 9.1s cold on 866k events,
+   *  fired in bursts on every extension service-worker reconnect). */
+  readonly readByAggregate: (aggregateId: string) => readonly AcceptedEvent[];
   readonly maxAcceptedAtMs: () => number;
   /** MAX(accepted_at_ms) for a single event type (events_type_idx filter),
    *  0 when the type has never been seen. A single aggregate query — used
@@ -174,6 +180,7 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS events_accepted_at_ms_idx ON events(accepted_at_ms);
   CREATE INDEX IF NOT EXISTS events_replica_seq_idx ON events(replica_id, seq);
+  CREATE INDEX IF NOT EXISTS events_aggregate_idx ON events(aggregate_id, replica_id, seq);
   CREATE INDEX IF NOT EXISTS events_type_idx ON events(type, replica_id, seq);
   CREATE TABLE IF NOT EXISTS ingest_watermark (
     replica_id TEXT PRIMARY KEY,
@@ -669,6 +676,18 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     );
   };
 
+  const readByAggregate = (aggregateId: string): readonly AcceptedEvent[] =>
+    rowsToEvents(
+      db
+        .query(
+          `SELECT ${SELECT_COLUMNS}
+           FROM events
+           WHERE aggregate_id = ?
+           ORDER BY replica_id, seq`,
+        )
+        .all(aggregateId),
+    );
+
   const maxAcceptedAtMs = (): number => {
     const row = db
       .query(
@@ -847,6 +866,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     catchUpFromJsonl,
     rebuildFromJsonl,
     readSince,
+    readByAggregate,
     maxAcceptedAtMs,
     maxAcceptedAtMsForType,
     maxCompactedAcceptedAtMsForType,
