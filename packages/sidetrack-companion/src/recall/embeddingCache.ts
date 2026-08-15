@@ -351,7 +351,14 @@ export const createEmbeddingCache = (
       // Re-read only after taking the cross-process writer lock. The previous
       // implementation read before write with no exclusion, so the parent and
       // drain child could each publish a map that omitted the other's batch.
-      const existing = await readCacheFileUncached(state);
+      //
+      // Memoized read is CORRECT here: the memo is guarded on the file's
+      // (mtimeMs, size, ino), so any foreign process's write since our last
+      // read busts it and forces a real parse — and we hold the writer lock,
+      // so nobody can write between the stat check and our write. The
+      // uncached read cost a full file parse (10.5MB live) per ≤8-vector
+      // batch on the embed lane's 4s cadence during backfills.
+      const existing = await readCacheFile(state);
       const modelMatches =
         existing !== null &&
         existing.header.modelId === model.modelId &&
