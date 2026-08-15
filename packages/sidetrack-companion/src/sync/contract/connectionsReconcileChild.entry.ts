@@ -10,6 +10,8 @@
 // hand-off: the child writes the new snapshot, the parent reads it
 // from disk on the next HTTP request.
 
+import { setPriority } from 'node:os';
+
 import { createConnectionsStore, SqliteConnectionsStore } from '../../connections/snapshot.js';
 import { createEventLog } from '../eventLog.js';
 import { loadOrCreateReplica } from '../replicaId.js';
@@ -36,6 +38,19 @@ if (typeof process.send !== 'function') {
 delete process.env['SIDETRACK_CONNECTIONS_CHILD'];
 delete process.env['SIDETRACK_CONNECTIONS_WORKER'];
 process.env['SIDETRACK_CONNECTIONS_INPROCESS'] = '1';
+
+// Deprioritize ourselves, not the serving parent. A catch-up over a real
+// vault burns a core for many minutes; at default priority it competes with
+// the parent's HTTP serving and the user's browser (observed 2026-08-15:
+// machine-wide paging + the panel's 15s banner while a child crunched a
+// 105k-event backlog). Nice 15 keeps full throughput on an idle machine and
+// yields under contention. Renicing the PARENT instead is wrong — children
+// inherit it, and the parent is the serving process.
+try {
+  setPriority(15);
+} catch {
+  // Best-effort; scheduling priority is not load-bearing.
+}
 
 interface ReconcileMessage {
   readonly kind: 'reconcile';
