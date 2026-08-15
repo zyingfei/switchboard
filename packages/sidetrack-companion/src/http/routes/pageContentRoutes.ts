@@ -195,10 +195,23 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
           manifestUpdate: 'incremental',
         });
         const t1 = Date.now();
-        const evidence = await writeExtractedPageEvidence(vaultRoot, {
-          ...payload,
-          storageMode: 'indexed_chunks',
-        });
+        // Fast variant: never run doc-embedding inference on the request
+        // path. The slow variant waited on the embedder (measured 24s+ when
+        // the embed lane's backlog holds the model busy) — the background
+        // embedding lane owns filling embeddingState:'missing', and an
+        // unchanged contentHash still carries the previous embedding forward
+        // as 'ready' inside the fast write.
+        const evidence = await writeExtractedPageEvidenceFast(
+          vaultRoot,
+          {
+            ...payload,
+            storageMode: 'indexed_chunks',
+          },
+          // O(1) manifest upsert — the full rebuild reads every record JSON
+          // (3,741 on the dogfood vault) and was this route's measured
+          // 11-16s `evidence` phase under boot load.
+          { manifestUpdate: 'incremental' },
+        );
         const t2 = Date.now();
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({

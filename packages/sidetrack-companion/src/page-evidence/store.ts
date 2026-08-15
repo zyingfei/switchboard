@@ -238,6 +238,68 @@ const writeRecord = async (vaultRoot: string, record: PageEvidenceRecord): Promi
   await atomicWriteJson(recordPathForCanonicalUrl(vaultRoot, record.canonicalUrl), record);
 };
 
+// O(1) incremental manifest maintenance — the page-evidence twin of
+// page-content's applyPageContentManifestUpsert. rebuildManifest reads ALL
+// record JSONs (3,741 on the dogfood vault) and ran per write on the
+// interactive capture path: measured live 2026-08-15 as the 11-16s
+// `evidence` phase of POST /v1/page-content/extracted during boot load.
+// One write adjusts exactly its own record's contribution; the manifest
+// carries an extra `topTermCountSum` field so the served average stays
+// exact under incremental updates (readers of the existing fields are
+// unaffected; a full rebuild remains the drift-healing source of truth).
+const evidenceManifestUpsertLocks = new Map<string, Promise<void>>();
+
+const applyPageEvidenceManifestUpsert = async (
+  vaultRoot: string,
+  previous: PageEvidenceRecord | null,
+  next: PageEvidenceRecord,
+): Promise<void> => {
+  const prior = evidenceManifestUpsertLocks.get(vaultRoot) ?? Promise.resolve();
+  const run = prior.then(async () => {
+    const manifest = (await readJson<Record<string, unknown>>(manifestPath(vaultRoot))) ?? {};
+    const byTierRaw = manifest['byTier'];
+    const byTier: Record<PageEvidenceTier, number> = {
+      metadata_only: 0,
+      content_features_only: 0,
+      indexed_chunks: 0,
+      ...(typeof byTierRaw === 'object' && byTierRaw !== null
+        ? (byTierRaw as Partial<Record<PageEvidenceTier, number>>)
+        : {}),
+    };
+    const recordCountRaw = manifest['recordCount'];
+    let recordCount = typeof recordCountRaw === 'number' ? recordCountRaw : 0;
+    const sumRaw = manifest['topTermCountSum'];
+    const avgRaw = manifest['avgTopTermCount'];
+    let topTermCountSum =
+      typeof sumRaw === 'number'
+        ? sumRaw
+        : typeof avgRaw === 'number'
+          ? Math.round(avgRaw * recordCount)
+          : 0;
+    if (previous === null) recordCount += 1;
+    else {
+      byTier[previous.evidenceTier] = Math.max(0, byTier[previous.evidenceTier] - 1);
+      topTermCountSum -= previous.content?.terms.length ?? 0;
+    }
+    byTier[next.evidenceTier] += 1;
+    topTermCountSum = Math.max(0, topTermCountSum + (next.content?.terms.length ?? 0));
+    await atomicWriteJson(manifestPath(vaultRoot), {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      recordCount: Math.max(0, recordCount),
+      byTier,
+      avgTopTermCount:
+        recordCount <= 0 ? 0 : Number((topTermCountSum / recordCount).toFixed(2)),
+      topTermCountSum,
+    });
+  });
+  evidenceManifestUpsertLocks.set(
+    vaultRoot,
+    run.catch(() => undefined),
+  );
+  return run;
+};
+
 const shouldWriteRecord = (
   previous: PageEvidenceRecord | null,
   record: PageEvidenceRecord,
@@ -250,11 +312,18 @@ const writeRecordIfChanged = async (
   vaultRoot: string,
   previous: PageEvidenceRecord | null,
   record: PageEvidenceRecord,
-  options: { readonly rebuildManifestAfterWrite?: boolean },
+  options: {
+    readonly rebuildManifestAfterWrite?: boolean;
+    readonly manifestUpdate?: 'rebuild' | 'incremental';
+  },
 ): Promise<boolean> => {
   if (!shouldWriteRecord(previous, record)) return false;
   await writeRecord(vaultRoot, record);
-  if (options.rebuildManifestAfterWrite !== false) await rebuildManifest(vaultRoot);
+  if (options.manifestUpdate === 'incremental') {
+    await applyPageEvidenceManifestUpsert(vaultRoot, previous, record);
+  } else if (options.rebuildManifestAfterWrite !== false) {
+    await rebuildManifest(vaultRoot);
+  }
   return true;
 };
 
@@ -416,6 +485,7 @@ const writeExtractedPageEvidenceFastState = async (
   options: {
     readonly embeddingsEnabled?: boolean;
     readonly rebuildManifestAfterWrite?: boolean;
+    readonly manifestUpdate?: 'rebuild' | 'incremental';
   } = {},
 ): Promise<FastExtractedPageEvidenceWriteResult> => {
   const canonicalUrl = canonicalizeEvidenceUrl(payload.canonicalUrl);
@@ -465,6 +535,7 @@ export const writeExtractedPageEvidenceFast = async (
   options: {
     readonly embeddingsEnabled?: boolean;
     readonly rebuildManifestAfterWrite?: boolean;
+    readonly manifestUpdate?: 'rebuild' | 'incremental';
   } = {},
 ): Promise<PageEvidenceRecord> =>
   (await writeExtractedPageEvidenceFastState(vaultRoot, payload, options)).record;
