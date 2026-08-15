@@ -181,11 +181,19 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         pageContentExtractedSchema.parse(await readBody(request)),
       );
       return await runIdempotent(context, 'pageContentExtracted', idempotencyKey, async () => {
+        // Per-phase timing, logged only when the route is slow. This POST is
+        // the extension's capture path — its 15s client timeout is the
+        // user-visible "Companion did not respond" banner — and it was
+        // observed in-flight for 114s during a boot catch-up with no way to
+        // tell WHICH of the four awaits below was starved.
+        const t0 = Date.now();
         const coverage = await writePageContentExtracted(vaultRoot, payload);
+        const t1 = Date.now();
         const evidence = await writeExtractedPageEvidence(vaultRoot, {
           ...payload,
           storageMode: 'indexed_chunks',
         });
+        const t2 = Date.now();
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({
             clientEventId: idempotencyKey,
@@ -204,6 +212,12 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
               }),
             },
           });
+        }
+        const t3 = Date.now();
+        if (t3 - t0 > 2000) {
+          console.warn(
+            `[page-content.extracted.slow] total=${String(t3 - t0)}ms content=${String(t1 - t0)}ms evidence=${String(t2 - t1)}ms appends=${String(t3 - t2)}ms url=${coverage.canonicalUrl.slice(0, 120)}`,
+          );
         }
         return [202, { data: { coverage } }];
       });
