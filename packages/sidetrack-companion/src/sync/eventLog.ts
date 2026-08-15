@@ -1,6 +1,6 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import {
@@ -978,6 +978,197 @@ export const createEventLog = (
     );
   };
 
+  // ── Persisted append-index snapshot ─────────────────────────────
+  // The warm walk parses EVERY line of the log (673MB / 767k events on
+  // the dogfood vault) while sharing the append queue; measured live
+  // 2026-08-15, appends queued 430s+ behind it after every restart —
+  // the extension's 15s "Companion did not respond" banner for the
+  // first ~10 minutes of every boot. The snapshot persists the three
+  // append-index maps together with a per-shard byte-coverage map, so
+  // the next boot loads the maps (one JSON parse) and scans only the
+  // byte-tail each shard gained since — shards are append-only outside
+  // exclusive maintenance, and maintenance deletes the snapshot.
+  //
+  // Safety on identity questions (dedupe / dot-free / aggregate
+  // frontier): coverage is exact, not heuristic. A snapshot is only
+  // written at a STRICT, non-drifted warm publish (log == baseline +
+  // own appends, all registered), sizes are recorded under the append
+  // mutex, and the loader aborts to a full warm unless every recorded
+  // shard still exists, is at least its recorded size, and has a
+  // newline exactly at the recorded boundary. dotKeys is derived from
+  // clientIdToDot at load (1:1 per event; a clientEventId maps to
+  // exactly one dot by the ClientEventIdReuse invariant).
+  const APPEND_INDEX_SNAPSHOT_VERSION = 1;
+  const appendIndexSnapshotPath = (): string =>
+    join(vaultPath, '_BAC', 'system', 'append-index-cache.json');
+
+  interface AppendIndexSnapshotShape {
+    readonly version: number;
+    readonly shards: readonly (readonly [string, string, number])[];
+    readonly clientIdToDot: readonly (readonly [string, string, number])[];
+    readonly aggregateVectors: readonly (readonly [string, Record<string, number>])[];
+  }
+
+  const deleteAppendIndexSnapshot = async (): Promise<void> => {
+    try {
+      await unlink(appendIndexSnapshotPath());
+    } catch {
+      // Absent is the desired state.
+    }
+  };
+
+  // Runs OUTSIDE the append mutex on data copied under it.
+  const persistAppendIndexSnapshot = async (
+    shards: readonly (readonly [string, string, number])[],
+    clientIdToDot: readonly (readonly [string, string, number])[],
+    aggregateVectors: readonly (readonly [string, Record<string, number>])[],
+  ): Promise<void> => {
+    try {
+      const path = appendIndexSnapshotPath();
+      await mkdir(join(vaultPath, '_BAC', 'system'), { recursive: true });
+      const tmp = `${path}.tmp`;
+      const body: AppendIndexSnapshotShape = {
+        version: APPEND_INDEX_SNAPSHOT_VERSION,
+        shards,
+        clientIdToDot,
+        aggregateVectors,
+      };
+      await writeFile(tmp, JSON.stringify(body), 'utf8');
+      await rename(tmp, path);
+    } catch (error) {
+      console.warn(
+        `[event-log] append-index snapshot write failed (warm falls back next boot): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
+
+  const captureAndPersistAppendIndexSnapshot = async (idx: AppendIndexes): Promise<void> => {
+    // Called under the append mutex: sizes and map copies are mutually
+    // consistent because nothing else can append while we run.
+    const shards: (readonly [string, string, number])[] = [];
+    const ids = await listReplicaIds();
+    for (const id of ids) {
+      for (const file of (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort()) {
+        try {
+          const s = await stat(file);
+          shards.push([id, basename(file), s.size]);
+        } catch {
+          return; // Racing deletion — skip persisting this time.
+        }
+      }
+    }
+    const clientIdToDot = [...idx.clientIdToDot.entries()].map(
+      ([clientEventId, dot]) => [clientEventId, dot.replicaId, dot.seq] as const,
+    );
+    const aggregateVectors = [...idx.aggregateVectors.entries()].map(
+      ([aggregateId, vector]) => [aggregateId, { ...vector }] as const,
+    );
+    // Stringify + write off-mutex; the copies above are immutable.
+    void persistAppendIndexSnapshot(shards, clientIdToDot, aggregateVectors);
+  };
+
+  // Returns a complete AppendIndexes (with how many tail events had to be
+  // scanned beyond the snapshot's coverage) or null (⇒ run the full warm).
+  const loadAppendIndexesFromSnapshot = async (): Promise<{
+    readonly idx: AppendIndexes;
+    readonly tailEvents: number;
+  } | null> => {
+    let parsed: AppendIndexSnapshotShape;
+    try {
+      const raw = await readFile(appendIndexSnapshotPath(), 'utf8');
+      parsed = JSON.parse(raw) as AppendIndexSnapshotShape;
+    } catch {
+      return null;
+    }
+    if (parsed.version !== APPEND_INDEX_SNAPSHOT_VERSION || !Array.isArray(parsed.shards)) {
+      return null;
+    }
+    const covered = new Map<string, number>();
+    for (const [replicaId, base, size] of parsed.shards) {
+      covered.set(`${replicaId}/${base}`, size);
+    }
+    const idx: AppendIndexes = {
+      clientIdToDot: new Map(),
+      dotKeys: new Set(),
+      aggregateVectors: new Map(),
+    };
+    for (const [clientEventId, replicaId, seq] of parsed.clientIdToDot) {
+      const dot = { replicaId, seq };
+      idx.clientIdToDot.set(clientEventId, dot);
+      idx.dotKeys.add(dotKeyOf(dot));
+    }
+    for (const [aggregateId, vector] of parsed.aggregateVectors) {
+      idx.aggregateVectors.set(aggregateId, vector);
+    }
+    const seen = new Set<string>();
+    let tailEvents = 0;
+    const ids = await listReplicaIds();
+    for (const id of ids) {
+      for (const file of (await listJsonlFiles(replicaLogDir(vaultPath, id))).sort()) {
+        const key = `${id}/${basename(file)}`;
+        seen.add(key);
+        const offset = covered.get(key) ?? 0;
+        let start = 0;
+        if (offset > 0) {
+          let s;
+          try {
+            s = await stat(file);
+          } catch {
+            return null;
+          }
+          // Shrunk ⇒ rewritten outside maintenance's snapshot delete —
+          // coverage claim is void.
+          if (s.size < offset) return null;
+          if (offset > 0) {
+            // The recorded boundary must be a line end; anything else
+            // means the prefix is not the bytes we indexed.
+            const fd = await open(file, 'r');
+            try {
+              const buf = Buffer.alloc(1);
+              await fd.read(buf, 0, 1, offset - 1);
+              if (buf.toString('utf8') !== '\n') return null;
+            } finally {
+              await fd.close();
+            }
+          }
+          if (s.size === offset) continue;
+          start = offset;
+        }
+        // Tail (or whole new shard) scan.
+        const stream = createReadStream(file, { encoding: 'utf8', start });
+        const rl = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
+        let processed = 0;
+        for await (const line of rl) {
+          const event = parseLine(line);
+          if (event !== null) {
+            registerInAppendIndexes(idx, event);
+            tailEvents += 1;
+          }
+          processed += 1;
+          if (processed % EVENT_LOG_PARSE_YIELD_EVERY === 0) {
+            await new Promise<void>((resolve) => {
+              setImmediate(resolve);
+            });
+          }
+        }
+      }
+    }
+    // A covered shard that no longer exists ⇒ retention/maintenance
+    // removed events; the maps may over-claim. Full warm re-derives.
+    for (const key of covered.keys()) {
+      if (!seen.has(key)) return null;
+    }
+    return { idx, tailEvents };
+  };
+
+  // Refresh cadence: a load whose tail outgrew this re-persists so the
+  // next boot's tail starts near zero — without it a long-running
+  // process never rewrites the snapshot and the tail regrows toward the
+  // full-warm cost it exists to avoid.
+  const APPEND_INDEX_SNAPSHOT_REFRESH_TAIL_EVENTS = 2_000;
+
   // Log signature the indexes were last reconciled against. The
   // indexes are in-process state, but the shard files can gain events
   // from OUTSIDE this process (a CLI `import` run against the same
@@ -1105,6 +1296,12 @@ export const createEventLog = (
             // next append's guard sees the drift and rebuilds.
             appendIndexesSignature = state.baselineSignature ?? live;
           }
+          // Persist only a STRICT, non-drifted publish: coverage (shard
+          // sizes) provably matches the maps. Runs under the append
+          // mutex; the JSON write itself is fired off-mutex.
+          if (state.strict && !state.drifted) {
+            await captureAndPersistAppendIndexSnapshot(state.idx);
+          }
           appendIndexes = state.idx;
           warmState = null;
           warmScopedAppends = 0;
@@ -1136,6 +1333,25 @@ export const createEventLog = (
     if (appendIndexes !== null) return Promise.resolve();
     warmDriver ??= (async () => {
       try {
+        // Snapshot fast path: load the persisted maps + per-shard tail
+        // delta in one bounded unit instead of walking the whole log.
+        // A rejected snapshot (rewritten/shrunk/missing shard) is
+        // deleted and the full segmented warm below takes over.
+        const loadedOutcome = await enqueueAppend(async (): Promise<WarmOutcome> => {
+          if (appendIndexes !== null) return 'done';
+          const loaded = await loadAppendIndexesFromSnapshot();
+          if (loaded === null) {
+            await deleteAppendIndexSnapshot();
+            return 'more';
+          }
+          if (loaded.tailEvents >= APPEND_INDEX_SNAPSHOT_REFRESH_TAIL_EVENTS) {
+            await captureAndPersistAppendIndexSnapshot(loaded.idx);
+          }
+          appendIndexes = loaded.idx;
+          appendIndexesSignature = await computeLogSignature();
+          return 'done';
+        });
+        if (loadedOutcome === 'done') return;
         for (;;) {
           const outcome = await enqueueAppend(runWarmSegment);
           if (outcome === 'done') return;
@@ -1670,6 +1886,9 @@ export const createEventLog = (
         await discardWarmState();
         mergedMemo = null;
         cancelMergedSweep();
+        // A rewrite invalidates the persisted append-index snapshot's
+        // byte-coverage claim; delete it so the next boot re-derives.
+        await deleteAppendIndexSnapshot();
       }
     });
 
