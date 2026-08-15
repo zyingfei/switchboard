@@ -109,11 +109,16 @@ export interface ReviewDraftChange {
   readonly threadId: string;
   readonly vector: VersionVector;
   readonly updatedAtMs: number;
+  /** 'deleted' entries must not be re-fetched — the draft is gone. */
+  readonly kind?: string;
 }
 
 export interface ReviewDraftChangesResponse {
   readonly cursor: string;
   readonly changed: readonly ReviewDraftChange[];
+  /** True when changelog rotation outran the caller's `since` cursor —
+   *  `changed` is then incomplete and a full listing resync is needed. */
+  readonly resyncRequired: boolean;
 }
 
 export interface ReviewDraftClientConfig {
@@ -240,6 +245,7 @@ export const fetchReviewDraftChanges = async (
   return {
     cursor: typeof body.cursor === 'string' ? body.cursor : '0',
     changed: Array.isArray(body.changed) ? body.changed : [],
+    resyncRequired: body.resyncRequired === true,
   };
 };
 
