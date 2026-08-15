@@ -1,6 +1,6 @@
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { getSharedEventStoreServeStale } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from './events.js';
 import type { AttributionPolicyMode, AttributionPolicyTelemetry } from './policy.js';
@@ -72,7 +72,10 @@ const projectTabSessionsFromStoreOrLog = async (
   vaultRoot: string | undefined,
 ): Promise<TabSessionProjection> => {
   if (vaultRoot === undefined) return projectTabSessions(await eventLog.readMerged());
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  // SERVE-STALE (the #330 doctrine): request-path caller — never await
+  // the coalesced catch-up here (see urls/autoApply.ts for the measured
+  // post-restart hang this caused). Catch-up still runs in background.
+  const store = await getSharedEventStoreServeStale(vaultRoot);
   if (store === null) return projectTabSessions(await eventLog.readMerged());
   const accumulator = createEmptyTabSessionProjectionAccumulator();
   await store.forEachChunk((chunk) => {

@@ -6,7 +6,7 @@ import {
 } from '../tabsession/resolver.js';
 import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
+import { getSharedEventStoreServeStale } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { URL_ATTRIBUTION_INFERRED } from './events.js';
 import {
@@ -79,7 +79,15 @@ const projectUrlsFromStoreOrLog = async (
   vaultRoot: string | undefined,
 ): Promise<UrlProjection> => {
   if (vaultRoot === undefined) return projectUrls(await eventLog.readMerged());
-  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  // SERVE-STALE (the #330 doctrine): this runs on request paths
+  // (visits batch-resolve → auto-apply). Awaiting the coalesced
+  // catch-up here made every such request hang for the whole post-
+  // restart catch-up — measured live: batch-resolve 117s, timeline
+  // POST 57s, edge POST 18s, all released the instant one catch-up
+  // finished. The stale window is the same eventual-consistency gap
+  // that exists between any two catch-ups; the getter still kicks
+  // catch-up in the background.
+  const store = await getSharedEventStoreServeStale(vaultRoot);
   if (store === null) return projectUrls(await eventLog.readMerged());
   const accumulator = createEmptyUrlProjectionAccumulator();
   await store.forEachChunk((chunk) => {
