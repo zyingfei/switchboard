@@ -1408,6 +1408,20 @@ export const createConnectionsMaterializer = (
   let lastEngagementClassRevision: ReturnType<typeof buildEngagementClassRevision> | undefined;
   let catchUpPendingEventWindow: readonly AcceptedEvent[] | null = null;
   let requireScopedTimelineDeltaForDrain = false;
+  // Thread-membership bail deferral for the chunked catch-up. The bail
+  // (threadDeltaFullBuildReason) compares workstream membership between the
+  // previous snapshot and the WINDOW-built scoped snapshot — which is
+  // assembled with `workstreams: []`, so any thread with real membership
+  // always looks "changed" during catch-up. Bailing there throws (chunks
+  // require the scoped path), the frontier never advances, and the same
+  // oldest chunk re-bails forever: a livelock, not a one-drain miss
+  // (observed live 2026-08-15: backlog 109k and growing, 30-64s per round).
+  // Instead the chunk proceeds scoped (preserveThreadRowsForScopedDelta
+  // carries the previous thread rows, so nothing is lost — membership edges
+  // are merely stale), and ONE forced full rebuild after the chunk loop
+  // reconciles memberships honestly.
+  let catchUpDeferredThreadReconcile = false;
+  let forceFullRebuildForThreadReconcile = false;
   // Persistent engagement fact store (lazy-opened; survives restart).
   // Sourced via deps for tests; defaults to the SQLite-backed store.
   let engagementFactStore: EngagementFactsStore | null = null;
@@ -5753,7 +5767,14 @@ export const createConnectionsMaterializer = (
       // rows forward and would drop the recovered edges).
       similarityRecoveryFresh: !similarityRecoveryNeedsBaseRebuild,
     };
+    if (forceFullRebuildForThreadReconcile) {
+      // Post-catch-up membership reconcile pass: the scoped delta must NOT
+      // run (it would trivially succeed on the tiny fresh window and skip
+      // the rebuild that re-derives thread_in_workstream edges).
+      scopedTimelineDeltaSkipDetail = 'thread-membership-reconcile-forced';
+    }
     if (
+      !forceFullRebuildForThreadReconcile &&
       scopedTimelineDeltaGate.incrementalScopes &&
       scopedTimelineDeltaGate.feature &&
       previousSnapshotForScopedDelta !== null &&
@@ -6005,9 +6026,15 @@ export const createConnectionsMaterializer = (
           threadScopes: dirtyThreadScopes,
           deletedThreadIds: deletedThreadIdsForScopedDelta,
         });
-        if (threadFullBuildReason !== null) {
+        if (threadFullBuildReason !== null && !requireScopedTimelineDeltaForDrain) {
           scopedTimelineDeltaSkipDetail = threadFullBuildReason;
         } else {
+          if (threadFullBuildReason !== null) {
+            catchUpDeferredThreadReconcile = true;
+            mark(
+              `threadDelta.bailDeferred reason=${threadFullBuildReason} — catch-up chunk proceeds scoped; full reconcile after catch-up`,
+            );
+          }
           const rowLocalScopes = dedupeScopeList([
             ...[...scopedVisitKeys.values()].map((id) => ({ kind: 'url' as const, id })),
             ...[...tabSessionIds.values()].map((id) => ({ kind: 'tab-session' as const, id })),
@@ -6323,7 +6350,11 @@ export const createConnectionsMaterializer = (
     // snapshot to serve. The ranker-augmented build below adds
     // closest_visit edges; on a 5K-event vault that pass takes ~20s of
     // synchronous CPU which would otherwise block HTTP.
-    if (scopeIncrementalEnabled) {
+    // The forced membership-reconcile pass must publish the WHOLE rebuilt
+    // snapshot (writeSnapshotWithDrainProgress below): the scope-incremental
+    // write only replaces this window's dirty scopes, and the threads whose
+    // membership went stale during catch-up are not in that set.
+    if (scopeIncrementalEnabled && !forceFullRebuildForThreadReconcile) {
       if (dirtyScopes.length > 0) {
         const scoped = unionScopeOutputs(
           dirtyScopes.map((scope) => recomputeScope(scope, baseSnapshot)),
@@ -6938,6 +6969,11 @@ export const createConnectionsMaterializer = (
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
         lastFailureAtMs = Date.now();
+        // Always audible: a swallowed drain failure hid a multi-hour
+        // catch-up livelock (health stayed "healthy" because a later
+        // trivial pass nulled lastError). One line per failed drain,
+        // naturally rate-limited by the drain cadence.
+        console.warn(`[connections] drain failed: ${lastError}`);
         // Re-flag dirty so the next trigger retries; exit drain to
         // avoid tight-retry on persistent failures.
         dirty = true;
@@ -7466,6 +7502,19 @@ export const createConnectionsMaterializer = (
       lastSuccessAt = new Date().toISOString();
       lastError = null;
     }
+    if (catchUpDeferredThreadReconcile) {
+      // One full rebuild reconciles the thread_in_workstream edges the
+      // deferred bails left stale. Runs once per catch-up, in the same
+      // (child) process, after the frontier is fully advanced.
+      catchUpDeferredThreadReconcile = false;
+      forceFullRebuildForThreadReconcile = true;
+      try {
+        await buildAndWrite();
+      } finally {
+        forceFullRebuildForThreadReconcile = false;
+        requestBunMemoryRelease();
+      }
+    }
     return { applied: true, reason: 'chunked-scoped' };
   };
 
@@ -7594,6 +7643,8 @@ export const createConnectionsMaterializer = (
       notifyDrainSuccess();
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
+      // Always audible — see the drain-loop twin of this warn.
+      console.warn(`[connections] catchUp failed: ${lastError}`);
       // Don't spin during catchUp — leave dirty=true so the next
       // event trigger (after cooldown) retries.
       dirty = true;
