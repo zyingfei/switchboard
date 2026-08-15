@@ -187,7 +187,13 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         // observed in-flight for 114s during a boot catch-up with no way to
         // tell WHICH of the four awaits below was starved.
         const t0 = Date.now();
-        const coverage = await writePageContentExtracted(vaultRoot, payload);
+        // O(1) manifest upsert instead of the O(records) rebuild — the rebuild
+        // was the measured 16-119s of this route's `content` phase under
+        // catch-up load (see applyPageContentManifestUpsert for the argument;
+        // deferring the same scan onto the event loop was measured worse).
+        const coverage = await writePageContentExtracted(vaultRoot, payload, {
+          manifestUpdate: 'incremental',
+        });
         const t1 = Date.now();
         const evidence = await writeExtractedPageEvidence(vaultRoot, {
           ...payload,
