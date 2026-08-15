@@ -6090,13 +6090,34 @@ export default defineBackground(() => {
       // that landed while we were disconnected is reflected in the
       // local projection cache. The SSE stream covers events after
       // reconnect; this fills the gap before reconnect.
+      //
+      // The cursor MUST be persisted and passed back: MV3 suspends this
+      // worker constantly, so reconcile fires many times per hour — a
+      // null cursor replayed the feed's FULL history each time and
+      // re-fetched a draft per historical change entry (measured live:
+      // 33.6k 404 GETs in 18h for one long-deleted draft, ~half of all
+      // companion traffic). Dedupe by threadId for the same reason: the
+      // feed is per-event, one draft edited N times is N entries.
       void (async () => {
         const cached = await refreshCompanionCache();
         void drainReviewDraftQueue().catch(() => undefined);
         if (cached === null) return;
         try {
-          const response = await fetchReviewDraftChanges(cached, null);
-          for (const change of response.changed) {
+          const CURSOR_KEY = 'sidetrack.reviewDraftChangesCursor';
+          const stored = await chrome.storage.local.get({ [CURSOR_KEY]: null });
+          const sinceCursor =
+            typeof stored[CURSOR_KEY] === 'string' ? (stored[CURSOR_KEY] as string) : null;
+          const response = await fetchReviewDraftChanges(cached, sinceCursor);
+          // Rotation outran our cursor: entries are incomplete, but a full
+          // dedup'd pass over what remains is exactly the legacy behavior
+          // once — go-forward correctness comes from the new cursor below.
+          const distinct = [...new Map(response.changed.map((c) => [c.threadId, c])).values()];
+          for (const change of distinct) {
+            if (change.kind === 'deleted') {
+              const { removeRemoteReviewDraft } = await import('../src/background/state');
+              await removeRemoteReviewDraft(change.threadId).catch(() => undefined);
+              continue;
+            }
             const projection = await fetchReviewDraft(cached, change.threadId).catch(() => null);
             if (projection === null) continue;
             const { mirrorRemoteReviewDraft } = await import('../src/background/state');
@@ -6117,6 +6138,7 @@ export default defineBackground(() => {
               updatedAtMs: projection.updatedAtMs,
             });
           }
+          await chrome.storage.local.set({ [CURSOR_KEY]: response.cursor });
         } catch {
           // Swallowed — reconnect retry will pick up if companion
           // settings changed. The SSE loop continues.
