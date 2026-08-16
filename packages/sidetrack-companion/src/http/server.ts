@@ -1197,6 +1197,19 @@ export const routes: readonly RouteDefinition[] = [
             [...expandedCandidateUrlsByTarget.values()].flatMap((candidateUrls) => candidateUrls),
           ),
         ];
+        // PERF (2026-08-16) — VERIFIED single pin for the whole misses loop
+        // below: this is the ONLY sqlite-metadata-deriving read
+        // (readResolverSubgraphForUrls -> #readMetadata -> the write_seq
+        // self-heal at snapshot.ts's #selfHealProjections) on this code path
+        // for the entire request. `missedSnapshot` is one object reference,
+        // reused verbatim by every URL in the misses loop below (the `const
+        // snapshot = missedSnapshot;` inside it) AND by finalizeBatchResolveResults's
+        // `joinSnapshot` fallback — nothing in either per-URL loop calls
+        // readSnapshotMetadata/readCurrent/any other subgraph read, so
+        // write_seq cannot advance (and re-trigger self-heal) mid-request.
+        // The reverse-shadow deferral (reverseShadowDefer.ts) does not change
+        // this: its deferred job reuses this SAME captured snapshot object,
+        // it never re-reads metadata. No separate pin needed.
         const missedSnapshot =
           misses.length === 0
             ? null

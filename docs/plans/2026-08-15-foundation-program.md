@@ -95,3 +95,32 @@ Record results in docs/audits/<date>-foundation-validation.md.
 3. Roll daily companion to main-tip build (one restart; snapshot warm
    makes it cheap).
 4. Kick a fresh acceptance-sampler window; record numbers here.
+
+## Landing notes (current state, dated)
+
+**2026-08-16 — resolver hub-subgraph traversal budgets
+(perf/resolver-subgraph-budget).** Not an F1–F7 item; filed here per the
+"binding plan tracks reality" rule since it hit the same measured symptom
+(15s/30s busy-banner class) via a different chokepoint. Root cause:
+`#readTraversedSubgraphInner` (connections/snapshot.ts) was an unbounded
+BFS with no node/edge ceiling and no per-node fan-out cap — one hub URL
+(e.g. an aggregator front page with thousands of inbound links) pulled
+2,800 nodes / 46,565 edges into a single synchronous bun:sqlite tick
+(5,266ms measured), holding `POST /v1/visits/batch-resolve` and every
+other request behind it. Fix: three independent env-gated budgets, all
+`0 = unlimited` (kill switch, restores prior unbounded behavior per
+knob):
+- `SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET` (default `1200`)
+- `SIDETRACK_RESOLVER_SUBGRAPH_EDGE_BUDGET` (default `4000`)
+- `SIDETRACK_RESOLVER_HUB_DEGREE_CAP` (default `400`) — a frontier node
+  whose incident-edge count exceeds the cap is read (capped, included)
+  but not expanded through.
+
+Plus: yields threaded through the traversal (setImmediate-based,
+between hop levels / chunked reads), `buildEvidenceGraph` memoized per
+snapshot object identity (one graph build per batch instead of one per
+miss URL), and the attribution reverse-shadow incumbent re-run deferred
+off the serve path (`attribution-v1/reverseShadowDefer.ts`, mirrors
+`http/resolverCacheDefer.ts`). Truncation is deterministic and reported
+via `ConnectionsSnapshot.truncated` + a throttled
+`[resolver.subgraph.truncated]` log line for soak observability.
