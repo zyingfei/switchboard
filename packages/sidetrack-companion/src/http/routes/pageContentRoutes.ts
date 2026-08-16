@@ -363,8 +363,15 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
             // Once the queue entry exists, a worker may immediately upgrade this
             // same record; writing features afterward could downgrade a completed
             // worker result back to features-only and strand the vector lane.
+            // O(1) manifest upsert, same as the /v1/page-content/extracted
+            // route above — the full rebuild this used to skip entirely
+            // (rebuildManifestAfterWrite:false) read every record JSON and
+            // left the manifest permanently stale for every features_only
+            // capture. This runs on the main HTTP thread, so it shares the
+            // same evidenceManifestUpsertLocks serialization as every other
+            // in-process caller.
             const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
-              rebuildManifestAfterWrite: false,
+              manifestUpdate: 'incremental',
             });
             // Auto/attention capture intentionally posts `features_only` so the
             // request path stays fast. Preserve its body in a bounded, durable,
@@ -383,8 +390,9 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
             async () => {
               await discardQueuedBodyEvidenceUnderLock(vaultRoot, pageContentPayload.canonicalUrl);
               const coverage = await writePageContentExtracted(vaultRoot, pageContentPayload);
+              // O(1) manifest upsert — see the features_only branch above.
               const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
-                rebuildManifestAfterWrite: false,
+                manifestUpdate: 'incremental',
               });
               return { coverage, evidence, bodyEvidenceQueue: null };
             },

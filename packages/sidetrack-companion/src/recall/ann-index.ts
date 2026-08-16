@@ -89,6 +89,40 @@ const HNSW_CONNECTIVITY = 16;
 const HNSW_EXPANSION_ADD = 64;
 const HNSW_EXPANSION_SEARCH = 64;
 const HNSW_FILTER_BUFFER = 8;
+// usearch's native `threads` argument: 0 means "let the addon decide", which
+// resolves to `std::thread::hardware_concurrency()` (javascript/lib.cpp) —
+// i.e. it silently fans a SINGLE `index.add()` batch, however small, out
+// across every core the process can see. usearch's own C++ source documents
+// the consequence (index.hpp, form_reverse_links_): "the order of insertion
+// is not guaranteed" under multi-threaded construction — concurrent graph
+// mutation races on which node "sees" which neighbors first, so the
+// resulting HNSW graph topology (and therefore which items an approximate
+// `search()` returns near a tight rank cutoff) is NOT reproducible across
+// otherwise-identical builds of the same vectors.
+//
+// Measured directly against the `usearch` addon (10k rebuilds of an
+// identical 61-vector fixture, add+search both with threads=0): 15 distinct
+// raw neighbor sets came back across those 10k builds. Pinning threads=1 on
+// both calls made it exactly 1 set, every time, over the same 10k builds.
+// This was the root cause of the long-running "does not emit a candidate
+// below the top-K cutoff" CI flake in visitSimilarity.test.ts — upstream of
+// and independent from the
+// FUSION_WINDOW tiebreak-sort fixes (both arms already sort score-desc/
+// id-asc before their window slice; that cannot repair a candidate SET that
+// is itself nondeterministic before sorting even begins). On CI runners
+// (often cgroup-limited containers where hardware_concurrency() typically
+// over-reports the host's core count rather than the container's real
+// quota) the resulting thread oversubscription widens this race window
+// far beyond what a quiet local machine ever exhibits, which is why the
+// flake reproduced in CI but not under thousands of local reruns.
+//
+// Pinning threads=1 trades index-build parallelism for determinism. Build
+// cost is a one-time per-drain expense (not per-query): measured ~4x slower
+// at 3,000 items (358ms → 1.58s), still small next to embedding latency.
+// `search()` is always called with exactly one query vector in this
+// codebase, so multi-threading it never helped — the only effect of
+// threads=0 there was spinning up an idle thread pool per query.
+const HNSW_INDEX_THREADS = 1;
 
 const defaultLogger: AnnLogger = {
   warn: (message) => {
@@ -260,7 +294,7 @@ export const buildAnnIndex = async ({
       keyToItem.set(key, item);
       vectors.set(vectorForDimension(item.embedding, dimensions), indexInSearchable * dimensions);
     });
-    index.add(keys, vectors, 0);
+    index.add(keys, vectors, HNSW_INDEX_THREADS);
     let queryFallbackWarned = false;
     return {
       revisionId,
@@ -274,7 +308,7 @@ export const buildAnnIndex = async ({
           const matches = index.search(
             vectorForDimension(queryEmbedding, dimensions),
             nativeLimit,
-            0,
+            HNSW_INDEX_THREADS,
           );
           const results: AnnSearchResult[] = [];
           for (let cursor = 0; cursor < matches.keys.length; cursor += 1) {

@@ -23,6 +23,11 @@ import { fileURLToPath } from 'node:url';
 
 import { ensureMcpAuthKey } from './auth/mcpAuthKey.js';
 import { bridgeKeyPath, pairTokenPath, pairingToken, writePairToken } from './auth/bridgeKey.js';
+import type {
+  EngagementCompactionObservation,
+  EngagementCompactionProof,
+  EngagementCompactionProofs,
+} from './gc/compactionPlanner.js';
 import { pickInstaller } from './install/index.js';
 import { withBunSmolCommand } from './process/bunMemory.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
@@ -206,6 +211,18 @@ export const renderHelp = (): string =>
     '    engagement.interval.observed events (per-visit sum, excluding visits that',
     '    already have a real aggregate) and appends them. Dry-run unless --apply.',
     '    Event-sourced + idempotent: safe to re-run; never rewrites the log.',
+    '',
+    'Compact-engagement subcommand (proof-gated canonical-log rewrite):',
+    '  sidetrack-companion compact-engagement --vault <path> [--report-only|--apply] \\',
+    '      [--retain-days <n>] [--json]',
+    '    Drops engagement.interval.observed lines from sealed (strictly-past-day)',
+    '    log shards for visits that already have a durable',
+    '    engagement.session.aggregated record — see src/gc/compactionPlanner.ts.',
+    '    REPORT-ONLY by default (plans and prints; never touches disk). --apply',
+    '    additionally requires SIDETRACK_ENGAGEMENT_COMPACT=1 in the environment',
+    "    (the planner's own arm switch) and refuses if a live companion holds the",
+    "    vault's recall process-lock. Rewrites run through EventLog's",
+    '    runExclusiveMaintenance; there is no force path.',
   ].join('\n');
 
 // Post-install guidance printed after `--install-service` succeeds. Pure
@@ -1244,6 +1261,208 @@ const runEngagementSubcommand = async (
   return errors > 0 ? 1 : 0;
 };
 
+// Task F1 — engagement-interval log compaction. `engagement.interval.observed`
+// is ~76% of the canonical JSONL log by line count and grows monotonically;
+// src/gc/compactionPlanner.ts already implements the full proof-gated rewrite
+// (aggregate coverage, dense-sequence reconciliation, crash-recoverable
+// receipts, no force path) but nothing in production ever called it. This is
+// the entry point.
+//
+// REPORT-ONLY by default: `planEngagementCompaction` only reads (streams
+// shards, reads the manifest) — safe against a live, shared vault. `--apply`
+// is the sole destructive path and requires TWO independent confirmations:
+// (1) SIDETRACK_ENGAGEMENT_COMPACT=1 in the environment — the planner's own
+// arm switch (compactionPlanner.ts:engagementCompactArmed), already wired
+// into `plan.wouldRewrite`; this CLI does not flip it and does not add a
+// bypass. (2) the `--apply` flag itself. Neither alone rewrites anything.
+//
+// Cross-process safety: `EventLog.runExclusiveMaintenance` only serialises
+// writers *within one process* (it's an in-process append-queue + cache
+// invalidation, not a filesystem lock — see eventLog.ts). A second process
+// rewriting sealed shards while a live companion holds warm append indexes
+// / merged-log memos over the same files would desync those caches from
+// disk. So `--apply` first takes the vault's recall process-lock
+// (`_BAC/recall/.lock`) the same way `recall reingest` does — "one process
+// writes a vault" — and refuses outright if a live companion owns it,
+// before ever touching the log.
+const runCompactEngagementSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion compact-engagement --vault <path> [--report-only|--apply]',
+    );
+    writeLine(streams.stdout, '           [--retain-days <n>] [--json]');
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for compact-engagement.');
+    return 2;
+  }
+  const apply = argv.includes('--apply');
+  const reportOnlyFlag = argv.includes('--report-only');
+  if (apply && reportOnlyFlag) {
+    writeLine(streams.stderr, 'compact-engagement: pass at most one of --report-only or --apply.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const retainDaysRaw = findArgValue(argv, '--retain-days');
+  let retainDays: number | undefined;
+  if (retainDaysRaw !== undefined) {
+    const parsed = Number.parseInt(retainDaysRaw, 10);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      writeLine(
+        streams.stderr,
+        `--retain-days must be a non-negative integer, got: ${retainDaysRaw}`,
+      );
+      return 2;
+    }
+    retainDays = parsed;
+  }
+
+  const { planEngagementCompaction, applyEngagementCompaction, engagementCompactArmed } =
+    await import('./gc/compactionPlanner.js');
+
+  const observations: EngagementCompactionObservation[] = [];
+  const recordObservation = (observation: EngagementCompactionObservation): void => {
+    observations.push(observation);
+  };
+  const proofEntries = (
+    proofs: EngagementCompactionProofs,
+  ): readonly [string, EngagementCompactionProof][] => [
+    ['aggregateCoverage', proofs.aggregateCoverage],
+    ['denseSequenceReconciliation', proofs.denseSequenceReconciliation],
+    ['crashRecovery', proofs.crashRecovery],
+    ['downstreamConsumers', proofs.downstreamConsumers],
+    ['appendLifecycle', proofs.appendLifecycle],
+    ['laneHealth', proofs.laneHealth],
+  ];
+
+  if (!apply) {
+    // Preview under the SAME lifecycle mode `--apply` actually uses below
+    // (onlineMaintenance, never offline) so the proof statuses/blockers
+    // shown here match what a subsequent --apply would see. Read-only:
+    // planEngagementCompaction never writes.
+    const plan = await planEngagementCompaction(vaultPath, {
+      onlineMaintenance: true,
+      observe: recordObservation,
+      ...(retainDays === undefined ? {} : { retainDays }),
+    });
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'report-only', plan, observations }, null, 2));
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      `compact-engagement report-only: vault=${vaultPath} retainDays=${String(plan.retainDays)} cutoff=${plan.cutoffDate}`,
+    );
+    writeLine(
+      streams.stdout,
+      `  candidateShards=${String(plan.shards.length)} intervalsFolded=${String(plan.intervalsFolded)} bytesReclaimable=${String(plan.bytesReclaimable)}`,
+    );
+    writeLine(
+      streams.stdout,
+      `  visitsCovered=${String(plan.visitsCovered)} visitsUncovered=${String(plan.visitsUncovered)} armed=${String(plan.armed)} wouldRewrite=${String(plan.wouldRewrite)}`,
+    );
+    for (const [name, proof] of proofEntries(plan.proofs)) {
+      writeLine(streams.stdout, `  proof ${name}: ${proof.status} — ${proof.evidence}`);
+    }
+    for (const blocker of plan.blockers) {
+      writeLine(streams.stdout, `  blocker [${blocker.severity}] ${blocker.id}: ${blocker.detail}`);
+    }
+    // Per-day breakdown: sealed shards can repeat a date across replicas,
+    // so aggregate before ranking (biggest offenders first).
+    const byDate = new Map<string, { intervals: number; bytes: number }>();
+    for (const shard of plan.shards) {
+      const entry = byDate.get(shard.date) ?? { intervals: 0, bytes: 0 };
+      entry.intervals += shard.coveredIntervalLines;
+      entry.bytes += shard.coveredBytes;
+      byDate.set(shard.date, entry);
+    }
+    const topDates = [...byDate.entries()].sort((left, right) => right[1].bytes - left[1].bytes);
+    writeLine(streams.stdout, '  top days by reclaimable bytes:');
+    for (const [date, entry] of topDates.slice(0, 10)) {
+      writeLine(
+        streams.stdout,
+        `    ${date}\tintervals=${String(entry.intervals)}\tbytes=${String(entry.bytes)}`,
+      );
+    }
+    if (!plan.armed) {
+      writeLine(
+        streams.stdout,
+        '  not armed: set SIDETRACK_ENGAGEMENT_COMPACT=1 and re-run with --apply to rewrite.',
+      );
+    }
+    return 0;
+  }
+
+  // --apply path. First confirmation: the planner's own arm switch.
+  if (!engagementCompactArmed()) {
+    writeLine(
+      streams.stderr,
+      'compact-engagement --apply refuses: SIDETRACK_ENGAGEMENT_COMPACT is not set to 1/true.',
+    );
+    writeLine(
+      streams.stderr,
+      "This is src/gc/compactionPlanner.ts's own arm switch — set it explicitly in the",
+    );
+    writeLine(streams.stderr, 'environment to confirm the destructive rewrite; --apply alone is not enough.');
+    return 1;
+  }
+
+  // Second confirmation / cross-process guard: refuse if a live companion
+  // owns this vault (see the comment above this function).
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `compact-engagement --apply refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(
+        streams.stderr,
+        'Stop it first — this process cannot invalidate that companion\'s in-memory append',
+      );
+      writeLine(streams.stderr, 'indexes / merged-log memo, only its own.');
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    const replica = await loadOrCreateReplica(vaultPath);
+    const eventLog = createEventLog(vaultPath, replica);
+    const plan = await planEngagementCompaction(vaultPath, {
+      onlineMaintenance: true,
+      observe: recordObservation,
+      ...(retainDays === undefined ? {} : { retainDays }),
+    });
+    const result = await applyEngagementCompaction(plan, { eventLog, observe: recordObservation });
+    if (json) {
+      writeLine(
+        streams.stdout,
+        JSON.stringify({ mode: 'apply', plan, result, observations }, null, 2),
+      );
+      return result.errors.length === 0 ? 0 : 1;
+    }
+    writeLine(
+      streams.stdout,
+      `compact-engagement apply: rewrittenShards=${String(result.rewrittenShards)} droppedLines=${String(result.droppedLines)} reclaimedBytes=${String(result.reclaimedBytes)} skipped=${String(result.skipped)}`,
+    );
+    for (const error of result.errors) writeLine(streams.stderr, error);
+    return result.errors.length === 0 ? 0 : 1;
+  } finally {
+    await lock.release();
+  }
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   // Sub-command dispatch happens BEFORE the flag-driven parser so a
   // verb like `models` doesn't get interpreted as a positional vault
@@ -1253,6 +1472,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'engagement') {
     return await runEngagementSubcommand(argv, streams);
+  }
+  if (argv[0] === 'compact-engagement') {
+    return await runCompactEngagementSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);

@@ -452,6 +452,201 @@ describe('runCli', () => {
       await rm(vaultRoot, { recursive: true, force: true });
     }
   });
+
+  it('compact-engagement report-only plans without writing; --apply refuses without the arm env var', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'compact-engagement-cli-'));
+    try {
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      let now = new Date('2020-01-01T12:00:00.000Z');
+      const log = createEventLog(vaultRoot, replica, { now: () => now });
+      const dims = (focusedWindowMs: number) => ({
+        activeMs: focusedWindowMs,
+        visibleMs: focusedWindowMs,
+        focusedWindowMs,
+        idleMs: 0,
+        foregroundBursts: 1,
+        returnCount: 0,
+        scrollEvents: 0,
+        maxScrollRatio: 0,
+        copyCount: 0,
+        pasteCount: 0,
+      });
+      // A sealed (2020-01-01, far past retention) interval with a
+      // durable aggregate elsewhere in the log — the single droppable
+      // case the planner is designed to find.
+      await log.appendClientObserved({
+        clientEventId: 'iv-1',
+        aggregateId: 'engagement.interval.observed:visit:covered',
+        type: 'engagement.interval.observed',
+        baseVector: {},
+        payload: {
+          payloadVersion: 1,
+          visitId: 'visit:covered',
+          intervalStart: now.getTime(),
+          intervalEnd: now.getTime() + 1_000,
+          dimensions: { engagement: dims(400) },
+        },
+      });
+      now = new Date();
+      await log.appendClientObserved({
+        clientEventId: 'ag-1',
+        aggregateId: 'engagement.session.aggregated:visit:covered',
+        type: 'engagement.session.aggregated',
+        baseVector: {},
+        payload: {
+          payloadVersion: 1,
+          visitId: 'visit:covered',
+          sessionId: 'session:covered',
+          dimensions: { engagement: dims(400) },
+        },
+      });
+
+      // Report-only (the default — no --apply given): prints the plan,
+      // writes nothing.
+      const report = createStreams();
+      const reportExit = await runCli(['compact-engagement', '--vault', vaultRoot], report);
+      expect(reportExit).toBe(0);
+      const reportText = report.stdout.text();
+      expect(reportText).toContain('intervalsFolded=1');
+      expect(reportText).toContain('armed=false');
+      expect(reportText).toContain('wouldRewrite=false');
+      expect(reportText).toContain('not armed: set SIDETRACK_ENGAGEMENT_COMPACT=1');
+
+      const beforeMerged = await log.readMerged();
+      expect(
+        beforeMerged.filter((e) => e.type === 'engagement.interval.observed'),
+      ).toHaveLength(1);
+
+      // --apply without SIDETRACK_ENGAGEMENT_COMPACT=1 refuses before
+      // touching the log or taking the recall process-lock — the
+      // planner's own arm switch, not a CLI-only gate.
+      const refused = createStreams();
+      const refusedExit = await runCli(
+        ['compact-engagement', '--vault', vaultRoot, '--apply'],
+        refused,
+      );
+      expect(refusedExit).toBe(1);
+      expect(refused.stderr.text()).toContain('SIDETRACK_ENGAGEMENT_COMPACT');
+      const stillMerged = await log.readMerged();
+      expect(
+        stillMerged.filter((e) => e.type === 'engagement.interval.observed'),
+      ).toHaveLength(1);
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('compact-engagement --apply drops covered intervals once armed, and is idempotent on re-run', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'compact-engagement-apply-'));
+    try {
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      let now = new Date('2020-01-01T12:00:00.000Z');
+      const log = createEventLog(vaultRoot, replica, { now: () => now });
+      const dims = (focusedWindowMs: number) => ({
+        activeMs: focusedWindowMs,
+        visibleMs: focusedWindowMs,
+        focusedWindowMs,
+        idleMs: 0,
+        foregroundBursts: 1,
+        returnCount: 0,
+        scrollEvents: 0,
+        maxScrollRatio: 0,
+        copyCount: 0,
+        pasteCount: 0,
+      });
+      await log.appendClientObserved({
+        clientEventId: 'iv-1',
+        aggregateId: 'engagement.interval.observed:visit:covered',
+        type: 'engagement.interval.observed',
+        baseVector: {},
+        payload: {
+          payloadVersion: 1,
+          visitId: 'visit:covered',
+          intervalStart: now.getTime(),
+          intervalEnd: now.getTime() + 1_000,
+          dimensions: { engagement: dims(400) },
+        },
+      });
+      now = new Date();
+      await log.appendClientObserved({
+        clientEventId: 'ag-1',
+        aggregateId: 'engagement.session.aggregated:visit:covered',
+        type: 'engagement.session.aggregated',
+        baseVector: {},
+        payload: {
+          payloadVersion: 1,
+          visitId: 'visit:covered',
+          sessionId: 'session:covered',
+          dimensions: { engagement: dims(400) },
+        },
+      });
+
+      process.env['SIDETRACK_ENGAGEMENT_COMPACT'] = '1';
+      try {
+        const apply = createStreams();
+        const applyExit = await runCli(
+          ['compact-engagement', '--vault', vaultRoot, '--apply'],
+          apply,
+        );
+        expect(applyExit).toBe(0);
+        expect(apply.stdout.text()).toContain('rewrittenShards=1');
+        expect(apply.stdout.text()).toContain('droppedLines=1');
+
+        // The interval is gone; the aggregate (the served artifact) survives
+        // byte-identical, and a fresh read off disk confirms it (not a
+        // stale in-memory merge from before the rewrite).
+        const afterMerged = await log.readMerged();
+        expect(
+          afterMerged.filter((e) => e.type === 'engagement.interval.observed'),
+        ).toHaveLength(0);
+        expect(
+          afterMerged.filter((e) => e.type === 'engagement.session.aggregated'),
+        ).toHaveLength(1);
+
+        // Re-run: nothing left to fold, so it's a clean no-op, not an error.
+        const reapply = createStreams();
+        const reapplyExit = await runCli(
+          ['compact-engagement', '--vault', vaultRoot, '--apply'],
+          reapply,
+        );
+        expect(reapplyExit).toBe(0);
+        expect(reapply.stdout.text()).toContain('rewrittenShards=0');
+        expect(reapply.stdout.text()).toContain('droppedLines=0');
+      } finally {
+        delete process.env['SIDETRACK_ENGAGEMENT_COMPACT'];
+      }
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('compact-engagement --apply refuses when the recall process-lock is held by a live foreign PID, even when armed', async () => {
+    // Mirrors the `recall reingest` lock-refusal test above: compaction is a
+    // second kind of writer against the vault, and EventLog.runExclusiveMaintenance
+    // only serialises writers within THIS process — it cannot invalidate a
+    // live companion's in-memory append indexes / merged-log memo in another
+    // process. So --apply takes the same one-writer-per-vault lock first.
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'compact-engagement-locked-'));
+    process.env['SIDETRACK_ENGAGEMENT_COMPACT'] = '1';
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['compact-engagement', '--vault', vaultRoot, '--apply'], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refuses');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      delete process.env['SIDETRACK_ENGAGEMENT_COMPACT'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('renderServiceNextSteps', () => {

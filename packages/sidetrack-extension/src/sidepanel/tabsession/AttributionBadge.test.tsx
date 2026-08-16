@@ -2,6 +2,7 @@ import { render } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { AttributionBadge } from './AttributionBadge';
+import { LANE_FALLBACK_WHY_PREFIX } from './laneFallbackPick';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
@@ -62,6 +63,37 @@ describe('AttributionBadge honesty variant', () => {
     expect(badge).not.toBeNull();
     // The label still shows the workstream so the user can act on it.
     expect(badge?.textContent).toContain('Research');
+  });
+
+  // Regression guard for the display-policy bug: fusion HELD (no candidates
+  // reached fusion) and the top candidate is the synthesized below-floor
+  // lane-fallback pick — the badge must not name that workstream as if it
+  // were a real ("In workstream: X") suggestion.
+  it('hides the fallback workstream name — shows "No good guess yet" — when fusion held', () => {
+    const { container } = render(
+      <AttributionBadge
+        record={record()}
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [
+          {
+            workstreamId: 'ws-1',
+            rawFusionLogit: 0.71,
+            dominantSource: 'none',
+            reasons: [
+              {
+                source: 'similarity',
+                summary: `${LANE_FALLBACK_WHY_PREFIX} · content lane 71%`,
+                anchors: [],
+              },
+            ],
+          },
+        ])}
+        workstreams={workstreams}
+      />,
+    );
+    const badge = container.querySelector('[data-attribution-variant="weak-guess"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.textContent).toBe('No good guess yet');
+    expect(badge?.textContent).not.toContain('Research');
   });
 
   it('renders the empty placeholder when there is no candidate', () => {

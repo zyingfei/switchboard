@@ -19,11 +19,13 @@ import {
   type RankerTrainQuality,
 } from '../../ranker/train.js';
 import { collectWorkGraphHealth } from '../../system/workGraphHealth.js';
-import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
+import { ENGAGEMENT_INTERVAL_OBSERVED, ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { NAVIGATION_COMMITTED } from '../../navigation/events.js';
-import { THREAD_UPSERTED } from '../../threads/events.js';
+import { CAPTURE_RECORDED } from '../../recall/events.js';
+import { THREAD_ARCHIVED, THREAD_DELETED, THREAD_UNARCHIVED, THREAD_UPSERTED } from '../../threads/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { createTimelineStore } from '../../timeline/projection.js';
+import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import {
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
@@ -37,6 +39,7 @@ import { EMPTY_PROGRESS, type MaterializerProgress } from './materializerProgres
 import {
   classifyConnectionsMaterializerHealth,
   createConnectionsMaterializer,
+  FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES,
   MATERIALIZER_VERSION,
 } from './connectionsMaterializer.js';
 
@@ -1621,6 +1624,318 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
           edge.kind === 'previous_visit_in_tab_session' &&
           edge.fromNodeId === `timeline-visit:${hnUrl}` &&
           edge.toNodeId === `timeline-visit:${articleUrl}`,
+      ),
+    ).toBe(true);
+  });
+
+  // F3 hot-item #1 equivalence coverage: writeForegroundNavigationDelta used
+  // to source `merged` from deps.eventLog.readMerged() (the FULL canonical
+  // JSONL log) — replaced with a bounded typed read
+  // (readForegroundNavigationOverlaySource) over exactly
+  // FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES. These two tests prove the
+  // migration is behaviour-preserving: (1) at the read layer, the typed
+  // read returns the byte-identical event set readMerged() would have
+  // contributed on this path, even with lots of other event types present
+  // in the log; (2) at the overlay-output layer, the real materializer
+  // (now running the migrated code, since SIDETRACK_EVENT_STORE is unset in
+  // this test env so it takes the streamFiltered fallback branch) still
+  // produces the same foreground-navigation overlay edges/nodes when the
+  // log is noisy with those other types.
+  it('foreground overlay typed read is byte-identical to readMerged() filtered to the same types, on a log with unrelated event types', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+
+    // Relevant types (NAVIGATION_COMMITTED + the 4 THREAD_* status types) —
+    // collectScopedEventsForDelta can select these on this call path.
+    await eventLog.importPeerEvent(
+      navigationCommittedEvent({
+        seq: 1,
+        visitId: 'visit-a',
+        url: 'https://example.test/a',
+        previousVisitId: null,
+        navigationSequence: 1,
+        commitTimestamp: Date.parse('2026-05-07T11:00:00.000Z'),
+      }),
+    );
+    await eventLog.importPeerEvent(
+      navigationCommittedEvent({
+        seq: 2,
+        visitId: 'visit-b',
+        url: 'https://example.test/b',
+        previousVisitId: 'visit-a',
+        navigationSequence: 2,
+        commitTimestamp: Date.parse('2026-05-07T11:00:10.000Z'),
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 3,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_noise',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/thread-noise',
+          title: 'noise thread',
+          lastSeenAt: '2026-05-07T11:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 4, type: THREAD_ARCHIVED, payload: { bac_id: 'thread_noise' } }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 5, type: THREAD_UNARCHIVED, payload: { bac_id: 'thread_noise' } }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 6, type: THREAD_DELETED, payload: { bac_id: 'thread_noise' } }),
+    );
+
+    // Unrelated types this call path never consumes — must NOT be picked up
+    // by the typed read.
+    await eventLog.importPeerEvent(
+      timelineObservedUrlEvent({
+        seq: 7,
+        eventId: 'timeline-noise',
+        url: 'https://example.test/timeline-noise',
+        title: 'timeline noise',
+        observedAt: '2026-05-07T11:00:05.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 8,
+        type: CAPTURE_RECORDED,
+        payload: { bac_id: 'capture-noise', capturedAt: '2026-05-07T11:00:03.000Z', turns: [] },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 9,
+        type: ENGAGEMENT_INTERVAL_OBSERVED,
+        payload: {
+          payloadVersion: 1,
+          visitId: 'visit-a',
+          intervalStart: 0,
+          intervalEnd: 1000,
+          dimensions: {
+            engagement: {
+              activeMs: 1000,
+              visibleMs: 1000,
+              focusedWindowMs: 1000,
+              idleMs: 0,
+              foregroundBursts: 1,
+              returnCount: 0,
+              scrollEvents: 0,
+              maxScrollRatio: 0,
+              copyCount: 0,
+              pasteCount: 0,
+            },
+          },
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 10,
+        type: WORKSTREAM_UPSERTED,
+        payload: { bac_id: 'workstream-noise', title: 'noise workstream' },
+      }),
+    );
+
+    const fullMerged = await eventLog.readMerged();
+    const referenceRelevant = fullMerged.filter((event) =>
+      FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES.includes(event.type),
+    );
+    // Sanity: the noise events really are in the log and really are
+    // excluded from the relevant-types slice, so this isn't a vacuous pass.
+    expect(fullMerged.length).toBe(10);
+    expect(referenceRelevant.length).toBe(6);
+
+    // This reproduces exactly what readForegroundNavigationOverlaySource's
+    // store-off fallback branch does in production (SIDETRACK_EVENT_STORE
+    // is unset here, so that's the branch the real code takes too).
+    const typedRead = await eventLog.streamFiltered(
+      (event) => FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES.includes(event.type),
+      new Set(FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES),
+    );
+
+    expect(typedRead).toEqual(referenceRelevant);
+  });
+
+  it('produces the same foreground navigation overlay when the log also contains thread/capture/engagement/workstream noise', async () => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    const timelineStore = createTimelineStore(vaultRoot);
+    type ReplaceScopeRowsInput = Parameters<NonNullable<ConnectionsStore['replaceScopeRows']>>[0];
+    let currentSnapshot: ConnectionsSnapshot | null = null;
+    let currentProgress: ReplaceScopeRowsInput['progress'] | null = null;
+    const replaceCalls: ReplaceScopeRowsInput[] = [];
+    const store = {
+      putCurrent: async (snapshot: ConnectionsSnapshot): Promise<void> => {
+        currentSnapshot = snapshot;
+      },
+      writeSnapshotAndProgress: async (
+        snapshot: ConnectionsSnapshot,
+        progress: ReplaceScopeRowsInput['progress'],
+      ): Promise<void> => {
+        currentSnapshot = snapshot;
+        currentProgress = progress;
+      },
+      readMaterializerProgress: () => Promise.resolve(currentProgress),
+      readCurrent: () => Promise.resolve(currentSnapshot),
+      replaceScopeRows: async (input: ReplaceScopeRowsInput): Promise<void> => {
+        replaceCalls.push(input);
+        const nodes = new Map<string, ConnectionsSnapshot['nodes'][number]>(
+          currentSnapshot?.nodes.map((node) => [node.id, node] as const) ?? [],
+        );
+        const edges = new Map<string, ConnectionsSnapshot['edges'][number]>(
+          currentSnapshot?.edges.map((edge) => [edge.id, edge] as const) ?? [],
+        );
+        for (const node of input.nodes) nodes.set(node.id, node);
+        for (const edge of input.edges) edges.set(edge.id, edge);
+        currentSnapshot = {
+          scope: {},
+          ...(currentSnapshot ?? {}),
+          nodes: [...nodes.values()],
+          edges: [...edges.values()],
+          nodeCount: nodes.size,
+          edgeCount: edges.size,
+          updatedAt: currentSnapshot?.updatedAt ?? '1970-01-01T00:00:00.000Z',
+          ...(input.metadata?.urlProjection === undefined
+            ? {}
+            : { urlProjection: input.metadata.urlProjection }),
+          ...(input.metadata?.tabSessionProjection === undefined
+            ? {}
+            : { tabSessionProjection: input.metadata.tabSessionProjection }),
+        };
+        currentProgress = input.progress;
+      },
+      putDay: () => Promise.resolve(undefined),
+      readDay: () => Promise.resolve(null),
+      listDays: () => Promise.resolve([]),
+    } satisfies ConnectionsStore;
+    const embed = embedFromVectors(
+      new Map<string, Float32Array>([
+        ['hn', unit([1, 0])],
+        ['article', unit([0, 1])],
+      ]),
+    );
+    const m = createConnectionsMaterializer({
+      vaultRoot,
+      eventLog,
+      timelineStore,
+      store,
+      embed,
+      rankerRetrainer: noRetrain,
+    });
+
+    const hnUrl = 'https://news.ycombinator.com/newest';
+    const articleUrl = 'https://example.test/fresh-article';
+    await eventLog.importPeerEvent(
+      timelineObservedUrlEvent({
+        seq: 1,
+        eventId: 'timeline-hn',
+        url: hnUrl,
+        title: 'hn newest',
+        observedAt: '2026-05-07T11:00:00.000Z',
+      }),
+    );
+    await eventLog.importPeerEvent(
+      navigationCommittedEvent({
+        seq: 2,
+        visitId: 'visit-hn',
+        url: hnUrl,
+        previousVisitId: null,
+        navigationSequence: 1,
+        commitTimestamp: Date.parse('2026-05-07T11:00:00.000Z'),
+      }),
+    );
+    // Noise interleaved before catch-up: thread lifecycle, capture, and an
+    // unrelated workstream upsert. None of these are types the foreground
+    // overlay's typed read can be confused by (the 4 THREAD_* types can
+    // never actually be selected on this call path either — see
+    // FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES's doc comment).
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 3,
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'thread_noise',
+          provider: 'chatgpt',
+          threadUrl: 'https://x/thread-noise',
+          title: 'noise thread',
+          lastSeenAt: '2026-05-07T11:00:00.000Z',
+          tags: [],
+        },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 4, type: THREAD_ARCHIVED, payload: { bac_id: 'thread_noise' } }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 5,
+        type: CAPTURE_RECORDED,
+        payload: { bac_id: 'capture-noise', capturedAt: '2026-05-07T11:00:03.000Z', turns: [] },
+      }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({
+        seq: 6,
+        type: WORKSTREAM_UPSERTED,
+        payload: { bac_id: 'workstream-noise', title: 'noise workstream' },
+      }),
+    );
+
+    await m.catchUp(eventLog);
+    await m.awaitIdle();
+    expect(m.health().lastError).toBeNull();
+    replaceCalls.length = 0;
+
+    // More noise arriving right before the foreground nav, so it's already
+    // in the log by the time the overlay's typed read fires.
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 7, type: THREAD_UNARCHIVED, payload: { bac_id: 'thread_noise' } }),
+    );
+    await eventLog.importPeerEvent(
+      buildEvent({ seq: 8, type: THREAD_DELETED, payload: { bac_id: 'thread_noise' } }),
+    );
+    const articleNavigation = navigationCommittedEvent({
+      seq: 9,
+      visitId: 'visit-article',
+      url: articleUrl,
+      previousVisitId: 'visit-hn',
+      navigationSequence: 2,
+      commitTimestamp: Date.parse('2026-05-07T11:00:10.000Z'),
+    });
+    await eventLog.importPeerEvent(articleNavigation);
+    m.onAccepted(articleNavigation, { origin: 'peer' });
+    await m.awaitIdle();
+
+    // progressMode 'snapshot-revision-only' is unique to
+    // writeForegroundNavigationDelta's replaceScopeRows call (the full/
+    // scoped drain paths use other progress modes), so this identifies the
+    // foreground-overlay write specifically, independent of exact seq
+    // numbering.
+    const foregroundWrite = replaceCalls.find(
+      (call) => call.progressMode === 'snapshot-revision-only',
+    );
+    expect(foregroundWrite).toBeDefined();
+    expect(
+      foregroundWrite?.edges.some(
+        (edge) =>
+          edge.kind === 'previous_visit_in_tab_session' &&
+          edge.fromNodeId === `timeline-visit:${hnUrl}` &&
+          edge.toNodeId === `timeline-visit:${articleUrl}`,
+      ),
+    ).toBe(true);
+    expect(
+      foregroundWrite?.nodes.some(
+        (node) =>
+          node.kind === 'visit-instance' &&
+          node.id ===
+            `visit-instance:tab-session-hn:2026-05-07T11:00:10.000Z:${articleUrl}`,
       ),
     ).toBe(true);
   });

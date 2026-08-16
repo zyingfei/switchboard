@@ -159,6 +159,29 @@ const materializeOne = async (
       await writePageContentExtracted(vaultRoot, payload, {
         rebuildManifestsAfterWrite: false,
       });
+      // INTENTIONALLY left as skip-forever, not switched to
+      // manifestUpdate:'incremental'. This function runs INSIDE the
+      // materialize-batch worker_threads Worker (see runBodyEvidenceWorker
+      // below + the isMainThread branch at the bottom of this file) — a
+      // separate V8 isolate with its OWN instance of page-evidence/store.ts
+      // and therefore its OWN `evidenceManifestUpsertLocks` Map. That lock
+      // only serializes callers within one isolate; it does not span the
+      // thread boundary. If this called the incremental upsert, it would
+      // race the main thread's HTTP-route and background-embedding-lane
+      // upserts on the same physical manifest.json (read-modify-write from
+      // two isolates, unordered) and could silently drift byTier/recordCount
+      // (a lost-update, not a crash — much harder to notice). The one-shot
+      // full rebuild this used to pay per record was itself self-healing
+      // under that same concurrency (it recomputes fresh from disk, so a
+      // "stale" rebuild is still internally consistent) but too slow to run
+      // per record; skipping it here trades a stale-but-harmless
+      // page-evidence manifest.json (no runtime reader was found for it —
+      // unlike the page-content manifest, which IS part of the served read
+      // model, see rebuildPageContentManifests below) for correctness. If a
+      // reader ever needs this manifest fresh after body-evidence writes,
+      // rebuild it ONCE per batch on the main thread after the worker
+      // returns (mirroring rebuildPageContentManifests), not per record
+      // inside the worker.
       await writeExtractedPageEvidenceFast(vaultRoot, evidenceRequest(payload), {
         rebuildManifestAfterWrite: false,
       });

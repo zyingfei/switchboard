@@ -211,11 +211,28 @@ describe('SuggestionStats — lane-fallback pick (unconfirmed, page-content only
     );
     const chip = screen.getByTestId('lane-fallback-pick');
     expect(chip.textContent).toBe('Unconfirmed — from page content (AI-assisted)');
-    // The workstream IS shown (the whole point — a best guess beats a dash) …
-    expect(screen.getAllByText('Infra / Deploy').length).toBeGreaterThanOrEqual(1);
     // … and the generic weak-guess wording is NOT used: there was no fusion
     // here at all, so "below the resolver's confidence bar" would misdescribe it.
     expect(screen.queryByText('weak guess — filed to inbox')).toBeNull();
+  });
+
+  // Regression guard for the display-policy bug: fusion HELD (gate
+  // 'no-candidates') must never surface the below-floor fallback pick as the
+  // headline "suggestion" — that reads as a real filing recommendation even
+  // with the "Unconfirmed" chip beside it (live report: "In workstream:
+  // interview / crypto · Unconfirmed — from page content (AI-assisted)").
+  it('shows a neutral "No good guess yet" headline instead of the fallback workstream name', () => {
+    const { container } = render(
+      <SuggestionStats suggestion={jfrogResolution()} workstreams={workstreams} showEmptyPlaceholder />,
+    );
+    const target = container.querySelector('.suggestion-stats-target');
+    expect(target?.textContent).toBe('No good guess yet');
+    expect(target?.textContent).not.toBe('Infra / Deploy');
+    // The fallback guess is NOT erased — it's demoted to the ranked
+    // possibilities list (below-floor, expanded, one-click filable), which
+    // is where the "Why" reasoning for a held fusion belongs.
+    expect(screen.getByText('Below confidence bar — possibilities:')).toBeDefined();
+    expect(screen.getAllByText('Infra / Deploy').length).toBeGreaterThanOrEqual(1);
   });
 
   it('never prints a confidence word for a synthesized score', () => {
