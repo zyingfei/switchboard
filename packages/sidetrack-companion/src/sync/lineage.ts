@@ -182,6 +182,26 @@ export const LINEAGE_REGISTRY: readonly LineageNode[] = [
     defaultState: 'default-on',
     toggleEnv: 'SIDETRACK_ENABLE_SEMANTIC_RECALL_POOL',
   },
+  {
+    id: 'workstream-prototypes',
+    label: 'Workstream prototype texts + vectors (prototype guess lane)',
+    path: '_BAC/recall/v2/index.sqlite (prototypes, prototype_vec)',
+    derivesFrom: [CANONICAL_EVENT_LOG, 'recall-v2-index'],
+    sourceEventTypes: ['workstream.prototype.generated'],
+    // Deterministic replay — re-embed the persisted `generatedText` per
+    // event; NEVER re-invokes the generation engine (see sync/contract/
+    // registry.ts's WORKSTREAM_PROTOTYPE_GENERATED entry, recovery:
+    // 'replay-event-log'). No dedicated CLI rebuild command exists yet
+    // (Phase 2 scope); the fold itself is the rebuild contract.
+    rebuildEntrypoint: 'workstreams/prototypeGeneration.ts:foldLatestPrototypeGenerations',
+    // The design doc (§3) proposed default-off for the SERVE-side disclosure
+    // flag; a 2026-08-16 follow-up directive made both SIDETRACK_PROTOTYPE_
+    // GENERATION and SIDETRACK_PROTOTYPE_LANE default ON (see prototypeLane.ts's
+    // doc comment for the full reasoning) — this registry reflects what
+    // actually ships, not the doc's original draft default.
+    defaultState: 'default-on',
+    toggleEnv: 'SIDETRACK_PROTOTYPE_GENERATION',
+  },
 ];
 
 const REGISTRY_BY_ID: ReadonlyMap<string, LineageNode> = new Map(

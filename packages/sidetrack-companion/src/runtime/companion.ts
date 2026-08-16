@@ -104,6 +104,7 @@ import type { LogTransport } from '../sync/transport.js';
 import { enforceRetention } from '../vault/auditRetention.js';
 import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
+import { schedulePrototypeGenerationLoop } from '../workstreams/prototypeGeneration.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -150,6 +151,12 @@ export interface HygieneStatus {
   lastSealIntegrityStoreDrift?: number;
   /** NEVER benign: segment corrupt or missing vs its own manifest entry. */
   lastSealIntegrityAlarmCount?: number;
+  /** Last prototype-lane offline generation tick (SIDETRACK_PROTOTYPE_GENERATION).
+   *  See workstreams/prototypeGeneration.ts. */
+  lastPrototypeGenerationAt?: string;
+  lastPrototypeGenerationRegenerated?: number;
+  lastPrototypeGenerationChecked?: number;
+  lastPrototypeGenerationEngineUnavailableReason?: string | null;
 }
 
 export const scheduleSqliteVacuumGc = (
@@ -617,12 +624,9 @@ export const startCompanion = async (
       clearInterval(eventSealLoop);
     });
     // First pass well after boot so it never competes with catch-up drains.
-    const eventSealKickoff = setTimeout(
-      () => {
-        void runEventSealTick();
-      },
-      5 * 60_000,
-    );
+    const eventSealKickoff = setTimeout(() => {
+      void runEventSealTick();
+    }, 5 * 60_000);
     teardown.push(() => {
       clearTimeout(eventSealKickoff);
     });
@@ -730,6 +734,21 @@ export const startCompanion = async (
       connectionsMaterializer.dispose();
     });
     syncContractRunner.register(connectionsMaterializer);
+
+    // Prototype-lane offline generation (SIDETRACK_PROTOTYPE_GENERATION,
+    // default ON — docs/plans/2026-08-16-category-flexibility-hyde.md §3).
+    // Hours-scale background tick, entirely off the request path: reuses
+    // the ALREADY-OPEN connectionsStore (a readonly-role reader, same as the
+    // sqlite-vacuum GC above) and baseEventLog — no second store handle is
+    // opened here. A failed tick never crashes the companion (see the
+    // scheduler's own try/catch).
+    const disposePrototypeGeneration = schedulePrototypeGenerationLoop(
+      connectionsStore,
+      baseEventLog,
+      options.vaultPath,
+      hygieneStatus,
+    );
+    teardown.push(disposePrototypeGeneration);
 
     // Reproject on startup if the projector logic has changed since
     // the last run. Writes a `_BAC/.projector-version` sentinel so

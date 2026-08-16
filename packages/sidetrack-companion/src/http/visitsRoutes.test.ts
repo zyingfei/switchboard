@@ -689,8 +689,9 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
           cache.set(`${visitId}\0${snapshotRevision}`, result);
         },
       ),
-      getCachedResolverResult: vi.fn(async (visitId: string, snapshotRevision: string) =>
-        cache.get(`${visitId}\0${snapshotRevision}`) ?? null,
+      getCachedResolverResult: vi.fn(
+        async (visitId: string, snapshotRevision: string) =>
+          cache.get(`${visitId}\0${snapshotRevision}`) ?? null,
       ),
       writeSnapshotAndProgress: vi.fn(async (snapshot: ConnectionsSnapshot) => {
         current = snapshot;
@@ -764,10 +765,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   // genuinely distinct write is in flight — picking the LAST one keeps these
   // assertions correct even when an earlier request's write in the SAME test
   // has not been individually flushed+cleared before this checkpoint.
-  const lastMockCallFor = (
-    fn: unknown,
-    url: string,
-  ): readonly unknown[] | undefined => {
+  const lastMockCallFor = (fn: unknown, url: string): readonly unknown[] | undefined => {
     const calls = mockCallsOf(fn).filter(([callUrl]) => callUrl === url);
     return calls[calls.length - 1];
   };
@@ -879,6 +877,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'recency',
       'content',
       'ai',
+      'prototype',
     ]);
     const contentLane = oneResult.lanes?.find((lane) => lane.lane === 'content');
     expect(contentLane?.emptyReason).toBe('recall store unavailable');
@@ -1066,10 +1065,11 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     await flushResolverCacheWrites();
     const changedCacheWriteCall = lastMockCallFor(cacheWrite, targetUrl);
     expect(changedCacheWriteCall).toBeDefined();
-    expectFoldedEventCandidateRevision(changedCacheWriteCall?.[1], 'rev-event-candidates-set-change', [
-      targetUrl,
-      anchorUrl,
-    ]);
+    expectFoldedEventCandidateRevision(
+      changedCacheWriteCall?.[1],
+      'rev-event-candidates-set-change',
+      [targetUrl, anchorUrl],
+    );
   });
 
   it('POST /v1/visits/batch-resolve accepts titleHints and appends the content lane', async () => {
@@ -1114,6 +1114,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'recency',
       'content',
       'ai',
+      'prototype',
     ]);
     expect(lanes?.find((lane) => lane.lane === 'content')?.emptyReason).toBe(
       'recall store unavailable',
@@ -1136,6 +1137,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
         data: { results: Record<string, { lanes?: readonly { readonly lane: string }[] }> };
       };
       // Content lane disabled ⇒ the six base lanes only, no 'content' entry.
+      // (This fixture's snapshot never reaches finalizeBatchResolveResults —
+      // readResolverSubgraphForUrls has nothing to join for a putCurrent-only
+      // snapshot — so lanes 7/8/9 are all omitted regardless of their own
+      // individual flags; unrelated to SIDETRACK_CONTENT_LANE specifically.)
       expect(body.data.results[url]?.lanes?.map((lane) => lane.lane)).toEqual([
         'graph',
         'similarity',

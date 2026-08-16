@@ -94,6 +94,23 @@ import {
   isUserRejectedRelationPayload,
 } from '../feedback/events.js';
 import { createRepairQueueStore } from '../connections/repairQueueStore.js';
+// Prototype lane (docs/plans/2026-08-16-category-flexibility-hyde.md §3,
+// falsifiability spine §5). Deliberately light imports only — statusContract
+// forbids a static recall/embedder pull into this status-reachable module;
+// the ACTUAL embedder/recall-v2-store graph (workstreams/prototypeGeneration.ts)
+// stays out of this file's import graph (this file only reads the pure event
+// guard + does its own tiny fold below, and probes the Apple FM service the
+// same lightweight way appleFmEngine.ts already does for enrichment).
+import {
+  isPrototypeGeneratedSnapshot,
+  WORKSTREAM_PROTOTYPE_GENERATED,
+} from '../workstreams/events.js';
+import {
+  PROTOTYPE_LANE_MIN_PRECISION,
+  PROTOTYPE_LANE_MIN_SAMPLES,
+  prototypeLaneEnabled,
+} from '../tabsession/prototypeLane.js';
+import { lanePrecisionFrom, lanePrequentialSummary } from '../tabsession/lanePrequential.js';
 
 // Absent/non-'0'/non-'false' = ON (shadow observe-only by default) —
 // mirrors ranker/candidates.ts's aggregatorGroupingGuardEnabled call-time
@@ -117,7 +134,9 @@ const learnedAggregatorWindow = (): number => {
   const raw = process.env[LEARNED_AGGREGATOR_WINDOW_ENV];
   if (raw === undefined || raw.length === 0) return DEFAULT_LEARNED_AGGREGATOR_WINDOW;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_LEARNED_AGGREGATOR_WINDOW;
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : DEFAULT_LEARNED_AGGREGATOR_WINDOW;
 };
 
 // The NAVIGATION_COMMITTED/BROWSER_TIMELINE_OBSERVED events fed to the
@@ -136,11 +155,17 @@ const learnedAggregatorObservationEvents = async (
 ): Promise<readonly AcceptedEvent[]> => {
   const window = learnedAggregatorWindow();
   if (window <= 0) {
-    return readEventsForHealth(vaultRoot, eventLog, [NAVIGATION_COMMITTED, BROWSER_TIMELINE_OBSERVED]);
+    return readEventsForHealth(vaultRoot, eventLog, [
+      NAVIGATION_COMMITTED,
+      BROWSER_TIMELINE_OBSERVED,
+    ]);
   }
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) {
-    return readEventsForHealth(vaultRoot, eventLog, [NAVIGATION_COMMITTED, BROWSER_TIMELINE_OBSERVED]);
+    return readEventsForHealth(vaultRoot, eventLog, [
+      NAVIGATION_COMMITTED,
+      BROWSER_TIMELINE_OBSERVED,
+    ]);
   }
   const events = [
     ...store.readMostRecentByType(NAVIGATION_COMMITTED, window),
@@ -149,11 +174,105 @@ const learnedAggregatorObservationEvents = async (
   return [...events].sort((left, right) => left.acceptedAtMs - right.acceptedAtMs);
 };
 
+// Prototype lane (falsifiability spine, design doc §5) — hit/agreement
+// counters via lanePrequential.ts (already generic over the lane id, see
+// prototypeLane.ts's header) plus generation coverage. Generation coverage
+// is a TINY LOCAL FOLD over the typed WORKSTREAM_PROTOTYPE_GENERATED read
+// (mirrors readFeedbackEvents's typed-index discipline) rather than an
+// import of workstreams/prototypeGeneration.ts's fold — deliberately, to
+// keep that module's heavier transitive graph (connections/snapshot.ts,
+// recall-v2/pipeline.ts's dynamic import site) out of this status-reachable
+// file's import graph.
+interface PrototypeGenerationCoverage {
+  readonly workstreamsWithPrototypes: number;
+  readonly mostRecentGeneratedAt: number | null;
+  readonly generatedMethodCount: number;
+  readonly selectedMethodCount: number;
+}
+
+const prototypeGenerationCoverage = (
+  events: readonly AcceptedEvent[],
+): PrototypeGenerationCoverage => {
+  const latestAtByWorkstream = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== WORKSTREAM_PROTOTYPE_GENERATED) continue;
+    if (!isPrototypeGeneratedSnapshot(event.payload)) continue;
+    const prior = latestAtByWorkstream.get(event.payload.workstreamId);
+    if (prior === undefined || event.payload.generatedAt > prior) {
+      latestAtByWorkstream.set(event.payload.workstreamId, event.payload.generatedAt);
+    }
+  }
+  let mostRecentGeneratedAt: number | null = null;
+  let generatedMethodCount = 0;
+  let selectedMethodCount = 0;
+  for (const event of events) {
+    if (event.type !== WORKSTREAM_PROTOTYPE_GENERATED) continue;
+    if (!isPrototypeGeneratedSnapshot(event.payload)) continue;
+    const p = event.payload;
+    if (latestAtByWorkstream.get(p.workstreamId) !== p.generatedAt) continue;
+    if (mostRecentGeneratedAt === null || p.generatedAt > mostRecentGeneratedAt) {
+      mostRecentGeneratedAt = p.generatedAt;
+    }
+    if (p.method === 'selected') selectedMethodCount += 1;
+    else generatedMethodCount += 1;
+  }
+  return {
+    workstreamsWithPrototypes: latestAtByWorkstream.size,
+    mostRecentGeneratedAt,
+    generatedMethodCount,
+    selectedMethodCount,
+  };
+};
+
+interface PrototypeLaneHealth {
+  readonly coverage: PrototypeGenerationCoverage;
+  readonly precision: number | null;
+  readonly samples: number;
+}
+
+// DELIBERATELY NO LIVE ENGINE PROBE HERE. collectWorkGraphHealth sits on the
+// status-reachable hot path (polled by the panel, exercised by a large
+// fraction of this file's own test suite) — a live loopback fetch to apfel
+// on every poll would be the SAME class of trap the extension's
+// appleFmEngine.ts precedent (appleService.ts) was written to avoid on ITS
+// side ("a UNIT TEST'S RESULT DEPENDS ON WHETHER A DAEMON HAPPENS TO BE
+// RUNNING", 2026-07-28). The generation TICK already probes the engine
+// immediately before it would use it (prototypeGeneration.ts's
+// producePrototypeTexts) — that is the correct, narrowly-scoped place for
+// that I/O. This health row reports what is DURABLY KNOWN instead: how much
+// has been generated, and how the generated lane is measuring.
+const prototypeLaneHealthSnapshot = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<PrototypeLaneHealth> => {
+  const [events, prequential] = await Promise.all([
+    readEventsForHealth(vaultRoot, eventLog, [WORKSTREAM_PROTOTYPE_GENERATED]),
+    lanePrequentialSummary(vaultRoot).catch(() => null),
+  ]);
+  const coverage = prototypeGenerationCoverage(events);
+  const precisionEntry =
+    prequential === null || prequential.status !== 'ok'
+      ? null
+      : lanePrecisionFrom(prequential, 'prototype');
+  return {
+    coverage,
+    precision: precisionEntry?.precision ?? null,
+    samples: precisionEntry?.n ?? 0,
+  };
+};
+
 type DiagnosticCandidateMetric = string | number | boolean | null;
 
 export interface DiagnosticCandidate {
   readonly id: string;
-  readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
+  readonly family:
+    | 'topic'
+    | 'similarity'
+    | 'ranker'
+    | 'content-lane'
+    | 'reconcile'
+    | 'quality'
+    | 'attribution';
   readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
@@ -552,32 +671,33 @@ const scanForOverCollapsedPageContentCached = async (
   return records;
 };
 
-const canonicalizationTelemetry = (): WorkGraphHealthReport['recall']['canonicalizationTelemetry'] => {
-  const snapshot = getCanonicalCollisionSnapshot();
-  const suspiciousHosts = Object.entries(snapshot.byHost)
-    .map(([host, hostSnapshot]) => ({
-      host,
-      canonicalCount: hostSnapshot.canonicalCount,
-      rawCount: hostSnapshot.rawCount,
-      collisionRatio:
-        hostSnapshot.canonicalCount === 0
-          ? 0
-          : hostSnapshot.rawCount / hostSnapshot.canonicalCount,
-      samplePairs: hostSnapshot.suspiciousPairs,
-    }))
-    .filter((host) => host.collisionRatio > 1.5)
-    .sort((left, right) => {
-      const ratioDelta = right.collisionRatio - left.collisionRatio;
-      if (ratioDelta !== 0) return ratioDelta;
-      const rawDelta = right.rawCount - left.rawCount;
-      return rawDelta !== 0 ? rawDelta : left.host.localeCompare(right.host);
-    })
-    .slice(0, 10);
-  return {
-    trackedHostCount: Object.keys(snapshot.byHost).length,
-    suspiciousHosts,
+const canonicalizationTelemetry =
+  (): WorkGraphHealthReport['recall']['canonicalizationTelemetry'] => {
+    const snapshot = getCanonicalCollisionSnapshot();
+    const suspiciousHosts = Object.entries(snapshot.byHost)
+      .map(([host, hostSnapshot]) => ({
+        host,
+        canonicalCount: hostSnapshot.canonicalCount,
+        rawCount: hostSnapshot.rawCount,
+        collisionRatio:
+          hostSnapshot.canonicalCount === 0
+            ? 0
+            : hostSnapshot.rawCount / hostSnapshot.canonicalCount,
+        samplePairs: hostSnapshot.suspiciousPairs,
+      }))
+      .filter((host) => host.collisionRatio > 1.5)
+      .sort((left, right) => {
+        const ratioDelta = right.collisionRatio - left.collisionRatio;
+        if (ratioDelta !== 0) return ratioDelta;
+        const rawDelta = right.rawCount - left.rawCount;
+        return rawDelta !== 0 ? rawDelta : left.host.localeCompare(right.host);
+      })
+      .slice(0, 10);
+    return {
+      trackedHostCount: Object.keys(snapshot.byHost).length,
+      suspiciousHosts,
+    };
   };
-};
 
 const metrics = (
   input: Readonly<Record<string, DiagnosticCandidateMetric>>,
@@ -796,6 +916,10 @@ const buildDiagnosticCandidates = (input: {
   // live, never read from a persisted diagnostics blob).
   readonly aggregatorShadowEnabled: boolean;
   readonly aggregatorShadowAgreement: AggregatorShadowAgreement | null;
+  // Prototype lane (design doc §5). null only on a read failure (typed
+  // 'unavailable' below) — unlike the aggregator shadow, this is computed
+  // unconditionally so the row can distinguish "flag off" from "no data yet".
+  readonly prototypeLaneHealth: PrototypeLaneHealth | null;
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
   const diagnosticsObservedAt = producedAt;
@@ -854,9 +978,9 @@ const buildDiagnosticCandidates = (input: {
   // the bottom of this function. Adding a new always-off candidate?
   // Add it to the predicate below too.
   const alwaysOffCandidateIds = new Set([
-    'topic.hdbscan-standby',          // status=off, no-production-selector
-    'topic.algorithm-comparison',      // status=off, no-runtime-route
-    'quality.gray-zone-scorer',        // status=off, no-runtime-model-injection
+    'topic.hdbscan-standby', // status=off, no-production-selector
+    'topic.algorithm-comparison', // status=off, no-runtime-route
+    'quality.gray-zone-scorer', // status=off, no-runtime-model-injection
   ]);
   const isStaleDiagnostic = (cand: DiagnosticCandidate): boolean => {
     if (alwaysOffCandidateIds.has(cand.id)) return true;
@@ -1048,9 +1172,12 @@ const buildDiagnosticCandidates = (input: {
         agreementCount: input.aggregatorShadowAgreement?.agreementCount ?? null,
         disagreementCount: input.aggregatorShadowAgreement?.disagreementCount ?? null,
         agreementRate: input.aggregatorShadowAgreement?.agreementRate ?? null,
-        registryOnlyAggregatorCount: input.aggregatorShadowAgreement?.registryOnlyAggregatorCount ?? null,
-        learnedOnlyAggregatorCount: input.aggregatorShadowAgreement?.learnedOnlyAggregatorCount ?? null,
-        feedVsItemDisagreementCount: input.aggregatorShadowAgreement?.feedVsItemDisagreementCount ?? null,
+        registryOnlyAggregatorCount:
+          input.aggregatorShadowAgreement?.registryOnlyAggregatorCount ?? null,
+        learnedOnlyAggregatorCount:
+          input.aggregatorShadowAgreement?.learnedOnlyAggregatorCount ?? null,
+        feedVsItemDisagreementCount:
+          input.aggregatorShadowAgreement?.feedVsItemDisagreementCount ?? null,
       }),
     },
     {
@@ -1232,18 +1359,15 @@ const buildDiagnosticCandidates = (input: {
               ? 'rendered-collapse-repaired-this-drain'
               : booleanOrFalse(similarityFloor['flapping'])
                 ? 'suppressed-collapse-recent'
-                : (stringOrNull(similarityFloor['allowedResetReason']) === null
-                    ? null
-                    : `collapse-allowed:${stringOrNull(similarityFloor['allowedResetReason'])}`),
+                : stringOrNull(similarityFloor['allowedResetReason']) === null
+                  ? null
+                  : `collapse-allowed:${stringOrNull(similarityFloor['allowedResetReason'])}`,
       revisionId: stringOrNull(similarityFloor?.['servedRevisionId']),
       asOf: diagnosticsObservedAt,
       metrics: metrics({
         suppressedCollapse:
-          similarityFloor === null
-            ? null
-            : booleanOrFalse(similarityFloor['suppressedCollapse']),
-        flapping:
-          similarityFloor === null ? null : booleanOrFalse(similarityFloor['flapping']),
+          similarityFloor === null ? null : booleanOrFalse(similarityFloor['suppressedCollapse']),
+        flapping: similarityFloor === null ? null : booleanOrFalse(similarityFloor['flapping']),
         suppressedCollapseCount: numberOrNull(similarityFloor?.['suppressedCollapseCount']),
         previousServedEdgeCount: numberOrNull(similarityFloor?.['previousServedEdgeCount']),
         builtEdgeCount: numberOrNull(similarityFloor?.['builtEdgeCount']),
@@ -1382,6 +1506,61 @@ const buildDiagnosticCandidates = (input: {
       asOf: liveObservedAt,
       metrics: metrics({ learnedModelLoaded: false }),
     },
+    // Prototype lane (docs/plans/2026-08-16-category-flexibility-hyde.md
+    // §3/§5). observe-only — same idiom as topic.incremental-shadow and
+    // aggregator.learned-stats-shadow: never active/served, disclosure only.
+    // 'warning' when the engine has been unreachable across the whole
+    // measurement window (generation exists but the engine cannot refresh
+    // it) OR when hits are measured below MIN_PRECISION at n>=MIN_SAMPLES —
+    // the exact numbers a future promotion decision would need, surfaced
+    // now so the gate is never the first place anyone sees them.
+    (() => {
+      const proto = input.prototypeLaneHealth;
+      const flagOn = prototypeLaneEnabled();
+      const belowPrecisionBar =
+        proto !== null &&
+        proto.samples >= PROTOTYPE_LANE_MIN_SAMPLES &&
+        proto.precision !== null &&
+        proto.precision < PROTOTYPE_LANE_MIN_PRECISION;
+      const status: DiagnosticCandidate['status'] = !flagOn
+        ? 'off'
+        : proto === null
+          ? 'unavailable'
+          : belowPrecisionBar
+            ? 'warning'
+            : proto.coverage.workstreamsWithPrototypes === 0
+              ? 'pending'
+              : 'ok';
+      const reason: string | null = !flagOn
+        ? 'disabled'
+        : proto === null
+          ? 'prototype-health-unavailable'
+          : belowPrecisionBar
+            ? 'below-precision-bar'
+            : proto.coverage.workstreamsWithPrototypes === 0
+              ? 'no-prototypes-generated-yet'
+              : null;
+      return {
+        id: 'attribution.prototype-lane-shadow',
+        family: 'attribution',
+        lane: 'shadow',
+        servingImpact: 'observe-only',
+        status,
+        reason,
+        revisionId: null,
+        asOf: liveObservedAt,
+        metrics: metrics({
+          workstreamsWithPrototypes: proto?.coverage.workstreamsWithPrototypes ?? null,
+          mostRecentGeneratedAt: millisToIso(proto?.coverage.mostRecentGeneratedAt ?? null),
+          generatedCount: proto?.coverage.generatedMethodCount ?? null,
+          selectedCount: proto?.coverage.selectedMethodCount ?? null,
+          precision: proto?.precision ?? null,
+          samples: proto?.samples ?? 0,
+          minPrecisionBar: PROTOTYPE_LANE_MIN_PRECISION,
+          minSamplesBar: PROTOTYPE_LANE_MIN_SAMPLES,
+        }),
+      };
+    })(),
   ];
 
   return allCandidates.filter((c) => !isStaleDiagnostic(c));
@@ -1461,9 +1640,15 @@ export const collectWorkGraphHealth = async ({
   if (learnedAggregatorShadowEnabled()) {
     const aggregatorEvents = await learnedAggregatorObservationEvents(vaultRoot, eventLog);
     const observations = aggregatorObservationsFromEvents(aggregatorEvents);
-    const aggregatorState = applyAggregatorObservations(createEmptyAggregatorStatsState(), observations);
+    const aggregatorState = applyAggregatorObservations(
+      createEmptyAggregatorStatsState(),
+      observations,
+    );
     const distinctUrls = new Set(observations.map((observation) => observation.canonicalUrl));
-    const pairs: { readonly registryType: AggregatorPageType; readonly learnedType: AggregatorPageType }[] = [];
+    const pairs: {
+      readonly registryType: AggregatorPageType;
+      readonly learnedType: AggregatorPageType;
+    }[] = [];
     for (const url of distinctUrls) {
       let parsed: URL;
       try {
@@ -1478,6 +1663,13 @@ export const collectWorkGraphHealth = async ({
     }
     aggregatorShadowAgreement = buildAggregatorShadowAgreement(pairs);
   }
+  // Prototype lane (falsifiability spine, design doc §5) — computed
+  // unconditionally (the row itself reports 'off' when the flag is off, the
+  // same idiom SIDETRACK_GUESS_LANES-family flags use elsewhere in this
+  // report; there is no separate shadow-enable gate to check first here).
+  const prototypeLaneHealth = await prototypeLaneHealthSnapshot(vaultRoot, eventLog).catch(
+    () => null,
+  );
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [
     activeManifest,
@@ -1581,8 +1773,7 @@ export const collectWorkGraphHealth = async ({
           ),
           shadowDiff: peekRankerShadowDiff(vaultRoot),
         };
-  const activeRevisionId =
-    activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null;
+  const activeRevisionId = activeManifest?.revisionId ?? activeManifestProbe?.revisionId ?? null;
   // Single source of truth for "would a retrain run right now" — the same
   // value surfaced as `retrainSkipReason`. `nextRetrain.eligible` is its
   // exact negation so the two never disagree.
@@ -1743,7 +1934,10 @@ export const collectWorkGraphHealth = async ({
       if (typeof kind === 'string') {
         actionsByKind[kind] = (actionsByKind[kind] ?? 0) + 1;
       }
-    } else if (event.type === USER_REJECTED_RELATION && isUserRejectedRelationPayload(event.payload)) {
+    } else if (
+      event.type === USER_REJECTED_RELATION &&
+      isUserRejectedRelationPayload(event.payload)
+    ) {
       rejectedRelationCount += 1;
       const surface = event.payload.surface;
       rejectedRelationsBySurface[surface] = (rejectedRelationsBySurface[surface] ?? 0) + 1;
@@ -1829,6 +2023,7 @@ export const collectWorkGraphHealth = async ({
       repairQueue,
       aggregatorShadowEnabled: learnedAggregatorShadowEnabled(),
       aggregatorShadowAgreement,
+      prototypeLaneHealth,
     }),
   };
 };
