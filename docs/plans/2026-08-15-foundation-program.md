@@ -192,3 +192,152 @@ flag's default: `sync/eventStore.test.ts`'s "F3: event-store bootstrap —
 first-boot seed, incremental reopen" (no `event-store.db` present → one
 full `catchUpFromJsonl` pass → a second `createEventStore` open against
 the same on-disk db is a zero-row incremental catch-up, not a rescan).
+**2026-08-16, round 2 — index-backed event-candidate resolve
+(perf/event-candidate-resolve).** Not an F1–F7 item; filed here per the
+"binding plan tracks reality" rule — same measured symptom family
+(multi-second `POST /v1/visits/batch-resolve`), a chokepoint specific to
+the panel's per-navigation "focused tab" resolve. Baseline measured on
+build bc862f1d: single fresh URL 3.1s, same URL warm (resolver-cache hit)
+1.5s, same URL passed via `eventCandidateUrls` 6.4s AND **never cached** —
+every focused-tab poll paid the full cost, forever, because the route
+unconditionally forced event-candidate URLs into the miss path and skipped
+both the cache read and the cache write for them (server.ts guard was
+`if (batchCacheRevision !== undefined && !expandEventCandidates)`).
+
+Measurement (item 1): a probe instrumented on a copied vault (never the
+live companion) plus a coordinator-supplied macOS `sample` profile from a
+real browsing burst agreed on the actual dominant cost: NOT the two
+per-candidate `.filter()` calls the original hypothesis named (cheap even
+on ~19K in-scope events, <25ms), but the WINDOW READ itself —
+`readEventsFromStoreOrLog`'s type-scoped SELECT materializing and
+JSON-decoding every `BROWSER_TIMELINE_OBSERVED`/`USER_FLOW_REJECTED`-family
+row before any per-URL work started (sqlite3_step/VdbeExec/
+BtreeFinishMoveto dominated the sample; the local probe showed this single
+read alone costing seconds, occasionally 10s+ under machine contention).
+The warm/cache-hit path additionally paid a full connections-subgraph read
+(`readResolverSubgraphForUrls`) on EVERY poll for the content lane's
+workstream join, even when every URL was a resolver-cache hit and no
+attribution work ran at all.
+
+Fix (four independent pieces, same PR):
+- **Maintained index**: `sync/eventStore.ts` gained a `resolver_url`
+  column + `events_resolver_url_idx` (migrated in-place with a one-time
+  ALTER+backfill on first open of a pre-existing store) and a
+  `events_type_accepted_at_idx`, plus `readByResolverUrls` /
+  `readMostRecentByType` store methods. Per-URL signal/timeline events for
+  the resolve now come from these indexed reads
+  (`resolverSignalEventsForCanonicalUrlsIndexed` /
+  `resolverTimelineEventsForCanonicalUrlsIndexed` in
+  `http/routes/visitsRoutes.ts`) instead of filtering the window read —
+  and the window read itself now DROPS the `BROWSER_TIMELINE_OBSERVED` /
+  `USER_FLOW_REJECTED` types entirely whenever the typed store is
+  available, since nothing downstream needs them from it anymore. The one
+  read that still needs breadth (candidate-generation's same-domain/
+  opener-chain/navigation-chain discovery, `resolverExpandedCandidateUrls
+  ForCanonicalUrls`) is now a BOUNDED most-recent-N read
+  (`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW`, default 20,000, `0` =
+  kill switch back to unbounded), mirroring the hub-subgraph budget
+  pattern above, instead of the full type-scoped history.
+- **Candidate-keyed cache**: `eventCandidateCacheRevision` folds a stable
+  hash (FNV-1a) of the batch's sorted, deduped `eventCandidateUrls` into
+  the resolver-cache revision string. Event-candidate targets now get a
+  real cache read (folded key) before falling to the miss path, and a real
+  cache write (folded key, never the plain key) after computing — same
+  `(visit_id, revision)` table, same deferred-write path
+  (`resolverCacheDefer.ts`) as every other entry. A changed candidate set
+  is a different key, i.e. a correct miss, not a stale hit. SWR priming
+  stays excluded for these entries (an event-candidate resolve is still
+  never served merely-stale) — only the persisted sqlite cache backs a
+  repeat.
+- **All-hit fast path**: the initial per-URL loop now checks the folded
+  cache BEFORE pushing an event-candidate URL into `misses`, so a repeat
+  poll with an unchanged candidate set never reaches the window
+  read/candidate-generation/subgraph code at all.
+- **Join-snapshot memo**: the content lane's subgraph read
+  (`readResolverSubgraphForUrls` for the workstream join) is now memoized
+  per `(snapshotRevision, sorted URL set)` — revision-gated, not
+  TTL-gated, so a cache hit is exactly as fresh as a re-read (same trust
+  boundary the resolver cache itself already relies on). This was paying a
+  fresh subgraph read on EVERY all-cache-hit batch before this fix.
+
+Acceptance (serve-path): focused-URL re-resolve warm <300ms; fresh
+event-candidate <1.5s; resolver-cache rows grow during browsing
+(event-candidate results included, verified via
+`visitsRoutes.test.ts`'s cache-read/cache-write assertions with the folded
+key). Absolute wall-clock numbers from the local copied-vault measurement
+were NOT clean enough to cite as a before/after table — the shared dev
+machine had a live companion + its own reconcile child + (at times) a
+concurrent full test-suite run contending for CPU, producing 10x swings
+between identical requests. The structural claims (index used, cache
+folded and hit, window read narrowed, subgraph read memoized) are verified
+by call-count assertions in the touched test suites instead of wall-clock
+deltas; see PR #368 for exact numbers and caveats.
+
+Tests added:
+`src/http/routes/visitsRoutes.test.ts` (new) — `stableHash` /
+`eventCandidateCacheRevision` unit tests (deterministic, sorted-set- and
+duplicate-invariant, distinct sets → distinct keys); events-prep
+equivalence test (indexed path vs. the O(merged) JS-filter reference on a
+synthetic fixture covering exact-vs-normalized URL matching, order-
+insensitive compare); store-unavailable fallback parity.
+`src/http/visitsRoutes.test.ts` — updated/added HTTP-level event-candidate
+cache tests (folded-key write, repeat-hits-cache, changed-set-misses).
+
+**CI follow-up (same day):** CI failed the "can expand focused URL event
+candidates" test on two consecutive runs; unreproducible locally (any
+single file, the whole `src/http/` dir, or a clean worktree of the branch
+all green). Root cause not pinned with certainty without CI log access,
+but the test's OWN assertions were genuinely fragile: three assertions
+reconstructed the expected folded resolver-cache key by calling
+`resolverCacheRevision(...)` a SECOND time at assertion time, which
+re-reads `attributionArm()` (env-backed) — any full-suite ordering
+difference (CI's Linux file-discovery order vs. local macOS, per the
+existing `TMPDIR=/dev/shm` COW-timing precedent in `ci.yml`) that leaves a
+DIFFERENT arm value active between the server's request-time computation
+and the test's assertion-time reconstruction breaks an exact-string match
+that was never actually part of the behavior under test. Fixed by
+asserting on the RECORDED call's actual revision string instead (shape:
+`{prefix}|arm=...|ec:{hash}`, where the `|ec:` hash portion — a pure
+function of the URL set, zero env dependency — is still checked exactly).
+Also closed a resource leak in the new equivalence test file: the typed
+event store's sqlite handle was never `.close()`d before its tmpdir was
+`rm -rf`'d, leaving a dangling handle in `sync/eventStore.ts`'s
+process-lifetime `sharedEventStores` map — a plausible source of the
+unattributed "3 errors" CI reported alongside the one named failure.
+
+**CI follow-up 2 (same day, confirmed root cause).** The arm-mismatch fix
+above was necessary hardening but NOT sufficient — CI failed again with
+the actual mechanism visible in the log this time: `cacheWriteCall` was
+`undefined` (the mock was never called at all with the target URL) and,
+separately, a recorded call's `|ec:` suffix didn't match the expected
+one. Real cause: the per-URL resolver-cache WRITE is deferred off the
+request path (`resolverCacheDefer.ts`, default ON) — queued during the
+request, drained on a `setImmediate` scheduled AFTER the response is
+already sent. The new tests asserted on the write immediately after
+`response.json()`, before the drain tick had necessarily run — a genuine
+scheduling race, not env pollution, that a slower/more-contended CI
+runner loses far more often than a quiet local Mac. The file already had
+a documented, working pattern for this exact problem ("persists the
+resolver cache AFTER responding", a poll-with-deadline) that the new
+tests should have reused and didn't. Fixed properly instead: awaited the
+module's own deterministic drain (`flushResolverCacheWrites()`, already
+exported and used by `resolverCacheDefer.test.ts`) at each checkpoint —
+no sleep/poll — and switched from "first matching call" to "last
+matching call" per URL (the deferred-write queue is keyed on
+`(visitId, revision)`, so two genuinely distinct writes for the same URL
+under different folded revisions can both be pending at once if not
+individually flushed+cleared between requests). Also added
+`__resetResolverCacheDeferQueue()` to the describe block's
+`beforeEach`/`afterEach` — the queue is process-lifetime module state,
+so a write still pending from a prior test could otherwise bleed into a
+later one's flush. A third, unrelated failure appeared in the same CI
+run — `connections incremental ranker frontier > forces a full ranker
+augmentation...` timed out at the bun:test default 5000ms. Proven
+pre-existing and load-related, not a regression: the test (real
+`connectionsMaterializer` work, no event-store/typed-store dependency at
+all) passed 6/6 in isolation on BOTH the pre-PR base commit and this
+branch, ~1s each, across 8 total runs; the SAME CI run that timed it out
+also logged an unrelated embedding-model load taking 6.9s (normally
+under 1s) and a 637ms event-loop stall immediately before the timeout —
+independent evidence the runner itself was heavily contended that pass,
+not that anything in this PR slowed the materializer down.

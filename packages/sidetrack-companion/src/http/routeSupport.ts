@@ -39,7 +39,7 @@ import type { RecallLifecycle } from '../recall/lifecycle.js';
 import type { BucketRegistry } from '../routing/registry.js';
 import { type AcceptedEvent, type VersionVector, vectorFromEvents } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
-import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../sync/eventStore.js';
+import { eventStoreCoverageToken, getSharedEventStoreServeStale, type EventStore } from '../sync/eventStore.js';
 import type { ProjectionChangeFeed } from '../sync/projectionChanges.js';
 import type { ReplicaContext } from '../sync/replicaId.js';
 import type { UpdateAdvisory } from '../system/versionCheck.js';
@@ -1020,6 +1020,23 @@ export const readEventsFromStoreOrLog = async (
     await store.forEachChunk(collect, 2000);
   }
   return events;
+};
+
+// The shared typed event store for this context's vault, or null when
+// disabled/unavailable — the SAME store-vs-log gate readEventsFromStoreOrLog
+// uses internally. Exposed for callers that need to make a STRUCTURAL
+// decision (which event types to even ask for) based on store availability,
+// not just read through it — see server.ts's batch-resolve route: when the
+// store is available, per-URL signal/timeline events come from an indexed
+// by-URL read instead of a type-scoped window read, so the window read's
+// type list can drop the (often largest) type entirely; when it is NOT
+// available, the window read is the only source and must keep the full type
+// list for the JS-filter fallback to stay correct.
+export const eventStoreForContext = async (context: {
+  readonly vaultRoot?: string | undefined;
+}): Promise<EventStore | null> => {
+  if (context.vaultRoot === undefined) return null;
+  return await getSharedEventStoreServeStale(context.vaultRoot);
 };
 
 // Coverage token matching readEventsFromStoreOrLog's read path. Callers that

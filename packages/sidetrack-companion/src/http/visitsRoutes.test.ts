@@ -16,6 +16,8 @@ import {
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
+import { __resetResolverCacheDeferQueue, flushResolverCacheWrites } from './resolverCacheDefer.js';
+import { eventCandidateCacheRevision } from './routes/visitsRoutes.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
 describe('per-URL HTTP routes', () => {
@@ -702,6 +704,12 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   };
 
   beforeEach(async () => {
+    // The deferred resolver-cache write queue is MODULE-LEVEL, process-
+    // lifetime state (resolverCacheDefer.ts) — reset it per test so a write
+    // still pending from a PRIOR test (this file's or another's, sharing the
+    // one bun:test process) can never be mistaken for THIS test's write when
+    // it is later flushed and its mock call recorded.
+    __resetResolverCacheDeferQueue();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-resolver-cache-'));
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
@@ -723,6 +731,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   afterEach(async () => {
     if (close !== null) await close();
     close = null;
+    // Drain (or drop) anything still queued for THIS test's now-closing store
+    // before resetting — an unflushed write left in the queue would otherwise
+    // carry into the next test's flush/assertions.
+    __resetResolverCacheDeferQueue();
     connectionsStore.close();
     await rm(vaultRoot, { recursive: true, force: true });
   });
@@ -731,6 +743,64 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     'content-type': 'application/json',
     'x-bac-bridge-key': bridgeKey,
   });
+
+  // bun:test's vitest-compat shim does not implement `vi.mocked` — every
+  // fake store method here is already a `vi.fn(...)`, just typed as its
+  // plain function signature (the fakes are cast to SqliteConnectionsStore),
+  // so `.mock.calls` exists at runtime but not in the type. This narrows
+  // just enough to read it back without an `any` leaking into a call site.
+  const mockCallsOf = (fn: unknown): readonly (readonly unknown[])[] =>
+    (fn as { readonly mock: { readonly calls: readonly (readonly unknown[])[] } }).mock.calls;
+
+  // Last (not first) matching call for a URL. The per-URL resolver-cache
+  // WRITE is deferred off the request path (resolverCacheDefer.ts, default
+  // ON) and queued in a MODULE-LEVEL, process-lifetime map keyed on
+  // (visitId, revision) — a DIFFERENT revision for the same URL (e.g. an
+  // earlier request in the same test, before a candidate-set change) queues
+  // a SEPARATE entry rather than overwriting it. `await
+  // flushResolverCacheWrites()` (called at each checkpoint below) drains
+  // whatever is pending AT THAT MOMENT in insertion order, so if more than
+  // one entry for the same URL is still pending it is because more than one
+  // genuinely distinct write is in flight — picking the LAST one keeps these
+  // assertions correct even when an earlier request's write in the SAME test
+  // has not been individually flushed+cleared before this checkpoint.
+  const lastMockCallFor = (
+    fn: unknown,
+    url: string,
+  ): readonly unknown[] | undefined => {
+    const calls = mockCallsOf(fn).filter(([callUrl]) => callUrl === url);
+    return calls[calls.length - 1];
+  };
+
+  // Structural check for a folded event-candidate resolver-cache revision —
+  // deliberately NOT an exact-string match against a second, independent
+  // `resolverCacheRevision(...)` call. That would re-read `attributionArm()`
+  // (env-backed) at ASSERTION time, which only needs to disagree with
+  // whatever the SERVER read at REQUEST time (e.g. a differently-ordered
+  // full suite run leaving a different arm active) to make this fragile in
+  // a way that has nothing to do with the behavior under test. The `|ec:`
+  // suffix is a pure function of `foldedUrls` (stableHash has no env
+  // dependency at all) and is asserted exactly; the `|arm=`-prefixed base
+  // revision is asserted only by shape.
+  const expectFoldedEventCandidateRevision = (
+    actualRevision: unknown,
+    plainRevisionPrefix: string,
+    foldedUrls: readonly string[],
+  ): void => {
+    expect(typeof actualRevision).toBe('string');
+    const revision = actualRevision as string;
+    expect(revision.startsWith(`${plainRevisionPrefix}|arm=`)).toBe(true);
+    // Neutral placeholder base -- eventCandidateCacheRevision has no env
+    // dependency at all (pure sort + stableHash), so its `|ec:<hash>`
+    // suffix for a given URL set is identical no matter what base revision
+    // it is folded onto. Deriving the expected suffix THIS way (rather than
+    // recomputing the hash inline) can never drift from the real
+    // implementation, including its internal join separator.
+    const expectedSuffix = eventCandidateCacheRevision('placeholder', foldedUrls).slice(
+      'placeholder'.length,
+    );
+    expect(revision.endsWith(expectedSuffix)).toBe(true);
+  };
 
   it('memoizes GET /v1/visits/{url}/resolve by snapshotRevision', async () => {
     const canonicalUrl = 'https://cache.test/a';
@@ -862,6 +932,11 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       };
     };
     expect(body.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    // The PLAIN revision is never used for an event-candidate target — a
+    // collision there would let an event-candidate-expanded resolve shadow
+    // (or be shadowed by) the six-lane plain result. It is cached, but only
+    // under the FOLDED revision (perf/event-candidate-resolve) — see the
+    // next test for the folded key's cache-hit behavior.
     expect(connectionsStore.getCachedResolverResult).not.toHaveBeenCalledWith(
       targetUrl,
       'rev-event-candidates',
@@ -871,6 +946,130 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'rev-event-candidates',
       expect.anything(),
     );
+    // Deterministic, not a poll: the write is queued but drains on a
+    // `setImmediate` AFTER this response was already sent, so it can still
+    // be in flight at this point — awaiting the SAME drain function the
+    // dispatch itself calls (resolverCacheDefer.ts) settles it exactly,
+    // with no sleep/backoff involved.
+    await flushResolverCacheWrites();
+    const cacheWriteCall = lastMockCallFor(connectionsStore.cacheResolverResult, targetUrl);
+    expect(cacheWriteCall).toBeDefined();
+    expectFoldedEventCandidateRevision(cacheWriteCall?.[1], 'rev-event-candidates', [targetUrl]);
+    expect(cacheWriteCall?.[2]).toEqual(
+      expect.objectContaining({
+        fusedCandidates: expect.arrayContaining([
+          expect.objectContaining({ workstreamId: 'ws_security' }),
+        ]),
+      }),
+    );
+  });
+
+  it('POST /v1/visits/batch-resolve serves a repeated event-candidate set from cache', async () => {
+    const targetUrl = 'https://docs.kernel.org/security/self-protection.html';
+    const anchorUrl = 'https://docs.kernel.org/security/lsm.html';
+    await connectionsStore.putCurrent(
+      snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates-repeat'),
+    );
+    await appendObservation({ seq: 1, url: targetUrl, title: 'Kernel Self-Protection' });
+    await appendObservation({ seq: 2, url: anchorUrl, title: 'Linux Security Module framework' });
+
+    const requestBody = JSON.stringify({
+      canonicalUrls: [targetUrl],
+      eventCandidateUrls: [targetUrl],
+    });
+    const first = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: requestBody,
+    });
+    expect(first.status).toBe(200);
+    // Deterministically settle the FIRST request's deferred write before the
+    // second request starts — otherwise whether the second request observes
+    // a cache hit depends on incidental scheduling (the write drains on a
+    // `setImmediate` after the response, which is not guaranteed to have run
+    // before the next `fetch` starts).
+    await flushResolverCacheWrites();
+
+    const readResolverSubgraphForUrls = vi.spyOn(connectionsStore, 'readResolverSubgraphForUrls');
+    readResolverSubgraphForUrls.mockClear();
+
+    const second = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: requestBody,
+    });
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as {
+      data: {
+        results: Record<
+          string,
+          { readonly fusedCandidates: readonly { readonly workstreamId: string }[] }
+        >;
+      };
+    };
+    // Second identical request hits the folded-key cache — same served
+    // answer, and no fresh subgraph read for the miss path (item 4: an
+    // all-cache-hit batch pays no subgraph read for attribution).
+    expect(secondBody.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe(
+      'ws_security',
+    );
+    const cacheReadCall = lastMockCallFor(connectionsStore.getCachedResolverResult, targetUrl);
+    expect(cacheReadCall).toBeDefined();
+    expectFoldedEventCandidateRevision(cacheReadCall?.[1], 'rev-event-candidates-repeat', [
+      targetUrl,
+    ]);
+  });
+
+  it('POST /v1/visits/batch-resolve misses the event-candidate cache when the candidate set changes', async () => {
+    const targetUrl = 'https://docs.kernel.org/security/self-protection.html';
+    const anchorUrl = 'https://docs.kernel.org/security/lsm.html';
+    await connectionsStore.putCurrent(
+      snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates-set-change'),
+    );
+    await appendObservation({ seq: 1, url: targetUrl, title: 'Kernel Self-Protection' });
+    await appendObservation({ seq: 2, url: anchorUrl, title: 'Linux Security Module framework' });
+
+    const first = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: [targetUrl], eventCandidateUrls: [targetUrl] }),
+    });
+    expect(first.status).toBe(200);
+    // Fully settle the FIRST request's deferred write (queued under the
+    // {targetUrl}-only folded key) BEFORE spying/clearing below — otherwise
+    // it can still be pending when the SECOND request's write is queued, and
+    // one flush would drain both entries together, leaving the mock with two
+    // calls for targetUrl under two different keys at once.
+    await flushResolverCacheWrites();
+
+    const cacheWrite = vi.spyOn(connectionsStore, 'cacheResolverResult');
+    cacheWrite.mockClear();
+
+    // Same target URL, but this batch ALSO flags anchorUrl as an event
+    // candidate. eventCandidateTargetSet (the intersection with
+    // canonicalUrls that actually drives the fold — see server.ts) is
+    // therefore genuinely different from the first request's {targetUrl},
+    // so this MUST miss the first request's folded cache entry and
+    // recompute (caching under its OWN, differently-folded key). Note:
+    // eventCandidateUrls entries NOT also present in canonicalUrls are
+    // dropped by that intersection, so anchorUrl must be requested too —
+    // an eventCandidateUrls-only change would be a no-op on the fold.
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({
+        canonicalUrls: [targetUrl, anchorUrl],
+        eventCandidateUrls: [targetUrl, anchorUrl],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await flushResolverCacheWrites();
+    const changedCacheWriteCall = lastMockCallFor(cacheWrite, targetUrl);
+    expect(changedCacheWriteCall).toBeDefined();
+    expectFoldedEventCandidateRevision(changedCacheWriteCall?.[1], 'rev-event-candidates-set-change', [
+      targetUrl,
+      anchorUrl,
+    ]);
   });
 
   it('POST /v1/visits/batch-resolve accepts titleHints and appends the content lane', async () => {
