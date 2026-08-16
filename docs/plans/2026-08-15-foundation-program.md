@@ -824,3 +824,130 @@ repo-only until a coordinator copies it into the live
 
 PR: perf(store): F2 report-only — hot-tail retirement report + compaction-
 aware seal proofs (branch `perf/f2-hot-tail-report`).
+
+**2026-08-16 — reconcile-child watchdog-loop KILLED
+(fix/child-index-migration-loop).** LIVE INCIDENT, not an F1–F7 item —
+filed here per the "binding plan tracks reality" rule. Since build
+00601ff8, the test companion's connections reconcile child (forked per
+drain, `SIDETRACK_CONNECTIONS_CHILD_NOPROGRESS_MS=1800000`) stalled with
+its main thread 100% inside one `sqlite3_step`
+(sqlite3VdbeExec → sqlite3BtreeNext → moveToChild → readDbPage → pread)
+every time a scoped delta touched a large edge batch — sometimes
+surviving just under the 30-minute watchdog (barely: one observed round
+took `dt=1803371ms`, 3.4s OVER 1,800,000ms, saved only because a later
+phase's per-row `.run()` loop happened to interleave enough JS-event-loop
+turns for the child's 30s heartbeat to keep resetting the parent's
+no-progress timer), sometimes not (pid 41415 was SIGKILLed after
+exactly 1,800,000ms with no progress). A killed child's `BEGIN IMMEDIATE`
+transaction rolls back completely, so the next forked child re-attempts
+the identical expensive work from the identical starting state — for a
+vault with enough backlog to need several large scoped-delta rounds, this
+reads as "catchingUp never completes," matching the incident report.
+
+PRIME HYPOTHESIS ENTERED AS: PR #368's `resolver_url` index +
+`events_type_accepted_at_idx` migration in `sync/eventStore.ts`, on the
+theory that a SIGKILL mid-`CREATE INDEX` rolls back and loops forever.
+REFUTED with direct evidence: a `sqlite3 ... .backup` copy of the LIVE
+`_BAC/connections/event-store.db` (957MB; copy took 2.6s, no live-process
+disruption) showed both new indexes already present in `sqlite_master`,
+`resolver_url` populated, migration fully complete. The hang is not there
+— `getSharedEventStore`/`ensureEventStore` runs once at the START of
+`buildAndWrite` (mark `w6 keys=N`), and the live phase log's last mark
+before every stall was always `scopedDelta.carryForwardSimilarity`, deep
+into the SAME `buildAndWrite` call, long after the event store had
+already opened cleanly.
+
+ACTUAL ROOT CAUSE (confirmed by reproducing the exact SQL against an
+offline copy of the vault's connections snapshot db — `current.db`  via
+`.backup`, isolated from the live process throughout): the next store
+call after `carryForwardSimilarity` is `replaceScopeRows`
+(`connections/snapshot.ts`). Its `edges_index` table (`edge_id ->
+(src, dst, kind)`, used for O(1) edge lookups) is kept in sync by
+`trg_edges_index_au`/`trg_edges_index_ad`, both of which run
+`DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst` once PER
+ROW touched on `edges`. `edges_index` had no index covering `(src, dst)`
+— only a PK on `edge_id` and an index on `kind` — so that DELETE resolved
+to `SCAN edges_index`: a full table scan, per trigger firing.
+`deleteOrphanEdges` in one large scoped delta deletes tens of thousands
+of `edges` rows; at this vault's live scale (edges_index ~107,007 rows)
+that is O(deletes × 107,007) row comparisons — billions — comfortably
+past the watchdog. Measured on the offline copy: the unmodified
+`deleteOrphanEdges` statement was still running after 5+ minutes (killed,
+never finished) against an 18,966-node/106,664-edge/107,007-edges_index-
+row copy; after adding the missing index, the SAME statement completed in
+2.279s. `EXPLAIN QUERY PLAN` confirmed the mechanism directly: before,
+`SCAN edges_index`; after, `SEARCH edges_index USING INDEX
+idx_edges_index_src_dst`. The same missing index also taxes the
+per-row upsert loop later in `replaceScopeRows` (`trg_edges_index_au`
+fires there too), just less catastrophically since that loop's many
+small `.run()` calls interleave with the heartbeat — which is exactly
+why some rounds survived the watchdog by a hair and others didn't.
+
+Fix (one line, two locations — both of `snapshot.ts`'s schema-init
+blocks: `#openDatabaseSerialized`, used by legacy/child-writer/
+single-buffer opens, and `#initSchemaOn`, used for a parent-reader's
+private write shadow):
+```
+CREATE INDEX IF NOT EXISTS idx_edges_index_src_dst ON edges_index(src, dst);
+```
+`IF NOT EXISTS` + running on every writable-handle open makes this
+self-healing for every existing generation file (including the
+per-drain shadow clones the child-writer/parent-reader roles create) the
+next time it is opened writable — no separate backfill/migration path
+needed, and the one-time index BUILD over existing rows is itself cheap
+(sub-second at this vault's scale, confirmed on the offline copy).
+`src/sync/eventStore.ts` was NOT touched — the prime hypothesis's target
+was already correct and is a decoy for this incident, not a red herring
+in general (it's a real, working migration for a different feature).
+`connectionsMaterializer.ts` was NOT touched — the fix is entirely
+inside `snapshot.ts`'s schema.
+
+Deviations from the task's pre-written fix list (written against the
+prime hypothesis, before it was refuted): items 1–3 (move migration to
+the parent, make it resumable, guard `readByResolverUrls`/
+`readMostRecentByType` against a missing index) do not apply — there is
+no eventStore.ts migration bug to guard against. Item 4 (PRAGMA tuning)
+was not needed — the index alone took the measured cost from "still
+running after 5+ minutes" to 2.3s.
+
+957MB event-store.db bloat, investigated per the task's ask (own copy
+only, live db never touched): `PRAGMA freelist_count` on the copy is
+99,202 of 244,756 total pages (4096-byte pages) — 40.5% free space,
+~406MB reclaimable by `VACUUM`, which would bring the file to ~596MB.
+That still isn't 236MB (the compacted JSONL log) — `dbstat` shows why
+the remainder is mostly legitimate structure, not waste: the db holds
+BOTH the raw `events` table (269MB) AND a separate `compacted_events`
+mirror table (139MB) AND six maintained indexes on `events` plus two on
+`compacted_events` (~155MB combined) — a raw+compacted dual-table design
+plus index overhead, not a single 1:1 mirror of the JSONL. VACUUM to
+reclaim the 406MB freelist is a legitimate, measured follow-up; NOT run
+against the live db (CLI-gated, operator's call, outside this PR).
+
+Tests: `connections/snapshot.replaceScopeRows.perf.test.ts` (new) — (1)
+deterministic schema/plan assertion (`PRAGMA index_list('edges_index')`
+carries `idx_edges_index_src_dst`; `EXPLAIN QUERY PLAN` on the trigger's
+exact DELETE is `SEARCH`, never `SCAN` — no wall-clock, can't flake); (2)
+a before/after ratio regression test (1,500-visit synthetic graph, index
+intact vs. index dropped post-init) asserting the indexed run is >3x
+faster than the unindexed one — generous margin so it doesn't flake on a
+loaded box, same convention as `scopeRecompute.perf.test.ts`. Full
+existing suite: `bun test` — 3284 pass, 8 skip, 0 fail, 366 files
+(`sqlite-store.test.ts`, `connectionsMaterializer.test.ts`,
+`doubleBuffer.acceptance.test.ts` etc. all green); `bun run build`
+clean. (Bun's own known exit-time C++ panic fired AFTER the full-suite
+summary printed — a pre-existing Bun 1.3.14 shutdown crash unrelated to
+this change, not a test failure.)
+
+Live corroboration (read-only observation of the still-running,
+untouched test companion throughout — never killed/restarted per the
+task's constraint): the phase log for pid 52610's second catch-up round
+shows `replaceScopeRows scopedTimelineDelta scopes=4742 nodes=6092
+edges=88806 ... dt=1803371ms` immediately following
+`carryForwardSimilarity` — an exact, independent confirmation of both the
+location and the ~30-minute magnitude of the bug, captured from
+production telemetry rather than the offline repro.
+
+PR: fix(store): index migration must not loop under the child watchdog
+(branch `fix/child-index-migration-loop`) — title kept per the task's
+instruction; the shipped fix targets `connections/snapshot.ts`, not an
+eventStore.ts migration, per the root-cause finding above.

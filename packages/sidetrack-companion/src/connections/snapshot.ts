@@ -5304,6 +5304,28 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           kind TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_edges_index_kind ON edges_index(kind);
+        -- Root cause of the 2026-08-16 reconcile-child infinite-SIGKILL-loop
+        -- incident: trg_edges_index_au/ad (below) run
+        -- 'DELETE FROM edges_index WHERE src = OLD.src AND dst = OLD.dst'
+        -- once PER ROW touched on edges. Without an index covering
+        -- (src, dst), that DELETE is 'SCAN edges_index' -- a full scan of
+        -- the WHOLE edges_index table for every single row deleted/updated
+        -- on edges. A scoped delta that upserts/deletes tens of thousands
+        -- of edges rows (routine at this vault's scale -- 100k+ edges_index
+        -- rows) turns an O(n) cleanup into O(n * edges_index size): tens of
+        -- billions of row comparisons, which reliably exceeds the reconcile
+        -- child's 30-minute no-progress watchdog. Measured live 2026-08-16:
+        -- the exact deleteOrphanEdges statement below went from hanging
+        -- indefinitely (>5 min, still running when killed) to 2.3s on an
+        -- 18,966-node/106,664-edge/107,007-edges_index-row copy of the vault
+        -- once this index existed. CREATE INDEX IF NOT EXISTS makes this
+        -- self-healing for every existing generation file the next time it
+        -- is opened writable (child-writer shadow clone or parent-reader
+        -- write shadow) -- no separate migration/backfill needed, and the
+        -- one-time index BUILD over existing edges_index rows is itself
+        -- fast (sub-second at this vault's current row counts -- see
+        -- src/connections/snapshot.replaceScopeRows.perf.test.ts).
+        CREATE INDEX IF NOT EXISTS idx_edges_index_src_dst ON edges_index(src, dst);
         CREATE TRIGGER IF NOT EXISTS trg_edges_index_ai AFTER INSERT ON edges BEGIN
           INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
           SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
@@ -6740,6 +6762,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       CREATE TABLE IF NOT EXISTS edges_index (
         edge_id TEXT PRIMARY KEY, src TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_edges_index_kind ON edges_index(kind);
+      -- See the matching comment in #openDatabaseSerialized's schema block —
+      -- this mirrors that DDL for a parent-reader's private write shadow.
+      CREATE INDEX IF NOT EXISTS idx_edges_index_src_dst ON edges_index(src, dst);
       CREATE TRIGGER IF NOT EXISTS trg_edges_index_ai AFTER INSERT ON edges BEGIN
         INSERT OR REPLACE INTO edges_index (edge_id, src, dst, kind)
         SELECT json_extract(e.value, '$.id'), NEW.src, NEW.dst, json_extract(e.value, '$.kind')
