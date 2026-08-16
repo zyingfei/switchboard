@@ -118,7 +118,10 @@ export type GuessLane =
   | 'content'
   // Lane 8 — the AI lane: the same query-time retrieval as 'content', asked
   // with the on-device gist ALONE. Present only when a gist exists.
-  | 'ai';
+  | 'ai'
+  // Lane 9 — the prototype lane: cosine match against offline-generated
+  // workstream prototypes (Apple FM, PR #377). Observe-only disclosure.
+  | 'prototype';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -319,6 +322,10 @@ const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>([
   // trace of the loss. Every lane added to the GuessLane union MUST be added
   // here in the same change.
   'ai',
+  // Lane 9 — 'prototype' (PR #377). The companion disclosed this lane for a
+  // build before it was added here, and the panel silently dropped it —
+  // the exact 'ai'-lane failure mode the comment above documents.
+  'prototype',
 ]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
