@@ -60,11 +60,13 @@ import { createTimelineStore } from '../timeline/projection.js';
 import {
   canonicalizeEvidenceUrl,
   ensurePageEvidenceForTimelineEntries,
+  ensurePageEvidenceStoreReady,
   embedBacklogCanonicalUrl,
   createIncrementalBackgroundEmbeddingCandidateSource,
   readBackgroundEmbeddingProgress,
   writeBackgroundEmbeddingProgress,
 } from '../page-evidence/store.js';
+import { ensurePageContentStoreReady } from '../page-content/store.js';
 import {
   createBackgroundEmbeddingLane,
   type BackgroundEmbeddingLaneHealth,
@@ -424,6 +426,13 @@ export const startCompanion = async (
     // Sweep stale `.index.bin.<rev>.tmp` files from a prior crash.
     // Idempotent; runs every startup.
     await cleanupOrphanIndexTmpFiles(options.vaultPath);
+    // F5: one-time port of the legacy page-content/page-evidence
+    // per-record file layout into their single SQLite stores (idempotent
+    // — a no-op once ported, and safe to re-run after a crash mid-port,
+    // see each store's module header). Runs deterministically at boot
+    // rather than silently on the first capture request.
+    await ensurePageContentStoreReady(options.vaultPath);
+    await ensurePageEvidenceStoreReady(options.vaultPath);
     resourceReadinessWatchdog.recordBootPhase('identity-lock');
     const vaultWriter = createVaultWriter(options.vaultPath);
     const pageEvidenceWriteQueue = createPageEvidenceWriteQueue(options.vaultPath);

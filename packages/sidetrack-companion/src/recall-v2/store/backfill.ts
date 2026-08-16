@@ -7,13 +7,14 @@
 // JSON at any time. This is the same pattern as today's in-memory
 // MiniSearch indexes, just durable.
 
-import { readFile, stat } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
   listPageEvidenceRecordFiles,
   listPageEvidenceRecords,
+  pageEvidenceDbPath,
   readPageEvidenceRecordByFileName,
 } from '../../page-evidence/store.js';
 import type { PageEvidenceRecord } from '../../page-evidence/types.js';
@@ -36,29 +37,24 @@ import type { PageEvidenceEmbedder } from '../../page-evidence/embedding.js';
 // /v1/status availability contract (statusContract.test.ts).
 const defaultEmbed: PageEvidenceEmbedder = async (texts) =>
   (await import('../../recall/embedder.js')).embed(texts);
+import {
+  pageContentDbPath,
+  readPageContentChunksByContentHash,
+  readPageContentCoverage,
+} from '../../page-content/store.js';
 import type { PageContentChunk } from '../../page-content/types.js';
 import type { RecallStore, StoreDocument, StoreDocumentChunk } from './types.js';
 
-// Local readJson — page-content/store.ts has the same shape internally
-// but doesn't export it. Inlined here to keep the SQLite backfill
-// independent of that module's internals.
-const readJson = async <T>(path: string): Promise<T | null> => {
-  try {
-    const raw = await readFile(path, 'utf8');
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
-};
-
-// Mirrors page-content/store.ts:recordPathForCanonicalUrl + chunksDir.
-// Inlined so we don't import store internals (and to keep backfill
-// resilient to refactors in page-content/store.ts).
+// F5 (2026-08-16): page-content and page-evidence are single SQLite
+// stores now — the direct `by-url/*.json` / `chunks/*.json` reads this
+// module used to inline (to stay independent of page-content/store.ts's
+// internals) would silently return nothing once those files stop being
+// written. Read through the real store exports instead:
+// `readPageContentCoverage` (contentHash fallback) and
+// `readPageContentChunksByContentHash` (direct by-hash chunk read, no
+// coverage-state gating — the same semantics the old direct file read
+// had: trust an already-known contentHash, current or remembered).
 const sha256Hex = (input: string): string => createHash('sha256').update(input).digest('hex');
-const pageContentRecordPath = (vaultRoot: string, canonicalUrl: string): string =>
-  join(vaultRoot, '_BAC', 'page-content', 'by-url', `${sha256Hex(canonicalUrl)}.json`);
-const pageContentChunksPath = (vaultRoot: string, contentHash: string): string =>
-  join(vaultRoot, '_BAC', 'page-content', 'chunks', `${contentHash}.json`);
 
 const entityIdForUrl = (url: string): string =>
   `url:${createHash('sha256').update(url).digest('hex').slice(0, 24)}`;
@@ -222,17 +218,12 @@ const ingestEvidenceRecords = async (
         let contentHash: string | undefined = r.content?.contentHash;
         if (contentHash === undefined) {
           // Fallback: read the page-content row directly to get the hash.
-          const rec = await readJson<{ readonly coverage?: { readonly contentHash?: string } }>(
-            pageContentRecordPath(vaultRoot, r.canonicalUrl),
-          );
-          contentHash = rec?.coverage?.contentHash;
+          const coverage = await readPageContentCoverage(vaultRoot, r.canonicalUrl);
+          contentHash = coverage.contentHash;
         }
         if (contentHash !== undefined) {
-          const raw = await readJson<{ readonly chunks?: readonly { readonly text: string }[] }>(
-            pageContentChunksPath(vaultRoot, contentHash),
-          );
-          const chunks = raw?.chunks;
-          if (chunks !== undefined && chunks.length > 0) {
+          const chunks = await readPageContentChunksByContentHash(vaultRoot, contentHash);
+          if (chunks !== null && chunks.length > 0) {
             body = chunks.map((c) => c.text).join('\n\n');
           }
         }
@@ -540,10 +531,7 @@ export const backfillChunkVectors = async (
   for (const record of records) {
     const contentHash = record.content?.contentHash;
     if (contentHash === undefined) continue;
-    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
-      pageContentChunksPath(vaultRoot, contentHash),
-    );
-    const chunks = raw?.chunks ?? [];
+    const chunks = (await readPageContentChunksByContentHash(vaultRoot, contentHash)) ?? [];
     const documentEntityId = entityIdForUrl(record.canonicalUrl);
     for (const chunk of chunks) {
       items.push({
@@ -679,10 +667,7 @@ const ingestChunksForRecords = async (
     const contentHash = record.content?.contentHash;
     if (contentHash === undefined) continue;
     const documentEntityId = entityIdForUrl(record.canonicalUrl);
-    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
-      pageContentChunksPath(vaultRoot, contentHash),
-    );
-    const chunks = raw?.chunks ?? [];
+    const chunks = (await readPageContentChunksByContentHash(vaultRoot, contentHash)) ?? [];
     const rows = chunks
       .map((chunk) =>
         chunkRowForStore({ chunk, documentEntityId, embedText: chunkEmbedText(chunk) }),
@@ -998,10 +983,19 @@ const sigForPaths = async (paths: readonly string[]): Promise<string> => {
 };
 
 export const computeSourceSignatures = async (vaultRoot: string): Promise<SourceSignatures> => ({
+  // F5 (2026-08-16): page-evidence and page-content are single SQLite
+  // dbs now — stat the db file AND its `-wal` sidecar (WAL-mode writes
+  // land there between checkpoints, so its mtime/size is the thing that
+  // actually moves on every write; the main db file's mtime only moves
+  // at a checkpoint). Combining both catches a source change in either
+  // window. Replaces the old by-url/chunks directory stats, which froze
+  // permanently at port time once those directories stopped being
+  // written — this signature would otherwise never move again.
   pageEvidence: await sigForPaths([
-    join(vaultRoot, '_BAC', 'page-evidence', 'by-url'),
-    join(vaultRoot, '_BAC', 'page-content', 'by-url'),
-    join(vaultRoot, '_BAC', 'page-content', 'chunks'),
+    pageEvidenceDbPath(vaultRoot),
+    `${pageEvidenceDbPath(vaultRoot)}-wal`,
+    pageContentDbPath(vaultRoot),
+    `${pageContentDbPath(vaultRoot)}-wal`,
   ]),
   chatTurn: await sigForPaths([join(vaultRoot, '_BAC', 'recall')]),
   vectors: await sigForPaths([join(vaultRoot, '_BAC', 'recall', 'semantic-pool', 'vectors.json')]),
