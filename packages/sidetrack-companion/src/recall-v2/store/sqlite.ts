@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS recall_metadata (
   value TEXT NOT NULL
 );
 
+-- Prototype lane (docs/plans/2026-08-16-category-flexibility-hyde.md §3).
+-- Metadata for offline-generated (or zh/non-en-selected) workstream
+-- prototype texts. The vector side lives in prototype_vec (created below,
+-- alongside docs_vec, gated on the same sqlite-vec extension load) — this
+-- table is the join target so a KNN hit resolves back to its workstream +
+-- generation provenance in one round trip, same split as docs/docs_vec.
+CREATE TABLE IF NOT EXISTS prototypes (
+  prototype_id        TEXT PRIMARY KEY,
+  workstream_id       TEXT NOT NULL,
+  generated_text      TEXT NOT NULL,
+  generator_model_id  TEXT NOT NULL,
+  method              TEXT NOT NULL,
+  generated_at        INTEGER NOT NULL,
+  evidence_watermark  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS prototypes_workstream ON prototypes(workstream_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
   title, body, url_tokens, host,
   content='docs', content_rowid='rowid',
@@ -203,6 +220,10 @@ class SqliteRecallStore implements RecallStore {
             chunk_id TEXT PRIMARY KEY,
             embedding float[${vecDim}]
           );
+          CREATE VIRTUAL TABLE IF NOT EXISTS prototype_vec USING vec0(
+            prototype_id TEXT PRIMARY KEY,
+            embedding FLOAT[${vecDim}]
+          );
         `);
         this.vecAvailable = true;
         console.warn(`[recall-v2] sqlite-vec loaded via ${driver.name}; docs_vec ready`);
@@ -265,7 +286,9 @@ class SqliteRecallStore implements RecallStore {
     // '_'/'%' in a hostname is matched literally, not as a wildcard.
     const suffix = `%.${escapeLike(trimmed)}`;
     const rows = this.db
-      .prepare(`SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`)
+      .prepare(
+        `SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`,
+      )
       .all<{ entityId: string }>(trimmed, suffix);
     if (rows.length === 0) return 0;
     // deleteDocument cascades to chunks + vectors. Wrap in a
@@ -292,7 +315,9 @@ class SqliteRecallStore implements RecallStore {
     // ('meet_x' must not wildcard to 'meetyx').
     const suffix = `%.${escapeLike(trimmed)}`;
     const rows = this.db
-      .prepare(`SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`)
+      .prepare(
+        `SELECT entity_id AS entityId FROM docs WHERE host = ? OR host LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`,
+      )
       .all<{ entityId: string }>(trimmed, suffix);
     if (rows.length === 0) return 0;
     // deleteDocument cascades to chunks + vectors. Wrap in a
@@ -752,6 +777,150 @@ class SqliteRecallStore implements RecallStore {
       return mapped.filter((r) => !exclude.has(r.entityId));
     } catch (err) {
       console.warn('[recall-v2] chunk vec query failed:', err);
+      return [];
+    }
+  }
+
+  // ---- prototype lane ---------------------------------------------------
+  // See docs/plans/2026-08-16-category-flexibility-hyde.md §3. `prototypes`
+  // holds generation provenance; `prototype_vec` (created above, alongside
+  // docs_vec) holds the embedding. Split the same way docs/docs_vec are.
+
+  upsertPrototype(
+    row: {
+      readonly prototypeId: string;
+      readonly workstreamId: string;
+      readonly generatedText: string;
+      readonly generatorModelId: string;
+      readonly method: 'generated' | 'selected';
+      readonly generatedAt: number;
+      readonly evidenceWatermark: string;
+    },
+    vec: Float32Array,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO prototypes
+           (prototype_id, workstream_id, generated_text, generator_model_id, method, generated_at, evidence_watermark)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(prototype_id) DO UPDATE SET
+           workstream_id=excluded.workstream_id,
+           generated_text=excluded.generated_text,
+           generator_model_id=excluded.generator_model_id,
+           method=excluded.method,
+           generated_at=excluded.generated_at,
+           evidence_watermark=excluded.evidence_watermark`,
+      )
+      .run(
+        row.prototypeId,
+        row.workstreamId,
+        row.generatedText,
+        row.generatorModelId,
+        row.method,
+        row.generatedAt,
+        row.evidenceWatermark,
+      );
+    if (!this.vecAvailable) return;
+    try {
+      this.db.prepare('DELETE FROM prototype_vec WHERE prototype_id = ?').run(row.prototypeId);
+      this.db
+        .prepare('INSERT INTO prototype_vec (prototype_id, embedding) VALUES (?, ?)')
+        .run(row.prototypeId, JSON.stringify(Array.from(vec)));
+    } catch (err) {
+      console.warn('[recall-v2] prototype vec upsert failed:', err);
+    }
+  }
+
+  /** Replace a workstream's ENTIRE standing prototype set. Called once per
+   *  regeneration batch so a workstream's active prototypes are always
+   *  exactly its latest generation — never an accumulating mix of stale and
+   *  fresh texts from different evidence watermarks. */
+  deletePrototypesForWorkstream(workstreamId: string): void {
+    const ids = this.db
+      .prepare('SELECT prototype_id AS id FROM prototypes WHERE workstream_id = ?')
+      .all(workstreamId) as { id: string }[];
+    if (this.vecAvailable) {
+      for (const { id } of ids) {
+        try {
+          this.db.prepare('DELETE FROM prototype_vec WHERE prototype_id = ?').run(id);
+        } catch (err) {
+          console.warn('[recall-v2] prototype vec delete failed:', err);
+        }
+      }
+    }
+    this.db.prepare('DELETE FROM prototypes WHERE workstream_id = ?').run(workstreamId);
+  }
+
+  listPrototypesForWorkstream(workstreamId: string): readonly {
+    readonly prototypeId: string;
+    readonly generatedText: string;
+    readonly generatorModelId: string;
+    readonly method: 'generated' | 'selected';
+    readonly generatedAt: number;
+    readonly evidenceWatermark: string;
+  }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT prototype_id AS prototypeId, generated_text AS generatedText,
+                generator_model_id AS generatorModelId, method AS method,
+                generated_at AS generatedAt, evidence_watermark AS evidenceWatermark
+         FROM prototypes WHERE workstream_id = ? ORDER BY generated_at DESC`,
+      )
+      .all(workstreamId) as {
+      prototypeId: string;
+      generatedText: string;
+      generatorModelId: string;
+      method: string;
+      generatedAt: number;
+      evidenceWatermark: string;
+    }[];
+    return rows.map((r) => ({
+      ...r,
+      method: r.method === 'selected' ? ('selected' as const) : ('generated' as const),
+    }));
+  }
+
+  /** Distinct workstream ids that currently have at least one standing
+   *  prototype — used by the health surface's coverage metric. */
+  allPrototypeWorkstreamIds(): ReadonlySet<string> {
+    const rows = this.db.prepare('SELECT DISTINCT workstream_id AS id FROM prototypes').all() as {
+      id: string;
+    }[];
+    return new Set(rows.map((r) => r.id));
+  }
+
+  /** KNN over prototype_vec, joined back to its workstream. Pure vector
+   *  match — no LLM call, no ranking beyond cosine distance (serve-time
+   *  contract, design doc §3). [] when vec is unavailable. */
+  queryPrototypeVector(opts: { readonly vec: Float32Array; readonly limit: number }): readonly {
+    readonly prototypeId: string;
+    readonly workstreamId: string;
+    readonly cosineDistance: number;
+  }[] {
+    if (!this.vecAvailable) return [];
+    try {
+      const target = JSON.stringify(Array.from(opts.vec));
+      const sql = `
+        SELECT v.prototypeId AS prototypeId,
+               p.workstream_id AS workstreamId,
+               v.distance AS cosineDistance
+        FROM (
+          SELECT prototype_id AS prototypeId, distance
+          FROM prototype_vec
+          WHERE embedding MATCH ?
+          ORDER BY distance
+          LIMIT ?
+        ) AS v
+        JOIN prototypes AS p ON p.prototype_id = v.prototypeId
+      `;
+      const rows = this.db.prepare(sql).all(target, opts.limit) as {
+        prototypeId: string;
+        workstreamId: string;
+        cosineDistance: number;
+      }[];
+      return rows;
+    } catch (err) {
+      console.warn('[recall-v2] prototype vec query failed:', err);
       return [];
     }
   }

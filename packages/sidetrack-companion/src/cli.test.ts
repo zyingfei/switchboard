@@ -648,6 +648,98 @@ describe('runCli', () => {
     }
   });
 
+  // F2 — hot-tail retirement report (docs/plans/2026-08-15-foundation-
+  // program.md, F2 row). Report-only: no --apply exists yet, no process
+  // lock is taken (nothing here can desync a live companion), and the
+  // event-store mirror is opened read-only.
+  it('retire-hot-tail refuses without --vault', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(['retire-hot-tail', '--report'], streams);
+    expect(exitCode).toBe(2);
+    expect(streams.stderr.text()).toContain('--vault');
+  });
+
+  it('retire-hot-tail requires --report; --apply is refused with a clear message (not implemented yet)', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-flags-'));
+    try {
+      const missingMode = createStreams();
+      const missingExit = await runCli(['retire-hot-tail', '--vault', vaultRoot], missingMode);
+      expect(missingExit).toBe(2);
+      expect(missingMode.stderr.text()).toContain('--report');
+
+      const applyAttempt = createStreams();
+      const applyExit = await runCli(
+        ['retire-hot-tail', '--apply', '--vault', vaultRoot],
+        applyAttempt,
+      );
+      expect(applyExit).toBe(2);
+      expect(applyAttempt.stderr.text()).toContain('does not exist yet');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retire-hot-tail --report is zero-write and reports sealed-vs-unsealed shards (text + json)', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-report-'));
+    const previousStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const { runEventSealPass } = await import('./analytics/eventSeal.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const now = new Date('2026-03-04T12:00:00.000Z');
+      const log = createEventLog(vaultRoot, replica, { now: () => new Date('2026-03-01T10:00:00.000Z') });
+      for (let seq = 0; seq < 3; seq += 1) {
+        await log.appendClientObserved({
+          clientEventId: `t-${String(seq)}`,
+          aggregateId: `thread.upserted:T${String(seq)}`,
+          type: 'thread.upserted',
+          baseVector: {},
+          payload: { bac_id: `T${String(seq)}`, title: `Thread ${String(seq)}` },
+        });
+      }
+      const sealPass = await runEventSealPass(vaultRoot, { now: () => now });
+      expect(sealPass.errors).toEqual([]);
+      expect(sealPass.sealed.length).toBeGreaterThan(0);
+
+      const dbPathModule = await import('node:path');
+      const dbPath = dbPathModule.join(vaultRoot, '_BAC', 'connections', 'event-store.db');
+      const { readFile } = await import('node:fs/promises');
+      const beforeMirror = await readFile(dbPath);
+
+      const text = createStreams();
+      const textExit = await runCli(['retire-hot-tail', '--report', '--vault', vaultRoot], text);
+      expect(textExit).toBe(0);
+      expect(text.stdout.text()).toContain('shardsTotal=');
+      expect(text.stdout.text()).toContain('shardsEligible=1');
+      expect(text.stdout.text()).toContain('segmentAlarms=0');
+
+      const jsonStreams = createStreams();
+      const jsonExit = await runCli(
+        ['retire-hot-tail', '--report', '--vault', vaultRoot, '--json'],
+        jsonStreams,
+      );
+      expect(jsonExit).toBe(0);
+      const parsed = JSON.parse(jsonStreams.stdout.text()) as {
+        readonly mode: string;
+        readonly result: { readonly totals: { readonly shardsEligible: number; readonly bytesRetirable: number } };
+      };
+      expect(parsed.mode).toBe('report');
+      expect(parsed.result.totals.shardsEligible).toBe(1);
+      expect(parsed.result.totals.bytesRetirable).toBeGreaterThan(0);
+
+      // Zero writes: the event-store mirror this report reads is
+      // byte-identical before and after (readonly open only).
+      const afterMirror = await readFile(dbPath);
+      expect(Buffer.compare(beforeMirror, afterMirror)).toBe(0);
+    } finally {
+      if (previousStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = previousStoreFlag;
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
   // F8 IVM plan W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
   // designs.md). `connections-rebuild` is the sole consented full-replay
   // entry point; these tests mirror the compact-engagement CLI tests'

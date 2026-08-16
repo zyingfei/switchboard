@@ -5,6 +5,39 @@ Status: proposed, phase 1 shippable in one PR. Companion research doc:
 sourced from `~/Downloads/deep-research-report-hyDE.md`; the source is
 volatile so this is now the durable copy).
 
+## Phase status (updated 2026-08-16)
+
+| Phase | Scope | Status | Landed in |
+|---|---|---|---|
+| 1 — data model + UX events | `membershipEvents.ts`, `workstreamMembershipStore.ts`, additive memberships route, generalized `declineMemory.ts`, one-time backfill | **Not started** | — |
+| 2 — prototype lane (offline generation + serve-time match + disclosure) | Evidence-grounded offline generation on Apple FM (or evidence-selection for zh/non-en), sqlite-vec `prototype_vec` storage, guess lane 9 (`prototype`), falsifiability counters, health row | **Shipped** (this PR) | `feat/prototype-lane-apple-fm` — `packages/sidetrack-companion/src/workstreams/prototypeGeneration.ts`, `prototypeEvidence.ts`, `events.ts`; `src/enrichment/appleFmEngine.ts`; `src/tabsession/prototypeLane.ts`, `guessLanes.ts`; `src/recall-v2/store/sqlite.ts` (`prototype_vec`/`prototypes`); `src/system/workGraphHealth.ts` (`attribution.prototype-lane-shadow`); `src/sync/lineage.ts`, `src/sync/contract/registry.ts` |
+| 3 — promotion gate | `'prototype-v1'` prequential arm, precision-gated promotion into `laneCorroboration.ts`'s corroborating set, private-codename golden case | **Not started** — this PR only DECLARES the threshold constants (`PROTOTYPE_LANE_MIN_PRECISION`/`_MIN_SAMPLES`/`_MAX_ACTION` in `prototypeLane.ts`) and proves (golden case 5) that the lane cannot yet influence a decision | — |
+| 4 — split/new-category suggestion | Structural clustering re-scoped per-workstream, LLM naming-only fallback | **Not started** | — |
+
+**Two deliberate deviations from this doc's original §3 draft, made under
+explicit 2026-08-16 follow-up instruction (documented, not silent) —**
+1. **Engine.** §3 sized the generation engine choice against measured
+   Apple FM vs. WebGPU numbers but left the choice open; the follow-up
+   directive pins it to Apple FM ONLY (no nano/WebGPU/remote fallback for
+   *generation* — WebGPU and Nano both require a live browser session this
+   companion-side background job does not have). Reached over loopback HTTP
+   from the companion process directly (`enrichment/appleFmEngine.ts`, a
+   companion-local PORT of the extension's `nano/appleService.ts` wire
+   contract — the two packages share no dependency edge, so this is a port,
+   not an import, kept byte-identical in constants/shapes on purpose).
+2. **Default state.** §3 proposed `SIDETRACK_PROTOTYPE_LANE` default OFF.
+   The follow-up directive made it (and `SIDETRACK_PROTOTYPE_GENERATION`)
+   default ON. This is consistent with, not a departure from, this
+   codebase's actual established pattern: every other guess-lane flag
+   (`SIDETRACK_GUESS_LANES`, `SIDETRACK_CONTENT_LANE`,
+   `SIDETRACK_LANE_PREQUENTIAL`, `SIDETRACK_LANE_CORROBORATION`) already
+   defaults ON as a kill-switch, not an opt-in — because
+   `laneCorroboration.ts`/`laneFallback.ts` hardcode their lane set to
+   `['content','ai']`, the prototype lane is structurally unable to affect
+   any served decision in this PR regardless of its flag state (see golden
+   case 5, `goldenResolveCases.test.ts`). See `prototypeLane.ts`'s doc
+   comment for the full reasoning.
+
 **Scope note on paths.** The brief cites `src/attribution-v1/`,
 `src/workstreams/`, `src/tabsession/fusion.ts`. All production code is
 under `packages/sidetrack-companion/src/...` and

@@ -476,3 +476,122 @@ describe('golden case 4 — decline-respected (a refusal is an answer)', () => {
     expect(out.fusedCandidates[0]?.workstreamId).toBe('ws-ai');
   });
 });
+
+// ---- G5. prototype-disclosure-never-decides -----------------------------
+
+describe('golden case 5 — prototype-disclosure-never-decides (a plausible-but-wrong prototype must never overwhelm grounded evidence)', () => {
+  // NOT a live incident — a REGRESSION GUARD for the design doc's central
+  // risk (docs/plans/2026-08-16-category-flexibility-hyde.md §6.1,
+  // "plausible-but-privately-wrong"): a generated prototype can be fluent and
+  // confidently wrong, and unlike a one-shot HyDE call it persists for weeks.
+  // This PR's answer is structural, not a threshold: laneCorroboration.ts and
+  // laneFallback.ts both hardcode their lane set to ['content','ai']
+  // (LANE_CORROBORATION_LANES / FALLBACK_LANES) and are therefore UNABLE to
+  // read a 'prototype' lane's opinion at all. This case proves that
+  // structural fact behaviorally: reusing golden case 2's exact KIMI/content/
+  // ai fixture, with a 'prototype' lane injected that confidently (and
+  // WRONGLY) names a DIFFERENT workstream at a HIGHER score than either real
+  // lane — the decision comes out byte-identical to case 2's, as if the
+  // prototype lane were never there.
+  const WRONG_PROTOTYPE_LANE = {
+    lane: 'prototype' as const,
+    candidates: [
+      // Higher score than content (0.66) or ai (0.71) — if this lane could
+      // sway the decision, it would. It must not be able to.
+      {
+        workstreamId: 'ws-private-codename',
+        score: 0.97,
+        why: 'closest of 4 matching generated prototypes, similarity 0.97',
+      },
+    ],
+  };
+  const KIMI_LANES_WITH_PROTOTYPE = [
+    ...EMPTY_STRUCTURAL_LANES,
+    {
+      lane: 'content' as const,
+      candidates: [{ workstreamId: 'ws-attention', score: 0.66, why: '8 matches · gist' }],
+    },
+    {
+      lane: 'ai' as const,
+      candidates: [{ workstreamId: 'ws-attention', score: 0.71, why: '6 matches' }],
+    },
+    WRONG_PROTOTYPE_LANE,
+  ];
+  const KIMI_TOP = candidate({
+    workstreamId: 'ws-attention',
+    simTopScore: 0.9,
+    simMeanScore: 0.7,
+    simAgreement: 0.1,
+    simMargin: 0.6,
+    corroborationCount: 1,
+    rawFusionLogit: 1.6,
+  });
+  const KIMI_WITH_PROTOTYPE = {
+    policyMode: 'balanced' as const,
+    decision: decideAttribution([KIMI_TOP], 'balanced'),
+    fusedCandidates: [KIMI_TOP],
+    lanes: KIMI_LANES_WITH_PROTOTYPE,
+  };
+
+  it('the corroboration promotion still fires on content+ai agreement — the prototype lane changes NOTHING', () => {
+    process.env[LANE_CORROBORATION_ENV] = '1';
+    const out = applyLaneCorroboration(KIMI_WITH_PROTOTYPE, {
+      canonicalUrl: 'https://arxiv.org/abs/2510.26692',
+      calibration: calibrated(0.72, 41),
+    });
+    // Byte-identical to golden case 2's outcome for the SAME content/ai
+    // fixture — 'ws-attention', not 'ws-private-codename'.
+    expect(out.decision.action).toBe('suggest');
+    expect(out.decision.workstreamId).toBe('ws-attention');
+  });
+
+  it('even a PERFECT (n=400, p=1.0) prototype-lane calibration cannot promote it — it is not in the corroborating set', () => {
+    process.env[LANE_CORROBORATION_ENV] = '1';
+    const perfectPrototype: LanePrequentialSummary = {
+      ...calibrated(0.72, 41),
+      lanes: [
+        ...calibrated(0.72, 41).lanes,
+        { lane: 'prototype', n: 400, hits: 400, precision: 1.0 },
+      ],
+    };
+    const out = applyLaneCorroboration(KIMI_WITH_PROTOTYPE, {
+      canonicalUrl: 'https://arxiv.org/abs/2510.26692',
+      calibration: perfectPrototype,
+    });
+    expect(out.decision.workstreamId).toBe('ws-attention');
+  });
+
+  it('the lane-fallback guess also ignores it — content+ai agreement still wins, not the louder prototype score', () => {
+    const JFROG_WITH_PROTOTYPE: ResultWithFusion = {
+      decision: {
+        action: 'inbox',
+        margin: 0,
+        gate: { reason: 'no-candidates', detail: 'no candidates reached fusion' },
+      },
+      fusedCandidates: [],
+      lanes: [
+        ...EMPTY_STRUCTURAL_LANES,
+        {
+          lane: 'content' as const,
+          candidates: [
+            { workstreamId: 'ws-ai', score: 0.62, why: '8 matches · gist' },
+            { workstreamId: 'ws-linux-security', score: 0.55, why: '5 matches · gist' },
+          ],
+        },
+        {
+          lane: 'ai' as const,
+          candidates: [{ workstreamId: 'ws-linux-security', score: 0.71, why: '6 matches' }],
+        },
+        {
+          lane: 'prototype' as const,
+          candidates: [{ workstreamId: 'ws-private-codename', score: 0.99, why: 'x' }],
+        },
+      ],
+    };
+    const out = applyLaneFallbackGuess(JFROG_WITH_PROTOTYPE, {
+      canonicalUrl: 'https://jfrog.example/prototype-disclosure',
+    });
+    expect(out.fusedCandidates.map((c) => c.workstreamId)).not.toContain('ws-private-codename');
+    expect(out.fusedCandidates[0]?.workstreamId).toBe('ws-linux-security');
+  });
+});

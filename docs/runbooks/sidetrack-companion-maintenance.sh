@@ -31,10 +31,21 @@
 #    it. Section 5 below is a nightly REPORT-ONLY survey (plan only, never
 #    applies) so the reclaimable-bytes trend is visible before anyone opts
 #    into --apply. See docs/runbooks/ (this file) §5 for the sync note.
+#
+# 5. F2 (Task, 2026-08-16): once a day's events are sealed into the columnar
+#    tier (src/analytics/eventSeal.ts) and verify-green, the hot-tail JSONL
+#    shard for that day no longer needs to be read/rewritten — but APPLYing
+#    that retirement is gated on a soak period (~2026-08-21) and explicit
+#    consent, not scripted here. Section 6 below is the nightly REPORT-ONLY
+#    eligibility survey (`retire-hot-tail --report`, zero writes — the
+#    event-store mirror it reads is opened `{ readonly: true }`), appended to
+#    a bounded (last-30) JSONL history under each vault's _BAC/system/ so the
+#    trend is visible before APPLY exists.
 
-# *** NOT YET SYNCED to ~/.sidetrack-companion-maintenance.sh — §5 below is new
-# *** (Task F1, 2026-08-15). The coordinator must copy the new section into the
-# *** live launchd script; nothing outside this repo checkout runs it yet.
+# *** NOT YET SYNCED to ~/.sidetrack-companion-maintenance.sh — §5 (Task F1,
+# *** 2026-08-15) and §6 (Task F2, 2026-08-16) below are new. The coordinator
+# *** must copy the new sections into the live launchd script; nothing
+# *** outside this repo checkout runs them yet.
 
 LOG="$HOME/.sidetrack-maintenance.log"
 exec >>"$LOG" 2>&1
@@ -183,6 +194,41 @@ for VAULT in "$HOME/.sidetrack-vault" "$HOME/.sidetrack-vault-test"; do
   [ -d "$VAULT" ] || continue
   echo "$VAULT: engagement-interval compaction survey (report-only)"
   bun dist/cli.js compact-engagement --vault "$VAULT" 2>&1 | sed 's/^/  /'
+done
+
+# --- 6. F2 hot-tail retirement eligibility report (REPORT-ONLY) -------------
+# *** NEW — Task F2 (2026-08-16). Not yet in the live launchd script; the
+# *** coordinator syncs this block into ~/.sidetrack-companion-maintenance.sh.
+#
+# `retire-hot-tail --report` (src/cli.ts) computes, per (replica, day)
+# hot-tail JSONL shard: events sealed vs unsealed, hot-tail bytes retirable
+# once APPLY ships, and the seal-coverage verdict (reusing the columnar
+# tier's DuckDB-over-Parquet integrity check, src/analytics/eventScan.ts).
+# ZERO writes — the event-store mirror it reads is opened `{ readonly: true }`
+# (never created, never caught up), so this is safe to run nightly against a
+# vault a live companion is also serving, same as §5 above. There is no
+# --apply yet: retiring the hot tail is a separate, consent-gated follow-up
+# behind the seal soak period (~2026-08-21) — do not wire one here without a
+# supervised pass first.
+#
+# Each run appends one JSON line to _BAC/system/retirement-reports.jsonl —
+# diagnostic history, not a growing log — bounded to the last 30 reports
+# (older lines pruned in the SAME run, right after the append).
+RETIREMENT_REPORT_RETAIN=30
+for VAULT in "$HOME/.sidetrack-vault" "$HOME/.sidetrack-vault-test"; do
+  [ -d "$VAULT" ] || continue
+  echo "$VAULT: hot-tail retirement eligibility report (report-only)"
+  # Human-readable summary in the maintenance log.
+  bun dist/cli.js retire-hot-tail --report --vault "$VAULT" 2>&1 | sed 's/^/  /'
+  # Machine-readable history: one compact JSON line appended per run.
+  REPORT_DIR="$VAULT/_BAC/system"
+  mkdir -p "$REPORT_DIR"
+  REPORT_FILE="$REPORT_DIR/retirement-reports.jsonl"
+  bun dist/cli.js retire-hot-tail --report --vault "$VAULT" --json 2>/dev/null >> "$REPORT_FILE"
+  if [ -f "$REPORT_FILE" ]; then
+    tail -n "$RETIREMENT_REPORT_RETAIN" "$REPORT_FILE" > "$REPORT_FILE.tmp" \
+      && mv "$REPORT_FILE.tmp" "$REPORT_FILE"
+  fi
 done
 
 echo "=== $(date -u +%FT%TZ) maintenance done"

@@ -225,6 +225,20 @@ export const renderHelp = (): string =>
     "    vault's recall process-lock. Rewrites run through EventLog's",
     '    runExclusiveMaintenance; there is no force path.',
     '',
+    'Retire-hot-tail subcommand (F2 — hot-tail retirement report, report-only):',
+    '  sidetrack-companion retire-hot-tail --report --vault <path> [--json]',
+    '    Per (replica, day) hot-tail JSONL shard: events sealed vs unsealed,',
+    '    hot-tail bytes retirable once APPLY ships, and the seal-coverage',
+    '    verdict (sealed-verified / store-drift / segment-corrupt /',
+    "    segment-missing / never-sealed / open) reusing the columnar tier's",
+    '    DuckDB-over-Parquet integrity check (src/analytics/eventScan.ts).',
+    '    ZERO writes: the event-store mirror is opened `{ readonly: true }`',
+    '    (never created, never caught up); sealed segments are only read via',
+    "    DuckDB; hot-tail shard files are only stat()'d, never read. Safe to",
+    '    run against a vault a live companion is serving. APPLY (retiring the',
+    '    hot tail) is a separate, consent-gated follow-up behind a soak',
+    '    period — this command only ever reports.',
+    '',
     'Connections-rebuild subcommand (user-consented full replay):',
     '  sidetrack-companion connections-rebuild --vault <path> [--json]',
     '    Rebuilds the connections graph from the COMPLETE event source and',
@@ -1490,6 +1504,95 @@ const runCompactEngagementSubcommand = async (
   }
 };
 
+// F2 — hot-tail retirement report (docs/plans/2026-08-15-foundation-program.md,
+// F2 row). REPORT-ONLY: `buildHotTailRetirementReport` never writes — the
+// event-store mirror is opened `{ readonly: true }` (never created, never
+// caught up), sealed segments are read via DuckDB (read-only by
+// construction), and hot-tail JSONL shard files are only `stat()`'d. No
+// process lock is needed or taken: unlike compact-engagement/gc --apply,
+// there is nothing here that could desync a live companion's in-memory
+// state, so this refuses nothing and is safe to run alongside one. APPLY
+// (actually retiring the hot tail) does not exist yet — it is a separate,
+// consent-gated follow-up behind the seal soak period; this command only
+// ever reports, hence requiring `--report` explicitly rather than defaulting
+// to it (an operator who types `--apply` today gets a clear refusal, not a
+// silent no-op).
+const runRetireHotTailSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(streams.stdout, 'Usage: sidetrack-companion retire-hot-tail --report --vault <path> [--json]');
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for retire-hot-tail.');
+    return 2;
+  }
+  const report = argv.includes('--report');
+  const apply = argv.includes('--apply');
+  if (apply) {
+    writeLine(
+      streams.stderr,
+      'retire-hot-tail --apply does not exist yet: F2 apply is gated on the seal soak period and',
+    );
+    writeLine(streams.stderr, 'ships as a separate, consent-gated command. Only --report is implemented.');
+    return 2;
+  }
+  if (!report) {
+    writeLine(streams.stderr, 'retire-hot-tail requires --report (the only implemented mode).');
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const { buildHotTailRetirementReport } = await import('./analytics/hotTailRetirement.js');
+  const result = await buildHotTailRetirementReport(vaultPath);
+  if (json) {
+    // Deliberately ONE line, no pretty-print indent (unlike sibling
+    // subcommands' --json): docs/runbooks/sidetrack-companion-maintenance.sh
+    // §6 appends this straight to a `.jsonl` history file — one record per
+    // line is the format, not a style choice.
+    writeLine(streams.stdout, JSON.stringify({ mode: 'report', result }));
+    return 0;
+  }
+  writeLine(
+    streams.stdout,
+    `retire-hot-tail report: vault=${vaultPath} sealManifestPresent=${String(
+      result.sealManifestPresent,
+    )} eventStoreMirrorPresent=${String(result.eventStoreMirrorPresent)}`,
+  );
+  writeLine(
+    streams.stdout,
+    `  shardsTotal=${String(result.totals.shardsTotal)} shardsEligible=${String(
+      result.totals.shardsEligible,
+    )} bytesRetirable=${String(result.totals.bytesRetirable)}`,
+  );
+  writeLine(
+    streams.stdout,
+    `  eventsUncoveredTotal=${String(result.totals.eventsUncoveredTotal)} segmentAlarms=${String(
+      result.totals.segmentAlarms,
+    )} storeDriftShards=${String(result.totals.storeDriftShards)} neverSealedShards=${String(
+      result.totals.neverSealedShards,
+    )} openShards=${String(result.totals.openShards)}`,
+  );
+  const blockers = result.shards.filter((shard) => !shard.retirementEligible && shard.verdict !== 'open');
+  if (blockers.length > 0) {
+    writeLine(streams.stdout, '  blockers (not yet retirement-eligible):');
+    for (const shard of blockers.slice(0, 20)) {
+      writeLine(
+        streams.stdout,
+        `    ${shard.replica}\t${shard.day}\t${shard.verdict}\tuncovered=${String(
+          shard.eventsUncovered,
+        )}\t${shard.detail}`,
+      );
+    }
+    if (blockers.length > 20) {
+      writeLine(streams.stdout, `    ... ${String(blockers.length - 20)} more not shown (capped at 20)`);
+    }
+  }
+  return result.totals.segmentAlarms === 0 ? 0 : 1;
+};
+
 // F8 IVM plan, W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
 // designs.md, "Recovery consent rule"). The materializer never auto-
 // invokes a full replay for a catastrophic-recovery condition on a
@@ -1716,6 +1819,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'membership-backfill') {
     return await runMembershipBackfillSubcommand(argv, streams);
+  }
+  if (argv[0] === 'retire-hot-tail') {
+    return await runRetireHotTailSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);
