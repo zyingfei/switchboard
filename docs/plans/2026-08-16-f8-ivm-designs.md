@@ -1,0 +1,93 @@
+# F8 designs — finish the IVM, demote full rebuild to an offline tool
+
+Source: F8 survey+design agent (2026-08-16), reviewed and amended by the
+coordinator. Evidence citations (file:line) are in the agent transcript;
+the load-bearing ones are restated here. Companion doc:
+2026-08-15-foundation-program.md (goal register).
+
+## Review verdict
+
+APPROVED with two amendments (below). Implementation in four waves,
+Sonnet-first, coordinator verifies each wave against its equivalence
+test before merge.
+
+## Root causes (verified)
+
+1. **Membership bail** = CRDT register resolved over a truncated window:
+   `thread_in_workstream` derives from `projectThread(mergeRegister(...))`
+   over `input.events`; a scoped window carries incomplete register
+   history, so the resolved value differs from truth regardless of real
+   changes. KEY FACT: `thread_in_workstream` has NO cross-thread
+   consumer (topic_in_workstream derives from visit attribution, not
+   thread membership) — a correct register makes recompute row-local.
+2. **Search bail** = two corpus-joins with no index:
+   `thread_text_mentions_search_query` (query × all capture/dispatch/
+   annotation text) and `same_search_query` ranker candidates (query ×
+   all visits). `closest_visit` carry-forward already preserves OLD
+   pairs on scoped drains; only NEW-pair minting is missing.
+3. **workstreamTree** invalidation = unconditional full rebuild on any
+   workstream CRUD; rare but unmitigated. `workstreamPathMemo` is
+   aspirational naming with no backing table.
+
+## Waves
+
+W1 — thread register store (kills the membership bail class):
+  `_BAC/connections/thread-register-facts.db`, table
+  `thread_register_state(bac_id PK, candidates_json, status_json,
+  deleted)` + per-replica `ingest_watermark` — REUSE timeline-facts.db's
+  watermark/catchUp lifecycle, but store RESOLVED register state (the
+  edges_index materialized-index pattern), not raw facts. Fold via the
+  SAME `mergeRegister` projection.ts uses. Drain: read register, if
+  membership changed push the thread scope into rowLocalScopes (existing
+  recomputeScope path). `threadDeltaFullBuildReason` is demoted to an
+  offline consistency check. Register under the connections-sidecar-dbs
+  GC family. Equivalence: multi-replica out-of-order conflicting
+  THREAD_UPSERTED across chunk boundaries; incremental register ==
+  projectThread(full log) at every watermark; thread_in_workstream edge
+  set byte-identical incremental vs full for reparent/archive/revive.
+
+W2 — search-visit incremental join (kills the search bail class):
+  sidecar `search_query_index(query_key, visit_key, observed_at)` (the
+  edges_index trigger idiom) + `capture_text_fts` FTS5 over capture/
+  dispatch/annotation text (the docs_fts idiom, recall-v2 sqlite store).
+  On a new search visit: select same-query visits from the index (feeds
+  the existing same_search_query→closest_visit path) + FTS match for
+  thread_text_mentions_search_query; also the reverse join (new capture
+  text × existing queries). AMENDMENT 1: the equivalence test MUST pin
+  tokenizer parity — FTS5's tokenizer vs the current JS whole-word
+  matcher (unicode, punctuation, case). If FTS5 cannot reproduce the JS
+  semantics exactly, put the candidate set through the JS matcher as a
+  post-filter (FTS as recall-only prefilter) so edges stay
+  byte-identical.
+
+W3 — demotion (all remaining bails → repair queue):
+  Every remaining skip branch: progress-only write (existing pattern) +
+  mark `scopedTimelineDelta.demoted reason=` + enqueue {scope, reason,
+  dot} in a persisted repair-queue table. AMENDMENT 2: no new worker
+  process — the repair queue is drained BY THE EXISTING reconcile child
+  at the start of each drain (bounded N scopes/drain through
+  recomputeScope/replaceScopeRows), preserving the single-writer
+  invariant and sidestepping the flagged locking question entirely.
+  Full rebuild becomes offline-only: `connections rebuild` /
+  `connections verify` CLI (audit = diff full vs served, alert on
+  divergence; recovery keeps the existing Layer-0
+  similarityRecoveryNeedsBaseRebuild path untouched). Health gains
+  repairQueueDepth so backlog is visible (never silent-stale).
+
+W4 — workstreamTree subtree scoping: materialize
+  `workstream_parent(bac_id, parent_id)`; a CRUD invalidates only the
+  affected subtree's workstream+thread scopes via bounded walk.
+
+## Interim state (already live)
+
+The hot-rebuild suppressor (#364) caps ALL bail classes at one healing
+rebuild per SIDETRACK_FULL_REBUILD_COOLDOWN_MS (dogfood 6h) with a
+sticky heal; boot inherits the on-disk snapshot as recently-built; the
+child is CPU-reniced (#354) and I/O-throttled (#363). The suppressor is
+deleted by W3 (demotion supersedes it).
+
+## Exit criteria (feeds the program's final validation)
+
+Steady-state week: zero `buildConnectionsSnapshot base` marks outside
+boot-cold-start/recovery/CLI; repairQueueDepth returns to 0 within one
+drain cycle of any enqueue; equivalence suites green in CI.
