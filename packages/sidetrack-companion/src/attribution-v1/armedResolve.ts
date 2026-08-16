@@ -32,12 +32,12 @@
 // skipReverseShadow:true so the health gauge reflects the shadow-free served
 // cost regardless of this flag.
 
-import { recordArmShadow } from './armShadow.js';
 import {
   loadAttributionV1State,
   titleForCanonicalUrlWithSource,
   type TitleWithSource,
 } from './emit.js';
+import { queueReverseShadow } from './reverseShadowDefer.js';
 import { attributionV1ShadowEnabled } from './shadow.js';
 import {
   attributionArm,
@@ -155,16 +155,22 @@ export const resolveUrlAttributionArmed = async (
     ...(tombstones === undefined ? {} : { tombstones }),
   });
 
-  // Reverse shadow: compute the incumbent beside the served vote arm and record
-  // agreement. Gated behind the v1-shadow flag so the incumbent PPR cost is
-  // droppable. Best-effort — a shadow failure never surfaces on the served path.
+  // Reverse shadow: compare the incumbent's answer against the served vote
+  // arm's and record agreement. Gated behind the v1-shadow flag so the
+  // incumbent PPR cost is droppable.
+  //
+  // PERF (2026-08-16) — DEFERRED off the serve path, not computed inline.
+  // Measured ~223ms/URL on the batch-resolve route (the incumbent pays the
+  // full PPR + similarity + cluster cost purely for the agreement tally).
+  // `resolverInput` is plain in-memory data (no live sqlite handle), safe to
+  // hold until the deferred job runs; `workstreamOf(voteResult)` is cheap
+  // (already-computed data, no PPR) so it is captured HERE rather than
+  // recomputed later. Every sample still counts exactly once — see
+  // reverseShadowDefer.ts for the full safety argument. The latency canary
+  // passes skipReverseShadow: true and never reaches this branch, so its
+  // measured cost is unaffected.
   if (skipReverseShadow !== true && attributionV1ShadowEnabled()) {
-    try {
-      const incumbent = resolveUrlAttribution(resolverInput);
-      recordArmShadow(workstreamOf(incumbent) === workstreamOf(voteResult));
-    } catch {
-      // observability only
-    }
+    queueReverseShadow(resolverInput, workstreamOf(voteResult));
   }
 
   // Attach the six guess lanes to the served vote result. The vote arm has no

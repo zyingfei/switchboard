@@ -35,6 +35,7 @@ import { VaultExportConfinementError, VaultUnavailableError } from './errors.js'
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import { createProblem, type ValidationIssue } from './problem.js';
 import { queueResolverCacheWrite, resolverCacheDeferEnabled, scheduleResolverCacheFlush } from './resolverCacheDefer.js';
+import { scheduleReverseShadowFlush } from '../attribution-v1/reverseShadowDefer.js';
 
 import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
 import type { CallerIdentity, CompanionHttpConfig, HttpMethod, RouteDefinition } from './routeSupport.js';
@@ -1813,6 +1814,11 @@ export const handleRequest = async (
     // scheduling at all, when the queue is empty — which is every request that
     // is not a batch-resolve with fresh misses.
     scheduleResolverCacheFlush();
+    // Same reasoning, same AFTER-the-response trigger point, for the
+    // reverse-shadow queue (reverseShadowDefer.ts) — the incumbent-resolver
+    // re-run that used to happen inline per miss URL now runs here instead.
+    // No-op when the shadow flag is off or the batch had zero misses.
+    scheduleReverseShadowFlush();
   }
 };
 
