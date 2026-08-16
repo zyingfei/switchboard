@@ -727,11 +727,33 @@ const isCurrentEvidenceForEmbeddingCompletion = (
   payload: PageEvidenceExtractedRequest,
 ): boolean => {
   if (record === null) return true;
-  if (
-    record.content?.contentHash !== undefined &&
-    record.content.contentHash !== payload.content.contentHash
-  ) {
-    return false;
+  if (record.content?.contentHash !== undefined) {
+    // Content hash IS the staleness signal once a record actually carries
+    // content: if it matches, this payload's content is byte-identical to
+    // what's currently on disk, so completing its embedding can never be
+    // "stale" — regardless of `record.updatedAt`.
+    //
+    // Root cause (2026-08-16, live-incident verified): `updatedAt` is
+    // NOT content-scoped. `writeMetadataOnlyPageEvidence` (called from
+    // `ensurePageEvidenceForTimelineEntries` on every timeline
+    // ensure/revisit) bumps `updatedAt` to the visit's `lastSeenAt` while
+    // carrying the existing `content` block forward UNCHANGED — so a page
+    // that is merely revisited (no content change at all) permanently
+    // pushes `record.updatedAt` past `payload.extractedAt`, the fixed
+    // timestamp the background-embedding lane's backlog reconstruction
+    // (`embedBacklogCanonicalUrl`) rebuilds from page-content. Comparing
+    // the two orderings under the OLD `return record.updatedAt <=
+    // payload.extractedAt` unconditionally rejected the completion before
+    // the embedder was ever called — on the live test vault this guard
+    // blocked 394/771 (51%) of the genuine indexed_chunks/missing
+    // backlog, verified by direct reproduction against a copy of the live
+    // page-content.db/page-evidence.db (see PR description). The lane
+    // then reported these as silent 'failed' outcomes with no reason,
+    // eventually quarantining them. Comparing contentHash equality
+    // instead of wall-clock ordering fixes the false rejection while
+    // still rejecting a genuinely stale payload (different contentHash)
+    // exactly as before.
+    return record.content.contentHash === payload.content.contentHash;
   }
   return record.updatedAt <= payload.extractedAt;
 };
@@ -1189,6 +1211,50 @@ export const createIncrementalBackgroundEmbeddingCandidateSource = (
   };
 };
 
+// Reason categories for a non-'embedded' outcome. AUDIBLE FAILURES: every
+// 'skipped'/'failed' attempt now carries WHY, so the lane's cycle log can
+// report a reason histogram instead of a bare count (the 2026-08-16
+// incident: `failed=4 skipped=4` every cycle with zero indication why —
+// a silent-failure violation of this repo's audible-drain-failure rule).
+//
+//   - 'no-page-content' — page-content has no current indexed payload for
+//     this URL (content-features-only page, purged, or never promoted).
+//     Not necessarily a bug — many content_features_only backlog entries
+//     genuinely never got a full-text page-content row.
+//   - 'stale-guard'     — `isCurrentEvidenceForEmbeddingCompletion` would
+//     reject (or did reject) the completion. BUG-CAUSED when it fires for
+//     a record whose content is actually unchanged (see the 2026-08-16
+//     fix above) — legitimate only when page-content is genuinely behind
+//     a newer page-evidence write (rare, self-heals next cycle).
+//   - 'embed-error'     — the embedder ran but produced no usable vector
+//     (threw, returned no vectors, or wrong dimensionality).
+//   - 'not-persisted'   — the completion reported success but the
+//     read-back at the requested key does not show it (the 676k-phantom-
+//     success class this module's read-back check already guards
+//     against; kept as its own category since it is a DIFFERENT bug class
+//     than an embedder failure).
+export type BackgroundEmbeddingFailureReason =
+  | 'no-page-content'
+  | 'stale-guard'
+  | 'embed-error'
+  | 'not-persisted';
+
+/** Bug-caused reason categories: quarantine caused by these is eligible
+ *  for the one-time boot requeue (see `requeueQuarantinedEmbeddingBacklog`
+ *  below). 'no-page-content' and 'embed-error' are deliberately EXCLUDED —
+ *  they can reflect a genuinely-unembeddable record (no full text ever
+ *  captured, or content the embedder legitimately can't vectorize) and
+ *  must not be resurrected on every boot. */
+export const REQUEUE_ELIGIBLE_FAILURE_REASONS: readonly BackgroundEmbeddingFailureReason[] = [
+  'stale-guard',
+  'not-persisted',
+];
+
+export type BackgroundEmbeddingAttemptResult =
+  | 'embedded'
+  | { readonly outcome: 'skipped'; readonly reason: BackgroundEmbeddingFailureReason }
+  | { readonly outcome: 'failed'; readonly reason: BackgroundEmbeddingFailureReason };
+
 /**
  * Embed one backlog canonical URL by reconstructing the extraction
  * payload (with raw text) from the page-content store, then routing it
@@ -1198,18 +1264,19 @@ export const createIncrementalBackgroundEmbeddingCandidateSource = (
  * embedder child.
  *
  * Returns:
- *   - 'skipped'  — no indexed content payload on disk (content-features-
- *                  only page, or raw text absent). Not a failure.
  *   - 'embedded' — a ready vector now backs the record.
- *   - 'failed'   — the record still has no ready vector after the pass
- *                  (embed threw, or produced no vector).
+ *   - `{outcome: 'skipped', reason}` — no indexed content payload on disk
+ *     (content-features-only page, or raw text absent). Not a failure.
+ *   - `{outcome: 'failed', reason}` — the record still has no ready
+ *     vector after the pass; `reason` classifies why (see
+ *     `BackgroundEmbeddingFailureReason` above).
  */
 export const embedBacklogCanonicalUrl = async (
   vaultRoot: string,
-): Promise<(canonicalUrl: string) => Promise<'embedded' | 'skipped' | 'failed'>> => {
+): Promise<(canonicalUrl: string) => Promise<BackgroundEmbeddingAttemptResult>> => {
   return async (rawCanonicalUrl) => {
     const payload = await readPageContentExtractedPayloadForEvidence(vaultRoot, rawCanonicalUrl);
-    if (payload === null) return 'skipped';
+    if (payload === null) return { outcome: 'skipped', reason: 'no-page-content' };
     // ONE KEY, END TO END. The page-content read canonicalizes with the
     // page-content rules (sorted query params, tracking params stripped),
     // which for multi-param URLs is a DIFFERENT string than the evidence
@@ -1219,13 +1286,21 @@ export const embedBacklogCanonicalUrl = async (
     // (676,537 phantom successes against a frozen backlog of ~453 on the
     // live vault). Pin the write to the evidence key that was requested.
     const requestedKey = canonicalizeEvidenceUrl(rawCanonicalUrl);
-    const record = await completeExtractedPageEvidenceEmbedding(vaultRoot, {
+    const normalizedPayload: PageEvidenceExtractedRequest = {
       ...payload,
       canonicalUrl: requestedKey,
       storageMode: 'indexed_chunks',
-    });
+    };
+    // Classify BEFORE calling complete...() so a guard-caused rejection is
+    // distinguishable from a genuine embedder failure: read the record as
+    // completeExtractedPageEvidenceEmbedding itself is about to, and ask
+    // the SAME predicate whether it will reject the completion.
+    const before = await readRawPageEvidence(vaultRoot, requestedKey);
+    const wouldGuardBlock =
+      before !== null && !isCurrentEvidenceForEmbeddingCompletion(before, normalizedPayload);
+    const record = await completeExtractedPageEvidenceEmbedding(vaultRoot, normalizedPayload);
     if (record.content?.embeddingState !== 'ready' || record.content.docEmbeddingRef === undefined) {
-      return 'failed';
+      return { outcome: 'failed', reason: wouldGuardBlock ? 'stale-guard' : 'embed-error' };
     }
     // Completion is what is ON DISK at the requested key, not what the
     // in-memory return claims (same read-back discipline as the body
@@ -1239,7 +1314,7 @@ export const embedBacklogCanonicalUrl = async (
     ) {
       return 'embedded';
     }
-    return 'failed';
+    return { outcome: 'failed', reason: 'not-persisted' };
   };
 };
 
@@ -1253,6 +1328,19 @@ export interface BackgroundEmbeddingProgressArtifact {
   readonly attemptsByCanonicalUrl: Record<string, number>;
   readonly embeddedTotal: number;
   readonly lastRunAtMs: number | null;
+  // Additive/optional — the LANE (backgroundEmbeddingLane.ts) writes a
+  // richer progress object (quarantinedAtMsByCanonicalUrl, lastSuccessAtMs,
+  // and — as of the 2026-08-16 audible-failures fix —
+  // lastFailureReasonByCanonicalUrl) that structurally satisfies this
+  // interface; declared here too so store.ts's own readers/writers
+  // (the boot-time requeue sweep) can see them without an `as` cast.
+  readonly quarantinedAtMsByCanonicalUrl?: Record<string, number>;
+  readonly lastSuccessAtMs?: number | null;
+  /** canonicalUrl -> the reason of its most recent 'failed' outcome.
+   *  Cleared on success. Drives the boot-time requeue sweep: only
+   *  BUG-CAUSED reasons (REQUEUE_ELIGIBLE_FAILURE_REASONS) are eligible,
+   *  so a genuinely-unembeddable record is never resurrected. */
+  readonly lastFailureReasonByCanonicalUrl?: Record<string, string>;
 }
 
 export const readBackgroundEmbeddingProgress = async (
@@ -1270,4 +1358,59 @@ export const writeBackgroundEmbeddingProgress = async (
   progress: BackgroundEmbeddingProgressArtifact,
 ): Promise<void> => {
   await atomicWriteJson(backgroundEmbeddingProgressPath(vaultRoot), progress);
+};
+
+export interface RequeueQuarantinedEmbeddingBacklogResult {
+  /** canonicalUrls whose attempt/quarantine bookkeeping was cleared. */
+  readonly requeued: readonly string[];
+}
+
+/**
+ * One-time, bounded, CATEGORY-SCOPED requeue for quarantined
+ * background-embedding backlog entries. Run ONCE at boot (before the lane
+ * starts) so records that were quarantined by a bug — not by genuinely
+ * being unembeddable — get one more shot without operator intervention.
+ *
+ * Only entries whose most-recently-recorded failure reason is in
+ * `reasons` (default REQUEUE_ELIGIBLE_FAILURE_REASONS) are cleared. A
+ * quarantined entry with an UNRECORDED reason (progress written before
+ * this field existed) or a reason outside the allowlist (e.g.
+ * 'no-page-content', 'embed-error') is left alone — "do not resurrect
+ * genuinely-bad items" (2026-08-16 incident fix requirement).
+ *
+ * Bounded: this touches at most the number of currently-quarantined
+ * entries (a few hundred at worst on the live vault) and runs exactly
+ * once per process start — it is NOT part of the lane's per-cycle loop.
+ */
+export const requeueQuarantinedEmbeddingBacklog = async (
+  vaultRoot: string,
+  reasons: readonly BackgroundEmbeddingFailureReason[] = REQUEUE_ELIGIBLE_FAILURE_REASONS,
+): Promise<RequeueQuarantinedEmbeddingBacklogResult> => {
+  const progress = await readBackgroundEmbeddingProgress(vaultRoot);
+  if (progress === null) return { requeued: [] };
+  const quarantinedAt = progress.quarantinedAtMsByCanonicalUrl ?? {};
+  const lastFailureReason = progress.lastFailureReasonByCanonicalUrl ?? {};
+  const eligible = new Set<BackgroundEmbeddingFailureReason>(reasons);
+  const requeued: string[] = [];
+  const nextAttempts = { ...progress.attemptsByCanonicalUrl };
+  const nextQuarantinedAt = { ...quarantinedAt };
+  const nextLastFailureReason = { ...lastFailureReason };
+  for (const canonicalUrl of Object.keys(quarantinedAt)) {
+    const reason = lastFailureReason[canonicalUrl];
+    if (reason === undefined || !eligible.has(reason as BackgroundEmbeddingFailureReason)) {
+      continue;
+    }
+    delete nextAttempts[canonicalUrl];
+    delete nextQuarantinedAt[canonicalUrl];
+    delete nextLastFailureReason[canonicalUrl];
+    requeued.push(canonicalUrl);
+  }
+  if (requeued.length === 0) return { requeued: [] };
+  await writeBackgroundEmbeddingProgress(vaultRoot, {
+    ...progress,
+    attemptsByCanonicalUrl: nextAttempts,
+    quarantinedAtMsByCanonicalUrl: nextQuarantinedAt,
+    lastFailureReasonByCanonicalUrl: nextLastFailureReason,
+  });
+  return { requeued };
 };

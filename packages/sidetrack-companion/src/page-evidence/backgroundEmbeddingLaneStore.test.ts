@@ -13,8 +13,11 @@ import {
   listBackgroundEmbeddingCandidates,
   readBackgroundEmbeddingDiscoveryIndex,
   readBackgroundEmbeddingProgress,
+  readPageEvidence,
+  requeueQuarantinedEmbeddingBacklog,
   writeBackgroundEmbeddingProgress,
   writeExtractedPageEvidenceFast,
+  writeMetadataOnlyPageEvidence,
 } from './store.js';
 import type { PageEvidenceExtractedRequest } from './types.js';
 
@@ -114,12 +117,64 @@ describe('background-embedding lane store adapters', () => {
     expect(isBackgroundEmbeddingBacklog(after[0]!)).toBe(false);
   });
 
+  it('embeds a backlog record whose evidence was touched by a LATER revisit (2026-08-16 regression)', async () => {
+    // ROOT CAUSE (verified against the live test vault's page-content.db /
+    // page-evidence.db, 394/771 = 51% of the genuine indexed_chunks/
+    // missing backlog): `writeMetadataOnlyPageEvidence` — called from
+    // `ensurePageEvidenceForTimelineEntries` on every timeline
+    // ensure/revisit — bumps the evidence record's `updatedAt` to the
+    // visit's `lastSeenAt` while carrying the existing `content` block
+    // forward UNCHANGED. The background-embedding lane's backlog
+    // reconstruction (`embedBacklogCanonicalUrl`) rebuilds a payload from
+    // page-content whose `extractedAt` stays fixed at the ORIGINAL
+    // extraction time. Before the fix, `isCurrentEvidenceForEmbeddingCompletion`
+    // compared `record.updatedAt <= payload.extractedAt` unconditionally
+    // and rejected the completion — even though the content (contentHash)
+    // was byte-identical — so a merely-REVISITED page could never be
+    // embedded by the backlog lane.
+    await writePageContentExtracted(root, {
+      payloadVersion: 1,
+      canonicalUrl: CANONICAL,
+      url: CANONICAL,
+      title: 'F16 Minipack Data Center Fabric',
+      extractedAt: '2026-05-16T10:00:00.000Z',
+      extractionSource: 'reader-mode',
+      extractionPolicy: { trigger: 'manual' },
+      quality: 'high',
+      qualitySignals: payload().qualitySignals,
+      content: payload().content,
+    });
+    await writeExtractedPageEvidenceFast(root, payload());
+
+    // Simulate a revisit landing AFTER the original extraction — exactly
+    // what `ensurePageEvidenceForTimelineEntries` does on every re-ensure.
+    // This bumps `updatedAt` to `lastSeenAt` while the content block (and
+    // its contentHash) is carried forward unchanged.
+    const revisited = await writeMetadataOnlyPageEvidence(root, {
+      canonicalUrl: CANONICAL,
+      url: CANONICAL,
+      lastSeenAt: '2026-05-16T10:05:00.000Z', // later than payload.extractedAt above
+    });
+    expect(revisited.updatedAt > payload().extractedAt).toBe(true);
+    expect(revisited.content?.embeddingState).toBe('missing'); // still backlog
+
+    const embedOne = await embedBacklogCanonicalUrl(root);
+    const outcome = await embedOne(CANONICAL);
+    expect(outcome).toBe('embedded');
+
+    const after = await readPageEvidence(root, CANONICAL);
+    expect(after.record?.content?.embeddingState).toBe('ready');
+    expect(after.record?.content?.docEmbeddingRef).toBeDefined();
+  });
+
   it('embedBacklogCanonicalUrl skips a record with no indexed content payload', async () => {
     // Evidence written features-only (no page-content raw text on disk):
     // the reconstruction returns null, so the lane must skip (not fail).
     await writeExtractedPageEvidenceFast(root, payload({ storageMode: 'features_only' }));
     const embedOne = await embedBacklogCanonicalUrl(root);
-    expect(await embedOne(CANONICAL)).toBe('skipped');
+    // AUDIBLE FAILURES: skip now carries WHY (page-content has no current
+    // indexed payload for this URL) instead of a bare string.
+    expect(await embedOne(CANONICAL)).toEqual({ outcome: 'skipped', reason: 'no-page-content' });
   });
 
   it('persists + reads the progress artifact round-trip', async () => {
@@ -245,5 +300,100 @@ describe('incremental background-embedding discovery', () => {
     const c3 = await restarted.listCandidates();
     expect(c3).toHaveLength(5);
     expect(restarted.lastScan().filesRead).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Boot-time requeue for bug-caused quarantine (2026-08-16 incident, item
+// 4): entries quarantined for a BUG-CAUSED reason ('stale-guard',
+// 'not-persisted') get one bounded, one-time fresh shot. Entries
+// quarantined for a reason that can reflect a genuinely-unembeddable
+// record ('no-page-content', 'embed-error') — or with no recorded reason
+// at all — must NOT be resurrected.
+// ─────────────────────────────────────────────────────────────────────
+describe('requeueQuarantinedEmbeddingBacklog', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'sidetrack-embed-lane-requeue-'));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it('clears only bug-caused reasons, leaving genuinely-bad and unrecorded entries quarantined', async () => {
+    await writeBackgroundEmbeddingProgress(root, {
+      schemaVersion: 1,
+      attemptsByCanonicalUrl: {
+        'https://stale-guard.test': 3,
+        'https://not-persisted.test': 3,
+        'https://embed-error.test': 3,
+        'https://no-page-content.test': 3,
+        'https://unrecorded.test': 3,
+      },
+      quarantinedAtMsByCanonicalUrl: {
+        'https://stale-guard.test': 1_000,
+        'https://not-persisted.test': 1_000,
+        'https://embed-error.test': 1_000,
+        'https://no-page-content.test': 1_000,
+        'https://unrecorded.test': 1_000,
+      },
+      lastFailureReasonByCanonicalUrl: {
+        'https://stale-guard.test': 'stale-guard',
+        'https://not-persisted.test': 'not-persisted',
+        'https://embed-error.test': 'embed-error',
+        'https://no-page-content.test': 'no-page-content',
+        // 'https://unrecorded.test' intentionally has no entry.
+      },
+      embeddedTotal: 0,
+      lastRunAtMs: 1_000,
+    });
+
+    const result = await requeueQuarantinedEmbeddingBacklog(root);
+    expect(new Set(result.requeued)).toEqual(
+      new Set(['https://stale-guard.test', 'https://not-persisted.test']),
+    );
+
+    const after = await readBackgroundEmbeddingProgress(root);
+    // Bug-caused entries: attempts + quarantine + reason all cleared.
+    expect(after?.attemptsByCanonicalUrl['https://stale-guard.test']).toBeUndefined();
+    expect(after?.quarantinedAtMsByCanonicalUrl?.['https://stale-guard.test']).toBeUndefined();
+    expect(after?.attemptsByCanonicalUrl['https://not-persisted.test']).toBeUndefined();
+    expect(after?.quarantinedAtMsByCanonicalUrl?.['https://not-persisted.test']).toBeUndefined();
+    // Genuinely-bad / unrecorded entries: untouched.
+    expect(after?.attemptsByCanonicalUrl['https://embed-error.test']).toBe(3);
+    expect(after?.quarantinedAtMsByCanonicalUrl?.['https://embed-error.test']).toBe(1_000);
+    expect(after?.attemptsByCanonicalUrl['https://no-page-content.test']).toBe(3);
+    expect(after?.quarantinedAtMsByCanonicalUrl?.['https://no-page-content.test']).toBe(1_000);
+    expect(after?.attemptsByCanonicalUrl['https://unrecorded.test']).toBe(3);
+    expect(after?.quarantinedAtMsByCanonicalUrl?.['https://unrecorded.test']).toBe(1_000);
+  });
+
+  it('is a one-time sweep: running it again requeues nothing further for already-cleared entries', async () => {
+    await writeBackgroundEmbeddingProgress(root, {
+      schemaVersion: 1,
+      attemptsByCanonicalUrl: { 'https://stale-guard.test': 3 },
+      quarantinedAtMsByCanonicalUrl: { 'https://stale-guard.test': 1_000 },
+      lastFailureReasonByCanonicalUrl: { 'https://stale-guard.test': 'stale-guard' },
+      embeddedTotal: 0,
+      lastRunAtMs: 1_000,
+    });
+
+    const first = await requeueQuarantinedEmbeddingBacklog(root);
+    expect(first.requeued).toEqual(['https://stale-guard.test']);
+
+    const second = await requeueQuarantinedEmbeddingBacklog(root);
+    expect(second.requeued).toEqual([]);
+  });
+
+  it('is a no-op when there is no persisted progress or nothing quarantined', async () => {
+    expect(await requeueQuarantinedEmbeddingBacklog(root)).toEqual({ requeued: [] });
+    await writeBackgroundEmbeddingProgress(root, {
+      schemaVersion: 1,
+      attemptsByCanonicalUrl: {},
+      embeddedTotal: 0,
+      lastRunAtMs: 1_000,
+    });
+    expect(await requeueQuarantinedEmbeddingBacklog(root)).toEqual({ requeued: [] });
   });
 });
