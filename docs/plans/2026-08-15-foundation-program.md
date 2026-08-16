@@ -951,3 +951,107 @@ PR: fix(store): index migration must not loop under the child watchdog
 (branch `fix/child-index-migration-loop`) — title kept per the task's
 instruction; the shipped fix targets `connections/snapshot.ts`, not an
 eventStore.ts migration, per the root-cause finding above.
+
+**2026-08-16 — SQL statement + phase budgets, CI query-plan lint
+(feat/sql-budget-plan-lint).** GUARDRAIL, not an F1–F7 item — filed here
+per the "binding plan tracks reality" rule, direct follow-up to the
+reconcile-child watchdog-loop incident above. That incident's ONLY
+signal was a 30-minute no-progress SIGKILL loop with zero attribution
+(which statement? which table? which plan?) — most of a day was spent
+finding the one `deleteOrphanEdges` call and the two triggers
+(`trg_edges_index_au`/`_ad`) actually responsible. This change is the
+standing guardrail so the SAME bug class (a missing index turning an
+O(n) operation into O(n·table_size)) surfaces in seconds-to-minutes with
+attribution, in production AND in CI, never again only via a 30-minute
+kill loop. Three independent layers, each detection/attribution only —
+none of them interrupt or kill a query (bun:sqlite has no
+`sqlite3_progress_handler` binding, and killing mid-write is its own
+risk class per the M7 hang-safety notes in
+`connectionsReconcileChildClient.ts`):
+
+1. **Statement budget (runtime).** `src/runtime/sqlBudget.ts` —
+   `budgetedStatement(db, site, sql)` drop-in-replaces `db.query(sql)`,
+   timing every `.run()`/`.all()`/`.get()` with a plain
+   `performance.now()` diff (no async, no allocation on the fast path;
+   measured overhead ~40-70ns/call, target <2µs/call, verified in
+   `sqlBudget.test.ts`). Over `SIDETRACK_SQL_BUDGET_MS` (default `1000`)
+   → one throttled `[sql.slow] ms=… site=… sql=<first 120 chars>` line
+   + a per-site counter (never silently dropped — the counter still
+   increments when the log line is throttled, so a statement stuck in a
+   tight loop, the incident's own shape, cannot flood the log but also
+   cannot hide). Over `SIDETRACK_SQL_BUDGET_HARD_MS` (default `60000`)
+   → additionally runs `EXPLAIN QUERY PLAN` for the statement on the
+   same handle, AFTER it completes, best-effort. Wired into
+   `connections/snapshot.ts` first (the incident site) at its ~13
+   hottest call sites — `replaceScopeRows`' delete-path statements
+   (including the exact `deleteOrphanEdges` from #378), the resolver
+   cache read/write, the resolver subgraph traversal reads, and the
+   projection-accumulator upserts. Other bun:sqlite-backed stores can
+   adopt incrementally — nothing in the module is connections-specific.
+
+2. **Phase budget (child).** `src/runtime/phaseBudget.ts` —
+   `checkPhaseBudgetExceeded(phaseDurations)` logs
+   `[phase.budget-exceeded] phase=… dt=… budgetMs=…` for any phase over
+   `SIDETRACK_PHASE_BUDGET_MS` (default `120000`). WIRING NOTE:
+   `connectionsMaterializer.ts` was off-limits for this change (operator
+   directive) and its `mark()` closure (the actual per-phase
+   `[connections-phase]` emitter, `buildAndWrite`, ~line 3652) formats
+   and logs inline with no shared utility to hook — so this is wired
+   into `collectMaterializerDiagnostics` in `materializerDiagnostics.ts`
+   instead, which `connectionsMaterializer.ts` already calls exactly
+   once per drain with the SAME raw `phaseDurations` array `mark()`
+   built. Trade-off, stated precisely: the alarm fires once the whole
+   drain finishes, not the instant the slow phase's own `mark()` would
+   have — acceptable because a phase wedged inside one synchronous
+   bun:sqlite call (the incident shape) can't make `mark()` fire either
+   until that call returns; the statement budget above is the layer
+   that actually alarms DURING such a phase, seconds in, from the first
+   slow statement. The existing no-progress watchdog remains the hard
+   backstop; this and the statement budget are audible-drain-failure
+   only — the log IS the alarm, never a throw, never a kill.
+
+3. **Plan lint (CI).** `src/connections/queryPlanLint.test.ts` — opens a
+   REAL `SqliteConnectionsStore(':memory:')` (the store's own
+   schema-init DDL, never hand-copied), seeds ~4,000 rows per big table
+   (`nodes`, `edges`, `edges_index` via the real triggers,
+   `connections_scope_nodes/edges`, `connections_resolver_cache`, both
+   projection-accumulator tables, `connections_applied_intervals`) so
+   SQLite's cost-based planner is honest at real-vault shape, runs
+   `ANALYZE`, then `EXPLAIN QUERY PLAN` over a 16-statement registry
+   (file:line pointers + a "how to register a new one" comment live
+   next to the array) and fails on any `SCAN <large-table>` not
+   explicitly allow-listed for that statement's own (unavoidable)
+   target. CRITICAL per the task's ask: trigger bodies are included —
+   `trg_edges_index_ai/au/ad` are extracted LIVE from `sqlite_master`
+   (never hand-copied, so they can't silently drift from production),
+   split into their individual statements, and `OLD.`/`NEW.` references
+   are substituted with a literal placeholder string
+   (`/\b(OLD|NEW)\.(\w+)/gi` → `'query-plan-lint-literal'`) so each
+   embedded statement can be EXPLAINed standalone outside a live trigger
+   firing — EXPLAIN QUERY PLAN never evaluates row content, so the
+   substituted value is irrelevant, only the resulting SQL shape
+   matters. A dedicated regression test proves the lint catches the
+   #378 bug class: it drops `idx_edges_index_src_dst` post-seed and
+   asserts `trg_edges_index_au`/`_ad` NOW report `SCAN edges_index`
+   (they don't with the index present). Ran against CURRENT main schema
+   (already carrying the #378 fix): all 16 registry entries clean, zero
+   additional unexpected scans found — `readIncidentEdgesForNodes`'s
+   `src IN (…) OR dst IN (…)` resolves via SQLite's `MULTI-INDEX OR`
+   (both `idx_edges_src`/`idx_edges_dst`), `deleteOrphanNodes`'s
+   `IN (SELECT … FROM temp_replace_nodes)` resolves via an index-driven
+   IN-operator rather than scanning `nodes` at all.
+
+Registering a new hot statement: add an entry to `HOT_STATEMENTS` in
+`queryPlanLint.test.ts` (SQL text + `sourceRef` file:line pointer +
+`allowScanTables` only for a statement's own unavoidable DELETE/UPDATE
+target) — see the comment block at the top of that file. Envs:
+`SIDETRACK_SQL_BUDGET_MS` (1000), `SIDETRACK_SQL_BUDGET_HARD_MS`
+(60000), `SIDETRACK_PHASE_BUDGET_MS` (120000) — all three re-read
+`process.env` on every call (no caching, matching
+`connectionsReconcileChildClient.ts`'s `noProgressTimeoutMs`
+convention), so tests can flip them per-case without a module reload
+and any process that mutates its own `process.env` at runtime (or is
+launched with the var already set) picks the value up immediately.
+
+PR: feat(runtime): SQL statement/phase budgets + CI query-plan lint
+(SCAN tripwire) (branch `feat/sql-budget-plan-lint`).
