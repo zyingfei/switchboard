@@ -271,7 +271,11 @@ import {
   isThreadStatusPayload,
   isThreadUpsertedPayload,
 } from '../../threads/events.js';
-import { projectThread } from '../../threads/projection.js';
+import { projectThread, type ThreadProjection } from '../../threads/projection.js';
+import {
+  createThreadRegisterStore,
+  type ThreadRegisterStore,
+} from '../../threads/threadRegisterStore.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -608,6 +612,13 @@ const engagementFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_ENGAGEMENT_FACTS_STORE'] === '1';
 const timelineFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_TIMELINE_FACTS_STORE'] === '1';
+// F8 W1 — thread register store (kills the thread-workstream-membership
+// scoped-delta bail: see threadRegisterStore.ts's header for the root
+// cause). Off by default, matching the sibling fact stores' rollout
+// posture (byte-equivalent + verified, opt-in via env=1 pending a
+// dogfood soak).
+const threadRegisterStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_THREAD_REGISTER_STORE'] === '1';
 // Scoped re-visit no-op fast path (default ON; disable with =0 + restart
 // for instant rollback). When a drain window touches scopes that own
 // graph rows but carries NO graph-row-affecting event (no
@@ -873,6 +884,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly engagementClassStore?: EngagementClassRevisionStore;
   readonly engagementFactsStore?: EngagementFactsStore;
   readonly timelineFactsStore?: TimelineFactsStore;
+  readonly threadRegisterStore?: ThreadRegisterStore;
   readonly eventStore?: EventStore;
   readonly rankerRetrainer?: RankerRetrainer;
   readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
@@ -1519,6 +1531,14 @@ export const createConnectionsMaterializer = (
   let timelineFactStore: TimelineFactsStore | null = null;
   let timelineFactStoreInit: Promise<TimelineFactsStore> | null = null;
   let timelineFactStoreUnavailable = false;
+  // F8 W1 — persistent thread register store (lazy-opened; survives
+  // restart). Bucketed by bac_id so the materializer can read a
+  // thread's COMPLETE relevant-event history without a full-log scan;
+  // see threadRegisterStore.ts's header for why this kills the
+  // scoped-delta membership bail.
+  let threadRegisterStore: ThreadRegisterStore | null = null;
+  let threadRegisterStoreInit: Promise<ThreadRegisterStore> | null = null;
+  let threadRegisterStoreUnavailable = false;
   let eventStore: EventStore | null = null;
   let eventStoreInit: Promise<EventStore> | null = null;
   let eventStoreUnavailable = false;
@@ -1554,6 +1574,22 @@ export const createConnectionsMaterializer = (
     } catch {
       timelineFactStoreUnavailable = true;
       timelineFactStoreInit = null;
+      return null;
+    }
+  };
+  const ensureThreadRegisterStore = async (): Promise<ThreadRegisterStore | null> => {
+    if (threadRegisterStore !== null) return threadRegisterStore;
+    if (threadRegisterStoreUnavailable) return null;
+    try {
+      threadRegisterStoreInit ??=
+        deps.threadRegisterStore !== undefined
+          ? Promise.resolve(deps.threadRegisterStore)
+          : createThreadRegisterStore(deps.vaultRoot);
+      threadRegisterStore = await threadRegisterStoreInit;
+      return threadRegisterStore;
+    } catch {
+      threadRegisterStoreUnavailable = true;
+      threadRegisterStoreInit = null;
       return null;
     }
   };
@@ -2599,6 +2635,45 @@ export const createConnectionsMaterializer = (
     return true;
   };
 
+  // F8 W1 — the same workstream-membership extraction snapshot.ts's Pass 1
+  // performs (buildConnectionsSnapshot's membershipCandidates loop), but
+  // read off a ThreadRegisterStore projection instead of a built snapshot's
+  // edges. Used to compare the AUTHORITATIVE (complete-history) register
+  // resolution against the previous served snapshot BEFORE a scoped build
+  // even runs, so the drain gate below can decide row-locally without the
+  // window-blind chicken/egg of building a snapshot first.
+  const threadWorkstreamIdsFromRegister = (projection: ThreadProjection): ReadonlySet<string> => {
+    if (projection.deleted) return new Set();
+    if (projection.record.status === 'resolved') {
+      const id = projection.record.value?.primaryWorkstreamId;
+      return id === undefined || id.length === 0 ? new Set() : new Set([id]);
+    }
+    return new Set(
+      projection.record.candidates
+        .map((candidate) => candidate.value.primaryWorkstreamId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0),
+    );
+  };
+
+  // Extracts the bac_id a thread-register-relevant event targets, mirroring
+  // threadRegisterStore.ts's own classification (kept in sync manually since
+  // the store's classifier is private — both read the same exported type
+  // guards from threads/events.js).
+  const threadBacIdForRegisterEvent = (evt: AcceptedEvent): string | undefined => {
+    if (evt.type === THREAD_UPSERTED && isThreadUpsertedPayload(evt.payload)) {
+      return evt.payload.bac_id;
+    }
+    if (
+      (evt.type === THREAD_ARCHIVED ||
+        evt.type === THREAD_UNARCHIVED ||
+        evt.type === THREAD_DELETED) &&
+      isThreadStatusPayload(evt.payload)
+    ) {
+      return evt.payload.bac_id;
+    }
+    return undefined;
+  };
+
   const threadDeltaFullBuildReason = (input: {
     readonly previousSnapshot: ConnectionsSnapshot;
     readonly scopedSnapshot: ConnectionsSnapshot;
@@ -3595,6 +3670,27 @@ export const createConnectionsMaterializer = (
     } else {
       engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
       mark(`engagementClassifier (legacy) inputs=${String(engagementInputs.length)}`);
+    }
+    // F8 W1 — catch the thread register store up BEFORE the scoped-delta
+    // gate below reads it. Same lifecycle discipline as the sibling fact
+    // stores above: catch up from the full merged set filtered by the
+    // store's OWN watermark (not the drain's pendingEventsForDrain window
+    // — a cold store must backfill its complete per-thread history once,
+    // the same way timelineFactStore/engagementFactStore do, or its
+    // "authoritative" read would just be a different kind of incomplete).
+    // Ingest itself is cheap: only the four thread event types are
+    // bucketed, everything else is a fast type-check no-op that still
+    // advances the watermark.
+    const threadRegisterFactStore = threadRegisterStoreEnabled()
+      ? await ensureThreadRegisterStore()
+      : null;
+    if (threadRegisterFactStore !== null) {
+      await threadRegisterFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(threadRegisterFactStore.watermark()),
+      );
+      mark('threadRegisterFactStore.catchUp');
     }
     // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
     // arrived since last drain AND a cached revision exists, reuse it
@@ -5925,6 +6021,59 @@ export const createConnectionsMaterializer = (
           deletedThreadIdsForScopedDelta.add(scope.id);
         }
       }
+      // F8 W1 — thread register store membership correction. Compare the
+      // AUTHORITATIVE (complete per-thread history) register resolution
+      // against the PREVIOUS SERVED snapshot's membership — not the
+      // window-built scopedSnapshot, which doesn't exist yet at this point
+      // and is exactly the comparison that was window-blind before. A real
+      // membership change is expected to differ here and must NOT trigger
+      // the full-rebuild bail below (threadDeltaFullBuildReason): it is
+      // handled row-locally by splicing the thread's COMPLETE stored event
+      // history into the scoped build's `events` in place of the drain
+      // window's (possibly incomplete) slice for that bac_id, so
+      // buildConnectionsSnapshot's own projectThread call resolves the
+      // SAME way a full rebuild would for that one thread — everything
+      // else in the drain stays scoped/cheap. Threads the store hasn't
+      // observed (cold store, mid-backfill) fall through to the existing
+      // window-based bail below unchanged — no unsafe assumption of "no
+      // change" when the register itself is unavailable.
+      const registerCorrectedThreadIds = new Set<string>();
+      const registerCorrectedThreadEvents: AcceptedEvent[] = [];
+      if (threadRegisterFactStore !== null) {
+        for (const scope of dirtyThreadScopes) {
+          if (scope.kind !== 'thread' || deletedThreadIdsForScopedDelta.has(scope.id)) continue;
+          const registered = threadRegisterFactStore.read(scope.id);
+          if (registered === undefined) continue;
+          const registerWorkstreams = threadWorkstreamIdsFromRegister(registered);
+          const previousWorkstreams = threadWorkstreamIdsFromSnapshot(
+            previousSnapshotForScopedDelta,
+            scope.id,
+          );
+          if (!setsEqual(registerWorkstreams, previousWorkstreams)) {
+            registerCorrectedThreadIds.add(scope.id);
+            registerCorrectedThreadEvents.push(...threadRegisterFactStore.eventsFor(scope.id));
+          }
+        }
+        if (registerCorrectedThreadIds.size > 0) {
+          mark(
+            `threadRegisterFactStore.membershipCorrected threads=${String(registerCorrectedThreadIds.size)} events=${String(registerCorrectedThreadEvents.length)}`,
+          );
+        }
+      }
+      // Replace the drain-window slice for corrected bac_ids with the
+      // store's complete history for that bac_id (never both — a
+      // duplicated dot would manufacture a spurious causal conflict when
+      // buildConnectionsSnapshot's projectThread re-folds it).
+      const scopedDeltaEventsForBuild =
+        registerCorrectedThreadIds.size === 0
+          ? scopedDeltaEvents
+          : [
+              ...scopedDeltaEvents.filter((evt) => {
+                const bacId = threadBacIdForRegisterEvent(evt);
+                return bacId === undefined || !registerCorrectedThreadIds.has(bacId);
+              }),
+              ...registerCorrectedThreadEvents,
+            ];
       for (const threadId of deletedThreadIdsForScopedDelta) {
         const previousUrl = normalizedThreadUrlFromSnapshot(
           previousSnapshotForScopedDelta,
@@ -6113,7 +6262,7 @@ export const createConnectionsMaterializer = (
         void _crossReplica;
         const scopedSnapshot = buildConnectionsSnapshot({
           ...scopedInputBase,
-          events: scopedDeltaEvents,
+          events: scopedDeltaEventsForBuild,
           threads: filterDeletedThreadsForScopedDelta(
             scopedInputBase.threads,
             deletedThreadIdsForScopedDelta,
@@ -6125,10 +6274,19 @@ export const createConnectionsMaterializer = (
           codingSessions: [],
           timelineDays: scopedTimelineDays,
         });
+        // F8 W1 — threads the register store already resolved+corrected
+        // above are excluded from this check: a genuine, now-correctly-
+        // resolved membership change is EXPECTED to differ from
+        // previousSnapshot (that's the fix working), not a reason to bail.
+        // threadDeltaFullBuildReason stays the gate for everything else
+        // (thread-url-changed; threads the store hasn't observed yet) —
+        // demoted to a narrower safety net, not removed.
         const threadFullBuildReason = threadDeltaFullBuildReason({
           previousSnapshot: previousSnapshotForScopedDelta,
           scopedSnapshot,
-          threadScopes: dirtyThreadScopes,
+          threadScopes: dirtyThreadScopes.filter(
+            (scope) => !registerCorrectedThreadIds.has(scope.id),
+          ),
           deletedThreadIds: deletedThreadIdsForScopedDelta,
         });
         if (threadFullBuildReason !== null && !requireScopedTimelineDeltaForDrain) {
