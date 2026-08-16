@@ -297,7 +297,13 @@ import {
   type Dot,
   type VersionVector,
 } from '../causal.js';
-import { eventStoreEnabled, getSharedEventStore, startCoalescedEventStoreCatchUp, type EventStore } from '../eventStore.js';
+import {
+  eventStoreEnabled,
+  getSharedEventStore,
+  getSharedEventStoreServeStale,
+  startCoalescedEventStoreCatchUp,
+  type EventStore,
+} from '../eventStore.js';
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
@@ -788,6 +794,49 @@ const THREAD_SCOPED_DELTA_HANDLES: ReadonlySet<string> = new Set<string>([
   THREAD_UNARCHIVED,
   THREAD_DELETED,
 ]);
+
+// F3 hot-item #1: the exact event types the foreground navigation overlay
+// (scheduleForegroundNavigationOverlay → writeForegroundNavigationDelta →
+// collectScopedEventsForDelta) can ever select out of `merged` on THIS call
+// path. Traced from code, not assumed:
+//   - NAVIGATION_COMMITTED: collectScopedEventsForDelta's first loop reads
+//     canonicalUrl/visitId/previousVisitId/openerVisitId off the pending nav
+//     events to seed `visitIds`; its second loop then walks `allEvents`
+//     matching NAVIGATION_COMMITTED rows whose visitId is in that set (the
+//     chain that resolves "direct visit" → actual referrer/opener).
+//   - THREAD_UPSERTED / THREAD_ARCHIVED / THREAD_UNARCHIVED / THREAD_DELETED
+//     (== THREAD_SCOPED_DELTA_HANDLES, mirrored via
+//     threadIdFromScopedDeltaEvent): the only types collectScopedEventsForDelta
+//     can add to `threadIds` and therefore match on its second loop's
+//     thread-id branch. On THIS call path threadIds is provably always
+//     empty — pendingEvents here is `foregroundNavigationEvents`,
+//     produced by newestNavigationCommittedEvents, which filters to
+//     `event.type === NAVIGATION_COMMITTED` before collectScopedEventsForDelta
+//     ever sees it (scheduleForegroundNavigationOverlay also only ever
+//     enqueues NAVIGATION_COMMITTED events in the first place) — so no
+//     THREAD_* event is EVER selected via this path today. The 4 types are
+//     included anyway as a zero-cost defensive bound (still 5 narrow types,
+//     not the whole log): they're exactly what collectScopedEventsForDelta's
+//     own shared matcher recognises, so a future change to what feeds
+//     pendingEventsForDrain here can't silently start dropping data.
+//   - collectScopedEventsForDelta is called WITHOUT `options.includeCaptures`
+//     on this path (see writeForegroundNavigationDelta), so CAPTURE_RECORDED
+//     is deliberately excluded — it can never be selected here.
+//   - timelineDays/tabSessionProjection/urlProjection are NOT passed at this
+//     call site, so the scoped timeline days are synthesised directly from
+//     scopedNavigationEvents (timelineObservedEventFromNavigation), and the
+//     tab-session projection starts empty — neither reads BROWSER_TIMELINE_
+//     OBSERVED or any other event type off `merged`.
+//   - buildConnectionsSnapshot (connections/snapshot.ts) is a pure function
+//     of the `events` array it's given plus the empty threads/workstreams/
+//     dispatches/queueItems/reminders/codingSessions/timelineDays passed at
+//     this call site — it does not reach back into deps/the event log for
+//     endpoint resolution or engagement, so it cannot need any type beyond
+//     what scopedNavigationEvents already contains.
+export const FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES: readonly string[] = [
+  NAVIGATION_COMMITTED,
+  ...THREAD_SCOPED_DELTA_HANDLES,
+];
 
 const PROJECTION_OVERLAY_HANDLES: ReadonlySet<string> = new Set<string>([
   BROWSER_TIMELINE_OBSERVED,
@@ -7354,6 +7403,42 @@ export const createConnectionsMaterializer = (
       });
   };
 
+  // Source writeForegroundNavigationDelta's `merged` from a bounded typed
+  // read instead of deps.eventLog.readMerged() (the FULL canonical JSONL
+  // log — an incident-linked event-loop wedge on large vaults; 673MB/767k
+  // events on the dogfood vault, paid on every foreground navigation even
+  // coalesced to one in-flight read). See
+  // FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES's doc comment for the full
+  // per-type evidence trace of why exactly those 5 types are byte-equivalent
+  // to filtering readMerged() to what this call path ever consumes.
+  // Mirrors readRequalifyEngagementSource above: store-backed reads use
+  // forEachChunkOfTypes (events_type_idx) and are re-sorted into merged
+  // order (sortAcceptedEvents), since chunk delivery order is not global dot
+  // order; store-off installs fall back to the log's own typed
+  // streamFiltered (already merged-order) so they also stop paying the
+  // full-log parse. getSharedEventStoreServeStale — never
+  // ensureEventStore/getCaughtUpSharedEventStore — because this overlay is
+  // a UI-latency nicety the next authoritative drain supersedes regardless;
+  // it must never await a JSONL catch-up pass.
+  const readForegroundNavigationOverlaySource = async (): Promise<readonly AcceptedEvent[]> => {
+    const store = await getSharedEventStoreServeStale(deps.vaultRoot);
+    if (store === null) {
+      return deps.eventLog.streamFiltered(
+        (event) => FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES.includes(event.type),
+        new Set(FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES),
+      );
+    }
+    const collected: AcceptedEvent[] = [];
+    await store.forEachChunkOfTypes(
+      FOREGROUND_NAVIGATION_OVERLAY_SOURCE_TYPES,
+      (chunk) => {
+        for (const event of chunk) collected.push(event);
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
+  };
+
   const scheduleForegroundNavigationOverlay = (event: AcceptedEvent): void => {
     if (event.type !== NAVIGATION_COMMITTED || !isNavigationCommittedPayload(event.payload)) {
       return;
@@ -7395,7 +7480,7 @@ export const createConnectionsMaterializer = (
         ) {
           return;
         }
-        const merged = await deps.eventLog.readMerged();
+        const merged = await readForegroundNavigationOverlaySource();
         const startedAtMs = Date.now();
         await writeForegroundNavigationDelta({
           pendingEventsForDrain: events,
