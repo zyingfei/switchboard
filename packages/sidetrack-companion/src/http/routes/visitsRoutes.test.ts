@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM } from '../../feedback/events.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
 import { createEventLog, type EventLog } from '../../sync/eventLog.js';
-import { getCaughtUpSharedEventStore } from '../../sync/eventStore.js';
+import { getCaughtUpSharedEventStore, getSharedEventStoreServeStale } from '../../sync/eventStore.js';
 import { loadOrCreateReplica } from '../../sync/replicaId.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import {
@@ -232,6 +232,18 @@ describe('events-prep equivalence: indexed path vs O(merged) JS filter', () => {
   });
 
   afterEach(async () => {
+    // Close the typed store's sqlite handle BEFORE deleting its directory.
+    // getCaughtUpSharedEventStore/getSharedEventStoreServeStale memoize one
+    // EventStore per vaultRoot in a MODULE-LEVEL map for the lifetime of the
+    // whole test process (there is no per-vaultRoot eviction) — leaving a
+    // handle open against a directory this rm() is about to delete risks a
+    // later, unrelated WAL-flush or GC-time error surfacing as an
+    // unattributed failure elsewhere in a full-suite run. Re-fetching here
+    // returns the SAME memoized instance the tests above created (or null,
+    // harmlessly, for the store-unavailable test).
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    const store = await getSharedEventStoreServeStale(vaultRoot);
+    store?.close();
     if (previousEventStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
     else process.env['SIDETRACK_EVENT_STORE'] = previousEventStoreFlag;
     await rm(vaultRoot, { recursive: true, force: true });

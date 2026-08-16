@@ -204,7 +204,7 @@ concurrent full test-suite run contending for CPU, producing 10x swings
 between identical requests. The structural claims (index used, cache
 folded and hit, window read narrowed, subgraph read memoized) are verified
 by call-count assertions in the touched test suites instead of wall-clock
-deltas; see PR #<TBD> for exact numbers and caveats.
+deltas; see PR #368 for exact numbers and caveats.
 
 Tests added:
 `src/http/routes/visitsRoutes.test.ts` (new) — `stableHash` /
@@ -215,3 +215,25 @@ synthetic fixture covering exact-vs-normalized URL matching, order-
 insensitive compare); store-unavailable fallback parity.
 `src/http/visitsRoutes.test.ts` — updated/added HTTP-level event-candidate
 cache tests (folded-key write, repeat-hits-cache, changed-set-misses).
+
+**CI follow-up (same day):** CI failed the "can expand focused URL event
+candidates" test on two consecutive runs; unreproducible locally (any
+single file, the whole `src/http/` dir, or a clean worktree of the branch
+all green). Root cause not pinned with certainty without CI log access,
+but the test's OWN assertions were genuinely fragile: three assertions
+reconstructed the expected folded resolver-cache key by calling
+`resolverCacheRevision(...)` a SECOND time at assertion time, which
+re-reads `attributionArm()` (env-backed) — any full-suite ordering
+difference (CI's Linux file-discovery order vs. local macOS, per the
+existing `TMPDIR=/dev/shm` COW-timing precedent in `ci.yml`) that leaves a
+DIFFERENT arm value active between the server's request-time computation
+and the test's assertion-time reconstruction breaks an exact-string match
+that was never actually part of the behavior under test. Fixed by
+asserting on the RECORDED call's actual revision string instead (shape:
+`{prefix}|arm=...|ec:{hash}`, where the `|ec:` hash portion — a pure
+function of the URL set, zero env dependency — is still checked exactly).
+Also closed a resource leak in the new equivalence test file: the typed
+event store's sqlite handle was never `.close()`d before its tmpdir was
+`rm -rf`'d, leaving a dangling handle in `sync/eventStore.ts`'s
+process-lifetime `sharedEventStores` map — a plausible source of the
+unattributed "3 errors" CI reported alongside the one named failure.

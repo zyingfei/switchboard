@@ -16,7 +16,7 @@ import {
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
-import { eventCandidateCacheRevision, resolverCacheRevision } from './routes/visitsRoutes.js';
+import { eventCandidateCacheRevision } from './routes/visitsRoutes.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
 describe('per-URL HTTP routes', () => {
@@ -733,6 +733,44 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     'x-bac-bridge-key': bridgeKey,
   });
 
+  // bun:test's vitest-compat shim does not implement `vi.mocked` — every
+  // fake store method here is already a `vi.fn(...)`, just typed as its
+  // plain function signature (the fakes are cast to SqliteConnectionsStore),
+  // so `.mock.calls` exists at runtime but not in the type. This narrows
+  // just enough to read it back without an `any` leaking into a call site.
+  const mockCallsOf = (fn: unknown): readonly (readonly unknown[])[] =>
+    (fn as { readonly mock: { readonly calls: readonly (readonly unknown[])[] } }).mock.calls;
+
+  // Structural check for a folded event-candidate resolver-cache revision —
+  // deliberately NOT an exact-string match against a second, independent
+  // `resolverCacheRevision(...)` call. That would re-read `attributionArm()`
+  // (env-backed) at ASSERTION time, which only needs to disagree with
+  // whatever the SERVER read at REQUEST time (e.g. a differently-ordered
+  // full suite run leaving a different arm active) to make this fragile in
+  // a way that has nothing to do with the behavior under test. The `|ec:`
+  // suffix is a pure function of `foldedUrls` (stableHash has no env
+  // dependency at all) and is asserted exactly; the `|arm=`-prefixed base
+  // revision is asserted only by shape.
+  const expectFoldedEventCandidateRevision = (
+    actualRevision: unknown,
+    plainRevisionPrefix: string,
+    foldedUrls: readonly string[],
+  ): void => {
+    expect(typeof actualRevision).toBe('string');
+    const revision = actualRevision as string;
+    expect(revision.startsWith(`${plainRevisionPrefix}|arm=`)).toBe(true);
+    // Neutral placeholder base -- eventCandidateCacheRevision has no env
+    // dependency at all (pure sort + stableHash), so its `|ec:<hash>`
+    // suffix for a given URL set is identical no matter what base revision
+    // it is folded onto. Deriving the expected suffix THIS way (rather than
+    // recomputing the hash inline) can never drift from the real
+    // implementation, including its internal join separator.
+    const expectedSuffix = eventCandidateCacheRevision('placeholder', foldedUrls).slice(
+      'placeholder'.length,
+    );
+    expect(revision.endsWith(expectedSuffix)).toBe(true);
+  };
+
   it('memoizes GET /v1/visits/{url}/resolve by snapshotRevision', async () => {
     const canonicalUrl = 'https://cache.test/a';
     await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-cache-a'));
@@ -877,13 +915,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'rev-event-candidates',
       expect.anything(),
     );
-    const foldedRevision = eventCandidateCacheRevision(
-      await resolverCacheRevision('rev-event-candidates', vaultRoot),
-      [targetUrl],
-    );
-    expect(connectionsStore.cacheResolverResult).toHaveBeenCalledWith(
-      targetUrl,
-      foldedRevision,
+    const cacheWriteCall = mockCallsOf(connectionsStore.cacheResolverResult).find(([url]) => url === targetUrl);
+    expect(cacheWriteCall).toBeDefined();
+    expectFoldedEventCandidateRevision(cacheWriteCall?.[1], 'rev-event-candidates', [targetUrl]);
+    expect(cacheWriteCall?.[2]).toEqual(
       expect.objectContaining({
         fusedCandidates: expect.arrayContaining([
           expect.objectContaining({ workstreamId: 'ws_security' }),
@@ -935,14 +970,11 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     expect(secondBody.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe(
       'ws_security',
     );
-    const foldedRevision = eventCandidateCacheRevision(
-      await resolverCacheRevision('rev-event-candidates-repeat', vaultRoot),
-      [targetUrl],
-    );
-    expect(connectionsStore.getCachedResolverResult).toHaveBeenCalledWith(
+    const cacheReadCall = mockCallsOf(connectionsStore.getCachedResolverResult).find(([url]) => url === targetUrl);
+    expect(cacheReadCall).toBeDefined();
+    expectFoldedEventCandidateRevision(cacheReadCall?.[1], 'rev-event-candidates-repeat', [
       targetUrl,
-      foldedRevision,
-    );
+    ]);
   });
 
   it('POST /v1/visits/batch-resolve misses the event-candidate cache when the candidate set changes', async () => {
@@ -981,11 +1013,12 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       }),
     });
     expect(response.status).toBe(200);
-    const changedFoldedRevision = eventCandidateCacheRevision(
-      await resolverCacheRevision('rev-event-candidates-set-change', vaultRoot),
-      [targetUrl, anchorUrl],
-    );
-    expect(cacheWrite).toHaveBeenCalledWith(targetUrl, changedFoldedRevision, expect.anything());
+    const changedCacheWriteCall = mockCallsOf(cacheWrite).find(([url]) => url === targetUrl);
+    expect(changedCacheWriteCall).toBeDefined();
+    expectFoldedEventCandidateRevision(changedCacheWriteCall?.[1], 'rev-event-candidates-set-change', [
+      targetUrl,
+      anchorUrl,
+    ]);
   });
 
   it('POST /v1/visits/batch-resolve accepts titleHints and appends the content lane', async () => {
