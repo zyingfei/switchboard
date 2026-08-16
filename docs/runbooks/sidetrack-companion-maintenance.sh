@@ -22,6 +22,19 @@
 #
 # The real fix for (1) is the columnar event tier; this script is the
 # containment until that ships.
+#
+# 4. engagement.interval.observed is ~76% of the canonical JSONL log by line
+#    count (Task F1, 2026-08-15) and grows forever. src/gc/compactionPlanner.ts
+#    already implements a proof-gated compaction (drops intervals whose visit
+#    has a durable engagement.session.aggregated, from sealed shards past
+#    retention) with a `compact-engagement` CLI entry point, but nothing ran
+#    it. Section 5 below is a nightly REPORT-ONLY survey (plan only, never
+#    applies) so the reclaimable-bytes trend is visible before anyone opts
+#    into --apply. See docs/runbooks/ (this file) §5 for the sync note.
+
+# *** NOT YET SYNCED to ~/.sidetrack-companion-maintenance.sh — §5 below is new
+# *** (Task F1, 2026-08-15). The coordinator must copy the new section into the
+# *** live launchd script; nothing outside this repo checkout runs it yet.
 
 LOG="$HOME/.sidetrack-maintenance.log"
 exec >>"$LOG" 2>&1
@@ -142,6 +155,34 @@ for VAULT in "$HOME/.sidetrack-vault" "$HOME/.sidetrack-vault-test"; do
     echo "  ... $((CAND - SHOWN)) more not shown (capped at 20)"
   fi
   echo "$LOGDIR: $CAND stale-log-dir candidate(s)"
+done
+
+# --- 5. Engagement-interval compaction survey (REPORT-ONLY) -----------------
+# *** NEW — Task F1 (2026-08-15). Not yet in the live launchd script; the
+# *** coordinator syncs this block into ~/.sidetrack-companion-maintenance.sh.
+#
+# engagement.interval.observed is ~76% of the canonical log by line count and
+# grows forever (measured on this vault: 673MB total, 439MB/65% reclaimable
+# once outside the 30-day retention window). src/gc/compactionPlanner.ts
+# implements the proof-gated rewrite (aggregate coverage, dense-sequence
+# reconciliation, crash-recoverable receipts, no force path); `compact-engagement`
+# is its CLI entry point (src/cli.ts). This survey ONLY plans and prints —
+# `compact-engagement` with no --apply never touches disk, so it's safe to run
+# nightly against a vault a live companion is also serving.
+#
+# Turning this into an APPLY pass is a deliberate, separate decision: it needs
+# (a) SIDETRACK_ENGAGEMENT_COMPACT=1 exported for this script (the planner's
+# own arm switch) AND (b) `--apply` added to the command below, AND (c) it
+# will refuse by itself if a live companion holds the vault's recall
+# process-lock (compaction is a second writer; EventLog.runExclusiveMaintenance
+# only serialises writers within one process, so a live companion's in-memory
+# append indexes / merged-log memo in ANOTHER process can't be invalidated by
+# this script's rewrite — the lock is the cross-process guard for that). Do
+# not add --apply here without a supervised pass first.
+for VAULT in "$HOME/.sidetrack-vault" "$HOME/.sidetrack-vault-test"; do
+  [ -d "$VAULT" ] || continue
+  echo "$VAULT: engagement-interval compaction survey (report-only)"
+  bun dist/cli.js compact-engagement --vault "$VAULT" 2>&1 | sed 's/^/  /'
 done
 
 echo "=== $(date -u +%FT%TZ) maintenance done"
