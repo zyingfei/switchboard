@@ -56,13 +56,13 @@ export interface SealIntegrityReport {
 
 const sqlPath = (path: string): string => path.replaceAll("'", "''");
 
-interface ParquetDayStat {
+export interface ParquetDayStat {
   readonly rows: number;
   readonly seqLo: number;
   readonly seqHi: number;
 }
 
-interface ParquetScanResult {
+export interface ParquetScanResult {
   readonly stats: Map<string, ParquetDayStat>;
   /** `${replica} ${day}` keys whose segment file could not be read at all. */
   readonly unreadable: Set<string>;
@@ -93,8 +93,15 @@ const collectRows = (
  * ONE query over the glob; DuckDB throws on the first unreadable file, which
  * would let a single corrupt segment hide every healthy one — so on failure,
  * degrade to per-entry queries and report the throwers as unreadable.
+ *
+ * Exported (not just `runSealIntegrityCheck`-internal) so other read-only
+ * consumers of the sealed tier — `analytics/hotTailRetirement.ts`'s
+ * retirement-eligibility report — reuse the SAME DuckDB-over-Parquet read
+ * instead of a second bespoke implementation (F2 OLAP comparison, this
+ * file's design doc: DuckDB-over-Parquet is the proven fast path; a raw
+ * JSONL/bespoke scan measured slower even for the sealer's own PoC).
  */
-const readParquetDayStats = async (
+export const readSealedParquetDayStats = async (
   vaultRoot: string,
   entries: readonly SealManifestEntry[],
 ): Promise<ParquetScanResult> => {
@@ -127,7 +134,9 @@ const readParquetDayStats = async (
   }
 };
 
-const entryMatches = (
+/** Exported for reuse by `hotTailRetirement.ts` — one comparison contract
+ *  shared by both the integrity A/B and the retirement-eligibility gate. */
+export const entryMatches = (
   entry: SealManifestEntry,
   other: { readonly rows: number; readonly seqLo: number; readonly seqHi: number },
 ): boolean =>
@@ -148,7 +157,7 @@ export const runSealIntegrityCheck = async (
   const store = await getCaughtUpSharedEventStore(vaultRoot);
   if (store === null) return null;
 
-  const { stats: parquetStats, unreadable } = await readParquetDayStats(vaultRoot, [
+  const { stats: parquetStats, unreadable } = await readSealedParquetDayStats(vaultRoot, [
     ...manifest.latest.values(),
   ]);
   const storeStatsByReplica = new Map<
