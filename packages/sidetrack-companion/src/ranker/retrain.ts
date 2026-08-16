@@ -22,7 +22,9 @@ import {
   writeActiveClosestVisitRankerRevision,
   writeClosestVisitRankerRevision,
 } from '../producers/closest-visit-revision.js';
-import type { AcceptedEvent } from '../sync/causal.js';
+import { sortAcceptedEvents, type AcceptedEvent } from '../sync/causal.js';
+import type { EventLog } from '../sync/eventLog.js';
+import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import { CANDIDATE_SOURCES, generateCandidates } from './candidates.js';
 import { extractFeatures } from './features.js';
 import { randomUnrelated } from './negatives.js';
@@ -48,6 +50,8 @@ import {
 } from './train.js';
 import {
   fingerprintTrainableEvents,
+  readTrainableEventsFromShard,
+  TRAINABLE_EVENT_TYPES,
   type TrainableEventsFingerprint,
 } from './trainableEventsShard.js';
 import type { Candidate, CandidateSource } from './types.js';
@@ -1231,6 +1235,64 @@ export const maybeRetrainClosestVisitRanker = async ({
       candidateCount: candidates.length,
     };
   }
+};
+
+export interface RetrainEventSources {
+  /** Full event history — the standalone worker has no drain-tail scoping,
+   *  so unlike connectionsMaterializer's `merged` this already IS the full
+   *  vault history. Feeds `maxObservedAt` / the legacy candidate-generation
+   *  fallback below, both of which read broad event types (navigation /
+   *  session chains) that no narrow index covers. */
+  readonly merged: readonly AcceptedEvent[];
+  /** Full training-event history (recall.served + recall.action + the four
+   *  explicit-feedback types), read I/O-safely — see field doc on
+   *  `RankerRetrainContext.readTrainingEvents`. */
+  readonly readTrainingEvents: () => Promise<readonly AcceptedEvent[]>;
+}
+
+// F3 — event-store-aware sourcing for the standalone retrain worker
+// (retrain.worker.ts). Mirrors the pattern connectionsMaterializer.ts
+// already established for its OWN readTrainingEvents wiring: an indexed
+// store type-scan (events_resolver_url_idx's sibling, events_type_idx via
+// forEachChunkOfTypes) when SIDETRACK_EVENT_STORE is on, else the O(labels)
+// trainable-events shard (trainableEventsShard.ts) — never a raw
+// `eventLog.readMerged()` for the training-event set, on OR off. `merged`
+// itself has no narrow-index substitute (the legacy candidate-generation
+// path reads broad event types), so it sources from the store's own full
+// ordered scan (`forEachChunk` — an indexed SQLite cursor read, the same
+// substitute ingestIncremental's tombstone scan already uses in
+// recall/ingestor.ts) when the store is available, falling back to
+// `eventLog.readMerged()` only when the store is off — exactly the
+// store-or-log branch workGraphHealth.ts / section15Collector.ts /
+// recall/ingestor.ts already use for their own typed reads.
+export const readRetrainEventSources = async (
+  vaultRoot: string,
+  eventLog: EventLog,
+): Promise<RetrainEventSources> => {
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  const readTrainingEvents = async (): Promise<readonly AcceptedEvent[]> => {
+    if (store !== null) {
+      const collected: AcceptedEvent[] = [];
+      await store.forEachChunkOfTypes(
+        TRAINABLE_EVENT_TYPES,
+        (chunk) => {
+          for (const event of chunk) collected.push(event);
+        },
+        2000,
+      );
+      return sortAcceptedEvents(collected);
+    }
+    const { events } = await readTrainableEventsFromShard(vaultRoot, eventLog);
+    return events;
+  };
+  if (store !== null) {
+    const collected: AcceptedEvent[] = [];
+    await store.forEachChunk((chunk) => {
+      for (const event of chunk) collected.push(event);
+    }, 2000);
+    return { merged: sortAcceptedEvents(collected), readTrainingEvents };
+  }
+  return { merged: await eventLog.readMerged(), readTrainingEvents };
 };
 
 // Stage 5 polish — Worker-thread spawn helper for ranker retrain.
