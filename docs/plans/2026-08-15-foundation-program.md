@@ -237,3 +237,40 @@ event store's sqlite handle was never `.close()`d before its tmpdir was
 `rm -rf`'d, leaving a dangling handle in `sync/eventStore.ts`'s
 process-lifetime `sharedEventStores` map — a plausible source of the
 unattributed "3 errors" CI reported alongside the one named failure.
+
+**CI follow-up 2 (same day, confirmed root cause).** The arm-mismatch fix
+above was necessary hardening but NOT sufficient — CI failed again with
+the actual mechanism visible in the log this time: `cacheWriteCall` was
+`undefined` (the mock was never called at all with the target URL) and,
+separately, a recorded call's `|ec:` suffix didn't match the expected
+one. Real cause: the per-URL resolver-cache WRITE is deferred off the
+request path (`resolverCacheDefer.ts`, default ON) — queued during the
+request, drained on a `setImmediate` scheduled AFTER the response is
+already sent. The new tests asserted on the write immediately after
+`response.json()`, before the drain tick had necessarily run — a genuine
+scheduling race, not env pollution, that a slower/more-contended CI
+runner loses far more often than a quiet local Mac. The file already had
+a documented, working pattern for this exact problem ("persists the
+resolver cache AFTER responding", a poll-with-deadline) that the new
+tests should have reused and didn't. Fixed properly instead: awaited the
+module's own deterministic drain (`flushResolverCacheWrites()`, already
+exported and used by `resolverCacheDefer.test.ts`) at each checkpoint —
+no sleep/poll — and switched from "first matching call" to "last
+matching call" per URL (the deferred-write queue is keyed on
+`(visitId, revision)`, so two genuinely distinct writes for the same URL
+under different folded revisions can both be pending at once if not
+individually flushed+cleared between requests). Also added
+`__resetResolverCacheDeferQueue()` to the describe block's
+`beforeEach`/`afterEach` — the queue is process-lifetime module state,
+so a write still pending from a prior test could otherwise bleed into a
+later one's flush. A third, unrelated failure appeared in the same CI
+run — `connections incremental ranker frontier > forces a full ranker
+augmentation...` timed out at the bun:test default 5000ms. Proven
+pre-existing and load-related, not a regression: the test (real
+`connectionsMaterializer` work, no event-store/typed-store dependency at
+all) passed 6/6 in isolation on BOTH the pre-PR base commit and this
+branch, ~1s each, across 8 total runs; the SAME CI run that timed it out
+also logged an unrelated embedding-model load taking 6.9s (normally
+under 1s) and a 637ms event-loop stall immediately before the timeout —
+independent evidence the runner itself was heavily contended that pass,
+not that anything in this PR slowed the materializer down.

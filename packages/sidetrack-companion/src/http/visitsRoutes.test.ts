@@ -16,6 +16,7 @@ import {
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
+import { __resetResolverCacheDeferQueue, flushResolverCacheWrites } from './resolverCacheDefer.js';
 import { eventCandidateCacheRevision } from './routes/visitsRoutes.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
@@ -703,6 +704,12 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   };
 
   beforeEach(async () => {
+    // The deferred resolver-cache write queue is MODULE-LEVEL, process-
+    // lifetime state (resolverCacheDefer.ts) — reset it per test so a write
+    // still pending from a PRIOR test (this file's or another's, sharing the
+    // one bun:test process) can never be mistaken for THIS test's write when
+    // it is later flushed and its mock call recorded.
+    __resetResolverCacheDeferQueue();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-resolver-cache-'));
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
@@ -724,6 +731,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   afterEach(async () => {
     if (close !== null) await close();
     close = null;
+    // Drain (or drop) anything still queued for THIS test's now-closing store
+    // before resetting — an unflushed write left in the queue would otherwise
+    // carry into the next test's flush/assertions.
+    __resetResolverCacheDeferQueue();
     connectionsStore.close();
     await rm(vaultRoot, { recursive: true, force: true });
   });
@@ -740,6 +751,26 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
   // just enough to read it back without an `any` leaking into a call site.
   const mockCallsOf = (fn: unknown): readonly (readonly unknown[])[] =>
     (fn as { readonly mock: { readonly calls: readonly (readonly unknown[])[] } }).mock.calls;
+
+  // Last (not first) matching call for a URL. The per-URL resolver-cache
+  // WRITE is deferred off the request path (resolverCacheDefer.ts, default
+  // ON) and queued in a MODULE-LEVEL, process-lifetime map keyed on
+  // (visitId, revision) — a DIFFERENT revision for the same URL (e.g. an
+  // earlier request in the same test, before a candidate-set change) queues
+  // a SEPARATE entry rather than overwriting it. `await
+  // flushResolverCacheWrites()` (called at each checkpoint below) drains
+  // whatever is pending AT THAT MOMENT in insertion order, so if more than
+  // one entry for the same URL is still pending it is because more than one
+  // genuinely distinct write is in flight — picking the LAST one keeps these
+  // assertions correct even when an earlier request's write in the SAME test
+  // has not been individually flushed+cleared before this checkpoint.
+  const lastMockCallFor = (
+    fn: unknown,
+    url: string,
+  ): readonly unknown[] | undefined => {
+    const calls = mockCallsOf(fn).filter(([callUrl]) => callUrl === url);
+    return calls[calls.length - 1];
+  };
 
   // Structural check for a folded event-candidate resolver-cache revision —
   // deliberately NOT an exact-string match against a second, independent
@@ -915,7 +946,13 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'rev-event-candidates',
       expect.anything(),
     );
-    const cacheWriteCall = mockCallsOf(connectionsStore.cacheResolverResult).find(([url]) => url === targetUrl);
+    // Deterministic, not a poll: the write is queued but drains on a
+    // `setImmediate` AFTER this response was already sent, so it can still
+    // be in flight at this point — awaiting the SAME drain function the
+    // dispatch itself calls (resolverCacheDefer.ts) settles it exactly,
+    // with no sleep/backoff involved.
+    await flushResolverCacheWrites();
+    const cacheWriteCall = lastMockCallFor(connectionsStore.cacheResolverResult, targetUrl);
     expect(cacheWriteCall).toBeDefined();
     expectFoldedEventCandidateRevision(cacheWriteCall?.[1], 'rev-event-candidates', [targetUrl]);
     expect(cacheWriteCall?.[2]).toEqual(
@@ -946,6 +983,12 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       body: requestBody,
     });
     expect(first.status).toBe(200);
+    // Deterministically settle the FIRST request's deferred write before the
+    // second request starts — otherwise whether the second request observes
+    // a cache hit depends on incidental scheduling (the write drains on a
+    // `setImmediate` after the response, which is not guaranteed to have run
+    // before the next `fetch` starts).
+    await flushResolverCacheWrites();
 
     const readResolverSubgraphForUrls = vi.spyOn(connectionsStore, 'readResolverSubgraphForUrls');
     readResolverSubgraphForUrls.mockClear();
@@ -970,7 +1013,7 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     expect(secondBody.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe(
       'ws_security',
     );
-    const cacheReadCall = mockCallsOf(connectionsStore.getCachedResolverResult).find(([url]) => url === targetUrl);
+    const cacheReadCall = lastMockCallFor(connectionsStore.getCachedResolverResult, targetUrl);
     expect(cacheReadCall).toBeDefined();
     expectFoldedEventCandidateRevision(cacheReadCall?.[1], 'rev-event-candidates-repeat', [
       targetUrl,
@@ -986,11 +1029,18 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     await appendObservation({ seq: 1, url: targetUrl, title: 'Kernel Self-Protection' });
     await appendObservation({ seq: 2, url: anchorUrl, title: 'Linux Security Module framework' });
 
-    await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+    const first = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
       method: 'POST',
       headers: reqHeaders(),
       body: JSON.stringify({ canonicalUrls: [targetUrl], eventCandidateUrls: [targetUrl] }),
     });
+    expect(first.status).toBe(200);
+    // Fully settle the FIRST request's deferred write (queued under the
+    // {targetUrl}-only folded key) BEFORE spying/clearing below — otherwise
+    // it can still be pending when the SECOND request's write is queued, and
+    // one flush would drain both entries together, leaving the mock with two
+    // calls for targetUrl under two different keys at once.
+    await flushResolverCacheWrites();
 
     const cacheWrite = vi.spyOn(connectionsStore, 'cacheResolverResult');
     cacheWrite.mockClear();
@@ -1013,7 +1063,8 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       }),
     });
     expect(response.status).toBe(200);
-    const changedCacheWriteCall = mockCallsOf(cacheWrite).find(([url]) => url === targetUrl);
+    await flushResolverCacheWrites();
+    const changedCacheWriteCall = lastMockCallFor(cacheWrite, targetUrl);
     expect(changedCacheWriteCall).toBeDefined();
     expectFoldedEventCandidateRevision(changedCacheWriteCall?.[1], 'rev-event-candidates-set-change', [
       targetUrl,
