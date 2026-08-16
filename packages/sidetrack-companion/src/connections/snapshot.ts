@@ -37,6 +37,7 @@ import type {
   PageEvidenceRecord,
   PageEvidenceSimilarityMetadata,
 } from '../page-evidence/types.js';
+import { matchesWholeWordQuery } from '../search-index/searchTextMatch.js';
 import { CAPTURE_RECORDED, isCaptureRecordedPayload } from '../recall/events.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
@@ -3010,8 +3011,14 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
   //
   // Min query length 4 chars to avoid noisy matches from common short
   // queries like "ai" or "ml" that would connect everywhere.
+  //
+  // The whole-word predicate itself is imported from
+  // search-index/searchTextMatch.ts — that module's header explains why:
+  // the F8 W2 incremental search-visit join (searchQueryIndexStore,
+  // captureTextFtsStore) must reproduce this EXACT predicate to stay
+  // byte-identical with the full build, so there is now exactly one
+  // implementation instead of a hand-copy per caller.
   // -------------------------------------------------------------------
-  const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   interface SearchVisitInfo {
     readonly visitNodeId: string;
     readonly query: string; // lowercased + trimmed
@@ -3029,12 +3036,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     });
   }
   if (searchVisits.length > 0) {
-    // Pre-compile a regex per query (whole-word match,
-    // case-insensitive). Reused across every event scan.
-    const compiledQueries = searchVisits.map((sv) => ({
-      ...sv,
-      regex: new RegExp(`\\b${escapeRegex(sv.query)}\\b`, 'iu'),
-    }));
+    const compiledQueries = searchVisits;
     const matchTextAgainstQueries = (
       fromNodeId: string,
       text: string,
@@ -3045,7 +3047,7 @@ export const buildConnectionsSnapshot = (input: ConnectionsInput): ConnectionsSn
     ): void => {
       if (text.length === 0) return;
       for (const cq of compiledQueries) {
-        if (!cq.regex.test(text)) continue;
+        if (!matchesWholeWordQuery(text, cq.query)) continue;
         upsertEdge(edges, {
           kind: 'thread_text_mentions_search_query',
           fromNodeId,

@@ -5,6 +5,7 @@ import {
   ANNOTATION_CREATED,
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
+  isAnnotationCreatedPayload,
 } from '../../annotations/events.js';
 import { recordSimilarityFullRebuildFallback } from '../../connections/drainDegradation.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
@@ -103,7 +104,11 @@ import {
   type EffectiveVisitSimilarityConfig,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
-import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import {
+  DISPATCH_LINKED,
+  DISPATCH_RECORDED,
+  isDispatchRecordedPayload,
+} from '../../dispatches/events.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -278,6 +283,15 @@ import {
   type ThreadRegisterStore,
 } from '../../threads/threadRegisterStore.js';
 import {
+  createSearchQueryIndexStore,
+  type SearchQueryIndexStore,
+} from '../../search-index/searchQueryIndexStore.js';
+import {
+  createCaptureTextFtsStore,
+  type CaptureTextFtsStore,
+} from '../../search-index/captureTextFtsStore.js';
+import { matchesWholeWordQuery } from '../../search-index/searchTextMatch.js';
+import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
   isBrowserTimelineObservedPayload,
@@ -312,8 +326,10 @@ import {
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
+  edgeIdFor,
   nodeIdFor,
   type ConnectionEdge,
+  type ConnectionNode,
   type VisitSimilarityEdge,
   type VisitSimilarityRevision,
 } from '../../connections/types.js';
@@ -620,6 +636,25 @@ const timelineFactsStoreEnabled = (): boolean =>
 // dogfood soak).
 const threadRegisterStoreEnabled = (): boolean =>
   process.env['SIDETRACK_THREAD_REGISTER_STORE'] === '1';
+// F8 W2 — search-visit incremental join stores (kills the
+// `pending-search-visit` scoped-delta bail class and its cooldown
+// coalescing: see search-index/searchQueryIndexStore.ts +
+// captureTextFtsStore.ts headers for the root cause + AMENDMENT 1's
+// tokenizer-parity requirement). Off by default, matching W1's
+// threadRegisterStore rollout posture (byte-equivalent + verified,
+// opt-in via env=1 pending a dogfood soak). Gates BOTH stores together —
+// the scoped search-visit path needs both (same_search_query candidates
+// + thread_text_mentions_search_query) to be safe, so there is one
+// switch rather than two half-enabled states.
+const searchIndexStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_SEARCH_INDEX_STORE'] === '1';
+// F8 W2 — reverse-join (new capture text → old search-visit queries)
+// candidate-query bound for the THREAD-owned side (see the call site's
+// comment for why the url-owned side stays narrower). Recency-ranked so
+// the common case (a just-added capture referencing a recent search)
+// is always covered without paying a full lifetime-history scan on
+// every drain with a new capture.
+const RECENT_SEARCH_QUERY_BOUND = 200;
 // Scoped re-visit no-op fast path (default ON; disable with =0 + restart
 // for instant rollback). When a drain window touches scopes that own
 // graph rows but carries NO graph-row-affecting event (no
@@ -886,6 +921,8 @@ export interface CreateConnectionsMaterializerDeps {
   readonly engagementFactsStore?: EngagementFactsStore;
   readonly timelineFactsStore?: TimelineFactsStore;
   readonly threadRegisterStore?: ThreadRegisterStore;
+  readonly searchQueryIndexStore?: SearchQueryIndexStore;
+  readonly captureTextFtsStore?: CaptureTextFtsStore;
   readonly eventStore?: EventStore;
   readonly rankerRetrainer?: RankerRetrainer;
   readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
@@ -1548,6 +1585,18 @@ export const createConnectionsMaterializer = (
   let threadRegisterStore: ThreadRegisterStore | null = null;
   let threadRegisterStoreInit: Promise<ThreadRegisterStore> | null = null;
   let threadRegisterStoreUnavailable = false;
+  // F8 W2 — search-visit incremental join stores (lazy-opened; survive
+  // restart). searchQueryIndexStore persists (queryKey, visitKey) pairs
+  // for the same_search_query→closest_visit join; captureTextFtsStore
+  // persists an FTS5 index over capture/dispatch/annotation text for the
+  // thread_text_mentions_search_query join. See their headers for why
+  // this kills the `pending-search-visit` scoped-delta bail class.
+  let searchQueryIndexStore: SearchQueryIndexStore | null = null;
+  let searchQueryIndexStoreInit: Promise<SearchQueryIndexStore> | null = null;
+  let searchQueryIndexStoreUnavailable = false;
+  let captureTextFtsStore: CaptureTextFtsStore | null = null;
+  let captureTextFtsStoreInit: Promise<CaptureTextFtsStore> | null = null;
+  let captureTextFtsStoreUnavailable = false;
   let eventStore: EventStore | null = null;
   let eventStoreInit: Promise<EventStore> | null = null;
   let eventStoreUnavailable = false;
@@ -1599,6 +1648,38 @@ export const createConnectionsMaterializer = (
     } catch {
       threadRegisterStoreUnavailable = true;
       threadRegisterStoreInit = null;
+      return null;
+    }
+  };
+  const ensureSearchQueryIndexStore = async (): Promise<SearchQueryIndexStore | null> => {
+    if (searchQueryIndexStore !== null) return searchQueryIndexStore;
+    if (searchQueryIndexStoreUnavailable) return null;
+    try {
+      searchQueryIndexStoreInit ??=
+        deps.searchQueryIndexStore !== undefined
+          ? Promise.resolve(deps.searchQueryIndexStore)
+          : createSearchQueryIndexStore(deps.vaultRoot);
+      searchQueryIndexStore = await searchQueryIndexStoreInit;
+      return searchQueryIndexStore;
+    } catch {
+      searchQueryIndexStoreUnavailable = true;
+      searchQueryIndexStoreInit = null;
+      return null;
+    }
+  };
+  const ensureCaptureTextFtsStore = async (): Promise<CaptureTextFtsStore | null> => {
+    if (captureTextFtsStore !== null) return captureTextFtsStore;
+    if (captureTextFtsStoreUnavailable) return null;
+    try {
+      captureTextFtsStoreInit ??=
+        deps.captureTextFtsStore !== undefined
+          ? Promise.resolve(deps.captureTextFtsStore)
+          : createCaptureTextFtsStore(deps.vaultRoot);
+      captureTextFtsStore = await captureTextFtsStoreInit;
+      return captureTextFtsStore;
+    } catch {
+      captureTextFtsStoreUnavailable = true;
+      captureTextFtsStoreInit = null;
       return null;
     }
   };
@@ -3701,6 +3782,42 @@ export const createConnectionsMaterializer = (
       );
       mark('threadRegisterFactStore.catchUp');
     }
+    // F8 W2 — catch the search-index stores up BEFORE the scoped-delta
+    // gate below reads them. Same lifecycle discipline as
+    // threadRegisterFactStore above (and the sibling fact stores): catch
+    // up from the full merged set filtered by each store's OWN watermark.
+    // Both stores are gated by the SAME flag: the scoped search-visit
+    // path below only relaxes the `pending-search-visit` bail when BOTH
+    // are ready (search-visit-window equivalence needs both joins).
+    const searchQueryIndexFactStore = searchIndexStoreEnabled()
+      ? await ensureSearchQueryIndexStore()
+      : null;
+    if (searchQueryIndexFactStore !== null) {
+      await searchQueryIndexFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(searchQueryIndexFactStore.watermark()),
+      );
+      mark('searchQueryIndexFactStore.catchUp');
+    }
+    const captureTextFtsFactStore = searchIndexStoreEnabled()
+      ? await ensureCaptureTextFtsStore()
+      : null;
+    if (captureTextFtsFactStore !== null) {
+      await captureTextFtsFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(captureTextFtsFactStore.watermark()),
+      );
+      mark('captureTextFtsFactStore.catchUp');
+    }
+    // Both search-index stores must be ready (opened + caught up) for the
+    // scoped search-visit path below to be safe — a search visit whose
+    // join stores are unavailable this drain (cold open, sqlite failure)
+    // falls back to the existing full-rebuild bail rather than silently
+    // minting a partial (missing-edges) scoped result.
+    const searchIndexStoresReady =
+      searchQueryIndexFactStore !== null && captureTextFtsFactStore !== null;
     // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
     // arrived since last drain AND a cached revision exists, reuse it
     // (skips the classifier + putRevision; inputs are still needed for
@@ -4416,7 +4533,12 @@ export const createConnectionsMaterializer = (
       deps.store.replaceScopeRows !== undefined &&
       pendingEventsForDrain.length > 0 &&
       pendingEventsForDrain.every(isScopedTimelineDeltaEvent) &&
-      !pendingHasSearchVisit &&
+      // F8 W2 — a search-visit window can still take the bounded page-
+      // evidence read when the search-index stores are ready: this flag
+      // only governs page-evidence LOADING STRATEGY (bounded vs full-
+      // corpus), not whether the scoped path itself applies (that gate
+      // is separate, below).
+      (!pendingHasSearchVisit || searchIndexStoresReady) &&
       !hnswFullRebuild &&
       // Force the base path when a corpus recovery is likely so the reused/
       // bootstrapped revision actually reaches the served snapshot.
@@ -6244,7 +6366,13 @@ export const createConnectionsMaterializer = (
         (scopedTimelineDays.length > 0 ||
           scopedDeltaEvents.length > 0 ||
           dirtyThreadScopes.length > 0) &&
-        !pendingHasSearchVisit &&
+        // F8 W2 — a search-visit window is no longer an automatic bail
+        // when the search-index stores are ready: same_search_query
+        // candidates and thread_text_mentions_search_query edges are
+        // minted below via the indexed join instead of the full-corpus
+        // scan those stores replace. See search-index/*.ts headers +
+        // docs/plans/2026-08-16-f8-ivm-designs.md "W2".
+        (!pendingHasSearchVisit || searchIndexStoresReady) &&
         hasRequiredTimelineRows
       ) {
         if (canAttemptBoundedScopedDelta && scopedTimelineDays.length > 0) {
@@ -6283,6 +6411,229 @@ export const createConnectionsMaterializer = (
           codingSessions: [],
           timelineDays: scopedTimelineDays,
         });
+        // F8 W2 — thread_text_mentions_search_query cross-window join.
+        // scopedSnapshot's OWN Pass 6 (buildConnectionsSnapshot, called
+        // just above) already correctly mints this edge kind for matches
+        // ENTIRELY WITHIN this drain's tiny window (a new search visit
+        // and new capture/dispatch/annotation text that both arrived
+        // this drain) — that path is untouched. What a windowed Pass 6
+        // structurally cannot see is the CROSS-window join: a brand-new
+        // search visit's query against OLD indexed text (forward), and
+        // brand-new text against an OLD search visit's query (reverse).
+        // Both sides are minted here from the search-index stores using
+        // the SAME edge shape/upsert semantics as snapshot.ts Pass 6
+        // (matchesWholeWordQuery is the shared predicate — see
+        // search-index/searchTextMatch.ts).
+        const searchIndexNewEdges = new Map<string, ConnectionEdge>();
+        const searchIndexExtraThreadIds = new Set<string>();
+        const upsertSearchIndexEdge = (edgeInput: Omit<ConnectionEdge, 'id'>): void => {
+          const id = edgeIdFor(edgeInput.kind, edgeInput.fromNodeId, edgeInput.toNodeId);
+          const existing = searchIndexNewEdges.get(id);
+          if (existing === undefined || edgeInput.observedAt < existing.observedAt) {
+            searchIndexNewEdges.set(id, { id, ...edgeInput });
+          }
+        };
+        const threadIdFromCaptureMatchNodeId = (nodeId: string): string =>
+          nodeId.startsWith('thread:') ? nodeId.slice('thread:'.length) : nodeId;
+        if (captureTextFtsFactStore !== null) {
+          // Forward: NEW search visit(s) this drain × ALL indexed text.
+          // Mirrors snapshot.ts Pass 6's own `searchVisits` collection
+          // exactly (same >=4-char gate, same node-metadata source), so
+          // a visit minted by THIS drain's scopedSnapshot is treated
+          // identically to one minted by a full rebuild. In-window
+          // matches are redundantly (but harmlessly) re-derived here —
+          // only the out-of-window ones are new information.
+          const newSearchVisits = scopedSnapshot.nodes.filter((node) => {
+            const q = node.metadata['searchQuery'];
+            return node.kind === 'timeline-visit' && typeof q === 'string' && q.trim().length >= 4;
+          });
+          for (const visitNode of newSearchVisits) {
+            const query = (visitNode.metadata['searchQuery'] as string).trim().toLowerCase();
+            const visitObservedAt = visitNode.lastSeenAt ?? '';
+            for (const match of captureTextFtsFactStore.matchWholeWord(query)) {
+              const observedAt =
+                match.observedAt > visitObservedAt ? match.observedAt : visitObservedAt;
+              upsertSearchIndexEdge({
+                kind: 'thread_text_mentions_search_query',
+                fromNodeId: match.nodeId,
+                toNodeId: visitNode.id,
+                observedAt,
+                producedBy: {
+                  source: 'event-log',
+                  eventType: match.eventType,
+                  dot: { replicaId: match.replicaId, seq: match.seq },
+                },
+                confidence: 'inferred',
+              });
+              // A capture-owned match's edge is owned by scope:thread=X
+              // (scopeForEdge routes to the recognized fromNodeId scope
+              // first) — X may be a thread this drain never otherwise
+              // touched, so its row set must be forced into the rewrite
+              // set below (mirrors registerCorrectedThreadIds' pattern:
+              // an extra reason to include a thread scope beyond the
+              // window's own dirty set). Dispatch-/annotation-owned
+              // matches fall back to the TO node's url scope, which is
+              // always scope:url=<this new search visit> here — already
+              // in rowLocalScopes via scopedVisitKeys, no extra scope
+              // needed.
+              if (match.docKind === 'capture') {
+                searchIndexExtraThreadIds.add(threadIdFromCaptureMatchNodeId(match.nodeId));
+              }
+            }
+          }
+          // Reverse: NEW capture/dispatch/annotation text this drain ×
+          // OLD (pre-existing) search-visit queries. The candidate QUERY
+          // list is bounded — but for two INDEPENDENT reasons that land
+          // on two different bounds:
+          //
+          //  - THREAD-owned matches (CAPTURE_RECORDED — fromNodeId is
+          //    always a recognized `thread:` scope node) are always SAFE
+          //    to mint: the capture's own thread is already dirty this
+          //    drain (it's literally why the event is in
+          //    scopedDeltaEventsForBuild), so thread:X's row set is
+          //    already being rewritten regardless of which query it
+          //    matches. The only reason to bound this side at all is
+          //    COST: testing every new capture against the vault's
+          //    entire lifetime search-visit history, on every drain with
+          //    a capture (far more common than search visits), would
+          //    reintroduce a query × all-visits scan on the OTHER axis
+          //    from the one this store was built to index. Bound to the
+          //    RECENT_SEARCH_QUERY_BOUND most-recently-seen search
+          //    visits (by lastSeenAt — also the highest-value case: a
+          //    just-added capture is far more likely to reference a
+          //    recent search than a stale one) UNIONED with this drain's
+          //    own touched scope set (scopedVisitKeys), so a same-drain
+          //    search-visit-plus-capture pair always matches regardless
+          //    of recency ranking.
+          //
+          //  - DISPATCH_RECORDED/ANNOTATION_CREATED-owned matches are
+          //    owned by the QUERY's url scope (scopeForEdge's fallback,
+          //    since dispatch:/annotation: aren't scope-typed nodes) —
+          //    NOT being rewritten this drain unless the query's own
+          //    visit is independently touched too. Safely widening this
+          //    side needs a general "preserve an arbitrary untouched url
+          //    scope's prior rows" carry-forward, which does not exist
+          //    yet (preserveThreadRowsForScopedDelta only covers
+          //    `thread` scopes) — so this side stays bounded to
+          //    scopedVisitKeys only. DOCUMENTED RESIDUAL for F8 W3's
+          //    repair queue: a dispatch/annotation that newly mentions a
+          //    query whose search visit is not independently touched
+          //    this same drain does not get its edge minted until that
+          //    visit's own next scoped drain or the next full rebuild —
+          //    stale-but-correct (the prior state is left untouched,
+          //    never wrong, never silently dropped), not a false result.
+          const isOldSearchVisitNode = (node: ConnectionNode): boolean => {
+            const q = node.metadata['searchQuery'];
+            return node.kind === 'timeline-visit' && typeof q === 'string' && q.trim().length >= 4;
+          };
+          const scopedOldSearchVisits = previousSnapshotForScopedDelta.nodes.filter(
+            (node) =>
+              isOldSearchVisitNode(node) &&
+              scopedVisitKeys.has(visitKeyFromTimelineNodeIdForDelta(node.id) ?? ''),
+          );
+          const recentOldSearchVisits = [...previousSnapshotForScopedDelta.nodes]
+            .filter(isOldSearchVisitNode)
+            .sort((a, b) => (b.lastSeenAt ?? '').localeCompare(a.lastSeenAt ?? ''))
+            .slice(0, RECENT_SEARCH_QUERY_BOUND);
+          const dedupeNodesById = (nodes: readonly ConnectionNode[]): readonly ConnectionNode[] => {
+            const byId = new Map<string, ConnectionNode>();
+            for (const node of nodes) byId.set(node.id, node);
+            return [...byId.values()];
+          };
+          const threadOwnedQueryCandidates = dedupeNodesById([
+            ...scopedOldSearchVisits,
+            ...recentOldSearchVisits,
+          ]);
+          const urlOwnedQueryCandidates = scopedOldSearchVisits;
+          if (threadOwnedQueryCandidates.length > 0 || urlOwnedQueryCandidates.length > 0) {
+            const textSourcesForEvent = (
+              event: AcceptedEvent,
+            ): {
+              readonly fromNodeId: string;
+              readonly sources: readonly string[];
+              readonly candidates: readonly ConnectionNode[];
+            } | null => {
+              if (event.type === CAPTURE_RECORDED && isCaptureRecordedPayload(event.payload)) {
+                const p = event.payload;
+                const threadKey = p.threadId ?? p.bac_id;
+                const sources: string[] = [];
+                for (const turn of p.turns ?? []) {
+                  for (const source of [turn.text, turn.markdown, turn.formattedText]) {
+                    if (typeof source === 'string' && source.length > 0) sources.push(source);
+                  }
+                }
+                return {
+                  fromNodeId: nodeIdFor('thread', threadKey),
+                  sources,
+                  candidates: threadOwnedQueryCandidates,
+                };
+              }
+              if (event.type === DISPATCH_RECORDED && isDispatchRecordedPayload(event.payload)) {
+                const p = event.payload;
+                return {
+                  fromNodeId: nodeIdFor('dispatch', p.bac_id),
+                  sources: p.body.length > 0 ? [p.body] : [],
+                  candidates: urlOwnedQueryCandidates,
+                };
+              }
+              if (event.type === ANNOTATION_CREATED && isAnnotationCreatedPayload(event.payload)) {
+                const p = event.payload;
+                return {
+                  fromNodeId: nodeIdFor('annotation', p.bac_id),
+                  sources: p.note.length > 0 ? [p.note] : [],
+                  candidates: urlOwnedQueryCandidates,
+                };
+              }
+              return null;
+            };
+            for (const event of scopedDeltaEventsForBuild) {
+              const extracted = textSourcesForEvent(event);
+              if (
+                extracted === null ||
+                extracted.sources.length === 0 ||
+                extracted.candidates.length === 0
+              ) {
+                continue;
+              }
+              const eventObservedAt = new Date(event.acceptedAtMs).toISOString();
+              for (const candidate of extracted.candidates) {
+                const query = (candidate.metadata['searchQuery'] as string).trim().toLowerCase();
+                const candidateObservedAt = candidate.lastSeenAt ?? '';
+                const matched = extracted.sources.some((source) =>
+                  matchesWholeWordQuery(source, query),
+                );
+                if (!matched) continue;
+                const observedAt =
+                  eventObservedAt > candidateObservedAt ? eventObservedAt : candidateObservedAt;
+                upsertSearchIndexEdge({
+                  kind: 'thread_text_mentions_search_query',
+                  fromNodeId: extracted.fromNodeId,
+                  toNodeId: candidate.id,
+                  observedAt,
+                  producedBy: {
+                    source: 'event-log',
+                    eventType: event.type,
+                    dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
+                  },
+                  confidence: 'inferred',
+                });
+              }
+            }
+          }
+        }
+        // Extra thread scopes discovered only via a forward-join capture
+        // match (searchIndexExtraThreadIds) must be rewritten this drain
+        // (rowLocalScopes + preserveThreadRowsForScopedDelta) so the new
+        // edge actually lands, but they are NOT a real membership/URL
+        // change — exclude them from threadFullBuildReason below, same
+        // treatment as registerCorrectedThreadIds.
+        const dirtyThreadScopesForSearchIndex =
+          searchIndexExtraThreadIds.size === 0
+            ? dirtyThreadScopes
+            : dedupeScopeList([
+                ...dirtyThreadScopes,
+                ...[...searchIndexExtraThreadIds].map((id) => ({ kind: 'thread' as const, id })),
+              ]);
         // F8 W1 — threads the register store already resolved+corrected
         // above are excluded from this check: a genuine, now-correctly-
         // resolved membership change is EXPECTED to differ from
@@ -6293,8 +6644,10 @@ export const createConnectionsMaterializer = (
         const threadFullBuildReason = threadDeltaFullBuildReason({
           previousSnapshot: previousSnapshotForScopedDelta,
           scopedSnapshot,
-          threadScopes: dirtyThreadScopes.filter(
-            (scope) => !registerCorrectedThreadIds.has(scope.id),
+          threadScopes: dirtyThreadScopesForSearchIndex.filter(
+            (scope) =>
+              !registerCorrectedThreadIds.has(scope.id) &&
+              !searchIndexExtraThreadIds.has(scope.id),
           ),
           deletedThreadIds: deletedThreadIdsForScopedDelta,
         });
@@ -6314,7 +6667,7 @@ export const createConnectionsMaterializer = (
               visitKeys: scopedVisitKeys,
               tabSessionIds,
             }),
-            ...dirtyThreadScopes,
+            ...dirtyThreadScopesForSearchIndex,
           ]);
           mark(`scopedDelta.rowLocalScopes n=${String(rowLocalScopes.length)}`);
           // Yield periodically: a catch-up chunk can carry thousands of
@@ -6327,19 +6680,32 @@ export const createConnectionsMaterializer = (
             scopeOutputs.push(recomputeScope(scope, scopedSnapshot));
             if (index % 100 === 99) await yieldToEventLoop();
           }
-          const rawScoped = unionScopeOutputs(scopeOutputs);
+          const rawScopedBeforeSearchIndex = unionScopeOutputs(scopeOutputs);
+          // F8 W2 — fold in the cross-window thread_text_mentions_search_query
+          // edges minted above. scopedSnapshot has no knowledge of them (by
+          // construction — that's the whole point of the join), so they must
+          // be added here rather than flowing through recomputeScope.
+          const rawScoped =
+            searchIndexNewEdges.size === 0
+              ? rawScopedBeforeSearchIndex
+              : unionScopeOutputs([
+                  rawScopedBeforeSearchIndex,
+                  { nodes: [], edges: [...searchIndexNewEdges.values()] },
+                ]);
           mark(
-            `scopedDelta.recomputeScopes n=${String(rowLocalScopes.length)} nodes=${String(rawScoped.nodes.length)} edges=${String(rawScoped.edges.length)}`,
+            `scopedDelta.recomputeScopes n=${String(rowLocalScopes.length)} nodes=${String(rawScoped.nodes.length)} edges=${String(rawScoped.edges.length)} searchIndexEdges=${String(searchIndexNewEdges.size)}`,
           );
           await yieldToEventLoop();
           const scopedWithThreads = preserveThreadRowsForScopedDelta({
             output: rawScoped,
             previousSnapshot: previousSnapshotForScopedDelta,
             scopedSnapshot,
-            threadScopes: dirtyThreadScopes,
+            threadScopes: dirtyThreadScopesForSearchIndex,
             deletedThreadIds: deletedThreadIdsForScopedDelta,
           });
-          mark(`scopedDelta.preserveThreadRows threads=${String(dirtyThreadScopes.length)}`);
+          mark(
+            `scopedDelta.preserveThreadRows threads=${String(dirtyThreadScopesForSearchIndex.length)}`,
+          );
           await yieldToEventLoop();
           // Losslessness (unconditional): the scoped snapshot carries no
           // ranker/frontier-scoped similarity edges, so re-asserting each
@@ -6957,13 +7323,61 @@ export const createConnectionsMaterializer = (
             (currentSnapshotRankerRevision !== undefined &&
               currentSnapshotRankerRevision !== producerRevision);
           const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+          // F8 W2 — same_search_query candidate pairs for a NEW search
+          // visit are invisible to expandRankerFrontier below (it has no
+          // same-query expansion step), so the touched visit ids it seeds
+          // from would never include a search visit's same-query
+          // SIBLINGS — only the touched visit itself. Feed the sibling
+          // set (searchQueryIndexStore.visitsForQuery — an indexed
+          // lookup instead of the corpus scan that store replaces) into
+          // the SAME EXISTING frontier-expansion path, so a sibling gets
+          // walked as `fromVisitKey` too and both directions get scored.
+          //
+          // KNOWN LIMITATION (not a regression — see below): this only
+          // reproduces full-rebuild equivalence when `input.events`
+          // (aliased `merged`) below happens to be the COMPLETE event
+          // log (cold boot, or a catch-up chunk with mergedIsFullLog —
+          // see the `merged` declaration's own comment). On the COMMON
+          // warm/live drain, `merged` is only this drain's pending
+          // window (readMergedSince), so closestVisitRankerEdgesForSnapshot's
+          // generateCandidates(sibling, rankerCandidateContext) can walk
+          // the sibling but still can't discover a `same_search_query`
+          // pairing whose OTHER endpoint's originating event isn't in
+          // that window — the frontier controls WHICH visits get walked,
+          // not what raw-event data each walk can see. Widening
+          // `input.events` itself would require either a full-log read
+          // (defeating the scoped delta) or a targeted historical-event
+          // fetch keyed by visit — searchQueryIndexStore's schema does
+          // not retain a (replicaId, seq) per visit row, so it cannot
+          // serve that fetch as built. Left as a DOCUMENTED RESIDUAL: no
+          // worse than before (the pre-existing full-rebuild-fallback
+          // path already ran this SAME narrow-frontier ranker pass on a
+          // warm drain — canUseIncrementalRanker below doesn't
+          // distinguish scoped-vs-full — so this sub-case was already
+          // this incomplete before W2, regardless of the search-visit
+          // bail). A future wave that teaches this phase to read back
+          // specific historical events by (replicaId, seq) closes it.
+          const searchQuerySiblingVisitIds = new Set<string>();
+          if (searchQueryIndexFactStore !== null) {
+            for (const visitKey of touchedVisitIds) {
+              const search = detectSearchUrl(visitKey);
+              if (search === null) continue;
+              for (const row of searchQueryIndexFactStore.visitsForQuery(search.query)) {
+                searchQuerySiblingVisitIds.add(row.visitKey);
+              }
+            }
+          }
+          const touchedVisitIdsForRanker =
+            searchQuerySiblingVisitIds.size === 0
+              ? touchedVisitIds
+              : new Set([...touchedVisitIds, ...searchQuerySiblingVisitIds]);
           const canUseIncrementalRanker =
             incrementalRankerEnabled() &&
             currentSnapshot !== null &&
-            touchedVisitIds.size > 0 &&
+            touchedVisitIdsForRanker.size > 0 &&
             !producerRevisionChanged;
           if (canUseIncrementalRanker) {
-            const rankerFrontier = expandRankerFrontier(touchedVisitIds, currentSnapshot, {
+            const rankerFrontier = expandRankerFrontier(touchedVisitIdsForRanker, currentSnapshot, {
               includeSameUrlSiblings: true,
               includeSameTabSession: true,
               includeSameWorkstream: true,
