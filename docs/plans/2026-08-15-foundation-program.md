@@ -36,7 +36,7 @@ from reality without being updated in the same PR that changes reality.
 |----|------|------------------------------------|--------------------|
 | F1 | Engagement compaction runs | Report-only numbers reproduced (done: 439.7MB = 65.3% of 672.8MB reclaimable, 0 uncovered visits); gated `--apply` on test vault shrinks log with post-apply equivalence (event counts, serving probes); nightly report-only scheduled via runbook → live script | CLI + schedule merged-pending (PR #361); apply scheduled idle window |
 | F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | Pending (after F1 apply) |
-| F3 | No full-log walks on hot paths | Survey complete (see below); foreground-nav overlay migrated to typed reads with equivalence test; phase-log shows no full-log walk during a normal drain + nav burst | Survey done; overlay migration in progress |
+| F3 | No full-log walks on hot paths | Survey complete (see below); foreground-nav overlay migrated to typed reads with equivalence test; phase-log shows no full-log walk during a normal drain + nav burst | Overlay migration done; remaining hot readMerged callers (health/§15/ingestor/retrain-worker) migrated + equivalence-tested (PR TBD, 2026-08-16); default-ON flip evaluated and NOT shipped (test-fixture blocker, see landing note) |
 | F4 | Blob diet | Accumulator blob + append-index snapshot off pretty JSON (CBOR/compact or incremental); snapshot load <1s (baseline 2.5s); measured before/after | Pending (after F1–F3) |
 | F5 | Small-file stores → SQLite | page-content (703 files) + page-evidence (3,741 files) each one SQLite; one transaction per capture; #356/#357 manifest upserts deleted as obsolete; migration + rollback documented | Pending |
 | F6 | Leftover bugs | Evidence-manifest staleness on lane writes fixed (done, verified 60/60); AttributionProvenance fallback honesty (done, verified 56/56) | Merged-pending (PR #361) |
@@ -125,6 +125,73 @@ off the serve path (`attribution-v1/reverseShadowDefer.ts`, mirrors
 via `ConnectionsSnapshot.truncated` + a throttled
 `[resolver.subgraph.truncated]` log line for soak observability.
 
+**2026-08-16 — F3 residual readMerged callers migrated; default-ON flip
+evaluated and NOT shipped (perf/f3-store-off-readmerged).** Closes the F3
+survey's remaining named callers (`connectionsMaterializer.ts`'s
+foreground-nav overlay, done earlier, is out of scope here and untouched).
+
+*Migrated / verified (all already degrade to the typed store when
+`SIDETRACK_EVENT_STORE=1`, and now carry an equivalence test proving the
+store-backed and readMerged-backed results are identical on a synthetic
+fixture):*
+- `system/workGraphHealth.ts:353` (`readEventsForHealth`, feeding
+  `readFeedbackEvents` at :375 and the recall.served/action read at
+  :1322) — was already store-aware; added
+  `system/workGraphHealth.test.ts`'s "F3: readFeedbackEvents is
+  store/readMerged equivalent".
+- `system/section15Collector.ts:36` (`readSection15Events`) — was
+  already store-aware; added `system/section15Collector.test.ts`'s "F3:
+  readSection15Events is store/readMerged equivalent".
+- `recall/ingestor.ts:142-143` (`ingestIncremental`'s fresh-events +
+  tombstone-scan branches) — was already store-aware; added
+  `recall/ingestor.test.ts`'s "F3: ingestIncremental is store/readMerged
+  equivalent".
+- `ranker/retrain.worker.ts:72` — genuinely NOT store-aware before this
+  PR (unconditional `eventLog.readMerged()`). New
+  `ranker/retrain.ts:1268` `readRetrainEventSources(vaultRoot, eventLog)`
+  factors the sourcing out of the worker (worker-thread code is hard to
+  unit-test directly) and gives it two fields: `readTrainingEvents`
+  (narrow trainable-types subset — indexed `forEachChunkOfTypes` when the
+  store is on, the existing O(labels)
+  `trainableEventsShard.ts:readTrainableEventsFromShard` when it's off —
+  never `readMerged()`, on OR off) and `merged` (full history, no narrow
+  index exists for the legacy candidate-generation fallback's broad event
+  types — full ordered `store.forEachChunk` when the store is on,
+  `eventLog.readMerged()` only when it's off). Equivalence test:
+  `ranker/retrain.test.ts`'s "F3 — readRetrainEventSources" describe
+  block.
+
+*Default-ON flip: evaluated, NOT shipped.* The code side is ready — every
+caller above (plus `attribution-v1/artifact.ts`'s
+`readAttributionV1SourceEvents`, discovered during this evaluation) already
+falls back correctly when the store is off, and both live companions have
+run `SIDETRACK_EVENT_STORE=1` for days with no regression. But flipping the
+process default on this branch and running the full `bun test` suite (356
+files) turned **67 assertions across 19 files red** — concentrated in
+`sync/contract/connectionsMaterializer.*.test.ts` +
+`connectionsHnswReconcileIntegration.test.ts` (29 of the 67), a file this
+PR is scoped not to touch. Root cause, confirmed by `git stash` isolating
+the one-line flag change and turning the same failures green: a repeated
+test-fixture shape — a real `mkdtemp` vaultRoot paired with a STUB
+`EventLog` (only `readMerged`/`streamFiltered` implemented) on the
+assumption "the store path is unused for a bare vault root" (verbatim,
+`attribution-v1/armedResolve.test.ts`), true only while the store defaults
+off. With it on, `getCaughtUpSharedEventStore` opens a REAL empty sqlite
+store against that real temp dir instead of no-op'ing, and typed readers
+silently read the empty store instead of the seeded stub. Fixing this
+needs either a way to stub the shared event store itself (not just
+`EventLog`) or an audit pinning `SIDETRACK_EVENT_STORE=0` on every affected
+fixture — real work, out of scope for a readMerged-migration PR, and
+partly inside the frozen `connectionsMaterializer.ts` test ecosystem.
+`eventStoreEnabled()` stays opt-in (`=== '1'`); the doc comment in
+`sync/eventStore.ts` and the `sync/lineage.ts` `event-store` node both
+record this decision + the measurement so a future flip starts from
+evidence, not the flip-and-see this evaluation just ran. The seeding
+bootstrap a future flip depends on is proven safe independent of the
+flag's default: `sync/eventStore.test.ts`'s "F3: event-store bootstrap —
+first-boot seed, incremental reopen" (no `event-store.db` present → one
+full `catchUpFromJsonl` pass → a second `createEventStore` open against
+the same on-disk db is a zero-row incremental catch-up, not a rescan).
 **2026-08-16, round 2 — index-backed event-candidate resolve
 (perf/event-candidate-resolve).** Not an F1–F7 item; filed here per the
 "binding plan tracks reality" rule — same measured symptom family

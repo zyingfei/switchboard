@@ -1,23 +1,33 @@
 // Stage 5 polish — ranker retrain worker entry. The HTTP route at
 // /v1/closestVisits/retrain spawns this worker via the helper in
 // retrain.ts so the LightGBM training math (≥1s of pure CPU on the
-// dogfood vault, more on larger ones) AND the cold-path
-// `readMerged()` + `readCurrent()` calls run off the main event loop.
-// /v1/status and every other warm-path request stay responsive while
-// retrain is in flight.
+// dogfood vault, more on larger ones) AND the cold-path event-log
+// read + `readCurrent()` calls run off the main event loop. /v1/status
+// and every other warm-path request stay responsive while retrain is
+// in flight.
 //
 // The worker accepts a minimal serializable job — vaultRoot + knobs
 // — and constructs its own EventLog + connectionsStore inside the
-// worker context so the heavy `readMerged()` and `readCurrent()`
-// I/O don't run on the request handler's thread. Mirrors the
-// pattern used by `connectionsReconcileWorker.entry.ts`.
+// worker context so the heavy event reads and `readCurrent()` I/O
+// don't run on the request handler's thread. Mirrors the pattern
+// used by `connectionsReconcileWorker.entry.ts`.
+//
+// F3 — event sourcing goes through `readRetrainEventSources`
+// (retrain.ts), which prefers the typed event store
+// (SIDETRACK_EVENT_STORE=1) over a raw `eventLog.readMerged()` full-log
+// walk whenever the store is available; see that function's doc
+// comment for the exact store-vs-log fallback per field.
 
 import { parentPort, workerData } from 'node:worker_threads';
 
 import { createConnectionsStore } from '../connections/snapshot.js';
 import { createEventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
-import { maybeRetrainClosestVisitRanker, type RankerRetrainResult } from './retrain.js';
+import {
+  maybeRetrainClosestVisitRanker,
+  readRetrainEventSources,
+  type RankerRetrainResult,
+} from './retrain.js';
 import type { TrainRankerOptions } from './train.js';
 
 export interface RetrainWorkerJob {
@@ -59,7 +69,10 @@ const run = async (): Promise<void> => {
     const replica = await loadOrCreateReplica(job.vaultRoot);
     const eventLog = createEventLog(job.vaultRoot, replica);
     const connectionsStore = createConnectionsStore(job.vaultRoot);
-    const merged = await eventLog.readMerged();
+    const { merged, readTrainingEvents } = await readRetrainEventSources(
+      job.vaultRoot,
+      eventLog,
+    );
     const snapshot = await connectionsStore.readCurrent();
     if (snapshot === null) {
       post({ ok: false, error: 'Connections snapshot is not ready' });
@@ -68,6 +81,7 @@ const run = async (): Promise<void> => {
     const result = await maybeRetrainClosestVisitRanker({
       vaultRoot: job.vaultRoot,
       merged,
+      readTrainingEvents,
       snapshot,
       ...(job.threshold === undefined ? {} : { threshold: job.threshold }),
       ...(job.force === undefined ? {} : { force: job.force }),

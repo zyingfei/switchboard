@@ -348,3 +348,73 @@ describe('getCaughtUpSharedEventStore single-flight', () => {
     },
   );
 });
+
+// F3 — boot safety of the store bootstrap a future default-ON flip would
+// rely on (see eventStoreEnabled's doc comment: the flip was evaluated,
+// found blocked on unrelated test-fixture debt, and NOT shipped — this
+// flag stays opt-in, `=1`). A vault that has never had `event-store.db`
+// must seed it exactly ONCE via the EXISTING bootstrap (`catchUpFromJsonl`,
+// chunked + yielding — no new full-log scan exists anywhere for this), and
+// every subsequent open of the same on-disk db must be a cheap incremental
+// catch-up (watermark/shard_progress-bounded), not a re-scan.
+describe('F3: event-store bootstrap — first-boot seed, incremental reopen', () => {
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it('eventStoreEnabled() is opt-in: false when unset or =0, true only at =1', async () => {
+    const { eventStoreEnabled } = await import('./eventStore.js');
+    const priorFlag = process.env['SIDETRACK_EVENT_STORE'];
+    try {
+      delete process.env['SIDETRACK_EVENT_STORE'];
+      expect(eventStoreEnabled()).toBe(false);
+      process.env['SIDETRACK_EVENT_STORE'] = '0';
+      expect(eventStoreEnabled()).toBe(false);
+      process.env['SIDETRACK_EVENT_STORE'] = '1';
+      expect(eventStoreEnabled()).toBe(true);
+    } finally {
+      if (priorFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = priorFlag;
+    }
+  });
+
+  sqliteIt(
+    'no store db present -> seeded once from JSONL -> a later reopen reads the persisted store without rescanning',
+    async () => {
+      const vault = await mkdtemp(join(tmpdir(), 'event-store-bootstrap-'));
+      dirs.push(vault);
+      const logRoot = join(vault, '_BAC', 'log');
+      await mkdir(join(logRoot, 'replica-a'), { recursive: true });
+      const events = buildEvents().filter((c) => c.dot.replicaId === 'replica-a');
+      await writeFile(
+        join(logRoot, 'replica-a', '0001.jsonl'),
+        `${events.map((c) => JSON.stringify(c)).join('\n')}\n`,
+        'utf8',
+      );
+
+      // Boot 1: no event-store.db exists yet. Opening it seeds fully from
+      // the log via the existing bootstrap — the "first boot after
+      // opt-in" cost, paid once.
+      const bootOne = await createEventStore(vault);
+      const seeded = await bootOne.catchUpFromJsonl(logRoot);
+      expect(seeded).toBe(events.length);
+      expect(bootOne.count()).toBe(events.length);
+      bootOne.close();
+
+      // Boot 2: a FRESH store handle against the SAME on-disk db (simulates
+      // a companion restart — a new process opening a vault that already
+      // has event-store.db). It must see the full seeded set immediately
+      // AND a catch-up pass must be a no-op (0 newly-ingested), proving the
+      // second boot reads the persisted store rather than re-walking the
+      // JSONL log.
+      const bootTwo = await createEventStore(vault);
+      expect(bootTwo.count()).toBe(events.length);
+      const rescanned = await bootTwo.catchUpFromJsonl(logRoot);
+      expect(rescanned).toBe(0);
+      expect(bootTwo.count()).toBe(events.length);
+      bootTwo.close();
+    },
+  );
+});

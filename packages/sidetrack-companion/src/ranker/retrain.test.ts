@@ -28,6 +28,7 @@ import {
   fingerprintFeedbackTrainingLabels,
   maybeRetrainClosestVisitRanker,
   planRankerRetrain,
+  readRetrainEventSources,
   type RankerRetrainState,
   type RankerTrainingLabelDatasetFingerprint,
   type TrainRankerRevisionFn,
@@ -1083,4 +1084,80 @@ describe('ranker retraining loop', () => {
     expect(mergedEventCount).toBe(1);
   });
 
+});
+
+describe('F3 — readRetrainEventSources (retrain worker event sourcing)', () => {
+  // The standalone retrain worker (retrain.worker.ts) has no drain-tail
+  // scoping, so `merged` is the FULL event history and `readTrainingEvents`
+  // is the narrow trainable-types subset. Both must fold to the SAME
+  // result whether SIDETRACK_EVENT_STORE is on (indexed store type-scan /
+  // full ordered store scan) or off (trainable-events shard / raw
+  // eventLog.readMerged()) — the same equivalence bar every other F3
+  // caller (workGraphHealth.ts, section15Collector.ts, recall/ingestor.ts)
+  // is held to.
+  const seedFixture = async (root: string): Promise<AcceptedEvent[]> => {
+    const replica = await loadOrCreateReplica(root);
+    const eventLog = createEventLog(root, replica);
+    const trainable = feedbackEvent(1, 'https://example.test/a', 'https://example.test/b');
+    await eventLog.importPeerEvent(trainable);
+    await eventLog.appendClient({
+      clientEventId: 'non-trainable-1',
+      aggregateId: 'thread_non_trainable',
+      type: 'capture.recorded',
+      payload: {
+        bac_id: 'thread_non_trainable',
+        capturedAt: observedAt,
+        turns: [{ ordinal: 0, role: 'assistant', text: 'not a trainable event type' }],
+      },
+      baseVector: {},
+    });
+    return [trainable];
+  };
+
+  it('merged (full history) and readTrainingEvents (narrow subset) match across the store/off split', async () => {
+    const vaultWithoutStore = await mkdtemp(join(tmpdir(), 'sidetrack-retrain-sources-off-'));
+    const vaultWithStore = await mkdtemp(join(tmpdir(), 'sidetrack-retrain-sources-on-'));
+    tempRoots.push(vaultWithoutStore, vaultWithStore);
+    await seedFixture(vaultWithoutStore);
+    await seedFixture(vaultWithStore);
+
+    const priorStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    try {
+      process.env['SIDETRACK_EVENT_STORE'] = '0';
+      const replicaOff = await loadOrCreateReplica(vaultWithoutStore);
+      const sourcesOff = await readRetrainEventSources(
+        vaultWithoutStore,
+        createEventLog(vaultWithoutStore, replicaOff),
+      );
+      const trainingOff = await sourcesOff.readTrainingEvents();
+
+      process.env['SIDETRACK_EVENT_STORE'] = '1';
+      const { getCaughtUpSharedEventStore } = await import('../sync/eventStore.js');
+      const store = await getCaughtUpSharedEventStore(vaultWithStore);
+      expect(store).not.toBeNull();
+      expect(store?.count()).toBeGreaterThan(0);
+      const replicaOn = await loadOrCreateReplica(vaultWithStore);
+      const sourcesOn = await readRetrainEventSources(
+        vaultWithStore,
+        createEventLog(vaultWithStore, replicaOn),
+      );
+      const trainingOn = await sourcesOn.readTrainingEvents();
+
+      // merged: full history — both non-trainable and trainable events,
+      // identical set/order regardless of store on/off.
+      expect(sourcesOn.merged.length).toBe(2);
+      expect(sourcesOn.merged.map((e) => e.clientEventId)).toEqual(
+        sourcesOff.merged.map((e) => e.clientEventId),
+      );
+      // readTrainingEvents: narrow trainable-types subset only.
+      expect(trainingOn.length).toBe(1);
+      expect(trainingOn.map((e) => e.clientEventId)).toEqual(
+        trainingOff.map((e) => e.clientEventId),
+      );
+      expect(trainingOn[0]?.type).toBe(USER_FLOW_CONFIRMED);
+    } finally {
+      if (priorStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = priorStoreFlag;
+    }
+  });
 });

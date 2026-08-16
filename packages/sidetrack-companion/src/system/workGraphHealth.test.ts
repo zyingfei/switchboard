@@ -1029,4 +1029,70 @@ describe('work graph diagnostic candidates', () => {
       expect(live.ranker.shipGateV2?.revisionId).toBe('rev-v6-passing');
     });
   });
+
+  // F3 — the typed-store branch (SIDETRACK_EVENT_STORE on) inside
+  // readEventsForHealth/readFeedbackEvents must fold to the SAME
+  // feedback projection as the readMerged fallback branch it replaces
+  // on default (store-off) installs. Locks the equivalence the F3
+  // default flip depends on.
+  it('F3: readFeedbackEvents is store/readMerged equivalent', async () => {
+    const replicaId = '55555555-5555-4555-8555-555555555555';
+    const peerReplicaId = '66666666-6666-4666-8666-666666666666';
+    let seq = 0;
+    const eventLog = createEventLog(vaultRoot, {
+      replicaId,
+      created: true,
+      nextSeq: async () => {
+        seq += 1;
+        return seq;
+      },
+      peekSeq: () => seq,
+      observeSeq: async (incoming: number) => {
+        seq = Math.max(seq, incoming);
+      },
+    });
+    const rejected: AcceptedEvent = {
+      clientEventId: 'client-f3-equiv-1',
+      dot: { replicaId: peerReplicaId, seq: 1 },
+      deps: {},
+      aggregateId: 'feedback:f3-equiv',
+      type: USER_ORGANIZED_ITEM,
+      payload: {
+        payloadVersion: 1,
+        itemKind: 'canonical-url',
+        itemId: 'https://example.test/f3-equiv',
+        action: 'ignore',
+        fromContainer: 'workstream:w-equiv',
+      },
+      acceptedAtMs: Date.parse('2026-05-16T14:00:00.000Z'),
+    };
+    await eventLog.importPeerEvent(rejected);
+
+    const priorStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    try {
+      process.env['SIDETRACK_EVENT_STORE'] = '0';
+      const withoutStore = await collectWorkGraphHealth({
+        vaultRoot,
+        eventLog,
+        now: () => new Date('2026-05-16T14:05:00.000Z'),
+      });
+      expect(withoutStore.feedback.negativeLabelCount).toBe(1);
+
+      process.env['SIDETRACK_EVENT_STORE'] = '1';
+      const { getCaughtUpSharedEventStore } = await import('../sync/eventStore.js');
+      const store = await getCaughtUpSharedEventStore(vaultRoot);
+      expect(store).not.toBeNull();
+      expect(store?.count()).toBeGreaterThan(0);
+      const withStore = await collectWorkGraphHealth({
+        vaultRoot,
+        eventLog,
+        now: () => new Date('2026-05-16T14:05:00.000Z'),
+      });
+
+      expect(withStore.feedback).toEqual(withoutStore.feedback);
+    } finally {
+      if (priorStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = priorStoreFlag;
+    }
+  });
 });

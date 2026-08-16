@@ -171,22 +171,51 @@ export interface SealRow {
 export const EVENT_STORE_AUTHORITY = 'canonical-jsonl' as const;
 export const EVENT_STORE_STORAGE_ROLE = 'rebuildable-mirror' as const;
 
-// Default OFF: measured net-negative. The off-heap event store does NOT
-// reduce memory — idle resident is already tiny (mergedMemo TTL-evicts;
-// ~39MB) and under load peak RSS was HIGHER with the store (1064MB) than
-// legacy readMerged (853MB) due to the sqlite handle + query/catchUp
-// overhead; the ~2.8G "footprint" is Bun allocator slack (compressed/
-// swapped), unaffected either way. Opt-in via env=1 (experimental).
-// Default OFF (measured 2026-05-29): fetching RAW events from the SQLite
-// mirror is a half-measure — it does NOT fix the JS heap (serving reads
-// still materialize the events as JS objects: heap stayed ~990MB), and it
-// trades the readMerged memo cache for CPU (every poll re-reads + re-
-// projects from SQLite → ~100% CPU under the extension's frequent polls;
-// RSS only modestly + noisily lower, ~1.24G vs ~1.8G). The real fix is
-// query-AGGREGATION: have serving run SQL projections that return the small
-// rolled-up result (URLs/sessions/engagement metrics) instead of raw
-// events — see engagement/engagementFactsStore.ts for that pattern, and
-// the chdb evaluation for the columnar option. Opt in with =1.
+// F3 (2026-08-16) — evaluated flipping this to default-ON and DID NOT ship
+// it; stays opt-in (env=1). Every hot reader that consults this flag
+// (workGraphHealth.ts, section15Collector.ts, recall/ingestor.ts,
+// attribution-v1/artifact.ts, ranker/retrain.ts's readRetrainEventSources)
+// already degrades correctly to a readMerged()/streamFiltered() fallback
+// when the flag is off, and both live companions (test + daily) have run
+// =1 continuously for days with no regression — the CODE is ready. The
+// blocker is test-fixture debt, measured directly: flipping the process
+// default to ON (tried on this branch, then reverted) turned 67 assertions
+// red across 19 files (`bun test`, full suite), concentrated in the
+// sync/contract/connectionsMaterializer.*.test.ts + connectionsHnsw*.test.ts
+// ecosystem (29 of the 67). Root cause is one repeated fixture shape: a
+// test builds a REAL temp vaultRoot but injects a STUB EventLog (only
+// `readMerged`/`streamFiltered` implemented) on the assumption that "the
+// store path is unused for a bare vault root" (verbatim comment,
+// attribution-v1/armedResolve.test.ts) — true only while the store
+// defaults off. With it on, `getCaughtUpSharedEventStore` opens a REAL
+// (empty) sqlite store against that real temp dir instead of no-op'ing,
+// and typed readers silently read the empty store instead of the
+// seeded stub, dropping the fixture's events. Reproduced and isolated:
+// `git stash` (removes only this flag's default) turns the SAME 6
+// armedResolve.test.ts failures green again. Fixing this properly means
+// auditing 19 files' fixtures (many touching
+// sync/contract/connectionsMaterializer.ts, which this PR does not
+// modify) — real work, out of scope for a readMerged-migration PR.
+// Recommended follow-up: either give tests a way to stub the shared event
+// store itself (not just EventLog), or have the affected fixtures pin
+// SIDETRACK_EVENT_STORE=0 explicitly; then flip this default in its own
+// PR with the full suite green.
+//
+// The seeding path a future flip would rely on is already proven safe:
+// a vault whose `_BAC/connections/event-store.db` does not yet exist pays
+// ONE bounded catch-up pass (`catchUpFromJsonl`, chunked + yielding, the
+// same path every store-backed caller already shares via
+// `getCaughtUpSharedEventStore` / `startCoalescedEventStoreCatchUp`) the
+// first time anything opens the store; every later open is a cheap
+// incremental catch-up bounded by the per-shard byte-offset watermark
+// (`shard_progress`), not a re-scan — see eventStore.test.ts's
+// "F3 default-flip" describe block.
+//
+// Prior history this supersedes: shipped default-OFF on two net-negative
+// measurements (2026-05-xx, 2026-05-29 — a naive raw-SQLite-fetch memory/
+// CPU profile predating forEachChunkOfTypes typed reads, serve-stale
+// catch-up splitting, and per-caller SQL aggregation). Neither measurement
+// is the reason it stays off today; the fixture debt above is.
 export const eventStoreEnabled = (): boolean => process.env['SIDETRACK_EVENT_STORE'] === '1';
 
 const sharedEventStores = new Map<string, Promise<EventStore | null>>();

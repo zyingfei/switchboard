@@ -98,6 +98,10 @@ export const LINEAGE_REGISTRY: readonly LineageNode[] = [
     derivesFrom: [CANONICAL_EVENT_LOG],
     sourceEventTypes: ['*'],
     rebuildEntrypoint: 'sync/eventStore.ts:rebuildFromJsonl',
+    // F3 (2026-08-16): default-ON was evaluated and NOT shipped — see
+    // eventStoreEnabled's doc comment in sync/eventStore.ts for the
+    // measured test-fixture blocker (67 assertions / 19 files) and the
+    // follow-up this is gated on.
     defaultState: 'default-off',
     toggleEnv: 'SIDETRACK_EVENT_STORE',
     retirement: {
