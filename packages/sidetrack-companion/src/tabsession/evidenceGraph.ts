@@ -21,7 +21,27 @@ const edgeWeight = (base: number, confidence: string): number => {
   return base;
 };
 
+// PERF (2026-08-16) — memoize per snapshot OBJECT IDENTITY, not content. A
+// batch-resolve request builds one shared subgraph snapshot for the whole
+// `misses` loop (server.ts pins `missedSnapshot` once and reuses the same
+// object reference for every URL — see readResolverSubgraphForUrls), and the
+// reverse-shadow / content-lane joins reuse the SAME reference again. Without
+// this, buildEvidenceGraph (a graphology build + full adjacency sort, ~140ms
+// on a hub subgraph) reran once per miss URL even though every call in a
+// batch was rebuilding the IDENTICAL graph. WeakMap is the correct structure
+// for this: no manual invalidation, no TTL — the entry is only ever reachable
+// while some caller still holds the snapshot object, and is collected the
+// moment nothing does. Keying on content (e.g. snapshotRevision) would be
+// WRONG here: subgraph reads (readResolverSubgraphForUrls et al.) don't
+// carry a per-request-stable revision distinct from the full graph's, so two
+// DIFFERENT subgraphs (different URL, different node/edge set) could share
+// one — object identity is the only boundary that is actually correct.
+const evidenceGraphCache = new WeakMap<ConnectionsSnapshot, EvidenceGraph>();
+
 export const buildEvidenceGraph = (snapshot: ConnectionsSnapshot): EvidenceGraph => {
+  const cached = evidenceGraphCache.get(snapshot);
+  if (cached !== undefined) return cached;
+
   const graph = new MultiDirectedGraph({ allowSelfLoops: false });
   for (const node of [...snapshot.nodes].sort((left, right) => compareString(left.id, right.id))) {
     graph.mergeNode(node.id, { kind: node.kind, label: node.label });
@@ -46,7 +66,7 @@ export const buildEvidenceGraph = (snapshot: ConnectionsSnapshot): EvidenceGraph
     addArc(`${edge.id}:reverse`, edge.toNodeId, edge.fromNodeId, weight * 0.85);
   }
 
-  return {
+  const result: EvidenceGraph = {
     graph,
     revision: `${snapshot.updatedAt}:${String(snapshot.nodeCount)}:${String(snapshot.edgeCount)}`,
     adjacency: new Map(
@@ -56,4 +76,6 @@ export const buildEvidenceGraph = (snapshot: ConnectionsSnapshot): EvidenceGraph
       ]),
     ),
   };
+  evidenceGraphCache.set(snapshot, result);
+  return result;
 };
