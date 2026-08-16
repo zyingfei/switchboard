@@ -64,6 +64,22 @@ import {
 // from process.env directly so we do NOT static-import the heavy
 // onlineHead.ts (predict/snapshot) into this status-reachable module.
 import { readOnlineRankerState } from '../ranker/onlineLabelLedger.js';
+// Learned aggregator-stats SHADOW (observe-only, default ON). Every module
+// in this chain is lightweight (URL parsing + typed-event folding, no
+// recall/embedder graph) — safe to static-import here per this file's own
+// statusContract discipline (see the peekRankerShadowDiff comment above).
+import { classifyAggregatorPageForUrl } from '../ranker/aggregatorProfiles.js';
+import {
+  applyAggregatorObservations,
+  buildAggregatorShadowAgreement,
+  classifyLearnedAggregatorUrl,
+  createEmptyAggregatorStatsState,
+  type AggregatorShadowAgreement,
+} from '../ranker/learnedAggregatorStats.js';
+import type { AggregatorPageType } from '../ranker/aggregatorProfiles.js';
+import { aggregatorObservationsFromEvents } from '../ranker/learnedAggregatorStatsEvents.js';
+import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -78,6 +94,60 @@ import {
   isUserRejectedRelationPayload,
 } from '../feedback/events.js';
 import { createRepairQueueStore } from '../connections/repairQueueStore.js';
+
+// Absent/non-'0'/non-'false' = ON (shadow observe-only by default) —
+// mirrors ranker/candidates.ts's aggregatorGroupingGuardEnabled call-time
+// style. Set to 0/false to skip the extra typed read entirely.
+const learnedAggregatorShadowEnabled = (): boolean => {
+  const raw = process.env['SIDETRACK_LEARNED_AGGREGATOR']?.toLowerCase();
+  return raw !== '0' && raw !== 'false';
+};
+
+// Per-type bounded window for the shadow's live event read — mirrors
+// http/server.ts's SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW idiom
+// (readMostRecentByType, events_accepted_at_ms_idx). NAVIGATION_COMMITTED
+// and BROWSER_TIMELINE_OBSERVED are the two highest-volume event types in
+// the log (one per visit / one per ~30s dwell window) — reading them
+// unbounded on every health poll would be exactly the O(full history) walk
+// this program's F3 goal exists to kill. `0` = kill switch, falls back to
+// the unbounded type-scoped read (still indexed, just not window-capped).
+const LEARNED_AGGREGATOR_WINDOW_ENV = 'SIDETRACK_LEARNED_AGGREGATOR_WINDOW';
+const DEFAULT_LEARNED_AGGREGATOR_WINDOW = 20_000;
+const learnedAggregatorWindow = (): number => {
+  const raw = process.env[LEARNED_AGGREGATOR_WINDOW_ENV];
+  if (raw === undefined || raw.length === 0) return DEFAULT_LEARNED_AGGREGATOR_WINDOW;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_LEARNED_AGGREGATOR_WINDOW;
+};
+
+// The NAVIGATION_COMMITTED/BROWSER_TIMELINE_OBSERVED events fed to the
+// aggregator-stats shadow fold. Bounded (readMostRecentByType) when the
+// typed store is available; falls back to readEventsForHealth's existing
+// type-scoped read (readMerged()-filtered when the store itself is off)
+// otherwise — the SAME fallback cost class readFeedbackEvents and the
+// recall.served/action read in this file already accept, not a new
+// regression class. readMostRecentByType returns most-recent-first, NOT
+// causal order, so the result is sorted by acceptedAtMs ascending — required
+// for aggregatorObservationsFromEvents' opener-chain resolution, which needs
+// an opener's own NAVIGATION_COMMITTED folded before its child's.
+const learnedAggregatorObservationEvents = async (
+  vaultRoot: string,
+  eventLog: EventLog | undefined,
+): Promise<readonly AcceptedEvent[]> => {
+  const window = learnedAggregatorWindow();
+  if (window <= 0) {
+    return readEventsForHealth(vaultRoot, eventLog, [NAVIGATION_COMMITTED, BROWSER_TIMELINE_OBSERVED]);
+  }
+  const store = await getCaughtUpSharedEventStore(vaultRoot);
+  if (store === null) {
+    return readEventsForHealth(vaultRoot, eventLog, [NAVIGATION_COMMITTED, BROWSER_TIMELINE_OBSERVED]);
+  }
+  const events = [
+    ...store.readMostRecentByType(NAVIGATION_COMMITTED, window),
+    ...store.readMostRecentByType(BROWSER_TIMELINE_OBSERVED, window),
+  ];
+  return [...events].sort((left, right) => left.acceptedAtMs - right.acceptedAtMs);
+};
 
 type DiagnosticCandidateMetric = string | number | boolean | null;
 
@@ -720,6 +790,12 @@ const buildDiagnosticCandidates = (input: {
   readonly incrementalShadowReport: ServedTopicProducerReport | null;
   readonly incrementalShadowSecondaryCount: number | null;
   readonly repairQueue: WorkGraphHealthReport['repairQueue'];
+  // Learned aggregator-stats shadow — see the collectWorkGraphHealth
+  // computation this thread comes from. `null` only when the flag is off
+  // (aggregatorShadowEnabled false); otherwise always populated (computed
+  // live, never read from a persisted diagnostics blob).
+  readonly aggregatorShadowEnabled: boolean;
+  readonly aggregatorShadowAgreement: AggregatorShadowAgreement | null;
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
   const diagnosticsObservedAt = producedAt;
@@ -929,6 +1005,52 @@ const buildDiagnosticCandidates = (input: {
         ranThisDrain: booleanOrFalse(topicIncrementalShadow?.['ranThisDrain']),
         churnP50: input.incrementalShadowReport?.churnP50 ?? null,
         churnP90: input.incrementalShadowReport?.churnP90 ?? null,
+      }),
+    },
+    // Learned per-node aggregator-stats SHADOW (2026-08-16) — observe-only,
+    // measures agreement between ranker/aggregatorProfiles.ts's hand-
+    // maintained domain registry (still deciding both guards) and
+    // ranker/learnedAggregatorStats.ts's behavioral classifier. See
+    // docs/plans/2026-08-15-foundation-program.md's design note. `warning`
+    // when the learned classifier under-reaches the registry (misses a URL
+    // the registry protects) — that direction risks resurrecting the
+    // 2026-07-10 false-friend if this shadow ever becomes the decider, so
+    // it is surfaced loudly; the reverse (learned finds MORE hubs than the
+    // registry, `learnedOnlyAggregatorCount`) is the intended, desired
+    // outcome and never raises the status past `ok`.
+    {
+      id: 'aggregator.learned-stats-shadow',
+      family: 'similarity',
+      lane: 'shadow',
+      servingImpact: 'observe-only',
+      status: !input.aggregatorShadowEnabled
+        ? 'off'
+        : input.aggregatorShadowAgreement === null
+          ? 'unavailable'
+          : input.aggregatorShadowAgreement.totalClassified === 0
+            ? 'pending'
+            : input.aggregatorShadowAgreement.registryOnlyAggregatorCount > 0
+              ? 'warning'
+              : 'ok',
+      reason: !input.aggregatorShadowEnabled
+        ? 'disabled'
+        : input.aggregatorShadowAgreement === null
+          ? 'shadow-diagnostics-unavailable'
+          : input.aggregatorShadowAgreement.totalClassified === 0
+            ? 'no-urls-classified-yet'
+            : input.aggregatorShadowAgreement.registryOnlyAggregatorCount > 0
+              ? 'learned-under-reaches-registry'
+              : null,
+      revisionId: null,
+      asOf: liveObservedAt,
+      metrics: metrics({
+        totalClassified: input.aggregatorShadowAgreement?.totalClassified ?? null,
+        agreementCount: input.aggregatorShadowAgreement?.agreementCount ?? null,
+        disagreementCount: input.aggregatorShadowAgreement?.disagreementCount ?? null,
+        agreementRate: input.aggregatorShadowAgreement?.agreementRate ?? null,
+        registryOnlyAggregatorCount: input.aggregatorShadowAgreement?.registryOnlyAggregatorCount ?? null,
+        learnedOnlyAggregatorCount: input.aggregatorShadowAgreement?.learnedOnlyAggregatorCount ?? null,
+        feedVsItemDisagreementCount: input.aggregatorShadowAgreement?.feedVsItemDisagreementCount ?? null,
       }),
     },
     {
@@ -1326,6 +1448,36 @@ export const collectWorkGraphHealth = async ({
     // stays O(matching events), never a full-log scan.
     USER_REJECTED_RELATION,
   ]);
+  // Learned aggregator-stats SHADOW (observe-only; default ON via
+  // SIDETRACK_LEARNED_AGGREGATOR). Recomputed fresh from a BOUNDED typed
+  // read every health poll (learnedAggregatorObservationEvents,
+  // SIDETRACK_LEARNED_AGGREGATOR_WINDOW default 20,000/type) — no persisted
+  // cross-poll cursor (that would live in connectionsMaterializer.ts's
+  // drain, out of scope for a shadow this PR keeps out of the serving path;
+  // see docs/plans/2026-08-15-foundation-program.md's design note). Changes
+  // ZERO serving decisions: the registry (ranker/aggregatorProfiles.ts)
+  // keeps deciding both guards; this only measures agreement.
+  let aggregatorShadowAgreement: AggregatorShadowAgreement | null = null;
+  if (learnedAggregatorShadowEnabled()) {
+    const aggregatorEvents = await learnedAggregatorObservationEvents(vaultRoot, eventLog);
+    const observations = aggregatorObservationsFromEvents(aggregatorEvents);
+    const aggregatorState = applyAggregatorObservations(createEmptyAggregatorStatsState(), observations);
+    const distinctUrls = new Set(observations.map((observation) => observation.canonicalUrl));
+    const pairs: { readonly registryType: AggregatorPageType; readonly learnedType: AggregatorPageType }[] = [];
+    for (const url of distinctUrls) {
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        continue;
+      }
+      pairs.push({
+        registryType: classifyAggregatorPageForUrl(parsed),
+        learnedType: classifyLearnedAggregatorUrl(aggregatorState, url),
+      });
+    }
+    aggregatorShadowAgreement = buildAggregatorShadowAgreement(pairs);
+  }
   const fingerprint = fingerprintFeedbackTrainingLabels(feedback);
   const [
     activeManifest,
@@ -1675,6 +1827,8 @@ export const collectWorkGraphHealth = async ({
       incrementalShadowReport,
       incrementalShadowSecondaryCount,
       repairQueue,
+      aggregatorShadowEnabled: learnedAggregatorShadowEnabled(),
+      aggregatorShadowAgreement,
     }),
   };
 };
