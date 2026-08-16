@@ -807,10 +807,13 @@ describe('SqliteConnectionsStore', () => {
 
   // F4 (blob diet) write-volume acceptance (b): a scoped drain touching K
   // accumulator keys must persist O(K) rows, not re-serialize the whole
-  // accumulator — and the order blob keys must be gone entirely (deleted,
-  // not rewritten) after a scoped write.
+  // accumulator — the order blob keys must be gone entirely (deleted, not
+  // rewritten) after a scoped write, AND the `current` metadata key itself
+  // must shrink to a KB-scale tag with no urlProjection/tabSessionProjection
+  // — the last per-drain O(state) rewrite (residual named in the prior F4
+  // commit's message, closed here).
   sqliteIt(
-    'replaceScopeRows persists the projection accumulator as O(dirty keys), not O(state)',
+    'replaceScopeRows persists the projection accumulator as O(dirty keys), not O(state), and shrinks `current` to a small tag',
     async () => {
       const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
       const snapshot = buildSnapshot();
@@ -872,6 +875,33 @@ describe('SqliteConnectionsStore', () => {
       const urlUpsertRunCalls: unknown[][] = [];
       let sawOrderDelete = false;
       let sawOrderRewrite = false;
+      // F4 (blob diet) — 'current' metadata rewrite volume: captured
+      // alongside the accumulator/order assertions below.
+      const currentMetadataWrites: string[] = [];
+      // bun:sqlite caches/reuses a single Statement object across
+      // db.query(sql) calls with IDENTICAL sql text — and this exact
+      // upsert-metadata text is used by several call sites within one
+      // replaceScopeRows transaction (this write, #persistProjectionAccumu-
+      // latorWrite's progress tag, #bumpWriteSeq). Without a wrap guard,
+      // each db.query(sameText) call here would layer ANOTHER wrapper
+      // around the shared statement's `.run`, so a single real `.run(...)`
+      // call fires every layer's closure — inflating the observed call
+      // count without any extra DB write actually happening. Mark the
+      // wrapped function so re-wrapping the same statement is a no-op.
+      const F4_WRAPPED = Symbol('f4WrappedRun');
+      const wrapOnce = (
+        stmt: { run: (...args: unknown[]) => unknown },
+        onRun: (args: readonly unknown[]) => void,
+      ): void => {
+        if ((stmt.run as { [F4_WRAPPED]?: boolean })[F4_WRAPPED] === true) return;
+        const originalRun = stmt.run.bind(stmt);
+        const wrapped = (...args: unknown[]): unknown => {
+          onRun(args);
+          return originalRun(...args);
+        };
+        (wrapped as { [F4_WRAPPED]?: boolean })[F4_WRAPPED] = true;
+        stmt.run = wrapped;
+      };
       const querySpy = vi
         .spyOn(Database.prototype, 'query')
         .mockImplementation(function trackUrlAccumulatorWrites(
@@ -882,21 +912,18 @@ describe('SqliteConnectionsStore', () => {
             run: (...args: unknown[]) => unknown;
           };
           if (sql.includes('INSERT INTO connections_projection_url_accumulator')) {
-            const originalRun = stmt.run.bind(stmt);
-            stmt.run = (...args: unknown[]): unknown => {
-              urlUpsertRunCalls.push(args);
-              return originalRun(...args);
-            };
+            wrapOnce(stmt, (args) => urlUpsertRunCalls.push([...args]));
           }
           if (
             sql.includes('INSERT INTO metadata') &&
             sql.includes('ON CONFLICT(key) DO UPDATE')
           ) {
-            const originalRun = stmt.run.bind(stmt);
-            stmt.run = (...args: unknown[]): unknown => {
+            wrapOnce(stmt, (args) => {
               if (args[0] === 'node_order' || args[0] === 'edge_order') sawOrderRewrite = true;
-              return originalRun(...args);
-            };
+              if (args[0] === 'current' && typeof args[1] === 'string') {
+                currentMetadataWrites.push(args[1]);
+              }
+            });
           }
           return stmt;
         });
@@ -938,6 +965,23 @@ describe('SqliteConnectionsStore', () => {
       // an 18MB/1.9MB blob, by a scoped replaceScopeRows write.
       expect(sawOrderDelete).toBe(true);
       expect(sawOrderRewrite).toBe(false);
+
+      // F4 (blob diet) — the LAST O(state) rewrite this feature eliminates:
+      // `current`'s urlProjection/tabSessionProjection fields. Exactly one
+      // 'current' write for this scoped delta, and it must be small (a KB-
+      // scale metadata tag: scope/updatedAt/counts/revision — no 200-key
+      // projection map) and must carry NEITHER projection field at all —
+      // #selfHealProjections derives them from the row tables on read.
+      expect(currentMetadataWrites).toHaveLength(1);
+      const currentWriteJson = currentMetadataWrites[0] ?? '';
+      expect(currentWriteJson.length).toBeLessThan(2_000);
+      const currentWriteParsed = JSON.parse(currentWriteJson) as Record<string, unknown>;
+      expect(currentWriteParsed['urlProjection']).toBeUndefined();
+      expect(currentWriteParsed['tabSessionProjection']).toBeUndefined();
+      expect(Object.prototype.hasOwnProperty.call(currentWriteParsed, 'urlProjection')).toBe(false);
+      expect(
+        Object.prototype.hasOwnProperty.call(currentWriteParsed, 'tabSessionProjection'),
+      ).toBe(false);
 
       // Correctness: the reused/updated accumulator still reports all 200
       // keys (the delta write did not silently drop the other 199 rows),

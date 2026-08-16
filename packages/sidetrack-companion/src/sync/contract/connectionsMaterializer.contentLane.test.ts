@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { pollUntil } from '../../test-helpers/bunTestTimers.js';
 
 import {
+  type ConnectionsProjectionAccumulatorWrite,
   type ConnectionsSnapshot,
   type ConnectionsStore,
 } from '../../connections/snapshot.js';
@@ -554,7 +555,7 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       readonly scopes: readonly { readonly kind: string; readonly id: string }[];
       readonly nodes: readonly unknown[];
       readonly edges: readonly unknown[];
-      readonly metadata?: ConnectionsSnapshot;
+      readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite | undefined;
     }[] = [];
     const store: ConnectionsStore = {
       putCurrent: async () => {
@@ -568,7 +569,7 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
           scopes: input.scopes,
           nodes: input.nodes,
           edges: input.edges,
-          metadata: input.metadata as ConnectionsSnapshot | undefined,
+          projectionAccumulatorWrite: input.projectionAccumulatorWrite,
         });
       },
       readMaterializerProgress: async () => baseProgress,
@@ -622,9 +623,14 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     ]);
     expect(replacements[0]?.nodes).toEqual([]);
     expect(replacements[0]?.edges).toEqual([]);
+    // F4 (blob diet) — the projection no longer rides replaceScopeRows's
+    // metadata param; the accepted attribution now shows up in the live
+    // accumulator the projectionAccumulatorWrite carries (the store
+    // persists it into the projection-accumulator row tables from there).
     expect(
-      replacements[0]?.metadata?.urlProjection?.byCanonicalUrl['https://new.test/page']
-        ?.currentAttribution,
+      replacements[0]?.projectionAccumulatorWrite?.urlAccumulator.records.get(
+        'https://new.test/page',
+      )?.currentAttribution,
     ).toMatchObject({ workstreamId: 'ws-1', source: 'inferred' });
   });
 
@@ -719,13 +725,17 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       noOpEnabled: boolean,
     ): Promise<{
       snapshotWrites: number;
-      replacements: { scopes: readonly { kind: string; id: string }[]; nodes: readonly unknown[] }[];
+      replacements: {
+        scopes: readonly { kind: string; id: string }[];
+        nodes: readonly unknown[];
+        projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite | undefined;
+      }[];
     }> => {
       let snapshotWrites = 0;
       const replacements: {
         scopes: readonly { kind: string; id: string }[];
         nodes: readonly unknown[];
-        metadata?: ConnectionsSnapshot;
+        projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite | undefined;
       }[] = [];
       const store: ConnectionsStore = {
         putCurrent: async () => {
@@ -738,7 +748,7 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
           replacements.push({
             scopes: input.scopes,
             nodes: input.nodes,
-            metadata: input.metadata as ConnectionsSnapshot | undefined,
+            projectionAccumulatorWrite: input.projectionAccumulatorWrite,
           });
         },
         readMaterializerProgress: async () => baseProgress,
@@ -790,8 +800,10 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
     expect((on.replacements[0]?.nodes ?? []).map((n) => (n as { id: string }).id)).toContain(
       `timeline-visit:${ownedUrl}`,
     );
+    // F4 (blob diet) — see the equivalent note on the first test above.
     expect(
-      on.replacements[0]?.metadata?.urlProjection?.byCanonicalUrl[ownedUrl]?.currentAttribution,
+      on.replacements[0]?.projectionAccumulatorWrite?.urlAccumulator.records.get(ownedUrl)
+        ?.currentAttribution,
     ).toMatchObject({ workstreamId: 'ws-1' });
   });
 

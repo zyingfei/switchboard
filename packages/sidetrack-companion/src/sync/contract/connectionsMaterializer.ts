@@ -365,7 +365,6 @@ import {
   deserializeTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
   seedTabSessionProjectionAccumulatorAsync,
-  serializeTabSessionProjection,
   tabSessionProjectionAccumulatorKeysForEvent,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
@@ -376,7 +375,6 @@ import {
   deserializeUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   seedUrlProjectionAccumulatorAsync,
-  serializeUrlProjection,
   urlProjectionAccumulatorKeyForEvent,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
@@ -3419,12 +3417,15 @@ export const createConnectionsMaterializer = (
       // overwritten with our stale snapshot.
       progress: input.existingProgress,
       progressMode: 'snapshot-revision-only',
-      metadata: {
-        ...(scopedSnapshot.urlProjection === undefined
-          ? {}
-          : { urlProjection: scopedSnapshot.urlProjection }),
-        tabSessionProjection: scopedSnapshot.tabSessionProjection,
-      },
+      // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection and
+      // no projectionAccumulatorWrite here: this UI-latency overlay reuses
+      // the CURRENT (unmodified) tabSessionProjection/urlProjection to build
+      // scopedSnapshot's rows — it folds no new event into either
+      // accumulator, so it has nothing new to persist into the
+      // projection-accumulator row tables. The row tables (and hence
+      // `current`'s derived projection) are left exactly as the last real
+      // drain/overlay wrote them, which is what this call already reused as
+      // its own input.
     });
     input.mark(
       `foregroundNavigationDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scopedSnapshot.nodes.length)} edges=${String(scopedSnapshot.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEvents.length)}`,
@@ -7519,13 +7520,10 @@ export const createConnectionsMaterializer = (
             nodes: scoped.nodes,
             edges: scoped.edges,
             progress,
+            // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+            // projectionAccumulatorWrite already persists the equivalent
+            // content into the projection-accumulator row tables.
             projectionAccumulatorWrite: projectionWrite.write,
-            metadata: {
-              ...(scopedSnapshot.urlProjection === undefined
-                ? {}
-                : { urlProjection: scopedSnapshot.urlProjection }),
-              tabSessionProjection: scopedSnapshot.tabSessionProjection,
-            },
           });
           projectionWrite.commit();
           lastFrontier = progress.appliedFrontier;
@@ -7555,11 +7553,12 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
@@ -7601,11 +7600,12 @@ export const createConnectionsMaterializer = (
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
@@ -7637,11 +7637,12 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
@@ -7699,11 +7700,12 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
@@ -7769,11 +7771,12 @@ export const createConnectionsMaterializer = (
           nodes: [],
           edges: [],
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
@@ -7934,13 +7937,10 @@ export const createConnectionsMaterializer = (
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables.
           projectionAccumulatorWrite: projectionWrite.write,
-          metadata: {
-            ...(baseSnapshot.urlProjection === undefined
-              ? {}
-              : { urlProjection: baseSnapshot.urlProjection }),
-            tabSessionProjection: baseSnapshot.tabSessionProjection,
-          },
         });
         projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;

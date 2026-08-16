@@ -50,11 +50,12 @@ import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScop
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+  createEmptyTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
   serializeTabSessionProjection,
   serializeTabSessionProjectionAccumulator,
   tabSessionProjectionAccumulatorFromSerialized,
-  tabSessionProjectionFromAccumulator,
+  tabSessionProjectionAccumulatorKeysForEvent,
   type SerializedTabSessionProjectionAccumulator,
   type SerializedTabSessionProjection,
   type TabSessionProjectionAccumulator,
@@ -63,6 +64,7 @@ import {
 } from '../tabsession/projection.js';
 import {
   URL_PROJECTION_SCHEMA_VERSION,
+  createEmptyUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   serializeUrlProjection,
   serializeUrlProjectionAccumulator,
@@ -75,7 +77,7 @@ import {
   type UrlProjectionAccumulator,
   type UrlVisitRecord,
   urlProjectionAccumulatorFromSerialized,
-  urlProjectionFromAccumulator,
+  urlProjectionAccumulatorKeyForEvent,
 } from '../urls/projection.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import {
@@ -3856,10 +3858,12 @@ export interface ConnectionsStore {
     readonly nodes: readonly ConnectionNode[];
     readonly edges: readonly ConnectionEdge[];
     readonly progress: MaterializerProgress;
-    readonly metadata?: {
-      readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
-      readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
-    };
+    // F4 (blob diet) — no `metadata.urlProjection`/`tabSessionProjection`
+    // input: the scoped-delta path no longer persists those fields into
+    // `current` at all (they are provably redundant with the
+    // projection-accumulator row tables `projectionAccumulatorWrite`
+    // already persists — see withoutProjections's doc comment in
+    // snapshot.ts). Readers self-heal via #selfHealProjections.
     readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite;
     // 'replace' (default): persist input.progress verbatim, advancing
     // both applied dot intervals and snapshotRevisionId. Used by the
@@ -4093,6 +4097,78 @@ const withoutContentSignature = (
   const copy: { contentSignature?: string } & StoredConnectionsMetadata = { ...metadata };
   delete copy.contentSignature;
   return copy;
+};
+
+// F4 (blob diet) — `current`'s urlProjection/tabSessionProjection fields are
+// the last O(state) content the scoped-delta path used to rewrite every
+// drain (replaceScopeRows). They are PROVABLY REDUNDANT with the
+// projection-accumulator row tables on the scoped path: urlProjectionFromAccumulator
+// / tabSessionProjectionFromAccumulator (see urls/projection.ts,
+// tabsession/projection.ts) are PURE functions of the accumulator's
+// `records` (+ `openSessionsByTabId`) maps — the exact same maps
+// #persistProjectionAccumulatorWrite mirrors into
+// connections_projection_url_accumulator / _tabsession_accumulator / _open_by_tab
+// in the SAME transaction. So once those rows are persisted, `current`'s copy
+// of the projection is a redundant byte-for-byte derivable cache, not new
+// information. replaceScopeRows and #applyOverlayOnDb (below) now omit these
+// fields from the stored blob entirely; #selfHealProjections re-derives them
+// on read from the row tables (self-detecting: a blob that already carries
+// the fields — from #writeCurrentRows's full-write path, or a pre-migration
+// vault — is trusted verbatim, matching the accumulator blob's own idiom).
+const withoutProjections = (metadata: StoredConnectionsMetadata): StoredConnectionsMetadata => {
+  const copy: {
+    urlProjection?: SerializedUrlProjection | undefined;
+    tabSessionProjection?: SerializedTabSessionProjection | undefined;
+  } & StoredConnectionsMetadata = { ...metadata };
+  delete copy.urlProjection;
+  delete copy.tabSessionProjection;
+  return copy;
+};
+
+// F4 (blob diet) — a MINIMAL SerializedUrlProjection carrying only the
+// records a scoped drain's fold actually touched this drain (dirty.mode ===
+// 'delta') or every record (dirty.mode === 'full', the rare cold-seed /
+// reset case). Fed to projectionOverlayUpdatedAt so replaceScopeRows can
+// compute `updatedAt` in O(delta) instead of O(state): the fallback
+// (rowUpdatedAt, seeded from previousMetadata.updatedAt) already dominates
+// the freshness of every record NOT touched this drain — see the long
+// comment on replaceScopeRows's updatedAt computation for the proof.
+const serializedUrlProjectionFragmentForWrite = (
+  write: ConnectionsProjectionAccumulatorWrite | undefined,
+): SerializedUrlProjection | undefined => {
+  if (write === undefined) return undefined;
+  const keys = write.dirty.mode === 'full' ? write.urlAccumulator.records.keys() : write.dirty.canonicalUrls;
+  const byCanonicalUrl: Record<string, UrlVisitRecord> = {};
+  let any = false;
+  for (const key of keys) {
+    const record = write.urlAccumulator.records.get(key);
+    if (record === undefined) continue;
+    byCanonicalUrl[key] = record;
+    any = true;
+  }
+  return any ? { schemaVersion: URL_PROJECTION_SCHEMA_VERSION, byCanonicalUrl } : undefined;
+};
+
+// F4 (blob diet) — tabSession sibling of serializedUrlProjectionFragmentForWrite.
+// openSessionsByTabId is deliberately left empty: projectionOverlayUpdatedAt
+// never reads it (only bySessionId record freshness fields feed `updatedAt`).
+const serializedTabSessionProjectionFragmentForWrite = (
+  write: ConnectionsProjectionAccumulatorWrite | undefined,
+): SerializedTabSessionProjection | undefined => {
+  if (write === undefined) return undefined;
+  const keys =
+    write.dirty.mode === 'full' ? write.tabSessionAccumulator.records.keys() : write.dirty.tabSessionIds;
+  const bySessionId: Record<string, TabSessionRecord> = {};
+  let any = false;
+  for (const key of keys) {
+    const record = write.tabSessionAccumulator.records.get(key);
+    if (record === undefined) continue;
+    bySessionId[key] = record;
+    any = true;
+  }
+  return any
+    ? { schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION, bySessionId, openSessionsByTabId: {} }
+    : undefined;
 };
 
 const snapshotFromParts = (
@@ -4534,10 +4610,28 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   static readonly #CACHED_SNAPSHOT_IDLE_MS = 60_000;
   #cachedSnapshotLastAccessMs = 0;
   #cachedSnapshotSweepTimer: ReturnType<typeof setTimeout> | null = null;
+  // F4 (blob diet) — memo for #deriveProjectionsFromRows, keyed by the
+  // `write_seq` commit token (same token #readCurrentAttempt's H6 check
+  // uses) rather than snapshotRevision: a mid-transaction self-heal read
+  // (#writeCurrentRows's existingMetadata) runs BEFORE this write's own
+  // snapshotRevision exists, and pre-R4-era metadata may carry no
+  // snapshotRevision at all — write_seq is always present and strictly
+  // monotonic, so it can never alias two different row-table states the
+  // way an absent/duplicate snapshotRevision could. Without this memo,
+  // every #readMetadata call on a post-scoped-write `current` (the common
+  // case now) would re-scan both row tables — this is what keeps
+  // read-heavy per-request paths (loadUrlProjection, readCurrent) cheap
+  // between drains.
+  #cachedDerivedProjections: {
+    readonly writeSeq: string;
+    readonly urlProjection: SerializedUrlProjection;
+    readonly tabSessionProjection: SerializedTabSessionProjection;
+  } | null = null;
   #dropCachedSnapshot = (): void => {
     this.#cachedSnapshot = null;
     this.#cachedSnapshotLastAccessMs = 0;
     this.#cancelCachedSnapshotSweep();
+    this.#cachedDerivedProjections = null;
   };
   #cancelCachedSnapshotSweep = (): void => {
     if (this.#cachedSnapshotSweepTimer !== null) {
@@ -5300,6 +5394,33 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           this.#db.query('DELETE FROM metadata WHERE key = ?').run(key);
         }
       }
+      // F4 (blob diet) migration — one-time, in-place, no back-compat kept:
+      // strip urlProjection/tabSessionProjection out of an already-stored
+      // `current` blob (a pre-F4 vault, or a shadow cloned from one). By the
+      // time this runs the accumulator migration above has already made the
+      // projection-accumulator row tables the correct, current source of
+      // truth for that content, so this is a pure size trim, not a data
+      // migration — #selfHealProjections would derive the identical fields
+      // from the rows on the very next read/write anyway (this just avoids
+      // carrying the multi-MB blob until that happens). Self-terminating:
+      // once stripped, `current` has neither field, so this scan is a no-op
+      // on every later boot. A corrupt/unparsable `current` is left
+      // untouched (unlike the accumulator blob, it is not reconstructible
+      // from a sibling row table) — the ordinary readCurrent/#readMetadata
+      // error path handles that case as it already does today.
+      try {
+        const currentRow = this.#db.query('SELECT data FROM metadata WHERE key = ?').get('current');
+        if (currentRow !== null && currentRow !== undefined) {
+          const parsed = JSON.parse(textField(currentRow, 'data')) as StoredConnectionsMetadata;
+          if (parsed.urlProjection !== undefined || parsed.tabSessionProjection !== undefined) {
+            this.#db
+              .query('INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data')
+              .run('current', JSON.stringify(withoutProjections(parsed)));
+          }
+        }
+      } catch {
+        // Leave `current` untouched — see comment above.
+      }
       this.#initialized = true;
     }
     if (this.#db === null) throw new Error('connections store handle failed to open');
@@ -5317,12 +5438,153 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     return this.#db;
   }
 
+  /** F4 (blob diet) — read the write_seq commit token as a plain string (it
+   *  is only ever compared for equality here, never arithmetic). */
+  #readWriteSeq(db: SqliteDatabase): string {
+    const row = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
+    return row === null || row === undefined ? '0' : textField(row, 'data');
+  }
+
+  /** F4 (blob diet) — reassemble the served url/tabSession projections from
+   *  the projection-accumulator row tables (kept in lockstep with the live
+   *  accumulators by #persistProjectionAccumulatorWrite / #applyOverlayOnDb —
+   *  see the long comment on withoutProjections for the redundancy proof).
+   *  Memoized by write_seq (#cachedDerivedProjections) so repeated calls
+   *  between drains — the common case for read-heavy HTTP paths like
+   *  loadUrlProjection — do not re-scan both tables. ORDER BY gives the same
+   *  key-sorted output urlProjectionFromAccumulator /
+   *  tabSessionProjectionFromAccumulator produce (Object.fromEntries over a
+   *  key-sorted Map), so this is byte-identical to what deriving from a live
+   *  accumulator would produce. */
+  #deriveProjectionsFromRows(db: SqliteDatabase): {
+    readonly urlProjection: SerializedUrlProjection;
+    readonly tabSessionProjection: SerializedTabSessionProjection;
+  } {
+    const writeSeq = this.#readWriteSeq(db);
+    const cached = this.#cachedDerivedProjections;
+    if (cached !== null && cached.writeSeq === writeSeq) {
+      return { urlProjection: cached.urlProjection, tabSessionProjection: cached.tabSessionProjection };
+    }
+    const byCanonicalUrl: Record<string, UrlVisitRecord> = {};
+    for (const row of db
+      .query(
+        'SELECT canonical_url, record_json FROM connections_projection_url_accumulator ORDER BY canonical_url',
+      )
+      .all()) {
+      if (!isRecord(row)) continue;
+      byCanonicalUrl[textField(row, 'canonical_url')] = JSON.parse(
+        textField(row, 'record_json'),
+      ) as UrlVisitRecord;
+    }
+    const bySessionId: Record<string, TabSessionRecord> = {};
+    for (const row of db
+      .query(
+        'SELECT tab_session_id, record_json FROM connections_projection_tabsession_accumulator ORDER BY tab_session_id',
+      )
+      .all()) {
+      if (!isRecord(row)) continue;
+      bySessionId[textField(row, 'tab_session_id')] = JSON.parse(
+        textField(row, 'record_json'),
+      ) as TabSessionRecord;
+    }
+    const openSessionsByTabId: Record<string, string> = {};
+    for (const row of db
+      .query(
+        'SELECT tab_id_hash, tab_session_id FROM connections_projection_tabsession_open_by_tab ORDER BY tab_id_hash',
+      )
+      .all()) {
+      if (!isRecord(row)) continue;
+      openSessionsByTabId[textField(row, 'tab_id_hash')] = textField(row, 'tab_session_id');
+    }
+    const derived: {
+      readonly urlProjection: SerializedUrlProjection;
+      readonly tabSessionProjection: SerializedTabSessionProjection;
+    } = {
+      urlProjection: { schemaVersion: URL_PROJECTION_SCHEMA_VERSION, byCanonicalUrl },
+      tabSessionProjection: {
+        schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+        bySessionId,
+        openSessionsByTabId,
+      },
+    };
+    this.#cachedDerivedProjections = { writeSeq, ...derived };
+    return derived;
+  }
+
+  /** F4 (blob diet) — evidence that the row-based projection-accumulator
+   *  system has been used at least once for this store: either
+   *  #persistProjectionAccumulatorWrite's progress tag
+   *  (projectionAccumulatorMetadataKey — written in the SAME transaction as
+   *  its rows, for every materializer name) or #applyOverlayOnDb's direct
+   *  row upserts (which have no progress tag of their own — a per-event
+   *  overlay carries no MaterializerProgress) has left at least one row
+   *  behind. Four cheap LIMIT-1 lookups, short-circuited — the `metadata`
+   *  table has a handful of keys and the row tables are exactly the ones
+   *  #deriveProjectionsFromRows would otherwise scan in full. */
+  #hasProjectionAccumulatorState(db: SqliteDatabase): boolean {
+    const exists = (sql: string): boolean => {
+      const row = db.query(sql).get();
+      return row !== null && row !== undefined;
+    };
+    return (
+      exists("SELECT 1 FROM metadata WHERE key LIKE 'projection_accumulators:%' LIMIT 1") ||
+      exists('SELECT 1 FROM connections_projection_url_accumulator LIMIT 1') ||
+      exists('SELECT 1 FROM connections_projection_tabsession_accumulator LIMIT 1') ||
+      exists('SELECT 1 FROM connections_projection_tabsession_open_by_tab LIMIT 1')
+    );
+  }
+
+  /** F4 (blob diet) — self-detecting read: a `current` blob already carrying
+   *  BOTH urlProjection and tabSessionProjection (the full-write path, or a
+   *  pre-migration vault the boot migration hasn't reached yet) is trusted
+   *  verbatim; a blob missing either field (the scoped-delta / overlay
+   *  steady state going forward) has that field derived from the row
+   *  tables — but ONLY when #hasProjectionAccumulatorState confirms the
+   *  row-based system is actually in use for this store. Without that
+   *  guard, a caller/test that never carries a projection at all (a
+   *  pre-R1 snapshot, or any ConnectionsSnapshot fixture that simply
+   *  never sets urlProjection/tabSessionProjection) would have its
+   *  genuinely-absent field silently promoted to a defined-but-EMPTY
+   *  projection — and defined-empty vs undefined are NOT the same signal
+   *  to metadataForSnapshotWrite's merge (mergeUrlProjectionForWrite /
+   *  its projectionChanged check): an empty object is "present", so the
+   *  merge would treat it as a real content change and mint a fresh
+   *  snapshotRevision hash instead of trusting the caller's own revision
+   *  id (broke doubleBuffer.acceptance.test.ts, whose fixtures assert
+   *  their input snapshotRevision round-trips verbatim).
+   *
+   *  Shared by #readMetadata (the async public-facing read) and
+   *  #writeCurrentRows's mid-transaction existing-metadata read —
+   *  metadataForSnapshotWrite's merge needs the REAL persisted projection
+   *  state, not an absent one, or a full write started before a fresher
+   *  overlay/scoped-delta row would silently revert it (see
+   *  sqlite-store.test.ts "preserves fresher projection overlays when an
+   *  older full snapshot commits"). */
+  #selfHealProjections(
+    db: SqliteDatabase,
+    parsed: StoredConnectionsMetadata,
+  ): StoredConnectionsMetadata {
+    if (parsed.urlProjection !== undefined && parsed.tabSessionProjection !== undefined) {
+      return parsed;
+    }
+    if (!this.#hasProjectionAccumulatorState(db)) return parsed;
+    const derived = this.#deriveProjectionsFromRows(db);
+    return {
+      ...parsed,
+      ...(parsed.urlProjection === undefined ? { urlProjection: derived.urlProjection } : {}),
+      ...(parsed.tabSessionProjection === undefined
+        ? { tabSessionProjection: derived.tabSessionProjection }
+        : {}),
+    };
+  }
+
   async #readMetadata(db: SqliteDatabase): Promise<StoredConnectionsMetadata | null> {
     const metadataRow = db.query('SELECT data FROM metadata WHERE key = ?').get('current');
     if (metadataRow === null || metadataRow === undefined) {
       return await this.#bootstrapFromJson(db);
     }
-    return JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+    const parsed = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
+    return this.#selfHealProjections(db, parsed);
   }
 
   async #bootstrapFromJson(db: SqliteDatabase): Promise<StoredConnectionsMetadata | null> {
@@ -5853,6 +6115,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   /** The overlay transaction body, factored so both the in-place (writer/
    *  single-buffer) path and the shadow-publish (parent-reader) path share it. */
+  // F4 (blob diet) — this overlay is a SINGLE-event fold applied outside a
+  // drain (to keep titles/attribution fresh between drains). It used to
+  // deserialize the WHOLE urlProjection/tabSessionProjection blob, fold one
+  // event in, and re-serialize the whole thing back — an O(state) read+write
+  // PER EVENT, worse per-write than even the scoped-drain blob this feature
+  // eliminates. Now it reads/folds/writes only the ONE row this event's
+  // payload resolves to, via the SAME dirty-key derivation the scoped-drain
+  // path uses (urlProjectionAccumulatorKeyForEvent /
+  // tabSessionProjectionAccumulatorKeysForEvent) — an O(1) row upsert.
+  // "Nothing to fold" is now determined by the EVENT (does it resolve to a
+  // key at all — PROJECTION_OVERLAY_HANDLES in connectionsMaterializer.ts is
+  // exactly the union of event types those two helpers handle, so a
+  // caller-dispatched event practically always resolves), not by whether
+  // `current` happens to carry the legacy full-blob shape — a prior
+  // scoped-delta drain (or overlay) having already stripped those fields is
+  // the steady state now, not a "nothing to do" signal.
   async #applyOverlayOnDb(db: SqliteDatabase, event: AcceptedEvent): Promise<string | null> {
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -5862,64 +6140,171 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         return null;
       }
       const metadata = JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata;
-      if (metadata.urlProjection === undefined && metadata.tabSessionProjection === undefined) {
+      const urlKey = urlProjectionAccumulatorKeyForEvent(event);
+      const tabKeys = tabSessionProjectionAccumulatorKeysForEvent(event);
+      if (urlKey === undefined && tabKeys === undefined) {
         db.exec('COMMIT');
         return null;
       }
 
-      const urlProjection =
-        metadata.urlProjection === undefined
+      let newUrlRecord: UrlVisitRecord | undefined;
+      if (urlKey !== undefined) {
+        const existingRow = db
+          .query(
+            'SELECT record_json, cursor_json FROM connections_projection_url_accumulator WHERE canonical_url = ?',
+          )
+          .get(urlKey);
+        const accumulator = createEmptyUrlProjectionAccumulator();
+        if (existingRow !== null && existingRow !== undefined) {
+          accumulator.records.set(
+            urlKey,
+            JSON.parse(textField(existingRow, 'record_json')) as UrlVisitRecord,
+          );
+          const cursorJson = isRecord(existingRow) ? existingRow['cursor_json'] : undefined;
+          if (typeof cursorJson === 'string') {
+            accumulator.observationCursors.set(
+              urlKey,
+              JSON.parse(cursorJson) as UrlObservationCursor,
+            );
+          }
+        }
+        foldEventIntoUrlProjectionAccumulator(accumulator, event);
+        newUrlRecord = accumulator.records.get(urlKey);
+        if (newUrlRecord === undefined) {
+          db.query(
+            'DELETE FROM connections_projection_url_accumulator WHERE canonical_url = ?',
+          ).run(urlKey);
+        } else {
+          const newCursor = accumulator.observationCursors.get(urlKey);
+          db.query(
+            `INSERT INTO connections_projection_url_accumulator (canonical_url, record_json, cursor_json)
+             VALUES (?, ?, ?)
+             ON CONFLICT(canonical_url) DO UPDATE SET
+               record_json = excluded.record_json, cursor_json = excluded.cursor_json`,
+          ).run(
+            urlKey,
+            JSON.stringify(newUrlRecord),
+            newCursor === undefined ? null : JSON.stringify(newCursor),
+          );
+        }
+      }
+
+      let newTabSessionRecord: TabSessionRecord | undefined;
+      if (tabKeys !== undefined) {
+        const accumulator = createEmptyTabSessionProjectionAccumulator();
+        const existingRow = db
+          .query(
+            'SELECT record_json FROM connections_projection_tabsession_accumulator WHERE tab_session_id = ?',
+          )
+          .get(tabKeys.sessionId);
+        if (existingRow !== null && existingRow !== undefined) {
+          accumulator.records.set(
+            tabKeys.sessionId,
+            JSON.parse(textField(existingRow, 'record_json')) as TabSessionRecord,
+          );
+        }
+        if (tabKeys.tabIdHash !== undefined) {
+          const openRow = db
+            .query(
+              'SELECT tab_session_id FROM connections_projection_tabsession_open_by_tab WHERE tab_id_hash = ?',
+            )
+            .get(tabKeys.tabIdHash);
+          if (openRow !== null && openRow !== undefined) {
+            accumulator.openSessionsByTabId.set(tabKeys.tabIdHash, textField(openRow, 'tab_session_id'));
+          }
+        }
+        foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
+        newTabSessionRecord = accumulator.records.get(tabKeys.sessionId);
+        if (newTabSessionRecord === undefined) {
+          db.query(
+            'DELETE FROM connections_projection_tabsession_accumulator WHERE tab_session_id = ?',
+          ).run(tabKeys.sessionId);
+        } else {
+          db.query(
+            `INSERT INTO connections_projection_tabsession_accumulator (tab_session_id, record_json)
+             VALUES (?, ?)
+             ON CONFLICT(tab_session_id) DO UPDATE SET record_json = excluded.record_json`,
+          ).run(tabKeys.sessionId, JSON.stringify(newTabSessionRecord));
+        }
+        if (tabKeys.tabIdHash !== undefined) {
+          const newOpenSessionId = accumulator.openSessionsByTabId.get(tabKeys.tabIdHash);
+          if (newOpenSessionId === undefined) {
+            db.query(
+              'DELETE FROM connections_projection_tabsession_open_by_tab WHERE tab_id_hash = ?',
+            ).run(tabKeys.tabIdHash);
+          } else {
+            db.query(
+              `INSERT INTO connections_projection_tabsession_open_by_tab (tab_id_hash, tab_session_id)
+               VALUES (?, ?)
+               ON CONFLICT(tab_id_hash) DO UPDATE SET tab_session_id = excluded.tab_session_id`,
+            ).run(tabKeys.tabIdHash, newOpenSessionId);
+          }
+        }
+      }
+
+      // F4 (blob diet) — updatedAt/snapshotRevision from just this one
+      // touched record: metadata.updatedAt is already the running max over
+      // everything folded before this event (same proof as
+      // replaceScopeRows's updatedAt computation).
+      const dirtyUrlProjectionFragment: SerializedUrlProjection | undefined =
+        urlKey === undefined || newUrlRecord === undefined
           ? undefined
-          : (() => {
-              const accumulator = urlProjectionAccumulatorFromSerialized(metadata.urlProjection);
-              foldEventIntoUrlProjectionAccumulator(accumulator, event);
-              return serializeUrlProjection(urlProjectionFromAccumulator(accumulator));
-            })();
-      const tabSessionProjection =
-        metadata.tabSessionProjection === undefined
+          : { schemaVersion: URL_PROJECTION_SCHEMA_VERSION, byCanonicalUrl: { [urlKey]: newUrlRecord } };
+      const dirtyTabSessionProjectionFragment: SerializedTabSessionProjection | undefined =
+        tabKeys === undefined || newTabSessionRecord === undefined
           ? undefined
-          : (() => {
-              const accumulator = tabSessionProjectionAccumulatorFromSerialized(
-                metadata.tabSessionProjection,
-              );
-              foldEventIntoTabSessionProjectionAccumulator(accumulator, event);
-              return serializeTabSessionProjection(
-                tabSessionProjectionFromAccumulator(accumulator),
-              );
-            })();
+          : {
+              schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+              bySessionId: { [tabKeys.sessionId]: newTabSessionRecord },
+              openSessionsByTabId: {},
+            };
       const updatedAt = projectionOverlayUpdatedAt({
         fallback: metadata.updatedAt,
-        ...(urlProjection === undefined ? {} : { urlProjection }),
-        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
+        ...(dirtyUrlProjectionFragment === undefined
+          ? {}
+          : { urlProjection: dirtyUrlProjectionFragment }),
+        ...(dirtyTabSessionProjectionFragment === undefined
+          ? {}
+          : { tabSessionProjection: dirtyTabSessionProjectionFragment }),
       });
+      const urlProjectionKeyCount =
+        (
+          db.query('SELECT COUNT(*) AS n FROM connections_projection_url_accumulator').get() as
+            | { n: number }
+            | undefined
+        )?.n ?? 0;
+      const tabSessionProjectionKeyCount =
+        (
+          db
+            .query('SELECT COUNT(*) AS n FROM connections_projection_tabsession_accumulator')
+            .get() as { n: number } | undefined
+        )?.n ?? 0;
       const snapshotRevision = computeSnapshotRevision({
         updatedAt,
         nodeCount: metadata.nodeCount,
         edgeCount: metadata.edgeCount,
-        urlProjectionKeyCount:
-          urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
-        tabSessionProjectionKeyCount:
-          tabSessionProjection === undefined
-            ? 0
-            : Object.keys(tabSessionProjection.bySessionId).length,
+        urlProjectionKeyCount,
+        tabSessionProjectionKeyCount,
       });
       const nextMetadata: StoredConnectionsMetadata = {
         // This metadata-only overlay does not have every node/edge byte in
         // hand, so it cannot honestly recompute the strong full-graph content
         // signature. Clear it; the next full write publishes conservatively
         // and restores a signature instead of risking a false no-op skip.
-        ...withoutContentSignature(metadata),
+        //
+        // F4 (blob diet) — also strip urlProjection/tabSessionProjection: the
+        // row upserts above already made the row tables authoritative for
+        // this event; #selfHealProjections derives them fresh on read.
+        ...withoutProjections(withoutContentSignature(metadata)),
         updatedAt,
-        ...(urlProjection === undefined ? {} : { urlProjection }),
-        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
         snapshotRevision,
       };
       db.query(
         'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       ).run('current', JSON.stringify(nextMetadata));
-      // H6: applyProjectionEventOverlay mutates metadata.current —
-      // bump the commit token so readCurrent's pre/post check sees
-      // this commit.
+      // H6: applyProjectionEventOverlay mutates metadata.current (+ the
+      // projection-accumulator rows) — bump the commit token so
+      // readCurrent's pre/post check sees this commit.
       this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#dropCachedSnapshot();
@@ -6282,10 +6667,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly nodes: readonly ConnectionNode[];
     readonly edges: readonly ConnectionEdge[];
     readonly progress: MaterializerProgress;
-    readonly metadata?: {
-      readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
-      readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
-    };
     readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite;
     readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
@@ -6466,72 +6847,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
             | { n: number }
             | undefined
         )?.n ?? 0;
-      const urlProjection =
-        input.metadata?.urlProjection === undefined
-          ? previousMetadata.urlProjection
-          : mergeUrlProjectionForWrite(
-              input.metadata.urlProjection,
-              previousMetadata.urlProjection,
-            );
-      const tabSessionProjection =
-        input.metadata?.tabSessionProjection === undefined
-          ? previousMetadata.tabSessionProjection
-          : mergeTabSessionProjectionForWrite(
-              input.metadata.tabSessionProjection,
-              previousMetadata.tabSessionProjection,
-            );
-      const rowUpdatedAt = maxObservedAtForRows(
-        previousMetadata.updatedAt,
-        input.nodes,
-        input.edges,
-      );
-      const updatedAt = projectionOverlayUpdatedAt({
-        fallback: rowUpdatedAt,
-        ...(urlProjection === undefined ? {} : { urlProjection }),
-        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
-      });
-      const snapshotRevision = computeSnapshotRevision({
-        updatedAt,
-        nodeCount,
-        edgeCount,
-        urlProjectionKeyCount:
-          urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
-        tabSessionProjectionKeyCount:
-          tabSessionProjection === undefined
-            ? 0
-            : Object.keys(tabSessionProjection.bySessionId).length,
-      });
-      const metadata: StoredConnectionsMetadata = {
-        // A scoped rewrite cannot recompute the full-graph content signature
-        // without reading every row. Clear it so the next full snapshot write
-        // publishes once rather than trusting a stale signature.
-        ...withoutContentSignature(previousMetadata),
-        updatedAt,
-        nodeCount,
-        edgeCount,
-        // W2 — recompute the non-similarity structural discriminator from the
-        // post-delta edges_index.kind. A scoped-delta write can add/remove
-        // NON-similarity edges (that is its job), so carrying the previous
-        // value would go stale and the resolve SWR sig would miss the change;
-        // computing it here from the trigger-maintained index keeps it correct
-        // on every write path with no edge-row decode. Similarity fields
-        // (visitSimilarityRevisionId / similarityCorpusSignature) are
-        // preserved via `...previousMetadata` — scoped drains do not recompute
-        // similarity, so the last full drain's values remain the served truth.
-        nonSimilarityEdgeCount,
-        ...(urlProjection === undefined ? {} : { urlProjection }),
-        ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
-        snapshotRevision,
-      };
-      upsertMetadata.run('current', JSON.stringify(metadata));
-      // F4 (blob diet) — DELETE, never rewrite: a scoped delta's post-write
-      // order was always a pure alpha-sort of the post-delta id set anyway
-      // (see the long comment on #readCurrentAttempt's order derivation), so
-      // there is nothing to persist here — clearing these two keys (cheap PK
-      // deletes) makes readCurrent fall back to deriving that same order
-      // to fresh nodes/edges rows instead of trusting a now-stale blob left
-      // by a PRECEDING full write.
-      db.exec(`DELETE FROM metadata WHERE key IN ('node_order', 'edge_order')`);
+      // F4 (blob diet) — persist the projection-accumulator row deltas BEFORE
+      // the key-count queries below, so those COUNTs see this drain's rows.
       if (input.projectionAccumulatorWrite !== undefined) {
         this.#persistProjectionAccumulatorWrite(db, input.projectionAccumulatorWrite);
         // Write-side probe for the stale-blob investigation: the persisted
@@ -6554,6 +6871,102 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       } else if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
         console.warn('[connections-phase] projectionAccumulators.persist skipped=no-state');
       }
+      // F4 (blob diet) — urlProjectionKeyCount/tabSessionProjectionKeyCount:
+      // cheap indexed COUNT queries against the row tables the persist above
+      // just brought current, mirroring the nodeCount/edgeCount pattern
+      // above. Exactly the key-set of the FULL live accumulator (every fold-
+      // touched key has a row; #persistProjectionAccumulatorWrite deletes a
+      // key's row the moment a fold removes it — there is none today, but the
+      // invariant holds either way), so this is the identical count the old
+      // code computed via Object.keys(mergedProjection).length.
+      const urlProjectionKeyCount =
+        (
+          db.query('SELECT COUNT(*) AS n FROM connections_projection_url_accumulator').get() as
+            | { n: number }
+            | undefined
+        )?.n ?? 0;
+      const tabSessionProjectionKeyCount =
+        (
+          db
+            .query('SELECT COUNT(*) AS n FROM connections_projection_tabsession_accumulator')
+            .get() as { n: number } | undefined
+        )?.n ?? 0;
+      // F4 (blob diet) — updatedAt from ONLY this drain's dirty records
+      // (serializedUrlProjectionFragmentForWrite / ...TabSession... below),
+      // not the full merged projection. PROOF this is byte-identical to the
+      // old full-scan result: `rowUpdatedAt`'s fallback already seeds from
+      // previousMetadata.updatedAt, and previousMetadata.updatedAt was
+      // itself computed (on whichever earlier drain last touched any given
+      // record) as a full-projection scan that INCLUDED that record — so by
+      // induction every record NOT touched THIS drain has a freshness value
+      // already <= previousMetadata.updatedAt <= rowUpdatedAt, and can only
+      // ever be dominated by the fallback, never raise the max. Only records
+      // this drain's fold actually mutated (the dirty set) can possibly
+      // exceed the fallback, so scanning just those + the fallback yields
+      // the exact same max as scanning the full merged map + the fallback.
+      const rowUpdatedAt = maxObservedAtForRows(
+        previousMetadata.updatedAt,
+        input.nodes,
+        input.edges,
+      );
+      const dirtyUrlProjectionFragment = serializedUrlProjectionFragmentForWrite(
+        input.projectionAccumulatorWrite,
+      );
+      const dirtyTabSessionProjectionFragment = serializedTabSessionProjectionFragmentForWrite(
+        input.projectionAccumulatorWrite,
+      );
+      const updatedAt = projectionOverlayUpdatedAt({
+        fallback: rowUpdatedAt,
+        ...(dirtyUrlProjectionFragment === undefined
+          ? {}
+          : { urlProjection: dirtyUrlProjectionFragment }),
+        ...(dirtyTabSessionProjectionFragment === undefined
+          ? {}
+          : { tabSessionProjection: dirtyTabSessionProjectionFragment }),
+      });
+      const snapshotRevision = computeSnapshotRevision({
+        updatedAt,
+        nodeCount,
+        edgeCount,
+        urlProjectionKeyCount,
+        tabSessionProjectionKeyCount,
+      });
+      const metadata: StoredConnectionsMetadata = {
+        // A scoped rewrite cannot recompute the full-graph content signature
+        // without reading every row. Clear it so the next full snapshot write
+        // publishes once rather than trusting a stale signature.
+        //
+        // F4 (blob diet) — also strip urlProjection/tabSessionProjection:
+        // #persistProjectionAccumulatorWrite above already made the row
+        // tables the source of truth for this drain's projection state, so
+        // carrying the old (possibly stale, possibly O(state)) blob forward
+        // via `...previousMetadata` would both waste bytes and risk serving
+        // pre-delta content. #selfHealProjections derives it fresh on read.
+        ...withoutProjections(withoutContentSignature(previousMetadata)),
+        updatedAt,
+        nodeCount,
+        edgeCount,
+        // W2 — recompute the non-similarity structural discriminator from the
+        // post-delta edges_index.kind. A scoped-delta write can add/remove
+        // NON-similarity edges (that is its job), so carrying the previous
+        // value would go stale and the resolve SWR sig would miss the change;
+        // computing it here from the trigger-maintained index keeps it correct
+        // on every write path with no edge-row decode. Similarity fields
+        // (visitSimilarityRevisionId / similarityCorpusSignature) are
+        // preserved via `...previousMetadata` — scoped drains do not recompute
+        // similarity, so the last full drain's values remain the served truth.
+        nonSimilarityEdgeCount,
+        snapshotRevision,
+      };
+      upsertMetadata.run('current', JSON.stringify(metadata));
+      // F4 (blob diet) — DELETE, never rewrite: a scoped delta's post-write
+      // order was always a pure alpha-sort of the post-delta id set anyway
+      // (see the long comment on #readCurrentAttempt's order derivation), so
+      // there is nothing to persist here — clearing these two keys (cheap PK
+      // deletes) makes readCurrent fall back to deriving that same order
+      // to fresh nodes/edges rows instead of trusting a now-stale blob left
+      // by a PRECEDING full write.
+      db.exec(`DELETE FROM metadata WHERE key IN ('node_order', 'edge_order')`);
       const baseProgress =
         input.progressMode === 'snapshot-revision-only'
           ? // Read persisted progress INSIDE this transaction and merge it with
@@ -6835,10 +7248,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       }
 
       const metadataRow = selectMetadata.get('current');
+      // F4 (blob diet) — self-heal BEFORE merging: a scoped-delta or overlay
+      // write since the last full write leaves `current` without
+      // urlProjection/tabSessionProjection (they now live in the
+      // projection-accumulator row tables). metadataForSnapshotWrite's merge
+      // needs the REAL existing projection state here, not an absent one —
+      // see #selfHealProjections's doc comment.
       const existingMetadata =
         metadataRow === null || metadataRow === undefined
           ? null
-          : (JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata);
+          : this.#selfHealProjections(
+              db,
+              JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata,
+            );
       upsertMetadata.run(
         'current',
         JSON.stringify(metadataForSnapshotWrite(snapshot, existingMetadata)),
