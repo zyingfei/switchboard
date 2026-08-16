@@ -432,6 +432,10 @@ describe('resolve canary acceptance — real core + health read-back', () => {
       unchangedPublishSkipCount: 9,
       progressCheckpointCount: 8,
       lastPublishSkipAtMs: 1_700_000_001_000,
+      inPlacePublishCount: 12,
+      lastInPlacePublishAtMs: 1_700_000_002_000,
+      inPlacePublishFallbackCount: 1,
+      lastInPlaceCheckpointAtMs: 1_700_000_003_000,
     });
     expect(enabled.connectionsDoubleBuffer?.enabled).toBe(true);
     expect(enabled.connectionsDoubleBuffer?.generation).toBe('gen-123-abc');
@@ -457,6 +461,10 @@ describe('resolve canary acceptance — real core + health read-back', () => {
       unchangedPublishSkipCount: 0,
       progressCheckpointCount: 0,
       lastPublishSkipAtMs: null,
+      inPlacePublishCount: 0,
+      lastInPlacePublishAtMs: null,
+      inPlacePublishFallbackCount: 0,
+      lastInPlaceCheckpointAtMs: null,
     });
     expect(legacy.connectionsDoubleBuffer).toBeUndefined();
   });

@@ -262,21 +262,34 @@ const sleepBusy = (ms: number): void => {
   }
 };
 
+/** Opaque handle returned by `acquirePublishLock` — `held` is false only when
+ *  the deadline-fallback fired with `failClosed` unset (the historical
+ *  deadlock-avoidance behaviour: proceed unlocked rather than hang forever). */
+export interface PublishLockHandle {
+  readonly held: boolean;
+}
+
 /**
- * Acquire the cross-process publish lock, run `fn` (the entire seed-read →
- * flip → GC critical section) with it held, and release it. Uses an O_EXCL
+ * Blocking-acquire half of the cross-process publish lock. Uses an O_EXCL
  * lockfile so contention is honoured across process boundaries (the parent
  * overlay/scoped-delta publishers and the fork-per-drain child all serialize
  * here). A lockfile older than PUBLISH_LOCK_STALE_MS is presumed orphaned by a
- * killed holder and stolen. `fn` is synchronous by design — the whole
- * critical section must complete without yielding the lock to another awaited
- * publisher (the flip + GC are pure fs ops).
+ * killed holder and stolen. Synchronous by design (a busy-spin, not an
+ * async poll) so the caller's critical section — whatever it does with the
+ * lock held — never yields the lock to another awaited publisher mid-section.
+ *
+ * Factored out of `withPublishLock` so a caller whose critical section spans
+ * more than one synchronous callback (in-place publish: open a handle, hand
+ * control back to the row-mutation caller, then finalize) can hold the lock
+ * across that whole span via explicit acquire/release instead of being
+ * forced into one big callback. `withPublishLock` is now a thin wrapper over
+ * this pair — existing callers (`casPublish`, `sweepOrphanGenerations`) are
+ * unchanged.
  */
-export const withPublishLock = <T>(
+export const acquirePublishLock = (
   connectionsDir: string,
-  fn: () => T,
   options: { readonly failClosed?: boolean } = {},
-): T => {
+): PublishLockHandle => {
   mkdirSync(connectionsDir, { recursive: true });
   const lockPath = publishLockPath(connectionsDir);
   const deadline = Date.now() + PUBLISH_LOCK_MAX_WAIT_MS;
@@ -318,10 +331,33 @@ export const withPublishLock = <T>(
       sleepBusy(PUBLISH_LOCK_POLL_MS);
     }
   }
+  return { held };
+};
+
+/** Release a lock acquired via `acquirePublishLock`. Idempotent-safe to call
+ *  even when `handle.held` is false (the deadline-fallback case) — it simply
+ *  does nothing, exactly like `withPublishLock`'s original `finally`. */
+export const releasePublishLock = (connectionsDir: string, handle: PublishLockHandle): void => {
+  if (handle.held) safeUnlink(publishLockPath(connectionsDir));
+};
+
+/**
+ * Acquire the cross-process publish lock, run `fn` (the entire seed-read →
+ * flip → GC critical section) with it held, and release it. `fn` is
+ * synchronous by design — the whole critical section must complete without
+ * yielding the lock to another awaited publisher (the flip + GC are pure fs
+ * ops). See `acquirePublishLock` for the underlying primitive.
+ */
+export const withPublishLock = <T>(
+  connectionsDir: string,
+  fn: () => T,
+  options: { readonly failClosed?: boolean } = {},
+): T => {
+  const handle = acquirePublishLock(connectionsDir, options);
   try {
     return fn();
   } finally {
-    if (held) safeUnlink(lockPath);
+    releasePublishLock(connectionsDir, handle);
   }
 };
 
@@ -973,6 +1009,55 @@ export const sweepOrphanGenerations = (
 
 export const generationDbPath = (connectionsDir: string, genId: string): string =>
   genFilePath(connectionsDir, genId);
+
+// ---------------------------------------------------------------------------
+// In-place scoped publish (2026-08-16) — see the "Storage-tier incremental
+// publish" design note in docs/plans/2026-08-15-foundation-program.md for
+// the full investigation, the empirical WAL-isolation verification, and the
+// reasoning behind every decision below. Summary: a scoped-delta write
+// (`replaceScopeRows`) or single-event overlay write
+// (`applyProjectionEventOverlay`) no longer clones the whole published
+// generation file just to apply an already-O(delta) SQL mutation — it opens
+// the CURRENT pointer's file `{ readwrite: true }` directly under this cross-
+// process lock and lets the caller's own existing `BEGIN IMMEDIATE`/
+// `COMMIT`/`ROLLBACK` block be the atomic unit for the mutation (see
+// snapshot.ts's `#acquireInPlaceWriteHandle` doc comment for why a literal
+// `SAVEPOINT` wasn't used). No new generation, no pointer flip, no GC. Kept
+// OFF this path entirely: full graph rewrites
+// (`putCurrent`/`writeSnapshotAndProgress` on a genuine content-signature
+// change), first-boot legacy migration, kill-switch downgrade reconciliation,
+// and any future structural schema migration — all of those still choose a
+// fresh generation deliberately via the existing clone+CAS-flip path.
+// ---------------------------------------------------------------------------
+
+/** `SIDETRACK_INPLACE_PUBLISH` — default ON (absent/non-`0`). `=0` reverts
+ *  every scoped/overlay write to the pre-existing clone+CAS-flip path,
+ *  byte-for-byte, for a soak-cycle kill switch. */
+export const inPlacePublishEnabled = (): boolean =>
+  process.env['SIDETRACK_INPLACE_PUBLISH'] !== '0';
+
+/** How long (ms) an in-place-publish-capable store waits with no further
+ *  publish before proactively folding the WAL back into the main db file
+ *  (`PRAGMA wal_checkpoint(TRUNCATE)`). Chosen so a burst of scoped
+ *  publishes (foreground-nav overlays fire on the order of once per
+ *  navigation) doesn't pay TRUNCATE's stronger checkpoint cost on every
+ *  single one, while an idle vault still reclaims WAL bytes promptly. See
+ *  the design note's "WAL checkpoint policy" section for the measurement
+ *  this default is based on. */
+export const inPlaceCheckpointIdleMs = (): number => {
+  const raw = process.env['SIDETRACK_INPLACE_CHECKPOINT_IDLE_MS'];
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+};
+
+/** Count-based checkpoint safety net, independent of the idle timer, so a
+ *  vault under CONTINUOUS activity (idle timer never fires) still bounds WAL
+ *  growth. Forces one TRUNCATE checkpoint every N in-place publishes. */
+export const inPlaceCheckpointEveryN = (): number => {
+  const raw = process.env['SIDETRACK_INPLACE_CHECKPOINT_EVERY_N'];
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+};
 
 /** Best-effort existence check for a generation db path (never throws). */
 export const generationExists = (connectionsDir: string, genId: string): boolean => {

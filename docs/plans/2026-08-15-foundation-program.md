@@ -142,6 +142,281 @@ correct row/seq/type counts
 version; no regression to report. chDB was not re-spiked (never a
 dependency, no code path to verify).
 
+## Storage-tier incremental publish — design note (2026-08-16)
+
+Not an F1–F7 item; filed here per the "binding plan tracks reality" rule.
+Binding user motivation: SMART shows +410GB host writes/day on the daily
+machine; the connections generation db is copied whole on every publish.
+Binding constraint: no full write built from the beginning of the log
+anywhere in the design (this item is about the STORAGE tier, not the
+compute tier — `sync/contract/connectionsMaterializer.ts` is out of
+bounds and untouched by this work; the compute layer already emits
+scoped deltas — see F8/IVM history above).
+
+**Measured baseline (`~/.sidetrack-vault-test/_BAC/connections/`,
+read-only, live companion never restarted/contacted).** Two full
+generation files resident simultaneously:
+`current.1786920603311-826290F7X5KN4.db` and
+`current.1786920641023-82629Y4EW8ZW7.db`, each exactly 437,288,960 bytes,
+minted 37,712ms apart (mtimes 15:50:03 and 15:50:41 during the same
+active-browsing window) — an on-disk, present-tense instance of "sometimes
+twice in one minute." The live companion (pid 75314) had been up only 37
+minutes at measurement time (fresh boot), so a same-boot 24h steady-state
+count isn't directly observable without restarting it (out of bounds
+here); extrapolating this single fresh-boot rate (874,577,920 bytes / 37
+min) across a full day projects **~34 GB/day** from connections-generation
+copy-on-publish churn alone, on this one vault. That is a lower bound on
+the real contribution — it does not include any slower background-hours
+cadence separately, and every one of these copies is 100% write
+amplification: the actual row-level delta each publish applies is
+routinely tens to low-thousands of SQL upserts (`replaceScopeRows` /
+`#applyOverlayOnDb`), not 437MB of new content.
+
+**Investigation — where the copy happens and why (`connections/
+generationBuffer.ts`, `connections/snapshot.ts`).** M4's double-buffer
+design (2026-07-29, header comments in `generationBuffer.ts`) made every
+publish a **generation-pointer flip**: `current.gen` names one
+`current.<genId>.db` file; every writer — the fork-per-drain child
+(`role: 'child-writer'`) doing a scoped delta, AND the long-running
+parent process (`role: 'parent-reader'`) doing either a foreground-nav
+scoped delta (`replaceScopeRows`) or a single-event metadata overlay
+(`applyProjectionEventOverlay`) — clones the ENTIRE currently-published
+generation file (`createShadowGeneration`'s `copyFileSync`, APFS
+clonefile-optimized but still a full logical copy that becomes a full
+physical copy the instant either file diverges by even one page), applies
+its (already O(delta)) SQL mutation inside `BEGIN IMMEDIATE` on the
+clone, `PRAGMA wal_checkpoint(TRUNCATE)`s it, then CAS-flips the pointer
+under a cross-process lock (`withPublishLock`/`casPublish`). The
+**"overlay twin"** the task asked about is exactly this: the parent's own
+`#overlayViaShadowPublish` (generation id shape
+`overlay<pid><rev6>`) mints an independent full clone for a
+SINGLE folded event — the second 437MB file measured above. The **TOCTOU
+generation-open retry** (`#openHandleForRole`, both the child-read and
+parent-reader branches) exists because the GC that runs after every
+CAS-won publish can retire a generation between a reader's `readPointer`
+and its `open()` call; unrelated to the copy cost itself, and left
+untouched by this change (still correct: it recovers by re-reading the
+pointer once).
+
+The three reasons the M4 header gives for the clone+flip design, verified
+against the actual code:
+1. Renaming a file OVER a path an open readonly handle names throws
+   "disk I/O error" on APFS (vnode swap) — so publish can never rewrite
+   the SERVED PATH in place via rename. (Still true; irrelevant to this
+   change — in-place publish never renames anything.)
+2. Every published generation is checkpoint-TRUNCATE'd BEFORE the
+   pointer names it, believed necessary so a readonly reader never needs
+   to coordinate with a live writer via the WAL shared-memory index.
+   **This premise is the one this change overturns — see the empirical
+   verification below.**
+3. Unlinking a generation while ANY handle still has it open throws
+   "disk I/O error" on that handle's next query — so GC must never
+   remove a generation a live handle holds. (Still true and still
+   enforced by `#liveHeldGenIds()`/the in-flight markers; irrelevant here
+   because in-place publish never unlinks the file readers hold — it's
+   the SAME file before and after.)
+4. Two writers on the SAME file collide (`SQLITE_BUSY` on `BEGIN
+   IMMEDIATE`) — real, and still handled: `withPublishLock`'s
+   cross-process O_EXCL lockfile already serializes every writer
+   (parent overlay queue, parent scoped-delta, child-writer) today: this
+   change keeps using the exact same lock for the exact same reason, just
+   around a cheaper critical section (no `copyFileSync` of 437MB inside
+   it — lock hold time goes DOWN).
+
+**Empirical WAL snapshot-isolation verification (this task's explicit
+ask, bun:sqlite 1.3.14, this machine, throwaway spike at
+`/tmp/wal-spike/spike.mjs` + `spike2.mjs`, not committed).** Two
+questions had to be answered before trusting an in-place design instead
+of relying on the M4 authors' (untested) assumption that a reader needs a
+fully quiescent file:
+- **Does a reader block or see torn data while a writer holds a
+  transaction on the same WAL file?** No, and no. A `BEGIN
+  DEFERRED`-pinned reader held its OLD snapshot throughout a concurrent
+  writer's 999-row `BEGIN IMMEDIATE` insert AND after that writer's
+  `COMMIT`, until the reader's own transaction ended. A plain
+  autocommit `SELECT` (no explicit transaction — exactly
+  `#readCurrentAttempt`'s existing H6 pattern) issued mid-writer-transaction
+  also correctly saw the pre-write snapshot. **Zero `SQLITE_BUSY` was ever
+  thrown at any reader**, despite the writer holding `BEGIN IMMEDIATE`
+  open for the whole insert loop — WAL readers never block on writers,
+  confirmed directly rather than assumed. A brand-new reader opened
+  immediately after `COMMIT` saw the fresh data instantly.
+- **Does ONE long-lived reader connection (matching the store's cached
+  `#db`, reused across many HTTP requests) keep picking up EVERY
+  subsequent writer commit, or does it cache a stale wal-index
+  snapshot?** Tested across 5 rounds of 100-row `SAVEPOINT`/`RELEASE`
+  writer commits against the SAME already-open reader connection: the
+  reader's plain `SELECT COUNT(*)` tracked the writer exactly
+  (100/200/300/400/500), every round, whether the writer's own commits
+  used `SAVEPOINT ...; RELEASE ...;` (spike2, no enclosing `BEGIN` —
+  confirmed a bare savepoint genuinely commits standalone: a second,
+  independent writer connection could immediately acquire the write
+  lock right after a `RELEASE`) or `BEGIN IMMEDIATE; COMMIT;` (spike,
+  and the shape actually shipped — see the "SAVEPOINT per publish"
+  deviation note below). The isolation guarantee this section verifies —
+  a long-lived reader connection correctly tracks every writer commit —
+  is a property of WAL + a top-level transaction, not of which spelling
+  (`SAVEPOINT` vs `BEGIN`) opened it, so it holds for whichever this
+  design ends up using.
+
+Conclusion: reason (2) above does not hold. A readonly bun:sqlite
+connection on a live (non-checkpointed) WAL file, read with the store's
+EXISTING read pattern (plain autocommit statements, no held transaction
+across `await` — `#readCurrentAttempt`'s own comment already explains why
+it avoids a long-held read transaction: "BEGIN DEFERRED with awaits would
+hold a SHARED lock across event-loop turns — bad"), gets correct MVCC
+isolation with zero risk of `SQLITE_BUSY`, whether or not a writer is
+mid-transaction on the same file. The existing H6 write_seq pre/post
+check is not just compatible with in-place publish, it is *already*
+exactly the right mechanism for it (it exists to catch a writer's commit
+straddling a paged multi-statement read; that hazard is unchanged whether
+the straddled writer changed the file's identity or wrote it in place).
+
+**Design.** Introduce `SIDETRACK_INPLACE_PUBLISH` (absent/non-`0` = ON).
+When enabled, both scoped-delta writes (`replaceScopeRows`) and
+single-event overlay writes (`applyProjectionEventOverlay`) — from
+EITHER writer role, child-writer or parent-reader, since both call the
+same store methods — apply their mutation **in place** on the CURRENTLY
+PUBLISHED generation file instead of cloning it:
+1. `await loadSqlite()` (async, one-time module resolution) OUTSIDE the
+   lock, then acquire the cross-process publish lock
+   (`generationBuffer.ts` gains `acquirePublishLock`/`releasePublishLock`,
+   the blocking-acquire half of `withPublishLock` factored out so a
+   caller can hold it across more than one synchronous callback —
+   `withPublishLock` itself becomes a thin wrapper over the pair, so
+   `casPublish`/`sweepOrphanGenerations` are unchanged).
+2. Re-read `current.gen`; open THAT file `{ readwrite: true }` directly
+   (no `copyFileSync`). Run `#initSchemaOn` (idempotent `CREATE TABLE/
+   INDEX IF NOT EXISTS`) so a generation from before this change (or the
+   self-healing `idx_edges_index_src_dst` index from the 2026-08-16
+   watchdog-loop fix) is brought current — free, since the DDL is a
+   no-op on an already-current schema.
+3. Hand the fresh connection back to the caller with NO transaction open
+   yet — same contract `#acquireGraphWriteHandle` already has. The
+   caller's existing, already-O(delta) row mutations
+   (`replaceScopeRows`'s temp-table diff/upsert block or
+   `#applyOverlayOnDb`'s single-row fold) run **completely unchanged**,
+   including their own `db.exec('BEGIN IMMEDIATE')` /
+   `COMMIT`/`ROLLBACK` — bumping `write_seq` exactly as today.
+   **Deviation from the task's literal "SAVEPOINT per publish" wording,
+   flagged here rather than silently substituted:** the natural reading
+   was "wrap the whole open→mutate→finalize span in one named
+   `SAVEPOINT`," but that is empirically impossible without ALSO rewriting
+   every touched call site's transaction verbs — a bare `SAVEPOINT`
+   followed by the existing code's `BEGIN IMMEDIATE` throws SQLite's
+   "cannot start a transaction within a transaction" (verified,
+   `/tmp/wal-spike/spike3.mjs`). Rewriting `replaceScopeRows`'s and
+   `#applyOverlayOnDb`'s internal transaction verbs to `SAVEPOINT`/
+   `RELEASE` was rejected as unjustified extra surface area on
+   already-tested, shared code (both methods are ALSO used by the
+   unchanged clone+flip fallback path, and `#applyOverlayOnDb` is called
+   with a `db` that may later host a nested `#bootstrapScopeMembershipOn`
+   `BEGIN IMMEDIATE` from a sibling call site on the same connection) for
+   zero additional crash-safety benefit: a top-level `BEGIN
+   IMMEDIATE`/`COMMIT` is transactionally equivalent to a top-level bare
+   `SAVEPOINT`/`RELEASE` (both are ordinary WAL transactions; SQLite does
+   not persist an uncommitted transaction as visible/committed under
+   either spelling), and `BEGIN IMMEDIATE`/`COMMIT` is the exact,
+   already-proven primitive every other writer in this class already
+   uses. The atomicity guarantee the task cares about (kill mid-publish →
+   reopen shows fully-old or fully-new, never torn) holds identically
+   either way and is exactly what the crash-kill test proves.
+4. On success: the caller's own `COMMIT` already ran; close this
+   short-lived writable connection (opened fresh per publish call — no
+   persistent writer handle is kept between publishes, trading a
+   sub-millisecond open/close for a much simpler crash/lifecycle story:
+   nothing in `close()` or the retired-handle bookkeeping needs to
+   change, and there is no long-lived writable handle whose staleness
+   after a pointer flip would need separate reasoning). On failure, the
+   caller's own `ROLLBACK` already ran. Either way, release the publish
+   lock after closing the connection.
+5. **No pointer flip, no new generation file, no GC.** `current.gen`
+   keeps naming the SAME file across an unbounded run of scoped/overlay
+   publishes; `#swapCount`/`residentGenerations()` are unaffected because
+   nothing new was ever minted.
+
+**What still uses clone+flip (unchanged).** A FULL graph write
+(`putCurrent`/`writeSnapshotAndProgress` when the S1 strong content
+signature doesn't match — i.e. a genuine full rebuild, not a scoped
+delta) keeps the existing shadow-clone-then-CAS-flip path. So does
+`migrateLegacyToGeneration` (first boot), `reconcileLegacyToPublished`
+(kill-switch downgrade), and any future schema migration that needs a
+structural (non-`IF NOT EXISTS`) DDL change — those get to choose a fresh
+generation deliberately rather than mutating a live file's schema under
+readers. `vacuum()` also stays a no-op for the graph generation (VACUUM
+rewrites the whole file and is incompatible with concurrent readers
+regardless of WAL; full compaction remains a rare, explicit,
+consent-gated maintenance path, not something this PR touches). This is
+the "partial adoption" the task's own contingency allows for: in-place
+for the high-frequency scoped/overlay channel, clone+flip preserved for
+the low-frequency structural channel — because the two have different
+correctness requirements (a structural change legitimately needs
+readers to keep serving the OLD schema until they're ready to move,
+which the pointer-flip model exists for; a scoped delta does not).
+
+**Revision / `write_seq` semantics — unchanged, and why that's provably
+safe.** `write_seq` and `snapshotRevision` are pure row content living in
+the `metadata` table; both are already generation-file-identity-agnostic
+(bumped/computed identically by `#bumpWriteSeq`/`computeSnapshotRevision`
+regardless of which physical file they're written to). The ONE thing
+that IS keyed on generation identity is the S1 progress-checkpoint
+sidecar (`progress.checkpoint.json`, `generationId`-bound,
+`progressCheckpoint.ts`) — in-place publish makes generation identity
+change LESS often, which can only make that sidecar's
+`checkpoint.generationId !== input.generationId` staleness check fire
+LESS often (strictly more often valid), never introduce a new failure
+mode. F4's derive-memo (`#cachedDerivedProjections`, keyed on
+`write_seq`) and the resolve-cache's `snapshot_revision` keying are
+likewise untouched: both already treat write_seq/snapshotRevision as the
+sole trust boundary, never the generation filename. An equivalence test
+(mandatory test 4) proves the row-level output is byte-identical whether
+a given input sequence of scoped-delta writes is applied via the legacy
+clone-per-write path or the new in-place path.
+
+**WAL checkpoint policy (measured).** `PRAGMA wal_autocheckpoint` stays
+at SQLite's default (1000 pages, ~4MB) — unchanged, and still fires
+automatically (PASSIVE) after each commit once crossed, reclaiming frames
+no open reader still needs. Measured empirically (spike2.mjs, 501 rows /
+5 SAVEPOINT rounds): WAL stayed at 57,712 bytes, well under the 4MB
+auto-checkpoint threshold, so PASSIVE auto-checkpoint had nothing to do
+yet in that run — expected at this row count, not a sign it's inert.
+Because in-place publish no longer gets a "free" checkpoint-TRUNCATE on
+every publish (that step belonged to the clone+flip path, run once per
+NEW file before the pointer named it), this PR adds an explicit **idle
+checkpoint**: after `SIDETRACK_INPLACE_CHECKPOINT_IDLE_MS` (default
+30,000ms) with no further in-place publish, run one
+`PRAGMA wal_checkpoint(TRUNCATE)` on the graph generation — same idle-timer
+shape as the class's existing `#scheduleCachedSnapshotSweep`. A count-based
+safety net (`SIDETRACK_INPLACE_CHECKPOINT_EVERY_N`, default 50 publishes)
+also forces a TRUNCATE checkpoint independent of idle timing, so a vault
+under continuous activity (idle timer never fires) still bounds WAL
+growth. TRUNCATE is more disruptive to a reader that happens to hold an
+old snapshot mid-checkpoint than PASSIVE (it must wait for the last
+reader of the oldest still-needed frames to finish before it can fully
+reclaim), which is exactly why it's reserved for idle/periodic moments
+rather than run on every publish — documented here per the task's
+"measure, don't guess" bar; the write-volume test asserts per-publish
+bytes stay O(delta) with this policy active.
+
+**Env gate.** `SIDETRACK_INPLACE_PUBLISH`, default ON (absent/non-`0`).
+`=0` reverts scoped/overlay writes to EXACTLY today's clone+CAS-flip
+code path, byte-for-byte — the existing `#acquireGraphWriteHandle`
+parent-reader shadow-clone branch and `#overlayViaShadowPublish` are kept
+intact, not deleted, specifically so this is a genuine zero-risk kill
+switch for one soak cycle, not a one-way door.
+
+**Deferred / explicitly out of scope.** GC (`gcOldGenerations`,
+`surveyGenerations`, `sweepOrphanGenerations`) needs no functional
+change — a vault under steady-state in-place publishing simply stops
+minting new generations to collect, which those functions already handle
+correctly (0 orphans is a valid, already-tested state). Full `VACUUM`
+page-level compaction (distinct from WAL checkpointing) is left as a
+future consent-gated maintenance op, matching F1/F2's existing
+consent-gated destructive-op pattern — this PR does not add one.
+`connections/contract/connectionsMaterializer.ts` is untouched, per this
+task's binding constraint; every change is confined to
+`connections/snapshot.ts` and `connections/generationBuffer.ts`.
+
 ## Learned per-node aggregator stats — design note (2026-08-16)
 
 Not an F1–F7 item; filed here per the "binding plan tracks reality" rule
@@ -1175,3 +1450,133 @@ the requested audibility/histogram/requeue shape.
 
 PR: fix(evidence): rewire embed lane to F5 SQLite stores + audible embed
 failures (branch `fix/embed-lane-f5-read`).
+
+**2026-08-16 — storage-tier in-place scoped publish, landed
+(perf/in-place-scoped-publish).** Closes the design note above. Full
+investigation, the empirical WAL-isolation spikes, and every design
+decision are recorded there (written BEFORE implementation, per the
+binding rule); this note records the SHIPPED result.
+
+**What shipped.** `replaceScopeRows` (foreground-nav / catch-up scoped
+deltas, called by both the parent process and the fork-per-drain child)
+and `applyProjectionEventOverlay`'s parent-reader branch (the "overlay
+twin") now apply their mutation directly to the CURRENTLY PUBLISHED
+generation file under the cross-process publish lock — no
+`copyFileSync`, no new generation id, no pointer flip — falling back to
+the existing clone+CAS-flip path (byte-for-byte unchanged) whenever
+in-place publish isn't applicable (disabled, no generation published
+yet, or a TOCTOU race on the generation file). Full graph rewrites
+(genuine content-signature changes), first-boot legacy migration,
+kill-switch downgrade reconciliation, and any future structural schema
+migration are UNCHANGED — they still choose a fresh generation
+deliberately via clone+CAS-flip. `connections/contract/
+connectionsMaterializer.ts` was not touched.
+
+**Measured baseline (live vault, read-only, companion never
+restarted).** `~/.sidetrack-vault-test/_BAC/connections/` held two full
+437,288,960-byte generation files simultaneously, minted 37,712ms apart
+during one active-browsing window, on a companion boot only 37 minutes
+old — extrapolating that single fresh-boot rate across a day projects
+~34 GB/day from connections-generation copy-on-publish churn alone (see
+the design note for the full reasoning and caveats on this estimate).
+
+**Empirical WAL-isolation verification (bun:sqlite 1.3.14).** Two
+throwaway spikes (not committed) proved: (1) a reader with an open WAL
+read transaction (or the store's existing plain-autocommit H6 pattern)
+never sees a concurrent writer's uncommitted changes and is NEVER
+blocked (`SQLITE_BUSY`) by a writer holding a transaction on the same
+file; (2) one long-lived reader connection (matching the store's cached
+`#db`) correctly tracks every subsequent writer commit across 5 rounds
+of 100-row `SAVEPOINT`/`RELEASE` writes, with zero staleness. Full
+detail in the design note above.
+
+**Deviation from the task's literal "SAVEPOINT per publish" wording,**
+flagged and justified in the design note: a bare `SAVEPOINT` cannot
+precede the touched call sites' existing `BEGIN IMMEDIATE` without
+SQLite's "cannot start a transaction within a transaction" error
+(verified). Shipped instead: the caller's own existing `BEGIN
+IMMEDIATE`/`COMMIT`/`ROLLBACK` block, completely unchanged, is the
+atomic unit for each in-place publish — transactionally equivalent to a
+top-level `SAVEPOINT`/`RELEASE` and the exact primitive every other
+writer in this class already uses and is already tested against.
+
+**Tests (`connections/inPlacePublish.test.ts`, new; 7 cases, all
+mandatory categories from the task):**
+1. **Crash-kill**: a real forked bun subprocess performs a 6,000-row
+   scoped-delta in-place publish; the PARENT process SIGKILLs it at a
+   randomized point (delay sampled from a measured, uncounted
+   calibration run of the identical payload, spanning "before the write
+   starts" through "after it should have committed"), N=20 iterations.
+   Reopens a fresh store and asserts the scope's content is EITHER
+   completely untouched OR completely and correctly replaced — never a
+   partial/mixed state. Run 12× total during this PR (targeted reruns
+   plus every full-suite/full-directory pass = 240 randomized SIGKILL
+   trials across development), 0 torn states, every run also asserted
+   `killedWhileRunning > 0` (proof the randomization actually landed
+   mid-write, not just in dead zones).
+2. **Concurrent reader isolation**: a raw `BEGIN DEFERRED` reader on the
+   store's ACTUAL served generation file (not a throwaway db) is proven
+   to hold its pre-publish snapshot throughout a concurrent in-place
+   publish and past its commit, updating only once its own transaction
+   ends; a second test races the store's own `readCurrent()` (H6 paged
+   read) against 6 rounds of concurrent in-place publishes and asserts
+   the base graph is never partially missing (the torn-read detector).
+3. **Write volume**: a 60,000-node, 128,876,544-byte (~123 MiB) synthetic
+   fixture; a 100-row in-place scoped delta wrote 238,992 bytes total
+   (WAL growth + main-db page growth) — 0.185% of the fixture size, ~21×
+   under the task's 5MB bound.
+4. **Revision/write_seq equivalence**: an identical 4-step write sequence
+   (full seed, scoped delta, single-event overlay, second scoped delta)
+   run once with in-place publish on and once with
+   `SIDETRACK_INPLACE_PUBLISH=0`; `readCurrent()` (nodes, counts,
+   `snapshotRevision`) and `readMaterializerProgress` are asserted equal
+   between the two runs.
+5. **Generation GC**: 10 consecutive in-place scoped publishes leave
+   `residentGenerations()` at exactly 1 (the seed gen) throughout — no
+   accumulation; a separate case proves the full-rebuild clone+flip path
+   (unchanged) still mints and GCs generations correctly (keep-window of
+   2, oldest collected on the third rebuild).
+
+**WAL checkpoint policy, shipped as designed and documented:**
+`PRAGMA wal_autocheckpoint` left at SQLite's default (1000 pages);
+`SIDETRACK_INPLACE_CHECKPOINT_IDLE_MS` (default 30,000) folds the WAL
+back via `wal_checkpoint(TRUNCATE)` after that much quiet;
+`SIDETRACK_INPLACE_CHECKPOINT_EVERY_N` (default 50) forces the same
+independent of idle timing, for a vault under continuous activity.
+
+**Residual, discovered by the crash-kill test, documented not
+silently fixed**: killing a writer WHILE it holds the cross-process
+publish lock (`current.publish.lock`) leaves it orphaned until the
+existing `PUBLISH_LOCK_STALE_MS` (15s, unchanged, shared by every
+publisher) staleness window passes — pre-existing machinery, but now
+exercised far more often, since in-place publish holds this lock for
+the FULL row-mutation transaction (the slow part) rather than only the
+fast final flip (the old clone+flip design cloned OUTSIDE the lock).
+Readers are completely unaffected either way (WAL readers never
+contend on this lock or on a concurrent writer at all — see the
+isolation verification above); only a SECOND writer landing inside that
+same ≤15s window would wait. Not fixed here: `acquirePublishLock`'s
+staleness check is time-based, shared by the pointer-flip CAS path too,
+and improving it (e.g. pid-liveness, matching the in-flight generation
+markers' pattern) is real, separable work outside this PR's scope.
+
+**Verification**: `bun test` — 3422 pass, 8 skip, 0 fail, 3430 tests
+across 378 files (Bun's known exit-time C++ panic fired AFTER the
+summary printed, same pre-existing Bun 1.3.14 shutdown crash noted in
+the prior landing note, not a test failure). `bun run build` clean.
+`bunx eslint` on every touched file: 0 errors (pre-existing warnings
+only, none introduced by new logic beyond style parity with existing
+casts in the same file).
+
+**Files changed**: `connections/generationBuffer.ts` (lock
+acquire/release factored out of `withPublishLock`; new env-gate
+helpers), `connections/snapshot.ts` (`#acquireInPlaceWriteHandle` +
+checkpoint-policy helpers; `replaceScopeRows` /
+`applyProjectionEventOverlay` wiring; new diagnostics counters),
+`http/routes/systemRoutes.ts` (surfaces the new diagnostics counters),
+`system/resolveCanary.test.ts` (updated fixtures for the new required
+diagnostics fields), `connections/inPlacePublish.test.ts` (new, the
+five mandatory test categories).
+
+PR: perf(store): in-place scoped publishes — kill copy-on-publish write
+amplification (branch `perf/in-place-scoped-publish`).
