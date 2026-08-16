@@ -49,23 +49,30 @@ import type { MaterializerProgress } from '../sync/contract/materializerProgress
 import { scopesForGraphRows, type Scope } from '../sync/contract/connectionsScopes.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
+  TAB_SESSION_PROJECTION_SCHEMA_VERSION,
   foldEventIntoTabSessionProjectionAccumulator,
   serializeTabSessionProjection,
+  serializeTabSessionProjectionAccumulator,
   tabSessionProjectionAccumulatorFromSerialized,
   tabSessionProjectionFromAccumulator,
   type SerializedTabSessionProjectionAccumulator,
   type SerializedTabSessionProjection,
+  type TabSessionProjectionAccumulator,
   type TabSessionRecord,
   type TabSessionProjection,
 } from '../tabsession/projection.js';
 import {
+  URL_PROJECTION_SCHEMA_VERSION,
   foldEventIntoUrlProjectionAccumulator,
   serializeUrlProjection,
+  serializeUrlProjectionAccumulator,
   type SerializedUrlProjectionAccumulator,
   type SerializedUrlProjection,
   type UrlAttribution,
+  type UrlObservationCursor,
   type UrlPageEvidenceSummary,
   type UrlProjection,
+  type UrlProjectionAccumulator,
   type UrlVisitRecord,
   urlProjectionAccumulatorFromSerialized,
   urlProjectionFromAccumulator,
@@ -3829,7 +3836,7 @@ export interface ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     dirtyScopes?: ReadonlySet<Scope>,
-    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
+    projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite,
   ) => Promise<void>;
   readonly readProjectionAccumulatorState?: (
     name: string,
@@ -3853,7 +3860,7 @@ export interface ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
-    readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
+    readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite;
     // 'replace' (default): persist input.progress verbatim, advancing
     // both applied dot intervals and snapshotRevisionId. Used by the
     // deterministic drain path that has freshly-computed progress.
@@ -3971,29 +3978,55 @@ export interface ConnectionsProjectionAccumulatorState {
   readonly tabSessionAccumulator: SerializedTabSessionProjectionAccumulator;
 }
 
-// W2 — the similarity-family edge-id prefixes, DERIVED from the single-source
-// SIMILARITY_FAMILY_RENDER_EDGE_KINDS set (renderedSimilarityFloor.ts) so the
-// two never drift. edgeIdFor emits `edge:${kind}:${from}:${to}`, so a family
-// membership check is a cheap prefix test on the id string, no edge-object
-// needed — this is what lets replaceScopeRows count non-family edges straight
-// from edge_order (id list) without decoding edge rows.
-const SIMILARITY_FAMILY_EDGE_ID_PREFIXES: readonly string[] = [
+// F4 (blob diet) — the small, replica-bounded progress tag persisted
+// alongside the projection accumulator's per-key rows (see
+// ConnectionsProjectionAccumulatorWrite below). Kept separate from the
+// url/tabSession content so the frontier-equality reuse check
+// (tryLoadProjectionAccumulatorState) never depends on reading the O(state)
+// row tables — it is written atomically with those rows in the same
+// transaction, so a kill-9 can never tear the two apart (mirrors the
+// nodes/edges/current invariant documented at #writeCurrentRows).
+export interface ConnectionsProjectionAccumulatorProgress {
+  readonly materializerName: string;
+  readonly materializerVersion: string;
+  readonly appliedDotIntervals: MaterializerProgress['appliedDotIntervals'];
+  readonly appliedFrontier: MaterializerProgress['appliedFrontier'];
+}
+
+// F4 (blob diet) — replaces the old "serialize the whole accumulator to one
+// JSON blob every drain" write shape. The caller (connectionsMaterializer)
+// hands over the LIVE Map-based accumulators plus either 'full' (cold seed /
+// post-reset — every row is replaced) or 'delta' (the set of keys this
+// drain's fold calls actually touched — see foldEventTrackingProjectionAccumulators
+// and the *KeyForEvent helpers in urls/projection.ts + tabsession/projection.ts).
+// The store upserts/deletes exactly those keys' rows instead of rewriting the
+// full url/tabSession maps every time.
+export interface ConnectionsProjectionAccumulatorWrite extends ConnectionsProjectionAccumulatorProgress {
+  readonly urlAccumulator: UrlProjectionAccumulator;
+  readonly tabSessionAccumulator: TabSessionProjectionAccumulator;
+  readonly dirty:
+    | { readonly mode: 'full' }
+    | {
+        readonly mode: 'delta';
+        readonly canonicalUrls: ReadonlySet<string>;
+        readonly tabSessionIds: ReadonlySet<string>;
+        readonly openTabIdHashes: ReadonlySet<string>;
+      };
+}
+
+// F4 (blob diet) — the similarity-family edge KINDS (not a derived id-prefix
+// list) for a direct SQL filter against edges_index.kind. Previously this
+// fed a JS prefix-match helper (`isSimilarityFamilyEdgeId`) run over the
+// full edge_order id list; edges_index already carries `kind` per edge
+// (trigger-maintained off the edges bucket JSON — see the DDL comment), so a
+// COUNT(*) ... WHERE kind NOT IN (...) query gets the same answer without
+// ever materializing an id array in JS.
+const SIMILARITY_FAMILY_EDGE_KINDS_LIST: readonly string[] = [
   ...SIMILARITY_FAMILY_RENDER_EDGE_KINDS,
-].map((kind) => `edge:${kind}:`);
-
-const isSimilarityFamilyEdgeId = (edgeId: string): boolean =>
-  SIMILARITY_FAMILY_EDGE_ID_PREFIXES.some((prefix) => edgeId.startsWith(prefix));
-
-// W2 — count the NON-similarity-family edges from an edge-id list (edge_order).
-// This is the stable structural discriminator for the resolve SWR graph
-// signature: it changes on a real non-similarity graph mutation (a new
-// thread_references_url / attribution / topic edge) but does NOT move on the
-// Pass-7 similarity edge oscillation. O(edges), zero allocation.
-const countNonSimilarityFamilyEdgeIds = (edgeIds: readonly string[]): number => {
-  let count = 0;
-  for (const id of edgeIds) if (!isSimilarityFamilyEdgeId(id)) count += 1;
-  return count;
-};
+];
+const NON_SIMILARITY_EDGE_COUNT_SQL = `SELECT COUNT(*) AS n FROM edges_index WHERE kind NOT IN (${SIMILARITY_FAMILY_EDGE_KINDS_LIST.map(
+  () => '?',
+).join(',')})`;
 
 const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMetadata => ({
   scope: snapshot.scope,
@@ -4018,7 +4051,7 @@ const metadataForSnapshot = (snapshot: ConnectionsSnapshot): StoredConnectionsMe
   // write always carries a fresh, correct value. This is a METADATA-ONLY
   // discriminator (see StoredConnectionsMetadata) — not surfaced on the
   // reconstructed snapshot. The scoped-delta path recomputes it independently
-  // from edge_order (replaceScopeRows).
+  // from edges_index.kind (replaceScopeRows; see NON_SIMILARITY_EDGE_COUNT_SQL).
   nonSimilarityEdgeCount: snapshot.edges.reduce(
     (n, edge) => (SIMILARITY_FAMILY_RENDER_EDGE_KINDS.has(edge.kind) ? n : n + 1),
     0,
@@ -4352,36 +4385,6 @@ const metadataForSnapshotWrite = (
     ...metadata,
     contentSignature: contentSignatureForSnapshot(snapshot, metadata),
   };
-};
-
-const metadataStringArray = (row: unknown): string[] => {
-  if (row === null || row === undefined) return [];
-  const parsed = JSON.parse(textField(row, 'data')) as unknown;
-  if (!Array.isArray(parsed)) return [];
-  return parsed.filter((value): value is string => typeof value === 'string');
-};
-
-const patchSortedOrder = (input: {
-  readonly current: readonly string[];
-  readonly removed: ReadonlySet<string>;
-  readonly added: ReadonlySet<string>;
-}): string[] => {
-  const ids = new Set<string>();
-  for (const id of input.current) {
-    if (!input.removed.has(id)) ids.add(id);
-  }
-  for (const id of input.added) ids.add(id);
-  return [...ids].sort();
-};
-
-const edgeIdsFromSerializedBucket = (serialized: string): string[] => {
-  const parsed = JSON.parse(serialized) as unknown;
-  if (!Array.isArray(parsed)) return [];
-  const edgeIds: string[] = [];
-  for (const value of parsed) {
-    if (isRecord(value) && typeof value['id'] === 'string') edgeIds.push(value['id']);
-  }
-  return edgeIds;
 };
 
 const maxObservedAtForRows = (
@@ -5118,13 +5121,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         -- Queryable edge index (P3): edge_id -> (src, dst, kind). Lets
         -- readEdge do an O(1) bucket lookup instead of a full-table scan, and
         -- enables server-side edgeKind filtering. It is NEVER read during
-        -- snapshot reconstruction (readCurrent/readSubgraph), so it is
-        -- byte-invisible to the served graph and to snapshotRevision (a
-        -- metadata-only hash). Auto-maintained by triggers off the edges
-        -- bucket JSON, so EVERY writer (writeCurrentRows, replaceScopeRows,
-        -- future) keeps it in sync without per-site code. Edge IDs encode
-        -- (kind, from, to) and the bucket key is (from, to), so each edge_id
-        -- maps to a fixed (src, dst) — it can never move buckets.
+        -- snapshot reconstruction (readCurrent/readSubgraph — those derive
+        -- edge order from the already-paged edges rows, not this index), so
+        -- it stays byte-invisible to the served graph and to
+        -- snapshotRevision (a metadata-only hash). F4 (blob diet) added a
+        -- second reader: replaceScopeRows COUNTs against it (total + non-
+        -- similarity-kind) to replace the old node_order/edge_order blob
+        -- rewrite — still a read, never mutated outside the triggers, so the
+        -- byte-invisibility claim above is unaffected. Auto-maintained by
+        -- triggers off the edges bucket JSON, so EVERY writer
+        -- (writeCurrentRows, replaceScopeRows, future) keeps it in sync
+        -- without per-site code. Edge IDs encode (kind, from, to) and the
+        -- bucket key is (from, to), so each edge_id maps to a fixed
+        -- (src, dst) — it can never move buckets.
         CREATE TABLE IF NOT EXISTS edges_index (
           edge_id TEXT PRIMARY KEY,
           src TEXT NOT NULL,
@@ -5190,6 +5199,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           computed_at TEXT NOT NULL,
           PRIMARY KEY (visit_id, snapshot_revision)
         );
+        -- F4 (blob diet) — per-key rows for the projection accumulator,
+        -- replacing the old projection_accumulators:<name> blob's
+        -- urlAccumulator/tabSessionAccumulator content. A drain upserts only
+        -- the keys its fold touched (see #persistProjectionAccumulatorWrite)
+        -- instead of rewriting the whole map every time. The small
+        -- replica-bounded frontier/intervals tag stays in the metadata blob
+        -- (projectionAccumulatorMetadataKey) — see
+        -- ConnectionsProjectionAccumulatorProgress.
+        CREATE TABLE IF NOT EXISTS connections_projection_url_accumulator (
+          canonical_url TEXT PRIMARY KEY,
+          record_json TEXT NOT NULL,
+          cursor_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS connections_projection_tabsession_accumulator (
+          tab_session_id TEXT PRIMARY KEY,
+          record_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS connections_projection_tabsession_open_by_tab (
+          tab_id_hash TEXT PRIMARY KEY,
+          tab_session_id TEXT NOT NULL
+        );
       `);
       // One-time backfill of edges_index for DBs created before it existed;
       // the triggers maintain it on every subsequent edge write. Gated to run
@@ -5209,6 +5239,66 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           SELECT json_extract(e.value, '$.id'), edges.src, edges.dst, json_extract(e.value, '$.kind')
           FROM edges, json_each(edges.data) e;
         `);
+      }
+      // F4 (blob diet) migration — one-time, in-place, no back-compat kept:
+      // any projection_accumulators:<name> blob still on disk (pre-F4
+      // generation, or a freshly-cloned shadow of one) is decomposed into the
+      // row tables above and the metadata key is rewritten down to just the
+      // small progress tag. Self-terminating: once migrated, the blob key is
+      // gone, so this scan finds nothing on every later boot. A corrupt/
+      // unparsable legacy blob is dropped outright — the next drain reseeds
+      // the accumulator from the event log exactly like a frontier-mismatch
+      // reject already does today.
+      const legacyProjectionAccumulatorBlobs = this.#db
+        .query("SELECT key, data FROM metadata WHERE key LIKE 'projection_accumulators:%'")
+        .all();
+      for (const row of legacyProjectionAccumulatorBlobs) {
+        if (!isRecord(row)) continue;
+        const key = textField(row, 'key');
+        try {
+          const legacy = JSON.parse(textField(row, 'data')) as {
+            readonly materializerName?: unknown;
+            readonly materializerVersion?: unknown;
+            readonly appliedDotIntervals?: unknown;
+            readonly appliedFrontier?: unknown;
+            readonly urlAccumulator?: SerializedUrlProjectionAccumulator;
+            readonly tabSessionAccumulator?: SerializedTabSessionProjectionAccumulator;
+          };
+          // A row already in the NEW small-progress-tag shape (written by
+          // #persistProjectionAccumulatorWrite) has no urlAccumulator/
+          // tabSessionAccumulator fields at all — that is NOT malformed, it
+          // is the post-migration steady state. Leave it untouched (this
+          // scan re-runs on every fresh child-writer fork, so it must be a
+          // true no-op once migrated, not a re-delete of the tag it just
+          // wrote on the previous drain).
+          if (legacy.urlAccumulator === undefined && legacy.tabSessionAccumulator === undefined) {
+            continue;
+          }
+          if (
+            typeof legacy.materializerName !== 'string' ||
+            typeof legacy.materializerVersion !== 'string' ||
+            !isRecord(legacy.appliedDotIntervals) ||
+            !isRecord(legacy.appliedFrontier) ||
+            legacy.urlAccumulator === undefined ||
+            legacy.tabSessionAccumulator === undefined
+          ) {
+            throw new Error('legacy projection accumulator blob is malformed');
+          }
+          this.#persistProjectionAccumulatorWrite(this.#db, {
+            materializerName: legacy.materializerName,
+            materializerVersion: legacy.materializerVersion,
+            appliedDotIntervals:
+              legacy.appliedDotIntervals as MaterializerProgress['appliedDotIntervals'],
+            appliedFrontier: legacy.appliedFrontier as MaterializerProgress['appliedFrontier'],
+            urlAccumulator: urlProjectionAccumulatorFromSerialized(legacy.urlAccumulator),
+            tabSessionAccumulator: tabSessionProjectionAccumulatorFromSerialized(
+              legacy.tabSessionAccumulator,
+            ),
+            dirty: { mode: 'full' },
+          });
+        } catch {
+          this.#db.query('DELETE FROM metadata WHERE key = ?').run(key);
+        }
       }
       this.#initialized = true;
     }
@@ -5410,6 +5500,11 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return await this.#readMetadata(db);
     });
 
+  /** F4 (blob diet) — reassembles the full accumulator state from the
+   *  per-key row tables (this is the ONE place the read is legitimately
+   *  O(state): a fork-per-drain child boot reconstructing its in-memory
+   *  Maps once, mirroring the old JSON.parse-of-one-blob cost, not the
+   *  per-drain rewrite this feature eliminates). */
   readonly readProjectionAccumulatorState = async (
     name: string,
   ): Promise<ConnectionsProjectionAccumulatorState | null> =>
@@ -5419,7 +5514,74 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         .query('SELECT data FROM metadata WHERE key = ?')
         .get(projectionAccumulatorMetadataKey(name));
       if (row === null || row === undefined) return null;
-      return JSON.parse(textField(row, 'data')) as ConnectionsProjectionAccumulatorState;
+      const parsed = JSON.parse(textField(row, 'data')) as ConnectionsProjectionAccumulatorProgress & {
+        readonly urlAccumulator?: SerializedUrlProjectionAccumulator;
+        readonly tabSessionAccumulator?: SerializedTabSessionProjectionAccumulator;
+      };
+      // F4 (blob diet) self-heal: a READONLY-opened generation cloned from a
+      // pre-F4 vault (parent-reader's migrateLegacyToGeneration raw file-copy
+      // path — no writable open, hence no schema/migration, ran on it yet)
+      // still has the metadata key in the OLD full-blob shape and may not
+      // even have the new row tables. Detect that shape directly (presence
+      // of urlAccumulator/tabSessionAccumulator — the small post-migration
+      // tag never carries them) and reconstruct from the embedded blob
+      // rather than querying the row tables. The next WRITABLE open
+      // physically migrates it (#persistProjectionAccumulatorWrite), after
+      // which this branch is dead for that generation.
+      if (parsed.urlAccumulator !== undefined && parsed.tabSessionAccumulator !== undefined) {
+        return {
+          materializerName: parsed.materializerName,
+          materializerVersion: parsed.materializerVersion,
+          appliedDotIntervals: parsed.appliedDotIntervals,
+          appliedFrontier: parsed.appliedFrontier,
+          urlAccumulator: parsed.urlAccumulator,
+          tabSessionAccumulator: parsed.tabSessionAccumulator,
+        };
+      }
+      const progress: ConnectionsProjectionAccumulatorProgress = parsed;
+      const byCanonicalUrl: Record<string, UrlVisitRecord> = {};
+      const observationCursors: Record<string, UrlObservationCursor> = {};
+      for (const r of db
+        .query('SELECT canonical_url, record_json, cursor_json FROM connections_projection_url_accumulator')
+        .all()) {
+        if (!isRecord(r)) continue;
+        const canonicalUrl = textField(r, 'canonical_url');
+        byCanonicalUrl[canonicalUrl] = JSON.parse(textField(r, 'record_json')) as UrlVisitRecord;
+        const cursorJson = r['cursor_json'];
+        if (typeof cursorJson === 'string') {
+          observationCursors[canonicalUrl] = JSON.parse(cursorJson) as UrlObservationCursor;
+        }
+      }
+      const bySessionId: Record<string, TabSessionRecord> = {};
+      for (const r of db
+        .query('SELECT tab_session_id, record_json FROM connections_projection_tabsession_accumulator')
+        .all()) {
+        bySessionId[textField(r, 'tab_session_id')] = JSON.parse(
+          textField(r, 'record_json'),
+        ) as TabSessionRecord;
+      }
+      const openSessionsByTabId: Record<string, string> = {};
+      for (const r of db
+        .query('SELECT tab_id_hash, tab_session_id FROM connections_projection_tabsession_open_by_tab')
+        .all()) {
+        openSessionsByTabId[textField(r, 'tab_id_hash')] = textField(r, 'tab_session_id');
+      }
+      return {
+        materializerName: progress.materializerName,
+        materializerVersion: progress.materializerVersion,
+        appliedDotIntervals: progress.appliedDotIntervals,
+        appliedFrontier: progress.appliedFrontier,
+        urlAccumulator: {
+          schemaVersion: URL_PROJECTION_SCHEMA_VERSION,
+          byCanonicalUrl,
+          observationCursors,
+        },
+        tabSessionAccumulator: {
+          schemaVersion: TAB_SESSION_PROJECTION_SCHEMA_VERSION,
+          bySessionId,
+          openSessionsByTabId,
+        },
+      };
     });
 
   readonly vacuum = async (): Promise<void> => {
@@ -5623,7 +5785,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     dirtyScopes?: ReadonlySet<Scope>,
-    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
+    projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite,
   ): Promise<void> => {
     const matchingSignature = await this.#matchingPublishedContentSignature(snapshot);
     if (matchingSignature !== null) {
@@ -5643,7 +5805,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         snapshot,
         progress,
         dirtyScopes,
-        projectionAccumulatorState,
+        projectionAccumulatorWrite,
       );
       // M4 — under double-buffer the scope bootstrap must land in the SAME
       // generation the pointer flips to (before finalize): the child exits
@@ -5936,6 +6098,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       CREATE TABLE IF NOT EXISTS connections_resolver_cache (
         visit_id TEXT NOT NULL, snapshot_revision TEXT NOT NULL, result_json TEXT NOT NULL,
         computed_at TEXT NOT NULL, PRIMARY KEY (visit_id, snapshot_revision));
+      CREATE TABLE IF NOT EXISTS connections_projection_url_accumulator (
+        canonical_url TEXT PRIMARY KEY, record_json TEXT NOT NULL, cursor_json TEXT);
+      CREATE TABLE IF NOT EXISTS connections_projection_tabsession_accumulator (
+        tab_session_id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS connections_projection_tabsession_open_by_tab (
+        tab_id_hash TEXT PRIMARY KEY, tab_session_id TEXT NOT NULL);
     `);
   }
 
@@ -6118,7 +6286,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       readonly urlProjection?: ConnectionsSnapshot['urlProjection'];
       readonly tabSessionProjection?: ConnectionsSnapshot['tabSessionProjection'];
     };
-    readonly projectionAccumulatorState?: ConnectionsProjectionAccumulatorState;
+    readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite;
     readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
     const { db, finalize } = await this.#acquireGraphWriteHandle();
@@ -6234,12 +6402,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const upsertMetadata = db.query(
         'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
       );
-      const removedNodeOrderIds = new Set<string>();
-      const addedNodeOrderIds = new Set<string>();
-      const removedEdgeOrderIds = new Set<string>();
-      const addedEdgeOrderIds = new Set<string>();
-      let nodeOrder = metadataStringArray(selectMetadata.get('node_order'));
-      let edgeOrder = metadataStringArray(selectMetadata.get('edge_order'));
 
       for (const scope of input.scopes) {
         insertTempScope.run(scope.kind, scope.id);
@@ -6265,59 +6427,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
            ON s.scope_kind = e.scope_kind AND s.scope_id = e.scope_id`,
       ).run();
 
-      for (const row of db
-        .query(
-          `SELECT e.data
-           FROM edges e
-           JOIN temp_replace_new_edges n
-             ON n.edge_src = e.src AND n.edge_dst = e.dst`,
-        )
-        .all()) {
-        for (const edgeId of edgeIdsFromSerializedBucket(textField(row, 'data'))) {
-          removedEdgeOrderIds.add(edgeId);
-        }
-      }
-
       deleteScopeNodes.run();
       deleteScopeEdges.run();
-
-      for (const row of db
-        .query(
-          `SELECT n.id
-           FROM nodes n
-           JOIN temp_replace_nodes t ON t.node_id = n.id
-           WHERE NOT EXISTS (
-             SELECT 1
-             FROM connections_scope_nodes c
-             WHERE c.node_id = n.id
-           )`,
-        )
-        .all()) {
-        removedNodeOrderIds.add(textField(row, 'id'));
-      }
-      for (const row of db
-        .query(
-          `SELECT e.data
-           FROM edges e
-           JOIN temp_replace_edges t
-             ON t.edge_src = e.src AND t.edge_dst = e.dst
-           WHERE NOT EXISTS (
-             SELECT 1
-             FROM connections_scope_edges c
-             WHERE c.edge_src = e.src AND c.edge_dst = e.dst
-           )`,
-        )
-        .all()) {
-        for (const edgeId of edgeIdsFromSerializedBucket(textField(row, 'data'))) {
-          removedEdgeOrderIds.add(edgeId);
-        }
-      }
       deleteOrphanNodes.run();
       deleteOrphanEdges.run();
 
       for (const node of input.nodes) {
         upsertNode.run(node.id, JSON.stringify(node));
-        addedNodeOrderIds.add(node.id);
         for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
           insertScopeNode.run(scope.kind, scope.id, node.id);
         }
@@ -6326,22 +6442,30 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const [src, dst] = key.split('\u0000');
         if (src === undefined || dst === undefined) throw new Error('invalid edge bucket key');
         upsertEdge.run(src, dst, JSON.stringify(sortAlphaById(bucket)));
-        for (const edge of bucket) addedEdgeOrderIds.add(edge.id);
         for (const scope of memberships.edgeScopes.get(key) ?? []) {
           insertScopeEdge.run(scope.kind, scope.id, src, dst);
         }
       }
 
-      nodeOrder = patchSortedOrder({
-        current: nodeOrder,
-        removed: removedNodeOrderIds,
-        added: addedNodeOrderIds,
-      });
-      edgeOrder = patchSortedOrder({
-        current: edgeOrder,
-        removed: removedEdgeOrderIds,
-        added: addedEdgeOrderIds,
-      });
+      // F4 (blob diet) — nodes.id and edges_index (edge_id, kind) are already
+      // trigger-/PK-maintained row-for-row by the upserts/deletes above, so
+      // the post-delta counts are cheap indexed COUNT queries instead of the
+      // old pattern (rebuild the FULL node_order/edge_order id array in JS —
+      // patchSortedOrder — then JSON.stringify + persist it as an
+      // 18MB/1.9MB blob EVERY drain regardless of how many rows changed).
+      // edges_index.kind also gives the non-similarity discriminator
+      // straight from SQL, no id-prefix scan needed.
+      const nodeCount =
+        (db.query('SELECT COUNT(*) AS n FROM nodes').get() as { n: number } | undefined)?.n ?? 0;
+      const edgeCount =
+        (db.query('SELECT COUNT(*) AS n FROM edges_index').get() as { n: number } | undefined)
+          ?.n ?? 0;
+      const nonSimilarityEdgeCount =
+        (
+          db.query(NON_SIMILARITY_EDGE_COUNT_SQL).get(...SIMILARITY_FAMILY_EDGE_KINDS_LIST) as
+            | { n: number }
+            | undefined
+        )?.n ?? 0;
       const urlProjection =
         input.metadata?.urlProjection === undefined
           ? previousMetadata.urlProjection
@@ -6368,8 +6492,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       });
       const snapshotRevision = computeSnapshotRevision({
         updatedAt,
-        nodeCount: nodeOrder.length,
-        edgeCount: edgeOrder.length,
+        nodeCount,
+        edgeCount,
         urlProjectionKeyCount:
           urlProjection === undefined ? 0 : Object.keys(urlProjection.byCanonicalUrl).length,
         tabSessionProjectionKeyCount:
@@ -6383,40 +6507,48 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         // publishes once rather than trusting a stale signature.
         ...withoutContentSignature(previousMetadata),
         updatedAt,
-        nodeCount: nodeOrder.length,
-        edgeCount: edgeOrder.length,
+        nodeCount,
+        edgeCount,
         // W2 — recompute the non-similarity structural discriminator from the
-        // post-delta edge_order. A scoped-delta write can add/remove
+        // post-delta edges_index.kind. A scoped-delta write can add/remove
         // NON-similarity edges (that is its job), so carrying the previous
         // value would go stale and the resolve SWR sig would miss the change;
-        // computing it here from the id list keeps it correct on every write
-        // path (edge ids encode kind, so no edge-row decode needed). Similarity
-        // fields (visitSimilarityRevisionId / similarityCorpusSignature) are
+        // computing it here from the trigger-maintained index keeps it correct
+        // on every write path with no edge-row decode. Similarity fields
+        // (visitSimilarityRevisionId / similarityCorpusSignature) are
         // preserved via `...previousMetadata` — scoped drains do not recompute
         // similarity, so the last full drain's values remain the served truth.
-        nonSimilarityEdgeCount: countNonSimilarityFamilyEdgeIds(edgeOrder),
+        nonSimilarityEdgeCount,
         ...(urlProjection === undefined ? {} : { urlProjection }),
         ...(tabSessionProjection === undefined ? {} : { tabSessionProjection }),
         snapshotRevision,
       };
       upsertMetadata.run('current', JSON.stringify(metadata));
-      upsertMetadata.run('node_order', JSON.stringify(nodeOrder));
-      upsertMetadata.run('edge_order', JSON.stringify(edgeOrder));
-      if (input.projectionAccumulatorState !== undefined) {
-        upsertMetadata.run(
-          projectionAccumulatorMetadataKey(input.projectionAccumulatorState.materializerName),
-          JSON.stringify(input.projectionAccumulatorState),
-        );
+      // F4 (blob diet) — DELETE, never rewrite: a scoped delta's post-write
+      // order was always a pure alpha-sort of the post-delta id set anyway
+      // (see the long comment on #readCurrentAttempt's order derivation), so
+      // there is nothing to persist here — clearing these two keys (cheap PK
+      // deletes) makes readCurrent fall back to deriving that same order
+      // to fresh nodes/edges rows instead of trusting a now-stale blob left
+      // by a PRECEDING full write.
+      db.exec(`DELETE FROM metadata WHERE key IN ('node_order', 'edge_order')`);
+      if (input.projectionAccumulatorWrite !== undefined) {
+        this.#persistProjectionAccumulatorWrite(db, input.projectionAccumulatorWrite);
         // Write-side probe for the stale-blob investigation: the persisted
-        // blob sat at frontier 187,920 while progress reached 763,851 —
+        // state sat at frontier 187,920 while progress reached 763,851 —
         // something on the write path stopped refreshing it. This names
-        // every blob write with its tagged frontier so the missing writes
-        // are attributable from the log alone.
+        // every persist with its tagged frontier so the missing writes are
+        // attributable from the log alone.
         if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
-          const fr = input.projectionAccumulatorState.appliedFrontier;
+          const fr = input.projectionAccumulatorWrite.appliedFrontier;
           const maxSeq = Math.max(0, ...Object.values(fr));
+          const dirty = input.projectionAccumulatorWrite.dirty;
+          const dirtyKeyCount =
+            dirty.mode === 'full'
+              ? -1
+              : dirty.canonicalUrls.size + dirty.tabSessionIds.size + dirty.openTabIdHashes.size;
           console.warn(
-            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)}`,
+            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)} mode=${dirty.mode} dirtyKeys=${String(dirtyKeyCount)}`,
           );
         }
       } else if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
@@ -6453,8 +6585,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         snapshotRevisionId: snapshotRevision,
       });
       // H6: replaceScopeRows mutates nodes/edges/current/node_order/
-      // edge_order — all inputs to readCurrent. Bump the commit
-      // token so the pre/post check fires.
+      // edge_order (the latter two via DELETE, not a rewrite — see above)
+      // — all inputs to readCurrent. Bump the commit token so the pre/post
+      // check fires.
       this.#bumpWriteSeq(db);
       db.exec('COMMIT');
       this.#dropCachedSnapshot();
@@ -6475,8 +6608,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   /** Monotonic commit token used by `readCurrent`'s pre/post check.
    *  Bump from INSIDE every transaction that mutates any of the rows
    *  `readCurrent` consumes (nodes, edges, metadata.current,
-   *  metadata.node_order, metadata.edge_order). Centralized so adding
-   *  a new writer can't accidentally bypass the consistency check —
+   *  metadata.node_order, metadata.edge_order — the latter two may be a
+   *  DELETE rather than a write, see replaceScopeRows). Centralized so
+   *  adding a new writer can't accidentally bypass the consistency check —
    *  caller just invokes this right before COMMIT. */
   #bumpWriteSeq(db: SqliteDatabase): void {
     const row = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
@@ -6542,8 +6676,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress | null,
     dirtyScopes?: ReadonlySet<Scope>,
-    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
+    projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite,
   ): boolean {
+    // F4 (blob diet) — this full-write path persists node_order/edge_order
+    // verbatim (below), preserving the CALLER's exact array order rather
+    // than normalizing to alpha-sort. That is a deliberate, tested contract
+    // (sqlite-store.test.ts round-trip cases feed arbitrary order and expect
+    // it back byte-for-byte) — and it's cheap to keep: this path is already
+    // O(state) for the node/edge row bytes themselves on every write, so an
+    // order array on top of that is not the per-drain rewrite problem this
+    // feature targets (that's replaceScopeRows, which DELETES these keys
+    // instead — see there).
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -6559,14 +6702,15 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return { src, dst };
     });
 
-    // INSTANT-BOOT INVARIANT: nodes/edges/metadata + the projection_accumulators
-    // blob + the materializer progress rows commit in this ONE transaction. Boot
-    // reuse (tryLoadProjectionAccumulatorState) trusts the blob only when its
-    // frontier EQUALS progress's; that equality is safe precisely because a
+    // INSTANT-BOOT INVARIANT: nodes/edges/metadata + the projection accumulator
+    // rows/progress-tag (#persistProjectionAccumulatorWrite) + the materializer
+    // progress rows commit in this ONE transaction. Boot reuse
+    // (tryLoadProjectionAccumulatorState) trusts the persisted state only when
+    // its frontier EQUALS progress's; that equality is safe precisely because a
     // kill-9 leaves both at frontier N or rolls both back to N-1 — never a torn
-    // blob-vs-progress pair. If a future refactor splits the blob and progress
-    // into separate transactions, instant boot could start reusing a torn blob;
-    // keep them atomic here (or invalidate the reuse check accordingly).
+    // state-vs-progress pair. If a future refactor splits them into separate
+    // transactions, instant boot could start reusing torn state; keep them
+    // atomic here (or invalidate the reuse check accordingly).
     db.exec('BEGIN IMMEDIATE');
     try {
       const upsertNode = db.query(
@@ -6701,18 +6845,20 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       upsertMetadata.run('node_order', JSON.stringify(nodeIds));
       upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
-      if (projectionAccumulatorState !== undefined) {
-        upsertMetadata.run(
-          projectionAccumulatorMetadataKey(projectionAccumulatorState.materializerName),
-          JSON.stringify(projectionAccumulatorState),
-        );
+      if (projectionAccumulatorWrite !== undefined) {
+        this.#persistProjectionAccumulatorWrite(db, projectionAccumulatorWrite);
         // Same write-side probe as the replaceScopeRows site — see the
-        // stale-blob note there (blob froze at 187,920 vs progress 763,851).
+        // stale-blob note there (state froze at 187,920 vs progress 763,851).
         if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
-          const fr = projectionAccumulatorState.appliedFrontier;
+          const fr = projectionAccumulatorWrite.appliedFrontier;
           const maxSeq = Math.max(0, ...Object.values(fr));
+          const dirty = projectionAccumulatorWrite.dirty;
+          const dirtyKeyCount =
+            dirty.mode === 'full'
+              ? -1
+              : dirty.canonicalUrls.size + dirty.tabSessionIds.size + dirty.openTabIdHashes.size;
           console.warn(
-            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)} src=writeCurrentRows`,
+            `[connections-phase] projectionAccumulators.persist maxSeq=${String(maxSeq)} replicas=${String(Object.keys(fr).length)} mode=${dirty.mode} dirtyKeys=${String(dirtyKeyCount)} src=writeCurrentRows`,
           );
         }
       } else if (process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] === '1') {
@@ -6821,6 +6967,98 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         insertInterval.run(progress.materializerName, replicaId, startSeq, endSeq);
       }
     }
+  }
+
+  /** F4 (blob diet) — persist the projection accumulator as per-key rows
+   *  instead of one JSON blob. `write.dirty.mode === 'full'` (cold seed,
+   *  post-reset, or the one-time legacy-blob migration) clears each row
+   *  table and rewrites every key from the live accumulator; `'delta'`
+   *  upserts (or, if the accumulator no longer has that key — the
+   *  openSessionsByTabId case — deletes) only the keys the caller says this
+   *  drain touched. The small frontier/intervals progress tag is written
+   *  in the SAME call under the existing projection_accumulators:<name>
+   *  metadata key, so a kill-9 mid-write can never tear the tag from the
+   *  rows it describes (both are inside the caller's transaction). */
+  #persistProjectionAccumulatorWrite(
+    db: SqliteDatabase,
+    write: ConnectionsProjectionAccumulatorWrite,
+  ): void {
+    const upsertMetadata = db.query(
+      'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+    );
+    const progress: ConnectionsProjectionAccumulatorProgress = {
+      materializerName: write.materializerName,
+      materializerVersion: write.materializerVersion,
+      appliedDotIntervals: write.appliedDotIntervals,
+      appliedFrontier: write.appliedFrontier,
+    };
+    upsertMetadata.run(projectionAccumulatorMetadataKey(write.materializerName), JSON.stringify(progress));
+
+    const upsertUrlRow = db.query(
+      `INSERT INTO connections_projection_url_accumulator (canonical_url, record_json, cursor_json)
+       VALUES (?, ?, ?)
+       ON CONFLICT(canonical_url) DO UPDATE SET
+         record_json = excluded.record_json, cursor_json = excluded.cursor_json`,
+    );
+    const deleteUrlRow = db.query(
+      'DELETE FROM connections_projection_url_accumulator WHERE canonical_url = ?',
+    );
+    const persistUrlKey = (key: string): void => {
+      const record = write.urlAccumulator.records.get(key);
+      if (record === undefined) {
+        deleteUrlRow.run(key);
+        return;
+      }
+      const cursor = write.urlAccumulator.observationCursors.get(key);
+      upsertUrlRow.run(key, JSON.stringify(record), cursor === undefined ? null : JSON.stringify(cursor));
+    };
+
+    const upsertTabRow = db.query(
+      `INSERT INTO connections_projection_tabsession_accumulator (tab_session_id, record_json)
+       VALUES (?, ?)
+       ON CONFLICT(tab_session_id) DO UPDATE SET record_json = excluded.record_json`,
+    );
+    const deleteTabRow = db.query(
+      'DELETE FROM connections_projection_tabsession_accumulator WHERE tab_session_id = ?',
+    );
+    const persistTabSessionKey = (key: string): void => {
+      const record = write.tabSessionAccumulator.records.get(key);
+      if (record === undefined) {
+        deleteTabRow.run(key);
+        return;
+      }
+      upsertTabRow.run(key, JSON.stringify(record));
+    };
+
+    const upsertOpenTabRow = db.query(
+      `INSERT INTO connections_projection_tabsession_open_by_tab (tab_id_hash, tab_session_id)
+       VALUES (?, ?)
+       ON CONFLICT(tab_id_hash) DO UPDATE SET tab_session_id = excluded.tab_session_id`,
+    );
+    const deleteOpenTabRow = db.query(
+      'DELETE FROM connections_projection_tabsession_open_by_tab WHERE tab_id_hash = ?',
+    );
+    const persistOpenTabKey = (key: string): void => {
+      const sessionId = write.tabSessionAccumulator.openSessionsByTabId.get(key);
+      if (sessionId === undefined) {
+        deleteOpenTabRow.run(key);
+        return;
+      }
+      upsertOpenTabRow.run(key, sessionId);
+    };
+
+    if (write.dirty.mode === 'full') {
+      db.exec('DELETE FROM connections_projection_url_accumulator');
+      for (const key of write.urlAccumulator.records.keys()) persistUrlKey(key);
+      db.exec('DELETE FROM connections_projection_tabsession_accumulator');
+      for (const key of write.tabSessionAccumulator.records.keys()) persistTabSessionKey(key);
+      db.exec('DELETE FROM connections_projection_tabsession_open_by_tab');
+      for (const key of write.tabSessionAccumulator.openSessionsByTabId.keys()) persistOpenTabKey(key);
+      return;
+    }
+    for (const key of write.dirty.canonicalUrls) persistUrlKey(key);
+    for (const key of write.dirty.tabSessionIds) persistTabSessionKey(key);
+    for (const key of write.dirty.openTabIdHashes) persistOpenTabKey(key);
   }
 
   readonly readMaterializerProgress = async (
@@ -6952,6 +7190,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // by #bumpWriteSeq from every transaction that mutates
     // readCurrent inputs (#writeCurrentRows, replaceScopeRows,
     // applyProjectionEventOverlay) and is the strict commit token.
+    // (node_order/edge_order are no longer among those inputs — order is
+    // derived below from the paged nodes/edges themselves.)
     const preSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
     const preWriteSeq =
       preSeqRow === null || preSeqRow === undefined
@@ -7007,9 +7247,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           : Number.parseInt(textField(postSeqRow, 'data'), 10) || 0;
       if (postWriteSeq !== preWriteSeq) return 'stale';
     }
+    // F4 (blob diet) — #writeCurrentRows (full write: putCurrent /
+    // writeSnapshotAndProgress) still persists node_order/edge_order,
+    // preserving the caller's exact array order — that path is already
+    // O(state) for the node/edge row bytes themselves, so a small order
+    // blob on top isn't the per-drain rewrite this feature targets, AND
+    // callers are allowed to hand it an arbitrary (non-alpha) order that
+    // must round-trip byte-for-byte (verified by sqlite-store.test.ts).
+    // replaceScopeRows (the actual O(state)-per-scoped-drain target) no
+    // longer writes this blob — it DELETES it instead (cheap: two PK
+    // deletes, not an 18MB/1.9MB rewrite), because every one of its writes
+    // always ended in a pure alpha-sort of the post-delta id set anyway
+    // (patchSortedOrder's `[...ids].sort()`, unconditionally, regardless of
+    // prior order) — so falling back to the alpha-sort computed below is
+    // BYTE-IDENTICAL to what replaceScopeRows used to persist. Order is
+    // therefore: read the blob when a full write left one; otherwise derive
+    // it fresh (`nodesById` is already in id order — the page query is
+    // `ORDER BY id`; `edgeById` is grouped by (src, dst) bucket, not global
+    // edge id, so it still needs an explicit sort).
     const nodeOrder =
       nodeOrderRow === null || nodeOrderRow === undefined
-        ? [...nodesById.keys()].sort()
+        ? [...nodesById.keys()]
         : (JSON.parse(textField(nodeOrderRow, 'data')) as string[]);
     const edgeOrder =
       edgeOrderRow === null || edgeOrderRow === undefined
@@ -7276,9 +7534,28 @@ export const createConnectionsStore = (
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress,
     _dirtyScopes?: ReadonlySet<Scope>,
-    projectionAccumulatorState?: ConnectionsProjectionAccumulatorState,
+    projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite,
   ): Promise<void> => {
     await putCurrent(snapshot);
+    // Legacy/test-only store: it has no per-key row tables, so it always
+    // serializes the whole live accumulator to one JSON blob regardless of
+    // `dirty` mode — this path is not part of the F4 blob-diet target (the
+    // SQLite store is), so it is left at its historical cost.
+    const projectionAccumulatorState: ConnectionsProjectionAccumulatorState | undefined =
+      projectionAccumulatorWrite === undefined
+        ? undefined
+        : {
+            materializerName: projectionAccumulatorWrite.materializerName,
+            materializerVersion: projectionAccumulatorWrite.materializerVersion,
+            appliedDotIntervals: projectionAccumulatorWrite.appliedDotIntervals,
+            appliedFrontier: projectionAccumulatorWrite.appliedFrontier,
+            urlAccumulator: serializeUrlProjectionAccumulator(
+              projectionAccumulatorWrite.urlAccumulator,
+            ),
+            tabSessionAccumulator: serializeTabSessionProjectionAccumulator(
+              projectionAccumulatorWrite.tabSessionAccumulator,
+            ),
+          };
     await writeAtomic(
       progressPath,
       JSON.stringify(

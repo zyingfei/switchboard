@@ -496,6 +496,83 @@ describe('M4 double-buffer acceptance', () => {
     store.close();
   });
 
+  // F4 (blob diet) migration — a pre-F4 projection_accumulators:<name> blob
+  // (the whole url/tabSession accumulator serialized as one JSON value under
+  // a metadata key) must be decomposed into the per-key row tables on first
+  // writable open, with the metadata key rewritten down to just the small
+  // progress tag. "NO backward compatibility — replace the representation
+  // outright" per docs/plans/2026-08-16-f8-ivm-designs.md; this is the one
+  // permitted migration step.
+  sqliteIt(
+    'migrates a pre-F4 projection_accumulators blob to per-key rows on boot',
+    async () => {
+      process.env['SIDETRACK_CONNECTIONS_DOUBLE_BUFFER'] = '0';
+      const legacyStore = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
+      await legacyStore.putCurrent(buildGraph(4, 'rev-legacy-blob'));
+      legacyStore.close();
+
+      // Inject a pre-F4 legacy blob directly — simulates a vault last
+      // written by pre-F4 code, before the per-key row tables existed.
+      const legacyDbPath = join(connectionsDir(), 'current.db');
+      const rawDb = new Database(legacyDbPath, { readwrite: true });
+      const legacyBlob = {
+        materializerName: 'connections',
+        materializerVersion: 'connections@test',
+        appliedDotIntervals: { replica: [[1, 3]] },
+        appliedFrontier: { replica: 3 },
+        urlAccumulator: {
+          schemaVersion: 1,
+          byCanonicalUrl: {
+            'https://legacy.test/a': {
+              canonicalUrl: 'https://legacy.test/a',
+              firstSeenAt: '2026-05-01T00:00:00.000Z',
+              lastSeenAt: '2026-05-01T00:00:00.000Z',
+              visitCount: 1,
+              tabSessionIds: [],
+              attributionHistory: [],
+            },
+          },
+          observationCursors: {},
+        },
+        tabSessionAccumulator: {
+          schemaVersion: 1,
+          bySessionId: {
+            'ts-legacy': {
+              tabSessionId: 'ts-legacy',
+              openedAt: '2026-05-01T00:00:00.000Z',
+              lastActivityAt: '2026-05-01T00:00:00.000Z',
+              attributionHistory: [],
+            },
+          },
+          openSessionsByTabId: {},
+        },
+      };
+      rawDb
+        .query(
+          'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
+        )
+        .run('projection_accumulators:connections', JSON.stringify(legacyBlob));
+      rawDb.close();
+      delete process.env['SIDETRACK_CONNECTIONS_DOUBLE_BUFFER'];
+
+      // Boot with double-buffer ON: legacy current.db (graph + legacy blob)
+      // migrates to gen0.
+      const store = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
+      const served = await store.readCurrent();
+      expect(served?.snapshotRevision).toBe('rev-legacy-blob');
+
+      const migrated = await store.readProjectionAccumulatorState('connections');
+      expect(migrated?.materializerVersion).toBe('connections@test');
+      expect(migrated?.appliedFrontier).toEqual({ replica: 3 });
+      expect(migrated?.appliedDotIntervals).toEqual({ replica: [[1, 3]] });
+      expect(migrated?.urlAccumulator.byCanonicalUrl['https://legacy.test/a']?.visitCount).toBe(1);
+      expect(migrated?.tabSessionAccumulator.bySessionId['ts-legacy']?.tabSessionId).toBe(
+        'ts-legacy',
+      );
+      store.close();
+    },
+  );
+
   // -------------------------------------------------------------------------
   // Deferred resolver-cache write ACROSS a generation publish (2026-07-29 P0).
   //

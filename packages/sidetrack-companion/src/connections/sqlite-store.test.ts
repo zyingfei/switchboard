@@ -3,7 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createConnectionsStore, SqliteConnectionsStore } from './snapshot.js';
+import {
+  createConnectionsStore,
+  SqliteConnectionsStore,
+  type ConnectionsProjectionAccumulatorWrite,
+} from './snapshot.js';
 import { connectionsGraphSig } from '../http/server.js';
 import {
   edgeIdFor,
@@ -13,6 +17,8 @@ import {
 } from './types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { EMPTY_PROGRESS } from '../sync/contract/materializerProgress.js';
+import type { UrlVisitRecord } from '../urls/projection.js';
+import { createEmptyTabSessionProjectionAccumulator } from '../tabsession/projection.js';
 
 const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
 
@@ -798,6 +804,153 @@ describe('SqliteConnectionsStore', () => {
     expect(current?.edgeCount).toBe(1);
     store.close();
   });
+
+  // F4 (blob diet) write-volume acceptance (b): a scoped drain touching K
+  // accumulator keys must persist O(K) rows, not re-serialize the whole
+  // accumulator — and the order blob keys must be gone entirely (deleted,
+  // not rewritten) after a scoped write.
+  sqliteIt(
+    'replaceScopeRows persists the projection accumulator as O(dirty keys), not O(state)',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      const snapshot = buildSnapshot();
+
+      // Seed a "large" accumulator (200 canonical URLs) via a full write —
+      // full mode is allowed to be O(state), same as the node/edge rows
+      // themselves on that path.
+      const bigRecords = new Map<string, UrlVisitRecord>();
+      for (let i = 0; i < 200; i += 1) {
+        const canonicalUrl = `https://big.test/${String(i)}`;
+        bigRecords.set(canonicalUrl, {
+          canonicalUrl,
+          firstSeenAt: '2026-05-01T00:00:00.000Z',
+          lastSeenAt: '2026-05-01T00:00:00.000Z',
+          visitCount: 1,
+          tabSessionIds: [],
+          attributionHistory: [],
+        });
+      }
+      const seedWrite: ConnectionsProjectionAccumulatorWrite = {
+        materializerName: 'connections',
+        materializerVersion: 'connections@test',
+        appliedDotIntervals: { replica: [[1, 1]] },
+        appliedFrontier: { replica: 1 },
+        urlAccumulator: { records: bigRecords, observationCursors: new Map() },
+        tabSessionAccumulator: createEmptyTabSessionProjectionAccumulator(),
+        dirty: { mode: 'full' },
+      };
+      await store.writeSnapshotAndProgress(snapshot, progressFor(snapshot), undefined, seedWrite);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const seeded = await store.readProjectionAccumulatorState('connections');
+      expect(Object.keys(seeded?.urlAccumulator.byCanonicalUrl ?? {})).toHaveLength(200);
+
+      // Now a scoped delta touching exactly ONE of those 200 keys.
+      bigRecords.set('https://big.test/0', {
+        canonicalUrl: 'https://big.test/0',
+        firstSeenAt: '2026-05-01T00:00:00.000Z',
+        lastSeenAt: '2026-05-01T01:00:00.000Z',
+        visitCount: 2,
+        tabSessionIds: [],
+        attributionHistory: [],
+      });
+      const deltaWrite: ConnectionsProjectionAccumulatorWrite = {
+        ...seedWrite,
+        appliedDotIntervals: { replica: [[1, 2]] },
+        appliedFrontier: { replica: 2 },
+        dirty: {
+          mode: 'delta',
+          canonicalUrls: new Set(['https://big.test/0']),
+          tabSessionIds: new Set(),
+          openTabIdHashes: new Set(),
+        },
+      };
+
+      const { Database } = (await import('bun:sqlite')) as typeof import('bun:sqlite');
+      const originalQuery = Database.prototype.query;
+      const originalExec = Database.prototype.exec;
+      const urlUpsertRunCalls: unknown[][] = [];
+      let sawOrderDelete = false;
+      let sawOrderRewrite = false;
+      const querySpy = vi
+        .spyOn(Database.prototype, 'query')
+        .mockImplementation(function trackUrlAccumulatorWrites(
+          this: InstanceType<typeof Database>,
+          sql: string,
+        ) {
+          const stmt = originalQuery.call(this, sql) as {
+            run: (...args: unknown[]) => unknown;
+          };
+          if (sql.includes('INSERT INTO connections_projection_url_accumulator')) {
+            const originalRun = stmt.run.bind(stmt);
+            stmt.run = (...args: unknown[]): unknown => {
+              urlUpsertRunCalls.push(args);
+              return originalRun(...args);
+            };
+          }
+          if (
+            sql.includes('INSERT INTO metadata') &&
+            sql.includes('ON CONFLICT(key) DO UPDATE')
+          ) {
+            const originalRun = stmt.run.bind(stmt);
+            stmt.run = (...args: unknown[]): unknown => {
+              if (args[0] === 'node_order' || args[0] === 'edge_order') sawOrderRewrite = true;
+              return originalRun(...args);
+            };
+          }
+          return stmt;
+        });
+      const execSpy = vi
+        .spyOn(Database.prototype, 'exec')
+        .mockImplementation(function trackOrderDelete(
+          this: InstanceType<typeof Database>,
+          sql: string,
+        ) {
+          if (sql.includes("DELETE FROM metadata WHERE key IN ('node_order', 'edge_order')")) {
+            sawOrderDelete = true;
+          }
+          return originalExec.call(this, sql);
+        });
+      try {
+        await store.replaceScopeRows({
+          scopes: [{ kind: 'thread', id: 'alpha' }],
+          nodes: [{ ...snapshot.nodes[0]!, label: 'Alpha patched again' }],
+          edges: [],
+          progress: {
+            ...progressFor(snapshot),
+            appliedDotIntervals: { replica: [[1, 2] as const] },
+            appliedFrontier: { replica: 2 },
+            snapshotRevisionId: 'rev-scope-delta-accumulator',
+          },
+          projectionAccumulatorWrite: deltaWrite,
+        });
+      } finally {
+        querySpy.mockRestore();
+        execSpy.mockRestore();
+      }
+
+      // The load-bearing assertion: exactly ONE row upsert, not 200 — the
+      // delta write touched a single dirty key, so the store must not have
+      // re-persisted the other 199 untouched records.
+      expect(urlUpsertRunCalls).toHaveLength(1);
+
+      // node_order/edge_order are DELETED (cheap, O(1)), never rewritten as
+      // an 18MB/1.9MB blob, by a scoped replaceScopeRows write.
+      expect(sawOrderDelete).toBe(true);
+      expect(sawOrderRewrite).toBe(false);
+
+      // Correctness: the reused/updated accumulator still reports all 200
+      // keys (the delta write did not silently drop the other 199 rows),
+      // and the touched key reflects the update.
+      const afterDelta = await store.readProjectionAccumulatorState('connections');
+      const byCanonicalUrl = afterDelta?.urlAccumulator.byCanonicalUrl ?? {};
+      expect(Object.keys(byCanonicalUrl)).toHaveLength(200);
+      expect(byCanonicalUrl['https://big.test/0']?.visitCount).toBe(2);
+      expect(byCanonicalUrl['https://big.test/1']?.visitCount).toBe(1);
+
+      store.close();
+    },
+  );
 
   sqliteIt('rolls back scope replacement when progress write fails', async () => {
     const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
