@@ -289,6 +289,11 @@ import {
   type ThreadRegisterStore,
 } from '../../threads/threadRegisterStore.js';
 import {
+  createWorkstreamParentStore,
+  workstreamBacIdForEvent,
+  type WorkstreamParentStore,
+} from '../../workstreams/workstreamParentStore.js';
+import {
   createSearchQueryIndexStore,
   type SearchQueryIndexStore,
 } from '../../search-index/searchQueryIndexStore.js';
@@ -646,6 +651,14 @@ const timelineFactsStoreEnabled = (): boolean =>
 // dogfood soak).
 const threadRegisterStoreEnabled = (): boolean =>
   process.env['SIDETRACK_THREAD_REGISTER_STORE'] === '1';
+// F8 W4 — workstream-tree ancestor-chain store (kills the unconditional
+// full-rebuild bail on ANY workstream CRUD: see workstreamParentStore.ts's
+// header for the root cause + why this is a scope-selection store only,
+// never a served-content source). Off by default, matching W1/W2's
+// rollout posture (byte-equivalent + verified, opt-in via env=1 pending a
+// dogfood soak).
+const workstreamParentStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_WORKSTREAM_PARENT_STORE'] === '1';
 // F8 W2 — search-visit incremental join stores (kills the
 // `pending-search-visit` scoped-delta bail class and its cooldown
 // coalescing: see search-index/searchQueryIndexStore.ts +
@@ -992,6 +1005,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly engagementFactsStore?: EngagementFactsStore;
   readonly timelineFactsStore?: TimelineFactsStore;
   readonly threadRegisterStore?: ThreadRegisterStore;
+  readonly workstreamParentStore?: WorkstreamParentStore;
   readonly searchQueryIndexStore?: SearchQueryIndexStore;
   readonly captureTextFtsStore?: CaptureTextFtsStore;
   readonly repairQueueStore?: RepairQueueStore;
@@ -1675,6 +1689,16 @@ export const createConnectionsMaterializer = (
   let threadRegisterStore: ThreadRegisterStore | null = null;
   let threadRegisterStoreInit: Promise<ThreadRegisterStore> | null = null;
   let threadRegisterStoreUnavailable = false;
+  // F8 W4 — persistent workstream-parent (ancestor-chain) store
+  // (lazy-opened; survives restart). See workstreamParentStore.ts's
+  // header for why this is a scope-selection store only, not a served-
+  // content source, and connectionsMaterializer.ts's isScopedTimelineDeltaEvent
+  // for how its readiness lets a workstreamTree invalidation ride the
+  // scoped path instead of the SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS
+  // bail.
+  let workstreamParentStore: WorkstreamParentStore | null = null;
+  let workstreamParentStoreInit: Promise<WorkstreamParentStore> | null = null;
+  let workstreamParentStoreUnavailable = false;
   // F8 W2 — search-visit incremental join stores (lazy-opened; survive
   // restart). searchQueryIndexStore persists (queryKey, visitKey) pairs
   // for the same_search_query→closest_visit join; captureTextFtsStore
@@ -1745,6 +1769,22 @@ export const createConnectionsMaterializer = (
     } catch {
       threadRegisterStoreUnavailable = true;
       threadRegisterStoreInit = null;
+      return null;
+    }
+  };
+  const ensureWorkstreamParentStore = async (): Promise<WorkstreamParentStore | null> => {
+    if (workstreamParentStore !== null) return workstreamParentStore;
+    if (workstreamParentStoreUnavailable) return null;
+    try {
+      workstreamParentStoreInit ??=
+        deps.workstreamParentStore !== undefined
+          ? Promise.resolve(deps.workstreamParentStore)
+          : createWorkstreamParentStore(deps.vaultRoot);
+      workstreamParentStore = await workstreamParentStoreInit;
+      return workstreamParentStore;
+    } catch {
+      workstreamParentStoreUnavailable = true;
+      workstreamParentStoreInit = null;
       return null;
     }
   };
@@ -2453,6 +2493,43 @@ export const createConnectionsMaterializer = (
     return sortAcceptedEvents(collected);
   };
 
+  // F8 W4 — the raw WORKSTREAM_UPSERTED/DELETED history for every id in
+  // this drain's workstreamTreeAffectedIds set, so buildConnectionsSnapshot's
+  // OWN Pass 1 (workstreamEventsByBacId → projectWorkstream) resolves the
+  // SAME node fields (title/observedAt/originReplicaIds/registerMetadata) a
+  // full rebuild would for those ids — the workstream-parent store itself
+  // only tracks a resolved parent_id for subtree walking (see
+  // workstreamParentStore.ts's header), it does not retain raw events.
+  // Mirrors readRequalifyEngagementSource's typed-store-first idiom: an
+  // events_type_idx read (O(matching rows)) when the typed store is on,
+  // else a full deps.eventLog.readMerged() filtered in memory — paid only
+  // on the rare drain that actually touches the workstream tree, which is
+  // still far cheaper than the full-graph rebuild this wave replaces.
+  const readWorkstreamHistoryForAffectedIds = async (
+    typedEventSource: EventStore | null,
+    affectedIds: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (affectedIds.size === 0) return [];
+    const matchesAffectedId = (event: AcceptedEvent): boolean => {
+      const bacId = workstreamBacIdForEvent(event);
+      return bacId !== undefined && affectedIds.has(bacId);
+    };
+    if (typedEventSource === null) {
+      return (await deps.eventLog.readMerged()).filter(matchesAffectedId);
+    }
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED],
+      (chunk) => {
+        for (const event of chunk) {
+          if (matchesAffectedId(event)) collected.push(event);
+        }
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
+  };
+
   // Re-derive the timeline entries for engagement-requalified visits from
   // the FULL event log WITH full engagement (mirrors the topicFullTimeline
   // precedent). Only the requalified visits' entries are returned, and
@@ -2615,10 +2692,29 @@ export const createConnectionsMaterializer = (
   const SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS: ReadonlySet<InvalidationKey['kind']> =
     new Set(['workstreamTree']);
 
+  // F8 W4 — a workstreamTree invalidation is scopable (rides the scoped
+  // path via workstreamTreeAffectedIds, instead of forcing the
+  // SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS bail below) exactly
+  // when BOTH: (a) the workstream-parent store is enabled and open (it
+  // is what computes the affected ancestor-chain scope set), and (b) the
+  // triggering event actually names a bac_id — the malformed/legacy
+  // fallback in invalidation.ts (`if (bacId === undefined) return
+  // [{kind:'workstreamTree'}]`) gives no id to scope by, so THAT case
+  // must still demote (rides W3), never silently "no-op".
+  const workstreamTreeScopableFor = (event: AcceptedEvent): boolean =>
+    workstreamParentStoreEnabled() &&
+    workstreamParentStore !== null &&
+    workstreamBacIdForEvent(event) !== undefined;
+
   const isScopedTimelineDeltaEvent = (event: AcceptedEvent): boolean => {
     const invalidationKeys = invalidationsForEvent(event);
+    const workstreamTreeScopable = workstreamTreeScopableFor(event);
     if (
-      invalidationKeys.some((key) => SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS.has(key.kind))
+      invalidationKeys.some(
+        (key) =>
+          SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS.has(key.kind) &&
+          !(key.kind === 'workstreamTree' && workstreamTreeScopable),
+      )
     ) {
       return false;
     }
@@ -2888,6 +2984,47 @@ export const createConnectionsMaterializer = (
       return evt.payload.bac_id;
     }
     return undefined;
+  };
+
+  // F8 W4 — the raw THREAD_UPSERTED/ARCHIVED/UNARCHIVED/DELETED history for
+  // a set of thread ids that REFERENCE an affected workstream (via
+  // primaryWorkstreamId) but are not otherwise touched this drain. Needed
+  // because snapshot.ts Pass 1's thread loop has a side effect on the
+  // TARGET workstream node: the membership-candidate upsertNode call
+  // stamps the workstream node with `observedAt: <the thread event's own
+  // timestamp>` (see the loop around `membershipCandidates` below) — a
+  // full rebuild picks that up for every thread that has EVER referenced
+  // the workstream, so a scoped build that only supplies the affected
+  // workstream ids' OWN event history under-counts firstSeenAt/
+  // originReplicaIds for a workstream a referencing thread's event
+  // predates. (Pass 2's vault-derived fallback node for the same
+  // relationship carries no `observedAt`, so it never causes this — see
+  // its own upsertNode call — this is purely a Pass 1 event-timestamp
+  // side effect.) Same typed-store-first / full-log-fallback idiom as
+  // readWorkstreamHistoryForAffectedIds.
+  const readThreadHistoryForIds = async (
+    typedEventSource: EventStore | null,
+    threadIds: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (threadIds.size === 0) return [];
+    const matchesThreadId = (event: AcceptedEvent): boolean => {
+      const bacId = threadBacIdForRegisterEvent(event);
+      return bacId !== undefined && threadIds.has(bacId);
+    };
+    if (typedEventSource === null) {
+      return (await deps.eventLog.readMerged()).filter(matchesThreadId);
+    }
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      [THREAD_UPSERTED, THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_DELETED],
+      (chunk) => {
+        for (const event of chunk) {
+          if (matchesThreadId(event)) collected.push(event);
+        }
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
   };
 
   const threadDeltaFullBuildReason = (input: {
@@ -3908,6 +4045,65 @@ export const createConnectionsMaterializer = (
       );
       mark('threadRegisterFactStore.catchUp');
     }
+    // F8 W4 — catch the workstream-parent store up BEFORE computing
+    // dirtyScopes, mirroring threadRegisterFactStore above. Captures the
+    // PRE-drain ancestor chain (via subtreeOf) for every workstream this
+    // drain's pending events CRUD, ingests those events, then captures the
+    // POST-drain chain — the union (self + old ancestors + new ancestors)
+    // is the affected-subtree scope set that lets a workstreamTree
+    // invalidation ride the scoped path below instead of the
+    // SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS bail. See
+    // workstreamParentStore.ts's header for why ancestor-chain (not
+    // descendant) is the right walk direction, and
+    // readWorkstreamHistoryForAffectedIds for why the raw event history
+    // for these ids is ALSO sourced here (Pass 1 node-field parity with a
+    // full rebuild — the store itself only tracks resolved parent_id).
+    const workstreamParentFactStore = workstreamParentStoreEnabled()
+      ? await ensureWorkstreamParentStore()
+      : null;
+    const workstreamTreeAffectedIds = new Set<string>();
+    let workstreamHistoryEventsForBuild: readonly AcceptedEvent[] = [];
+    if (workstreamParentFactStore !== null) {
+      const crudIds = new Set<string>();
+      for (const event of pendingEventsForDrain) {
+        const bacId = workstreamBacIdForEvent(event);
+        if (bacId !== undefined) crudIds.add(bacId);
+      }
+      if (crudIds.size > 0) {
+        const beforeChains = new Map<string, readonly string[]>();
+        for (const bacId of crudIds) {
+          beforeChains.set(bacId, workstreamParentFactStore.subtreeOf(bacId));
+        }
+        await workstreamParentFactStore.catchUp(
+          storeBackedEvents === null || forcedPendingEventWindow !== null
+            ? merged
+            : storeBackedEvents.readSince(workstreamParentFactStore.watermark()),
+        );
+        for (const bacId of crudIds) {
+          for (const id of beforeChains.get(bacId) ?? []) workstreamTreeAffectedIds.add(id);
+          for (const id of workstreamParentFactStore.subtreeOf(bacId)) {
+            workstreamTreeAffectedIds.add(id);
+          }
+        }
+        workstreamHistoryEventsForBuild = await readWorkstreamHistoryForAffectedIds(
+          storeBackedEvents,
+          workstreamTreeAffectedIds,
+        );
+        mark(
+          `workstreamParentFactStore.affectedSubtree crud=${String(crudIds.size)} scopes=${String(workstreamTreeAffectedIds.size)} historyEvents=${String(workstreamHistoryEventsForBuild.length)}`,
+        );
+      } else {
+        await workstreamParentFactStore.catchUp(
+          storeBackedEvents === null || forcedPendingEventWindow !== null
+            ? merged
+            : storeBackedEvents.readSince(workstreamParentFactStore.watermark()),
+        );
+      }
+    }
+    const workstreamTreeAffectedScopes: Scope[] = [...workstreamTreeAffectedIds].map((id) => ({
+      kind: 'workstream' as const,
+      id,
+    }));
     // F8 W2 — catch the search-index stores up BEFORE the scoped-delta
     // gate below reads them. Same lifecycle discipline as
     // threadRegisterFactStore above (and the sibling fact stores): catch
@@ -3995,10 +4191,17 @@ export const createConnectionsMaterializer = (
     // a repaired scope against the CURRENT base snapshot is what actually
     // heals it (or, if the underlying cause is still unresolved, re-demotes
     // it with a fresh timestamp; see repairQueueStore.ts's header).
+    // F8 W4 — workstreamTreeAffectedScopes (the ancestor-chain scope set
+    // computed above) is unioned in the same way: it rides the ordinary
+    // scoped recompute path below instead of the full-rebuild bail.
+    const extraDirtyScopes: readonly Scope[] = [
+      ...repairScopesForDrain,
+      ...workstreamTreeAffectedScopes,
+    ];
     const dirtyScopes =
-      repairScopesForDrain.length === 0
+      extraDirtyScopes.length === 0
         ? invalidationKeysToScopes(buildKeys)
-        : dedupeScopeList([...invalidationKeysToScopes(buildKeys), ...repairScopesForDrain]);
+        : dedupeScopeList([...invalidationKeysToScopes(buildKeys), ...extraDirtyScopes]);
     const previousSnapshotForRanker = await deps.store.readCurrent();
     // F8 W3 — Recovery consent rule. Lazy + memoized per drain: the fs
     // walk only pays its cost on the rare drains that actually reach a
@@ -6828,7 +7031,13 @@ export const createConnectionsMaterializer = (
       if (
         (scopedTimelineDays.length > 0 ||
           scopedDeltaEvents.length > 0 ||
-          dirtyThreadScopes.length > 0) &&
+          dirtyThreadScopes.length > 0 ||
+          // F8 W4 — a workstream CRUD carries no timeline/navigation/thread
+          // signal of its own (dirtyThreadScopes stays empty — see
+          // workstreamParentStore.ts's header for why thread_in_workstream
+          // never needs recompute here), so it needs its own admission
+          // clause into the scoped-snapshot build below.
+          workstreamTreeAffectedIds.size > 0) &&
         // F8 W2 — a search-visit window is no longer an automatic bail
         // when the search-index stores are ready: same_search_query
         // candidates and thread_text_mentions_search_query edges are
@@ -6860,14 +7069,50 @@ export const createConnectionsMaterializer = (
         void _topicRevision;
         void _closestVisitRanker;
         void _crossReplica;
+        // F8 W4 — splice the raw workstream event history (Pass 1 — for
+        // node-field parity: title/observedAt/originReplicaIds/
+        // registerMetadata), the vault records (Pass 2 — for the
+        // authoritative workstream_parent_of edge, which always wins over
+        // Pass 1's contribution; see snapshot.ts's "richer source" comment
+        // and upsertEdge's earliest-observedAt tie-break), AND the history
+        // of any thread that REFERENCES an affected workstream (Pass 1's
+        // membership-candidate loop stamps the TARGET workstream node's
+        // observedAt from the referencing thread's OWN event — see
+        // readThreadHistoryForIds's header) for the affected ancestor-chain
+        // ids into this scoped build. All three stay empty (identical to
+        // the pre-W4 behavior) when no workstream CRUD landed this drain.
+        const referencingThreadIds = new Set(
+          workstreamTreeAffectedIds.size === 0
+            ? []
+            : scopedInputBase.threads
+                .filter(
+                  (t) =>
+                    typeof t.primaryWorkstreamId === 'string' &&
+                    workstreamTreeAffectedIds.has(t.primaryWorkstreamId),
+                )
+                .map((t) => t.bac_id),
+        );
+        const threadHistoryForWorkstreamNodesEventsForBuild = await readThreadHistoryForIds(
+          storeBackedEvents,
+          referencingThreadIds,
+        );
+        const scopedEventsWithWorkstreamHistory = [
+          ...scopedDeltaEventsForBuild,
+          ...workstreamHistoryEventsForBuild,
+          ...threadHistoryForWorkstreamNodesEventsForBuild,
+        ];
+        const scopedWorkstreamRecords =
+          workstreamTreeAffectedIds.size === 0
+            ? []
+            : scopedInputBase.workstreams.filter((w) => workstreamTreeAffectedIds.has(w.bac_id));
         const scopedSnapshot = buildConnectionsSnapshot({
           ...scopedInputBase,
-          events: scopedDeltaEventsForBuild,
+          events: scopedEventsWithWorkstreamHistory,
           threads: filterDeletedThreadsForScopedDelta(
             scopedInputBase.threads,
             deletedThreadIdsForScopedDelta,
           ),
-          workstreams: [],
+          workstreams: scopedWorkstreamRecords,
           dispatches: [],
           queueItems: [],
           reminders: [],
@@ -7131,6 +7376,14 @@ export const createConnectionsMaterializer = (
               tabSessionIds,
             }),
             ...dirtyThreadScopesForSearchIndex,
+            // F8 W4 — the affected workstream ancestor-chain scopes. No
+            // matching thread scopes are added: thread_in_workstream is
+            // owned by the THREAD's own scope and depends only on that
+            // thread's resolved primaryWorkstreamId (see snapshot.ts Pass
+            // 1/2), which is invariant to the TARGET workstream's tree
+            // position, title, or deletion — a workstream CRUD never
+            // changes it, so nothing thread-scoped needs rewriting here.
+            ...workstreamTreeAffectedScopes,
           ]);
           mark(`scopedDelta.rowLocalScopes n=${String(rowLocalScopes.length)}`);
           // Yield periodically: a catch-up chunk can carry thousands of
@@ -8750,6 +9003,17 @@ export const createConnectionsMaterializer = (
     if (previousSnapshot === null) return { applied: false, reason: 'no-current-snapshot' };
     if (deps.store.replaceScopeRows === undefined) {
       return { applied: false, reason: 'replaceScopeRows-unavailable' };
+    }
+    // F8 W4 — open (but don't catch up) the workstream-parent store before
+    // the isScopedTimelineDeltaEvent check below: that check reads the
+    // store's readiness (a closure `let`, populated by ensure*) to decide
+    // whether a workstreamTree-invalidating event in this backlog is
+    // scopable. Without this, the first-ever backlog containing a
+    // workstream CRUD would see the store still null (buildAndWrite is
+    // what normally opens it, and that hasn't run for this backlog yet)
+    // and wrongly fall back to non-scoped for the WHOLE chunked pass.
+    if (workstreamParentStoreEnabled()) {
+      await ensureWorkstreamParentStore();
     }
     if (!ordered.every(isScopedTimelineDeltaEvent)) {
       return { applied: false, reason: 'non-scoped-events' };

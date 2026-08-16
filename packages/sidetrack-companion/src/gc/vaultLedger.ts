@@ -218,6 +218,10 @@ export const classifyVaultPath = (segments: readonly string[]): LedgerFamily => 
         // demotion target) + the durable needs-repair marker share this
         // sidecar. See src/connections/repairQueueStore.ts.
         leaf === 'repair-queue.db' ||
+        // W4 of the F8 IVM plan — workstream-tree ancestor-chain lookup
+        // (subtreeOf) for scoped workstream CRUD. See
+        // src/workstreams/workstreamParentStore.ts.
+        leaf === 'workstream-parent.db' ||
         leaf === 'snapshot.sqlite'
       ) {
         return 'connections-sidecar-dbs';
