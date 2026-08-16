@@ -50,6 +50,26 @@ import type { UrlProjection } from '../urls/projection.js';
 
 export const MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION = 1;
 
+// W5 Phase B — per-drain facts about the incremental topic-revision
+// SHADOW (observe-only; see connectionsMaterializer.ts's
+// `topicIncrementalShadowEnabled` wiring and incrementalTopicRevision.ts).
+// These are ephemeral (this-drain) facts that cannot be reconstructed from
+// the persisted candidate-shadow TopicRevision file alone — topic/member/
+// churn counts ARE reconstructable from that file (workGraphHealth.ts
+// derives them live via buildServedTopicProducerReport), so this struct
+// only carries what the revision itself can't say: whether the shadow ran,
+// how many candidates it promoted, and whether it hit the subgraph cap.
+export interface TopicIncrementalShadowDiagnostics {
+  readonly enabled: boolean;
+  /** False on a cache-hit skip (corpus unchanged since the last shadow pass). */
+  readonly ranThisDrain: boolean;
+  readonly promotedCount: number;
+  readonly overflow: boolean;
+  readonly overflowSubgraphSize: number | null;
+  readonly overflowCap: number | null;
+  readonly runtimeMs: number;
+}
+
 const DIAGNOSTICS_RELATIVE_DIR = '_BAC/connections/diagnostics';
 const DIAGNOSTICS_LATEST_FILENAME = 'latest.json';
 const DIAGNOSTICS_HISTORY_DIRNAME = 'history';
@@ -275,6 +295,9 @@ export interface MaterializerDiagnostics {
   readonly latency?: MaterializerLatencyCounters;
   readonly shadowVsBaseline?: TopicShadowDiagnostics;
   readonly shadowObservation?: TopicShadowObservationDiagnostics;
+  // W5 Phase B — incremental topic-revision shadow (observe-only). Absent
+  // on vaults/drains that predate the wiring or never enabled the flag.
+  readonly topicIncrementalShadow?: TopicIncrementalShadowDiagnostics;
   // U2 — incremental hot-path decision + cheap counters (similarity +
   // topics). Always present (the materializer always produces it).
   readonly hotPath?: HotPathDiagnostics;
@@ -315,6 +338,7 @@ export interface MaterializerDiagnosticsInput {
   readonly phaseDurations?: readonly MaterializerPhaseDuration[];
   readonly topicShadowDiagnostics?: TopicShadowDiagnostics;
   readonly topicShadowObservation?: TopicShadowObservationDiagnostics;
+  readonly topicIncrementalShadowDiagnostics?: TopicIncrementalShadowDiagnostics;
   readonly hotPathDiagnostics?: HotPathDiagnostics;
   readonly servedTopicProducerReport?: ServedTopicProducerReport;
   readonly similarityFloorDiagnostics?: SimilarityFloorDiagnostics;
@@ -907,6 +931,9 @@ export const collectMaterializerDiagnostics = (
     ...(input.topicShadowObservation === undefined
       ? {}
       : { shadowObservation: input.topicShadowObservation }),
+    ...(input.topicIncrementalShadowDiagnostics === undefined
+      ? {}
+      : { topicIncrementalShadow: input.topicIncrementalShadowDiagnostics }),
     ...(input.hotPathDiagnostics === undefined
       ? {}
       : { hotPath: input.hotPathDiagnostics }),

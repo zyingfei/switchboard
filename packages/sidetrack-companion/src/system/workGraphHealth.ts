@@ -21,10 +21,15 @@ import {
 } from '../producers/closest-visit-revision.js';
 import {
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_INCREMENTAL_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
 } from '../producers/topic-revision.js';
+import {
+  buildServedTopicProducerReport,
+  type ServedTopicProducerReport,
+} from '../connections/servedTopicProducer.js';
 import {
   HOT_SIMILARITY_ENV,
   HOT_TOPICS_ENV,
@@ -635,6 +640,13 @@ const buildDiagnosticCandidates = (input: {
   readonly connectionsDiagnostics: ConnectionsDiagnosticSnapshot | null;
   readonly collectedAt: string;
   readonly topicProducedAt: string | null;
+  // W5 Phase B — the incremental topic-revision shadow's live revisionId +
+  // churn-vs-served report, derived (in collectWorkGraphHealth) fresh from
+  // the on-disk candidate-shadow revision. null when no shadow has ever
+  // been persisted for this vault.
+  readonly incrementalShadowRevisionId: string | null;
+  readonly incrementalShadowReport: ServedTopicProducerReport | null;
+  readonly incrementalShadowSecondaryCount: number | null;
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
   const diagnosticsObservedAt = producedAt;
@@ -643,6 +655,8 @@ const buildDiagnosticCandidates = (input: {
   const rankerObservedAt = millisToIso(input.ranker.trainedAt) ?? liveObservedAt;
   const raw = input.diagnostics.raw;
   const shadow = raw !== null && isRecord(raw['shadowVsBaseline']) ? raw['shadowVsBaseline'] : null;
+  const topicIncrementalShadow =
+    raw !== null && isRecord(raw['topicIncrementalShadow']) ? raw['topicIncrementalShadow'] : null;
   const observation =
     raw !== null && isRecord(raw['shadowObservation']) ? raw['shadowObservation'] : null;
   const driftReport = raw !== null && isRecord(raw['drift']) ? raw['drift'] : null;
@@ -699,6 +713,9 @@ const buildDiagnosticCandidates = (input: {
     if (alwaysOffCandidateIds.has(cand.id)) return true;
     // Shadow producer that nobody enabled — pure noise.
     if (cand.id === 'topic.shadow-idf-rkn-split' && cand.status === 'unavailable') return true;
+    // W5 Phase B — same rule: an experiment nobody opted into (flag off,
+    // or a vault/drain that predates the diagnostics wiring) is noise.
+    if (cand.id === 'topic.incremental-shadow' && cand.status === 'unavailable') return true;
     // Legacy methodology spine when not populated (shipGateV2 owns this surface now).
     if (cand.id === 'ranker.methodology-spine' && cand.status === 'unavailable') return true;
     // Served-signal floor: only render the row once the diagnostic exists
@@ -787,6 +804,58 @@ const buildDiagnosticCandidates = (input: {
         shadowMaxTopicShare: numberOrNull(shadow?.['shadowMaxTopicShare']),
         noiseShare: numberOrNull(shadow?.['noiseShare']),
         adjacentPerVisitChurn: numberOrNull(observation?.['adjacentPerVisitChurn']),
+      }),
+    },
+    // W5 Phase B — the incremental topic-revision producer, run as an
+    // observe-only SHADOW alongside the served leiden-cpm producer on
+    // every drain (SIDETRACK_TOPIC_INCREMENTAL_SHADOW, default OFF).
+    // Never active/served — see connectionsMaterializer.ts's
+    // `topicIncrementalShadowEnabled` wiring. topicCount/secondaryCount/
+    // churn are derived LIVE from the persisted candidate-shadow revision
+    // (via buildServedTopicProducerReport against the currently served
+    // revision, computed in collectWorkGraphHealth); promotedCount/
+    // overflow/ranThisDrain are this-drain facts threaded through the
+    // diagnostics artifact (`topicIncrementalShadow`) since they cannot
+    // be reconstructed from the revision file alone.
+    {
+      id: 'topic.incremental-shadow',
+      family: 'topic',
+      lane: 'shadow',
+      servingImpact: 'observe-only',
+      status:
+        topicIncrementalShadow === null
+          ? 'unavailable'
+          : booleanOrFalse(topicIncrementalShadow['enabled']) === false
+            ? 'off'
+            : booleanOrFalse(topicIncrementalShadow['overflow'])
+              ? 'warning'
+              : input.incrementalShadowRevisionId === null
+                ? 'pending'
+                : 'ok',
+      reason:
+        topicIncrementalShadow === null
+          ? 'shadow-diagnostics-unavailable'
+          : booleanOrFalse(topicIncrementalShadow['enabled']) === false
+            ? 'disabled'
+            : booleanOrFalse(topicIncrementalShadow['overflow'])
+              ? 'subgraph-cap-exceeded'
+              : input.incrementalShadowRevisionId === null
+                ? 'no-shadow-revision-yet'
+                : null,
+      revisionId: input.incrementalShadowRevisionId,
+      asOf: diagnosticsObservedAt,
+      metrics: metrics({
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+        baseRevisionId: input.incrementalShadowReport?.previousRevisionId ?? null,
+        topicCount: input.incrementalShadowReport?.topicCount ?? null,
+        secondaryCount: input.incrementalShadowSecondaryCount,
+        promotedCount: numberOrNull(topicIncrementalShadow?.['promotedCount']),
+        overflowCount: booleanOrFalse(topicIncrementalShadow?.['overflow'])
+          ? (numberOrNull(topicIncrementalShadow?.['overflowSubgraphSize']) ?? 0)
+          : 0,
+        ranThisDrain: booleanOrFalse(topicIncrementalShadow?.['ranThisDrain']),
+        churnP50: input.incrementalShadowReport?.churnP50 ?? null,
+        churnP90: input.incrementalShadowReport?.churnP90 ?? null,
       }),
     },
     {
@@ -1159,6 +1228,12 @@ export const collectWorkGraphHealth = async ({
     topicRevision,
     diagnostics,
     overCollapsedRecords,
+    // W5 Phase B — the incremental topic-revision SHADOW's current
+    // candidate-shadow revision (observe-only; never active/served). Read
+    // fresh from disk (same pattern as `topicRevision` above) so the
+    // topic/secondary counts + churn-vs-served in the health row reflect
+    // the latest persisted shadow, not a stale drain-time snapshot.
+    incrementalShadowRevision,
   ] = await Promise.all([
     readActiveClosestVisitRankerRevisionManifest(vaultRoot),
     readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
@@ -1169,6 +1244,7 @@ export const collectWorkGraphHealth = async ({
     createTopicRevisionStore(vaultRoot).readActiveRevision(),
     readLatestConnectionsDiagnostics(vaultRoot),
     scanForOverCollapsedPageContentCached(vaultRoot),
+    createTopicRevisionStore(vaultRoot).readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY),
   ]);
   const augmentation = parseRankerAugmentationStatus(diagnostics);
   const activeRevision =
@@ -1367,6 +1443,24 @@ export const collectWorkGraphHealth = async ({
   const connectionsDiagnosticSnapshot = readConnectionsDiagnostics?.() ?? null;
   const topicProducedAt =
     topicRevision === null ? null : new Date(topicRevision.producedAt).toISOString();
+  // W5 Phase B — churn/quality of the incremental topic-revision shadow
+  // vs the currently SERVED (active) topic revision, derived fresh from
+  // the two on-disk revisions (never stored ahead of time) via the same
+  // pure churn/lineage math the leiden-cpm served-producer report uses.
+  // `producer` here is a shape placeholder only (buildServedTopicProducerReport
+  // never branches on it) — the incremental shadow has no ServedTopicProducer
+  // member of its own since it's never served.
+  const incrementalShadowReport: ServedTopicProducerReport | null =
+    incrementalShadowRevision === null
+      ? null
+      : buildServedTopicProducerReport('leiden-cpm', incrementalShadowRevision, topicRevision);
+  const incrementalShadowSecondaryCount =
+    incrementalShadowRevision === null
+      ? null
+      : incrementalShadowRevision.topics.reduce(
+          (sum, topic) => sum + (topic.secondaryAffiliations?.length ?? 0),
+          0,
+        );
   // Phase 0 — count recall.served + recall.action events from the
   // merged log. Cheap single pass; same data the trainer reads.
   let servedCount = 0;
@@ -1465,6 +1559,9 @@ export const collectWorkGraphHealth = async ({
       connectionsDiagnostics: connectionsDiagnosticSnapshot,
       collectedAt,
       topicProducedAt,
+      incrementalShadowRevisionId: incrementalShadowRevision?.revisionId ?? null,
+      incrementalShadowReport,
+      incrementalShadowSecondaryCount,
     }),
   };
 };

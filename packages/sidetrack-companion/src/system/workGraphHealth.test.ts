@@ -11,6 +11,8 @@ import { recordCanonicalCollision } from '../page-content/canonicalize-telemetry
 import { sha256Hex } from '../page-content/store.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import {
+  TOPIC_INCREMENTAL_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
@@ -275,6 +277,168 @@ describe('work graph diagnostic candidates', () => {
     for (const id of filteredIds) {
       expect(health.candidates.some((c) => c.id === id)).toBe(false);
     }
+  });
+
+  it('surfaces the W5 Phase B incremental-shadow candidate row (topic.incremental-shadow)', async () => {
+    const members = [
+      'https://example.test/a',
+      'https://example.test/b',
+      'https://example.test/c',
+      'https://example.test/d',
+      'https://example.test/e',
+    ];
+    const nodeMetadata = (memberCount: number) => ({
+      memberCount,
+      representativeTitles: ['t'],
+      firstObservedAt: '2026-05-16T12:00:00.000Z',
+      lastObservedAt: '2026-05-16T12:00:00.000Z',
+      cohesion: 1,
+    });
+    // Served (active) revision: one leiden-cpm topic holding all 5 members.
+    const servedRevision: TopicRevision = {
+      revisionId: 'topic-rev-served',
+      visitSimilarityRevisionId: 'sim-rev',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_LEIDEN_CPM_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic-served-1',
+          memberCanonicalUrls: members,
+          metadata: nodeMetadata(members.length),
+        },
+      ],
+      lineage: [],
+      producedAt: Date.parse('2026-05-16T12:00:00.000Z'),
+    };
+    // Incremental shadow: the SAME 5 members, split into two topics — a
+    // real co-membership churn vs the served revision (5 shared members
+    // clears buildServedTopicProducerReport's churn-computation floor).
+    const shadowRevision: TopicRevision = {
+      revisionId: 'topic-rev-incremental-shadow',
+      visitSimilarityRevisionId: 'sim-rev-2',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic-shadow-1',
+          memberCanonicalUrls: members.slice(0, 3),
+          metadata: nodeMetadata(3),
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://example.test/f',
+              score: 0.91,
+              reasons: ['edge_support'],
+              supportCount: 2,
+              maxCosine: 0.91,
+              lexicalScore: 0,
+              reciprocalSupport: 0,
+            },
+          ],
+        },
+        {
+          topicId: 'topic-shadow-2',
+          memberCanonicalUrls: members.slice(3),
+          metadata: nodeMetadata(2),
+        },
+      ],
+      lineage: [{ fromTopicId: 'topic-served-1', toTopicId: 'topic-shadow-1', kind: 'split', observedAt: '2026-05-16T12:30:00.000Z' }],
+      producedAt: Date.parse('2026-05-16T12:30:00.000Z'),
+    };
+    await createTopicRevisionStore(vaultRoot).putActiveRevision(servedRevision);
+    await createTopicRevisionStore(vaultRoot).putCandidateShadowRevision(
+      TOPIC_INCREMENTAL_REVISION_KEY,
+      shadowRevision,
+    );
+    await mkdir(join(vaultRoot, '_BAC', 'connections', 'diagnostics'), { recursive: true });
+    await writeFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      `${JSON.stringify({
+        producedAt: '2026-05-16T12:34:00.000Z',
+        topicIncrementalShadow: {
+          enabled: true,
+          ranThisDrain: true,
+          promotedCount: 2,
+          overflow: false,
+          overflowSubgraphSize: null,
+          overflowCap: null,
+          runtimeMs: 12,
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T12:45:00.000Z'),
+    });
+
+    const row = health.candidates.find((c) => c.id === 'topic.incremental-shadow');
+    expect(row).toBeDefined();
+    expect(row).toEqual(
+      expect.objectContaining({
+        family: 'topic',
+        lane: 'shadow',
+        servingImpact: 'observe-only',
+        status: 'ok',
+        reason: null,
+        revisionId: 'topic-rev-incremental-shadow',
+      }),
+    );
+    expect(row?.metrics['topicCount']).toBe(2);
+    expect(row?.metrics['secondaryCount']).toBe(1);
+    expect(row?.metrics['promotedCount']).toBe(2);
+    expect(row?.metrics['overflowCount']).toBe(0);
+    expect(row?.metrics['ranThisDrain']).toBe(true);
+    expect(row?.metrics['baseRevisionId']).toBe('topic-rev-served');
+    expect(typeof row?.metrics['churnP90']).toBe('number');
+    expect(row?.metrics['churnP90']).toBeGreaterThan(0);
+  });
+
+  it('marks topic.incremental-shadow overflow=true as a warning row', async () => {
+    const shadowRevision: TopicRevision = {
+      revisionId: 'topic-rev-incremental-shadow-2',
+      visitSimilarityRevisionId: 'sim-rev-3',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      topics: [],
+      lineage: [],
+      producedAt: Date.parse('2026-05-16T12:00:00.000Z'),
+    };
+    await createTopicRevisionStore(vaultRoot).putCandidateShadowRevision(
+      TOPIC_INCREMENTAL_REVISION_KEY,
+      shadowRevision,
+    );
+    await mkdir(join(vaultRoot, '_BAC', 'connections', 'diagnostics'), { recursive: true });
+    await writeFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      `${JSON.stringify({
+        producedAt: '2026-05-16T12:34:00.000Z',
+        topicIncrementalShadow: {
+          enabled: true,
+          ranThisDrain: true,
+          promotedCount: 0,
+          overflow: true,
+          overflowSubgraphSize: 900,
+          overflowCap: 500,
+          runtimeMs: 8,
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T12:45:00.000Z'),
+    });
+
+    const row = health.candidates.find((c) => c.id === 'topic.incremental-shadow');
+    expect(row).toEqual(
+      expect.objectContaining({
+        status: 'warning',
+        reason: 'subgraph-cap-exceeded',
+      }),
+    );
+    expect(row?.metrics['overflowCount']).toBe(900);
   });
 
   it('warns on content-lane backlog only when an age threshold is tripped', async () => {

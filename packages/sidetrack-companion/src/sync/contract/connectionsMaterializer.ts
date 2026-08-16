@@ -23,6 +23,7 @@ import {
   type MaterializerRankerAugmentationCounters,
   type MaterializerRankerMethodologySpineDiagnostics,
   type MaterializerRankerModelFreshness,
+  type TopicIncrementalShadowDiagnostics,
 } from '../../connections/materializerDiagnostics.js';
 import {
   SIMILARITY_FLOOR_MIN_RETAINED_FRACTION,
@@ -70,6 +71,11 @@ import {
   type BuildTopicRevisionInput,
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
+import {
+  buildIncrementalTopicRevision,
+  type EligibleVisitLookup,
+  type SimilarityEdgesAccessor,
+} from '../../connections/incrementalTopicRevision.js';
 import {
   deriveUserAssertedRelations,
   knownCanonicalUrlsFor,
@@ -700,6 +706,15 @@ const rankerFullAugmentationOnScopedDeltaEnabled = (): boolean =>
 // without an O(N) leiden pass. Instant rollback via env unset + restart.
 const incrementalTopicMembershipEnabled = (): boolean =>
   process.env['SIDETRACK_CONNECTIONS_TOPIC_INCREMENTAL_MEMBERSHIP'] === '1';
+// W5 Phase B (default OFF) — runs buildIncrementalTopicRevision as an
+// observe-only SHADOW alongside the served leiden-cpm producer on every
+// drain. Publishes ONLY to the dedicated TOPIC_INCREMENTAL_REVISION_KEY
+// candidate-shadow slot (putCandidateShadowRevision/readCandidateShadowRevision)
+// — never active/served — so churn/quality diagnostics accumulate in
+// workGraphHealth's Experiments row (topic.incremental-shadow) with zero
+// serving-path risk. Instant rollback via env unset.
+const topicIncrementalShadowEnabled = (): boolean =>
+  process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] === '1';
 // Instant boot (default ON; disable with SIDETRACK_INSTANT_BOOT=0 + restart to
 // revert to the legacy full-recompute boot). Measured on a live-vault clone
 // (744k events, a few-hundred-event delta since the persisted frontier): a normal
@@ -1711,6 +1726,19 @@ export const createConnectionsMaterializer = (
   // revision flip (re-embedding, model upgrade) drives a removeEdge
   // diff against the new revision's edges.
   let lastAcceptedSimilarityRevisionId: string | undefined;
+  // W5 Phase B — the similarity edge set (keyed by unordered pair) that
+  // fed the incremental topic-revision SHADOW's most recent SUCCESSFUL
+  // pass. Diffing against this on the next drain gives addedEdges/
+  // removedEdges "since the shadow's own previous revision was built"
+  // (the input contract buildIncrementalTopicRevision expects) without a
+  // fresh O(corpus) rescan — just a Map built once from the already-
+  // materialized `visitSimilarity.edges` this drain. `null` until the
+  // shadow's first successful pass (bootstrap: treated as an empty diff
+  // so the very first activation doesn't see every corpus edge as
+  // "added" and blow the subgraph cap). Left UNCHANGED on an overflow
+  // drain so the next drain's diff still accumulates against the last
+  // successfully-processed state, not a half-applied one.
+  let lastIncrementalShadowEdgePairs: ReadonlyMap<string, VisitSimilarityEdge> | null = null;
   let lastTopicRunAtMs = 0;
   let topicDrainsSinceLastRun = 0;
   let lastTopicRunSimilarityRevisionId: string | undefined;
@@ -5765,6 +5793,7 @@ export const createConnectionsMaterializer = (
     let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
+    let topicIncrementalShadowDiagnostics: TopicIncrementalShadowDiagnostics | null = null;
     const servedProducer: ServedTopicProducer = resolveServedTopicProducer();
     const topicCadenceSkipped = !shouldRunTopicRevision && previousTopicRevision !== null;
     if (servedProducer === 'leiden-cpm' && !topicCadenceSkipped) {
@@ -5900,6 +5929,239 @@ export const createConnectionsMaterializer = (
         servedTopicRevision = shadow.revision;
         await topicRevisionStore.putActiveRevision(shadow.revision);
         mark('topicShadowCandidate->active (flip)');
+      }
+    }
+    // W5 Phase B — incremental topic-revision SHADOW (observe-only,
+    // default OFF via SIDETRACK_TOPIC_INCREMENTAL_SHADOW). Runs
+    // buildIncrementalTopicRevision alongside the served leiden-cpm
+    // producer on every drain; publishes ONLY to the dedicated
+    // TOPIC_INCREMENTAL_REVISION_KEY candidate-shadow slot — never
+    // active/served — so churn/quality diagnostics accumulate in
+    // workGraphHealth's Experiments row (topic.incremental-shadow) with
+    // zero serving-path risk. Lineage chains across drains by reading
+    // its OWN prior candidate-shadow revision back each drain; the very
+    // first activation (no prior shadow yet) seeds off whichever
+    // leiden-cpm candidate is currently on disk (built above this drain,
+    // or carried from an earlier one).
+    {
+      const shadowStartedAtMs = Date.now();
+      if (!topicIncrementalShadowEnabled()) {
+        topicIncrementalShadowDiagnostics = {
+          enabled: false,
+          ranThisDrain: false,
+          promotedCount: 0,
+          overflow: false,
+          overflowSubgraphSize: null,
+          overflowCap: null,
+          runtimeMs: 0,
+        };
+      } else {
+        try {
+          const previousIncrementalShadow = await topicRevisionStore.readCandidateShadowRevision(
+            TOPIC_INCREMENTAL_REVISION_KEY,
+          );
+          const leidenBaseForShadow =
+            previousIncrementalShadow ??
+            (await topicRevisionStore.readCandidateShadowRevision(TOPIC_LEIDEN_CPM_REVISION_KEY));
+          if (leidenBaseForShadow === null) {
+            // Nothing to refine off yet (servedProducer isn't leiden-cpm
+            // this drain, or leiden hasn't built its first candidate).
+            topicIncrementalShadowDiagnostics = {
+              enabled: true,
+              ranThisDrain: false,
+              promotedCount: 0,
+              overflow: false,
+              overflowSubgraphSize: null,
+              overflowCap: null,
+              runtimeMs: Date.now() - shadowStartedAtMs,
+            };
+            mark('topicIncremental.shadow dt=0 topics=0 promoted=0 overflow=0 (no-leiden-base)');
+          } else {
+            // Skip-gate mirroring the leiden/idf-rkn candidates above:
+            // the revisionId is a pure fn of (visitSimilarityRevisionId,
+            // threshold, algorithm), so an unchanged corpus since the
+            // shadow's last pass means an identical id — skip the rebuild
+            // entirely rather than re-derive and re-persist the same
+            // content.
+            const expectedIncrementalShadowId = await createTopicRevisionId({
+              visitSimilarityRevisionId: visitSimilarity.revisionId,
+              cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+              algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+            });
+            if (
+              previousIncrementalShadow !== null &&
+              previousIncrementalShadow.revisionId === expectedIncrementalShadowId
+            ) {
+              topicIncrementalShadowDiagnostics = {
+                enabled: true,
+                ranThisDrain: false,
+                promotedCount: 0,
+                overflow: false,
+                overflowSubgraphSize: null,
+                overflowCap: null,
+                runtimeMs: Date.now() - shadowStartedAtMs,
+              };
+              mark(
+                `topicIncremental.shadow dt=${String(Date.now() - shadowStartedAtMs)} topics=${String(previousIncrementalShadow.topics.length)} promoted=0 overflow=0 (cacheHit)`,
+              );
+            } else {
+              const shadowDirtyVisitKeys = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+              // Eligibility lookup over the FULL corpus. A per-drain
+              // window slice (topicVisitsForBuild) would wrongly report
+              // "ineligible" for any untouched previous member (it simply
+              // isn't in that slice), silently shrinking/killing its
+              // topic in the shadow — so this is built from
+              // fullBuildTimelineDays (already materialized this drain
+              // for Pass 1 of the main snapshot build), not
+              // topicVisitsForBuild. One flatMap + Map-insert pass over
+              // already-in-memory data, not a fresh disk read.
+              const shadowVisitByCanonical = new Map<string, TopicVisit>();
+              for (const day of fullBuildTimelineDays) {
+                for (const entry of day.entries) {
+                  const visit = topicVisitFromEntry(entry);
+                  if (visit.canonicalUrl.length === 0) continue;
+                  const existing = shadowVisitByCanonical.get(visit.canonicalUrl);
+                  if (existing === undefined || visit.focusedWindowMs > existing.focusedWindowMs) {
+                    shadowVisitByCanonical.set(visit.canonicalUrl, visit);
+                  }
+                }
+              }
+              const getEligibleVisitForShadow: EligibleVisitLookup = (canonicalUrl) => {
+                const visit = shadowVisitByCanonical.get(canonicalUrl);
+                return visit !== undefined && visit.focusedWindowMs > 0 ? visit : null;
+              };
+              // Adjacency index built ONCE per drain (O(edges), reusing
+              // the already-materialized visitSimilarity.edges) — an
+              // index, not a filter() over the full edge array per
+              // accessor call.
+              const shadowEdgesByVisit = new Map<string, VisitSimilarityEdge[]>();
+              const addShadowEdge = (key: string, edge: VisitSimilarityEdge): void => {
+                const list = shadowEdgesByVisit.get(key);
+                if (list === undefined) shadowEdgesByVisit.set(key, [edge]);
+                else list.push(edge);
+              };
+              for (const edge of visitSimilarity.edges) {
+                addShadowEdge(edge.fromVisitKey, edge);
+                addShadowEdge(edge.toVisitKey, edge);
+              }
+              const edgesForVisitShadow: SimilarityEdgesAccessor = (canonicalUrl) =>
+                shadowEdgesByVisit.get(canonicalUrl) ?? [];
+              // addedEdges/removedEdges "since the shadow's own previous
+              // revision was built" — diffed against the small in-memory
+              // pair map this same block maintained on its last
+              // SUCCESSFUL pass (lastIncrementalShadowEdgePairs), never a
+              // fresh O(corpus) rescan and never another subsystem's
+              // unrelated diff (e.g. the topicAccumulator revision-flip
+              // diff above tracks "since the last drain", a different —
+              // and for a shadow that can skip drains via the cache-hit
+              // gate above, potentially misaligned — notion).
+              const shadowEdgePairKey = (edge: VisitSimilarityEdge): string =>
+                edge.fromVisitKey < edge.toVisitKey
+                  ? `${edge.fromVisitKey} ${edge.toVisitKey}`
+                  : `${edge.toVisitKey} ${edge.fromVisitKey}`;
+              const shadowEdgePairs = new Map<string, VisitSimilarityEdge>();
+              for (const edge of visitSimilarity.edges) {
+                shadowEdgePairs.set(shadowEdgePairKey(edge), edge);
+              }
+              const shadowAddedEdges: VisitSimilarityEdge[] = [];
+              const shadowRemovedEdges: VisitSimilarityEdge[] = [];
+              if (lastIncrementalShadowEdgePairs !== null) {
+                for (const [pair, edge] of shadowEdgePairs) {
+                  if (!lastIncrementalShadowEdgePairs.has(pair)) shadowAddedEdges.push(edge);
+                }
+                for (const [pair, edge] of lastIncrementalShadowEdgePairs) {
+                  if (!shadowEdgePairs.has(pair)) shadowRemovedEdges.push(edge);
+                }
+              }
+              // else: first-ever shadow pass — bootstrap off
+              // leidenBaseForShadow with a zero-edge-delta (no structural
+              // trigger from an edge diff this drain); dirtyVisitKeys'
+              // own-topic path still seeds the initial dirty-topic set
+              // (every touched visit that's already a leiden member), so
+              // the lineage starts clean and small rather than treating
+              // the whole corpus as "added" and blowing the subgraph cap.
+
+              const shadowResult = await buildIncrementalTopicRevision({
+                previousRevision: leidenBaseForShadow,
+                visitSimilarityRevisionId: visitSimilarity.revisionId,
+                dirtyVisitKeys: shadowDirtyVisitKeys,
+                addedEdges: shadowAddedEdges,
+                removedEdges: shadowRemovedEdges,
+                getEligibleVisit: getEligibleVisitForShadow,
+                edgesForVisit: edgesForVisitShadow,
+                hnswStore: loadedHnswSimilarityStore,
+                cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+              });
+              const shadowRuntimeMs = Date.now() - shadowStartedAtMs;
+              if (shadowResult.overflow !== null) {
+                // Do NOT serve/persist result.revision (it IS the
+                // previous revision, unchanged) and do NOT advance the
+                // edge-pair diff baseline — the next drain's diff keeps
+                // accumulating against the last successfully-processed
+                // state rather than a half-applied one. No repair queue
+                // yet (that's W3); log the mark + counts.
+                console.warn(
+                  `[connections] topicIncremental shadow OVERFLOW subgraph=${String(
+                    shadowResult.overflow.subgraphSize,
+                  )} cap=${String(shadowResult.overflow.cap)} dirtyTopics=${String(
+                    shadowResult.overflow.dirtyTopicIds.length,
+                  )}`,
+                );
+                topicIncrementalShadowDiagnostics = {
+                  enabled: true,
+                  ranThisDrain: true,
+                  promotedCount: 0,
+                  overflow: true,
+                  overflowSubgraphSize: shadowResult.overflow.subgraphSize,
+                  overflowCap: shadowResult.overflow.cap,
+                  runtimeMs: shadowRuntimeMs,
+                };
+                mark(
+                  `topicIncremental.shadow dt=${String(shadowRuntimeMs)} topics=${String(
+                    shadowResult.revision.topics.length,
+                  )} promoted=0 overflow=${String(shadowResult.overflow.subgraphSize)}`,
+                );
+              } else {
+                await topicRevisionStore.putCandidateShadowRevision(
+                  TOPIC_INCREMENTAL_REVISION_KEY,
+                  shadowResult.revision,
+                );
+                lastIncrementalShadowEdgePairs = shadowEdgePairs;
+                topicIncrementalShadowDiagnostics = {
+                  enabled: true,
+                  ranThisDrain: true,
+                  promotedCount: shadowResult.promotedCount,
+                  overflow: false,
+                  overflowSubgraphSize: null,
+                  overflowCap: null,
+                  runtimeMs: shadowRuntimeMs,
+                };
+                mark(
+                  `topicIncremental.shadow dt=${String(shadowRuntimeMs)} topics=${String(
+                    shadowResult.revision.topics.length,
+                  )} promoted=${String(shadowResult.promotedCount)} overflow=0`,
+                );
+              }
+            }
+          }
+        } catch (error) {
+          // Observe-only: the shadow must never fail an otherwise-
+          // successful drain.
+          console.warn(
+            `[connections] topicIncremental shadow FAILED (observe-only, drain unaffected): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          topicIncrementalShadowDiagnostics = {
+            enabled: true,
+            ranThisDrain: false,
+            promotedCount: 0,
+            overflow: false,
+            overflowSubgraphSize: null,
+            overflowCap: null,
+            runtimeMs: Date.now() - shadowStartedAtMs,
+          };
+        }
       }
     }
     // W2 step 5 — served-producer marker + observability (the
@@ -7560,6 +7822,9 @@ export const createConnectionsMaterializer = (
       phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
+      ...(topicIncrementalShadowDiagnostics === null
+        ? {}
+        : { topicIncrementalShadowDiagnostics }),
       hotPathDiagnostics,
       servedTopicProducerReport,
       similarityFloorDiagnostics,
