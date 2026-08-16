@@ -6,6 +6,11 @@ import {
 import { formatAnchorDisplay, type EntityDisplayCtx } from '../entityDisplay/format';
 import type { ConnectionNode } from '../connections/types';
 import {
+  isLaneFallbackCandidate,
+  LANE_FALLBACK_PICK_LABEL,
+  LANE_FALLBACK_PICK_TITLE,
+} from './laneFallbackPick';
+import {
   dominantSourceLabel,
   endorsementFor,
   hostFromUrl,
@@ -157,18 +162,42 @@ export function AttributionProvenance({
     }
     const chips = reasonChipsFor(topCandidate, record.pageEvidence);
     const isWeak = endorsement.level === 'weak-guess';
-    // Honest phrasing: endorsed → "Suggested"; un-endorsed lean →
+    // Lane-fallback pick (companion tabsession/laneFallback.ts): fusion HELD
+    // NOTHING (zero real candidates reached fusion) and this un-endorsed lean
+    // was synthesized from the content + ai guess lanes instead — never
+    // scored by fusion at all. Only possible when isWeak: an endorsed pick
+    // (action suggest/auto-apply) can't be a synthesized candidate, because
+    // applyLaneFallbackGuess only fires when fusedCandidates was empty, which
+    // can never produce an endorsement (see endorsementFor). Same honesty
+    // policy already applied to AttributionBadge / SuggestionStats
+    // (isLaneFallbackCandidate): the headline must say "No good guess yet",
+    // not the real workstream name — naming it here read as a real filing
+    // decision even next to a "weak guess" qualifier, the exact bug class
+    // the badge/stats fix closed. The real name still reaches the user,
+    // honestly labelled, via the title tooltip.
+    const isLaneFallback = isWeak && isLaneFallbackCandidate(topCandidate);
+    // Honest phrasing: endorsed → "Suggested"; un-endorsed real lean →
     // "Weak guess — filed to inbox" (policy action='inbox' means the item
     // went to the inbox, not a workstream — "not filed" wrongly implied it
-    // went nowhere).
-    const verb = isWeak ? 'Weak guess — filed to inbox' : 'Suggested';
+    // went nowhere); un-endorsed SYNTHESIZED lean → the same "Unconfirmed"
+    // wording the badge/stats use, since there is no fusion margin/logit
+    // behind it at all.
+    const verb = isLaneFallback
+      ? LANE_FALLBACK_PICK_LABEL
+      : isWeak
+        ? 'Weak guess — filed to inbox'
+        : 'Suggested';
     const margin = endorsement.margin;
     return (
       <span
-        className={`tab-session-provenance mono${isWeak ? ' is-weak-guess' : ''}`}
-        data-endorsement={endorsement.level}
+        className={`tab-session-provenance mono${isWeak ? ' is-weak-guess' : ''}${
+          isLaneFallback ? ' is-lane-fallback' : ''
+        }`}
+        data-endorsement={isLaneFallback ? 'lane-fallback' : endorsement.level}
+        {...(isLaneFallback ? { title: `${LANE_FALLBACK_PICK_TITLE}\n\nLean: ${targetPath}` } : {})}
       >
-        <span className="tab-session-provenance-verb">{verb}</span>: {targetPath}
+        <span className="tab-session-provenance-verb">{verb}</span>:{' '}
+        {isLaneFallback ? 'No good guess yet' : targetPath}
         {chips.length > 0 ? (
           <span className="tab-session-reason-chips">
             {chips.map((chip) => (

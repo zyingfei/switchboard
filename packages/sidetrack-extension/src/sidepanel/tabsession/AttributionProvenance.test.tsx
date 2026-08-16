@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { AttributionProvenance } from './AttributionProvenance';
+import { LANE_FALLBACK_WHY_PREFIX } from './laneFallbackPick';
 import type {
   TabSessionRecord,
   TabSessionResolutionResult,
@@ -68,6 +69,43 @@ describe('AttributionProvenance honesty', () => {
     expect(screen.getByText('Weak guess — filed to inbox')).toBeDefined();
     expect(screen.queryByText('Suggested')).toBeNull();
     expect(container.querySelector('[data-endorsement="weak-guess"]')).not.toBeNull();
+  });
+
+  // Regression guard for the display-policy bug: fusion HELD (no candidates
+  // reached fusion) and the top candidate is the synthesized below-floor
+  // lane-fallback pick — the provenance row must not name that workstream as
+  // if it were a real "Weak guess — filed to inbox: X" lean. Mirrors the
+  // AttributionBadge regression test above (same bug class, same fixture
+  // shape: a candidate whose reasons[0].summary carries LANE_FALLBACK_WHY_PREFIX).
+  it('hides the fallback workstream name — shows "No good guess yet" — when fusion held', () => {
+    const { container } = render(
+      <AttributionProvenance
+        record={record()}
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [
+          {
+            workstreamId: 'ws-1',
+            rawFusionLogit: 0.71,
+            dominantSource: 'none',
+            reasons: [
+              {
+                source: 'similarity',
+                summary: `${LANE_FALLBACK_WHY_PREFIX} · content lane 71%`,
+                anchors: [],
+              },
+            ],
+          },
+        ])}
+        workstreams={workstreams}
+      />,
+    );
+    const row = container.querySelector('[data-endorsement="lane-fallback"]');
+    expect(row).not.toBeNull();
+    expect(row?.textContent).toContain('No good guess yet');
+    expect(row?.textContent).not.toContain('Research / Probability');
+    expect(screen.getByText('Unconfirmed — from page content (AI-assisted)')).toBeDefined();
+    expect(screen.queryByText('Weak guess — filed to inbox')).toBeNull();
+    // The real name is still reachable — honestly labelled — via the tooltip.
+    expect(row?.getAttribute('title')).toContain('Research / Probability');
   });
 
   it('renders a graph-proximity reason chip for a ppr candidate', () => {

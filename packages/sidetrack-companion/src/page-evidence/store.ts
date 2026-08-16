@@ -561,6 +561,7 @@ export const completeExtractedPageEvidenceEmbedding = async (
     readonly embedder?: PageEvidenceEmbedder;
     readonly embeddingsEnabled?: boolean;
     readonly rebuildManifestAfterWrite?: boolean;
+    readonly manifestUpdate?: 'rebuild' | 'incremental';
   } = {},
 ): Promise<PageEvidenceRecord> => {
   if (options.embeddingsEnabled === false) {
@@ -1046,10 +1047,20 @@ export const embedBacklogCanonicalUrl = async (
     // (676,537 phantom successes against a frozen backlog of ~453 on the
     // live vault). Pin the write to the evidence key that was requested.
     const requestedKey = canonicalizeEvidenceUrl(rawCanonicalUrl);
+    // O(1) manifest upsert instead of the O(records) rebuild the lane used to
+    // skip entirely (rebuildManifestAfterWrite:false left the manifest
+    // permanently stale for embedding-only completions). Safe to use the
+    // incremental path here: this lane runs in-process on the main
+    // companion event loop (only the ONNX compute is off in the embedder
+    // child — see the module header), so it shares the SAME
+    // evidenceManifestUpsertLocks serialization as the HTTP routes below.
+    // Unlike the body-evidence worker (a real node:worker_threads Worker
+    // with its own module instance and therefore its own, non-shared
+    // lock), there is no cross-thread race here.
     const record = await completeExtractedPageEvidenceEmbedding(
       vaultRoot,
       { ...payload, canonicalUrl: requestedKey, storageMode: 'indexed_chunks' },
-      { rebuildManifestAfterWrite: false },
+      { manifestUpdate: 'incremental' },
     );
     if (record.content?.embeddingState !== 'ready' || record.content.docEmbeddingRef === undefined) {
       return 'failed';
