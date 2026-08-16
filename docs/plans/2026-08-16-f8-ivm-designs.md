@@ -144,3 +144,21 @@ not recovery. Materializer version bumps on a large vault prompt too:
 an upgrade may not silently rewrite hundreds of MB.
 W3 owns implementing the detection→degrade→callout path and removing
 every auto-invocation of full rebuilds from recovery branches.
+
+## Execution authorization (2026-08-16, from the user, standing)
+
+"Keep driving subagents till this severe issue is resolved... no wait
+for me, no ask for test until the incremental logic all landed, no
+backward compatibility needed (but allow reimport data once without
+data loss)."
+
+Implications, binding on all waves:
+- Autonomous execution until W1-W5 + demotion land; coordinator
+  verifies each wave (tests + evidence) without pausing for the user.
+- NO backward compatibility: stores/formats may be replaced outright;
+  no dual-read shims, no migration layers.
+- The canonical event log (+ page-content/evidence raw files) remain
+  the lossless source: a ONE-TIME user-consented reimport/derive
+  command rebuilds all derived state after the switch (this is the
+  same consent-gated CLI as disaster recovery). Nothing else preserves
+  old derived formats.
