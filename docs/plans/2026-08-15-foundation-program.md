@@ -125,135 +125,6 @@ that must be hand-added for every new site.
 **What the two guards actually consume** (read from their source, not
 inferred): both call sites need exactly `AggregatorPageType` ('feed' |
 'item' | 'not-aggregator') per URL, nothing else from the classification
-surface. `candidates.ts`'s `suppressCoarseGrouping`/`repoOrDomainKeys`
-uses it to decide whether a URL contributes a bare `domain:` grouping key
-(suppressed for feed pages) or participates normally; `titlePathTokenKeys`
-suppresses ALL title/path lexical tokens for any aggregator host
-unconditionally (not gated on feed/item). `tabsession/similarity.ts`'s
-`isAnyAggregatorVisit` (feed OR item, ignoring item-narrowing — see the
-file's own 2026-07-24 comment on why) drops two chrome-derived signal
-classes between any two aggregator pages: raw `embedding_neighborhood`
-candidates and `title_only`-tier persisted resemblance edges. Both guards
-exist because of the 2026-07-10 false-friend (feed pages at 82% confidence
-mis-filed an AI-video HN post next to unrelated linux-security items via
-shared site-chrome title/path tokens) — any replacement must keep that
-protection at least as strong, hence the conservative cold-start rule
-below. `stripSiteTitleSuffix` (site-chrome title stripping,
-`visitSimilarity.ts`) and `aggregatorCommunityKey` (subreddit/author
-grouping, `candidates.ts`) are NOT part of this replacement — they
-inherently encode per-site chrome/community knowledge (a literal " |
-Hacker News" suffix, a subreddit path segment) that a behavioral
-classifier has no basis to reconstruct; only `AggregatorPageType` is in
-scope.
-
-**Signals available without touching `connectionsMaterializer.ts`** (out of
-bounds for this work): `NAVIGATION_COMMITTED` events carry
-`visitId`/`canonicalUrl`/`openerVisitId` (opener-chain edges — the same
-data `candidates.ts`'s `opener_chain`/`navigation_chain` generators use);
-`BROWSER_TIMELINE_OBSERVED` carries `canonicalUrl`/`title` per observation;
-`PAGE_EVIDENCE_EXTRACTED` (`page-evidence/types.ts`
-`PageEvidenceExtractedEventPayload`) carries `contentHash` per capture of a
-URL. All three are typed events, readable via the existing
-`readEventsForHealth`/`forEachChunkOfTypes` indexed-type-filter idiom
-(`system/workGraphHealth.ts:353`) — bounded by matching-event count, never
-a full-log scan.
-
-**Per-node counters** (folded incrementally, one event at a time, over
-these three typed streams — `applyAggregatorStatsEvent(state, event)`):
-- `captureCount` / `distinctContentHashCount` — content churn across
-  captures of the SAME url. A feed URL (root, `/newest`, a listing) is
-  revisited and re-extracted many times with a DIFFERENT content hash each
-  time (the list underneath changes); an item URL's hash is stable once
-  captured. This is the direct behavioral analog of "ephemeral, weak
-  content identity" vs "distinct content object" from the registry's own
-  header comment.
-- `distinctOutlinkTargets` — the set of distinct canonicalUrls this URL was
-  the `openerVisitId` origin for. A hub/feed page fans out to many distinct
-  stories; an item page's descendants are typically the single external
-  article it links to (plus same-site replies). This is "hub-ness is
-  behavior" made concrete: fan-out degree, not a URL shape.
-- `visitCount` / `distinctTitleCount` — revisit cadence and title
-  stability, secondary signals (a stable single-title item vs. a
-  repeatedly-checked, title-stable-but-content-churning feed root).
-
-**Per-domain aggregates** (rolled up from the same fold, keyed by a
-structural registrable-domain approximation — last two hostname labels,
-NOT a hand list): `maxOutlinkFanout` and `urlCount` across all observed
-URLs on the domain. A domain is "hub-like" only if SOME url on it has
-crossed the fan-out bar — this is what lets postgres.org/openai/clickhouse
-blogs classify as `not-aggregator` (never observed fanning out) while HN/
-Reddit/GitHub-shaped domains classify as hub-like from behavior alone.
-
-**Classification** (`classifyLearnedAggregatorPage`): domain not hub-like
-→ `not-aggregator` (no guard applied — conservative in the sense of never
-restricting a normal site's similarity that the registry never restricted
-either). Domain hub-like AND (url unseen, OR high fan-out, OR high capture-
-to-capture content churn) → `feed` (quarantined — the conservative
-default; matches "unknown high-churn shapes stay feed-like" so the
-false-friend guard never weakens under the shadow). Domain hub-like AND
-url seen with low fan-out AND (insufficient churn evidence OR low churn)
-→ `item`.
-
-**Shadow wiring** (`SIDETRACK_LEARNED_AGGREGATOR`, absent/non-`0` = ON,
-matching `aggregatorGroupingGuardEnabled`'s call-time style): a new
-`system/workGraphHealth.ts` `DiagnosticCandidate` (id
-`aggregator.learned-stats-shadow`, family `similarity`, lane `shadow`,
-servingImpact `observe-only` — the existing Experiments-row pattern,
-`topic.incremental-shadow`'s sibling) computed INSIDE
-`collectWorkGraphHealth` from the three typed reads above, never touching
-`connectionsMaterializer.ts`. It classifies every distinct canonicalUrl
-observed against BOTH the registry (`classifyAggregatorPageForUrl`) and
-the learned classifier, and reports agreement/disagreement counts —
-overall, restricted to registry-covered domains, and for domains the
-registry has never heard of (where "the learned stats exceed the
-registry" would show up as newly-flagged hub domains). This PR changes
-zero serving decisions; the registry keeps deciding both guards.
-Registry-replacement is a follow-up gated on shadow-agreement evidence
-from the real vault (see PR body for the actual numbers).
-
-**Known scope limit, resolved during implementation.** The live shadow row
-reads a BOUNDED most-recent-N window via the typed event store's
-`readMostRecentByType(type, limit)` (`sync/eventStore.ts:107`,
-`events_accepted_at_ms_idx`) for `NAVIGATION_COMMITTED` and
-`BROWSER_TIMELINE_OBSERVED` — the same bounded idiom `http/server.ts`'s
-`timelineEventsForCandidateGeneration` already established for
-`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW` (see the 2026-08-16
-"index-backed event-candidate resolve" landing note above) —
-`SIDETRACK_LEARNED_AGGREGATOR_WINDOW`, default 20,000 per type, `0` =
-kill switch back to the unbounded type-scoped `forEachChunkOfTypes` read.
-`readMostRecentByType` returns most-recent-first, not causal order, so the
-health-collection adapter sorts by `acceptedAtMs` ascending before folding
-— required for `NAVIGATION_COMMITTED`'s opener-chain resolution, which
-needs an opener's own commit event folded before its child's. When the
-typed store is unavailable, this diagnostic falls back to
-`eventLog.readMerged()` filtered by type — the SAME fallback cost class
-`readEventsForHealth`'s other callers in this exact file already accept
-(`readFeedbackEvents`, the recall.served/action read), not a new regression
-class. The full-history fold (no window) is reserved for the offline
-measurement CLI, matching the F3 exit-criteria's own carve-out ("allowed:
-cold boot recovery, gap seal, CLI/eval").
-
-## Learned per-node aggregator stats — design note (2026-08-16)
-
-Not an F1–F7 item; filed here per the "binding plan tracks reality" rule
-because it replaces load-bearing machinery (`ranker/aggregatorProfiles.ts`)
-consumed by two serving guards. Binding user directive: replace the
-hand-maintained per-domain registry (ycombinator/reddit/twitter/… profiles,
-hand-written `isItemUrl` predicates + title-chrome patterns) with LEARNED
-per-node behavioral statistics — no domain list, no URL-shape special-casing
-in the replacement. First shipped as a SHADOW (observe-only); the registry
-keeps deciding until shadow-agreement evidence justifies a follow-up flip.
-
-**Why the registry rots.** One label per domain cannot capture: HN
-(categories + item pages), postgres.org/openai/clickhouse blogs
-(single-source, every page is a distinct object), and Uber/Cloudflare eng
-blogs (multi-source-WITH-preference — categorized but each post still a
-stable object). The registry's `isItemUrl` predicates are per-domain regexes
-that must be hand-added for every new site.
-
-**What the two guards actually consume** (read from their source, not
-inferred): both call sites need exactly `AggregatorPageType` ('feed' |
-'item' | 'not-aggregator') per URL, nothing else from the classification
 surface. `candidates.ts`'s `suppressCoarseGrouping`/`repoOrDomainKeys` uses
 it to decide whether a URL contributes a bare `domain:` grouping key
 (suppressed for feed pages) or participates normally; `titlePathTokenKeys`
@@ -276,6 +147,28 @@ grouping, `candidates.ts`) are NOT part of this replacement — they
 inherently encode per-site chrome/community knowledge (a literal " | Hacker
 News" suffix, a subreddit path segment) a behavioral classifier has no basis
 to reconstruct; only `AggregatorPageType` is in scope.
+
+**Known scope limit, resolved during implementation.** The live shadow row
+reads a BOUNDED most-recent-N window via the typed event store's
+`readMostRecentByType(type, limit)` (`sync/eventStore.ts:107`,
+`events_accepted_at_ms_idx`) for `NAVIGATION_COMMITTED` and
+`BROWSER_TIMELINE_OBSERVED` — the same bounded idiom `http/server.ts`'s
+`timelineEventsForCandidateGeneration` already established for
+`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW` (see the 2026-08-16
+"index-backed event-candidate resolve" landing note above) —
+`SIDETRACK_LEARNED_AGGREGATOR_WINDOW`, default 20,000 per type, `0` = kill
+switch back to the unbounded type-scoped `forEachChunkOfTypes` read.
+`readMostRecentByType` returns most-recent-first, not causal order, so the
+health-collection adapter sorts by `acceptedAtMs` ascending before folding —
+required for `NAVIGATION_COMMITTED`'s opener-chain resolution, which needs
+an opener's own commit event folded before its child's. When the typed
+store is unavailable, this diagnostic falls back to `eventLog.readMerged()`
+filtered by type — the SAME fallback cost class `readEventsForHealth`'s
+other callers in this exact file already accept (`readFeedbackEvents`, the
+recall.served/action read), not a new regression class. The full-history
+fold (no window) is reserved for the offline measurement CLI, matching the
+F3 exit-criteria's own carve-out ("allowed: cold boot recovery, gap seal,
+CLI/eval").
 
 **Signals available without touching `connectionsMaterializer.ts`** (out of
 bounds for this work), per the actual data model: `NAVIGATION_COMMITTED`
@@ -361,7 +254,21 @@ distinguish from a true multi-author hub without an authorship signal this
 vault doesn't capture. This is exactly what the real-vault measurement
 (agreement on registry domains + spot-check plausibility on 5+ non-registry
 domains, single-source blogs included) is for — reported honestly in the PR
-body rather than hidden.
+body rather than hidden. Confirmed live on the real vault: a personal
+docs/cheat-sheets site (8 distinct URLs total, name withheld here —
+see PR body) crossed the domain hub bar — root plus a couple of category
+pages fan out to enough of the site's own other pages via ordinary
+nav-menu clicks — and EVERY page on the domain, including clearly
+single-author content leaves like a `/cheat-sheets/big-o-complexity`-style
+page, classified `feed`. Root cause: on a domain this small, no single
+page can ever accumulate the `inboundSources`-side fan-out (`>= 8`)
+`classifyLearnedAggregatorPage`'s positive item signal (step 4) requires,
+so step 5's conservative default always wins. Sample size (7 of 8
+non-registry spot-check domains classified plausibly as `not-aggregator` —
+an encyclopedia, an audiobook storefront, a crypto textbook site, an AI
+console/settings surface, two docs sites, and one multi-author-style blog)
+suggests this is a narrow, small-site edge case rather than the common
+case, but it is real, not hypothetical.
 
 **Second limitation, found BY the real-vault measurement (not predicted up
 front).** Agreement varies enormously by domain: news.ycombinator.com
