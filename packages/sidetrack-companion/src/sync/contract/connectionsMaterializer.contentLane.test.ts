@@ -765,10 +765,20 @@ describe('Stage 5.2 W7 — connectionsMaterializer dirty-source queue wiring', (
       return { snapshotWrites, replacements };
     };
 
-    // Disabled: the owned-rows + graph-inert window falls into the full
-    // base rebuild (the bug) — a whole-snapshot write, no scoped replace.
+    // Disabled: the owned-rows + graph-inert window used to fall into the
+    // full base rebuild (the bug) — a whole-snapshot write, no scoped
+    // replace. F8 W3 (docs/plans/2026-08-16-f8-ivm-designs.md, "W3")
+    // supersedes that: the bail now ALWAYS demotes — a progress-only
+    // scoped replace (empty scopes/nodes, prior snapshot served
+    // unchanged) — never a full `writeSnapshotAndProgress`/`putCurrent`
+    // call. The dirty url scope also lands in the persisted repair queue
+    // (see connectionsRepairDemotion.test.ts for that equivalence), which
+    // this in-memory fake store doesn't observe.
     const off = await runDrain(false);
-    expect(off.snapshotWrites).toBeGreaterThan(0);
+    expect(off.snapshotWrites).toBe(0);
+    expect(off.replacements).toHaveLength(1);
+    expect(off.replacements[0]?.scopes).toEqual([]);
+    expect(off.replacements[0]?.nodes).toEqual([]);
 
     // Enabled (the fix / default): no full rebuild; a scoped replace that
     // re-asserts the owned url's existing node and carries the attribution

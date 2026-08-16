@@ -223,6 +223,19 @@ export const renderHelp = (): string =>
     "    (the planner's own arm switch) and refuses if a live companion holds the",
     "    vault's recall process-lock. Rewrites run through EventLog's",
     '    runExclusiveMaintenance; there is no force path.',
+    '',
+    'Connections-rebuild subcommand (user-consented full replay):',
+    '  sidetrack-companion connections-rebuild --vault <path> [--json]',
+    '    Rebuilds the connections graph from the COMPLETE event source and',
+    '    publishes it — the one remaining place a full replay is allowed (F8',
+    '    IVM Recovery consent rule, docs/plans/2026-08-16-f8-ivm-designs.md).',
+    '    The materializer never auto-invokes this: a cold boot / materializer',
+    '    version bump / Layer-0 similarity reset on a non-empty vault instead',
+    '    serves degraded and sets a needs-repair health condition naming this',
+    '    exact command. Takes the vault\'s recall process-lock first and refuses',
+    "    if a live companion owns it — quit the companion (or its background",
+    '    service) before running this. Clears the repair queue + needs-repair',
+    '    marker on success (a full rebuild heals everything by construction).',
   ].join('\n');
 
 // Post-install guidance printed after `--install-service` succeeds. Pure
@@ -1463,6 +1476,106 @@ const runCompactEngagementSubcommand = async (
   }
 };
 
+// F8 IVM plan, W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
+// designs.md, "Recovery consent rule"). The materializer never auto-
+// invokes a full replay for a catastrophic-recovery condition on a
+// non-empty vault (cold boot with no previous snapshot, a materializer
+// version bump, a Layer-0 similarity reset driven by a version bump /
+// store-corruption reason) — it serves degraded and sets a needs-repair
+// health condition naming THIS exact command instead. This is the sole
+// consented entry point for that full replay: same process-lock
+// discipline as compact-engagement (refuses a live companion outright —
+// a second process rewriting current.db while a live companion holds warm
+// in-memory state / a generation lock would desync them).
+const runConnectionsRebuildSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(streams.stdout, 'Usage: sidetrack-companion connections-rebuild --vault <path> [--json]');
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for connections-rebuild.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `connections-rebuild refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(
+        streams.stderr,
+        'Quit the companion (or its background service) first, then re-run this command.',
+      );
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    const { createConnectionsStore } = await import('./connections/snapshot.js');
+    const { createTimelineStore } = await import('./timeline/projection.js');
+    const { createConnectionsMaterializer } = await import('./sync/contract/connectionsMaterializer.js');
+
+    const replica = await loadOrCreateReplica(vaultPath);
+    const eventLog = createEventLog(vaultPath, replica);
+    const timelineStore = createTimelineStore(vaultPath);
+    const connectionsStore = createConnectionsStore(vaultPath, { role: 'child-writer' });
+    const materializer = createConnectionsMaterializer({
+      vaultRoot: vaultPath,
+      eventLog,
+      timelineStore,
+      store: connectionsStore,
+    });
+
+    if (!json) {
+      writeLine(streams.stdout, `connections-rebuild: starting full replay of ${vaultPath} ...`);
+    }
+    const startedAtMs = Date.now();
+    try {
+      const snapshot = await materializer.runConsentedFullRebuild();
+      const elapsedMs = Date.now() - startedAtMs;
+      if (json) {
+        writeLine(
+          streams.stdout,
+          JSON.stringify(
+            {
+              vaultPath,
+              elapsedMs,
+              nodeCount: snapshot.nodes.length,
+              edgeCount: snapshot.edges.length,
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        writeLine(
+          streams.stdout,
+          `connections-rebuild: done in ${String(elapsedMs)}ms — nodes=${String(
+            snapshot.nodes.length,
+          )} edges=${String(snapshot.edges.length)}`,
+        );
+      }
+      return 0;
+    } finally {
+      materializer.dispose();
+    }
+  } finally {
+    await lock.release();
+  }
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   // Sub-command dispatch happens BEFORE the flag-driven parser so a
   // verb like `models` doesn't get interpreted as a positional vault
@@ -1475,6 +1588,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'compact-engagement') {
     return await runCompactEngagementSubcommand(argv, streams);
+  }
+  if (argv[0] === 'connections-rebuild') {
+    return await runConnectionsRebuildSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);

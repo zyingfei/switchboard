@@ -207,6 +207,21 @@ export const classifyVaultPath = (segments: readonly string[]): LedgerFamily => 
         leaf === 'resolver-cache.db' ||
         leaf === 'timeline-facts.db' ||
         leaf === 'engagement-facts.db' ||
+        leaf === 'thread-register-facts.db' ||
+        // W2 of the F8 IVM plan (docs/plans/2026-08-16-f8-ivm-designs.md):
+        // search-query-index.db / capture-text-fts.db — see
+        // src/search-index/searchQueryIndexStore.ts and
+        // src/search-index/captureTextFtsStore.ts.
+        leaf === 'search-query-index.db' ||
+        leaf === 'capture-text-fts.db' ||
+        // W3 of the F8 IVM plan — the persisted repair queue (bail
+        // demotion target) + the durable needs-repair marker share this
+        // sidecar. See src/connections/repairQueueStore.ts.
+        leaf === 'repair-queue.db' ||
+        // W4 of the F8 IVM plan — workstream-tree ancestor-chain lookup
+        // (subtreeOf) for scoped workstream CRUD. See
+        // src/workstreams/workstreamParentStore.ts.
+        leaf === 'workstream-parent.db' ||
         leaf === 'snapshot.sqlite'
       ) {
         return 'connections-sidecar-dbs';

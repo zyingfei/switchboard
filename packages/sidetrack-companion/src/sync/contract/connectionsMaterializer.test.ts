@@ -28,6 +28,8 @@ import { createTimelineStore } from '../../timeline/projection.js';
 import { WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import {
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_INCREMENTAL_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
@@ -2751,5 +2753,201 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
     await m.catchUp(eventLog);
     await m.awaitIdle();
     expect(putActiveRevisionCalls).toBe(firstCalls);
+  });
+
+  describe('W5 Phase B — incremental topic-revision shadow wiring', () => {
+    let priorIncrementalShadow: string | undefined;
+    let priorSubgraphCap: string | undefined;
+
+    beforeEach(() => {
+      priorIncrementalShadow = process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'];
+      priorSubgraphCap = process.env['SIDETRACK_TOPIC_SUBGRAPH_CAP'];
+      // The shadow runs alongside leiden-cpm; the outer beforeEach pins
+      // the producer to idf-rkn-split for the rest of this file (leiden's
+      // own coverage lives in leidenCpmTopicRevision.test.ts), so
+      // override it back for this describe block only.
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'leiden-cpm';
+    });
+
+    afterEach(() => {
+      if (priorIncrementalShadow === undefined) {
+        delete process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'];
+      } else {
+        process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] = priorIncrementalShadow;
+      }
+      if (priorSubgraphCap === undefined) {
+        delete process.env['SIDETRACK_TOPIC_SUBGRAPH_CAP'];
+      } else {
+        process.env['SIDETRACK_TOPIC_SUBGRAPH_CAP'] = priorSubgraphCap;
+      }
+    });
+
+    const similarVisitEvent = (input: {
+      seq: number;
+      slug: string;
+      observedAt: string;
+    }): AcceptedEvent =>
+      buildEvent({
+        seq: input.seq,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: `timeline-${input.slug}`,
+          observedAt: input.observedAt,
+          url: `https://example.test/${input.slug}`,
+          canonicalUrl: `https://example.test/${input.slug}`,
+          title: `visit-${input.slug}`,
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      });
+
+    // All slugs embed to the SAME unit vector (cosine=1.0 for every
+    // pair) — comfortably above LEIDEN_CPM_COSINE_THRESHOLD (0.9), so
+    // leiden-cpm merges them into one dense community (mirrors the
+    // clique fixtures in leidenCpmTopicRevision.test.ts).
+    const identicalVectorEmbedder = (slugs: readonly string[]): VisitSimilarityEmbedder =>
+      embedFromVectors(new Map(slugs.map((slug) => [`visit-${slug}`, unit([1, 0])])));
+
+    it('with the flag on, chains a shadow revision across two drains while served topics stay leiden-cpm', async () => {
+      process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] = '1';
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = identicalVectorEmbedder(['alpha', 'bravo', 'charlie', 'delta']);
+      const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 1, slug: 'alpha', observedAt: '2026-05-07T10:00:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 2, slug: 'bravo', observedAt: '2026-05-07T10:01:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 3, slug: 'charlie', observedAt: '2026-05-07T10:02:00.000Z' }),
+      );
+
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      const revisionStore = createTopicRevisionStore(vaultRoot);
+      const servedAfterDrain1 = await revisionStore.readActiveRevision();
+      expect(servedAfterDrain1?.algorithmVersion).toBe(TOPIC_LEIDEN_CPM_REVISION_KEY);
+
+      const revA = await revisionStore.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(revA, 'drain 1 produces a shadow revision').not.toBeNull();
+      expect(revA?.algorithmVersion).toBe(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(revA?.topics).toHaveLength(1);
+      expect([...(revA?.topics[0]?.memberCanonicalUrls ?? [])].sort()).toEqual([
+        'https://example.test/alpha',
+        'https://example.test/bravo',
+        'https://example.test/charlie',
+      ]);
+      const topicIdA = revA?.topics[0]?.topicId;
+      expect(typeof topicIdA).toBe('string');
+
+      const deltaEvent = similarVisitEvent({
+        seq: 4,
+        slug: 'delta',
+        observedAt: '2026-05-07T10:03:00.000Z',
+      });
+      await eventLog.importPeerEvent(deltaEvent);
+      m.onAccepted(deltaEvent, { origin: 'peer' });
+      await m.awaitIdle();
+
+      const revB = await revisionStore.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(revB, 'drain 2 produces a shadow revision').not.toBeNull();
+      expect(revB?.revisionId).not.toBe(revA?.revisionId);
+      expect(revB?.topics).toHaveLength(1);
+      expect([...(revB?.topics[0]?.memberCanonicalUrls ?? [])].sort()).toEqual([
+        'https://example.test/alpha',
+        'https://example.test/bravo',
+        'https://example.test/charlie',
+        'https://example.test/delta',
+      ]);
+      // Chained on the previous shadow, not re-derived from scratch: the
+      // new topic's lineage 'continue's from drain 1's shadow topicId. A
+      // wiring bug that dropped the read-back (e.g. always starting fresh)
+      // would show 'birth' here instead.
+      expect(
+        revB?.lineage.some((entry) => entry.kind === 'continue' && entry.fromTopicId === topicIdA),
+      ).toBe(true);
+
+      // The shadow never promotes to the served/active revision.
+      const servedAfterDrain2 = await revisionStore.readActiveRevision();
+      expect(servedAfterDrain2?.algorithmVersion).toBe(TOPIC_LEIDEN_CPM_REVISION_KEY);
+    });
+
+    it('flag off (default): a drain never persists a shadow candidate', async () => {
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = identicalVectorEmbedder(['alpha', 'bravo', 'charlie']);
+      const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 1, slug: 'alpha', observedAt: '2026-05-07T10:00:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 2, slug: 'bravo', observedAt: '2026-05-07T10:01:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 3, slug: 'charlie', observedAt: '2026-05-07T10:02:00.000Z' }),
+      );
+
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      const revisionStore = createTopicRevisionStore(vaultRoot);
+      expect(await revisionStore.readActiveRevision()).not.toBeNull();
+      expect(
+        await revisionStore.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY),
+      ).toBeNull();
+    });
+
+    it('overflow path logs a warning and leaves the shadow slot + served topics untouched', async () => {
+      process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] = '1';
+      // A cap of 1 guarantees drain 1's 3-member bootstrap subgraph overflows.
+      process.env['SIDETRACK_TOPIC_SUBGRAPH_CAP'] = '1';
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = identicalVectorEmbedder(['alpha', 'bravo', 'charlie']);
+      const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 1, slug: 'alpha', observedAt: '2026-05-07T10:00:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 2, slug: 'bravo', observedAt: '2026-05-07T10:01:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        similarVisitEvent({ seq: 3, slug: 'charlie', observedAt: '2026-05-07T10:02:00.000Z' }),
+      );
+
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      const revisionStore = createTopicRevisionStore(vaultRoot);
+      // Served topics are unaffected by the shadow hitting its cap.
+      const served = await revisionStore.readActiveRevision();
+      expect(served?.algorithmVersion).toBe(TOPIC_LEIDEN_CPM_REVISION_KEY);
+      expect(served?.topics[0]?.memberCanonicalUrls).toHaveLength(3);
+      // Overflow ⇒ never persisted to the candidate-shadow slot.
+      expect(
+        await revisionStore.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY),
+      ).toBeNull();
+      expect(
+        warnSpy.mock.calls.some((call) =>
+          String(call[0]).includes('topicIncremental shadow OVERFLOW'),
+        ),
+      ).toBe(true);
+      warnSpy.mockRestore();
+    });
   });
 });

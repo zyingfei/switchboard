@@ -1,10 +1,11 @@
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
   ANNOTATION_CREATED,
   ANNOTATION_DELETED,
   ANNOTATION_NOTE_SET,
+  isAnnotationCreatedPayload,
 } from '../../annotations/events.js';
 import { recordSimilarityFullRebuildFallback } from '../../connections/drainDegradation.js';
 import { buildEngagementClassRevision } from '../../connections/engagementClassifier.js';
@@ -22,6 +23,7 @@ import {
   type MaterializerRankerAugmentationCounters,
   type MaterializerRankerMethodologySpineDiagnostics,
   type MaterializerRankerModelFreshness,
+  type TopicIncrementalShadowDiagnostics,
 } from '../../connections/materializerDiagnostics.js';
 import {
   SIMILARITY_FLOOR_MIN_RETAINED_FRACTION,
@@ -70,6 +72,11 @@ import {
   type TopicVisit,
 } from '../../connections/topicClusterer.js';
 import {
+  buildIncrementalTopicRevision,
+  type EligibleVisitLookup,
+  type SimilarityEdgesAccessor,
+} from '../../connections/incrementalTopicRevision.js';
+import {
   deriveUserAssertedRelations,
   knownCanonicalUrlsFor,
 } from '../../connections/userAssertedRelations.js';
@@ -103,7 +110,11 @@ import {
   type EffectiveVisitSimilarityConfig,
   type VisitSimilarityEmbedder,
 } from '../../connections/visitSimilarity.js';
-import { DISPATCH_LINKED, DISPATCH_RECORDED } from '../../dispatches/events.js';
+import {
+  DISPATCH_LINKED,
+  DISPATCH_RECORDED,
+  isDispatchRecordedPayload,
+} from '../../dispatches/events.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -163,6 +174,7 @@ import {
   DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_LEIDEN_CPM_REVISION_KEY,
+  TOPIC_INCREMENTAL_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
@@ -271,7 +283,29 @@ import {
   isThreadStatusPayload,
   isThreadUpsertedPayload,
 } from '../../threads/events.js';
-import { projectThread } from '../../threads/projection.js';
+import { projectThread, type ThreadProjection } from '../../threads/projection.js';
+import {
+  createThreadRegisterStore,
+  type ThreadRegisterStore,
+} from '../../threads/threadRegisterStore.js';
+import {
+  createWorkstreamParentStore,
+  workstreamBacIdForEvent,
+  type WorkstreamParentStore,
+} from '../../workstreams/workstreamParentStore.js';
+import {
+  createSearchQueryIndexStore,
+  type SearchQueryIndexStore,
+} from '../../search-index/searchQueryIndexStore.js';
+import {
+  createCaptureTextFtsStore,
+  type CaptureTextFtsStore,
+} from '../../search-index/captureTextFtsStore.js';
+import { matchesWholeWordQuery } from '../../search-index/searchTextMatch.js';
+import {
+  createRepairQueueStore,
+  type RepairQueueStore,
+} from '../../connections/repairQueueStore.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -307,8 +341,10 @@ import {
 import type { EventLog } from '../eventLog.js';
 import type { Materializer, MaterializerHealth } from './materializer.js';
 import {
+  edgeIdFor,
   nodeIdFor,
   type ConnectionEdge,
+  type ConnectionNode,
   type VisitSimilarityEdge,
   type VisitSimilarityRevision,
 } from '../../connections/types.js';
@@ -608,6 +644,92 @@ const engagementFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_ENGAGEMENT_FACTS_STORE'] === '1';
 const timelineFactsStoreEnabled = (): boolean =>
   process.env['SIDETRACK_TIMELINE_FACTS_STORE'] === '1';
+// F8 W1 — thread register store (kills the thread-workstream-membership
+// scoped-delta bail: see threadRegisterStore.ts's header for the root
+// cause). Off by default, matching the sibling fact stores' rollout
+// posture (byte-equivalent + verified, opt-in via env=1 pending a
+// dogfood soak).
+const threadRegisterStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_THREAD_REGISTER_STORE'] === '1';
+// F8 W4 — workstream-tree ancestor-chain store (kills the unconditional
+// full-rebuild bail on ANY workstream CRUD: see workstreamParentStore.ts's
+// header for the root cause + why this is a scope-selection store only,
+// never a served-content source). Off by default, matching W1/W2's
+// rollout posture (byte-equivalent + verified, opt-in via env=1 pending a
+// dogfood soak).
+const workstreamParentStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_WORKSTREAM_PARENT_STORE'] === '1';
+// F8 W2 — search-visit incremental join stores (kills the
+// `pending-search-visit` scoped-delta bail class and its cooldown
+// coalescing: see search-index/searchQueryIndexStore.ts +
+// captureTextFtsStore.ts headers for the root cause + AMENDMENT 1's
+// tokenizer-parity requirement). Off by default, matching W1's
+// threadRegisterStore rollout posture (byte-equivalent + verified,
+// opt-in via env=1 pending a dogfood soak). Gates BOTH stores together —
+// the scoped search-visit path needs both (same_search_query candidates
+// + thread_text_mentions_search_query) to be safe, so there is one
+// switch rather than two half-enabled states.
+const searchIndexStoreEnabled = (): boolean =>
+  process.env['SIDETRACK_SEARCH_INDEX_STORE'] === '1';
+// F8 W2 — reverse-join (new capture text → old search-visit queries)
+// candidate-query bound for the THREAD-owned side (see the call site's
+// comment for why the url-owned side stays narrower). Recency-ranked so
+// the common case (a just-added capture referencing a recent search)
+// is always covered without paying a full lifetime-history scan on
+// every drain with a new capture.
+const RECENT_SEARCH_QUERY_BOUND = 200;
+// F8 W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-designs.md,
+// "Recovery consent rule"). Catastrophic-loss recovery (cold boot with no
+// previous snapshot on a NON-empty vault, a materializer version bump, a
+// Layer-0 similarity-corruption reset) must never auto-invoke a full
+// replay on a vault of meaningful size — only a genuinely fresh/small
+// vault gets the first-run auto-build exemption. `estimateEventLogBytes`
+// sums the canonical JSONL log's on-disk size (stat only, never reads
+// content) the same directory shape threadRegisterStore.rebuildFromJsonl
+// walks. A missing/unreadable log root is treated as 0 bytes (fresh
+// vault), matching every other "no log yet" fallback in this file.
+export const estimateEventLogBytes = async (vaultRoot: string): Promise<number> => {
+  const logRoot = join(vaultRoot, '_BAC', 'log');
+  let replicaDirs: string[];
+  try {
+    replicaDirs = await readdir(logRoot);
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const replicaDir of replicaDirs) {
+    let files: string[];
+    try {
+      files = (await readdir(join(logRoot, replicaDir))).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      try {
+        const info = await stat(join(logRoot, replicaDir, file));
+        total += info.size;
+      } catch {
+        // File vanished mid-walk (concurrent seal/rotate) — skip, not fatal.
+      }
+    }
+  }
+  return total;
+};
+const RECOVERY_CONSENT_DEFAULT_THRESHOLD_BYTES = 10 * 1024 * 1024;
+// Env-tunable so tests can exercise "large vault" behavior without writing
+// 10MB of fixture log.
+export const recoveryConsentThresholdBytes = (): number => {
+  const raw = process.env['SIDETRACK_RECOVERY_CONSENT_THRESHOLD_BYTES'];
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : RECOVERY_CONSENT_DEFAULT_THRESHOLD_BYTES;
+};
+// The exact command string surfaced in the needs-repair health condition
+// (Recovery consent rule item 2) — must match src/cli.ts's
+// `connections-rebuild` subcommand literally.
+export const connectionsRebuildCommandFor = (vaultRoot: string): string =>
+  `sidetrack-companion connections-rebuild --vault ${vaultRoot}`;
 // Scoped re-visit no-op fast path (default ON; disable with =0 + restart
 // for instant rollback). When a drain window touches scopes that own
 // graph rows but carries NO graph-row-affecting event (no
@@ -653,6 +775,15 @@ const rankerFullAugmentationOnScopedDeltaEnabled = (): boolean =>
 // without an O(N) leiden pass. Instant rollback via env unset + restart.
 const incrementalTopicMembershipEnabled = (): boolean =>
   process.env['SIDETRACK_CONNECTIONS_TOPIC_INCREMENTAL_MEMBERSHIP'] === '1';
+// W5 Phase B (default OFF) — runs buildIncrementalTopicRevision as an
+// observe-only SHADOW alongside the served leiden-cpm producer on every
+// drain. Publishes ONLY to the dedicated TOPIC_INCREMENTAL_REVISION_KEY
+// candidate-shadow slot (putCandidateShadowRevision/readCandidateShadowRevision)
+// — never active/served — so churn/quality diagnostics accumulate in
+// workGraphHealth's Experiments row (topic.incremental-shadow) with zero
+// serving-path risk. Instant rollback via env unset.
+const topicIncrementalShadowEnabled = (): boolean =>
+  process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] === '1';
 // Instant boot (default ON; disable with SIDETRACK_INSTANT_BOOT=0 + restart to
 // revert to the legacy full-recompute boot). Measured on a live-vault clone
 // (744k events, a few-hundred-event delta since the persisted frontier): a normal
@@ -873,6 +1004,11 @@ export interface CreateConnectionsMaterializerDeps {
   readonly engagementClassStore?: EngagementClassRevisionStore;
   readonly engagementFactsStore?: EngagementFactsStore;
   readonly timelineFactsStore?: TimelineFactsStore;
+  readonly threadRegisterStore?: ThreadRegisterStore;
+  readonly workstreamParentStore?: WorkstreamParentStore;
+  readonly searchQueryIndexStore?: SearchQueryIndexStore;
+  readonly captureTextFtsStore?: CaptureTextFtsStore;
+  readonly repairQueueStore?: RepairQueueStore;
   readonly eventStore?: EventStore;
   readonly rankerRetrainer?: RankerRetrainer;
   readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
@@ -952,6 +1088,14 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
       return buildLeidenCpmTopicRevision;
     case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
       return buildTopicRevision;
+    case TOPIC_INCREMENTAL_REVISION_KEY:
+      // The incremental producer (W5) has richer dependencies than the
+      // uniform TopicRevisionBuilder signature and uses a bespoke call
+      // site (buildIncrementalTopicRevision — wired in phase B). It must
+      // never be reached through this registry.
+      throw new Error(
+        'incremental topic producer uses a bespoke call site (buildIncrementalTopicRevision), not the builder registry',
+      );
   }
 };
 
@@ -1072,6 +1216,17 @@ export interface ConnectionsMaterializer extends Materializer {
    * must never contend with embedding CPU (CPU regime).
    */
   readonly isDrainActive: () => boolean;
+  /**
+   * F8 W3 — Recovery consent rule. The ONLY consented entry point for a
+   * full-log rebuild outside the existing Layer-0 recovery tier. Forces
+   * exactly one `buildAndWrite` pass down the full-rebuild path (bypassing
+   * demotion and the non-empty-vault consent gates, since calling this
+   * function IS the consent) and clears the persisted repair queue +
+   * needs-repair marker on success, since a full rebuild heals every
+   * queued scope by construction. Intended caller: the `connections-rebuild`
+   * CLI subcommand (src/cli.ts) — never an automatic/scheduled path.
+   */
+  readonly runConsentedFullRebuild: () => Promise<ConnectionsSnapshot>;
   /**
    * Lifecycle — release this instance. Cancels all scheduled work the
    * factory owns (the drain debounce timer and the content-only
@@ -1487,23 +1642,32 @@ export const createConnectionsMaterializer = (
   // Chunk counter for catch-up blob pacing (see
   // chunkProjectionAccumulatorStateFor). Reset per chunked catch-up.
   let catchUpChunkCounter = 0;
-  // Search-visit rebuild coalescing. A search visit in a drain window
-  // cannot take the scoped path (cross-visit search edges need the full
-  // corpus), so every drain whose window contains one fell to the full
-  // rebuild — during active search-heavy browsing that meant a
-  // multi-minute full pass PER DRAIN (observed live 2026-08-16: real
-  // captures starved to 26-30s behind back-to-back rebuilds). The full
-  // rebuild now runs at most once per cooldown; in between, search-visit
-  // drains advance progress only (prior snapshot served, same mechanics
-  // as the catch-up deferral). `searchVisitRowsDeferred` is sticky so
-  // that once the cooldown expires the NEXT drain — search or not —
-  // performs the healing rebuild rather than waiting for another search.
-  let lastFullBaseRebuildAtMs = 0;
-  let searchVisitRowsDeferred = false;
-  const searchRebuildCoalesceMs = (): number => {
-    const raw = process.env['SIDETRACK_SEARCH_REBUILD_COALESCE_MS'];
+  // F8 W3 — the hot-rebuild suppressor (#364) that used to live here
+  // (lastFullBaseRebuildAtMs / searchVisitRowsDeferred /
+  // searchRebuildCoalesceMs, a once-per-cooldown healing full rebuild) is
+  // SUPERSEDED by demotion: see docs/plans/2026-08-16-f8-ivm-designs.md
+  // "W3". Every non-recovery-tier bail now demotes unconditionally
+  // (progress-only write + repair-queue enqueue, no cooldown, no sticky
+  // healing rebuild) instead of coalescing full rebuilds on a timer — a
+  // full rebuild off an operational drain path no longer exists at all
+  // for these classes, healing runs through the repair-queue drain at the
+  // top of buildAndWrite instead (see repairQueueStore below).
+  //
+  // `forceFullRebuildConsented` is the ONE remaining way a drain takes a
+  // full-log rebuild outside the existing recovery tier
+  // (similarityRecoveryNeedsBaseRebuild / forceFullRebuildForThreadReconcile):
+  // the user-consented `connections-rebuild` CLI (Recovery consent rule)
+  // sets it via `runConsentedFullRebuild` before calling buildAndWrite once,
+  // and it is never set by any automatic/scheduled path.
+  let forceFullRebuildConsented = false;
+  // F8 W3 — persistent repair queue (see repairQueueStore.ts). Batch size
+  // for the drain-start takeBatch; env-tunable for tests/ops, never
+  // disabled outright (an unbounded batch would reintroduce an
+  // unbounded-cost drain).
+  const repairBatchSize = (): number => {
+    const raw = process.env['SIDETRACK_REPAIR_BATCH'];
     const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 600_000;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 16;
   };
   // Persistent engagement fact store (lazy-opened; survives restart).
   // Sourced via deps for tests; defaults to the SQLite-backed store.
@@ -1517,6 +1681,43 @@ export const createConnectionsMaterializer = (
   let timelineFactStore: TimelineFactsStore | null = null;
   let timelineFactStoreInit: Promise<TimelineFactsStore> | null = null;
   let timelineFactStoreUnavailable = false;
+  // F8 W1 — persistent thread register store (lazy-opened; survives
+  // restart). Bucketed by bac_id so the materializer can read a
+  // thread's COMPLETE relevant-event history without a full-log scan;
+  // see threadRegisterStore.ts's header for why this kills the
+  // scoped-delta membership bail.
+  let threadRegisterStore: ThreadRegisterStore | null = null;
+  let threadRegisterStoreInit: Promise<ThreadRegisterStore> | null = null;
+  let threadRegisterStoreUnavailable = false;
+  // F8 W4 — persistent workstream-parent (ancestor-chain) store
+  // (lazy-opened; survives restart). See workstreamParentStore.ts's
+  // header for why this is a scope-selection store only, not a served-
+  // content source, and connectionsMaterializer.ts's isScopedTimelineDeltaEvent
+  // for how its readiness lets a workstreamTree invalidation ride the
+  // scoped path instead of the SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS
+  // bail.
+  let workstreamParentStore: WorkstreamParentStore | null = null;
+  let workstreamParentStoreInit: Promise<WorkstreamParentStore> | null = null;
+  let workstreamParentStoreUnavailable = false;
+  // F8 W2 — search-visit incremental join stores (lazy-opened; survive
+  // restart). searchQueryIndexStore persists (queryKey, visitKey) pairs
+  // for the same_search_query→closest_visit join; captureTextFtsStore
+  // persists an FTS5 index over capture/dispatch/annotation text for the
+  // thread_text_mentions_search_query join. See their headers for why
+  // this kills the `pending-search-visit` scoped-delta bail class.
+  let searchQueryIndexStore: SearchQueryIndexStore | null = null;
+  let searchQueryIndexStoreInit: Promise<SearchQueryIndexStore> | null = null;
+  let searchQueryIndexStoreUnavailable = false;
+  let captureTextFtsStore: CaptureTextFtsStore | null = null;
+  let captureTextFtsStoreInit: Promise<CaptureTextFtsStore> | null = null;
+  let captureTextFtsStoreUnavailable = false;
+  // F8 W3 — persistent repair queue (lazy-opened; survives restart).
+  // ALWAYS on (no feature flag, unlike W1/W2's opt-in stores): demotion
+  // is the only remaining path for a non-recovery-tier bail, so this
+  // store must always be reachable. See repairQueueStore.ts's header.
+  let repairQueueStore: RepairQueueStore | null = null;
+  let repairQueueStoreInit: Promise<RepairQueueStore> | null = null;
+  let repairQueueStoreUnavailable = false;
   let eventStore: EventStore | null = null;
   let eventStoreInit: Promise<EventStore> | null = null;
   let eventStoreUnavailable = false;
@@ -1555,6 +1756,86 @@ export const createConnectionsMaterializer = (
       return null;
     }
   };
+  const ensureThreadRegisterStore = async (): Promise<ThreadRegisterStore | null> => {
+    if (threadRegisterStore !== null) return threadRegisterStore;
+    if (threadRegisterStoreUnavailable) return null;
+    try {
+      threadRegisterStoreInit ??=
+        deps.threadRegisterStore !== undefined
+          ? Promise.resolve(deps.threadRegisterStore)
+          : createThreadRegisterStore(deps.vaultRoot);
+      threadRegisterStore = await threadRegisterStoreInit;
+      return threadRegisterStore;
+    } catch {
+      threadRegisterStoreUnavailable = true;
+      threadRegisterStoreInit = null;
+      return null;
+    }
+  };
+  const ensureWorkstreamParentStore = async (): Promise<WorkstreamParentStore | null> => {
+    if (workstreamParentStore !== null) return workstreamParentStore;
+    if (workstreamParentStoreUnavailable) return null;
+    try {
+      workstreamParentStoreInit ??=
+        deps.workstreamParentStore !== undefined
+          ? Promise.resolve(deps.workstreamParentStore)
+          : createWorkstreamParentStore(deps.vaultRoot);
+      workstreamParentStore = await workstreamParentStoreInit;
+      return workstreamParentStore;
+    } catch {
+      workstreamParentStoreUnavailable = true;
+      workstreamParentStoreInit = null;
+      return null;
+    }
+  };
+  const ensureSearchQueryIndexStore = async (): Promise<SearchQueryIndexStore | null> => {
+    if (searchQueryIndexStore !== null) return searchQueryIndexStore;
+    if (searchQueryIndexStoreUnavailable) return null;
+    try {
+      searchQueryIndexStoreInit ??=
+        deps.searchQueryIndexStore !== undefined
+          ? Promise.resolve(deps.searchQueryIndexStore)
+          : createSearchQueryIndexStore(deps.vaultRoot);
+      searchQueryIndexStore = await searchQueryIndexStoreInit;
+      return searchQueryIndexStore;
+    } catch {
+      searchQueryIndexStoreUnavailable = true;
+      searchQueryIndexStoreInit = null;
+      return null;
+    }
+  };
+  const ensureCaptureTextFtsStore = async (): Promise<CaptureTextFtsStore | null> => {
+    if (captureTextFtsStore !== null) return captureTextFtsStore;
+    if (captureTextFtsStoreUnavailable) return null;
+    try {
+      captureTextFtsStoreInit ??=
+        deps.captureTextFtsStore !== undefined
+          ? Promise.resolve(deps.captureTextFtsStore)
+          : createCaptureTextFtsStore(deps.vaultRoot);
+      captureTextFtsStore = await captureTextFtsStoreInit;
+      return captureTextFtsStore;
+    } catch {
+      captureTextFtsStoreUnavailable = true;
+      captureTextFtsStoreInit = null;
+      return null;
+    }
+  };
+  const ensureRepairQueueStore = async (): Promise<RepairQueueStore | null> => {
+    if (repairQueueStore !== null) return repairQueueStore;
+    if (repairQueueStoreUnavailable) return null;
+    try {
+      repairQueueStoreInit ??=
+        deps.repairQueueStore !== undefined
+          ? Promise.resolve(deps.repairQueueStore)
+          : createRepairQueueStore(deps.vaultRoot);
+      repairQueueStore = await repairQueueStoreInit;
+      return repairQueueStore;
+    } catch {
+      repairQueueStoreUnavailable = true;
+      repairQueueStoreInit = null;
+      return null;
+    }
+  };
   const ensureEventStore = async (): Promise<EventStore | null> => {
     if (eventStore !== null) return eventStore;
     if (eventStoreUnavailable) return null;
@@ -1583,6 +1864,19 @@ export const createConnectionsMaterializer = (
   // revision flip (re-embedding, model upgrade) drives a removeEdge
   // diff against the new revision's edges.
   let lastAcceptedSimilarityRevisionId: string | undefined;
+  // W5 Phase B — the similarity edge set (keyed by unordered pair) that
+  // fed the incremental topic-revision SHADOW's most recent SUCCESSFUL
+  // pass. Diffing against this on the next drain gives addedEdges/
+  // removedEdges "since the shadow's own previous revision was built"
+  // (the input contract buildIncrementalTopicRevision expects) without a
+  // fresh O(corpus) rescan — just a Map built once from the already-
+  // materialized `visitSimilarity.edges` this drain. `null` until the
+  // shadow's first successful pass (bootstrap: treated as an empty diff
+  // so the very first activation doesn't see every corpus edge as
+  // "added" and blow the subgraph cap). Left UNCHANGED on an overflow
+  // drain so the next drain's diff still accumulates against the last
+  // successfully-processed state, not a half-applied one.
+  let lastIncrementalShadowEdgePairs: ReadonlyMap<string, VisitSimilarityEdge> | null = null;
   let lastTopicRunAtMs = 0;
   let topicDrainsSinceLastRun = 0;
   let lastTopicRunSimilarityRevisionId: string | undefined;
@@ -2199,6 +2493,43 @@ export const createConnectionsMaterializer = (
     return sortAcceptedEvents(collected);
   };
 
+  // F8 W4 — the raw WORKSTREAM_UPSERTED/DELETED history for every id in
+  // this drain's workstreamTreeAffectedIds set, so buildConnectionsSnapshot's
+  // OWN Pass 1 (workstreamEventsByBacId → projectWorkstream) resolves the
+  // SAME node fields (title/observedAt/originReplicaIds/registerMetadata) a
+  // full rebuild would for those ids — the workstream-parent store itself
+  // only tracks a resolved parent_id for subtree walking (see
+  // workstreamParentStore.ts's header), it does not retain raw events.
+  // Mirrors readRequalifyEngagementSource's typed-store-first idiom: an
+  // events_type_idx read (O(matching rows)) when the typed store is on,
+  // else a full deps.eventLog.readMerged() filtered in memory — paid only
+  // on the rare drain that actually touches the workstream tree, which is
+  // still far cheaper than the full-graph rebuild this wave replaces.
+  const readWorkstreamHistoryForAffectedIds = async (
+    typedEventSource: EventStore | null,
+    affectedIds: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (affectedIds.size === 0) return [];
+    const matchesAffectedId = (event: AcceptedEvent): boolean => {
+      const bacId = workstreamBacIdForEvent(event);
+      return bacId !== undefined && affectedIds.has(bacId);
+    };
+    if (typedEventSource === null) {
+      return (await deps.eventLog.readMerged()).filter(matchesAffectedId);
+    }
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      [WORKSTREAM_UPSERTED, WORKSTREAM_DELETED],
+      (chunk) => {
+        for (const event of chunk) {
+          if (matchesAffectedId(event)) collected.push(event);
+        }
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
+  };
+
   // Re-derive the timeline entries for engagement-requalified visits from
   // the FULL event log WITH full engagement (mirrors the topicFullTimeline
   // precedent). Only the requalified visits' entries are returned, and
@@ -2361,10 +2692,29 @@ export const createConnectionsMaterializer = (
   const SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS: ReadonlySet<InvalidationKey['kind']> =
     new Set(['workstreamTree']);
 
+  // F8 W4 — a workstreamTree invalidation is scopable (rides the scoped
+  // path via workstreamTreeAffectedIds, instead of forcing the
+  // SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS bail below) exactly
+  // when BOTH: (a) the workstream-parent store is enabled and open (it
+  // is what computes the affected ancestor-chain scope set), and (b) the
+  // triggering event actually names a bac_id — the malformed/legacy
+  // fallback in invalidation.ts (`if (bacId === undefined) return
+  // [{kind:'workstreamTree'}]`) gives no id to scope by, so THAT case
+  // must still demote (rides W3), never silently "no-op".
+  const workstreamTreeScopableFor = (event: AcceptedEvent): boolean =>
+    workstreamParentStoreEnabled() &&
+    workstreamParentStore !== null &&
+    workstreamBacIdForEvent(event) !== undefined;
+
   const isScopedTimelineDeltaEvent = (event: AcceptedEvent): boolean => {
     const invalidationKeys = invalidationsForEvent(event);
+    const workstreamTreeScopable = workstreamTreeScopableFor(event);
     if (
-      invalidationKeys.some((key) => SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS.has(key.kind))
+      invalidationKeys.some(
+        (key) =>
+          SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS.has(key.kind) &&
+          !(key.kind === 'workstreamTree' && workstreamTreeScopable),
+      )
     ) {
       return false;
     }
@@ -2595,6 +2945,86 @@ export const createConnectionsMaterializer = (
       if (!right.has(item)) return false;
     }
     return true;
+  };
+
+  // F8 W1 — the same workstream-membership extraction snapshot.ts's Pass 1
+  // performs (buildConnectionsSnapshot's membershipCandidates loop), but
+  // read off a ThreadRegisterStore projection instead of a built snapshot's
+  // edges. Used to compare the AUTHORITATIVE (complete-history) register
+  // resolution against the previous served snapshot BEFORE a scoped build
+  // even runs, so the drain gate below can decide row-locally without the
+  // window-blind chicken/egg of building a snapshot first.
+  const threadWorkstreamIdsFromRegister = (projection: ThreadProjection): ReadonlySet<string> => {
+    if (projection.deleted) return new Set();
+    if (projection.record.status === 'resolved') {
+      const id = projection.record.value?.primaryWorkstreamId;
+      return id === undefined || id.length === 0 ? new Set() : new Set([id]);
+    }
+    return new Set(
+      projection.record.candidates
+        .map((candidate) => candidate.value.primaryWorkstreamId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0),
+    );
+  };
+
+  // Extracts the bac_id a thread-register-relevant event targets, mirroring
+  // threadRegisterStore.ts's own classification (kept in sync manually since
+  // the store's classifier is private — both read the same exported type
+  // guards from threads/events.js).
+  const threadBacIdForRegisterEvent = (evt: AcceptedEvent): string | undefined => {
+    if (evt.type === THREAD_UPSERTED && isThreadUpsertedPayload(evt.payload)) {
+      return evt.payload.bac_id;
+    }
+    if (
+      (evt.type === THREAD_ARCHIVED ||
+        evt.type === THREAD_UNARCHIVED ||
+        evt.type === THREAD_DELETED) &&
+      isThreadStatusPayload(evt.payload)
+    ) {
+      return evt.payload.bac_id;
+    }
+    return undefined;
+  };
+
+  // F8 W4 — the raw THREAD_UPSERTED/ARCHIVED/UNARCHIVED/DELETED history for
+  // a set of thread ids that REFERENCE an affected workstream (via
+  // primaryWorkstreamId) but are not otherwise touched this drain. Needed
+  // because snapshot.ts Pass 1's thread loop has a side effect on the
+  // TARGET workstream node: the membership-candidate upsertNode call
+  // stamps the workstream node with `observedAt: <the thread event's own
+  // timestamp>` (see the loop around `membershipCandidates` below) — a
+  // full rebuild picks that up for every thread that has EVER referenced
+  // the workstream, so a scoped build that only supplies the affected
+  // workstream ids' OWN event history under-counts firstSeenAt/
+  // originReplicaIds for a workstream a referencing thread's event
+  // predates. (Pass 2's vault-derived fallback node for the same
+  // relationship carries no `observedAt`, so it never causes this — see
+  // its own upsertNode call — this is purely a Pass 1 event-timestamp
+  // side effect.) Same typed-store-first / full-log-fallback idiom as
+  // readWorkstreamHistoryForAffectedIds.
+  const readThreadHistoryForIds = async (
+    typedEventSource: EventStore | null,
+    threadIds: ReadonlySet<string>,
+  ): Promise<readonly AcceptedEvent[]> => {
+    if (threadIds.size === 0) return [];
+    const matchesThreadId = (event: AcceptedEvent): boolean => {
+      const bacId = threadBacIdForRegisterEvent(event);
+      return bacId !== undefined && threadIds.has(bacId);
+    };
+    if (typedEventSource === null) {
+      return (await deps.eventLog.readMerged()).filter(matchesThreadId);
+    }
+    const collected: AcceptedEvent[] = [];
+    await typedEventSource.forEachChunkOfTypes(
+      [THREAD_UPSERTED, THREAD_ARCHIVED, THREAD_UNARCHIVED, THREAD_DELETED],
+      (chunk) => {
+        for (const event of chunk) {
+          if (matchesThreadId(event)) collected.push(event);
+        }
+      },
+      2000,
+    );
+    return sortAcceptedEvents(collected);
   };
 
   const threadDeltaFullBuildReason = (input: {
@@ -3594,6 +4024,122 @@ export const createConnectionsMaterializer = (
       engagementInputs = buildEngagementClassifierInputs(merged, rawTimelineDays);
       mark(`engagementClassifier (legacy) inputs=${String(engagementInputs.length)}`);
     }
+    // F8 W1 — catch the thread register store up BEFORE the scoped-delta
+    // gate below reads it. Same lifecycle discipline as the sibling fact
+    // stores above: catch up from the full merged set filtered by the
+    // store's OWN watermark (not the drain's pendingEventsForDrain window
+    // — a cold store must backfill its complete per-thread history once,
+    // the same way timelineFactStore/engagementFactStore do, or its
+    // "authoritative" read would just be a different kind of incomplete).
+    // Ingest itself is cheap: only the four thread event types are
+    // bucketed, everything else is a fast type-check no-op that still
+    // advances the watermark.
+    const threadRegisterFactStore = threadRegisterStoreEnabled()
+      ? await ensureThreadRegisterStore()
+      : null;
+    if (threadRegisterFactStore !== null) {
+      await threadRegisterFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(threadRegisterFactStore.watermark()),
+      );
+      mark('threadRegisterFactStore.catchUp');
+    }
+    // F8 W4 — catch the workstream-parent store up BEFORE computing
+    // dirtyScopes, mirroring threadRegisterFactStore above. Captures the
+    // PRE-drain ancestor chain (via subtreeOf) for every workstream this
+    // drain's pending events CRUD, ingests those events, then captures the
+    // POST-drain chain — the union (self + old ancestors + new ancestors)
+    // is the affected-subtree scope set that lets a workstreamTree
+    // invalidation ride the scoped path below instead of the
+    // SCOPED_DELTA_FULL_REBUILD_INVALIDATION_KINDS bail. See
+    // workstreamParentStore.ts's header for why ancestor-chain (not
+    // descendant) is the right walk direction, and
+    // readWorkstreamHistoryForAffectedIds for why the raw event history
+    // for these ids is ALSO sourced here (Pass 1 node-field parity with a
+    // full rebuild — the store itself only tracks resolved parent_id).
+    const workstreamParentFactStore = workstreamParentStoreEnabled()
+      ? await ensureWorkstreamParentStore()
+      : null;
+    const workstreamTreeAffectedIds = new Set<string>();
+    let workstreamHistoryEventsForBuild: readonly AcceptedEvent[] = [];
+    if (workstreamParentFactStore !== null) {
+      const crudIds = new Set<string>();
+      for (const event of pendingEventsForDrain) {
+        const bacId = workstreamBacIdForEvent(event);
+        if (bacId !== undefined) crudIds.add(bacId);
+      }
+      if (crudIds.size > 0) {
+        const beforeChains = new Map<string, readonly string[]>();
+        for (const bacId of crudIds) {
+          beforeChains.set(bacId, workstreamParentFactStore.subtreeOf(bacId));
+        }
+        await workstreamParentFactStore.catchUp(
+          storeBackedEvents === null || forcedPendingEventWindow !== null
+            ? merged
+            : storeBackedEvents.readSince(workstreamParentFactStore.watermark()),
+        );
+        for (const bacId of crudIds) {
+          for (const id of beforeChains.get(bacId) ?? []) workstreamTreeAffectedIds.add(id);
+          for (const id of workstreamParentFactStore.subtreeOf(bacId)) {
+            workstreamTreeAffectedIds.add(id);
+          }
+        }
+        workstreamHistoryEventsForBuild = await readWorkstreamHistoryForAffectedIds(
+          storeBackedEvents,
+          workstreamTreeAffectedIds,
+        );
+        mark(
+          `workstreamParentFactStore.affectedSubtree crud=${String(crudIds.size)} scopes=${String(workstreamTreeAffectedIds.size)} historyEvents=${String(workstreamHistoryEventsForBuild.length)}`,
+        );
+      } else {
+        await workstreamParentFactStore.catchUp(
+          storeBackedEvents === null || forcedPendingEventWindow !== null
+            ? merged
+            : storeBackedEvents.readSince(workstreamParentFactStore.watermark()),
+        );
+      }
+    }
+    const workstreamTreeAffectedScopes: Scope[] = [...workstreamTreeAffectedIds].map((id) => ({
+      kind: 'workstream' as const,
+      id,
+    }));
+    // F8 W2 — catch the search-index stores up BEFORE the scoped-delta
+    // gate below reads them. Same lifecycle discipline as
+    // threadRegisterFactStore above (and the sibling fact stores): catch
+    // up from the full merged set filtered by each store's OWN watermark.
+    // Both stores are gated by the SAME flag: the scoped search-visit
+    // path below only relaxes the `pending-search-visit` bail when BOTH
+    // are ready (search-visit-window equivalence needs both joins).
+    const searchQueryIndexFactStore = searchIndexStoreEnabled()
+      ? await ensureSearchQueryIndexStore()
+      : null;
+    if (searchQueryIndexFactStore !== null) {
+      await searchQueryIndexFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(searchQueryIndexFactStore.watermark()),
+      );
+      mark('searchQueryIndexFactStore.catchUp');
+    }
+    const captureTextFtsFactStore = searchIndexStoreEnabled()
+      ? await ensureCaptureTextFtsStore()
+      : null;
+    if (captureTextFtsFactStore !== null) {
+      await captureTextFtsFactStore.catchUp(
+        storeBackedEvents === null || forcedPendingEventWindow !== null
+          ? merged
+          : storeBackedEvents.readSince(captureTextFtsFactStore.watermark()),
+      );
+      mark('captureTextFtsFactStore.catchUp');
+    }
+    // Both search-index stores must be ready (opened + caught up) for the
+    // scoped search-visit path below to be safe — a search visit whose
+    // join stores are unavailable this drain (cold open, sqlite failure)
+    // falls back to the existing full-rebuild bail rather than silently
+    // minting a partial (missing-edges) scoped result.
+    const searchIndexStoresReady =
+      searchQueryIndexFactStore !== null && captureTextFtsFactStore !== null;
     // Stage 5.2 W6 per-pass skip — when no engagement-touching keys
     // arrived since last drain AND a cached revision exists, reuse it
     // (skips the classifier + putRevision; inputs are still needed for
@@ -3618,8 +4164,69 @@ export const createConnectionsMaterializer = (
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
     mark('enrichTimelineDays');
     await yieldToEventLoop();
-    const dirtyScopes = invalidationKeysToScopes(buildKeys);
+    // F8 W3 — repair-queue drain. Always attempted (no feature flag); a
+    // failure to open just means no scopes get pulled this drain (the
+    // queue keeps them for the next one — never lost). Only drains
+    // outside chunk mode: a catch-up chunk's own deferral mechanics
+    // (catchUpDeferredThreadReconcile) already handle its bail class, and
+    // pulling repair work into a chunk would fight the chunk's own
+    // bounded-cost contract.
+    const repairQueueFactStore = await ensureRepairQueueStore();
+    const repairScopesForDrain: Scope[] = [];
+    if (repairQueueFactStore !== null && !requireScopedTimelineDeltaForDrain) {
+      const drained = repairQueueFactStore.takeBatch(repairBatchSize());
+      for (const entry of drained) repairScopesForDrain.push(entry.scope);
+      if (drained.length > 0) {
+        mark(
+          `repairQueue.drain n=${String(drained.length)} reasons=${[
+            ...new Set(drained.map((entry) => entry.reason)),
+          ]
+            .slice(0, 5)
+            .join(',')}`,
+        );
+      }
+    }
+    // Union repaired scopes into THIS drain's dirty set so they ride the
+    // ordinary scoped recompute + replaceScopeRows path below — recomputing
+    // a repaired scope against the CURRENT base snapshot is what actually
+    // heals it (or, if the underlying cause is still unresolved, re-demotes
+    // it with a fresh timestamp; see repairQueueStore.ts's header).
+    // F8 W4 — workstreamTreeAffectedScopes (the ancestor-chain scope set
+    // computed above) is unioned in the same way: it rides the ordinary
+    // scoped recompute path below instead of the full-rebuild bail.
+    const extraDirtyScopes: readonly Scope[] = [
+      ...repairScopesForDrain,
+      ...workstreamTreeAffectedScopes,
+    ];
+    const dirtyScopes =
+      extraDirtyScopes.length === 0
+        ? invalidationKeysToScopes(buildKeys)
+        : dedupeScopeList([...invalidationKeysToScopes(buildKeys), ...extraDirtyScopes]);
     const previousSnapshotForRanker = await deps.store.readCurrent();
+    // F8 W3 — Recovery consent rule. Lazy + memoized per drain: the fs
+    // walk only pays its cost on the rare drains that actually reach a
+    // catastrophic-recovery decision point (cold boot with no previous
+    // snapshot, a materializer version bump) — never the ordinary warm
+    // scoped-delta path. `forceFullRebuildConsented` (the CLI) always
+    // short-circuits to "consented" without touching disk.
+    let vaultLogBytesMemo: number | undefined;
+    const vaultIsLargeForConsent = async (): Promise<boolean> => {
+      if (forceFullRebuildConsented) return false;
+      if (vaultLogBytesMemo === undefined) {
+        vaultLogBytesMemo = await estimateEventLogBytes(deps.vaultRoot);
+      }
+      return vaultLogBytesMemo > recoveryConsentThresholdBytes();
+    };
+    const markNeedsRepairIfLarge = async (reason: string): Promise<boolean> => {
+      const large = await vaultIsLargeForConsent();
+      if (large && repairQueueFactStore !== null) {
+        repairQueueFactStore.markNeedsRepair(reason, connectionsRebuildCommandFor(deps.vaultRoot));
+        mark(
+          `recoveryConsent.needsRepair reason=${reason} cmd=${connectionsRebuildCommandFor(deps.vaultRoot)}`,
+        );
+      }
+      return large;
+    };
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
     // corpus/focus). If the same set of visits has already been
@@ -3886,6 +4493,14 @@ export const createConnectionsMaterializer = (
       existingProgress.materializerVersion !== MATERIALIZER_VERSION
     ) {
       similarityFloorResetReasons.push('materializer-version-bump');
+      // F8 W3 — Recovery consent rule: a version bump on a large vault
+      // must not silently trigger a hundreds-of-MB rewrite. The demotion
+      // machinery already prevents the auto-rebuild structurally (no
+      // scoped-delta gate passes under a version mismatch, so every bail
+      // demotes rather than falling into the full-rebuild fallback); this
+      // additionally surfaces the specific, actionable condition via the
+      // needs-repair health row instead of a generic per-scope reason.
+      await markNeedsRepairIfLarge('materializer-version-bump');
     }
     if (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) {
       similarityFloorResetReasons.push('store-corruption-recovery');
@@ -4301,7 +4916,12 @@ export const createConnectionsMaterializer = (
       deps.store.replaceScopeRows !== undefined &&
       pendingEventsForDrain.length > 0 &&
       pendingEventsForDrain.every(isScopedTimelineDeltaEvent) &&
-      !pendingHasSearchVisit &&
+      // F8 W2 — a search-visit window can still take the bounded page-
+      // evidence read when the search-index stores are ready: this flag
+      // only governs page-evidence LOADING STRATEGY (bounded vs full-
+      // corpus), not whether the scoped path itself applies (that gate
+      // is separate, below).
+      (!pendingHasSearchVisit || searchIndexStoresReady) &&
       !hnswFullRebuild &&
       // Force the base path when a corpus recovery is likely so the reused/
       // bootstrapped revision actually reaches the served snapshot.
@@ -5528,6 +6148,7 @@ export const createConnectionsMaterializer = (
     let servedTopicRevision = topicRevision;
     let topicShadowDiagnostics: TopicShadowDiagnostics | null = null;
     let topicShadowObservation: TopicShadowObservationDiagnostics | null = null;
+    let topicIncrementalShadowDiagnostics: TopicIncrementalShadowDiagnostics | null = null;
     const servedProducer: ServedTopicProducer = resolveServedTopicProducer();
     const topicCadenceSkipped = !shouldRunTopicRevision && previousTopicRevision !== null;
     if (servedProducer === 'leiden-cpm' && !topicCadenceSkipped) {
@@ -5665,6 +6286,239 @@ export const createConnectionsMaterializer = (
         mark('topicShadowCandidate->active (flip)');
       }
     }
+    // W5 Phase B — incremental topic-revision SHADOW (observe-only,
+    // default OFF via SIDETRACK_TOPIC_INCREMENTAL_SHADOW). Runs
+    // buildIncrementalTopicRevision alongside the served leiden-cpm
+    // producer on every drain; publishes ONLY to the dedicated
+    // TOPIC_INCREMENTAL_REVISION_KEY candidate-shadow slot — never
+    // active/served — so churn/quality diagnostics accumulate in
+    // workGraphHealth's Experiments row (topic.incremental-shadow) with
+    // zero serving-path risk. Lineage chains across drains by reading
+    // its OWN prior candidate-shadow revision back each drain; the very
+    // first activation (no prior shadow yet) seeds off whichever
+    // leiden-cpm candidate is currently on disk (built above this drain,
+    // or carried from an earlier one).
+    {
+      const shadowStartedAtMs = Date.now();
+      if (!topicIncrementalShadowEnabled()) {
+        topicIncrementalShadowDiagnostics = {
+          enabled: false,
+          ranThisDrain: false,
+          promotedCount: 0,
+          overflow: false,
+          overflowSubgraphSize: null,
+          overflowCap: null,
+          runtimeMs: 0,
+        };
+      } else {
+        try {
+          const previousIncrementalShadow = await topicRevisionStore.readCandidateShadowRevision(
+            TOPIC_INCREMENTAL_REVISION_KEY,
+          );
+          const leidenBaseForShadow =
+            previousIncrementalShadow ??
+            (await topicRevisionStore.readCandidateShadowRevision(TOPIC_LEIDEN_CPM_REVISION_KEY));
+          if (leidenBaseForShadow === null) {
+            // Nothing to refine off yet (servedProducer isn't leiden-cpm
+            // this drain, or leiden hasn't built its first candidate).
+            topicIncrementalShadowDiagnostics = {
+              enabled: true,
+              ranThisDrain: false,
+              promotedCount: 0,
+              overflow: false,
+              overflowSubgraphSize: null,
+              overflowCap: null,
+              runtimeMs: Date.now() - shadowStartedAtMs,
+            };
+            mark('topicIncremental.shadow dt=0 topics=0 promoted=0 overflow=0 (no-leiden-base)');
+          } else {
+            // Skip-gate mirroring the leiden/idf-rkn candidates above:
+            // the revisionId is a pure fn of (visitSimilarityRevisionId,
+            // threshold, algorithm), so an unchanged corpus since the
+            // shadow's last pass means an identical id — skip the rebuild
+            // entirely rather than re-derive and re-persist the same
+            // content.
+            const expectedIncrementalShadowId = await createTopicRevisionId({
+              visitSimilarityRevisionId: visitSimilarity.revisionId,
+              cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+              algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+            });
+            if (
+              previousIncrementalShadow !== null &&
+              previousIncrementalShadow.revisionId === expectedIncrementalShadowId
+            ) {
+              topicIncrementalShadowDiagnostics = {
+                enabled: true,
+                ranThisDrain: false,
+                promotedCount: 0,
+                overflow: false,
+                overflowSubgraphSize: null,
+                overflowCap: null,
+                runtimeMs: Date.now() - shadowStartedAtMs,
+              };
+              mark(
+                `topicIncremental.shadow dt=${String(Date.now() - shadowStartedAtMs)} topics=${String(previousIncrementalShadow.topics.length)} promoted=0 overflow=0 (cacheHit)`,
+              );
+            } else {
+              const shadowDirtyVisitKeys = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+              // Eligibility lookup over the FULL corpus. A per-drain
+              // window slice (topicVisitsForBuild) would wrongly report
+              // "ineligible" for any untouched previous member (it simply
+              // isn't in that slice), silently shrinking/killing its
+              // topic in the shadow — so this is built from
+              // fullBuildTimelineDays (already materialized this drain
+              // for Pass 1 of the main snapshot build), not
+              // topicVisitsForBuild. One flatMap + Map-insert pass over
+              // already-in-memory data, not a fresh disk read.
+              const shadowVisitByCanonical = new Map<string, TopicVisit>();
+              for (const day of fullBuildTimelineDays) {
+                for (const entry of day.entries) {
+                  const visit = topicVisitFromEntry(entry);
+                  if (visit.canonicalUrl.length === 0) continue;
+                  const existing = shadowVisitByCanonical.get(visit.canonicalUrl);
+                  if (existing === undefined || visit.focusedWindowMs > existing.focusedWindowMs) {
+                    shadowVisitByCanonical.set(visit.canonicalUrl, visit);
+                  }
+                }
+              }
+              const getEligibleVisitForShadow: EligibleVisitLookup = (canonicalUrl) => {
+                const visit = shadowVisitByCanonical.get(canonicalUrl);
+                return visit !== undefined && visit.focusedWindowMs > 0 ? visit : null;
+              };
+              // Adjacency index built ONCE per drain (O(edges), reusing
+              // the already-materialized visitSimilarity.edges) — an
+              // index, not a filter() over the full edge array per
+              // accessor call.
+              const shadowEdgesByVisit = new Map<string, VisitSimilarityEdge[]>();
+              const addShadowEdge = (key: string, edge: VisitSimilarityEdge): void => {
+                const list = shadowEdgesByVisit.get(key);
+                if (list === undefined) shadowEdgesByVisit.set(key, [edge]);
+                else list.push(edge);
+              };
+              for (const edge of visitSimilarity.edges) {
+                addShadowEdge(edge.fromVisitKey, edge);
+                addShadowEdge(edge.toVisitKey, edge);
+              }
+              const edgesForVisitShadow: SimilarityEdgesAccessor = (canonicalUrl) =>
+                shadowEdgesByVisit.get(canonicalUrl) ?? [];
+              // addedEdges/removedEdges "since the shadow's own previous
+              // revision was built" — diffed against the small in-memory
+              // pair map this same block maintained on its last
+              // SUCCESSFUL pass (lastIncrementalShadowEdgePairs), never a
+              // fresh O(corpus) rescan and never another subsystem's
+              // unrelated diff (e.g. the topicAccumulator revision-flip
+              // diff above tracks "since the last drain", a different —
+              // and for a shadow that can skip drains via the cache-hit
+              // gate above, potentially misaligned — notion).
+              const shadowEdgePairKey = (edge: VisitSimilarityEdge): string =>
+                edge.fromVisitKey < edge.toVisitKey
+                  ? `${edge.fromVisitKey} ${edge.toVisitKey}`
+                  : `${edge.toVisitKey} ${edge.fromVisitKey}`;
+              const shadowEdgePairs = new Map<string, VisitSimilarityEdge>();
+              for (const edge of visitSimilarity.edges) {
+                shadowEdgePairs.set(shadowEdgePairKey(edge), edge);
+              }
+              const shadowAddedEdges: VisitSimilarityEdge[] = [];
+              const shadowRemovedEdges: VisitSimilarityEdge[] = [];
+              if (lastIncrementalShadowEdgePairs !== null) {
+                for (const [pair, edge] of shadowEdgePairs) {
+                  if (!lastIncrementalShadowEdgePairs.has(pair)) shadowAddedEdges.push(edge);
+                }
+                for (const [pair, edge] of lastIncrementalShadowEdgePairs) {
+                  if (!shadowEdgePairs.has(pair)) shadowRemovedEdges.push(edge);
+                }
+              }
+              // else: first-ever shadow pass — bootstrap off
+              // leidenBaseForShadow with a zero-edge-delta (no structural
+              // trigger from an edge diff this drain); dirtyVisitKeys'
+              // own-topic path still seeds the initial dirty-topic set
+              // (every touched visit that's already a leiden member), so
+              // the lineage starts clean and small rather than treating
+              // the whole corpus as "added" and blowing the subgraph cap.
+
+              const shadowResult = await buildIncrementalTopicRevision({
+                previousRevision: leidenBaseForShadow,
+                visitSimilarityRevisionId: visitSimilarity.revisionId,
+                dirtyVisitKeys: shadowDirtyVisitKeys,
+                addedEdges: shadowAddedEdges,
+                removedEdges: shadowRemovedEdges,
+                getEligibleVisit: getEligibleVisitForShadow,
+                edgesForVisit: edgesForVisitShadow,
+                hnswStore: loadedHnswSimilarityStore,
+                cosineThreshold: LEIDEN_CPM_COSINE_THRESHOLD,
+              });
+              const shadowRuntimeMs = Date.now() - shadowStartedAtMs;
+              if (shadowResult.overflow !== null) {
+                // Do NOT serve/persist result.revision (it IS the
+                // previous revision, unchanged) and do NOT advance the
+                // edge-pair diff baseline — the next drain's diff keeps
+                // accumulating against the last successfully-processed
+                // state rather than a half-applied one. No repair queue
+                // yet (that's W3); log the mark + counts.
+                console.warn(
+                  `[connections] topicIncremental shadow OVERFLOW subgraph=${String(
+                    shadowResult.overflow.subgraphSize,
+                  )} cap=${String(shadowResult.overflow.cap)} dirtyTopics=${String(
+                    shadowResult.overflow.dirtyTopicIds.length,
+                  )}`,
+                );
+                topicIncrementalShadowDiagnostics = {
+                  enabled: true,
+                  ranThisDrain: true,
+                  promotedCount: 0,
+                  overflow: true,
+                  overflowSubgraphSize: shadowResult.overflow.subgraphSize,
+                  overflowCap: shadowResult.overflow.cap,
+                  runtimeMs: shadowRuntimeMs,
+                };
+                mark(
+                  `topicIncremental.shadow dt=${String(shadowRuntimeMs)} topics=${String(
+                    shadowResult.revision.topics.length,
+                  )} promoted=0 overflow=${String(shadowResult.overflow.subgraphSize)}`,
+                );
+              } else {
+                await topicRevisionStore.putCandidateShadowRevision(
+                  TOPIC_INCREMENTAL_REVISION_KEY,
+                  shadowResult.revision,
+                );
+                lastIncrementalShadowEdgePairs = shadowEdgePairs;
+                topicIncrementalShadowDiagnostics = {
+                  enabled: true,
+                  ranThisDrain: true,
+                  promotedCount: shadowResult.promotedCount,
+                  overflow: false,
+                  overflowSubgraphSize: null,
+                  overflowCap: null,
+                  runtimeMs: shadowRuntimeMs,
+                };
+                mark(
+                  `topicIncremental.shadow dt=${String(shadowRuntimeMs)} topics=${String(
+                    shadowResult.revision.topics.length,
+                  )} promoted=${String(shadowResult.promotedCount)} overflow=0`,
+                );
+              }
+            }
+          }
+        } catch (error) {
+          // Observe-only: the shadow must never fail an otherwise-
+          // successful drain.
+          console.warn(
+            `[connections] topicIncremental shadow FAILED (observe-only, drain unaffected): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          topicIncrementalShadowDiagnostics = {
+            enabled: true,
+            ranThisDrain: false,
+            promotedCount: 0,
+            overflow: false,
+            overflowSubgraphSize: null,
+            overflowCap: null,
+            runtimeMs: Date.now() - shadowStartedAtMs,
+          };
+        }
+      }
+    }
     // W2 step 5 — served-producer marker + observability (the
     // post-flip auto-rollback signal). algorithmVersion on the
     // revision already records the producer; this adds churn/lineage.
@@ -5769,6 +6623,42 @@ export const createConnectionsMaterializer = (
       bootstrapAdopted ||
       renderedSimilarityRecoveryNeeded ||
       resetForcesFullCorpusRebuild;
+    // F8 W3 investigation note (Recovery consent rule, "Layer-0 similarity
+    // corruption"): the W3 wave bullet describes this whole path as
+    // "scoped repair, not full replay" and says to leave it untouched.
+    // Reading `baseRebuildEvents` a few lines below shows that claim is
+    // FALSE — `similarityRecoveryNeedsBaseRebuild` (any of its 4 sub-
+    // reasons) drives a `storeBackedEvents.readSince({})` /
+    // `deps.eventLog.readMerged()` read (the COMPLETE log) and a full
+    // `buildConnectionsSnapshot` over it: a genuine full-log rebuild.
+    // DELIBERATELY NOT consent-gated here despite that, for two of the
+    // four sub-reasons: `laneUnloadedReuse` / `bootstrapAdopted` /
+    // `renderedSimilarityRecoveryNeeded` are ROUTINE self-heals (the HNSW
+    // lane not warm yet, a wiped served signal recovering from an
+    // on-disk revision) that fire on ordinary restarts, not catastrophic
+    // loss — gating them would silently regress Layer-0 self-recovery on
+    // every large-vault restart. `resetForcesFullCorpusRebuild` driven by
+    // `privacy-purge` or `operator-rebuild` must also stay ungated: a
+    // purge has to complete for privacy correctness, and an operator
+    // rebuild IS itself the consent. Only `resetForcesFullCorpusRebuild`
+    // driven by `materializer-version-bump` or `store-corruption-recovery`
+    // — the two sub-reasons that actually match the Recovery consent
+    // rule's enumerated list — are candidates for gating; left ungated in
+    // this wave (see the coordinator report) because splitting the
+    // similarity-floor reset-reason set finer risks the floor guard's
+    // "exactly one of the three flags" invariant and its render-floor
+    // backstop, which need dedicated regression coverage beyond this
+    // wave's scope. Marked here so the gap is visible in phase logs, not
+    // silent.
+    if (
+      resetForcesFullCorpusRebuild &&
+      (similarityFloorResetReasons.includes('materializer-version-bump') ||
+        similarityFloorResetReasons.includes('store-corruption-recovery'))
+    ) {
+      mark(
+        `similarityRecovery.fullLogRebuild.notConsentGated reasons=${similarityFloorResetReasons.join(',')} — see F8 W3 report`,
+      );
+    }
     if (renderedSimilarityRecoveryNeeded && !laneUnloadedReuse && !bootstrapAdopted) {
       mark(
         `renderedSimilarityRecovery.forceBaseRebuild adopted=${String(
@@ -5802,14 +6692,30 @@ export const createConnectionsMaterializer = (
           buildEngagementClassifierInputs(baseRebuildEvents, buildTimelineDays(baseRebuildEvents)),
         )
       : timelineDays;
-    let baseSnapshot: ConnectionsSnapshot =
-      similarityRecoveryNeedsBaseRebuild
-        ? buildConnectionsSnapshot({
-            ...input,
-            events: baseRebuildEvents,
-            timelineDays: baseRebuildTimelineDays,
-          })
-        : (previousSnapshotForRanker ?? buildConnectionsSnapshot(input));
+    let baseSnapshot: ConnectionsSnapshot;
+    if (similarityRecoveryNeedsBaseRebuild) {
+      baseSnapshot = buildConnectionsSnapshot({
+        ...input,
+        events: baseRebuildEvents,
+        timelineDays: baseRebuildTimelineDays,
+      });
+    } else if (previousSnapshotForRanker !== null) {
+      baseSnapshot = previousSnapshotForRanker;
+    } else if (await markNeedsRepairIfLarge('cold-boot-non-empty-vault')) {
+      // F8 W3 — Recovery consent rule. Cold boot with NO previous
+      // snapshot on a vault whose canonical log is already substantial:
+      // this used to be an UNCONDITIONAL `buildConnectionsSnapshot(input)`
+      // over the complete merged event set — exactly the silent
+      // hundreds-of-MB full replay the consent rule forbids. Serve
+      // degraded (empty graph, zero event-derived rows) instead of
+      // auto-replaying; the needs-repair mark above names the exact CLI
+      // command. A genuinely fresh/small vault (below the threshold)
+      // still auto-builds below — first-run setup is not recovery.
+      baseSnapshot = buildConnectionsSnapshot({ ...input, events: [], timelineDays: [] });
+      mark('coldBoot.degraded reason=non-empty-vault-no-previous-snapshot');
+    } else {
+      baseSnapshot = buildConnectionsSnapshot(input);
+    }
     // A Layer-0 recovery rebuild produces the COMPLETE graph from the full
     // log (same as the cold build), so treat it as prebuilt: the
     // scoped-delta / incremental-view paths below must not run against it.
@@ -5856,19 +6762,16 @@ export const createConnectionsMaterializer = (
       // the rebuild that re-derives thread_in_workstream edges).
       scopedTimelineDeltaSkipDetail = 'thread-membership-reconcile-forced';
     }
-    // Sticky search-visit healing: rows were deferred by a coalesced
-    // search-visit drain and the cooldown has expired — force THIS drain
-    // (search or not) down the full-rebuild path so the deferred rows and
-    // cross-search edges land now rather than waiting for another search.
-    const searchVisitCadenceRebuildDue =
-      !requireScopedTimelineDeltaForDrain &&
-      searchVisitRowsDeferred &&
-      Date.now() - lastFullBaseRebuildAtMs >= searchRebuildCoalesceMs();
-    if (searchVisitCadenceRebuildDue && !forceFullRebuildForThreadReconcile) {
-      scopedTimelineDeltaSkipDetail = 'search-visit-cadence-rebuild';
+    // F8 W3 — the user-consented `connections-rebuild` CLI forces the full
+    // path exactly once (see `forceFullRebuildConsented`'s declaration):
+    // the scoped delta must NOT run, matching the reconcile-forced case
+    // above (this drain's whole point is to re-derive the graph from the
+    // complete event source).
+    if (forceFullRebuildConsented && !forceFullRebuildForThreadReconcile) {
+      scopedTimelineDeltaSkipDetail = 'consented-full-rebuild';
     }
     if (
-      !searchVisitCadenceRebuildDue &&
+      !forceFullRebuildConsented &&
       !forceFullRebuildForThreadReconcile &&
       scopedTimelineDeltaGate.incrementalScopes &&
       scopedTimelineDeltaGate.feature &&
@@ -5915,6 +6818,59 @@ export const createConnectionsMaterializer = (
           deletedThreadIdsForScopedDelta.add(scope.id);
         }
       }
+      // F8 W1 — thread register store membership correction. Compare the
+      // AUTHORITATIVE (complete per-thread history) register resolution
+      // against the PREVIOUS SERVED snapshot's membership — not the
+      // window-built scopedSnapshot, which doesn't exist yet at this point
+      // and is exactly the comparison that was window-blind before. A real
+      // membership change is expected to differ here and must NOT trigger
+      // the full-rebuild bail below (threadDeltaFullBuildReason): it is
+      // handled row-locally by splicing the thread's COMPLETE stored event
+      // history into the scoped build's `events` in place of the drain
+      // window's (possibly incomplete) slice for that bac_id, so
+      // buildConnectionsSnapshot's own projectThread call resolves the
+      // SAME way a full rebuild would for that one thread — everything
+      // else in the drain stays scoped/cheap. Threads the store hasn't
+      // observed (cold store, mid-backfill) fall through to the existing
+      // window-based bail below unchanged — no unsafe assumption of "no
+      // change" when the register itself is unavailable.
+      const registerCorrectedThreadIds = new Set<string>();
+      const registerCorrectedThreadEvents: AcceptedEvent[] = [];
+      if (threadRegisterFactStore !== null) {
+        for (const scope of dirtyThreadScopes) {
+          if (scope.kind !== 'thread' || deletedThreadIdsForScopedDelta.has(scope.id)) continue;
+          const registered = threadRegisterFactStore.read(scope.id);
+          if (registered === undefined) continue;
+          const registerWorkstreams = threadWorkstreamIdsFromRegister(registered);
+          const previousWorkstreams = threadWorkstreamIdsFromSnapshot(
+            previousSnapshotForScopedDelta,
+            scope.id,
+          );
+          if (!setsEqual(registerWorkstreams, previousWorkstreams)) {
+            registerCorrectedThreadIds.add(scope.id);
+            registerCorrectedThreadEvents.push(...threadRegisterFactStore.eventsFor(scope.id));
+          }
+        }
+        if (registerCorrectedThreadIds.size > 0) {
+          mark(
+            `threadRegisterFactStore.membershipCorrected threads=${String(registerCorrectedThreadIds.size)} events=${String(registerCorrectedThreadEvents.length)}`,
+          );
+        }
+      }
+      // Replace the drain-window slice for corrected bac_ids with the
+      // store's complete history for that bac_id (never both — a
+      // duplicated dot would manufacture a spurious causal conflict when
+      // buildConnectionsSnapshot's projectThread re-folds it).
+      const scopedDeltaEventsForBuild =
+        registerCorrectedThreadIds.size === 0
+          ? scopedDeltaEvents
+          : [
+              ...scopedDeltaEvents.filter((evt) => {
+                const bacId = threadBacIdForRegisterEvent(evt);
+                return bacId === undefined || !registerCorrectedThreadIds.has(bacId);
+              }),
+              ...registerCorrectedThreadEvents,
+            ];
       for (const threadId of deletedThreadIdsForScopedDelta) {
         const previousUrl = normalizedThreadUrlFromSnapshot(
           previousSnapshotForScopedDelta,
@@ -6075,8 +7031,20 @@ export const createConnectionsMaterializer = (
       if (
         (scopedTimelineDays.length > 0 ||
           scopedDeltaEvents.length > 0 ||
-          dirtyThreadScopes.length > 0) &&
-        !pendingHasSearchVisit &&
+          dirtyThreadScopes.length > 0 ||
+          // F8 W4 — a workstream CRUD carries no timeline/navigation/thread
+          // signal of its own (dirtyThreadScopes stays empty — see
+          // workstreamParentStore.ts's header for why thread_in_workstream
+          // never needs recompute here), so it needs its own admission
+          // clause into the scoped-snapshot build below.
+          workstreamTreeAffectedIds.size > 0) &&
+        // F8 W2 — a search-visit window is no longer an automatic bail
+        // when the search-index stores are ready: same_search_query
+        // candidates and thread_text_mentions_search_query edges are
+        // minted below via the indexed join instead of the full-corpus
+        // scan those stores replace. See search-index/*.ts headers +
+        // docs/plans/2026-08-16-f8-ivm-designs.md "W2".
+        (!pendingHasSearchVisit || searchIndexStoresReady) &&
         hasRequiredTimelineRows
       ) {
         if (canAttemptBoundedScopedDelta && scopedTimelineDays.length > 0) {
@@ -6101,24 +7069,294 @@ export const createConnectionsMaterializer = (
         void _topicRevision;
         void _closestVisitRanker;
         void _crossReplica;
+        // F8 W4 — splice the raw workstream event history (Pass 1 — for
+        // node-field parity: title/observedAt/originReplicaIds/
+        // registerMetadata), the vault records (Pass 2 — for the
+        // authoritative workstream_parent_of edge, which always wins over
+        // Pass 1's contribution; see snapshot.ts's "richer source" comment
+        // and upsertEdge's earliest-observedAt tie-break), AND the history
+        // of any thread that REFERENCES an affected workstream (Pass 1's
+        // membership-candidate loop stamps the TARGET workstream node's
+        // observedAt from the referencing thread's OWN event — see
+        // readThreadHistoryForIds's header) for the affected ancestor-chain
+        // ids into this scoped build. All three stay empty (identical to
+        // the pre-W4 behavior) when no workstream CRUD landed this drain.
+        const referencingThreadIds = new Set(
+          workstreamTreeAffectedIds.size === 0
+            ? []
+            : scopedInputBase.threads
+                .filter(
+                  (t) =>
+                    typeof t.primaryWorkstreamId === 'string' &&
+                    workstreamTreeAffectedIds.has(t.primaryWorkstreamId),
+                )
+                .map((t) => t.bac_id),
+        );
+        const threadHistoryForWorkstreamNodesEventsForBuild = await readThreadHistoryForIds(
+          storeBackedEvents,
+          referencingThreadIds,
+        );
+        const scopedEventsWithWorkstreamHistory = [
+          ...scopedDeltaEventsForBuild,
+          ...workstreamHistoryEventsForBuild,
+          ...threadHistoryForWorkstreamNodesEventsForBuild,
+        ];
+        const scopedWorkstreamRecords =
+          workstreamTreeAffectedIds.size === 0
+            ? []
+            : scopedInputBase.workstreams.filter((w) => workstreamTreeAffectedIds.has(w.bac_id));
         const scopedSnapshot = buildConnectionsSnapshot({
           ...scopedInputBase,
-          events: scopedDeltaEvents,
+          events: scopedEventsWithWorkstreamHistory,
           threads: filterDeletedThreadsForScopedDelta(
             scopedInputBase.threads,
             deletedThreadIdsForScopedDelta,
           ),
-          workstreams: [],
+          workstreams: scopedWorkstreamRecords,
           dispatches: [],
           queueItems: [],
           reminders: [],
           codingSessions: [],
           timelineDays: scopedTimelineDays,
         });
+        // F8 W2 — thread_text_mentions_search_query cross-window join.
+        // scopedSnapshot's OWN Pass 6 (buildConnectionsSnapshot, called
+        // just above) already correctly mints this edge kind for matches
+        // ENTIRELY WITHIN this drain's tiny window (a new search visit
+        // and new capture/dispatch/annotation text that both arrived
+        // this drain) — that path is untouched. What a windowed Pass 6
+        // structurally cannot see is the CROSS-window join: a brand-new
+        // search visit's query against OLD indexed text (forward), and
+        // brand-new text against an OLD search visit's query (reverse).
+        // Both sides are minted here from the search-index stores using
+        // the SAME edge shape/upsert semantics as snapshot.ts Pass 6
+        // (matchesWholeWordQuery is the shared predicate — see
+        // search-index/searchTextMatch.ts).
+        const searchIndexNewEdges = new Map<string, ConnectionEdge>();
+        const searchIndexExtraThreadIds = new Set<string>();
+        const upsertSearchIndexEdge = (edgeInput: Omit<ConnectionEdge, 'id'>): void => {
+          const id = edgeIdFor(edgeInput.kind, edgeInput.fromNodeId, edgeInput.toNodeId);
+          const existing = searchIndexNewEdges.get(id);
+          if (existing === undefined || edgeInput.observedAt < existing.observedAt) {
+            searchIndexNewEdges.set(id, { id, ...edgeInput });
+          }
+        };
+        const threadIdFromCaptureMatchNodeId = (nodeId: string): string =>
+          nodeId.startsWith('thread:') ? nodeId.slice('thread:'.length) : nodeId;
+        if (captureTextFtsFactStore !== null) {
+          // Forward: NEW search visit(s) this drain × ALL indexed text.
+          // Mirrors snapshot.ts Pass 6's own `searchVisits` collection
+          // exactly (same >=4-char gate, same node-metadata source), so
+          // a visit minted by THIS drain's scopedSnapshot is treated
+          // identically to one minted by a full rebuild. In-window
+          // matches are redundantly (but harmlessly) re-derived here —
+          // only the out-of-window ones are new information.
+          const newSearchVisits = scopedSnapshot.nodes.filter((node) => {
+            const q = node.metadata['searchQuery'];
+            return node.kind === 'timeline-visit' && typeof q === 'string' && q.trim().length >= 4;
+          });
+          for (const visitNode of newSearchVisits) {
+            const query = (visitNode.metadata['searchQuery'] as string).trim().toLowerCase();
+            const visitObservedAt = visitNode.lastSeenAt ?? '';
+            for (const match of captureTextFtsFactStore.matchWholeWord(query)) {
+              const observedAt =
+                match.observedAt > visitObservedAt ? match.observedAt : visitObservedAt;
+              upsertSearchIndexEdge({
+                kind: 'thread_text_mentions_search_query',
+                fromNodeId: match.nodeId,
+                toNodeId: visitNode.id,
+                observedAt,
+                producedBy: {
+                  source: 'event-log',
+                  eventType: match.eventType,
+                  dot: { replicaId: match.replicaId, seq: match.seq },
+                },
+                confidence: 'inferred',
+              });
+              // A capture-owned match's edge is owned by scope:thread=X
+              // (scopeForEdge routes to the recognized fromNodeId scope
+              // first) — X may be a thread this drain never otherwise
+              // touched, so its row set must be forced into the rewrite
+              // set below (mirrors registerCorrectedThreadIds' pattern:
+              // an extra reason to include a thread scope beyond the
+              // window's own dirty set). Dispatch-/annotation-owned
+              // matches fall back to the TO node's url scope, which is
+              // always scope:url=<this new search visit> here — already
+              // in rowLocalScopes via scopedVisitKeys, no extra scope
+              // needed.
+              if (match.docKind === 'capture') {
+                searchIndexExtraThreadIds.add(threadIdFromCaptureMatchNodeId(match.nodeId));
+              }
+            }
+          }
+          // Reverse: NEW capture/dispatch/annotation text this drain ×
+          // OLD (pre-existing) search-visit queries. The candidate QUERY
+          // list is bounded — but for two INDEPENDENT reasons that land
+          // on two different bounds:
+          //
+          //  - THREAD-owned matches (CAPTURE_RECORDED — fromNodeId is
+          //    always a recognized `thread:` scope node) are always SAFE
+          //    to mint: the capture's own thread is already dirty this
+          //    drain (it's literally why the event is in
+          //    scopedDeltaEventsForBuild), so thread:X's row set is
+          //    already being rewritten regardless of which query it
+          //    matches. The only reason to bound this side at all is
+          //    COST: testing every new capture against the vault's
+          //    entire lifetime search-visit history, on every drain with
+          //    a capture (far more common than search visits), would
+          //    reintroduce a query × all-visits scan on the OTHER axis
+          //    from the one this store was built to index. Bound to the
+          //    RECENT_SEARCH_QUERY_BOUND most-recently-seen search
+          //    visits (by lastSeenAt — also the highest-value case: a
+          //    just-added capture is far more likely to reference a
+          //    recent search than a stale one) UNIONED with this drain's
+          //    own touched scope set (scopedVisitKeys), so a same-drain
+          //    search-visit-plus-capture pair always matches regardless
+          //    of recency ranking.
+          //
+          //  - DISPATCH_RECORDED/ANNOTATION_CREATED-owned matches are
+          //    owned by the QUERY's url scope (scopeForEdge's fallback,
+          //    since dispatch:/annotation: aren't scope-typed nodes) —
+          //    NOT being rewritten this drain unless the query's own
+          //    visit is independently touched too. Safely widening this
+          //    side needs a general "preserve an arbitrary untouched url
+          //    scope's prior rows" carry-forward, which does not exist
+          //    yet (preserveThreadRowsForScopedDelta only covers
+          //    `thread` scopes) — so this side stays bounded to
+          //    scopedVisitKeys only. DOCUMENTED RESIDUAL for F8 W3's
+          //    repair queue: a dispatch/annotation that newly mentions a
+          //    query whose search visit is not independently touched
+          //    this same drain does not get its edge minted until that
+          //    visit's own next scoped drain or the next full rebuild —
+          //    stale-but-correct (the prior state is left untouched,
+          //    never wrong, never silently dropped), not a false result.
+          const isOldSearchVisitNode = (node: ConnectionNode): boolean => {
+            const q = node.metadata['searchQuery'];
+            return node.kind === 'timeline-visit' && typeof q === 'string' && q.trim().length >= 4;
+          };
+          const scopedOldSearchVisits = previousSnapshotForScopedDelta.nodes.filter(
+            (node) =>
+              isOldSearchVisitNode(node) &&
+              scopedVisitKeys.has(visitKeyFromTimelineNodeIdForDelta(node.id) ?? ''),
+          );
+          const recentOldSearchVisits = [...previousSnapshotForScopedDelta.nodes]
+            .filter(isOldSearchVisitNode)
+            .sort((a, b) => (b.lastSeenAt ?? '').localeCompare(a.lastSeenAt ?? ''))
+            .slice(0, RECENT_SEARCH_QUERY_BOUND);
+          const dedupeNodesById = (nodes: readonly ConnectionNode[]): readonly ConnectionNode[] => {
+            const byId = new Map<string, ConnectionNode>();
+            for (const node of nodes) byId.set(node.id, node);
+            return [...byId.values()];
+          };
+          const threadOwnedQueryCandidates = dedupeNodesById([
+            ...scopedOldSearchVisits,
+            ...recentOldSearchVisits,
+          ]);
+          const urlOwnedQueryCandidates = scopedOldSearchVisits;
+          if (threadOwnedQueryCandidates.length > 0 || urlOwnedQueryCandidates.length > 0) {
+            const textSourcesForEvent = (
+              event: AcceptedEvent,
+            ): {
+              readonly fromNodeId: string;
+              readonly sources: readonly string[];
+              readonly candidates: readonly ConnectionNode[];
+            } | null => {
+              if (event.type === CAPTURE_RECORDED && isCaptureRecordedPayload(event.payload)) {
+                const p = event.payload;
+                const threadKey = p.threadId ?? p.bac_id;
+                const sources: string[] = [];
+                for (const turn of p.turns ?? []) {
+                  for (const source of [turn.text, turn.markdown, turn.formattedText]) {
+                    if (typeof source === 'string' && source.length > 0) sources.push(source);
+                  }
+                }
+                return {
+                  fromNodeId: nodeIdFor('thread', threadKey),
+                  sources,
+                  candidates: threadOwnedQueryCandidates,
+                };
+              }
+              if (event.type === DISPATCH_RECORDED && isDispatchRecordedPayload(event.payload)) {
+                const p = event.payload;
+                return {
+                  fromNodeId: nodeIdFor('dispatch', p.bac_id),
+                  sources: p.body.length > 0 ? [p.body] : [],
+                  candidates: urlOwnedQueryCandidates,
+                };
+              }
+              if (event.type === ANNOTATION_CREATED && isAnnotationCreatedPayload(event.payload)) {
+                const p = event.payload;
+                return {
+                  fromNodeId: nodeIdFor('annotation', p.bac_id),
+                  sources: p.note.length > 0 ? [p.note] : [],
+                  candidates: urlOwnedQueryCandidates,
+                };
+              }
+              return null;
+            };
+            for (const event of scopedDeltaEventsForBuild) {
+              const extracted = textSourcesForEvent(event);
+              if (
+                extracted === null ||
+                extracted.sources.length === 0 ||
+                extracted.candidates.length === 0
+              ) {
+                continue;
+              }
+              const eventObservedAt = new Date(event.acceptedAtMs).toISOString();
+              for (const candidate of extracted.candidates) {
+                const query = (candidate.metadata['searchQuery'] as string).trim().toLowerCase();
+                const candidateObservedAt = candidate.lastSeenAt ?? '';
+                const matched = extracted.sources.some((source) =>
+                  matchesWholeWordQuery(source, query),
+                );
+                if (!matched) continue;
+                const observedAt =
+                  eventObservedAt > candidateObservedAt ? eventObservedAt : candidateObservedAt;
+                upsertSearchIndexEdge({
+                  kind: 'thread_text_mentions_search_query',
+                  fromNodeId: extracted.fromNodeId,
+                  toNodeId: candidate.id,
+                  observedAt,
+                  producedBy: {
+                    source: 'event-log',
+                    eventType: event.type,
+                    dot: { replicaId: event.dot.replicaId, seq: event.dot.seq },
+                  },
+                  confidence: 'inferred',
+                });
+              }
+            }
+          }
+        }
+        // Extra thread scopes discovered only via a forward-join capture
+        // match (searchIndexExtraThreadIds) must be rewritten this drain
+        // (rowLocalScopes + preserveThreadRowsForScopedDelta) so the new
+        // edge actually lands, but they are NOT a real membership/URL
+        // change — exclude them from threadFullBuildReason below, same
+        // treatment as registerCorrectedThreadIds.
+        const dirtyThreadScopesForSearchIndex =
+          searchIndexExtraThreadIds.size === 0
+            ? dirtyThreadScopes
+            : dedupeScopeList([
+                ...dirtyThreadScopes,
+                ...[...searchIndexExtraThreadIds].map((id) => ({ kind: 'thread' as const, id })),
+              ]);
+        // F8 W1 — threads the register store already resolved+corrected
+        // above are excluded from this check: a genuine, now-correctly-
+        // resolved membership change is EXPECTED to differ from
+        // previousSnapshot (that's the fix working), not a reason to bail.
+        // threadDeltaFullBuildReason stays the gate for everything else
+        // (thread-url-changed; threads the store hasn't observed yet) —
+        // demoted to a narrower safety net, not removed.
         const threadFullBuildReason = threadDeltaFullBuildReason({
           previousSnapshot: previousSnapshotForScopedDelta,
           scopedSnapshot,
-          threadScopes: dirtyThreadScopes,
+          threadScopes: dirtyThreadScopesForSearchIndex.filter(
+            (scope) =>
+              !registerCorrectedThreadIds.has(scope.id) &&
+              !searchIndexExtraThreadIds.has(scope.id),
+          ),
           deletedThreadIds: deletedThreadIdsForScopedDelta,
         });
         if (threadFullBuildReason !== null && !requireScopedTimelineDeltaForDrain) {
@@ -6137,7 +7375,15 @@ export const createConnectionsMaterializer = (
               visitKeys: scopedVisitKeys,
               tabSessionIds,
             }),
-            ...dirtyThreadScopes,
+            ...dirtyThreadScopesForSearchIndex,
+            // F8 W4 — the affected workstream ancestor-chain scopes. No
+            // matching thread scopes are added: thread_in_workstream is
+            // owned by the THREAD's own scope and depends only on that
+            // thread's resolved primaryWorkstreamId (see snapshot.ts Pass
+            // 1/2), which is invariant to the TARGET workstream's tree
+            // position, title, or deletion — a workstream CRUD never
+            // changes it, so nothing thread-scoped needs rewriting here.
+            ...workstreamTreeAffectedScopes,
           ]);
           mark(`scopedDelta.rowLocalScopes n=${String(rowLocalScopes.length)}`);
           // Yield periodically: a catch-up chunk can carry thousands of
@@ -6150,19 +7396,32 @@ export const createConnectionsMaterializer = (
             scopeOutputs.push(recomputeScope(scope, scopedSnapshot));
             if (index % 100 === 99) await yieldToEventLoop();
           }
-          const rawScoped = unionScopeOutputs(scopeOutputs);
+          const rawScopedBeforeSearchIndex = unionScopeOutputs(scopeOutputs);
+          // F8 W2 — fold in the cross-window thread_text_mentions_search_query
+          // edges minted above. scopedSnapshot has no knowledge of them (by
+          // construction — that's the whole point of the join), so they must
+          // be added here rather than flowing through recomputeScope.
+          const rawScoped =
+            searchIndexNewEdges.size === 0
+              ? rawScopedBeforeSearchIndex
+              : unionScopeOutputs([
+                  rawScopedBeforeSearchIndex,
+                  { nodes: [], edges: [...searchIndexNewEdges.values()] },
+                ]);
           mark(
-            `scopedDelta.recomputeScopes n=${String(rowLocalScopes.length)} nodes=${String(rawScoped.nodes.length)} edges=${String(rawScoped.edges.length)}`,
+            `scopedDelta.recomputeScopes n=${String(rowLocalScopes.length)} nodes=${String(rawScoped.nodes.length)} edges=${String(rawScoped.edges.length)} searchIndexEdges=${String(searchIndexNewEdges.size)}`,
           );
           await yieldToEventLoop();
           const scopedWithThreads = preserveThreadRowsForScopedDelta({
             output: rawScoped,
             previousSnapshot: previousSnapshotForScopedDelta,
             scopedSnapshot,
-            threadScopes: dirtyThreadScopes,
+            threadScopes: dirtyThreadScopesForSearchIndex,
             deletedThreadIds: deletedThreadIdsForScopedDelta,
           });
-          mark(`scopedDelta.preserveThreadRows threads=${String(dirtyThreadScopes.length)}`);
+          mark(
+            `scopedDelta.preserveThreadRows threads=${String(dirtyThreadScopesForSearchIndex.length)}`,
+          );
           await yieldToEventLoop();
           // Losslessness (unconditional): the scoped snapshot carries no
           // ranker/frontier-scoped similarity edges, so re-asserting each
@@ -6336,7 +7595,7 @@ export const createConnectionsMaterializer = (
         }
       }
     }
-    let searchVisitRebuildCoalesced = false;
+    let demotedThisDrain = false;
     if (!scopedTimelineDeltaApplied) {
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
@@ -6391,19 +7650,44 @@ export const createConnectionsMaterializer = (
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
       }
-      // Search-visit rebuild coalescing (see the flag declarations for the
-      // full argument): within the cooldown a search-visit drain advances
-      // progress only and serves the prior snapshot; the deferred rows are
-      // healed by the next full rebuild, which the sticky flag forces on
-      // the first drain after cooldown expiry.
+      // F8 W3 — unconditional demotion (supersedes the interim hot-rebuild
+      // suppressor #364, which coalesced full rebuilds onto a cooldown
+      // timer instead of eliminating them). EVERY remaining bail — any
+      // reason NOT already handled above — now ALWAYS advances progress
+      // only and serves the prior snapshot (never a cooldown window, never
+      // a sticky healing rebuild), and enqueues this drain's dirty scopes
+      // into the persisted repair queue so the NEXT drain's repair-queue
+      // drain (top of buildAndWrite) heals them through the ordinary
+      // scoped-recompute path. Recovery-tier classes (similarity
+      // base-rebuild, forced membership reconcile, the user-consented CLI
+      // rebuild) are excluded — those are the repair tier / explicit
+      // consent and must run when asked; everything else structurally
+      // never reaches a full rebuild from an operational drain again.
+      // Bootstrap exemption: an EMPTY previous snapshot cannot be "served
+      // stale" into existence — demoting from it starves forever (the heal
+      // recomputes scopes over the empty base, and every heal drain re-bails
+      // at the same gate; caught by timelineRelaySync: a fresh vault whose
+      // first real window mixed workstream.upserted with timeline visits
+      // ended with zero graph nodes on BOTH peers). An empty base with
+      // pending graph events is bootstrap, not a bail — same consent
+      // semantics as cold boot: small vault builds now; a large vault
+      // already went through (or will go through) the needs-repair path.
+      const previousSnapshotEmptyBootstrap =
+        previousSnapshotForScopedDelta !== null &&
+        previousSnapshotForScopedDelta.nodes.length === 0 &&
+        pendingEventsForDrain.length > 0 &&
+        // A large vault whose base is empty got there via a consent refusal
+        // (needs-repair is already marked) — bootstrap must not bypass the
+        // consent gate; it keeps demoting until the user runs the CLI.
+        !(await vaultIsLargeForConsent());
       if (
         !requireScopedTimelineDeltaForDrain &&
-        scopedTimelineDeltaSkipDetail === 'pending-search-visit' &&
         !similarityRecoveryNeedsBaseRebuild &&
         !forceFullRebuildForThreadReconcile &&
+        !forceFullRebuildConsented &&
+        !previousSnapshotEmptyBootstrap &&
         previousSnapshotForScopedDelta !== null &&
-        replaceScopeRowsForScopedDelta !== undefined &&
-        Date.now() - lastFullBaseRebuildAtMs < searchRebuildCoalesceMs()
+        replaceScopeRowsForScopedDelta !== undefined
       ) {
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
         await replaceScopeRowsForScopedDelta({
@@ -6421,12 +7705,12 @@ export const createConnectionsMaterializer = (
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
         scopedTimelineDeltaApplied = true;
-        searchVisitRowsDeferred = true;
-        searchVisitRebuildCoalesced = true;
+        demotedThisDrain = true;
+        if (repairQueueFactStore !== null && dirtyScopes.length > 0) {
+          repairQueueFactStore.enqueue(dirtyScopes, scopedTimelineDeltaSkipDetail);
+        }
         mark(
-          `searchVisitRebuild.coalesced pending=${String(pendingEventsForDrain.length)} nextEligibleMs=${String(
-            Math.max(0, searchRebuildCoalesceMs() - (Date.now() - lastFullBaseRebuildAtMs)),
-          )}`,
+          `scopedTimelineDelta.demoted reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)} dirtyScopes=${String(dirtyScopes.length)} queueDepth=${String(repairQueueFactStore?.depth() ?? -1)}`,
         );
       }
       if (canAttemptBoundedScopedDelta) {
@@ -6435,12 +7719,32 @@ export const createConnectionsMaterializer = (
           `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
         );
       }
-      if (!baseSnapshotPrebuilt && !searchVisitRebuildCoalesced) {
-        // Any full base rebuild re-derives cross-search edges, so it resets
-        // the search-visit rebuild cooldown and clears the deferred-rows
-        // sticky (the rebuild below reads the complete event source).
-        lastFullBaseRebuildAtMs = Date.now();
-        searchVisitRowsDeferred = false;
+      // F8 W3 tripwire — after the demotion above, this fallback should be
+      // reachable ONLY via the user-consented CLI rebuild
+      // (forceFullRebuildConsented) or a store that doesn't implement
+      // replaceScopeRows at all (demotion has nothing to write through).
+      // Any OTHER arrival here means a bail slipped past demotion — mark
+      // it loudly so it's never a silent full rebuild.
+      if (
+        !baseSnapshotPrebuilt &&
+        !demotedThisDrain &&
+        !forceFullRebuildConsented &&
+        !previousSnapshotEmptyBootstrap
+      ) {
+        mark(
+          `fullRebuildFallback.unexpected reason=${scopedTimelineDeltaSkipDetail} — bail reached the full-rebuild fallback without demotion or consent; see F8 W3`,
+        );
+      }
+      if (previousSnapshotEmptyBootstrap && !demotedThisDrain && !baseSnapshotPrebuilt) {
+        // Legitimate bootstrap tier (empty base, pending events): the build
+        // below IS the first real materialization, same standing as the
+        // first-run cold build. Size consent was already applied at the
+        // cold-boot gate for large vaults.
+        mark(
+          `fullRebuildFallback.bootstrap reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)}`,
+        );
+      }
+      if (!baseSnapshotPrebuilt && !demotedThisDrain) {
         // Full-rebuild fallback (scoped-delta could not apply; NOT a catch-up,
         // which threw above). `input.events` (= merged) is only the pending
         // WINDOW on every warm path, so buildConnectionsSnapshot would yield a
@@ -6774,13 +8078,61 @@ export const createConnectionsMaterializer = (
             (currentSnapshotRankerRevision !== undefined &&
               currentSnapshotRankerRevision !== producerRevision);
           const touchedVisitIds = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
+          // F8 W2 — same_search_query candidate pairs for a NEW search
+          // visit are invisible to expandRankerFrontier below (it has no
+          // same-query expansion step), so the touched visit ids it seeds
+          // from would never include a search visit's same-query
+          // SIBLINGS — only the touched visit itself. Feed the sibling
+          // set (searchQueryIndexStore.visitsForQuery — an indexed
+          // lookup instead of the corpus scan that store replaces) into
+          // the SAME EXISTING frontier-expansion path, so a sibling gets
+          // walked as `fromVisitKey` too and both directions get scored.
+          //
+          // KNOWN LIMITATION (not a regression — see below): this only
+          // reproduces full-rebuild equivalence when `input.events`
+          // (aliased `merged`) below happens to be the COMPLETE event
+          // log (cold boot, or a catch-up chunk with mergedIsFullLog —
+          // see the `merged` declaration's own comment). On the COMMON
+          // warm/live drain, `merged` is only this drain's pending
+          // window (readMergedSince), so closestVisitRankerEdgesForSnapshot's
+          // generateCandidates(sibling, rankerCandidateContext) can walk
+          // the sibling but still can't discover a `same_search_query`
+          // pairing whose OTHER endpoint's originating event isn't in
+          // that window — the frontier controls WHICH visits get walked,
+          // not what raw-event data each walk can see. Widening
+          // `input.events` itself would require either a full-log read
+          // (defeating the scoped delta) or a targeted historical-event
+          // fetch keyed by visit — searchQueryIndexStore's schema does
+          // not retain a (replicaId, seq) per visit row, so it cannot
+          // serve that fetch as built. Left as a DOCUMENTED RESIDUAL: no
+          // worse than before (the pre-existing full-rebuild-fallback
+          // path already ran this SAME narrow-frontier ranker pass on a
+          // warm drain — canUseIncrementalRanker below doesn't
+          // distinguish scoped-vs-full — so this sub-case was already
+          // this incomplete before W2, regardless of the search-visit
+          // bail). A future wave that teaches this phase to read back
+          // specific historical events by (replicaId, seq) closes it.
+          const searchQuerySiblingVisitIds = new Set<string>();
+          if (searchQueryIndexFactStore !== null) {
+            for (const visitKey of touchedVisitIds) {
+              const search = detectSearchUrl(visitKey);
+              if (search === null) continue;
+              for (const row of searchQueryIndexFactStore.visitsForQuery(search.query)) {
+                searchQuerySiblingVisitIds.add(row.visitKey);
+              }
+            }
+          }
+          const touchedVisitIdsForRanker =
+            searchQuerySiblingVisitIds.size === 0
+              ? touchedVisitIds
+              : new Set([...touchedVisitIds, ...searchQuerySiblingVisitIds]);
           const canUseIncrementalRanker =
             incrementalRankerEnabled() &&
             currentSnapshot !== null &&
-            touchedVisitIds.size > 0 &&
+            touchedVisitIdsForRanker.size > 0 &&
             !producerRevisionChanged;
           if (canUseIncrementalRanker) {
-            const rankerFrontier = expandRankerFrontier(touchedVisitIds, currentSnapshot, {
+            const rankerFrontier = expandRankerFrontier(touchedVisitIdsForRanker, currentSnapshot, {
               includeSameUrlSiblings: true,
               includeSameTabSession: true,
               includeSameWorkstream: true,
@@ -6963,6 +8315,9 @@ export const createConnectionsMaterializer = (
       phaseDurations,
       ...(topicShadowDiagnostics === null ? {} : { topicShadowDiagnostics }),
       ...(topicShadowObservation === null ? {} : { topicShadowObservation }),
+      ...(topicIncrementalShadowDiagnostics === null
+        ? {}
+        : { topicIncrementalShadowDiagnostics }),
       hotPathDiagnostics,
       servedTopicProducerReport,
       similarityFloorDiagnostics,
@@ -7681,6 +9036,17 @@ export const createConnectionsMaterializer = (
     if (deps.store.replaceScopeRows === undefined) {
       return { applied: false, reason: 'replaceScopeRows-unavailable' };
     }
+    // F8 W4 — open (but don't catch up) the workstream-parent store before
+    // the isScopedTimelineDeltaEvent check below: that check reads the
+    // store's readiness (a closure `let`, populated by ensure*) to decide
+    // whether a workstreamTree-invalidating event in this backlog is
+    // scopable. Without this, the first-ever backlog containing a
+    // workstream CRUD would see the store still null (buildAndWrite is
+    // what normally opens it, and that hasn't run for this backlog yet)
+    // and wrongly fall back to non-scoped for the WHOLE chunked pass.
+    if (workstreamParentStoreEnabled()) {
+      await ensureWorkstreamParentStore();
+    }
     if (!ordered.every(isScopedTimelineDeltaEvent)) {
       return { applied: false, reason: 'non-scoped-events' };
     }
@@ -8015,6 +9381,34 @@ export const createConnectionsMaterializer = (
     return processed.length;
   };
 
+  // F8 W3 — Recovery consent rule. See the interface doc comment. Intended
+  // for a freshly-constructed materializer instance in an isolated process
+  // (the `connections-rebuild` CLI, which holds the vault's process lock
+  // before ever constructing this materializer) — unlike `onAccepted` /
+  // `catchUp`, it does not coordinate with the `running`/`pending`
+  // debounce-scheduling state, since the CLI is the only caller and never
+  // shares a process with the live companion's own drain scheduling.
+  const runConsentedFullRebuild = async (): Promise<ConnectionsSnapshot> => {
+    forceFullRebuildConsented = true;
+    try {
+      const snapshot = await buildAndWrite();
+      const repairStore = await ensureRepairQueueStore();
+      if (repairStore !== null) {
+        // A full rebuild heals every queued scope by construction (it
+        // re-derives the whole graph from the complete event source) —
+        // drain the queue to empty and clear the needs-repair marker this
+        // rebuild just resolved.
+        while (repairStore.takeBatch(10_000).length > 0) {
+          // draining
+        }
+        repairStore.clearNeedsRepair();
+      }
+      return snapshot;
+    } finally {
+      forceFullRebuildConsented = false;
+    }
+  };
+
   // The runner gates event dispatch on `m.handles.has(event.type)`. The
   // materializer ALSO accepts content-lane-only and projection-only events
   // (see onAccepted's three-way classification), so `handles` must report
@@ -8040,6 +9434,7 @@ export const createConnectionsMaterializer = (
     drainContentLaneQueue,
     requalifyVisitForSimilarity,
     isDrainActive,
+    runConsentedFullRebuild,
     dispose,
   };
 };

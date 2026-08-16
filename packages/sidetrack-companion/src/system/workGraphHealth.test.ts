@@ -11,6 +11,8 @@ import { recordCanonicalCollision } from '../page-content/canonicalize-telemetry
 import { sha256Hex } from '../page-content/store.js';
 import { writeActiveClosestVisitRankerRevision } from '../producers/closest-visit-revision.js';
 import {
+  TOPIC_INCREMENTAL_REVISION_KEY,
+  TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   createTopicRevisionStore,
   type TopicRevision,
@@ -32,6 +34,7 @@ import {
 } from '../recall-v2/rankerShadowDiff.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog } from '../sync/eventLog.js';
+import { createRepairQueueStore } from '../connections/repairQueueStore.js';
 import {
   collectWorkGraphHealth,
   withLiveShipGateV2Serving,
@@ -277,6 +280,168 @@ describe('work graph diagnostic candidates', () => {
     }
   });
 
+  it('surfaces the W5 Phase B incremental-shadow candidate row (topic.incremental-shadow)', async () => {
+    const members = [
+      'https://example.test/a',
+      'https://example.test/b',
+      'https://example.test/c',
+      'https://example.test/d',
+      'https://example.test/e',
+    ];
+    const nodeMetadata = (memberCount: number) => ({
+      memberCount,
+      representativeTitles: ['t'],
+      firstObservedAt: '2026-05-16T12:00:00.000Z',
+      lastObservedAt: '2026-05-16T12:00:00.000Z',
+      cohesion: 1,
+    });
+    // Served (active) revision: one leiden-cpm topic holding all 5 members.
+    const servedRevision: TopicRevision = {
+      revisionId: 'topic-rev-served',
+      visitSimilarityRevisionId: 'sim-rev',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_LEIDEN_CPM_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic-served-1',
+          memberCanonicalUrls: members,
+          metadata: nodeMetadata(members.length),
+        },
+      ],
+      lineage: [],
+      producedAt: Date.parse('2026-05-16T12:00:00.000Z'),
+    };
+    // Incremental shadow: the SAME 5 members, split into two topics — a
+    // real co-membership churn vs the served revision (5 shared members
+    // clears buildServedTopicProducerReport's churn-computation floor).
+    const shadowRevision: TopicRevision = {
+      revisionId: 'topic-rev-incremental-shadow',
+      visitSimilarityRevisionId: 'sim-rev-2',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      topics: [
+        {
+          topicId: 'topic-shadow-1',
+          memberCanonicalUrls: members.slice(0, 3),
+          metadata: nodeMetadata(3),
+          secondaryAffiliations: [
+            {
+              canonicalUrl: 'https://example.test/f',
+              score: 0.91,
+              reasons: ['edge_support'],
+              supportCount: 2,
+              maxCosine: 0.91,
+              lexicalScore: 0,
+              reciprocalSupport: 0,
+            },
+          ],
+        },
+        {
+          topicId: 'topic-shadow-2',
+          memberCanonicalUrls: members.slice(3),
+          metadata: nodeMetadata(2),
+        },
+      ],
+      lineage: [{ fromTopicId: 'topic-served-1', toTopicId: 'topic-shadow-1', kind: 'split', observedAt: '2026-05-16T12:30:00.000Z' }],
+      producedAt: Date.parse('2026-05-16T12:30:00.000Z'),
+    };
+    await createTopicRevisionStore(vaultRoot).putActiveRevision(servedRevision);
+    await createTopicRevisionStore(vaultRoot).putCandidateShadowRevision(
+      TOPIC_INCREMENTAL_REVISION_KEY,
+      shadowRevision,
+    );
+    await mkdir(join(vaultRoot, '_BAC', 'connections', 'diagnostics'), { recursive: true });
+    await writeFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      `${JSON.stringify({
+        producedAt: '2026-05-16T12:34:00.000Z',
+        topicIncrementalShadow: {
+          enabled: true,
+          ranThisDrain: true,
+          promotedCount: 2,
+          overflow: false,
+          overflowSubgraphSize: null,
+          overflowCap: null,
+          runtimeMs: 12,
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T12:45:00.000Z'),
+    });
+
+    const row = health.candidates.find((c) => c.id === 'topic.incremental-shadow');
+    expect(row).toBeDefined();
+    expect(row).toEqual(
+      expect.objectContaining({
+        family: 'topic',
+        lane: 'shadow',
+        servingImpact: 'observe-only',
+        status: 'ok',
+        reason: null,
+        revisionId: 'topic-rev-incremental-shadow',
+      }),
+    );
+    expect(row?.metrics['topicCount']).toBe(2);
+    expect(row?.metrics['secondaryCount']).toBe(1);
+    expect(row?.metrics['promotedCount']).toBe(2);
+    expect(row?.metrics['overflowCount']).toBe(0);
+    expect(row?.metrics['ranThisDrain']).toBe(true);
+    expect(row?.metrics['baseRevisionId']).toBe('topic-rev-served');
+    expect(typeof row?.metrics['churnP90']).toBe('number');
+    expect(row?.metrics['churnP90']).toBeGreaterThan(0);
+  });
+
+  it('marks topic.incremental-shadow overflow=true as a warning row', async () => {
+    const shadowRevision: TopicRevision = {
+      revisionId: 'topic-rev-incremental-shadow-2',
+      visitSimilarityRevisionId: 'sim-rev-3',
+      cosineThreshold: 0.9,
+      algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      topics: [],
+      lineage: [],
+      producedAt: Date.parse('2026-05-16T12:00:00.000Z'),
+    };
+    await createTopicRevisionStore(vaultRoot).putCandidateShadowRevision(
+      TOPIC_INCREMENTAL_REVISION_KEY,
+      shadowRevision,
+    );
+    await mkdir(join(vaultRoot, '_BAC', 'connections', 'diagnostics'), { recursive: true });
+    await writeFile(
+      join(vaultRoot, '_BAC', 'connections', 'diagnostics', 'latest.json'),
+      `${JSON.stringify({
+        producedAt: '2026-05-16T12:34:00.000Z',
+        topicIncrementalShadow: {
+          enabled: true,
+          ranThisDrain: true,
+          promotedCount: 0,
+          overflow: true,
+          overflowSubgraphSize: 900,
+          overflowCap: 500,
+          runtimeMs: 8,
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      now: () => new Date('2026-05-16T12:45:00.000Z'),
+    });
+
+    const row = health.candidates.find((c) => c.id === 'topic.incremental-shadow');
+    expect(row).toEqual(
+      expect.objectContaining({
+        status: 'warning',
+        reason: 'subgraph-cap-exceeded',
+      }),
+    );
+    expect(row?.metrics['overflowCount']).toBe(900);
+  });
+
   it('warns on content-lane backlog only when an age threshold is tripped', async () => {
     const health = await collectWorkGraphHealth({
       vaultRoot,
@@ -332,6 +497,142 @@ describe('work graph diagnostic candidates', () => {
         }),
       ]),
     );
+  });
+
+  // F8 IVM plan W3 — repair-queue gauge + needs-repair condition
+  // (docs/plans/2026-08-16-f8-ivm-designs.md, "W3"; "Health" §5).
+  describe('repair-queue health (F8 W3)', () => {
+    beforeEach(async () => {
+      await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
+    });
+
+    it('reports depth=0 / status=ok / no needs-repair on a fresh vault', async () => {
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue).toEqual({
+        depth: 0,
+        oldestEnqueuedAt: null,
+        oldestAgeMs: null,
+        status: 'ok',
+        needsRepair: null,
+      });
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            family: 'reconcile',
+            lane: 'queue',
+            status: 'ok',
+            reason: null,
+          }),
+        ]),
+      );
+    });
+
+    it('warns when repair-queue depth exceeds the threshold', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        for (let i = 0; i < 101; i += 1) {
+          store.enqueue([{ kind: 'url', id: `https://example.test/${String(i)}` }], 'gate');
+        }
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue.depth).toBe(101);
+      expect(health.repairQueue.status).toBe('warning');
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            status: 'warning',
+            reason: 'repair-queue-backlog',
+            metrics: expect.objectContaining({ depth: 101, depthWarnThreshold: 100 }),
+          }),
+        ]),
+      );
+    });
+
+    it('warns when the oldest repair-queue entry has been queued over an hour', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.enqueue([{ kind: 'thread', id: 'T1' }], 'thread-workstream-membership-changed');
+      } finally {
+        store.close();
+      }
+
+      // Entry was enqueued "now" (real wall clock); ask health to evaluate
+      // staleness 2 hours in the future rather than manipulating the
+      // stored timestamp directly.
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date(Date.now() + 2 * 60 * 60 * 1000),
+      });
+
+      expect(health.repairQueue.depth).toBe(1);
+      expect(health.repairQueue.status).toBe('warning');
+      expect(health.repairQueue.oldestAgeMs).not.toBeNull();
+      expect(health.repairQueue.oldestAgeMs ?? 0).toBeGreaterThan(60 * 60 * 1000);
+    });
+
+    it('does not warn below both thresholds', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.enqueue([{ kind: 'thread', id: 'T1' }], 'thread-workstream-membership-changed');
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date(Date.now() + 60_000),
+      });
+
+      expect(health.repairQueue.depth).toBe(1);
+      expect(health.repairQueue.status).toBe('ok');
+    });
+
+    it('surfaces the needs-repair condition with the exact CLI command (Recovery consent rule)', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.markNeedsRepair(
+          'cold-boot-non-empty-vault',
+          `sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+        );
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue.needsRepair).toEqual({
+        reason: 'cold-boot-non-empty-vault',
+        command: `sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+        detectedAt: expect.any(String),
+      });
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            status: 'alarm',
+            reason: expect.stringContaining(
+              `run: sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+            ),
+          }),
+        ]),
+      );
+    });
   });
 
   it('surfaces canonicalization telemetry and over-collapsed page-content hygiene', async () => {
