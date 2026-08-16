@@ -13,7 +13,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { advanceTimersByTimeAsync } from '../test-helpers/bunTestTimers.js';
 import { installStubEmbedder, type StubEmbedderHandle } from '../test-helpers/stubEmbedder.js';
 
+import { enqueueBodyEvidence } from '../page-evidence/bodyEvidenceQueue.js';
 import { readPageEvidence } from '../page-evidence/store.js';
+import type { PageContentExtractedPayload } from '../page-content/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { AppendInputObserved } from '../sync/eventLog.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
@@ -587,4 +589,148 @@ describe('startCompanion resolve-canary → /v1/system/health', () => {
       'http-listen',
     ]);
   }, 30_000);
+});
+
+// Regression coverage for the SIGTERM shutdown hang observed live twice
+// (2026-08-15/16): close() used to jump straight from closing the HTTP
+// listener to `await syncContractRunner.awaitIdle()` while the
+// body-evidence lane (and other background lanes) kept running — because
+// their stop() was only ever registered on the startup-FAILURE teardown
+// path, never on a normal close(). Each materialized item's
+// onMaterialized hook appends a NEW accepted event
+// (`eventLog.appendServerObserved`), which re-marks connectionsMaterializer
+// dirty, so `awaitIdle()`'s bare `while (running || dirty) await sleep(5)`
+// never converged. The process hung forever, held the recall process
+// lock, and the next boot refused to start with "Another companion (pid
+// N) already owns the recall index". Operator recovery both times
+// required SIGKILL.
+describe('startCompanion close() — SIGTERM shutdown drain', () => {
+  let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
+  let companion: Awaited<ReturnType<typeof startCompanion>> | null = null;
+  let port = 39_900;
+
+  const bodyEvidencePayload = (canonicalUrl: string): PageContentExtractedPayload => ({
+    payloadVersion: 1,
+    canonicalUrl,
+    url: canonicalUrl,
+    title: 'Shutdown-drain fixture page',
+    extractedAt: '2026-08-15T12:00:00.000Z',
+    extractionSource: 'reader-mode',
+    extractionPolicy: { trigger: 'attention-gate' },
+    quality: 'high',
+    qualitySignals: {
+      extractedWordCount: 200,
+      contentToDomRatio: 0.6,
+      boilerplateFraction: 0.05,
+      extractionStrategy: 'reader-mode',
+    },
+    content: {
+      text: 'Body content used only to give the R3 lane real work at boot.',
+      contentHash: `hash-${canonicalUrl}`,
+      charCount: 64,
+    },
+    redaction: { applied: false, rules: [] },
+  });
+
+  beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
+    vaultRoot = await mkdtemp(join(tmpdir(), 'startcompanion-shutdown-drain-'));
+  });
+
+  afterEach(async () => {
+    if (companion !== null) await companion.close().catch(() => undefined);
+    companion = null;
+    stubEmbedder.restore();
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it(
+    'close() drains a live body-evidence lane, releases the recall lock, and permanently ' +
+      'silences the lane instead of letting it keep ticking (2026-08-15/16 SIGTERM hang)',
+    async () => {
+      // Seed MORE than one batch's worth of REAL pending body-evidence
+      // queue items (batchCap defaults to 4) so the very first cycle
+      // still has work left over afterward (`pendingAfter > 0`), which
+      // is what makes the lane re-arm its OWN timer for another cycle
+      // ~cycleIntervalMs (5s) later — exactly the still-scheduled,
+      // still-mid-backlog state a live SIGTERM landed in. Each
+      // materialized item's onMaterialized hook appends a NEW accepted
+      // event, marking connectionsMaterializer dirty again; before this
+      // fix nothing ever called lane.stop() on a normal shutdown (only
+      // on the startup-FAILURE teardown path), so the lane — and its
+      // event-append side effect — outlived close() entirely.
+      for (let i = 0; i < 6; i += 1) {
+        await enqueueBodyEvidence(
+          vaultRoot,
+          bodyEvidencePayload(`https://shutdown-drain.example/${String(i)}`),
+        );
+      }
+
+      // Count real `[page_evidence.body_lane.cycle]` log lines the lane
+      // writes via `process.stdout.write` (companion.ts wires `log:` to
+      // stdout directly — there's no other DI seam) without swallowing
+      // any other test output.
+      let cycleLogCount = 0;
+      const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+      const countingWrite: typeof process.stdout.write = (chunk, ...rest) => {
+        if (typeof chunk === 'string' && chunk.includes('[page_evidence.body_lane.cycle]')) {
+          cycleLogCount += 1;
+        }
+        // @ts-expect-error — forwarding the exact overload Node picked.
+        return originalStdoutWrite(chunk, ...rest);
+      };
+      process.stdout.write = countingWrite;
+
+      try {
+        companion = await startCompanion({
+          vaultPath: vaultRoot,
+          port: port++,
+          allowAutoUpdate: false,
+        });
+
+        // Wait for the lane's immediate `schedule(0)` tick to actually
+        // run one full cycle (batchCap=4 of the 6 seeded items) —
+        // proof the lane had genuine, real in-flight work, not an
+        // idle-empty queue.
+        const deadline = Date.now() + 5_000;
+        while (cycleLogCount < 1 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(cycleLogCount).toBeGreaterThanOrEqual(1);
+        const cyclesBeforeClose = cycleLogCount;
+
+        // SIGTERM lands now: 2 items are still queued, and the lane's
+        // OWN scheduler has already armed a second cycle ~5s out
+        // (DEFAULT_BODY_EVIDENCE_LANE_CONFIG.cycleIntervalMs) — the
+        // shutdown must land while that timer is still live.
+        const closeStartedAtMs = Date.now();
+        await companion.close();
+        const closeDurationMs = Date.now() - closeStartedAtMs;
+
+        // The incident's operator-facing bound was "hangs forever,
+        // needs SIGKILL". 20s is the regression bar from the fix
+        // ticket; a correctly draining shutdown resolves far sooner.
+        expect(closeDurationMs).toBeLessThan(20_000);
+
+        const lockPath = join(vaultRoot, '_BAC', 'recall', '.lock');
+        await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+        // The load-bearing assertion: wait past the moment the lane's
+        // still-armed second cycle WOULD have fired (cycleIntervalMs +
+        // margin) and confirm it never did. Without close() calling
+        // stop() first, this second cycle fires regardless of whether
+        // the process has "finished" shutting down, appending yet
+        // another event — the mechanism that kept the drain from ever
+        // converging live.
+        await new Promise((resolve) => setTimeout(resolve, 6_000));
+        expect(cycleLogCount).toBe(cyclesBeforeClose);
+
+        companion = null;
+      } finally {
+        process.stdout.write = originalStdoutWrite;
+      }
+    },
+    25_000,
+  );
 });

@@ -33,6 +33,7 @@ import { withBunSmolCommand } from './process/bunMemory.js';
 import { getModelCacheStatus, resolveModelsDir } from './recall/modelCache.js';
 import { RECALL_MODEL } from './recall/modelManifest.js';
 import { startCompanion } from './runtime/companion.js';
+import { createShutdownWatchdog, resolveShutdownGraceMs } from './runtime/shutdownWatchdog.js';
 import { ensureRendezvousSecret } from './sync/rendezvousSecret.js';
 import { startRelayServer, type StartedRelayServer } from './sync/relayServer.js';
 import { installCrashHandlers } from './system/crashHandler.js';
@@ -1970,20 +1971,47 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   // so `kill` left `_BAC/recall/.lock` pointing at the now-dead pid
   // and stranded the next-launch on the recovery path's stale-pid
   // takeover. closeAll() releases the lock via runtime.close().
-  const shutdown = (signal: NodeJS.Signals): void => {
-    if (mcpChild !== undefined) mcpChild.kill(signal);
-    if (localRelay !== undefined) {
-      writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
-    }
-    void closeAll().finally(() => {
-      process.exit(0);
-    });
-  };
-  process.once('SIGINT', () => {
-    shutdown('SIGINT');
+  //
+  // Wrapped in a bounded watchdog (SIDETRACK_SHUTDOWN_GRACE_MS, default
+  // 15s): observed live (2026-08-15/16, twice) that a still-running
+  // background lane could keep closeAll()'s drain from ever converging,
+  // hanging the process forever and stranding the recall lock — operator
+  // recovery both times required SIGKILL. companion.ts's close() now
+  // root-causes that specific hang (stops lanes before draining), but
+  // this watchdog is the backstop for any other future wedge: past the
+  // grace period it logs what's still pending and force-exits(1) instead
+  // of hanging silently. A second SIGINT/SIGTERM while a shutdown is
+  // already in flight skips the grace period and exits immediately.
+  const shutdownGraceMs = resolveShutdownGraceMs(process.env['SIDETRACK_SHUTDOWN_GRACE_MS']);
+  const shutdownWatchdog = createShutdownWatchdog({
+    graceMs: shutdownGraceMs,
+    close: async (signal) => {
+      if (mcpChild !== undefined) mcpChild.kill(signal);
+      if (localRelay !== undefined) {
+        writeLine(streams.stdout, `[sync relay] received ${signal}, shutting down`);
+      }
+      await closeAll();
+    },
+    getDiagnostics: () => runtime.getShutdownDiagnostics(),
+    log: (line) => {
+      writeLine(streams.stderr, line);
+    },
+    exit: (code) => {
+      process.exit(code);
+    },
+    // Best-effort, non-blocking: if the watchdog or a double-signal is
+    // forcing us out, make sure the mcp child doesn't outlive us even
+    // though the graceful mcpChild.kill(signal) above may not have run
+    // (early SIGTERM) or may not have taken effect yet.
+    forceRelease: () => {
+      if (mcpChild !== undefined) mcpChild.kill('SIGKILL');
+    },
   });
-  process.once('SIGTERM', () => {
-    shutdown('SIGTERM');
+  process.on('SIGINT', () => {
+    shutdownWatchdog.handleSignal('SIGINT');
+  });
+  process.on('SIGTERM', () => {
+    shutdownWatchdog.handleSignal('SIGTERM');
   });
   return 0;
 };

@@ -193,4 +193,56 @@ describe('body-evidence lane', () => {
       'Newer captured body revision.',
     );
   });
+
+  // Regression coverage for the SIGTERM shutdown hang (2026-08-15/16):
+  // companion.ts's close() now calls lane.stop() BEFORE draining the
+  // contract runner, and depends on stop() honoring two things — (1) an
+  // in-flight cycle is left to finish rather than aborted mid-write, and
+  // (2) no FURTHER cycle gets scheduled once stopped, even though the
+  // scheduler loop only checks `stopped` from inside the in-flight
+  // cycle's `finally`. Before this fix nothing ever called stop() on a
+  // normal shutdown (it was only reachable via the startup-failure
+  // teardown path), so the lane kept ticking — and kept appending new
+  // accepted events — forever after SIGTERM.
+  it('stop() lets an in-flight cycle finish but schedules no further cycle', async () => {
+    await enqueueBodyEvidence(root, payload('https://lane.test/stop-mid-cycle'));
+    let runWorkerCalls = 0;
+    let releaseWorker: () => void = () => undefined;
+    const workerGate = new Promise<void>((resolve) => {
+      releaseWorker = resolve;
+    });
+    const lane = createBodyEvidenceLane(
+      {
+        vaultRoot: root,
+        runWorker: async (items) => {
+          runWorkerCalls += 1;
+          // Blocks the FIRST cycle open so the test can call stop()
+          // while it's genuinely mid-cycle, mirroring a SIGTERM landing
+          // while the lane is in the middle of materializing a batch.
+          await workerGate;
+          return {
+            results: items.map((item) => ({ jobId: item.jobId, ok: true })),
+            coverage: coverage(0.8),
+          };
+        },
+      },
+      { ...DEFAULT_BODY_EVIDENCE_LANE_CONFIG, cycleIntervalMs: 5, idleIntervalMs: 5 },
+    );
+
+    lane.start();
+    // Let the scheduled tick begin — it immediately blocks inside
+    // runWorker on workerGate.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runWorkerCalls).toBe(1);
+
+    // Shutdown arrives mid-cycle.
+    lane.stop();
+    releaseWorker();
+
+    // Give the in-flight cycle time to finish its `finally` (which is
+    // where a buggy stop() implementation could still re-arm a timer)
+    // and, if it did, time for that next cycle to have started too.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(runWorkerCalls).toBe(1);
+  });
 });

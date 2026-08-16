@@ -17,18 +17,99 @@ export interface ScopeRecomputeOutput {
   readonly edges: readonly ConnectionEdge[];
 }
 
+// Perf note (2026-08-16, item 2 of the shutdown-watchdog +
+// bounded-recomputeScopes fix): every scoped-delta drain in
+// connectionsMaterializer.ts calls recomputeScope/rowsForScope once PER
+// DIRTY SCOPE against the SAME snapshot object -- several independent
+// hot loops there do this (the per-scope catch-up loop, the
+// scopesToPreserve map, two separate dirtyScopes maps). rowsForScope
+// used to call scopesForGraphRows -- a full O(nodes) pass plus TWO
+// O(edges log edges) sorts -- from scratch on EVERY call, then linearly
+// filtered the full nodes/edges arrays again to pick out one scope's
+// rows. That makes a whole drain O(scopes * (nodes + edges log edges))
+// when it only needs to be O(nodes + edges log edges) ONCE, followed by
+// O(1)-amortized per-scope lookups.
+//
+// Measured live: `scopedDelta.recomputeScopes n=4781 nodes=4614
+// edges=81046` took 723004ms in a single catch-up chunk (~151ms/scope)
+// -- this redundant re-derivation is where that time went.
+//
+// Fix: build a per-scope node/edge INDEX once per snapshot (same cost
+// as the old scopesForGraphRows call) and cache it by snapshot object
+// identity. ConnectionsSnapshot.nodes/.edges are readonly -- every
+// drain constructs a genuinely new snapshot object, so a WeakMap keyed
+// on that object is automatically correct (a new snapshot object is
+// always a cache miss; nothing can ever serve a stale index for a
+// mutated snapshot) and automatically bounded (entries are reclaimed
+// by the GC once a drain's snapshot goes out of scope -- no manual
+// eviction, no size cap, no env gate needed). This changes ONLY where
+// the O(nodes + edges) work happens (once, shared across every scope
+// in a drain, instead of once per scope); the per-scope OUTPUT (which
+// nodes/edges land in which scope, and their relative order) is
+// unchanged -- see scopeRecompute.perf.test.ts for a byte-identical-
+// output proof against the original filter-based implementation.
+interface ScopeMembershipIndex {
+  readonly nodesByScope: ReadonlyMap<string, readonly ConnectionNode[]>;
+  readonly edgesByScope: ReadonlyMap<string, readonly ConnectionEdge[]>;
+}
+
+// Test-only counter: how many times the O(nodes + edges) index build
+// actually ran. The fix's whole point is that this stays at 1 per
+// snapshot no matter how many scopes are queried against it — see
+// scopeRecompute.perf.test.ts.
+let scopeMembershipIndexBuildCount = 0;
+export const __scopeMembershipIndexBuildCountForTests = (): number =>
+  scopeMembershipIndexBuildCount;
+
+const buildScopeMembershipIndex = (snapshot: ConnectionsSnapshot): ScopeMembershipIndex => {
+  scopeMembershipIndexBuildCount += 1;
+  const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
+  const nodesByScope = new Map<string, ConnectionNode[]>();
+  for (const node of snapshot.nodes) {
+    for (const scope of memberships.nodeScopes.get(node.id) ?? []) {
+      const key = scopeKey(scope);
+      const bucket = nodesByScope.get(key);
+      if (bucket === undefined) nodesByScope.set(key, [node]);
+      else bucket.push(node);
+    }
+  }
+  const edgesByScope = new Map<string, ConnectionEdge[]>();
+  for (const edge of snapshot.edges) {
+    const membershipKey = `${edge.fromNodeId}\u0000${edge.toNodeId}`;
+    for (const scope of memberships.edgeScopes.get(membershipKey) ?? []) {
+      const key = scopeKey(scope);
+      const bucket = edgesByScope.get(key);
+      if (bucket === undefined) edgesByScope.set(key, [edge]);
+      else bucket.push(edge);
+    }
+  }
+  return { nodesByScope, edgesByScope };
+};
+
+let scopeMembershipIndexCache = new WeakMap<ConnectionsSnapshot, ScopeMembershipIndex>();
+
+const membershipIndexFor = (snapshot: ConnectionsSnapshot): ScopeMembershipIndex => {
+  const cached = scopeMembershipIndexCache.get(snapshot);
+  if (cached !== undefined) return cached;
+  const computed = buildScopeMembershipIndex(snapshot);
+  scopeMembershipIndexCache.set(snapshot, computed);
+  return computed;
+};
+
+/** Test-only: reset the cache so tests can't observe cross-test
+ * snapshot identity reuse. Never called from production code. */
+export const __resetScopeMembershipCacheForTests = (): void => {
+  scopeMembershipIndexCache = new WeakMap();
+  scopeMembershipIndexBuildCount = 0;
+};
+
 const rowsForScope = (snapshot: ConnectionsSnapshot, scope: Scope): ScopeRecomputeOutput => {
   const wanted = scopeKey(scope);
-  const memberships = scopesForGraphRows({ nodes: snapshot.nodes, edges: snapshot.edges });
-  const nodes = snapshot.nodes.filter((node) =>
-    (memberships.nodeScopes.get(node.id) ?? []).some((member) => scopeKey(member) === wanted),
-  );
-  const edges = snapshot.edges.filter((edge) =>
-    (memberships.edgeScopes.get(`${edge.fromNodeId}\u0000${edge.toNodeId}`) ?? []).some(
-      (member) => scopeKey(member) === wanted,
-    ),
-  );
-  return { nodes, edges };
+  const index = membershipIndexFor(snapshot);
+  return {
+    nodes: index.nodesByScope.get(wanted) ?? [],
+    edges: index.edgesByScope.get(wanted) ?? [],
+  };
 };
 
 export const scopesForConnectionsSnapshot = (snapshot: ConnectionsSnapshot): Scope[] => {
