@@ -1,5 +1,8 @@
 # Minimal honest CI for the Sidetrack Bun monorepo.
-# Runs on every push and pull request.
+# Runs on pushes to main and on every pull request. Branch pushes are
+# covered by their PR run alone — an unfiltered `push:` trigger made every
+# branch push run the suite TWICE (push + pull_request), doubling failure
+# emails and CI minutes for zero extra signal.
 #
 # What is NOT here:
 #   - e2e / Playwright (needs a live browser + companion vault)
@@ -16,6 +19,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
