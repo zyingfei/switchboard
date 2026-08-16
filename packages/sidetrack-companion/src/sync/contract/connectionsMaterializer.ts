@@ -3622,6 +3622,14 @@ export const createConnectionsMaterializer = (
     await yieldToEventLoop();
     const dirtyScopes = invalidationKeysToScopes(buildKeys);
     const previousSnapshotForRanker = await deps.store.readCurrent();
+    // Boot inherits the on-disk snapshot as "recently rebuilt": without this
+    // every RESTART pays one full ~370MB generation rewrite on the first
+    // bailed drain (lastFullBaseRebuildAtMs starts at 0 ⇒ cooldown trivially
+    // expired). An existing published generation is at worst one cooldown
+    // stale, which the sticky healing rebuild already bounds.
+    if (lastFullBaseRebuildAtMs === 0 && previousSnapshotForRanker !== null) {
+      lastFullBaseRebuildAtMs = Date.now();
+    }
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
     // corpus/focus). If the same set of visits has already been
