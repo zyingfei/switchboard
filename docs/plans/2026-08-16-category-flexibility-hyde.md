@@ -456,3 +456,116 @@ show the lane declining to confidently mis-suggest.
 **Phase 4 — split/new-category suggestion.** *Acceptance*: fires on a
 scoped-down version of the north-star study's `"ai"` catch-all shape;
 does not fire on a legitimately cohesive workstream (negative control).
+
+## 8. Landing note — Phase 1 + Phase 4 stats/data layer (2026-08-16)
+
+Shipped in one PR on `feat/category-multi-membership`: the multi-membership
+data model + events (§1), the additive UX-operation events (§2), and the
+split/new-category suggestion STATS machinery (§4, no LLM). Phase 2/3 (the
+prototype lane) are untouched — a concurrent sibling branch owns
+`guessLanes.ts` / `laneCorroboration.ts` / recall-v2 / the enrichment
+engine, and this PR deliberately does not touch lane or generation code.
+
+**§1 — data model.** `workstreams/membershipEvents.ts`
+(`WORKSTREAM_MEMBERSHIP_SET` / `WORKSTREAM_MEMBERSHIP_REMOVED`,
+`foldWorkstreamMembership`) implements the fold exactly as specified:
+latest-wins per (subjectKind, subjectId, workstreamId) pair on an
+(acceptedAtMs, replicaId, seq) tuple, plus the cross-pair "at most one
+primary" invariant (setting a new primary demotes the previous one to
+secondary, never silently promotes another). `workstreams/
+workstreamMembershipStore.ts` is modeled on `threadRegisterStore.ts` as
+directed: an unpruned per-subject event bucket, the resolved projection
+recomputed from the COMPLETE bucket on every ingest (order-independent by
+construction), plus a normalized `workstream_membership_current` reverse
+index for O(indexed rows) "who's in workstream W" reads. One deviation from
+a literal reading of the SQL sketch in §1: the store keeps the raw bucket
+*in addition to* the flattened `workstream_membership_state`-shaped table,
+because — per the same reasoning threadRegisterStore itself documents — an
+incrementally-maintained single-row cache (workstreamParentStore's leaner
+pattern) cannot correctly reproduce the cross-pair primary invariant under
+arbitrary out-of-order catch-up without re-deriving it from full history
+anyway.
+
+**One-time backfill.** `workstreams/membershipBackfill.ts` +
+`sidetrack-companion membership-backfill --vault <path> [--apply] [--json]`
+(cli.ts, same consent-gated / process-lock pattern as
+`connections-rebuild`). Derives `role:'primary'` rows from the THREE
+sources the design names (`urls.attribution.inferred` /
+`tabsession.attribution.inferred` / `user.organized.item` moves) by calling
+the EXISTING `projectUrls`/`projectTabSessions` projectors rather than
+re-deriving their tie-break logic — compatibility by construction. Also
+backfills `thread.upserted`'s `primaryWorkstreamId` register field (not one
+of the three literal event types, but explicitly one of the three scalar
+fields the design names as becoming derived, so it needed its own source).
+Report-only by default; deterministic and idempotent (safe to re-run).
+
+**Graph edges.** `workstreams/membershipEdges.ts`'s
+`visitInWorkstreamEdgesFromMembership` mints one `visit_in_workstream` edge
+per active membership row with the asserted/inferred confidence split the
+design specifies. It is NOT wired into `connections/snapshot.ts`'s existing
+single-primary emission of that edge — doing so needs
+`sync/contract/connectionsMaterializer.ts` (explicitly off-limits for this
+PR) to thread membership-store reads into the snapshot input assembly.
+Left as a ready-to-splice, fully-tested pure function; wiring it in is the
+next PR's first task.
+
+**§2 — UX-operation events + routes.** `USER_ORGANIZED_ITEM_ACTIONS` gained
+`'add-container'` / `'remove-container'` (feedback/events.ts). New routes,
+additive beside the existing replace-primary `/attribute`:
+`POST /v1/visits/:canonicalUrl/memberships` (set — accepts an optional
+`suggestionSource` to also append `SUGGESTION_ACCEPTED` first, matching
+the design's accept flow), `POST /v1/visits/:canonicalUrl/memberships/
+:workstreamId/remove`, and `POST /v1/visits/:canonicalUrl/suggestions/
+decline`. Scope note: these routes only cover `subjectKind:'canonical-url'`
+— thread/tab-session membership routes are not built this PR (no existing
+UI surface calls for them yet); the store and fold already support all
+three subject kinds.
+
+**§4 — split/new-category suggestions.** `connections/hdbscanClusterer.ts`
+gained one new exported pure primitive, `densityConnectedComponents`
+(mutual-reachability MST + cosine-threshold cut, extracted from the
+existing visit-topic pipeline so it's genuinely reused, not duplicated) —
+the existing `buildHdbscanTopicRevision` now calls the same extracted core
+functions. `workstreams/splitSuggestionEngine.ts` +
+`suggestionCandidateStore.ts` implement the stats engine: scoped clustering
+(split = one workstream's own evidence; new-category = same machinery over
+a caller-supplied unaffiliated pool), a stability gate requiring 3
+CONSECUTIVE recomputations with matching (Jaccard-overlap, not exact-id)
+cluster membership before a candidate is allowed to emit, sticky
+`emitted` (never re-emits), and dirty-marking via a caller-supplied
+`revisionId` that short-circuits the whole clustering pass when unchanged.
+The "3 consecutive" and "0.75 overlap" constants are judgment calls the
+design left unspecified numerically — flagged here for the golden-set
+tuning pass §5 calls for before promotion. Deliberately NOT built this PR:
+live evidence-embedding retrieval from recall-v2 for a real workstream, and
+gathering the vault-wide "unaffiliated pool" from the resolver's abstain
+set — both real-data wiring that would touch the sibling branch's recall-v2
+area; the engine takes plain `evidence: {id, embedding, title}[]` so that
+wiring is a pure addition later, not a rewrite. LLM naming is out of scope
+as designed; a structural fallback name (top-3 discriminative title terms,
+reusing `suggestions/tokens.ts`'s tokenizer) is always computed instead.
+
+**§5 — falsifiability spine.** `declineMemory.ts`'s `DeclineLookup` gained
+`declinedWorkstreamsByUrl` (folded from `SUGGESTION_ACCEPTED`/
+`SUGGESTION_DECLINED`, latest-wins per pair) and a new `isWorkstreamDeclined
+(lookup, subjectId, workstreamId)` export, additive beside the untouched
+existing `isUrlDeclined` — no existing caller (`laneFallback.ts`,
+`laneCorroboration.ts`) needed to change. `system/workGraphHealth.ts` gained
+one new `DiagnosticCandidate` (`workstreams.membership-suggestions`,
+`family:'workstreams'` — new union member, `lane:'diagnostic'`,
+`servingImpact:'observe-only'`) folding suggestion accept/decline-by-source
+and raw membership-edit counts live from the merged log, same idiom as
+`topic.incremental-shadow`.
+
+**Deviations from a literal reading of the design, all judgment calls
+under the "conservative defaults" instruction:** (1) stability threshold =
+3 consecutive computations, overlap-match threshold = 0.75 Jaccard — both
+unspecified numerically in §4, chosen conservative-but-not-paralyzing,
+flagged for golden-set tuning. (2) Graph-edge minting stops at a tested
+pure function rather than reaching into the forbidden materializer file.
+(3) Thread/tab-session membership HTTP routes not built (store/fold already
+support them). (4) recall-v2 evidence-gathering wiring for the suggestion
+engine deferred to avoid the sibling branch's active files.
+
+Full test suite green (`bun test`); `bun run build` clean. See the PR for
+file list and exact test counts.

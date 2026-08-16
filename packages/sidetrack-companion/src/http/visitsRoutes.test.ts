@@ -205,6 +205,108 @@ describe('per-URL HTTP routes', () => {
     );
   });
 
+  it('POST /v1/visits/{url}/memberships adds a secondary membership additively', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/issues';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_a' });
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      {
+        method: 'POST',
+        headers: headers('idem-membership-1'),
+        body: JSON.stringify({ workstreamId: 'ws_secondary' }),
+      },
+    );
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as {
+      data: { accepted: { type: string; payload: Record<string, unknown> } };
+    };
+    expect(body.data.accepted.type).toBe('workstream.membership.set');
+    expect(body.data.accepted.payload).toMatchObject({
+      subjectKind: 'canonical-url',
+      subjectId: canonicalUrl,
+      workstreamId: 'ws_secondary',
+      role: 'secondary',
+      provenance: 'user-filed',
+    });
+
+    const merged = await eventLog.readMerged();
+    const organized = merged.find(
+      (event) =>
+        event.type === 'user.organized.item' &&
+        (event.payload as { action?: unknown }).action === 'add-container',
+    );
+    expect(organized).toBeDefined();
+  });
+
+  it('POST /v1/visits/{url}/memberships accepting a suggestion appends BOTH the accept and the set event', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/discussions';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_b' });
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      {
+        method: 'POST',
+        headers: headers('idem-membership-2'),
+        body: JSON.stringify({ workstreamId: 'ws_split', suggestionSource: 'workstream-split' }),
+      },
+    );
+    expect(response.status).toBe(201);
+
+    const merged = await eventLog.readMerged();
+    const acceptedTypes = merged.map((event) => event.type);
+    expect(acceptedTypes).toContain('workstream.suggestion.accepted');
+    expect(acceptedTypes).toContain('workstream.membership.set');
+    const setEvent = merged.find((event) => event.type === 'workstream.membership.set');
+    expect((setEvent?.payload as { provenance?: unknown })?.provenance).toBe('ai-suggested-accepted');
+  });
+
+  it('POST /v1/visits/{url}/memberships/{workstreamId}/remove drops one row without an accompanying decline', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/wiki';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_c' });
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships/ws_gone/remove`,
+      {
+        method: 'POST',
+        headers: headers('idem-membership-3'),
+        body: JSON.stringify({}),
+      },
+    );
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as {
+      data: { accepted: { type: string; payload: Record<string, unknown> } };
+    };
+    expect(body.data.accepted.type).toBe('workstream.membership.removed');
+    expect(body.data.accepted.payload).toMatchObject({
+      subjectId: canonicalUrl,
+      workstreamId: 'ws_gone',
+      reason: 'user-removed',
+    });
+  });
+
+  it('POST /v1/visits/{url}/suggestions/decline writes a decline with no membership row', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/actions';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_d' });
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/suggestions/decline`,
+      {
+        method: 'POST',
+        headers: headers('idem-decline-1'),
+        body: JSON.stringify({ workstreamId: 'ws_declined', suggestionSource: 'workstream-new-category' }),
+      },
+    );
+    expect(response.status).toBe(201);
+    const body = (await response.json()) as {
+      data: { accepted: { type: string; payload: Record<string, unknown> } };
+    };
+    expect(body.data.accepted.type).toBe('workstream.suggestion.declined');
+
+    const merged = await eventLog.readMerged();
+    expect(merged.some((event) => event.type === 'workstream.membership.set')).toBe(false);
+  });
+
   it('serves a durable opportunity id, stores the explicit outcome, and reads back a joined score', async () => {
     const canonicalUrl = 'https://coverage.test/served-page';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_coverage' });

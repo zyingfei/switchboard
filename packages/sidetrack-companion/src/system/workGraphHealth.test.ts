@@ -1050,6 +1050,85 @@ describe('work graph diagnostic candidates', () => {
     expect(health.labelChannels.weakNegativesEnabled).toBe(true);
   });
 
+  it('surfaces suggestion accept/decline + membership-edit counters (Phase 1 multi-membership §5)', async () => {
+    const peerReplicaId = '55555555-5555-4555-8555-555555555555';
+    let seq = 0;
+    const eventLog = createEventLog(vaultRoot, {
+      replicaId: '66666666-6666-4666-8666-666666666666',
+      created: true,
+      nextSeq: async () => {
+        seq += 1;
+        return seq;
+      },
+      peekSeq: () => seq,
+      observeSeq: async (incoming: number) => {
+        seq = Math.max(seq, incoming);
+      },
+    });
+    const at = (seqValue: number): AcceptedEvent['dot'] => ({ replicaId: peerReplicaId, seq: seqValue });
+    await eventLog.importPeerEvent({
+      clientEventId: 'client-suggestion-accepted-1',
+      dot: at(1),
+      deps: {},
+      aggregateId: 'workstream-suggestion:workstream-split:canonical-url:https://a.test/x:ws-2',
+      type: 'workstream.suggestion.accepted',
+      payload: {
+        payloadVersion: 1,
+        suggestionSource: 'workstream-split',
+        subjectKind: 'canonical-url',
+        subjectId: 'https://a.test/x',
+        workstreamId: 'ws-2',
+      },
+      acceptedAtMs: Date.parse('2026-08-16T14:00:00.000Z'),
+    });
+    await eventLog.importPeerEvent({
+      clientEventId: 'client-suggestion-declined-1',
+      dot: at(2),
+      deps: {},
+      aggregateId: 'workstream-suggestion:workstream-new-category:canonical-url:https://a.test/y:ws-3',
+      type: 'workstream.suggestion.declined',
+      payload: {
+        payloadVersion: 1,
+        suggestionSource: 'workstream-new-category',
+        subjectKind: 'canonical-url',
+        subjectId: 'https://a.test/y',
+        workstreamId: 'ws-3',
+      },
+      acceptedAtMs: Date.parse('2026-08-16T14:01:00.000Z'),
+    });
+    await eventLog.importPeerEvent({
+      clientEventId: 'client-membership-set-1',
+      dot: at(3),
+      deps: {},
+      aggregateId: 'workstream-membership:canonical-url:https://a.test/x:ws-2',
+      type: 'workstream.membership.set',
+      payload: {
+        payloadVersion: 1,
+        subjectKind: 'canonical-url',
+        subjectId: 'https://a.test/x',
+        workstreamId: 'ws-2',
+        role: 'primary',
+        provenance: 'ai-suggested-accepted',
+      },
+      acceptedAtMs: Date.parse('2026-08-16T14:02:00.000Z'),
+    });
+
+    const health = await collectWorkGraphHealth({
+      vaultRoot,
+      eventLog,
+      now: () => new Date('2026-08-16T14:05:00.000Z'),
+    });
+
+    const candidate = health.candidates.find((c) => c.id === 'workstreams.membership-suggestions');
+    expect(candidate?.status).toBe('ok');
+    expect(candidate?.servingImpact).toBe('observe-only');
+    expect(candidate?.metrics['suggestionAcceptedCount']).toBe(1);
+    expect(candidate?.metrics['suggestionDeclinedCount']).toBe(1);
+    expect(candidate?.metrics['membershipEditCount']).toBe(1);
+    expect(candidate?.metrics['accepted.workstream-split']).toBe(1);
+    expect(candidate?.metrics['declined.workstream-new-category']).toBe(1);
+  });
+
   describe('shipGateV2 serving-gate enforcement + shadow-diff (read-back)', () => {
     const priorServeV6 = process.env['SIDETRACK_RANKER_SERVE_V6'];
     const priorLegacy = process.env['SIDETRACK_RECALL_LEARNED_RERANK'];

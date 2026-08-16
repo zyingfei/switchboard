@@ -24,6 +24,25 @@ import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../
 import { autoApplyUrlAttribution } from '../../urls/autoApply.js';
 import { URL_IGNORED } from '../../urls/events.js';
 import { serializeUrlProjection, urlInbox } from '../../urls/projection.js';
+import {
+  membershipAggregateId,
+  MEMBERSHIP_PROVENANCES,
+  MEMBERSHIP_REMOVED_REASONS,
+  WORKSTREAM_MEMBERSHIP_REMOVED,
+  WORKSTREAM_MEMBERSHIP_SET,
+  type MembershipProvenance,
+  type MembershipRemovedReason,
+  type MembershipRole,
+  type WorkstreamMembershipRemovedPayload,
+  type WorkstreamMembershipSetPayload,
+} from '../../workstreams/membershipEvents.js';
+import {
+  suggestionAggregateId,
+  SUGGESTION_DECLINED,
+  SUGGESTION_SOURCES,
+  type SuggestionDeclinedPayload,
+  type SuggestionSource,
+} from '../../workstreams/suggestionEvents.js';
 
 import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, aggregateIdForFeedbackEvent, baseVectorForAggregate, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, invalidateResolveCaches, loadUrlProjection, objectRecord, optionalAttributionPolicyMode, optionalAttributionPolicyTelemetry, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, requireVaultRoot, runIdempotent, serveResolveSwr } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
@@ -839,6 +858,327 @@ export const visitsRoutesB: readonly RouteDefinition[] = [
             },
           },
         ];
+      });
+    },
+  },
+  // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §1/§2) — ADDITIVE, sits beside the replace-primary /attribute
+  // route above. `workstreamId` gains a `role:'secondary'` (default) or
+  // `role:'primary'` membership row without disturbing any other
+  // workstream the URL already belongs to — /attribute's single-winner
+  // replace semantics are untouched. Accepting a served suggestion is the
+  // SAME route: pass `suggestionSource` (+ optional `sourceOpportunityId`)
+  // and a `workstream.suggestion.accepted` event is appended first, per the
+  // design's §2 table.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/memberships$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlMembershipSet', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const workstreamId = body?.['workstreamId'];
+        if (typeof workstreamId !== 'string' || workstreamId.length === 0) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must contain workstreamId as a non-empty string.',
+          );
+        }
+        const rawRole = body?.['role'];
+        if (rawRole !== undefined && rawRole !== 'primary' && rawRole !== 'secondary') {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'role must be "primary" or "secondary" when provided.',
+          );
+        }
+        const role: MembershipRole = rawRole ?? 'secondary';
+        const rawSuggestionSource = body?.['suggestionSource'];
+        if (
+          rawSuggestionSource !== undefined &&
+          !(SUGGESTION_SOURCES as readonly string[]).includes(rawSuggestionSource as string)
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            `suggestionSource must be one of ${SUGGESTION_SOURCES.join(', ')} when provided.`,
+          );
+        }
+        const suggestionSource = rawSuggestionSource as SuggestionSource | undefined;
+        const rawProvenance = body?.['provenance'];
+        if (
+          rawProvenance !== undefined &&
+          !(MEMBERSHIP_PROVENANCES as readonly string[]).includes(rawProvenance as string)
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            `provenance must be one of ${MEMBERSHIP_PROVENANCES.join(', ')} when provided.`,
+          );
+        }
+        const provenance: MembershipProvenance =
+          (rawProvenance as MembershipProvenance | undefined) ??
+          (suggestionSource === undefined ? 'user-filed' : 'ai-suggested-accepted');
+        if (
+          (provenance === 'ai-suggested-accepted' || provenance === 'prototype-matched') &&
+          suggestionSource === undefined
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'suggestionSource is required when provenance is an AI/prototype source.',
+          );
+        }
+        const servedOpportunityId = body?.['servedOpportunityId'];
+        if (servedOpportunityId !== undefined && !isLaneOpportunityId(servedOpportunityId)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'servedOpportunityId must be a valid lane opportunity id when provided.',
+          );
+        }
+
+        if (suggestionSource !== undefined) {
+          const acceptedPayload = {
+            payloadVersion: 1 as const,
+            suggestionSource,
+            subjectKind: 'canonical-url' as const,
+            subjectId: canonicalUrl,
+            workstreamId,
+            ...(servedOpportunityId === undefined ? {} : { servedOpportunityId }),
+          };
+          const acceptedAggregateId = suggestionAggregateId(
+            suggestionSource,
+            'canonical-url',
+            canonicalUrl,
+            workstreamId,
+          );
+          await eventLog.appendClient({
+            clientEventId: `${idempotencyKey}:accepted`,
+            aggregateId: acceptedAggregateId,
+            type: 'workstream.suggestion.accepted',
+            payload: acceptedPayload,
+            baseVector: await baseVectorForAggregate(eventLog, acceptedAggregateId),
+          });
+        }
+
+        const setPayload = {
+          payloadVersion: 1,
+          subjectKind: 'canonical-url',
+          subjectId: canonicalUrl,
+          workstreamId,
+          role,
+          provenance,
+          ...(servedOpportunityId === undefined ? {} : { sourceOpportunityId: servedOpportunityId }),
+        } satisfies WorkstreamMembershipSetPayload;
+        const setAggregateId = membershipAggregateId('canonical-url', canonicalUrl, workstreamId);
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId: setAggregateId,
+          type: WORKSTREAM_MEMBERSHIP_SET,
+          payload: setPayload,
+          baseVector: await baseVectorForAggregate(eventLog, setAggregateId),
+        });
+
+        // Telemetry continuity — every membership mutation also appends a
+        // USER_ORGANIZED_ITEM so the existing recordOrganizedItemFeedback ->
+        // lane-outcome telemetry path keeps working unchanged (design §2).
+        const organizedPayload = {
+          payloadVersion: 1 as const,
+          itemKind: 'canonical-url' as const,
+          itemId: canonicalUrl,
+          action: 'add-container' as const,
+          toContainer: workstreamId,
+          ...(servedOpportunityId === undefined ? {} : { details: { servedOpportunityId } }),
+        };
+        const organizedAggregateId = aggregateIdForFeedbackEvent(USER_ORGANIZED_ITEM, organizedPayload);
+        await eventLog.appendClient({
+          clientEventId: `${idempotencyKey}:organized`,
+          aggregateId: organizedAggregateId,
+          type: USER_ORGANIZED_ITEM,
+          payload: organizedPayload,
+          baseVector: await baseVectorForAggregate(eventLog, organizedAggregateId),
+        });
+
+        invalidateResolveCaches();
+        return [201, { data: { accepted } }];
+      });
+    },
+  },
+  // Removes ONE membership row without touching any other workstream the
+  // URL belongs to — distinct from /attribute {workstreamId:null}, which
+  // replaces the whole single-primary answer with "not in any stream".
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/memberships\/(?<workstreamId>[^/]+)\/remove$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      const workstreamId = decodeURIComponent(match.workstreamId ?? '');
+      if (canonicalUrl.length === 0 || workstreamId.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlMembershipRemove', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request)) ?? {};
+        const rawReason = body['reason'];
+        if (
+          rawReason !== undefined &&
+          !(MEMBERSHIP_REMOVED_REASONS as readonly string[]).includes(rawReason as string)
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            `reason must be one of ${MEMBERSHIP_REMOVED_REASONS.join(', ')} when provided.`,
+          );
+        }
+        const reason: MembershipRemovedReason = (rawReason as MembershipRemovedReason | undefined) ?? 'user-removed';
+
+        const removedPayload = {
+          payloadVersion: 1,
+          subjectKind: 'canonical-url',
+          subjectId: canonicalUrl,
+          workstreamId,
+          reason,
+        } satisfies WorkstreamMembershipRemovedPayload;
+        const aggregateId = membershipAggregateId('canonical-url', canonicalUrl, workstreamId);
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: WORKSTREAM_MEMBERSHIP_REMOVED,
+          payload: removedPayload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
+
+        const organizedPayload = {
+          payloadVersion: 1 as const,
+          itemKind: 'canonical-url' as const,
+          itemId: canonicalUrl,
+          action: 'remove-container' as const,
+          fromContainer: workstreamId,
+        };
+        const organizedAggregateId = aggregateIdForFeedbackEvent(USER_ORGANIZED_ITEM, organizedPayload);
+        await eventLog.appendClient({
+          clientEventId: `${idempotencyKey}:organized`,
+          aggregateId: organizedAggregateId,
+          type: USER_ORGANIZED_ITEM,
+          payload: organizedPayload,
+          baseVector: await baseVectorForAggregate(eventLog, organizedAggregateId),
+        });
+
+        invalidateResolveCaches();
+        return [201, { data: { accepted } }];
+      });
+    },
+  },
+  // Decline an AI/prototype suggestion — no membership row is written; this
+  // feeds the generalized per-workstream decline memory (declineMemory.ts
+  // §5) so the SAME workstream never resurfaces on this URL again while
+  // every other workstream stays unaffected.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/suggestions\/decline$/u,
+    authRequired: true,
+    handle: async (request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const idempotencyKey = requireIdempotencyKey(request);
+      return await runIdempotent(context, 'urlSuggestionDecline', idempotencyKey, async () => {
+        const body = objectRecord(await readBody(request));
+        const workstreamId = body?.['workstreamId'];
+        if (typeof workstreamId !== 'string' || workstreamId.length === 0) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'Body must contain workstreamId as a non-empty string.',
+          );
+        }
+        const suggestionSource = body?.['suggestionSource'];
+        if (
+          typeof suggestionSource !== 'string' ||
+          !(SUGGESTION_SOURCES as readonly string[]).includes(suggestionSource)
+        ) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            `Body must contain suggestionSource as one of ${SUGGESTION_SOURCES.join(', ')}.`,
+          );
+        }
+        const servedOpportunityId = body?.['servedOpportunityId'];
+        if (servedOpportunityId !== undefined && !isLaneOpportunityId(servedOpportunityId)) {
+          throw new HttpRouteError(
+            400,
+            'VALIDATION_ERROR',
+            'Validation failed.',
+            'servedOpportunityId must be a valid lane opportunity id when provided.',
+          );
+        }
+
+        const payload = {
+          payloadVersion: 1,
+          suggestionSource: suggestionSource as SuggestionSource,
+          subjectKind: 'canonical-url',
+          subjectId: canonicalUrl,
+          workstreamId,
+          ...(servedOpportunityId === undefined ? {} : { servedOpportunityId }),
+        } satisfies SuggestionDeclinedPayload;
+        const aggregateId = suggestionAggregateId(
+          suggestionSource as SuggestionSource,
+          'canonical-url',
+          canonicalUrl,
+          workstreamId,
+        );
+        const accepted = await eventLog.appendClient({
+          clientEventId: idempotencyKey,
+          aggregateId,
+          type: SUGGESTION_DECLINED,
+          payload,
+          baseVector: await baseVectorForAggregate(eventLog, aggregateId),
+        });
+
+        invalidateResolveCaches();
+        return [201, { data: { accepted } }];
       });
     },
   },

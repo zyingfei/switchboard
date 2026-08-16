@@ -5,11 +5,13 @@ import {
   EMPTY_DECLINE_LOOKUP,
   foldDeclineMemory,
   isUrlDeclined,
+  isWorkstreamDeclined,
 } from './declineMemory.js';
 import { applyLaneFallbackGuess, type ResultWithFusion } from './laneFallback.js';
 import type { GuessLaneResult } from './guessLanes.js';
 import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM } from '../feedback/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
+import { SUGGESTION_ACCEPTED, SUGGESTION_DECLINED } from '../workstreams/suggestionEvents.js';
 
 // DECLINE MEMORY — "Not in any stream" is an answer, and it must stick.
 //
@@ -38,6 +40,27 @@ const organized = (
       itemId,
       action: over.action ?? 'move',
       ...(toContainer === null ? { toContainer: null } : { toContainer }),
+    },
+  } as unknown as AcceptedEvent;
+};
+
+const suggestion = (
+  type: typeof SUGGESTION_ACCEPTED | typeof SUGGESTION_DECLINED,
+  subjectId: string,
+  workstreamId: string,
+  atMs: number,
+): AcceptedEvent => {
+  seq += 1;
+  return {
+    type,
+    acceptedAtMs: atMs,
+    dot: { replicaId: 'r1', seq },
+    payload: {
+      payloadVersion: 1,
+      suggestionSource: 'workstream-split',
+      subjectKind: 'canonical-url',
+      subjectId,
+      workstreamId,
     },
   } as unknown as AcceptedEvent;
 };
@@ -232,5 +255,62 @@ describe('decline memory — (d) the lane-fallback veto (the live bug)', () => {
       declines,
     });
     expect(out.fusedCandidates[0]?.workstreamId).toBe('ws-ai');
+  });
+});
+
+// Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-hyde.md
+// §5) — generalized, per-workstream decline memory. E6: "declined workstream
+// A, still open to B" is a different assertion than the global "not in any
+// stream" bit above, and must be consulted separately.
+describe('decline memory — generalized per-workstream (§5)', () => {
+  it('declining workstream C for a URL does not suppress A or B', () => {
+    const lookup = foldDeclineMemory([suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 1_000)]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-c')).toBe(true);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-a')).toBe(false);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-b')).toBe(false);
+  });
+
+  it('a decline on one URL never leaks to a different URL ("declined here != declined there")', () => {
+    const lookup = foldDeclineMemory([suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 1_000)]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/y', 'ws-c')).toBe(false);
+  });
+
+  it('never resurfaces after decline: repeated folds of the same event stay declined', () => {
+    const events = [suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 1_000)];
+    expect(isWorkstreamDeclined(foldDeclineMemory(events), 'https://a.test/x', 'ws-c')).toBe(true);
+    expect(isWorkstreamDeclined(foldDeclineMemory(events), 'https://a.test/x', 'ws-c')).toBe(true);
+  });
+
+  it('a later accept of the exact same pair clears the decline (latest-wins, not append-only)', () => {
+    const lookup = foldDeclineMemory([
+      suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 1_000),
+      suggestion(SUGGESTION_ACCEPTED, 'https://a.test/x', 'ws-c', 2_000),
+    ]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-c')).toBe(false);
+  });
+
+  it('an earlier accept does not override a LATER decline (order matters, not just presence)', () => {
+    const lookup = foldDeclineMemory([
+      suggestion(SUGGESTION_ACCEPTED, 'https://a.test/x', 'ws-c', 1_000),
+      suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 2_000),
+    ]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-c')).toBe(true);
+  });
+
+  it('a global "not in any stream" decline subsumes every per-workstream check', () => {
+    const lookup = foldDeclineMemory([organized('https://a.test/x', null, 1_000)]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-anything')).toBe(true);
+  });
+
+  it('the kill switch also disables the per-workstream check', () => {
+    process.env[DECLINE_MEMORY_ENV] = '0';
+    const lookup = foldDeclineMemory([suggestion(SUGGESTION_DECLINED, 'https://a.test/x', 'ws-c', 1_000)]);
+    expect(isWorkstreamDeclined(lookup, 'https://a.test/x', 'ws-c')).toBe(false);
+  });
+
+  it('a null/undefined lookup reads as "no known decline"', () => {
+    expect(isWorkstreamDeclined(null, 'https://a.test/x', 'ws-c')).toBe(false);
+    expect(isWorkstreamDeclined(undefined, 'https://a.test/x', 'ws-c')).toBe(false);
+    expect(isWorkstreamDeclined(EMPTY_DECLINE_LOOKUP, 'https://a.test/x', 'ws-c')).toBe(false);
   });
 });
