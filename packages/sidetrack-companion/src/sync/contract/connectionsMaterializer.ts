@@ -1487,6 +1487,24 @@ export const createConnectionsMaterializer = (
   // Chunk counter for catch-up blob pacing (see
   // chunkProjectionAccumulatorStateFor). Reset per chunked catch-up.
   let catchUpChunkCounter = 0;
+  // Search-visit rebuild coalescing. A search visit in a drain window
+  // cannot take the scoped path (cross-visit search edges need the full
+  // corpus), so every drain whose window contains one fell to the full
+  // rebuild — during active search-heavy browsing that meant a
+  // multi-minute full pass PER DRAIN (observed live 2026-08-16: real
+  // captures starved to 26-30s behind back-to-back rebuilds). The full
+  // rebuild now runs at most once per cooldown; in between, search-visit
+  // drains advance progress only (prior snapshot served, same mechanics
+  // as the catch-up deferral). `searchVisitRowsDeferred` is sticky so
+  // that once the cooldown expires the NEXT drain — search or not —
+  // performs the healing rebuild rather than waiting for another search.
+  let lastFullBaseRebuildAtMs = 0;
+  let searchVisitRowsDeferred = false;
+  const searchRebuildCoalesceMs = (): number => {
+    const raw = process.env['SIDETRACK_SEARCH_REBUILD_COALESCE_MS'];
+    const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 600_000;
+  };
   // Persistent engagement fact store (lazy-opened; survives restart).
   // Sourced via deps for tests; defaults to the SQLite-backed store.
   let engagementFactStore: EngagementFactsStore | null = null;
@@ -5838,7 +5856,19 @@ export const createConnectionsMaterializer = (
       // the rebuild that re-derives thread_in_workstream edges).
       scopedTimelineDeltaSkipDetail = 'thread-membership-reconcile-forced';
     }
+    // Sticky search-visit healing: rows were deferred by a coalesced
+    // search-visit drain and the cooldown has expired — force THIS drain
+    // (search or not) down the full-rebuild path so the deferred rows and
+    // cross-search edges land now rather than waiting for another search.
+    const searchVisitCadenceRebuildDue =
+      !requireScopedTimelineDeltaForDrain &&
+      searchVisitRowsDeferred &&
+      Date.now() - lastFullBaseRebuildAtMs >= searchRebuildCoalesceMs();
+    if (searchVisitCadenceRebuildDue && !forceFullRebuildForThreadReconcile) {
+      scopedTimelineDeltaSkipDetail = 'search-visit-cadence-rebuild';
+    }
     if (
+      !searchVisitCadenceRebuildDue &&
       !forceFullRebuildForThreadReconcile &&
       scopedTimelineDeltaGate.incrementalScopes &&
       scopedTimelineDeltaGate.feature &&
@@ -6306,6 +6336,7 @@ export const createConnectionsMaterializer = (
         }
       }
     }
+    let searchVisitRebuildCoalesced = false;
     if (!scopedTimelineDeltaApplied) {
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
@@ -6360,13 +6391,56 @@ export const createConnectionsMaterializer = (
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
       }
+      // Search-visit rebuild coalescing (see the flag declarations for the
+      // full argument): within the cooldown a search-visit drain advances
+      // progress only and serves the prior snapshot; the deferred rows are
+      // healed by the next full rebuild, which the sticky flag forces on
+      // the first drain after cooldown expiry.
+      if (
+        !requireScopedTimelineDeltaForDrain &&
+        scopedTimelineDeltaSkipDetail === 'pending-search-visit' &&
+        !similarityRecoveryNeedsBaseRebuild &&
+        !forceFullRebuildForThreadReconcile &&
+        previousSnapshotForScopedDelta !== null &&
+        replaceScopeRowsForScopedDelta !== undefined &&
+        Date.now() - lastFullBaseRebuildAtMs < searchRebuildCoalesceMs()
+      ) {
+        const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        await replaceScopeRowsForScopedDelta({
+          scopes: [],
+          nodes: [],
+          edges: [],
+          progress,
+          ...chunkProjectionAccumulatorStateFor(progress),
+          metadata: {
+            urlProjection: serializeUrlProjection(urlProjection),
+            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
+          },
+        });
+        lastFrontier = progress.appliedFrontier;
+        baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
+        incrementalGraphView.seed(baseSnapshot);
+        scopedTimelineDeltaApplied = true;
+        searchVisitRowsDeferred = true;
+        searchVisitRebuildCoalesced = true;
+        mark(
+          `searchVisitRebuild.coalesced pending=${String(pendingEventsForDrain.length)} nextEligibleMs=${String(
+            Math.max(0, searchRebuildCoalesceMs() - (Date.now() - lastFullBaseRebuildAtMs)),
+          )}`,
+        );
+      }
       if (canAttemptBoundedScopedDelta) {
         const readCount = await loadPageEvidenceForEntries(similarityEntries);
         mark(
           `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
         );
       }
-      if (!baseSnapshotPrebuilt) {
+      if (!baseSnapshotPrebuilt && !searchVisitRebuildCoalesced) {
+        // Any full base rebuild re-derives cross-search edges, so it resets
+        // the search-visit rebuild cooldown and clears the deferred-rows
+        // sticky (the rebuild below reads the complete event source).
+        lastFullBaseRebuildAtMs = Date.now();
+        searchVisitRowsDeferred = false;
         // Full-rebuild fallback (scoped-delta could not apply; NOT a catch-up,
         // which threw above). `input.events` (= merged) is only the pending
         // WINDOW on every warm path, so buildConnectionsSnapshot would yield a
